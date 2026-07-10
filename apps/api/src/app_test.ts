@@ -1,6 +1,7 @@
 import { assertEquals, assertExists, assertStringIncludes } from "jsr:@std/assert@1.0.14";
 import { createApp } from "./app.ts";
 import type { RateLimiter } from "./rate-limit.ts";
+import type { ChatCompletionRequest } from "@dg-chat/contracts";
 
 async function json(response: Response) {
   // deno-lint-ignore no-explicit-any
@@ -210,4 +211,71 @@ Deno.test("rate limiter outages fail closed with a controlled service error", as
   assertEquals(response.status, 503);
   assertEquals(response.headers.get("retry-after"), "5");
   assertEquals((await json(response)).error.code, "service_unavailable");
+});
+
+Deno.test("disconnecting after a role-only provider chunk refunds the reservation", async () => {
+  const providerStream = async function* (_request: ChatCompletionRequest, signal: AbortSignal) {
+    yield JSON.stringify({
+      id: "chatcmpl-role-only",
+      object: "chat.completion.chunk",
+      choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+    });
+    await new Promise<void>((resolve) =>
+      signal.addEventListener("abort", () => resolve(), {
+        once: true,
+      })
+    );
+    signal.throwIfAborted();
+  };
+  const { app, repository } = createApp({
+    setupToken: "disconnect-setup",
+    providerStream,
+  });
+  await app.request("/api/setup/bootstrap", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-setup-token": "disconnect-setup" },
+    body: JSON.stringify({
+      email: "disconnect@example.com",
+      password: "correct horse battery",
+      name: "Disconnect Admin",
+    }),
+  });
+  const login = await app.request("/api/auth/sign-in/email", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email: "disconnect@example.com",
+      password: "correct horse battery",
+    }),
+  });
+  const me = await json(login);
+  const auth = {
+    cookie: sessionCookie(login),
+    origin: "http://localhost:5173",
+    "content-type": "application/json",
+  };
+  const tokenResponse = await app.request("/api/tokens", {
+    method: "POST",
+    headers: auth,
+    body: JSON.stringify({ name: "disconnect", scopes: ["chat:write"] }),
+  });
+  const token = (await json(tokenResponse)).token as string;
+  const before = await repository.usage(me.user.id);
+  const response = await app.request("/v1/chat/completions", {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "openai/default",
+      messages: [{ role: "user", content: "disconnect now" }],
+      stream: true,
+    }),
+  });
+  const reader = response.body?.getReader();
+  assertExists(reader);
+  assertEquals((await reader.read()).done, false);
+  await reader.cancel();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const after = await repository.usage(me.user.id);
+  assertEquals(after.balanceMicros, before.balanceMicros);
+  assertEquals(after.calls, before.calls);
 });

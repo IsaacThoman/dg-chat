@@ -22,6 +22,7 @@ export const models: ModelInfo[] = [
 ];
 
 export function contentText(content: ChatCompletionRequest["messages"][number]["content"]): string {
+  if (content === null) return "";
   if (typeof content === "string") return content;
   return content.map((part) =>
     typeof part.text === "string" ? part.text : part.type === "image_url" ? "[image]" : ""
@@ -32,7 +33,8 @@ export function simulate(request: ChatCompletionRequest): string {
   const last = [...request.messages].reverse().find((m) => m.role === "user");
   const prompt = last ? contentText(last.content) : "Hello";
   const response = `This is a simulated response to: ${prompt}`;
-  return request.max_tokens === undefined ? response : response.slice(0, request.max_tokens * 4);
+  const maxTokens = request.max_tokens ?? request.max_completion_tokens;
+  return maxTokens === undefined ? response : response.slice(0, maxTokens * 4);
 }
 
 function providerEndpoint(baseUrl: string): string {

@@ -36,6 +36,7 @@ export interface AppOptions {
   setupToken?: string;
   startingCreditMicros?: number;
   rateLimiter?: RateLimiter;
+  providerStream?: typeof streamChatCompletion;
 }
 
 const openAIError = (message: string, code: string | null = null) => ({
@@ -73,6 +74,7 @@ const parseJson = async <T>(
 export function createApp(options: AppOptions = {}) {
   const repo = options.repository ?? new MemoryRepository();
   const rateLimiter = options.rateLimiter ?? new MemoryRateLimiter();
+  const providerStream = options.providerStream ?? streamChatCompletion;
   const setupToken = options.setupToken ?? Deno.env.get("SETUP_TOKEN") ?? "";
   const configuredStartingCredit = Deno.env.get("STARTING_CREDIT_MICROS");
   const configuredStartingUsd = Deno.env.get("DEFAULT_APPROVAL_CREDIT_USD");
@@ -112,6 +114,14 @@ export function createApp(options: AppOptions = {}) {
   );
   app.use("/api/*", bodyLimit({ maxSize: 2 * 1024 * 1024 }));
   app.use("/v1/*", bodyLimit({ maxSize: 4 * 1024 * 1024 }));
+  app.use(
+    "*",
+    cors({
+      origin: webOrigin,
+      credentials: true,
+      allowHeaders: ["Authorization", "Content-Type", "Idempotency-Key"],
+    }),
+  );
   app.use("*", async (c, next) => {
     if (c.req.method === "OPTIONS") return next();
     const path = c.req.path;
@@ -133,8 +143,15 @@ export function createApp(options: AppOptions = {}) {
     if (!policy) return next();
     let result;
     try {
+      const credential = authRoute
+        ? undefined
+        : c.req.header("authorization") ?? getCookie(c, sessionCookie) ??
+          (production ? getCookie(c, "dg_session") : undefined);
+      const clientKey = credential
+        ? `credential:${await sha256(credential)}`
+        : requestClientKey(c.req.raw.headers);
       result = await rateLimiter.consume(
-        `${policy.name}:${requestClientKey(c.req.raw.headers)}`,
+        `${policy.name}:${clientKey}`,
         policy.limit,
         policy.window,
       );
@@ -159,14 +176,6 @@ export function createApp(options: AppOptions = {}) {
     }
     await next();
   });
-  app.use(
-    "*",
-    cors({
-      origin: webOrigin,
-      credentials: true,
-      allowHeaders: ["Authorization", "Content-Type", "Idempotency-Key"],
-    }),
-  );
   app.use("/api/*", async (c, next) => {
     if (!["GET", "HEAD", "OPTIONS"].includes(c.req.method)) {
       const origin = c.req.header("origin");
@@ -638,7 +647,7 @@ export function createApp(options: AppOptions = {}) {
     const runId = `${c.get("user").id}:chat:${
       c.req.header("idempotency-key") ?? crypto.randomUUID()
     }`;
-    const maxOutput = request.max_tokens ?? 4096;
+    const maxOutput = request.max_tokens ?? request.max_completion_tokens ?? 4096;
     const reserveMicros = reservationPrice(model, request.messages, maxOutput).costMicros;
     await repo.reserve(
       c.get("user").id,
@@ -658,7 +667,7 @@ export function createApp(options: AppOptions = {}) {
         let settled = false;
         try {
           for (const word of words) {
-            if (stream.closed || c.req.raw.signal.aborted) break;
+            if (stream.aborted || c.req.raw.signal.aborted) break;
             await stream.writeSSE({
               data: JSON.stringify({
                 id,
@@ -689,7 +698,7 @@ export function createApp(options: AppOptions = {}) {
             Math.round(performance.now() - started),
           );
           settled = true;
-          if (stream.closed || c.req.raw.signal.aborted) return;
+          if (stream.aborted || c.req.raw.signal.aborted) return;
           await stream.writeSSE({
             data: JSON.stringify({
               id,
@@ -714,18 +723,24 @@ export function createApp(options: AppOptions = {}) {
           } else if (!settled) {
             await repo.refund(runId);
           }
+          if (stream.aborted || c.req.raw.signal.aborted) return;
           throw error;
         }
       });
     }
     if (request.stream) {
       return streamSSE(c, async (stream) => {
+        const downstreamAbort = new AbortController();
+        stream.onAbort(() =>
+          downstreamAbort.abort(new DOMException("Client disconnected", "AbortError"))
+        );
+        const upstreamSignal = AbortSignal.any([c.req.raw.signal, downstreamAbort.signal]);
         let deliveredText = "";
         let inputTokens = estimateInputTokens(request.messages);
         let outputTokens = 0;
         let settled = false;
         try {
-          for await (const data of streamChatCompletion(request, c.req.raw.signal)) {
+          for await (const data of providerStream(request, upstreamSignal)) {
             if (data === "[DONE]") {
               const finalOutput = outputTokens || Math.ceil(deliveredText.length / 4);
               await repo.settle(
@@ -736,7 +751,7 @@ export function createApp(options: AppOptions = {}) {
                 Math.round(performance.now() - started),
               );
               settled = true;
-              if (!stream.closed && !c.req.raw.signal.aborted) {
+              if (!stream.aborted && !upstreamSignal.aborted) {
                 await stream.writeSSE({ data: "[DONE]" });
               }
               return;
@@ -744,13 +759,16 @@ export function createApp(options: AppOptions = {}) {
             const chunk = JSON.parse(data) as {
               choices?: Array<{ delta?: { content?: string } }>;
               usage?: { prompt_tokens?: number; completion_tokens?: number };
+              error?: { message?: string };
             };
-            deliveredText += chunk.choices?.map((choice) => choice.delta?.content ?? "").join("") ??
-              "";
+            if (chunk.error) throw new Error(chunk.error.message ?? "Provider stream failed");
             inputTokens = chunk.usage?.prompt_tokens ?? inputTokens;
             outputTokens = chunk.usage?.completion_tokens ?? outputTokens;
-            if (stream.closed || c.req.raw.signal.aborted) break;
+            if (stream.aborted || upstreamSignal.aborted) break;
             await stream.writeSSE({ data });
+            if (stream.aborted || upstreamSignal.aborted) break;
+            deliveredText += chunk.choices?.map((choice) => choice.delta?.content ?? "").join("") ??
+              "";
           }
           if (!settled) {
             const finalOutput = outputTokens || Math.ceil(deliveredText.length / 4);
@@ -762,6 +780,9 @@ export function createApp(options: AppOptions = {}) {
                 finalOutput,
                 Math.round(performance.now() - started),
               );
+              settled = true;
+            } else {
+              await repo.refund(runId);
               settled = true;
             }
           }
@@ -778,6 +799,7 @@ export function createApp(options: AppOptions = {}) {
           } else if (!settled) {
             await repo.refund(runId);
           }
+          if (upstreamSignal.aborted) return;
           throw error;
         }
       });
@@ -914,7 +936,7 @@ export function createApp(options: AppOptions = {}) {
         part: { type: "output_text", text: "", annotations: [] },
       });
       for (const delta of result.text.split(/(?<=\s)/)) {
-        if (stream.closed || c.req.raw.signal.aborted) return;
+        if (stream.aborted || c.req.raw.signal.aborted) return;
         await emit({
           type: "response.output_text.delta",
           item_id: messageId,

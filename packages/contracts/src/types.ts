@@ -84,9 +84,10 @@ export interface ModelInfo {
 
 export interface OpenAIMessage {
   role: MessageRole;
-  content: string | Array<Record<string, unknown>>;
+  content: string | Array<Record<string, unknown>> | null;
   name?: string;
   tool_call_id?: string;
+  tool_calls?: unknown[];
 }
 
 export interface ChatCompletionRequest {
@@ -95,6 +96,16 @@ export interface ChatCompletionRequest {
   stream?: boolean;
   temperature?: number;
   max_tokens?: number;
+  max_completion_tokens?: number;
+  stream_options?: { include_usage?: boolean };
+  tool_choice?: unknown;
+  response_format?: unknown;
+  parallel_tool_calls?: boolean;
+  stop?: string | string[];
+  frequency_penalty?: number;
+  presence_penalty?: number;
+  seed?: number;
+  n?: number;
   tools?: unknown[];
   user?: string;
 }
