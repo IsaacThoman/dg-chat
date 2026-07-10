@@ -23,6 +23,11 @@ with only list, location, read, write, and delete permissions for that bucket. N
 identity. `MINIO_APP_POLICY_NAME` may be set to an installation-unique policy name when multiple
 deployments share one MinIO control plane. Its default is derived from the application access key.
 
+Both the API and background worker require the same `S3_*` application credentials. The bundled
+Compose stack passes them to both services and holds startup until `minio-init` has provisioned the
+bucket-scoped identity. Custom deployments must preserve that ordering because text/JSON ingestion
+reads immutable objects directly from the worker.
+
 Uploads default to 25 MiB with at most four concurrent uploads per application replica and two per
 user. Tune `UPLOAD_MAX_BYTES`, `UPLOAD_MAX_CONCURRENT`, and `UPLOAD_MAX_CONCURRENT_PER_USER` while
 keeping the application `/tmp` tmpfs large enough for the resulting worst-case staged bytes.

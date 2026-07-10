@@ -50,6 +50,13 @@
       "when": 1783656006000,
       "tag": "0006_audit_pagination",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1783656007000,
+      "tag": "0007_attachment_ingestion",
+      "breakpoints": true
     }
   ]
 }

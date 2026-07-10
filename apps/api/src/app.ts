@@ -132,6 +132,9 @@ const publicAttachment = (attachment: AttachmentRecord) => ({
   sizeBytes: attachment.sizeBytes,
   state: attachment.state,
   inspectionError: attachment.inspectionError,
+  ingestionStatus: attachment.ingestionStatus,
+  ingestionError: attachment.ingestionError,
+  ingestedAt: attachment.ingestedAt,
   createdAt: attachment.createdAt,
   updatedAt: attachment.updatedAt,
 });
@@ -1340,6 +1343,17 @@ export function createApp(options: AppOptions = {}) {
     await repo.deleteAttachment(c.req.param("id"), c.get("user").id);
     return c.body(null, 204);
   });
+  app.get(
+    "/api/attachments/:id/chunks",
+    async (c) =>
+      c.json({ data: await repo.listDocumentChunks(c.req.param("id"), c.get("user").id) }),
+  );
+  app.post("/api/attachments/:id/ingestion/retry", async (c) =>
+    c.json({
+      attachment: publicAttachment(
+        await repo.retryAttachmentIngestion(c.req.param("id"), c.get("user").id),
+      ),
+    }));
   app.use("/api/messages/*", authenticate, approved, sessionOnly);
   app.get("/api/messages/:messageId/attachments/:attachmentId/content", async (c) => {
     const ownerId = c.get("user").id;

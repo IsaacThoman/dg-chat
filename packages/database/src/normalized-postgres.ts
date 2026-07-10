@@ -26,6 +26,8 @@ import type {
   CreateAttachmentInput,
   CreateAttachmentResult,
   CreateUserInput,
+  DocumentChunk,
+  DocumentChunkInput,
   DomainRepository,
   FailApiRequestInput,
   FailGenerationInput,
@@ -138,10 +140,39 @@ function attachment(row: Row): AttachmentRecord {
     sha256: String(row.sha256),
     state: row.state as AttachmentState,
     inspectionError: row.inspection_error ? String(row.inspection_error) : null,
+    ingestionStatus: String(
+      row.ingestion_status ?? "not_applicable",
+    ) as AttachmentRecord["ingestionStatus"],
+    ingestionError: row.ingestion_error ? String(row.ingestion_error) : null,
+    ingestedAt: nullableIso(row.ingested_at),
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at ?? row.created_at),
     deletedAt: nullableIso(row.deleted_at),
   };
+}
+function documentChunk(row: Row): DocumentChunk {
+  return {
+    id: String(row.id),
+    attachmentId: String(row.attachment_id),
+    ordinal: number(row.ordinal),
+    content: String(row.content),
+    metadata: row.metadata as Record<string, unknown>,
+  };
+}
+
+const isIngestibleMime = (mime: string) => mime === "text/plain" || mime === "application/json";
+
+function validateDocumentChunks(chunks: DocumentChunkInput[]) {
+  const ids = new Set<string>();
+  for (const [index, chunk] of chunks.entries()) {
+    if (
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+        chunk.id,
+      ) || chunk.ordinal !== index || !chunk.content || chunk.content.length > 20_000 ||
+      ids.has(chunk.id)
+    ) throw new DomainError("invalid_document_chunks", "Document chunks are invalid", 422);
+    ids.add(chunk.id);
+  }
 }
 function validateAttachmentInput(input: CreateAttachmentInput) {
   if (!/^[0-9a-f]{64}$/.test(input.sha256)) {
@@ -1020,9 +1051,11 @@ export class PostgresRepository implements DomainRepository {
       if (!owner.length) throw new DomainError("not_found", "User not found", 404);
       const inserted = await tx<
         Row[]
-      >`INSERT INTO attachments(owner_id,object_key,filename,mime_type,size_bytes,sha256,state,inspection_error) VALUES(${input.ownerId},${input.objectKey},${input.filename},${input.mimeType},${input.sizeBytes},${input.sha256},${
+      >`INSERT INTO attachments(owner_id,object_key,filename,mime_type,size_bytes,sha256,state,inspection_error,ingestion_status) VALUES(${input.ownerId},${input.objectKey},${input.filename},${input.mimeType},${input.sizeBytes},${input.sha256},${
         input.state ?? "pending"
-      },${input.inspectionError ?? null}) ON CONFLICT DO NOTHING RETURNING *`;
+      },${input.inspectionError ?? null},${
+        input.state === "ready" && isIngestibleMime(input.mimeType) ? "queued" : "not_applicable"
+      }) ON CONFLICT DO NOTHING RETURNING *`;
       let record = inserted[0];
       const deduplicated = !record;
       if (!record) {
@@ -1051,6 +1084,11 @@ export class PostgresRepository implements DomainRepository {
       >`INSERT INTO jobs(type,payload,idempotency_key) VALUES('attachment.inspect',${
         tx.json({ attachmentId, ownerId: input.ownerId })
       },${idempotencyKey}) ON CONFLICT(idempotency_key) DO UPDATE SET idempotency_key=EXCLUDED.idempotency_key RETURNING id`;
+      if (String(record.ingestion_status) === "queued") {
+        await tx`INSERT INTO jobs(type,payload,idempotency_key) VALUES('attachment.ingest',${
+          tx.json({ attachmentId, ownerId: input.ownerId })
+        },${`attachment.ingest:${attachmentId}`}) ON CONFLICT(idempotency_key) DO NOTHING`;
+      }
       return {
         attachment: attachment(record),
         inspectionJobId: String(jobs[0].id),
@@ -1110,14 +1148,24 @@ export class PostgresRepository implements DomainRepository {
         422,
       );
     }
-    const rows = await this.#sql<
-      Row[]
-    >`UPDATE attachments SET state=${nextState},inspection_error=${inspectionError},deleted_at=CASE WHEN ${nextState}='deleted' THEN COALESCE(deleted_at,now()) ELSE deleted_at END,updated_at=now() WHERE id=${id} AND owner_id=${ownerId} AND state=${expectedState} RETURNING *`;
-    if (rows[0]) return attachment(rows[0]);
-    const exists = await this
-      .#sql`SELECT id FROM attachments WHERE id=${id} AND owner_id=${ownerId}`;
-    if (!exists.length) throw new DomainError("not_found", "Attachment not found", 404);
-    throw new DomainError("attachment_state_conflict", "Attachment state changed", 409);
+    return await this.#sql.begin(async (tx) => {
+      const rows = await tx<
+        Row[]
+      >`UPDATE attachments SET state=${nextState},inspection_error=${inspectionError},
+        ingestion_status=CASE WHEN ${nextState}='ready' AND mime_type IN ('text/plain','application/json') THEN 'queued' ELSE ingestion_status END,
+        ingestion_error=CASE WHEN ${nextState}='ready' THEN NULL ELSE ingestion_error END,
+        deleted_at=CASE WHEN ${nextState}='deleted' THEN COALESCE(deleted_at,now()) ELSE deleted_at END,
+        updated_at=now() WHERE id=${id} AND owner_id=${ownerId} AND state=${expectedState} RETURNING *`;
+      if (rows[0] && nextState === "ready" && isIngestibleMime(String(rows[0].mime_type))) {
+        await tx`INSERT INTO jobs(type,payload,idempotency_key) VALUES('attachment.ingest',${
+          tx.json({ attachmentId: id, ownerId })
+        },${`attachment.ingest:${id}`}) ON CONFLICT(idempotency_key) DO NOTHING`;
+      }
+      if (rows[0]) return attachment(rows[0]);
+      const exists = await tx`SELECT id FROM attachments WHERE id=${id} AND owner_id=${ownerId}`;
+      if (!exists.length) throw new DomainError("not_found", "Attachment not found", 404);
+      throw new DomainError("attachment_state_conflict", "Attachment state changed", 409);
+    });
   }
 
   async linkAttachmentToMessage(messageId: string, attachmentId: string, ownerId: string) {
@@ -1138,6 +1186,101 @@ export class PostgresRepository implements DomainRepository {
       Row[]
     >`SELECT a.* FROM attachments a JOIN message_attachments ma ON ma.attachment_id=a.id WHERE ma.message_id=${messageId} ORDER BY a.created_at,a.id`)
       .map(attachment);
+  }
+
+  async beginAttachmentIngestion(id: string, ownerId: string) {
+    const rows = await this.#sql<Row[]>`
+      UPDATE attachments SET ingestion_status='processing',ingestion_error=NULL,updated_at=now()
+      WHERE id=${id} AND owner_id=${ownerId} AND deleted_at IS NULL AND state='ready'
+        AND mime_type IN ('text/plain','application/json')
+        AND ingestion_status IN ('queued','processing') RETURNING *`;
+    if (rows[0]) return attachment(rows[0]);
+    const exists = await this
+      .#sql`SELECT id FROM attachments WHERE id=${id} AND owner_id=${ownerId}`;
+    if (!exists.length) throw new DomainError("not_found", "Attachment not found", 404);
+    throw new DomainError("ingestion_state_conflict", "Attachment ingestion is not queued", 409);
+  }
+
+  async completeAttachmentIngestion(
+    id: string,
+    ownerId: string,
+    chunks: DocumentChunkInput[],
+  ) {
+    validateDocumentChunks(chunks);
+    return await this.#sql.begin(async (tx) => {
+      const rows = await tx<Row[]>`
+        SELECT * FROM attachments WHERE id=${id} AND owner_id=${ownerId}
+          AND deleted_at IS NULL AND ingestion_status='processing' FOR UPDATE`;
+      if (!rows[0]) {
+        throw new DomainError(
+          "ingestion_state_conflict",
+          "Attachment ingestion is not processing",
+          409,
+        );
+      }
+      await tx`DELETE FROM document_chunks WHERE attachment_id=${id}`;
+      for (const chunk of chunks) {
+        await tx`INSERT INTO document_chunks(id,attachment_id,ordinal,content,metadata)
+          VALUES(${chunk.id},${id},${chunk.ordinal},${chunk.content},${
+          tx.json(chunk.metadata as never)
+        })`;
+      }
+      const updated = await tx<Row[]>`
+        UPDATE attachments SET ingestion_status='ready',ingestion_error=NULL,ingested_at=now(),updated_at=now()
+        WHERE id=${id} RETURNING *`;
+      return attachment(updated[0]);
+    });
+  }
+
+  async failAttachmentIngestion(id: string, ownerId: string, error: string) {
+    const rows = await this.#sql<Row[]>`
+      UPDATE attachments SET ingestion_status='failed',ingestion_error=${
+      error.slice(0, 1000)
+    },updated_at=now()
+      WHERE id=${id} AND owner_id=${ownerId} AND deleted_at IS NULL
+        AND ingestion_status IN ('queued','processing') RETURNING *`;
+    if (rows[0]) return attachment(rows[0]);
+    const exists = await this
+      .#sql`SELECT id FROM attachments WHERE id=${id} AND owner_id=${ownerId}`;
+    if (!exists.length) throw new DomainError("not_found", "Attachment not found", 404);
+    throw new DomainError("ingestion_state_conflict", "Attachment ingestion is not active", 409);
+  }
+
+  async retryAttachmentIngestion(id: string, ownerId: string) {
+    return await this.#sql.begin(async (tx) => {
+      const records = await tx<Row[]>`SELECT * FROM attachments WHERE id=${id}
+        AND owner_id=${ownerId} AND deleted_at IS NULL AND state='ready' FOR UPDATE`;
+      if (!records[0]) throw new DomainError("not_found", "Attachment not found", 404);
+      const jobs = await tx<Row[]>`SELECT * FROM jobs
+        WHERE idempotency_key=${`attachment.ingest:${id}`} FOR UPDATE`;
+      const legacySplit = String(records[0].ingestion_status) === "queued" &&
+        String(jobs[0]?.status) === "failed";
+      if (String(records[0].ingestion_status) !== "failed" && !legacySplit) {
+        throw new DomainError(
+          "ingestion_state_conflict",
+          "Only failed ingestion can be retried",
+          409,
+        );
+      }
+      const rows = await tx<Row[]>`UPDATE attachments SET ingestion_status='queued',
+        ingestion_error=NULL,ingested_at=NULL,updated_at=now() WHERE id=${id} RETURNING *`;
+      await tx`INSERT INTO jobs(type,payload,idempotency_key,status,attempts,available_at)
+        VALUES('attachment.ingest',${
+        tx.json({ attachmentId: id, ownerId })
+      },${`attachment.ingest:${id}`},'queued',0,now())
+        ON CONFLICT(idempotency_key) DO UPDATE SET status='queued',attempts=0,available_at=now(),
+          last_error=NULL,locked_at=NULL,locked_by=NULL,completed_at=NULL`;
+      return attachment(rows[0]);
+    });
+  }
+
+  async listDocumentChunks(id: string, ownerId: string) {
+    const exists = await this.#sql`
+      SELECT id FROM attachments WHERE id=${id} AND owner_id=${ownerId} AND deleted_at IS NULL`;
+    if (!exists.length) throw new DomainError("not_found", "Attachment not found", 404);
+    return (await this.#sql<Row[]>`
+      SELECT dc.* FROM document_chunks dc WHERE dc.attachment_id=${id} ORDER BY dc.ordinal`)
+      .map(documentChunk);
   }
 
   async createApiToken(userId: string, input: CreateApiTokenInput) {

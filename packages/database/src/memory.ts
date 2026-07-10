@@ -30,6 +30,8 @@ import type {
   CreateAttachmentInput,
   CreateAttachmentResult,
   CreateUserInput,
+  DocumentChunk,
+  DocumentChunkInput,
   FailApiRequestInput,
   FailGenerationInput,
   GenerationResult,
@@ -84,6 +86,21 @@ export class DomainError extends Error {
   }
 }
 
+const isIngestibleMime = (mime: string) => mime === "text/plain" || mime === "application/json";
+
+function validateDocumentChunks(chunks: DocumentChunkInput[]) {
+  const ids = new Set<string>();
+  for (const [index, chunk] of chunks.entries()) {
+    if (
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+        chunk.id,
+      ) || chunk.ordinal !== index || !chunk.content || chunk.content.length > 20_000 ||
+      ids.has(chunk.id)
+    ) throw new DomainError("invalid_document_chunks", "Document chunks are invalid", 422);
+    ids.add(chunk.id);
+  }
+}
+
 export class MemoryRepository {
   readonly storageKind: "memory" | "postgres" = "memory";
   readonly users = new Map<string, StoredUser>();
@@ -98,6 +115,7 @@ export class MemoryRepository {
   readonly auditEvents: AuditEvent[] = [];
   readonly attachments = new Map<string, AttachmentRecord>();
   readonly messageAttachments = new Map<string, Set<string>>();
+  readonly documentChunks = new Map<string, DocumentChunk[]>();
   readonly conversations = new Map<string, Conversation>();
   readonly messages = new Map<string, MessageNode>();
   readonly idempotency = new Map<string, string>();
@@ -832,11 +850,17 @@ export class MemoryRepository {
       id: crypto.randomUUID(),
       state: input.state ?? "pending",
       inspectionError: input.inspectionError ?? null,
+      ingestionStatus: input.state === "ready" && isIngestibleMime(input.mimeType)
+        ? "queued"
+        : "not_applicable",
+      ingestionError: null,
+      ingestedAt: null,
       createdAt: now,
       updatedAt: now,
       deletedAt: null,
     };
     this.attachments.set(attachment.id, attachment);
+    this.enqueueAttachmentIngestion(attachment);
     return {
       attachment,
       inspectionJobId: this.enqueueAttachmentInspection(attachment),
@@ -899,6 +923,11 @@ export class MemoryRepository {
     attachment.inspectionError = inspectionError;
     attachment.updatedAt = new Date().toISOString();
     if (nextState === "deleted") attachment.deletedAt = attachment.updatedAt;
+    if (nextState === "ready" && isIngestibleMime(attachment.mimeType)) {
+      attachment.ingestionStatus = "queued";
+      attachment.ingestionError = null;
+      this.enqueueAttachmentIngestion(attachment);
+    }
     return attachment;
   }
 
@@ -928,6 +957,83 @@ export class MemoryRepository {
     );
   }
 
+  beginAttachmentIngestion(id: string, ownerId: string) {
+    const attachment = this.getAttachment(id, ownerId);
+    if (!isIngestibleMime(attachment.mimeType) || attachment.state !== "ready") {
+      throw new DomainError("attachment_not_ingestible", "Attachment cannot be ingested", 422);
+    }
+    if (!["queued", "processing"].includes(attachment.ingestionStatus)) {
+      throw new DomainError("ingestion_state_conflict", "Attachment ingestion is not queued", 409);
+    }
+    attachment.ingestionStatus = "processing";
+    attachment.ingestionError = null;
+    attachment.updatedAt = new Date().toISOString();
+    return attachment;
+  }
+
+  completeAttachmentIngestion(
+    id: string,
+    ownerId: string,
+    chunks: DocumentChunkInput[],
+  ) {
+    const attachment = this.getAttachment(id, ownerId);
+    if (attachment.ingestionStatus !== "processing") {
+      throw new DomainError(
+        "ingestion_state_conflict",
+        "Attachment ingestion is not processing",
+        409,
+      );
+    }
+    validateDocumentChunks(chunks);
+    const next = chunks.map((chunk) => ({ ...chunk, attachmentId: id }));
+    this.documentChunks.set(id, next);
+    const now = new Date().toISOString();
+    attachment.ingestionStatus = "ready";
+    attachment.ingestionError = null;
+    attachment.ingestedAt = now;
+    attachment.updatedAt = now;
+    return attachment;
+  }
+
+  failAttachmentIngestion(id: string, ownerId: string, error: string) {
+    const attachment = this.getAttachment(id, ownerId);
+    if (!["queued", "processing"].includes(attachment.ingestionStatus)) {
+      throw new DomainError("ingestion_state_conflict", "Attachment ingestion is not active", 409);
+    }
+    attachment.ingestionStatus = "failed";
+    attachment.ingestionError = error.slice(0, 1000);
+    attachment.updatedAt = new Date().toISOString();
+    return attachment;
+  }
+
+  retryAttachmentIngestion(id: string, ownerId: string) {
+    const attachment = this.getAttachment(id, ownerId);
+    const key = `attachment.ingest:${attachment.id}`;
+    const prior = this.jobs.find((job) => job.idempotencyKey === key);
+    const legacySplit = attachment.ingestionStatus === "queued" && prior?.status === "failed";
+    if (attachment.ingestionStatus !== "failed" && !legacySplit) {
+      throw new DomainError(
+        "ingestion_state_conflict",
+        "Only failed ingestion can be retried",
+        409,
+      );
+    }
+    attachment.ingestionStatus = "queued";
+    attachment.ingestionError = null;
+    attachment.ingestedAt = null;
+    attachment.updatedAt = new Date().toISOString();
+    if (prior) {
+      prior.status = "queued";
+      prior.attempts = 0;
+    } else this.enqueueAttachmentIngestion(attachment);
+    return attachment;
+  }
+
+  listDocumentChunks(id: string, ownerId: string) {
+    this.getAttachment(id, ownerId);
+    return [...(this.documentChunks.get(id) ?? [])].sort((a, b) => a.ordinal - b.ordinal);
+  }
+
   private enqueueAttachmentInspection(attachment: AttachmentRecord) {
     const idempotencyKey = `attachment.inspect:${attachment.id}`;
     const prior = this.jobs.find((job) => job.idempotencyKey === idempotencyKey);
@@ -936,6 +1042,24 @@ export class MemoryRepository {
     this.jobs.push({
       id,
       type: "attachment.inspect",
+      payload: { attachmentId: attachment.id, ownerId: attachment.ownerId },
+      status: "queued",
+      attempts: 0,
+      idempotencyKey,
+      createdAt: new Date().toISOString(),
+    });
+    return id;
+  }
+
+  private enqueueAttachmentIngestion(attachment: AttachmentRecord) {
+    if (attachment.ingestionStatus !== "queued") return undefined;
+    const idempotencyKey = `attachment.ingest:${attachment.id}`;
+    const prior = this.jobs.find((job) => job.idempotencyKey === idempotencyKey);
+    if (prior) return prior.id;
+    const id = crypto.randomUUID();
+    this.jobs.push({
+      id,
+      type: "attachment.ingest",
       payload: { attachmentId: attachment.id, ownerId: attachment.ownerId },
       status: "queued",
       attempts: 0,

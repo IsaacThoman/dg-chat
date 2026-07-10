@@ -64,6 +64,9 @@ export interface Attachment {
   mimeType: string;
   sizeBytes: number;
   state: string;
+  ingestionStatus?: "not_applicable" | "queued" | "processing" | "ready" | "failed";
+  ingestionError?: string | null;
+  ingestedAt?: string | null;
   createdAt: string;
 }
 

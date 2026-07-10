@@ -111,6 +111,12 @@ export type AttachmentState =
   | "quarantined"
   | "failed"
   | "deleted";
+export type AttachmentIngestionStatus =
+  | "not_applicable"
+  | "queued"
+  | "processing"
+  | "ready"
+  | "failed";
 export interface AttachmentRecord {
   id: string;
   ownerId: string;
@@ -121,9 +127,21 @@ export interface AttachmentRecord {
   sha256: string;
   state: AttachmentState;
   inspectionError: string | null;
+  ingestionStatus: AttachmentIngestionStatus;
+  ingestionError: string | null;
+  ingestedAt: string | null;
   createdAt: string;
   updatedAt: string;
   deletedAt: string | null;
+}
+export interface DocumentChunkInput {
+  id: string;
+  ordinal: number;
+  content: string;
+  metadata: Record<string, unknown>;
+}
+export interface DocumentChunk extends DocumentChunkInput {
+  attachmentId: string;
 }
 export interface CreateAttachmentInput {
   ownerId: string;
@@ -405,6 +423,19 @@ export interface DomainRepository {
     ownerId: string,
   ): MaybePromise<void>;
   listMessageAttachments(messageId: string, ownerId: string): MaybePromise<AttachmentRecord[]>;
+  beginAttachmentIngestion(id: string, ownerId: string): MaybePromise<AttachmentRecord>;
+  completeAttachmentIngestion(
+    id: string,
+    ownerId: string,
+    chunks: DocumentChunkInput[],
+  ): MaybePromise<AttachmentRecord>;
+  failAttachmentIngestion(
+    id: string,
+    ownerId: string,
+    error: string,
+  ): MaybePromise<AttachmentRecord>;
+  retryAttachmentIngestion(id: string, ownerId: string): MaybePromise<AttachmentRecord>;
+  listDocumentChunks(id: string, ownerId: string): MaybePromise<DocumentChunk[]>;
   createApiToken(userId: string, input: CreateApiTokenInput): MaybePromise<StoredApiToken>;
   findApiTokenByHash(hash: string): MaybePromise<StoredApiToken | undefined>;
   listApiTokens(userId: string): MaybePromise<ApiTokenSummary[]>;

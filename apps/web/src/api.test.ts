@@ -191,6 +191,25 @@ describe("conversation lifecycle API", () => {
 });
 
 describe("attachment API", () => {
+  it("retries failed ingestion through the owner-scoped attachment route", async () => {
+    const attachment = {
+      id: "attachment/retry",
+      filename: "notes.txt",
+      mimeType: "text/plain",
+      sizeBytes: 5,
+      state: "ready",
+      ingestionStatus: "queued" as const,
+      createdAt: "2026-07-10T00:00:00.000Z",
+    };
+    const fetchMock = vi.fn().mockResolvedValue(Response.json({ attachment }));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(api.retryAttachmentIngestion(attachment.id)).resolves.toEqual(attachment);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/attachments/attachment%2Fretry/ingestion/retry",
+      expect.objectContaining({ method: "POST", credentials: "include" }),
+    );
+  });
+
   it("uploads multipart data and reports progress", async () => {
     const progress: number[] = [];
     let sent: FormData | undefined;

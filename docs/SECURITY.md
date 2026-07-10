@@ -39,8 +39,10 @@ because a trusted full decoder is not yet configured.
 The current attachment worker acknowledges terminal inspection states; it is not an antivirus,
 content-disarm, PDF, Office, audio, or archive scanner. PDF and audio acceptance currently relies on
 bounded upload handling and MIME/signature checks, so deployments requiring malware scanning must
-add an external quarantine scanner before allowing those formats. Office uploads, OCR, document
-extraction, ingestion, object garbage collection, and retention-aware deletion are not implemented.
+add an external quarantine scanner before allowing those formats. Bounded, strict UTF-8 ingestion is
+implemented only for `text/plain` and fully validated JSON, with deterministic citation chunks.
+Office and PDF extraction, OCR, embeddings/vector retrieval, object garbage collection, and
+retention-aware deletion are not implemented.
 
 The current OpenAI-compatible provider transport resolves every A and AAAA answer, rejects
 special-use destinations, and pins the approved address while preserving TLS hostname validation. It
