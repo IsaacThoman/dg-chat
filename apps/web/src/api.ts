@@ -74,6 +74,7 @@ function mapMessage(value: RawMessage): Message {
     siblingIndex: value.siblingIndex,
     role: value.role === "assistant" ? "assistant" : "user",
     content: value.content,
+    createdAtIso: value.createdAt,
     createdAt: new Date(value.createdAt).toLocaleTimeString([], {
       hour: "2-digit",
       minute: "2-digit",
@@ -206,4 +207,13 @@ export const api = {
       conversation: mapConversation(result.conversation),
     };
   },
+  setActiveLeaf: async (conversation: Conversation, leafId: string) =>
+    demoMode
+      ? { ...conversation, activeLeafId: leafId, version: (conversation.version ?? 0) + 1 }
+      : mapConversation(
+        await request<RawConversation>(`/conversations/${conversation.id}/active-leaf`, {
+          method: "POST",
+          body: JSON.stringify({ leafId, expectedVersion: conversation.version ?? 0 }),
+        }),
+      ),
 };

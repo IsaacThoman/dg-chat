@@ -30,6 +30,7 @@ export interface Message {
   role: "user" | "assistant";
   content: string;
   createdAt: string;
+  createdAtIso?: string;
   model?: string;
   latency?: string;
   branch?: Branch;

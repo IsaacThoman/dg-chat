@@ -76,6 +76,11 @@ textarea:focus-visible {
   color: var(--ink);
   background: #e9e8e3;
 }
+.icon-button:disabled {
+  opacity: .32;
+  cursor: default;
+  background: transparent;
+}
 .brand {
   height: 38px;
   display: flex;
@@ -826,6 +831,13 @@ kbd {
   border-radius: 10px;
   padding: 8px;
   box-shadow: 0 2px 5px #00000008;
+  width: calc(100% - var(--tree-indent, 0px));
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.tree-node:disabled {
+  cursor: wait;
 }
 .tree-node > span {
   width: 25px;
@@ -856,6 +868,24 @@ kbd {
 .tree-node.active {
   border-color: #9481c7;
   box-shadow: 0 0 0 2px #e9e5f5;
+}
+.tree-subtree + .tree-subtree {
+  margin-top: 7px;
+}
+.tree-children {
+  position: relative;
+  margin-top: 7px;
+  display: grid;
+  gap: 7px;
+}
+.tree-children::before {
+  content: "";
+  position: absolute;
+  top: -7px;
+  bottom: 27px;
+  left: 12px;
+  width: 1px;
+  background: #d6d2ca;
 }
 .tree-node.faded {
   opacity: .52;
