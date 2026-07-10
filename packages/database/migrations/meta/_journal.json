@@ -64,6 +64,13 @@
       "when": 1783656008000,
       "tag": "0008_provider_registry",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1783656009000,
+      "tag": "0009_provider_resilience",
+      "breakpoints": true
     }
   ]
 }

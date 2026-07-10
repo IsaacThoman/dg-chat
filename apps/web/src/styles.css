@@ -20,6 +20,65 @@
 * {
   box-sizing: border-box;
 }
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.resilience-playground {
+  margin: 1rem 0 1.75rem;
+  padding: 1rem;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--card) 92%, var(--purple) 8%);
+}
+
+.playground-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+  gap: 1rem;
+  margin: 0.75rem 0;
+}
+
+.playground-grid label {
+  min-width: 0;
+}
+.playground-grid textarea {
+  width: 100%;
+  margin-top: 0.4rem;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.playground-result {
+  min-width: 0;
+  padding: 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--card);
+}
+
+.playground-result pre {
+  max-height: 22rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 0.78rem;
+}
+
+@media (max-width: 720px) {
+  .playground-grid {
+    grid-template-columns: 1fr;
+  }
+}
 html,
 body,
 #root {

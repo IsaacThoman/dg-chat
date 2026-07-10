@@ -253,9 +253,51 @@ Deno.test("admin provider registry protects credentials and powers dynamic OpenA
   ) => request.idempotencyKey === "provider-registry-stream");
   assertExists(streamRequest);
   const streamRun = (repository as MemoryRepository).usageRuns.get(streamRequest.usageRunId);
+  const streamAttempts = (repository as MemoryRepository).listProviderAttempts(
+    streamRequest.usageRunId,
+  );
+  const streamAttempt = streamAttempts[0];
+  assertEquals({
+    inputTokens: streamAttempt.inputTokens,
+    cachedInputTokens: streamAttempt.cachedInputTokens,
+    reasoningTokens: streamAttempt.reasoningTokens,
+    outputTokens: streamAttempt.outputTokens,
+    costMicros: streamAttempt.costMicros,
+    tokenSource: streamAttempt.tokenSource,
+  }, {
+    inputTokens: 10_000,
+    cachedInputTokens: 4_000,
+    reasoningTokens: 5_000,
+    outputTokens: 20_000,
+    costMicros: 6_310,
+    tokenSource: "provider",
+  });
   assertEquals(streamRun?.costMicros, 6_310);
   assertEquals(streamRun?.inputTokens, 10_000);
   assertEquals(streamRun?.outputTokens, 20_000);
+
+  const priorRunIds = new Set((repository as MemoryRepository).usageRuns.keys());
+  const ordinaryCompletion = await app.request("/v1/chat/completions", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model: "vendor/chat",
+      messages: [{ role: "user", content: "exercise the ordinary execution lease" }],
+      max_tokens: 20_000,
+    }),
+  });
+  assertEquals(ordinaryCompletion.status, 200);
+  const ordinaryRun = [...(repository as MemoryRepository).usageRuns.values()].find((run) =>
+    !priorRunIds.has(run.id)
+  );
+  assertExists(ordinaryRun);
+  assertEquals(ordinaryRun.status, "completed");
+  assertEquals(ordinaryRun.executionEpoch, 1);
+  assertEquals(ordinaryRun.runLeaseToken, null);
+  assertEquals(
+    (await repository.listProviderAttempts(ordinaryRun.id)).map((attempt) => attempt.status),
+    ["succeeded"],
+  );
 
   const listed = await body(await app.request("/api/admin/providers", { headers }));
   const listedJson = JSON.stringify(listed);

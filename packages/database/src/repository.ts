@@ -489,6 +489,184 @@ export interface CreateModelPriceVersionInput {
   source: string;
 }
 
+export interface ProviderRetryPolicy {
+  id: string;
+  name: string;
+  enabled: boolean;
+  maxAttempts: number;
+  maxRetries: number;
+  baseDelayMs: number;
+  maxDelayMs: number;
+  backoffMultiplierBps: number;
+  jitterBps: number;
+  firstTokenTimeoutMs: number;
+  idleTimeoutMs: number;
+  totalTimeoutMs: number;
+  retryableStatuses: number[];
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+}
+export interface CreateProviderRetryPolicyInput {
+  name: string;
+  enabled?: boolean;
+  maxAttempts: number;
+  maxRetries: number;
+  baseDelayMs: number;
+  maxDelayMs: number;
+  backoffMultiplierBps: number;
+  jitterBps: number;
+  firstTokenTimeoutMs: number;
+  idleTimeoutMs: number;
+  totalTimeoutMs: number;
+  retryableStatuses: number[];
+}
+export type UpdateProviderRetryPolicyInput = Partial<CreateProviderRetryPolicyInput>;
+
+export interface ProviderModelRoute {
+  id: string;
+  sourceModelId: string;
+  retryPolicyId: string | null;
+  fallbackModelIds: string[];
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+}
+export interface SetProviderModelRouteInput {
+  sourceModelId: string;
+  expectedVersion: number;
+  retryPolicyId?: string | null;
+  fallbackModelIds: string[];
+}
+export interface ProviderExecutionTarget {
+  ordinal: number;
+  providerId: string;
+  providerSlug: string;
+  providerVersion: number;
+  protocol: ProviderProtocol;
+  providerModelId: string;
+  publicModelId: string;
+  upstreamModelId: string;
+  modelVersion: number;
+  pricing: UsagePricingSnapshot;
+}
+export interface ProviderExecutionPlan {
+  sourceModelId: string;
+  routeId: string | null;
+  routeVersion: number;
+  retryPolicy: ProviderRetryPolicy | null;
+  targets: ProviderExecutionTarget[];
+  resolvedAt: string;
+}
+
+export type ProviderAttemptStatus = "running" | "succeeded" | "failed" | "cancelled" | "skipped";
+export type ProviderAttemptPhase =
+  | "planning"
+  | "connect"
+  | "headers"
+  | "first_token"
+  | "streaming"
+  | "complete";
+export type ProviderTokenSource = "provider" | "estimated" | "none";
+export type ProviderCostSource = "provider" | "calculated" | "none";
+export type ProviderAttemptReason = "primary" | "retry" | "fallback" | "circuit_skip" | "half_open";
+export type ProviderBreakerState = "closed" | "open" | "half_open" | "unavailable";
+export interface ProviderAttempt {
+  id: string;
+  usageRunId: string;
+  attemptNumber: number;
+  executionEpoch: number;
+  targetOrdinal: number;
+  retryNumber: number;
+  reason: ProviderAttemptReason;
+  breakerBefore: ProviderBreakerState | null;
+  breakerAfter: ProviderBreakerState | null;
+  retryable: boolean;
+  providerId: string;
+  providerSlug: string;
+  providerVersion: number;
+  protocol: ProviderProtocol;
+  providerModelId: string;
+  publicModelId: string;
+  upstreamModelId: string;
+  modelVersion: number;
+  pricing: UsagePricingSnapshot;
+  status: ProviderAttemptStatus;
+  phase: ProviderAttemptPhase;
+  errorCode: string | null;
+  httpStatus: number | null;
+  visibleOutput: boolean;
+  inputTokens: number;
+  cachedInputTokens: number;
+  reasoningTokens: number;
+  outputTokens: number;
+  costMicros: number;
+  tokenSource: ProviderTokenSource;
+  costSource: ProviderCostSource;
+  latencyMs: number | null;
+  ttftMs: number | null;
+  upstreamRequestId: string | null;
+  tokensPerSecond: number | null;
+  startedAt: string;
+  completedAt: string | null;
+}
+export interface StartProviderAttemptInput extends
+  Omit<
+    ProviderExecutionTarget,
+    "ordinal"
+  > {
+  usageRunId: string;
+  ownerLeaseToken: string;
+  executionEpoch: number;
+  attemptNumber: number;
+  targetOrdinal: number;
+  retryNumber: number;
+  reason: ProviderAttemptReason;
+  breakerBefore?: ProviderBreakerState | null;
+}
+export interface FinishProviderAttemptInput {
+  id: string;
+  ownerLeaseToken: string;
+  executionEpoch: number;
+  status: Exclude<ProviderAttemptStatus, "running">;
+  phase: ProviderAttemptPhase;
+  errorCode?: string | null;
+  httpStatus?: number | null;
+  visibleOutput: boolean;
+  inputTokens: number;
+  cachedInputTokens: number;
+  reasoningTokens: number;
+  outputTokens: number;
+  costMicros: number;
+  tokenSource: ProviderTokenSource;
+  costSource: ProviderCostSource;
+  latencyMs: number;
+  ttftMs?: number | null;
+  breakerAfter?: ProviderBreakerState | null;
+  retryable: boolean;
+  upstreamRequestId?: string | null;
+  tokensPerSecond?: number | null;
+}
+export interface ProviderExecutionClaim {
+  usageRunId: string;
+  executionEpoch: number;
+  nextAttemptNumber: number;
+  /** Physical upstream calls already started across every lease epoch. */
+  consumedAttempts: number;
+  reconciledAttemptIds: string[];
+}
+export interface ProviderExecutionLease {
+  leaseToken: string;
+  leaseExpiresAt: string;
+}
+export interface FinalizeProviderUsageInput {
+  usageRunId: string;
+  ownerLeaseToken: string;
+  executionEpoch: number;
+  latencyMs: number;
+  error?: string | null;
+}
+
 /** Persistence boundary shared by synchronous test stores and async production stores. */
 export interface DomainRepository {
   readonly storageKind: "postgres" | "memory";
@@ -632,6 +810,46 @@ export interface DomainRepository {
     providerModelId: string,
     at?: string,
   ): MaybePromise<ModelPriceVersion | undefined>;
+  createProviderRetryPolicy(
+    input: CreateProviderRetryPolicyInput,
+    mutation: RegistryMutationContext,
+  ): MaybePromise<ProviderRetryPolicy>;
+  updateProviderRetryPolicy(
+    id: string,
+    expectedVersion: number,
+    input: UpdateProviderRetryPolicyInput,
+    mutation: RegistryMutationContext,
+  ): MaybePromise<ProviderRetryPolicy>;
+  listProviderRetryPolicies(enabledOnly?: boolean): MaybePromise<ProviderRetryPolicy[]>;
+  setProviderModelRoute(
+    input: SetProviderModelRouteInput,
+    mutation: RegistryMutationContext,
+  ): MaybePromise<ProviderModelRoute>;
+  findProviderModelRoute(sourceModelId: string): MaybePromise<ProviderModelRoute | undefined>;
+  resolveProviderExecutionPlan(
+    sourceModelId: string,
+    at?: string,
+  ): MaybePromise<ProviderExecutionPlan>;
+  claimProviderExecution(
+    usageRunId: string,
+    ownerLeaseToken: string,
+  ): MaybePromise<ProviderExecutionClaim>;
+  heartbeatProviderExecutionLease(
+    usageRunId: string,
+    ownerLeaseToken: string,
+    leaseSeconds?: number,
+  ): MaybePromise<ProviderExecutionLease>;
+  reclaimProviderExecutionLease(
+    usageRunId: string,
+    expiredLeaseToken: string,
+    leaseSeconds?: number,
+  ): MaybePromise<ProviderExecutionLease>;
+  startProviderAttempt(input: StartProviderAttemptInput): MaybePromise<ProviderAttempt>;
+  finishProviderAttempt(input: FinishProviderAttemptInput): MaybePromise<ProviderAttempt>;
+  listProviderAttempts(usageRunId: string): MaybePromise<ProviderAttempt[]>;
+  settleProviderUsage(input: FinalizeProviderUsageInput): MaybePromise<UsageRun>;
+  refundProviderUsage(input: FinalizeProviderUsageInput): MaybePromise<UsageRun>;
+  reapStaleProviderExecutionLeases(limit?: number): MaybePromise<number>;
   reserve(
     userId: string,
     runId: string,

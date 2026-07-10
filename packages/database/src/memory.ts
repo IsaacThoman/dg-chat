@@ -32,23 +32,34 @@ import type {
   CreateModelPriceVersionInput,
   CreateProviderInput,
   CreateProviderModelInput,
+  CreateProviderRetryPolicyInput,
   CreateUserInput,
   DocumentChunk,
   DocumentChunkInput,
   FailApiRequestInput,
   FailGenerationInput,
+  FinalizeProviderUsageInput,
+  FinishProviderAttemptInput,
   GenerationResult,
   IdentityTokenPurpose,
   ModelPriceVersion,
+  ProviderAttempt,
   ProviderCredentialEnvelope,
   ProviderCredentialMutation,
+  ProviderExecutionClaim,
+  ProviderExecutionPlan,
   ProviderModelRecord,
+  ProviderModelRoute,
   ProviderRecord,
+  ProviderRetryPolicy,
   RegistryMutationContext,
   SessionSummary,
+  SetProviderModelRouteInput,
+  StartProviderAttemptInput,
   StoredProviderCredential,
   UpdateProviderInput,
   UpdateProviderModelInput,
+  UpdateProviderRetryPolicyInput,
   UsagePricingSnapshot,
 } from "./repository.ts";
 import { decodeAuditCursor, encodeAuditCursor, isUsagePricingSnapshot } from "./repository.ts";
@@ -88,6 +99,15 @@ export interface UsageRun {
   inputTokens: number;
   outputTokens: number;
   latencyMs: number;
+  executionEpoch: number;
+  executionOwnerLeaseToken: string | null;
+  runLeaseToken: string | null;
+  runLeaseExpiresAt: string | null;
+  actualProviderCostMicros: number;
+  actualProviderInputTokens: number;
+  actualProviderCachedInputTokens: number;
+  actualProviderReasoningTokens: number;
+  actualProviderOutputTokens: number;
   pricingSnapshot: UsagePricingSnapshot | null;
   generationLeaseToken: string | null;
   generationLeaseExpiresAt: string | null;
@@ -225,6 +245,74 @@ function validatePriceInput(input: CreateModelPriceVersionInput) {
   }
 }
 
+function validateRetryPolicy(input: CreateProviderRetryPolicyInput) {
+  const integer = (value: number, minimum: number, maximum: number) =>
+    Number.isSafeInteger(value) && value >= minimum && value <= maximum;
+  if (
+    !input.name.trim() || input.name.length > 120 ||
+    !integer(input.maxAttempts, 1, 8) ||
+    !integer(input.maxRetries, 0, 3) || input.maxRetries >= input.maxAttempts ||
+    !integer(input.baseDelayMs, 0, 60_000) ||
+    !integer(input.maxDelayMs, input.baseDelayMs, 300_000) ||
+    !integer(input.backoffMultiplierBps, 10_000, 40_000) ||
+    !integer(input.jitterBps, 0, 10_000) ||
+    !integer(input.firstTokenTimeoutMs, 250, 300_000) ||
+    !integer(input.idleTimeoutMs, 250, 300_000) ||
+    !integer(
+      input.totalTimeoutMs,
+      Math.max(input.firstTokenTimeoutMs, input.idleTimeoutMs),
+      900_000,
+    ) ||
+    input.retryableStatuses.length > 32 ||
+    new Set(input.retryableStatuses).size !== input.retryableStatuses.length ||
+    input.retryableStatuses.some((status) => ![408, 425, 429, 500, 502, 503, 504].includes(status))
+  ) {
+    throw new DomainError("validation_error", "Provider retry policy is invalid", 422);
+  }
+}
+
+function validateAttemptFinish(input: FinishProviderAttemptInput) {
+  const count = (value: number) =>
+    Number.isSafeInteger(value) && value >= 0 && value <= 1_000_000_000;
+  if (
+    ![input.inputTokens, input.cachedInputTokens, input.reasoningTokens, input.outputTokens].every(
+      count,
+    ) ||
+    input.cachedInputTokens > input.inputTokens || input.reasoningTokens > input.outputTokens ||
+    !Number.isSafeInteger(input.costMicros) || input.costMicros < 0 ||
+    !Number.isSafeInteger(input.latencyMs) || input.latencyMs < 0 ||
+    (input.ttftMs != null &&
+      (!Number.isSafeInteger(input.ttftMs) || input.ttftMs < 0 ||
+        input.ttftMs > input.latencyMs)) ||
+    (input.httpStatus != null &&
+      (!Number.isSafeInteger(input.httpStatus) || input.httpStatus < 100 ||
+        input.httpStatus > 599)) ||
+    (input.errorCode != null && !/^[a-z0-9][a-z0-9_.-]{0,119}$/.test(input.errorCode)) ||
+    !["succeeded", "failed", "cancelled", "skipped"].includes(input.status) ||
+    !["planning", "connect", "headers", "first_token", "streaming", "complete"].includes(
+      input.phase,
+    ) ||
+    !["provider", "estimated", "none"].includes(input.tokenSource) ||
+    !["provider", "calculated", "none"].includes(input.costSource) ||
+    (input.status === "succeeded" &&
+      (input.phase !== "complete" || input.errorCode != null ||
+        (input.httpStatus != null && (input.httpStatus < 200 || input.httpStatus > 299)))) ||
+    (["failed", "cancelled", "skipped"].includes(input.status) && input.errorCode == null) ||
+    (input.status === "skipped" &&
+      (input.visibleOutput || input.inputTokens + input.outputTokens + input.costMicros !== 0 ||
+        input.tokenSource !== "none" || input.costSource !== "none")) ||
+    (input.breakerAfter != null &&
+      !["closed", "open", "half_open", "unavailable"].includes(input.breakerAfter)) ||
+    (input.upstreamRequestId != null &&
+      !/^[A-Za-z0-9._:-]{1,255}$/.test(input.upstreamRequestId)) ||
+    (input.tokensPerSecond != null &&
+      (!Number.isFinite(input.tokensPerSecond) || input.tokensPerSecond < 0 ||
+        input.tokensPerSecond > 1_000_000))
+  ) {
+    throw new DomainError("validation_error", "Provider attempt telemetry is invalid", 422);
+  }
+}
+
 function validateCredentialEnvelope(envelope: ProviderCredentialEnvelope) {
   const strings = [
     envelope.wrappedKeyNonce,
@@ -260,6 +348,9 @@ export class MemoryRepository {
   readonly providers = new Map<string, StoredProvider>();
   readonly providerModels = new Map<string, ProviderModelRecord>();
   readonly modelPriceVersions = new Map<string, ModelPriceVersion[]>();
+  readonly providerRetryPolicies = new Map<string, ProviderRetryPolicy>();
+  readonly providerModelRoutes = new Map<string, ProviderModelRoute>();
+  readonly providerAttempts = new Map<string, ProviderAttempt>();
   readonly conversations = new Map<string, Conversation>();
   readonly messages = new Map<string, MessageNode>();
   readonly idempotency = new Map<string, string>();
@@ -813,6 +904,8 @@ export class MemoryRepository {
       input.pricingSnapshot,
     );
     const leaseToken = crypto.randomUUID();
+    usageRun.runLeaseToken = null;
+    usageRun.runLeaseExpiresAt = null;
     usageRun.generationLeaseToken = leaseToken;
     usageRun.generationLeaseExpiresAt = new Date(
       Date.now() + (input.leaseSeconds ?? 120) * 1000,
@@ -862,8 +955,11 @@ export class MemoryRepository {
       !usageRun.generationLeaseExpiresAt ||
       Date.parse(usageRun.generationLeaseExpiresAt) <= Date.now()
     ) throw new DomainError("stale_lease", "Generation lease is no longer active", 409);
+    const effectiveCost = usageRun.executionEpoch > 0
+      ? usageRun.actualProviderCostMicros
+      : input.costMicros;
     const balanceAfterSettlement = this.users.get(input.ownerId)!.balanceMicros +
-      usageRun.reservedMicros - input.costMicros;
+      usageRun.reservedMicros - effectiveCost;
     if (balanceAfterSettlement < 0) {
       throw new DomainError("insufficient_credit", "Actual cost exceeds available credit", 402);
     }
@@ -934,6 +1030,16 @@ export class MemoryRepository {
         !run.generationLeaseExpiresAt || Date.parse(run.generationLeaseExpiresAt) > Date.now()
       ) continue;
       const refunded = this.refund(run.id);
+      for (const attempt of this.providerAttempts.values()) {
+        if (attempt.usageRunId !== run.id || attempt.status !== "running") continue;
+        attempt.status = "cancelled";
+        attempt.phase = "planning";
+        attempt.errorCode = "generation_lease_expired";
+        attempt.breakerAfter = "unavailable";
+        attempt.retryable = true;
+        attempt.latencyMs = Math.max(0, Date.now() - Date.parse(attempt.startedAt));
+        attempt.completedAt = new Date().toISOString();
+      }
       if (refunded) {
         refunded.generationLeaseToken = null;
         refunded.generationLeaseExpiresAt = null;
@@ -1242,7 +1348,12 @@ export class MemoryRepository {
 
   private registryAudit(
     mutation: RegistryMutationContext,
-    targetType: "provider" | "provider_model" | "model_price_version",
+    targetType:
+      | "provider"
+      | "provider_model"
+      | "model_price_version"
+      | "provider_retry_policy"
+      | "provider_model_route",
     targetId: string,
     metadata: Record<string, unknown>,
   ) {
@@ -1538,6 +1649,692 @@ export class MemoryRepository {
     );
   }
 
+  createProviderRetryPolicy(
+    input: CreateProviderRetryPolicyInput,
+    mutation: RegistryMutationContext,
+  ): ProviderRetryPolicy {
+    this.validateRegistryMutation(mutation);
+    validateRetryPolicy(input);
+    if (
+      [...this.providerRetryPolicies.values()].some((policy) => policy.name === input.name.trim())
+    ) {
+      throw new DomainError("retry_policy_name_taken", "Retry policy name already exists", 409);
+    }
+    const now = new Date().toISOString();
+    const policy: ProviderRetryPolicy = {
+      id: crypto.randomUUID(),
+      ...structuredClone(input),
+      name: input.name.trim(),
+      enabled: input.enabled ?? true,
+      retryableStatuses: [...input.retryableStatuses].sort((a, b) => a - b),
+      version: 1,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.providerRetryPolicies.set(policy.id, policy);
+    this.registryAudit(mutation, "provider_retry_policy", policy.id, { version: 1 });
+    return structuredClone(policy);
+  }
+
+  updateProviderRetryPolicy(
+    id: string,
+    expectedVersion: number,
+    input: UpdateProviderRetryPolicyInput,
+    mutation: RegistryMutationContext,
+  ): ProviderRetryPolicy {
+    this.validateRegistryMutation(mutation);
+    const current = this.providerRetryPolicies.get(id);
+    if (!current) throw new DomainError("not_found", "Retry policy not found", 404);
+    if (current.version !== expectedVersion) throw registryConflict();
+    const next = {
+      ...current,
+      ...structuredClone(input),
+      name: input.name?.trim() ?? current.name,
+    };
+    validateRetryPolicy(next);
+    if (
+      [...this.providerRetryPolicies.values()].some((policy) =>
+        policy.id !== id && policy.name === next.name
+      )
+    ) {
+      throw new DomainError("retry_policy_name_taken", "Retry policy name already exists", 409);
+    }
+    next.retryableStatuses = [...next.retryableStatuses].sort((a, b) => a - b);
+    next.version += 1;
+    next.updatedAt = new Date().toISOString();
+    this.providerRetryPolicies.set(id, next);
+    this.registryAudit(mutation, "provider_retry_policy", id, { version: next.version });
+    return structuredClone(next);
+  }
+
+  listProviderRetryPolicies(enabledOnly = false): ProviderRetryPolicy[] {
+    return [...this.providerRetryPolicies.values()]
+      .filter((policy) => !enabledOnly || policy.enabled)
+      .sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id))
+      .map((policy) => structuredClone(policy));
+  }
+
+  private assertAcyclicRoutes(candidate: ProviderModelRoute) {
+    const routes = new Map(this.providerModelRoutes);
+    routes.set(candidate.sourceModelId, candidate);
+    const visit = (modelId: string, path: Set<string>) => {
+      if (path.has(modelId)) {
+        throw new DomainError("fallback_cycle", "Fallback routes must be acyclic", 422);
+      }
+      const route = routes.get(modelId);
+      if (!route) return;
+      const next = new Set(path).add(modelId);
+      for (const target of route.fallbackModelIds) visit(target, next);
+    };
+    for (const source of routes.keys()) visit(source, new Set());
+    for (const source of routes.keys()) {
+      const reachable = new Set<string>([source]);
+      const expand = (modelId: string) => {
+        for (const target of routes.get(modelId)?.fallbackModelIds ?? []) {
+          if (reachable.has(target)) continue;
+          reachable.add(target);
+          expand(target);
+        }
+      };
+      expand(source);
+      if (reachable.size > 8) {
+        throw new DomainError(
+          "fallback_depth",
+          "Execution plans may contain at most eight targets",
+          422,
+        );
+      }
+    }
+  }
+
+  setProviderModelRoute(
+    input: SetProviderModelRouteInput,
+    mutation: RegistryMutationContext,
+  ): ProviderModelRoute {
+    this.validateRegistryMutation(mutation);
+    const source = this.providerModels.get(input.sourceModelId);
+    if (!source) throw new DomainError("not_found", "Source model not found", 404);
+    const current = this.providerModelRoutes.get(input.sourceModelId);
+    if ((current?.version ?? 0) !== input.expectedVersion) throw registryConflict();
+    if (
+      input.fallbackModelIds.length > 8 ||
+      new Set(input.fallbackModelIds).size !== input.fallbackModelIds.length ||
+      input.fallbackModelIds.includes(input.sourceModelId) ||
+      input.fallbackModelIds.some((id) => !this.providerModels.has(id))
+    ) {
+      throw new DomainError("validation_error", "Fallback targets are invalid", 422);
+    }
+    if (input.retryPolicyId != null && !this.providerRetryPolicies.has(input.retryPolicyId)) {
+      throw new DomainError("not_found", "Retry policy not found", 404);
+    }
+    const sourceProvider = this.providers.get(source.providerId);
+    const compatible = input.fallbackModelIds.every((id) => {
+      const target = this.providerModels.get(id)!;
+      const provider = this.providers.get(target.providerId);
+      return target.enabled && provider?.enabled && provider.hasCredential &&
+        this.effectiveModelPrice(target.id) !== undefined && sourceProvider &&
+        provider.protocol === sourceProvider.protocol &&
+        target.contextWindow >= source.contextWindow &&
+        source.capabilities.every((capability) => target.capabilities.includes(capability));
+    });
+    if (!compatible) {
+      throw new DomainError(
+        "fallback_incompatible",
+        "Fallback targets must be available and compatible with the source model",
+        422,
+      );
+    }
+    const now = new Date().toISOString();
+    const route: ProviderModelRoute = {
+      id: current?.id ?? crypto.randomUUID(),
+      sourceModelId: input.sourceModelId,
+      retryPolicyId: input.retryPolicyId ?? null,
+      fallbackModelIds: [...input.fallbackModelIds],
+      version: (current?.version ?? 0) + 1,
+      createdAt: current?.createdAt ?? now,
+      updatedAt: now,
+    };
+    this.assertAcyclicRoutes(route);
+    this.providerModelRoutes.set(input.sourceModelId, route);
+    this.registryAudit(mutation, "provider_model_route", route.id, {
+      sourceModelId: route.sourceModelId,
+      version: route.version,
+      fallbackCount: route.fallbackModelIds.length,
+    });
+    return structuredClone(route);
+  }
+
+  findProviderModelRoute(sourceModelId: string): ProviderModelRoute | undefined {
+    const route = this.providerModelRoutes.get(sourceModelId);
+    return route ? structuredClone(route) : undefined;
+  }
+
+  resolveProviderExecutionPlan(
+    sourceModelId: string,
+    at = new Date().toISOString(),
+  ): ProviderExecutionPlan {
+    if (!Number.isFinite(Date.parse(at))) {
+      throw new DomainError("validation_error", "Plan timestamp is invalid", 422);
+    }
+    const route = this.providerModelRoutes.get(sourceModelId);
+    const ids: string[] = [];
+    const seen = new Set<string>();
+    const flatten = (id: string) => {
+      if (seen.has(id)) return;
+      seen.add(id);
+      ids.push(id);
+      for (const fallback of this.providerModelRoutes.get(id)?.fallbackModelIds ?? []) {
+        flatten(fallback);
+      }
+    };
+    flatten(sourceModelId);
+    const source = this.providerModels.get(sourceModelId);
+    const sourceProvider = source ? this.providers.get(source.providerId) : undefined;
+    const targets: ProviderExecutionPlan["targets"] = [];
+    for (const id of ids) {
+      const model = this.providerModels.get(id);
+      const provider = model ? this.providers.get(model.providerId) : undefined;
+      const price = model ? this.effectiveModelPrice(model.id, at) : undefined;
+      const compatible = source && sourceProvider && model && provider &&
+        provider.protocol === sourceProvider.protocol &&
+        model.contextWindow >= source.contextWindow &&
+        source.capabilities.every((capability) => model.capabilities.includes(capability));
+      const unavailable = !model || !provider || !model.enabled || !provider.enabled ||
+        !provider.hasCredential ||
+        !price || !compatible;
+      if (unavailable) {
+        if (id !== sourceModelId) continue;
+        throw new DomainError(
+          "execution_plan_unavailable",
+          "Provider execution target is unavailable",
+          409,
+        );
+      }
+      targets.push({
+        ordinal: targets.length,
+        providerId: provider.id,
+        providerSlug: provider.slug,
+        providerVersion: provider.version,
+        protocol: provider.protocol,
+        providerModelId: model.id,
+        publicModelId: model.publicModelId,
+        upstreamModelId: model.upstreamModelId,
+        modelVersion: model.version,
+        pricing: {
+          pricingVersionId: price.id,
+          inputMicrosPerMillion: price.inputMicrosPerMillion,
+          cachedInputMicrosPerMillion: price.cachedInputMicrosPerMillion,
+          reasoningMicrosPerMillion: price.reasoningMicrosPerMillion,
+          outputMicrosPerMillion: price.outputMicrosPerMillion,
+          fixedCallMicros: price.fixedCallMicros,
+          source: price.source,
+        },
+      });
+    }
+    return {
+      sourceModelId,
+      routeId: route?.id ?? null,
+      routeVersion: route?.version ?? 0,
+      retryPolicy: route?.retryPolicyId &&
+          this.providerRetryPolicies.get(route.retryPolicyId)?.enabled
+        ? structuredClone(this.providerRetryPolicies.get(route.retryPolicyId)!)
+        : null,
+      targets,
+      resolvedAt: new Date(at).toISOString(),
+    };
+  }
+
+  private providerExecutionRun(usageRunId: string, ownerLeaseToken: string) {
+    const run = this.usageRuns.get(usageRunId);
+    if (!run) throw new DomainError("not_found", "Usage run not found", 404);
+    if (run.status !== "reserved") {
+      throw new DomainError("invalid_usage_state", "Usage run is not reserved", 409);
+    }
+    const generationLease = run.generationLeaseToken === ownerLeaseToken &&
+      run.generationLeaseExpiresAt !== null &&
+      Date.parse(run.generationLeaseExpiresAt) > Date.now();
+    const api = [...this.apiIdempotencyRequests.values()].find((request) =>
+      request.usageRunId === usageRunId
+    );
+    const apiLease = api?.state === "in_progress" && api.leaseToken === ownerLeaseToken &&
+      api.leaseExpiresAt !== null && Date.parse(api.leaseExpiresAt) > Date.now();
+    const runLease = run.runLeaseToken === ownerLeaseToken && run.runLeaseExpiresAt !== null &&
+      Date.parse(run.runLeaseExpiresAt) > Date.now();
+    if (!generationLease && !apiLease && !runLease) {
+      throw new DomainError("stale_lease", "Provider execution lease is stale", 409);
+    }
+    return run;
+  }
+
+  heartbeatProviderExecutionLease(
+    usageRunId: string,
+    ownerLeaseToken: string,
+    leaseSeconds = 120,
+  ) {
+    const run = this.usageRuns.get(usageRunId);
+    if (
+      !Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1 || leaseSeconds > 900 || !run ||
+      run.status !== "reserved" || run.runLeaseToken !== ownerLeaseToken ||
+      !run.runLeaseExpiresAt || Date.parse(run.runLeaseExpiresAt) <= Date.now()
+    ) {
+      throw new DomainError("stale_lease", "Provider execution lease is no longer active", 409);
+    }
+    run.runLeaseExpiresAt = new Date(Date.now() + leaseSeconds * 1000).toISOString();
+    return { leaseToken: ownerLeaseToken, leaseExpiresAt: run.runLeaseExpiresAt };
+  }
+
+  reclaimProviderExecutionLease(
+    usageRunId: string,
+    expiredLeaseToken: string,
+    leaseSeconds = 120,
+  ) {
+    const run = this.usageRuns.get(usageRunId);
+    if (
+      !Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1 || leaseSeconds > 900 || !run ||
+      run.status !== "reserved" || run.runLeaseToken !== expiredLeaseToken ||
+      !run.runLeaseExpiresAt || Date.parse(run.runLeaseExpiresAt) > Date.now()
+    ) {
+      throw new DomainError(
+        "lease_not_reclaimable",
+        "Provider execution lease cannot be reclaimed",
+        409,
+      );
+    }
+    run.runLeaseToken = crypto.randomUUID();
+    run.runLeaseExpiresAt = new Date(Date.now() + leaseSeconds * 1000).toISOString();
+    return { leaseToken: run.runLeaseToken, leaseExpiresAt: run.runLeaseExpiresAt };
+  }
+
+  claimProviderExecution(
+    usageRunId: string,
+    ownerLeaseToken: string,
+  ): ProviderExecutionClaim {
+    const run = this.providerExecutionRun(usageRunId, ownerLeaseToken);
+    const reconciledAttemptIds: string[] = [];
+    if (run.executionOwnerLeaseToken !== ownerLeaseToken) {
+      run.executionEpoch += 1;
+      run.executionOwnerLeaseToken = ownerLeaseToken;
+      for (const attempt of this.providerAttempts.values()) {
+        if (attempt.usageRunId !== usageRunId || attempt.status !== "running") continue;
+        // The old epoch fences completion. Keeping this row running preserves the durable marker
+        // that a dispatched call's terminal accounting is unknown.
+        reconciledAttemptIds.push(attempt.id);
+      }
+    }
+    const nextAttemptNumber = Math.max(
+      1,
+      ...[...this.providerAttempts.values()].filter((attempt) => attempt.usageRunId === usageRunId)
+        .map((attempt) => attempt.attemptNumber + 1),
+    );
+    const consumedAttempts =
+      [...this.providerAttempts.values()].filter((attempt) =>
+        attempt.usageRunId === usageRunId && attempt.status !== "skipped"
+      ).length;
+    if (nextAttemptNumber > 16) {
+      throw new DomainError(
+        "execution_path_exhausted",
+        "Provider execution path is exhausted",
+        409,
+      );
+    }
+    return {
+      usageRunId,
+      executionEpoch: run.executionEpoch,
+      nextAttemptNumber,
+      consumedAttempts,
+      reconciledAttemptIds,
+    };
+  }
+
+  private exactAttemptCost(attempt: ProviderAttempt, input: FinishProviderAttemptInput): number {
+    if (input.status === "skipped") return 0;
+    if (
+      input.costSource === "none" && input.costMicros === 0 && input.inputTokens === 0 &&
+      input.outputTokens === 0 && input.status !== "succeeded"
+    ) return 0;
+    const uncached = input.inputTokens - input.cachedInputTokens;
+    const ordinaryOutput = input.outputTokens - input.reasoningTokens;
+    const numerator = BigInt(uncached) * BigInt(attempt.pricing.inputMicrosPerMillion) +
+      BigInt(input.cachedInputTokens) * BigInt(attempt.pricing.cachedInputMicrosPerMillion) +
+      BigInt(input.reasoningTokens) * BigInt(attempt.pricing.reasoningMicrosPerMillion) +
+      BigInt(ordinaryOutput) * BigInt(attempt.pricing.outputMicrosPerMillion);
+    const cost = BigInt(attempt.pricing.fixedCallMicros) + (numerator + 999_999n) / 1_000_000n;
+    if (cost > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new DomainError(
+        "accounting_overflow",
+        "Provider attempt cost exceeds accounting bounds",
+        422,
+      );
+    }
+    return Number(cost);
+  }
+
+  startProviderAttempt(input: StartProviderAttemptInput): ProviderAttempt {
+    if (
+      !Number.isSafeInteger(input.attemptNumber) || input.attemptNumber < 1 ||
+      input.attemptNumber > 16 ||
+      !Number.isSafeInteger(input.executionEpoch) || input.executionEpoch < 1 ||
+      !/^[0-9a-f-]{36}$/i.test(input.ownerLeaseToken) ||
+      !isUsagePricingSnapshot(input.pricing) ||
+      !/^[a-z0-9][a-z0-9-]{0,62}$/.test(input.providerSlug) ||
+      input.publicModelId.length < 3 || input.publicModelId.length > 255 ||
+      !input.upstreamModelId || input.upstreamModelId.length > 255 ||
+      !Number.isSafeInteger(input.providerVersion) || input.providerVersion < 1 ||
+      !Number.isSafeInteger(input.modelVersion) || input.modelVersion < 1 ||
+      !["chat_completions", "responses"].includes(input.protocol) ||
+      !Number.isSafeInteger(input.targetOrdinal) || input.targetOrdinal < 0 ||
+      input.targetOrdinal > 7 || !Number.isSafeInteger(input.retryNumber) ||
+      input.retryNumber < 0 || input.retryNumber > 3 ||
+      !["primary", "retry", "fallback", "circuit_skip", "half_open"].includes(input.reason) ||
+      (input.breakerBefore != null &&
+        !["closed", "open", "half_open", "unavailable"].includes(input.breakerBefore))
+    ) {
+      throw new DomainError("validation_error", "Provider attempt start is invalid", 422);
+    }
+    const run = this.providerExecutionRun(input.usageRunId, input.ownerLeaseToken);
+    if (
+      run.executionEpoch !== input.executionEpoch ||
+      run.executionOwnerLeaseToken !== input.ownerLeaseToken
+    ) {
+      throw new DomainError("stale_lease", "Provider execution epoch is stale", 409);
+    }
+    const model = this.providerModels.get(input.providerModelId);
+    const price = (this.modelPriceVersions.get(input.providerModelId) ?? []).find((candidate) =>
+      candidate.id === input.pricing.pricingVersionId
+    );
+    if (
+      !model || model.providerId !== input.providerId || !price ||
+      JSON.stringify({
+          pricingVersionId: price.id,
+          inputMicrosPerMillion: price.inputMicrosPerMillion,
+          cachedInputMicrosPerMillion: price.cachedInputMicrosPerMillion,
+          reasoningMicrosPerMillion: price.reasoningMicrosPerMillion,
+          outputMicrosPerMillion: price.outputMicrosPerMillion,
+          fixedCallMicros: price.fixedCallMicros,
+          source: price.source,
+        }) !== JSON.stringify(input.pricing)
+    ) {
+      throw new DomainError("validation_error", "Provider attempt target snapshot is invalid", 422);
+    }
+    const existing = [...this.providerAttempts.values()].find((attempt) =>
+      attempt.usageRunId === input.usageRunId && attempt.attemptNumber === input.attemptNumber
+    );
+    const immutable = {
+      usageRunId: input.usageRunId,
+      attemptNumber: input.attemptNumber,
+      executionEpoch: input.executionEpoch,
+      targetOrdinal: input.targetOrdinal,
+      retryNumber: input.retryNumber,
+      reason: input.reason,
+      breakerBefore: input.breakerBefore ?? null,
+      providerId: input.providerId,
+      providerSlug: input.providerSlug,
+      providerVersion: input.providerVersion,
+      protocol: input.protocol,
+      providerModelId: input.providerModelId,
+      publicModelId: input.publicModelId,
+      upstreamModelId: input.upstreamModelId,
+      modelVersion: input.modelVersion,
+      pricing: structuredClone(input.pricing),
+    };
+    if (existing) {
+      const comparable = ((
+        {
+          usageRunId,
+          attemptNumber,
+          executionEpoch,
+          targetOrdinal,
+          retryNumber,
+          reason,
+          breakerBefore,
+          providerId,
+          providerSlug,
+          providerVersion,
+          protocol,
+          providerModelId,
+          publicModelId,
+          upstreamModelId,
+          modelVersion,
+          pricing,
+        },
+      ) => ({
+        usageRunId,
+        attemptNumber,
+        executionEpoch,
+        targetOrdinal,
+        retryNumber,
+        reason,
+        breakerBefore,
+        providerId,
+        providerSlug,
+        providerVersion,
+        protocol,
+        providerModelId,
+        publicModelId,
+        upstreamModelId,
+        modelVersion,
+        pricing,
+      }))(existing);
+      if (JSON.stringify(comparable) !== JSON.stringify(immutable)) {
+        throw new DomainError(
+          "idempotency_conflict",
+          "Attempt number already has different target data",
+          409,
+        );
+      }
+      return structuredClone(existing);
+    }
+    const attempt: ProviderAttempt = {
+      id: crypto.randomUUID(),
+      ...immutable,
+      status: "running",
+      phase: "planning",
+      breakerAfter: null,
+      retryable: false,
+      errorCode: null,
+      httpStatus: null,
+      visibleOutput: false,
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      reasoningTokens: 0,
+      outputTokens: 0,
+      costMicros: 0,
+      tokenSource: "none",
+      costSource: "none",
+      latencyMs: null,
+      ttftMs: null,
+      upstreamRequestId: null,
+      tokensPerSecond: null,
+      startedAt: new Date().toISOString(),
+      completedAt: null,
+    };
+    this.providerAttempts.set(attempt.id, attempt);
+    return structuredClone(attempt);
+  }
+
+  finishProviderAttempt(input: FinishProviderAttemptInput): ProviderAttempt {
+    validateAttemptFinish(input);
+    const attempt = this.providerAttempts.get(input.id);
+    if (!attempt) throw new DomainError("not_found", "Provider attempt not found", 404);
+    const run = this.providerExecutionRun(attempt.usageRunId, input.ownerLeaseToken);
+    if (
+      attempt.executionEpoch !== input.executionEpoch ||
+      run.executionEpoch !== input.executionEpoch ||
+      run.executionOwnerLeaseToken !== input.ownerLeaseToken
+    ) {
+      throw new DomainError("stale_lease", "Provider execution epoch is stale", 409);
+    }
+    const { ownerLeaseToken: _ownerLeaseToken, executionEpoch: _executionEpoch, ...terminalInput } =
+      input;
+    const terminal = {
+      ...terminalInput,
+      errorCode: input.errorCode ?? null,
+      httpStatus: input.httpStatus ?? null,
+      ttftMs: input.ttftMs ?? null,
+      breakerAfter: input.breakerAfter ?? null,
+      upstreamRequestId: input.upstreamRequestId ?? null,
+      tokensPerSecond: input.tokensPerSecond ?? null,
+    };
+    if (attempt.status !== "running") {
+      const current = ((
+        {
+          id,
+          status,
+          phase,
+          errorCode,
+          httpStatus,
+          visibleOutput,
+          inputTokens,
+          cachedInputTokens,
+          reasoningTokens,
+          outputTokens,
+          costMicros,
+          tokenSource,
+          costSource,
+          latencyMs,
+          ttftMs,
+          breakerAfter,
+          retryable,
+          upstreamRequestId,
+          tokensPerSecond,
+        },
+      ) => ({
+        id,
+        status,
+        phase,
+        errorCode,
+        httpStatus,
+        visibleOutput,
+        inputTokens,
+        cachedInputTokens,
+        reasoningTokens,
+        outputTokens,
+        costMicros,
+        tokenSource,
+        costSource,
+        latencyMs,
+        ttftMs,
+        breakerAfter,
+        retryable,
+        upstreamRequestId,
+        tokensPerSecond,
+      }))(attempt);
+      if (JSON.stringify(current) !== JSON.stringify(terminal)) {
+        throw new DomainError(
+          "attempt_terminal_conflict",
+          "Provider attempt is already terminal",
+          409,
+        );
+      }
+      return structuredClone(attempt);
+    }
+    const exactCost = this.exactAttemptCost(attempt, input);
+    if (input.costMicros !== exactCost) {
+      throw new DomainError(
+        "invalid_attempt_cost",
+        "Provider attempt cost does not match its pricing snapshot",
+        422,
+      );
+    }
+    const aggregates = [
+      ["actualProviderCostMicros", exactCost],
+      ["actualProviderInputTokens", input.inputTokens],
+      ["actualProviderCachedInputTokens", input.cachedInputTokens],
+      ["actualProviderReasoningTokens", input.reasoningTokens],
+      ["actualProviderOutputTokens", input.outputTokens],
+    ] as const;
+    const totals = new Map<
+      typeof aggregates[number][0],
+      number
+    >();
+    for (const [field, amount] of aggregates) {
+      const total = run[field] + amount;
+      if (!Number.isSafeInteger(total) || total < 0) {
+        throw new DomainError(
+          "accounting_overflow",
+          "Provider usage aggregate exceeds accounting bounds",
+          422,
+        );
+      }
+      totals.set(field, total);
+    }
+    Object.assign(attempt, terminal, { completedAt: new Date().toISOString() });
+    for (const [field, total] of totals) run[field] = total;
+    return structuredClone(attempt);
+  }
+
+  listProviderAttempts(usageRunId: string): ProviderAttempt[] {
+    return [...this.providerAttempts.values()].filter((attempt) =>
+      attempt.usageRunId === usageRunId
+    )
+      .sort((a, b) => a.attemptNumber - b.attemptNumber).map((attempt) => structuredClone(attempt));
+  }
+
+  private providerAccountingUncertain(usageRunId: string): boolean {
+    return [...this.providerAttempts.values()].some((attempt) =>
+      attempt.usageRunId === usageRunId && attempt.status === "running"
+    );
+  }
+
+  private authoritativeProviderCost(run: UsageRun): number {
+    return this.providerAccountingUncertain(run.id)
+      ? run.reservedMicros
+      : run.actualProviderCostMicros;
+  }
+
+  private finalizeAccountingUnknownAttempts(usageRunId: string): void {
+    for (const attempt of this.providerAttempts.values()) {
+      if (attempt.usageRunId !== usageRunId || attempt.status !== "running") continue;
+      attempt.status = "cancelled";
+      attempt.phase = "planning";
+      attempt.errorCode = "accounting_unknown";
+      attempt.breakerAfter = "unavailable";
+      attempt.retryable = false;
+      attempt.latencyMs = Math.max(0, Date.now() - Date.parse(attempt.startedAt));
+      attempt.completedAt = new Date().toISOString();
+    }
+  }
+
+  private finalizeProviderUsage(input: FinalizeProviderUsageInput, refundOnly: boolean): UsageRun {
+    const run = this.usageRuns.get(input.usageRunId);
+    if (!run) throw new DomainError("not_found", "Usage run not found", 404);
+    if (run.status !== "reserved") {
+      if (
+        run.executionEpoch === input.executionEpoch &&
+        run.executionOwnerLeaseToken === input.ownerLeaseToken
+      ) return structuredClone(run);
+      throw new DomainError("invalid_usage_state", "Usage run is already terminal", 409);
+    }
+    this.providerExecutionRun(input.usageRunId, input.ownerLeaseToken);
+    if (
+      run.executionEpoch !== input.executionEpoch ||
+      run.executionOwnerLeaseToken !== input.ownerLeaseToken
+    ) {
+      throw new DomainError("stale_lease", "Provider execution epoch is stale", 409);
+    }
+    if (refundOnly) {
+      return structuredClone(this.refund(run.id)!);
+    }
+    const settled = this.settle(
+      run.id,
+      run.actualProviderCostMicros,
+      run.actualProviderInputTokens,
+      run.actualProviderOutputTokens,
+      input.latencyMs,
+    );
+    settled.runLeaseToken = null;
+    settled.runLeaseExpiresAt = null;
+    return structuredClone(settled);
+  }
+
+  settleProviderUsage(input: FinalizeProviderUsageInput): UsageRun {
+    return this.finalizeProviderUsage(input, false);
+  }
+
+  refundProviderUsage(input: FinalizeProviderUsageInput): UsageRun {
+    return this.finalizeProviderUsage(input, true);
+  }
+
   createApiToken(
     userId: string,
     input: {
@@ -1634,6 +2431,15 @@ export class MemoryRepository {
       inputTokens: 0,
       outputTokens: 0,
       latencyMs: 0,
+      executionEpoch: 0,
+      executionOwnerLeaseToken: null,
+      runLeaseToken: crypto.randomUUID(),
+      runLeaseExpiresAt: new Date(Date.now() + 120_000).toISOString(),
+      actualProviderCostMicros: 0,
+      actualProviderInputTokens: 0,
+      actualProviderCachedInputTokens: 0,
+      actualProviderReasoningTokens: 0,
+      actualProviderOutputTokens: 0,
       pricingSnapshot: pricingSnapshot ? structuredClone(pricingSnapshot) : null,
       generationLeaseToken: null,
       generationLeaseExpiresAt: null,
@@ -1653,6 +2459,12 @@ export class MemoryRepository {
     const run = this.usageRuns.get(runId);
     if (!run) throw new DomainError("not_found", "Usage reservation not found", 404);
     if (run.status === "completed") return run;
+    if (run.executionEpoch > 0) {
+      costMicros = this.authoritativeProviderCost(run);
+      inputTokens = run.actualProviderInputTokens;
+      outputTokens = run.actualProviderOutputTokens;
+      this.finalizeAccountingUnknownAttempts(run.id);
+    }
     if (costMicros > run.reservedMicros) {
       this.credit(run.userId, runId, "settle", -(costMicros - run.reservedMicros));
     } else if (run.reservedMicros > costMicros) {
@@ -1663,12 +2475,29 @@ export class MemoryRepository {
     run.inputTokens = inputTokens;
     run.outputTokens = outputTokens;
     run.latencyMs = latencyMs;
+    run.runLeaseToken = null;
+    run.runLeaseExpiresAt = null;
+    run.generationLeaseToken = null;
+    run.generationLeaseExpiresAt = null;
     return run;
   }
 
   refund(runId: string) {
     const run = this.usageRuns.get(runId);
     if (!run || run.status !== "reserved") return run;
+    if (run.executionEpoch > 0) {
+      const cost = this.authoritativeProviderCost(run);
+      this.finalizeAccountingUnknownAttempts(run.id);
+      const delta = run.reservedMicros - cost;
+      if (delta !== 0) this.credit(run.userId, runId, delta > 0 ? "refund" : "settle", delta);
+      run.status = "failed";
+      run.costMicros = cost;
+      run.inputTokens = run.actualProviderInputTokens;
+      run.outputTokens = run.actualProviderOutputTokens;
+      run.runLeaseToken = null;
+      run.runLeaseExpiresAt = null;
+      return run;
+    }
     this.credit(run.userId, runId, "refund", run.reservedMicros);
     run.status = "failed";
     return run;
@@ -1760,6 +2589,8 @@ export class MemoryRepository {
       input.tokenId,
       input.pricingSnapshot,
     );
+    usageRun.runLeaseToken = null;
+    usageRun.runLeaseExpiresAt = null;
     const now = new Date();
     const leaseToken = crypto.randomUUID();
     const request: ApiIdempotencyRequest = {
@@ -2032,7 +2863,10 @@ export class MemoryRepository {
         request.state !== "in_progress" || !request.leaseExpiresAt ||
         Date.parse(request.leaseExpiresAt) > Date.now()
       ) continue;
-      if (request.observedCostMicros > 0) {
+      const usageRun = this.usageRuns.get(request.usageRunId);
+      if ((usageRun?.executionEpoch ?? 0) > 0) {
+        this.refund(request.usageRunId);
+      } else if (request.observedCostMicros > 0) {
         this.settle(
           request.usageRunId,
           request.observedCostMicros,
@@ -2041,6 +2875,16 @@ export class MemoryRepository {
           request.observedLatencyMs,
         );
       } else this.refund(request.usageRunId);
+      for (const attempt of this.providerAttempts.values()) {
+        if (attempt.usageRunId !== request.usageRunId || attempt.status !== "running") continue;
+        attempt.status = "cancelled";
+        attempt.phase = "planning";
+        attempt.errorCode = "api_lease_expired";
+        attempt.breakerAfter = "unavailable";
+        attempt.retryable = true;
+        attempt.latencyMs = Math.max(0, Date.now() - Date.parse(attempt.startedAt));
+        attempt.completedAt = new Date().toISOString();
+      }
       request.state = "failed";
       request.responseStatus = 500;
       request.responseBody = JSON.stringify({
@@ -2065,6 +2909,36 @@ export class MemoryRepository {
       request.leaseExpiresAt = null;
       request.completedAt = new Date().toISOString();
       request.expiresAt = new Date(Date.now() + request.retentionSeconds * 1000).toISOString();
+      count++;
+    }
+    return count;
+  }
+
+  reapStaleProviderExecutionLeases(limit = 100) {
+    let count = 0;
+    for (const run of this.usageRuns.values()) {
+      if (count >= limit) break;
+      const belongsToApiReplay = [...this.apiIdempotencyRequests.values()].some((request) =>
+        request.usageRunId === run.id
+      );
+      if (
+        run.status !== "reserved" || !run.runLeaseToken || !run.runLeaseExpiresAt ||
+        Date.parse(run.runLeaseExpiresAt) > Date.now() || run.generationLeaseToken ||
+        belongsToApiReplay
+      ) continue;
+      this.refund(run.id);
+      for (const attempt of this.providerAttempts.values()) {
+        if (attempt.usageRunId !== run.id || attempt.status !== "running") continue;
+        attempt.status = "cancelled";
+        attempt.phase = "planning";
+        attempt.errorCode = "execution_lease_expired";
+        attempt.breakerAfter = "unavailable";
+        attempt.retryable = true;
+        attempt.latencyMs = Math.max(0, Date.now() - Date.parse(attempt.startedAt));
+        attempt.completedAt = new Date().toISOString();
+      }
+      run.runLeaseToken = null;
+      run.runLeaseExpiresAt = null;
       count++;
     }
     return count;

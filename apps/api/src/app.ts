@@ -55,7 +55,7 @@ import {
   type UpstreamStreamOptions,
 } from "./models.ts";
 import { estimateInputTokens, priceUsage, reservationPrice } from "./pricing.ts";
-import { responseMessage, responseObject } from "./responses.ts";
+import { responseObject } from "./responses.ts";
 import { type IdentityMailer, smtpIdentityMailer } from "./mail.ts";
 import {
   authorizationCredentialIdentity,
@@ -73,6 +73,15 @@ import {
 import { discoverProviderModels, ProviderTestError } from "./provider-admin.ts";
 import { type ProviderSecretEnvelope, ProviderSecretKeyring } from "./provider-secrets.ts";
 import {
+  type BreakerPolicy,
+  type CircuitBreaker,
+  MemoryCircuitBreaker,
+} from "./provider-circuit.ts";
+import {
+  ProviderExecutionEngine,
+  TerminalAccountingPersistenceError,
+} from "./provider-execution.ts";
+import {
   modelPriceCreate,
   providerCreate,
   providerCredential,
@@ -82,6 +91,25 @@ import {
   providerPatch,
   ProviderValidationError,
 } from "./provider-validation.ts";
+import {
+  providerModelRouteSet,
+  ProviderResilienceValidationError,
+  providerRetryPolicyCreate,
+  providerRetryPolicyPatch,
+} from "./provider-resilience-validation.ts";
+import {
+  normalizeChatCompletionResult,
+  ProviderProtocolError,
+  publicChatCompletion,
+  publicChatStreamChunk,
+  responsesRequestToChatCompletions,
+} from "./provider-protocol.ts";
+import {
+  completeSimulatedProvider,
+  SimulatedProviderError,
+  SimulatedScenarioValidationError,
+  validateSimulatedProviderScenario,
+} from "./provider-simulator.ts";
 
 type Variables = {
   user: PublicUser;
@@ -110,6 +138,12 @@ export interface AppOptions {
   attachmentContextMaxRawBytes?: number;
   providerKeyring?: ProviderSecretKeyring;
   providerDiscoveryFetch?: typeof fetch;
+  circuitBreaker?: CircuitBreaker;
+  breakerPolicy?: BreakerPolicy;
+  providerSlowStream?: {
+    windowMs: number;
+    minimumVisibleUnitsPerSecond: number;
+  };
 }
 
 interface StagedUpload {
@@ -287,6 +321,152 @@ const chunkUtf8 = (value: string, maxBytes = 16 * 1024, maxChunks = 512): string
   }
   return chunks;
 };
+const bufferedResponseOutputEvents = (
+  output: Array<Record<string, unknown>>,
+  eventFrame: (event: Record<string, unknown>) => string,
+) =>
+  output.flatMap((item, outputIndex) => {
+    const itemId = String(item.id);
+    const addedItem = item.type === "message"
+      ? { ...item, status: "in_progress", content: [] }
+      : item.type === "function_call"
+      ? { ...item, status: "in_progress", arguments: "" }
+      : item.type === "reasoning"
+      ? { ...item, status: "in_progress", summary: [], content: [] }
+      : { ...item, status: "in_progress" };
+    const frames = [eventFrame({
+      type: "response.output_item.added",
+      output_index: outputIndex,
+      item: addedItem,
+    })];
+    if (item.type === "message") {
+      const content = Array.isArray(item.content)
+        ? item.content as Array<Record<string, unknown>>
+        : [];
+      for (const [contentIndex, part] of content.entries()) {
+        frames.push(eventFrame({
+          type: "response.content_part.added",
+          item_id: itemId,
+          output_index: outputIndex,
+          content_index: contentIndex,
+          part: part.type === "output_text"
+            ? { type: "output_text", text: "", annotations: [] }
+            : { type: "refusal", refusal: "" },
+        }));
+        const value = String(part.type === "refusal" ? part.refusal ?? "" : part.text ?? "");
+        const prefix = part.type === "refusal" ? "response.refusal" : "response.output_text";
+        for (const delta of chunkUtf8(value)) {
+          frames.push(eventFrame({
+            type: `${prefix}.delta`,
+            item_id: itemId,
+            output_index: outputIndex,
+            content_index: contentIndex,
+            delta,
+            ...(part.type === "output_text" ? { logprobs: [] } : {}),
+          }));
+        }
+        frames.push(eventFrame({
+          type: `${prefix}.done`,
+          item_id: itemId,
+          output_index: outputIndex,
+          content_index: contentIndex,
+          ...(part.type === "refusal" ? { refusal: value } : { text: value, logprobs: [] }),
+        }));
+        frames.push(eventFrame({
+          type: "response.content_part.done",
+          item_id: itemId,
+          output_index: outputIndex,
+          content_index: contentIndex,
+          part,
+        }));
+      }
+    } else if (item.type === "function_call") {
+      const argumentsText = String(item.arguments ?? "");
+      for (const delta of chunkUtf8(argumentsText)) {
+        frames.push(eventFrame({
+          type: "response.function_call_arguments.delta",
+          item_id: itemId,
+          output_index: outputIndex,
+          delta,
+        }));
+      }
+      frames.push(eventFrame({
+        type: "response.function_call_arguments.done",
+        item_id: itemId,
+        output_index: outputIndex,
+        name: String(item.name ?? ""),
+        arguments: argumentsText,
+      }));
+    } else if (item.type === "reasoning") {
+      for (
+        const [kind, parts] of [["reasoning_summary_text", item.summary], [
+          "reasoning_text",
+          item.content,
+        ]] as const
+      ) {
+        if (!Array.isArray(parts)) continue;
+        for (const [contentIndex, part] of (parts as Array<Record<string, unknown>>).entries()) {
+          const value = String(part.text ?? "");
+          const summary = kind === "reasoning_summary_text";
+          const indexField = summary
+            ? { summary_index: contentIndex }
+            : { content_index: contentIndex };
+          frames.push(eventFrame(
+            summary
+              ? {
+                type: "response.reasoning_summary_part.added",
+                item_id: itemId,
+                output_index: outputIndex,
+                summary_index: contentIndex,
+                part: { type: "summary_text", text: "" },
+              }
+              : {
+                type: "response.content_part.added",
+                item_id: itemId,
+                output_index: outputIndex,
+                content_index: contentIndex,
+                part: { type: "reasoning_text", text: "" },
+              },
+          ));
+          for (const delta of chunkUtf8(value)) {
+            frames.push(eventFrame({
+              type: `response.${kind}.delta`,
+              item_id: itemId,
+              output_index: outputIndex,
+              ...indexField,
+              delta,
+            }));
+          }
+          frames.push(eventFrame({
+            type: `response.${kind}.done`,
+            item_id: itemId,
+            output_index: outputIndex,
+            ...indexField,
+            text: value,
+          }));
+          frames.push(eventFrame(
+            summary
+              ? {
+                type: "response.reasoning_summary_part.done",
+                item_id: itemId,
+                output_index: outputIndex,
+                summary_index: contentIndex,
+                part: { type: "summary_text", text: value },
+              }
+              : {
+                type: "response.content_part.done",
+                item_id: itemId,
+                output_index: outputIndex,
+                content_index: contentIndex,
+                part: { type: "reasoning_text", text: value },
+              },
+          ));
+        }
+      }
+    }
+    frames.push(eventFrame({ type: "response.output_item.done", output_index: outputIndex, item }));
+    return frames;
+  });
 const sameOrigin = (candidate: string, allowed: string): boolean => {
   try {
     return new URL(candidate).origin === allowed;
@@ -580,6 +760,37 @@ export function createApp(options: AppOptions = {}) {
     ),
   ];
   const providerKeyring = options.providerKeyring ?? ProviderSecretKeyring.fromEnv();
+  const circuitBreaker = options.circuitBreaker ?? new MemoryCircuitBreaker();
+  const breakerPolicy = options.breakerPolicy ?? {
+    failureThreshold: positiveInteger("PROVIDER_BREAKER_FAILURE_THRESHOLD", 3),
+    failureWindowSeconds: positiveInteger("PROVIDER_BREAKER_FAILURE_WINDOW_SECONDS", 60),
+    openSeconds: positiveInteger("PROVIDER_BREAKER_OPEN_SECONDS", 30),
+    halfOpenLeaseSeconds: positiveInteger("PROVIDER_BREAKER_HALF_OPEN_LEASE_SECONDS", 10),
+  };
+  const slowWindowValue = Deno.env.get("PROVIDER_SLOW_STREAM_WINDOW_MS");
+  const slowRateValue = Deno.env.get("PROVIDER_MIN_VISIBLE_UNITS_PER_SECOND");
+  if ((slowWindowValue === undefined) !== (slowRateValue === undefined)) {
+    throw new Error(
+      "PROVIDER_SLOW_STREAM_WINDOW_MS and PROVIDER_MIN_VISIBLE_UNITS_PER_SECOND must be set together",
+    );
+  }
+  const providerSlowStream = options.providerSlowStream ?? (slowWindowValue
+    ? {
+      windowMs: Number(slowWindowValue),
+      minimumVisibleUnitsPerSecond: Number(slowRateValue),
+    }
+    : undefined);
+  const providerExecution = providerKeyring
+    ? new ProviderExecutionEngine({
+      repository: repo,
+      keyring: providerKeyring,
+      circuitBreaker,
+      breakerPolicy,
+      complete: providerComplete,
+      stream: providerStream,
+      slowStream: providerSlowStream,
+    })
+    : undefined;
   type RuntimeModel = {
     info: ModelInfo;
     provider?: ProviderRecord;
@@ -719,7 +930,8 @@ export function createApp(options: AppOptions = {}) {
       (path.endsWith("/generate") || path === "/v1/chat/completions" ||
         path === "/v1/responses" || path.endsWith("/active-leaf"));
     const providerAdminRoute = c.req.method !== "GET" && (
-      path.startsWith("/api/admin/providers") || path.startsWith("/api/admin/models")
+      path.startsWith("/api/admin/providers") || path.startsWith("/api/admin/models") ||
+      path.startsWith("/api/admin/resilience")
     );
     const policy = authRoute
       ? { name: "auth", limit: configuredAuthLimit, window: configuredRateWindow }
@@ -1557,7 +1769,10 @@ export function createApp(options: AppOptions = {}) {
     const runId = `${ownerId}:web-generation:${body.idempotencyKey}`;
     // Claim the immutable operation before reading attachment objects so a completed replay
     // remains available even after its library attachment has been tombstoned.
-    const webReservation = Math.max(
+    const providerPlan = resolvedModel.registryModel && providerExecution
+      ? await providerExecution.resolvePlan(resolvedModel.registryModel.id)
+      : undefined;
+    const directWebReservation = Math.max(
       priceUsage(model, model.contextWindow, 0).costMicros,
       priceUsage(model, model.contextWindow, 0, {
         cachedInputTokens: model.contextWindow,
@@ -1567,6 +1782,13 @@ export function createApp(options: AppOptions = {}) {
         reasoningTokens: model.contextWindow,
       }).costMicros,
     );
+    const webReservation = providerPlan && providerExecution
+      ? providerExecution.reservationMicros(
+        providerPlan,
+        model.contextWindow,
+        model.contextWindow,
+      )
+      : directWebReservation;
     const begun = await repo.beginGeneration({
       message: {
         conversationId,
@@ -1688,15 +1910,21 @@ export function createApp(options: AppOptions = {}) {
         );
       }
       const maxWebOutput = model.contextWindow - estimatedInputTokens;
-      const result = await webComplete(
-        {
-          model: body.model,
-          messages: history,
-          max_tokens: maxWebOutput,
-        },
-        c.req.raw.signal,
-        resolvedModel.upstream,
-      );
+      const providerRequest = {
+        model: body.model,
+        messages: history,
+        max_tokens: maxWebOutput,
+      };
+      const result = resolvedModel.registryModel && providerExecution
+        ? await providerExecution.complete(
+          resolvedModel.registryModel.id,
+          runId,
+          begun.leaseToken,
+          providerRequest,
+          c.req.raw.signal,
+          providerPlan,
+        )
+        : await webComplete(providerRequest, c.req.raw.signal, resolvedModel.upstream);
       providerCompleted = true;
       await checkpoint();
       const cost = priceUsage(model, result.inputTokens, result.outputTokens, {
@@ -1725,6 +1953,7 @@ export function createApp(options: AppOptions = {}) {
       });
       return c.json(await completedPayload(), 201);
     } catch (error) {
+      if (error instanceof TerminalAccountingPersistenceError) throw error;
       if (!providerCompleted) {
         await repo.failGeneration({
           conversationId,
@@ -1891,7 +2120,10 @@ export function createApp(options: AppOptions = {}) {
       value = await c.req.json();
       return parse(value);
     } catch (error) {
-      if (error instanceof ProviderValidationError || error instanceof TypeError) {
+      if (
+        error instanceof ProviderValidationError ||
+        error instanceof ProviderResilienceValidationError || error instanceof TypeError
+      ) {
         throw new DomainError("validation_error", error.message, 422);
       }
       throw new DomainError("validation_error", "Request body must be valid JSON", 422);
@@ -2104,6 +2336,126 @@ export function createApp(options: AppOptions = {}) {
       201,
     );
   });
+  app.get("/api/admin/resilience/policies", async (c) => {
+    providerNoStore(c);
+    return c.json({ data: await repo.listProviderRetryPolicies() });
+  });
+  app.post("/api/admin/resilience/policies", async (c) => {
+    providerNoStore(c);
+    const input = await parseProviderAdminBody(c, providerRetryPolicyCreate);
+    return c.json(
+      await repo.createProviderRetryPolicy(
+        input,
+        registryMutation(c, "provider_retry_policy.created"),
+      ),
+      201,
+    );
+  });
+  app.patch("/api/admin/resilience/policies/:id", async (c) => {
+    providerNoStore(c);
+    const { expectedVersion, changes } = await parseProviderAdminBody(
+      c,
+      providerRetryPolicyPatch,
+    );
+    return c.json(
+      await repo.updateProviderRetryPolicy(
+        c.req.param("id"),
+        expectedVersion,
+        changes,
+        registryMutation(c, "provider_retry_policy.updated"),
+      ),
+    );
+  });
+  app.get("/api/admin/resilience/routes", async (c) => {
+    providerNoStore(c);
+    const [models, providers] = await Promise.all([
+      repo.listProviderModels(),
+      repo.listProviders(),
+    ]);
+    const providersById = new Map(providers.map((provider) => [provider.id, provider]));
+    const now = Date.now();
+    const data = await Promise.all(models.map(async (model) => {
+      const provider = providersById.get(model.providerId);
+      const prices = await repo.listModelPriceVersions(model.id);
+      return {
+        model: {
+          id: model.id,
+          publicModelId: model.publicModelId,
+          displayName: model.displayName,
+          providerId: model.providerId,
+          providerName: provider?.displayName ?? "Unavailable provider",
+          enabled: model.enabled,
+          providerEnabled: provider?.enabled ?? false,
+          configured: provider?.hasCredential ?? false,
+          protocol: provider?.protocol ?? null,
+          priced: prices.some((price) => Date.parse(price.effectiveAt) <= now),
+          capabilities: model.capabilities,
+          contextWindow: model.contextWindow,
+        },
+        route: await repo.findProviderModelRoute(model.id) ?? null,
+      };
+    }));
+    return c.json({ data });
+  });
+  app.put("/api/admin/resilience/routes/:sourceModelId", async (c) => {
+    providerNoStore(c);
+    const input = await parseProviderAdminBody(c, providerModelRouteSet);
+    if (input.sourceModelId !== c.req.param("sourceModelId")) {
+      throw new DomainError("validation_error", "Source model ID does not match the route", 422);
+    }
+    return c.json(
+      await repo.setProviderModelRoute(
+        input,
+        registryMutation(c, "provider_model_route.updated"),
+      ),
+    );
+  });
+  app.get("/api/admin/resilience/plans/:sourceModelId", async (c) => {
+    providerNoStore(c);
+    return c.json(await repo.resolveProviderExecutionPlan(c.req.param("sourceModelId")));
+  });
+  app.get("/api/admin/resilience/attempts", async (c) => {
+    providerNoStore(c);
+    const usageRunId = c.req.query("usageRunId")?.trim();
+    const unsafe = usageRunId && [...usageRunId].some((character) => {
+      const code = character.charCodeAt(0);
+      return code < 32 || code === 127;
+    });
+    if (!usageRunId || usageRunId.length > 220 || unsafe) {
+      throw new DomainError("validation_error", "A valid usageRunId is required", 422);
+    }
+    return c.json({ data: await repo.listProviderAttempts(usageRunId) });
+  });
+  app.post("/api/admin/resilience/playground", async (c) => {
+    providerNoStore(c);
+    let scenario;
+    try {
+      scenario = validateSimulatedProviderScenario(await c.req.json());
+    } catch (error) {
+      if (error instanceof SimulatedScenarioValidationError || error instanceof SyntaxError) {
+        throw new DomainError("validation_error", "Simulator scenario is invalid", 422);
+      }
+      throw error;
+    }
+    try {
+      return c.json({
+        ok: true,
+        completion: await completeSimulatedProvider(scenario, c.req.raw.signal),
+      });
+    } catch (error) {
+      if (error instanceof SimulatedProviderError) {
+        return c.json({
+          ok: false,
+          error: {
+            kind: error.kind,
+            message: error.message,
+            details: error.details,
+          },
+        });
+      }
+      throw error;
+    }
+  });
 
   app.use("/v1/*", authenticate, approved);
   const replayResponse = (request: ApiIdempotencyRequest) => {
@@ -2121,7 +2473,10 @@ export function createApp(options: AppOptions = {}) {
       { status: request.responseStatus ?? 500, headers },
     );
   };
-  const keepApiLeaseAlive = (idempotency?: { id: string; leaseToken: string }) => {
+  const keepApiLeaseAlive = (
+    idempotency?: { id: string; leaseToken: string },
+    runLease?: { runId: string; leaseToken: string },
+  ) => {
     let stopped = false;
     let heartbeatError: unknown;
     let inFlight = Promise.resolve();
@@ -2131,23 +2486,33 @@ export function createApp(options: AppOptions = {}) {
       costMicros: number;
       latencyMs: number;
     }) => {
-      if (!idempotency) return Promise.resolve();
+      if (!idempotency && !runLease) return Promise.resolve();
       inFlight = inFlight.then(async () => {
         if (stopped || heartbeatError) return;
         try {
-          await repo.heartbeatApiRequest(
-            idempotency.id,
-            idempotency.leaseToken,
-            idempotencyLeaseSeconds,
-            observation,
-          );
+          if (idempotency) {
+            await repo.heartbeatApiRequest(
+              idempotency.id,
+              idempotency.leaseToken,
+              idempotencyLeaseSeconds,
+              observation,
+            );
+          } else if (runLease) {
+            await repo.heartbeatProviderExecutionLease(
+              runLease.runId,
+              runLease.leaseToken,
+              idempotencyLeaseSeconds,
+            );
+          }
         } catch (error) {
           heartbeatError = error;
         }
       });
       return inFlight;
     };
-    const timer = idempotency ? setInterval(() => void pulse(), idempotencyHeartbeatMs) : undefined;
+    const timer = idempotency || runLease
+      ? setInterval(() => void pulse(), idempotencyHeartbeatMs)
+      : undefined;
     return {
       checkpoint: async (observation?: {
         inputTokens: number;
@@ -2176,7 +2541,7 @@ export function createApp(options: AppOptions = {}) {
     const idempotencyKey = c.req.header("idempotency-key");
     const runId = `${c.get("user").id}:${endpoint}:${crypto.randomUUID()}`;
     if (!idempotencyKey) {
-      await repo.reserve(
+      const usageRun = await repo.reserve(
         c.get("user").id,
         runId,
         model.id,
@@ -2185,7 +2550,19 @@ export function createApp(options: AppOptions = {}) {
         c.get("tokenId"),
         pricingSnapshot(price),
       );
-      return { kind: "started" as const, runId };
+      if (!usageRun.runLeaseToken) {
+        throw new DomainError(
+          "execution_lease_missing",
+          "Provider execution lease is missing",
+          500,
+        );
+      }
+      return {
+        kind: "started" as const,
+        runId,
+        executionLeaseToken: usageRun.runLeaseToken,
+        runLease: true as const,
+      };
     }
     if (idempotencyKey.length < 8 || idempotencyKey.length > 200) {
       throw new DomainError(
@@ -2232,6 +2609,8 @@ export function createApp(options: AppOptions = {}) {
         kind: "started" as const,
         runId,
         idempotency: { id: result.request.id, leaseToken: result.leaseToken },
+        executionLeaseToken: result.leaseToken,
+        runLease: false as const,
       };
     }
     return { kind: "replay" as const, response: replayResponse(result.request) };
@@ -2259,7 +2638,19 @@ export function createApp(options: AppOptions = {}) {
       return c.json(openAIError(`Model '${request.model}' does not exist`, "model_not_found"), 404);
     }
     const maxOutput = request.max_tokens ?? request.max_completion_tokens ?? 4096;
-    const reserveMicros = reservationPrice(model, request, maxOutput).costMicros;
+    const providerPlan = resolvedModel.registryModel && providerExecution
+      ? await providerExecution.resolvePlan(resolvedModel.registryModel.id)
+      : undefined;
+    const reserveMicros = providerPlan && providerExecution
+      ? providerExecution.reservationMicros(
+        providerPlan,
+        Math.max(
+          estimateInputTokens(request),
+          model.contextWindow - Math.min(maxOutput, model.contextWindow),
+        ),
+        maxOutput,
+      )
+      : reservationPrice(model, request, maxOutput).costMicros;
     const usage = await beginOpenAIUsage(
       c,
       "chat.completions",
@@ -2269,13 +2660,19 @@ export function createApp(options: AppOptions = {}) {
       resolvedModel.price,
     );
     if (usage.kind === "replay") return usage.response;
-    const { runId, idempotency } = usage;
-    const lease = keepApiLeaseAlive(idempotency);
+    const { runId, idempotency, executionLeaseToken, runLease } = usage;
+    const lease = keepApiLeaseAlive(
+      idempotency,
+      runLease ? { runId, leaseToken: executionLeaseToken } : undefined,
+    );
     const started = performance.now();
+    // A provider fallback is an implementation detail. The public response identity belongs to
+    // this gateway request and must remain stable across every upstream attempt and stream chunk.
+    const gatewayCompletionId = `chatcmpl-${crypto.randomUUID()}`;
     if (request.stream && request.model.startsWith("simulated/")) {
       const text = simulate(request);
       const words = text.split(/(?<=\s)/);
-      const id = `chatcmpl-${crypto.randomUUID()}`;
+      const id = gatewayCompletionId;
       return streamSSE(c, async (stream) => {
         let deliveredText = "";
         let settled = false;
@@ -2425,58 +2822,44 @@ export function createApp(options: AppOptions = {}) {
           downstreamAbort.abort(new DOMException("Client disconnected", "AbortError"))
         );
         const upstreamSignal = AbortSignal.any([c.req.raw.signal, downstreamAbort.signal]);
-        let deliveredText = "";
-        let toolOutput = "";
+        let visibleOutputBytes = 0;
         let inputTokens = estimateInputTokens(request);
         let outputTokens = 0;
         let cachedInputTokens = 0;
         let reasoningTokens = 0;
         let settled = false;
+        let sawDone = false;
         let sequence = 0;
         try {
-          for await (
-            const data of providerStream(request, upstreamSignal, resolvedModel.upstream)
-          ) {
+          const providerEvents = resolvedModel.registryModel && providerExecution
+            ? providerExecution.stream(
+              resolvedModel.registryModel.id,
+              runId,
+              executionLeaseToken,
+              request,
+              upstreamSignal,
+              providerPlan,
+            )
+            : providerStream(request, upstreamSignal, resolvedModel.upstream);
+          for await (const data of providerEvents) {
             if (data === "[DONE]") {
-              const finalOutput = outputTokens ||
-                Math.ceil((deliveredText + toolOutput).length / 4);
-              const cost = priceUsage(model, inputTokens, finalOutput, {
-                cachedInputTokens,
-                reasoningTokens,
-              }).costMicros;
-              if (idempotency) {
-                await repo.completeApiStream({
-                  id: idempotency.id,
-                  leaseToken: idempotency.leaseToken,
-                  responseStatus: 200,
-                  responseHeaders: {
-                    "content-type": "text/event-stream",
-                    "cache-control": "no-cache",
-                  },
-                  terminalFrame: sseData("[DONE]"),
-                  costMicros: cost,
-                  inputTokens,
-                  outputTokens: finalOutput,
-                  latencyMs: Math.round(performance.now() - started),
-                  quota: replayQuota,
-                });
-              } else {
-                await repo.settle(
-                  runId,
-                  cost,
-                  inputTokens,
-                  finalOutput,
-                  Math.round(performance.now() - started),
-                );
-              }
-              settled = true;
-              if (!stream.aborted && !upstreamSignal.aborted) {
-                await stream.writeSSE({ data: "[DONE]" });
-              }
-              return;
+              sawDone = true;
+              continue;
             }
-            const chunk = JSON.parse(data) as {
-              choices?: Array<{ delta?: { content?: string; tool_calls?: unknown } }>;
+            const chunk = publicChatStreamChunk(
+              JSON.parse(data),
+              gatewayCompletionId,
+              request.model,
+            ) as {
+              choices?: Array<{
+                delta?: {
+                  content?: string;
+                  reasoning_content?: string;
+                  reasoning?: string;
+                  refusal?: string;
+                  tool_calls?: unknown;
+                };
+              }>;
               usage?: {
                 prompt_tokens?: number;
                 completion_tokens?: number;
@@ -2495,21 +2878,29 @@ export function createApp(options: AppOptions = {}) {
             const chunkText = chunk.choices?.map((choice) =>
               choice.delta?.content ?? ""
             ).join("") ?? "";
+            const chunkReasoning = chunk.choices?.map((choice) =>
+              (choice.delta?.reasoning_content ?? "") + (choice.delta?.reasoning ?? "")
+            ).join("") ?? "";
+            const chunkRefusal = chunk.choices?.map((choice) => choice.delta?.refusal ?? "").join(
+              "",
+            ) ?? "";
             const chunkTools = chunk.choices?.map((choice) => choice.delta?.tool_calls)
               .filter((value) => value !== undefined)
               .map((value) => JSON.stringify(value)).join("") ?? "";
+            const outwardData = JSON.stringify(chunk);
+            const nextVisibleOutputBytes = visibleOutputBytes + new TextEncoder().encode(
+              chunkText + chunkReasoning + chunkRefusal + chunkTools,
+            ).byteLength;
             if (stream.aborted || upstreamSignal.aborted) {
               throw upstreamSignal.reason ?? new DOMException("Client disconnected", "AbortError");
             }
             if (idempotency) {
-              const observedOutput = outputTokens || Math.ceil(
-                (deliveredText + chunkText + toolOutput + chunkTools).length / 4,
-              );
+              const observedOutput = Math.max(outputTokens, Math.ceil(nextVisibleOutputBytes / 4));
               await repo.appendApiSseFrame(
                 idempotency.id,
                 idempotency.leaseToken,
                 sequence++,
-                sseData(data),
+                sseData(outwardData),
                 undefined,
                 {
                   inputTokens,
@@ -2523,16 +2914,49 @@ export function createApp(options: AppOptions = {}) {
                 replayQuota,
               );
             }
-            deliveredText += chunkText;
-            toolOutput += chunkTools;
-            await stream.writeSSE({ data });
+            visibleOutputBytes = nextVisibleOutputBytes;
+            await stream.writeSSE({ data: outwardData });
             if (stream.aborted || upstreamSignal.aborted) {
               throw upstreamSignal.reason ?? new DOMException("Client disconnected", "AbortError");
             }
           }
-          if (!settled && !idempotency) {
-            const finalOutput = outputTokens ||
-              Math.ceil((deliveredText + toolOutput).length / 4);
+          if (sawDone) {
+            const finalOutput = Math.max(outputTokens, Math.ceil(visibleOutputBytes / 4));
+            const cost = priceUsage(model, inputTokens, finalOutput, {
+              cachedInputTokens,
+              reasoningTokens,
+            }).costMicros;
+            if (idempotency) {
+              await repo.completeApiStream({
+                id: idempotency.id,
+                leaseToken: idempotency.leaseToken,
+                responseStatus: 200,
+                responseHeaders: {
+                  "content-type": "text/event-stream",
+                  "cache-control": "no-cache",
+                },
+                terminalFrame: sseData("[DONE]"),
+                costMicros: cost,
+                inputTokens,
+                outputTokens: finalOutput,
+                latencyMs: Math.round(performance.now() - started),
+                quota: replayQuota,
+              });
+            } else {
+              await repo.settle(
+                runId,
+                cost,
+                inputTokens,
+                finalOutput,
+                Math.round(performance.now() - started),
+              );
+            }
+            settled = true;
+            if (!stream.aborted && !upstreamSignal.aborted) {
+              await stream.writeSSE({ data: "[DONE]" });
+            }
+          } else if (!settled && !idempotency) {
+            const finalOutput = Math.max(outputTokens, Math.ceil(visibleOutputBytes / 4));
             if (finalOutput > 0) {
               await repo.settle(
                 runId,
@@ -2550,10 +2974,10 @@ export function createApp(options: AppOptions = {}) {
               settled = true;
             }
           }
-        } catch {
+        } catch (error) {
+          if (error instanceof TerminalAccountingPersistenceError) throw error;
           if (!settled && idempotency) {
-            const finalOutput = outputTokens ||
-              Math.ceil((deliveredText + toolOutput).length / 4);
+            const finalOutput = Math.max(outputTokens, Math.ceil(visibleOutputBytes / 4));
             const latencyMs = Math.round(performance.now() - started);
             await repo.failApiRequest({
               id: idempotency.id,
@@ -2580,9 +3004,8 @@ export function createApp(options: AppOptions = {}) {
                 }
                 : { mode: "refund" },
             });
-          } else if (!settled && deliveredText.length + toolOutput.length > 0) {
-            const finalOutput = outputTokens ||
-              Math.ceil((deliveredText + toolOutput).length / 4);
+          } else if (!settled && visibleOutputBytes > 0) {
+            const finalOutput = Math.max(outputTokens, Math.ceil(visibleOutputBytes / 4));
             await repo.settle(
               runId,
               priceUsage(model, inputTokens, finalOutput, {
@@ -2607,7 +3030,16 @@ export function createApp(options: AppOptions = {}) {
     }
     let providerCompleted = false;
     try {
-      const result = await providerComplete(request, c.req.raw.signal, resolvedModel.upstream);
+      const result = resolvedModel.registryModel && providerExecution
+        ? await providerExecution.complete(
+          resolvedModel.registryModel.id,
+          runId,
+          executionLeaseToken,
+          request,
+          c.req.raw.signal,
+          providerPlan,
+        )
+        : await providerComplete(request, c.req.raw.signal, resolvedModel.upstream);
       providerCompleted = true;
       const cost = priceUsage(model, result.inputTokens, result.outputTokens, {
         cachedInputTokens: result.cachedInputTokens,
@@ -2619,11 +3051,9 @@ export function createApp(options: AppOptions = {}) {
         costMicros: cost,
         latencyMs: Math.round(performance.now() - started),
       });
-      const payload = result.upstream ?? {
-        id: `chatcmpl-${crypto.randomUUID()}`,
+      const fallbackPayload = {
         object: "chat.completion",
         created: Math.floor(Date.now() / 1000),
-        model: request.model,
         choices: [{
           index: 0,
           message: { role: "assistant", content: result.text },
@@ -2635,6 +3065,11 @@ export function createApp(options: AppOptions = {}) {
           total_tokens: result.inputTokens + result.outputTokens,
         },
       };
+      const upstreamPayload = result.upstream && typeof result.upstream === "object" &&
+          !Array.isArray(result.upstream)
+        ? result.upstream as Record<string, unknown>
+        : fallbackPayload;
+      const payload = publicChatCompletion(upstreamPayload, gatewayCompletionId, request.model);
       const responseBody = JSON.stringify(payload);
       if (idempotency) {
         try {
@@ -2681,6 +3116,10 @@ export function createApp(options: AppOptions = {}) {
       }
       return new Response(responseBody, { headers: { "content-type": "application/json" } });
     } catch (error) {
+      if (error instanceof TerminalAccountingPersistenceError) {
+        await lease.stop();
+        throw error;
+      }
       if (!providerCompleted && idempotency) {
         const body = JSON.stringify(openAIError("Provider request failed", "provider_error"));
         await repo.failApiRequest({
@@ -2702,13 +3141,16 @@ export function createApp(options: AppOptions = {}) {
   app.post("/v1/chat/completions", requireScope("chat:write"), chatHandler);
   app.post("/v1/responses", requireScope("chat:write"), async (c) => {
     const body = await parseJson(c, responsesSchema);
-    const messages = typeof body.input === "string"
-      ? [{ role: "user" as const, content: body.input }]
-      : body.input.map((m) => ({
-        role: m.role,
-        content: m.content,
-      }));
-    const request = { model: body.model, messages, stream: false };
+    let request: ChatCompletionRequest;
+    try {
+      request = responsesRequestToChatCompletions(body) as unknown as ChatCompletionRequest;
+    } catch (error) {
+      if (error instanceof ProviderProtocolError) {
+        const status = error.code === "payload_too_large" ? 413 : 400;
+        return c.json(openAIError(error.message, error.code), status);
+      }
+      throw error;
+    }
     const resolvedModel = await resolveRuntimeModel(body.model);
     const model = resolvedModel?.info;
     if (!model) {
@@ -2720,11 +3162,19 @@ export function createApp(options: AppOptions = {}) {
     if (maxResponseOutput * 16 * 5 + 1_048_576 > 16_777_216) {
       throw new DomainError("response_too_large", "Requested output exceeds replay storage", 413);
     }
-    const responseReservation = reservationPrice(
-      model,
-      { ...request, max_tokens: maxResponseOutput },
-      maxResponseOutput,
-    ).costMicros;
+    const providerPlan = resolvedModel.registryModel && providerExecution
+      ? await providerExecution.resolvePlan(resolvedModel.registryModel.id)
+      : undefined;
+    const responseReservation = providerPlan && providerExecution
+      ? providerExecution.reservationMicros(
+        providerPlan,
+        Math.max(
+          estimateInputTokens(request),
+          model.contextWindow - Math.min(maxResponseOutput, model.contextWindow),
+        ),
+        maxResponseOutput,
+      )
+      : reservationPrice(model, request, maxResponseOutput).costMicros;
     const usage = await beginOpenAIUsage(
       c,
       "responses",
@@ -2734,19 +3184,38 @@ export function createApp(options: AppOptions = {}) {
       resolvedModel.price,
     );
     if (usage.kind === "replay") return usage.response;
-    const { runId, idempotency } = usage;
-    const lease = keepApiLeaseAlive(idempotency);
+    const { runId, idempotency, executionLeaseToken, runLease } = usage;
+    const lease = keepApiLeaseAlive(
+      idempotency,
+      runLease ? { runId, leaseToken: executionLeaseToken } : undefined,
+    );
     const started = performance.now();
     let result;
     let providerCompleted = false;
     try {
-      result = await providerComplete(
-        { ...request, max_tokens: maxResponseOutput },
-        c.req.raw.signal,
-        resolvedModel.upstream,
-      );
+      // Responses streaming is currently synthesized from one bounded completion so replay can be
+      // committed atomically. Keep the converted request fields, but request a non-stream result.
+      const providerRequest = {
+        ...request,
+        stream: false,
+        max_completion_tokens: maxResponseOutput,
+      };
+      result = resolvedModel.registryModel && providerExecution
+        ? await providerExecution.complete(
+          resolvedModel.registryModel.id,
+          runId,
+          executionLeaseToken,
+          providerRequest,
+          c.req.raw.signal,
+          providerPlan,
+        )
+        : await providerComplete(providerRequest, c.req.raw.signal, resolvedModel.upstream);
       providerCompleted = true;
     } catch (error) {
+      if (error instanceof TerminalAccountingPersistenceError) {
+        await lease.stop();
+        throw error;
+      }
       if (!providerCompleted && idempotency) {
         const failureBody = JSON.stringify(
           openAIError("Provider request failed", "provider_error"),
@@ -2773,14 +3242,39 @@ export function createApp(options: AppOptions = {}) {
       const responseId = `resp_${crypto.randomUUID()}`;
       const messageId = `msg_${crypto.randomUUID()}`;
       const createdAt = Math.floor(Date.now() / 1000);
+      const rawCompletion = result.upstream && typeof result.upstream === "object" &&
+          !Array.isArray(result.upstream)
+        ? result.upstream
+        : {
+          choices: [{
+            index: 0,
+            message: { role: "assistant", content: result.text },
+            finish_reason: "stop",
+          }],
+          usage: {
+            prompt_tokens: result.inputTokens,
+            completion_tokens: result.outputTokens,
+            total_tokens: result.inputTokens + result.outputTokens,
+            prompt_tokens_details: { cached_tokens: result.cachedInputTokens ?? 0 },
+            completion_tokens_details: { reasoning_tokens: result.reasoningTokens ?? 0 },
+          },
+        };
+      const canonicalResult = normalizeChatCompletionResult(
+        publicChatCompletion(rawCompletion, `chatcmpl-${crypto.randomUUID()}`, body.model),
+      );
       const completedResponse = responseObject({
         id: responseId,
         messageId,
         model: body.model,
         createdAt,
         status: "completed",
-        text: result.text,
-        usage: { inputTokens: result.inputTokens, outputTokens: result.outputTokens },
+        result: canonicalResult,
+        usage: {
+          inputTokens: result.inputTokens,
+          outputTokens: result.outputTokens,
+          cachedInputTokens: result.cachedInputTokens,
+          reasoningTokens: result.reasoningTokens,
+        },
       });
       const responseCost = priceUsage(model, result.inputTokens, result.outputTokens, {
         cachedInputTokens: result.cachedInputTokens,
@@ -2863,50 +3357,10 @@ export function createApp(options: AppOptions = {}) {
         const payload: Record<string, unknown> = { ...event, sequence_number: ++eventSequence };
         return sseData(JSON.stringify(payload), String(payload.type));
       };
+      const completedOutput = completedResponse.output as Array<Record<string, unknown>>;
       const responseFrames = [
         eventFrame({ type: "response.created", response: pendingResponse }),
-        eventFrame({
-          type: "response.output_item.added",
-          output_index: 0,
-          item: { ...responseMessage(messageId, "", "in_progress"), content: [] },
-        }),
-        eventFrame({
-          type: "response.content_part.added",
-          item_id: messageId,
-          output_index: 0,
-          content_index: 0,
-          part: { type: "output_text", text: "", annotations: [] },
-        }),
-        ...chunkUtf8(result.text).map((delta) =>
-          eventFrame({
-            type: "response.output_text.delta",
-            item_id: messageId,
-            output_index: 0,
-            content_index: 0,
-            delta,
-            logprobs: [],
-          })
-        ),
-        eventFrame({
-          type: "response.output_text.done",
-          item_id: messageId,
-          output_index: 0,
-          content_index: 0,
-          text: result.text,
-          logprobs: [],
-        }),
-        eventFrame({
-          type: "response.content_part.done",
-          item_id: messageId,
-          output_index: 0,
-          content_index: 0,
-          part: { type: "output_text", text: result.text, annotations: [] },
-        }),
-        eventFrame({
-          type: "response.output_item.done",
-          output_index: 0,
-          item: responseMessage(messageId, result.text),
-        }),
+        ...bufferedResponseOutputEvents(completedOutput, eventFrame),
         eventFrame({ type: "response.completed", response: completedResponse }),
       ];
       if (idempotency) {
@@ -3053,5 +3507,5 @@ export function createApp(options: AppOptions = {}) {
     return c.json(openAIError(`Internal server error (${correlationId})`, "internal_error"), 500);
   });
   app.notFound((c) => c.json(openAIError("Route not found", "not_found"), 404));
-  return { app, repository: repo };
+  return { app, repository: repo, circuitBreaker };
 }

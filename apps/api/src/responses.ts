@@ -1,6 +1,10 @@
+import type { CanonicalResult } from "./provider-protocol.ts";
+
 export interface ResponseUsage {
   inputTokens: number;
   outputTokens: number;
+  cachedInputTokens?: number;
+  reasoningTokens?: number;
 }
 
 export function responseMessage(messageId: string, text: string, status = "completed") {
@@ -13,6 +17,57 @@ export function responseMessage(messageId: string, text: string, status = "compl
   };
 }
 
+export function responseOutput(result: CanonicalResult, messageId: string) {
+  const output: Record<string, unknown>[] = [];
+  if (result.reasoning?.content || result.reasoning?.summary) {
+    output.push({
+      id: `rs_${crypto.randomUUID()}`,
+      type: "reasoning",
+      status: "completed",
+      summary: result.reasoning.summary
+        ? [{ type: "summary_text", text: result.reasoning.summary }]
+        : [],
+      content: result.reasoning.content
+        ? [{ type: "reasoning_text", text: result.reasoning.content }]
+        : [],
+    });
+  }
+  const content: Record<string, unknown>[] = result.text
+    ? [{
+      type: "output_text",
+      text: result.text,
+      annotations: (result.annotations ?? []).map((annotation) => ({
+        type: annotation.type,
+        start_index: annotation.startIndex,
+        end_index: annotation.endIndex,
+        title: annotation.title,
+        url: annotation.url,
+      })),
+    }]
+    : [];
+  if (result.refusal) content.push({ type: "refusal", refusal: result.refusal });
+  if (content.length > 0) {
+    output.push({
+      id: messageId,
+      type: "message",
+      status: "completed",
+      role: "assistant",
+      content,
+    });
+  }
+  for (const call of result.toolCalls) {
+    output.push({
+      id: `fc_${crypto.randomUUID()}`,
+      type: "function_call",
+      status: call.status ?? "completed",
+      call_id: call.id,
+      name: call.name,
+      arguments: call.arguments,
+    });
+  }
+  return output;
+}
+
 export function responseObject(input: {
   id: string;
   messageId: string;
@@ -21,6 +76,7 @@ export function responseObject(input: {
   status: "in_progress" | "completed";
   text?: string;
   usage?: ResponseUsage;
+  result?: CanonicalResult;
 }) {
   const completed = input.status === "completed";
   return {
@@ -32,13 +88,17 @@ export function responseObject(input: {
     error: null,
     incomplete_details: null,
     model: input.model,
-    output: completed ? [responseMessage(input.messageId, input.text ?? "")] : [],
+    output: completed
+      ? input.result
+        ? responseOutput(input.result, input.messageId)
+        : [responseMessage(input.messageId, input.text ?? "")]
+      : [],
     usage: input.usage
       ? {
         input_tokens: input.usage.inputTokens,
-        input_tokens_details: { cached_tokens: 0 },
+        input_tokens_details: { cached_tokens: input.usage.cachedInputTokens ?? 0 },
         output_tokens: input.usage.outputTokens,
-        output_tokens_details: { reasoning_tokens: 0 },
+        output_tokens_details: { reasoning_tokens: input.usage.reasoningTokens ?? 0 },
         total_tokens: input.usage.inputTokens + input.usage.outputTokens,
       }
       : null,

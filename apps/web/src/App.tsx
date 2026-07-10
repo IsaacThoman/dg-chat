@@ -96,6 +96,7 @@ import {
 } from "./conversationLifecycle.ts";
 import { Modal } from "./Modal.tsx";
 import { AdminModels, AdminProviders } from "./AdminRegistry.tsx";
+import { AdminResilience } from "./AdminResilience.tsx";
 import type {
   Attachment,
   AuditFilters,
@@ -113,6 +114,7 @@ type AdminSection =
   | "users"
   | "providers"
   | "models"
+  | "resilience"
   | "usage"
   | "jobs"
   | "audit"
@@ -1212,9 +1214,14 @@ function TreePanel({
   const closeRef = useRef(close);
   const busyRef = useRef(busy);
   const previousFocus = useRef<HTMLElement | null>(null);
+  const restoreFrame = useRef<number | null>(null);
   closeRef.current = close;
   busyRef.current = busy;
   useEffect(() => {
+    if (restoreFrame.current !== null) {
+      cancelAnimationFrame(restoreFrame.current);
+      restoreFrame.current = null;
+    }
     previousFocus.current = returnFocus ?? document.activeElement as HTMLElement;
     const panel = panelRef.current;
     panel?.querySelector<HTMLElement>("button")?.focus();
@@ -1244,7 +1251,10 @@ function TreePanel({
     document.addEventListener("keydown", keydown);
     return () => {
       document.removeEventListener("keydown", keydown);
-      requestAnimationFrame(() => previousFocus.current?.focus());
+      restoreFrame.current = requestAnimationFrame(() => {
+        restoreFrame.current = null;
+        previousFocus.current?.focus();
+      });
     };
   }, []);
   return (
@@ -2002,6 +2012,7 @@ const adminNav: { id: AdminSection; label: string; icon: typeof Gauge }[] = [
   { id: "users", label: "Users", icon: Users },
   { id: "providers", label: "Providers", icon: Cloud },
   { id: "models", label: "Models & pricing", icon: Bot },
+  { id: "resilience", label: "Routing resilience", icon: GitBranch },
   { id: "usage", label: "Usage analytics", icon: BarChart3 },
   { id: "jobs", label: "Background jobs", icon: Boxes },
   { id: "audit", label: "Audit log", icon: Shield },
@@ -2035,6 +2046,7 @@ function AdminView({ onMenu }: { onMenu: () => void }) {
               key={id}
               onClick={() => setSection(id)}
               className={section === id ? "active" : ""}
+              aria-current={section === id ? "page" : undefined}
             >
               <Icon size={17} />
               {label}
@@ -2074,6 +2086,9 @@ function AdminSectionContent(
   }
   if (section === "models") {
     return <AdminModels />;
+  }
+  if (section === "resilience") {
+    return <AdminResilience />;
   }
   if (section === "users") {
     return <UserManagement />;

@@ -7,6 +7,171 @@ import { backfillLegacyRuntimeSnapshot } from "./legacy-backfill.ts";
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
 
 Deno.test({
+  name: "Postgres provider accounting is authoritative for API failure and stale run leases",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 1 });
+    await sql`TRUNCATE provider_attempts, provider_model_route_targets, provider_model_routes,
+      provider_retry_policies, model_price_versions, provider_models, providers,
+      api_idempotency_events, api_idempotency_requests, ledger_entries, usage_runs,
+      api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
+    const repo = await PostgresRepository.connect(databaseUrl!);
+    try {
+      const user = await repo.bootstrapAdmin({
+        email: "provider-accounting-pg@example.com",
+        name: "Provider accounting",
+        passwordHash: "hash",
+      }, 1_000);
+      const begun = await repo.beginApiRequest({
+        userId: user.id,
+        endpoint: "chat.completions",
+        idempotencyKey: "postgres-provider-failure",
+        requestHash: "c".repeat(64),
+        stream: false,
+        model: "provider/model",
+        provider: "provider",
+        runId: "postgres-provider-failure-run",
+        reserveMicros: 100,
+      });
+      if (begun.kind !== "started") throw new Error("request did not start");
+      await sql`UPDATE usage_runs SET execution_epoch=1,actual_provider_cost_micros=7,
+        actual_provider_input_tokens=3,actual_provider_output_tokens=2
+        WHERE id=${begun.usageRun.id}`;
+      await repo.failApiRequest({
+        id: begun.request.id,
+        leaseToken: begun.leaseToken,
+        responseStatus: 502,
+        responseBody: "{}",
+        billing: { mode: "refund" },
+      });
+      const failed = await sql<
+        { status: string; cost: string; input_tokens: number }[]
+      >`SELECT status,cost_micros::text cost,input_tokens FROM usage_runs WHERE id=${begun.usageRun.id}`;
+      assertEquals(failed[0], { status: "failed", cost: "7", input_tokens: 3 });
+
+      const stale = await repo.reserve(user.id, "postgres-provider-stale", "provider/model", 100);
+      await sql`UPDATE usage_runs SET execution_epoch=1,actual_provider_cost_micros=5,
+        run_lease_expires_at=now()-interval '1 second' WHERE id=${stale.id}`;
+      const providers = await sql<{ id: string }[]>`INSERT INTO providers
+        (slug,display_name,base_url,protocol) VALUES
+        ('uncertain-provider','Uncertain provider','https://uncertain.example/v1','chat_completions')
+        RETURNING id`;
+      const models = await sql<{ id: string }[]>`INSERT INTO provider_models
+        (provider_id,public_model_id,upstream_model_id,display_name,capabilities,context_window)
+        VALUES(${providers[0].id},'uncertain/model','upstream','Uncertain model','["chat"]',8192)
+        RETURNING id`;
+      const prices = await sql<{ id: string }[]>`INSERT INTO model_price_versions
+        (provider_model_id,effective_at,input_micros_per_million,
+          cached_input_micros_per_million,reasoning_micros_per_million,
+          output_micros_per_million,fixed_call_micros,source)
+        VALUES(${models[0].id},now(),100000,50000,200000,300000,10,'test') RETURNING id`;
+      const insertUncertainAttempt = (runId: string) =>
+        sql`INSERT INTO provider_attempts
+          (usage_run_id,attempt_number,execution_epoch,target_ordinal,retry_number,reason,
+            breaker_before,provider_id,provider_slug,provider_version,protocol,provider_model_id,
+            public_model_id,upstream_model_id,model_version,pricing_version_id,
+            pricing_input_micros_per_million,pricing_cached_input_micros_per_million,
+            pricing_reasoning_micros_per_million,pricing_output_micros_per_million,
+            pricing_fixed_call_micros,pricing_source)
+          VALUES(${runId},1,1,0,0,'primary','closed',${providers[0].id},
+            'uncertain-provider',1,'chat_completions',${
+          models[0].id
+        },'uncertain/model','upstream',1,
+            ${prices[0].id},100000,50000,200000,300000,10,'test')`;
+      await insertUncertainAttempt(stale.id);
+      assertEquals(await repo.reapStaleProviderExecutionLeases(), 1);
+      assertEquals(await repo.reapStaleProviderExecutionLeases(), 0);
+      const reaped = await sql<
+        { status: string; cost: string; run_lease_token: string | null }[]
+      >`SELECT status,cost_micros::text cost,run_lease_token::text FROM usage_runs WHERE id=${stale.id}`;
+      assertEquals(reaped[0], { status: "failed", cost: "100", run_lease_token: null });
+      const attempts = await sql<
+        { status: string; error_code: string | null }[]
+      >`SELECT status,error_code FROM provider_attempts WHERE usage_run_id=${stale.id}`;
+      assertEquals([...attempts], [{ status: "cancelled", error_code: "execution_lease_expired" }]);
+
+      const api = await repo.beginApiRequest({
+        userId: user.id,
+        endpoint: "chat.completions",
+        idempotencyKey: "postgres-uncertain-api-reaper",
+        requestHash: "e".repeat(64),
+        stream: false,
+        model: "uncertain/model",
+        provider: "uncertain-provider",
+        runId: "postgres-uncertain-api-run",
+        reserveMicros: 100,
+      });
+      if (api.kind !== "started") throw new Error("API request did not start");
+      await sql`UPDATE usage_runs SET execution_epoch=1 WHERE id=${api.usageRun.id}`;
+      await sql`UPDATE api_idempotency_requests SET lease_expires_at=now()-interval '1 second'
+        WHERE id=${api.request.id}`;
+      await insertUncertainAttempt(api.usageRun.id);
+      const apiBalanceBefore = await sql<
+        { balance: string }[]
+      >`SELECT balance_micros::text balance FROM users WHERE id=${user.id}`;
+      assertEquals(await repo.reapStaleApiRequests(), 1);
+      const apiRun = await sql<
+        { status: string; cost: string }[]
+      >`SELECT status,cost_micros::text cost FROM usage_runs WHERE id=${api.usageRun.id}`;
+      const apiBalanceAfter = await sql<
+        { balance: string }[]
+      >`SELECT balance_micros::text balance FROM users WHERE id=${user.id}`;
+      const apiAttempts = await sql<
+        { status: string; error_code: string | null }[]
+      >`SELECT status,error_code FROM provider_attempts WHERE usage_run_id=${api.usageRun.id}`;
+      assertEquals([...apiRun], [{ status: "failed", cost: "100" }]);
+      assertEquals([...apiBalanceAfter], [...apiBalanceBefore]);
+      assertEquals([...apiAttempts], [{ status: "cancelled", error_code: "api_lease_expired" }]);
+
+      const conversation = await repo.createConversation(user.id, "Uncertain generation");
+      const generation = await repo.beginGeneration({
+        message: {
+          conversationId: conversation.id,
+          ownerId: user.id,
+          parentId: null,
+          role: "user",
+          content: "hello",
+          model: "uncertain/model",
+          expectedVersion: conversation.version,
+          idempotencyKey: "postgres-uncertain-generation-user",
+        },
+        runId: "postgres-uncertain-generation-run",
+        provider: "uncertain-provider",
+        reserveMicros: 100,
+      });
+      if (generation.kind !== "started") throw new Error("generation did not start");
+      await sql`UPDATE usage_runs SET execution_epoch=1,
+        generation_lease_expires_at=now()-interval '1 second' WHERE id=${generation.usageRun.id}`;
+      await insertUncertainAttempt(generation.usageRun.id);
+      const generationBalanceBefore = await sql<
+        { balance: string }[]
+      >`SELECT balance_micros::text balance FROM users WHERE id=${user.id}`;
+      assertEquals(await repo.reapStaleGenerations(), 1);
+      const generationRun = await sql<
+        { status: string; cost: string }[]
+      >`SELECT status,cost_micros::text cost FROM usage_runs WHERE id=${generation.usageRun.id}`;
+      const generationBalanceAfter = await sql<
+        { balance: string }[]
+      >`SELECT balance_micros::text balance FROM users WHERE id=${user.id}`;
+      const generationAttempts = await sql<
+        { status: string; error_code: string | null }[]
+      >`SELECT status,error_code FROM provider_attempts
+        WHERE usage_run_id=${generation.usageRun.id}`;
+      assertEquals([...generationRun], [{ status: "failed", cost: "100" }]);
+      assertEquals([...generationBalanceAfter], [...generationBalanceBefore]);
+      assertEquals([...generationAttempts], [{
+        status: "cancelled",
+        error_code: "generation_lease_expired",
+      }]);
+    } finally {
+      await repo.close();
+    }
+  },
+});
+
+Deno.test({
   name: "normalized repository commits identity, graph, and credit mutations atomically",
   ignore: !databaseUrl,
   sanitizeOps: false,
@@ -495,6 +660,237 @@ Deno.test({
       ]);
       assertEquals(removals.filter((result) => result.status === "fulfilled").length, 1);
       assertEquals(removals.filter((result) => result.status === "rejected").length, 1);
+    } finally {
+      await repo.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "Postgres provider resilience serializes acyclic routes and immutable attempts",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 1 });
+    await sql`TRUNCATE provider_attempts,provider_model_route_targets,provider_model_routes,
+      provider_retry_policies,model_price_versions,provider_models,providers,audit_events,
+      ledger_entries,usage_runs,api_tokens,sessions,messages,conversations,users RESTART IDENTITY CASCADE`;
+    await sql.end();
+    const repo = await PostgresRepository.connect(databaseUrl!);
+    try {
+      const actor = await repo.bootstrapAdmin({
+        email: "resilience@database.test",
+        name: "Resilience",
+        passwordHash: "x",
+      }, 1_000);
+      const policy = await repo.createProviderRetryPolicy({
+        name: "transient",
+        maxAttempts: 3,
+        maxRetries: 1,
+        baseDelayMs: 100,
+        maxDelayMs: 2_000,
+        backoffMultiplierBps: 20_000,
+        jitterBps: 1_000,
+        firstTokenTimeoutMs: 10_000,
+        idleTimeoutMs: 20_000,
+        totalTimeoutMs: 60_000,
+        retryableStatuses: [429, 503],
+      }, { actorId: actor.id, action: "retry.create" });
+      const provider = await repo.createProvider({
+        slug: "resilience",
+        displayName: "Resilience",
+        baseUrl: "https://resilience.database.test/v1",
+        protocol: "chat_completions",
+      }, { actorId: actor.id, action: "provider.create" });
+      const credentialed = await repo.setProviderCredential(provider.id, provider.version, {
+        envelope: {
+          version: 1,
+          algorithm: "AES-256-GCM",
+          keyId: "test",
+          credentialVersion: 1,
+          wrappedKeyNonce: "bm9uY2U=",
+          wrappedKey: "d3JhcA==",
+          contentNonce: "bm9uY2U=",
+          ciphertext: "Y2lwaGVy",
+        },
+      }, { actorId: actor.id, action: "provider.credential" });
+      const makeModel = async (name: string) => {
+        const model = await repo.createProviderModel({
+          providerId: provider.id,
+          publicModelId: `resilience/${name}`,
+          upstreamModelId: name,
+          displayName: name,
+          capabilities: ["chat"],
+          contextWindow: 1_000,
+        }, { actorId: actor.id, action: "model.create" });
+        const price = await repo.createModelPriceVersion({
+          providerModelId: model.id,
+          expectedModelVersion: model.version,
+          effectiveAt: "2026-01-01T00:00:00Z",
+          inputMicrosPerMillion: 10,
+          cachedInputMicrosPerMillion: 5,
+          reasoningMicrosPerMillion: 30,
+          outputMicrosPerMillion: 20,
+          fixedCallMicros: 1,
+          source: "test",
+        }, { actorId: actor.id, action: "price.create" });
+        return { model: (await repo.findProviderModel(model.id))!, price };
+      };
+      const a = await makeModel("a"), b = await makeModel("b"), c = await makeModel("c");
+      const routeA = await repo.setProviderModelRoute({
+        sourceModelId: a.model.id,
+        expectedVersion: 0,
+        retryPolicyId: policy.id,
+        fallbackModelIds: [b.model.id],
+      }, { actorId: actor.id, action: "route.set" });
+      await repo.setProviderModelRoute({
+        sourceModelId: b.model.id,
+        expectedVersion: 0,
+        fallbackModelIds: [c.model.id],
+      }, { actorId: actor.id, action: "route.set" });
+      await assertRejects(
+        () =>
+          repo.setProviderModelRoute({
+            sourceModelId: c.model.id,
+            expectedVersion: 0,
+            fallbackModelIds: [a.model.id],
+          }, { actorId: actor.id, action: "route.set" }),
+        DomainError,
+        "acyclic",
+      );
+      const plan = await repo.resolveProviderExecutionPlan(a.model.id, "2026-06-01T00:00:00Z");
+      assertEquals(plan.targets.map((target) => target.providerModelId), [
+        a.model.id,
+        b.model.id,
+        c.model.id,
+      ]);
+      await repo.updateProviderModel(c.model.id, c.model.version, { enabled: false }, {
+        actorId: actor.id,
+        action: "model.disable",
+      });
+      await assertRejects(
+        () =>
+          repo.setProviderModelRoute({
+            sourceModelId: a.model.id,
+            expectedVersion: routeA.version,
+            fallbackModelIds: [c.model.id],
+          }, { actorId: actor.id, action: "route.set" }),
+        DomainError,
+        "compatible",
+      );
+      assertEquals(
+        (await repo.resolveProviderExecutionPlan(a.model.id, "2026-06-01T00:00:00Z")).targets.map((
+          target,
+        ) => target.providerModelId),
+        [a.model.id, b.model.id],
+      );
+      const run = await repo.reserve(
+        actor.id,
+        "postgres-resilience-run",
+        a.model.publicModelId,
+        100,
+        credentialed.slug,
+        undefined,
+        plan.targets[0].pricing,
+      );
+      const ownerLeaseToken = run.runLeaseToken!;
+      const claim = await repo.claimProviderExecution(run.id, ownerLeaseToken);
+      const ownership = { ownerLeaseToken, executionEpoch: claim.executionEpoch };
+      const attempt = await repo.startProviderAttempt({
+        ...ownership,
+        usageRunId: run.id,
+        attemptNumber: 1,
+        targetOrdinal: 1,
+        retryNumber: 0,
+        reason: "fallback",
+        breakerBefore: "closed",
+        ...plan.targets[1],
+      });
+      assertEquals(
+        (await repo.startProviderAttempt({
+          ...ownership,
+          usageRunId: run.id,
+          attemptNumber: 1,
+          targetOrdinal: 1,
+          retryNumber: 0,
+          reason: "fallback",
+          breakerBefore: "closed",
+          ...plan.targets[1],
+        })).id,
+        attempt.id,
+      );
+      const finish = {
+        ...ownership,
+        id: attempt.id,
+        status: "failed" as const,
+        phase: "headers" as const,
+        errorCode: "http_503",
+        httpStatus: 503,
+        visibleOutput: false,
+        inputTokens: 10,
+        cachedInputTokens: 2,
+        reasoningTokens: 0,
+        outputTokens: 0,
+        costMicros: 2,
+        tokenSource: "provider" as const,
+        costSource: "calculated" as const,
+        latencyMs: 25,
+        ttftMs: null,
+        breakerAfter: "open" as const,
+        retryable: true,
+        upstreamRequestId: "req_provider_1",
+        tokensPerSecond: 400,
+      };
+      const terminal = await repo.finishProviderAttempt(finish);
+      assertEquals((await repo.finishProviderAttempt(finish)).completedAt, terminal.completedAt);
+      const skipped = await repo.startProviderAttempt({
+        ...ownership,
+        usageRunId: run.id,
+        attemptNumber: 8,
+        targetOrdinal: 2,
+        retryNumber: 0,
+        reason: "circuit_skip",
+        breakerBefore: "open",
+        ...plan.targets[2],
+      });
+      await repo.finishProviderAttempt({
+        ...ownership,
+        id: skipped.id,
+        status: "skipped",
+        phase: "planning",
+        errorCode: "circuit_open",
+        visibleOutput: false,
+        inputTokens: 0,
+        cachedInputTokens: 0,
+        reasoningTokens: 0,
+        outputTokens: 0,
+        costMicros: 0,
+        tokenSource: "none",
+        costSource: "none",
+        latencyMs: 0,
+        breakerAfter: "open",
+        retryable: true,
+      });
+      await repo.startProviderAttempt({
+        ...ownership,
+        usageRunId: run.id,
+        attemptNumber: 9,
+        targetOrdinal: 1,
+        retryNumber: 1,
+        reason: "retry",
+        breakerBefore: "closed",
+        ...plan.targets[1],
+      });
+      assertEquals(
+        (await repo.listProviderAttempts(run.id)).map((item) => item.attemptNumber),
+        [1, 8, 9],
+      );
+      assertEquals(
+        (await repo.listProviderAttempts(run.id))[0].pricing.pricingVersionId,
+        b.price.id,
+      );
+      assertEquals(run.pricingSnapshot?.pricingVersionId, a.price.id);
     } finally {
       await repo.close();
     }
