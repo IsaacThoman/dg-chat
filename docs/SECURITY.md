@@ -29,9 +29,11 @@ File upload routes are deliberately unavailable in the current release. Do not e
 streaming limits, MIME sniffing, quarantine scanning, immutable object keys, signed access, and
 ownership checks are implemented and tested.
 
-URL fetchers resolve DNS and reject loopback, private, link-local, multicast, Unix-socket, and cloud
-metadata destinations. They re-check every redirect and cap redirects, bytes, decompressed bytes,
-dimensions, and duration. Tool and sandbox egress use explicit allowlists.
+The current OpenAI-compatible provider transport resolves every A and AAAA answer, rejects
+special-use destinations, and pins the approved address while preserving TLS hostname validation. It
+rejects redirects and bounds response and streaming bytes. Future OCR, search, tool, upload, and
+sandbox fetchers must independently enforce redirect, decompression, image-dimension, and duration
+limits before those features are enabled.
 
 ## Secrets and privacy
 
@@ -39,8 +41,10 @@ API token plaintext is revealed once and never logged; only its SHA-256 hash and
 The current provider credential is supplied by environment variable and is never exposed through an
 admin API. A future provider registry must add envelope encryption before accepting credentials.
 
-Chat snapshots are private by default, revocable, read-only, pinned to an immutable leaf, and
-independently control identity and attachment exposure. Revocation must invalidate cached access.
+Public chat snapshots are not implemented in the current release. Conversations remain private to
+their owner. A future sharing implementation must be revocable, read-only, pinned to an immutable
+leaf, independently control identity and attachment exposure, and invalidate cached access on
+revocation.
 
 ## Reporting vulnerabilities
 

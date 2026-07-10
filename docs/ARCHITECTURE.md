@@ -6,9 +6,10 @@ compatibility endpoints live under `/v1/*`.
 
 ## Target runtime topology
 
-The Compose stack provisions the full dependency topology. The current application release uses
-PostgreSQL for durable single-instance snapshots and jobs; Redis coordination and S3-backed uploads
-are reserved for the next implementation milestone and are not yet on the request path.
+The Compose stack provisions the full dependency topology. PostgreSQL is authoritative for the
+normalized domain model, durable jobs, accounting, and OpenAI replay state. Redis is on the request
+path for distributed rate limits. MinIO is provisioned, but S3-backed uploads are not yet on the
+request path.
 
 ```mermaid
 flowchart LR
@@ -26,10 +27,10 @@ flowchart LR
 
 - PostgreSQL is authoritative for identity, immutable conversations, accounting, durable jobs,
   configuration, and audit records.
-- Redis contains disposable coordination state: rate-limit windows, circuit breakers, presence, and
-  stream metadata. Correctness must not depend on Redis persistence.
-- S3-compatible storage owns immutable upload objects. Database rows authorize and reference
-  objects; messages never own or overwrite object bytes.
+- Redis currently contains disposable rate-limit windows. Circuit breakers, presence, and ephemeral
+  stream coordination remain planned; correctness must not depend on Redis persistence.
+- S3-compatible storage is the planned owner of immutable upload objects, but upload routes and
+  object-store authorization are deliberately disabled until their security controls are complete.
 - The worker claims durable jobs using `FOR UPDATE SKIP LOCKED`. Handlers must be idempotent and
   retry-safe.
 

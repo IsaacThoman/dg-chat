@@ -9,10 +9,12 @@ import {
   primaryKey,
   text,
   timestamp,
+  unique,
   uniqueIndex,
   uuid,
   vector,
 } from "npm:drizzle-orm@0.45.2/pg-core";
+import { sql } from "npm:drizzle-orm@0.45.2";
 
 export const approvalStatus = pgEnum("approval_status", ["pending", "approved", "rejected"]);
 export const userRole = pgEnum("user_role", ["user", "admin"]);
@@ -216,3 +218,51 @@ export const auditEvents = pgTable("audit_events", {
   metadata: jsonb("metadata").notNull().default({}),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
+
+export const apiIdempotencyRequests = pgTable("api_idempotency_requests", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  endpoint: text("endpoint").notNull(),
+  idempotencyKey: text("idempotency_key").notNull(),
+  requestHash: text("request_hash").notNull(),
+  stream: boolean("stream").notNull(),
+  model: text("model").notNull(),
+  state: text("state").notNull(),
+  leaseToken: uuid("lease_token"),
+  leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+  usageRunId: text("usage_run_id").notNull().unique(
+    "api_idempotency_requests_usage_run_id_key",
+  ).references(() => usageRuns.id),
+  responseStatus: integer("response_status"),
+  responseHeaders: jsonb("response_headers").$type<Record<string, string>>().notNull().default({}),
+  responseBody: text("response_body"),
+  failureStartedStream: boolean("failure_started_stream").notNull().default(false),
+  observedInputTokens: integer("observed_input_tokens").notNull().default(0),
+  observedOutputTokens: integer("observed_output_tokens").notNull().default(0),
+  observedCostMicros: bigint("observed_cost_micros", { mode: "number" }).notNull().default(0),
+  observedLatencyMs: integer("observed_latency_ms").notNull().default(0),
+  retentionSeconds: integer("retention_seconds").notNull().default(86400),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  completedAt: timestamp("completed_at", { withTimezone: true }),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+}, (table) => [
+  unique("api_idempotency_requests_user_id_endpoint_idempotency_key_key").on(
+    table.userId,
+    table.endpoint,
+    table.idempotencyKey,
+  ),
+  index("api_idempotency_lease_idx").on(table.state, table.leaseExpiresAt).where(
+    sql`${table.state} = 'in_progress'`,
+  ),
+  index("api_idempotency_expiry_idx").on(table.expiresAt),
+]);
+
+export const apiIdempotencyEvents = pgTable("api_idempotency_events", {
+  requestId: uuid("request_id").notNull().references(() => apiIdempotencyRequests.id, {
+    onDelete: "cascade",
+  }),
+  sequence: integer("sequence").notNull(),
+  frame: text("frame").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [primaryKey({ columns: [table.requestId, table.sequence] })]);

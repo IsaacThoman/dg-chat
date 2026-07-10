@@ -93,3 +93,59 @@ describe("conversation creation API", () => {
     );
   });
 });
+
+describe("conversation lifecycle API", () => {
+  const rawConversation = (id: string, deletedAt: string | null = null) => ({
+    id,
+    title: id,
+    activeLeafId: null,
+    version: 1,
+    pinned: false,
+    archivedAt: null,
+    deletedAt,
+    updatedAt: "2026-07-10T00:00:00.000Z",
+  });
+
+  it("lists only deleted conversations from the include-deleted endpoint", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          data: [
+            rawConversation("active"),
+            rawConversation("deleted", "2026-07-10T01:00:00.000Z"),
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(api.deletedConversations()).resolves.toMatchObject([{
+      id: "deleted",
+      deleted: true,
+    }]);
+    expect(fetchMock).toHaveBeenCalledWith("/api/conversations?deleted=true", expect.anything());
+  });
+
+  it("sends typed rename, pin, archive, delete, and restore patches", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(rawConversation("chat")), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    await api.updateConversation("chat", {
+      title: "Renamed",
+      pinned: true,
+      archived: true,
+      deleted: false,
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/conversations/chat",
+      expect.objectContaining({
+        method: "PATCH",
+        body: JSON.stringify({ title: "Renamed", pinned: true, archived: true, deleted: false }),
+      }),
+    );
+  });
+});

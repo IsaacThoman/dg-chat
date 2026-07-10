@@ -3,13 +3,23 @@ import type { AccountState, Conversation, MessageNode, PublicUser } from "@dg-ch
 import { DomainError } from "./memory.ts";
 import type { LedgerEntry, StoredApiToken, StoredSession, StoredUser, UsageRun } from "./memory.ts";
 import type {
+  ApiIdempotencyEndpoint,
+  ApiIdempotencyFrame,
+  ApiIdempotencyRequest,
+  ApiReplayQuota,
+  ApiSseFrameInput,
+  ApiUsageObservation,
   AppendMessageInput,
+  BeginApiRequestInput,
+  BeginApiRequestResult,
   BeginGenerationInput,
+  CompleteApiRequestInput,
   CompleteGenerationInput,
   ConversationPatch,
   CreateApiTokenInput,
   CreateUserInput,
   DomainRepository,
+  FailApiRequestInput,
   FailGenerationInput,
 } from "./repository.ts";
 
@@ -17,6 +27,15 @@ type Row = Record<string, unknown>;
 const iso = (value: unknown) => value instanceof Date ? value.toISOString() : String(value);
 const nullableIso = (value: unknown) => value == null ? null : iso(value);
 const number = (value: unknown) => Number(value);
+const replayQuota = (quota?: ApiReplayQuota): ApiReplayQuota => {
+  const value = quota ?? { maxRequests: 256, maxBytes: 67_108_864, maxEvents: 20_000 };
+  if (
+    !Number.isSafeInteger(value.maxRequests) || value.maxRequests < 1 ||
+    !Number.isSafeInteger(value.maxBytes) || value.maxBytes < 1 ||
+    !Number.isSafeInteger(value.maxEvents) || value.maxEvents < 1
+  ) throw new DomainError("validation_error", "Invalid replay quota", 422);
+  return value;
+};
 
 function user(row: Row): StoredUser {
   return {
@@ -91,6 +110,41 @@ function run(row: Row): UsageRun {
     inputTokens: number(row.input_tokens),
     outputTokens: number(row.output_tokens),
     latencyMs: number(row.latency_ms ?? 0),
+    createdAt: iso(row.created_at),
+  };
+}
+function apiRequest(row: Row, frames: ApiIdempotencyFrame[] = []): ApiIdempotencyRequest {
+  return {
+    id: String(row.id),
+    userId: String(row.user_id),
+    endpoint: row.endpoint as ApiIdempotencyEndpoint,
+    idempotencyKey: String(row.idempotency_key),
+    requestHash: String(row.request_hash),
+    stream: Boolean(row.stream),
+    model: String(row.model),
+    state: row.state as ApiIdempotencyRequest["state"],
+    leaseToken: row.lease_token == null ? null : String(row.lease_token),
+    leaseExpiresAt: nullableIso(row.lease_expires_at),
+    usageRunId: String(row.usage_run_id),
+    responseStatus: row.response_status == null ? null : number(row.response_status),
+    responseHeaders: (row.response_headers ?? {}) as Record<string, string>,
+    responseBody: row.response_body == null ? null : String(row.response_body),
+    failureStartedStream: Boolean(row.failure_started_stream),
+    observedInputTokens: number(row.observed_input_tokens),
+    observedOutputTokens: number(row.observed_output_tokens),
+    observedCostMicros: number(row.observed_cost_micros),
+    observedLatencyMs: number(row.observed_latency_ms),
+    retentionSeconds: number(row.retention_seconds),
+    frames,
+    createdAt: iso(row.created_at),
+    completedAt: nullableIso(row.completed_at),
+    expiresAt: iso(row.expires_at),
+  };
+}
+function apiFrame(row: Row): ApiIdempotencyFrame {
+  return {
+    sequence: number(row.sequence),
+    frame: String(row.frame),
     createdAt: iso(row.created_at),
   };
 }
@@ -752,6 +806,567 @@ export class PostgresRepository implements DomainRepository {
       },completed_at=now() WHERE id=${runId} RETURNING *`;
       return run(updated[0]);
     });
+  }
+  async beginApiRequest(input: BeginApiRequestInput): Promise<BeginApiRequestResult> {
+    const leaseSeconds = input.leaseSeconds ?? 120;
+    const retentionSeconds = input.retentionSeconds ?? 86400;
+    if (input.idempotencyKey.length < 8 || input.idempotencyKey.length > 200) {
+      throw new DomainError("validation_error", "Idempotency key length is invalid", 422);
+    }
+    if (!/^[0-9a-f]{64}$/.test(input.requestHash)) {
+      throw new DomainError("validation_error", "Request fingerprint must be SHA-256 hex", 422);
+    }
+    if (
+      input.reserveMicros < 0 || leaseSeconds < 1 || retentionSeconds < 60 ||
+      retentionSeconds > 2_592_000
+    ) throw new DomainError("validation_error", "Invalid idempotent request parameters", 422);
+    return await this.#sql.begin(async (tx) => {
+      const users = await tx<
+        Row[]
+      >`SELECT balance_micros FROM users WHERE id=${input.userId} FOR UPDATE`;
+      if (!users[0]) throw new DomainError("not_found", "User not found", 404);
+      await tx`DELETE FROM api_idempotency_requests WHERE user_id=${input.userId} AND endpoint=${input.endpoint} AND idempotency_key=${input.idempotencyKey} AND state<>'in_progress' AND expires_at<=now()`;
+      const leaseToken = crypto.randomUUID();
+      const id = crypto.randomUUID();
+      const inserted = await tx<
+        Row[]
+      >`INSERT INTO api_idempotency_requests(id,user_id,endpoint,idempotency_key,request_hash,stream,model,state,lease_token,lease_expires_at,usage_run_id,retention_seconds,expires_at) VALUES(${id},${input.userId},${input.endpoint},${input.idempotencyKey},${input.requestHash},${input.stream},${input.model},'in_progress',${leaseToken},now()+${leaseSeconds}*interval '1 second',${input.runId},${retentionSeconds},now()+${retentionSeconds}*interval '1 second') ON CONFLICT(user_id,endpoint,idempotency_key) DO NOTHING RETURNING *`;
+      if (!inserted[0]) {
+        const rows = await tx<
+          Row[]
+        >`SELECT * FROM api_idempotency_requests WHERE user_id=${input.userId} AND endpoint=${input.endpoint} AND idempotency_key=${input.idempotencyKey}`;
+        const row = rows[0];
+        if (
+          String(row.request_hash) !== input.requestHash || Boolean(row.stream) !== input.stream
+        ) {
+          throw new DomainError("idempotency_conflict", "Idempotency key payload differs", 409);
+        }
+        const events = await tx<Row[]>`SELECT * FROM api_idempotency_events WHERE request_id=${
+          String(row.id)
+        } ORDER BY sequence`;
+        const request = apiRequest(row, events.map(apiFrame));
+        if (request.state === "completed" || request.state === "failed") {
+          return { kind: request.state, request };
+        }
+        return {
+          kind: "in_progress",
+          request,
+          retryAfterSeconds: Math.max(
+            1,
+            Math.ceil((Date.parse(request.leaseExpiresAt!) - Date.now()) / 1000),
+          ),
+        };
+      }
+      const quota = replayQuota(input.quota);
+      const live = await tx<
+        { count: number }[]
+      >`SELECT count(*)::int count FROM api_idempotency_requests WHERE user_id=${input.userId} AND expires_at>now()`;
+      if (live[0].count > quota.maxRequests) {
+        throw new DomainError("replay_quota_exceeded", "Replay request quota exceeded", 429);
+      }
+      const balance = number(users[0].balance_micros);
+      if (balance < input.reserveMicros) {
+        throw new DomainError("insufficient_credit", "Insufficient credit", 402);
+      }
+      const runs = await tx<
+        Row[]
+      >`INSERT INTO usage_runs(id,user_id,token_id,model,provider,status,reserved_micros) VALUES(${input.runId},${input.userId},${
+        input.tokenId ?? null
+      },${input.model},${input.provider},'reserved',${input.reserveMicros}) RETURNING *`;
+      const after = balance - input.reserveMicros;
+      await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${input.userId}`;
+      await tx`INSERT INTO ledger_entries(user_id,usage_run_id,kind,amount_micros,balance_after_micros) VALUES(${input.userId},${input.runId},'reserve',${-input
+        .reserveMicros},${after})`;
+      return {
+        kind: "started",
+        request: apiRequest(inserted[0]),
+        leaseToken,
+        usageRun: run(runs[0]),
+      };
+    });
+  }
+  async getApiRequest(userId: string, endpoint: ApiIdempotencyEndpoint, idempotencyKey: string) {
+    const rows = await this.#sql<
+      Row[]
+    >`SELECT * FROM api_idempotency_requests WHERE user_id=${userId} AND endpoint=${endpoint} AND idempotency_key=${idempotencyKey} AND expires_at>now()`;
+    if (!rows[0]) return undefined;
+    const events = await this.#sql<Row[]>`SELECT * FROM api_idempotency_events WHERE request_id=${
+      String(rows[0].id)
+    } ORDER BY sequence`;
+    return apiRequest(rows[0], events.map(apiFrame));
+  }
+  async appendApiSseFrame(
+    id: string,
+    leaseToken: string,
+    sequence: number,
+    frame: string,
+    leaseSeconds = 120,
+    observation?: ApiUsageObservation,
+    quota?: ApiReplayQuota,
+  ) {
+    return await this.appendApiSseFrames(
+      id,
+      leaseToken,
+      [{ sequence, frame }],
+      leaseSeconds,
+      observation,
+      quota,
+    );
+  }
+  async appendApiSseFrames(
+    id: string,
+    leaseToken: string,
+    frames: ApiSseFrameInput[],
+    leaseSeconds = 120,
+    observation?: ApiUsageObservation,
+    quotaInput?: ApiReplayQuota,
+  ) {
+    if (frames.length === 0) {
+      const request = await this.#sql<Row[]>`SELECT * FROM api_idempotency_requests WHERE id=${id}`;
+      if (!request[0]) throw new DomainError("not_found", "Idempotent request not found", 404);
+      const events = await this.#sql<
+        Row[]
+      >`SELECT * FROM api_idempotency_events WHERE request_id=${id} ORDER BY sequence`;
+      return apiRequest(request[0], events.map(apiFrame));
+    }
+    const encoder = new TextEncoder();
+    const frameBytes = frames.map(({ frame }) => encoder.encode(frame).length);
+    if (frameBytes.some((bytes) => bytes > 1_048_576)) {
+      throw new DomainError("response_too_large", "SSE frame exceeds replay limit", 413);
+    }
+    return await this.#sql.begin(async (tx) => {
+      const rows = await tx<
+        Row[]
+      >`SELECT *,lease_expires_at>now() AS lease_active FROM api_idempotency_requests WHERE id=${id} FOR UPDATE`;
+      if (!rows[0]) throw new DomainError("not_found", "Idempotent request not found", 404);
+      if (
+        rows[0].state !== "in_progress" || String(rows[0].lease_token) !== leaseToken ||
+        rows[0].lease_active !== true
+      ) {
+        throw new DomainError("stale_lease", "Idempotent request lease is no longer active", 409);
+      }
+      await tx`SELECT id FROM users WHERE id=${String(rows[0].user_id)} FOR UPDATE`;
+      const stats = await tx<
+        { count: number; bytes: number }[]
+      >`SELECT count(*)::int count,COALESCE(sum(octet_length(frame)),0)::int bytes FROM api_idempotency_events WHERE request_id=${id}`;
+      const firstSequence = Math.min(...frames.map(({ sequence }) => sequence));
+      const lastSequence = Math.max(...frames.map(({ sequence }) => sequence));
+      const existing = await tx<
+        Row[]
+      >`SELECT * FROM api_idempotency_events WHERE request_id=${id} AND sequence BETWEEN ${firstSequence} AND ${lastSequence} ORDER BY sequence`;
+      const existingBySequence = new Map(existing.map((row) => [number(row.sequence), row]));
+      const pending: ApiSseFrameInput[] = [];
+      for (const item of frames) {
+        const prior = existingBySequence.get(item.sequence);
+        if (prior) {
+          if (String(prior.frame) !== item.frame) {
+            throw new DomainError("sequence_conflict", "SSE frame sequence payload differs", 409);
+          }
+          continue;
+        }
+        if (item.sequence !== stats[0].count + pending.length) {
+          throw new DomainError("sequence_conflict", "SSE replay sequence is not contiguous", 409);
+        }
+        pending.push(item);
+      }
+      const pendingBytes = pending.reduce(
+        (sum, item) => sum + encoder.encode(item.frame).length,
+        0,
+      );
+      if (stats[0].count + pending.length > 10_000 || stats[0].bytes + pendingBytes > 16_777_216) {
+        throw new DomainError("response_too_large", "SSE replay exceeds storage limit", 413);
+      }
+      const quota = replayQuota(quotaInput);
+      const aggregate = await tx<
+        { events: number; bytes: number }[]
+      >`SELECT
+        (SELECT count(*)::int FROM api_idempotency_events e JOIN api_idempotency_requests r ON r.id=e.request_id WHERE r.user_id=${
+        String(rows[0].user_id)
+      } AND r.expires_at>now()) events,
+        ((SELECT COALESCE(sum(octet_length(e.frame)),0)::bigint FROM api_idempotency_events e JOIN api_idempotency_requests r ON r.id=e.request_id WHERE r.user_id=${
+        String(rows[0].user_id)
+      } AND r.expires_at>now()) +
+         (SELECT COALESCE(sum(octet_length(response_body)),0)::bigint FROM api_idempotency_requests WHERE user_id=${
+        String(rows[0].user_id)
+      } AND expires_at>now())) bytes`;
+      if (
+        number(aggregate[0].events) + pending.length > quota.maxEvents ||
+        number(aggregate[0].bytes) + pendingBytes > quota.maxBytes
+      ) throw new DomainError("replay_quota_exceeded", "User replay storage quota exceeded", 429);
+      if (pending.length > 0) {
+        await tx`INSERT INTO api_idempotency_events ${
+          tx(
+            pending.map((item) => ({ request_id: id, sequence: item.sequence, frame: item.frame })),
+            "request_id",
+            "sequence",
+            "frame",
+          )
+        }`;
+      }
+      const updated = await tx<
+        Row[]
+      >`UPDATE api_idempotency_requests SET lease_expires_at=now()+${leaseSeconds}*interval '1 second',observed_input_tokens=GREATEST(observed_input_tokens,${
+        observation?.inputTokens ?? 0
+      }),observed_output_tokens=GREATEST(observed_output_tokens,${
+        observation?.outputTokens ?? 0
+      }),observed_cost_micros=GREATEST(observed_cost_micros,${
+        observation?.costMicros ?? 0
+      }),observed_latency_ms=GREATEST(observed_latency_ms,${
+        observation?.latencyMs ?? 0
+      }),updated_at=now() WHERE id=${id} RETURNING *`;
+      const events = await tx<
+        Row[]
+      >`SELECT * FROM api_idempotency_events WHERE request_id=${id} ORDER BY sequence`;
+      return apiRequest(updated[0], events.map(apiFrame));
+    });
+  }
+  async heartbeatApiRequest(
+    id: string,
+    leaseToken: string,
+    leaseSeconds = 120,
+    observation?: ApiUsageObservation,
+  ) {
+    const rows = await this
+      .#sql`UPDATE api_idempotency_requests SET lease_expires_at=now()+${leaseSeconds}*interval '1 second',observed_input_tokens=GREATEST(observed_input_tokens,${
+      observation?.inputTokens ?? 0
+    }),observed_output_tokens=GREATEST(observed_output_tokens,${
+      observation?.outputTokens ?? 0
+    }),observed_cost_micros=GREATEST(observed_cost_micros,${
+      observation?.costMicros ?? 0
+    }),observed_latency_ms=GREATEST(observed_latency_ms,${
+      observation?.latencyMs ?? 0
+    }),updated_at=now() WHERE id=${id} AND state='in_progress' AND lease_token=${leaseToken} AND lease_expires_at>now() RETURNING id`;
+    if (!rows.length) {
+      throw new DomainError("stale_lease", "Idempotent request lease is no longer active", 409);
+    }
+  }
+  async #completeApi(input: CompleteApiRequestInput, stream: boolean) {
+    if (input.responseBody && new TextEncoder().encode(input.responseBody).length > 16_777_216) {
+      throw new DomainError("response_too_large", "Replay response exceeds storage limit", 413);
+    }
+    return await this.#sql.begin(async (tx) => {
+      const requests = await tx<
+        Row[]
+      >`SELECT *,lease_expires_at>now() AS lease_active FROM api_idempotency_requests WHERE id=${input.id} FOR UPDATE`;
+      if (!requests[0]) throw new DomainError("not_found", "Idempotent request not found", 404);
+      const row = requests[0];
+      if (row.state === "completed") {
+        if (
+          number(row.response_status) !== input.responseStatus ||
+          String(row.response_body ?? "") !== (input.responseBody ?? "")
+        ) throw new DomainError("idempotency_conflict", "Completion replay payload differs", 409);
+        const events = await tx<
+          Row[]
+        >`SELECT * FROM api_idempotency_events WHERE request_id=${input.id} ORDER BY sequence`;
+        return apiRequest(row, events.map(apiFrame));
+      }
+      if (
+        row.state !== "in_progress" || String(row.lease_token) !== input.leaseToken ||
+        row.lease_active !== true
+      ) {
+        throw new DomainError("stale_lease", "Idempotent request lease is no longer active", 409);
+      }
+      if (!stream && input.frames?.length) {
+        throw new DomainError("validation_error", "JSON completion cannot include SSE frames", 422);
+      }
+      const encoder = new TextEncoder();
+      const stats = await tx<
+        { count: number; bytes: number }[]
+      >`SELECT count(*)::int count,COALESCE(sum(octet_length(frame)),0)::int bytes FROM api_idempotency_events WHERE request_id=${input.id}`;
+      const frameInputs = input.frames ?? [];
+      if (frameInputs.some(({ frame }) => encoder.encode(frame).length > 1_048_576)) {
+        throw new DomainError("response_too_large", "SSE frame exceeds replay limit", 413);
+      }
+      const existingBySequence = new Map<number, Row>();
+      if (frameInputs.length > 0) {
+        const first = Math.min(...frameInputs.map(({ sequence }) => sequence));
+        const last = Math.max(...frameInputs.map(({ sequence }) => sequence));
+        const existing = await tx<
+          Row[]
+        >`SELECT * FROM api_idempotency_events WHERE request_id=${input.id} AND sequence BETWEEN ${first} AND ${last}`;
+        for (const event of existing) existingBySequence.set(number(event.sequence), event);
+      }
+      const pending: ApiSseFrameInput[] = [];
+      for (const item of frameInputs) {
+        const prior = existingBySequence.get(item.sequence);
+        if (prior) {
+          if (String(prior.frame) !== item.frame) {
+            throw new DomainError("sequence_conflict", "SSE frame sequence payload differs", 409);
+          }
+          continue;
+        }
+        if (item.sequence !== stats[0].count + pending.length) {
+          throw new DomainError("sequence_conflict", "SSE replay sequence is not contiguous", 409);
+        }
+        pending.push(item);
+      }
+      const pendingBytes = pending.reduce(
+        (sum, item) => sum + encoder.encode(item.frame).length,
+        0,
+      );
+      const terminalBytes = input.terminalFrame ? encoder.encode(input.terminalFrame).length : 0;
+      if (terminalBytes > 1_048_576) {
+        throw new DomainError("response_too_large", "Terminal SSE frame exceeds replay limit", 413);
+      }
+      if (
+        stats[0].count + pending.length + (input.terminalFrame ? 1 : 0) > 10_000 ||
+        stats[0].bytes + pendingBytes + terminalBytes > 16_777_216
+      ) throw new DomainError("response_too_large", "SSE replay exceeds storage limit", 413);
+      const quota = replayQuota(input.quota);
+      await tx`SELECT id FROM users WHERE id=${String(row.user_id)} FOR UPDATE`;
+      const aggregate = await tx<
+        { events: number; bytes: number }[]
+      >`SELECT
+        (SELECT count(*)::int FROM api_idempotency_events e JOIN api_idempotency_requests r ON r.id=e.request_id WHERE r.user_id=${
+        String(row.user_id)
+      } AND r.expires_at>now()) events,
+        ((SELECT COALESCE(sum(octet_length(e.frame)),0)::bigint FROM api_idempotency_events e JOIN api_idempotency_requests r ON r.id=e.request_id WHERE r.user_id=${
+        String(row.user_id)
+      } AND r.expires_at>now()) +
+         (SELECT COALESCE(sum(octet_length(response_body)),0)::bigint FROM api_idempotency_requests WHERE user_id=${
+        String(row.user_id)
+      } AND expires_at>now())) bytes`;
+      const responseBytes = input.responseBody
+        ? new TextEncoder().encode(input.responseBody).length
+        : 0;
+      if (
+        number(aggregate[0].events) + pending.length + (input.terminalFrame ? 1 : 0) >
+          quota.maxEvents ||
+        number(aggregate[0].bytes) + responseBytes + pendingBytes + terminalBytes > quota.maxBytes
+      ) throw new DomainError("replay_quota_exceeded", "User replay storage quota exceeded", 429);
+      const completingFrames = [...pending];
+      if (stream && input.terminalFrame !== undefined) {
+        completingFrames.push({
+          sequence: stats[0].count + pending.length,
+          frame: input.terminalFrame,
+        });
+      }
+      if (completingFrames.length > 0) {
+        await tx`INSERT INTO api_idempotency_events ${
+          tx(
+            completingFrames.map((item) => ({
+              request_id: input.id,
+              sequence: item.sequence,
+              frame: item.frame,
+            })),
+            "request_id",
+            "sequence",
+            "frame",
+          )
+        }`;
+      }
+      const runs = await tx<Row[]>`SELECT * FROM usage_runs WHERE id=${
+        String(row.usage_run_id)
+      } FOR UPDATE`;
+      if (!runs[0]) throw new DomainError("not_found", "Usage reservation not found", 404);
+      if (runs[0].status === "reserved") {
+        const reserved = number(runs[0].reserved_micros);
+        const delta = reserved - input.costMicros;
+        const userId = String(row.user_id);
+        const users = await tx<
+          Row[]
+        >`SELECT balance_micros FROM users WHERE id=${userId} FOR UPDATE`;
+        const after = number(users[0].balance_micros) + delta;
+        if (after < 0) {
+          throw new DomainError("insufficient_credit", "Actual cost exceeds available credit", 402);
+        }
+        await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${userId}`;
+        if (delta !== 0) {
+          await tx`INSERT INTO ledger_entries(user_id,usage_run_id,kind,amount_micros,balance_after_micros) VALUES(${userId},${
+            String(row.usage_run_id)
+          },${delta > 0 ? "refund" : "settle"},${delta},${after})`;
+        }
+        await tx`UPDATE usage_runs SET status='completed',cost_micros=${input.costMicros},input_tokens=${input.inputTokens},output_tokens=${input.outputTokens},latency_ms=${input.latencyMs},completed_at=now() WHERE id=${
+          String(row.usage_run_id)
+        }`;
+      } else if (runs[0].status !== "completed") {
+        throw new DomainError("invalid_usage_state", "Usage run is not reserved", 409);
+      }
+      const updated = await tx<
+        Row[]
+      >`UPDATE api_idempotency_requests SET state='completed',lease_token=NULL,lease_expires_at=NULL,response_status=${input.responseStatus},response_headers=${
+        tx.json((input.responseHeaders ?? {}) as postgres.JSONValue)
+      },response_body=${
+        input.responseBody ?? null
+      },completed_at=now(),updated_at=now(),expires_at=now()+retention_seconds*interval '1 second' WHERE id=${input.id} RETURNING *`;
+      const events = await tx<
+        Row[]
+      >`SELECT * FROM api_idempotency_events WHERE request_id=${input.id} ORDER BY sequence`;
+      return apiRequest(updated[0], events.map(apiFrame));
+    });
+  }
+  completeApiJson(input: CompleteApiRequestInput) {
+    return this.#completeApi(input, false);
+  }
+  completeApiStream(input: CompleteApiRequestInput) {
+    return this.#completeApi(input, true);
+  }
+  async failApiRequest(input: FailApiRequestInput) {
+    if (new TextEncoder().encode(input.responseBody).length > 16_777_216) {
+      throw new DomainError("response_too_large", "Replay response exceeds storage limit", 413);
+    }
+    return await this.#sql.begin(async (tx) => {
+      const requests = await tx<
+        Row[]
+      >`SELECT *,lease_expires_at>now() AS lease_active FROM api_idempotency_requests WHERE id=${input.id} FOR UPDATE`;
+      if (!requests[0]) throw new DomainError("not_found", "Idempotent request not found", 404);
+      const row = requests[0];
+      if (row.state === "failed") {
+        const events = await tx<
+          Row[]
+        >`SELECT * FROM api_idempotency_events WHERE request_id=${input.id} ORDER BY sequence`;
+        return apiRequest(row, events.map(apiFrame));
+      }
+      if (
+        row.state !== "in_progress" || String(row.lease_token) !== input.leaseToken ||
+        row.lease_active !== true
+      ) {
+        throw new DomainError("stale_lease", "Idempotent request lease is no longer active", 409);
+      }
+      let eventCount = 0;
+      const stats = await tx<
+        { count: number; bytes: number }[]
+      >`SELECT count(*)::int count,COALESCE(sum(octet_length(frame)),0)::int bytes FROM api_idempotency_events WHERE request_id=${input.id}`;
+      eventCount = stats[0].count;
+      const failureStartedStream = eventCount > 0 || input.terminalFrame !== undefined;
+      if (input.terminalFrame !== undefined) {
+        const terminalBytes = new TextEncoder().encode(input.terminalFrame).length;
+        if (terminalBytes > 1_048_576 || stats[0].bytes + terminalBytes > 16_777_216) {
+          throw new DomainError(
+            "response_too_large",
+            "Terminal SSE frame exceeds replay limit",
+            413,
+          );
+        }
+        await tx`INSERT INTO api_idempotency_events(request_id,sequence,frame) VALUES(${input.id},${eventCount},${input.terminalFrame})`;
+        eventCount++;
+      }
+      const runs = await tx<Row[]>`SELECT * FROM usage_runs WHERE id=${
+        String(row.usage_run_id)
+      } FOR UPDATE`;
+      if (runs[0]?.status === "reserved") {
+        const userId = String(row.user_id);
+        const users = await tx<
+          Row[]
+        >`SELECT balance_micros FROM users WHERE id=${userId} FOR UPDATE`;
+        if (input.billing.mode === "refund") {
+          const amount = number(runs[0].reserved_micros);
+          const after = number(users[0].balance_micros) + amount;
+          await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${userId}`;
+          await tx`INSERT INTO ledger_entries(user_id,usage_run_id,kind,amount_micros,balance_after_micros) VALUES(${userId},${
+            String(row.usage_run_id)
+          },'refund',${amount},${after})`;
+          await tx`UPDATE usage_runs SET status='failed',error='idempotent request failed',completed_at=now() WHERE id=${
+            String(row.usage_run_id)
+          }`;
+        } else {
+          const delta = number(runs[0].reserved_micros) - input.billing.costMicros;
+          const after = number(users[0].balance_micros) + delta;
+          if (after < 0) {
+            throw new DomainError(
+              "insufficient_credit",
+              "Actual cost exceeds available credit",
+              402,
+            );
+          }
+          await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${userId}`;
+          if (delta !== 0) {
+            await tx`INSERT INTO ledger_entries(user_id,usage_run_id,kind,amount_micros,balance_after_micros) VALUES(${userId},${
+              String(row.usage_run_id)
+            },${delta > 0 ? "refund" : "settle"},${delta},${after})`;
+          }
+          await tx`UPDATE usage_runs SET status='completed',cost_micros=${input.billing.costMicros},input_tokens=${input.billing.inputTokens},output_tokens=${input.billing.outputTokens},latency_ms=${input.billing.latencyMs},error='request failed after partial usage',completed_at=now() WHERE id=${
+            String(row.usage_run_id)
+          }`;
+        }
+      }
+      const updated = await tx<
+        Row[]
+      >`UPDATE api_idempotency_requests SET state='failed',lease_token=NULL,lease_expires_at=NULL,response_status=${input.responseStatus},response_headers=${
+        tx.json((input.responseHeaders ?? {}) as postgres.JSONValue)
+      },response_body=${input.responseBody},failure_started_stream=${failureStartedStream},completed_at=now(),updated_at=now(),expires_at=now()+retention_seconds*interval '1 second' WHERE id=${input.id} RETURNING *`;
+      const events = await tx<
+        Row[]
+      >`SELECT * FROM api_idempotency_events WHERE request_id=${input.id} ORDER BY sequence`;
+      return apiRequest(updated[0], events.map(apiFrame));
+    });
+  }
+  async reapStaleApiRequests(limit = 100) {
+    return await this.#sql.begin(async (tx) => {
+      const rows = await tx<
+        Row[]
+      >`SELECT * FROM api_idempotency_requests WHERE state='in_progress' AND lease_expires_at<=now() ORDER BY lease_expires_at FOR UPDATE SKIP LOCKED LIMIT ${limit}`;
+      for (const row of rows) {
+        const id = String(row.id);
+        const runs = await tx<Row[]>`SELECT * FROM usage_runs WHERE id=${
+          String(row.usage_run_id)
+        } FOR UPDATE`;
+        if (runs[0]?.status === "reserved") {
+          const userId = String(row.user_id);
+          const users = await tx<
+            Row[]
+          >`SELECT balance_micros FROM users WHERE id=${userId} FOR UPDATE`;
+          const reserved = number(runs[0].reserved_micros);
+          const observedCost = number(row.observed_cost_micros);
+          const delta = observedCost > 0 ? reserved - observedCost : reserved;
+          const after = number(users[0].balance_micros) + delta;
+          if (after < 0) {
+            throw new DomainError(
+              "insufficient_credit",
+              "Observed cost exceeds available credit",
+              402,
+            );
+          }
+          await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${userId}`;
+          if (delta !== 0) {
+            await tx`INSERT INTO ledger_entries(user_id,usage_run_id,kind,amount_micros,balance_after_micros) VALUES(${userId},${
+              String(row.usage_run_id)
+            },${delta > 0 ? "refund" : "settle"},${delta},${after})`;
+          }
+          if (observedCost > 0) {
+            await tx`UPDATE usage_runs SET status='completed',cost_micros=${observedCost},input_tokens=${
+              number(row.observed_input_tokens)
+            },output_tokens=${number(row.observed_output_tokens)},latency_ms=${
+              number(row.observed_latency_ms)
+            },error='request lease expired after partial usage',completed_at=now() WHERE id=${
+              String(row.usage_run_id)
+            }`;
+          } else {
+            await tx`UPDATE usage_runs SET status='failed',error='request lease expired',completed_at=now() WHERE id=${
+              String(row.usage_run_id)
+            }`;
+          }
+        }
+        const stats = await tx<
+          { count: number }[]
+        >`SELECT count(*)::int count FROM api_idempotency_events WHERE request_id=${id}`;
+        const errorBody = JSON.stringify({
+          error: {
+            message: "Request interrupted before completion",
+            type: "server_error",
+            param: null,
+            code: "request_abandoned",
+          },
+        });
+        if (stats[0].count > 0) {
+          const frame = row.endpoint === "responses"
+            ? `event: error\ndata: ${errorBody}\n\n`
+            : `data: ${errorBody}\n\n`;
+          await tx`INSERT INTO api_idempotency_events(request_id,sequence,frame) VALUES(${id},${
+            stats[0].count
+          },${frame})`;
+        }
+        await tx`UPDATE api_idempotency_requests SET state='failed',lease_token=NULL,lease_expires_at=NULL,response_status=500,response_headers='{"content-type":"application/json"}'::jsonb,response_body=${errorBody},failure_started_stream=${
+          stats[0].count > 0
+        },completed_at=now(),updated_at=now(),expires_at=now()+retention_seconds*interval '1 second' WHERE id=${id}`;
+      }
+      return rows.length;
+    });
+  }
+  async pruneExpiredApiRequests(limit = 100) {
+    const rows = await this
+      .#sql`WITH doomed AS (SELECT id FROM api_idempotency_requests WHERE state<>'in_progress' AND expires_at<=now() ORDER BY expires_at LIMIT ${limit}) DELETE FROM api_idempotency_requests r USING doomed WHERE r.id=doomed.id RETURNING r.id`;
+    return rows.length;
   }
   async usage(userId: string) {
     const rows = await this.#sql<

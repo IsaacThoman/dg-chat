@@ -25,7 +25,7 @@ jobs:
           deno-version: v2.x
           cache: true
       - name: Install dependencies
-        run: deno install --frozen=false
+        run: deno install --frozen
       - name: Check formatting, lint, and types
         run: deno task check
       - name: Unit and integration tests
@@ -40,7 +40,9 @@ jobs:
           APP_SECRET: ci-app-secret-at-least-thirty-two-bytes
           ENCRYPTION_KEY: Y2ktZW5jcnlwdGlvbi1rZXktMzItYnl0ZXMtbG9uZw==
           SETUP_TOKEN: e2e-setup-token
-        run: docker compose -f docker-compose.yml -f docker-compose.ci.yml config --quiet
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml config --quiet
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml -f docker-compose.contracts.yml config --quiet
 
   postgres-integration:
     name: PostgreSQL integration and concurrency
@@ -115,26 +117,32 @@ jobs:
           deno-version: v2.x
           cache: true
       - name: Start disposable stack
-        run: docker compose -f docker-compose.yml -f docker-compose.ci.yml up -d --build
+        run: docker compose -f docker-compose.yml -f docker-compose.ci.yml -f docker-compose.contracts.yml up -d --build
       - name: Wait for readiness
         run: deno run --allow-net tests/wait-for-ready.ts http://localhost:8000/ready 180000
       - name: Assert migration-safe worker startup
-        run: bash tests/assert-compose-health.sh -f docker-compose.yml -f docker-compose.ci.yml
-      - name: Run official JavaScript and Python SDK contracts
+        run: bash tests/assert-compose-health.sh -f docker-compose.yml -f docker-compose.ci.yml -f docker-compose.contracts.yml
+      - name: Run official SDK and upstream streaming contracts
         run: bash tests/run-openai-contracts.sh
       - name: Capture service logs
         if: failure()
-        run: docker compose -f docker-compose.yml -f docker-compose.ci.yml logs --no-color > compose-contracts.log
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml -f docker-compose.contracts.yml logs --no-color > compose-contracts.log
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml -f docker-compose.contracts.yml exec -T mock-provider \
+            deno eval 'fetch("http://127.0.0.1:4010/__test/state", {headers:{authorization:"Bearer ci-mock-control-token"}}).then(async r => { console.log(await r.text()); if (!r.ok) Deno.exit(1); })' \
+            > mock-provider-state.json || true
       - name: Upload service logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: compose-contract-logs
-          path: compose-contracts.log
+          path: |
+            compose-contracts.log
+            mock-provider-state.json
           retention-days: 7
       - name: Stop disposable stack
         if: always()
-        run: docker compose -f docker-compose.yml -f docker-compose.ci.yml down -v --remove-orphans
+        run: docker compose -f docker-compose.yml -f docker-compose.ci.yml -f docker-compose.contracts.yml down -v --remove-orphans
 
   e2e:
     name: Browser tests

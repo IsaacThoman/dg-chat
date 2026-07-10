@@ -1,5 +1,9 @@
 import { assertEquals } from "jsr:@std/assert@1.0.14";
-import { MemoryRateLimiter, requestClientKey } from "./rate-limit.ts";
+import {
+  authorizationCredentialIdentity,
+  MemoryRateLimiter,
+  requestClientKey,
+} from "./rate-limit.ts";
 
 Deno.test("memory rate limiter enforces a fixed window deterministically", async () => {
   const limiter = new MemoryRateLimiter();
@@ -8,6 +12,15 @@ Deno.test("memory rate limiter enforces a fixed window deterministically", async
   const blocked = await limiter.consume("login:client", 2, 60);
   assertEquals(blocked.allowed, false);
   assertEquals(blocked.retryAfterSeconds > 0, true);
+});
+
+Deno.test("Bearer credential identity normalizes scheme case and whitespace", () => {
+  assertEquals(
+    authorizationCredentialIdentity("Bearer dg_same-token"),
+    authorizationCredentialIdentity("bearer    dg_same-token\t"),
+  );
+  assertEquals(authorizationCredentialIdentity("Basic dg_same-token"), undefined);
+  assertEquals(authorizationCredentialIdentity("Bearer token with spaces"), undefined);
 });
 
 Deno.test("client identity ignores spoofable forwarded headers by default", () => {

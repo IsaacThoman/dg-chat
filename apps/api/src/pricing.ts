@@ -6,8 +6,10 @@ export interface UsagePrice {
   costMicros: number;
 }
 
-export function estimateInputTokens(messages: ChatCompletionRequest["messages"]): number {
-  return Math.max(1, Math.ceil(JSON.stringify(messages).length / 4));
+export function estimateInputTokens(input: ChatCompletionRequest["messages"] | object): number {
+  // UTF-8 bytes are a conservative tokenizer-independent reservation bound: modern
+  // byte-level tokenizers cannot represent more tokens than the encoded byte count.
+  return Math.max(1, new TextEncoder().encode(JSON.stringify(input)).length);
 }
 
 export function priceUsage(
@@ -32,8 +34,8 @@ export function priceUsage(
 
 export function reservationPrice(
   model: ModelInfo,
-  messages: ChatCompletionRequest["messages"],
+  prompt: ChatCompletionRequest["messages"] | object,
   maxOutputTokens: number,
 ): UsagePrice {
-  return priceUsage(model, estimateInputTokens(messages), maxOutputTokens);
+  return priceUsage(model, estimateInputTokens(prompt), maxOutputTokens);
 }

@@ -16,14 +16,29 @@ import {
   loginSchema,
   registerSchema,
   responsesSchema,
+  setActiveLeafSchema,
+  updateConversationSchema,
 } from "@dg-chat/contracts";
-import type { ChatCompletionRequest, PublicUser } from "@dg-chat/contracts";
-import { DomainError, type DomainRepository, MemoryRepository } from "@dg-chat/database";
-import { hashPassword, randomToken, sha256, verifyPassword } from "./crypto.ts";
+import type { ChatCompletionRequest, ModelInfo, PublicUser } from "@dg-chat/contracts";
+import {
+  type ApiIdempotencyEndpoint,
+  type ApiIdempotencyRequest,
+  type ApiReplayQuota,
+  DomainError,
+  type DomainRepository,
+  MemoryRepository,
+} from "@dg-chat/database";
+import { hashPassword, randomToken, sha256, sha256Hex, verifyPassword } from "./crypto.ts";
 import { complete, models, simulate, streamChatCompletion } from "./models.ts";
 import { estimateInputTokens, priceUsage, reservationPrice } from "./pricing.ts";
 import { responseMessage, responseObject } from "./responses.ts";
-import { MemoryRateLimiter, type RateLimiter, requestClientKey } from "./rate-limit.ts";
+import {
+  authorizationCredentialIdentity,
+  MemoryRateLimiter,
+  type RateLimiter,
+  requestClientKey,
+  requestTrustedClientKey,
+} from "./rate-limit.ts";
 
 type Variables = {
   user: PublicUser;
@@ -37,11 +52,44 @@ export interface AppOptions {
   startingCreditMicros?: number;
   rateLimiter?: RateLimiter;
   providerStream?: typeof streamChatCompletion;
+  idempotencyHeartbeatMs?: number;
+  idempotencyLeaseSeconds?: number;
+  replayQuota?: ApiReplayQuota;
+  trustProxyHeaders?: boolean;
+  authClientRateLimit?: number;
 }
 
 const openAIError = (message: string, code: string | null = null) => ({
   error: { message, type: "invalid_request_error", param: null, code },
 });
+const DUMMY_PASSWORD_HASH =
+  "pbkdf2_sha256$210000$dg-chat-dummy-login-salt$18NUXRu_COEHJHYjLomFDBvS1D9vIlVzCYYqox7WSUw";
+const canonicalJson = (value: unknown): string => {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  const object = value as Record<string, unknown>;
+  const entries = Object.keys(object).filter((key) => object[key] !== undefined).sort().map((key) =>
+    `${JSON.stringify(key)}:${canonicalJson(object[key])}`
+  );
+  return `{${entries.join(",")}}`;
+};
+const sseData = (data: string, event?: string) =>
+  `${event ? `event: ${event}\n` : ""}data: ${data}\n\n`;
+const chunkUtf8 = (value: string, maxBytes = 16 * 1024, maxChunks = 512): string[] => {
+  const bytes = new TextEncoder().encode(value);
+  if (bytes.length === 0) return [];
+  if (bytes.length > maxBytes * maxChunks) {
+    throw new DomainError("response_too_large", "Response exceeds replay storage limit", 413);
+  }
+  const decoder = new TextDecoder();
+  const chunks: string[] = [];
+  for (let offset = 0; offset < bytes.length; offset += maxBytes) {
+    const end = Math.min(offset + maxBytes, bytes.length);
+    const chunk = decoder.decode(bytes.subarray(offset, end), { stream: end < bytes.length });
+    if (chunk) chunks.push(chunk);
+  }
+  return chunks;
+};
 const sameOrigin = (candidate: string, allowed: string): boolean => {
   try {
     return new URL(candidate).origin === allowed;
@@ -75,6 +123,8 @@ export function createApp(options: AppOptions = {}) {
   const repo = options.repository ?? new MemoryRepository();
   const rateLimiter = options.rateLimiter ?? new MemoryRateLimiter();
   const providerStream = options.providerStream ?? streamChatCompletion;
+  const idempotencyHeartbeatMs = Math.max(10, options.idempotencyHeartbeatMs ?? 30_000);
+  const idempotencyLeaseSeconds = Math.max(1, options.idempotencyLeaseSeconds ?? 120);
   const setupToken = options.setupToken ?? Deno.env.get("SETUP_TOKEN") ?? "";
   const configuredStartingCredit = Deno.env.get("STARTING_CREDIT_MICROS");
   const configuredStartingUsd = Deno.env.get("DEFAULT_APPROVAL_CREDIT_USD");
@@ -92,10 +142,29 @@ export function createApp(options: AppOptions = {}) {
   ).origin;
   const production = Deno.env.get("DENO_ENV") === "production";
   const sessionCookie = production ? "__Host-dg_session" : "dg_session";
-  const configuredAuthLimit = Number(Deno.env.get("AUTH_RATE_LIMIT") ?? "10");
-  if (!Number.isSafeInteger(configuredAuthLimit) || configuredAuthLimit < 1) {
-    throw new Error("AUTH_RATE_LIMIT must be a positive safe integer");
+  const positiveInteger = (name: string, fallback: number) => {
+    const value = Number(Deno.env.get(name) ?? fallback);
+    if (!Number.isSafeInteger(value) || value < 1) {
+      throw new Error(`${name} must be a positive safe integer`);
+    }
+    return value;
+  };
+  const configuredAuthLimit = positiveInteger("AUTH_RATE_LIMIT", 10);
+  const configuredAuthClientLimit = options.authClientRateLimit ??
+    positiveInteger("AUTH_CLIENT_RATE_LIMIT", 100);
+  if (!Number.isSafeInteger(configuredAuthClientLimit) || configuredAuthClientLimit < 1) {
+    throw new Error("AUTH_CLIENT_RATE_LIMIT must be a positive safe integer");
   }
+  const configuredGenerationLimit = positiveInteger("GENERATION_RATE_LIMIT", 30);
+  const configuredOpenAILimit = positiveInteger("OPENAI_RATE_LIMIT", 120);
+  const configuredRateWindow = positiveInteger("RATE_LIMIT_WINDOW_SECONDS", 60);
+  const replayQuota = options.replayQuota ?? {
+    maxRequests: positiveInteger("REPLAY_MAX_REQUESTS_PER_USER", 256),
+    maxBytes: positiveInteger("REPLAY_MAX_BYTES_PER_USER", 67_108_864),
+    maxEvents: positiveInteger("REPLAY_MAX_EVENTS_PER_USER", 20_000),
+  };
+  const trustProxyHeaders = options.trustProxyHeaders ??
+    Deno.env.get("TRUST_PROXY_HEADERS") === "true";
   let bootstrapInProgress = false;
   const app = new Hono<{ Variables: Variables }>();
   app.use("*", logger());
@@ -132,29 +201,75 @@ export function createApp(options: AppOptions = {}) {
     );
     const generationRoute = c.req.method === "POST" &&
       (path.endsWith("/generate") || path === "/v1/chat/completions" ||
-        path === "/v1/responses");
+        path === "/v1/responses" || path.endsWith("/active-leaf"));
     const policy = authRoute
-      ? { name: "auth", limit: configuredAuthLimit, window: 60 }
+      ? { name: "auth", limit: configuredAuthLimit, window: configuredRateWindow }
       : generationRoute
-      ? { name: "generation", limit: 30, window: 60 }
+      ? { name: "generation", limit: configuredGenerationLimit, window: configuredRateWindow }
       : path.startsWith("/v1/")
-      ? { name: "openai", limit: 120, window: 60 }
+      ? { name: "openai", limit: configuredOpenAILimit, window: configuredRateWindow }
       : null;
     if (!policy) return next();
     let result;
     try {
-      const credential = authRoute
-        ? undefined
-        : c.req.header("authorization") ?? getCookie(c, sessionCookie) ??
+      if (authRoute) {
+        let accountIdentity = "unknown-account";
+        try {
+          const candidate = await c.req.raw.clone().json() as { email?: unknown };
+          if (typeof candidate.email === "string") {
+            const email = candidate.email.trim().toLowerCase();
+            if (email.length >= 3 && email.length <= 320) {
+              accountIdentity = `email:${await sha256(email)}`;
+            }
+          }
+        } catch {
+          // Malformed bodies share a small fallback bucket and are rejected by route parsing.
+        }
+        const results = [
+          await rateLimiter.consume(
+            `auth:account:${accountIdentity}`,
+            configuredAuthLimit,
+            configuredRateWindow,
+          ),
+        ];
+        const trustedClient = requestTrustedClientKey(c.req.raw.headers, trustProxyHeaders);
+        if (trustedClient) {
+          results.push(
+            await rateLimiter.consume(
+              `auth:client:${trustedClient}`,
+              configuredAuthClientLimit,
+              configuredRateWindow,
+            ),
+          );
+        } else {
+          // Fetch does not expose a direct peer address. This installation-wide ceiling
+          // prevents rotating-email PBKDF2 exhaustion until a trusted proxy is configured.
+          results.push(
+            await rateLimiter.consume(
+              "auth:client:untrusted-deployment",
+              configuredAuthClientLimit,
+              configuredRateWindow,
+            ),
+          );
+        }
+        result = results.find((candidate) => !candidate.allowed) ?? results[0];
+      } else {
+        const authorizationIdentity = authorizationCredentialIdentity(
+          c.req.header("authorization"),
+        );
+        const sessionIdentity = getCookie(c, sessionCookie) ??
           (production ? getCookie(c, "dg_session") : undefined);
-      const clientKey = credential
-        ? `credential:${await sha256(credential)}`
-        : requestClientKey(c.req.raw.headers);
-      result = await rateLimiter.consume(
-        `${policy.name}:${clientKey}`,
-        policy.limit,
-        policy.window,
-      );
+        const credentialIdentity = authorizationIdentity ??
+          (sessionIdentity ? `session:${sessionIdentity}` : undefined);
+        const clientKey = credentialIdentity
+          ? `credential:${await sha256(credentialIdentity)}`
+          : requestClientKey(c.req.raw.headers, trustProxyHeaders);
+        result = await rateLimiter.consume(
+          `${policy.name}:${clientKey}`,
+          policy.limit,
+          policy.window,
+        );
+      }
     } catch {
       c.header("Retry-After", "5");
       return path.startsWith("/v1/")
@@ -326,7 +441,11 @@ export function createApp(options: AppOptions = {}) {
   const signIn = async (c: Context) => {
     const body = await parseJson(c, loginSchema);
     const user = await repo.findUserByEmail(body.email);
-    if (!user || !await verifyPassword(body.password, user.passwordHash)) {
+    const passwordValid = await verifyPassword(
+      body.password,
+      user?.passwordHash ?? DUMMY_PASSWORD_HASH,
+    );
+    if (!user || !passwordValid) {
       throw new DomainError("invalid_credentials", "Email or password is incorrect", 401);
     }
     if (user.state !== "active") {
@@ -481,10 +600,7 @@ export function createApp(options: AppOptions = {}) {
         max_tokens: maxWebOutput,
       }, c.req.raw.signal);
       providerCompleted = true;
-      const cost = Math.min(
-        priceUsage(model, result.inputTokens, result.outputTokens).costMicros,
-        webReservation,
-      );
+      const cost = priceUsage(model, result.inputTokens, result.outputTokens).costMicros;
       const completed = await repo.completeGeneration({
         conversationId,
         ownerId,
@@ -530,7 +646,7 @@ export function createApp(options: AppOptions = {}) {
     }
   });
   app.post("/api/conversations/:id/active-leaf", async (c) => {
-    const body = await c.req.json<{ leafId: string; expectedVersion: number }>();
+    const body = await parseJson(c, setActiveLeafSchema);
     return c.json(
       await repo.setActiveLeaf(
         c.req.param("id"),
@@ -541,9 +657,7 @@ export function createApp(options: AppOptions = {}) {
     );
   });
   app.patch("/api/conversations/:id", async (c) => {
-    const body = await c.req.json<
-      { title?: string; pinned?: boolean; archived?: boolean; deleted?: boolean }
-    >();
+    const body = await parseJson(c, updateConversationSchema);
     return c.json(
       await repo.updateConversation(c.get("user").id, c.req.param("id"), body),
     );
@@ -621,6 +735,133 @@ export function createApp(options: AppOptions = {}) {
   );
 
   app.use("/v1/*", authenticate, approved);
+  const replayResponse = (request: ApiIdempotencyRequest) => {
+    // A streaming request can fail before the first event is exposed. In that case the
+    // original response is the stored JSON error, not an empty event stream.
+    const replayAsStream = request.stream &&
+      (request.state === "completed" || request.failureStartedStream);
+    const headers = new Headers(request.responseHeaders);
+    headers.set("X-Idempotent-Replay", "true");
+    if (replayAsStream && !headers.has("Content-Type")) {
+      headers.set("Content-Type", "text/event-stream");
+    } else if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+    return new Response(
+      replayAsStream ? request.frames.map((frame) => frame.frame).join("") : request.responseBody,
+      { status: request.responseStatus ?? 500, headers },
+    );
+  };
+  const keepApiLeaseAlive = (idempotency?: { id: string; leaseToken: string }) => {
+    let stopped = false;
+    let heartbeatError: unknown;
+    let inFlight = Promise.resolve();
+    const pulse = (observation?: {
+      inputTokens: number;
+      outputTokens: number;
+      costMicros: number;
+      latencyMs: number;
+    }) => {
+      if (!idempotency) return Promise.resolve();
+      inFlight = inFlight.then(async () => {
+        if (stopped || heartbeatError) return;
+        try {
+          await repo.heartbeatApiRequest(
+            idempotency.id,
+            idempotency.leaseToken,
+            idempotencyLeaseSeconds,
+            observation,
+          );
+        } catch (error) {
+          heartbeatError = error;
+        }
+      });
+      return inFlight;
+    };
+    const timer = idempotency ? setInterval(() => void pulse(), idempotencyHeartbeatMs) : undefined;
+    return {
+      checkpoint: async (observation?: {
+        inputTokens: number;
+        outputTokens: number;
+        costMicros: number;
+        latencyMs: number;
+      }) => {
+        await pulse(observation);
+        if (heartbeatError) throw heartbeatError;
+      },
+      stop: async () => {
+        if (timer !== undefined) clearInterval(timer);
+        await inFlight;
+        stopped = true;
+      },
+    };
+  };
+  const beginOpenAIUsage = async (
+    c: Context<{ Variables: Variables }>,
+    endpoint: ApiIdempotencyEndpoint,
+    request: unknown,
+    model: ModelInfo,
+    reserveMicros: number,
+  ) => {
+    const idempotencyKey = c.req.header("idempotency-key");
+    const runId = `${c.get("user").id}:${endpoint}:${crypto.randomUUID()}`;
+    if (!idempotencyKey) {
+      await repo.reserve(
+        c.get("user").id,
+        runId,
+        model.id,
+        reserveMicros,
+        model.provider,
+        c.get("tokenId"),
+      );
+      return { kind: "started" as const, runId };
+    }
+    if (idempotencyKey.length < 8 || idempotencyKey.length > 200) {
+      throw new DomainError(
+        "invalid_idempotency_key",
+        "Idempotency-Key must contain between 8 and 200 characters",
+        400,
+      );
+    }
+    const requestHash = await sha256Hex(canonicalJson({ endpoint, request }));
+    const result = await repo.beginApiRequest({
+      userId: c.get("user").id,
+      endpoint,
+      idempotencyKey,
+      requestHash,
+      stream: Boolean((request as { stream?: boolean }).stream),
+      model: model.id,
+      runId,
+      reserveMicros,
+      provider: model.provider,
+      tokenId: c.get("tokenId"),
+      leaseSeconds: idempotencyLeaseSeconds,
+      quota: replayQuota,
+    });
+    if (result.kind === "in_progress") {
+      return {
+        kind: "replay" as const,
+        response: new Response(
+          JSON.stringify(
+            openAIError("An identical request is still in progress", "idempotency_in_progress"),
+          ),
+          {
+            status: 409,
+            headers: {
+              "content-type": "application/json",
+              "retry-after": String(result.retryAfterSeconds),
+            },
+          },
+        ),
+      };
+    }
+    if (result.kind === "started") {
+      return {
+        kind: "started" as const,
+        runId,
+        idempotency: { id: result.request.id, leaseToken: result.leaseToken },
+      };
+    }
+    return { kind: "replay" as const, response: replayResponse(result.request) };
+  };
   app.get(
     "/v1/models",
     requireScope("models:read"),
@@ -645,19 +886,12 @@ export function createApp(options: AppOptions = {}) {
     if (!model) {
       return c.json(openAIError(`Model '${request.model}' does not exist`, "model_not_found"), 404);
     }
-    const runId = `${c.get("user").id}:chat:${
-      c.req.header("idempotency-key") ?? crypto.randomUUID()
-    }`;
     const maxOutput = request.max_tokens ?? request.max_completion_tokens ?? 4096;
-    const reserveMicros = reservationPrice(model, request.messages, maxOutput).costMicros;
-    await repo.reserve(
-      c.get("user").id,
-      runId,
-      request.model,
-      reserveMicros,
-      model.provider,
-      c.get("tokenId"),
-    );
+    const reserveMicros = reservationPrice(model, request, maxOutput).costMicros;
+    const usage = await beginOpenAIUsage(c, "chat.completions", request, model, reserveMicros);
+    if (usage.kind === "replay") return usage.response;
+    const { runId, idempotency } = usage;
+    const lease = keepApiLeaseAlive(idempotency);
     const started = performance.now();
     if (request.stream && request.model.startsWith("simulated/")) {
       const text = simulate(request);
@@ -666,19 +900,41 @@ export function createApp(options: AppOptions = {}) {
       return streamSSE(c, async (stream) => {
         let deliveredText = "";
         let settled = false;
+        let sequence = 0;
         try {
           for (const word of words) {
-            if (stream.aborted || c.req.raw.signal.aborted) break;
-            await stream.writeSSE({
-              data: JSON.stringify({
-                id,
-                object: "chat.completion.chunk",
-                created: Math.floor(Date.now() / 1000),
-                model: request.model,
-                choices: [{ index: 0, delta: { content: word }, finish_reason: null }],
-              }),
+            if (stream.aborted || c.req.raw.signal.aborted) {
+              throw new DOMException("Client disconnected", "AbortError");
+            }
+            const data = JSON.stringify({
+              id,
+              object: "chat.completion.chunk",
+              created: Math.floor(Date.now() / 1000),
+              model: request.model,
+              choices: [{ index: 0, delta: { content: word }, finish_reason: null }],
             });
+            const frame = sseData(data);
+            if (idempotency) {
+              const observedText = deliveredText + word;
+              const observedOutput = Math.ceil(observedText.length / 4);
+              const observedInput = estimateInputTokens(request);
+              await repo.appendApiSseFrame(
+                idempotency.id,
+                idempotency.leaseToken,
+                sequence++,
+                frame,
+                undefined,
+                {
+                  inputTokens: observedInput,
+                  outputTokens: observedOutput,
+                  costMicros: priceUsage(model, observedInput, observedOutput).costMicros,
+                  latencyMs: Math.round(performance.now() - started),
+                },
+                replayQuota,
+              );
+            }
             deliveredText += word;
+            await stream.writeSSE({ data });
             await Promise.race([
               stream.sleep(18),
               new Promise<void>((resolve) =>
@@ -686,46 +942,100 @@ export function createApp(options: AppOptions = {}) {
               ),
             ]);
           }
-          const input = estimateInputTokens(request.messages);
+          const input = estimateInputTokens(request);
           const output = Math.ceil(deliveredText.length / 4);
-          const cost = Math.min(priceUsage(model, input, output).costMicros, reserveMicros);
+          const cost = priceUsage(model, input, output).costMicros;
           // Accounting is durable before the success marker is visible. A client disconnect
           // after receiving content therefore cannot turn delivered output into a full refund.
-          await repo.settle(
-            runId,
-            cost,
-            input,
-            output,
-            Math.round(performance.now() - started),
-          );
-          settled = true;
-          if (stream.aborted || c.req.raw.signal.aborted) return;
-          await stream.writeSSE({
-            data: JSON.stringify({
-              id,
-              object: "chat.completion.chunk",
-              created: Math.floor(Date.now() / 1000),
-              model: request.model,
-              choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-            }),
+          const finishData = JSON.stringify({
+            id,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: request.model,
+            choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
           });
-          await stream.writeSSE({ data: "[DONE]" });
-        } catch (error) {
-          if (!settled && deliveredText.length > 0) {
-            const input = estimateInputTokens(request.messages);
-            const output = Math.ceil(deliveredText.length / 4);
+          if (idempotency) {
+            await repo.appendApiSseFrame(
+              idempotency.id,
+              idempotency.leaseToken,
+              sequence++,
+              sseData(finishData),
+              undefined,
+              undefined,
+              replayQuota,
+            );
+            await repo.completeApiStream({
+              id: idempotency.id,
+              leaseToken: idempotency.leaseToken,
+              responseStatus: 200,
+              responseHeaders: {
+                "content-type": "text/event-stream",
+                "cache-control": "no-cache",
+              },
+              terminalFrame: sseData("[DONE]"),
+              costMicros: cost,
+              inputTokens: input,
+              outputTokens: output,
+              latencyMs: Math.round(performance.now() - started),
+              quota: replayQuota,
+            });
+          } else {
             await repo.settle(
               runId,
-              Math.min(priceUsage(model, input, output).costMicros, reserveMicros),
+              cost,
               input,
               output,
               Math.round(performance.now() - started),
             );
-          } else if (!settled) {
-            await repo.refund(runId);
+          }
+          settled = true;
+          if (stream.aborted || c.req.raw.signal.aborted) return;
+          await stream.writeSSE({ data: finishData });
+          await stream.writeSSE({ data: "[DONE]" });
+        } catch {
+          if (!settled) {
+            const input = estimateInputTokens(request);
+            const output = Math.ceil(deliveredText.length / 4);
+            const latencyMs = Math.round(performance.now() - started);
+            if (idempotency) {
+              await repo.failApiRequest({
+                id: idempotency.id,
+                leaseToken: idempotency.leaseToken,
+                responseStatus: 200,
+                responseHeaders: {
+                  "content-type": "text/event-stream",
+                  "cache-control": "no-cache",
+                },
+                responseBody: JSON.stringify(openAIError("Generation interrupted", "stream_error")),
+                terminalFrame: sseData(
+                  JSON.stringify(openAIError("Generation interrupted", "stream_error")),
+                ),
+                billing: output > 0
+                  ? {
+                    mode: "settle",
+                    costMicros: priceUsage(model, input, output).costMicros,
+                    inputTokens: input,
+                    outputTokens: output,
+                    latencyMs,
+                  }
+                  : { mode: "refund" },
+              });
+            } else if (output > 0) {
+              await repo.settle(
+                runId,
+                priceUsage(model, input, output).costMicros,
+                input,
+                output,
+                latencyMs,
+              );
+            } else await repo.refund(runId);
           }
           if (stream.aborted || c.req.raw.signal.aborted) return;
-          throw error;
+          await stream.writeSSE({
+            data: JSON.stringify(openAIError("Generation interrupted", "stream_error")),
+          });
+        } finally {
+          await lease.stop();
         }
       });
     }
@@ -737,20 +1047,42 @@ export function createApp(options: AppOptions = {}) {
         );
         const upstreamSignal = AbortSignal.any([c.req.raw.signal, downstreamAbort.signal]);
         let deliveredText = "";
-        let inputTokens = estimateInputTokens(request.messages);
+        let toolOutput = "";
+        let inputTokens = estimateInputTokens(request);
         let outputTokens = 0;
         let settled = false;
+        let sequence = 0;
         try {
           for await (const data of providerStream(request, upstreamSignal)) {
             if (data === "[DONE]") {
-              const finalOutput = outputTokens || Math.ceil(deliveredText.length / 4);
-              await repo.settle(
-                runId,
-                Math.min(priceUsage(model, inputTokens, finalOutput).costMicros, reserveMicros),
-                inputTokens,
-                finalOutput,
-                Math.round(performance.now() - started),
-              );
+              const finalOutput = outputTokens ||
+                Math.ceil((deliveredText + toolOutput).length / 4);
+              const cost = priceUsage(model, inputTokens, finalOutput).costMicros;
+              if (idempotency) {
+                await repo.completeApiStream({
+                  id: idempotency.id,
+                  leaseToken: idempotency.leaseToken,
+                  responseStatus: 200,
+                  responseHeaders: {
+                    "content-type": "text/event-stream",
+                    "cache-control": "no-cache",
+                  },
+                  terminalFrame: sseData("[DONE]"),
+                  costMicros: cost,
+                  inputTokens,
+                  outputTokens: finalOutput,
+                  latencyMs: Math.round(performance.now() - started),
+                  quota: replayQuota,
+                });
+              } else {
+                await repo.settle(
+                  runId,
+                  cost,
+                  inputTokens,
+                  finalOutput,
+                  Math.round(performance.now() - started),
+                );
+              }
               settled = true;
               if (!stream.aborted && !upstreamSignal.aborted) {
                 await stream.writeSSE({ data: "[DONE]" });
@@ -758,25 +1090,55 @@ export function createApp(options: AppOptions = {}) {
               return;
             }
             const chunk = JSON.parse(data) as {
-              choices?: Array<{ delta?: { content?: string } }>;
+              choices?: Array<{ delta?: { content?: string; tool_calls?: unknown } }>;
               usage?: { prompt_tokens?: number; completion_tokens?: number };
               error?: { message?: string };
             };
             if (chunk.error) throw new Error(chunk.error.message ?? "Provider stream failed");
             inputTokens = chunk.usage?.prompt_tokens ?? inputTokens;
             outputTokens = chunk.usage?.completion_tokens ?? outputTokens;
-            if (stream.aborted || upstreamSignal.aborted) break;
+            const chunkText = chunk.choices?.map((choice) =>
+              choice.delta?.content ?? ""
+            ).join("") ?? "";
+            const chunkTools = chunk.choices?.map((choice) => choice.delta?.tool_calls)
+              .filter((value) => value !== undefined)
+              .map((value) => JSON.stringify(value)).join("") ?? "";
+            if (stream.aborted || upstreamSignal.aborted) {
+              throw upstreamSignal.reason ?? new DOMException("Client disconnected", "AbortError");
+            }
+            if (idempotency) {
+              const observedOutput = outputTokens || Math.ceil(
+                (deliveredText + chunkText + toolOutput + chunkTools).length / 4,
+              );
+              await repo.appendApiSseFrame(
+                idempotency.id,
+                idempotency.leaseToken,
+                sequence++,
+                sseData(data),
+                undefined,
+                {
+                  inputTokens,
+                  outputTokens: observedOutput,
+                  costMicros: priceUsage(model, inputTokens, observedOutput).costMicros,
+                  latencyMs: Math.round(performance.now() - started),
+                },
+                replayQuota,
+              );
+            }
+            deliveredText += chunkText;
+            toolOutput += chunkTools;
             await stream.writeSSE({ data });
-            if (stream.aborted || upstreamSignal.aborted) break;
-            deliveredText += chunk.choices?.map((choice) => choice.delta?.content ?? "").join("") ??
-              "";
+            if (stream.aborted || upstreamSignal.aborted) {
+              throw upstreamSignal.reason ?? new DOMException("Client disconnected", "AbortError");
+            }
           }
-          if (!settled) {
-            const finalOutput = outputTokens || Math.ceil(deliveredText.length / 4);
+          if (!settled && !idempotency) {
+            const finalOutput = outputTokens ||
+              Math.ceil((deliveredText + toolOutput).length / 4);
             if (finalOutput > 0) {
               await repo.settle(
                 runId,
-                Math.min(priceUsage(model, inputTokens, finalOutput).costMicros, reserveMicros),
+                priceUsage(model, inputTokens, finalOutput).costMicros,
                 inputTokens,
                 finalOutput,
                 Math.round(performance.now() - started),
@@ -787,12 +1149,39 @@ export function createApp(options: AppOptions = {}) {
               settled = true;
             }
           }
-        } catch (error) {
-          if (!settled && deliveredText.length > 0) {
-            const finalOutput = outputTokens || Math.ceil(deliveredText.length / 4);
+        } catch {
+          if (!settled && idempotency) {
+            const finalOutput = outputTokens ||
+              Math.ceil((deliveredText + toolOutput).length / 4);
+            const latencyMs = Math.round(performance.now() - started);
+            await repo.failApiRequest({
+              id: idempotency.id,
+              leaseToken: idempotency.leaseToken,
+              responseStatus: 200,
+              responseHeaders: {
+                "content-type": "text/event-stream",
+                "cache-control": "no-cache",
+              },
+              responseBody: JSON.stringify(openAIError("Provider stream failed", "provider_error")),
+              terminalFrame: sseData(
+                JSON.stringify(openAIError("Provider stream failed", "provider_error")),
+              ),
+              billing: finalOutput > 0
+                ? {
+                  mode: "settle",
+                  costMicros: priceUsage(model, inputTokens, finalOutput).costMicros,
+                  inputTokens,
+                  outputTokens: finalOutput,
+                  latencyMs,
+                }
+                : { mode: "refund" },
+            });
+          } else if (!settled && deliveredText.length > 0) {
+            const finalOutput = outputTokens ||
+              Math.ceil((deliveredText + toolOutput).length / 4);
             await repo.settle(
               runId,
-              Math.min(priceUsage(model, inputTokens, finalOutput).costMicros, reserveMicros),
+              priceUsage(model, inputTokens, finalOutput).costMicros,
               inputTokens,
               finalOutput,
               Math.round(performance.now() - started),
@@ -801,7 +1190,11 @@ export function createApp(options: AppOptions = {}) {
             await repo.refund(runId);
           }
           if (upstreamSignal.aborted) return;
-          throw error;
+          await stream.writeSSE({
+            data: JSON.stringify(openAIError("Provider stream failed", "provider_error")),
+          });
+        } finally {
+          await lease.stop();
         }
       });
     }
@@ -809,19 +1202,14 @@ export function createApp(options: AppOptions = {}) {
     try {
       const result = await complete(request, c.req.raw.signal);
       providerCompleted = true;
-      const cost = Math.min(
-        priceUsage(model, result.inputTokens, result.outputTokens).costMicros,
-        reserveMicros,
-      );
-      await repo.settle(
-        runId,
-        cost,
-        result.inputTokens,
-        result.outputTokens,
-        Math.round(performance.now() - started),
-      );
-      if (result.upstream) return c.json(result.upstream);
-      return c.json({
+      const cost = priceUsage(model, result.inputTokens, result.outputTokens).costMicros;
+      await lease.checkpoint({
+        inputTokens: result.inputTokens,
+        outputTokens: result.outputTokens,
+        costMicros: cost,
+        latencyMs: Math.round(performance.now() - started),
+      });
+      const payload = result.upstream ?? {
         id: `chatcmpl-${crypto.randomUUID()}`,
         object: "chat.completion",
         created: Math.floor(Date.now() / 1000),
@@ -836,10 +1224,69 @@ export function createApp(options: AppOptions = {}) {
           completion_tokens: result.outputTokens,
           total_tokens: result.inputTokens + result.outputTokens,
         },
-      });
+      };
+      const responseBody = JSON.stringify(payload);
+      if (idempotency) {
+        try {
+          await repo.completeApiJson({
+            id: idempotency.id,
+            leaseToken: idempotency.leaseToken,
+            responseStatus: 200,
+            responseHeaders: { "content-type": "application/json" },
+            responseBody,
+            costMicros: cost,
+            inputTokens: result.inputTokens,
+            outputTokens: result.outputTokens,
+            latencyMs: Math.round(performance.now() - started),
+            quota: replayQuota,
+          });
+        } catch (persistenceError) {
+          const status = persistenceError instanceof DomainError ? persistenceError.status : 500;
+          await repo.failApiRequest({
+            id: idempotency.id,
+            leaseToken: idempotency.leaseToken,
+            responseStatus: status,
+            responseHeaders: { "content-type": "application/json" },
+            responseBody: JSON.stringify(
+              openAIError("Response replay persistence failed", "replay_persistence_error"),
+            ),
+            billing: {
+              mode: "settle",
+              costMicros: cost,
+              inputTokens: result.inputTokens,
+              outputTokens: result.outputTokens,
+              latencyMs: Math.round(performance.now() - started),
+            },
+          });
+          throw persistenceError;
+        }
+      } else {
+        await repo.settle(
+          runId,
+          cost,
+          result.inputTokens,
+          result.outputTokens,
+          Math.round(performance.now() - started),
+        );
+      }
+      return new Response(responseBody, { headers: { "content-type": "application/json" } });
     } catch (error) {
+      if (!providerCompleted && idempotency) {
+        const body = JSON.stringify(openAIError("Provider request failed", "provider_error"));
+        await repo.failApiRequest({
+          id: idempotency.id,
+          leaseToken: idempotency.leaseToken,
+          responseStatus: 502,
+          responseHeaders: { "content-type": "application/json" },
+          responseBody: body,
+          billing: { mode: "refund" },
+        });
+        return new Response(body, { status: 502, headers: { "content-type": "application/json" } });
+      }
       if (!providerCompleted) await repo.refund(runId);
       throw error;
+    } finally {
+      await lease.stop();
     }
   };
   app.post("/v1/chat/completions", requireScope("chat:write"), chatHandler);
@@ -859,116 +1306,226 @@ export function createApp(options: AppOptions = {}) {
     if (!model) {
       return c.json(openAIError(`Model '${body.model}' does not exist`, "model_not_found"), 404);
     }
-    const runId = `${c.get("user").id}:responses:${
-      c.req.header("idempotency-key") ?? crypto.randomUUID()
-    }`;
     const maxResponseOutput = body.max_output_tokens ?? 4096;
-    const responseReservation = reservationPrice(model, messages, maxResponseOutput).costMicros;
-    await repo.reserve(
-      c.get("user").id,
-      runId,
-      body.model,
-      responseReservation,
-      model.provider,
-      c.get("tokenId"),
-    );
+    // Responses replay repeats the final text in several terminal events. Reject requests whose
+    // declared output ceiling cannot fit before spending provider credits.
+    if (maxResponseOutput * 16 * 5 + 1_048_576 > 16_777_216) {
+      throw new DomainError("response_too_large", "Requested output exceeds replay storage", 413);
+    }
+    const responseReservation = reservationPrice(
+      model,
+      { ...request, max_tokens: maxResponseOutput },
+      maxResponseOutput,
+    ).costMicros;
+    const usage = await beginOpenAIUsage(c, "responses", body, model, responseReservation);
+    if (usage.kind === "replay") return usage.response;
+    const { runId, idempotency } = usage;
+    const lease = keepApiLeaseAlive(idempotency);
     const started = performance.now();
     let result;
     let providerCompleted = false;
     try {
       result = await complete({ ...request, max_tokens: maxResponseOutput }, c.req.raw.signal);
       providerCompleted = true;
-      const cost = Math.min(
-        priceUsage(model, result.inputTokens, result.outputTokens).costMicros,
-        responseReservation,
-      );
-      await repo.settle(
-        runId,
-        cost,
-        result.inputTokens,
-        result.outputTokens,
-        Math.round(performance.now() - started),
-      );
     } catch (error) {
+      if (!providerCompleted && idempotency) {
+        const failureBody = JSON.stringify(
+          openAIError("Provider request failed", "provider_error"),
+        );
+        await repo.failApiRequest({
+          id: idempotency.id,
+          leaseToken: idempotency.leaseToken,
+          responseStatus: 502,
+          responseHeaders: { "content-type": "application/json" },
+          responseBody: failureBody,
+          billing: { mode: "refund" },
+        });
+        await lease.stop();
+        return new Response(failureBody, {
+          status: 502,
+          headers: { "content-type": "application/json" },
+        });
+      }
       if (!providerCompleted) await repo.refund(runId);
+      await lease.stop();
       throw error;
     }
-    const responseId = `resp_${crypto.randomUUID()}`;
-    const messageId = `msg_${crypto.randomUUID()}`;
-    const createdAt = Math.floor(Date.now() / 1000);
-    const completedResponse = responseObject({
-      id: responseId,
-      messageId,
-      model: body.model,
-      createdAt,
-      status: "completed",
-      text: result.text,
-      usage: { inputTokens: result.inputTokens, outputTokens: result.outputTokens },
-    });
-    if (!body.stream) return c.json(completedResponse);
-
-    const pendingResponse = responseObject({
-      id: responseId,
-      messageId,
-      model: body.model,
-      createdAt,
-      status: "in_progress",
-    });
-    return streamSSE(c, async (stream) => {
-      let sequence = 0;
-      const emit = async (event: Record<string, unknown>) => {
-        const payload: Record<string, unknown> = { ...event, sequence_number: ++sequence };
-        await stream.writeSSE({
-          event: String(payload.type),
-          data: JSON.stringify(payload),
+    try {
+      const responseId = `resp_${crypto.randomUUID()}`;
+      const messageId = `msg_${crypto.randomUUID()}`;
+      const createdAt = Math.floor(Date.now() / 1000);
+      const completedResponse = responseObject({
+        id: responseId,
+        messageId,
+        model: body.model,
+        createdAt,
+        status: "completed",
+        text: result.text,
+        usage: { inputTokens: result.inputTokens, outputTokens: result.outputTokens },
+      });
+      const responseCost = priceUsage(model, result.inputTokens, result.outputTokens).costMicros;
+      const latencyMs = Math.round(performance.now() - started);
+      await lease.checkpoint({
+        inputTokens: result.inputTokens,
+        outputTokens: result.outputTokens,
+        costMicros: responseCost,
+        latencyMs,
+      });
+      // Usage is now durably observed, so a later response-persistence failure cannot
+      // turn completed upstream work into a refund.
+      const terminalizePersistenceFailure = async (error: unknown) => {
+        if (!idempotency) throw error;
+        const status = error instanceof DomainError ? error.status : 500;
+        const failure = new DomainError(
+          "replay_persistence_error",
+          "Response replay persistence failed",
+          status,
+        );
+        const failureBody = JSON.stringify(openAIError(failure.message, failure.code));
+        await repo.failApiRequest({
+          id: idempotency.id,
+          leaseToken: idempotency.leaseToken,
+          responseStatus: status,
+          responseHeaders: { "content-type": "application/json" },
+          responseBody: failureBody,
+          billing: {
+            mode: "settle",
+            costMicros: responseCost,
+            inputTokens: result.inputTokens,
+            outputTokens: result.outputTokens,
+            latencyMs,
+          },
         });
+        throw failure;
       };
-      await emit({ type: "response.created", response: pendingResponse });
-      await emit({
-        type: "response.output_item.added",
-        output_index: 0,
-        item: { ...responseMessage(messageId, "", "in_progress"), content: [] },
+      if (!body.stream) {
+        const responseBody = JSON.stringify(completedResponse);
+        if (idempotency) {
+          try {
+            await repo.completeApiJson({
+              id: idempotency.id,
+              leaseToken: idempotency.leaseToken,
+              responseStatus: 200,
+              responseHeaders: { "content-type": "application/json" },
+              responseBody,
+              costMicros: responseCost,
+              inputTokens: result.inputTokens,
+              outputTokens: result.outputTokens,
+              latencyMs,
+              quota: replayQuota,
+            });
+          } catch (error) {
+            await terminalizePersistenceFailure(error);
+          }
+        } else {
+          await repo.settle(
+            runId,
+            responseCost,
+            result.inputTokens,
+            result.outputTokens,
+            latencyMs,
+          );
+        }
+        return new Response(responseBody, { headers: { "content-type": "application/json" } });
+      }
+
+      const pendingResponse = responseObject({
+        id: responseId,
+        messageId,
+        model: body.model,
+        createdAt,
+        status: "in_progress",
       });
-      await emit({
-        type: "response.content_part.added",
-        item_id: messageId,
-        output_index: 0,
-        content_index: 0,
-        part: { type: "output_text", text: "", annotations: [] },
-      });
-      for (const delta of result.text.split(/(?<=\s)/)) {
-        if (stream.aborted || c.req.raw.signal.aborted) return;
-        await emit({
-          type: "response.output_text.delta",
+      let eventSequence = 0;
+      const eventFrame = (event: Record<string, unknown>) => {
+        const payload: Record<string, unknown> = { ...event, sequence_number: ++eventSequence };
+        return sseData(JSON.stringify(payload), String(payload.type));
+      };
+      const responseFrames = [
+        eventFrame({ type: "response.created", response: pendingResponse }),
+        eventFrame({
+          type: "response.output_item.added",
+          output_index: 0,
+          item: { ...responseMessage(messageId, "", "in_progress"), content: [] },
+        }),
+        eventFrame({
+          type: "response.content_part.added",
           item_id: messageId,
           output_index: 0,
           content_index: 0,
-          delta,
+          part: { type: "output_text", text: "", annotations: [] },
+        }),
+        ...chunkUtf8(result.text).map((delta) =>
+          eventFrame({
+            type: "response.output_text.delta",
+            item_id: messageId,
+            output_index: 0,
+            content_index: 0,
+            delta,
+            logprobs: [],
+          })
+        ),
+        eventFrame({
+          type: "response.output_text.done",
+          item_id: messageId,
+          output_index: 0,
+          content_index: 0,
+          text: result.text,
           logprobs: [],
-        });
+        }),
+        eventFrame({
+          type: "response.content_part.done",
+          item_id: messageId,
+          output_index: 0,
+          content_index: 0,
+          part: { type: "output_text", text: result.text, annotations: [] },
+        }),
+        eventFrame({
+          type: "response.output_item.done",
+          output_index: 0,
+          item: responseMessage(messageId, result.text),
+        }),
+        eventFrame({ type: "response.completed", response: completedResponse }),
+      ];
+      if (idempotency) {
+        try {
+          await repo.completeApiStream({
+            id: idempotency.id,
+            leaseToken: idempotency.leaseToken,
+            responseStatus: 200,
+            responseHeaders: {
+              "content-type": "text/event-stream",
+              "cache-control": "no-cache",
+            },
+            frames: responseFrames.slice(0, -1).map((frame, sequence) => ({ sequence, frame })),
+            terminalFrame: responseFrames.at(-1),
+            costMicros: responseCost,
+            inputTokens: result.inputTokens,
+            outputTokens: result.outputTokens,
+            latencyMs,
+            quota: replayQuota,
+          });
+        } catch (error) {
+          await terminalizePersistenceFailure(error);
+        }
+      } else {
+        await repo.settle(
+          runId,
+          responseCost,
+          result.inputTokens,
+          result.outputTokens,
+          latencyMs,
+        );
       }
-      await emit({
-        type: "response.output_text.done",
-        item_id: messageId,
-        output_index: 0,
-        content_index: 0,
-        text: result.text,
-        logprobs: [],
+      return streamSSE(c, async (stream) => {
+        for (const frame of responseFrames) {
+          if (stream.aborted || c.req.raw.signal.aborted) return;
+          await stream.write(frame);
+        }
       });
-      await emit({
-        type: "response.content_part.done",
-        item_id: messageId,
-        output_index: 0,
-        content_index: 0,
-        part: { type: "output_text", text: result.text, annotations: [] },
-      });
-      await emit({
-        type: "response.output_item.done",
-        output_index: 0,
-        item: responseMessage(messageId, result.text),
-      });
-      await emit({ type: "response.completed", response: completedResponse });
-    });
+    } finally {
+      await lease.stop();
+    }
   });
   app.post(
     "/v1/embeddings",

@@ -23,12 +23,28 @@ const rateLimiter = Deno.env.get("REDIS_URL")
   ? new RedisRateLimiter(Deno.env.get("REDIS_URL")!)
   : new MemoryRateLimiter();
 const { app } = createApp({ repository, rateLimiter });
+const replayMaintenance = setInterval(async () => {
+  try {
+    const reaped = await repository.reapStaleApiRequests(100);
+    const pruned = await repository.pruneExpiredApiRequests(100);
+    if (reaped || pruned) {
+      console.log(JSON.stringify({ level: "info", message: "Replay maintenance", reaped, pruned }));
+    }
+  } catch (error) {
+    console.error(JSON.stringify({
+      level: "error",
+      message: "Replay maintenance failed",
+      error: error instanceof Error ? error.message : String(error),
+    }));
+  }
+}, 60_000);
 console.log(JSON.stringify({ level: "info", message: "API listening", port }));
 const server = Deno.serve({ port, onListen: () => {} }, app.fetch);
 let stopping = false;
 const shutdown = async (signal: string) => {
   if (stopping) return;
   stopping = true;
+  clearInterval(replayMaintenance);
   console.log(JSON.stringify({ level: "info", message: "API shutting down", signal }));
   await server.shutdown();
   await Promise.all([repository.close(), rateLimiter.close()]);

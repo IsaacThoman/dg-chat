@@ -5,11 +5,11 @@ const baseURL = Deno.env.get("OPENAI_BASE_URL") ?? "http://localhost:8000/v1";
 if (!apiKey) throw new Error("OPENAI_API_KEY is required");
 
 const client = new OpenAI({ apiKey, baseURL, maxRetries: 0 });
-const model = "simulated/dg-chat";
+const model = "openai/mock-fast";
 
 const models = await client.models.list();
-if (!models.data.some((candidate) => candidate.id === model)) {
-  throw new Error(`Official JavaScript client did not receive ${model} from models.list()`);
+if (!models.data.some((candidate) => candidate.id === "openai/default")) {
+  throw new Error("Official JavaScript client did not receive the configured upstream model");
 }
 
 const completion = await client.chat.completions.create({

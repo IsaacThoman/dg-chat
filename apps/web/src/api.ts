@@ -21,6 +21,7 @@ type RawConversation = {
   version: number;
   pinned: boolean;
   archivedAt: string | null;
+  deletedAt: string | null;
   updatedAt: string;
   messages?: RawMessage[];
 };
@@ -57,6 +58,7 @@ function mapConversation(value: RawConversation): Conversation {
     updatedAt: new Date(value.updatedAt).toLocaleString(),
     pinned: value.pinned,
     archived: Boolean(value.archivedAt),
+    deleted: Boolean(value.deletedAt),
     activeLeafId: value.activeLeafId,
     version: value.version,
   };
@@ -126,6 +128,21 @@ export const api = {
     demoMode
       ? structuredClone(demoConversations)
       : (await request<{ data: RawConversation[] }>("/conversations")).data.map(mapConversation),
+  deletedConversations: async () =>
+    demoMode
+      ? structuredClone(demoConversations.filter((conversation) => conversation.deleted))
+      : (await request<{ data: RawConversation[] }>("/conversations?deleted=true")).data
+        .map(mapConversation).filter((conversation) => conversation.deleted),
+  updateConversation: async (
+    id: string,
+    patch: { title?: string; pinned?: boolean; archived?: boolean; deleted?: boolean },
+  ) =>
+    mapConversation(
+      await request<RawConversation>(`/conversations/${id}`, {
+        method: "PATCH",
+        body: JSON.stringify(patch),
+      }),
+    ),
   conversation: async (id: string) =>
     mapConversation(await request<RawConversation>(`/conversations/${id}`)),
   conversationGraph: async (id: string) => {

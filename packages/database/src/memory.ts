@@ -11,9 +11,17 @@ import type {
   UserRole,
 } from "@dg-chat/contracts";
 import type {
+  ApiIdempotencyEndpoint,
+  ApiIdempotencyRequest,
+  ApiReplayQuota,
+  ApiUsageObservation,
+  BeginApiRequestInput,
+  BeginApiRequestResult,
   BeginGenerationInput,
+  CompleteApiRequestInput,
   CompleteGenerationInput,
   CreateUserInput,
+  FailApiRequestInput,
   FailGenerationInput,
   GenerationResult,
 } from "./repository.ts";
@@ -69,6 +77,8 @@ export class MemoryRepository {
   readonly idempotency = new Map<string, string>();
   readonly ledger: LedgerEntry[] = [];
   readonly usageRuns = new Map<string, UsageRun>();
+  readonly apiIdempotencyRequests = new Map<string, ApiIdempotencyRequest>();
+  readonly apiIdempotencyKeys = new Map<string, string>();
   readonly jobs: Array<
     {
       id: string;
@@ -632,6 +642,412 @@ export class MemoryRepository {
     this.credit(run.userId, runId, "refund", run.reservedMicros);
     run.status = "failed";
     return run;
+  }
+
+  #apiKey(userId: string, endpoint: ApiIdempotencyEndpoint, key: string) {
+    return `${userId}:${endpoint}:${key}`;
+  }
+  #apiRequest(id: string) {
+    const request = this.apiIdempotencyRequests.get(id);
+    if (!request) throw new DomainError("not_found", "Idempotent request not found", 404);
+    return request;
+  }
+  #replayQuota(quota?: ApiReplayQuota): ApiReplayQuota {
+    const value = quota ?? { maxRequests: 256, maxBytes: 67_108_864, maxEvents: 20_000 };
+    if (
+      !Number.isSafeInteger(value.maxRequests) || value.maxRequests < 1 ||
+      !Number.isSafeInteger(value.maxBytes) || value.maxBytes < 1 ||
+      !Number.isSafeInteger(value.maxEvents) || value.maxEvents < 1
+    ) throw new DomainError("validation_error", "Invalid replay quota", 422);
+    return value;
+  }
+  #replayTotals(userId: string) {
+    const encoder = new TextEncoder();
+    let requests = 0;
+    let events = 0;
+    let bytes = 0;
+    for (const request of this.apiIdempotencyRequests.values()) {
+      if (request.userId !== userId || Date.parse(request.expiresAt) <= Date.now()) continue;
+      requests++;
+      events += request.frames.length;
+      bytes += request.frames.reduce((sum, item) => sum + encoder.encode(item.frame).length, 0);
+      if (request.responseBody) bytes += encoder.encode(request.responseBody).length;
+    }
+    return { requests, events, bytes };
+  }
+  #assertLease(request: ApiIdempotencyRequest, leaseToken: string) {
+    if (
+      request.state !== "in_progress" || request.leaseToken !== leaseToken ||
+      !request.leaseExpiresAt || Date.parse(request.leaseExpiresAt) <= Date.now()
+    ) {
+      throw new DomainError("stale_lease", "Idempotent request lease is no longer active", 409);
+    }
+  }
+  beginApiRequest(input: BeginApiRequestInput): BeginApiRequestResult {
+    if (
+      input.idempotencyKey.length < 8 || input.idempotencyKey.length > 200 ||
+      !/^[0-9a-f]{64}$/.test(input.requestHash) || input.reserveMicros < 0 ||
+      (input.leaseSeconds ?? 120) < 1 ||
+      (input.retentionSeconds ?? 86400) < 60 || (input.retentionSeconds ?? 86400) > 2_592_000
+    ) throw new DomainError("validation_error", "Invalid idempotent request parameters", 422);
+    const key = this.#apiKey(input.userId, input.endpoint, input.idempotencyKey);
+    let priorId = this.apiIdempotencyKeys.get(key);
+    if (priorId) {
+      const prior = this.#apiRequest(priorId);
+      if (prior.state !== "in_progress" && Date.parse(prior.expiresAt) <= Date.now()) {
+        this.apiIdempotencyRequests.delete(prior.id);
+        this.apiIdempotencyKeys.delete(key);
+        priorId = undefined;
+      }
+    }
+    if (priorId) {
+      const prior = this.#apiRequest(priorId);
+      if (prior.requestHash !== input.requestHash || prior.stream !== input.stream) {
+        throw new DomainError("idempotency_conflict", "Idempotency key payload differs", 409);
+      }
+      if (prior.state === "completed" || prior.state === "failed") {
+        return { kind: prior.state, request: structuredClone(prior) };
+      }
+      return {
+        kind: "in_progress",
+        request: structuredClone(prior),
+        retryAfterSeconds: Math.max(
+          1,
+          Math.ceil((Date.parse(prior.leaseExpiresAt!) - Date.now()) / 1000),
+        ),
+      };
+    }
+    const quota = this.#replayQuota(input.quota);
+    if (this.#replayTotals(input.userId).requests >= quota.maxRequests) {
+      throw new DomainError("replay_quota_exceeded", "Replay request quota exceeded", 429);
+    }
+    const usageRun = this.reserve(
+      input.userId,
+      input.runId,
+      input.model,
+      input.reserveMicros,
+    );
+    const now = new Date();
+    const leaseToken = crypto.randomUUID();
+    const request: ApiIdempotencyRequest = {
+      id: crypto.randomUUID(),
+      userId: input.userId,
+      endpoint: input.endpoint,
+      idempotencyKey: input.idempotencyKey,
+      requestHash: input.requestHash,
+      stream: input.stream,
+      model: input.model,
+      state: "in_progress",
+      leaseToken,
+      leaseExpiresAt: new Date(now.getTime() + (input.leaseSeconds ?? 120) * 1000).toISOString(),
+      usageRunId: input.runId,
+      responseStatus: null,
+      responseHeaders: {},
+      responseBody: null,
+      failureStartedStream: false,
+      observedInputTokens: 0,
+      observedOutputTokens: 0,
+      observedCostMicros: 0,
+      observedLatencyMs: 0,
+      retentionSeconds: input.retentionSeconds ?? 86400,
+      frames: [],
+      createdAt: now.toISOString(),
+      completedAt: null,
+      expiresAt: new Date(now.getTime() + (input.retentionSeconds ?? 86400) * 1000).toISOString(),
+    };
+    this.apiIdempotencyRequests.set(request.id, request);
+    this.apiIdempotencyKeys.set(key, request.id);
+    return { kind: "started", request: structuredClone(request), leaseToken, usageRun };
+  }
+  getApiRequest(userId: string, endpoint: ApiIdempotencyEndpoint, idempotencyKey: string) {
+    const id = this.apiIdempotencyKeys.get(this.#apiKey(userId, endpoint, idempotencyKey));
+    return id ? structuredClone(this.#apiRequest(id)) : undefined;
+  }
+  appendApiSseFrame(
+    id: string,
+    leaseToken: string,
+    sequence: number,
+    frame: string,
+    leaseSeconds = 120,
+    observation?: ApiUsageObservation,
+    quota?: ApiReplayQuota,
+  ) {
+    return this.appendApiSseFrames(
+      id,
+      leaseToken,
+      [{ sequence, frame }],
+      leaseSeconds,
+      observation,
+      quota,
+    );
+  }
+  appendApiSseFrames(
+    id: string,
+    leaseToken: string,
+    frames: Array<{ sequence: number; frame: string }>,
+    leaseSeconds = 120,
+    observation?: ApiUsageObservation,
+    quotaInput?: ApiReplayQuota,
+  ) {
+    const request = this.#apiRequest(id);
+    this.#assertLease(request, leaseToken);
+    if (frames.length === 0) return structuredClone(request);
+    const encoder = new TextEncoder();
+    const encodedBytes = frames.map(({ frame }) => encoder.encode(frame).length);
+    if (encodedBytes.some((bytes) => bytes > 1_048_576)) {
+      throw new DomainError("response_too_large", "SSE frame exceeds replay limit", 413);
+    }
+    const total = request.frames.reduce(
+      (sum, item) => sum + encoder.encode(item.frame).length,
+      0,
+    );
+    const pending: Array<{ sequence: number; frame: string; createdAt: string }> = [];
+    for (const item of frames) {
+      const existing = request.frames[item.sequence];
+      if (existing) {
+        if (existing.frame !== item.frame) {
+          throw new DomainError("sequence_conflict", "SSE frame sequence payload differs", 409);
+        }
+        continue;
+      }
+      if (item.sequence !== request.frames.length + pending.length) {
+        throw new DomainError("sequence_conflict", "SSE replay sequence is not contiguous", 409);
+      }
+      pending.push({ ...item, createdAt: new Date().toISOString() });
+    }
+    const pendingBytes = pending.reduce(
+      (sum, item) => sum + encoder.encode(item.frame).length,
+      0,
+    );
+    if (request.frames.length + pending.length > 10_000 || total + pendingBytes > 16_777_216) {
+      throw new DomainError("response_too_large", "SSE replay exceeds storage limit", 413);
+    }
+    const quota = this.#replayQuota(quotaInput);
+    const aggregate = this.#replayTotals(request.userId);
+    if (
+      aggregate.events + pending.length > quota.maxEvents ||
+      aggregate.bytes + pendingBytes > quota.maxBytes
+    ) throw new DomainError("replay_quota_exceeded", "User replay storage quota exceeded", 429);
+    request.frames.push(...pending);
+    if (observation) {
+      request.observedInputTokens = Math.max(request.observedInputTokens, observation.inputTokens);
+      request.observedOutputTokens = Math.max(
+        request.observedOutputTokens,
+        observation.outputTokens,
+      );
+      request.observedCostMicros = Math.max(request.observedCostMicros, observation.costMicros);
+      request.observedLatencyMs = Math.max(request.observedLatencyMs, observation.latencyMs);
+    }
+    request.leaseExpiresAt = new Date(Date.now() + leaseSeconds * 1000).toISOString();
+    return structuredClone(request);
+  }
+  heartbeatApiRequest(
+    id: string,
+    leaseToken: string,
+    leaseSeconds = 120,
+    observation?: ApiUsageObservation,
+  ) {
+    const request = this.#apiRequest(id);
+    this.#assertLease(request, leaseToken);
+    if (observation) {
+      request.observedInputTokens = Math.max(request.observedInputTokens, observation.inputTokens);
+      request.observedOutputTokens = Math.max(
+        request.observedOutputTokens,
+        observation.outputTokens,
+      );
+      request.observedCostMicros = Math.max(request.observedCostMicros, observation.costMicros);
+      request.observedLatencyMs = Math.max(request.observedLatencyMs, observation.latencyMs);
+    }
+    request.leaseExpiresAt = new Date(Date.now() + leaseSeconds * 1000).toISOString();
+  }
+  #completeApi(input: CompleteApiRequestInput, stream: boolean) {
+    const request = this.#apiRequest(input.id);
+    if (request.state === "completed") return structuredClone(request);
+    this.#assertLease(request, input.leaseToken);
+    const encoder = new TextEncoder();
+    const quota = this.#replayQuota(input.quota);
+    const aggregate = this.#replayTotals(request.userId);
+    if (!stream && input.frames?.length) {
+      throw new DomainError("validation_error", "JSON completion cannot include SSE frames", 422);
+    }
+    const pending: Array<{ sequence: number; frame: string; createdAt: string }> = [];
+    for (const item of input.frames ?? []) {
+      const bytes = encoder.encode(item.frame).length;
+      if (bytes > 1_048_576) {
+        throw new DomainError("response_too_large", "SSE frame exceeds replay limit", 413);
+      }
+      const existing = request.frames[item.sequence];
+      if (existing) {
+        if (existing.frame !== item.frame) {
+          throw new DomainError("sequence_conflict", "SSE frame sequence payload differs", 409);
+        }
+        continue;
+      }
+      if (item.sequence !== request.frames.length + pending.length) {
+        throw new DomainError("sequence_conflict", "SSE replay sequence is not contiguous", 409);
+      }
+      pending.push({ ...item, createdAt: new Date().toISOString() });
+    }
+    const pendingBytes = pending.reduce(
+      (sum, item) => sum + encoder.encode(item.frame).length,
+      0,
+    );
+    const responseBytes = input.responseBody ? encoder.encode(input.responseBody).length : 0;
+    const terminalBytes = input.terminalFrame ? encoder.encode(input.terminalFrame).length : 0;
+    const existingBytes = request.frames.reduce(
+      (sum, item) => sum + encoder.encode(item.frame).length,
+      0,
+    );
+    if (terminalBytes > 1_048_576) {
+      throw new DomainError("response_too_large", "Terminal SSE frame exceeds replay limit", 413);
+    }
+    if (
+      request.frames.length + pending.length + (input.terminalFrame ? 1 : 0) > 10_000 ||
+      existingBytes + pendingBytes + terminalBytes > 16_777_216
+    ) throw new DomainError("response_too_large", "SSE replay exceeds storage limit", 413);
+    if (
+      aggregate.events + pending.length + (input.terminalFrame ? 1 : 0) > quota.maxEvents ||
+      aggregate.bytes + responseBytes + pendingBytes + terminalBytes > quota.maxBytes
+    ) throw new DomainError("replay_quota_exceeded", "User replay storage quota exceeded", 429);
+    const run = this.usageRuns.get(request.usageRunId);
+    if (!run || run.status !== "reserved") {
+      throw new DomainError("invalid_usage_state", "Usage run is not reserved", 409);
+    }
+    if (this.users.get(request.userId)!.balanceMicros + run.reservedMicros - input.costMicros < 0) {
+      throw new DomainError("insufficient_credit", "Actual cost exceeds available credit", 402);
+    }
+    this.settle(
+      request.usageRunId,
+      input.costMicros,
+      input.inputTokens,
+      input.outputTokens,
+      input.latencyMs,
+    );
+    request.frames.push(...pending);
+    if (stream && input.terminalFrame !== undefined) {
+      request.frames.push({
+        sequence: request.frames.length,
+        frame: input.terminalFrame,
+        createdAt: new Date().toISOString(),
+      });
+    }
+    request.state = "completed";
+    request.leaseToken = null;
+    request.leaseExpiresAt = null;
+    request.responseStatus = input.responseStatus;
+    request.responseHeaders = input.responseHeaders ?? {};
+    request.responseBody = input.responseBody ?? null;
+    request.completedAt = new Date().toISOString();
+    request.expiresAt = new Date(Date.now() + request.retentionSeconds * 1000).toISOString();
+    return structuredClone(request);
+  }
+  completeApiJson(input: CompleteApiRequestInput) {
+    return this.#completeApi(input, false);
+  }
+  completeApiStream(input: CompleteApiRequestInput) {
+    return this.#completeApi(input, true);
+  }
+  failApiRequest(input: FailApiRequestInput) {
+    const request = this.#apiRequest(input.id);
+    if (request.state === "failed") return structuredClone(request);
+    this.#assertLease(request, input.leaseToken);
+    if (input.billing.mode === "settle") {
+      const run = this.usageRuns.get(request.usageRunId);
+      if (!run || run.status !== "reserved") {
+        throw new DomainError("invalid_usage_state", "Usage run is not reserved", 409);
+      }
+      if (
+        this.users.get(request.userId)!.balanceMicros + run.reservedMicros -
+            input.billing.costMicros < 0
+      ) throw new DomainError("insufficient_credit", "Actual cost exceeds available credit", 402);
+    }
+    const failureStartedStream = request.frames.length > 0 || input.terminalFrame !== undefined;
+    if (input.terminalFrame !== undefined) {
+      this.appendApiSseFrame(
+        request.id,
+        input.leaseToken,
+        request.frames.length,
+        input.terminalFrame,
+      );
+    }
+    if (input.billing.mode === "refund") this.refund(request.usageRunId);
+    else {
+      this.settle(
+        request.usageRunId,
+        input.billing.costMicros,
+        input.billing.inputTokens,
+        input.billing.outputTokens,
+        input.billing.latencyMs,
+      );
+    }
+    request.state = "failed";
+    request.failureStartedStream = failureStartedStream;
+    request.leaseToken = null;
+    request.leaseExpiresAt = null;
+    request.responseStatus = input.responseStatus;
+    request.responseHeaders = input.responseHeaders ?? {};
+    request.responseBody = input.responseBody;
+    request.completedAt = new Date().toISOString();
+    request.expiresAt = new Date(Date.now() + request.retentionSeconds * 1000).toISOString();
+    return structuredClone(request);
+  }
+  reapStaleApiRequests(limit = 100) {
+    let count = 0;
+    for (const request of this.apiIdempotencyRequests.values()) {
+      if (count >= limit) break;
+      if (
+        request.state !== "in_progress" || !request.leaseExpiresAt ||
+        Date.parse(request.leaseExpiresAt) > Date.now()
+      ) continue;
+      if (request.observedCostMicros > 0) {
+        this.settle(
+          request.usageRunId,
+          request.observedCostMicros,
+          request.observedInputTokens,
+          request.observedOutputTokens,
+          request.observedLatencyMs,
+        );
+      } else this.refund(request.usageRunId);
+      request.state = "failed";
+      request.responseStatus = 500;
+      request.responseBody = JSON.stringify({
+        error: {
+          message: "Request interrupted before completion",
+          type: "server_error",
+          code: "request_abandoned",
+        },
+      });
+      request.failureStartedStream = request.frames.length > 0;
+      if (request.failureStartedStream) {
+        const frame = request.endpoint === "responses"
+          ? `event: error\ndata: ${request.responseBody}\n\n`
+          : `data: ${request.responseBody}\n\n`;
+        request.frames.push({
+          sequence: request.frames.length,
+          frame,
+          createdAt: new Date().toISOString(),
+        });
+      }
+      request.leaseToken = null;
+      request.leaseExpiresAt = null;
+      request.completedAt = new Date().toISOString();
+      request.expiresAt = new Date(Date.now() + request.retentionSeconds * 1000).toISOString();
+      count++;
+    }
+    return count;
+  }
+  pruneExpiredApiRequests(limit = 100) {
+    let count = 0;
+    for (const [id, request] of this.apiIdempotencyRequests) {
+      if (count >= limit) break;
+      if (request.state === "in_progress" || Date.parse(request.expiresAt) > Date.now()) continue;
+      this.apiIdempotencyRequests.delete(id);
+      this.apiIdempotencyKeys.delete(
+        this.#apiKey(request.userId, request.endpoint, request.idempotencyKey),
+      );
+      count++;
+    }
+    return count;
   }
 
   usage(userId: string): UsageSummary {

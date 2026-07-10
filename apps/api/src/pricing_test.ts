@@ -30,3 +30,11 @@ Deno.test("usage pricing has a one-micro minimum and rounds token counts safely"
   assertEquals(priceUsage(model, 0.1, 0.1).inputTokens, 1);
   assertEquals(priceUsage(model, 0.1, 0.1).outputTokens, 1);
 });
+
+Deno.test("input reservations conservatively count UTF-8 bytes", () => {
+  const messages = [{ role: "user" as const, content: "😀漢字" }];
+  assertEquals(
+    estimateInputTokens(messages),
+    new TextEncoder().encode(JSON.stringify(messages)).length,
+  );
+});

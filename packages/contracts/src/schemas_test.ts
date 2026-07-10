@@ -1,5 +1,21 @@
 import { assertEquals } from "jsr:@std/assert@1.0.14";
-import { chatCompletionSchema, responsesSchema } from "./schemas.ts";
+import {
+  chatCompletionSchema,
+  responsesSchema,
+  setActiveLeafSchema,
+  updateConversationSchema,
+} from "./schemas.ts";
+
+Deno.test("Chat Completions rejects unsupported multi-choice accounting", () => {
+  assertEquals(
+    chatCompletionSchema.safeParse({
+      model: "test",
+      messages: [{ role: "user", content: "hello" }],
+      n: 2,
+    }).success,
+    false,
+  );
+});
 
 Deno.test("Chat Completions preserves common SDK fields and tool-call history", () => {
   const parsed = chatCompletionSchema.parse({
@@ -37,4 +53,35 @@ Deno.test("Responses accepts multimodal content items without stripping options"
   assertEquals(Array.isArray(parsed.input), true);
   assertEquals(parsed.instructions, "Be concise");
   assertEquals(parsed.temperature, 0.2);
+});
+
+Deno.test("conversation patches are strict, bounded, and normalized", () => {
+  assertEquals(updateConversationSchema.parse({ title: "  Renamed  " }), { title: "Renamed" });
+  assertEquals(updateConversationSchema.safeParse({}).success, false);
+  assertEquals(updateConversationSchema.safeParse({ title: "x".repeat(201) }).success, false);
+  assertEquals(
+    updateConversationSchema.safeParse({ title: "ok", ownerId: "other" }).success,
+    false,
+  );
+  assertEquals(updateConversationSchema.safeParse({ pinned: "yes" }).success, false);
+});
+
+Deno.test("active leaf changes require a strict UUID and optimistic version", () => {
+  assertEquals(
+    setActiveLeafSchema.safeParse({ leafId: crypto.randomUUID(), expectedVersion: 0 }).success,
+    true,
+  );
+  assertEquals(
+    setActiveLeafSchema.safeParse({ leafId: "not-a-uuid", expectedVersion: 0 }).success,
+    false,
+  );
+  assertEquals(
+    setActiveLeafSchema.safeParse({ leafId: crypto.randomUUID(), expectedVersion: -1 }).success,
+    false,
+  );
+  assertEquals(
+    setActiveLeafSchema.safeParse({ leafId: crypto.randomUUID(), expectedVersion: 0, ownerId: "x" })
+      .success,
+    false,
+  );
 });

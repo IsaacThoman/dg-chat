@@ -54,8 +54,10 @@ correctness. Keep encrypted backups outside the deployment host and test restora
 2. Export PostgreSQL in a format supported by the target server version.
 3. Replicate the private bucket, including object versions when enabled.
 4. Record the application image digest, migration version, and encryption-key identifiers.
-5. Restore into an isolated environment, run the application's restore dry-run, then verify login, a
-   branched conversation, an attachment, token authentication, and ledger totals.
+5. Restore into an isolated environment, run migrations and readiness checks, then verify login, a
+   branched conversation, token authentication, and ledger totals. The application-level validated
+   restore dry-run and attachment lifecycle are not implemented yet; use native PostgreSQL restore
+   validation until those features ship.
 
 Never discard an encryption key while provider credentials or privileged exports still depend on it.
 Secret-bearing backup exports require separate encryption and must not be placed in the normal chat
