@@ -1,0 +1,8 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Static, non-secret encryption key used only by the isolated CI Compose stack"
+regexTarget = "match"
+regexes = ['''Y2ktZW5jcnlwdGlvbi1rZXktMzItYnl0ZXMtbG9uZw==''']
+paths = ['''\.github/workflows/ci\.yml''']

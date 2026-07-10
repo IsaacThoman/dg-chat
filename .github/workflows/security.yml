@@ -26,7 +26,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Secret scan
-        run: docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.24.2 detect --source /repo --no-banner --redact
+        run: docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.24.2 detect --source /repo --config /repo/.gitleaks.toml --no-banner --redact
       - name: Dependency vulnerability scan
         run: docker run --rm -v "$PWD:/src" ghcr.io/google/osv-scanner/osv-scanner:v2.0.2 scan source -r /src
       - name: Filesystem vulnerability and misconfiguration scan
