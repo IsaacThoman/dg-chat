@@ -1249,6 +1249,105 @@ Deno.test("earlier assistant generation selects its branch and preserves a later
   assertEquals(completed.message.supersedesId, assistantOne.id);
 });
 
+Deno.test("earlier failed and reaped generations advance only an untouched branch selection", () => {
+  for (const terminal of ["failure", "reaper"] as const) {
+    for (const preserveLaterSelection of [false, true]) {
+      const suffix = `${terminal}-${preserveLaterSelection ? "selected" : "untouched"}`;
+      const repo = new MemoryRepository();
+      const owner = repo.createUser({
+        email: `earlier-${suffix}@example.com`,
+        name: "Owner",
+        passwordHash: "x",
+      });
+      repo.credit(owner.id, `earlier-${suffix}-grant`, "grant", 1_000_000);
+      const conversation = repo.createConversation(owner.id, `Earlier ${suffix}`);
+      const userOne = repo.appendMessage({
+        conversationId: conversation.id,
+        ownerId: owner.id,
+        parentId: null,
+        role: "user",
+        content: "one",
+        expectedVersion: 0,
+        idempotencyKey: `${suffix}-user-one`,
+      });
+      const assistantOne = repo.appendMessage({
+        conversationId: conversation.id,
+        ownerId: owner.id,
+        parentId: userOne.id,
+        role: "assistant",
+        content: "one answer",
+        expectedVersion: 1,
+        idempotencyKey: `${suffix}-assistant-one`,
+      });
+      const userTwo = repo.appendMessage({
+        conversationId: conversation.id,
+        ownerId: owner.id,
+        parentId: assistantOne.id,
+        role: "user",
+        content: "two",
+        expectedVersion: 2,
+        idempotencyKey: `${suffix}-user-two`,
+      });
+      const assistantTwo = repo.appendMessage({
+        conversationId: conversation.id,
+        ownerId: owner.id,
+        parentId: userTwo.id,
+        role: "assistant",
+        content: "two answer",
+        expectedVersion: 3,
+        idempotencyKey: `${suffix}-assistant-two`,
+      });
+      const runId = `${suffix}-run`;
+      const begun = repo.beginAssistantGeneration({
+        conversationId: conversation.id,
+        ownerId: owner.id,
+        sourceAssistantId: assistantOne.id,
+        mode: "regenerate",
+        model: "simulated/dg-chat",
+        expectedVersion: 4,
+        idempotencyKey: `${suffix}-regenerate`,
+        runId,
+        generationId: crypto.randomUUID(),
+        provider: "simulated",
+        reserveMicros: 10,
+      });
+      if (begun.kind !== "started") throw new Error("generation did not start");
+      if (preserveLaterSelection) {
+        repo.setActiveLeaf(conversation.id, owner.id, assistantTwo.id, begun.conversation.version);
+      }
+
+      let terminalMessageId: string;
+      if (terminal === "failure") {
+        terminalMessageId = repo.failGeneration({
+          conversationId: conversation.id,
+          ownerId: owner.id,
+          userMessageId: userOne.id,
+          runId,
+          leaseToken: begun.leaseToken,
+          idempotencyKey: `${suffix}-error`,
+          model: "simulated/dg-chat",
+          error: "provider failed",
+          supersedesId: assistantOne.id,
+        }).message.id;
+      } else {
+        begun.usageRun.generationLeaseExpiresAt = new Date(Date.now() - 1).toISOString();
+        assertEquals(repo.reapStaleGenerations(), 1);
+        const terminalMessage = repo.detail(conversation.id, owner.id).messages.find((message) =>
+          message.metadata.runId === runId
+        );
+        if (!terminalMessage) throw new Error("reaper terminal was not created");
+        terminalMessageId = terminalMessage.id;
+      }
+
+      assertEquals(
+        repo.detail(conversation.id, owner.id).activeLeafId,
+        preserveLaterSelection ? assistantTwo.id : terminalMessageId,
+        suffix,
+      );
+    }
+  }
+});
+
 Deno.test("attachments deduplicate, inspect, link immutably, and preserve tombstones", () => {
   const repo = new MemoryRepository();
   const owner = repo.createUser({ email: "files@example.com", name: "Files", passwordHash: "x" });
