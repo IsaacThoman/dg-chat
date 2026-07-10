@@ -22,12 +22,16 @@ test("a public signup remains pending until an administrator approves it", async
   const users = (await usersResponse.json()).data as Array<{ id: string; email: string }>;
   const applicantUser = users.find((user) => user.email === applicant.email);
   expect(applicantUser).toBeTruthy();
-  await page.request.patch(
+  const approval = await page.request.patch(
     `${env("E2E_API_URL") ?? "http://localhost:8000"}/api/admin/users/${
       applicantUser!.id
     }/approval`,
-    { data: { status: "approved" } },
+    {
+      headers: { origin: new URL(page.url()).origin },
+      data: { status: "approved" },
+    },
   );
+  expect(approval.status()).toBe(200);
 
   await page.context().clearCookies();
   await login(page, applicant.email, applicant.password);

@@ -49,12 +49,25 @@ export const chatCompletionSchema = z.object({
     content: z.union([z.string(), z.array(z.record(z.string(), z.unknown()))]),
     name: z.string().optional(),
     tool_call_id: z.string().optional(),
-  })).min(1),
+  })).min(1).max(256),
   stream: z.boolean().optional(),
   temperature: z.number().min(0).max(2).optional(),
   max_tokens: z.number().int().positive().max(131072).optional(),
   tools: z.array(z.unknown()).optional(),
   user: z.string().optional(),
+});
+
+export const responsesSchema = z.object({
+  model: z.string().min(1).max(200),
+  input: z.union([
+    z.string().min(1).max(2_000_000),
+    z.array(z.object({
+      role: z.enum(["system", "user", "assistant"]),
+      content: z.string().max(2_000_000),
+    })).min(1).max(256),
+  ]),
+  stream: z.boolean().optional(),
+  max_output_tokens: z.number().int().positive().max(131_072).optional(),
 });
 
 export const approvalSchema = z.object({

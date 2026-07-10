@@ -2,7 +2,11 @@
   "name": "@dg-chat/api",
   "version": "0.1.0",
   "exports": "./src/app.ts",
-  "imports": { "hono": "npm:hono@4.12.28", "hono/": "npm:hono@4.12.28/" },
+  "imports": {
+    "hono": "npm:hono@4.12.28",
+    "hono/": "npm:hono@4.12.28/",
+    "ioredis": "npm:ioredis@5.8.2"
+  },
   "tasks": {
     "dev": "deno run --watch -A src/main.ts",
     "start": "deno run -A src/main.ts",

@@ -3,6 +3,8 @@ services:
     environment:
       MIGRATE_ON_START: "true"
       LOG_LEVEL: warn
+      # Browser suites intentionally exercise repeated sign-in journeys from one runner address.
+      AUTH_RATE_LIMIT: "1000"
 
   mock-provider:
     image: denoland/deno:alpine

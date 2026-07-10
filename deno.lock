@@ -4228,7 +4228,8 @@
     "members": {
       "apps/api": {
         "dependencies": [
-          "npm:hono@4.12.28"
+          "npm:hono@4.12.28",
+          "npm:ioredis@5.8.2"
         ]
       },
       "apps/web": {

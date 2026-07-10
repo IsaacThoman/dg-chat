@@ -836,8 +836,13 @@ kbd {
   text-align: left;
   cursor: pointer;
 }
-.tree-node:disabled {
+.tree-subtree[aria-disabled="true"] > .tree-node {
   cursor: wait;
+}
+.tree-subtree:focus-visible {
+  outline: 2px solid #7963bb;
+  outline-offset: 3px;
+  border-radius: 10px;
 }
 .tree-node > span {
   width: 25px;

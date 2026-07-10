@@ -6,6 +6,8 @@ x-app-environment: &app-environment
   WEB_URL: ${WEB_URL:-http://localhost:8000}
   DATABASE_URL: postgresql://${POSTGRES_USER:-dgchat}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-dgchat}
   REDIS_URL: redis://redis:6379
+  # The bundled nginx overwrites X-Real-IP with the connecting address.
+  TRUST_PROXY_HEADERS: "true"
   S3_ENDPOINT: http://minio:9000
   S3_REGION: ${S3_REGION:-us-east-1}
   S3_BUCKET: ${S3_BUCKET:-dg-chat}

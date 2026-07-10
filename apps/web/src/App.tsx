@@ -586,20 +586,32 @@ function TreeNode(
   },
 ) {
   return (
-    <div className="tree-subtree" role="treeitem" aria-current={node.active ? "true" : undefined}>
-      <button
-        className={cn("tree-node", node.active && "active")}
-        disabled={busy}
-        onClick={() =>
-          onSelect(node.message.id)}
-      >
+    <div
+      className="tree-subtree"
+      role="treeitem"
+      tabIndex={busy ? -1 : 0}
+      aria-disabled={busy || undefined}
+      aria-current={node.active ? "true" : undefined}
+      onClick={(event) => {
+        event.stopPropagation();
+        if (!busy) onSelect(node.message.id);
+      }}
+      onKeyDown={(event) => {
+        if (!busy && (event.key === "Enter" || event.key === " ")) {
+          event.preventDefault();
+          event.stopPropagation();
+          onSelect(node.message.id);
+        }
+      }}
+    >
+      <div className={cn("tree-node", node.active && "active")}>
         <span>{node.message.role === "user" ? "I" : <Sparkles size={13} />}</span>
         <div>
           <small>{node.message.role === "user" ? "You" : "Assistant"}</small>
           <strong>{node.message.content || "Empty message"}</strong>
         </div>
         {node.active && <Check size={14} />}
-      </button>
+      </div>
       {node.children.length > 0 && (
         <div className="tree-children" role="group">
           {node.children.map((child) => (
