@@ -229,7 +229,10 @@ Deno.test({
         createdAt: now,
       }],
     };
-    await sql`INSERT INTO runtime_snapshots(id,payload) VALUES('primary',${sql.json(snapshot)})`;
+    await sql`INSERT INTO runtime_snapshots(id,payload) VALUES('primary',${
+      sql.json(JSON.stringify(snapshot))
+    })`;
+    await sql`INSERT INTO repository_migrations(name,metadata) VALUES('legacy-runtime-snapshot-v1','{}')`;
     await sql.end();
     assertEquals((await backfillLegacyRuntimeSnapshot(databaseUrl!)).status, "imported");
     assertEquals((await backfillLegacyRuntimeSnapshot(databaseUrl!)).status, "already_imported");

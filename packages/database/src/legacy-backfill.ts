@@ -40,15 +40,22 @@ export async function backfillLegacyRuntimeSnapshot(url: string): Promise<Legacy
   try {
     return await sql.begin(async (tx) => {
       await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-legacy-backfill'))`;
+      const snapshots = await tx<
+        { payload: LegacySnapshot | string }[]
+      >`SELECT payload FROM runtime_snapshots WHERE id='primary'`;
+      if (!snapshots[0]) return { status: "no_snapshot", users: 0, conversations: 0, messages: 0 };
+      const snapshot = typeof snapshots[0].payload === "string"
+        ? JSON.parse(snapshots[0].payload) as LegacySnapshot
+        : snapshots[0].payload;
       const applied =
         await tx`SELECT name FROM repository_migrations WHERE name='legacy-runtime-snapshot-v1'`;
       if (applied.length) {
-        return { status: "already_imported", users: 0, conversations: 0, messages: 0 };
+        const normalized = await tx<{ count: number }[]>`SELECT count(*)::int AS count FROM users`;
+        if (normalized[0].count > 0 || (snapshot.users?.length ?? 0) === 0) {
+          return { status: "already_imported", users: 0, conversations: 0, messages: 0 };
+        }
+        await tx`DELETE FROM repository_migrations WHERE name='legacy-runtime-snapshot-v1'`;
       }
-      const snapshots = await tx<
-        { payload: LegacySnapshot }[]
-      >`SELECT payload FROM runtime_snapshots WHERE id='primary'`;
-      if (!snapshots[0]) return { status: "no_snapshot", users: 0, conversations: 0, messages: 0 };
       const occupied = await tx<{ count: number }[]>`SELECT count(*)::int AS count FROM users`;
       if (occupied[0].count !== 0) {
         throw new DomainError(
@@ -57,7 +64,6 @@ export async function backfillLegacyRuntimeSnapshot(url: string): Promise<Legacy
           409,
         );
       }
-      const snapshot = snapshots[0].payload;
       await tx`SET CONSTRAINTS ALL DEFERRED`;
       for (const [, value] of snapshot.users ?? []) {
         await tx`INSERT INTO users(id,email,name,password_hash,role,approval_status,state,balance_micros,created_at,updated_at) VALUES(${value.id},${value.email},${value.name},${value.passwordHash},${value.role},${value.approvalStatus},${value.state},${value.balanceMicros},${value.createdAt},${value.createdAt})`;
