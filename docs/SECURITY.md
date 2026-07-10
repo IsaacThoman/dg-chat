@@ -41,8 +41,10 @@ content-disarm, PDF, Office, audio, or archive scanner. PDF and audio acceptance
 bounded upload handling and MIME/signature checks, so deployments requiring malware scanning must
 add an external quarantine scanner before allowing those formats. Bounded, strict UTF-8 ingestion is
 implemented only for `text/plain` and fully validated JSON, with deterministic citation chunks.
-Office and PDF extraction, OCR, embeddings/vector retrieval, object garbage collection, and
-retention-aware deletion are not implemented.
+Office and PDF extraction, OCR, vector persistence/retrieval, object garbage collection, and
+retention-aware deletion are not implemented. The embeddings proxy is implemented with the same
+DNS-pinned, private-network-blocking provider transport and strict bounded response validation used
+by other provider calls; conversation knowledge currently uses local lexical ranking.
 
 The current OpenAI-compatible provider transport resolves every A and AAAA answer, rejects
 special-use destinations, and pins the approved address while preserving TLS hostname validation. It

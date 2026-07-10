@@ -37,8 +37,10 @@ flowchart LR
 - The worker claims durable jobs using `FOR UPDATE SKIP LOCKED`. Handlers must be idempotent and
   retry-safe. Text and JSON attachments use a separate, fenced ingestion state machine that streams
   private objects through byte/time and UTF-8/JSON validation, then transactionally replaces stable,
-  citation-aware chunks. PDF/Office extraction, OCR, embeddings/vector retrieval, malware scanning,
-  and quarantined-file reprocessing remain planned.
+  citation-aware chunks. Conversation-bound collections support deterministic lexical retrieval or
+  bounded full-context injection with persisted source provenance. The OpenAI-compatible embeddings
+  endpoint is implemented for capable provider-registry models, but vector persistence/retrieval,
+  PDF/Office extraction, OCR, malware scanning, and quarantined-file reprocessing remain planned.
 
 ## Core invariants
 

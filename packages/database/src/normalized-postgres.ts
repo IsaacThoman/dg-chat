@@ -26,6 +26,7 @@ import type {
   CreateApiTokenInput,
   CreateAttachmentInput,
   CreateAttachmentResult,
+  CreateKnowledgeCollectionInput,
   CreateModelPriceVersionInput,
   CreateProviderInput,
   CreateProviderModelInput,
@@ -39,6 +40,10 @@ import type {
   FinalizeProviderUsageInput,
   FinishProviderAttemptInput,
   IdentityTokenPurpose,
+  KnowledgeCollection,
+  KnowledgeCollectionPatch,
+  KnowledgeConversationBinding,
+  KnowledgeRetrievalMode,
   ModelPriceVersion,
   ProviderAttempt,
   ProviderCredentialEnvelope,
@@ -50,6 +55,7 @@ import type {
   ProviderRecord,
   ProviderRetryPolicy,
   RegistryMutationContext,
+  ReplaceConversationKnowledgeInput,
   SessionSummary,
   SetProviderModelRouteInput,
   StartProviderAttemptInput,
@@ -69,6 +75,25 @@ type Row = Record<string, unknown>;
 const iso = (value: unknown) => value instanceof Date ? value.toISOString() : String(value);
 const nullableIso = (value: unknown) => value == null ? null : iso(value);
 const number = (value: unknown) => Number(value);
+const knowledgeCollection = (row: Row): KnowledgeCollection => ({
+  id: String(row.id),
+  ownerId: String(row.owner_id),
+  name: String(row.name),
+  description: String(row.description),
+  version: number(row.version),
+  createdAt: iso(row.created_at),
+  updatedAt: iso(row.updated_at),
+  deletedAt: nullableIso(row.deleted_at),
+});
+const knowledgeBinding = (row: Row): KnowledgeConversationBinding => ({
+  conversationId: String(row.conversation_id),
+  collectionId: String(row.collection_id),
+  ownerId: String(row.owner_id),
+  mode: row.mode as KnowledgeRetrievalMode,
+  version: number(row.version),
+  createdAt: iso(row.created_at),
+  updatedAt: iso(row.updated_at),
+});
 const replayQuota = (quota?: ApiReplayQuota): ApiReplayQuota => {
   const value = quota ?? { maxRequests: 256, maxBytes: 67_108_864, maxEvents: 20_000 };
   if (
@@ -1065,6 +1090,13 @@ export class PostgresRepository implements DomainRepository {
       throw new DomainError("validation_error", "Attachment identifiers are invalid", 422);
     }
     return await this.#sql.begin(async (tx) => {
+      if (!input.message.content.trim() && attachmentIds.length === 0) {
+        throw new DomainError(
+          "validation_error",
+          "Message content or at least one attachment is required",
+          422,
+        );
+      }
       const c = await tx<
         Row[]
       >`SELECT * FROM conversations WHERE id=${input.message.conversationId} AND owner_id=${input.message.ownerId} FOR UPDATE`;
@@ -1984,6 +2016,272 @@ export class PostgresRepository implements DomainRepository {
     return (await this.#sql<Row[]>`
       SELECT dc.* FROM document_chunks dc WHERE dc.attachment_id=${id} ORDER BY dc.ordinal`)
       .map(documentChunk);
+  }
+
+  async createKnowledgeCollection(ownerId: string, input: CreateKnowledgeCollectionInput) {
+    const name = input.name.trim();
+    if (
+      !name || name.length > 120 || (input.description?.length ?? 0) > 2000 ||
+      !/^[A-Za-z0-9._:-]{1,160}$/.test(input.idempotencyKey)
+    ) {
+      throw new DomainError("validation_error", "Knowledge collection input is invalid", 422);
+    }
+    const rows = await this.#sql<
+      Row[]
+    >`INSERT INTO knowledge_collections(owner_id,name,description,idempotency_key)
+      VALUES(${ownerId},${name},${input.description?.trim() ?? ""},${input.idempotencyKey})
+      ON CONFLICT(owner_id,idempotency_key) DO UPDATE SET idempotency_key=EXCLUDED.idempotency_key RETURNING *`;
+    const record = knowledgeCollection(rows[0]);
+    if (record.deletedAt) {
+      throw new DomainError("idempotency_conflict", "Idempotency key was already used", 409);
+    }
+    if (record.name !== name || record.description !== (input.description?.trim() ?? "")) {
+      throw new DomainError("idempotency_conflict", "Idempotency key payload differs", 409);
+    }
+    return record;
+  }
+  async listKnowledgeCollections(ownerId: string) {
+    return (await this.#sql<
+      Row[]
+    >`SELECT * FROM knowledge_collections WHERE owner_id=${ownerId} AND deleted_at IS NULL ORDER BY updated_at DESC,id`)
+      .map(knowledgeCollection);
+  }
+  async getKnowledgeCollection(id: string, ownerId: string) {
+    const rows = await this.#sql<
+      Row[]
+    >`SELECT * FROM knowledge_collections WHERE id=${id} AND owner_id=${ownerId} AND deleted_at IS NULL`;
+    if (!rows[0]) throw new DomainError("not_found", "Knowledge collection not found", 404);
+    return knowledgeCollection(rows[0]);
+  }
+  async updateKnowledgeCollection(id: string, ownerId: string, patch: KnowledgeCollectionPatch) {
+    const name = patch.name?.trim();
+    if ((name != null && (!name || name.length > 120)) || (patch.description?.length ?? 0) > 2000) {
+      throw new DomainError("validation_error", "Knowledge collection input is invalid", 422);
+    }
+    const rows = await this.#sql<Row[]>`UPDATE knowledge_collections SET name=COALESCE(${
+      name ?? null
+    },name),description=COALESCE(${
+      patch.description?.trim() ?? null
+    },description),version=version+1,updated_at=now()
+      WHERE id=${id} AND owner_id=${ownerId} AND deleted_at IS NULL AND version=${patch.expectedVersion} RETURNING *`;
+    if (!rows[0]) {
+      await this.getKnowledgeCollection(id, ownerId);
+      throw new DomainError("version_conflict", "Knowledge collection changed", 409);
+    }
+    return knowledgeCollection(rows[0]);
+  }
+  async deleteKnowledgeCollection(id: string, ownerId: string, expectedVersion: number) {
+    const rows = await this.#sql<
+      Row[]
+    >`UPDATE knowledge_collections SET deleted_at=now(),updated_at=now(),version=version+1 WHERE id=${id} AND owner_id=${ownerId} AND deleted_at IS NULL AND version=${expectedVersion} RETURNING *`;
+    if (!rows[0]) {
+      await this.getKnowledgeCollection(id, ownerId);
+      throw new DomainError("version_conflict", "Knowledge collection changed", 409);
+    }
+    return knowledgeCollection(rows[0]);
+  }
+  async linkKnowledgeAttachment(
+    collectionId: string,
+    attachmentId: string,
+    ownerId: string,
+    expectedVersion: number,
+  ) {
+    return await this.#sql.begin(async (tx) => {
+      const collections = await tx<
+        Row[]
+      >`SELECT * FROM knowledge_collections WHERE id=${collectionId} AND owner_id=${ownerId} AND deleted_at IS NULL FOR UPDATE`;
+      if (!collections[0]) {
+        throw new DomainError("not_found", "Knowledge collection not found", 404);
+      }
+      const attachments = await tx<
+        Row[]
+      >`SELECT id FROM attachments WHERE id=${attachmentId} AND owner_id=${ownerId} AND state='ready' AND deleted_at IS NULL`;
+      if (!attachments[0]) throw new DomainError("not_found", "Ready attachment not found", 404);
+      const prior =
+        await tx`SELECT 1 FROM knowledge_collection_attachments WHERE collection_id=${collectionId} AND attachment_id=${attachmentId}`;
+      if (prior.length) return knowledgeCollection(collections[0]);
+      if (number(collections[0].version) !== expectedVersion) {
+        throw new DomainError("version_conflict", "Knowledge collection changed", 409);
+      }
+      const inserted =
+        await tx`INSERT INTO knowledge_collection_attachments(collection_id,attachment_id) VALUES(${collectionId},${attachmentId}) ON CONFLICT DO NOTHING RETURNING collection_id`;
+      if (!inserted.length) return knowledgeCollection(collections[0]);
+      return knowledgeCollection(
+        (await tx<
+          Row[]
+        >`UPDATE knowledge_collections SET version=version+1,updated_at=now() WHERE id=${collectionId} RETURNING *`)[
+          0
+        ],
+      );
+    });
+  }
+  async unlinkKnowledgeAttachment(
+    collectionId: string,
+    attachmentId: string,
+    ownerId: string,
+    expectedVersion: number,
+  ) {
+    return await this.#sql.begin(async (tx) => {
+      const rows = await tx<
+        Row[]
+      >`SELECT * FROM knowledge_collections WHERE id=${collectionId} AND owner_id=${ownerId} AND deleted_at IS NULL FOR UPDATE`;
+      if (!rows[0]) throw new DomainError("not_found", "Knowledge collection not found", 404);
+      const attachments =
+        await tx`SELECT 1 FROM attachments WHERE id=${attachmentId} AND owner_id=${ownerId} AND deleted_at IS NULL`;
+      if (!attachments.length) throw new DomainError("not_found", "Attachment not found", 404);
+      const prior =
+        await tx`SELECT 1 FROM knowledge_collection_attachments WHERE collection_id=${collectionId} AND attachment_id=${attachmentId}`;
+      if (!prior.length) return knowledgeCollection(rows[0]);
+      if (number(rows[0].version) !== expectedVersion) {
+        throw new DomainError("version_conflict", "Knowledge collection changed", 409);
+      }
+      const deleted =
+        await tx`DELETE FROM knowledge_collection_attachments WHERE collection_id=${collectionId} AND attachment_id=${attachmentId} RETURNING collection_id`;
+      if (!deleted.length) return knowledgeCollection(rows[0]);
+      return knowledgeCollection(
+        (await tx<
+          Row[]
+        >`UPDATE knowledge_collections SET version=version+1,updated_at=now() WHERE id=${collectionId} RETURNING *`)[
+          0
+        ],
+      );
+    });
+  }
+  async listKnowledgeAttachments(collectionId: string, ownerId: string) {
+    await this.getKnowledgeCollection(collectionId, ownerId);
+    return (await this.#sql<
+      Row[]
+    >`SELECT a.* FROM attachments a
+      JOIN knowledge_collection_attachments ka ON ka.attachment_id=a.id
+      JOIN knowledge_collections k ON k.id=ka.collection_id AND k.owner_id=a.owner_id AND k.deleted_at IS NULL
+      WHERE ka.collection_id=${collectionId} AND a.owner_id=${ownerId} AND a.state='ready' AND a.deleted_at IS NULL
+      ORDER BY ka.created_at,a.id`)
+      .map(attachment);
+  }
+  async bindKnowledgeCollection(
+    conversationId: string,
+    collectionId: string,
+    ownerId: string,
+    mode: KnowledgeRetrievalMode,
+    expectedVersion?: number,
+  ) {
+    if (!["retrieval", "full_context"].includes(mode)) {
+      throw new DomainError("validation_error", "Invalid retrieval mode", 422);
+    }
+    return await this.#sql.begin(async (tx) => {
+      // Serialize first creation as well as updates. A row lock cannot protect the
+      // initially-absent composite key, while this transaction lock can.
+      await tx`SELECT pg_advisory_xact_lock(hashtextextended(${`${conversationId}:${collectionId}`},0))`;
+      const parents = await tx`SELECT 1 FROM conversations c, knowledge_collections k
+        WHERE c.id=${conversationId} AND c.owner_id=${ownerId} AND c.deleted_at IS NULL
+          AND k.id=${collectionId} AND k.owner_id=${ownerId} AND k.deleted_at IS NULL`;
+      if (!parents.length) {
+        throw new DomainError("not_found", "Conversation or knowledge collection not found", 404);
+      }
+      const prior = await tx<
+        Row[]
+      >`SELECT * FROM conversation_knowledge_bindings WHERE conversation_id=${conversationId} AND collection_id=${collectionId} FOR UPDATE`;
+      if (prior[0]) {
+        if (String(prior[0].owner_id) !== ownerId) {
+          throw new DomainError("not_found", "Knowledge binding not found", 404);
+        }
+        if (prior[0].mode === mode) return knowledgeBinding(prior[0]);
+        if (number(prior[0].version) !== expectedVersion) {
+          throw new DomainError("version_conflict", "Knowledge binding changed", 409);
+        }
+        return knowledgeBinding(
+          (await tx<
+            Row[]
+          >`UPDATE conversation_knowledge_bindings SET mode=${mode},version=version+1,updated_at=now() WHERE conversation_id=${conversationId} AND collection_id=${collectionId} RETURNING *`)[
+            0
+          ],
+        );
+      }
+      if (expectedVersion != null && expectedVersion !== 0) {
+        throw new DomainError("version_conflict", "Knowledge binding changed", 409);
+      }
+      const rows = await tx<
+        Row[]
+      >`INSERT INTO conversation_knowledge_bindings(conversation_id,collection_id,owner_id,mode) VALUES(${conversationId},${collectionId},${ownerId},${mode}) RETURNING *`;
+      return knowledgeBinding(rows[0]);
+    });
+  }
+  async unbindKnowledgeCollection(
+    conversationId: string,
+    collectionId: string,
+    ownerId: string,
+    expectedVersion: number,
+  ) {
+    await this.#sql.begin(async (tx) => {
+      const live = await tx`SELECT 1 FROM conversation_knowledge_bindings b
+        JOIN conversations c ON c.id=b.conversation_id AND c.owner_id=b.owner_id AND c.deleted_at IS NULL
+        JOIN knowledge_collections k ON k.id=b.collection_id AND k.owner_id=b.owner_id AND k.deleted_at IS NULL
+        WHERE b.conversation_id=${conversationId} AND b.collection_id=${collectionId} AND b.owner_id=${ownerId} FOR UPDATE OF b`;
+      if (!live.length) throw new DomainError("not_found", "Knowledge binding not found", 404);
+      const rows =
+        await tx`DELETE FROM conversation_knowledge_bindings WHERE conversation_id=${conversationId} AND collection_id=${collectionId} AND owner_id=${ownerId} AND version=${expectedVersion} RETURNING conversation_id`;
+      if (!rows.length) throw new DomainError("version_conflict", "Knowledge binding changed", 409);
+    });
+  }
+  async listConversationKnowledge(conversationId: string, ownerId: string) {
+    const conversations = await this
+      .#sql`SELECT 1 FROM conversations WHERE id=${conversationId} AND owner_id=${ownerId} AND deleted_at IS NULL`;
+    if (!conversations.length) throw new DomainError("not_found", "Conversation not found", 404);
+    return (await this.#sql<
+      Row[]
+    >`SELECT b.* FROM conversation_knowledge_bindings b
+      JOIN conversations c ON c.id=b.conversation_id AND c.owner_id=b.owner_id AND c.deleted_at IS NULL
+      JOIN knowledge_collections k ON k.id=b.collection_id AND k.owner_id=b.owner_id AND k.deleted_at IS NULL
+      WHERE b.conversation_id=${conversationId} AND b.owner_id=${ownerId} ORDER BY b.created_at,b.collection_id`)
+      .map(knowledgeBinding);
+  }
+
+  async replaceConversationKnowledge(
+    conversationId: string,
+    ownerId: string,
+    input: ReplaceConversationKnowledgeInput,
+  ) {
+    if (
+      !["retrieval", "full_context"].includes(input.mode) ||
+      new Set(input.collectionIds).size !== input.collectionIds.length
+    ) throw new DomainError("validation_error", "Knowledge replacement is invalid", 422);
+    return await this.#sql.begin(async (tx) => {
+      // The conversation lock serializes every replacement for this conversation,
+      // including empty-set replacements where there is no binding row to lock.
+      const conversations = await tx`SELECT 1 FROM conversations
+        WHERE id=${conversationId} AND owner_id=${ownerId} AND deleted_at IS NULL FOR UPDATE`;
+      if (!conversations.length) throw new DomainError("not_found", "Conversation not found", 404);
+      for (const collectionId of input.collectionIds) {
+        const collection = await tx`SELECT 1 FROM knowledge_collections
+          WHERE id=${collectionId} AND owner_id=${ownerId} AND deleted_at IS NULL FOR SHARE`;
+        if (!collection.length) {
+          throw new DomainError("not_found", "Knowledge collection not found", 404);
+        }
+      }
+      if (input.collectionIds.length === 0) {
+        await tx`DELETE FROM conversation_knowledge_bindings
+          WHERE conversation_id=${conversationId} AND owner_id=${ownerId}`;
+        return [];
+      }
+      await tx`DELETE FROM conversation_knowledge_bindings
+        WHERE conversation_id=${conversationId} AND owner_id=${ownerId}
+          AND NOT (collection_id = ANY(${tx.array(input.collectionIds)}::uuid[]))`;
+      const result: KnowledgeConversationBinding[] = [];
+      for (const collectionId of input.collectionIds) {
+        const rows = await tx<Row[]>`INSERT INTO conversation_knowledge_bindings(
+            conversation_id,collection_id,owner_id,mode)
+          VALUES(${conversationId},${collectionId},${ownerId},${input.mode})
+          ON CONFLICT(conversation_id,collection_id) DO UPDATE SET
+            mode=EXCLUDED.mode,
+            version=conversation_knowledge_bindings.version +
+              CASE WHEN conversation_knowledge_bindings.mode IS DISTINCT FROM EXCLUDED.mode THEN 1 ELSE 0 END,
+            updated_at=CASE WHEN conversation_knowledge_bindings.mode IS DISTINCT FROM EXCLUDED.mode
+              THEN now() ELSE conversation_knowledge_bindings.updated_at END
+          RETURNING *`;
+        result.push(knowledgeBinding(rows[0]));
+      }
+      return result;
+    });
   }
 
   async createProvider(input: CreateProviderInput, mutation: RegistryMutationContext) {

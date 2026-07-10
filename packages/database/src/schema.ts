@@ -151,6 +151,51 @@ export const messageAttachments = pgTable("message_attachments", {
   attachmentId: uuid("attachment_id").notNull().references(() => attachments.id),
 }, (table) => [primaryKey({ columns: [table.messageId, table.attachmentId] })]);
 
+export const knowledgeCollections = pgTable("knowledge_collections", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  ownerId: uuid("owner_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  name: text("name").notNull(),
+  description: text("description").notNull().default(""),
+  idempotencyKey: text("idempotency_key").notNull(),
+  version: integer("version").notNull().default(1),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  deletedAt: timestamp("deleted_at", { withTimezone: true }),
+}, (table) => [
+  uniqueIndex("knowledge_collections_owner_idempotency_uq").on(table.ownerId, table.idempotencyKey),
+  index("knowledge_collections_owner_updated_idx").on(table.ownerId, table.updatedAt),
+  check("knowledge_collections_version_check", sql`${table.version} >= 1`),
+]);
+
+export const knowledgeCollectionAttachments = pgTable("knowledge_collection_attachments", {
+  collectionId: uuid("collection_id").notNull().references(() => knowledgeCollections.id, {
+    onDelete: "cascade",
+  }),
+  attachmentId: uuid("attachment_id").notNull().references(() => attachments.id, {
+    onDelete: "cascade",
+  }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [primaryKey({ columns: [table.collectionId, table.attachmentId] })]);
+
+export const conversationKnowledgeBindings = pgTable("conversation_knowledge_bindings", {
+  conversationId: uuid("conversation_id").notNull().references(() => conversations.id, {
+    onDelete: "cascade",
+  }),
+  collectionId: uuid("collection_id").notNull().references(() => knowledgeCollections.id, {
+    onDelete: "cascade",
+  }),
+  ownerId: uuid("owner_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  mode: text("mode").notNull(),
+  version: integer("version").notNull().default(1),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  primaryKey({ columns: [table.conversationId, table.collectionId] }),
+  index("conversation_knowledge_owner_idx").on(table.ownerId, table.conversationId),
+  check("conversation_knowledge_mode_check", sql`${table.mode} IN ('retrieval','full_context')`),
+  check("conversation_knowledge_version_check", sql`${table.version} >= 1`),
+]);
+
 export const apiTokens = pgTable(
   "api_tokens",
   {

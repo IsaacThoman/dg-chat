@@ -31,6 +31,12 @@ import {
   CircuitBreakerStoreAdapter,
 } from "./provider-circuit.ts";
 import { estimateInputTokens } from "./pricing.ts";
+import {
+  createEmbeddings,
+  type EmbeddingsRequest,
+  type EmbeddingsResponse,
+  type ProviderFetch,
+} from "./embeddings.ts";
 
 type Completion = Awaited<ReturnType<typeof complete>>;
 
@@ -63,6 +69,7 @@ export interface ProviderExecutionOptions {
   breakerPolicy: BreakerPolicy;
   complete?: typeof complete;
   stream?: typeof streamChatCompletion;
+  embeddingsFetch?: ProviderFetch;
   now?: () => number;
   slowStream?: {
     windowMs: number;
@@ -314,6 +321,7 @@ export class ProviderExecutionEngine {
   readonly #breakerPolicy: BreakerPolicy;
   readonly #complete: typeof complete;
   readonly #stream: typeof streamChatCompletion;
+  readonly #embeddingsFetch?: ProviderFetch;
   readonly #now: () => number;
   readonly #slowStream?: ProviderExecutionOptions["slowStream"];
 
@@ -324,6 +332,7 @@ export class ProviderExecutionEngine {
     this.#breakerPolicy = options.breakerPolicy;
     this.#complete = options.complete ?? complete;
     this.#stream = options.stream ?? streamChatCompletion;
+    this.#embeddingsFetch = options.embeddingsFetch;
     this.#now = options.now ?? Date.now;
     this.#slowStream = options.slowStream;
     if (this.#slowStream) {
@@ -378,7 +387,11 @@ export class ProviderExecutionEngine {
     return Number(reservation);
   }
 
-  async #prepare(sourceModelId: string, frozenPlan?: ProviderExecutionPlan): Promise<{
+  async #prepare(
+    sourceModelId: string,
+    frozenPlan?: ProviderExecutionPlan,
+    capability: "chat" | "embeddings" = "chat",
+  ): Promise<{
     plan: ProviderExecutionPlan;
     candidates: Map<string, RuntimeCandidate>;
   }> {
@@ -391,7 +404,7 @@ export class ProviderExecutionEngine {
     }
     const candidates = new Map<string, RuntimeCandidate>();
     for (const target of plan.targets) {
-      if (target.protocol !== "chat_completions") {
+      if (capability === "chat" && target.protocol !== "chat_completions") {
         throw new ProviderAttemptError(
           "Native Responses provider execution is not enabled in this runtime",
           { category: "invalid_request", transient: false },
@@ -433,7 +446,9 @@ export class ProviderExecutionEngine {
         modelBefore.providerId === target.providerId &&
         modelAfter.providerId === target.providerId &&
         modelBefore.upstreamModelId === target.upstreamModelId &&
-        modelAfter.upstreamModelId === target.upstreamModelId;
+        modelAfter.upstreamModelId === target.upstreamModelId &&
+        modelBefore.capabilities.includes(capability) &&
+        modelAfter.capabilities.includes(capability);
       if (!stableProvider || !stableModel || !stableCredential) {
         throw new ProviderAttemptError("Provider execution plan changed before dispatch", {
           category: "invalid_request",
@@ -754,6 +769,78 @@ export class ProviderExecutionEngine {
             if (observed) observed.dispatched = true;
             const result = await this.#complete(request, attemptSignal, upstream);
             metrics.set(key(candidate.id, context), completionMetrics(result));
+            return result;
+          } catch (error) {
+            this.#normalizeError(error, plan);
+          }
+        },
+      });
+    } catch (error) {
+      this.#normalizeError(error, plan);
+    }
+  }
+
+  async embeddings(
+    sourceModelId: string,
+    usageRunId: string,
+    ownerLeaseToken: string,
+    request: EmbeddingsRequest,
+    signal: AbortSignal,
+    frozenPlan?: ProviderExecutionPlan,
+  ): Promise<EmbeddingsResponse> {
+    const { plan, candidates } = await this.#prepare(sourceModelId, frozenPlan, "embeddings");
+    const claim = await this.#repository.claimProviderExecution(usageRunId, ownerLeaseToken);
+    const remainingAttempts = policyFor(plan, undefined, this.#slowStream).maxAttempts -
+      claim.consumedAttempts;
+    const estimatedInput = estimateInputTokens({ input: request.input });
+    const metrics = new Map<string, AttemptMetrics>();
+    const upstreams = new Map<string, UpstreamStreamOptions>();
+    const onAttempt = this.#telemetry(
+      usageRunId,
+      ownerLeaseToken,
+      claim,
+      plan,
+      metrics,
+      estimatedInput,
+    );
+    try {
+      return await executeProviderRequest({
+        initialCandidateId: plan.targets[0].providerModelId,
+        resolveCandidate: (id) => candidates.get(id),
+        policy: policyFor(plan, remainingAttempts, this.#slowStream),
+        signal,
+        circuitStore: this.#circuitStore(candidates),
+        onAttempt,
+        beforeAttempt: async (candidate, _signal, context) => {
+          upstreams.set(
+            key(candidate.id, context),
+            await this.#upstreamFor(candidates.get(candidate.id)!),
+          );
+        },
+        attempt: async (candidate, attemptSignal, context) => {
+          try {
+            const upstream = upstreams.get(key(candidate.id, context));
+            upstreams.delete(key(candidate.id, context));
+            if (!upstream?.baseUrl || !upstream.apiKey || !upstream.upstreamModel) {
+              throw new Error("Provider dispatch options are missing");
+            }
+            const observed = metrics.get(key(candidate.id, context)) ??
+              emptyMetrics(estimatedInput);
+            observed.dispatched = true;
+            const result = await createEmbeddings(request, {
+              baseUrl: upstream.baseUrl,
+              apiKey: upstream.apiKey,
+              upstreamModel: upstream.upstreamModel,
+              publicModel: request.model,
+              signal: attemptSignal,
+              fetch: this.#embeddingsFetch,
+            });
+            observed.providerInputTokens = result.usage.prompt_tokens;
+            observed.providerOutputTokens = 0;
+            observed.inputTokens = result.usage.prompt_tokens;
+            observed.outputTokens = 0;
+            observed.tokenSource = "provider";
+            metrics.set(key(candidate.id, context), observed);
             return result;
           } catch (error) {
             this.#normalizeError(error, plan);

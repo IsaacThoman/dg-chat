@@ -12,10 +12,30 @@ if not api_key:
 
 client = OpenAI(api_key=api_key, base_url=base_url, max_retries=0)
 model = "openai/mock-fast"
+embedding_model = "contracts/mock-embedding"
 
 models = client.models.list()
 if not any(candidate.id == "openai/default" for candidate in models.data):
     raise RuntimeError("Official Python client did not receive the configured upstream model")
+if not any(candidate.id == embedding_model for candidate in models.data):
+    raise RuntimeError("Official Python client did not receive the embeddings model")
+
+embeddings = client.embeddings.create(
+    model=embedding_model,
+    input=["Python embeddings one", "Python embeddings two"],
+    encoding_format="float",
+)
+if (
+    embeddings.object != "list"
+    or embeddings.model != embedding_model
+    or len(embeddings.data) != 2
+    or embeddings.data[0].index != 0
+    or embeddings.data[1].index != 1
+    or embeddings.data[0].embedding != [0.1, 0.2, 0.3, 0.4]
+    or embeddings.usage.prompt_tokens != 2
+    or embeddings.usage.total_tokens != 2
+):
+    raise RuntimeError("Python embeddings.create() returned an invalid response")
 
 completion = client.chat.completions.create(
     model=model,
