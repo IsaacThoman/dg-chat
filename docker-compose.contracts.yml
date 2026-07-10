@@ -1,0 +1,41 @@
+services:
+  app:
+    environment:
+      DENO_ENV: test
+      OPENAI_BASE_URL: http://mock-provider:4010/v1
+      OPENAI_API_KEY: ci-mock-provider-key
+      OPENAI_ALLOWED_MODELS: mock-fast,mock-split,mock-error,mock-role-stall
+      # This exact-name exception is honored only in DENO_ENV=test.
+      OPENAI_TEST_ALLOW_HTTP_HOST: mock-provider
+    depends_on:
+      mock-provider:
+        condition: service_healthy
+
+  mock-provider:
+    image: denoland/deno:alpine
+    working_dir: /tests
+    command:
+      [
+        "run",
+        "--allow-net",
+        "--allow-env=MOCK_PROVIDER_PORT,MOCK_PROVIDER_API_KEY,MOCK_PROVIDER_CONTROL_TOKEN",
+        "mock-provider.ts",
+      ]
+    environment:
+      MOCK_PROVIDER_API_KEY: ci-mock-provider-key
+      MOCK_PROVIDER_CONTROL_TOKEN: ci-mock-control-token
+    volumes:
+      - ./tests/mock-provider.ts:/tests/mock-provider.ts:ro
+    networks:
+      - backend
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "deno",
+          "eval",
+          "fetch('http://127.0.0.1:4010/health').then(r=>{if(!r.ok)Deno.exit(1)}).catch(()=>Deno.exit(1))",
+        ]
+      interval: 3s
+      timeout: 2s
+      retries: 20

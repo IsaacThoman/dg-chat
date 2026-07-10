@@ -1,25 +1,6 @@
 services:
   app:
     environment:
-      MIGRATE_ON_START: "true"
       LOG_LEVEL: warn
-
-  mock-provider:
-    image: denoland/deno:alpine
-    working_dir: /tests
-    command: ["run", "--allow-net", "--allow-env=MOCK_PROVIDER_PORT", "mock-provider.ts"]
-    volumes:
-      - ./tests/mock-provider.ts:/tests/mock-provider.ts:ro
-    networks:
-      - backend
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "deno",
-          "eval",
-          "fetch('http://127.0.0.1:4010/health').then(r=>{if(!r.ok)Deno.exit(1)}).catch(()=>Deno.exit(1))",
-        ]
-      interval: 3s
-      timeout: 2s
-      retries: 20
+      # Browser suites intentionally exercise repeated sign-in journeys from one runner address.
+      AUTH_RATE_LIMIT: "1000"

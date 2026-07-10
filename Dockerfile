@@ -3,25 +3,23 @@
 FROM denoland/deno:alpine AS dependencies
 WORKDIR /workspace
 ENV DENO_DIR=/deno-dir
-COPY deno.json package.json ./
+COPY deno.json package.json deno.lock ./
 COPY apps ./apps
 COPY packages ./packages
 # Keep the resolved dependency cache in the image. Runtime containers are read-only
 # and must never need network access or mutate workspace links during startup.
-RUN deno install --frozen=false
+RUN deno install --frozen
 
 FROM dependencies AS web-build
 RUN deno task build
 
 FROM denoland/deno:alpine AS service-build
 WORKDIR /service
-COPY deno.service.json ./deno.json
-COPY apps/api ./apps/api
-COPY apps/worker ./apps/worker
-COPY packages/contracts ./packages/contracts
-COPY packages/database ./packages/database
-RUN deno compile -A --node-modules-dir=none --output /service/dg-chat-api apps/api/src/main.ts \
-    && deno compile -A --node-modules-dir=none --output /service/dg-chat-worker apps/worker/src/main.ts
+COPY deno.json package.json deno.lock ./
+COPY apps ./apps
+COPY packages ./packages
+RUN deno compile --frozen -A --node-modules-dir=none --output /service/dg-chat-api apps/api/src/main.ts \
+    && deno compile --frozen -A --node-modules-dir=none --output /service/dg-chat-worker apps/worker/src/main.ts
 
 FROM nginxinc/nginx-unprivileged:1.27-alpine AS web
 COPY --from=web-build /workspace/apps/web/dist /usr/share/nginx/html
@@ -58,11 +56,21 @@ EOF
 EXPOSE 8080
 
 FROM debian:trixie-slim AS app
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd --system dgchat \
-    && useradd --system --gid dgchat --no-create-home dgchat
+RUN set -eux; \
+    installed=0; \
+    for attempt in 1 2 3 4 5; do \
+      rm -rf /var/lib/apt/lists/*; \
+      if apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update \
+        && apt-get install -y --no-install-recommends ca-certificates curl; then \
+        installed=1; \
+        break; \
+      fi; \
+      sleep "$((attempt * 2))"; \
+    done; \
+    test "$installed" = 1; \
+    rm -rf /var/lib/apt/lists/*; \
+    groupadd --system dgchat; \
+    useradd --system --gid dgchat --no-create-home dgchat
 COPY --from=service-build /service/dg-chat-api /usr/local/bin/dg-chat-api
 ENV DENO_ENV=production \
     PORT=8000
@@ -71,8 +79,30 @@ USER dgchat
 CMD ["/usr/local/bin/dg-chat-api"]
 
 FROM debian:trixie-slim AS worker
-RUN groupadd --system dgchat \
-    && useradd --system --gid dgchat --no-create-home dgchat
+RUN set -eux; \
+    installed=0; \
+    for attempt in 1 2 3 4 5; do \
+      rm -rf /var/lib/apt/lists/*; \
+      if apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update \
+        && apt-get install -y --no-install-recommends ca-certificates postgresql-client; then \
+        installed=1; \
+        break; \
+      fi; \
+      sleep "$((attempt * 2))"; \
+    done; \
+    test "$installed" = 1; \
+    rm -rf /var/lib/apt/lists/*; \
+    groupadd --system dgchat; \
+    useradd --system --gid dgchat --no-create-home dgchat
+RUN <<'EOF'
+cat > /usr/local/bin/worker-healthcheck <<'SCRIPT'
+#!/bin/sh
+set -eu
+test "$(cat /proc/1/comm)" = "dg-chat-worker"
+exec psql "$DATABASE_URL" --no-psqlrc --tuples-only --command "SELECT 1 FROM jobs LIMIT 0" >/dev/null
+SCRIPT
+chmod 0755 /usr/local/bin/worker-healthcheck
+EOF
 COPY --from=service-build /service/dg-chat-worker /usr/local/bin/dg-chat-worker
 ENV DENO_ENV=production
 USER dgchat

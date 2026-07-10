@@ -10,15 +10,60 @@ import type {
   UsageSummary,
   UserRole,
 } from "@dg-chat/contracts";
+import type {
+  ApiIdempotencyEndpoint,
+  ApiIdempotencyRequest,
+  ApiReplayQuota,
+  ApiUsageObservation,
+  AttachmentRecord,
+  AttachmentState,
+  AuditEvent,
+  AuditEventInput,
+  AuditPage,
+  AuditQuery,
+  BeginApiRequestInput,
+  BeginApiRequestResult,
+  BeginGenerationInput,
+  BeginGenerationResult,
+  CompleteApiRequestInput,
+  CompleteGenerationInput,
+  CreateAttachmentInput,
+  CreateAttachmentResult,
+  CreateModelPriceVersionInput,
+  CreateProviderInput,
+  CreateProviderModelInput,
+  CreateUserInput,
+  DocumentChunk,
+  DocumentChunkInput,
+  FailApiRequestInput,
+  FailGenerationInput,
+  GenerationResult,
+  IdentityTokenPurpose,
+  ModelPriceVersion,
+  ProviderCredentialEnvelope,
+  ProviderCredentialMutation,
+  ProviderModelRecord,
+  ProviderRecord,
+  RegistryMutationContext,
+  SessionSummary,
+  StoredProviderCredential,
+  UpdateProviderInput,
+  UpdateProviderModelInput,
+  UsagePricingSnapshot,
+} from "./repository.ts";
+import { decodeAuditCursor, encodeAuditCursor, isUsagePricingSnapshot } from "./repository.ts";
 
 export interface StoredUser extends PublicUser {
   passwordHash: string;
 }
 export interface StoredSession {
+  id: string;
   tokenHash: string;
   userId: string;
   limited: boolean;
   expiresAt: number;
+  createdAt: string;
+  invalidatedAt: string | null;
 }
 export interface StoredApiToken extends ApiTokenSummary {
   userId: string;
@@ -43,6 +88,9 @@ export interface UsageRun {
   inputTokens: number;
   outputTokens: number;
   latencyMs: number;
+  pricingSnapshot: UsagePricingSnapshot | null;
+  generationLeaseToken: string | null;
+  generationLeaseExpiresAt: string | null;
   createdAt: string;
 }
 
@@ -52,16 +100,173 @@ export class DomainError extends Error {
   }
 }
 
+const isIngestibleMime = (mime: string) => mime === "text/plain" || mime === "application/json";
+
+function validateDocumentChunks(chunks: DocumentChunkInput[]) {
+  const ids = new Set<string>();
+  for (const [index, chunk] of chunks.entries()) {
+    if (
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+        chunk.id,
+      ) || chunk.ordinal !== index || !chunk.content || chunk.content.length > 20_000 ||
+      ids.has(chunk.id)
+    ) throw new DomainError("invalid_document_chunks", "Document chunks are invalid", 422);
+    ids.add(chunk.id);
+  }
+}
+
+interface StoredProvider extends ProviderRecord {
+  credentialEnvelope: ProviderCredentialEnvelope | null;
+}
+
+const registryConflict = () =>
+  new DomainError("version_conflict", "The registry record changed; reload and try again", 409);
+
+function normalizeProviderBaseUrl(value: string): string {
+  if (value !== value.trim() || value.length > 2048) {
+    throw new DomainError("validation_error", "Provider base URL is invalid", 422);
+  }
+  try {
+    const url = new URL(value);
+    if (
+      url.protocol !== "https:" || url.username || url.password || url.search || url.hash ||
+      url.port === "0"
+    ) {
+      throw new Error();
+    }
+    const path = url.pathname.replace(/\/+$/, "");
+    return `${url.origin}${path}`;
+  } catch {
+    throw new DomainError("validation_error", "Provider base URL is invalid", 422);
+  }
+}
+
+function validateProviderInput(input: Partial<CreateProviderInput & UpdateProviderInput>) {
+  if (input.slug !== undefined && !/^[a-z0-9][a-z0-9-]{0,62}$/.test(input.slug)) {
+    throw new DomainError("validation_error", "Provider slug is invalid", 422);
+  }
+  if (
+    input.displayName !== undefined &&
+    (input.displayName.trim().length < 1 || input.displayName.trim().length > 120)
+  ) throw new DomainError("validation_error", "Provider display name is invalid", 422);
+  if (input.baseUrl !== undefined) normalizeProviderBaseUrl(input.baseUrl);
+  if (input.protocol !== undefined && !["chat_completions", "responses"].includes(input.protocol)) {
+    throw new DomainError("validation_error", "Provider protocol is invalid", 422);
+  }
+  if (
+    input.healthStatus !== undefined &&
+    !["unknown", "healthy", "unhealthy", "disabled"].includes(input.healthStatus)
+  ) throw new DomainError("validation_error", "Provider health status is invalid", 422);
+  if (
+    input.healthLatencyMs !== undefined && input.healthLatencyMs !== null &&
+    (!Number.isSafeInteger(input.healthLatencyMs) || input.healthLatencyMs < 0)
+  ) throw new DomainError("validation_error", "Provider health latency is invalid", 422);
+  if (
+    input.healthError !== undefined && input.healthError !== null && input.healthError.length > 1000
+  ) {
+    throw new DomainError("validation_error", "Provider health error is too long", 422);
+  }
+  if (
+    input.healthCheckedAt !== undefined && input.healthCheckedAt !== null &&
+    !Number.isFinite(Date.parse(input.healthCheckedAt))
+  ) throw new DomainError("validation_error", "Provider health timestamp is invalid", 422);
+}
+
+function validateProviderModelInput(
+  input: Partial<CreateProviderModelInput & UpdateProviderModelInput>,
+) {
+  if (
+    input.publicModelId !== undefined &&
+    (input.publicModelId.length < 3 || input.publicModelId.length > 255 ||
+      input.publicModelId.indexOf("/") < 1)
+  ) throw new DomainError("validation_error", "Public model ID must be namespaced", 422);
+  for (
+    const [value, maximum] of [[input.upstreamModelId, 255], [input.displayName, 120]] as const
+  ) {
+    if (value !== undefined && (value.trim().length < 1 || value.length > maximum)) {
+      throw new DomainError("validation_error", "Provider model text is invalid", 422);
+    }
+  }
+  if (
+    input.contextWindow !== undefined &&
+    (!Number.isSafeInteger(input.contextWindow) || input.contextWindow < 1)
+  ) throw new DomainError("validation_error", "Model context window is invalid", 422);
+  if (
+    input.capabilities !== undefined &&
+    (input.capabilities.length > 64 ||
+      new Set(input.capabilities).size !== input.capabilities.length ||
+      input.capabilities.some((value) => !value || value.length > 64))
+  ) throw new DomainError("validation_error", "Model capabilities are invalid", 422);
+  if (
+    input.customParams !== undefined &&
+    (input.customParams === null || Array.isArray(input.customParams))
+  ) throw new DomainError("validation_error", "Model custom parameters are invalid", 422);
+}
+
+function validatePriceInput(input: CreateModelPriceVersionInput) {
+  if (!Number.isFinite(Date.parse(input.effectiveAt))) {
+    throw new DomainError("validation_error", "Price effective timestamp is invalid", 422);
+  }
+  for (
+    const value of [
+      input.inputMicrosPerMillion,
+      input.cachedInputMicrosPerMillion,
+      input.reasoningMicrosPerMillion,
+      input.outputMicrosPerMillion,
+      input.fixedCallMicros,
+    ]
+  ) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new DomainError("validation_error", "Price amounts must be non-negative integers", 422);
+    }
+  }
+  if (!input.source.trim() || input.source.length > 120) {
+    throw new DomainError("validation_error", "Price source is invalid", 422);
+  }
+}
+
+function validateCredentialEnvelope(envelope: ProviderCredentialEnvelope) {
+  const strings = [
+    envelope.wrappedKeyNonce,
+    envelope.wrappedKey,
+    envelope.contentNonce,
+    envelope.ciphertext,
+  ];
+  if (
+    envelope.version !== 1 || envelope.algorithm !== "AES-256-GCM" ||
+    !/^[A-Za-z0-9._-]{1,64}$/.test(envelope.keyId) ||
+    !Number.isSafeInteger(envelope.credentialVersion) || envelope.credentialVersion < 1 ||
+    strings.some((value) =>
+      typeof value !== "string" || !/^[A-Za-z0-9+/]+={0,2}$/.test(value) || value.length > 65_536
+    )
+  ) throw new DomainError("validation_error", "Provider credential envelope is invalid", 422);
+}
+
 export class MemoryRepository {
-  readonly storageKind: string = "memory";
+  readonly storageKind: "memory" | "postgres" = "memory";
   readonly users = new Map<string, StoredUser>();
   readonly sessions = new Map<string, StoredSession>();
   readonly tokens = new Map<string, StoredApiToken>();
+  readonly identityTokens = new Map<string, {
+    userId: string;
+    purpose: IdentityTokenPurpose;
+    expiresAt: string;
+    consumedAt: string | null;
+  }>();
+  readonly auditEvents: AuditEvent[] = [];
+  readonly attachments = new Map<string, AttachmentRecord>();
+  readonly messageAttachments = new Map<string, Set<string>>();
+  readonly documentChunks = new Map<string, DocumentChunk[]>();
+  readonly providers = new Map<string, StoredProvider>();
+  readonly providerModels = new Map<string, ProviderModelRecord>();
+  readonly modelPriceVersions = new Map<string, ModelPriceVersion[]>();
   readonly conversations = new Map<string, Conversation>();
   readonly messages = new Map<string, MessageNode>();
   readonly idempotency = new Map<string, string>();
   readonly ledger: LedgerEntry[] = [];
   readonly usageRuns = new Map<string, UsageRun>();
+  readonly apiIdempotencyRequests = new Map<string, ApiIdempotencyRequest>();
+  readonly apiIdempotencyKeys = new Map<string, string>();
   readonly jobs: Array<
     {
       id: string;
@@ -69,12 +274,34 @@ export class MemoryRepository {
       payload: unknown;
       status: string;
       attempts: number;
+      idempotencyKey?: string;
       createdAt: string;
     }
   > = [];
 
   async flush(): Promise<void> {
     // Memory mode is intentionally ephemeral; durable adapters override this hook.
+  }
+
+  async close(): Promise<void> {
+    await this.flush();
+  }
+
+  bootstrapAdmin(
+    input: CreateUserInput,
+    startingCreditMicros: number,
+  ): StoredUser {
+    if ([...this.users.values()].some((user) => user.role === "admin")) {
+      throw new DomainError("already_bootstrapped", "An administrator already exists", 409);
+    }
+    const user = this.createUser({
+      ...input,
+      role: "admin",
+      approvalStatus: "approved",
+      emailVerified: true,
+    });
+    this.credit(user.id, `bootstrap:${user.id}`, "grant", startingCreditMicros);
+    return user;
   }
 
   createUser(
@@ -85,6 +312,7 @@ export class MemoryRepository {
       role?: UserRole;
       approvalStatus?: ApprovalStatus;
       state?: AccountState;
+      emailVerified?: boolean;
     },
   ): StoredUser {
     if ([...this.users.values()].some((u) => u.email === input.email)) {
@@ -99,6 +327,9 @@ export class MemoryRepository {
       approvalStatus: input.approvalStatus ?? "pending",
       state: input.state ?? "active",
       balanceMicros: 0,
+      emailVerifiedAt: input.emailVerified || input.approvalStatus === "approved"
+        ? new Date().toISOString()
+        : null,
       createdAt: new Date().toISOString(),
     };
     this.users.set(user.id, user);
@@ -117,12 +348,20 @@ export class MemoryRepository {
     return this.users.get(id);
   }
 
+  listUsers(): PublicUser[] {
+    return [...this.users.values()].map((user) => this.publicUser(user));
+  }
+
   createSession(userId: string, tokenHash: string, limited: boolean): StoredSession {
+    const now = new Date().toISOString();
     const session = {
+      id: crypto.randomUUID(),
       tokenHash,
       userId,
       limited,
       expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000,
+      createdAt: now,
+      invalidatedAt: null,
     };
     this.sessions.set(tokenHash, session);
     return session;
@@ -139,10 +378,136 @@ export class MemoryRepository {
       if (session.userId === userId) this.sessions.delete(hash);
     }
   }
+  deleteSession(tokenHash: string) {
+    this.sessions.delete(tokenHash);
+  }
+  listSessions(userId: string): SessionSummary[] {
+    return [...this.sessions.values()].filter((session) => session.userId === userId).map((
+      session,
+    ) => ({
+      id: session.id,
+      userId: session.userId,
+      limited: session.limited,
+      expiresAt: new Date(session.expiresAt).toISOString(),
+      createdAt: session.createdAt,
+      invalidatedAt: session.invalidatedAt,
+    }));
+  }
+  revokeSession(id: string, ownerId?: string) {
+    const entry = [...this.sessions.entries()].find(([, session]) =>
+      session.id === id && (!ownerId || session.userId === ownerId)
+    );
+    if (!entry) throw new DomainError("not_found", "Session not found", 404);
+    this.sessions.delete(entry[0]);
+  }
+  createIdentityToken(
+    userId: string,
+    purpose: IdentityTokenPurpose,
+    tokenHash: string,
+    expiresAt: string,
+  ) {
+    this.identityTokens.set(tokenHash, { userId, purpose, expiresAt, consumedAt: null });
+  }
+  verifyEmail(tokenHash: string) {
+    const token = this.identityTokens.get(tokenHash);
+    if (
+      !token || token.purpose !== "email_verification" || token.consumedAt ||
+      Date.parse(token.expiresAt) <= Date.now()
+    ) {
+      throw new DomainError(
+        "invalid_identity_token",
+        "Verification token is invalid or expired",
+        400,
+      );
+    }
+    token.consumedAt = new Date().toISOString();
+    const user = this.users.get(token.userId)!;
+    user.emailVerifiedAt = new Date().toISOString();
+    return user;
+  }
+  resetPassword(tokenHash: string, passwordHash: string) {
+    const token = this.identityTokens.get(tokenHash);
+    if (
+      !token || token.purpose !== "password_reset" || token.consumedAt ||
+      Date.parse(token.expiresAt) <= Date.now()
+    ) throw new DomainError("invalid_identity_token", "Reset token is invalid or expired", 400);
+    token.consumedAt = new Date().toISOString();
+    const user = this.users.get(token.userId)!;
+    user.passwordHash = passwordHash;
+    this.invalidateUserSessions(user.id);
+    for (const apiToken of this.tokens.values()) {
+      if (apiToken.userId === user.id && !apiToken.revokedAt) {
+        apiToken.revokedAt = new Date().toISOString();
+      }
+    }
+    const consumedAt = new Date().toISOString();
+    for (const identityToken of this.identityTokens.values()) {
+      if (identityToken.userId === user.id && !identityToken.consumedAt) {
+        identityToken.consumedAt = consumedAt;
+      }
+    }
+    return user;
+  }
+  recordAudit(input: AuditEventInput): AuditEvent {
+    const event = {
+      ...input,
+      id: crypto.randomUUID(),
+      actorId: input.actorId ?? null,
+      targetId: input.targetId ?? null,
+      metadata: input.metadata ?? {},
+      createdAt: new Date().toISOString(),
+    };
+    this.auditEvents.push(event);
+    return event;
+  }
+  listAudit(query: AuditQuery = {}): AuditPage {
+    const limit = query.limit ?? 100;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
+      throw new DomainError("validation_error", "Audit limit must be between 1 and 200", 422);
+    }
+    const cursor = query.cursor ? decodeAuditCursor(query.cursor) : undefined;
+    if (query.cursor && (!cursor || cursor.kind !== "timestamp")) {
+      throw new DomainError("validation_error", "Invalid audit cursor", 422);
+    }
+    const timestampCursor = cursor?.kind === "timestamp" ? cursor : undefined;
+    const from = query.from ? Date.parse(query.from) : undefined;
+    const to = query.to ? Date.parse(query.to) : undefined;
+    if ((query.from && !Number.isFinite(from)) || (query.to && !Number.isFinite(to))) {
+      throw new DomainError("validation_error", "Invalid audit date range", 422);
+    }
+    if (from !== undefined && to !== undefined && from > to) {
+      throw new DomainError("validation_error", "Audit date range is reversed", 422);
+    }
+    const matches = this.auditEvents
+      .filter((event) =>
+        (!query.action || event.action === query.action) &&
+        (!query.actorId || event.actorId === query.actorId) &&
+        (!query.targetType || event.targetType === query.targetType) &&
+        (!query.targetId || event.targetId === query.targetId) &&
+        (from === undefined || Date.parse(event.createdAt) >= from) &&
+        (to === undefined || Date.parse(event.createdAt) <= to) &&
+        (!timestampCursor || event.createdAt < timestampCursor.createdAt ||
+          (event.createdAt === timestampCursor.createdAt && event.id < timestampCursor.id))
+      )
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
+    const data = matches.slice(0, limit);
+    return {
+      data,
+      nextCursor: matches.length > limit ? encodeAuditCursor(data[data.length - 1]) : null,
+    };
+  }
 
-  approveUser(id: string, status: "approved" | "rejected", creditMicros: number): StoredUser {
+  approveUser(
+    id: string,
+    status: "approved" | "rejected",
+    creditMicros: number,
+    requireEmailVerification = false,
+  ): StoredUser {
     const user = this.users.get(id);
     if (!user) throw new DomainError("not_found", "User not found", 404);
+    if (status === "approved" && requireEmailVerification && !user.emailVerifiedAt) {
+      throw new DomainError("email_not_verified", "Email must be verified before approval", 409);
+    }
     if (user.role === "admin" && status === "rejected") {
       const availableAdmins = [...this.users.values()].filter((candidate) =>
         candidate.role === "admin" && candidate.state === "active" &&
@@ -153,10 +518,18 @@ export class MemoryRepository {
       }
     }
     user.approvalStatus = status;
-    if (status === "approved" && creditMicros > 0 && user.balanceMicros === 0) {
+    const alreadyGranted = this.ledger.some((entry) =>
+      entry.usageRunId === `approval:${id}` && entry.kind === "grant"
+    );
+    if (status === "approved" && creditMicros > 0 && !alreadyGranted) {
       this.credit(id, `approval:${id}`, "grant", creditMicros);
     }
-    if (status === "rejected") this.invalidateUserSessions(id);
+    if (status === "rejected") {
+      this.invalidateUserSessions(id);
+      for (const token of this.tokens.values()) {
+        if (token.userId === id && !token.revokedAt) token.revokedAt = new Date().toISOString();
+      }
+    }
     return user;
   }
 
@@ -181,7 +554,22 @@ export class MemoryRepository {
     return user;
   }
 
-  createConversation(ownerId: string, title: string): Conversation {
+  createConversation(
+    ownerId: string,
+    title: string,
+    temporary = false,
+    idempotencyKey?: string,
+  ): Conversation {
+    if (idempotencyKey) {
+      const priorId = this.idempotency.get(`conversation:${ownerId}:${idempotencyKey}`);
+      if (priorId) {
+        const prior = this.conversations.get(priorId)!;
+        if (prior.title !== title || prior.temporary !== temporary) {
+          throw new DomainError("idempotency_conflict", "Conversation replay payload differs", 409);
+        }
+        return prior;
+      }
+    }
     const now = new Date().toISOString();
     const conversation: Conversation = {
       id: crypto.randomUUID(),
@@ -190,12 +578,16 @@ export class MemoryRepository {
       activeLeafId: null,
       version: 0,
       pinned: false,
+      temporary,
       archivedAt: null,
       deletedAt: null,
       createdAt: now,
       updatedAt: now,
     };
     this.conversations.set(conversation.id, conversation);
+    if (idempotencyKey) {
+      this.idempotency.set(`conversation:${ownerId}:${idempotencyKey}`, conversation.id);
+    }
     return conversation;
   }
 
@@ -203,6 +595,27 @@ export class MemoryRepository {
     return [...this.conversations.values()].filter((c) =>
       c.ownerId === ownerId && (includeDeleted || !c.deletedAt)
     ).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+  updateConversation(
+    ownerId: string,
+    id: string,
+    patch: import("./repository.ts").ConversationPatch,
+  ) {
+    const value = this.conversations.get(id);
+    if (!value || value.ownerId !== ownerId) {
+      throw new DomainError("not_found", "Conversation not found", 404);
+    }
+    if (patch.title !== undefined) value.title = patch.title.trim().slice(0, 200);
+    if (patch.pinned !== undefined) value.pinned = patch.pinned;
+    if (patch.archived !== undefined) {
+      value.archivedAt = patch.archived ? new Date().toISOString() : null;
+    }
+    if (patch.deleted !== undefined) {
+      value.deletedAt = patch.deleted ? new Date().toISOString() : null;
+    }
+    value.version++;
+    value.updatedAt = new Date().toISOString();
+    return value;
   }
 
   detail(id: string, ownerId: string): ConversationDetail {
@@ -235,9 +648,29 @@ export class MemoryRepository {
     if (!conversation || conversation.ownerId !== input.ownerId) {
       throw new DomainError("not_found", "Conversation not found", 404);
     }
+    if (conversation.deletedAt) {
+      throw new DomainError("conversation_deleted", "Deleted conversations are read-only", 409);
+    }
+    if (conversation.archivedAt) {
+      throw new DomainError("conversation_archived", "Archived conversations are read-only", 409);
+    }
     const idemKey = `${input.conversationId}:${input.idempotencyKey}`;
     const existing = this.idempotency.get(idemKey);
-    if (existing) return this.messages.get(existing)!;
+    if (existing) {
+      const prior = this.messages.get(existing)!;
+      if (
+        prior.parentId !== input.parentId ||
+        prior.supersedesId !== (input.supersedesId ?? null) || prior.role !== input.role ||
+        prior.content !== input.content || prior.model !== (input.model ?? null)
+      ) {
+        throw new DomainError(
+          "idempotency_conflict",
+          "This idempotency key was used with a different message",
+          409,
+        );
+      }
+      return prior;
+    }
     if (conversation.version !== input.expectedVersion) {
       throw new DomainError(
         "version_conflict",
@@ -289,6 +722,227 @@ export class MemoryRepository {
     return message;
   }
 
+  beginGeneration(input: BeginGenerationInput): BeginGenerationResult {
+    if (input.pricingSnapshot !== undefined && !isUsagePricingSnapshot(input.pricingSnapshot)) {
+      throw new DomainError("validation_error", "Usage pricing snapshot is invalid", 422);
+    }
+    const conversation = this.conversations.get(input.message.conversationId);
+    if (!conversation || conversation.ownerId !== input.message.ownerId) {
+      throw new DomainError("not_found", "Conversation not found", 404);
+    }
+    if (conversation.deletedAt) {
+      throw new DomainError("conversation_deleted", "Deleted conversations are read-only", 409);
+    }
+    if (conversation.archivedAt) {
+      throw new DomainError("conversation_archived", "Archived conversations are read-only", 409);
+    }
+    const attachmentIds = [...(input.attachmentIds ?? [])].sort();
+    if (new Set(attachmentIds).size !== attachmentIds.length || attachmentIds.length > 10) {
+      throw new DomainError("validation_error", "Attachment identifiers are invalid", 422);
+    }
+    const existingId = this.idempotency.get(
+      `${input.message.conversationId}:${input.message.idempotencyKey}`,
+    );
+    const existingRun = this.usageRuns.get(input.runId);
+    if (existingId && existingRun) {
+      const existing = this.messages.get(existingId)!;
+      const priorAttachments = [...(this.messageAttachments.get(existing.id) ?? [])].sort();
+      if (
+        existing.content !== input.message.content ||
+        existingRun.userId !== input.message.ownerId ||
+        priorAttachments.join("\0") !== [...attachmentIds].sort().join("\0")
+      ) {
+        throw new DomainError("idempotency_conflict", "Generation replay payload differs", 409);
+      }
+      if (existingRun.status === "failed") {
+        throw new DomainError(
+          "generation_failed_replay",
+          "Failed generations require a new idempotency key",
+          409,
+        );
+      }
+      if (existingRun.status === "completed") {
+        return { kind: "completed", message: existing, conversation, usageRun: existingRun };
+      }
+      if (
+        existingRun.generationLeaseToken && existingRun.generationLeaseExpiresAt &&
+        Date.parse(existingRun.generationLeaseExpiresAt) > Date.now()
+      ) {
+        return {
+          kind: "in_progress",
+          message: existing,
+          conversation,
+          usageRun: existingRun,
+          retryAfterSeconds: Math.max(
+            1,
+            Math.ceil((Date.parse(existingRun.generationLeaseExpiresAt) - Date.now()) / 1000),
+          ),
+        };
+      }
+      const leaseToken = crypto.randomUUID();
+      existingRun.generationLeaseToken = leaseToken;
+      existingRun.generationLeaseExpiresAt = new Date(
+        Date.now() + (input.leaseSeconds ?? 120) * 1000,
+      ).toISOString();
+      return {
+        kind: "claimed",
+        leaseToken,
+        message: existing,
+        conversation,
+        usageRun: existingRun,
+      };
+    }
+    const account = this.users.get(input.message.ownerId);
+    if (!account || account.balanceMicros < input.reserveMicros) {
+      throw new DomainError("insufficient_credit", "Insufficient credit", 402);
+    }
+    for (const attachmentId of attachmentIds) {
+      const attachment = this.getAttachment(attachmentId, input.message.ownerId);
+      if (attachment.state !== "ready") {
+        throw new DomainError("attachment_not_ready", "Attachment is not ready", 409);
+      }
+    }
+    const message = this.appendMessage(input.message);
+    const usageRun = this.reserve(
+      input.message.ownerId,
+      input.runId,
+      input.message.model ?? "unknown",
+      input.reserveMicros,
+      input.provider,
+      input.tokenId,
+      input.pricingSnapshot,
+    );
+    const leaseToken = crypto.randomUUID();
+    usageRun.generationLeaseToken = leaseToken;
+    usageRun.generationLeaseExpiresAt = new Date(
+      Date.now() + (input.leaseSeconds ?? 120) * 1000,
+    ).toISOString();
+    if (attachmentIds.length) this.messageAttachments.set(message.id, new Set(attachmentIds));
+    return { kind: "started", leaseToken, message, conversation, usageRun };
+  }
+
+  heartbeatGeneration(
+    runId: string,
+    ownerId: string,
+    leaseToken: string,
+    leaseSeconds = 120,
+  ) {
+    const run = this.usageRuns.get(runId);
+    if (
+      !run || run.userId !== ownerId || run.status !== "reserved" ||
+      run.generationLeaseToken !== leaseToken || !run.generationLeaseExpiresAt ||
+      Date.parse(run.generationLeaseExpiresAt) <= Date.now()
+    ) throw new DomainError("stale_lease", "Generation lease is no longer active", 409);
+    run.generationLeaseExpiresAt = new Date(Date.now() + leaseSeconds * 1000).toISOString();
+  }
+
+  completeGeneration(input: CompleteGenerationInput): GenerationResult {
+    const conversation = this.conversations.get(input.conversationId);
+    const parent = this.messages.get(input.userMessageId);
+    const usageRun = this.usageRuns.get(input.runId);
+    if (!conversation || conversation.ownerId !== input.ownerId || !parent || !usageRun) {
+      throw new DomainError("not_found", "Generation not found", 404);
+    }
+    const existingId = this.idempotency.get(`${input.conversationId}:${input.idempotencyKey}`);
+    if (existingId) {
+      const existing = this.messages.get(existingId)!;
+      if (existing.content !== input.content || existing.parentId !== input.userMessageId) {
+        throw new DomainError("idempotency_conflict", "Generation replay payload differs", 409);
+      }
+      if (usageRun.status !== "completed") {
+        throw new DomainError("invalid_usage_state", "Generation is not completed", 409);
+      }
+      return { message: existing, conversation, usageRun };
+    }
+    if (usageRun.status !== "reserved") {
+      throw new DomainError("invalid_usage_state", "Generation is not reserved", 409);
+    }
+    if (
+      usageRun.generationLeaseToken !== input.leaseToken ||
+      !usageRun.generationLeaseExpiresAt ||
+      Date.parse(usageRun.generationLeaseExpiresAt) <= Date.now()
+    ) throw new DomainError("stale_lease", "Generation lease is no longer active", 409);
+    const balanceAfterSettlement = this.users.get(input.ownerId)!.balanceMicros +
+      usageRun.reservedMicros - input.costMicros;
+    if (balanceAfterSettlement < 0) {
+      throw new DomainError("insufficient_credit", "Actual cost exceeds available credit", 402);
+    }
+    const previousActive = conversation.activeLeafId;
+    const settled = this.settle(
+      input.runId,
+      input.costMicros,
+      input.inputTokens,
+      input.outputTokens,
+      input.latencyMs,
+    );
+    settled.generationLeaseToken = null;
+    settled.generationLeaseExpiresAt = null;
+    const message = this.appendMessage({
+      conversationId: input.conversationId,
+      ownerId: input.ownerId,
+      parentId: input.userMessageId,
+      role: "assistant",
+      content: input.content,
+      model: input.model,
+      expectedVersion: conversation.version,
+      idempotencyKey: input.idempotencyKey,
+      metadata: input.metadata,
+    });
+    if (previousActive !== input.userMessageId) conversation.activeLeafId = previousActive;
+    return { message, conversation, usageRun: settled };
+  }
+
+  failGeneration(input: FailGenerationInput): GenerationResult {
+    const conversation = this.conversations.get(input.conversationId);
+    const parent = this.messages.get(input.userMessageId);
+    if (!conversation || conversation.ownerId !== input.ownerId || !parent) {
+      throw new DomainError("not_found", "Generation not found", 404);
+    }
+    const reserved = this.usageRuns.get(input.runId);
+    if (
+      !reserved || reserved.status !== "reserved" ||
+      reserved.generationLeaseToken !== input.leaseToken ||
+      !reserved.generationLeaseExpiresAt ||
+      Date.parse(reserved.generationLeaseExpiresAt) <= Date.now()
+    ) throw new DomainError("stale_lease", "Generation lease is no longer active", 409);
+    const previousActive = conversation.activeLeafId;
+    const usageRun = this.refund(input.runId)!;
+    usageRun.generationLeaseToken = null;
+    usageRun.generationLeaseExpiresAt = null;
+    const message = this.appendMessage({
+      conversationId: input.conversationId,
+      ownerId: input.ownerId,
+      parentId: input.userMessageId,
+      role: "assistant",
+      content: input.error,
+      model: input.model,
+      expectedVersion: conversation.version,
+      idempotencyKey: input.idempotencyKey,
+      metadata: { generationError: input.error, retryable: true },
+    });
+    message.status = "error";
+    if (previousActive !== input.userMessageId) conversation.activeLeafId = previousActive;
+    return { message, conversation, usageRun };
+  }
+
+  reapStaleGenerations(limit = 100) {
+    let reaped = 0;
+    for (const run of this.usageRuns.values()) {
+      if (reaped >= limit) break;
+      if (
+        run.status !== "reserved" || !run.generationLeaseToken ||
+        !run.generationLeaseExpiresAt || Date.parse(run.generationLeaseExpiresAt) > Date.now()
+      ) continue;
+      const refunded = this.refund(run.id);
+      if (refunded) {
+        refunded.generationLeaseToken = null;
+        refunded.generationLeaseExpiresAt = null;
+        reaped++;
+      }
+    }
+    return reaped;
+  }
+
   setActiveLeaf(conversationId: string, ownerId: string, leafId: string, expectedVersion: number) {
     const conversation = this.conversations.get(conversationId);
     const leaf = this.messages.get(leafId);
@@ -296,13 +950,592 @@ export class MemoryRepository {
       !conversation || conversation.ownerId !== ownerId || !leaf ||
       leaf.conversationId !== conversationId
     ) throw new DomainError("not_found", "Conversation or branch not found", 404);
+    if (conversation.deletedAt) {
+      throw new DomainError("conversation_deleted", "Deleted conversations are read-only", 409);
+    }
+    if (conversation.archivedAt) {
+      throw new DomainError("conversation_archived", "Archived conversations are read-only", 409);
+    }
     if (conversation.version !== expectedVersion) {
       throw new DomainError("version_conflict", "Conversation changed in another tab", 409);
+    }
+    if ([...this.messages.values()].some((message) => message.parentId === leafId)) {
+      throw new DomainError("invalid_leaf", "Active branch must end at a leaf", 422);
     }
     conversation.activeLeafId = leafId;
     conversation.version++;
     conversation.updatedAt = new Date().toISOString();
     return conversation;
+  }
+
+  createAttachment(input: CreateAttachmentInput): CreateAttachmentResult {
+    this.validateAttachmentInput(input);
+    if (!this.users.has(input.ownerId)) throw new DomainError("not_found", "User not found", 404);
+    const prior = [...this.attachments.values()].find((attachment) =>
+      attachment.ownerId === input.ownerId && attachment.sha256 === input.sha256 &&
+      attachment.state !== "deleted"
+    );
+    if (prior) {
+      if (prior.sizeBytes !== input.sizeBytes || prior.mimeType !== input.mimeType) {
+        throw new DomainError(
+          "attachment_hash_conflict",
+          "Attachment digest metadata differs",
+          409,
+        );
+      }
+      return {
+        attachment: prior,
+        inspectionJobId: this.enqueueAttachmentInspection(prior),
+        deduplicated: true,
+      };
+    }
+    if (
+      [...this.attachments.values()].some((attachment) => attachment.objectKey === input.objectKey)
+    ) {
+      throw new DomainError("object_key_taken", "Attachment object key already exists", 409);
+    }
+    const now = new Date().toISOString();
+    const attachment: AttachmentRecord = {
+      ...input,
+      id: crypto.randomUUID(),
+      state: input.state ?? "pending",
+      inspectionError: input.inspectionError ?? null,
+      ingestionStatus: input.state === "ready" && isIngestibleMime(input.mimeType)
+        ? "queued"
+        : "not_applicable",
+      ingestionError: null,
+      ingestedAt: null,
+      createdAt: now,
+      updatedAt: now,
+      deletedAt: null,
+    };
+    this.attachments.set(attachment.id, attachment);
+    this.enqueueAttachmentIngestion(attachment);
+    return {
+      attachment,
+      inspectionJobId: this.enqueueAttachmentInspection(attachment),
+      deduplicated: false,
+    };
+  }
+
+  listAttachments(ownerId: string, includeDeleted = false) {
+    return [...this.attachments.values()].filter((attachment) =>
+      attachment.ownerId === ownerId && (includeDeleted || attachment.state !== "deleted")
+    ).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  getAttachment(id: string, ownerId: string, includeDeleted = false) {
+    const attachment = this.attachments.get(id);
+    if (
+      !attachment || attachment.ownerId !== ownerId ||
+      (!includeDeleted && attachment.state === "deleted")
+    ) throw new DomainError("not_found", "Attachment not found", 404);
+    return attachment;
+  }
+
+  deleteAttachment(id: string, ownerId: string) {
+    const attachment = this.getAttachment(id, ownerId, true);
+    if (attachment.state === "deleted") return attachment;
+    const now = new Date().toISOString();
+    attachment.state = "deleted";
+    attachment.deletedAt = now;
+    attachment.updatedAt = now;
+    return attachment;
+  }
+
+  transitionAttachment(
+    id: string,
+    ownerId: string,
+    expectedState: AttachmentState,
+    nextState: AttachmentState,
+    inspectionError: string | null = null,
+  ) {
+    const attachment = this.getAttachment(id, ownerId, true);
+    if (attachment.state !== expectedState) {
+      throw new DomainError("attachment_state_conflict", "Attachment state changed", 409);
+    }
+    const allowed: Record<AttachmentState, AttachmentState[]> = {
+      pending: ["inspecting", "deleted"],
+      inspecting: ["ready", "quarantined", "failed", "deleted"],
+      ready: ["deleted"],
+      quarantined: ["deleted"],
+      failed: ["pending", "deleted"],
+      deleted: [],
+    };
+    if (!allowed[expectedState].includes(nextState)) {
+      throw new DomainError(
+        "invalid_attachment_transition",
+        "Attachment transition is invalid",
+        422,
+      );
+    }
+    attachment.state = nextState;
+    attachment.inspectionError = inspectionError;
+    attachment.updatedAt = new Date().toISOString();
+    if (nextState === "deleted") attachment.deletedAt = attachment.updatedAt;
+    if (nextState === "ready" && isIngestibleMime(attachment.mimeType)) {
+      attachment.ingestionStatus = "queued";
+      attachment.ingestionError = null;
+      this.enqueueAttachmentIngestion(attachment);
+    }
+    return attachment;
+  }
+
+  linkAttachmentToMessage(messageId: string, attachmentId: string, ownerId: string) {
+    const message = this.messages.get(messageId);
+    const conversation = message ? this.conversations.get(message.conversationId) : undefined;
+    if (!message || !conversation || conversation.ownerId !== ownerId) {
+      throw new DomainError("not_found", "Message not found", 404);
+    }
+    const attachment = this.getAttachment(attachmentId, ownerId);
+    if (attachment.state !== "ready") {
+      throw new DomainError("attachment_not_ready", "Attachment is not ready", 409);
+    }
+    const links = this.messageAttachments.get(messageId) ?? new Set<string>();
+    links.add(attachmentId);
+    this.messageAttachments.set(messageId, links);
+  }
+
+  listMessageAttachments(messageId: string, ownerId: string) {
+    const message = this.messages.get(messageId);
+    const conversation = message ? this.conversations.get(message.conversationId) : undefined;
+    if (!message || !conversation || conversation.ownerId !== ownerId) {
+      throw new DomainError("not_found", "Message not found", 404);
+    }
+    return [...(this.messageAttachments.get(messageId) ?? [])].map((id) =>
+      this.getAttachment(id, ownerId, true)
+    );
+  }
+
+  beginAttachmentIngestion(id: string, ownerId: string) {
+    const attachment = this.getAttachment(id, ownerId);
+    if (!isIngestibleMime(attachment.mimeType) || attachment.state !== "ready") {
+      throw new DomainError("attachment_not_ingestible", "Attachment cannot be ingested", 422);
+    }
+    if (!["queued", "processing"].includes(attachment.ingestionStatus)) {
+      throw new DomainError("ingestion_state_conflict", "Attachment ingestion is not queued", 409);
+    }
+    attachment.ingestionStatus = "processing";
+    attachment.ingestionError = null;
+    attachment.updatedAt = new Date().toISOString();
+    return attachment;
+  }
+
+  completeAttachmentIngestion(
+    id: string,
+    ownerId: string,
+    chunks: DocumentChunkInput[],
+  ) {
+    const attachment = this.getAttachment(id, ownerId);
+    if (attachment.ingestionStatus !== "processing") {
+      throw new DomainError(
+        "ingestion_state_conflict",
+        "Attachment ingestion is not processing",
+        409,
+      );
+    }
+    validateDocumentChunks(chunks);
+    const next = chunks.map((chunk) => ({ ...chunk, attachmentId: id }));
+    this.documentChunks.set(id, next);
+    const now = new Date().toISOString();
+    attachment.ingestionStatus = "ready";
+    attachment.ingestionError = null;
+    attachment.ingestedAt = now;
+    attachment.updatedAt = now;
+    return attachment;
+  }
+
+  failAttachmentIngestion(id: string, ownerId: string, error: string) {
+    const attachment = this.getAttachment(id, ownerId);
+    if (!["queued", "processing"].includes(attachment.ingestionStatus)) {
+      throw new DomainError("ingestion_state_conflict", "Attachment ingestion is not active", 409);
+    }
+    attachment.ingestionStatus = "failed";
+    attachment.ingestionError = error.slice(0, 1000);
+    attachment.updatedAt = new Date().toISOString();
+    return attachment;
+  }
+
+  retryAttachmentIngestion(id: string, ownerId: string) {
+    const attachment = this.getAttachment(id, ownerId);
+    const key = `attachment.ingest:${attachment.id}`;
+    const prior = this.jobs.find((job) => job.idempotencyKey === key);
+    const legacySplit = attachment.ingestionStatus === "queued" && prior?.status === "failed";
+    if (attachment.ingestionStatus !== "failed" && !legacySplit) {
+      throw new DomainError(
+        "ingestion_state_conflict",
+        "Only failed ingestion can be retried",
+        409,
+      );
+    }
+    attachment.ingestionStatus = "queued";
+    attachment.ingestionError = null;
+    attachment.ingestedAt = null;
+    attachment.updatedAt = new Date().toISOString();
+    if (prior) {
+      prior.status = "queued";
+      prior.attempts = 0;
+    } else this.enqueueAttachmentIngestion(attachment);
+    return attachment;
+  }
+
+  listDocumentChunks(id: string, ownerId: string) {
+    this.getAttachment(id, ownerId);
+    return [...(this.documentChunks.get(id) ?? [])].sort((a, b) => a.ordinal - b.ordinal);
+  }
+
+  private enqueueAttachmentInspection(attachment: AttachmentRecord) {
+    const idempotencyKey = `attachment.inspect:${attachment.id}`;
+    const prior = this.jobs.find((job) => job.idempotencyKey === idempotencyKey);
+    if (prior) return prior.id;
+    const id = crypto.randomUUID();
+    this.jobs.push({
+      id,
+      type: "attachment.inspect",
+      payload: { attachmentId: attachment.id, ownerId: attachment.ownerId },
+      status: "queued",
+      attempts: 0,
+      idempotencyKey,
+      createdAt: new Date().toISOString(),
+    });
+    return id;
+  }
+
+  private enqueueAttachmentIngestion(attachment: AttachmentRecord) {
+    if (attachment.ingestionStatus !== "queued") return undefined;
+    const idempotencyKey = `attachment.ingest:${attachment.id}`;
+    const prior = this.jobs.find((job) => job.idempotencyKey === idempotencyKey);
+    if (prior) return prior.id;
+    const id = crypto.randomUUID();
+    this.jobs.push({
+      id,
+      type: "attachment.ingest",
+      payload: { attachmentId: attachment.id, ownerId: attachment.ownerId },
+      status: "queued",
+      attempts: 0,
+      idempotencyKey,
+      createdAt: new Date().toISOString(),
+    });
+    return id;
+  }
+
+  private validateAttachmentInput(input: CreateAttachmentInput) {
+    if (!/^[0-9a-f]{64}$/.test(input.sha256)) {
+      throw new DomainError("validation_error", "Attachment SHA-256 is invalid", 422);
+    }
+    if (!Number.isSafeInteger(input.sizeBytes) || input.sizeBytes < 0) {
+      throw new DomainError("validation_error", "Attachment size is invalid", 422);
+    }
+    if (
+      !input.filename || input.filename.length > 255 || /[\\/\0]/.test(input.filename) ||
+      !input.mimeType || input.mimeType.length > 255 ||
+      !/^[\w.+-]+\/[\w.+-]+$/.test(input.mimeType) ||
+      !input.objectKey || input.objectKey.length > 1024 || input.objectKey.startsWith("/") ||
+      input.objectKey.split("/").some((part) => part === ".." || part === "")
+    ) throw new DomainError("validation_error", "Attachment metadata is invalid", 422);
+  }
+
+  private publicProvider(value: StoredProvider): ProviderRecord {
+    const { credentialEnvelope: _credentialEnvelope, ...safe } = value;
+    return structuredClone(safe);
+  }
+
+  private registryAudit(
+    mutation: RegistryMutationContext,
+    targetType: "provider" | "provider_model" | "model_price_version",
+    targetId: string,
+    metadata: Record<string, unknown>,
+  ) {
+    this.recordAudit({
+      actorId: mutation.actorId,
+      action: mutation.action,
+      targetType,
+      targetId,
+      metadata: { ...mutation.metadata, ...metadata },
+    });
+  }
+
+  private validateRegistryMutation(mutation: RegistryMutationContext) {
+    if (!mutation.action.trim() || mutation.action.length > 255) {
+      throw new DomainError("validation_error", "Registry audit action is invalid", 422);
+    }
+    if (mutation.actorId && !this.users.has(mutation.actorId)) {
+      throw new DomainError("not_found", "Registry actor not found", 404);
+    }
+  }
+
+  createProvider(input: CreateProviderInput, mutation: RegistryMutationContext): ProviderRecord {
+    this.validateRegistryMutation(mutation);
+    validateProviderInput(input);
+    if ([...this.providers.values()].some((provider) => provider.slug === input.slug)) {
+      throw new DomainError("provider_slug_taken", "Provider slug already exists", 409);
+    }
+    const now = new Date().toISOString();
+    const stored: StoredProvider = {
+      id: crypto.randomUUID(),
+      slug: input.slug,
+      displayName: input.displayName.trim(),
+      baseUrl: normalizeProviderBaseUrl(input.baseUrl),
+      protocol: input.protocol,
+      enabled: input.enabled ?? true,
+      version: 1,
+      credentialEnvelope: null,
+      hasCredential: false,
+      credentialUpdatedAt: null,
+      healthStatus: input.enabled === false ? "disabled" : "unknown",
+      healthCheckedAt: null,
+      healthLatencyMs: null,
+      healthError: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.providers.set(stored.id, stored);
+    this.registryAudit(mutation, "provider", stored.id, { version: stored.version });
+    return this.publicProvider(stored);
+  }
+
+  updateProvider(
+    id: string,
+    expectedVersion: number,
+    input: UpdateProviderInput,
+    mutation: RegistryMutationContext,
+  ): ProviderRecord {
+    this.validateRegistryMutation(mutation);
+    validateProviderInput(input);
+    const stored = this.providers.get(id);
+    if (!stored) throw new DomainError("not_found", "Provider not found", 404);
+    if (stored.version !== expectedVersion) throw registryConflict();
+    if (
+      input.slug !== undefined &&
+      [...this.providers.values()].some((provider) =>
+        provider.id !== id && provider.slug === input.slug
+      )
+    ) throw new DomainError("provider_slug_taken", "Provider slug already exists", 409);
+    if (input.slug !== undefined) stored.slug = input.slug;
+    if (input.displayName !== undefined) stored.displayName = input.displayName.trim();
+    if (input.baseUrl !== undefined) stored.baseUrl = normalizeProviderBaseUrl(input.baseUrl);
+    if (input.protocol !== undefined) stored.protocol = input.protocol;
+    if (input.enabled !== undefined) {
+      stored.enabled = input.enabled;
+      if (!input.enabled) stored.healthStatus = "disabled";
+      else if (stored.healthStatus === "disabled") stored.healthStatus = "unknown";
+    }
+    if (input.healthStatus !== undefined) stored.healthStatus = input.healthStatus;
+    if (input.healthCheckedAt !== undefined) {
+      stored.healthCheckedAt = input.healthCheckedAt === null
+        ? null
+        : new Date(input.healthCheckedAt).toISOString();
+    }
+    if (input.healthLatencyMs !== undefined) stored.healthLatencyMs = input.healthLatencyMs;
+    if (input.healthError !== undefined) stored.healthError = input.healthError;
+    if (!stored.enabled) stored.healthStatus = "disabled";
+    stored.version += 1;
+    stored.updatedAt = new Date().toISOString();
+    this.registryAudit(mutation, "provider", stored.id, { version: stored.version });
+    return this.publicProvider(stored);
+  }
+
+  listProviders(enabledOnly = false): ProviderRecord[] {
+    return [...this.providers.values()]
+      .filter((provider) => !enabledOnly || provider.enabled)
+      .sort((left, right) =>
+        left.displayName.localeCompare(right.displayName) ||
+        left.id.localeCompare(right.id)
+      )
+      .map((provider) => this.publicProvider(provider));
+  }
+
+  findProvider(idOrSlug: string): ProviderRecord | undefined {
+    const stored = this.providers.get(idOrSlug) ??
+      [...this.providers.values()].find((provider) => provider.slug === idOrSlug);
+    return stored ? this.publicProvider(stored) : undefined;
+  }
+
+  setProviderCredential(
+    id: string,
+    expectedVersion: number,
+    credential: ProviderCredentialMutation | null,
+    mutation: RegistryMutationContext,
+  ): ProviderRecord {
+    this.validateRegistryMutation(mutation);
+    const stored = this.providers.get(id);
+    if (!stored) throw new DomainError("not_found", "Provider not found", 404);
+    if (stored.version !== expectedVersion) throw registryConflict();
+    if (credential) validateCredentialEnvelope(credential.envelope);
+    stored.credentialEnvelope = credential ? structuredClone(credential.envelope) : null;
+    stored.credentialUpdatedAt = credential ? new Date().toISOString() : null;
+    stored.hasCredential = credential !== null;
+    stored.healthStatus = stored.enabled ? "unknown" : "disabled";
+    stored.healthCheckedAt = null;
+    stored.healthLatencyMs = null;
+    stored.healthError = null;
+    stored.version += 1;
+    stored.updatedAt = new Date().toISOString();
+    this.registryAudit(mutation, "provider", stored.id, {
+      version: stored.version,
+      credentialChanged: true,
+      hasCredential: stored.hasCredential,
+    });
+    return this.publicProvider(stored);
+  }
+
+  getProviderCredential(id: string): StoredProviderCredential | undefined {
+    const stored = this.providers.get(id);
+    if (!stored?.credentialEnvelope) return undefined;
+    return {
+      providerId: stored.id,
+      envelope: structuredClone(stored.credentialEnvelope),
+    };
+  }
+
+  createProviderModel(
+    input: CreateProviderModelInput,
+    mutation: RegistryMutationContext,
+  ): ProviderModelRecord {
+    this.validateRegistryMutation(mutation);
+    validateProviderModelInput(input);
+    if (!this.providers.has(input.providerId)) {
+      throw new DomainError("not_found", "Provider not found", 404);
+    }
+    if (
+      [...this.providerModels.values()].some((model) => model.publicModelId === input.publicModelId)
+    ) {
+      throw new DomainError("model_id_taken", "Public model ID already exists", 409);
+    }
+    const now = new Date().toISOString();
+    const model: ProviderModelRecord = {
+      id: crypto.randomUUID(),
+      providerId: input.providerId,
+      publicModelId: input.publicModelId,
+      upstreamModelId: input.upstreamModelId.trim(),
+      displayName: input.displayName.trim(),
+      capabilities: [...input.capabilities],
+      contextWindow: input.contextWindow,
+      enabled: input.enabled ?? true,
+      version: 1,
+      customParams: structuredClone(input.customParams ?? {}),
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.providerModels.set(model.id, model);
+    this.registryAudit(mutation, "provider_model", model.id, {
+      providerId: model.providerId,
+      version: model.version,
+    });
+    return structuredClone(model);
+  }
+
+  updateProviderModel(
+    id: string,
+    expectedVersion: number,
+    input: UpdateProviderModelInput,
+    mutation: RegistryMutationContext,
+  ): ProviderModelRecord {
+    this.validateRegistryMutation(mutation);
+    validateProviderModelInput(input);
+    const model = this.providerModels.get(id);
+    if (!model) throw new DomainError("not_found", "Provider model not found", 404);
+    if (model.version !== expectedVersion) throw registryConflict();
+    if (
+      input.publicModelId !== undefined &&
+      [...this.providerModels.values()].some((candidate) =>
+        candidate.id !== id && candidate.publicModelId === input.publicModelId
+      )
+    ) throw new DomainError("model_id_taken", "Public model ID already exists", 409);
+    if (input.publicModelId !== undefined) model.publicModelId = input.publicModelId;
+    if (input.upstreamModelId !== undefined) model.upstreamModelId = input.upstreamModelId.trim();
+    if (input.displayName !== undefined) model.displayName = input.displayName.trim();
+    if (input.capabilities !== undefined) model.capabilities = [...input.capabilities];
+    if (input.contextWindow !== undefined) model.contextWindow = input.contextWindow;
+    if (input.enabled !== undefined) model.enabled = input.enabled;
+    if (input.customParams !== undefined) model.customParams = structuredClone(input.customParams);
+    model.version += 1;
+    model.updatedAt = new Date().toISOString();
+    this.registryAudit(mutation, "provider_model", model.id, {
+      providerId: model.providerId,
+      version: model.version,
+    });
+    return structuredClone(model);
+  }
+
+  listProviderModels(providerId?: string, enabledOnly = false): ProviderModelRecord[] {
+    return [...this.providerModels.values()]
+      .filter((model) =>
+        (!providerId || model.providerId === providerId) && (!enabledOnly || model.enabled)
+      )
+      .sort((left, right) =>
+        left.displayName.localeCompare(right.displayName) ||
+        left.id.localeCompare(right.id)
+      )
+      .map((model) => structuredClone(model));
+  }
+
+  findProviderModel(idOrPublicModelId: string): ProviderModelRecord | undefined {
+    const model = this.providerModels.get(idOrPublicModelId) ??
+      [...this.providerModels.values()].find((candidate) =>
+        candidate.publicModelId === idOrPublicModelId
+      );
+    return model ? structuredClone(model) : undefined;
+  }
+
+  createModelPriceVersion(
+    input: CreateModelPriceVersionInput,
+    mutation: RegistryMutationContext,
+  ): ModelPriceVersion {
+    this.validateRegistryMutation(mutation);
+    validatePriceInput(input);
+    const model = this.providerModels.get(input.providerModelId);
+    if (!model) throw new DomainError("not_found", "Provider model not found", 404);
+    if (model.version !== input.expectedModelVersion) throw registryConflict();
+    const effectiveAt = new Date(input.effectiveAt).toISOString();
+    const versions = this.modelPriceVersions.get(model.id) ?? [];
+    if (versions.some((price) => price.effectiveAt === effectiveAt)) {
+      throw new DomainError("price_effective_at_taken", "A price already starts at that time", 409);
+    }
+    const price: ModelPriceVersion = {
+      id: crypto.randomUUID(),
+      providerModelId: model.id,
+      effectiveAt,
+      inputMicrosPerMillion: input.inputMicrosPerMillion,
+      cachedInputMicrosPerMillion: input.cachedInputMicrosPerMillion,
+      reasoningMicrosPerMillion: input.reasoningMicrosPerMillion,
+      outputMicrosPerMillion: input.outputMicrosPerMillion,
+      fixedCallMicros: input.fixedCallMicros,
+      source: input.source.trim(),
+      createdAt: new Date().toISOString(),
+    };
+    versions.push(price);
+    this.modelPriceVersions.set(model.id, versions);
+    model.version += 1;
+    model.updatedAt = new Date().toISOString();
+    this.registryAudit(mutation, "model_price_version", price.id, {
+      providerModelId: model.id,
+      effectiveAt,
+      modelVersion: model.version,
+    });
+    return structuredClone(price);
+  }
+
+  listModelPriceVersions(providerModelId: string): ModelPriceVersion[] {
+    if (!this.providerModels.has(providerModelId)) {
+      throw new DomainError("not_found", "Provider model not found", 404);
+    }
+    return [...(this.modelPriceVersions.get(providerModelId) ?? [])]
+      .sort((left, right) =>
+        right.effectiveAt.localeCompare(left.effectiveAt) ||
+        right.id.localeCompare(left.id)
+      )
+      .map((price) => structuredClone(price));
+  }
+
+  effectiveModelPrice(providerModelId: string, at = new Date().toISOString()) {
+    if (!Number.isFinite(Date.parse(at))) {
+      throw new DomainError("validation_error", "Price lookup timestamp is invalid", 422);
+    }
+    const lookup = new Date(at).toISOString();
+    return this.listModelPriceVersions(providerModelId).find((price) =>
+      price.effectiveAt <= lookup
+    );
   }
 
   createApiToken(
@@ -346,7 +1579,6 @@ export class MemoryRepository {
       throw new DomainError("not_found", "Token not found", 404);
     }
     token.revokedAt = new Date().toISOString();
-    return token;
   }
 
   credit(userId: string, usageRunId: string, kind: LedgerEntry["kind"], amountMicros: number) {
@@ -371,7 +1603,18 @@ export class MemoryRepository {
     return entry;
   }
 
-  reserve(userId: string, runId: string, model: string, amountMicros: number) {
+  reserve(
+    userId: string,
+    runId: string,
+    model: string,
+    amountMicros: number,
+    _provider = "unknown",
+    _tokenId?: string,
+    pricingSnapshot?: UsagePricingSnapshot,
+  ) {
+    if (pricingSnapshot !== undefined && !isUsagePricingSnapshot(pricingSnapshot)) {
+      throw new DomainError("validation_error", "Usage pricing snapshot is invalid", 422);
+    }
     const existing = this.usageRuns.get(runId);
     if (existing) {
       throw new DomainError(
@@ -391,6 +1634,9 @@ export class MemoryRepository {
       inputTokens: 0,
       outputTokens: 0,
       latencyMs: 0,
+      pricingSnapshot: pricingSnapshot ? structuredClone(pricingSnapshot) : null,
+      generationLeaseToken: null,
+      generationLeaseExpiresAt: null,
       createdAt: new Date().toISOString(),
     };
     this.usageRuns.set(runId, run);
@@ -428,6 +1674,415 @@ export class MemoryRepository {
     return run;
   }
 
+  #apiKey(userId: string, endpoint: ApiIdempotencyEndpoint, key: string) {
+    return `${userId}:${endpoint}:${key}`;
+  }
+  #apiRequest(id: string) {
+    const request = this.apiIdempotencyRequests.get(id);
+    if (!request) throw new DomainError("not_found", "Idempotent request not found", 404);
+    return request;
+  }
+  #replayQuota(quota?: ApiReplayQuota): ApiReplayQuota {
+    const value = quota ?? { maxRequests: 256, maxBytes: 67_108_864, maxEvents: 20_000 };
+    if (
+      !Number.isSafeInteger(value.maxRequests) || value.maxRequests < 1 ||
+      !Number.isSafeInteger(value.maxBytes) || value.maxBytes < 1 ||
+      !Number.isSafeInteger(value.maxEvents) || value.maxEvents < 1
+    ) throw new DomainError("validation_error", "Invalid replay quota", 422);
+    return value;
+  }
+  #replayTotals(userId: string) {
+    const encoder = new TextEncoder();
+    let requests = 0;
+    let events = 0;
+    let bytes = 0;
+    for (const request of this.apiIdempotencyRequests.values()) {
+      if (request.userId !== userId || Date.parse(request.expiresAt) <= Date.now()) continue;
+      requests++;
+      events += request.frames.length;
+      bytes += request.frames.reduce((sum, item) => sum + encoder.encode(item.frame).length, 0);
+      if (request.responseBody) bytes += encoder.encode(request.responseBody).length;
+    }
+    return { requests, events, bytes };
+  }
+  #assertLease(request: ApiIdempotencyRequest, leaseToken: string) {
+    if (
+      request.state !== "in_progress" || request.leaseToken !== leaseToken ||
+      !request.leaseExpiresAt || Date.parse(request.leaseExpiresAt) <= Date.now()
+    ) {
+      throw new DomainError("stale_lease", "Idempotent request lease is no longer active", 409);
+    }
+  }
+  beginApiRequest(input: BeginApiRequestInput): BeginApiRequestResult {
+    if (
+      input.idempotencyKey.length < 8 || input.idempotencyKey.length > 200 ||
+      !/^[0-9a-f]{64}$/.test(input.requestHash) || input.reserveMicros < 0 ||
+      (input.leaseSeconds ?? 120) < 1 ||
+      (input.retentionSeconds ?? 86400) < 60 || (input.retentionSeconds ?? 86400) > 2_592_000
+    ) throw new DomainError("validation_error", "Invalid idempotent request parameters", 422);
+    const key = this.#apiKey(input.userId, input.endpoint, input.idempotencyKey);
+    let priorId = this.apiIdempotencyKeys.get(key);
+    if (priorId) {
+      const prior = this.#apiRequest(priorId);
+      if (prior.state !== "in_progress" && Date.parse(prior.expiresAt) <= Date.now()) {
+        this.apiIdempotencyRequests.delete(prior.id);
+        this.apiIdempotencyKeys.delete(key);
+        priorId = undefined;
+      }
+    }
+    if (priorId) {
+      const prior = this.#apiRequest(priorId);
+      if (prior.requestHash !== input.requestHash || prior.stream !== input.stream) {
+        throw new DomainError("idempotency_conflict", "Idempotency key payload differs", 409);
+      }
+      if (prior.state === "completed" || prior.state === "failed") {
+        return { kind: prior.state, request: structuredClone(prior) };
+      }
+      return {
+        kind: "in_progress",
+        request: structuredClone(prior),
+        retryAfterSeconds: Math.max(
+          1,
+          Math.ceil((Date.parse(prior.leaseExpiresAt!) - Date.now()) / 1000),
+        ),
+      };
+    }
+    const quota = this.#replayQuota(input.quota);
+    if (this.#replayTotals(input.userId).requests >= quota.maxRequests) {
+      throw new DomainError("replay_quota_exceeded", "Replay request quota exceeded", 429);
+    }
+    const usageRun = this.reserve(
+      input.userId,
+      input.runId,
+      input.model,
+      input.reserveMicros,
+      input.provider,
+      input.tokenId,
+      input.pricingSnapshot,
+    );
+    const now = new Date();
+    const leaseToken = crypto.randomUUID();
+    const request: ApiIdempotencyRequest = {
+      id: crypto.randomUUID(),
+      userId: input.userId,
+      endpoint: input.endpoint,
+      idempotencyKey: input.idempotencyKey,
+      requestHash: input.requestHash,
+      stream: input.stream,
+      model: input.model,
+      state: "in_progress",
+      leaseToken,
+      leaseExpiresAt: new Date(now.getTime() + (input.leaseSeconds ?? 120) * 1000).toISOString(),
+      usageRunId: input.runId,
+      responseStatus: null,
+      responseHeaders: {},
+      responseBody: null,
+      failureStartedStream: false,
+      observedInputTokens: 0,
+      observedOutputTokens: 0,
+      observedCostMicros: 0,
+      observedLatencyMs: 0,
+      retentionSeconds: input.retentionSeconds ?? 86400,
+      frames: [],
+      createdAt: now.toISOString(),
+      completedAt: null,
+      expiresAt: new Date(now.getTime() + (input.retentionSeconds ?? 86400) * 1000).toISOString(),
+    };
+    this.apiIdempotencyRequests.set(request.id, request);
+    this.apiIdempotencyKeys.set(key, request.id);
+    return { kind: "started", request: structuredClone(request), leaseToken, usageRun };
+  }
+  getApiRequest(userId: string, endpoint: ApiIdempotencyEndpoint, idempotencyKey: string) {
+    const id = this.apiIdempotencyKeys.get(this.#apiKey(userId, endpoint, idempotencyKey));
+    return id ? structuredClone(this.#apiRequest(id)) : undefined;
+  }
+  appendApiSseFrame(
+    id: string,
+    leaseToken: string,
+    sequence: number,
+    frame: string,
+    leaseSeconds = 120,
+    observation?: ApiUsageObservation,
+    quota?: ApiReplayQuota,
+  ) {
+    return this.appendApiSseFrames(
+      id,
+      leaseToken,
+      [{ sequence, frame }],
+      leaseSeconds,
+      observation,
+      quota,
+    );
+  }
+  appendApiSseFrames(
+    id: string,
+    leaseToken: string,
+    frames: Array<{ sequence: number; frame: string }>,
+    leaseSeconds = 120,
+    observation?: ApiUsageObservation,
+    quotaInput?: ApiReplayQuota,
+  ) {
+    const request = this.#apiRequest(id);
+    this.#assertLease(request, leaseToken);
+    if (frames.length === 0) return structuredClone(request);
+    const encoder = new TextEncoder();
+    const encodedBytes = frames.map(({ frame }) => encoder.encode(frame).length);
+    if (encodedBytes.some((bytes) => bytes > 1_048_576)) {
+      throw new DomainError("response_too_large", "SSE frame exceeds replay limit", 413);
+    }
+    const total = request.frames.reduce(
+      (sum, item) => sum + encoder.encode(item.frame).length,
+      0,
+    );
+    const pending: Array<{ sequence: number; frame: string; createdAt: string }> = [];
+    for (const item of frames) {
+      const existing = request.frames[item.sequence];
+      if (existing) {
+        if (existing.frame !== item.frame) {
+          throw new DomainError("sequence_conflict", "SSE frame sequence payload differs", 409);
+        }
+        continue;
+      }
+      if (item.sequence !== request.frames.length + pending.length) {
+        throw new DomainError("sequence_conflict", "SSE replay sequence is not contiguous", 409);
+      }
+      pending.push({ ...item, createdAt: new Date().toISOString() });
+    }
+    const pendingBytes = pending.reduce(
+      (sum, item) => sum + encoder.encode(item.frame).length,
+      0,
+    );
+    if (request.frames.length + pending.length > 10_000 || total + pendingBytes > 16_777_216) {
+      throw new DomainError("response_too_large", "SSE replay exceeds storage limit", 413);
+    }
+    const quota = this.#replayQuota(quotaInput);
+    const aggregate = this.#replayTotals(request.userId);
+    if (
+      aggregate.events + pending.length > quota.maxEvents ||
+      aggregate.bytes + pendingBytes > quota.maxBytes
+    ) throw new DomainError("replay_quota_exceeded", "User replay storage quota exceeded", 429);
+    request.frames.push(...pending);
+    if (observation) {
+      request.observedInputTokens = Math.max(request.observedInputTokens, observation.inputTokens);
+      request.observedOutputTokens = Math.max(
+        request.observedOutputTokens,
+        observation.outputTokens,
+      );
+      request.observedCostMicros = Math.max(request.observedCostMicros, observation.costMicros);
+      request.observedLatencyMs = Math.max(request.observedLatencyMs, observation.latencyMs);
+    }
+    request.leaseExpiresAt = new Date(Date.now() + leaseSeconds * 1000).toISOString();
+    return structuredClone(request);
+  }
+  heartbeatApiRequest(
+    id: string,
+    leaseToken: string,
+    leaseSeconds = 120,
+    observation?: ApiUsageObservation,
+  ) {
+    const request = this.#apiRequest(id);
+    this.#assertLease(request, leaseToken);
+    if (observation) {
+      request.observedInputTokens = Math.max(request.observedInputTokens, observation.inputTokens);
+      request.observedOutputTokens = Math.max(
+        request.observedOutputTokens,
+        observation.outputTokens,
+      );
+      request.observedCostMicros = Math.max(request.observedCostMicros, observation.costMicros);
+      request.observedLatencyMs = Math.max(request.observedLatencyMs, observation.latencyMs);
+    }
+    request.leaseExpiresAt = new Date(Date.now() + leaseSeconds * 1000).toISOString();
+  }
+  #completeApi(input: CompleteApiRequestInput, stream: boolean) {
+    const request = this.#apiRequest(input.id);
+    if (request.state === "completed") return structuredClone(request);
+    this.#assertLease(request, input.leaseToken);
+    const encoder = new TextEncoder();
+    const quota = this.#replayQuota(input.quota);
+    const aggregate = this.#replayTotals(request.userId);
+    if (!stream && input.frames?.length) {
+      throw new DomainError("validation_error", "JSON completion cannot include SSE frames", 422);
+    }
+    const pending: Array<{ sequence: number; frame: string; createdAt: string }> = [];
+    for (const item of input.frames ?? []) {
+      const bytes = encoder.encode(item.frame).length;
+      if (bytes > 1_048_576) {
+        throw new DomainError("response_too_large", "SSE frame exceeds replay limit", 413);
+      }
+      const existing = request.frames[item.sequence];
+      if (existing) {
+        if (existing.frame !== item.frame) {
+          throw new DomainError("sequence_conflict", "SSE frame sequence payload differs", 409);
+        }
+        continue;
+      }
+      if (item.sequence !== request.frames.length + pending.length) {
+        throw new DomainError("sequence_conflict", "SSE replay sequence is not contiguous", 409);
+      }
+      pending.push({ ...item, createdAt: new Date().toISOString() });
+    }
+    const pendingBytes = pending.reduce(
+      (sum, item) => sum + encoder.encode(item.frame).length,
+      0,
+    );
+    const responseBytes = input.responseBody ? encoder.encode(input.responseBody).length : 0;
+    const terminalBytes = input.terminalFrame ? encoder.encode(input.terminalFrame).length : 0;
+    const existingBytes = request.frames.reduce(
+      (sum, item) => sum + encoder.encode(item.frame).length,
+      0,
+    );
+    if (terminalBytes > 1_048_576) {
+      throw new DomainError("response_too_large", "Terminal SSE frame exceeds replay limit", 413);
+    }
+    if (
+      request.frames.length + pending.length + (input.terminalFrame ? 1 : 0) > 10_000 ||
+      existingBytes + pendingBytes + terminalBytes > 16_777_216
+    ) throw new DomainError("response_too_large", "SSE replay exceeds storage limit", 413);
+    if (
+      aggregate.events + pending.length + (input.terminalFrame ? 1 : 0) > quota.maxEvents ||
+      aggregate.bytes + responseBytes + pendingBytes + terminalBytes > quota.maxBytes
+    ) throw new DomainError("replay_quota_exceeded", "User replay storage quota exceeded", 429);
+    const run = this.usageRuns.get(request.usageRunId);
+    if (!run || run.status !== "reserved") {
+      throw new DomainError("invalid_usage_state", "Usage run is not reserved", 409);
+    }
+    if (this.users.get(request.userId)!.balanceMicros + run.reservedMicros - input.costMicros < 0) {
+      throw new DomainError("insufficient_credit", "Actual cost exceeds available credit", 402);
+    }
+    this.settle(
+      request.usageRunId,
+      input.costMicros,
+      input.inputTokens,
+      input.outputTokens,
+      input.latencyMs,
+    );
+    request.frames.push(...pending);
+    if (stream && input.terminalFrame !== undefined) {
+      request.frames.push({
+        sequence: request.frames.length,
+        frame: input.terminalFrame,
+        createdAt: new Date().toISOString(),
+      });
+    }
+    request.state = "completed";
+    request.leaseToken = null;
+    request.leaseExpiresAt = null;
+    request.responseStatus = input.responseStatus;
+    request.responseHeaders = input.responseHeaders ?? {};
+    request.responseBody = input.responseBody ?? null;
+    request.completedAt = new Date().toISOString();
+    request.expiresAt = new Date(Date.now() + request.retentionSeconds * 1000).toISOString();
+    return structuredClone(request);
+  }
+  completeApiJson(input: CompleteApiRequestInput) {
+    return this.#completeApi(input, false);
+  }
+  completeApiStream(input: CompleteApiRequestInput) {
+    return this.#completeApi(input, true);
+  }
+  failApiRequest(input: FailApiRequestInput) {
+    const request = this.#apiRequest(input.id);
+    if (request.state === "failed") return structuredClone(request);
+    this.#assertLease(request, input.leaseToken);
+    if (input.billing.mode === "settle") {
+      const run = this.usageRuns.get(request.usageRunId);
+      if (!run || run.status !== "reserved") {
+        throw new DomainError("invalid_usage_state", "Usage run is not reserved", 409);
+      }
+      if (
+        this.users.get(request.userId)!.balanceMicros + run.reservedMicros -
+            input.billing.costMicros < 0
+      ) throw new DomainError("insufficient_credit", "Actual cost exceeds available credit", 402);
+    }
+    const failureStartedStream = request.frames.length > 0 || input.terminalFrame !== undefined;
+    if (input.terminalFrame !== undefined) {
+      this.appendApiSseFrame(
+        request.id,
+        input.leaseToken,
+        request.frames.length,
+        input.terminalFrame,
+      );
+    }
+    if (input.billing.mode === "refund") this.refund(request.usageRunId);
+    else {
+      this.settle(
+        request.usageRunId,
+        input.billing.costMicros,
+        input.billing.inputTokens,
+        input.billing.outputTokens,
+        input.billing.latencyMs,
+      );
+    }
+    request.state = "failed";
+    request.failureStartedStream = failureStartedStream;
+    request.leaseToken = null;
+    request.leaseExpiresAt = null;
+    request.responseStatus = input.responseStatus;
+    request.responseHeaders = input.responseHeaders ?? {};
+    request.responseBody = input.responseBody;
+    request.completedAt = new Date().toISOString();
+    request.expiresAt = new Date(Date.now() + request.retentionSeconds * 1000).toISOString();
+    return structuredClone(request);
+  }
+  reapStaleApiRequests(limit = 100) {
+    let count = 0;
+    for (const request of this.apiIdempotencyRequests.values()) {
+      if (count >= limit) break;
+      if (
+        request.state !== "in_progress" || !request.leaseExpiresAt ||
+        Date.parse(request.leaseExpiresAt) > Date.now()
+      ) continue;
+      if (request.observedCostMicros > 0) {
+        this.settle(
+          request.usageRunId,
+          request.observedCostMicros,
+          request.observedInputTokens,
+          request.observedOutputTokens,
+          request.observedLatencyMs,
+        );
+      } else this.refund(request.usageRunId);
+      request.state = "failed";
+      request.responseStatus = 500;
+      request.responseBody = JSON.stringify({
+        error: {
+          message: "Request interrupted before completion",
+          type: "server_error",
+          code: "request_abandoned",
+        },
+      });
+      request.failureStartedStream = request.frames.length > 0;
+      if (request.failureStartedStream) {
+        const frame = request.endpoint === "responses"
+          ? `event: error\ndata: ${request.responseBody}\n\n`
+          : `data: ${request.responseBody}\n\n`;
+        request.frames.push({
+          sequence: request.frames.length,
+          frame,
+          createdAt: new Date().toISOString(),
+        });
+      }
+      request.leaseToken = null;
+      request.leaseExpiresAt = null;
+      request.completedAt = new Date().toISOString();
+      request.expiresAt = new Date(Date.now() + request.retentionSeconds * 1000).toISOString();
+      count++;
+    }
+    return count;
+  }
+  pruneExpiredApiRequests(limit = 100) {
+    let count = 0;
+    for (const [id, request] of this.apiIdempotencyRequests) {
+      if (count >= limit) break;
+      if (request.state === "in_progress" || Date.parse(request.expiresAt) > Date.now()) continue;
+      this.apiIdempotencyRequests.delete(id);
+      this.apiIdempotencyKeys.delete(
+        this.#apiKey(request.userId, request.endpoint, request.idempotencyKey),
+      );
+      count++;
+    }
+    return count;
+  }
+
   usage(userId: string): UsageSummary {
     const user = this.users.get(userId);
     if (!user) throw new DomainError("not_found", "User not found", 404);
@@ -441,5 +2096,36 @@ export class MemoryRepository {
       outputTokens: runs.reduce((n, r) => n + r.outputTokens, 0),
       spentMicros: runs.reduce((n, r) => n + r.costMicros, 0),
     };
+  }
+  adminSummary() {
+    return {
+      calls: this.usageRuns.size,
+      users: this.users.size,
+      balanceMicros: [...this.users.values()].reduce((sum, value) => sum + value.balanceMicros, 0),
+      ledger: [...this.ledger],
+    };
+  }
+  listJobs() {
+    return [...this.jobs];
+  }
+  readiness() {
+    return { ready: true, storage: this.storageKind };
+  }
+
+  listLedger(userId: string): LedgerEntry[] {
+    return this.ledger.filter((entry) => entry.userId === userId);
+  }
+
+  enqueueJob(type: string, payload: unknown): string {
+    const id = crypto.randomUUID();
+    this.jobs.push({
+      id,
+      type,
+      payload,
+      status: "queued",
+      attempts: 0,
+      createdAt: new Date().toISOString(),
+    });
+    return id;
   }
 }

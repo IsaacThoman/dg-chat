@@ -19,28 +19,50 @@ Sessions use secure, HTTP-only, same-site cookies in production. State-changing 
 requests enforce an exact Origin when one is present. Approval, role, suspension, and deletion are
 independent states; suspension invalidates sessions and API tokens. The final active approved
 administrator cannot be rejected, suspended, or deleted. Redis-backed distributed rate limiting,
-email verification, and OIDC remain required before exposing public registration to the internet.
+hash-only one-time email verification and password-reset tokens, transactional credential
+invalidation, session revocation, and immutable identity audit events are enforced. Email
+verification is opt-in with `REQUIRE_EMAIL_VERIFICATION=true`; leave it false for approval-only
+registration without SMTP. When verification is required, configure SMTP before exposing
+registration. Generic OIDC remains a follow-up integration.
 
 Markdown, Mermaid, citations, artifacts, filenames, provider errors, and tool results are rendered
 as hostile content under a restrictive Content Security Policy. Raw HTML is disabled unless passed
 through a maintained sanitizer. Spreadsheet formulas are escaped in CSV exports.
 
-File upload routes are deliberately unavailable in the current release. Do not enable them until
-streaming limits, MIME sniffing, quarantine scanning, immutable object keys, signed access, and
-ownership checks are implemented and tested.
+File upload routes stream multipart bodies through byte and concurrency limits, MIME sniffing,
+filename normalization, immutable object keys, ownership checks, and image dimension/decompression
+guards. Objects are private in S3-compatible storage; direct reads require ownership, while
+tombstoned objects remain available only through an immutable historical message link. PNG and JPEG
+files receive a bounded full decode before becoming ready. GIF and WebP files remain quarantined
+because a trusted full decoder is not yet configured.
 
-URL fetchers resolve DNS and reject loopback, private, link-local, multicast, Unix-socket, and cloud
-metadata destinations. They re-check every redirect and cap redirects, bytes, decompressed bytes,
-dimensions, and duration. Tool and sandbox egress use explicit allowlists.
+The current attachment worker acknowledges terminal inspection states; it is not an antivirus,
+content-disarm, PDF, Office, audio, or archive scanner. PDF and audio acceptance currently relies on
+bounded upload handling and MIME/signature checks, so deployments requiring malware scanning must
+add an external quarantine scanner before allowing those formats. Bounded, strict UTF-8 ingestion is
+implemented only for `text/plain` and fully validated JSON, with deterministic citation chunks.
+Office and PDF extraction, OCR, embeddings/vector retrieval, object garbage collection, and
+retention-aware deletion are not implemented.
+
+The current OpenAI-compatible provider transport resolves every A and AAAA answer, rejects
+special-use destinations, and pins the approved address while preserving TLS hostname validation. It
+rejects redirects and bounds response and streaming bytes. Future OCR, search, tool, ingestion, and
+sandbox fetchers must independently enforce redirect, decompression, image-dimension, and duration
+limits before those features are enabled.
 
 ## Secrets and privacy
 
 API token plaintext is revealed once and never logged; only its SHA-256 hash and preview persist.
-The current provider credential is supplied by environment variable and is never exposed through an
-admin API. A future provider registry must add envelope encryption before accepting credentials.
+Provider credentials use randomized per-credential AES-256-GCM data keys wrapped by an
+environment-supplied keyring. Envelopes are bound to the provider and credential version, public
+admin responses expose only credential presence/update time, and plaintext is never revealed after
+replacement. Provider discovery reuses the DNS-pinned, HTTPS-only, no-redirect transport and stores
+only bounded failure categories.
 
-Chat snapshots are private by default, revocable, read-only, pinned to an immutable leaf, and
-independently control identity and attachment exposure. Revocation must invalidate cached access.
+Public chat snapshots are not implemented in the current release. Conversations remain private to
+their owner. A future sharing implementation must be revocable, read-only, pinned to an immutable
+leaf, independently control identity and attachment exposure, and invalidate cached access on
+revocation.
 
 ## Reporting vulnerabilities
 

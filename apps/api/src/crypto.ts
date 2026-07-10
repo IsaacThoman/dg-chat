@@ -10,6 +10,11 @@ export async function sha256(value: string): Promise<string> {
   return encodeBase64Url(new Uint8Array(digest));
 }
 
+export async function sha256Hex(value: string): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", encoder.encode(value)));
+  return [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 export async function hashPassword(password: string, salt = randomToken()): Promise<string> {
   const key = await crypto.subtle.importKey("raw", encoder.encode(password), "PBKDF2", false, [
     "deriveBits",

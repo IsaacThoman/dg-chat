@@ -49,6 +49,8 @@ services:
       - .:/workspace
       - deno-cache:/deno-dir
     read_only: false
+    healthcheck:
+      disable: true
 
   postgres:
     ports:

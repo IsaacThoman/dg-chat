@@ -6,6 +6,11 @@ export const adminEmail = env("E2E_ADMIN_EMAIL") ?? "admin@e2e.invalid";
 export const adminPassword = env("E2E_ADMIN_PASSWORD") ?? "Correct-Horse-42-Battery!";
 
 export async function bootstrap(request: APIRequestContext): Promise<void> {
+  const status = await request.get(`${apiURL}/api/setup/status`);
+  expect(status.ok()).toBeTruthy();
+  const setup = await status.json() as { bootstrapRequired?: boolean };
+  if (setup.bootstrapRequired === false) return;
+
   const response = await request.post(`${apiURL}/api/setup/bootstrap`, {
     headers: { "x-setup-token": env("SETUP_TOKEN") ?? "e2e-setup-token" },
     data: { name: "E2E Administrator", email: adminEmail, password: adminPassword },
@@ -26,11 +31,19 @@ export async function login(
 }
 
 export async function createChat(page: Page): Promise<void> {
+  const activeActions = page.locator(".conversation-row.active [data-conversation-actions]");
+  const previousId = await activeActions.count() === 1
+    ? await activeActions.getAttribute("data-conversation-actions")
+    : null;
   const button = page.getByRole("button", { name: "New chat ⌘ K", exact: true });
   if ((page.viewportSize()?.width ?? 1280) <= 800) {
     await page.getByRole("button", { name: "Open menu", exact: true }).click();
   }
   await button.click();
+  await expect.poll(
+    () => activeActions.getAttribute("data-conversation-actions"),
+    { message: "the newly created conversation to become active" },
+  ).not.toBe(previousId);
 }
 
 export function uniqueUser(prefix = "applicant") {

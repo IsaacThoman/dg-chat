@@ -2,10 +2,18 @@
   "name": "@dg-chat/api",
   "version": "0.1.0",
   "exports": "./src/app.ts",
-  "imports": { "hono": "npm:hono@4.12.28", "hono/": "npm:hono@4.12.28/" },
+  "imports": {
+    "@fastify/busboy": "npm:@fastify/busboy@3.2.0",
+    "@types/node": "npm:@types/node@22.15.3",
+    "hono": "npm:hono@4.12.28",
+    "hono/": "npm:hono@4.12.28/",
+    "imagescript": "npm:imagescript@1.3.1",
+    "ioredis": "npm:ioredis@5.8.2",
+    "nodemailer": "npm:nodemailer@9.0.3"
+  },
   "tasks": {
     "dev": "deno run --watch -A src/main.ts",
     "start": "deno run -A src/main.ts",
-    "test": "deno test --allow-env --allow-net --allow-read"
+    "test": "deno test --allow-env --allow-net --allow-read --allow-write"
   }
 }

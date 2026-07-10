@@ -43,6 +43,19 @@ npx playwright install chromium
 npx playwright test
 ```
 
+Run the normalized PostgreSQL suite against a migrated disposable database by setting both
+`DATABASE_URL` and `TEST_DATABASE_URL`, then running `deno task db:migrate` followed by
+`deno test packages/database --allow-env --allow-net --allow-read --allow-write`.
+
+With a disposable DG Chat stack running, execute the supported OpenAI SDK contract surface with:
+
+```sh
+SETUP_TOKEN=your-disposable-setup-token bash tests/run-openai-contracts.sh
+```
+
+The runner uses pinned official JavaScript and Python OpenAI clients. Unsupported endpoints remain
+listed as explicit TODOs in `tests/contracts/unsupported-contracts.json` until implemented.
+
 Playwright defaults to `http://localhost:5173`. Override `E2E_BASE_URL`, `E2E_API_URL`,
 `E2E_ADMIN_EMAIL`, `E2E_ADMIN_PASSWORD`, and `SETUP_TOKEN` for another environment. Tests create
 unique accounts and must only run against disposable installations.

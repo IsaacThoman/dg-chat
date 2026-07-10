@@ -2,7 +2,13 @@
 useDefault = true
 
 [allowlist]
-description = "Static, non-secret encryption key used only by the isolated CI Compose stack"
+description = "Known non-secret CI fixture and environment-variable identifiers"
 regexTarget = "match"
-regexes = ['''Y2ktZW5jcnlwdGlvbi1rZXktMzItYnl0ZXMtbG9uZw==''']
-paths = ['''\.github/workflows/ci\.yml''']
+regexes = [
+  '''Y2ktZW5jcnlwdGlvbi1rZXktMzItYnl0ZXMtbG9uZw==''',
+  '''env\.S3_SECRET_KEY''',
+]
+paths = [
+  '''\.github/workflows/ci\.yml''',
+  '''packages/database/src/object-store\.ts''',
+]

@@ -2,12 +2,16 @@ name: CI
 
 on:
   push:
-    branches: [main, "codex/**"]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
+
+env:
+  S3_ACCESS_KEY: ci-dgchat
+  S3_SECRET_KEY: ci-dgchat-application-secret
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -25,7 +29,7 @@ jobs:
           deno-version: v2.x
           cache: true
       - name: Install dependencies
-        run: deno install --frozen=false
+        run: deno install --frozen
       - name: Check formatting, lint, and types
         run: deno task check
       - name: Unit and integration tests
@@ -38,9 +42,47 @@ jobs:
           MINIO_ROOT_USER: ci-minio-user
           MINIO_ROOT_PASSWORD: ci-minio-password
           APP_SECRET: ci-app-secret-at-least-thirty-two-bytes
-          ENCRYPTION_KEY: Y2ktZW5jcnlwdGlvbi1rZXktMzItYnl0ZXMtbG9uZw==
+          ENCRYPTION_KEY: Y2ktZW5jcnlwdGlvbi1rZXktMzItYnl0ZXMtbG9uZyE=
           SETUP_TOKEN: e2e-setup-token
-        run: docker compose -f docker-compose.yml -f docker-compose.ci.yml config --quiet
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml config --quiet
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml -f docker-compose.contracts.yml config --quiet
+
+  postgres-integration:
+    name: PostgreSQL integration and concurrency
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: dgchat
+          POSTGRES_PASSWORD: integration-password
+          POSTGRES_DB: dgchat_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U dgchat -d dgchat_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql://dgchat:integration-password@localhost:5432/dgchat_test
+      TEST_DATABASE_URL: postgresql://dgchat:integration-password@localhost:5432/dgchat_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+          cache: true
+      - name: Install dependencies
+        run: deno install --frozen
+      - name: Apply migrations
+        run: deno task db:migrate
+      - name: Run database integration, concurrency, and backfill tests
+        run: |
+          deno test packages/database --allow-env --allow-net --allow-read --allow-write
+          deno test apps/worker --allow-env --allow-net --allow-read --allow-write
 
   containers:
     name: Container build
@@ -60,17 +102,65 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.target }}
           cache-to: type=gha,mode=max,scope=${{ matrix.target }}
 
-  e2e:
-    name: Browser and contract tests
+  openai-contracts:
+    name: Official OpenAI SDK contracts
     runs-on: ubuntu-latest
-    needs: [quality, containers]
+    needs: [quality, containers, postgres-integration]
+    timeout-minutes: 30
+    env:
+      POSTGRES_PASSWORD: contract-postgres-password
+      MINIO_ROOT_USER: contract-minio-user
+      MINIO_ROOT_PASSWORD: contract-minio-password
+      APP_SECRET: contract-app-secret-at-least-thirty-two-bytes
+      ENCRYPTION_KEY: Y29udHJhY3QtZW5jcnlwdGlvbi1rZXktMzItYnl0ZXM=
+      SETUP_TOKEN: contract-setup-token
+      CONTRACT_API_URL: http://localhost:8000
+      CI: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+          cache: true
+      - name: Start disposable stack
+        run: docker compose -f docker-compose.yml -f docker-compose.ci.yml -f docker-compose.contracts.yml up -d --build
+      - name: Wait for readiness
+        run: deno run --allow-net tests/wait-for-ready.ts http://localhost:8000/ready 180000
+      - name: Assert migration-safe worker startup
+        run: bash tests/assert-compose-health.sh -f docker-compose.yml -f docker-compose.ci.yml -f docker-compose.contracts.yml
+      - name: Run official SDK and upstream streaming contracts
+        run: bash tests/run-openai-contracts.sh
+      - name: Capture service logs
+        if: failure()
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml -f docker-compose.contracts.yml logs --no-color > compose-contracts.log
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml -f docker-compose.contracts.yml exec -T mock-provider \
+            deno eval 'fetch("http://127.0.0.1:4010/__test/state", {headers:{authorization:"Bearer ci-mock-control-token"}}).then(async r => { console.log(await r.text()); if (!r.ok) Deno.exit(1); })' \
+            > mock-provider-state.json || true
+      - name: Upload service logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-contract-logs
+          path: |
+            compose-contracts.log
+            mock-provider-state.json
+          retention-days: 7
+      - name: Stop disposable stack
+        if: always()
+        run: docker compose -f docker-compose.yml -f docker-compose.ci.yml -f docker-compose.contracts.yml down -v --remove-orphans
+
+  e2e:
+    name: Browser tests
+    runs-on: ubuntu-latest
+    needs: [quality, containers, postgres-integration]
     timeout-minutes: 30
     env:
       POSTGRES_PASSWORD: ci-postgres-password
       MINIO_ROOT_USER: ci-minio-user
       MINIO_ROOT_PASSWORD: ci-minio-password
       APP_SECRET: ci-app-secret-at-least-thirty-two-bytes
-      ENCRYPTION_KEY: Y2ktZW5jcnlwdGlvbi1rZXktMzItYnl0ZXMtbG9uZw==
+      ENCRYPTION_KEY: Y2ktZW5jcnlwdGlvbi1rZXktMzItYnl0ZXMtbG9uZyE=
       SETUP_TOKEN: e2e-setup-token
       E2E_BASE_URL: http://localhost:8000
       E2E_API_URL: http://localhost:8000
@@ -89,6 +179,8 @@ jobs:
         run: docker compose -f docker-compose.yml -f docker-compose.ci.yml up -d --build
       - name: Wait for readiness
         run: deno run --allow-net tests/wait-for-ready.ts http://localhost:8000/ready 180000
+      - name: Assert migration-safe worker startup
+        run: bash tests/assert-compose-health.sh -f docker-compose.yml -f docker-compose.ci.yml
       - name: Install browser
         run: npx playwright install --with-deps chromium
       - name: Run Playwright

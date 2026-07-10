@@ -6,9 +6,10 @@ compatibility endpoints live under `/v1/*`.
 
 ## Target runtime topology
 
-The Compose stack provisions the full dependency topology. The current application release uses
-PostgreSQL for durable single-instance snapshots and jobs; Redis coordination and S3-backed uploads
-are reserved for the next implementation milestone and are not yet on the request path.
+The Compose stack provisions the full dependency topology. PostgreSQL is authoritative for the
+normalized domain model, durable jobs, accounting, and OpenAI replay state. Redis is on the request
+path for distributed rate limits. MinIO is provisioned, but S3-backed uploads are not yet on the
+request path.
 
 ```mermaid
 flowchart LR
@@ -26,12 +27,18 @@ flowchart LR
 
 - PostgreSQL is authoritative for identity, immutable conversations, accounting, durable jobs,
   configuration, and audit records.
-- Redis contains disposable coordination state: rate-limit windows, circuit breakers, presence, and
-  stream metadata. Correctness must not depend on Redis persistence.
-- S3-compatible storage owns immutable upload objects. Database rows authorize and reference
-  objects; messages never own or overwrite object bytes.
+- Redis currently contains disposable rate-limit windows. Circuit breakers, presence, and ephemeral
+  stream coordination remain planned; correctness must not depend on Redis persistence.
+- S3-compatible storage owns immutable upload objects. Browser attachment routes and the
+  OpenAI-compatible Files lifecycle stream uploads into private objects and authorize every read by
+  owner or immutable historical message link. Attachment deletion is a logical tombstone so edits
+  cannot break an earlier conversation branch; retention-aware object garbage collection remains
+  planned.
 - The worker claims durable jobs using `FOR UPDATE SKIP LOCKED`. Handlers must be idempotent and
-  retry-safe.
+  retry-safe. Text and JSON attachments use a separate, fenced ingestion state machine that streams
+  private objects through byte/time and UTF-8/JSON validation, then transactionally replaces stable,
+  citation-aware chunks. PDF/Office extraction, OCR, embeddings/vector retrieval, malware scanning,
+  and quarantined-file reprocessing remain planned.
 
 ## Core invariants
 
@@ -45,8 +52,11 @@ refunds exactly once using an idempotency key. Derived balances are cacheable, w
 remain authoritative.
 
 API token plaintext is shown once. Only a cryptographic hash, a short preview, scope metadata, and
-usage timestamps persist. The current provider credential is environment-only; an admin-managed
-provider registry must use envelope encryption before it can be enabled.
+usage timestamps persist. Admin-managed provider credentials use per-version envelope encryption;
+the API decrypts them only while resolving an enabled, effectively priced runtime model. Provider,
+model, credential, and append-only price mutations use optimistic versions and atomic audit writes.
+Usage reservations snapshot the exact effective price version and all rate categories so later
+administrative price changes cannot rewrite historical accounting.
 
 ## Trust boundaries
 
