@@ -1,9 +1,41 @@
 import type { z } from "npm:zod@4.1.12";
 import { embeddingsSchema } from "@dg-chat/contracts";
+import { request as httpRequest } from "node:http";
+import { Readable } from "node:stream";
 import { pinnedProviderFetch } from "./provider_transport.ts";
 
 export type EmbeddingsRequest = z.infer<typeof embeddingsSchema>;
 export type ProviderFetch = typeof fetch;
+
+const testProviderFetch =
+  ((input: string | URL | Request, init: RequestInit = {}) =>
+    new Promise<Response>((resolve, reject) => {
+      const url = input instanceof Request ? new URL(input.url) : new URL(input.toString());
+      const request = httpRequest(url, {
+        method: init.method,
+        headers: Object.fromEntries(new Headers(init.headers).entries()),
+      }, (response) => {
+        const headers = new Headers();
+        for (const [name, value] of Object.entries(response.headers)) {
+          if (Array.isArray(value)) value.forEach((item) => headers.append(name, item));
+          else if (value !== undefined) headers.set(name, String(value));
+        }
+        resolve(
+          new Response(Readable.toWeb(response) as ReadableStream<Uint8Array>, {
+            status: response.statusCode ?? 502,
+            headers,
+          }),
+        );
+      });
+      const abort = () => request.destroy(init.signal?.reason);
+      init.signal?.addEventListener("abort", abort, { once: true });
+      request.once("close", () => init.signal?.removeEventListener("abort", abort));
+      request.once("error", reject);
+      if (typeof init.body === "string" || init.body instanceof Uint8Array) {
+        request.write(init.body);
+      }
+      request.end();
+    })) as ProviderFetch;
 
 export interface EmbeddingDatum {
   object: "embedding";
@@ -218,17 +250,20 @@ export async function createEmbeddings(
     }
     url.hostname = address;
   }
-  const response = await (options.fetch ?? (testHttp ? fetch : pinnedProviderFetch))(url, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${options.apiKey}`,
-      "content-type": "application/json",
-      accept: "application/json",
+  const response = await (options.fetch ?? (testHttp ? testProviderFetch : pinnedProviderFetch))(
+    url,
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${options.apiKey}`,
+        "content-type": "application/json",
+        accept: "application/json",
+      },
+      body: JSON.stringify(upstreamRequest),
+      redirect: "error",
+      signal: options.signal,
     },
-    body: JSON.stringify(upstreamRequest),
-    redirect: "error",
-    signal: options.signal,
-  });
+  );
   const payload = await boundedJson(response);
   if (!response.ok) {
     throw new EmbeddingsProviderError(
