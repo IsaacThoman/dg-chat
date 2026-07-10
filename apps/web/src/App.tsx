@@ -1,5 +1,5 @@
-import { type FormEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { type FormEvent, type ReactNode, useEffect, useId, useMemo, useRef, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
@@ -39,8 +39,10 @@ import {
   MoreHorizontal,
   Paperclip,
   Pencil,
+  Pin,
   Plus,
   RefreshCw,
+  RotateCcw,
   Search,
   Settings,
   Shield,
@@ -50,6 +52,7 @@ import {
   Square,
   Sun,
   Terminal,
+  Trash2,
   Upload,
   UserCheck,
   Users,
@@ -75,9 +78,14 @@ import {
 } from "./conversationGraph.ts";
 import { demoConversations, demoMessages, demoModels, demoUser } from "./demo.ts";
 import { setupDestination } from "./setupDiscovery.ts";
+import {
+  type ConversationListView,
+  conversationsForView,
+  fallbackConversationId,
+} from "./conversationLifecycle.ts";
 import type { Conversation, Message, Model, Token, User } from "./types.ts";
 
-type View = "chat" | "settings" | "tokens" | "admin";
+type View = "chat" | "archived" | "trash" | "settings" | "tokens" | "admin";
 type AdminSection =
   | "overview"
   | "applicants"
@@ -107,12 +115,14 @@ function Brand({ compact = false }: { compact?: boolean }) {
 }
 
 function IconButton(
-  { label, children, className, onClick, disabled }: {
+  { label, children, className, onClick, disabled, ariaHaspopup, ariaExpanded }: {
     label: string;
     children: ReactNode;
     className?: string;
     onClick?: () => void;
     disabled?: boolean;
+    ariaHaspopup?: "menu";
+    ariaExpanded?: boolean;
   },
 ) {
   return (
@@ -122,6 +132,8 @@ function IconButton(
       title={label}
       onClick={onClick}
       disabled={disabled}
+      aria-haspopup={ariaHaspopup}
+      aria-expanded={ariaExpanded}
     >
       {children}
     </button>
@@ -145,6 +157,11 @@ function Sidebar({
   mobileOpen,
   closeMobile,
   user,
+  onUpdate,
+  listError,
+  listLoading,
+  staleWarning,
+  retryList,
 }: {
   conversations: Conversation[];
   active: string;
@@ -154,9 +171,19 @@ function Sidebar({
   mobileOpen: boolean;
   closeMobile: () => void;
   user: User;
+  onUpdate: (
+    conversation: Conversation,
+    patch: { title?: string; pinned?: boolean; archived?: boolean; deleted?: boolean },
+  ) => Promise<void>;
+  listError: boolean;
+  listLoading: boolean;
+  staleWarning: boolean;
+  retryList: () => void;
 }) {
   const [query, setQuery] = useState("");
-  const filtered = conversations.filter((c) =>
+  const listView: ConversationListView = view === "archived" || view === "trash" ? view : "chat";
+  const visible = conversationsForView(conversations, listView);
+  const filtered = visible.filter((c) =>
     `${c.title} ${c.preview}`.toLowerCase().includes(query.toLowerCase())
   );
   const select = (v: View) => {
@@ -193,40 +220,86 @@ function Sidebar({
         <button onClick={() => select("chat")} className={view === "chat" ? "selected" : ""}>
           <MessageSquare size={17} /> Chats
         </button>
-        <button>
+        <button type="button">
           <Folder size={17} /> Projects <Plus size={15} className="push" />
         </button>
-        <button>
+        <button type="button">
           <BookOpen size={17} /> Knowledge
         </button>
-        <button>
+        <button
+          onClick={() => select("archived")}
+          className={view === "archived" ? "selected" : ""}
+        >
           <Archive size={17} /> Archived
+        </button>
+        <button onClick={() => select("trash")} className={view === "trash" ? "selected" : ""}>
+          <Trash2 size={17} /> Trash
         </button>
       </nav>
       <div className="conversation-scroll">
-        {filtered.some((c) => c.pinned) && <p className="section-label">PINNED</p>}
-        {filtered.filter((c) => c.pinned).map((c) => (
-          <ConversationRow
-            key={c.id}
-            c={c}
-            active={active === c.id && view === "chat"}
-            onOpen={onOpen}
-          />
-        ))}
-        <p className="section-label">RECENT</p>
-        {filtered.filter((c) => !c.pinned).map((c) => (
-          <ConversationRow
-            key={c.id}
-            c={c}
-            active={active === c.id && view === "chat"}
-            onOpen={onOpen}
-          />
-        ))}
-        {!filtered.length && (
-          <div className="empty-mini">
-            <Search size={20} />
-            <span>No conversations found</span>
+        {listLoading && (
+          <div className="empty-mini" role="status">
+            <div className="typing" aria-hidden="true">
+              <span />
+              <span />
+              <span />
+            </div>
+            <span>Loading conversations…</span>
           </div>
+        )}
+        {listError && (
+          <div className="empty-mini" role="alert">
+            <span>Conversations are unavailable</span>
+            <button className="secondary" onClick={retryList}>
+              <RefreshCw size={14} /> Retry
+            </button>
+          </div>
+        )}
+        {staleWarning && (
+          <div className="stale-warning" role="status">
+            <span>Showing saved conversations. Refresh failed.</span>
+            <button onClick={retryList}>Retry</button>
+          </div>
+        )}
+        {!listLoading && !listError && (
+          <>
+            {filtered.some((c) => c.pinned) && <p className="section-label">PINNED</p>}
+            {filtered.filter((c) => c.pinned).map((c) => (
+              <ConversationRow
+                key={c.id}
+                c={c}
+                active={active === c.id &&
+                  (view === "chat" || view === "archived" || view === "trash")}
+                onOpen={onOpen}
+                listView={listView}
+                onUpdate={onUpdate}
+              />
+            ))}
+            <p className="section-label">RECENT</p>
+            {filtered.filter((c) => !c.pinned).map((c) => (
+              <ConversationRow
+                key={c.id}
+                c={c}
+                active={active === c.id &&
+                  (view === "chat" || view === "archived" || view === "trash")}
+                onOpen={onOpen}
+                listView={listView}
+                onUpdate={onUpdate}
+              />
+            ))}
+            {!filtered.length && (
+              <div className="empty-mini">
+                <Search size={20} />
+                <span>
+                  {listView === "archived"
+                    ? "No archived conversations"
+                    : listView === "trash"
+                    ? "Trash is empty"
+                    : "No conversations found"}
+                </span>
+              </div>
+            )}
+          </>
         )}
       </div>
       <div className="sidebar-footer">
@@ -258,19 +331,270 @@ function Sidebar({
 }
 
 function ConversationRow(
-  { c, active, onOpen }: { c: Conversation; active: boolean; onOpen: (id: string) => void },
+  { c, active, onOpen, listView, onUpdate }: {
+    c: Conversation;
+    active: boolean;
+    onOpen: (id: string) => void;
+    listView: ConversationListView;
+    onUpdate: (
+      conversation: Conversation,
+      patch: { title?: string; pinned?: boolean; archived?: boolean; deleted?: boolean },
+    ) => Promise<void>;
+  },
 ) {
+  const [menu, setMenu] = useState(false);
+  const [menuUp, setMenuUp] = useState(false);
+  const [rename, setRename] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const rowRef = useRef<HTMLDivElement>(null);
+  const actionRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (!menu) return;
+    const dismiss = (event: PointerEvent) => {
+      if (!rowRef.current?.contains(event.target as Node)) setMenu(false);
+    };
+    document.addEventListener("pointerdown", dismiss);
+    return () => document.removeEventListener("pointerdown", dismiss);
+  }, [menu]);
+  const closeMenu = () => {
+    setMenu(false);
+    requestAnimationFrame(() => actionRef.current?.focus());
+  };
+  const update = async (patch: Parameters<typeof onUpdate>[1]) => {
+    setBusy(true);
+    setError("");
+    try {
+      await onUpdate(c, patch);
+      if (patch.pinned !== undefined) {
+        setMenu(false);
+        requestAnimationFrame(() => {
+          document.querySelector<HTMLButtonElement>(
+            `[data-conversation-actions="${CSS.escape(c.id)}"]`,
+          )?.focus();
+        });
+      } else setMenu(false);
+      return true;
+    } catch {
+      setError("Action failed. Try again.");
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  };
   return (
-    <button
+    <div
+      ref={rowRef}
       className={cn("conversation-row", active && "active")}
-      onClick={() => onOpen(c.id)}
+      onKeyDown={(event) => {
+        if (event.key === "Escape" && menu) {
+          event.preventDefault();
+          closeMenu();
+        }
+      }}
     >
-      <span>
-        <strong>{c.title}</strong>
-        <small>{c.preview}</small>
-      </span>
-      <span className="row-meta">{c.updatedAt}{active && <Ellipsis size={16} />}</span>
-    </button>
+      <button className="conversation-open" onClick={() => onOpen(c.id)}>
+        <span>
+          <strong>{c.title}</strong>
+          <small>{c.preview}</small>
+        </span>
+        <span className="row-meta">{c.updatedAt}</span>
+      </button>
+      <button
+        ref={actionRef}
+        className="icon-button"
+        type="button"
+        title={`Actions for ${c.title}`}
+        aria-label={`Actions for ${c.title}`}
+        aria-haspopup="menu"
+        aria-expanded={menu}
+        data-conversation-actions={c.id}
+        onClick={() => {
+          if (!menu) {
+            const rowBottom = rowRef.current?.getBoundingClientRect().bottom ?? 0;
+            setMenuUp(rowBottom + 190 > globalThis.innerHeight);
+          }
+          setMenu(!menu);
+        }}
+      >
+        <Ellipsis size={16} />
+      </button>
+      {menu && (
+        <div
+          className={cn("conversation-menu", menuUp && "menu-up")}
+          role="menu"
+          onKeyDown={(event) => {
+            const items = [
+              ...event.currentTarget.querySelectorAll<HTMLButtonElement>(
+                '[role="menuitem"]:not(:disabled)',
+              ),
+            ];
+            const index = items.indexOf(document.activeElement as HTMLButtonElement);
+            let next: HTMLButtonElement | undefined;
+            if (event.key === "ArrowDown") next = items[(index + 1) % items.length];
+            if (event.key === "ArrowUp") next = items[(index - 1 + items.length) % items.length];
+            if (event.key === "Home") next = items[0];
+            if (event.key === "End") {
+              next = items.at(-1);
+            }
+            if (next) {
+              event.preventDefault();
+              next.focus();
+            }
+          }}
+        >
+          {listView === "chat" && (
+            <button
+              autoFocus
+              role="menuitem"
+              onClick={() => {
+                actionRef.current?.focus();
+                setRename(true);
+                setMenu(false);
+              }}
+            >
+              <Pencil size={14} /> Rename
+            </button>
+          )}
+          {listView === "chat" && (
+            <button
+              role="menuitem"
+              disabled={busy}
+              onClick={() => update({ pinned: !c.pinned })}
+            >
+              <Pin size={14} /> {c.pinned ? "Unpin" : "Pin"}
+            </button>
+          )}
+          {listView === "chat" && (
+            <button
+              role="menuitem"
+              disabled={busy}
+              onClick={() => update({ archived: true })}
+            >
+              <Archive size={14} /> Archive
+            </button>
+          )}
+          {listView === "archived" && (
+            <button
+              autoFocus
+              role="menuitem"
+              disabled={busy}
+              onClick={() => update({ archived: false })}
+            >
+              <RotateCcw size={14} /> Restore to chats
+            </button>
+          )}
+          {listView === "trash" && (
+            <button
+              autoFocus
+              role="menuitem"
+              disabled={busy}
+              onClick={() => update({ deleted: false })}
+            >
+              <RotateCcw size={14} /> {c.archived ? "Restore to Archived" : "Restore to Chats"}
+            </button>
+          )}
+          {listView !== "trash" && (
+            <button
+              className="menu-danger"
+              role="menuitem"
+              onClick={() => {
+                actionRef.current?.focus();
+                setConfirmDelete(true);
+                setMenu(false);
+              }}
+            >
+              <Trash2 size={14} /> Move to trash
+            </button>
+          )}
+        </div>
+      )}
+      {error && <span className="conversation-error" role="status">{error}</span>}
+      {rename && (
+        <RenameConversationDialog
+          conversation={c}
+          close={() => setRename(false)}
+          save={async (title) => {
+            const saved = await update({ title });
+            if (saved) setRename(false);
+            return saved;
+          }}
+        />
+      )}
+      {confirmDelete && (
+        <Modal
+          title="Move conversation to trash?"
+          close={() => setConfirmDelete(false)}
+          dismissible={!busy}
+        >
+          <p className="muted">“{c.title}” can be restored later from Trash.</p>
+          <div className="modal-actions">
+            <button className="secondary" disabled={busy} onClick={() => setConfirmDelete(false)}>
+              Cancel
+            </button>
+            <button
+              className="danger-button"
+              disabled={busy}
+              onClick={async () => {
+                if (await update({ deleted: true })) setConfirmDelete(false);
+              }}
+            >
+              Move to trash
+            </button>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+function RenameConversationDialog(
+  { conversation, close, save }: {
+    conversation: Conversation;
+    close: () => void;
+    save: (title: string) => Promise<boolean>;
+  },
+) {
+  const [title, setTitle] = useState(conversation.title);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    const next = title.trim();
+    if (!next) return;
+    setBusy(true);
+    setError("");
+    try {
+      if (!await save(next)) setError("Rename failed. Try again.");
+    } catch {
+      setError("Rename failed. Try again.");
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Modal title="Rename conversation" close={close} dismissible={!busy}>
+      <form onSubmit={submit}>
+        <label className="field">
+          <span>Conversation title</span>
+          <input
+            maxLength={200}
+            value={title}
+            onChange={(event) => setTitle(event.target.value)}
+          />
+        </label>
+        {error && <p className="form-error" role="status">{error}</p>}
+        <div className="modal-actions">
+          <button type="button" className="secondary" disabled={busy} onClick={close}>
+            Cancel
+          </button>
+          <button className="primary" disabled={busy || !title.trim()}>
+            {busy ? "Saving…" : "Save"}
+          </button>
+        </div>
+      </form>
+    </Modal>
   );
 }
 
@@ -322,18 +646,19 @@ function ModelPicker(
 }
 
 function BranchControl(
-  { branch, onTree, onSelect, busy }: {
+  { branch, onTree, onSelect, busy, readOnly = false }: {
     branch: MessageBranch;
     onTree: () => void;
     onSelect: (messageId: string) => void;
     busy: boolean;
+    readOnly?: boolean;
   },
 ) {
   return (
     <div className="branch-control" aria-label={`Branch ${branch.index} of ${branch.total}`}>
       <IconButton
         label="Previous branch"
-        disabled={!branch.previousId || busy}
+        disabled={!branch.previousId || busy || readOnly}
         onClick={() => branch.previousId && onSelect(branch.previousId)}
       >
         <ChevronLeft size={15} />
@@ -341,7 +666,7 @@ function BranchControl(
       <span aria-live="polite">{branch.index} / {branch.total}</span>
       <IconButton
         label="Next branch"
-        disabled={!branch.nextId || busy}
+        disabled={!branch.nextId || busy || readOnly}
         onClick={() => branch.nextId && onSelect(branch.nextId)}
       >
         <ChevronRight size={15} />
@@ -354,13 +679,14 @@ function BranchControl(
 }
 
 function MessageItem(
-  { message, branch, onTree, onEdit, onSelectBranch, branchBusy }: {
+  { message, branch, onTree, onEdit, onSelectBranch, branchBusy, readOnly = false }: {
     message: Message;
     branch: MessageBranch | null;
     onTree: () => void;
     onEdit: (m: Message) => void;
     onSelectBranch: (messageId: string) => void;
     branchBusy: boolean;
+    readOnly?: boolean;
   },
 ) {
   const [copied, setCopied] = useState(false);
@@ -392,15 +718,21 @@ function MessageItem(
             <IconButton label="Copy" onClick={copy}>
               {copied ? <Check size={15} /> : <Copy size={15} />}
             </IconButton>
-            <IconButton label="Edit without overwriting" onClick={() => onEdit(message)}>
-              <Pencil size={15} />
-            </IconButton>
+            {!readOnly && (
+              <IconButton
+                label="Edit without overwriting"
+                onClick={() => onEdit(message)}
+              >
+                <Pencil size={15} />
+              </IconButton>
+            )}
             {branch && (
               <BranchControl
                 branch={branch}
                 onTree={onTree}
                 onSelect={onSelectBranch}
                 busy={branchBusy}
+                readOnly={readOnly}
               />
             )}
           </div>
@@ -429,9 +761,11 @@ function MessageItem(
           <IconButton label="Read aloud">
             <Volume2 size={15} />
           </IconButton>
-          <IconButton label="Regenerate">
-            <RefreshCw size={15} />
-          </IconButton>
+          {!readOnly && (
+            <IconButton label="Regenerate">
+              <RefreshCw size={15} />
+            </IconButton>
+          )}
           <IconButton label="More">
             <MoreHorizontal size={15} />
           </IconButton>
@@ -441,6 +775,7 @@ function MessageItem(
               onTree={onTree}
               onSelect={onSelectBranch}
               busy={branchBusy}
+              readOnly={readOnly}
             />
           )}
           <span className="response-meta">{message.latency}</span>
@@ -531,23 +866,80 @@ function Composer(
   );
 }
 
-function TreePanel({ messages, activeLeafId, close, onSelect, busy }: {
+function TreePanel({
+  messages,
+  activeLeafId,
+  close,
+  onSelect,
+  busy,
+  readOnly = false,
+  returnFocus,
+}: {
   messages: Message[];
   activeLeafId?: string | null;
   close: () => void;
   onSelect: (messageId: string) => void;
   busy: boolean;
+  readOnly?: boolean;
+  returnFocus?: HTMLElement | null;
 }) {
   const roots = conversationTree(messages, activeLeafId);
+  const titleId = useId();
+  const panelRef = useRef<HTMLElement>(null);
+  const closeRef = useRef(close);
+  const busyRef = useRef(busy);
+  const previousFocus = useRef<HTMLElement | null>(null);
+  closeRef.current = close;
+  busyRef.current = busy;
+  useEffect(() => {
+    previousFocus.current = returnFocus ?? document.activeElement as HTMLElement;
+    const panel = panelRef.current;
+    panel?.querySelector<HTMLElement>("button")?.focus();
+    const keydown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !busyRef.current) {
+        event.preventDefault();
+        closeRef.current();
+        return;
+      }
+      if (event.key !== "Tab" || !panel) return;
+      const items = [
+        ...panel.querySelectorAll<HTMLElement>(
+          'button:not(:disabled), [role="treeitem"]:not([aria-disabled="true"])',
+        ),
+      ];
+      if (!items.length) return;
+      const first = items[0];
+      const last = items.at(-1)!;
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", keydown);
+    return () => {
+      document.removeEventListener("keydown", keydown);
+      requestAnimationFrame(() => previousFocus.current?.focus());
+    };
+  }, []);
   return (
-    <div className="drawer-overlay" onClick={close}>
-      <aside className="tree-panel" onClick={(e) => e.stopPropagation()}>
+    <div className="drawer-overlay" onClick={() => !busyRef.current && closeRef.current()}>
+      <aside
+        ref={panelRef}
+        className="tree-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="panel-head">
           <div>
             <p className="eyebrow">IMMUTABLE HISTORY</p>
-            <h2>Conversation tree</h2>
+            <h2 id={titleId}>Conversation tree</h2>
           </div>
-          <IconButton label="Close" onClick={close}>
+          <IconButton label="Close" disabled={busy} onClick={close}>
             <X size={19} />
           </IconButton>
         </div>
@@ -586,6 +978,7 @@ function TreePanel({ messages, activeLeafId, close, onSelect, busy }: {
                 node={root}
                 onSelect={onSelect}
                 busy={busy}
+                readOnly={readOnly}
               />
             ))
             : <p className="muted">This conversation does not have any messages yet.</p>}
@@ -602,25 +995,27 @@ function TreePanel({ messages, activeLeafId, close, onSelect, busy }: {
   );
 }
 function TreeNode(
-  { node, onSelect, busy }: {
+  { node, onSelect, busy, readOnly }: {
     node: MessageTreeNode;
     onSelect: (messageId: string) => void;
     busy: boolean;
+    readOnly: boolean;
   },
 ) {
+  const disabled = busy || readOnly;
   return (
     <div
       className="tree-subtree"
       role="treeitem"
-      tabIndex={busy ? -1 : 0}
-      aria-disabled={busy || undefined}
+      tabIndex={disabled ? -1 : 0}
+      aria-disabled={disabled || undefined}
       aria-current={node.active ? "true" : undefined}
       onClick={(event) => {
         event.stopPropagation();
-        if (!busy) onSelect(node.message.id);
+        if (!disabled) onSelect(node.message.id);
       }}
       onKeyDown={(event) => {
-        if (!busy && (event.key === "Enter" || event.key === " ")) {
+        if (!disabled && (event.key === "Enter" || event.key === " ")) {
           event.preventDefault();
           event.stopPropagation();
           onSelect(node.message.id);
@@ -643,6 +1038,7 @@ function TreeNode(
               node={child}
               onSelect={onSelect}
               busy={busy}
+              readOnly={readOnly}
             />
           ))}
         </div>
@@ -661,6 +1057,8 @@ function ChatView({
   onMenu,
   balance,
   onConversationCreated,
+  onUpdateConversation,
+  readOnly = false,
 }: {
   conversations: Conversation[];
   activeId: string;
@@ -671,32 +1069,33 @@ function ChatView({
   onMenu: () => void;
   balance: number;
   onConversationCreated: (id: string) => Promise<void>;
+  onUpdateConversation: (
+    conversation: Conversation,
+    patch: { title?: string; pinned?: boolean; archived?: boolean; deleted?: boolean },
+  ) => Promise<void>;
+  readOnly?: boolean;
 }) {
+  const queryClient = useQueryClient();
   const [localMessages, setLocalMessages] = useState(messages);
   const [tree, setTree] = useState(false);
+  const treeReturnFocusRef = useRef<HTMLElement | null>(null);
   const [edit, setEdit] = useState<Message>();
   const [streaming, setStreaming] = useState(false);
   const sendInFlightRef = useRef(false);
   const pendingOperationRef = useRef<SendOperation | null>(null);
   const [branchBusy, setBranchBusy] = useState(false);
   const [sendError, setSendError] = useState("");
+  const [renaming, setRenaming] = useState(false);
   const initialConversation = conversations.find((c) => c.id === activeId);
   const [conversation, setConversation] = useState(initialConversation);
   useEffect(() => setLocalMessages(messages), [messages]);
   useEffect(() => setConversation(initialConversation), [initialConversation]);
-  useEffect(() => {
-    // Never carry a previous conversation's optimistic UI into a newly selected chat
-    // while its query is still resolving.
-    setLocalMessages([]);
-    setEdit(undefined);
-    setSendError("");
-  }, [activeId]);
   const activePath = useMemo(
     () => activeMessagePath(localMessages, conversation?.activeLeafId),
     [localMessages, conversation?.activeLeafId],
   );
   const selectBranch = async (messageId: string) => {
-    if (!conversation || branchBusy) return;
+    if (!conversation || branchBusy || readOnly) return;
     const leafId = preferredLeaf(localMessages, messageId);
     if (leafId === conversation.activeLeafId) return;
     setBranchBusy(true);
@@ -707,6 +1106,7 @@ function ChatView({
       const refreshed = await refreshConversationGraph(conversation.id, {
         load: api.conversationGraph,
       });
+      queryClient.setQueryData(["messages", conversation.id], refreshed.messages);
       setConversation(refreshed.conversation);
       setLocalMessages(refreshed.messages);
       setSendError("That branch changed in another tab. The latest conversation has been loaded.");
@@ -729,7 +1129,11 @@ function ChatView({
       const target = resolved.conversation;
       if (resolved.created) setConversation(target);
       const result = await api.generate(target, content, selectedModel, edited, operation.id);
-      setLocalMessages((current) => [...current, result.user, result.assistant]);
+      setLocalMessages((current) => {
+        const next = [...current, result.user, result.assistant];
+        queryClient.setQueryData(["messages", result.conversation.id], next);
+        return next;
+      });
       setConversation(result.conversation);
       setEdit(undefined);
       if (resolved.created) await onConversationCreated(result.conversation.id);
@@ -741,6 +1145,7 @@ function ChatView({
           api.messages(activeId),
           api.conversation(activeId),
         ]);
+        queryClient.setQueryData(["messages", activeId], refreshedMessages);
         setLocalMessages(refreshedMessages);
         setConversation(refreshedConversation);
       }
@@ -773,7 +1178,7 @@ function ChatView({
       <div className="chat-scroll">
         <div className="chat-title">
           <h1>{conversation?.title ?? "New conversation"}</h1>
-          <button>
+          <button onClick={() => setRenaming(true)} disabled={!conversation || readOnly}>
             <Pencil size={14} /> Rename
           </button>
         </div>
@@ -782,10 +1187,14 @@ function ChatView({
             key={m.id}
             message={m}
             branch={messageBranch(localMessages, m.id)}
-            onTree={() => setTree(true)}
+            onTree={() => {
+              treeReturnFocusRef.current = document.activeElement as HTMLElement;
+              setTree(true);
+            }}
             onEdit={setEdit}
             onSelectBranch={selectBranch}
             branchBusy={branchBusy}
+            readOnly={readOnly}
           />
         ))}
         {streaming && (
@@ -797,12 +1206,20 @@ function ChatView({
         )}
         {sendError && <p className="form-error">{sendError}</p>}
       </div>
-      <Composer
-        onSend={send}
-        edit={edit}
-        cancelEdit={() => setEdit(undefined)}
-        disabled={streaming}
-      />
+      {readOnly
+        ? (
+          <div className="read-only-banner" role="status">
+            <Lock size={16} /> Restore this conversation to Chats before editing or continuing it.
+          </div>
+        )
+        : (
+          <Composer
+            onSend={send}
+            edit={edit}
+            cancelEdit={() => setEdit(undefined)}
+            disabled={streaming}
+          />
+        )}
       {tree && (
         <TreePanel
           messages={localMessages}
@@ -810,6 +1227,19 @@ function ChatView({
           close={() => setTree(false)}
           onSelect={selectBranch}
           busy={branchBusy}
+          readOnly={readOnly}
+          returnFocus={treeReturnFocusRef.current}
+        />
+      )}
+      {renaming && conversation && (
+        <RenameConversationDialog
+          conversation={conversation}
+          close={() => setRenaming(false)}
+          save={async (title) => {
+            await onUpdateConversation(conversation, { title });
+            setRenaming(false);
+            return true;
+          }}
         />
       )}
     </main>
@@ -1594,14 +2024,69 @@ function GenericAdmin(
 }
 
 function Modal(
-  { title, close, children }: { title: string; close: () => void; children: ReactNode },
+  { title, close, children, dismissible = true }: {
+    title: string;
+    close: () => void;
+    children: ReactNode;
+    dismissible?: boolean;
+  },
 ) {
+  const titleId = useId();
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const previousFocus = useRef<HTMLElement | null>(null);
+  const closeRef = useRef(close);
+  const dismissibleRef = useRef(dismissible);
+  closeRef.current = close;
+  dismissibleRef.current = dismissible;
+  useEffect(() => {
+    previousFocus.current = document.activeElement as HTMLElement;
+    const dialog = dialogRef.current;
+    dialog?.querySelector<HTMLElement>("[autofocus], input, button")?.focus();
+    const keydown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && dismissibleRef.current) {
+        event.preventDefault();
+        closeRef.current();
+        return;
+      }
+      if (event.key !== "Tab" || !dialog) return;
+      const items = [
+        ...dialog.querySelectorAll<HTMLElement>(
+          'button:not(:disabled), input:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])',
+        ),
+      ];
+      if (!items.length) return;
+      const first = items[0];
+      const last = items.at(-1)!;
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", keydown);
+    return () => {
+      document.removeEventListener("keydown", keydown);
+      requestAnimationFrame(() => previousFocus.current?.focus());
+    };
+  }, []);
   return (
-    <div className="modal-overlay" onMouseDown={close}>
-      <div className="modal" onMouseDown={(e) => e.stopPropagation()}>
+    <div
+      className="modal-overlay"
+      onMouseDown={() => dismissibleRef.current && closeRef.current()}
+    >
+      <div
+        ref={dialogRef}
+        className="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
         <div className="modal-head">
-          <h2>{title}</h2>
-          <IconButton label="Close" onClick={close}>
+          <h2 id={titleId}>{title}</h2>
+          <IconButton label="Close" disabled={!dismissible} onClick={close}>
             <X size={19} />
           </IconButton>
         </div>
@@ -1612,16 +2097,32 @@ function Modal(
 }
 
 export function App() {
+  const queryClient = useQueryClient();
   const setupQuery = useQuery({ queryKey: ["setup-status"], queryFn: api.setupStatus });
   const userQuery = useQuery({ queryKey: ["me"], queryFn: api.me });
   const conversationQuery = useQuery({ queryKey: ["conversations"], queryFn: api.conversations });
+  const deletedConversationQuery = useQuery({
+    queryKey: ["conversations", "deleted"],
+    queryFn: api.deletedConversations,
+  });
   const modelQuery = useQuery({ queryKey: ["models"], queryFn: api.models });
   const demoMode = import.meta.env.VITE_DEMO_MODE === "true";
   const user = userQuery.data ?? (demoMode ? demoUser : undefined);
   const conversations = conversationQuery.data ?? (demoMode ? demoConversations : []);
+  const deletedConversations = deletedConversationQuery.data ?? [];
+  const allConversations = [
+    ...conversations,
+    ...deletedConversations.filter((deleted) =>
+      !conversations.some((conversation) => conversation.id === deleted.id)
+    ),
+  ];
   const models = modelQuery.data ?? (demoMode ? demoModels : []);
   const [activeId, setActiveId] = useState("");
   const [view, setView] = useState<View>("chat");
+  const lifecycleQuery = view === "trash" ? deletedConversationQuery : conversationQuery;
+  const lifecycleLoading = lifecycleQuery.isLoading;
+  const lifecycleBlockingError = lifecycleQuery.isError && lifecycleQuery.data === undefined;
+  const lifecycleStaleWarning = lifecycleQuery.isError && lifecycleQuery.data !== undefined;
   const [mobile, setMobile] = useState(false);
   const [creatingConversation, setCreatingConversation] = useState(false);
   const [selectedModel, setSelectedModel] = useState(models[0]?.id ?? "openai/gpt-4.1");
@@ -1639,8 +2140,12 @@ export function App() {
     if (destination) location.replace(destination);
   }, [userQuery.isError, setupQuery.data, demoMode]);
   useEffect(() => {
-    if (!activeId && conversations[0]) setActiveId(conversations[0].id);
-  }, [activeId, conversations]);
+    if (view !== "chat" && view !== "archived" && view !== "trash") return;
+    const visible = conversationsForView(allConversations, view);
+    if (!visible.some((conversation) => conversation.id === activeId)) {
+      setActiveId(visible[0]?.id ?? "");
+    }
+  }, [activeId, allConversations, view]);
   useEffect(() => {
     if (models.length && !models.some((model) => model.id === selectedModel)) {
       setSelectedModel(models[0].id);
@@ -1649,7 +2154,6 @@ export function App() {
   const open = async (id: string) => {
     if (id !== "new") {
       setActiveId(id);
-      setView("chat");
       setMobile(false);
       return;
     }
@@ -1658,6 +2162,10 @@ export function App() {
     setMobile(false);
     try {
       const resolved = await api.createConversation();
+      queryClient.setQueryData<Conversation[]>(
+        ["conversations"],
+        (current = []) => [resolved, ...current.filter((item) => item.id !== resolved.id)],
+      );
       setActiveId(resolved.id);
       await conversationQuery.refetch();
     } finally {
@@ -1665,8 +2173,54 @@ export function App() {
     }
   };
   const conversationCreated = async (id: string) => {
-    setActiveId(id);
     await conversationQuery.refetch();
+    setActiveId(id);
+  };
+  const updateConversation = async (
+    conversation: Conversation,
+    patch: { title?: string; pinned?: boolean; archived?: boolean; deleted?: boolean },
+  ) => {
+    const updated = await api.updateConversation(conversation.id, patch);
+    const replace = (current: Conversation[] = []) =>
+      current.some((item) => item.id === updated.id)
+        ? current.map((item) => item.id === updated.id ? updated : item)
+        : [updated, ...current];
+    queryClient.setQueryData<Conversation[]>(
+      ["conversations"],
+      (current = []) =>
+        updated.deleted ? current.filter((item) => item.id !== updated.id) : replace(current),
+    );
+    queryClient.setQueryData<Conversation[]>(
+      ["conversations", "deleted"],
+      (current = []) =>
+        updated.deleted ? replace(current) : current.filter((item) => item.id !== updated.id),
+    );
+    await Promise.allSettled([conversationQuery.refetch(), deletedConversationQuery.refetch()]);
+    if (
+      conversation.id !== activeId || view === "settings" || view === "tokens" || view === "admin"
+    ) return;
+    const regular = queryClient.getQueryData<Conversation[]>(["conversations"]) ?? [];
+    const deleted = queryClient.getQueryData<Conversation[]>(["conversations", "deleted"]) ?? [];
+    const refreshed = [
+      ...regular,
+      ...deleted.filter((item) => !regular.some((candidate) => candidate.id === item.id)),
+    ];
+    const listView: ConversationListView = view;
+    if (!conversationsForView(refreshed, listView).some((item) => item.id === activeId)) {
+      const nextId = fallbackConversationId(refreshed, listView, conversation.id);
+      setActiveId(nextId);
+      requestAnimationFrame(() => {
+        const nextAction = nextId
+          ? document.querySelector<HTMLButtonElement>(
+            `[data-conversation-actions="${CSS.escape(nextId)}"]`,
+          )
+          : undefined;
+        const fallbacks = [
+          ...document.querySelectorAll<HTMLButtonElement>(".lifecycle-empty button, .new-chat"),
+        ];
+        (nextAction ?? fallbacks.find((button) => button.offsetParent !== null))?.focus();
+      });
+    }
   };
   if (!user) {
     return <DiscoveryLoading unavailable={setupQuery.isError && userQuery.isError} />;
@@ -1674,7 +2228,7 @@ export function App() {
   return (
     <div className="app-shell">
       <Sidebar
-        conversations={conversations}
+        conversations={allConversations}
         active={activeId}
         onOpen={open}
         view={view}
@@ -1682,9 +2236,18 @@ export function App() {
         mobileOpen={mobile}
         closeMobile={() => setMobile(false)}
         user={user}
+        onUpdate={updateConversation}
+        listError={lifecycleBlockingError}
+        listLoading={lifecycleLoading}
+        staleWarning={lifecycleStaleWarning}
+        retryList={() => {
+          void (view === "trash"
+            ? deletedConversationQuery.refetch()
+            : conversationQuery.refetch());
+        }}
       />
       {mobile && <div className="sidebar-scrim" onClick={() => setMobile(false)} />}
-      {view === "chat" && creatingConversation && (
+      {(view === "chat" || view === "archived" || view === "trash") && creatingConversation && (
         <main className="chat-main auth-page" aria-label="Creating conversation">
           <div className="typing" aria-hidden="true">
             <span />
@@ -1693,21 +2256,88 @@ export function App() {
           </div>
         </main>
       )}
-      {view === "chat" && !creatingConversation && (
+      {(view === "chat" || view === "archived" || view === "trash") && !creatingConversation &&
+        activeId && (
         <ChatView
           key={activeId}
-          conversations={conversations}
+          conversations={allConversations}
           activeId={activeId}
-          messages={messagesQuery.isFetching
-            ? []
-            : messagesQuery.data ?? (demoMode ? demoMessages : [])}
+          messages={messagesQuery.data ?? (demoMode ? demoMessages : [])}
           models={models}
           selectedModel={selectedModel}
           setSelectedModel={setSelectedModel}
           onMenu={() => setMobile(true)}
           balance={user.balance}
           onConversationCreated={conversationCreated}
+          onUpdateConversation={updateConversation}
+          readOnly={view !== "chat"}
         />
+      )}
+      {(view === "chat" || view === "archived" || view === "trash") && !creatingConversation &&
+        !activeId && lifecycleLoading && (
+        <main className="chat-main lifecycle-empty" role="status">
+          <div className="typing" aria-hidden="true">
+            <span />
+            <span />
+            <span />
+          </div>
+          <p>Loading conversations…</p>
+        </main>
+      )}
+      {(view === "chat" || view === "archived" || view === "trash") && !creatingConversation &&
+        !activeId &&
+        !lifecycleLoading && lifecycleBlockingError && (
+        <main className="chat-main lifecycle-empty" role="alert">
+          <header className="admin-mobile-head lifecycle-mobile-head">
+            <IconButton
+              label="Open menu"
+              onClick={() =>
+                setMobile(true)}
+            >
+              <Menu size={20} />
+            </IconButton>
+            <strong>Conversations unavailable</strong>
+          </header>
+          <RefreshCw size={28} />
+          <h2>Couldn’t load conversations</h2>
+          <p>Check your connection and try again.</p>
+          <button
+            className="secondary"
+            onClick={() =>
+              void (view === "trash"
+                ? deletedConversationQuery.refetch()
+                : conversationQuery.refetch())}
+          >
+            Retry
+          </button>
+        </main>
+      )}
+      {(view === "chat" || view === "archived" || view === "trash") && !creatingConversation &&
+        !activeId &&
+        !lifecycleLoading && !lifecycleBlockingError && (
+        <main className="chat-main lifecycle-empty">
+          <header className="admin-mobile-head lifecycle-mobile-head">
+            <IconButton label="Open menu" onClick={() => setMobile(true)}>
+              <Menu size={20} />
+            </IconButton>
+            <strong>
+              {view === "chat" ? "Chats" : view === "archived" ? "Archived" : "Trash"}
+            </strong>
+          </header>
+          <Archive size={28} />
+          <h2>
+            {view === "trash"
+              ? "Trash is empty"
+              : view === "archived"
+              ? "No archived conversations"
+              : "Start a new conversation"}
+          </h2>
+          <p>
+            {view === "chat"
+              ? "Choose New chat to begin."
+              : "Conversations moved here will appear in this view."}
+          </p>
+        </main>
       )}
       {view === "settings" && <SettingsView user={user} onMenu={() => setMobile(true)} />}
       {view === "tokens" && (

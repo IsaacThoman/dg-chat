@@ -16,6 +16,7 @@ export interface Conversation {
   updatedAt: string;
   pinned?: boolean;
   archived?: boolean;
+  deleted?: boolean;
   project?: string;
   activeLeafId?: string | null;
   version?: number;

@@ -3,25 +3,23 @@
 FROM denoland/deno:alpine AS dependencies
 WORKDIR /workspace
 ENV DENO_DIR=/deno-dir
-COPY deno.json package.json ./
+COPY deno.json package.json deno.lock ./
 COPY apps ./apps
 COPY packages ./packages
 # Keep the resolved dependency cache in the image. Runtime containers are read-only
 # and must never need network access or mutate workspace links during startup.
-RUN deno install --frozen=false
+RUN deno install --frozen
 
 FROM dependencies AS web-build
 RUN deno task build
 
 FROM denoland/deno:alpine AS service-build
 WORKDIR /service
-COPY deno.service.json ./deno.json
-COPY apps/api ./apps/api
-COPY apps/worker ./apps/worker
-COPY packages/contracts ./packages/contracts
-COPY packages/database ./packages/database
-RUN deno compile -A --node-modules-dir=none --output /service/dg-chat-api apps/api/src/main.ts \
-    && deno compile -A --node-modules-dir=none --output /service/dg-chat-worker apps/worker/src/main.ts
+COPY deno.json package.json deno.lock ./
+COPY apps ./apps
+COPY packages ./packages
+RUN deno compile --frozen -A --node-modules-dir=none --output /service/dg-chat-api apps/api/src/main.ts \
+    && deno compile --frozen -A --node-modules-dir=none --output /service/dg-chat-worker apps/worker/src/main.ts
 
 FROM nginxinc/nginx-unprivileged:1.27-alpine AS web
 COPY --from=web-build /workspace/apps/web/dist /usr/share/nginx/html

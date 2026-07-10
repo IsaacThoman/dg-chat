@@ -31,11 +31,19 @@ export async function login(
 }
 
 export async function createChat(page: Page): Promise<void> {
+  const activeActions = page.locator(".conversation-row.active [data-conversation-actions]");
+  const previousId = await activeActions.count() === 1
+    ? await activeActions.getAttribute("data-conversation-actions")
+    : null;
   const button = page.getByRole("button", { name: "New chat ⌘ K", exact: true });
   if ((page.viewportSize()?.width ?? 1280) <= 800) {
     await page.getByRole("button", { name: "Open menu", exact: true }).click();
   }
   await button.click();
+  await expect.poll(
+    () => activeActions.getAttribute("data-conversation-actions"),
+    { message: "the newly created conversation to become active" },
+  ).not.toBe(previousId);
 }
 
 export function uniqueUser(prefix = "applicant") {

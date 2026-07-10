@@ -16,6 +16,20 @@ export const createConversationSchema = z.object({
   temporary: z.boolean().default(false),
 });
 
+export const updateConversationSchema = z.object({
+  title: z.string().trim().min(1).max(200).optional(),
+  pinned: z.boolean().optional(),
+  archived: z.boolean().optional(),
+  deleted: z.boolean().optional(),
+}).strict().refine((value) => Object.keys(value).length > 0, {
+  message: "At least one conversation field is required",
+});
+
+export const setActiveLeafSchema = z.object({
+  leafId: z.string().uuid(),
+  expectedVersion: z.number().int().nonnegative(),
+}).strict();
+
 export const appendMessageSchema = z.object({
   parentId: z.string().uuid().nullable(),
   role: z.enum(["system", "user", "assistant", "tool"]),
@@ -66,7 +80,7 @@ export const chatCompletionSchema = z.object({
   frequency_penalty: z.number().min(-2).max(2).optional(),
   presence_penalty: z.number().min(-2).max(2).optional(),
   seed: z.number().int().optional(),
-  n: z.number().int().positive().max(16).optional(),
+  n: z.literal(1).optional(),
   user: z.string().optional(),
 }).passthrough();
 

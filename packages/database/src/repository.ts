@@ -100,6 +100,102 @@ export interface JobSummary {
   attempts: number;
   createdAt: string;
 }
+export type ApiIdempotencyEndpoint = "chat.completions" | "responses";
+export type ApiIdempotencyState = "in_progress" | "completed" | "failed";
+export interface ApiIdempotencyFrame {
+  sequence: number;
+  frame: string;
+  createdAt: string;
+}
+export interface ApiUsageObservation {
+  inputTokens: number;
+  outputTokens: number;
+  costMicros: number;
+  latencyMs: number;
+}
+export interface ApiReplayQuota {
+  maxRequests: number;
+  maxBytes: number;
+  maxEvents: number;
+}
+export interface ApiSseFrameInput {
+  sequence: number;
+  frame: string;
+}
+export interface ApiIdempotencyRequest {
+  id: string;
+  userId: string;
+  endpoint: ApiIdempotencyEndpoint;
+  idempotencyKey: string;
+  requestHash: string;
+  stream: boolean;
+  model: string;
+  state: ApiIdempotencyState;
+  leaseToken: string | null;
+  leaseExpiresAt: string | null;
+  usageRunId: string;
+  responseStatus: number | null;
+  responseHeaders: Record<string, string>;
+  responseBody: string | null;
+  failureStartedStream: boolean;
+  observedInputTokens: number;
+  observedOutputTokens: number;
+  observedCostMicros: number;
+  observedLatencyMs: number;
+  retentionSeconds: number;
+  frames: ApiIdempotencyFrame[];
+  createdAt: string;
+  completedAt: string | null;
+  expiresAt: string;
+}
+export interface BeginApiRequestInput {
+  userId: string;
+  endpoint: ApiIdempotencyEndpoint;
+  idempotencyKey: string;
+  requestHash: string;
+  stream: boolean;
+  model: string;
+  runId: string;
+  reserveMicros: number;
+  provider: string;
+  tokenId?: string;
+  leaseSeconds?: number;
+  retentionSeconds?: number;
+  quota?: ApiReplayQuota;
+}
+export type BeginApiRequestResult =
+  | { kind: "started"; request: ApiIdempotencyRequest; leaseToken: string; usageRun: UsageRun }
+  | { kind: "completed" | "failed"; request: ApiIdempotencyRequest }
+  | { kind: "in_progress"; request: ApiIdempotencyRequest; retryAfterSeconds: number };
+export interface CompleteApiRequestInput {
+  id: string;
+  leaseToken: string;
+  responseStatus: number;
+  responseHeaders?: Record<string, string>;
+  responseBody?: string;
+  frames?: ApiSseFrameInput[];
+  terminalFrame?: string;
+  costMicros: number;
+  inputTokens: number;
+  outputTokens: number;
+  latencyMs: number;
+  quota?: ApiReplayQuota;
+}
+export interface FailApiRequestInput {
+  id: string;
+  leaseToken: string;
+  responseStatus: number;
+  responseHeaders?: Record<string, string>;
+  responseBody: string;
+  terminalFrame?: string;
+  billing: { mode: "refund" } | {
+    mode: "settle";
+    costMicros: number;
+    inputTokens: number;
+    outputTokens: number;
+    latencyMs: number;
+  };
+}
 
 /** Persistence boundary shared by synchronous test stores and async production stores. */
 export interface DomainRepository {
@@ -163,6 +259,40 @@ export interface DomainRepository {
     latencyMs: number,
   ): MaybePromise<UsageRun>;
   refund(runId: string, error?: string): MaybePromise<UsageRun | undefined>;
+  beginApiRequest(input: BeginApiRequestInput): MaybePromise<BeginApiRequestResult>;
+  getApiRequest(
+    userId: string,
+    endpoint: ApiIdempotencyEndpoint,
+    idempotencyKey: string,
+  ): MaybePromise<ApiIdempotencyRequest | undefined>;
+  appendApiSseFrame(
+    id: string,
+    leaseToken: string,
+    sequence: number,
+    frame: string,
+    leaseSeconds?: number,
+    observation?: ApiUsageObservation,
+    quota?: ApiReplayQuota,
+  ): MaybePromise<ApiIdempotencyRequest>;
+  appendApiSseFrames(
+    id: string,
+    leaseToken: string,
+    frames: ApiSseFrameInput[],
+    leaseSeconds?: number,
+    observation?: ApiUsageObservation,
+    quota?: ApiReplayQuota,
+  ): MaybePromise<ApiIdempotencyRequest>;
+  heartbeatApiRequest(
+    id: string,
+    leaseToken: string,
+    leaseSeconds?: number,
+    observation?: ApiUsageObservation,
+  ): MaybePromise<void>;
+  completeApiJson(input: CompleteApiRequestInput): MaybePromise<ApiIdempotencyRequest>;
+  completeApiStream(input: CompleteApiRequestInput): MaybePromise<ApiIdempotencyRequest>;
+  failApiRequest(input: FailApiRequestInput): MaybePromise<ApiIdempotencyRequest>;
+  reapStaleApiRequests(limit?: number): MaybePromise<number>;
+  pruneExpiredApiRequests(limit?: number): MaybePromise<number>;
   usage(userId: string): MaybePromise<UsageSummary>;
   listLedger(userId: string): MaybePromise<LedgerEntry[]>;
   enqueueJob(type: string, payload: unknown, availableAt?: string): MaybePromise<string>;

@@ -1,6 +1,19 @@
 const port = Number(Deno.env.get("MOCK_PROVIDER_PORT") ?? "4010");
+const apiKey = Deno.env.get("MOCK_PROVIDER_API_KEY") ?? "ci-mock-provider-key";
+const controlToken = Deno.env.get("MOCK_PROVIDER_CONTROL_TOKEN") ?? "ci-mock-control-token";
 const encoder = new TextEncoder();
 const attempts = new Map<string, number>();
+
+interface ScenarioState {
+  opened: number;
+  completed: number;
+  aborted: number;
+  lastAccept: string | null;
+  lastAuthorized: boolean;
+  lastStream: boolean;
+}
+
+const scenarios = new Map<string, ScenarioState>();
 
 const headers = {
   "access-control-allow-origin": "*",
@@ -15,6 +28,14 @@ function json(body: unknown, status = 200): Response {
 
 function error(message: string, status: number, code: string): Response {
   return json({ error: { message, type: "mock_provider_error", param: null, code } }, status);
+}
+
+function authorized(request: Request, expected: string): boolean {
+  return request.headers.get("authorization") === `Bearer ${expected}`;
+}
+
+function controlAuthorized(request: Request): boolean {
+  return authorized(request, controlToken);
 }
 
 function modelFrom(body: Record<string, unknown>): string {
@@ -47,47 +68,154 @@ function maybeFail(model: string): Response | undefined {
   if (model.includes("fail-first") && attempt === 1) {
     return error("Intentional first-attempt failure", 503, "mock_retryable");
   }
-  if (model.includes("fail")) return error("Intentional provider failure", 503, "mock_failure");
+  if (model.includes("error") || model.includes("fail")) {
+    return error("Intentional provider failure", 503, "mock_failure");
+  }
 }
 
-function chatStream(model: string, content: string, id: string): Response {
+function stateFor(model: string): ScenarioState {
+  const state = scenarios.get(model) ?? {
+    opened: 0,
+    completed: 0,
+    aborted: 0,
+    lastAccept: null,
+    lastAuthorized: false,
+    lastStream: false,
+  };
+  scenarios.set(model, state);
+  return state;
+}
+
+function observe(request: Request, model: string, body: Record<string, unknown>): ScenarioState {
+  const state = stateFor(model);
+  state.opened++;
+  state.lastAccept = request.headers.get("accept");
+  state.lastAuthorized = authorized(request, apiKey);
+  state.lastStream = body.stream === true;
+  return state;
+}
+
+function chatChunk(
+  model: string,
+  id: string,
+  delta: Record<string, unknown>,
+  finish: string | null,
+) {
+  return {
+    id,
+    object: "chat.completion.chunk",
+    created: 1_700_000_000,
+    model,
+    choices: [{ index: 0, delta, finish_reason: finish }],
+  };
+}
+
+function normalChatStream(
+  request: Request,
+  model: string,
+  content: string,
+  id: string,
+  state: ScenarioState,
+): Response {
   const words = content.split(/(\s+)/).filter(Boolean);
   const slow = model.includes("slow");
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
+      let aborted = false;
+      const onAbort = () => {
+        aborted = true;
+        state.aborted++;
+      };
+      request.signal.addEventListener("abort", onAbort, { once: true });
       const emit = (value: unknown) =>
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(value)}\n\n`));
-      emit({
-        id,
-        object: "chat.completion.chunk",
-        created: Math.floor(Date.now() / 1000),
-        model,
-        choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
-      });
-      for (const word of words) {
-        if (slow) await new Promise((resolve) => setTimeout(resolve, 125));
+      try {
+        emit(chatChunk(model, id, { role: "assistant", content: "" }, null));
+        for (const word of words) {
+          if (slow) await new Promise((resolve) => setTimeout(resolve, 125));
+          if (aborted) return;
+          emit(chatChunk(model, id, { content: word }, null));
+        }
         emit({
-          id,
-          object: "chat.completion.chunk",
-          created: Math.floor(Date.now() / 1000),
-          model,
-          choices: [{ index: 0, delta: { content: word }, finish_reason: null }],
+          ...chatChunk(model, id, {}, "stop"),
+          usage: {
+            prompt_tokens: 8,
+            completion_tokens: words.length,
+            total_tokens: 8 + words.length,
+          },
         });
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+        state.completed++;
+      } catch (streamError) {
+        if (!aborted) controller.error(streamError);
+      } finally {
+        request.signal.removeEventListener("abort", onAbort);
       }
-      emit({
-        id,
-        object: "chat.completion.chunk",
-        created: Math.floor(Date.now() / 1000),
-        model,
-        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-        usage: {
-          prompt_tokens: 8,
-          completion_tokens: words.length,
-          total_tokens: 8 + words.length,
-        },
-      });
-      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+    },
+  });
+  return new Response(stream, {
+    headers: { ...headers, "content-type": "text/event-stream", "cache-control": "no-cache" },
+  });
+}
+
+function splitChatStream(
+  model: string,
+  content: string,
+  id: string,
+  state: ScenarioState,
+): Response {
+  const role = JSON.stringify(chatChunk(model, id, { role: "assistant", content: "" }, null));
+  const delta = JSON.stringify(chatChunk(model, id, { content }, null));
+  const splitAt = delta.indexOf('"choices"');
+  const finish = JSON.stringify({
+    ...chatChunk(model, id, {}, "stop"),
+    usage: { prompt_tokens: 8, completion_tokens: 4, total_tokens: 12 },
+  });
+  const wire = [
+    ": keepalive\r",
+    `\ndata: ${role}\r\n\r`,
+    `\ndata: ${delta.slice(0, splitAt)}`,
+    `\ndata: ${delta.slice(splitAt)}\n\n`,
+    `data: ${finish}\n\n`,
+    "data: [DO",
+    "NE]\n\n",
+  ];
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const part of wire) controller.enqueue(encoder.encode(part));
       controller.close();
+      state.completed++;
+    },
+  });
+  return new Response(stream, {
+    headers: { ...headers, "content-type": "text/event-stream; charset=utf-8" },
+  });
+}
+
+function roleStallStream(
+  request: Request,
+  model: string,
+  id: string,
+  state: ScenarioState,
+): Response {
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(encoder.encode(
+        `data: ${JSON.stringify(chatChunk(model, id, { role: "assistant" }, null))}\n\n`,
+      ));
+      const onAbort = () => {
+        state.aborted++;
+        try {
+          controller.close();
+        } catch {
+          // A downstream cancellation may already have closed the controller.
+        }
+      };
+      request.signal.addEventListener("abort", onAbort, { once: true });
+    },
+    cancel() {
+      state.aborted++;
     },
   });
   return new Response(stream, {
@@ -96,18 +224,25 @@ function chatStream(model: string, content: string, id: string): Response {
 }
 
 async function handleChat(request: Request): Promise<Response> {
+  if (!authorized(request, apiKey)) return error("Invalid mock provider key", 401, "unauthorized");
   const body = await request.json() as Record<string, unknown>;
   const model = modelFrom(body);
+  const state = observe(request, model, body);
   const failure = maybeFail(model);
   if (failure) return failure;
   const id = `chatcmpl_${crypto.randomUUID().replaceAll("-", "")}`;
   const prompt = textFrom(body);
   const content = completionText(model, prompt);
-  if (body.stream === true) return chatStream(model, content, id);
+  if (body.stream === true) {
+    if (model.includes("split")) return splitChatStream(model, content, id, state);
+    if (model.includes("role-stall")) return roleStallStream(request, model, id, state);
+    return normalChatStream(request, model, content, id, state);
+  }
+  state.completed++;
   return json({
     id,
     object: "chat.completion",
-    created: Math.floor(Date.now() / 1000),
+    created: 1_700_000_000,
     model,
     choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
     usage: { prompt_tokens: 8, completion_tokens: 12, total_tokens: 20 },
@@ -115,6 +250,7 @@ async function handleChat(request: Request): Promise<Response> {
 }
 
 async function handleResponses(request: Request): Promise<Response> {
+  if (!authorized(request, apiKey)) return error("Invalid mock provider key", 401, "unauthorized");
   const body = await request.json() as Record<string, unknown>;
   const model = modelFrom(body);
   const failure = maybeFail(model);
@@ -148,9 +284,7 @@ async function handleResponses(request: Request): Promise<Response> {
     ];
     return new Response(
       events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""),
-      {
-        headers: { ...headers, "content-type": "text/event-stream" },
-      },
+      { headers: { ...headers, "content-type": "text/event-stream" } },
     );
   }
   return json({
@@ -173,15 +307,33 @@ Deno.serve({ port }, async (request) => {
   const url = new URL(request.url);
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers });
   if (url.pathname === "/health") return json({ status: "ok" });
+  if (url.pathname === "/__test/reset" && request.method === "POST") {
+    if (!controlAuthorized(request)) return error("Invalid control token", 401, "unauthorized");
+    attempts.clear();
+    scenarios.clear();
+    return json({ reset: true });
+  }
+  if (url.pathname === "/__test/state" && request.method === "GET") {
+    if (!controlAuthorized(request)) return error("Invalid control token", 401, "unauthorized");
+    return json({
+      attempts: Object.fromEntries(attempts),
+      scenarios: Object.fromEntries(scenarios),
+    });
+  }
   if (url.pathname === "/v1/models" && request.method === "GET") {
+    if (!authorized(request, apiKey)) {
+      return error("Invalid mock provider key", 401, "unauthorized");
+    }
     return json({
       object: "list",
       data: [
         "mock-fast",
+        "mock-split",
+        "mock-error",
+        "mock-role-stall",
         "mock-slow",
         "mock-reasoning",
         "mock-tool",
-        "mock-fail",
         "mock-fail-first",
       ].map((id) => ({ id, object: "model", created: 1_700_000_000, owned_by: "dg-chat-tests" })),
     });
@@ -193,6 +345,9 @@ Deno.serve({ port }, async (request) => {
     return await handleResponses(request);
   }
   if (url.pathname === "/v1/embeddings" && request.method === "POST") {
+    if (!authorized(request, apiKey)) {
+      return error("Invalid mock provider key", 401, "unauthorized");
+    }
     const body = await request.json() as Record<string, unknown>;
     const inputs = Array.isArray(body.input) ? body.input : [body.input];
     return json({
@@ -207,12 +362,18 @@ Deno.serve({ port }, async (request) => {
     });
   }
   if (url.pathname === "/v1/images/generations" && request.method === "POST") {
+    if (!authorized(request, apiKey)) {
+      return error("Invalid mock provider key", 401, "unauthorized");
+    }
     return json({
-      created: Math.floor(Date.now() / 1000),
+      created: 1_700_000_000,
       data: [{ b64_json: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB" }],
     });
   }
   if (url.pathname.startsWith("/v1/audio/") && request.method === "POST") {
+    if (!authorized(request, apiKey)) {
+      return error("Invalid mock provider key", 401, "unauthorized");
+    }
     if (url.pathname.endsWith("/speech")) {
       return new Response(new Uint8Array([73, 68, 51]), {
         headers: { "content-type": "audio/mpeg" },

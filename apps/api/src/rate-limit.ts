@@ -13,6 +13,12 @@ export interface RateLimiter {
   close(): Promise<void>;
 }
 
+export function authorizationCredentialIdentity(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const bearer = /^\s*Bearer[\t ]+([^\t ]+)[\t ]*$/i.exec(value);
+  return bearer ? `bearer:${bearer[1]}` : undefined;
+}
+
 export class MemoryRateLimiter implements RateLimiter {
   readonly #entries = new Map<string, { count: number; resetsAt: number }>();
   readonly #maxEntries: number;
@@ -73,6 +79,7 @@ export class MemoryRateLimiter implements RateLimiter {
 
 export class RedisRateLimiter implements RateLimiter {
   readonly #redis: Redis;
+  #connecting?: Promise<void>;
 
   constructor(url: string) {
     this.#redis = new Redis(url, {
@@ -80,15 +87,30 @@ export class RedisRateLimiter implements RateLimiter {
       lazyConnect: true,
       maxRetriesPerRequest: 1,
     });
+    // Connection failures are surfaced through consume()/health(); registering a listener keeps
+    // ioredis from emitting duplicate "Unhandled error event" diagnostics during recovery.
+    this.#redis.on("error", () => undefined);
+  }
+
+  async #ensureConnected() {
+    if (this.#redis.status === "ready") return;
+    this.#connecting ??= this.#redis.connect().finally(() => {
+      this.#connecting = undefined;
+    });
+    await this.#connecting;
   }
 
   async consume(key: string, limit: number, windowSeconds: number): Promise<RateLimitResult> {
-    if (this.#redis.status === "wait") await this.#redis.connect();
+    await this.#ensureConnected();
     const redisKey = `dg-chat:rate:${key}`;
     const [count, ttl] = await this.#redis.eval(
       `local count = redis.call('INCR', KEYS[1])
-       if count == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
-       return {count, redis.call('TTL', KEYS[1])}`,
+       local ttl = redis.call('TTL', KEYS[1])
+       if count == 1 or ttl < 0 then
+         redis.call('EXPIRE', KEYS[1], ARGV[1])
+         ttl = tonumber(ARGV[1])
+       end
+       return {count, ttl}`,
       1,
       redisKey,
       windowSeconds,
@@ -102,12 +124,13 @@ export class RedisRateLimiter implements RateLimiter {
   }
 
   async close() {
-    if (this.#redis.status !== "wait" && this.#redis.status !== "end") await this.#redis.quit();
+    if (this.#redis.status === "ready") await this.#redis.quit();
+    else this.#redis.disconnect();
   }
 
   async health() {
     try {
-      if (this.#redis.status === "wait") await this.#redis.connect();
+      await this.#ensureConnected();
       return await this.#redis.ping() === "PONG";
     } catch {
       return false;
@@ -141,4 +164,13 @@ export function requestClientKey(
   const realIp = validAddress(headers.get("x-real-ip"));
   if (realIp) return realIp;
   return validAddress(headers.get("x-forwarded-for")?.split(",", 1)[0]) ?? "unknown-proxy-client";
+}
+
+export function requestTrustedClientKey(
+  headers: Headers,
+  trustProxy = Deno.env.get("TRUST_PROXY_HEADERS") === "true",
+): string | undefined {
+  if (!trustProxy) return undefined;
+  return validAddress(headers.get("x-real-ip")) ??
+    validAddress(headers.get("x-forwarded-for")?.split(",", 1)[0]);
 }

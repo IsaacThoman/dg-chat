@@ -15,6 +15,13 @@
       "when": 1783656001000,
       "tag": "0001_normalized_repository",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1783656002000,
+      "tag": "0002_openai_replays",
+      "breakpoints": true
     }
   ]
 }

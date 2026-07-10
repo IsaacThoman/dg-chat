@@ -9,11 +9,11 @@ if not api_key:
     raise RuntimeError("OPENAI_API_KEY is required")
 
 client = OpenAI(api_key=api_key, base_url=base_url, max_retries=0)
-model = "simulated/dg-chat"
+model = "openai/mock-fast"
 
 models = client.models.list()
-if not any(candidate.id == model for candidate in models.data):
-    raise RuntimeError(f"Official Python client did not receive {model} from models.list()")
+if not any(candidate.id == "openai/default" for candidate in models.data):
+    raise RuntimeError("Official Python client did not receive the configured upstream model")
 
 completion = client.chat.completions.create(
     model=model,

@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "exports": "./src/app.ts",
   "imports": {
+    "@types/node": "npm:@types/node@22.15.3",
     "hono": "npm:hono@4.12.28",
     "hono/": "npm:hono@4.12.28/",
     "ioredis": "npm:ioredis@5.8.2"
