@@ -47,6 +47,15 @@ export function ingestionStatusText(file: Attachment): string {
   }
 }
 
+export async function retryIngestionAndRefresh(
+  attachmentId: string,
+  retry: (id: string) => Promise<Attachment>,
+  refresh: () => Promise<unknown>,
+): Promise<void> {
+  await retry(attachmentId);
+  await refresh();
+}
+
 function AttachmentIngestionStatus(
   { file, retry, busy }: { file: Attachment; retry?: () => void; busy?: boolean },
 ) {
@@ -194,6 +203,7 @@ function AttachmentPicker(
   });
   const [selected, setSelected] = useState("");
   const [busy, setBusy] = useState(false);
+  const [retryingId, setRetryingId] = useState("");
   const [error, setError] = useState("");
   const available = files.data?.filter((file) => !current.some((item) => item.id === file.id)) ??
     [];
@@ -217,27 +227,49 @@ function AttachmentPicker(
       {available.length > 0 && (
         <div className="knowledge-file-picker" role="radiogroup" aria-label="Uploaded files">
           {available.map((file) => (
-            <label
-              key={file.id}
-              className={`${selected === file.id ? "selected" : ""} ${
-                isReady(file) ? "" : "disabled"
-              }`}
-            >
-              <input
-                type="radio"
-                name="attachment"
-                value={file.id}
-                checked={selected === file.id}
-                disabled={!isReady(file)}
-                onChange={() => setSelected(file.id)}
-              />
-              <FileText size={18} />
-              <span>
-                <strong>{file.filename}</strong>
-                <AttachmentIngestionStatus file={file} />
-              </span>
-              {selected === file.id && <Check size={17} className="push" />}
-            </label>
+            <div className="knowledge-file-picker-row" key={file.id}>
+              <label
+                className={`${selected === file.id ? "selected" : ""} ${
+                  isReady(file) ? "" : "disabled"
+                }`}
+              >
+                <input
+                  type="radio"
+                  name="attachment"
+                  value={file.id}
+                  checked={selected === file.id}
+                  disabled={!isReady(file)}
+                  onChange={() => setSelected(file.id)}
+                />
+                <FileText size={18} />
+                <span>
+                  <strong>{file.filename}</strong>
+                  <AttachmentIngestionStatus file={file} />
+                </span>
+                {selected === file.id && <Check size={17} className="push" />}
+              </label>
+              {file.ingestionStatus === "failed" && (
+                <button
+                  type="button"
+                  className="secondary knowledge-picker-retry"
+                  disabled={Boolean(retryingId)}
+                  aria-label={`Retry extraction for ${file.filename}`}
+                  onClick={() => {
+                    setRetryingId(file.id);
+                    setError("");
+                    void retryIngestionAndRefresh(
+                      file.id,
+                      api.retryAttachmentIngestion,
+                      files.refetch,
+                    ).catch((caught) => setError(errorMessage(caught))).finally(() =>
+                      setRetryingId("")
+                    );
+                  }}
+                >
+                  <RefreshCw size={14} /> {retryingId === file.id ? "Retrying…" : "Retry"}
+                </button>
+              )}
+            </div>
           ))}
         </div>
       )}
@@ -285,8 +317,7 @@ export function KnowledgeView({ onMenu }: { onMenu: () => void }) {
     queryKey: ["collections", selected?.id],
     queryFn: () => api.collection(selected!.id),
     enabled: Boolean(selected),
-    refetchInterval: (query) =>
-      hasActiveIngestion(query.state.data?.attachments) ? 2_000 : false,
+    refetchInterval: (query) => hasActiveIngestion(query.state.data?.attachments) ? 2_000 : false,
   });
   const refresh = async () => {
     await Promise.all([collections.refetch(), detail.refetch()]);

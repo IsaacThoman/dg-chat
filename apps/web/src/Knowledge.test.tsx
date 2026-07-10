@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
 import type { Attachment } from "./types.ts";
-import { hasActiveIngestion, ingestionStatusText } from "./Knowledge.tsx";
+import { hasActiveIngestion, ingestionStatusText, retryIngestionAndRefresh } from "./Knowledge.tsx";
 
 const attachment = (status: Attachment["ingestionStatus"], error?: string): Attachment => ({
   id: `file-${status}`,
@@ -29,5 +30,21 @@ describe("knowledge ingestion status", () => {
     );
     expect(ingestionStatusText(attachment("failed"))).toContain("Retry");
     expect(ingestionStatusText(attachment("ready"))).toBe("Extraction ready");
+  });
+
+  it("keeps the picker retry control outside its radio label and refreshes after retry", async () => {
+    const source = readFileSync(new URL("./Knowledge.tsx", import.meta.url), "utf8");
+    const row = source.slice(
+      source.indexOf('<div className="knowledge-file-picker-row"'),
+      source.indexOf('{file.ingestionStatus === "failed"'),
+    );
+    expect(row).toContain("</label>");
+    expect(source).toContain("aria-label={`Retry extraction for ${file.filename}`}");
+    const retry = vi.fn().mockResolvedValue(attachment("queued"));
+    const refresh = vi.fn().mockResolvedValue(undefined);
+    await retryIngestionAndRefresh("failed-file", retry, refresh);
+    expect(retry).toHaveBeenCalledWith("failed-file");
+    expect(refresh).toHaveBeenCalledOnce();
+    expect(retry.mock.invocationCallOrder[0]).toBeLessThan(refresh.mock.invocationCallOrder[0]);
   });
 });

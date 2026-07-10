@@ -3368,6 +3368,19 @@ kbd {
   cursor: not-allowed;
   opacity: .62;
 }
+.knowledge-file-picker-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: stretch;
+  gap: 6px;
+}
+.knowledge-file-picker-row > label {
+  min-width: 0;
+}
+.knowledge-picker-retry {
+  align-self: stretch;
+  min-height: 44px;
+}
 .knowledge-mode:disabled label,
 .knowledge-checks input:disabled {
   cursor: not-allowed;
