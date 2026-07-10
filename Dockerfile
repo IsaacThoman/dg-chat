@@ -56,11 +56,21 @@ EOF
 EXPOSE 8080
 
 FROM debian:trixie-slim AS app
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd --system dgchat \
-    && useradd --system --gid dgchat --no-create-home dgchat
+RUN set -eux; \
+    installed=0; \
+    for attempt in 1 2 3 4 5; do \
+      rm -rf /var/lib/apt/lists/*; \
+      if apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update \
+        && apt-get install -y --no-install-recommends ca-certificates curl; then \
+        installed=1; \
+        break; \
+      fi; \
+      sleep "$((attempt * 2))"; \
+    done; \
+    test "$installed" = 1; \
+    rm -rf /var/lib/apt/lists/*; \
+    groupadd --system dgchat; \
+    useradd --system --gid dgchat --no-create-home dgchat
 COPY --from=service-build /service/dg-chat-api /usr/local/bin/dg-chat-api
 ENV DENO_ENV=production \
     PORT=8000
@@ -69,11 +79,21 @@ USER dgchat
 CMD ["/usr/local/bin/dg-chat-api"]
 
 FROM debian:trixie-slim AS worker
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates postgresql-client \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd --system dgchat \
-    && useradd --system --gid dgchat --no-create-home dgchat
+RUN set -eux; \
+    installed=0; \
+    for attempt in 1 2 3 4 5; do \
+      rm -rf /var/lib/apt/lists/*; \
+      if apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update \
+        && apt-get install -y --no-install-recommends ca-certificates postgresql-client; then \
+        installed=1; \
+        break; \
+      fi; \
+      sleep "$((attempt * 2))"; \
+    done; \
+    test "$installed" = 1; \
+    rm -rf /var/lib/apt/lists/*; \
+    groupadd --system dgchat; \
+    useradd --system --gid dgchat --no-create-home dgchat
 RUN <<'EOF'
 cat > /usr/local/bin/worker-healthcheck <<'SCRIPT'
 #!/bin/sh
