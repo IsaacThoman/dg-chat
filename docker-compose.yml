@@ -49,13 +49,7 @@ services:
       dockerfile: Dockerfile
       target: app
     healthcheck:
-      test:
-        [
-          "CMD",
-          "deno",
-          "eval",
-          "fetch('http://127.0.0.1:8000/ready').then(r=>{if(!r.ok)Deno.exit(1)}).catch(()=>Deno.exit(1))",
-        ]
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8000/ready"]
       interval: 10s
       timeout: 5s
       retries: 12

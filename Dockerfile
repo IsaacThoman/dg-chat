@@ -13,6 +13,16 @@ RUN deno install --frozen=false
 FROM dependencies AS web-build
 RUN deno task build
 
+FROM denoland/deno:alpine AS service-build
+WORKDIR /service
+COPY deno.service.json ./deno.json
+COPY apps/api ./apps/api
+COPY apps/worker ./apps/worker
+COPY packages/contracts ./packages/contracts
+COPY packages/database ./packages/database
+RUN deno compile -A --node-modules-dir=none --output /service/dg-chat-api apps/api/src/main.ts \
+    && deno compile -A --node-modules-dir=none --output /service/dg-chat-worker apps/worker/src/main.ts
+
 FROM nginxinc/nginx-unprivileged:1.27-alpine AS web
 COPY --from=web-build /workspace/apps/web/dist /usr/share/nginx/html
 RUN <<'EOF'
@@ -47,18 +57,26 @@ NGINX
 EOF
 EXPOSE 8080
 
-FROM dependencies AS app
-COPY --from=web-build /workspace/apps/web/dist ./apps/web/dist
+FROM debian:trixie-slim AS app
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system dgchat \
+    && useradd --system --gid dgchat --no-create-home dgchat
+COPY --from=service-build /service/dg-chat-api /usr/local/bin/dg-chat-api
 ENV DENO_ENV=production \
     PORT=8000
 EXPOSE 8000
-USER deno
-CMD ["task", "--filter", "@dg-chat/api", "start"]
+USER dgchat
+CMD ["/usr/local/bin/dg-chat-api"]
 
-FROM dependencies AS worker
+FROM debian:trixie-slim AS worker
+RUN groupadd --system dgchat \
+    && useradd --system --gid dgchat --no-create-home dgchat
+COPY --from=service-build /service/dg-chat-worker /usr/local/bin/dg-chat-worker
 ENV DENO_ENV=production
-USER deno
-CMD ["task", "--filter", "@dg-chat/worker", "start"]
+USER dgchat
+CMD ["/usr/local/bin/dg-chat-worker"]
 
 FROM dependencies AS development
 USER deno

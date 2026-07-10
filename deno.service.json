@@ -1,0 +1,9 @@
+{
+  "workspace": [
+    "./apps/api",
+    "./apps/worker",
+    "./packages/contracts",
+    "./packages/database"
+  ],
+  "nodeModulesDir": "none"
+}
