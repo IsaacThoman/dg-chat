@@ -1,0 +1,780 @@
+import type {
+  DomainRepository,
+  FinishProviderAttemptInput,
+  ProviderAttempt,
+  ProviderAttemptReason,
+  ProviderBreakerState,
+  ProviderExecutionClaim,
+  ProviderExecutionPlan,
+  ProviderExecutionTarget,
+  UsagePricingSnapshot,
+} from "@dg-chat/database";
+import { DomainError } from "@dg-chat/database";
+import type { ChatCompletionRequest } from "@dg-chat/contracts";
+import { type ProviderSecretEnvelope, ProviderSecretKeyring } from "./provider-secrets.ts";
+import { complete, streamChatCompletion, type UpstreamStreamOptions } from "./models.ts";
+import {
+  type AttemptContext,
+  type AttemptEvent,
+  type CircuitPermit,
+  type CircuitStore,
+  executeProviderRequest,
+  openAIVisibleUnits,
+  ProviderAttemptError,
+  type ProviderCandidate,
+  type ResiliencePolicy,
+  streamProviderRequest,
+} from "./provider-resilience.ts";
+import {
+  type BreakerPolicy,
+  type CircuitBreaker,
+  CircuitBreakerStoreAdapter,
+} from "./provider-circuit.ts";
+import { estimateInputTokens } from "./pricing.ts";
+
+type Completion = Awaited<ReturnType<typeof complete>>;
+
+interface RuntimeCandidate extends ProviderCandidate {
+  target: ProviderExecutionTarget;
+  credentialEnvelope: Record<string, unknown>;
+}
+
+interface AttemptMetrics {
+  dispatched: boolean;
+  inputTokens: number;
+  cachedInputTokens: number;
+  reasoningTokens: number;
+  outputTokens: number;
+  upstreamRequestId: string | null;
+  firstVisibleAt: number | null;
+  visibleCharacters: number;
+  reasoningCharacters: number;
+  tokenSource: "provider" | "estimated" | "none";
+}
+
+export interface ProviderExecutionOptions {
+  repository: DomainRepository;
+  keyring: ProviderSecretKeyring;
+  circuitBreaker: CircuitBreaker;
+  breakerPolicy: BreakerPolicy;
+  complete?: typeof complete;
+  stream?: typeof streamChatCompletion;
+  now?: () => number;
+}
+
+const defaultRetryableStatuses = [408, 425, 429, 500, 502, 503, 504];
+const terminalPersistenceDelaysMs = [0, 10, 50, 200] as const;
+
+export class TerminalAccountingPersistenceError extends Error {
+  constructor(public readonly persistenceCause: unknown) {
+    super("Provider completed, but its terminal accounting record could not be persisted");
+    this.name = "TerminalAccountingPersistenceError";
+  }
+}
+
+function retryablePersistenceError(error: unknown): boolean {
+  return !(error instanceof DomainError) || error.status >= 500;
+}
+
+async function accountingBackoff(delayMs: number): Promise<void> {
+  if (delayMs === 0) return;
+  await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+}
+
+function safeCount(value: unknown): number {
+  return Number.isSafeInteger(value) && Number(value) >= 0 ? Number(value) : 0;
+}
+
+function pricingCost(pricing: UsagePricingSnapshot, metrics: AttemptMetrics): number {
+  const uncached = BigInt(Math.max(0, metrics.inputTokens - metrics.cachedInputTokens));
+  const ordinaryOutput = BigInt(Math.max(0, metrics.outputTokens - metrics.reasoningTokens));
+  const numerator = uncached * BigInt(pricing.inputMicrosPerMillion) +
+    BigInt(metrics.cachedInputTokens) * BigInt(pricing.cachedInputMicrosPerMillion) +
+    BigInt(metrics.reasoningTokens) * BigInt(pricing.reasoningMicrosPerMillion) +
+    ordinaryOutput * BigInt(pricing.outputMicrosPerMillion);
+  const cost = (numerator + 999_999n) / 1_000_000n + BigInt(pricing.fixedCallMicros);
+  if (cost < 0 || cost > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new ProviderAttemptError("Provider attempt cost exceeds accounting bounds", {
+      category: "invalid_response",
+      transient: false,
+    });
+  }
+  return Number(cost);
+}
+
+function requestId(value: unknown): string | null {
+  return typeof value === "string" && /^[A-Za-z0-9._:-]{1,200}$/.test(value) ? value : null;
+}
+
+function policyFor(plan: ProviderExecutionPlan, remainingAttempts?: number): ResiliencePolicy {
+  const policy = plan.retryPolicy;
+  const configuredAttempts = policy?.maxAttempts ?? Math.max(1, Math.min(8, plan.targets.length));
+  const maxAttempts = remainingAttempts ?? configuredAttempts;
+  if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > configuredAttempts) {
+    throw new ProviderAttemptError("Provider execution attempt budget is exhausted", {
+      category: "invalid_request",
+      transient: false,
+    });
+  }
+  return {
+    maxRetries: Math.min(policy?.maxRetries ?? 0, maxAttempts - 1),
+    baseDelayMs: policy?.baseDelayMs ?? 200,
+    maxDelayMs: policy?.maxDelayMs ?? 2_000,
+    backoffMultiplier: (policy?.backoffMultiplierBps ?? 20_000) / 10_000,
+    jitterRatio: (policy?.jitterBps ?? 2_000) / 10_000,
+    maxAttempts,
+    // Circuit skips do not spend the physical-call budget, so one remaining call may still
+    // traverse the complete frozen fallback path to find a runnable target.
+    maxHops: Math.max(0, Math.min(7, plan.targets.length - 1)),
+    totalTimeoutMs: policy?.totalTimeoutMs ?? 120_000,
+    firstVisibleTimeoutMs: policy?.firstTokenTimeoutMs ?? 15_000,
+    idleTimeoutMs: policy?.idleTimeoutMs ?? 30_000,
+    maxPreVisibleChunks: 256,
+    maxPreVisibleBytes: 4_194_304,
+    circuitFailureThreshold: 3,
+    circuitOpenMs: 30_000,
+  };
+}
+
+function key(candidateId: string, context: Pick<AttemptContext, "attempt" | "hop" | "retry">) {
+  return `${candidateId}:${context.attempt}:${context.hop}:${context.retry}`;
+}
+
+function breakerState(value: string | undefined): ProviderBreakerState | null {
+  return value && ["closed", "open", "half_open", "unavailable"].includes(value)
+    ? value as ProviderBreakerState
+    : null;
+}
+
+function attemptReason(context: AttemptContext): ProviderAttemptReason {
+  if (context.circuitState === "half_open") return "half_open";
+  if (context.retry > 0) return "retry";
+  return context.hop > 0 ? "fallback" : "primary";
+}
+
+function emptyMetrics(estimatedInput = 0): AttemptMetrics {
+  return {
+    dispatched: false,
+    inputTokens: estimatedInput,
+    cachedInputTokens: 0,
+    reasoningTokens: 0,
+    outputTokens: 0,
+    upstreamRequestId: null,
+    firstVisibleAt: null,
+    visibleCharacters: 0,
+    reasoningCharacters: 0,
+    tokenSource: estimatedInput > 0 ? "estimated" : "none",
+  };
+}
+
+function observeChunk(metrics: AttemptMetrics, data: string, now: number) {
+  if (data === "[DONE]") return;
+  let value: Record<string, unknown>;
+  try {
+    value = JSON.parse(data) as Record<string, unknown>;
+  } catch {
+    return;
+  }
+  metrics.upstreamRequestId ??= requestId(value.id);
+  const usage = value.usage && typeof value.usage === "object" && !Array.isArray(value.usage)
+    ? value.usage as Record<string, unknown>
+    : {};
+  const prompt = usage.prompt_tokens_details && typeof usage.prompt_tokens_details === "object"
+    ? usage.prompt_tokens_details as Record<string, unknown>
+    : {};
+  const output = usage.completion_tokens_details &&
+      typeof usage.completion_tokens_details === "object"
+    ? usage.completion_tokens_details as Record<string, unknown>
+    : {};
+  const hasPromptUsage = Number.isSafeInteger(usage.prompt_tokens) &&
+    Number(usage.prompt_tokens) >= 0;
+  const hasOutputUsage = Number.isSafeInteger(usage.completion_tokens) &&
+    Number(usage.completion_tokens) >= 0;
+  if (hasPromptUsage) metrics.inputTokens = safeCount(usage.prompt_tokens);
+  if (hasOutputUsage) metrics.outputTokens = safeCount(usage.completion_tokens);
+  if (Number.isSafeInteger(prompt.cached_tokens) && Number(prompt.cached_tokens) >= 0) {
+    metrics.cachedInputTokens = safeCount(prompt.cached_tokens);
+  }
+  if (Number.isSafeInteger(output.reasoning_tokens) && Number(output.reasoning_tokens) >= 0) {
+    metrics.reasoningTokens = safeCount(output.reasoning_tokens);
+  }
+  if (hasPromptUsage || hasOutputUsage) metrics.tokenSource = "provider";
+  if (metrics.tokenSource !== "provider") {
+    const choices = Array.isArray(value.choices) ? value.choices : [];
+    let characters = 0;
+    for (const choice of choices) {
+      if (!choice || typeof choice !== "object" || Array.isArray(choice)) continue;
+      const delta = (choice as Record<string, unknown>).delta;
+      if (!delta || typeof delta !== "object" || Array.isArray(delta)) continue;
+      const fields = delta as Record<string, unknown>;
+      for (const name of ["content", "refusal"]) {
+        if (typeof fields[name] === "string") characters += fields[name].length;
+      }
+      for (const name of ["reasoning_content", "reasoning"]) {
+        if (typeof fields[name] === "string") {
+          characters += fields[name].length;
+          metrics.reasoningCharacters = Math.min(
+            33_554_432,
+            metrics.reasoningCharacters + fields[name].length,
+          );
+        }
+      }
+      if (Array.isArray(fields.tool_calls)) {
+        characters += JSON.stringify(fields.tool_calls).length;
+      }
+    }
+    metrics.visibleCharacters = Math.min(33_554_432, metrics.visibleCharacters + characters);
+    metrics.outputTokens = Math.ceil(metrics.visibleCharacters / 4);
+    metrics.reasoningTokens = Math.min(
+      metrics.outputTokens,
+      Math.ceil(metrics.reasoningCharacters / 4),
+    );
+    if (metrics.inputTokens > 0 || metrics.outputTokens > 0) metrics.tokenSource = "estimated";
+  }
+  if (metrics.firstVisibleAt === null && openAIVisibleUnits(value) > 0) {
+    metrics.firstVisibleAt = now;
+  }
+}
+
+function completionMetrics(result: Completion): AttemptMetrics {
+  const upstream = result.upstream && typeof result.upstream === "object" &&
+      !Array.isArray(result.upstream)
+    ? result.upstream as Record<string, unknown>
+    : {};
+  const usage =
+    upstream.usage && typeof upstream.usage === "object" && !Array.isArray(upstream.usage)
+      ? upstream.usage as Record<string, unknown>
+      : {};
+  return {
+    dispatched: true,
+    inputTokens: result.inputTokens,
+    cachedInputTokens: result.cachedInputTokens ?? 0,
+    reasoningTokens: result.reasoningTokens ?? 0,
+    outputTokens: result.outputTokens,
+    upstreamRequestId: requestId(upstream.id),
+    firstVisibleAt: null,
+    visibleCharacters: result.text.length,
+    reasoningCharacters: 0,
+    tokenSource:
+      Number.isSafeInteger(usage.prompt_tokens) || Number.isSafeInteger(usage.completion_tokens)
+        ? "provider"
+        : "estimated",
+  };
+}
+
+export class ProviderExecutionEngine {
+  readonly #repository: DomainRepository;
+  readonly #keyring: ProviderSecretKeyring;
+  readonly #circuitBreaker: CircuitBreaker;
+  readonly #breakerPolicy: BreakerPolicy;
+  readonly #complete: typeof complete;
+  readonly #stream: typeof streamChatCompletion;
+  readonly #now: () => number;
+
+  constructor(options: ProviderExecutionOptions) {
+    this.#repository = options.repository;
+    this.#keyring = options.keyring;
+    this.#circuitBreaker = options.circuitBreaker;
+    this.#breakerPolicy = options.breakerPolicy;
+    this.#complete = options.complete ?? complete;
+    this.#stream = options.stream ?? streamChatCompletion;
+    this.#now = options.now ?? Date.now;
+  }
+
+  async resolvePlan(sourceModelId: string): Promise<ProviderExecutionPlan> {
+    return await this.#repository.resolveProviderExecutionPlan(sourceModelId);
+  }
+
+  reservationMicros(
+    plan: ProviderExecutionPlan,
+    inputTokens: number,
+    outputTokens: number,
+  ): number {
+    if (
+      !Number.isSafeInteger(inputTokens) || inputTokens < 0 ||
+      !Number.isSafeInteger(outputTokens) || outputTokens < 0
+    ) {
+      throw new TypeError("Provider reservation token counts must be non-negative safe integers");
+    }
+    const attempts = policyFor(plan).maxAttempts;
+    let largestAttempt = 0n;
+    for (const target of plan.targets) {
+      const pricing = target.pricing;
+      const inputRate = BigInt(Math.max(
+        pricing.inputMicrosPerMillion,
+        pricing.cachedInputMicrosPerMillion,
+      ));
+      const outputRate = BigInt(Math.max(
+        pricing.outputMicrosPerMillion,
+        pricing.reasoningMicrosPerMillion,
+      ));
+      const variable = BigInt(inputTokens) * inputRate + BigInt(outputTokens) * outputRate;
+      const cost = (variable + 999_999n) / 1_000_000n + BigInt(pricing.fixedCallMicros);
+      if (cost > largestAttempt) largestAttempt = cost;
+    }
+    const reservation = largestAttempt * BigInt(attempts);
+    if (reservation < 0n || reservation > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new ProviderAttemptError("Provider reservation exceeds accounting bounds", {
+        category: "invalid_request",
+        transient: false,
+      });
+    }
+    return Number(reservation);
+  }
+
+  async #prepare(sourceModelId: string, frozenPlan?: ProviderExecutionPlan): Promise<{
+    plan: ProviderExecutionPlan;
+    candidates: Map<string, RuntimeCandidate>;
+  }> {
+    const plan = frozenPlan ?? await this.#repository.resolveProviderExecutionPlan(sourceModelId);
+    if (plan.sourceModelId !== sourceModelId) {
+      throw new ProviderAttemptError("Provider execution plan does not match the requested model", {
+        category: "invalid_request",
+        transient: false,
+      });
+    }
+    const candidates = new Map<string, RuntimeCandidate>();
+    for (const target of plan.targets) {
+      if (target.protocol !== "chat_completions") {
+        throw new ProviderAttemptError(
+          "Native Responses provider execution is not enabled in this runtime",
+          { category: "invalid_request", transient: false },
+        );
+      }
+      const providerBefore = await this.#repository.findProvider(target.providerId);
+      const modelBefore = await this.#repository.findProviderModel(target.providerModelId);
+      const credential = await this.#repository.getProviderCredential(target.providerId);
+      if (!credential || credential.providerId !== target.providerId) {
+        throw new ProviderAttemptError("Provider execution plan changed before dispatch", {
+          category: "invalid_request",
+          transient: false,
+        });
+      }
+      try {
+        await this.#keyring.decrypt(
+          target.providerId,
+          credential.envelope as unknown as ProviderSecretEnvelope,
+        );
+      } catch {
+        throw new ProviderAttemptError("Provider credential is unavailable", {
+          category: "invalid_request",
+          transient: false,
+        });
+      }
+      const providerAfter = await this.#repository.findProvider(target.providerId);
+      const modelAfter = await this.#repository.findProviderModel(target.providerModelId);
+      const credentialAfter = await this.#repository.getProviderCredential(target.providerId);
+      const stableCredential = credentialAfter?.providerId === credential.providerId &&
+        Object.entries(credential.envelope).every(([name, value]) =>
+          credentialAfter.envelope[name as keyof typeof credentialAfter.envelope] === value
+        );
+      const stableProvider = providerBefore && providerAfter &&
+        providerBefore.version === target.providerVersion &&
+        providerAfter.version === target.providerVersion &&
+        providerBefore.baseUrl === providerAfter.baseUrl;
+      const stableModel = modelBefore && modelAfter &&
+        modelBefore.version === target.modelVersion && modelAfter.version === target.modelVersion &&
+        modelBefore.providerId === target.providerId &&
+        modelAfter.providerId === target.providerId &&
+        modelBefore.upstreamModelId === target.upstreamModelId &&
+        modelAfter.upstreamModelId === target.upstreamModelId;
+      if (!stableProvider || !stableModel || !stableCredential) {
+        throw new ProviderAttemptError("Provider execution plan changed before dispatch", {
+          category: "invalid_request",
+          transient: false,
+        });
+      }
+      candidates.set(target.providerModelId, {
+        id: target.providerModelId,
+        target,
+        credentialEnvelope: structuredClone(credential.envelope) as unknown as Record<
+          string,
+          unknown
+        >,
+      });
+    }
+    const ordered = plan.targets;
+    for (const [index, target] of ordered.entries()) {
+      candidates.get(target.providerModelId)!.fallbackId = ordered[index + 1]?.providerModelId ??
+        null;
+    }
+    if (!ordered.length) {
+      throw new ProviderAttemptError("Provider execution plan has no runnable target", {
+        category: "invalid_request",
+        transient: false,
+      });
+    }
+    // Preparing later fallbacks can take long enough for an earlier provider or credential to be
+    // rotated. Fence the complete snapshot once more before any candidate may be dispatched.
+    for (const candidate of candidates.values()) await this.#assertSnapshotCurrent(candidate);
+    return { plan: { ...plan, targets: ordered }, candidates };
+  }
+
+  async #assertSnapshotCurrent(candidate: RuntimeCandidate): Promise<void> {
+    const { target, credentialEnvelope } = candidate;
+    const [provider, model, credential] = await Promise.all([
+      this.#repository.findProvider(target.providerId),
+      this.#repository.findProviderModel(target.providerModelId),
+      this.#repository.getProviderCredential(target.providerId),
+    ]);
+    const stableCredential = credential?.providerId === target.providerId &&
+      Object.entries(credentialEnvelope).every(([name, value]) =>
+        credential.envelope[name as keyof typeof credential.envelope] === value
+      ) && Object.keys(credential.envelope).length === Object.keys(credentialEnvelope).length;
+    if (
+      !provider || provider.version !== target.providerVersion || !provider.enabled ||
+      !model || model.version !== target.modelVersion || !model.enabled ||
+      model.providerId !== target.providerId || model.upstreamModelId !== target.upstreamModelId ||
+      !stableCredential
+    ) {
+      throw new ProviderAttemptError("Provider execution plan changed before dispatch", {
+        category: "invalid_request",
+        transient: false,
+      });
+    }
+  }
+
+  async #upstreamFor(candidate: RuntimeCandidate): Promise<UpstreamStreamOptions> {
+    await this.#assertSnapshotCurrent(candidate);
+    const { target } = candidate;
+    const providerBefore = await this.#repository.findProvider(target.providerId);
+    const modelBefore = await this.#repository.findProviderModel(target.providerModelId);
+    const credentialBefore = await this.#repository.getProviderCredential(target.providerId);
+    if (!providerBefore || !modelBefore || !credentialBefore) {
+      throw new ProviderAttemptError("Provider execution plan changed before dispatch", {
+        category: "invalid_request",
+        transient: false,
+      });
+    }
+    let apiKey: string;
+    try {
+      apiKey = await this.#keyring.decrypt(
+        target.providerId,
+        credentialBefore.envelope as unknown as ProviderSecretEnvelope,
+      );
+    } catch {
+      throw new ProviderAttemptError("Provider credential is unavailable", {
+        category: "invalid_request",
+        transient: false,
+      });
+    }
+    const providerAfter = await this.#repository.findProvider(target.providerId);
+    const modelAfter = await this.#repository.findProviderModel(target.providerModelId);
+    const credentialAfter = await this.#repository.getProviderCredential(target.providerId);
+    const sameCredential = credentialAfter &&
+      JSON.stringify(credentialAfter.envelope) === JSON.stringify(credentialBefore.envelope) &&
+      JSON.stringify(credentialAfter.envelope) === JSON.stringify(candidate.credentialEnvelope);
+    if (
+      !providerAfter || providerAfter.version !== providerBefore.version ||
+      providerAfter.version !== target.providerVersion ||
+      providerAfter.baseUrl !== providerBefore.baseUrl ||
+      !modelAfter || modelAfter.version !== modelBefore.version ||
+      modelAfter.version !== target.modelVersion ||
+      modelAfter.upstreamModelId !== target.upstreamModelId || !sameCredential
+    ) {
+      apiKey = "";
+      throw new ProviderAttemptError("Provider execution plan changed before dispatch", {
+        category: "invalid_request",
+        transient: false,
+      });
+    }
+    return {
+      baseUrl: providerAfter.baseUrl,
+      apiKey,
+      upstreamModel: target.upstreamModelId,
+    };
+  }
+
+  #telemetry(
+    usageRunId: string,
+    ownerLeaseToken: string,
+    claim: ProviderExecutionClaim,
+    plan: ProviderExecutionPlan,
+    metrics: Map<string, AttemptMetrics>,
+    estimatedInput: number,
+  ) {
+    const attempts = new Map<string, { attempt: ProviderAttempt; startedAt: number }>();
+    let pathOrdinal = claim.nextAttemptNumber - 1;
+    const target = (id: string) => {
+      const value = plan.targets.find((candidate) => candidate.providerModelId === id);
+      if (!value) throw new Error("Provider execution target disappeared");
+      return value;
+    };
+    return async (event: AttemptEvent) => {
+      const targetSnapshot = target(event.candidateId);
+      const eventKey = key(event.candidateId, event);
+      if (event.type === "skipped") {
+        const started = await this.#repository.startProviderAttempt({
+          ...targetSnapshot,
+          usageRunId,
+          ownerLeaseToken,
+          executionEpoch: claim.executionEpoch,
+          attemptNumber: ++pathOrdinal,
+          targetOrdinal: targetSnapshot.ordinal,
+          retryNumber: event.retry,
+          reason: "circuit_skip",
+          breakerBefore: breakerState(event.circuitState),
+        });
+        await this.#repository.finishProviderAttempt({
+          id: started.id,
+          ownerLeaseToken,
+          executionEpoch: claim.executionEpoch,
+          status: "skipped",
+          phase: "planning",
+          errorCode: "circuit_open",
+          visibleOutput: false,
+          inputTokens: 0,
+          cachedInputTokens: 0,
+          reasoningTokens: 0,
+          outputTokens: 0,
+          costMicros: 0,
+          tokenSource: "none",
+          costSource: "none",
+          latencyMs: 0,
+          breakerAfter: breakerState(event.circuitState),
+          retryable: true,
+        });
+        return;
+      }
+      if (event.type === "started") {
+        const context: AttemptContext = {
+          attempt: event.attempt,
+          hop: event.hop,
+          retry: event.retry,
+          circuitState: event.circuitState,
+        };
+        const started = await this.#repository.startProviderAttempt({
+          ...targetSnapshot,
+          usageRunId,
+          ownerLeaseToken,
+          executionEpoch: claim.executionEpoch,
+          attemptNumber: ++pathOrdinal,
+          targetOrdinal: targetSnapshot.ordinal,
+          retryNumber: event.retry,
+          reason: attemptReason(context),
+          breakerBefore: breakerState(event.circuitState),
+        });
+        attempts.set(eventKey, { attempt: started, startedAt: this.#now() });
+        metrics.set(eventKey, emptyMetrics(estimatedInput));
+        return;
+      }
+      const started = attempts.get(eventKey);
+      if (!started) throw new Error("Provider attempt telemetry start is missing");
+      const observed = metrics.get(eventKey) ?? emptyMetrics();
+      const latencyMs = Math.max(0, this.#now() - started.startedAt);
+      const costMicros = !observed.dispatched
+        ? 0
+        : event.type === "succeeded" || observed.inputTokens > 0 || observed.outputTokens > 0
+        ? pricingCost(targetSnapshot.pricing, observed)
+        : targetSnapshot.pricing.fixedCallMicros;
+      const ttftMs = observed.firstVisibleAt === null
+        ? null
+        : Math.max(0, observed.firstVisibleAt - started.startedAt);
+      const finish: FinishProviderAttemptInput = {
+        id: started.attempt.id,
+        ownerLeaseToken,
+        executionEpoch: claim.executionEpoch,
+        status: event.type === "succeeded"
+          ? "succeeded"
+          : event.errorCategory === "aborted"
+          ? "cancelled"
+          : "failed",
+        phase: event.type === "succeeded"
+          ? "complete"
+          : event.visibleOutput
+          ? "streaming"
+          : "complete",
+        errorCode: event.errorCategory ?? null,
+        httpStatus: event.httpStatus ?? null,
+        visibleOutput: event.visibleOutput ?? false,
+        inputTokens: observed.dispatched ? observed.inputTokens : 0,
+        cachedInputTokens: observed.dispatched ? observed.cachedInputTokens : 0,
+        reasoningTokens: observed.dispatched ? observed.reasoningTokens : 0,
+        outputTokens: observed.dispatched ? observed.outputTokens : 0,
+        costMicros,
+        tokenSource: observed.dispatched ? observed.tokenSource : "none",
+        costSource: observed.dispatched ? "calculated" : "none",
+        latencyMs,
+        ttftMs,
+        // The resilience callback precedes the exact permit transition. Null is honest; a later
+        // post-transition event can fill this without predicting concurrent Redis state.
+        breakerAfter: null,
+        retryable: event.retryable ?? false,
+        upstreamRequestId: observed.upstreamRequestId,
+        tokensPerSecond: observed.outputTokens > 0 && ttftMs !== null && latencyMs - ttftMs > 0
+          ? Math.min(
+            1_000_000,
+            Math.round(observed.outputTokens / ((latencyMs - ttftMs) / 1_000)),
+          )
+          : null,
+      };
+      let lastError: unknown;
+      for (const delayMs of terminalPersistenceDelaysMs) {
+        await accountingBackoff(delayMs);
+        try {
+          // The attempt id and complete terminal payload are deliberately reused. Both repository
+          // implementations treat this as an idempotent replay, including when a commit succeeded
+          // but its acknowledgement was lost.
+          await this.#repository.finishProviderAttempt(finish);
+          return;
+        } catch (error) {
+          lastError = error;
+          if (!retryablePersistenceError(error)) break;
+        }
+      }
+      throw new TerminalAccountingPersistenceError(lastError);
+    };
+  }
+
+  #circuitStore(candidates: Map<string, RuntimeCandidate>): CircuitStore {
+    const adapter = new CircuitBreakerStoreAdapter(this.#circuitBreaker, this.#breakerPolicy);
+    const circuitId = (candidateId: string) => {
+      const candidate = candidates.get(candidateId);
+      if (!candidate) throw new TypeError("Provider execution circuit candidate is unavailable");
+      return candidate.target.providerId;
+    };
+    return {
+      acquire: (candidateId, policy) => adapter.acquire(circuitId(candidateId), policy),
+      success: (candidateId, permit: CircuitPermit) =>
+        adapter.success(circuitId(candidateId), permit),
+      failure: (candidateId, permit: CircuitPermit, policy) =>
+        adapter.failure(circuitId(candidateId), permit, policy),
+    };
+  }
+
+  #normalizeError(error: unknown, plan: ProviderExecutionPlan): never {
+    if (error instanceof ProviderAttemptError && error.options.status !== undefined) {
+      const retryable = plan.retryPolicy?.retryableStatuses ?? defaultRetryableStatuses;
+      if (!retryable.includes(error.options.status)) {
+        throw new ProviderAttemptError(error.message, {
+          ...error.options,
+          transient: false,
+        });
+      }
+    }
+    throw error;
+  }
+
+  async complete(
+    sourceModelId: string,
+    usageRunId: string,
+    ownerLeaseToken: string,
+    request: ChatCompletionRequest,
+    signal: AbortSignal,
+    frozenPlan?: ProviderExecutionPlan,
+  ): Promise<Completion> {
+    const { plan, candidates } = await this.#prepare(sourceModelId, frozenPlan);
+    const claim = await this.#repository.claimProviderExecution(usageRunId, ownerLeaseToken);
+    const remainingAttempts = policyFor(plan).maxAttempts - claim.consumedAttempts;
+    const metrics = new Map<string, AttemptMetrics>();
+    const upstreams = new Map<string, UpstreamStreamOptions>();
+    const onAttempt = this.#telemetry(
+      usageRunId,
+      ownerLeaseToken,
+      claim,
+      plan,
+      metrics,
+      estimateInputTokens(request),
+    );
+    try {
+      return await executeProviderRequest({
+        initialCandidateId: plan.targets[0].providerModelId,
+        resolveCandidate: (id) => candidates.get(id),
+        policy: policyFor(plan, remainingAttempts),
+        signal,
+        circuitStore: this.#circuitStore(candidates),
+        onAttempt,
+        beforeAttempt: async (candidate, _signal, context) => {
+          upstreams.set(
+            key(candidate.id, context),
+            await this.#upstreamFor(candidates.get(candidate.id)!),
+          );
+        },
+        attempt: async (candidate, attemptSignal, context) => {
+          try {
+            const upstream = upstreams.get(key(candidate.id, context));
+            upstreams.delete(key(candidate.id, context));
+            if (!upstream) throw new Error("Provider dispatch options are missing");
+            const observed = metrics.get(key(candidate.id, context));
+            if (observed) observed.dispatched = true;
+            const result = await this.#complete(request, attemptSignal, upstream);
+            metrics.set(key(candidate.id, context), completionMetrics(result));
+            return result;
+          } catch (error) {
+            this.#normalizeError(error, plan);
+          }
+        },
+      });
+    } catch (error) {
+      this.#normalizeError(error, plan);
+    }
+  }
+
+  async *#observeStream(
+    upstream: AsyncIterable<string>,
+    observed: AttemptMetrics,
+    plan: ProviderExecutionPlan,
+  ): AsyncGenerator<string> {
+    try {
+      for await (const data of upstream) {
+        observeChunk(observed, data, this.#now());
+        yield data;
+      }
+    } catch (error) {
+      this.#normalizeError(error, plan);
+    }
+  }
+
+  async *stream(
+    sourceModelId: string,
+    usageRunId: string,
+    ownerLeaseToken: string,
+    request: ChatCompletionRequest,
+    signal: AbortSignal,
+    frozenPlan?: ProviderExecutionPlan,
+  ): AsyncGenerator<string> {
+    const { plan, candidates } = await this.#prepare(sourceModelId, frozenPlan);
+    const claim = await this.#repository.claimProviderExecution(usageRunId, ownerLeaseToken);
+    const remainingAttempts = policyFor(plan).maxAttempts - claim.consumedAttempts;
+    const metrics = new Map<string, AttemptMetrics>();
+    const upstreams = new Map<string, UpstreamStreamOptions>();
+    const onAttempt = this.#telemetry(
+      usageRunId,
+      ownerLeaseToken,
+      claim,
+      plan,
+      metrics,
+      estimateInputTokens(request),
+    );
+    try {
+      yield* streamProviderRequest({
+        initialCandidateId: plan.targets[0].providerModelId,
+        resolveCandidate: (id) => candidates.get(id),
+        policy: policyFor(plan, remainingAttempts),
+        signal,
+        circuitStore: this.#circuitStore(candidates),
+        onAttempt,
+        visibleUnits: openAIVisibleUnits,
+        beforeAttempt: async (candidate, _signal, context) => {
+          upstreams.set(
+            key(candidate.id, context),
+            await this.#upstreamFor(candidates.get(candidate.id)!),
+          );
+        },
+        attempt: (candidate, attemptSignal, context) => {
+          const upstreamOptions = upstreams.get(key(candidate.id, context));
+          upstreams.delete(key(candidate.id, context));
+          if (!upstreamOptions) throw new Error("Provider dispatch options are missing");
+          const observed = metrics.get(key(candidate.id, context)) ??
+            emptyMetrics(estimateInputTokens(request));
+          observed.dispatched = true;
+          const upstream = this.#stream(request, attemptSignal, upstreamOptions);
+          metrics.set(key(candidate.id, context), observed);
+          return this.#observeStream(upstream, observed, plan);
+        },
+      });
+    } catch (error) {
+      this.#normalizeError(error, plan);
+    }
+  }
+}

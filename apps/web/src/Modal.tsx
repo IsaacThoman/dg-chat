@@ -17,9 +17,14 @@ export function Modal(
   );
   const closeRef = useRef(close);
   const dismissibleRef = useRef(dismissible);
+  const restoreFrame = useRef<number | null>(null);
   closeRef.current = close;
   dismissibleRef.current = dismissible;
   useEffect(() => {
+    if (restoreFrame.current !== null) {
+      cancelAnimationFrame(restoreFrame.current);
+      restoreFrame.current = null;
+    }
     const dialog = dialogRef.current;
     const focusable = dialog ? modalFocusableElements(dialog) : [];
     const autofocus = focusable.find((element) =>
@@ -48,7 +53,10 @@ export function Modal(
     document.addEventListener("keydown", keydown);
     return () => {
       document.removeEventListener("keydown", keydown);
-      requestAnimationFrame(() => previousFocus.current?.focus());
+      restoreFrame.current = requestAnimationFrame(() => {
+        restoreFrame.current = null;
+        previousFocus.current?.focus();
+      });
     };
   }, []);
   return (

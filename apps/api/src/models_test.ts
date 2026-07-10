@@ -1,6 +1,7 @@
 import { assert, assertEquals, assertRejects } from "jsr:@std/assert@1.0.14";
 import type { ChatCompletionRequest } from "@dg-chat/contracts";
 import { complete, parseOpenAIEventStream, streamChatCompletion } from "./models.ts";
+import { ProviderAttemptError } from "./provider-resilience.ts";
 
 const encoder = new TextEncoder();
 const request: ChatCompletionRequest = {
@@ -179,6 +180,21 @@ Deno.test("upstream streaming surfaces structured provider errors", async () => 
   );
 });
 
+Deno.test("SSE error events fail the provider attempt even when followed by DONE", async () => {
+  await assertRejects(
+    () =>
+      collect(parseOpenAIEventStream(
+        byteStream([
+          'data: {"error":{"code":"overloaded","message":"stream exploded"}}\n\n',
+          "data: [DONE]\n\n",
+        ]),
+        new AbortController().signal,
+      )),
+    ProviderAttemptError,
+    "stream exploded",
+  );
+});
+
 Deno.test("upstream timeout remains active after response headers", async () => {
   let cancelled = false;
   const fetchMock = (() =>
@@ -353,6 +369,105 @@ Deno.test("non-stream success and error bodies enforce byte caps", async () => {
       "size limit",
     );
   }
+});
+
+Deno.test("non-stream refusal and reasoning are validated and included in token estimates", async () => {
+  const fetchMock = (() =>
+    Promise.resolve(Response.json({
+      id: "chatcmpl_reasoning",
+      model: "provider-model",
+      choices: [{
+        message: {
+          role: "assistant",
+          content: null,
+          refusal: "cannot comply",
+          reasoning_content: "policy analysis",
+          reasoning_summary: "checked policy",
+        },
+        finish_reason: "stop",
+      }],
+    }))) as typeof fetch;
+  const result = await complete(request, new AbortController().signal, {
+    baseUrl: "https://provider.example/v1",
+    apiKey: "secret",
+    fetch: fetchMock,
+  });
+  assertEquals(result.text, "");
+  assert(result.outputTokens > 0);
+
+  const invalidFetch = (() =>
+    Promise.resolve(Response.json({
+      choices: [{ message: { role: "assistant", content: null, refusal: 7 } }],
+    }))) as typeof fetch;
+  await assertRejects(
+    () =>
+      complete(request, new AbortController().signal, {
+        baseUrl: "https://provider.example/v1",
+        apiKey: "secret",
+        fetch: invalidFetch,
+      }),
+    Error,
+    "invalid",
+  );
+});
+
+Deno.test("malformed non-2xx bodies preserve status and Retry-After classification", async () => {
+  for (
+    const [status, retryAfter, expectedDelay] of [[401, "120", 120_000], [503, "2", 2_000]] as const
+  ) {
+    const fetchMock = (() =>
+      Promise.resolve(
+        new Response("not-json", { status, headers: { "retry-after": retryAfter } }),
+      )) as typeof fetch;
+    try {
+      await complete(request, new AbortController().signal, {
+        baseUrl: "https://provider.example/v1",
+        apiKey: "secret",
+        fetch: fetchMock,
+      });
+      throw new Error("expected provider failure");
+    } catch (error) {
+      assert(error instanceof ProviderAttemptError);
+      assertEquals(error.options.status, status);
+      assertEquals(error.options.retryAfterMs, expectedDelay);
+    }
+  }
+});
+
+Deno.test("streaming HTTP and SSE error fields are strictly bounded", async () => {
+  const malformedFetch =
+    (() =>
+      Promise.resolve(Response.json({ error: { message: { private: "object" }, code: "bad" } }, {
+        status: 503,
+        headers: { "retry-after": "3" },
+      }))) as typeof fetch;
+  try {
+    await collect(streamChatCompletion(request, new AbortController().signal, {
+      baseUrl: "https://provider.example/v1",
+      apiKey: "secret",
+      fetch: malformedFetch,
+    }));
+    throw new Error("expected provider failure");
+  } catch (error) {
+    assert(error instanceof ProviderAttemptError);
+    assertEquals(error.message, "Provider returned 503");
+    assertEquals(error.options.status, 503);
+    assertEquals(error.options.retryAfterMs, 3_000);
+  }
+
+  await assertRejects(
+    () =>
+      collect(parseOpenAIEventStream(
+        byteStream([
+          `data: ${
+            JSON.stringify({ error: { message: "x".repeat(501), type: "overloaded" } })
+          }\n\n`,
+        ]),
+        new AbortController().signal,
+      )),
+    Error,
+    "invalid stream error",
+  );
 });
 
 Deno.test("provider bounds include tool schemas and cumulative generated output", async () => {

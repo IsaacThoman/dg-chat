@@ -7,6 +7,66 @@ import { backfillLegacyRuntimeSnapshot } from "./legacy-backfill.ts";
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
 
 Deno.test({
+  name: "Postgres provider accounting is authoritative for API failure and stale run leases",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 1 });
+    await sql`TRUNCATE provider_attempts, provider_model_route_targets, provider_model_routes,
+      provider_retry_policies, model_price_versions, provider_models, providers,
+      api_idempotency_events, api_idempotency_requests, ledger_entries, usage_runs,
+      api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
+    const repo = await PostgresRepository.connect(databaseUrl!);
+    try {
+      const user = await repo.bootstrapAdmin({
+        email: "provider-accounting-pg@example.com",
+        name: "Provider accounting",
+        passwordHash: "hash",
+      }, 1_000);
+      const begun = await repo.beginApiRequest({
+        userId: user.id,
+        endpoint: "chat.completions",
+        idempotencyKey: "postgres-provider-failure",
+        requestHash: "c".repeat(64),
+        stream: false,
+        model: "provider/model",
+        provider: "provider",
+        runId: "postgres-provider-failure-run",
+        reserveMicros: 100,
+      });
+      if (begun.kind !== "started") throw new Error("request did not start");
+      await sql`UPDATE usage_runs SET execution_epoch=1,actual_provider_cost_micros=7,
+        actual_provider_input_tokens=3,actual_provider_output_tokens=2
+        WHERE id=${begun.usageRun.id}`;
+      await repo.failApiRequest({
+        id: begun.request.id,
+        leaseToken: begun.leaseToken,
+        responseStatus: 502,
+        responseBody: "{}",
+        billing: { mode: "refund" },
+      });
+      const failed = await sql<
+        { status: string; cost: string; input_tokens: number }[]
+      >`SELECT status,cost_micros::text cost,input_tokens FROM usage_runs WHERE id=${begun.usageRun.id}`;
+      assertEquals(failed[0], { status: "failed", cost: "7", input_tokens: 3 });
+
+      const stale = await repo.reserve(user.id, "postgres-provider-stale", "provider/model", 100);
+      await sql`UPDATE usage_runs SET execution_epoch=1,actual_provider_cost_micros=5,
+        run_lease_expires_at=now()-interval '1 second' WHERE id=${stale.id}`;
+      assertEquals(await repo.reapStaleProviderExecutionLeases(), 1);
+      assertEquals(await repo.reapStaleProviderExecutionLeases(), 0);
+      const reaped = await sql<
+        { status: string; cost: string; run_lease_token: string | null }[]
+      >`SELECT status,cost_micros::text cost,run_lease_token::text FROM usage_runs WHERE id=${stale.id}`;
+      assertEquals(reaped[0], { status: "failed", cost: "5", run_lease_token: null });
+    } finally {
+      await repo.close();
+    }
+  },
+});
+
+Deno.test({
   name: "normalized repository commits identity, graph, and credit mutations atomically",
   ignore: !databaseUrl,
   sanitizeOps: false,

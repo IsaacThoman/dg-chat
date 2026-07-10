@@ -41,6 +41,7 @@ test("every admin section is reachable across desktop and mobile", async ({
     ["users", "Users", "Users"],
     ["providers", "Providers", "Providers"],
     ["models", "Models & pricing", "Models & pricing"],
+    ["resilience", "Routing resilience", "Routing resilience"],
     ["usage", "Usage analytics", "Usage analytics"],
     ["jobs", "Background jobs", "Background jobs"],
     ["audit", "Audit log", "Audit log"],

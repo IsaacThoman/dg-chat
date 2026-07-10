@@ -482,7 +482,7 @@ Deno.test("provider resilience routes are acyclic and attempts are immutable and
     latencyMs: 100,
     error: "all paths failed",
   });
-  assertEquals(finalized.status, "completed");
+  assertEquals(finalized.status, "failed");
   assertEquals(finalized.costMicros, 2);
   assertEquals(
     repo.refundProviderUsage({
@@ -494,6 +494,131 @@ Deno.test("provider resilience routes are acyclic and attempts are immutable and
     }).costMicros,
     2,
   );
+});
+
+Deno.test("provider aggregates authoritatively settle API failures and stale run leases", () => {
+  const repo = new MemoryRepository();
+  const user = repo.createUser({
+    email: "provider-accounting@example.com",
+    name: "Provider accounting",
+    passwordHash: "hash",
+    approvalStatus: "approved",
+  });
+  user.balanceMicros = 1_000;
+  const begun = repo.beginApiRequest({
+    userId: user.id,
+    endpoint: "chat.completions",
+    idempotencyKey: "provider-accounting-complete",
+    requestHash: "a".repeat(64),
+    stream: false,
+    model: "provider/model",
+    provider: "provider",
+    runId: "provider-api-complete",
+    reserveMicros: 100,
+  });
+  if (begun.kind !== "started") throw new Error("request did not start");
+  const completedRun = repo.usageRuns.get(begun.usageRun.id)!;
+  completedRun.executionEpoch = 1;
+  completedRun.actualProviderCostMicros = 7;
+  completedRun.actualProviderInputTokens = 3;
+  completedRun.actualProviderOutputTokens = 2;
+  repo.completeApiJson({
+    id: begun.request.id,
+    leaseToken: begun.leaseToken,
+    responseStatus: 200,
+    responseBody: "{}",
+    costMicros: 99,
+    inputTokens: 99,
+    outputTokens: 99,
+    latencyMs: 1,
+  });
+  assertEquals(completedRun.costMicros, 7);
+  assertEquals(completedRun.inputTokens, 3);
+
+  const failed = repo.beginApiRequest({
+    userId: user.id,
+    endpoint: "responses",
+    idempotencyKey: "provider-accounting-failed",
+    requestHash: "b".repeat(64),
+    stream: false,
+    model: "provider/model",
+    provider: "provider",
+    runId: "provider-api-failed",
+    reserveMicros: 100,
+  });
+  if (failed.kind !== "started") throw new Error("request did not start");
+  const failedRun = repo.usageRuns.get(failed.usageRun.id)!;
+  failedRun.executionEpoch = 1;
+  failedRun.actualProviderCostMicros = 5;
+  repo.failApiRequest({
+    id: failed.request.id,
+    leaseToken: failed.leaseToken,
+    responseStatus: 502,
+    responseBody: "{}",
+    billing: { mode: "refund" },
+  });
+  assertEquals({ status: failedRun.status, cost: failedRun.costMicros }, {
+    status: "failed",
+    cost: 5,
+  });
+
+  const stale = repo.reserve(user.id, "provider-run-stale", "provider/model", 100);
+  stale.executionEpoch = 1;
+  stale.actualProviderCostMicros = 3;
+  stale.runLeaseExpiresAt = new Date(Date.now() - 1).toISOString();
+  assertEquals(repo.reapStaleProviderExecutionLeases(), 1);
+  assertEquals({ status: stale.status, cost: stale.costMicros, lease: stale.runLeaseToken }, {
+    status: "failed",
+    cost: 3,
+    lease: null,
+  });
+});
+
+Deno.test("paid provider generation failure remains an operation failure", () => {
+  const repo = new MemoryRepository();
+  const user = repo.createUser({
+    email: "provider-generation-failure@example.com",
+    name: "Provider failure",
+    passwordHash: "hash",
+    approvalStatus: "approved",
+  });
+  user.balanceMicros = 1_000;
+  const conversation = repo.createConversation(user.id, "Failure");
+  const input = {
+    message: {
+      conversationId: conversation.id,
+      ownerId: user.id,
+      parentId: null,
+      role: "user" as const,
+      content: "fail",
+      model: "provider/model",
+      expectedVersion: 0,
+      idempotencyKey: "paid-failure-user",
+    },
+    runId: "paid-failure-run",
+    provider: "provider",
+    reserveMicros: 100,
+  };
+  const begun = repo.beginGeneration(input);
+  if (begun.kind !== "started") throw new Error("generation did not start");
+  const run = repo.usageRuns.get(input.runId)!;
+  run.executionEpoch = 1;
+  run.actualProviderCostMicros = 4;
+  const failed = repo.failGeneration({
+    conversationId: conversation.id,
+    ownerId: user.id,
+    userMessageId: begun.message.id,
+    runId: input.runId,
+    leaseToken: begun.leaseToken,
+    idempotencyKey: "paid-failure-assistant",
+    model: "provider/model",
+    error: "provider failed",
+  });
+  assertEquals({ status: failed.usageRun.status, cost: failed.usageRun.costMicros }, {
+    status: "failed",
+    cost: 4,
+  });
+  assertThrows(() => repo.beginGeneration(input), DomainError, "new idempotency key");
 });
 
 Deno.test("message edits append immutable sibling branches", () => {

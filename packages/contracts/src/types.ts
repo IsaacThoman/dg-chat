@@ -19,7 +19,7 @@ export interface SessionResponse {
   limited: boolean;
 }
 
-export type MessageRole = "system" | "user" | "assistant" | "tool";
+export type MessageRole = "system" | "developer" | "user" | "assistant" | "tool";
 
 export interface MessageNode {
   id: string;

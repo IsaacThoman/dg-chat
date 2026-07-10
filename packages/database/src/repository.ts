@@ -651,6 +651,8 @@ export interface ProviderExecutionClaim {
   usageRunId: string;
   executionEpoch: number;
   nextAttemptNumber: number;
+  /** Physical upstream calls already started across every lease epoch. */
+  consumedAttempts: number;
   reconciledAttemptIds: string[];
 }
 export interface ProviderExecutionLease {
@@ -847,6 +849,7 @@ export interface DomainRepository {
   listProviderAttempts(usageRunId: string): MaybePromise<ProviderAttempt[]>;
   settleProviderUsage(input: FinalizeProviderUsageInput): MaybePromise<UsageRun>;
   refundProviderUsage(input: FinalizeProviderUsageInput): MaybePromise<UsageRun>;
+  reapStaleProviderExecutionLeases(limit?: number): MaybePromise<number>;
   reserve(
     userId: string,
     runId: string,
