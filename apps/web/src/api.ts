@@ -5,7 +5,10 @@ import type {
   AuditEvent,
   AuditFilters,
   Conversation,
+  ConversationKnowledge,
   DiscoveredProviderModel,
+  KnowledgeCollection,
+  KnowledgeMode,
   Message,
   Model,
   ModelPriceVersion,
@@ -262,6 +265,57 @@ export const api = {
     );
     return result.data ?? result.attachments ?? [];
   },
+  collections: async () => (await request<{ data: KnowledgeCollection[] }>("/collections")).data,
+  collection: (id: string) =>
+    request<{ collection: KnowledgeCollection; attachments: Attachment[] }>(
+      `/collections/${encodeURIComponent(id)}`,
+    ),
+  createCollection: (name: string) =>
+    request<KnowledgeCollection>("/collections", {
+      method: "POST",
+      headers: { "Idempotency-Key": crypto.randomUUID() },
+      body: JSON.stringify({ name }),
+    }),
+  updateCollection: (collection: KnowledgeCollection, name: string) =>
+    request<KnowledgeCollection>(
+      `/collections/${encodeURIComponent(collection.id)}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({ name, expectedVersion: collection.version }),
+      },
+    ),
+  deleteCollection: (collection: KnowledgeCollection) =>
+    request<void>(`/collections/${encodeURIComponent(collection.id)}`, {
+      method: "DELETE",
+      body: JSON.stringify({ expectedVersion: collection.version }),
+    }),
+  addCollectionAttachment: (collection: KnowledgeCollection, attachmentId: string) =>
+    request<{ collection: KnowledgeCollection }>(
+      `/collections/${encodeURIComponent(collection.id)}/attachments/${
+        encodeURIComponent(attachmentId)
+      }`,
+      { method: "POST", body: JSON.stringify({ expectedVersion: collection.version }) },
+    ),
+  removeCollectionAttachment: (collection: KnowledgeCollection, attachmentId: string) =>
+    request<{ collection: KnowledgeCollection }>(
+      `/collections/${encodeURIComponent(collection.id)}/attachments/${
+        encodeURIComponent(attachmentId)
+      }`,
+      { method: "DELETE", body: JSON.stringify({ expectedVersion: collection.version }) },
+    ),
+  conversationKnowledge: (conversationId: string) =>
+    request<ConversationKnowledge>(
+      `/conversations/${encodeURIComponent(conversationId)}/knowledge`,
+    ),
+  setConversationKnowledge: (
+    conversationId: string,
+    collectionIds: string[],
+    mode: KnowledgeMode,
+  ) =>
+    request<ConversationKnowledge>(
+      `/conversations/${encodeURIComponent(conversationId)}/knowledge`,
+      { method: "PUT", body: JSON.stringify({ collectionIds, mode }) },
+    ),
   uploadAttachment,
   deleteAttachment: (id: string) =>
     request<unknown>(`/attachments/${encodeURIComponent(id)}`, { method: "DELETE" }),

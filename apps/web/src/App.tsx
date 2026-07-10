@@ -102,6 +102,7 @@ import {
 import { Modal } from "./Modal.tsx";
 import { AdminModels, AdminProviders } from "./AdminRegistry.tsx";
 import { AdminResilience } from "./AdminResilience.tsx";
+import { ConversationKnowledgePicker, KnowledgeView } from "./Knowledge.tsx";
 import type {
   Attachment,
   AuditFilters,
@@ -112,7 +113,7 @@ import type {
   User,
 } from "./types.ts";
 
-type View = "chat" | "archived" | "trash" | "settings" | "tokens" | "admin";
+type View = "chat" | "archived" | "trash" | "knowledge" | "settings" | "tokens" | "admin";
 type AdminSection =
   | "overview"
   | "applicants"
@@ -249,10 +250,18 @@ function Sidebar({
         <button onClick={() => select("chat")} className={view === "chat" ? "selected" : ""}>
           <MessageSquare size={17} /> Chats
         </button>
-        <button type="button">
+        <button
+          type="button"
+          onClick={() => select("knowledge")}
+          className={view === "knowledge" ? "selected" : ""}
+        >
           <Folder size={17} /> Projects <Plus size={15} className="push" />
         </button>
-        <button type="button">
+        <button
+          type="button"
+          onClick={() => select("knowledge")}
+          className={view === "knowledge" ? "selected" : ""}
+        >
           <BookOpen size={17} /> Knowledge
         </button>
         <button
@@ -1044,14 +1053,18 @@ function Composer(
     }
   };
   const blockedByUpload = uploads.some((item) => item.status !== "ready");
+  const readyAttachmentIds = mergeAttachmentIds(
+    retainedAttachments.map((attachment) => attachment.id),
+    uploads.flatMap((item) =>
+      item.status === "ready" && item.attachment ? [item.attachment.id] : []
+    ),
+  );
+  const canSubmit = (value.trim().length > 0 || readyAttachmentIds.length > 0) &&
+    !disabled && !blockedByUpload;
   const submit = async (e: FormEvent) => {
     e.preventDefault();
-    if (!value.trim() || disabled || blockedByUpload) return;
-    const attachmentIds = mergeAttachmentIds(
-      retainedAttachments.map((attachment) => attachment.id),
-      uploads.flatMap((item) => item.attachment ? [item.attachment.id] : []),
-    );
-    if (await onSend(value.trim(), attachmentIds)) {
+    if (!canSubmit) return;
+    if (await onSend(value.trim(), readyAttachmentIds)) {
       setValue("");
       setUploads([]);
     }
@@ -1234,7 +1247,7 @@ function Composer(
           <button
             className="send-button"
             aria-label={streaming ? "Queue message" : "Send"}
-            disabled={!value.trim() || disabled || blockedByUpload}
+            disabled={!canSubmit}
           >
             <ArrowDown size={19} />
           </button>
@@ -1770,6 +1783,12 @@ function ChatView({
         </IconButton>
         <ModelPicker models={models} selected={selectedModel} setSelected={setSelectedModel} />
         <div className="header-actions">
+          {conversation && (
+            <ConversationKnowledgePicker
+              conversationId={conversation.id}
+              disabled={readOnly || streaming || queue.length > 0}
+            />
+          )}
           <span className="balance-pill">
             <CircleDollarSign size={15} /> ${balance.toFixed(2)}
           </span>
@@ -1903,7 +1922,12 @@ function ChatView({
                   {queue.map((item, index) => (
                     <li key={item.id}>
                       <span>{index + 1}</span>
-                      <p>{item.content}</p>
+                      <p>
+                        {item.content ||
+                          `${item.attachmentIds.length} attachment${
+                            item.attachmentIds.length === 1 ? "" : "s"
+                          }`}
+                      </p>
                       <IconButton
                         label={`Cancel queued message ${index + 1}`}
                         onClick={() =>
@@ -3044,7 +3068,8 @@ export function App() {
     );
     await Promise.allSettled([conversationQuery.refetch(), deletedConversationQuery.refetch()]);
     if (
-      conversation.id !== activeId || view === "settings" || view === "tokens" || view === "admin"
+      conversation.id !== activeId || view === "settings" || view === "tokens" ||
+      view === "admin" || view === "knowledge"
     ) return;
     const regular = queryClient.getQueryData<Conversation[]>(["conversations"]) ?? [];
     const deleted = queryClient.getQueryData<Conversation[]>(["conversations", "deleted"]) ?? [];
@@ -3195,6 +3220,7 @@ export function App() {
         />
       )}
       {view === "admin" && <AdminView onMenu={() => setMobile(true)} />}
+      {view === "knowledge" && <KnowledgeView onMenu={() => setMobile(true)} />}
     </div>
   );
 }
