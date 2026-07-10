@@ -1166,6 +1166,89 @@ Deno.test("assistant generation fence is conversation-wide across different acti
   );
 });
 
+Deno.test("earlier assistant generation selects its branch and preserves a later explicit selection", () => {
+  const repo = new MemoryRepository();
+  const owner = repo.createUser({
+    email: "earlier-branch@example.com",
+    name: "Owner",
+    passwordHash: "x",
+  });
+  repo.credit(owner.id, "earlier-branch-grant", "grant", 1_000_000);
+  const conversation = repo.createConversation(owner.id, "Earlier branch");
+  const userOne = repo.appendMessage({
+    conversationId: conversation.id,
+    ownerId: owner.id,
+    parentId: null,
+    role: "user",
+    content: "one",
+    expectedVersion: 0,
+    idempotencyKey: "earlier-user-one",
+  });
+  const assistantOne = repo.appendMessage({
+    conversationId: conversation.id,
+    ownerId: owner.id,
+    parentId: userOne.id,
+    role: "assistant",
+    content: "one answer",
+    expectedVersion: 1,
+    idempotencyKey: "earlier-assistant-one",
+  });
+  const userTwo = repo.appendMessage({
+    conversationId: conversation.id,
+    ownerId: owner.id,
+    parentId: assistantOne.id,
+    role: "user",
+    content: "two",
+    expectedVersion: 2,
+    idempotencyKey: "earlier-user-two",
+  });
+  const assistantTwo = repo.appendMessage({
+    conversationId: conversation.id,
+    ownerId: owner.id,
+    parentId: userTwo.id,
+    role: "assistant",
+    content: "two answer",
+    expectedVersion: 3,
+    idempotencyKey: "earlier-assistant-two",
+  });
+  const begun = repo.beginAssistantGeneration({
+    conversationId: conversation.id,
+    ownerId: owner.id,
+    sourceAssistantId: assistantOne.id,
+    mode: "regenerate",
+    model: "simulated/dg-chat",
+    expectedVersion: 4,
+    idempotencyKey: "earlier-regenerate",
+    runId: "earlier-regenerate-run",
+    generationId: crypto.randomUUID(),
+    provider: "simulated",
+    reserveMicros: 10,
+  });
+  if (begun.kind !== "started") throw new Error("generation did not start");
+  assertEquals(begun.conversation.activeLeafId, assistantOne.id);
+  assertEquals(begun.conversation.version, 5);
+
+  const selected = repo.setActiveLeaf(conversation.id, owner.id, assistantTwo.id, 5);
+  assertEquals(selected.activeLeafId, assistantTwo.id);
+  const completed = repo.completeGeneration({
+    conversationId: conversation.id,
+    ownerId: owner.id,
+    userMessageId: userOne.id,
+    runId: "earlier-regenerate-run",
+    leaseToken: begun.leaseToken,
+    idempotencyKey: "earlier-regenerate-assistant",
+    content: "replacement",
+    model: "simulated/dg-chat",
+    costMicros: 1,
+    inputTokens: 1,
+    outputTokens: 1,
+    latencyMs: 1,
+    supersedesId: assistantOne.id,
+  });
+  assertEquals(completed.conversation.activeLeafId, assistantTwo.id);
+  assertEquals(completed.message.supersedesId, assistantOne.id);
+});
+
 Deno.test("attachments deduplicate, inspect, link immutably, and preserve tombstones", () => {
   const repo = new MemoryRepository();
   const owner = repo.createUser({ email: "files@example.com", name: "Files", passwordHash: "x" });

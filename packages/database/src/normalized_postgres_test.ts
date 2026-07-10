@@ -1374,6 +1374,8 @@ Deno.test({
         reserveMicros: 100,
       });
       if (regeneration.kind !== "started") throw new Error("regeneration did not start");
+      assertEquals(regeneration.conversation.activeLeafId, original.message.id);
+      assertEquals(regeneration.conversation.version, original.conversation.version + 1);
       const replacement = await repo.completeGeneration({
         conversationId: conversation.id,
         ownerId: owner.id,
@@ -1393,6 +1395,63 @@ Deno.test({
       assertEquals(replacement.message.parentId, original.message.parentId);
       assertEquals(replacement.message.supersedesId, original.message.id);
       assertEquals((await repo.detail(conversation.id, owner.id)).messages.length, 3);
+
+      const nextUser = await repo.appendMessage({
+        conversationId: conversation.id,
+        ownerId: owner.id,
+        parentId: replacement.message.id,
+        role: "user",
+        content: "next",
+        expectedVersion: replacement.conversation.version,
+        idempotencyKey: "pg-stream-next-user",
+      });
+      const laterAssistant = await repo.appendMessage({
+        conversationId: conversation.id,
+        ownerId: owner.id,
+        parentId: nextUser.id,
+        role: "assistant",
+        content: "later",
+        expectedVersion: replacement.conversation.version + 1,
+        idempotencyKey: "pg-stream-later-assistant",
+      });
+      const earlier = await repo.beginAssistantGeneration({
+        conversationId: conversation.id,
+        ownerId: owner.id,
+        sourceAssistantId: replacement.message.id,
+        mode: "continue",
+        model: "simulated/dg-chat",
+        expectedVersion: replacement.conversation.version + 2,
+        idempotencyKey: "pg-stream-earlier-continue",
+        runId: "pg-stream-earlier-continue-run",
+        generationId: crypto.randomUUID(),
+        provider: "simulated",
+        reserveMicros: 100,
+      });
+      if (earlier.kind !== "started") throw new Error("earlier continuation did not start");
+      assertEquals(earlier.conversation.activeLeafId, replacement.message.id);
+      const selected = await repo.setActiveLeaf(
+        conversation.id,
+        owner.id,
+        laterAssistant.id,
+        earlier.conversation.version,
+      );
+      const earlierTerminal = await repo.completeGeneration({
+        conversationId: conversation.id,
+        ownerId: owner.id,
+        userMessageId: earlier.message.id,
+        runId: "pg-stream-earlier-continue-run",
+        leaseToken: earlier.leaseToken,
+        idempotencyKey: "pg-stream-earlier-continue-assistant",
+        content: "continued earlier",
+        model: "simulated/dg-chat",
+        costMicros: 1,
+        inputTokens: 1,
+        outputTokens: 1,
+        latencyMs: 1,
+        supersedesId: replacement.message.id,
+      });
+      assertEquals(selected.activeLeafId, laterAssistant.id);
+      assertEquals(earlierTerminal.conversation.activeLeafId, laterAssistant.id);
     } finally {
       await repo.close();
     }
