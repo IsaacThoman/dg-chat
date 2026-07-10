@@ -1273,7 +1273,13 @@ export class PostgresRepository implements DomainRepository {
         Row[]
       >`SELECT balance_micros FROM users WHERE id=${input.ownerId} FOR UPDATE`;
       const providerExecution = number(runs[0].execution_epoch) > 0;
-      const actualCost = number(runs[0].actual_provider_cost_micros);
+      const uncertainty = providerExecution
+        ? await tx<{ uncertain: boolean }[]>`SELECT EXISTS(SELECT 1 FROM provider_attempts
+            WHERE usage_run_id=${input.runId} AND status='running') AS uncertain`
+        : [{ uncertain: false }];
+      const actualCost = uncertainty[0].uncertain
+        ? number(runs[0].reserved_micros)
+        : number(runs[0].actual_provider_cost_micros);
       const effectiveCost = providerExecution ? actualCost : input.costMicros;
       const effectiveInputTokens = providerExecution
         ? number(runs[0].actual_provider_input_tokens)
@@ -1281,6 +1287,12 @@ export class PostgresRepository implements DomainRepository {
       const effectiveOutputTokens = providerExecution
         ? number(runs[0].actual_provider_output_tokens)
         : input.outputTokens;
+      if (providerExecution && uncertainty[0].uncertain) {
+        await tx`UPDATE provider_attempts SET status='cancelled',phase='planning',
+          error_code='accounting_unknown',breaker_after='unavailable',retryable=false,
+          latency_ms=GREATEST(0,floor(extract(epoch FROM (now()-started_at))*1000)::int),
+          completed_at=now() WHERE usage_run_id=${input.runId} AND status='running'`;
+      }
       const delta = number(runs[0].reserved_micros) - effectiveCost;
       const after = number(account[0].balance_micros) + delta;
       if (after < 0) {
@@ -1353,7 +1365,21 @@ export class PostgresRepository implements DomainRepository {
         Row[]
       >`SELECT balance_micros FROM users WHERE id=${input.ownerId} FOR UPDATE`;
       const providerExecution = number(runs[0].execution_epoch) > 0;
-      const actualCost = providerExecution ? number(runs[0].actual_provider_cost_micros) : 0;
+      const uncertainty = providerExecution
+        ? await tx<{ uncertain: boolean }[]>`SELECT EXISTS(SELECT 1 FROM provider_attempts
+            WHERE usage_run_id=${input.runId} AND status='running') AS uncertain`
+        : [{ uncertain: false }];
+      const actualCost = providerExecution
+        ? uncertainty[0].uncertain
+          ? number(runs[0].reserved_micros)
+          : number(runs[0].actual_provider_cost_micros)
+        : 0;
+      if (providerExecution && uncertainty[0].uncertain) {
+        await tx`UPDATE provider_attempts SET status='cancelled',phase='planning',
+          error_code='accounting_unknown',breaker_after='unavailable',retryable=false,
+          latency_ms=GREATEST(0,floor(extract(epoch FROM (now()-started_at))*1000)::int),
+          completed_at=now() WHERE usage_run_id=${input.runId} AND status='running'`;
+      }
       const delta = number(runs[0].reserved_micros) - actualCost;
       const after = number(account[0].balance_micros) + delta;
       const idx = await tx<
@@ -1398,6 +1424,9 @@ export class PostgresRepository implements DomainRepository {
       >`SELECT * FROM usage_runs WHERE status='reserved' AND generation_lease_token IS NOT NULL AND generation_lease_expires_at<=now() ORDER BY generation_lease_expires_at FOR UPDATE SKIP LOCKED LIMIT ${limit}`;
       for (const row of rows) {
         const userId = String(row.user_id);
+        const uncertainty = await tx<{ uncertain: boolean }[]>`SELECT EXISTS(SELECT 1
+          FROM provider_attempts WHERE usage_run_id=${String(row.id)} AND status='running')
+          AS uncertain`;
         await tx`UPDATE provider_attempts SET status='cancelled',phase='planning',
           error_code='generation_lease_expired',breaker_after='unavailable',retryable=true,
           latency_ms=GREATEST(0,floor(extract(epoch FROM (now()-started_at))*1000)::int),
@@ -1406,7 +1435,11 @@ export class PostgresRepository implements DomainRepository {
           Row[]
         >`SELECT balance_micros FROM users WHERE id=${userId} FOR UPDATE`;
         const providerExecution = number(row.execution_epoch) > 0;
-        const actualCost = providerExecution ? number(row.actual_provider_cost_micros) : 0;
+        const actualCost = providerExecution
+          ? uncertainty[0].uncertain
+            ? number(row.reserved_micros)
+            : number(row.actual_provider_cost_micros)
+          : 0;
         const amount = number(row.reserved_micros) - actualCost;
         const after = number(account[0].balance_micros) + amount;
         await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${userId}`;
@@ -2331,10 +2364,8 @@ export class PostgresRepository implements DomainRepository {
       const reconciledAttemptIds: string[] = [];
       if (String(runs[0].execution_owner_lease_token ?? "") !== ownerLeaseToken) {
         epoch += 1;
-        const reconciled = await tx<Row[]>`UPDATE provider_attempts SET status='cancelled',
-          phase='planning',error_code='execution_reclaimed',breaker_after='unavailable',
-          retryable=true,latency_ms=GREATEST(0,floor(extract(epoch FROM (now()-started_at))*1000)::int),
-          completed_at=now() WHERE usage_run_id=${usageRunId} AND status='running' RETURNING id`;
+        const reconciled = await tx<Row[]>`SELECT id FROM provider_attempts
+          WHERE usage_run_id=${usageRunId} AND status='running' FOR UPDATE`;
         reconciledAttemptIds.push(...reconciled.map((row) => String(row.id)));
         await tx`UPDATE usage_runs SET execution_epoch=${epoch},
           execution_owner_lease_token=${ownerLeaseToken} WHERE id=${usageRunId}`;
@@ -2638,7 +2669,18 @@ export class PostgresRepository implements DomainRepository {
       ) {
         throw new DomainError("stale_lease", "Provider execution epoch is stale", 409);
       }
-      const cost = number(rows[0].actual_provider_cost_micros);
+      const uncertainty = await tx<{ uncertain: boolean }[]>`SELECT EXISTS(SELECT 1
+        FROM provider_attempts WHERE usage_run_id=${input.usageRunId} AND status='running')
+        AS uncertain`;
+      const cost = uncertainty[0].uncertain
+        ? number(rows[0].reserved_micros)
+        : number(rows[0].actual_provider_cost_micros);
+      if (uncertainty[0].uncertain) {
+        await tx`UPDATE provider_attempts SET status='cancelled',phase='planning',
+          error_code='accounting_unknown',breaker_after='unavailable',retryable=false,
+          latency_ms=GREATEST(0,floor(extract(epoch FROM (now()-started_at))*1000)::int),
+          completed_at=now() WHERE usage_run_id=${input.usageRunId} AND status='running'`;
+      }
       const userId = String(rows[0].user_id);
       const users = await tx<Row[]>`SELECT balance_micros FROM users WHERE id=${userId} FOR UPDATE`;
       const reserved = number(rows[0].reserved_micros);
@@ -2687,6 +2729,8 @@ export class PostgresRepository implements DomainRepository {
         ORDER BY r.run_lease_expires_at FOR UPDATE SKIP LOCKED LIMIT ${limit}`;
       for (const row of rows) {
         const runId = String(row.id);
+        const uncertainty = await tx<{ uncertain: boolean }[]>`SELECT EXISTS(SELECT 1
+          FROM provider_attempts WHERE usage_run_id=${runId} AND status='running') AS uncertain`;
         await tx`UPDATE provider_attempts SET status='cancelled',phase='planning',
           error_code='execution_lease_expired',breaker_after='unavailable',retryable=true,
           latency_ms=GREATEST(0,floor(extract(epoch FROM (now()-started_at))*1000)::int),
@@ -2696,7 +2740,11 @@ export class PostgresRepository implements DomainRepository {
           Row[]
         >`SELECT balance_micros FROM users WHERE id=${userId} FOR UPDATE`;
         const providerExecution = number(row.execution_epoch) > 0;
-        const cost = providerExecution ? number(row.actual_provider_cost_micros) : 0;
+        const cost = providerExecution
+          ? uncertainty[0].uncertain
+            ? number(row.reserved_micros)
+            : number(row.actual_provider_cost_micros)
+          : 0;
         const delta = number(row.reserved_micros) - cost;
         const after = number(users[0].balance_micros) + delta;
         await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${userId}`;
@@ -2801,16 +2849,26 @@ export class PostgresRepository implements DomainRepository {
     latencyMs: number,
   ) {
     return await this.#sql.begin(async (tx) => {
-      const runs = await tx<Row[]>`SELECT * FROM usage_runs WHERE id=${runId} FOR UPDATE`;
+      const runs = await tx<Row[]>`SELECT *,EXISTS(SELECT 1 FROM provider_attempts
+        WHERE usage_run_id=usage_runs.id AND status='running') AS provider_accounting_uncertain
+        FROM usage_runs WHERE id=${runId} FOR UPDATE`;
       if (!runs[0]) throw new DomainError("not_found", "Usage reservation not found", 404);
       if (runs[0].status === "completed") return run(runs[0]);
       if (runs[0].status !== "reserved") {
         throw new DomainError("invalid_usage_state", "Usage run is not reserved", 409);
       }
       if (number(runs[0].execution_epoch) > 0) {
-        cost = number(runs[0].actual_provider_cost_micros);
+        cost = runs[0].provider_accounting_uncertain === true
+          ? number(runs[0].reserved_micros)
+          : number(runs[0].actual_provider_cost_micros);
         inputTokens = number(runs[0].actual_provider_input_tokens);
         outputTokens = number(runs[0].actual_provider_output_tokens);
+        if (runs[0].provider_accounting_uncertain === true) {
+          await tx`UPDATE provider_attempts SET status='cancelled',phase='planning',
+            error_code='accounting_unknown',breaker_after='unavailable',retryable=false,
+            latency_ms=GREATEST(0,floor(extract(epoch FROM (now()-started_at))*1000)::int),
+            completed_at=now() WHERE usage_run_id=${runId} AND status='running'`;
+        }
       }
       const reserved = number(runs[0].reserved_micros);
       const delta = reserved - cost;
@@ -2834,13 +2892,25 @@ export class PostgresRepository implements DomainRepository {
   }
   async refund(runId: string, error?: string) {
     return await this.#sql.begin(async (tx) => {
-      const runs = await tx<Row[]>`SELECT * FROM usage_runs WHERE id=${runId} FOR UPDATE`;
+      const runs = await tx<Row[]>`SELECT *,EXISTS(SELECT 1 FROM provider_attempts
+        WHERE usage_run_id=usage_runs.id AND status='running') AS provider_accounting_uncertain
+        FROM usage_runs WHERE id=${runId} FOR UPDATE`;
       if (!runs[0]) return undefined;
       if (runs[0].status !== "reserved") return run(runs[0]);
       const userId = String(runs[0].user_id);
       const users = await tx<Row[]>`SELECT balance_micros FROM users WHERE id=${userId} FOR UPDATE`;
       const providerExecution = number(runs[0].execution_epoch) > 0;
-      const actualCost = providerExecution ? number(runs[0].actual_provider_cost_micros) : 0;
+      const actualCost = providerExecution
+        ? runs[0].provider_accounting_uncertain === true
+          ? number(runs[0].reserved_micros)
+          : number(runs[0].actual_provider_cost_micros)
+        : 0;
+      if (providerExecution && runs[0].provider_accounting_uncertain === true) {
+        await tx`UPDATE provider_attempts SET status='cancelled',phase='planning',
+          error_code='accounting_unknown',breaker_after='unavailable',retryable=false,
+          latency_ms=GREATEST(0,floor(extract(epoch FROM (now()-started_at))*1000)::int),
+          completed_at=now() WHERE usage_run_id=${runId} AND status='running'`;
+      }
       const delta = number(runs[0].reserved_micros) - actualCost;
       const after = number(users[0].balance_micros) + delta;
       await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${userId}`;
@@ -3219,14 +3289,16 @@ export class PostgresRepository implements DomainRepository {
           )
         }`;
       }
-      const runs = await tx<Row[]>`SELECT * FROM usage_runs WHERE id=${
-        String(row.usage_run_id)
-      } FOR UPDATE`;
+      const runs = await tx<Row[]>`SELECT *,EXISTS(SELECT 1 FROM provider_attempts
+        WHERE usage_run_id=usage_runs.id AND status='running') AS provider_accounting_uncertain
+        FROM usage_runs WHERE id=${String(row.usage_run_id)} FOR UPDATE`;
       if (!runs[0]) throw new DomainError("not_found", "Usage reservation not found", 404);
       if (runs[0].status === "reserved") {
         const providerExecution = number(runs[0].execution_epoch) > 0;
         const effectiveCost = providerExecution
-          ? number(runs[0].actual_provider_cost_micros)
+          ? runs[0].provider_accounting_uncertain === true
+            ? number(runs[0].reserved_micros)
+            : number(runs[0].actual_provider_cost_micros)
           : input.costMicros;
         const effectiveInputTokens = providerExecution
           ? number(runs[0].actual_provider_input_tokens)
@@ -3234,6 +3306,12 @@ export class PostgresRepository implements DomainRepository {
         const effectiveOutputTokens = providerExecution
           ? number(runs[0].actual_provider_output_tokens)
           : input.outputTokens;
+        if (providerExecution && runs[0].provider_accounting_uncertain === true) {
+          await tx`UPDATE provider_attempts SET status='cancelled',phase='planning',
+            error_code='accounting_unknown',breaker_after='unavailable',retryable=false,
+            latency_ms=GREATEST(0,floor(extract(epoch FROM (now()-started_at))*1000)::int),
+            completed_at=now() WHERE usage_run_id=${String(row.usage_run_id)} AND status='running'`;
+        }
         const reserved = number(runs[0].reserved_micros);
         const delta = reserved - effectiveCost;
         const userId = String(row.user_id);
@@ -3315,9 +3393,9 @@ export class PostgresRepository implements DomainRepository {
         await tx`INSERT INTO api_idempotency_events(request_id,sequence,frame) VALUES(${input.id},${eventCount},${input.terminalFrame})`;
         eventCount++;
       }
-      const runs = await tx<Row[]>`SELECT * FROM usage_runs WHERE id=${
-        String(row.usage_run_id)
-      } FOR UPDATE`;
+      const runs = await tx<Row[]>`SELECT *,EXISTS(SELECT 1 FROM provider_attempts
+        WHERE usage_run_id=usage_runs.id AND status='running') AS provider_accounting_uncertain
+        FROM usage_runs WHERE id=${String(row.usage_run_id)} FOR UPDATE`;
       if (runs[0]?.status === "reserved") {
         const userId = String(row.user_id);
         const users = await tx<
@@ -3325,7 +3403,19 @@ export class PostgresRepository implements DomainRepository {
         >`SELECT balance_micros FROM users WHERE id=${userId} FOR UPDATE`;
         const providerExecution = number(runs[0].execution_epoch) > 0;
         if (providerExecution || input.billing.mode === "refund") {
-          const effectiveCost = providerExecution ? number(runs[0].actual_provider_cost_micros) : 0;
+          const effectiveCost = providerExecution
+            ? runs[0].provider_accounting_uncertain === true
+              ? number(runs[0].reserved_micros)
+              : number(runs[0].actual_provider_cost_micros)
+            : 0;
+          if (providerExecution && runs[0].provider_accounting_uncertain === true) {
+            await tx`UPDATE provider_attempts SET status='cancelled',phase='planning',
+              error_code='accounting_unknown',breaker_after='unavailable',retryable=false,
+              latency_ms=GREATEST(0,floor(extract(epoch FROM (now()-started_at))*1000)::int),
+              completed_at=now() WHERE usage_run_id=${
+              String(row.usage_run_id)
+            } AND status='running'`;
+          }
           const amount = number(runs[0].reserved_micros) - effectiveCost;
           const after = number(users[0].balance_micros) + amount;
           await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${userId}`;
@@ -3380,9 +3470,9 @@ export class PostgresRepository implements DomainRepository {
       >`SELECT * FROM api_idempotency_requests WHERE state='in_progress' AND lease_expires_at<=now() ORDER BY lease_expires_at FOR UPDATE SKIP LOCKED LIMIT ${limit}`;
       for (const row of rows) {
         const id = String(row.id);
-        const runs = await tx<Row[]>`SELECT * FROM usage_runs WHERE id=${
-          String(row.usage_run_id)
-        } FOR UPDATE`;
+        const runs = await tx<Row[]>`SELECT *,EXISTS(SELECT 1 FROM provider_attempts
+          WHERE usage_run_id=usage_runs.id AND status='running') AS provider_accounting_uncertain
+          FROM usage_runs WHERE id=${String(row.usage_run_id)} FOR UPDATE`;
         if (runs[0]?.status === "reserved") {
           await tx`UPDATE provider_attempts SET status='cancelled',phase='planning',
             error_code='api_lease_expired',breaker_after='unavailable',retryable=true,
@@ -3395,7 +3485,9 @@ export class PostgresRepository implements DomainRepository {
           const reserved = number(runs[0].reserved_micros);
           const providerExecution = number(runs[0].execution_epoch) > 0;
           const effectiveCost = providerExecution
-            ? number(runs[0].actual_provider_cost_micros)
+            ? runs[0].provider_accounting_uncertain === true
+              ? number(runs[0].reserved_micros)
+              : number(runs[0].actual_provider_cost_micros)
             : number(row.observed_cost_micros);
           const delta = reserved - effectiveCost;
           const after = number(users[0].balance_micros) + delta;

@@ -41,6 +41,10 @@ interface RuntimeCandidate extends ProviderCandidate {
 
 interface AttemptMetrics {
   dispatched: boolean;
+  estimatedInputTokens: number;
+  providerInputTokens: number | null;
+  providerOutputTokens: number | null;
+  providerReasoningTokens: number | null;
   inputTokens: number;
   cachedInputTokens: number;
   reasoningTokens: number;
@@ -60,6 +64,10 @@ export interface ProviderExecutionOptions {
   complete?: typeof complete;
   stream?: typeof streamChatCompletion;
   now?: () => number;
+  slowStream?: {
+    windowMs: number;
+    minimumVisibleUnitsPerSecond: number;
+  };
 }
 
 const defaultRetryableStatuses = [408, 425, 429, 500, 502, 503, 504];
@@ -106,7 +114,11 @@ function requestId(value: unknown): string | null {
   return typeof value === "string" && /^[A-Za-z0-9._:-]{1,200}$/.test(value) ? value : null;
 }
 
-function policyFor(plan: ProviderExecutionPlan, remainingAttempts?: number): ResiliencePolicy {
+function policyFor(
+  plan: ProviderExecutionPlan,
+  remainingAttempts?: number,
+  slowStream?: ProviderExecutionOptions["slowStream"],
+): ResiliencePolicy {
   const policy = plan.retryPolicy;
   const configuredAttempts = policy?.maxAttempts ?? Math.max(1, Math.min(8, plan.targets.length));
   const maxAttempts = remainingAttempts ?? configuredAttempts;
@@ -133,6 +145,12 @@ function policyFor(plan: ProviderExecutionPlan, remainingAttempts?: number): Res
     maxPreVisibleBytes: 4_194_304,
     circuitFailureThreshold: 3,
     circuitOpenMs: 30_000,
+    ...(slowStream
+      ? {
+        slowWindowMs: slowStream.windowMs,
+        minimumVisibleUnitsPerSecond: slowStream.minimumVisibleUnitsPerSecond,
+      }
+      : {}),
   };
 }
 
@@ -155,6 +173,10 @@ function attemptReason(context: AttemptContext): ProviderAttemptReason {
 function emptyMetrics(estimatedInput = 0): AttemptMetrics {
   return {
     dispatched: false,
+    estimatedInputTokens: estimatedInput,
+    providerInputTokens: null,
+    providerOutputTokens: null,
+    providerReasoningTokens: null,
     inputTokens: estimatedInput,
     cachedInputTokens: 0,
     reasoningTokens: 0,
@@ -165,6 +187,28 @@ function emptyMetrics(estimatedInput = 0): AttemptMetrics {
     reasoningCharacters: 0,
     tokenSource: estimatedInput > 0 ? "estimated" : "none",
   };
+}
+
+function reconcileObservedTokens(metrics: AttemptMetrics) {
+  const estimatedOutput = Math.ceil(metrics.visibleCharacters / 4);
+  const estimatedReasoning = Math.ceil(metrics.reasoningCharacters / 4);
+  metrics.inputTokens = metrics.providerInputTokens ?? metrics.estimatedInputTokens;
+  metrics.outputTokens = Math.max(metrics.providerOutputTokens ?? 0, estimatedOutput);
+  metrics.reasoningTokens = Math.min(
+    metrics.outputTokens,
+    Math.max(metrics.providerReasoningTokens ?? 0, estimatedReasoning),
+  );
+  metrics.cachedInputTokens = Math.min(metrics.cachedInputTokens, metrics.inputTokens);
+  const providerCoversObservedOutput = metrics.providerOutputTokens !== null &&
+    metrics.providerOutputTokens >= estimatedOutput &&
+    (estimatedReasoning === 0 ||
+      (metrics.providerReasoningTokens !== null &&
+        metrics.providerReasoningTokens >= estimatedReasoning));
+  metrics.tokenSource = metrics.providerInputTokens !== null && providerCoversObservedOutput
+    ? "provider"
+    : metrics.inputTokens > 0 || metrics.outputTokens > 0
+    ? "estimated"
+    : "none";
 }
 
 function observeChunk(metrics: AttemptMetrics, data: string, now: number) {
@@ -190,47 +234,39 @@ function observeChunk(metrics: AttemptMetrics, data: string, now: number) {
     Number(usage.prompt_tokens) >= 0;
   const hasOutputUsage = Number.isSafeInteger(usage.completion_tokens) &&
     Number(usage.completion_tokens) >= 0;
-  if (hasPromptUsage) metrics.inputTokens = safeCount(usage.prompt_tokens);
-  if (hasOutputUsage) metrics.outputTokens = safeCount(usage.completion_tokens);
+  if (hasPromptUsage) metrics.providerInputTokens = safeCount(usage.prompt_tokens);
+  if (hasOutputUsage) metrics.providerOutputTokens = safeCount(usage.completion_tokens);
   if (Number.isSafeInteger(prompt.cached_tokens) && Number(prompt.cached_tokens) >= 0) {
     metrics.cachedInputTokens = safeCount(prompt.cached_tokens);
   }
   if (Number.isSafeInteger(output.reasoning_tokens) && Number(output.reasoning_tokens) >= 0) {
-    metrics.reasoningTokens = safeCount(output.reasoning_tokens);
+    metrics.providerReasoningTokens = safeCount(output.reasoning_tokens);
   }
-  if (hasPromptUsage || hasOutputUsage) metrics.tokenSource = "provider";
-  if (metrics.tokenSource !== "provider") {
-    const choices = Array.isArray(value.choices) ? value.choices : [];
-    let characters = 0;
-    for (const choice of choices) {
-      if (!choice || typeof choice !== "object" || Array.isArray(choice)) continue;
-      const delta = (choice as Record<string, unknown>).delta;
-      if (!delta || typeof delta !== "object" || Array.isArray(delta)) continue;
-      const fields = delta as Record<string, unknown>;
-      for (const name of ["content", "refusal"]) {
-        if (typeof fields[name] === "string") characters += fields[name].length;
-      }
-      for (const name of ["reasoning_content", "reasoning"]) {
-        if (typeof fields[name] === "string") {
-          characters += fields[name].length;
-          metrics.reasoningCharacters = Math.min(
-            33_554_432,
-            metrics.reasoningCharacters + fields[name].length,
-          );
-        }
-      }
-      if (Array.isArray(fields.tool_calls)) {
-        characters += JSON.stringify(fields.tool_calls).length;
+  const choices = Array.isArray(value.choices) ? value.choices : [];
+  let characters = 0;
+  for (const choice of choices) {
+    if (!choice || typeof choice !== "object" || Array.isArray(choice)) continue;
+    const delta = (choice as Record<string, unknown>).delta;
+    if (!delta || typeof delta !== "object" || Array.isArray(delta)) continue;
+    const fields = delta as Record<string, unknown>;
+    for (const name of ["content", "refusal"]) {
+      if (typeof fields[name] === "string") characters += fields[name].length;
+    }
+    for (const name of ["reasoning_content", "reasoning"]) {
+      if (typeof fields[name] === "string") {
+        characters += fields[name].length;
+        metrics.reasoningCharacters = Math.min(
+          33_554_432,
+          metrics.reasoningCharacters + fields[name].length,
+        );
       }
     }
-    metrics.visibleCharacters = Math.min(33_554_432, metrics.visibleCharacters + characters);
-    metrics.outputTokens = Math.ceil(metrics.visibleCharacters / 4);
-    metrics.reasoningTokens = Math.min(
-      metrics.outputTokens,
-      Math.ceil(metrics.reasoningCharacters / 4),
-    );
-    if (metrics.inputTokens > 0 || metrics.outputTokens > 0) metrics.tokenSource = "estimated";
+    if (Array.isArray(fields.tool_calls)) {
+      characters += JSON.stringify(fields.tool_calls).length;
+    }
   }
+  metrics.visibleCharacters = Math.min(33_554_432, metrics.visibleCharacters + characters);
+  reconcileObservedTokens(metrics);
   if (metrics.firstVisibleAt === null && openAIVisibleUnits(value) > 0) {
     metrics.firstVisibleAt = now;
   }
@@ -245,8 +281,20 @@ function completionMetrics(result: Completion): AttemptMetrics {
     upstream.usage && typeof upstream.usage === "object" && !Array.isArray(upstream.usage)
       ? upstream.usage as Record<string, unknown>
       : {};
+  const providerInputTokens = Number.isSafeInteger(usage.prompt_tokens)
+    ? safeCount(usage.prompt_tokens)
+    : null;
+  const providerOutputTokens = Number.isSafeInteger(usage.completion_tokens)
+    ? safeCount(usage.completion_tokens)
+    : null;
+  const fullyProviderCounted = providerInputTokens !== null && providerOutputTokens !== null &&
+    providerInputTokens === result.inputTokens && providerOutputTokens === result.outputTokens;
   return {
     dispatched: true,
+    estimatedInputTokens: result.inputTokens,
+    providerInputTokens,
+    providerOutputTokens,
+    providerReasoningTokens: result.reasoningTokens ?? null,
     inputTokens: result.inputTokens,
     cachedInputTokens: result.cachedInputTokens ?? 0,
     reasoningTokens: result.reasoningTokens ?? 0,
@@ -255,10 +303,7 @@ function completionMetrics(result: Completion): AttemptMetrics {
     firstVisibleAt: null,
     visibleCharacters: result.text.length,
     reasoningCharacters: 0,
-    tokenSource:
-      Number.isSafeInteger(usage.prompt_tokens) || Number.isSafeInteger(usage.completion_tokens)
-        ? "provider"
-        : "estimated",
+    tokenSource: fullyProviderCounted ? "provider" : "estimated",
   };
 }
 
@@ -270,6 +315,7 @@ export class ProviderExecutionEngine {
   readonly #complete: typeof complete;
   readonly #stream: typeof streamChatCompletion;
   readonly #now: () => number;
+  readonly #slowStream?: ProviderExecutionOptions["slowStream"];
 
   constructor(options: ProviderExecutionOptions) {
     this.#repository = options.repository;
@@ -279,6 +325,16 @@ export class ProviderExecutionEngine {
     this.#complete = options.complete ?? complete;
     this.#stream = options.stream ?? streamChatCompletion;
     this.#now = options.now ?? Date.now;
+    this.#slowStream = options.slowStream;
+    if (this.#slowStream) {
+      if (
+        !Number.isSafeInteger(this.#slowStream.windowMs) || this.#slowStream.windowMs < 250 ||
+        this.#slowStream.windowMs > 300_000 ||
+        !Number.isFinite(this.#slowStream.minimumVisibleUnitsPerSecond) ||
+        this.#slowStream.minimumVisibleUnitsPerSecond <= 0 ||
+        this.#slowStream.minimumVisibleUnitsPerSecond > 1_000_000
+      ) throw new TypeError("Slow-stream policy is outside its safe bounds");
+    }
   }
 
   async resolvePlan(sourceModelId: string): Promise<ProviderExecutionPlan> {
@@ -296,7 +352,7 @@ export class ProviderExecutionEngine {
     ) {
       throw new TypeError("Provider reservation token counts must be non-negative safe integers");
     }
-    const attempts = policyFor(plan).maxAttempts;
+    const attempts = policyFor(plan, undefined, this.#slowStream).maxAttempts;
     let largestAttempt = 0n;
     for (const target of plan.targets) {
       const pricing = target.pricing;
@@ -596,9 +652,7 @@ export class ProviderExecutionEngine {
         costSource: observed.dispatched ? "calculated" : "none",
         latencyMs,
         ttftMs,
-        // The resilience callback precedes the exact permit transition. Null is honest; a later
-        // post-transition event can fill this without predicting concurrent Redis state.
-        breakerAfter: null,
+        breakerAfter: breakerState(event.breakerAfter),
         retryable: event.retryable ?? false,
         upstreamRequestId: observed.upstreamRequestId,
         tokensPerSecond: observed.outputTokens > 0 && ttftMs !== null && latencyMs - ttftMs > 0
@@ -665,7 +719,8 @@ export class ProviderExecutionEngine {
   ): Promise<Completion> {
     const { plan, candidates } = await this.#prepare(sourceModelId, frozenPlan);
     const claim = await this.#repository.claimProviderExecution(usageRunId, ownerLeaseToken);
-    const remainingAttempts = policyFor(plan).maxAttempts - claim.consumedAttempts;
+    const remainingAttempts = policyFor(plan, undefined, this.#slowStream).maxAttempts -
+      claim.consumedAttempts;
     const metrics = new Map<string, AttemptMetrics>();
     const upstreams = new Map<string, UpstreamStreamOptions>();
     const onAttempt = this.#telemetry(
@@ -680,7 +735,7 @@ export class ProviderExecutionEngine {
       return await executeProviderRequest({
         initialCandidateId: plan.targets[0].providerModelId,
         resolveCandidate: (id) => candidates.get(id),
-        policy: policyFor(plan, remainingAttempts),
+        policy: policyFor(plan, remainingAttempts, this.#slowStream),
         signal,
         circuitStore: this.#circuitStore(candidates),
         onAttempt,
@@ -735,7 +790,8 @@ export class ProviderExecutionEngine {
   ): AsyncGenerator<string> {
     const { plan, candidates } = await this.#prepare(sourceModelId, frozenPlan);
     const claim = await this.#repository.claimProviderExecution(usageRunId, ownerLeaseToken);
-    const remainingAttempts = policyFor(plan).maxAttempts - claim.consumedAttempts;
+    const remainingAttempts = policyFor(plan, undefined, this.#slowStream).maxAttempts -
+      claim.consumedAttempts;
     const metrics = new Map<string, AttemptMetrics>();
     const upstreams = new Map<string, UpstreamStreamOptions>();
     const onAttempt = this.#telemetry(
@@ -750,7 +806,7 @@ export class ProviderExecutionEngine {
       yield* streamProviderRequest({
         initialCandidateId: plan.targets[0].providerModelId,
         resolveCandidate: (id) => candidates.get(id),
-        policy: policyFor(plan, remainingAttempts),
+        policy: policyFor(plan, remainingAttempts, this.#slowStream),
         signal,
         circuitStore: this.#circuitStore(candidates),
         onAttempt,

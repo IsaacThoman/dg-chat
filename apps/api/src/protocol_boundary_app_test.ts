@@ -69,7 +69,19 @@ Deno.test("OpenAI gateway preserves public identity, visible stream billing, and
         model: "fallback/secret-model",
         choices: [{
           index: 0,
-          message: { role: "assistant", content: "gateway result" },
+          message: {
+            role: "assistant",
+            content: "gateway result",
+            annotations: [{
+              type: "url_citation",
+              url_citation: {
+                start_index: 0,
+                end_index: 7,
+                title: "Gateway source",
+                url: "https://example.com/gateway",
+              },
+            }],
+          },
           finish_reason: "stop",
         }],
         usage: { prompt_tokens: 12, completion_tokens: 4, total_tokens: 16 },
@@ -240,6 +252,17 @@ Deno.test("OpenAI gateway preserves public identity, visible stream billing, and
     function: { name: "lookup", parameters: { type: "object" } },
   }]);
   assertEquals(converted.reasoning_effort, "medium");
+  const supportedBody = await json(supported);
+  const citedText = supportedBody.output.flatMap(
+    (item: { content?: Array<Record<string, unknown>> }) => item.content ?? [],
+  ).find((part: { type?: string }) => part.type === "output_text");
+  assertEquals(citedText.annotations, [{
+    type: "url_citation",
+    start_index: 0,
+    end_index: 7,
+    title: "Gateway source",
+    url: "https://example.com/gateway",
+  }]);
 
   const toolHistory = await app.request("/v1/responses", {
     method: "POST",

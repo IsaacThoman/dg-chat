@@ -32,9 +32,19 @@ export function responseOutput(result: CanonicalResult, messageId: string) {
         : [],
     });
   }
-  const content: Record<string, unknown>[] = result.content
-    .filter((part) => part.type === "text")
-    .map((part) => ({ type: "output_text", text: part.text, annotations: [] }));
+  const content: Record<string, unknown>[] = result.text
+    ? [{
+      type: "output_text",
+      text: result.text,
+      annotations: (result.annotations ?? []).map((annotation) => ({
+        type: annotation.type,
+        start_index: annotation.startIndex,
+        end_index: annotation.endIndex,
+        title: annotation.title,
+        url: annotation.url,
+      })),
+    }]
+    : [];
   if (result.refusal) content.push({ type: "refusal", refusal: result.refusal });
   if (content.length > 0) {
     output.push({

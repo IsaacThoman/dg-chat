@@ -1029,6 +1029,7 @@ export class MemoryRepository {
         run.status !== "reserved" || !run.generationLeaseToken ||
         !run.generationLeaseExpiresAt || Date.parse(run.generationLeaseExpiresAt) > Date.now()
       ) continue;
+      const refunded = this.refund(run.id);
       for (const attempt of this.providerAttempts.values()) {
         if (attempt.usageRunId !== run.id || attempt.status !== "running") continue;
         attempt.status = "cancelled";
@@ -1039,7 +1040,6 @@ export class MemoryRepository {
         attempt.latencyMs = Math.max(0, Date.now() - Date.parse(attempt.startedAt));
         attempt.completedAt = new Date().toISOString();
       }
-      const refunded = this.refund(run.id);
       if (refunded) {
         refunded.generationLeaseToken = null;
         refunded.generationLeaseExpiresAt = null;
@@ -1956,13 +1956,8 @@ export class MemoryRepository {
       run.executionOwnerLeaseToken = ownerLeaseToken;
       for (const attempt of this.providerAttempts.values()) {
         if (attempt.usageRunId !== usageRunId || attempt.status !== "running") continue;
-        attempt.status = "cancelled";
-        attempt.phase = "planning";
-        attempt.errorCode = "execution_reclaimed";
-        attempt.breakerAfter = "unavailable";
-        attempt.retryable = true;
-        attempt.latencyMs = Math.max(0, Date.now() - Date.parse(attempt.startedAt));
-        attempt.completedAt = new Date().toISOString();
+        // The old epoch fences completion. Keeping this row running preserves the durable marker
+        // that a dispatched call's terminal accounting is unknown.
         reconciledAttemptIds.push(attempt.id);
       }
     }
@@ -2275,6 +2270,31 @@ export class MemoryRepository {
       .sort((a, b) => a.attemptNumber - b.attemptNumber).map((attempt) => structuredClone(attempt));
   }
 
+  private providerAccountingUncertain(usageRunId: string): boolean {
+    return [...this.providerAttempts.values()].some((attempt) =>
+      attempt.usageRunId === usageRunId && attempt.status === "running"
+    );
+  }
+
+  private authoritativeProviderCost(run: UsageRun): number {
+    return this.providerAccountingUncertain(run.id)
+      ? run.reservedMicros
+      : run.actualProviderCostMicros;
+  }
+
+  private finalizeAccountingUnknownAttempts(usageRunId: string): void {
+    for (const attempt of this.providerAttempts.values()) {
+      if (attempt.usageRunId !== usageRunId || attempt.status !== "running") continue;
+      attempt.status = "cancelled";
+      attempt.phase = "planning";
+      attempt.errorCode = "accounting_unknown";
+      attempt.breakerAfter = "unavailable";
+      attempt.retryable = false;
+      attempt.latencyMs = Math.max(0, Date.now() - Date.parse(attempt.startedAt));
+      attempt.completedAt = new Date().toISOString();
+    }
+  }
+
   private finalizeProviderUsage(input: FinalizeProviderUsageInput, refundOnly: boolean): UsageRun {
     const run = this.usageRuns.get(input.usageRunId);
     if (!run) throw new DomainError("not_found", "Usage run not found", 404);
@@ -2440,9 +2460,10 @@ export class MemoryRepository {
     if (!run) throw new DomainError("not_found", "Usage reservation not found", 404);
     if (run.status === "completed") return run;
     if (run.executionEpoch > 0) {
-      costMicros = run.actualProviderCostMicros;
+      costMicros = this.authoritativeProviderCost(run);
       inputTokens = run.actualProviderInputTokens;
       outputTokens = run.actualProviderOutputTokens;
+      this.finalizeAccountingUnknownAttempts(run.id);
     }
     if (costMicros > run.reservedMicros) {
       this.credit(run.userId, runId, "settle", -(costMicros - run.reservedMicros));
@@ -2465,7 +2486,8 @@ export class MemoryRepository {
     const run = this.usageRuns.get(runId);
     if (!run || run.status !== "reserved") return run;
     if (run.executionEpoch > 0) {
-      const cost = run.actualProviderCostMicros;
+      const cost = this.authoritativeProviderCost(run);
+      this.finalizeAccountingUnknownAttempts(run.id);
       const delta = run.reservedMicros - cost;
       if (delta !== 0) this.credit(run.userId, runId, delta > 0 ? "refund" : "settle", delta);
       run.status = "failed";
@@ -2842,16 +2864,6 @@ export class MemoryRepository {
         Date.parse(request.leaseExpiresAt) > Date.now()
       ) continue;
       const usageRun = this.usageRuns.get(request.usageRunId);
-      for (const attempt of this.providerAttempts.values()) {
-        if (attempt.usageRunId !== request.usageRunId || attempt.status !== "running") continue;
-        attempt.status = "cancelled";
-        attempt.phase = "planning";
-        attempt.errorCode = "api_lease_expired";
-        attempt.breakerAfter = "unavailable";
-        attempt.retryable = true;
-        attempt.latencyMs = Math.max(0, Date.now() - Date.parse(attempt.startedAt));
-        attempt.completedAt = new Date().toISOString();
-      }
       if ((usageRun?.executionEpoch ?? 0) > 0) {
         this.refund(request.usageRunId);
       } else if (request.observedCostMicros > 0) {
@@ -2863,6 +2875,16 @@ export class MemoryRepository {
           request.observedLatencyMs,
         );
       } else this.refund(request.usageRunId);
+      for (const attempt of this.providerAttempts.values()) {
+        if (attempt.usageRunId !== request.usageRunId || attempt.status !== "running") continue;
+        attempt.status = "cancelled";
+        attempt.phase = "planning";
+        attempt.errorCode = "api_lease_expired";
+        attempt.breakerAfter = "unavailable";
+        attempt.retryable = true;
+        attempt.latencyMs = Math.max(0, Date.now() - Date.parse(attempt.startedAt));
+        attempt.completedAt = new Date().toISOString();
+      }
       request.state = "failed";
       request.responseStatus = 500;
       request.responseBody = JSON.stringify({
@@ -2904,6 +2926,7 @@ export class MemoryRepository {
         Date.parse(run.runLeaseExpiresAt) > Date.now() || run.generationLeaseToken ||
         belongsToApiReplay
       ) continue;
+      this.refund(run.id);
       for (const attempt of this.providerAttempts.values()) {
         if (attempt.usageRunId !== run.id || attempt.status !== "running") continue;
         attempt.status = "cancelled";
@@ -2914,7 +2937,6 @@ export class MemoryRepository {
         attempt.latencyMs = Math.max(0, Date.now() - Date.parse(attempt.startedAt));
         attempt.completedAt = new Date().toISOString();
       }
-      this.refund(run.id);
       run.runLeaseToken = null;
       run.runLeaseExpiresAt = null;
       count++;

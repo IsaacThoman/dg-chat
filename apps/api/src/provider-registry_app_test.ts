@@ -253,6 +253,25 @@ Deno.test("admin provider registry protects credentials and powers dynamic OpenA
   ) => request.idempotencyKey === "provider-registry-stream");
   assertExists(streamRequest);
   const streamRun = (repository as MemoryRepository).usageRuns.get(streamRequest.usageRunId);
+  const streamAttempts = (repository as MemoryRepository).listProviderAttempts(
+    streamRequest.usageRunId,
+  );
+  const streamAttempt = streamAttempts[0];
+  assertEquals({
+    inputTokens: streamAttempt.inputTokens,
+    cachedInputTokens: streamAttempt.cachedInputTokens,
+    reasoningTokens: streamAttempt.reasoningTokens,
+    outputTokens: streamAttempt.outputTokens,
+    costMicros: streamAttempt.costMicros,
+    tokenSource: streamAttempt.tokenSource,
+  }, {
+    inputTokens: 10_000,
+    cachedInputTokens: 4_000,
+    reasoningTokens: 5_000,
+    outputTokens: 20_000,
+    costMicros: 6_310,
+    tokenSource: "provider",
+  });
   assertEquals(streamRun?.costMicros, 6_310);
   assertEquals(streamRun?.inputTokens, 10_000);
   assertEquals(streamRun?.outputTokens, 20_000);

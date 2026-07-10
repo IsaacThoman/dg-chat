@@ -33,12 +33,15 @@ export interface CircuitPermit {
 
 export interface CircuitStore {
   acquire(candidateId: string, policy: ResiliencePolicy): CircuitPermit | Promise<CircuitPermit>;
-  success(candidateId: string, permit: CircuitPermit): void | Promise<void>;
+  success(
+    candidateId: string,
+    permit: CircuitPermit,
+  ): CircuitState | void | Promise<CircuitState | void>;
   failure(
     candidateId: string,
     permit: CircuitPermit,
     policy: ResiliencePolicy,
-  ): void | Promise<void>;
+  ): CircuitState | void | Promise<CircuitState | void>;
 }
 
 export type AttemptEvent = {
@@ -55,6 +58,7 @@ export type AttemptEvent = {
   retryable?: boolean;
   retryAfterMs?: number;
   reason?: "circuit_open";
+  breakerAfter?: CircuitState;
 };
 
 export interface AttemptContext {
@@ -301,7 +305,10 @@ async function candidateSequence(
   run: (
     candidate: ProviderCandidate,
     context: AttemptContext,
-  ) => Promise<{ ok: true } | { ok: false; error: unknown; visible: boolean }>,
+  ) => Promise<
+    | { ok: true; durationMs: number; visible: boolean }
+    | { ok: false; error: unknown; visible: boolean; durationMs: number }
+  >,
 ): Promise<void> {
   const policy = validateResiliencePolicy(options.policy);
   const now = options.now ?? Date.now;
@@ -368,7 +375,15 @@ async function candidateSequence(
       await options.beforeAttempt?.(candidate, options.signal, context);
       const result = await run(candidate, context);
       if (result.ok) {
-        await options.circuitStore?.success(candidate.id, permit);
+        const breakerAfter = await options.circuitStore?.success(candidate.id, permit);
+        await emit(options.onAttempt, {
+          type: "succeeded",
+          candidateId: candidate.id,
+          ...context,
+          durationMs: result.durationMs,
+          visibleOutput: result.visible,
+          ...(breakerAfter ? { breakerAfter } : {}),
+        });
         return;
       }
       lastError = result.error;
@@ -382,9 +397,21 @@ async function candidateSequence(
         });
       }
       const classified = classifyProviderError(result.error);
-      if (classified.transient || permit.state === "half_open") {
-        await options.circuitStore?.failure(candidate.id, permit, policy);
-      }
+      const breakerAfter = classified.transient || permit.state === "half_open"
+        ? await options.circuitStore?.failure(candidate.id, permit, policy)
+        : undefined;
+      await emit(options.onAttempt, {
+        type: "failed",
+        candidateId: candidate.id,
+        ...context,
+        durationMs: result.durationMs,
+        visibleOutput: result.visible,
+        errorCategory: classified.category,
+        httpStatus: classified.status,
+        retryable: classified.transient,
+        retryAfterMs: safeRetryAfterMs(result.error),
+        ...(breakerAfter ? { breakerAfter } : {}),
+      });
       if (result.visible || !classified.transient) {
         throw result.error;
       }
@@ -422,30 +449,14 @@ export async function executeProviderRequest<T>(
       const failure = orchestrationOptions.signal.aborted
         ? orchestrationOptions.signal.reason
         : error;
-      const classified = classifyProviderError(failure);
-      await emit(options.onAttempt, {
-        type: "failed",
-        candidateId: candidate.id,
-        ...context,
+      return {
+        ok: false,
+        error: failure,
+        visible: false,
         durationMs: Math.max(0, now() - started),
-        visibleOutput: false,
-        errorCategory: classified.category,
-        httpStatus: classified.status,
-        retryable: classified.transient,
-        retryAfterMs: safeRetryAfterMs(failure),
-      });
-      return { ok: false, error: failure, visible: false };
+      };
     }
-    // Terminal telemetry is deliberately outside the provider try/catch. A persistence failure
-    // must fail the request without reclassifying a completed upstream call or invoking fallback.
-    await emit(options.onAttempt, {
-      type: "succeeded",
-      candidateId: candidate.id,
-      ...context,
-      durationMs: Math.max(0, now() - started),
-      visibleOutput: false,
-    });
-    return { ok: true };
+    return { ok: true, visible: false, durationMs: Math.max(0, now() - started) };
   });
   return value as T;
 }
@@ -700,28 +711,14 @@ export async function* streamProviderRequest<T>(
       await boundedCleanup(
         iterator?.return ? Promise.resolve().then(() => iterator!.return!()) : undefined,
       );
-      const classified = classifyProviderError(failure);
-      await emit(options.onAttempt, {
-        type: "failed",
-        candidateId: candidate.id,
-        ...context,
+      return {
+        ok: false,
+        error: failure,
+        visible,
         durationMs: Math.max(0, now() - started),
-        visibleOutput: visible,
-        errorCategory: classified.category,
-        httpStatus: classified.status,
-        retryable: classified.transient,
-        retryAfterMs: safeRetryAfterMs(failure),
-      });
-      return { ok: false, error: failure, visible };
+      };
     }
-    await emit(options.onAttempt, {
-      type: "succeeded",
-      candidateId: candidate.id,
-      ...context,
-      durationMs: Math.max(0, now() - started),
-      visibleOutput: visible,
-    });
-    return { ok: true };
+    return { ok: true, visible, durationMs: Math.max(0, now() - started) };
   });
   running.then(() => queue.close(), (error) => queue.fail(error));
   try {
@@ -764,11 +761,12 @@ export class MemoryCircuitStore implements CircuitStore {
     return { allowed: true, state: "closed" };
   }
 
-  success(candidateId: string, _permit: CircuitPermit): void {
+  success(candidateId: string, _permit: CircuitPermit): CircuitState {
     this.#entries.delete(candidateId);
+    return "closed";
   }
 
-  failure(candidateId: string, _permit: CircuitPermit, policy: ResiliencePolicy): void {
+  failure(candidateId: string, _permit: CircuitPermit, policy: ResiliencePolicy): CircuitState {
     const time = this.now();
     const current = this.#entries.get(candidateId) ?? {
       failures: 0,
@@ -784,6 +782,7 @@ export class MemoryCircuitStore implements CircuitStore {
     }
     this.#entries.set(candidateId, current);
     this.#evict();
+    return this.state(candidateId);
   }
 
   state(candidateId: string): CircuitState {

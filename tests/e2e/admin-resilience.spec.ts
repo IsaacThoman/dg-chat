@@ -146,7 +146,7 @@ test("an administrator creates and orders a resilient route accessibly", async (
 
   await editRoute.click();
   await page.getByRole("button", { name: `Move ${fallbackTwo.displayName} up` }).click();
-  await expect(page.locator('[aria-live="polite"]')).toContainText(
+  await expect(page.locator('.sr-only[aria-live="polite"]')).toContainText(
     `${fallbackTwo.displayName} moved to position 1 of 2`,
   );
   const orderedItems = page.getByRole("list", {
@@ -155,6 +155,7 @@ test("an administrator creates and orders a resilient route accessibly", async (
   await expect(orderedItems.nth(0)).toContainText(fallbackTwo.displayName);
   await expect(orderedItems.nth(1)).toContainText(fallbackOne.displayName);
   await page.getByRole("button", { name: "Save route", exact: true }).click();
+  await expect(page.getByRole("dialog")).toBeHidden();
 
   const routesResponse = await page.request.get(`${apiURL}/api/admin/resilience/routes`);
   expect(routesResponse.ok()).toBeTruthy();

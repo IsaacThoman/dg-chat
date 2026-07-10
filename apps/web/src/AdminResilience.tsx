@@ -1,6 +1,6 @@
 import { type FormEvent, type ReactNode, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowDown, ArrowUp, Plus, RefreshCw, RotateCcw, Trash2 } from "lucide-react";
+import { ArrowDown, ArrowUp, Play, Plus, RefreshCw, RotateCcw, Trash2 } from "lucide-react";
 import { Modal } from "./Modal.tsx";
 
 export const retryableHttpStatuses = [408, 425, 429, 500, 502, 503, 504] as const;
@@ -67,7 +67,24 @@ export interface ResilienceAdminClient {
     retryPolicyId: string | null;
     fallbackModelIds: string[];
   }): Promise<ModelRoute>;
+  runPlayground(scenario: unknown): Promise<PlaygroundResult>;
 }
+
+export type PlaygroundResult = {
+  ok: true;
+  completion: {
+    scenarioId: string;
+    seed: number;
+    role: string;
+    text: string;
+    reasoning: string;
+    toolCalls: unknown[];
+    usage: Record<string, unknown>;
+  };
+} | {
+  ok: false;
+  error: { kind: string; message: string; details: Record<string, unknown> };
+};
 
 export class ResilienceAdminError extends Error {
   constructor(public status: number, public code: string, message: string) {
@@ -121,6 +138,8 @@ export const resilienceAdminClient: ResilienceAdminClient = {
       method: "PUT",
       body: JSON.stringify(input),
     }),
+  runPlayground: (scenario) =>
+    resilienceRequest("/playground", { method: "POST", body: JSON.stringify(scenario) }),
 };
 
 export const defaultPolicyInput = (): RetryPolicyInput => ({
@@ -681,6 +700,92 @@ function RouteModal({ entry, entries, policies, client, close, saved }: {
   );
 }
 
+const defaultPlaygroundScenario = JSON.stringify(
+  {
+    id: "admin-preview",
+    name: "Reasoning preview",
+    seed: 42,
+    steps: [
+      { type: "reasoning", text: "Checking the configured route…", delayMs: 40, jitterMs: 10 },
+      { type: "text", text: "The deterministic simulator is ready.", delayMs: 60, jitterMs: 10 },
+      {
+        type: "usage",
+        inputTokens: 24,
+        cachedInputTokens: 0,
+        reasoningTokens: 8,
+        outputTokens: 12,
+        delayMs: 0,
+        jitterMs: 0,
+      },
+    ],
+  },
+  null,
+  2,
+);
+
+function ResiliencePlayground({ client }: { client: ResilienceAdminClient }) {
+  const [scenario, setScenario] = useState(defaultPlaygroundScenario);
+  const [result, setResult] = useState<PlaygroundResult>();
+  const [error, setError] = useState("");
+  const [running, setRunning] = useState(false);
+  const run = async () => {
+    setError("");
+    setResult(undefined);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(scenario);
+    } catch {
+      setError("Scenario must be valid JSON.");
+      return;
+    }
+    setRunning(true);
+    try {
+      setResult(await client.runPlayground(parsed));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "The simulator could not run.");
+    } finally {
+      setRunning(false);
+    }
+  };
+  return (
+    <section className="resilience-playground" aria-labelledby="playground-title">
+      <div>
+        <h2 id="playground-title">Deterministic playground</h2>
+        <p className="registry-help">
+          Exercise latency, reasoning, tool calls, usage, and failures without provider secrets or
+          user credits. Scenarios are strictly bounded and run only in this isolated admin
+          playground.
+        </p>
+      </div>
+      <div className="playground-grid">
+        <label>
+          Scenario JSON
+          <textarea
+            value={scenario}
+            onChange={(event) => setScenario(event.target.value)}
+            rows={14}
+            spellCheck={false}
+            aria-describedby="playground-help"
+          />
+        </label>
+        <div className="playground-result" aria-live="polite" aria-busy={running}>
+          <strong>Result</strong>
+          {running
+            ? <p>Running deterministic scenario…</p>
+            : error
+            ? <p className="model-blockers">{error}</p>
+            : result
+            ? <pre>{JSON.stringify(result, null, 2)}</pre>
+            : <p id="playground-help">Run the sample or edit its bounded steps.</p>}
+        </div>
+      </div>
+      <button type="button" className="primary" onClick={() => void run()} disabled={running}>
+        <Play size={16} /> {running ? "Running…" : "Run scenario"}
+      </button>
+    </section>
+  );
+}
+
 export function AdminResilience(
   { client = resilienceAdminClient }: { client?: ResilienceAdminClient },
 ) {
@@ -719,6 +824,7 @@ export function AdminResilience(
         }
       />
       <h2 id="resilience-title" className="sr-only">Routing resilience configuration</h2>
+      <ResiliencePlayground client={client} />
       {notice && (
         <div className="registry-banner" role="status">
           {notice}

@@ -1214,9 +1214,14 @@ function TreePanel({
   const closeRef = useRef(close);
   const busyRef = useRef(busy);
   const previousFocus = useRef<HTMLElement | null>(null);
+  const restoreFrame = useRef<number | null>(null);
   closeRef.current = close;
   busyRef.current = busy;
   useEffect(() => {
+    if (restoreFrame.current !== null) {
+      cancelAnimationFrame(restoreFrame.current);
+      restoreFrame.current = null;
+    }
     previousFocus.current = returnFocus ?? document.activeElement as HTMLElement;
     const panel = panelRef.current;
     panel?.querySelector<HTMLElement>("button")?.focus();
@@ -1246,7 +1251,10 @@ function TreePanel({
     document.addEventListener("keydown", keydown);
     return () => {
       document.removeEventListener("keydown", keydown);
-      requestAnimationFrame(() => previousFocus.current?.focus());
+      restoreFrame.current = requestAnimationFrame(() => {
+        restoreFrame.current = null;
+        previousFocus.current?.focus();
+      });
     };
   }, []);
   return (

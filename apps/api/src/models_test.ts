@@ -247,8 +247,25 @@ Deno.test("streaming rejects unsafe usage, content, and tool delta fields", asyn
   }
 });
 
+Deno.test("streaming rejects multiple upstream choices before yielding public output", async () => {
+  const stream = parseOpenAIEventStream(
+    byteStream([
+      'data: {"choices":[{"index":0,"delta":{"content":"first"}},{"index":1,"delta":{"content":"second"}}]}\n\n' +
+      "data: [DONE]\n\n",
+    ]),
+    new AbortController().signal,
+  );
+  await assertRejects(() => stream.next(), Error, "invalid chat completion choices");
+});
+
 Deno.test("non-stream completions validate shapes and bounded usage", async () => {
   const invalidPayloads = [
+    {
+      choices: [
+        { index: 0, message: { content: "first" } },
+        { index: 1, message: { content: "second" } },
+      ],
+    },
     { choices: [{ message: { content: "ok" } }], usage: { prompt_tokens: -1 } },
     { choices: [{ message: { content: "ok" } }], usage: { completion_tokens: 1_000_000_001 } },
     { choices: [{ message: { content: 7 } }] },

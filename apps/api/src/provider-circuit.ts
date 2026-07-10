@@ -86,7 +86,7 @@ export class MemoryCircuitBreaker implements CircuitBreaker {
     options: { now?: () => number; randomId?: () => string; maxEntries?: number } = {},
   ) {
     this.#now = options.now ?? Date.now;
-    this.#randomId = options.randomId ?? crypto.randomUUID;
+    this.#randomId = options.randomId ?? (() => crypto.randomUUID());
     this.#maxEntries = options.maxEntries ?? 1_000;
     if (!Number.isSafeInteger(this.#maxEntries) || this.#maxEntries < 1) {
       throw new TypeError("maxEntries must be a positive integer");
@@ -561,18 +561,18 @@ export class CircuitBreakerStoreAdapter implements CircuitStore {
     };
   }
 
-  async success(candidateId: string, permit: ResilienceCircuitPermit): Promise<void> {
+  async success(candidateId: string, permit: ResilienceCircuitPermit): Promise<BreakerState> {
     const lease = this.#lease(permit);
-    await this.breaker.recordSuccess(candidateId, lease);
+    return (await this.breaker.recordSuccess(candidateId, lease)).state;
   }
 
   async failure(
     candidateId: string,
     permit: ResilienceCircuitPermit,
     _policy: ResiliencePolicy,
-  ): Promise<void> {
+  ): Promise<BreakerState> {
     const lease = this.#lease(permit);
-    await this.breaker.recordFailure(candidateId, lease, this.#policy);
+    return (await this.breaker.recordFailure(candidateId, lease, this.#policy)).state;
   }
 
   #lease(permit: ResilienceCircuitPermit): BreakerPermit {
