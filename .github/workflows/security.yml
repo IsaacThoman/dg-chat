@@ -30,7 +30,7 @@ jobs:
       - name: Dependency vulnerability scan
         run: docker run --rm -v "$PWD:/src" ghcr.io/google/osv-scanner/osv-scanner:v2.0.2 scan source -r /src
       - name: Filesystem vulnerability and misconfiguration scan
-        uses: aquasecurity/trivy-action@0.30.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: .
@@ -56,7 +56,7 @@ jobs:
           cache-from: type=gha,scope=security-app
           cache-to: type=gha,mode=max,scope=security-app
       - name: Scan application image
-        uses: aquasecurity/trivy-action@0.30.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: dg-chat:security-scan
           format: sarif
