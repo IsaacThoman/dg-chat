@@ -1,0 +1,19 @@
+{
+  "name": "dg-chat",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "deno task dev",
+    "dev:web": "deno task dev:web",
+    "check": "deno task check",
+    "test": "deno task test",
+    "build": "deno task build"
+  },
+  "engines": {
+    "deno": ">=2.9"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.58.2"
+  }
+}
