@@ -4,6 +4,25 @@ import type { Conversation } from "./types.ts";
 
 afterEach(() => vi.unstubAllGlobals());
 
+describe("setup discovery API", () => {
+  it("reads bootstrap and OIDC capabilities from the public status endpoint", async () => {
+    const status = { bootstrapRequired: true, setupEnabled: true, oidcEnabled: false };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(status), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(api.setupStatus()).resolves.toEqual(status);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/setup/status",
+      expect.objectContaining({ credentials: "include" }),
+    );
+  });
+});
+
 describe("active branch API", () => {
   it("persists a selected leaf with the current conversation version", async () => {
     const conversation: Conversation = {

@@ -74,6 +74,7 @@ import {
   preferredLeaf,
 } from "./conversationGraph.ts";
 import { demoConversations, demoMessages, demoModels, demoUser } from "./demo.ts";
+import { setupDestination } from "./setupDiscovery.ts";
 import type { Conversation, Message, Model, Token, User } from "./types.ts";
 
 type View = "chat" | "settings" | "tokens" | "admin";
@@ -1568,6 +1569,7 @@ function Modal(
 }
 
 export function App() {
+  const setupQuery = useQuery({ queryKey: ["setup-status"], queryFn: api.setupStatus });
   const userQuery = useQuery({ queryKey: ["me"], queryFn: api.me });
   const conversationQuery = useQuery({ queryKey: ["conversations"], queryFn: api.conversations });
   const modelQuery = useQuery({ queryKey: ["models"], queryFn: api.models });
@@ -1589,8 +1591,10 @@ export function App() {
     document.documentElement.dataset.theme = "light";
   }, []);
   useEffect(() => {
-    if (userQuery.isError && !demoMode) location.assign("/login");
-  }, [userQuery.isError, demoMode]);
+    if (demoMode) return;
+    const destination = setupDestination("/", setupQuery.data, userQuery.isError);
+    if (destination) location.replace(destination);
+  }, [userQuery.isError, setupQuery.data, demoMode]);
   useEffect(() => {
     if (!activeId && conversations[0]) setActiveId(conversations[0].id);
   }, [activeId, conversations]);
@@ -1622,15 +1626,7 @@ export function App() {
     await conversationQuery.refetch();
   };
   if (!user) {
-    return (
-      <main className="auth-page">
-        <div className="typing">
-          <span />
-          <span />
-          <span />
-        </div>
-      </main>
-    );
+    return <DiscoveryLoading unavailable={setupQuery.isError && userQuery.isError} />;
   }
   return (
     <div className="app-shell">
@@ -1698,13 +1694,47 @@ function AuthCard(
     </main>
   );
 }
+function DiscoveryLoading({ unavailable = false }: { unavailable?: boolean }) {
+  return (
+    <main className="auth-page" aria-live="polite">
+      <div className="auth-card discovery-card">
+        <Brand />
+        {unavailable
+          ? (
+            <>
+              <h1>Workspace unavailable</h1>
+              <p>DG Chat could not reach the server. Check the deployment and try again.</p>
+              <button className="secondary wide" onClick={() => location.reload()}>
+                <RefreshCw size={16} /> Retry
+              </button>
+            </>
+          )
+          : (
+            <>
+              <div className="typing" aria-hidden="true">
+                <span />
+                <span />
+                <span />
+              </div>
+              <p>Opening your workspace…</p>
+            </>
+          )}
+      </div>
+    </main>
+  );
+}
 export function AuthScreen() {
+  const setupQuery = useQuery({ queryKey: ["setup-status"], queryFn: api.setupStatus });
   const [signup, setSignup] = useState(false);
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    const destination = setupDestination("/login", setupQuery.data);
+    if (destination) location.replace(destination);
+  }, [setupQuery.data]);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setBusy(true);
@@ -1720,6 +1750,7 @@ export function AuthScreen() {
       setBusy(false);
     }
   };
+  if (setupQuery.isLoading || setupQuery.data?.bootstrapRequired) return <DiscoveryLoading />;
   return (
     <AuthCard
       title={signup ? "Create your account" : "Welcome back"}
@@ -1769,12 +1800,16 @@ export function AuthScreen() {
           <ArrowRight size={17} />
         </button>
       </form>
-      <div className="divider">
-        <span>or</span>
-      </div>
-      <button className="oidc-button">
-        <span>SSO</span> Continue with organization SSO
-      </button>
+      {setupQuery.data?.oidcEnabled && (
+        <>
+          <div className="divider">
+            <span>or</span>
+          </div>
+          <button className="oidc-button" type="button">
+            <span>SSO</span> Continue with organization SSO
+          </button>
+        </>
+      )}
       <p className="switch-auth">
         {signup ? "Already have an account?" : "New to this workspace?"}{" "}
         <button onClick={() => setSignup(!signup)}>{signup ? "Sign in" : "Request access"}</button>
@@ -1783,12 +1818,17 @@ export function AuthScreen() {
   );
 }
 export function SetupScreen() {
+  const setupQuery = useQuery({ queryKey: ["setup-status"], queryFn: api.setupStatus });
   const [setupToken, setSetupToken] = useState("");
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    const destination = setupDestination("/setup", setupQuery.data);
+    if (destination) location.replace(destination);
+  }, [setupQuery.data]);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setBusy(true);
@@ -1802,6 +1842,25 @@ export function SetupScreen() {
       setBusy(false);
     }
   };
+  if (setupQuery.isLoading || setupQuery.data && !setupQuery.data.bootstrapRequired) {
+    return <DiscoveryLoading />;
+  }
+  if (setupQuery.data && !setupQuery.data.setupEnabled) {
+    return (
+      <AuthCard
+        title="Setup is not enabled"
+        subtitle="This workspace needs an administrator, but bootstrap is disabled."
+      >
+        <div className="setup-note">
+          <ShieldCheck size={20} />
+          <span>
+            <strong>Configure the server</strong>
+            <small>Set the one-time setup token, restart the API, and reload this page.</small>
+          </span>
+        </div>
+      </AuthCard>
+    );
+  }
   return (
     <AuthCard
       title="Set up your workspace"
