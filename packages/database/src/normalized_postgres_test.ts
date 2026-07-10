@@ -1459,6 +1459,126 @@ Deno.test({
 });
 
 Deno.test({
+  name: "Postgres earlier failed and reaped generations advance only untouched selections",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 1 });
+    await sql`TRUNCATE generation_controls, provider_attempts, ledger_entries, usage_runs,
+      messages, conversations, users RESTART IDENTITY CASCADE`;
+    await sql.end();
+    const repo = await PostgresRepository.connect(databaseUrl!);
+    const expirySql = postgres(databaseUrl!, { max: 1 });
+    try {
+      const owner = await repo.bootstrapAdmin({
+        email: "earlier-terminal@database.test",
+        name: "Earlier terminal owner",
+        passwordHash: "hash",
+      }, 1_000_000);
+      for (const terminal of ["failure", "reaper"] as const) {
+        for (const preserveLaterSelection of [false, true]) {
+          const suffix = `${terminal}-${preserveLaterSelection ? "selected" : "untouched"}`;
+          const conversation = await repo.createConversation(owner.id, `Earlier ${suffix}`);
+          const userOne = await repo.appendMessage({
+            conversationId: conversation.id,
+            ownerId: owner.id,
+            parentId: null,
+            role: "user",
+            content: "one",
+            expectedVersion: 0,
+            idempotencyKey: `pg-${suffix}-user-one`,
+          });
+          const assistantOne = await repo.appendMessage({
+            conversationId: conversation.id,
+            ownerId: owner.id,
+            parentId: userOne.id,
+            role: "assistant",
+            content: "one answer",
+            expectedVersion: 1,
+            idempotencyKey: `pg-${suffix}-assistant-one`,
+          });
+          const userTwo = await repo.appendMessage({
+            conversationId: conversation.id,
+            ownerId: owner.id,
+            parentId: assistantOne.id,
+            role: "user",
+            content: "two",
+            expectedVersion: 2,
+            idempotencyKey: `pg-${suffix}-user-two`,
+          });
+          const assistantTwo = await repo.appendMessage({
+            conversationId: conversation.id,
+            ownerId: owner.id,
+            parentId: userTwo.id,
+            role: "assistant",
+            content: "two answer",
+            expectedVersion: 3,
+            idempotencyKey: `pg-${suffix}-assistant-two`,
+          });
+          const runId = `pg-${suffix}-run`;
+          const begun = await repo.beginAssistantGeneration({
+            conversationId: conversation.id,
+            ownerId: owner.id,
+            sourceAssistantId: assistantOne.id,
+            mode: "regenerate",
+            model: "simulated/dg-chat",
+            expectedVersion: 4,
+            idempotencyKey: `pg-${suffix}-regenerate`,
+            runId,
+            generationId: crypto.randomUUID(),
+            provider: "simulated",
+            reserveMicros: 10,
+          });
+          if (begun.kind !== "started") throw new Error("generation did not start");
+          if (preserveLaterSelection) {
+            await repo.setActiveLeaf(
+              conversation.id,
+              owner.id,
+              assistantTwo.id,
+              begun.conversation.version,
+            );
+          }
+
+          let terminalMessageId: string;
+          if (terminal === "failure") {
+            terminalMessageId = (await repo.failGeneration({
+              conversationId: conversation.id,
+              ownerId: owner.id,
+              userMessageId: userOne.id,
+              runId,
+              leaseToken: begun.leaseToken,
+              idempotencyKey: `pg-${suffix}-error`,
+              model: "simulated/dg-chat",
+              error: "provider failed",
+              supersedesId: assistantOne.id,
+            })).message.id;
+          } else {
+            await expirySql`UPDATE usage_runs SET generation_lease_expires_at=now()-interval '1 second'
+              WHERE id=${runId}`;
+            assertEquals(await repo.reapStaleGenerations(), 1);
+            const terminalMessage = (await repo.detail(conversation.id, owner.id)).messages.find(
+              (message) => message.metadata.runId === runId,
+            );
+            if (!terminalMessage) throw new Error("reaper terminal was not created");
+            terminalMessageId = terminalMessage.id;
+          }
+
+          assertEquals(
+            (await repo.detail(conversation.id, owner.id)).activeLeafId,
+            preserveLaterSelection ? assistantTwo.id : terminalMessageId,
+            suffix,
+          );
+        }
+      }
+    } finally {
+      await repo.close();
+      await expirySql.end();
+    }
+  },
+});
+
+Deno.test({
   name: "normalized generation leases claim once and fence stale owners",
   ignore: !databaseUrl,
   sanitizeOps: false,
