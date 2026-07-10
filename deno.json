@@ -1,0 +1,30 @@
+{
+  "workspace": [
+    "./apps/api",
+    "./apps/worker",
+    "./apps/web",
+    "./packages/contracts",
+    "./packages/database"
+  ],
+  "nodeModulesDir": "manual",
+  "tasks": {
+    "dev": "deno task --filter @dg-chat/api dev",
+    "dev:web": "deno task --filter @dg-chat/web dev",
+    "dev:worker": "deno task --filter @dg-chat/worker dev",
+    "check": "deno fmt --check && deno lint && deno check apps/api/src/main.ts apps/worker/src/main.ts apps/web/src/main.tsx packages/contracts/mod.ts packages/database/mod.ts",
+    "test": "deno test apps/api packages/contracts packages/database --allow-env --allow-net --allow-read --allow-write",
+    "build": "deno task --filter @dg-chat/web build",
+    "db:generate": "deno task --filter @dg-chat/database generate",
+    "db:migrate": "deno task --filter @dg-chat/database migrate"
+  },
+  "fmt": {
+    "lineWidth": 100,
+    "semiColons": true,
+    "singleQuote": false
+  },
+  "lint": {
+    "rules": {
+      "tags": ["recommended"]
+    }
+  }
+}

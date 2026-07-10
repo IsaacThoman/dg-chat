@@ -1,0 +1,50 @@
+import { defineConfig, devices } from "@playwright/test";
+
+const runtime = globalThis as typeof globalThis & {
+  Deno?: { env: { get(key: string): string | undefined } };
+  process?: { env: Record<string, string | undefined> };
+};
+const env = (name: string) => runtime.Deno?.env.get(name) ?? runtime.process?.env[name];
+const baseURL = env("E2E_BASE_URL") ?? "http://localhost:5173";
+
+export default defineConfig({
+  testDir: "./tests/e2e",
+  fullyParallel: false,
+  forbidOnly: Boolean(env("CI")),
+  retries: env("CI") ? 2 : 0,
+  workers: env("CI") ? 1 : undefined,
+  timeout: 45_000,
+  expect: { timeout: 8_000 },
+  reporter: env("CI")
+    ? [["line"], ["html", { open: "never" }], ["junit", { outputFile: "test-results/junit.xml" }]]
+    : [["list"], ["html", { open: "never" }]],
+  outputDir: "test-results/artifacts",
+  use: {
+    baseURL,
+    actionTimeout: 10_000,
+    navigationTimeout: 20_000,
+    trace: "retain-on-failure",
+    screenshot: "only-on-failure",
+    video: "retain-on-failure",
+  },
+  projects: [
+    { name: "chromium", use: { ...devices["Desktop Chrome"] } },
+    { name: "mobile-chromium", use: { ...devices["Pixel 7"] } },
+  ],
+  webServer: env("E2E_MANAGED_SERVER") === "true"
+    ? [
+      {
+        command: "deno task dev",
+        url: `${env("E2E_API_URL") ?? "http://localhost:8000"}/health`,
+        reuseExistingServer: !env("CI"),
+        timeout: 120_000,
+      },
+      {
+        command: "deno task dev:web --host 0.0.0.0",
+        url: baseURL,
+        reuseExistingServer: !env("CI"),
+        timeout: 120_000,
+      },
+    ]
+    : undefined,
+});

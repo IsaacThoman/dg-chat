@@ -1,0 +1,11 @@
+{
+  "name": "@dg-chat/api",
+  "version": "0.1.0",
+  "exports": "./src/app.ts",
+  "imports": { "hono": "npm:hono@4.9.8", "hono/": "npm:hono@4.9.8/" },
+  "tasks": {
+    "dev": "deno run --watch -A src/main.ts",
+    "start": "deno run -A src/main.ts",
+    "test": "deno test --allow-env --allow-net --allow-read"
+  }
+}

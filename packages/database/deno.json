@@ -1,0 +1,14 @@
+{
+  "name": "@dg-chat/database",
+  "version": "0.1.0",
+  "exports": "./mod.ts",
+  "imports": {
+    "drizzle-orm/": "npm:drizzle-orm@0.44.7/",
+    "drizzle-kit": "npm:drizzle-kit@0.31.7",
+    "postgres": "npm:postgres@3.4.7"
+  },
+  "tasks": {
+    "generate": "deno run -A npm:drizzle-kit generate --config=drizzle.config.ts",
+    "migrate": "deno run -A src/migrate.ts"
+  }
+}

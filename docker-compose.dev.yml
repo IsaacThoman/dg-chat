@@ -1,0 +1,67 @@
+services:
+  app:
+    build:
+      target: development
+    environment:
+      DENO_ENV: development
+      APP_URL: http://localhost:8000
+      WEB_URL: http://localhost:5173
+    command: ["task", "--filter", "@dg-chat/api", "dev"]
+    volumes:
+      - .:/workspace
+      - deno-cache:/deno-dir
+    read_only: false
+    ports:
+      - "8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    environment:
+      DENO_ENV: development
+      VITE_API_URL: http://localhost:8000
+    command: ["task", "--filter", "@dg-chat/web", "dev", "--host", "0.0.0.0"]
+    depends_on:
+      app:
+        condition: service_started
+    volumes:
+      - .:/workspace
+      - deno-cache:/deno-dir
+    ports:
+      - "5173:5173"
+    networks:
+      - backend
+
+  worker:
+    build:
+      target: development
+    environment:
+      DENO_ENV: development
+      APP_URL: http://localhost:8000
+      WEB_URL: http://localhost:5173
+    command: ["task", "--filter", "@dg-chat/worker", "dev"]
+    volumes:
+      - .:/workspace
+      - deno-cache:/deno-dir
+    read_only: false
+
+  postgres:
+    ports:
+      - "5432:5432"
+
+  redis:
+    ports:
+      - "6379:6379"
+
+  minio:
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+
+volumes:
+  deno-cache:

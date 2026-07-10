@@ -1,0 +1,70 @@
+# Deployment
+
+## Production Compose
+
+Create a private `.env` file containing strong, unique values for at least:
+
+```dotenv
+POSTGRES_PASSWORD=...
+MINIO_ROOT_USER=...
+MINIO_ROOT_PASSWORD=...
+APP_SECRET=... # at least 32 random bytes
+ENCRYPTION_KEY=... # keyring value documented by the application
+SETUP_TOKEN=... # one-time bootstrap secret
+APP_URL=https://chat.example.com
+WEB_URL=https://chat.example.com
+```
+
+Validate and launch:
+
+```sh
+docker compose config --quiet
+docker compose build --pull
+docker compose up -d
+docker compose ps
+curl --fail https://chat.example.com/ready
+```
+
+The app is published on `${PORT:-8000}`. Put it behind a TLS-terminating reverse proxy and forward
+the original scheme and host. Preserve streaming responses by disabling proxy buffering for `/v1/*`
+and chat streams and by setting idle timeouts above the maximum generation timeout.
+
+The default images are version-tagged but operators should pin image digests after validation. Run
+the app and worker at the same release during migrations. Apply expand/contract migrations in
+separate releases so rolling upgrades remain compatible.
+
+## Managed dependencies
+
+PostgreSQL, Redis, and S3 can be externalized by overriding their connection environment variables
+and removing the matching Compose dependencies. PostgreSQL must provide the `vector` extension.
+Object storage needs private buckets, server-side encryption, lifecycle rules compatible with the
+application retention policy, and CORS only if direct browser uploads are enabled.
+
+## Backups and restore
+
+Back up PostgreSQL and the object bucket as one recovery set. Redis does not require backup for
+correctness. Keep encrypted backups outside the deployment host and test restoration regularly.
+
+1. Quiesce writes or take a database snapshot with a matching object-store version marker.
+2. Export PostgreSQL in a format supported by the target server version.
+3. Replicate the private bucket, including object versions when enabled.
+4. Record the application image digest, migration version, and encryption-key identifiers.
+5. Restore into an isolated environment, run the application's restore dry-run, then verify login, a
+   branched conversation, an attachment, token authentication, and ledger totals.
+
+Never discard an encryption key while provider credentials or privileged exports still depend on it.
+Secret-bearing backup exports require separate encryption and must not be placed in the normal chat
+export path.
+
+## Upgrades and rollback
+
+Before upgrading, read migration notes, take a recovery point, and verify at least twice the largest
+table's free storage. Deploy the new app, run migrations once, then deploy workers. Roll back only
+when the old binary is compatible with the migrated schema; otherwise forward-fix or restore the
+recovery set.
+
+## Monitoring
+
+Alert on readiness, HTTP error ratio, stream starts without first tokens, queue age, failed jobs,
+credit settlement backlog, database saturation, Redis availability, object-store errors, and disk
+growth. Provider health is a degraded dependency and should not make `/health` fail.

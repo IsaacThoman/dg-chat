@@ -1,0 +1,16 @@
+{
+  "name": "@dg-chat/web",
+  "version": "0.1.0",
+  "exports": "./src/main.tsx",
+  "lint": {
+    "rules": {
+      "exclude": ["jsx-button-has-type"]
+    }
+  },
+  "tasks": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "npm run build",
+    "check": "npm run check",
+    "test": "npm run test"
+  }
+}
