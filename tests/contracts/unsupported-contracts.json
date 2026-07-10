@@ -1,11 +1,6 @@
 [
   {
     "status": "todo",
-    "endpoint": "POST /v1/embeddings",
-    "reason": "Embedding provider integration is not implemented"
-  },
-  {
-    "status": "todo",
     "endpoint": "POST /v1/images/generations",
     "reason": "Image provider integration is not implemented"
   },

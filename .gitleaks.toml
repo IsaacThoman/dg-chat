@@ -7,6 +7,8 @@ regexTarget = "match"
 regexes = [
   '''Y2ktZW5jcnlwdGlvbi1rZXktMzItYnl0ZXMtbG9uZw==''',
   '''env\.S3_SECRET_KEY''',
+  # Historical test idempotency fixture; it is not a credential.
+  '''knowledge-api-docs-1''',
 ]
 paths = [
   '''\.github/workflows/ci\.yml''',
