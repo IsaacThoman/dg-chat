@@ -30,6 +30,7 @@ import type {
   CompleteGenerationInput,
   CreateAttachmentInput,
   CreateAttachmentResult,
+  CreateKnowledgeCollectionInput,
   CreateModelPriceVersionInput,
   CreateProviderInput,
   CreateProviderModelInput,
@@ -44,6 +45,10 @@ import type {
   GenerationControl,
   GenerationResult,
   IdentityTokenPurpose,
+  KnowledgeCollection,
+  KnowledgeCollectionPatch,
+  KnowledgeConversationBinding,
+  KnowledgeRetrievalMode,
   ModelPriceVersion,
   ProviderAttempt,
   ProviderCredentialEnvelope,
@@ -55,6 +60,7 @@ import type {
   ProviderRecord,
   ProviderRetryPolicy,
   RegistryMutationContext,
+  ReplaceConversationKnowledgeInput,
   SessionSummary,
   SetProviderModelRouteInput,
   StartProviderAttemptInput,
@@ -347,6 +353,10 @@ export class MemoryRepository {
   readonly attachments = new Map<string, AttachmentRecord>();
   readonly messageAttachments = new Map<string, Set<string>>();
   readonly documentChunks = new Map<string, DocumentChunk[]>();
+  readonly knowledgeCollections = new Map<string, KnowledgeCollection>();
+  readonly knowledgeAttachments = new Map<string, Set<string>>();
+  readonly knowledgeBindings = new Map<string, KnowledgeConversationBinding>();
+  readonly knowledgeIdempotency = new Map<string, string>();
   readonly providers = new Map<string, StoredProvider>();
   readonly providerModels = new Map<string, ProviderModelRecord>();
   readonly modelPriceVersions = new Map<string, ModelPriceVersion[]>();
@@ -836,6 +846,13 @@ export class MemoryRepository {
     const attachmentIds = [...(input.attachmentIds ?? [])].sort();
     if (new Set(attachmentIds).size !== attachmentIds.length || attachmentIds.length > 10) {
       throw new DomainError("validation_error", "Attachment identifiers are invalid", 422);
+    }
+    if (!input.message.content.trim() && attachmentIds.length === 0) {
+      throw new DomainError(
+        "validation_error",
+        "Message content or at least one attachment is required",
+        422,
+      );
     }
     const existingId = this.idempotency.get(
       `${input.message.conversationId}:${input.message.idempotencyKey}`,
@@ -1558,6 +1575,266 @@ export class MemoryRepository {
   listDocumentChunks(id: string, ownerId: string) {
     this.getAttachment(id, ownerId);
     return [...(this.documentChunks.get(id) ?? [])].sort((a, b) => a.ordinal - b.ordinal);
+  }
+
+  createKnowledgeCollection(ownerId: string, input: CreateKnowledgeCollectionInput) {
+    const name = input.name.trim();
+    if (
+      !name || name.length > 120 || (input.description?.length ?? 0) > 2000 ||
+      !/^[A-Za-z0-9._:-]{1,160}$/.test(input.idempotencyKey)
+    ) {
+      throw new DomainError("validation_error", "Knowledge collection input is invalid", 422);
+    }
+    if (!this.users.has(ownerId)) throw new DomainError("not_found", "User not found", 404);
+    const replayId = this.knowledgeIdempotency.get(`${ownerId}:${input.idempotencyKey}`);
+    if (replayId) {
+      const replay = this.knowledgeCollections.get(replayId);
+      if (!replay || replay.ownerId !== ownerId || replay.deletedAt) {
+        throw new DomainError("idempotency_conflict", "Idempotency key was already used", 409);
+      }
+      if (replay.name !== name || replay.description !== (input.description?.trim() ?? "")) {
+        throw new DomainError("idempotency_conflict", "Idempotency key payload differs", 409);
+      }
+      return replay;
+    }
+    const now = new Date().toISOString();
+    const record: KnowledgeCollection = {
+      id: crypto.randomUUID(),
+      ownerId,
+      name,
+      description: input.description?.trim() ?? "",
+      version: 1,
+      createdAt: now,
+      updatedAt: now,
+      deletedAt: null,
+    };
+    this.knowledgeCollections.set(record.id, record);
+    this.knowledgeIdempotency.set(`${ownerId}:${input.idempotencyKey}`, record.id);
+    return record;
+  }
+
+  listKnowledgeCollections(ownerId: string) {
+    return [...this.knowledgeCollections.values()].filter((value) =>
+      value.ownerId === ownerId && value.deletedAt === null
+    ).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.id.localeCompare(b.id));
+  }
+
+  getKnowledgeCollection(id: string, ownerId: string) {
+    const record = this.knowledgeCollections.get(id);
+    if (!record || record.ownerId !== ownerId || record.deletedAt) {
+      throw new DomainError("not_found", "Knowledge collection not found", 404);
+    }
+    return record;
+  }
+
+  updateKnowledgeCollection(id: string, ownerId: string, patch: KnowledgeCollectionPatch) {
+    const record = this.getKnowledgeCollection(id, ownerId);
+    if (record.version !== patch.expectedVersion) {
+      throw new DomainError("version_conflict", "Knowledge collection changed", 409);
+    }
+    const name = patch.name?.trim();
+    if ((name != null && (!name || name.length > 120)) || (patch.description?.length ?? 0) > 2000) {
+      throw new DomainError("validation_error", "Knowledge collection input is invalid", 422);
+    }
+    if (name != null) record.name = name;
+    if (patch.description != null) record.description = patch.description.trim();
+    record.version++;
+    record.updatedAt = new Date().toISOString();
+    return record;
+  }
+
+  deleteKnowledgeCollection(id: string, ownerId: string, expectedVersion: number) {
+    const record = this.getKnowledgeCollection(id, ownerId);
+    if (record.version !== expectedVersion) {
+      throw new DomainError("version_conflict", "Knowledge collection changed", 409);
+    }
+    record.deletedAt = record.updatedAt = new Date().toISOString();
+    record.version++;
+    this.knowledgeAttachments.delete(id);
+    for (const [key, binding] of this.knowledgeBindings) {
+      if (binding.collectionId === id) this.knowledgeBindings.delete(key);
+    }
+    return record;
+  }
+
+  linkKnowledgeAttachment(
+    collectionId: string,
+    attachmentId: string,
+    ownerId: string,
+    expectedVersion: number,
+  ) {
+    const collection = this.getKnowledgeCollection(collectionId, ownerId);
+    const attachment = this.getAttachment(attachmentId, ownerId);
+    if (attachment.state !== "ready") {
+      throw new DomainError("attachment_not_ready", "Attachment is not ready", 409);
+    }
+    const links = this.knowledgeAttachments.get(collectionId) ?? new Set<string>();
+    if (links.has(attachmentId)) return collection;
+    if (collection.version !== expectedVersion) {
+      throw new DomainError("version_conflict", "Knowledge collection changed", 409);
+    }
+    links.add(attachmentId);
+    this.knowledgeAttachments.set(collectionId, links);
+    collection.version++;
+    collection.updatedAt = new Date().toISOString();
+    return collection;
+  }
+
+  unlinkKnowledgeAttachment(
+    collectionId: string,
+    attachmentId: string,
+    ownerId: string,
+    expectedVersion: number,
+  ) {
+    const collection = this.getKnowledgeCollection(collectionId, ownerId);
+    this.getAttachment(attachmentId, ownerId);
+    const links = this.knowledgeAttachments.get(collectionId);
+    if (!links?.has(attachmentId)) return collection;
+    if (collection.version !== expectedVersion) {
+      throw new DomainError("version_conflict", "Knowledge collection changed", 409);
+    }
+    links.delete(attachmentId);
+    collection.version++;
+    collection.updatedAt = new Date().toISOString();
+    return collection;
+  }
+
+  listKnowledgeAttachments(collectionId: string, ownerId: string) {
+    this.getKnowledgeCollection(collectionId, ownerId);
+    return [...(this.knowledgeAttachments.get(collectionId) ?? [])]
+      .map((id) => this.attachments.get(id))
+      .filter((value): value is AttachmentRecord =>
+        value != null && value.ownerId === ownerId && value.deletedAt === null &&
+        value.state === "ready"
+      );
+  }
+
+  bindKnowledgeCollection(
+    conversationId: string,
+    collectionId: string,
+    ownerId: string,
+    mode: KnowledgeRetrievalMode,
+    expectedVersion?: number,
+  ) {
+    const conversation = this.conversations.get(conversationId);
+    if (!conversation || conversation.ownerId !== ownerId || conversation.deletedAt) {
+      throw new DomainError("not_found", "Conversation not found", 404);
+    }
+    this.getKnowledgeCollection(collectionId, ownerId);
+    if (!["retrieval", "full_context"].includes(mode)) {
+      throw new DomainError("validation_error", "Invalid retrieval mode", 422);
+    }
+    const key = `${conversationId}:${collectionId}`;
+    const prior = this.knowledgeBindings.get(key);
+    if (prior) {
+      if (prior.mode === mode) return prior;
+      if (expectedVersion !== prior.version) {
+        throw new DomainError("version_conflict", "Knowledge binding changed", 409);
+      }
+      prior.mode = mode;
+      prior.version++;
+      prior.updatedAt = new Date().toISOString();
+      return prior;
+    }
+    if (expectedVersion != null && expectedVersion !== 0) {
+      throw new DomainError("version_conflict", "Knowledge binding changed", 409);
+    }
+    const now = new Date().toISOString();
+    const binding = {
+      conversationId,
+      collectionId,
+      ownerId,
+      mode,
+      version: 1,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.knowledgeBindings.set(key, binding);
+    return binding;
+  }
+
+  unbindKnowledgeCollection(
+    conversationId: string,
+    collectionId: string,
+    ownerId: string,
+    expectedVersion: number,
+  ) {
+    const key = `${conversationId}:${collectionId}`;
+    const binding = this.knowledgeBindings.get(key);
+    if (!binding || binding.ownerId !== ownerId) {
+      throw new DomainError("not_found", "Knowledge binding not found", 404);
+    }
+    if (binding.version !== expectedVersion) {
+      throw new DomainError("version_conflict", "Knowledge binding changed", 409);
+    }
+    this.knowledgeBindings.delete(key);
+  }
+
+  listConversationKnowledge(conversationId: string, ownerId: string) {
+    const conversation = this.conversations.get(conversationId);
+    if (!conversation || conversation.ownerId !== ownerId || conversation.deletedAt) {
+      throw new DomainError("not_found", "Conversation not found", 404);
+    }
+    return [...this.knowledgeBindings.values()].filter((value) => {
+      const collection = this.knowledgeCollections.get(value.collectionId);
+      return value.conversationId === conversationId && value.ownerId === ownerId &&
+        collection?.ownerId === ownerId && collection.deletedAt === null;
+    })
+      .sort((a, b) =>
+        a.createdAt.localeCompare(b.createdAt) || a.collectionId.localeCompare(b.collectionId)
+      );
+  }
+
+  replaceConversationKnowledge(
+    conversationId: string,
+    ownerId: string,
+    input: ReplaceConversationKnowledgeInput,
+  ) {
+    const conversation = this.conversations.get(conversationId);
+    if (!conversation || conversation.ownerId !== ownerId || conversation.deletedAt) {
+      throw new DomainError("not_found", "Conversation not found", 404);
+    }
+    if (
+      !["retrieval", "full_context"].includes(input.mode) ||
+      new Set(input.collectionIds).size !== input.collectionIds.length
+    ) {
+      throw new DomainError("validation_error", "Knowledge replacement is invalid", 422);
+    }
+    // Validate the entire desired set before mutating anything.
+    for (const collectionId of input.collectionIds) {
+      this.getKnowledgeCollection(collectionId, ownerId);
+    }
+    const desired = new Set(input.collectionIds);
+    for (const [key, binding] of this.knowledgeBindings) {
+      if (
+        binding.conversationId === conversationId && binding.ownerId === ownerId &&
+        !desired.has(binding.collectionId)
+      ) this.knowledgeBindings.delete(key);
+    }
+    const result: KnowledgeConversationBinding[] = [];
+    for (const collectionId of input.collectionIds) {
+      const key = `${conversationId}:${collectionId}`;
+      let binding = this.knowledgeBindings.get(key);
+      if (!binding) {
+        const now = new Date().toISOString();
+        binding = {
+          conversationId,
+          collectionId,
+          ownerId,
+          mode: input.mode,
+          version: 1,
+          createdAt: now,
+          updatedAt: now,
+        };
+        this.knowledgeBindings.set(key, binding);
+      } else if (binding.mode !== input.mode) {
+        binding.mode = input.mode;
+        binding.version++;
+        binding.updatedAt = new Date().toISOString();
+      }
+      result.push(binding);
+    }
+    return result;
   }
 
   private enqueueAttachmentInspection(attachment: AttachmentRecord) {

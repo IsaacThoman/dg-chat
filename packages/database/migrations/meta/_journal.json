@@ -78,6 +78,13 @@
       "when": 1783656010000,
       "tag": "0010_web_generation_controls",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1783656011000,
+      "tag": "0011_knowledge_collections",
+      "breakpoints": true
     }
   ]
 }
