@@ -55,7 +55,14 @@ export const demoMessages: Message[] = [
     createdAt: "10:31 AM",
     parentId: null,
     siblingIndex: 0,
-    attachments: [{ name: "architecture-notes.pdf", type: "PDF", size: "1.8 MB" }],
+    attachments: [{
+      id: "demo-attachment",
+      filename: "architecture-notes.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 1_800_000,
+      state: "ready",
+      createdAt: new Date(0).toISOString(),
+    }],
   },
   {
     id: "m2",

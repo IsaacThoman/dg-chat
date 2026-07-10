@@ -2,6 +2,7 @@ import { createApp } from "./app.ts";
 import {
   backfillLegacyRuntimeSnapshot,
   MemoryRepository,
+  objectStoreFromEnv,
   PostgresRepository,
 } from "@dg-chat/database";
 import { MemoryRateLimiter, RedisRateLimiter } from "./rate-limit.ts";
@@ -22,7 +23,8 @@ const repository = databaseUrl
 const rateLimiter = Deno.env.get("REDIS_URL")
   ? new RedisRateLimiter(Deno.env.get("REDIS_URL")!)
   : new MemoryRateLimiter();
-const { app } = createApp({ repository, rateLimiter });
+const objectStore = objectStoreFromEnv();
+const { app } = createApp({ repository, rateLimiter, objectStore });
 const replayMaintenance = setInterval(async () => {
   try {
     const reaped = await repository.reapStaleApiRequests(100);
@@ -54,7 +56,7 @@ const shutdown = async (signal: string) => {
   clearInterval(replayMaintenance);
   console.log(JSON.stringify({ level: "info", message: "API shutting down", signal }));
   await server.shutdown();
-  await Promise.all([repository.close(), rateLimiter.close()]);
+  await Promise.all([repository.close(), rateLimiter.close(), objectStore?.close()]);
 };
 for (const signal of ["SIGTERM", "SIGINT"] as const) {
   Deno.addSignalListener(signal, () => void shutdown(signal));

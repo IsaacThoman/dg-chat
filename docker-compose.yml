@@ -8,11 +8,12 @@ x-app-environment: &app-environment
   REDIS_URL: redis://redis:6379
   # The bundled nginx overwrites X-Real-IP with the connecting address.
   TRUST_PROXY_HEADERS: "true"
-  S3_ENDPOINT: http://minio:9000
+  S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
   S3_REGION: ${S3_REGION:-us-east-1}
   S3_BUCKET: ${S3_BUCKET:-dg-chat}
-  # Upload routes are disabled; do not expose MinIO root credentials to the application.
-  # Provision a bucket-scoped application identity before enabling object storage.
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY:?S3_ACCESS_KEY is required}
+  S3_SECRET_KEY: ${S3_SECRET_KEY:?S3_SECRET_KEY is required}
+  S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
   APP_SECRET: ${APP_SECRET:?APP_SECRET is required}
   ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY is required}
   SETUP_TOKEN: ${SETUP_TOKEN:?SETUP_TOKEN is required}
@@ -127,6 +128,7 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-dgchat}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-dgchat}
       WORKER_ID: ${WORKER_ID:-worker-compose}
       WORKER_POLL_MS: ${WORKER_POLL_MS:-1000}
+      WORKER_JOB_LEASE_SECONDS: ${WORKER_JOB_LEASE_SECONDS:-120}
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -214,10 +216,34 @@ services:
           mc --config-dir /tmp/.mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"
           mc --config-dir /tmp/.mc mb --ignore-existing "local/$${S3_BUCKET}"
           mc --config-dir /tmp/.mc anonymous set none "local/$${S3_BUCKET}"
+          cat > /tmp/dg-chat-app-policy.json <<EOF
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": ["s3:GetBucketLocation", "s3:ListBucket"],
+                "Resource": ["arn:aws:s3:::$${S3_BUCKET}"]
+              },
+              {
+                "Effect": "Allow",
+                "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+                "Resource": ["arn:aws:s3:::$${S3_BUCKET}/*"]
+              }
+            ]
+          }
+          EOF
+          policy_name="$${MINIO_APP_POLICY_NAME:-dg-chat-$${S3_ACCESS_KEY}}"
+          mc --config-dir /tmp/.mc admin user add local "$${S3_ACCESS_KEY}" "$${S3_SECRET_KEY}"
+          mc --config-dir /tmp/.mc admin policy create local "$${policy_name}" /tmp/dg-chat-app-policy.json
+          mc --config-dir /tmp/.mc admin policy attach local "$${policy_name}" --user "$${S3_ACCESS_KEY}"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:?MINIO_ROOT_USER is required}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
       S3_BUCKET: ${S3_BUCKET:-dg-chat}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:?S3_ACCESS_KEY is required}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:?S3_SECRET_KEY is required}
+      MINIO_APP_POLICY_NAME: ${MINIO_APP_POLICY_NAME:-}
     networks:
       - backend
     read_only: true

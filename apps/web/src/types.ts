@@ -35,7 +35,7 @@ export interface Message {
   model?: string;
   latency?: string;
   branch?: Branch;
-  attachments?: { name: string; type: string; size: string }[];
+  attachments?: Attachment[];
   parentId?: string | null;
   supersedesId?: string | null;
   siblingIndex?: number;
@@ -56,4 +56,13 @@ export interface Token {
   createdAt: string;
   lastUsed?: string;
   expires?: string;
+}
+
+export interface Attachment {
+  id: string;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+  state: string;
+  createdAt: string;
 }

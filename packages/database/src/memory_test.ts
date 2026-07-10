@@ -203,6 +203,133 @@ Deno.test("generation leases allow one owner and fence expired workers", () => {
   assertEquals(abandoned.usageRun.status, "failed");
 });
 
+Deno.test("attachments deduplicate, inspect, link immutably, and preserve tombstones", () => {
+  const repo = new MemoryRepository();
+  const owner = repo.createUser({ email: "files@example.com", name: "Files", passwordHash: "x" });
+  const stranger = repo.createUser({
+    email: "stranger-files@example.com",
+    name: "Stranger",
+    passwordHash: "x",
+  });
+  const conversation = repo.createConversation(owner.id, "Files");
+  const message = repo.appendMessage({
+    conversationId: conversation.id,
+    ownerId: owner.id,
+    parentId: null,
+    role: "user",
+    content: "see file",
+    expectedVersion: 0,
+    idempotencyKey: "files-message",
+  });
+  const input = {
+    ownerId: owner.id,
+    objectKey: `users/${owner.id}/objects/one`,
+    filename: "notes.txt",
+    mimeType: "text/plain",
+    sizeBytes: 5,
+    sha256: "a".repeat(64),
+  };
+  const created = repo.createAttachment(input);
+  const replay = repo.createAttachment({ ...input, objectKey: `users/${owner.id}/objects/two` });
+  assertEquals(replay.attachment.id, created.attachment.id);
+  assertEquals(replay.inspectionJobId, created.inspectionJobId);
+  assertEquals(replay.deduplicated, true);
+  assertEquals(repo.listJobs().filter((job) => job.type === "attachment.inspect").length, 1);
+  assertThrows(
+    () => repo.getAttachment(created.attachment.id, stranger.id),
+    DomainError,
+    "not found",
+  );
+  repo.transitionAttachment(created.attachment.id, owner.id, "pending", "inspecting");
+  repo.transitionAttachment(created.attachment.id, owner.id, "inspecting", "ready");
+  repo.linkAttachmentToMessage(message.id, created.attachment.id, owner.id);
+  repo.linkAttachmentToMessage(message.id, created.attachment.id, owner.id);
+  assertEquals(repo.listMessageAttachments(message.id, owner.id).length, 1);
+  assertThrows(
+    () => repo.linkAttachmentToMessage(message.id, created.attachment.id, stranger.id),
+    DomainError,
+  );
+  repo.deleteAttachment(created.attachment.id, owner.id);
+  assertEquals(repo.listAttachments(owner.id).length, 0);
+  assertEquals(repo.listMessageAttachments(message.id, owner.id)[0].state, "deleted");
+  const replacement = repo.createAttachment({
+    ...input,
+    objectKey: `users/${owner.id}/objects/replacement`,
+  });
+  assertEquals(replacement.deduplicated, false);
+  assertEquals(replacement.attachment.id === created.attachment.id, false);
+  assertThrows(
+    () =>
+      repo.createAttachment({
+        ...input,
+        objectKey: "../unsafe",
+        sha256: "not-a-digest",
+      }),
+    DomainError,
+    "SHA-256",
+  );
+});
+
+Deno.test("generation atomically links only ready attachments and rejects attachment replay drift", () => {
+  const repo = new MemoryRepository();
+  const owner = repo.createUser({
+    email: "generation-files@example.com",
+    name: "Generation Files",
+    passwordHash: "x",
+  });
+  repo.credit(owner.id, "generation-files-grant", "grant", 1_000_000);
+  const conversation = repo.createConversation(owner.id, "Generation files");
+  const created = repo.createAttachment({
+    ownerId: owner.id,
+    objectKey: `users/${owner.id}/objects/generation-file`,
+    filename: "ready.txt",
+    mimeType: "text/plain",
+    sizeBytes: 5,
+    sha256: "c".repeat(64),
+  });
+  const input = {
+    message: {
+      conversationId: conversation.id,
+      ownerId: owner.id,
+      parentId: null,
+      role: "user" as const,
+      content: "Use this file",
+      model: "simulated/dg-chat",
+      expectedVersion: 0,
+      idempotencyKey: "generation-file-message",
+    },
+    runId: "generation-file-run",
+    provider: "simulated",
+    reserveMicros: 100,
+    attachmentIds: [created.attachment.id],
+  };
+
+  assertThrows(
+    () => repo.beginGeneration(input),
+    DomainError,
+    "not ready",
+  );
+  assertEquals(repo.detail(conversation.id, owner.id).messages.length, 0);
+  assertEquals(repo.findUser(owner.id)?.balanceMicros, 1_000_000);
+
+  repo.transitionAttachment(created.attachment.id, owner.id, "pending", "inspecting");
+  repo.transitionAttachment(created.attachment.id, owner.id, "inspecting", "ready");
+  const started = repo.beginGeneration(input);
+  if (started.kind !== "started") throw new Error("generation did not start");
+  assertEquals(repo.listMessageAttachments(started.message.id, owner.id).map((a) => a.id), [
+    created.attachment.id,
+  ]);
+  assertEquals(repo.beginGeneration(input).kind, "in_progress");
+  assertThrows(
+    () => repo.beginGeneration({ ...input, attachmentIds: [] }),
+    DomainError,
+    "payload differs",
+  );
+  assertEquals(repo.detail(conversation.id, owner.id).messages.length, 1);
+  assertEquals(repo.findUser(owner.id)?.balanceMicros, 999_900);
+  assertEquals(repo.listMessageAttachments(started.message.id, owner.id).length, 1);
+});
+
 Deno.test("ledger reserve settle and refund are idempotent", () => {
   const repo = new MemoryRepository();
   const user = repo.createUser({ email: "u@example.com", name: "User", passwordHash: "x" });

@@ -44,6 +44,43 @@ export interface AuditEvent extends AuditEventInput {
   createdAt: string;
 }
 
+export type AttachmentState =
+  | "pending"
+  | "inspecting"
+  | "ready"
+  | "quarantined"
+  | "failed"
+  | "deleted";
+export interface AttachmentRecord {
+  id: string;
+  ownerId: string;
+  objectKey: string;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+  sha256: string;
+  state: AttachmentState;
+  inspectionError: string | null;
+  createdAt: string;
+  updatedAt: string;
+  deletedAt: string | null;
+}
+export interface CreateAttachmentInput {
+  ownerId: string;
+  objectKey: string;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+  sha256: string;
+  state?: "pending" | "ready" | "quarantined";
+  inspectionError?: string | null;
+}
+export interface CreateAttachmentResult {
+  attachment: AttachmentRecord;
+  inspectionJobId: string;
+  deduplicated: boolean;
+}
+
 export interface AppendMessageInput {
   conversationId: string;
   ownerId: string;
@@ -67,6 +104,7 @@ export interface CreateApiTokenInput {
 
 export interface BeginGenerationInput {
   message: AppendMessageInput;
+  attachmentIds?: string[];
   runId: string;
   provider: string;
   reserveMicros: number;
@@ -286,6 +324,27 @@ export interface DomainRepository {
     leafId: string,
     expectedVersion: number,
   ): MaybePromise<Conversation>;
+  createAttachment(input: CreateAttachmentInput): MaybePromise<CreateAttachmentResult>;
+  listAttachments(ownerId: string, includeDeleted?: boolean): MaybePromise<AttachmentRecord[]>;
+  getAttachment(
+    id: string,
+    ownerId: string,
+    includeDeleted?: boolean,
+  ): MaybePromise<AttachmentRecord>;
+  deleteAttachment(id: string, ownerId: string): MaybePromise<AttachmentRecord>;
+  transitionAttachment(
+    id: string,
+    ownerId: string,
+    expectedState: AttachmentState,
+    nextState: AttachmentState,
+    inspectionError?: string | null,
+  ): MaybePromise<AttachmentRecord>;
+  linkAttachmentToMessage(
+    messageId: string,
+    attachmentId: string,
+    ownerId: string,
+  ): MaybePromise<void>;
+  listMessageAttachments(messageId: string, ownerId: string): MaybePromise<AttachmentRecord[]>;
   createApiToken(userId: string, input: CreateApiTokenInput): MaybePromise<StoredApiToken>;
   findApiTokenByHash(hash: string): MaybePromise<StoredApiToken | undefined>;
   listApiTokens(userId: string): MaybePromise<ApiTokenSummary[]>;

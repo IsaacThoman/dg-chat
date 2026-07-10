@@ -10,6 +10,8 @@ import type {
   ApiSseFrameInput,
   ApiUsageObservation,
   AppendMessageInput,
+  AttachmentRecord,
+  AttachmentState,
   AuditEvent,
   AuditEventInput,
   BeginApiRequestInput,
@@ -19,6 +21,8 @@ import type {
   CompleteGenerationInput,
   ConversationPatch,
   CreateApiTokenInput,
+  CreateAttachmentInput,
+  CreateAttachmentResult,
   CreateUserInput,
   DomainRepository,
   FailApiRequestInput,
@@ -119,6 +123,37 @@ function run(row: Row): UsageRun {
     generationLeaseExpiresAt: nullableIso(row.generation_lease_expires_at),
     createdAt: iso(row.created_at),
   };
+}
+function attachment(row: Row): AttachmentRecord {
+  return {
+    id: String(row.id),
+    ownerId: String(row.owner_id),
+    objectKey: String(row.object_key),
+    filename: String(row.filename),
+    mimeType: String(row.mime_type),
+    sizeBytes: number(row.size_bytes),
+    sha256: String(row.sha256),
+    state: row.state as AttachmentState,
+    inspectionError: row.inspection_error ? String(row.inspection_error) : null,
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at ?? row.created_at),
+    deletedAt: nullableIso(row.deleted_at),
+  };
+}
+function validateAttachmentInput(input: CreateAttachmentInput) {
+  if (!/^[0-9a-f]{64}$/.test(input.sha256)) {
+    throw new DomainError("validation_error", "Attachment SHA-256 is invalid", 422);
+  }
+  if (!Number.isSafeInteger(input.sizeBytes) || input.sizeBytes < 0) {
+    throw new DomainError("validation_error", "Attachment size is invalid", 422);
+  }
+  if (
+    !input.filename || input.filename.length > 255 || /[\\/\0]/.test(input.filename) ||
+    !input.mimeType || input.mimeType.length > 255 ||
+    !/^[\w.+-]+\/[\w.+-]+$/.test(input.mimeType) ||
+    !input.objectKey || input.objectKey.length > 1024 || input.objectKey.startsWith("/") ||
+    input.objectKey.split("/").some((part) => part === ".." || part === "")
+  ) throw new DomainError("validation_error", "Attachment metadata is invalid", 422);
 }
 function apiRequest(row: Row, frames: ApiIdempotencyFrame[] = []): ApiIdempotencyRequest {
   return {
@@ -570,6 +605,10 @@ export class PostgresRepository implements DomainRepository {
     if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1) {
       throw new DomainError("validation_error", "Generation lease duration is invalid", 422);
     }
+    const attachmentIds = [...(input.attachmentIds ?? [])].sort();
+    if (new Set(attachmentIds).size !== attachmentIds.length || attachmentIds.length > 10) {
+      throw new DomainError("validation_error", "Attachment identifiers are invalid", 422);
+    }
     return await this.#sql.begin(async (tx) => {
       const c = await tx<
         Row[]
@@ -589,10 +628,17 @@ export class PostgresRepository implements DomainRepository {
       >`SELECT *,generation_lease_expires_at>now() AS generation_lease_active,GREATEST(1,ceil(extract(epoch FROM (generation_lease_expires_at-now()))))::int AS generation_lease_retry_seconds FROM usage_runs WHERE id=${input.runId} FOR UPDATE`;
       if (prior[0] && priorRun[0]) {
         const replay = message(prior[0]);
+        const priorAttachments = await tx<{ attachment_id: string }[]>`
+          SELECT attachment_id FROM message_attachments
+          WHERE message_id=${replay.id}
+          ORDER BY attachment_id
+        `;
         if (
           replay.content !== input.message.content || replay.parentId !== input.message.parentId ||
           replay.model !== (input.message.model ?? null) ||
-          String(priorRun[0].user_id) !== input.message.ownerId
+          String(priorRun[0].user_id) !== input.message.ownerId ||
+          priorAttachments.map((row) => String(row.attachment_id)).join("\0") !==
+            [...attachmentIds].sort().join("\0")
         ) {
           throw new DomainError("idempotency_conflict", "Generation replay payload differs", 409);
         }
@@ -656,6 +702,17 @@ export class PostgresRepository implements DomainRepository {
           );
         }
       }
+      for (const attachmentId of attachmentIds) {
+        const ready = await tx`
+          SELECT id FROM attachments
+          WHERE id=${attachmentId} AND owner_id=${input.message.ownerId}
+            AND state='ready' AND deleted_at IS NULL
+          FOR UPDATE
+        `;
+        if (!ready.length) {
+          throw new DomainError("attachment_not_ready", "Attachment is not ready", 409);
+        }
+      }
       const account = await tx<
         Row[]
       >`SELECT balance_micros FROM users WHERE id=${input.message.ownerId} FOR UPDATE`;
@@ -683,6 +740,12 @@ export class PostgresRepository implements DomainRepository {
       },${
         input.message.model ?? "unknown"
       },${input.provider},'reserved',${input.reserveMicros},${leaseToken},now()+${leaseSeconds}*interval '1 second') RETURNING *`;
+      for (const attachmentId of attachmentIds) {
+        await tx`
+          INSERT INTO message_attachments(message_id,attachment_id)
+          VALUES(${String(nodes[0].id)},${attachmentId})
+        `;
+      }
       const after = balance - input.reserveMicros;
       await tx`UPDATE users SET balance_micros=${after} WHERE id=${input.message.ownerId}`;
       await tx`INSERT INTO ledger_entries(user_id,usage_run_id,kind,amount_micros,balance_after_micros) VALUES(${input.message.ownerId},${input.runId},'reserve',${-input
@@ -905,6 +968,133 @@ export class PostgresRepository implements DomainRepository {
       >`UPDATE conversations SET active_leaf_id=${leafId},version=version+1,updated_at=now() WHERE id=${conversationId} RETURNING *`;
       return conversation(updated[0]);
     });
+  }
+
+  async createAttachment(input: CreateAttachmentInput): Promise<CreateAttachmentResult> {
+    validateAttachmentInput(input);
+    return await this.#sql.begin(async (tx) => {
+      const owner = await tx`SELECT id FROM users WHERE id=${input.ownerId} FOR UPDATE`;
+      if (!owner.length) throw new DomainError("not_found", "User not found", 404);
+      const inserted = await tx<
+        Row[]
+      >`INSERT INTO attachments(owner_id,object_key,filename,mime_type,size_bytes,sha256,state,inspection_error) VALUES(${input.ownerId},${input.objectKey},${input.filename},${input.mimeType},${input.sizeBytes},${input.sha256},${
+        input.state ?? "pending"
+      },${input.inspectionError ?? null}) ON CONFLICT DO NOTHING RETURNING *`;
+      let record = inserted[0];
+      const deduplicated = !record;
+      if (!record) {
+        const existing = await tx<
+          Row[]
+        >`SELECT * FROM attachments WHERE owner_id=${input.ownerId} AND sha256=${input.sha256} AND deleted_at IS NULL FOR UPDATE`;
+        record = existing[0];
+        if (!record) {
+          throw new DomainError("object_key_taken", "Attachment object key already exists", 409);
+        }
+        if (
+          number(record.size_bytes) !== input.sizeBytes ||
+          String(record.mime_type) !== input.mimeType
+        ) {
+          throw new DomainError(
+            "attachment_hash_conflict",
+            "Attachment digest metadata differs",
+            409,
+          );
+        }
+      }
+      const attachmentId = String(record.id);
+      const idempotencyKey = `attachment.inspect:${attachmentId}`;
+      const jobs = await tx<
+        Row[]
+      >`INSERT INTO jobs(type,payload,idempotency_key) VALUES('attachment.inspect',${
+        tx.json({ attachmentId, ownerId: input.ownerId })
+      },${idempotencyKey}) ON CONFLICT(idempotency_key) DO UPDATE SET idempotency_key=EXCLUDED.idempotency_key RETURNING id`;
+      return {
+        attachment: attachment(record),
+        inspectionJobId: String(jobs[0].id),
+        deduplicated,
+      };
+    });
+  }
+
+  async listAttachments(ownerId: string, includeDeleted = false) {
+    const rows = includeDeleted
+      ? await this.#sql<
+        Row[]
+      >`SELECT * FROM attachments WHERE owner_id=${ownerId} ORDER BY created_at DESC,id`
+      : await this.#sql<
+        Row[]
+      >`SELECT * FROM attachments WHERE owner_id=${ownerId} AND deleted_at IS NULL ORDER BY created_at DESC,id`;
+    return rows.map(attachment);
+  }
+
+  async getAttachment(id: string, ownerId: string, includeDeleted = false) {
+    const rows = includeDeleted
+      ? await this.#sql<Row[]>`SELECT * FROM attachments WHERE id=${id} AND owner_id=${ownerId}`
+      : await this.#sql<
+        Row[]
+      >`SELECT * FROM attachments WHERE id=${id} AND owner_id=${ownerId} AND deleted_at IS NULL`;
+    if (!rows[0]) throw new DomainError("not_found", "Attachment not found", 404);
+    return attachment(rows[0]);
+  }
+
+  async deleteAttachment(id: string, ownerId: string) {
+    const rows = await this.#sql<
+      Row[]
+    >`UPDATE attachments SET state='deleted',deleted_at=COALESCE(deleted_at,now()),updated_at=now() WHERE id=${id} AND owner_id=${ownerId} RETURNING *`;
+    if (!rows[0]) throw new DomainError("not_found", "Attachment not found", 404);
+    return attachment(rows[0]);
+  }
+
+  async transitionAttachment(
+    id: string,
+    ownerId: string,
+    expectedState: AttachmentState,
+    nextState: AttachmentState,
+    inspectionError: string | null = null,
+  ) {
+    const allowed: Record<AttachmentState, AttachmentState[]> = {
+      pending: ["inspecting", "deleted"],
+      inspecting: ["ready", "quarantined", "failed", "deleted"],
+      ready: ["deleted"],
+      quarantined: ["deleted"],
+      failed: ["pending", "deleted"],
+      deleted: [],
+    };
+    if (!allowed[expectedState]?.includes(nextState)) {
+      throw new DomainError(
+        "invalid_attachment_transition",
+        "Attachment transition is invalid",
+        422,
+      );
+    }
+    const rows = await this.#sql<
+      Row[]
+    >`UPDATE attachments SET state=${nextState},inspection_error=${inspectionError},deleted_at=CASE WHEN ${nextState}='deleted' THEN COALESCE(deleted_at,now()) ELSE deleted_at END,updated_at=now() WHERE id=${id} AND owner_id=${ownerId} AND state=${expectedState} RETURNING *`;
+    if (rows[0]) return attachment(rows[0]);
+    const exists = await this
+      .#sql`SELECT id FROM attachments WHERE id=${id} AND owner_id=${ownerId}`;
+    if (!exists.length) throw new DomainError("not_found", "Attachment not found", 404);
+    throw new DomainError("attachment_state_conflict", "Attachment state changed", 409);
+  }
+
+  async linkAttachmentToMessage(messageId: string, attachmentId: string, ownerId: string) {
+    const authorized = await this
+      .#sql`SELECT m.id FROM messages m JOIN conversations c ON c.id=m.conversation_id JOIN attachments a ON a.id=${attachmentId} AND a.owner_id=${ownerId} AND a.state='ready' AND a.deleted_at IS NULL WHERE m.id=${messageId} AND c.owner_id=${ownerId}`;
+    if (!authorized.length) {
+      throw new DomainError("attachment_not_ready", "Message or ready attachment not found", 409);
+    }
+    await this
+      .#sql`INSERT INTO message_attachments(message_id,attachment_id) VALUES(${messageId},${attachmentId}) ON CONFLICT DO NOTHING`;
+  }
+
+  async listMessageAttachments(messageId: string, ownerId: string) {
+    const message = await this
+      .#sql`SELECT m.id FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE m.id=${messageId} AND c.owner_id=${ownerId}`;
+    if (!message.length) throw new DomainError("not_found", "Message not found", 404);
+    return (await this.#sql<
+      Row[]
+    >`SELECT a.* FROM attachments a JOIN message_attachments ma ON ma.attachment_id=a.id WHERE ma.message_id=${messageId} ORDER BY a.created_at,a.id`)
+      .map(attachment);
   }
 
   async createApiToken(userId: string, input: CreateApiTokenInput) {

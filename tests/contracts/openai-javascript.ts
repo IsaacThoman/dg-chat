@@ -1,4 +1,4 @@
-import OpenAI from "npm:openai@6.16.0";
+import OpenAI, { toFile } from "npm:openai@6.16.0";
 
 const apiKey = Deno.env.get("OPENAI_API_KEY");
 const baseURL = Deno.env.get("OPENAI_BASE_URL") ?? "http://localhost:8000/v1";
@@ -53,7 +53,63 @@ if (!responseStreamText.includes("JavaScript Responses streaming contract")) {
   throw new Error("JavaScript Responses stream did not contain the expected content");
 }
 
-const files = await client.files.list();
-if (!Array.isArray(files.data)) throw new Error("JavaScript files.list() did not return a list");
+const fileText = `JavaScript files contract ${crypto.randomUUID()}\n`;
+const fileName = `javascript-contract-${crypto.randomUUID()}.txt`;
+const uploaded = await client.files.create({
+  file: await toFile(new TextEncoder().encode(fileText), fileName, { type: "text/plain" }),
+  purpose: "assistants",
+});
+let deleted = false;
+try {
+  if (
+    uploaded.object !== "file" || uploaded.filename !== fileName ||
+    uploaded.bytes !== new TextEncoder().encode(fileText).byteLength ||
+    uploaded.status !== "processed"
+  ) {
+    throw new Error("JavaScript files.create() returned an invalid file object");
+  }
+
+  const files = await client.files.list();
+  if (
+    !Array.isArray(files.data) || files.has_more !== false ||
+    !files.data.some((file) => file.id === uploaded.id)
+  ) {
+    throw new Error("JavaScript files.list() did not include the uploaded file");
+  }
+
+  const retrieved = await client.files.retrieve(uploaded.id);
+  if (retrieved.id !== uploaded.id || retrieved.filename !== fileName) {
+    throw new Error("JavaScript files.retrieve() returned the wrong file");
+  }
+
+  const content = await client.files.content(uploaded.id);
+  if (await content.text() !== fileText) {
+    throw new Error("JavaScript files.content() did not preserve the uploaded bytes");
+  }
+
+  const result = await client.files.delete(uploaded.id);
+  deleted = true;
+  if (result.id !== uploaded.id || result.object !== "file" || result.deleted !== true) {
+    throw new Error("JavaScript files.delete() returned an invalid deletion object");
+  }
+
+  try {
+    await client.files.retrieve(uploaded.id);
+    throw new Error("JavaScript deleted file remained retrievable");
+  } catch (error) {
+    if (
+      error instanceof Error && error.message === "JavaScript deleted file remained retrievable"
+    ) {
+      throw error;
+    }
+    if (!(error instanceof OpenAI.APIError) || error.status !== 404) {
+      throw new Error("JavaScript deleted file did not return an OpenAI-compatible 404", {
+        cause: error,
+      });
+    }
+  }
+} finally {
+  if (!deleted) await client.files.delete(uploaded.id).catch(() => undefined);
+}
 
 console.log("Official OpenAI JavaScript client contracts passed");

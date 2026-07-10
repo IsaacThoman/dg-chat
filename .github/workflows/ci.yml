@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+env:
+  S3_ACCESS_KEY: ci-dgchat
+  S3_SECRET_KEY: ci-dgchat-application-secret
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -76,7 +80,9 @@ jobs:
       - name: Apply migrations
         run: deno task db:migrate
       - name: Run database integration, concurrency, and backfill tests
-        run: deno test packages/database --allow-env --allow-net --allow-read --allow-write
+        run: |
+          deno test packages/database --allow-env --allow-net --allow-read --allow-write
+          deno test apps/worker --allow-env --allow-net --allow-read --allow-write
 
   containers:
     name: Container build

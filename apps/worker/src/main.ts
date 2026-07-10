@@ -1,8 +1,21 @@
 import postgres from "npm:postgres@3.4.7";
+import {
+  assertAttachmentInspectionTerminal,
+  AttachmentInspectionPendingError,
+  parseAttachmentInspectionPayload,
+} from "./attachment-inspection.ts";
+import { claimJob, completeJob, deferJob, failOrRetryJob } from "./job-queue.ts";
 
 const databaseUrl = Deno.env.get("DATABASE_URL");
 const workerId = Deno.env.get("WORKER_ID") ?? `worker-${crypto.randomUUID().slice(0, 8)}`;
 const pollMs = Number(Deno.env.get("WORKER_POLL_MS") ?? 1000);
+const jobLeaseSeconds = Number(Deno.env.get("WORKER_JOB_LEASE_SECONDS") ?? 120);
+if (!Number.isSafeInteger(pollMs) || pollMs < 10) {
+  throw new Error("WORKER_POLL_MS must be an integer of at least 10 milliseconds");
+}
+if (!Number.isSafeInteger(jobLeaseSeconds) || jobLeaseSeconds < 1) {
+  throw new Error("WORKER_JOB_LEASE_SECONDS must be a positive integer");
+}
 let stopping = false;
 
 const abort = () => {
@@ -22,59 +35,49 @@ if (!databaseUrl) {
 const sql = postgres(databaseUrl, { max: 4 });
 console.log(JSON.stringify({ level: "info", message: "Worker started", workerId }));
 
-async function claimJob() {
-  return await sql.begin(async (tx) => {
-    const rows = await tx<{ id: string; type: string; payload: unknown; attempts: number }[]>`
-      SELECT id, type, payload, attempts FROM jobs
-      WHERE status = 'queued' AND available_at <= now()
-      ORDER BY available_at, created_at
-      FOR UPDATE SKIP LOCKED LIMIT 1
-    `;
-    const job = rows[0];
-    if (!job) return undefined;
-    await tx`UPDATE jobs SET status = 'running', locked_at = now(), locked_by = ${workerId}, attempts = attempts + 1 WHERE id = ${job.id}`;
-    return job;
-  });
-}
-
-function processJob(job: { id: string; type: string; payload: unknown; attempts: number }) {
+async function processJob(
+  job: { id: string; type: string; payload: unknown; attempts: number },
+) {
   switch (job.type) {
-    case "attachment.ingest":
+    case "attachment.inspect": {
+      const { attachmentId, ownerId } = parseAttachmentInspectionPayload(job.payload);
+      const rows = await sql<{ state: string }[]>`
+        SELECT state FROM attachments WHERE id=${attachmentId} AND owner_id=${ownerId}
+      `;
+      const state = rows[0]?.state;
+      assertAttachmentInspectionTerminal(state);
       console.log(
         JSON.stringify({
           level: "info",
-          message: "Attachment ingestion placeholder completed",
+          message: "Attachment inspection result acknowledged",
           jobId: job.id,
+          attachmentId,
+          state,
         }),
       );
       break;
-    case "retention.scrub":
-      console.log(
-        JSON.stringify({ level: "info", message: "Retention scrub completed", jobId: job.id }),
-      );
-      break;
+    }
     default:
       throw new Error(`Unsupported job type: ${job.type}`);
   }
 }
 
 while (!stopping) {
-  const job = await claimJob();
+  const job = await claimJob(sql, workerId, jobLeaseSeconds);
   if (!job) {
     await new Promise((resolve) => setTimeout(resolve, pollMs));
     continue;
   }
   try {
-    processJob(job);
-    await sql`UPDATE jobs SET status = 'completed', completed_at = now(), locked_at = NULL, locked_by = NULL WHERE id = ${job.id}`;
+    await processJob(job);
+    await completeJob(sql, job);
   } catch (error) {
+    if (error instanceof AttachmentInspectionPendingError) {
+      await deferJob(sql, job, 5);
+      continue;
+    }
     const message = error instanceof Error ? error.message : String(error);
-    const retry = job.attempts + 1 < 5;
-    await sql`UPDATE jobs SET status = ${
-      retry ? "queued" : "failed"
-    }, last_error = ${message}, available_at = now() + (${
-      Math.min(300, 2 ** job.attempts)
-    } * interval '1 second'), locked_at = NULL, locked_by = NULL WHERE id = ${job.id}`;
+    await failOrRetryJob(sql, job, message);
   }
 }
 await sql.end({ timeout: 5 });
