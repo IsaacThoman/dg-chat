@@ -9,19 +9,21 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{"model":"provider/model","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-The implemented surface is models, chat completions, non-streaming Responses, and the Files
-lifecycle. Simulated-model chat streams use SSE and terminate with `[DONE]`; configured upstream
-calls currently use non-streaming passthrough. Files support upload, list, retrieve, content, and
-delete through the official JavaScript and Python clients. Uploads currently accept only the
-`assistants` purpose, and list responses do not yet implement cursor pagination. Embeddings, image
-generation, and audio routes return explicit OpenAI-shaped `501 provider_not_configured` responses
+The implemented surface is models, chat completions, Responses, embeddings, and the Files lifecycle.
+Simulated-model chat streams use SSE and terminate with `[DONE]`; configured upstream calls
+currently use non-streaming passthrough. Files support upload, list, retrieve, content, and delete
+through the official JavaScript and Python clients. Uploads currently accept only the `assistants`
+purpose, and list responses do not yet implement cursor pagination. Embeddings use admin-configured
+models with the `embeddings` capability, preserve input ordering and float/base64 formats,
+participate in provider fallback and circuit breaking, and are credit-metered and idempotent. Image
+generation and audio routes return explicit OpenAI-shaped `501 provider_not_configured` responses
 until their adapters are configured in a later milestone. Assistants, batches, fine-tuning, and
 realtime are not supported.
 
 Use a unique `Idempotency-Key` for each request. Keys are scoped to the authenticated user and
-endpoint; this release rejects reuse instead of replaying a cached response. Client disconnects
-cancel upstream work where possible, and requests reserve a conservative maximum before provider
-work begins.
+endpoint. Embeddings replay a completed response for an identical request and reject the same key
+with a changed body; other endpoints may reject reuse. Client disconnects cancel upstream work where
+possible, and requests reserve a conservative maximum before provider work begins.
 
 The provider-qualified model ID is the stable identifier. Admin aliases may point at it, but clients
 should not assume every model supports tools, vision, reasoning, images, or audio; inspect model
