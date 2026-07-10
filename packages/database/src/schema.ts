@@ -245,7 +245,30 @@ export const auditEvents = pgTable("audit_events", {
   targetId: text("target_id"),
   metadata: jsonb("metadata").notNull().default({}),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
+}, (table) => [
+  index("audit_events_page_idx").on(table.createdAt.desc(), table.id.desc()),
+  index("audit_events_action_page_idx").on(
+    table.action,
+    table.createdAt.desc(),
+    table.id.desc(),
+  ),
+  index("audit_events_actor_page_idx").on(
+    table.actorId,
+    table.createdAt.desc(),
+    table.id.desc(),
+  ),
+  index("audit_events_target_page_idx").on(
+    table.targetType,
+    table.targetId,
+    table.createdAt.desc(),
+    table.id.desc(),
+  ),
+  index("audit_events_target_id_page_idx").on(
+    table.targetId,
+    table.createdAt.desc(),
+    table.id.desc(),
+  ),
+]);
 
 export const apiIdempotencyRequests = pgTable("api_idempotency_requests", {
   id: uuid("id").primaryKey().defaultRandom(),

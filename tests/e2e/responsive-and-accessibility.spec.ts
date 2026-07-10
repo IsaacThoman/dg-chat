@@ -77,3 +77,39 @@ test("health and readiness distinguish process and dependencies", async ({ reque
   expect(health.ok()).toBeTruthy();
   expect(ready.ok()).toBeTruthy();
 });
+
+test(
+  "audit log filters real events and exports a bounded CSV page",
+  async ({ page, request }, testInfo) => {
+    await bootstrap(request);
+    await login(page);
+    const mobile = testInfo.project.name.includes("mobile");
+    if (mobile) await page.getByRole("button", { name: "Open menu", exact: true }).click();
+    await page.getByRole("button", { name: "Admin console", exact: true }).click();
+    if (mobile) {
+      await page.getByRole("combobox", { name: "Admin section" }).selectOption("audit");
+    } else {
+      await page.getByRole("button", { name: "Audit log", exact: true }).click();
+    }
+
+    const filters = page.getByRole("form", { name: "Audit filters" });
+    await expect(filters).toBeVisible();
+    await filters.getByLabel("Action").fill("identity.bootstrap_admin");
+    await filters.getByRole("button", { name: "Apply filters" }).click();
+    const table = page.getByRole("table", { name: "Audit events" });
+    await expect(table).toBeVisible();
+    await expect(table.getByText("identity.bootstrap_admin", { exact: true })).toBeVisible();
+
+    const exportLink = page.getByRole("link", { name: "Export page CSV" });
+    await expect(exportLink).toHaveAttribute(
+      "href",
+      /audit\.csv\?.*action=identity\.bootstrap_admin/,
+    );
+    const href = await exportLink.getAttribute("href");
+    const api = env("E2E_API_URL") ?? "http://localhost:8000";
+    const csv = await page.context().request.get(new URL(href!, api).toString());
+    expect(csv.ok()).toBeTruthy();
+    expect(csv.headers()["content-type"]).toContain("text/csv");
+    expect(await csv.text()).toContain("identity.bootstrap_admin");
+  },
+);

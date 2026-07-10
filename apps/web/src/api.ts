@@ -1,4 +1,13 @@
-import type { Attachment, Conversation, Message, Model, Token, User } from "./types.ts";
+import type {
+  Attachment,
+  AuditEvent,
+  AuditFilters,
+  Conversation,
+  Message,
+  Model,
+  Token,
+  User,
+} from "./types.ts";
 import { demoConversations, demoMessages, demoModels, demoTokens, demoUser } from "./demo.ts";
 import type { SetupStatus } from "./setupDiscovery.ts";
 
@@ -125,6 +134,15 @@ function uploadError(xhr: XMLHttpRequest): Error {
     // Preserve a stable, non-HTML error when the server did not return JSON.
   }
   return new Error(xhr.status ? `Upload failed (${xhr.status})` : "Upload failed");
+}
+
+function auditQuery(filters: AuditFilters, cursor?: string, limit = 50) {
+  const query = new URLSearchParams({ limit: String(limit) });
+  for (const [key, value] of Object.entries(filters)) {
+    if (value) query.set(key, value);
+  }
+  if (cursor) query.set("cursor", cursor);
+  return query.toString();
 }
 
 export function uploadAttachment(
@@ -339,4 +357,10 @@ export const api = {
       data: Array<{ id: string; status: string; configured: boolean }>;
     }>("/admin/providers")).data,
   adminJobs: async () => (await request<{ data: unknown[] }>("/admin/jobs")).data,
+  adminAudit: (filters: AuditFilters = {}, cursor?: string, limit = 50) =>
+    request<{ data: AuditEvent[]; nextCursor: string | null }>(
+      `/admin/audit?${auditQuery(filters, cursor, limit)}`,
+    ),
+  adminAuditCsvUrl: (filters: AuditFilters = {}, cursor?: string, limit = 50) =>
+    `/api/admin/audit.csv?${auditQuery(filters, cursor, limit)}`,
 };

@@ -14,6 +14,8 @@ import type {
   AttachmentState,
   AuditEvent,
   AuditEventInput,
+  AuditPage,
+  AuditQuery,
   BeginApiRequestInput,
   BeginApiRequestResult,
   BeginGenerationInput,
@@ -30,6 +32,7 @@ import type {
   IdentityTokenPurpose,
   SessionSummary,
 } from "./repository.ts";
+import { decodeAuditCursor, encodeAuditPostgresCursor } from "./repository.ts";
 
 type Row = Record<string, unknown>;
 const iso = (value: unknown) => value instanceof Date ? value.toISOString() : String(value);
@@ -374,13 +377,43 @@ export class PostgresRepository implements DomainRepository {
       createdAt: iso(row.created_at),
     };
   }
-  async listAudit(limit = 100): Promise<AuditEvent[]> {
-    const safeLimit = Math.max(1, Math.min(500, limit));
-    return (await this.#sql<
-      Row[]
-    >`SELECT * FROM audit_events ORDER BY created_at DESC,id DESC LIMIT ${safeLimit}`).map((
-      row,
-    ) => ({
+  async listAudit(query: AuditQuery = {}): Promise<AuditPage> {
+    const limit = query.limit ?? 100;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
+      throw new DomainError("validation_error", "Audit limit must be between 1 and 200", 422);
+    }
+    const cursor = query.cursor ? decodeAuditCursor(query.cursor) : undefined;
+    if (query.cursor && !cursor) {
+      throw new DomainError("validation_error", "Invalid audit cursor", 422);
+    }
+    const from = query.from ? Date.parse(query.from) : undefined;
+    const to = query.to ? Date.parse(query.to) : undefined;
+    if ((query.from && !Number.isFinite(from)) || (query.to && !Number.isFinite(to))) {
+      throw new DomainError("validation_error", "Invalid audit date range", 422);
+    }
+    if (from !== undefined && to !== undefined && from > to) {
+      throw new DomainError("validation_error", "Audit date range is reversed", 422);
+    }
+    const fromIso = from === undefined ? null : new Date(from).toISOString();
+    const toIso = to === undefined ? null : new Date(to).toISOString();
+    const cursorTimestamp = cursor?.kind === "postgres_timestamp"
+      ? cursor.timestamp
+      : cursor?.kind === "timestamp"
+      ? cursor.createdAt
+      : null;
+    const rows = await this.#sql<Row[]>`
+      SELECT *,created_at::text audit_cursor_timestamp
+      FROM audit_events
+      WHERE (${query.action ?? null}::text IS NULL OR action=${query.action ?? null})
+        AND (${query.actorId ?? null}::text IS NULL OR actor_id::text=${query.actorId ?? null})
+        AND (${query.targetType ?? null}::text IS NULL OR target_type=${query.targetType ?? null})
+        AND (${query.targetId ?? null}::text IS NULL OR target_id::text=${query.targetId ?? null})
+        AND (${fromIso}::timestamptz IS NULL OR created_at>=${fromIso})
+        AND (${toIso}::timestamptz IS NULL OR created_at<=${toIso})
+        AND (${cursorTimestamp}::text IS NULL OR
+          (created_at,id)<(${cursorTimestamp}::text::timestamptz,${cursor?.id ?? null}::uuid))
+      ORDER BY created_at DESC,id DESC LIMIT ${limit + 1}`;
+    const events = rows.map((row) => ({
       id: String(row.id),
       actorId: row.actor_id ? String(row.actor_id) : null,
       action: String(row.action),
@@ -389,6 +422,16 @@ export class PostgresRepository implements DomainRepository {
       metadata: row.metadata as Record<string, unknown>,
       createdAt: iso(row.created_at),
     }));
+    const data = events.slice(0, limit);
+    return {
+      data,
+      nextCursor: events.length > limit
+        ? encodeAuditPostgresCursor(
+          String(rows[limit - 1].audit_cursor_timestamp),
+          String(rows[limit - 1].id),
+        )
+        : null,
+    };
   }
 
   async approveUser(

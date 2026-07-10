@@ -123,10 +123,56 @@ Deno.test({
         targetType: "user",
         targetId: identityUser.id,
       });
+      await repo.recordAudit({
+        actorId: applicant.id,
+        action: "identity.other",
+        targetType: "session",
+        targetId: session.id,
+      });
       assertEquals(
-        (await repo.listAudit()).some((event) => event.action === "identity.test"),
+        (await repo.listAudit({ action: "identity.test", actorId: identityUser.id })).data.some(
+          (event) => event.action === "identity.test" && event.targetId === identityUser.id,
+        ),
         true,
       );
+      const auditFirstPage = await repo.listAudit({ limit: 1 });
+      assertEquals(auditFirstPage.data.length, 1);
+      assertEquals(typeof auditFirstPage.nextCursor, "string");
+      const auditSecondPage = await repo.listAudit({
+        limit: 1,
+        cursor: auditFirstPage.nextCursor!,
+      });
+      assertEquals(
+        auditSecondPage.data.some((event) => event.id === auditFirstPage.data[0].id),
+        false,
+      );
+      const precisionEvents = await Promise.all([
+        repo.recordAudit({ action: "precision.audit", targetType: "test" }),
+        repo.recordAudit({ action: "precision.audit", targetType: "test" }),
+        repo.recordAudit({ action: "precision.audit", targetType: "test" }),
+      ]);
+      const precisionSql = postgres(databaseUrl!, { max: 1 });
+      await precisionSql`UPDATE audit_events SET created_at='2026-07-10 00:00:00.000100+00' WHERE id=${
+        precisionEvents[0].id
+      }`;
+      await precisionSql`UPDATE audit_events SET created_at='2026-07-10 00:00:00.000200+00' WHERE id IN (${
+        precisionEvents[1].id
+      },${precisionEvents[2].id})`;
+      await precisionSql.end();
+      const sameTimestamp = [precisionEvents[1].id, precisionEvents[2].id].sort().reverse();
+      const expectedPrecisionOrder = [...sameTimestamp, precisionEvents[0].id];
+      const seenPrecision: string[] = [];
+      let precisionCursor: string | undefined;
+      do {
+        const page = await repo.listAudit({
+          action: "precision.audit",
+          limit: 1,
+          cursor: precisionCursor,
+        });
+        seenPrecision.push(...page.data.map((event) => event.id));
+        precisionCursor = page.nextCursor ?? undefined;
+      } while (precisionCursor);
+      assertEquals(seenPrecision, expectedPrecisionOrder);
 
       const quotaUser = await repo.createUser({
         email: "quota-requests@database.test",

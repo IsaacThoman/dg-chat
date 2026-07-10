@@ -29,10 +29,15 @@ flowchart LR
   configuration, and audit records.
 - Redis currently contains disposable rate-limit windows. Circuit breakers, presence, and ephemeral
   stream coordination remain planned; correctness must not depend on Redis persistence.
-- S3-compatible storage is the planned owner of immutable upload objects, but upload routes and
-  object-store authorization are deliberately disabled until their security controls are complete.
+- S3-compatible storage owns immutable upload objects. Browser attachment routes and the
+  OpenAI-compatible Files lifecycle stream uploads into private objects and authorize every read by
+  owner or immutable historical message link. Attachment deletion is a logical tombstone so edits
+  cannot break an earlier conversation branch; retention-aware object garbage collection remains
+  planned.
 - The worker claims durable jobs using `FOR UPDATE SKIP LOCKED`. Handlers must be idempotent and
-  retry-safe.
+  retry-safe. Its current attachment handler acknowledges upload-time inspection results; document
+  extraction, OCR, embedding, retrieval, malware scanning, and quarantined-file reprocessing remain
+  planned.
 
 ## Core invariants
 

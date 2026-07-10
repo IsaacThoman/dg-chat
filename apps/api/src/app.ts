@@ -34,6 +34,8 @@ import {
   type ApiIdempotencyRequest,
   type ApiReplayQuota,
   type AttachmentRecord,
+  type AuditEvent,
+  type AuditQuery,
   DomainError,
   type DomainRepository,
   MemoryRepository,
@@ -148,6 +150,65 @@ const openAIFile = (attachment: AttachmentRecord, purpose = "assistants") => ({
 const openAIError = (message: string, code: string | null = null) => ({
   error: { message, type: "invalid_request_error", param: null, code },
 });
+const auditIdentifier = /^[a-z0-9][a-z0-9._:-]*$/i;
+const auditUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const parseAuditQuery = (c: Context): AuditQuery => {
+  const rawLimit = c.req.query("limit");
+  const limit = rawLimit === undefined ? 100 : Number(rawLimit);
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
+    throw new DomainError("validation_error", "limit must be an integer from 1 to 200", 422);
+  }
+  const bounded = (name: string, max: number, pattern = auditIdentifier) => {
+    const value = c.req.query(name)?.trim();
+    if (value === undefined) return undefined;
+    if (!value || value.length > max || !pattern.test(value)) {
+      throw new DomainError("validation_error", `${name} is invalid`, 422);
+    }
+    return value;
+  };
+  const cursor = c.req.query("cursor");
+  if (cursor !== undefined && (!cursor || cursor.length > 1024)) {
+    throw new DomainError("validation_error", "cursor is invalid", 422);
+  }
+  const date = (name: "from" | "to") => {
+    const value = c.req.query(name);
+    if (value === undefined) return undefined;
+    if (value.length > 64 || !Number.isFinite(Date.parse(value))) {
+      throw new DomainError("validation_error", `${name} must be a valid timestamp`, 422);
+    }
+    return new Date(value).toISOString();
+  };
+  return {
+    limit,
+    cursor,
+    action: bounded("action", 120),
+    actorId: bounded("actorId", 36, auditUuid),
+    targetType: bounded("targetType", 80),
+    targetId: bounded("targetId", 200),
+    from: date("from"),
+    to: date("to"),
+  };
+};
+const csvCell = (value: unknown) => {
+  let text = value == null ? "" : String(value);
+  if (/^[\t\r]|^\s*[=+\-@]/.test(text)) text = `'${text}`;
+  return `"${text.replaceAll('"', '""')}"`;
+};
+const auditCsv = (events: AuditEvent[]) => {
+  const rows = events.map((event) => [
+    event.id,
+    event.createdAt,
+    event.action,
+    event.actorId,
+    event.targetType,
+    event.targetId,
+    JSON.stringify(event.metadata),
+  ]);
+  return [
+    ["id", "created_at", "action", "actor_id", "target_type", "target_id", "metadata"],
+    ...rows,
+  ].map((row) => row.map(csvCell).join(",")).join("\r\n") + "\r\n";
+};
 
 function nodeReadableAsWeb(source: Readable): ReadableStream<Uint8Array> {
   const iterator = source[Symbol.asyncIterator]();
@@ -1638,12 +1699,19 @@ export function createApp(options: AppOptions = {}) {
   app.get(
     "/api/admin/audit",
     async (c) => {
-      const rawLimit = c.req.query("limit");
-      const limit = rawLimit === undefined ? 100 : Number(rawLimit);
-      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
-        throw new DomainError("validation_error", "limit must be an integer from 1 to 200", 422);
-      }
-      return c.json({ data: await repo.listAudit(limit) });
+      c.header("Cache-Control", "private, no-store");
+      return c.json(await repo.listAudit(parseAuditQuery(c)));
+    },
+  );
+  app.get(
+    "/api/admin/audit.csv",
+    async (c) => {
+      const page = await repo.listAudit(parseAuditQuery(c));
+      c.header("Content-Type", "text/csv; charset=utf-8");
+      c.header("Content-Disposition", 'attachment; filename="dg-chat-audit.csv"');
+      c.header("Cache-Control", "private, no-store");
+      c.header("X-Content-Type-Options", "nosniff");
+      return c.body(auditCsv(page.data));
     },
   );
   app.get(

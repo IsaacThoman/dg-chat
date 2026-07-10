@@ -1,4 +1,13 @@
-import { type FormEvent, type ReactNode, useEffect, useId, useMemo, useRef, useState } from "react";
+import {
+  type ChangeEvent,
+  type FormEvent,
+  type ReactNode,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -84,7 +93,15 @@ import {
   conversationsForView,
   fallbackConversationId,
 } from "./conversationLifecycle.ts";
-import type { Attachment, Conversation, Message, Model, Token, User } from "./types.ts";
+import type {
+  Attachment,
+  AuditFilters,
+  Conversation,
+  Message,
+  Model,
+  Token,
+  User,
+} from "./types.ts";
 
 type View = "chat" | "archived" | "trash" | "settings" | "tokens" | "admin";
 type AdminSection =
@@ -2043,13 +2060,7 @@ function AdminSectionContent(
     );
   }
   if (section === "audit") {
-    return (
-      <GenericAdmin
-        title="Audit log"
-        subtitle="Review immutable security and administration events"
-        icon={Shield}
-      />
-    );
+    return <AuditLog />;
   }
   return (
     <GenericAdmin
@@ -2063,6 +2074,10 @@ function AdminOverview({ setSection }: { setSection: (section: AdminSection) => 
   const users = useQuery({ queryKey: ["admin-users"], queryFn: api.adminUsers });
   const usage = useQuery({ queryKey: ["admin-usage"], queryFn: api.adminUsage });
   const providers = useQuery({ queryKey: ["admin-providers"], queryFn: api.adminProviders });
+  const audit = useQuery({
+    queryKey: ["admin-audit-overview"],
+    queryFn: () => api.adminAudit({}, undefined, 3),
+  });
   const activeUsers = users.data?.filter((user) => user.status === "approved").length;
   const pendingUsers = users.data?.filter((user) => user.status === "pending").length;
   const value = (number: number | undefined) =>
@@ -2148,10 +2163,31 @@ function AdminOverview({ setSection }: { setSection: (section: AdminSection) => 
           </div>
           <Applicants compact />
         </div>
-        <div className="activity-card unavailable-card">
-          <Shield size={24} />
-          <h3>Recent activity unavailable</h3>
-          <p>The API does not expose audit events yet. No example activity is shown.</p>
+        <div className="activity-card">
+          <div className="card-title">
+            <div>
+              <h3>Recent audit activity</h3>
+              <p>Latest immutable security and administration events</p>
+            </div>
+            <button className="link-button" onClick={() => setSection("audit")}>
+              View all <ArrowRight size={15} />
+            </button>
+          </div>
+          {audit.isLoading && <div className="empty-mini">Loading activity…</div>}
+          {audit.isError && <div className="empty-mini">Recent activity is unavailable</div>}
+          {audit.data?.data.map((event) => (
+            <div className="activity-row" key={event.id}>
+              <Shield size={15} />
+              <span>
+                <strong>{event.action}</strong>
+                <small>{event.targetType}</small>
+              </span>
+              <time dateTime={event.createdAt}>{new Date(event.createdAt).toLocaleString()}</time>
+            </div>
+          ))}
+          {!audit.isLoading && !audit.isError && !audit.data?.data.length && (
+            <div className="empty-mini">No audit events recorded yet</div>
+          )}
         </div>
       </div>
     </>
@@ -2317,6 +2353,175 @@ function UserManagement() {
             </button>
           </div>
         ))}
+      </div>
+    </>
+  );
+}
+
+type AuditFilterDraft = {
+  action: string;
+  actorId: string;
+  targetType: string;
+  targetId: string;
+  from: string;
+  to: string;
+};
+const emptyAuditFilters: AuditFilterDraft = {
+  action: "",
+  actorId: "",
+  targetType: "",
+  targetId: "",
+  from: "",
+  to: "",
+};
+function appliedAuditFilters(draft: AuditFilterDraft): AuditFilters {
+  return {
+    action: draft.action.trim() || undefined,
+    actorId: draft.actorId.trim() || undefined,
+    targetType: draft.targetType.trim() || undefined,
+    targetId: draft.targetId.trim() || undefined,
+    from: draft.from ? new Date(draft.from).toISOString() : undefined,
+    to: draft.to ? new Date(draft.to).toISOString() : undefined,
+  };
+}
+function AuditLog() {
+  const [draft, setDraft] = useState<AuditFilterDraft>(emptyAuditFilters);
+  const [filters, setFilters] = useState<AuditFilters>({});
+  const [cursors, setCursors] = useState<Array<string | undefined>>([undefined]);
+  const cursor = cursors.at(-1);
+  const events = useQuery({
+    queryKey: ["admin-audit", filters, cursor],
+    queryFn: () => api.adminAudit(filters, cursor),
+  });
+  const apply = (event: FormEvent) => {
+    event.preventDefault();
+    setFilters(appliedAuditFilters(draft));
+    setCursors([undefined]);
+  };
+  const reset = () => {
+    setDraft(emptyAuditFilters);
+    setFilters({});
+    setCursors([undefined]);
+  };
+  const update = (field: keyof AuditFilterDraft) => (event: ChangeEvent<HTMLInputElement>) =>
+    setDraft((current) => ({ ...current, [field]: event.target.value }));
+  return (
+    <>
+      <PageHeader title="Audit log" subtitle="Review immutable security and administration events">
+        <a
+          className="secondary"
+          href={api.adminAuditCsvUrl(filters, cursor)}
+          download="dg-chat-audit.csv"
+        >
+          <Download size={16} /> Export page CSV
+        </a>
+      </PageHeader>
+      <form className="audit-filters" onSubmit={apply} aria-label="Audit filters">
+        <label>
+          <span>Action</span>
+          <input
+            value={draft.action}
+            onChange={update("action")}
+            placeholder="user.state.suspended"
+          />
+        </label>
+        <label>
+          <span>Actor ID</span>
+          <input value={draft.actorId} onChange={update("actorId")} placeholder="UUID" />
+        </label>
+        <label>
+          <span>Target type</span>
+          <input value={draft.targetType} onChange={update("targetType")} placeholder="user" />
+        </label>
+        <label>
+          <span>Target ID</span>
+          <input value={draft.targetId} onChange={update("targetId")} placeholder="Identifier" />
+        </label>
+        <label>
+          <span>From</span>
+          <input type="datetime-local" value={draft.from} onChange={update("from")} />
+        </label>
+        <label>
+          <span>To</span>
+          <input type="datetime-local" value={draft.to} onChange={update("to")} />
+        </label>
+        <div className="audit-filter-actions">
+          <button className="primary" type="submit">Apply filters</button>
+          <button className="secondary" type="button" onClick={reset}>Reset</button>
+        </div>
+      </form>
+      <div className="table-card full audit-table-card">
+        {events.isLoading && <div className="empty-mini" role="status">Loading audit events…</div>}
+        {events.isError && (
+          <div className="empty-mini" role="alert">
+            Audit events could not be loaded. Check the filters and try again.
+          </div>
+        )}
+        {!events.isLoading && !events.isError && !events.data?.data.length && (
+          <div className="empty-mini">No audit events match these filters.</div>
+        )}
+        {!!events.data?.data.length && (
+          <table className="audit-table" aria-label="Audit events">
+            <thead>
+              <tr>
+                <th>TIME</th>
+                <th>ACTION</th>
+                <th>ACTOR</th>
+                <th>TARGET</th>
+                <th>DETAILS</th>
+              </tr>
+            </thead>
+            <tbody>
+              {events.data.data.map((item) => {
+                const metadata = Object.keys(item.metadata).length
+                  ? JSON.stringify(item.metadata)
+                  : "—";
+                return (
+                  <tr key={item.id}>
+                    <td>
+                      <time dateTime={item.createdAt}>
+                        {new Date(item.createdAt).toLocaleString()}
+                      </time>
+                    </td>
+                    <td>
+                      <strong>{item.action}</strong>
+                    </td>
+                    <td>
+                      <code title={item.actorId ?? "System"}>{item.actorId ?? "System"}</code>
+                    </td>
+                    <td>
+                      <strong>{item.targetType}</strong>
+                      <code title={item.targetId ?? "—"}>{item.targetId ?? "—"}</code>
+                    </td>
+                    <td>
+                      <code className="audit-metadata" title={metadata}>{metadata}</code>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+      <div className="audit-pagination" aria-label="Audit pagination">
+        <button
+          className="secondary"
+          disabled={cursors.length === 1 || events.isFetching}
+          onClick={() => setCursors((current) => current.slice(0, -1))}
+        >
+          <ChevronLeft size={15} /> Previous
+        </button>
+        <span>Page {cursors.length}</span>
+        <button
+          className="secondary"
+          disabled={!events.data?.nextCursor || events.isFetching}
+          onClick={() => {
+            const next = events.data?.nextCursor;
+            if (next) setCursors((current) => [...current, next]);
+          }}
+        >
+          Next <ChevronRight size={15} />
+        </button>
       </div>
     </>
   );
