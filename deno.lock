@@ -15,7 +15,7 @@
     "npm:hono@4.12.28": "4.12.28",
     "npm:ioredis@5.8.2": "5.8.2",
     "npm:lucide-react@0.468": "0.468.0_react@19.2.7",
-    "npm:nodemailer@7.0.3": "7.0.3",
+    "npm:nodemailer@9.0.3": "9.0.3",
     "npm:postgres@3.4.7": "3.4.7",
     "npm:react-dom@^19.1.0": "19.2.7_react@19.2.7",
     "npm:react-markdown@^10.1.0": "10.1.0_@types+react@19.2.17_react@19.2.7",
@@ -3196,8 +3196,8 @@
     "node-releases@2.0.50": {
       "integrity": "sha512-J6l92tKHX6w8Jy5nO1Vuc01NoIiRGi/d6qBKVxh+IQ8Cr3b6HbVNfKiF8ZpFKufTwpwxMmce2W3iQZ861ZRyTg=="
     },
-    "nodemailer@7.0.3": {
-      "integrity": "sha512-Ajq6Sz1x7cIK3pN6KesGTah+1gnwMnx5gKl3piQlQQE/PwyJ4Mbc8is2psWYxK3RJTVeqsDaCv8ZzXLCDHMTZw=="
+    "nodemailer@9.0.3": {
+      "integrity": "sha512-n+YP+NKwR5zRWa60k3GiQ6Q3B4KXCoAw40dAKeCtYn020iNN74aWK2liXIC3ZEATeGql7we3tE3t8QwhY0eskw=="
     },
     "object-inspect@1.13.4": {
       "integrity": "sha512-W67iLl4J2EXEGTbfeHCffrjDfitvLANg0UlX3wFUUSTx92KXRFegMHUVgSqE+wvhAbi4WqjGg9czysTV2Epbew=="
@@ -4295,7 +4295,7 @@
           "npm:@types/node@22.15.3",
           "npm:hono@4.12.28",
           "npm:ioredis@5.8.2",
-          "npm:nodemailer@7.0.3"
+          "npm:nodemailer@9.0.3"
         ]
       },
       "apps/web": {
