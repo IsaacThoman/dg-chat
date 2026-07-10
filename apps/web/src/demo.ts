@@ -16,6 +16,8 @@ export const demoConversations: Conversation[] = [
     updatedAt: "Now",
     pinned: true,
     project: "DG Chat",
+    activeLeafId: "m4",
+    version: 6,
   },
   {
     id: "2",
@@ -51,6 +53,8 @@ export const demoMessages: Message[] = [
     content:
       "Help me design a **reliable knowledge ingestion system** for PDFs and images. It should preserve citations and survive retries.",
     createdAt: "10:31 AM",
+    parentId: null,
+    siblingIndex: 0,
     attachments: [{ name: "architecture-notes.pdf", type: "PDF", size: "1.8 MB" }],
   },
   {
@@ -59,9 +63,28 @@ export const demoMessages: Message[] = [
     model: "Claude Sonnet 4",
     latency: "2.4s · 786 tokens",
     createdAt: "10:31 AM",
+    parentId: "m1",
+    siblingIndex: 0,
     content:
       'A reliable ingestion system works best as a small state machine rather than one long job. The key is making every transition **idempotent**.\n\n### Recommended pipeline\n\n1. **Ingest** — stream the object to S3-compatible storage, calculate its content hash, and write the attachment record.\n2. **Inspect** — sniff the real MIME type, enforce size and pixel limits, and quarantine anything suspicious.\n3. **Extract** — use a format-specific parser. Preserve page numbers and bounding boxes as source metadata.\n4. **Chunk & embed** — create deterministic chunk IDs from `(document, version, page, position)`.\n5. **Publish** — atomically swap the active document version only after every chunk is ready.\n\n```ts\nconst chunkId = hash(`${documentId}:${version}:${page}:${offset}`)\nawait jobs.enqueue({ key: chunkId, kind: "embed" })\n```\n\nThis makes retries safe: duplicate jobs converge on the same records instead of creating duplicate chunks.',
-    branch: { index: 1, total: 2, labels: ["Original response", "More concise"] },
+  },
+  {
+    id: "m3-original",
+    role: "user",
+    content: "What happens when an ingestion job fails halfway through?",
+    createdAt: "10:33 AM",
+    parentId: "m2",
+    siblingIndex: 0,
+  },
+  {
+    id: "m4-original",
+    role: "assistant",
+    model: "GPT-4.1",
+    content:
+      "Resume from the last durable state transition. Each stage can safely retry because its output keys are deterministic.",
+    createdAt: "10:33 AM",
+    parentId: "m3-original",
+    siblingIndex: 0,
   },
   {
     id: "m3",
@@ -69,7 +92,9 @@ export const demoMessages: Message[] = [
     content:
       "How should edits work if a user changes the original request later? I never want history to be destroyed.",
     createdAt: "10:34 AM",
-    branch: { index: 2, total: 3, labels: ["Original", "Added retry constraint", "Current edit"] },
+    parentId: "m2",
+    supersedesId: "m3-original",
+    siblingIndex: 1,
   },
   {
     id: "m4",
@@ -77,9 +102,10 @@ export const demoMessages: Message[] = [
     model: "GPT-4.1",
     latency: "1.7s · 421 tokens",
     createdAt: "10:34 AM",
+    parentId: "m3",
+    siblingIndex: 0,
     content:
       "Treat each edit as a new node in an **immutable conversation graph**. The edited message becomes a sibling of the prior message, and the new response grows from that sibling.\n\nUsers can move between alternatives with the arrows beneath the message, while a tree view exposes the full history. Nothing is overwritten: even attachment links and generation metadata remain attached to the original node.",
-    branch: { index: 3, total: 3, labels: ["First answer", "With example", "Current answer"] },
   },
 ];
 export const demoModels: Model[] = [

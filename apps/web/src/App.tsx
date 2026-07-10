@@ -1,4 +1,4 @@
-import { type FormEvent, type ReactNode, useEffect, useRef, useState } from "react";
+import { type FormEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -58,6 +58,15 @@ import {
   Zap,
 } from "lucide-react";
 import { api } from "./api.ts";
+import { conversationForFirstSend } from "./chatWorkflow.ts";
+import {
+  activeMessagePath,
+  conversationTree,
+  type MessageBranch,
+  messageBranch,
+  type MessageTreeNode,
+  preferredLeaf,
+} from "./conversationGraph.ts";
 import { demoConversations, demoMessages, demoModels, demoUser } from "./demo.ts";
 import type { Conversation, Message, Model, Token, User } from "./types.ts";
 
@@ -91,11 +100,12 @@ function Brand({ compact = false }: { compact?: boolean }) {
 }
 
 function IconButton(
-  { label, children, className, onClick }: {
+  { label, children, className, onClick, disabled }: {
     label: string;
     children: ReactNode;
     className?: string;
     onClick?: () => void;
+    disabled?: boolean;
   },
 ) {
   return (
@@ -104,6 +114,7 @@ function IconButton(
       aria-label={label}
       title={label}
       onClick={onClick}
+      disabled={disabled}
     >
       {children}
     </button>
@@ -304,15 +315,28 @@ function ModelPicker(
 }
 
 function BranchControl(
-  { branch, onTree }: { branch: NonNullable<Message["branch"]>; onTree: () => void },
+  { branch, onTree, onSelect, busy }: {
+    branch: MessageBranch;
+    onTree: () => void;
+    onSelect: (messageId: string) => void;
+    busy: boolean;
+  },
 ) {
   return (
-    <div className="branch-control">
-      <IconButton label="Previous branch">
+    <div className="branch-control" aria-label={`Branch ${branch.index} of ${branch.total}`}>
+      <IconButton
+        label="Previous branch"
+        disabled={!branch.previousId || busy}
+        onClick={() => branch.previousId && onSelect(branch.previousId)}
+      >
         <ChevronLeft size={15} />
       </IconButton>
-      <span>{branch.index} / {branch.total}</span>
-      <IconButton label="Next branch">
+      <span aria-live="polite">{branch.index} / {branch.total}</span>
+      <IconButton
+        label="Next branch"
+        disabled={!branch.nextId || busy}
+        onClick={() => branch.nextId && onSelect(branch.nextId)}
+      >
         <ChevronRight size={15} />
       </IconButton>
       <IconButton label="View conversation tree" onClick={onTree}>
@@ -323,10 +347,13 @@ function BranchControl(
 }
 
 function MessageItem(
-  { message, onTree, onEdit }: {
+  { message, branch, onTree, onEdit, onSelectBranch, branchBusy }: {
     message: Message;
+    branch: MessageBranch | null;
     onTree: () => void;
     onEdit: (m: Message) => void;
+    onSelectBranch: (messageId: string) => void;
+    branchBusy: boolean;
   },
 ) {
   const [copied, setCopied] = useState(false);
@@ -361,7 +388,14 @@ function MessageItem(
             <IconButton label="Edit without overwriting" onClick={() => onEdit(message)}>
               <Pencil size={15} />
             </IconButton>
-            {message.branch && <BranchControl branch={message.branch} onTree={onTree} />}
+            {branch && (
+              <BranchControl
+                branch={branch}
+                onTree={onTree}
+                onSelect={onSelectBranch}
+                busy={branchBusy}
+              />
+            )}
           </div>
         </div>
       </article>
@@ -394,7 +428,14 @@ function MessageItem(
           <IconButton label="More">
             <MoreHorizontal size={15} />
           </IconButton>
-          {message.branch && <BranchControl branch={message.branch} onTree={onTree} />}
+          {branch && (
+            <BranchControl
+              branch={branch}
+              onTree={onTree}
+              onSelect={onSelectBranch}
+              busy={branchBusy}
+            />
+          )}
           <span className="response-meta">{message.latency}</span>
         </div>
       </div>
@@ -477,7 +518,14 @@ function Composer(
   );
 }
 
-function TreePanel({ close }: { close: () => void }) {
+function TreePanel({ messages, activeLeafId, close, onSelect, busy }: {
+  messages: Message[];
+  activeLeafId?: string | null;
+  close: () => void;
+  onSelect: (messageId: string) => void;
+  busy: boolean;
+}) {
+  const roots = conversationTree(messages, activeLeafId);
   return (
     <div className="drawer-overlay" onClick={close}>
       <aside className="tree-panel" onClick={(e) => e.stopPropagation()}>
@@ -494,24 +542,18 @@ function TreePanel({ close }: { close: () => void }) {
           Every edit creates a new path. Your original messages and responses are always
           recoverable.
         </p>
-        <div className="tree">
-          <TreeNode label="Reliable knowledge ingestion system" kind="user" />
-          <div className="tree-line" />
-          <TreeNode label="Five-stage pipeline" kind="assistant" />
-          <div className="fork-lines">
-            <span />
-            <span />
-          </div>
-          <div className="tree-columns">
-            <div>
-              <TreeNode label="Original request" kind="user" faded />
-              <TreeNode label="Original answer" kind="assistant" faded />
-            </div>
-            <div>
-              <TreeNode label="How should edits work?" kind="user" active />
-              <TreeNode label="Immutable conversation graph" kind="assistant" active />
-            </div>
-          </div>
+        <div className="tree" role="tree" aria-label="Conversation branches">
+          {roots.length
+            ? roots.map((root) => (
+              <TreeNode
+                key={root.message.id}
+                node={root}
+                depth={0}
+                onSelect={onSelect}
+                busy={busy}
+              />
+            ))
+            : <p className="muted">This conversation does not have any messages yet.</p>}
         </div>
         <div className="info-card">
           <Lock size={18} />
@@ -525,21 +567,42 @@ function TreePanel({ close }: { close: () => void }) {
   );
 }
 function TreeNode(
-  { label, kind, faded, active }: {
-    label: string;
-    kind: string;
-    faded?: boolean;
-    active?: boolean;
+  { node, depth, onSelect, busy }: {
+    node: MessageTreeNode;
+    depth: number;
+    onSelect: (messageId: string) => void;
+    busy: boolean;
   },
 ) {
   return (
-    <div className={cn("tree-node", faded && "faded", active && "active")}>
-      <span>{kind === "user" ? "I" : <Sparkles size={13} />}</span>
-      <div>
-        <small>{kind === "user" ? "You" : "Assistant"}</small>
-        <strong>{label}</strong>
-      </div>
-      {active && <Check size={14} />}
+    <div className="tree-subtree" role="treeitem" aria-current={node.active ? "true" : undefined}>
+      <button
+        className={cn("tree-node", node.active && "active")}
+        style={{ marginLeft: `${depth * 18}px`, width: `calc(100% - ${depth * 18}px)` }}
+        disabled={busy}
+        onClick={() =>
+          onSelect(node.message.id)}
+      >
+        <span>{node.message.role === "user" ? "I" : <Sparkles size={13} />}</span>
+        <div>
+          <small>{node.message.role === "user" ? "You" : "Assistant"}</small>
+          <strong>{node.message.content || "Empty message"}</strong>
+        </div>
+        {node.active && <Check size={14} />}
+      </button>
+      {node.children.length > 0 && (
+        <div className="tree-children" role="group">
+          {node.children.map((child) => (
+            <TreeNode
+              key={child.message.id}
+              node={child}
+              depth={depth + 1}
+              onSelect={onSelect}
+              busy={busy}
+            />
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -553,6 +616,7 @@ function ChatView({
   setSelectedModel,
   onMenu,
   balance,
+  onConversationCreated,
 }: {
   conversations: Conversation[];
   activeId: string;
@@ -562,11 +626,13 @@ function ChatView({
   setSelectedModel: (id: string) => void;
   onMenu: () => void;
   balance: number;
+  onConversationCreated: (id: string) => Promise<void>;
 }) {
   const [localMessages, setLocalMessages] = useState(messages);
   const [tree, setTree] = useState(false);
   const [edit, setEdit] = useState<Message>();
   const [streaming, setStreaming] = useState(false);
+  const [branchBusy, setBranchBusy] = useState(false);
   const [sendError, setSendError] = useState("");
   const initialConversation = conversations.find((c) => c.id === activeId);
   const [conversation, setConversation] = useState(initialConversation);
@@ -579,25 +645,51 @@ function ChatView({
     setEdit(undefined);
     setSendError("");
   }, [activeId]);
+  const activePath = useMemo(
+    () => activeMessagePath(localMessages, conversation?.activeLeafId),
+    [localMessages, conversation?.activeLeafId],
+  );
+  const selectBranch = async (messageId: string) => {
+    if (!conversation || branchBusy) return;
+    const leafId = preferredLeaf(localMessages, messageId);
+    if (leafId === conversation.activeLeafId) return;
+    setBranchBusy(true);
+    setSendError("");
+    try {
+      setConversation(await api.setActiveLeaf(conversation, leafId));
+    } catch {
+      const refreshed = await api.conversation(conversation.id);
+      setConversation(refreshed);
+      setSendError("That branch changed in another tab. The latest conversation has been loaded.");
+    } finally {
+      setBranchBusy(false);
+    }
+  };
   const send = async (content: string) => {
     const edited = edit;
     setStreaming(true);
     setSendError("");
     try {
-      // A freshly created conversation can become active one render before the
-      // sidebar query commits. Resolve it on demand so an immediate Enter is never lost.
-      const target = conversation ?? await api.conversation(activeId);
+      const resolved = await conversationForFirstSend(activeId, conversation, {
+        load: api.conversation,
+        create: () => api.createConversation(),
+      });
+      const target = resolved.conversation;
+      if (resolved.created) setConversation(target);
       const result = await api.generate(target, content, selectedModel, edited);
       setLocalMessages((current) => [...current, result.user, result.assistant]);
       setConversation(result.conversation);
       setEdit(undefined);
+      if (resolved.created) await onConversationCreated(result.conversation.id);
     } catch {
-      const [refreshedMessages, refreshedConversation] = await Promise.all([
-        api.messages(activeId),
-        api.conversation(activeId),
-      ]);
-      setLocalMessages(refreshedMessages);
-      setConversation(refreshedConversation);
+      if (activeId) {
+        const [refreshedMessages, refreshedConversation] = await Promise.all([
+          api.messages(activeId),
+          api.conversation(activeId),
+        ]);
+        setLocalMessages(refreshedMessages);
+        setConversation(refreshedConversation);
+      }
       setSendError("The message could not be sent. Refresh the conversation and try again.");
     } finally {
       setStreaming(false);
@@ -629,12 +721,15 @@ function ChatView({
             <Pencil size={14} /> Rename
           </button>
         </div>
-        {localMessages.map((m) => (
+        {activePath.map((m) => (
           <MessageItem
             key={m.id}
             message={m}
+            branch={messageBranch(localMessages, m.id)}
             onTree={() => setTree(true)}
             onEdit={setEdit}
+            onSelectBranch={selectBranch}
+            branchBusy={branchBusy}
           />
         ))}
         {streaming && (
@@ -647,7 +742,15 @@ function ChatView({
         {sendError && <p className="form-error">{sendError}</p>}
       </div>
       <Composer onSend={send} edit={edit} cancelEdit={() => setEdit(undefined)} />
-      {tree && <TreePanel close={() => setTree(false)} />}
+      {tree && (
+        <TreePanel
+          messages={localMessages}
+          activeLeafId={conversation?.activeLeafId}
+          close={() => setTree(false)}
+          onSelect={selectBranch}
+          busy={branchBusy}
+        />
+      )}
     </main>
   );
 }
@@ -1006,14 +1109,14 @@ function PageHeader(
     </header>
   );
 }
-const adminNav: { id: AdminSection; label: string; icon: typeof Gauge; badge?: string }[] = [
+const adminNav: { id: AdminSection; label: string; icon: typeof Gauge }[] = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
-  { id: "applicants", label: "Applicants", icon: UserCheck, badge: "3" },
+  { id: "applicants", label: "Applicants", icon: UserCheck },
   { id: "users", label: "Users", icon: Users },
   { id: "providers", label: "Providers", icon: Cloud },
   { id: "models", label: "Models & pricing", icon: Bot },
   { id: "usage", label: "Usage analytics", icon: BarChart3 },
-  { id: "jobs", label: "Background jobs", icon: Boxes, badge: "2" },
+  { id: "jobs", label: "Background jobs", icon: Boxes },
   { id: "audit", label: "Audit log", icon: Shield },
   { id: "storage", label: "Storage & backups", icon: HardDrive },
 ];
@@ -1033,7 +1136,7 @@ function AdminView({ onMenu }: { onMenu: () => void }) {
             <p className="eyebrow">ADMIN CONSOLE</p>
             <h2>Workspace</h2>
           </div>
-          {adminNav.map(({ id, label, icon: Icon, badge }) => (
+          {adminNav.map(({ id, label, icon: Icon }) => (
             <button
               key={id}
               onClick={() => setSection(id)}
@@ -1041,7 +1144,6 @@ function AdminView({ onMenu }: { onMenu: () => void }) {
             >
               <Icon size={17} />
               {label}
-              {badge && <span className="badge push">{badge}</span>}
             </button>
           ))}
         </nav>
@@ -1122,7 +1224,7 @@ function AdminSectionContent(
             <div className="card-title">
               <div>
                 <h3>Pending applicants</h3>
-                <p>3 people are waiting for approval</p>
+                <p>Review account requests awaiting a decision</p>
               </div>
               <button className="link-button" onClick={() => setSection("applicants")}>
                 View all <ArrowRight size={15} />
@@ -1507,6 +1609,10 @@ export function App() {
       setCreatingConversation(false);
     }
   };
+  const conversationCreated = async (id: string) => {
+    setActiveId(id);
+    await conversationQuery.refetch();
+  };
   if (!user) {
     return (
       <main className="auth-page">
@@ -1553,6 +1659,7 @@ export function App() {
           setSelectedModel={setSelectedModel}
           onMenu={() => setMobile(true)}
           balance={user.balance}
+          onConversationCreated={conversationCreated}
         />
       )}
       {view === "settings" && <SettingsView user={user} />}
