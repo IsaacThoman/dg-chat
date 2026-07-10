@@ -1027,6 +1027,18 @@ export class MemoryRepository {
     if (existingRun || existingControl) {
       throw new DomainError("idempotency_conflict", "Incomplete generation replay", 409);
     }
+    if (
+      [...this.generationControls.values()].some((control) =>
+        control.conversationId === input.conversationId &&
+        !control.terminalAt
+      )
+    ) {
+      throw new DomainError(
+        "generation_in_progress",
+        "This response is already being generated",
+        409,
+      );
+    }
     const activePath = new Set<string>();
     let cursor = conversation.activeLeafId
       ? this.messages.get(conversation.activeLeafId)
@@ -1040,18 +1052,6 @@ export class MemoryRepository {
     }
     if (conversation.version !== input.expectedVersion) {
       throw new DomainError("version_conflict", "Conversation changed in another tab", 409);
-    }
-    if (
-      [...this.generationControls.values()].some((control) =>
-        control.conversationId === input.conversationId &&
-        !control.terminalAt
-      )
-    ) {
-      throw new DomainError(
-        "generation_in_progress",
-        "This response is already being generated",
-        409,
-      );
     }
     const usageRun = this.reserve(
       input.ownerId,
@@ -1080,6 +1080,12 @@ export class MemoryRepository {
       stopRequestedAt: null,
       terminalAt: null,
     });
+    // Starting from an earlier response is also an explicit branch selection. Fence that
+    // selection with the version check above so the eventual terminal node (or reaper)
+    // advances this branch, without overwriting a newer selection from another tab.
+    conversation.activeLeafId = source.id;
+    conversation.version++;
+    conversation.updatedAt = new Date().toISOString();
     return { kind: "started", leaseToken, message: userMessage, conversation, usageRun };
   }
 

@@ -1319,6 +1319,11 @@ export class PostgresRepository implements DomainRepository {
       if (priorRuns[0] || priorControls[0]) {
         throw new DomainError("idempotency_conflict", "Incomplete generation replay", 409);
       }
+      const running =
+        await tx`SELECT 1 FROM generation_controls WHERE conversation_id=${input.conversationId} AND terminal_at IS NULL FOR UPDATE`;
+      if (running.length) {
+        throw new DomainError("generation_in_progress", "A generation is already active", 409);
+      }
       const activeLeafId = String(current.active_leaf_id);
       const active = await tx<{ found: boolean }[]>`
         WITH RECURSIVE path AS (
@@ -1336,11 +1341,6 @@ export class PostgresRepository implements DomainRepository {
       }
       if (number(current.version) !== input.expectedVersion) {
         throw new DomainError("version_conflict", "Conversation changed in another tab", 409);
-      }
-      const running =
-        await tx`SELECT 1 FROM generation_controls WHERE conversation_id=${input.conversationId} AND terminal_at IS NULL FOR UPDATE`;
-      if (running.length) {
-        throw new DomainError("generation_in_progress", "A generation is already active", 409);
       }
       const account = await tx<
         Row[]
@@ -1371,11 +1371,19 @@ export class PostgresRepository implements DomainRepository {
       await tx`INSERT INTO ledger_entries(user_id,usage_run_id,kind,amount_micros,balance_after_micros)
         VALUES(${input.ownerId},${input.runId},'reserve',${-input.reserveMicros},${after})`;
       const userRows = await tx<Row[]>`SELECT * FROM messages WHERE id=${sourceUserMessageId}`;
+      // The conversation row is locked and its version was checked above, so selecting
+      // an earlier source here is atomic with reserving the generation. A concurrent
+      // explicit branch selection either wins first (causing version_conflict) or runs
+      // afterwards and is preserved by terminal/reaper compare-and-set updates.
+      const updated = await tx<
+        Row[]
+      >`UPDATE conversations SET active_leaf_id=${input.sourceAssistantId},
+        version=version+1,updated_at=now() WHERE id=${input.conversationId} RETURNING *`;
       return {
         kind: "started" as const,
         leaseToken,
         message: message(userRows[0]),
-        conversation: conversation(current),
+        conversation: conversation(updated[0]),
         usageRun: run(runs[0]),
       };
     });

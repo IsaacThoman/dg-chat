@@ -100,7 +100,11 @@ Deno.test("typed web streaming completes, replays, regenerates, and continues im
 
   let detail = await (await app.request(`/api/conversations/${conversation.id}`, {
     headers: { cookie: auth },
-  })).json() as { version: number; messages: Array<Record<string, unknown>> };
+  })).json() as {
+    version: number;
+    activeLeafId: string | null;
+    messages: Array<Record<string, unknown>>;
+  };
   assertEquals(detail.messages.length, 2);
   const originalAssistant = detail.messages.find((message) => message.role === "assistant")!;
 
@@ -170,6 +174,68 @@ Deno.test("typed web streaming completes, replays, regenerates, and continues im
   const continueReplayEvents = eventPayloads(await continueReplay.text());
   assertEquals(continueReplayEvents[0].replay, true);
   assertEquals(continueReplayEvents[0].generationId, continueEvents[0].generationId);
+
+  // Build a genuine descendant path, then regenerate its earlier assistant ancestor.
+  const earlierConversation = await (await app.request("/api/conversations", {
+    method: "POST",
+    headers: headers(auth),
+    body: JSON.stringify({ title: "Earlier branch" }),
+  })).json() as { id: string };
+  answer = "ancestor";
+  await (await app.request(`/api/conversations/${earlierConversation.id}/generate/stream`, {
+    method: "POST",
+    headers: headers(auth),
+    body: JSON.stringify({
+      ...sendBody,
+      idempotencyKey: "typed-stream-ancestor",
+    }),
+  })).text();
+  let earlierDetail = await (await app.request(`/api/conversations/${earlierConversation.id}`, {
+    headers: { cookie: auth },
+  })).json() as typeof detail;
+  const ancestor = earlierDetail.messages.find((message) => message.content === "ancestor")!;
+  answer = "descendant";
+  await (await app.request(`/api/conversations/${earlierConversation.id}/generate/stream`, {
+    method: "POST",
+    headers: headers(auth),
+    body: JSON.stringify({
+      ...sendBody,
+      parentId: ancestor.id,
+      content: "follow up",
+      expectedVersion: earlierDetail.version,
+      idempotencyKey: "typed-stream-descendant",
+    }),
+  })).text();
+  earlierDetail = await (await app.request(`/api/conversations/${earlierConversation.id}`, {
+    headers: { cookie: auth },
+  })).json() as typeof detail;
+  answer = "earlier replacement";
+  const earlier = await app.request(
+    `/api/conversations/${earlierConversation.id}/generate/stream`,
+    {
+      method: "POST",
+      headers: headers(auth),
+      body: JSON.stringify({
+        mode: "regenerate",
+        sourceMessageId: ancestor.id,
+        model: "simulated/dg-chat",
+        expectedVersion: earlierDetail.version,
+        idempotencyKey: "typed-stream-earlier-regenerate",
+      }),
+    },
+  );
+  assertEquals(earlier.status, 200);
+  const earlierEvents = eventPayloads(await earlier.text());
+  const earlierStartedConversation = earlierEvents[0].conversation as Record<string, unknown>;
+  assertEquals(earlierStartedConversation.activeLeafId, ancestor.id);
+  earlierDetail = await (await app.request(`/api/conversations/${earlierConversation.id}`, {
+    headers: { cookie: auth },
+  })).json() as typeof detail;
+  const earlierReplacement = earlierDetail.messages.find((message) =>
+    message.content === "earlier replacement"
+  )!;
+  assertEquals(earlierDetail.activeLeafId, earlierReplacement.id);
+  assertEquals(earlierReplacement.supersedesId, ancestor.id);
 
   const stale = await app.request(`/api/conversations/${conversation.id}/generate/stream`, {
     method: "POST",

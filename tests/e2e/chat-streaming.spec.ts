@@ -134,3 +134,33 @@ test("regenerate and continue append recoverable assistant branches", async ({ p
   expect(assistants[2].supersedesId).toBe(assistants[0].id);
   expect(assistants[2].metadata.continuesId).toBe(assistants[0].id);
 });
+
+test("regenerating an earlier turn selects and keeps the new branch", async ({ page }) => {
+  const composer = page.getByRole("textbox", { name: "Message" });
+  await composer.fill("first turn with a later descendant");
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(page.locator(".assistant-message")).toHaveCount(1);
+  await composer.fill("second turn makes the first assistant non-leaf");
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(page.locator(".assistant-message")).toHaveCount(2);
+
+  await page.getByRole("button", { name: "Regenerate response in a new branch" }).first().click();
+  await expect(page.locator(".assistant-message")).toHaveCount(1);
+  await expect(page.getByLabel("Branch 2 of 2")).toBeVisible();
+  await expect(page.getByText("second turn makes the first assistant non-leaf")).toBeHidden();
+
+  const conversationId = await page.locator(
+    ".conversation-row.active [data-conversation-actions]",
+  ).getAttribute("data-conversation-actions");
+  expect(conversationId).toBeTruthy();
+  await page.reload();
+  if ((page.viewportSize()?.width ?? 1280) <= 800) {
+    await page.getByRole("button", { name: "Open menu", exact: true }).click();
+  }
+  await page.locator(
+    `.conversation-row:has([data-conversation-actions="${conversationId}"]) button.conversation-open`,
+  ).click();
+  await expect(page.locator(".assistant-message")).toHaveCount(1);
+  await expect(page.getByLabel("Branch 2 of 2")).toBeVisible();
+  await expect(page.getByText("second turn makes the first assistant non-leaf")).toBeHidden();
+});
