@@ -44,6 +44,7 @@ export const users = pgTable("users", {
   approvalStatus: approvalStatus("approval_status").notNull().default("pending"),
   state: accountState("state").notNull().default("active"),
   balanceMicros: bigint("balance_micros", { mode: "number" }).notNull().default(0),
+  emailVerifiedAt: timestamp("email_verified_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   deletedAt: timestamp("deleted_at", { withTimezone: true }),
@@ -67,6 +68,19 @@ export const sessions = pgTable(
     index("sessions_user_idx").on(table.userId),
   ],
 );
+
+export const identityTokens = pgTable("identity_tokens", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  purpose: text("purpose").notNull(),
+  tokenHash: text("token_hash").notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  consumedAt: timestamp("consumed_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("identity_tokens_hash_uq").on(table.tokenHash),
+  index("identity_tokens_user_purpose_idx").on(table.userId, table.purpose),
+]);
 
 export const conversations = pgTable("conversations", {
   id: uuid("id").primaryKey().defaultRandom(),
@@ -180,6 +194,8 @@ export const usageRuns = pgTable("usage_runs", {
   latencyMs: integer("latency_ms"),
   ttftMs: integer("ttft_ms"),
   error: text("error"),
+  generationLeaseToken: uuid("generation_lease_token"),
+  generationLeaseExpiresAt: timestamp("generation_lease_expires_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   completedAt: timestamp("completed_at", { withTimezone: true }),
 });

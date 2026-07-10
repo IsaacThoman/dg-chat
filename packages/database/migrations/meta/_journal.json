@@ -22,6 +22,20 @@
       "when": 1783656002000,
       "tag": "0002_openai_replays",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1783656003000,
+      "tag": "0003_identity_readiness",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1783656004000,
+      "tag": "0004_generation_leases",
+      "breakpoints": true
     }
   ]
 }

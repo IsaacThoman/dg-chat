@@ -10,6 +10,7 @@ export interface PublicUser {
   approvalStatus: ApprovalStatus;
   state: AccountState;
   balanceMicros: number;
+  emailVerifiedAt?: string | null;
   createdAt: string;
 }
 

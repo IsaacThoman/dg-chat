@@ -66,7 +66,9 @@ export async function backfillLegacyRuntimeSnapshot(url: string): Promise<Legacy
       }
       await tx`SET CONSTRAINTS ALL DEFERRED`;
       for (const [, value] of snapshot.users ?? []) {
-        await tx`INSERT INTO users(id,email,name,password_hash,role,approval_status,state,balance_micros,created_at,updated_at) VALUES(${value.id},${value.email},${value.name},${value.passwordHash},${value.role},${value.approvalStatus},${value.state},${value.balanceMicros},${value.createdAt},${value.createdAt})`;
+        await tx`INSERT INTO users(id,email,name,password_hash,role,approval_status,state,balance_micros,email_verified_at,created_at,updated_at) VALUES(${value.id},${value.email},${value.name},${value.passwordHash},${value.role},${value.approvalStatus},${value.state},${value.balanceMicros},${
+          value.approvalStatus === "approved" ? value.createdAt : null
+        },${value.createdAt},${value.createdAt})`;
       }
       for (const [hash, value] of snapshot.sessions ?? []) {
         await tx`INSERT INTO sessions(user_id,token_hash,limited,expires_at) VALUES(${value.userId},${hash},${value.limited},${new Date(

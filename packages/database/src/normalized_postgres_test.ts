@@ -22,6 +22,7 @@ Deno.test({
         email: "admin@database.test",
         name: "Admin",
         passwordHash: "hash",
+        emailVerified: true,
       }, 5_000_000);
       assertEquals(admin.balanceMicros, 5_000_000);
       await assertRejects(
@@ -39,15 +40,99 @@ Deno.test({
         email: "user@database.test",
         name: "User",
         passwordHash: "hash",
+        emailVerified: true,
       });
       await repo.approveUser(applicant.id, "approved", 1_000_000);
       const session = await repo.createSession(applicant.id, "session-hash", false);
       assertEquals((await repo.getSession(session.tokenHash))?.userId, applicant.id);
+      assertEquals((await repo.listSessions(applicant.id))[0].id, session.id);
+
+      const identityUser = await repo.createUser({
+        email: "identity@database.test",
+        name: "Identity",
+        passwordHash: "old-hash",
+      });
+      await assertRejects(
+        () => repo.approveUser(identityUser.id, "approved", 10, true),
+        DomainError,
+        "verified",
+      );
+      await Promise.all([
+        repo.createIdentityToken(
+          identityUser.id,
+          "email_verification",
+          "verify-db-hash",
+          new Date(Date.now() + 60_000).toISOString(),
+        ),
+        repo.createIdentityToken(
+          identityUser.id,
+          "email_verification",
+          "verify-db-hash-concurrent",
+          new Date(Date.now() + 60_000).toISOString(),
+        ),
+      ]);
+      await repo.verifyEmail("verify-db-hash");
+      await repo.verifyEmail("verify-db-hash-concurrent");
+      await assertRejects(
+        () => repo.verifyEmail("verify-db-hash"),
+        DomainError,
+        "invalid or expired",
+      );
+      const identitySession = await repo.createSession(
+        identityUser.id,
+        "identity-session-hash",
+        false,
+      );
+      const identityApiToken = await repo.createApiToken(identityUser.id, {
+        name: "identity-token",
+        scopes: ["chat:write"],
+        tokenHash: "identity-api-hash",
+        preview: "identity…hash",
+      });
+      await Promise.all([
+        repo.createIdentityToken(
+          identityUser.id,
+          "password_reset",
+          "reset-db-hash",
+          new Date(Date.now() + 60_000).toISOString(),
+        ),
+        repo.createIdentityToken(
+          identityUser.id,
+          "password_reset",
+          "reset-db-hash-concurrent",
+          new Date(Date.now() + 60_000).toISOString(),
+        ),
+      ]);
+      await repo.resetPassword("reset-db-hash", "new-hash");
+      assertEquals(await repo.getSession(identitySession.tokenHash), undefined);
+      assertEquals((await repo.findApiTokenByHash("identity-api-hash"))?.revokedAt !== null, true);
+      assertEquals(identityApiToken.userId, identityUser.id);
+      await assertRejects(
+        () => repo.resetPassword("reset-db-hash", "again"),
+        DomainError,
+        "invalid or expired",
+      );
+      await assertRejects(
+        () => repo.resetPassword("reset-db-hash-concurrent", "again"),
+        DomainError,
+        "invalid or expired",
+      );
+      await repo.recordAudit({
+        actorId: identityUser.id,
+        action: "identity.test",
+        targetType: "user",
+        targetId: identityUser.id,
+      });
+      assertEquals(
+        (await repo.listAudit()).some((event) => event.action === "identity.test"),
+        true,
+      );
 
       const quotaUser = await repo.createUser({
         email: "quota-requests@database.test",
         name: "Request Quota",
         passwordHash: "hash",
+        emailVerified: true,
       });
       await repo.approveUser(quotaUser.id, "approved", 1_000_000);
       const requestQuota = { maxRequests: 1, maxEvents: 10, maxBytes: 10_000 };
@@ -71,6 +156,7 @@ Deno.test({
         email: "quota-events@database.test",
         name: "Event Quota",
         passwordHash: "hash",
+        emailVerified: true,
       });
       await repo.approveUser(eventQuotaUser.id, "approved", 1_000_000);
       const eventQuota = { maxRequests: 2, maxEvents: 1, maxBytes: 10_000 };
@@ -159,11 +245,13 @@ Deno.test({
         provider: "test",
         reserveMicros: 50_000,
       });
+      if (started.kind !== "started") throw new Error("generation did not start");
       const completed = await repo.completeGeneration({
         conversationId: chat.id,
         ownerId: applicant.id,
         userMessageId: started.message.id,
         runId: "atomic-run",
+        leaseToken: started.leaseToken,
         idempotencyKey: "atomic-assistant",
         content: "answer",
         model: "test/model",
@@ -353,6 +441,7 @@ Deno.test({
         passwordHash: "hash",
         role: "admin",
         approvalStatus: "approved",
+        emailVerified: true,
       });
       const removals = await Promise.allSettled([
         repo.setUserState(admin.id, "suspended"),
@@ -499,5 +588,198 @@ Deno.test({
     >`SELECT idempotency_key FROM messages WHERE id=${messageId}`;
     assertEquals(imported[0].idempotency_key, "legacy-message");
     await verify.end();
+  },
+});
+
+Deno.test({
+  name: "normalized repository fences graph writes after archive or deletion",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 1 });
+    await sql`TRUNCATE audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
+    await sql.end();
+    const repo = await PostgresRepository.connect(databaseUrl!);
+    try {
+      const owner = await repo.bootstrapAdmin({
+        email: "readonly@database.test",
+        name: "Read-only owner",
+        passwordHash: "hash",
+      }, 1_000_000);
+      const conversation = await repo.createConversation(owner.id, "Read only");
+      const root = await repo.appendMessage({
+        conversationId: conversation.id,
+        ownerId: owner.id,
+        parentId: null,
+        role: "user",
+        content: "root",
+        expectedVersion: 0,
+        idempotencyKey: "readonly-root",
+      });
+      const assertReadOnly = async () => {
+        await assertRejects(
+          () =>
+            repo.appendMessage({
+              conversationId: conversation.id,
+              ownerId: owner.id,
+              parentId: root.id,
+              role: "user",
+              content: "blocked",
+              expectedVersion: 2,
+              idempotencyKey: `readonly-message-${crypto.randomUUID()}`,
+            }),
+          DomainError,
+          "read-only",
+        );
+        await assertRejects(
+          () =>
+            repo.beginGeneration({
+              message: {
+                conversationId: conversation.id,
+                ownerId: owner.id,
+                parentId: root.id,
+                role: "user",
+                content: "blocked generation",
+                model: "simulated/dg-chat",
+                expectedVersion: 2,
+                idempotencyKey: `readonly-generation-${crypto.randomUUID()}`,
+              },
+              runId: `readonly-run-${crypto.randomUUID()}`,
+              provider: "simulated",
+              reserveMicros: 1,
+            }),
+          DomainError,
+          "read-only",
+        );
+        await assertRejects(
+          () => repo.setActiveLeaf(conversation.id, owner.id, root.id, 2),
+          DomainError,
+          "read-only",
+        );
+      };
+
+      await repo.updateConversation(owner.id, conversation.id, { archived: true });
+      await assertReadOnly();
+      await repo.updateConversation(owner.id, conversation.id, { archived: false, deleted: true });
+      await assertReadOnly();
+    } finally {
+      await repo.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "normalized generation leases claim once and fence stale owners",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 2 });
+    await sql`TRUNCATE audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
+    const repo = await PostgresRepository.connect(databaseUrl!);
+    try {
+      const owner = await repo.bootstrapAdmin({
+        email: "generation-lease@database.test",
+        name: "Lease owner",
+        passwordHash: "hash",
+      }, 1_000_000);
+      const conversation = await repo.createConversation(owner.id, "Lease");
+      const input = {
+        message: {
+          conversationId: conversation.id,
+          ownerId: owner.id,
+          parentId: null,
+          role: "user" as const,
+          content: "generate once",
+          model: "simulated/dg-chat",
+          expectedVersion: 0,
+          idempotencyKey: "postgres-lease-user",
+        },
+        runId: "postgres-generation-lease",
+        provider: "simulated",
+        reserveMicros: 100,
+        leaseSeconds: 60,
+      };
+      const started = await repo.beginGeneration(input);
+      if (started.kind !== "started") throw new Error("generation did not start");
+      await sql`UPDATE usage_runs SET generation_lease_expires_at=now()-interval '1 second' WHERE id=${input.runId}`;
+      const contenders = await Promise.all([
+        repo.beginGeneration(input),
+        repo.beginGeneration(input),
+      ]);
+      assertEquals(contenders.map((result) => result.kind).sort(), ["claimed", "in_progress"]);
+      const claimed = contenders.find((result) => result.kind === "claimed");
+      if (!claimed || claimed.kind !== "claimed") throw new Error("generation was not claimed");
+      await assertRejects(
+        () =>
+          repo.completeGeneration({
+            conversationId: conversation.id,
+            ownerId: owner.id,
+            userMessageId: started.message.id,
+            runId: input.runId,
+            leaseToken: started.leaseToken,
+            idempotencyKey: "postgres-lease-stale-assistant",
+            content: "stale",
+            model: "simulated/dg-chat",
+            costMicros: 10,
+            inputTokens: 1,
+            outputTokens: 1,
+            latencyMs: 1,
+          }),
+        DomainError,
+        "lease",
+      );
+      await repo.heartbeatGeneration(input.runId, owner.id, claimed.leaseToken, 60);
+      const completed = await repo.completeGeneration({
+        conversationId: conversation.id,
+        ownerId: owner.id,
+        userMessageId: claimed.message.id,
+        runId: input.runId,
+        leaseToken: claimed.leaseToken,
+        idempotencyKey: "postgres-lease-assistant",
+        content: "owned",
+        model: "simulated/dg-chat",
+        costMicros: 10,
+        inputTokens: 1,
+        outputTokens: 1,
+        latencyMs: 1,
+      });
+      assertEquals(completed.message.content, "owned");
+      assertEquals(completed.usageRun.generationLeaseToken, null);
+
+      const abandonedConversation = await repo.createConversation(owner.id, "Abandoned");
+      const abandoned = await repo.beginGeneration({
+        ...input,
+        message: {
+          ...input.message,
+          conversationId: abandonedConversation.id,
+          expectedVersion: 0,
+          idempotencyKey: "postgres-reaper-user",
+        },
+        runId: "postgres-generation-reaper",
+      });
+      if (abandoned.kind !== "started") throw new Error("abandoned generation did not start");
+      await sql`UPDATE usage_runs SET generation_lease_expires_at=now()-interval '1 second' WHERE id='postgres-generation-reaper'`;
+      assertEquals(await repo.reapStaleGenerations(), 1);
+      assertEquals(await repo.reapStaleGenerations(), 0);
+      await assertRejects(
+        () =>
+          repo.failGeneration({
+            conversationId: abandonedConversation.id,
+            ownerId: owner.id,
+            userMessageId: abandoned.message.id,
+            runId: "postgres-generation-reaper",
+            leaseToken: abandoned.leaseToken,
+            idempotencyKey: "postgres-reaper-error",
+            model: "simulated/dg-chat",
+            error: "stale",
+          }),
+        DomainError,
+      );
+    } finally {
+      await repo.close();
+      await sql.end();
+    }
   },
 });

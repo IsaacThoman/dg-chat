@@ -2,7 +2,8 @@ import { assertEquals, assertExists, assertStringIncludes } from "jsr:@std/asser
 import { createApp } from "./app.ts";
 import type { RateLimiter } from "./rate-limit.ts";
 import type { ChatCompletionRequest } from "@dg-chat/contracts";
-import { DomainError } from "@dg-chat/database";
+import { DomainError, MemoryRepository } from "@dg-chat/database";
+import { type IdentityMailer, TestIdentityMailer } from "./mail.ts";
 
 async function json(response: Response) {
   // deno-lint-ignore no-explicit-any
@@ -16,9 +17,12 @@ function sessionCookie(response: Response): string {
 }
 
 Deno.test("bootstrap, signup, approval, immutable chat, API token and OpenAI completion", async () => {
+  const mailer = new TestIdentityMailer();
   const { app, repository } = createApp({
     setupToken: "setup-secret",
     startingCreditMicros: 5_000_000,
+    mailer,
+    requireEmailVerification: true,
     idempotencyHeartbeatMs: 20,
     idempotencyLeaseSeconds: 1,
   });
@@ -66,6 +70,12 @@ Deno.test("bootstrap, signup, approval, immutable chat, API token and OpenAI com
     headers: userAuth,
   });
   assertEquals(blocked.status, 403);
+  const verification = await app.request("/api/auth/verify-email", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token: mailer.messages.at(-1)?.token }),
+  });
+  assertEquals(verification.status, 200);
   const approval = await app.request(`/api/admin/users/${signed.user.id}/approval`, {
     method: "PATCH",
     headers: adminAuth,
@@ -349,6 +359,75 @@ Deno.test("bootstrap, signup, approval, immutable chat, API token and OpenAI com
   );
   assertEquals(await failedPersistenceReplay.text(), failedPersistenceBody);
 
+  const resetRequest = await app.request("/api/auth/password-reset/request", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email: "person@example.com" }),
+  });
+  assertEquals(resetRequest.status, 202);
+  const resetToken = mailer.messages.findLast((message) => message.kind === "password_reset")
+    ?.token;
+  assertExists(resetToken);
+  const reset = await app.request("/api/auth/password-reset", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token: resetToken, password: "new correct horse battery" }),
+  });
+  assertEquals(reset.status, 204);
+  const resetReplay = await app.request("/api/auth/password-reset", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token: resetToken, password: "another correct horse battery" }),
+  });
+  assertEquals(resetReplay.status, 400);
+  assertEquals(
+    (await app.request("/v1/models", {
+      headers: { authorization: `Bearer ${apiToken.token}` },
+    })).status,
+    401,
+  );
+  const newLogin = await app.request("/api/auth/sign-in/email", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email: "person@example.com",
+      password: "new correct horse battery",
+    }),
+  });
+  assertEquals(newLogin.status, 200);
+  const newUserAuth = {
+    cookie: sessionCookie(newLogin),
+    origin: "http://localhost:5173",
+    "content-type": "application/json",
+  };
+  const sessions = await json(await app.request("/api/sessions", { headers: newUserAuth }));
+  const activeSession = sessions.data.find((session: { invalidatedAt: string | null }) =>
+    session.invalidatedAt === null
+  );
+  assertExists(activeSession);
+  assertEquals(
+    (await app.request(`/api/sessions/${activeSession.id}`, {
+      method: "DELETE",
+      headers: newUserAuth,
+    })).status,
+    204,
+  );
+  const audit = await json(await app.request("/api/admin/audit", { headers: adminAuth }));
+  assertEquals(
+    audit.data.some((event: { action: string }) =>
+      event.action === "identity.password_reset_completed"
+    ),
+    true,
+  );
+  assertEquals(
+    (await app.request("/api/admin/audit?limit=2.5", { headers: adminAuth })).status,
+    422,
+  );
+  assertEquals(
+    (await app.request("/api/admin/audit?limit=201", { headers: adminAuth })).status,
+    422,
+  );
+
   const missingOrigin = await app.request("/api/conversations", {
     method: "POST",
     headers: { cookie: sessionCookie(signup), "content-type": "application/json" },
@@ -358,6 +437,94 @@ Deno.test("bootstrap, signup, approval, immutable chat, API token and OpenAI com
   assertStringIncludes(
     (await app.request("/health")).headers.get("content-security-policy") ?? "",
     "default-src 'self'",
+  );
+});
+
+Deno.test("email verification defaults off and SMTP failures do not break identity requests", async () => {
+  const failingMailer: IdentityMailer = {
+    send: () => Promise.reject(new Error("delivery unavailable")),
+  };
+  const { app, repository } = createApp({
+    setupToken: "setup-secret",
+    mailer: failingMailer,
+  });
+  const status = await json(await app.request("/api/setup/status"));
+  assertEquals(status.requireEmailVerification, false);
+  assertEquals(status.emailEnabled, true);
+
+  const bootstrap = await app.request("/api/setup/bootstrap", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-setup-token": "setup-secret" },
+    body: JSON.stringify({
+      email: "smtp-admin@example.com",
+      password: "correct horse battery",
+      name: "Admin",
+    }),
+  });
+  assertEquals(bootstrap.status, 201);
+  const adminLogin = await app.request("/api/auth/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email: "smtp-admin@example.com",
+      password: "correct horse battery",
+    }),
+  });
+  const adminHeaders = {
+    cookie: sessionCookie(adminLogin),
+    origin: "http://localhost:5173",
+    "content-type": "application/json",
+  };
+  const signup = await app.request("/api/auth/register", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email: "smtp-user@example.com",
+      password: "correct horse battery",
+      name: "User",
+    }),
+  });
+  assertEquals(signup.status, 201);
+  const signed = await json(signup);
+  assertEquals(signed.user.emailVerifiedAt, null);
+  assertEquals(
+    (await app.request(`/api/admin/users/${signed.user.id}/approval`, {
+      method: "PATCH",
+      headers: adminHeaders,
+      body: JSON.stringify({ status: "approved" }),
+    })).status,
+    200,
+  );
+  const login = await app.request("/api/auth/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email: "smtp-user@example.com",
+      password: "correct horse battery",
+    }),
+  });
+  assertEquals((await json(login)).limited, false);
+  assertEquals(
+    (await app.request("/api/auth/password-reset/request", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "smtp-user@example.com" }),
+    })).status,
+    202,
+  );
+  assertEquals(
+    (await app.request("/api/auth/password-reset/request", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "unknown@example.com" }),
+    })).status,
+    202,
+  );
+  assertEquals(
+    (await repository.listAudit()).some((event) =>
+      event.action === "identity.password_reset_delivery_failed"
+    ),
+    true,
   );
 });
 
@@ -693,4 +860,137 @@ Deno.test("disconnecting after a role-only provider chunk refunds the reservatio
   const after = await repository.usage(me.user.id);
   assertEquals(after.balanceMicros, before.balanceMicros);
   assertEquals(after.calls, before.calls);
+});
+
+Deno.test("OpenAI routes reject upstream models that are not explicitly configured", async () => {
+  const { app } = createApp({ setupToken: "model-allowlist-setup" });
+  await app.request("/api/setup/bootstrap", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-setup-token": "model-allowlist-setup",
+    },
+    body: JSON.stringify({
+      email: "model-allowlist@example.com",
+      password: "correct horse battery",
+      name: "Model Admin",
+    }),
+  });
+  const login = await app.request("/api/auth/sign-in/email", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email: "model-allowlist@example.com",
+      password: "correct horse battery",
+    }),
+  });
+  const auth = {
+    cookie: sessionCookie(login),
+    origin: "http://localhost:5173",
+    "content-type": "application/json",
+  };
+  const tokenResponse = await app.request("/api/tokens", {
+    method: "POST",
+    headers: auth,
+    body: JSON.stringify({ name: "allowlist", scopes: ["models:read", "chat:write"] }),
+  });
+  const token = (await json(tokenResponse)).token as string;
+  const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
+
+  const completion = await app.request("/v1/chat/completions", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model: "openai/not-configured",
+      messages: [{ role: "user", content: "must not reach the provider" }],
+    }),
+  });
+  assertEquals(completion.status, 404);
+  assertEquals((await json(completion)).error.code, "model_not_found");
+
+  const responses = await app.request("/v1/responses", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ model: "openai/not-configured", input: "must not reach the provider" }),
+  });
+  assertEquals(responses.status, 404);
+  assertEquals((await json(responses)).error.code, "model_not_found");
+});
+
+Deno.test("expired web generation ownership is reclaimed once and fences the old worker", async () => {
+  const pending: Array<
+    (value: { text: string; inputTokens: number; outputTokens: number }) => void
+  > = [];
+  const webComplete = () =>
+    new Promise<{ text: string; inputTokens: number; outputTokens: number }>((resolve) =>
+      pending.push(resolve)
+    );
+  const repository = new MemoryRepository();
+  const { app } = createApp({
+    repository,
+    setupToken: "generation-lease-setup",
+    generationHeartbeatMs: 60_000,
+    generationLeaseSeconds: 60,
+    webComplete,
+  });
+  const bootstrap = await app.request("/api/setup/bootstrap", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-setup-token": "generation-lease-setup" },
+    body: JSON.stringify({
+      email: "generation-lease@example.com",
+      password: "correct horse battery",
+      name: "Lease Admin",
+    }),
+  });
+  const owner = (await json(bootstrap)).user;
+  const login = await app.request("/api/auth/sign-in/email", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email: "generation-lease@example.com",
+      password: "correct horse battery",
+    }),
+  });
+  const headers = {
+    cookie: sessionCookie(login),
+    origin: "http://localhost:5173",
+    "content-type": "application/json",
+  };
+  const created = await app.request("/api/conversations", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ title: "Lease" }),
+  });
+  const conversation = await json(created);
+  const generationBody = JSON.stringify({
+    content: "claim me",
+    model: "simulated/dg-chat",
+    parentId: null,
+    expectedVersion: 0,
+    idempotencyKey: "web-generation-fenced",
+  });
+  const request = () =>
+    app.request(`/api/conversations/${conversation.id}/generate`, {
+      method: "POST",
+      headers,
+      body: generationBody,
+    });
+
+  const oldWorker = request();
+  while (pending.length < 1) await new Promise((resolve) => setTimeout(resolve, 0));
+  const runId = `${owner.id}:web-generation:web-generation-fenced`;
+  const run = repository.usageRuns.get(runId);
+  assertExists(run);
+  run.generationLeaseExpiresAt = new Date(Date.now() - 1).toISOString();
+  const newWorker = request();
+  while (pending.length < 2) await new Promise((resolve) => setTimeout(resolve, 0));
+
+  pending[0]({ text: "stale answer", inputTokens: 1, outputTokens: 2 });
+  assertEquals((await oldWorker).status, 409);
+  pending[1]({ text: "owned answer", inputTokens: 1, outputTokens: 2 });
+  const completed = await newWorker;
+  assertEquals(completed.status, 201);
+  assertEquals((await json(completed)).assistant.content, "owned answer");
+  const detail = await repository.detail(conversation.id, owner.id);
+  assertEquals(detail.messages.filter((message) => message.role === "assistant").length, 1);
 });

@@ -21,6 +21,27 @@ export interface CreateUserInput {
   role?: UserRole;
   approvalStatus?: ApprovalStatus;
   state?: AccountState;
+  emailVerified?: boolean;
+}
+export type IdentityTokenPurpose = "email_verification" | "password_reset";
+export interface SessionSummary {
+  id: string;
+  userId: string;
+  limited: boolean;
+  expiresAt: string;
+  createdAt: string;
+  invalidatedAt: string | null;
+}
+export interface AuditEventInput {
+  actorId?: string | null;
+  action: string;
+  targetType: string;
+  targetId?: string | null;
+  metadata?: Record<string, unknown>;
+}
+export interface AuditEvent extends AuditEventInput {
+  id: string;
+  createdAt: string;
 }
 
 export interface AppendMessageInput {
@@ -50,12 +71,14 @@ export interface BeginGenerationInput {
   provider: string;
   reserveMicros: number;
   tokenId?: string;
+  leaseSeconds?: number;
 }
 export interface CompleteGenerationInput {
   conversationId: string;
   ownerId: string;
   userMessageId: string;
   runId: string;
+  leaseToken: string;
   idempotencyKey: string;
   content: string;
   model: string;
@@ -70,6 +93,7 @@ export interface FailGenerationInput {
   ownerId: string;
   userMessageId: string;
   runId: string;
+  leaseToken: string;
   idempotencyKey: string;
   model: string;
   error: string;
@@ -78,8 +102,11 @@ export interface GenerationResult {
   message: MessageNode;
   conversation: Conversation;
   usageRun: UsageRun;
-  replayed?: boolean;
 }
+export type BeginGenerationResult =
+  | (GenerationResult & { kind: "started" | "claimed"; leaseToken: string })
+  | (GenerationResult & { kind: "completed" })
+  | (GenerationResult & { kind: "in_progress"; retryAfterSeconds: number });
 export interface ConversationPatch {
   title?: string;
   pinned?: boolean;
@@ -210,10 +237,23 @@ export interface DomainRepository {
   getSession(tokenHash: string): MaybePromise<StoredSession | undefined>;
   invalidateUserSessions(userId: string): MaybePromise<void>;
   deleteSession(tokenHash: string): MaybePromise<void>;
+  listSessions(userId: string): MaybePromise<SessionSummary[]>;
+  revokeSession(id: string, ownerId?: string): MaybePromise<void>;
+  createIdentityToken(
+    userId: string,
+    purpose: IdentityTokenPurpose,
+    tokenHash: string,
+    expiresAt: string,
+  ): MaybePromise<void>;
+  verifyEmail(tokenHash: string): MaybePromise<StoredUser>;
+  resetPassword(tokenHash: string, passwordHash: string): MaybePromise<StoredUser>;
+  recordAudit(input: AuditEventInput): MaybePromise<AuditEvent>;
+  listAudit(limit?: number): MaybePromise<AuditEvent[]>;
   approveUser(
     id: string,
     status: "approved" | "rejected",
     creditMicros: number,
+    requireEmailVerification?: boolean,
   ): MaybePromise<StoredUser>;
   setUserState(id: string, state: AccountState): MaybePromise<StoredUser>;
   createConversation(
@@ -230,9 +270,16 @@ export interface DomainRepository {
   ): MaybePromise<Conversation>;
   detail(id: string, ownerId: string): MaybePromise<ConversationDetail>;
   appendMessage(input: AppendMessageInput): MaybePromise<MessageNode>;
-  beginGeneration(input: BeginGenerationInput): MaybePromise<GenerationResult>;
+  beginGeneration(input: BeginGenerationInput): MaybePromise<BeginGenerationResult>;
+  heartbeatGeneration(
+    runId: string,
+    ownerId: string,
+    leaseToken: string,
+    leaseSeconds?: number,
+  ): MaybePromise<void>;
   completeGeneration(input: CompleteGenerationInput): MaybePromise<GenerationResult>;
   failGeneration(input: FailGenerationInput): MaybePromise<GenerationResult>;
+  reapStaleGenerations(limit?: number): MaybePromise<number>;
   setActiveLeaf(
     conversationId: string,
     ownerId: string,
