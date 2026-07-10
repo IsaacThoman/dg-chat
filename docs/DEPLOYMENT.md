@@ -25,6 +25,11 @@ docker compose ps
 curl --fail https://chat.example.com/ready
 ```
 
+Wait for both `app` and `worker` to report healthy. The worker health check verifies that its
+process is running and that the migrated durable-job table is queryable. A worker restart during
+initial deployment indicates a migration-ordering or database-connectivity fault and should block
+rollout.
+
 The app is published on `${PORT:-8000}`. Put it behind a TLS-terminating reverse proxy and forward
 the original scheme and host. Preserve streaming responses by disabling proxy buffering for `/v1/*`
 and chat streams and by setting idle timeouts above the maximum generation timeout.

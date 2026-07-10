@@ -71,8 +71,20 @@ USER dgchat
 CMD ["/usr/local/bin/dg-chat-api"]
 
 FROM debian:trixie-slim AS worker
-RUN groupadd --system dgchat \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates postgresql-client \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system dgchat \
     && useradd --system --gid dgchat --no-create-home dgchat
+RUN <<'EOF'
+cat > /usr/local/bin/worker-healthcheck <<'SCRIPT'
+#!/bin/sh
+set -eu
+test "$(cat /proc/1/comm)" = "dg-chat-worker"
+exec psql "$DATABASE_URL" --no-psqlrc --tuples-only --command "SELECT 1 FROM jobs LIMIT 0" >/dev/null
+SCRIPT
+chmod 0755 /usr/local/bin/worker-healthcheck
+EOF
 COPY --from=service-build /service/dg-chat-worker /usr/local/bin/dg-chat-worker
 ENV DENO_ENV=production
 USER dgchat
