@@ -54,6 +54,10 @@ export const generateMessageSchema = z.object({
   model: z.string().min(1).max(200),
   expectedVersion: z.number().int().nonnegative(),
   idempotencyKey: z.string().min(8).max(200),
+  attachmentIds: z.array(z.string().uuid()).max(10).refine(
+    (ids) => new Set(ids).size === ids.length,
+    "Attachment identifiers must be unique",
+  ).optional().default([]),
 });
 
 export const createTokenSchema = z.object({

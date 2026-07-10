@@ -1,4 +1,4 @@
-import type { Conversation, Message, Model, Token, User } from "./types.ts";
+import type { Attachment, Conversation, Message, Model, Token, User } from "./types.ts";
 import { demoConversations, demoMessages, demoModels, demoTokens, demoUser } from "./demo.ts";
 import type { SetupStatus } from "./setupDiscovery.ts";
 
@@ -35,6 +35,7 @@ type RawMessage = {
   model: string | null;
   metadata: Record<string, unknown>;
   createdAt: string;
+  attachments?: Attachment[];
 };
 type RawModel = {
   id: string;
@@ -84,6 +85,7 @@ function mapMessage(value: RawMessage): Message {
     }),
     model: value.model ?? undefined,
     latency: [duration, tokens].filter(Boolean).join(" · ") || undefined,
+    attachments: value.attachments,
   };
 }
 function mapModel(value: RawModel): Model {
@@ -107,11 +109,74 @@ async function request<T>(path: string, init?: RequestInit, fallback?: T): Promi
       headers: { ...json, ...init?.headers },
     });
     if (!response.ok) throw new Error(`${response.status}`);
+    if (response.status === 204) return undefined as T;
     return await response.json() as T;
   } catch (error) {
     if (demoMode && fallback !== undefined) return structuredClone(fallback);
     throw error;
   }
+}
+
+function uploadError(xhr: XMLHttpRequest): Error {
+  try {
+    const payload = JSON.parse(xhr.responseText) as { error?: { message?: string } };
+    if (payload.error?.message) return new Error(payload.error.message);
+  } catch {
+    // Preserve a stable, non-HTML error when the server did not return JSON.
+  }
+  return new Error(xhr.status ? `Upload failed (${xhr.status})` : "Upload failed");
+}
+
+export function uploadAttachment(
+  file: File,
+  onProgress: (percent: number) => void,
+  signal: AbortSignal,
+  createRequest: () => XMLHttpRequest = () => new XMLHttpRequest(),
+): Promise<Attachment> {
+  signal.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const xhr = createRequest();
+    const abort = () => xhr.abort();
+    const cleanup = () => signal.removeEventListener("abort", abort);
+    xhr.open("POST", "/api/attachments");
+    xhr.withCredentials = true;
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable && event.total > 0) {
+        onProgress(Math.min(100, Math.round(event.loaded / event.total * 100)));
+      }
+    };
+    xhr.onload = () => {
+      cleanup();
+      if (xhr.status < 200 || xhr.status >= 300) {
+        reject(uploadError(xhr));
+        return;
+      }
+      try {
+        const payload = JSON.parse(xhr.responseText) as { attachment?: Attachment };
+        if (!payload.attachment?.id) throw new Error("Upload returned an invalid attachment");
+        onProgress(100);
+        resolve(payload.attachment);
+      } catch (error) {
+        reject(error);
+      }
+    };
+    xhr.onerror = () => {
+      cleanup();
+      reject(uploadError(xhr));
+    };
+    xhr.onabort = () => {
+      cleanup();
+      reject(
+        signal.reason instanceof Error
+          ? signal.reason
+          : new DOMException("Upload cancelled", "AbortError"),
+      );
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    const form = new FormData();
+    form.append("file", file);
+    xhr.send(form);
+  });
 }
 
 export const api = {
@@ -133,6 +198,15 @@ export const api = {
       ? structuredClone(demoConversations.filter((conversation) => conversation.deleted))
       : (await request<{ data: RawConversation[] }>("/conversations?deleted=true")).data
         .map(mapConversation).filter((conversation) => conversation.deleted),
+  attachments: async () => {
+    const result = await request<{ data?: Attachment[]; attachments?: Attachment[] }>(
+      "/attachments",
+    );
+    return result.data ?? result.attachments ?? [];
+  },
+  uploadAttachment,
+  deleteAttachment: (id: string) =>
+    request<unknown>(`/attachments/${encodeURIComponent(id)}`, { method: "DELETE" }),
   updateConversation: async (
     id: string,
     patch: { title?: string; pinned?: boolean; archived?: boolean; deleted?: boolean },
@@ -214,10 +288,10 @@ export const api = {
         body: JSON.stringify({ title, idempotencyKey }),
       }),
     ),
-  createToken: (name: string) =>
+  createToken: (name: string, scopes: string[] = ["chat:write", "models:read"]) =>
     request<{ token: string }>("/tokens", {
       method: "POST",
-      body: JSON.stringify({ name, scopes: ["chat:write", "models:read"] }),
+      body: JSON.stringify({ name, scopes }),
     }),
   generate: async (
     conversation: Conversation,
@@ -225,6 +299,7 @@ export const api = {
     model: string,
     edit?: Message,
     idempotencyKey: string = crypto.randomUUID(),
+    attachmentIds: string[] = [],
   ) => {
     const result = await request<
       { user: RawMessage; assistant: RawMessage; conversation: RawConversation }
@@ -237,6 +312,7 @@ export const api = {
         supersedesId: edit?.id ?? null,
         expectedVersion: conversation.version,
         idempotencyKey,
+        attachmentIds,
       }),
     });
     return {

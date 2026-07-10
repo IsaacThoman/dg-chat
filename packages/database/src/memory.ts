@@ -15,6 +15,8 @@ import type {
   ApiIdempotencyRequest,
   ApiReplayQuota,
   ApiUsageObservation,
+  AttachmentRecord,
+  AttachmentState,
   AuditEvent,
   AuditEventInput,
   BeginApiRequestInput,
@@ -23,6 +25,8 @@ import type {
   BeginGenerationResult,
   CompleteApiRequestInput,
   CompleteGenerationInput,
+  CreateAttachmentInput,
+  CreateAttachmentResult,
   CreateUserInput,
   FailApiRequestInput,
   FailGenerationInput,
@@ -89,6 +93,8 @@ export class MemoryRepository {
     consumedAt: string | null;
   }>();
   readonly auditEvents: AuditEvent[] = [];
+  readonly attachments = new Map<string, AttachmentRecord>();
+  readonly messageAttachments = new Map<string, Set<string>>();
   readonly conversations = new Map<string, Conversation>();
   readonly messages = new Map<string, MessageNode>();
   readonly idempotency = new Map<string, string>();
@@ -103,6 +109,7 @@ export class MemoryRepository {
       payload: unknown;
       status: string;
       attempts: number;
+      idempotencyKey?: string;
       createdAt: string;
     }
   > = [];
@@ -528,14 +535,21 @@ export class MemoryRepository {
     if (conversation.archivedAt) {
       throw new DomainError("conversation_archived", "Archived conversations are read-only", 409);
     }
+    const attachmentIds = [...(input.attachmentIds ?? [])].sort();
+    if (new Set(attachmentIds).size !== attachmentIds.length || attachmentIds.length > 10) {
+      throw new DomainError("validation_error", "Attachment identifiers are invalid", 422);
+    }
     const existingId = this.idempotency.get(
       `${input.message.conversationId}:${input.message.idempotencyKey}`,
     );
     const existingRun = this.usageRuns.get(input.runId);
     if (existingId && existingRun) {
       const existing = this.messages.get(existingId)!;
+      const priorAttachments = [...(this.messageAttachments.get(existing.id) ?? [])].sort();
       if (
-        existing.content !== input.message.content || existingRun.userId !== input.message.ownerId
+        existing.content !== input.message.content ||
+        existingRun.userId !== input.message.ownerId ||
+        priorAttachments.join("\0") !== [...attachmentIds].sort().join("\0")
       ) {
         throw new DomainError("idempotency_conflict", "Generation replay payload differs", 409);
       }
@@ -581,6 +595,12 @@ export class MemoryRepository {
     if (!account || account.balanceMicros < input.reserveMicros) {
       throw new DomainError("insufficient_credit", "Insufficient credit", 402);
     }
+    for (const attachmentId of attachmentIds) {
+      const attachment = this.getAttachment(attachmentId, input.message.ownerId);
+      if (attachment.state !== "ready") {
+        throw new DomainError("attachment_not_ready", "Attachment is not ready", 409);
+      }
+    }
     const message = this.appendMessage(input.message);
     const usageRun = this.reserve(
       input.message.ownerId,
@@ -593,6 +613,7 @@ export class MemoryRepository {
     usageRun.generationLeaseExpiresAt = new Date(
       Date.now() + (input.leaseSeconds ?? 120) * 1000,
     ).toISOString();
+    if (attachmentIds.length) this.messageAttachments.set(message.id, new Set(attachmentIds));
     return { kind: "started", leaseToken, message, conversation, usageRun };
   }
 
@@ -741,6 +762,167 @@ export class MemoryRepository {
     conversation.version++;
     conversation.updatedAt = new Date().toISOString();
     return conversation;
+  }
+
+  createAttachment(input: CreateAttachmentInput): CreateAttachmentResult {
+    this.validateAttachmentInput(input);
+    if (!this.users.has(input.ownerId)) throw new DomainError("not_found", "User not found", 404);
+    const prior = [...this.attachments.values()].find((attachment) =>
+      attachment.ownerId === input.ownerId && attachment.sha256 === input.sha256 &&
+      attachment.state !== "deleted"
+    );
+    if (prior) {
+      if (prior.sizeBytes !== input.sizeBytes || prior.mimeType !== input.mimeType) {
+        throw new DomainError(
+          "attachment_hash_conflict",
+          "Attachment digest metadata differs",
+          409,
+        );
+      }
+      return {
+        attachment: prior,
+        inspectionJobId: this.enqueueAttachmentInspection(prior),
+        deduplicated: true,
+      };
+    }
+    if (
+      [...this.attachments.values()].some((attachment) => attachment.objectKey === input.objectKey)
+    ) {
+      throw new DomainError("object_key_taken", "Attachment object key already exists", 409);
+    }
+    const now = new Date().toISOString();
+    const attachment: AttachmentRecord = {
+      ...input,
+      id: crypto.randomUUID(),
+      state: input.state ?? "pending",
+      inspectionError: input.inspectionError ?? null,
+      createdAt: now,
+      updatedAt: now,
+      deletedAt: null,
+    };
+    this.attachments.set(attachment.id, attachment);
+    return {
+      attachment,
+      inspectionJobId: this.enqueueAttachmentInspection(attachment),
+      deduplicated: false,
+    };
+  }
+
+  listAttachments(ownerId: string, includeDeleted = false) {
+    return [...this.attachments.values()].filter((attachment) =>
+      attachment.ownerId === ownerId && (includeDeleted || attachment.state !== "deleted")
+    ).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  getAttachment(id: string, ownerId: string, includeDeleted = false) {
+    const attachment = this.attachments.get(id);
+    if (
+      !attachment || attachment.ownerId !== ownerId ||
+      (!includeDeleted && attachment.state === "deleted")
+    ) throw new DomainError("not_found", "Attachment not found", 404);
+    return attachment;
+  }
+
+  deleteAttachment(id: string, ownerId: string) {
+    const attachment = this.getAttachment(id, ownerId, true);
+    if (attachment.state === "deleted") return attachment;
+    const now = new Date().toISOString();
+    attachment.state = "deleted";
+    attachment.deletedAt = now;
+    attachment.updatedAt = now;
+    return attachment;
+  }
+
+  transitionAttachment(
+    id: string,
+    ownerId: string,
+    expectedState: AttachmentState,
+    nextState: AttachmentState,
+    inspectionError: string | null = null,
+  ) {
+    const attachment = this.getAttachment(id, ownerId, true);
+    if (attachment.state !== expectedState) {
+      throw new DomainError("attachment_state_conflict", "Attachment state changed", 409);
+    }
+    const allowed: Record<AttachmentState, AttachmentState[]> = {
+      pending: ["inspecting", "deleted"],
+      inspecting: ["ready", "quarantined", "failed", "deleted"],
+      ready: ["deleted"],
+      quarantined: ["deleted"],
+      failed: ["pending", "deleted"],
+      deleted: [],
+    };
+    if (!allowed[expectedState].includes(nextState)) {
+      throw new DomainError(
+        "invalid_attachment_transition",
+        "Attachment transition is invalid",
+        422,
+      );
+    }
+    attachment.state = nextState;
+    attachment.inspectionError = inspectionError;
+    attachment.updatedAt = new Date().toISOString();
+    if (nextState === "deleted") attachment.deletedAt = attachment.updatedAt;
+    return attachment;
+  }
+
+  linkAttachmentToMessage(messageId: string, attachmentId: string, ownerId: string) {
+    const message = this.messages.get(messageId);
+    const conversation = message ? this.conversations.get(message.conversationId) : undefined;
+    if (!message || !conversation || conversation.ownerId !== ownerId) {
+      throw new DomainError("not_found", "Message not found", 404);
+    }
+    const attachment = this.getAttachment(attachmentId, ownerId);
+    if (attachment.state !== "ready") {
+      throw new DomainError("attachment_not_ready", "Attachment is not ready", 409);
+    }
+    const links = this.messageAttachments.get(messageId) ?? new Set<string>();
+    links.add(attachmentId);
+    this.messageAttachments.set(messageId, links);
+  }
+
+  listMessageAttachments(messageId: string, ownerId: string) {
+    const message = this.messages.get(messageId);
+    const conversation = message ? this.conversations.get(message.conversationId) : undefined;
+    if (!message || !conversation || conversation.ownerId !== ownerId) {
+      throw new DomainError("not_found", "Message not found", 404);
+    }
+    return [...(this.messageAttachments.get(messageId) ?? [])].map((id) =>
+      this.getAttachment(id, ownerId, true)
+    );
+  }
+
+  private enqueueAttachmentInspection(attachment: AttachmentRecord) {
+    const idempotencyKey = `attachment.inspect:${attachment.id}`;
+    const prior = this.jobs.find((job) => job.idempotencyKey === idempotencyKey);
+    if (prior) return prior.id;
+    const id = crypto.randomUUID();
+    this.jobs.push({
+      id,
+      type: "attachment.inspect",
+      payload: { attachmentId: attachment.id, ownerId: attachment.ownerId },
+      status: "queued",
+      attempts: 0,
+      idempotencyKey,
+      createdAt: new Date().toISOString(),
+    });
+    return id;
+  }
+
+  private validateAttachmentInput(input: CreateAttachmentInput) {
+    if (!/^[0-9a-f]{64}$/.test(input.sha256)) {
+      throw new DomainError("validation_error", "Attachment SHA-256 is invalid", 422);
+    }
+    if (!Number.isSafeInteger(input.sizeBytes) || input.sizeBytes < 0) {
+      throw new DomainError("validation_error", "Attachment size is invalid", 422);
+    }
+    if (
+      !input.filename || input.filename.length > 255 || /[\\/\0]/.test(input.filename) ||
+      !input.mimeType || input.mimeType.length > 255 ||
+      !/^[\w.+-]+\/[\w.+-]+$/.test(input.mimeType) ||
+      !input.objectKey || input.objectKey.length > 1024 || input.objectKey.startsWith("/") ||
+      input.objectKey.split("/").some((part) => part === ".." || part === "")
+    ) throw new DomainError("validation_error", "Attachment metadata is invalid", 422);
   }
 
   createApiToken(

@@ -783,3 +783,155 @@ Deno.test({
     }
   },
 });
+
+Deno.test({
+  name: "normalized attachments enforce ownership, dedupe, immutable links, and jobs",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 1 });
+    await sql`TRUNCATE audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
+    await sql.end();
+    const repo = await PostgresRepository.connect(databaseUrl!);
+    try {
+      const owner = await repo.bootstrapAdmin({
+        email: "attachments@database.test",
+        name: "Attachments",
+        passwordHash: "hash",
+      }, 1_000_000);
+      const stranger = await repo.createUser({
+        email: "attachment-stranger@database.test",
+        name: "Stranger",
+        passwordHash: "hash",
+      });
+      const conversation = await repo.createConversation(owner.id, "Files");
+      const message = await repo.appendMessage({
+        conversationId: conversation.id,
+        ownerId: owner.id,
+        parentId: null,
+        role: "user",
+        content: "file",
+        expectedVersion: 0,
+        idempotencyKey: "attachment-message",
+      });
+      const base = {
+        ownerId: owner.id,
+        filename: "notes.txt",
+        mimeType: "text/plain",
+        sizeBytes: 5,
+        sha256: "b".repeat(64),
+      };
+      const concurrent = await Promise.all([
+        repo.createAttachment({ ...base, objectKey: `users/${owner.id}/objects/one` }),
+        repo.createAttachment({ ...base, objectKey: `users/${owner.id}/objects/two` }),
+      ]);
+      assertEquals(new Set(concurrent.map((result) => result.attachment.id)).size, 1);
+      assertEquals(new Set(concurrent.map((result) => result.inspectionJobId)).size, 1);
+      assertEquals(concurrent.map((result) => result.deduplicated).sort(), [false, true]);
+      assertEquals(
+        (await repo.listJobs()).filter((job) => job.type === "attachment.inspect").length,
+        1,
+      );
+      const attachment = concurrent[0].attachment;
+      await assertRejects(
+        () => repo.getAttachment(attachment.id, stranger.id),
+        DomainError,
+        "not found",
+      );
+      await repo.transitionAttachment(attachment.id, owner.id, "pending", "inspecting");
+      await repo.transitionAttachment(attachment.id, owner.id, "inspecting", "ready");
+      await repo.linkAttachmentToMessage(message.id, attachment.id, owner.id);
+      await repo.linkAttachmentToMessage(message.id, attachment.id, owner.id);
+      assertEquals((await repo.listMessageAttachments(message.id, owner.id)).length, 1);
+      await assertRejects(
+        () => repo.linkAttachmentToMessage(message.id, attachment.id, stranger.id),
+        DomainError,
+      );
+      await repo.deleteAttachment(attachment.id, owner.id);
+      assertEquals((await repo.listAttachments(owner.id)).length, 0);
+      assertEquals((await repo.listMessageAttachments(message.id, owner.id))[0].state, "deleted");
+      const replacement = await repo.createAttachment({
+        ...base,
+        objectKey: `users/${owner.id}/objects/replacement`,
+      });
+      assertEquals(replacement.deduplicated, false);
+      assertEquals(replacement.attachment.id === attachment.id, false);
+    } finally {
+      await repo.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "normalized generation atomically links only ready attachments and rejects replay drift",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 1 });
+    await sql`TRUNCATE audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
+    await sql.end();
+    const repo = await PostgresRepository.connect(databaseUrl!);
+    try {
+      const owner = await repo.bootstrapAdmin({
+        email: "generation-attachments@database.test",
+        name: "Generation Attachments",
+        passwordHash: "hash",
+      }, 1_000_000);
+      const conversation = await repo.createConversation(owner.id, "Generation attachments");
+      const created = await repo.createAttachment({
+        ownerId: owner.id,
+        objectKey: `users/${owner.id}/objects/generation-attachment`,
+        filename: "ready.txt",
+        mimeType: "text/plain",
+        sizeBytes: 5,
+        sha256: "d".repeat(64),
+      });
+      const input = {
+        message: {
+          conversationId: conversation.id,
+          ownerId: owner.id,
+          parentId: null,
+          role: "user" as const,
+          content: "Use this file",
+          model: "simulated/dg-chat",
+          expectedVersion: 0,
+          idempotencyKey: "generation-attachment-message",
+        },
+        runId: "generation-attachment-run",
+        provider: "simulated",
+        reserveMicros: 100,
+        attachmentIds: [created.attachment.id],
+      };
+
+      await assertRejects(
+        () => repo.beginGeneration(input),
+        DomainError,
+        "not ready",
+      );
+      assertEquals((await repo.detail(conversation.id, owner.id)).messages.length, 0);
+      assertEquals((await repo.findUser(owner.id))?.balanceMicros, 1_000_000);
+
+      await repo.transitionAttachment(created.attachment.id, owner.id, "pending", "inspecting");
+      await repo.transitionAttachment(created.attachment.id, owner.id, "inspecting", "ready");
+      const started = await repo.beginGeneration(input);
+      if (started.kind !== "started") throw new Error("generation did not start");
+      assertEquals(
+        (await repo.listMessageAttachments(started.message.id, owner.id)).map((a) => a.id),
+        [created.attachment.id],
+      );
+      assertEquals((await repo.beginGeneration(input)).kind, "in_progress");
+      await assertRejects(
+        () => repo.beginGeneration({ ...input, attachmentIds: [] }),
+        DomainError,
+        "payload differs",
+      );
+      assertEquals((await repo.detail(conversation.id, owner.id)).messages.length, 1);
+      assertEquals((await repo.findUser(owner.id))?.balanceMicros, 999_900);
+      assertEquals((await repo.listMessageAttachments(started.message.id, owner.id)).length, 1);
+    } finally {
+      await repo.close();
+    }
+  },
+});

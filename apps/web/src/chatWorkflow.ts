@@ -2,15 +2,15 @@ import type { Conversation } from "./types.ts";
 
 export interface SendOperation {
   id: string;
-  content: string;
+  fingerprint: string;
 }
 
 export function operationForMessage(
   previous: SendOperation | null,
-  content: string,
+  fingerprint: string,
   createId: () => string = () => crypto.randomUUID(),
 ): SendOperation {
-  return previous?.content === content ? previous : { id: createId(), content };
+  return previous?.fingerprint === fingerprint ? previous : { id: createId(), fingerprint };
 }
 
 export function beginInFlight(lock: { current: boolean }): boolean {
@@ -21,6 +21,24 @@ export function beginInFlight(lock: { current: boolean }): boolean {
 
 export function endInFlight(lock: { current: boolean }): void {
   lock.current = false;
+}
+
+export function mergeAttachmentIds(...groups: string[][]): string[] {
+  return [...new Set(groups.flat())];
+}
+
+export function tokenScopesFromSelection(selection: {
+  chat: boolean;
+  models: boolean;
+  filesRead: boolean;
+  filesWrite: boolean;
+}): string[] {
+  return [
+    ...(selection.chat ? ["chat:write"] : []),
+    ...(selection.models ? ["models:read"] : []),
+    ...(selection.filesRead ? ["files:read"] : []),
+    ...(selection.filesWrite ? ["files:write"] : []),
+  ];
 }
 
 export function refreshConversationGraph(

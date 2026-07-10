@@ -36,6 +36,13 @@
       "when": 1783656004000,
       "tag": "0004_generation_leases",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1783656005000,
+      "tag": "0005_attachments",
+      "breakpoints": true
     }
   ]
 }

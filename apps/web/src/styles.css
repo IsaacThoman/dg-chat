@@ -777,6 +777,78 @@ kbd {
   background: linear-gradient(to top,#fff 78%,#ffffff00);
   z-index: 8;
 }
+.composer-wrap.dragging::before {
+  content: "Drop files to upload";
+  position: absolute;
+  z-index: 3;
+  inset: 0 8px 8px;
+  display: grid;
+  place-items: center;
+  border: 2px dashed #7465a8;
+  border-radius: 14px;
+  color: #43386b;
+  background: #f5f2ffeb;
+  font-size: 13px;
+  font-weight: 700;
+  pointer-events: none;
+}
+.upload-list {
+  width: min(780px, calc(100% - 16px));
+  margin: 0 auto 8px;
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding: 2px;
+}
+.upload-chip {
+  min-width: 230px;
+  max-width: 320px;
+  min-height: 54px;
+  padding: 7px 7px 7px 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--panel);
+}
+.upload-chip > span {
+  min-width: 0;
+  flex: 1;
+  display: grid;
+  gap: 2px;
+}
+.upload-chip strong,
+.upload-chip small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.upload-chip strong {
+  font-size: 11px;
+}
+.upload-chip small {
+  color: var(--muted);
+  font-size: 10px;
+}
+.upload-chip progress {
+  width: 100%;
+  height: 4px;
+  accent-color: #7465a8;
+}
+.upload-failed,
+.upload-cancelled,
+.upload-not-ready,
+.upload-delete-failed {
+  border-color: #e4b6b6;
+  background: #fff7f7;
+}
+.upload-failed small,
+.upload-cancelled small,
+.upload-not-ready small,
+.upload-delete-failed small {
+  color: var(--danger);
+}
 .composer {
   position: relative;
   background: #fff;
@@ -2365,6 +2437,17 @@ kbd {
   .composer-wrap {
     padding-left: 8px;
     padding-right: 8px;
+  }
+  .upload-list {
+    width: 100%;
+  }
+  .upload-chip {
+    min-width: min(280px, calc(100vw - 32px));
+  }
+  .upload-chip > .icon-button {
+    width: 44px;
+    min-width: 44px;
+    height: 44px;
   }
   .composer-note span {
     display: none;

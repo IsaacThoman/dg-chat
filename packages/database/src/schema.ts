@@ -130,8 +130,16 @@ export const attachments = pgTable("attachments", {
   sizeBytes: bigint("size_bytes", { mode: "number" }).notNull(),
   sha256: text("sha256").notNull(),
   state: text("state").notNull().default("pending"),
+  inspectionError: text("inspection_error"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-}, (table) => [uniqueIndex("attachments_owner_hash_uq").on(table.ownerId, table.sha256)]);
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  deletedAt: timestamp("deleted_at", { withTimezone: true }),
+}, (table) => [
+  uniqueIndex("attachments_object_key_uq").on(table.objectKey),
+  uniqueIndex("attachments_owner_active_hash_uq").on(table.ownerId, table.sha256).where(
+    sql`${table.deletedAt} IS NULL`,
+  ),
+]);
 
 export const messageAttachments = pgTable("message_attachments", {
   messageId: uuid("message_id").notNull().references(() => messages.id, { onDelete: "cascade" }),
@@ -210,9 +218,13 @@ export const jobs = pgTable("jobs", {
   lockedAt: timestamp("locked_at", { withTimezone: true }),
   lockedBy: text("locked_by"),
   lastError: text("last_error"),
+  idempotencyKey: text("idempotency_key"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   completedAt: timestamp("completed_at", { withTimezone: true }),
-}, (table) => [index("jobs_claim_idx").on(table.status, table.availableAt)]);
+}, (table) => [
+  index("jobs_claim_idx").on(table.status, table.availableAt),
+  uniqueIndex("jobs_idempotency_key_uq").on(table.idempotencyKey),
+]);
 
 export const documentChunks = pgTable("document_chunks", {
   id: uuid("id").primaryKey().defaultRandom(),

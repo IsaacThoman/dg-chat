@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { api } from "./api.ts";
+import { api, uploadAttachment } from "./api.ts";
 import type { Conversation } from "./types.ts";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -146,6 +146,144 @@ describe("conversation lifecycle API", () => {
         method: "PATCH",
         body: JSON.stringify({ title: "Renamed", pinned: true, archived: true, deleted: false }),
       }),
+    );
+  });
+});
+
+describe("attachment API", () => {
+  it("uploads multipart data and reports progress", async () => {
+    const progress: number[] = [];
+    let sent: FormData | undefined;
+    const xhr = {
+      status: 201,
+      responseText: JSON.stringify({
+        attachment: {
+          id: "attachment-1",
+          filename: "notes.txt",
+          mimeType: "text/plain",
+          sizeBytes: 5,
+          state: "ready",
+          createdAt: "2026-07-10T00:00:00.000Z",
+        },
+      }),
+      upload: {} as XMLHttpRequestUpload,
+      open: vi.fn(),
+      send: vi.fn((body: FormData) => {
+        sent = body;
+        xhr.upload.onprogress?.call(
+          xhr as unknown as XMLHttpRequest,
+          { lengthComputable: true, loaded: 2, total: 5 } as ProgressEvent,
+        );
+        xhr.onload?.({} as ProgressEvent);
+      }),
+      abort: vi.fn(),
+      onload: null as ((event: ProgressEvent) => void) | null,
+      onerror: null as ((event: ProgressEvent) => void) | null,
+      onabort: null as ((event: ProgressEvent) => void) | null,
+      withCredentials: false,
+    };
+    const file = new File(["hello"], "notes.txt", { type: "text/plain" });
+    await expect(
+      uploadAttachment(
+        file,
+        (value) => progress.push(value),
+        new AbortController().signal,
+        () => xhr as unknown as XMLHttpRequest,
+      ),
+    ).resolves.toMatchObject({ id: "attachment-1", filename: "notes.txt" });
+    expect(xhr.open).toHaveBeenCalledWith("POST", "/api/attachments");
+    expect(xhr.withCredentials).toBe(true);
+    expect(sent?.get("file")).toBe(file);
+    expect(progress).toEqual([40, 100]);
+  });
+
+  it("aborts the underlying upload when the caller cancels", async () => {
+    const controller = new AbortController();
+    const xhr = {
+      upload: {} as XMLHttpRequestUpload,
+      open: vi.fn(),
+      send: vi.fn(),
+      abort: vi.fn(() => xhr.onabort?.({} as ProgressEvent)),
+      onload: null as ((event: ProgressEvent) => void) | null,
+      onerror: null as ((event: ProgressEvent) => void) | null,
+      onabort: null as ((event: ProgressEvent) => void) | null,
+      withCredentials: false,
+      status: 0,
+      responseText: "",
+    };
+    const uploading = uploadAttachment(
+      new File(["cancel"], "cancel.txt"),
+      () => undefined,
+      controller.signal,
+      () => xhr as unknown as XMLHttpRequest,
+    );
+    controller.abort(new DOMException("User cancelled", "AbortError"));
+    await expect(uploading).rejects.toThrow("User cancelled");
+    expect(xhr.abort).toHaveBeenCalledOnce();
+  });
+
+  it("passes ready attachment ids to generation and deletes with an encoded id", async () => {
+    const rawConversation = {
+      id: "chat",
+      title: "Chat",
+      activeLeafId: "assistant-1",
+      version: 2,
+      pinned: false,
+      archivedAt: null,
+      deletedAt: null,
+      updatedAt: "2026-07-10T00:00:00.000Z",
+    };
+    const rawMessage = (id: string, role: "user" | "assistant") => ({
+      id,
+      parentId: null,
+      supersedesId: null,
+      siblingIndex: 0,
+      role,
+      content: role,
+      model: null,
+      metadata: {},
+      createdAt: "2026-07-10T00:00:00.000Z",
+    });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            user: rawMessage("user-1", "user"),
+            assistant: rawMessage("assistant-1", "assistant"),
+            conversation: rawConversation,
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const conversation: Conversation = {
+      id: "chat",
+      title: "Chat",
+      preview: "",
+      updatedAt: "now",
+      version: 1,
+    };
+    await api.generate(
+      conversation,
+      "hello",
+      "model",
+      undefined,
+      "operation-1",
+      ["attachment-1"],
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "/api/conversations/chat/generate",
+      expect.objectContaining({
+        body: expect.stringContaining('"attachmentIds":["attachment-1"]'),
+      }),
+    );
+    await api.deleteAttachment("attachment/1");
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/attachments/attachment%2F1",
+      expect.objectContaining({ method: "DELETE" }),
     );
   });
 });

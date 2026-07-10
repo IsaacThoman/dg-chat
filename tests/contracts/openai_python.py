@@ -1,4 +1,6 @@
 import os
+import io
+import uuid
 
 from openai import OpenAI
 
@@ -47,8 +49,58 @@ response_stream_text = "".join(
 if "Python Responses streaming contract" not in response_stream_text:
     raise RuntimeError("Python Responses stream did not contain the expected content")
 
-files = client.files.list()
-if not isinstance(files.data, list):
-    raise RuntimeError("Python files.list() did not return a list")
+file_text = f"Python files contract {uuid.uuid4()}\n"
+file_bytes = file_text.encode("utf-8")
+file_name = f"python-contract-{uuid.uuid4()}.txt"
+uploaded = client.files.create(
+    file=(file_name, io.BytesIO(file_bytes), "text/plain"),
+    purpose="assistants",
+)
+deleted = False
+try:
+    if (
+        uploaded.object != "file"
+        or uploaded.filename != file_name
+        or uploaded.bytes != len(file_bytes)
+        or uploaded.status != "processed"
+    ):
+        raise RuntimeError("Python files.create() returned an invalid file object")
+
+    files = client.files.list()
+    if (
+        not isinstance(files.data, list)
+        or files.has_more is not False
+        or not any(item.id == uploaded.id for item in files.data)
+    ):
+        raise RuntimeError("Python files.list() did not include the uploaded file")
+
+    retrieved = client.files.retrieve(uploaded.id)
+    if retrieved.id != uploaded.id or retrieved.filename != file_name:
+        raise RuntimeError("Python files.retrieve() returned the wrong file")
+
+    content = client.files.content(uploaded.id)
+    if content.read() != file_bytes:
+        raise RuntimeError("Python files.content() did not preserve the uploaded bytes")
+
+    result = client.files.delete(uploaded.id)
+    deleted = True
+    if result.id != uploaded.id or result.object != "file" or result.deleted is not True:
+        raise RuntimeError("Python files.delete() returned an invalid deletion object")
+
+    try:
+        client.files.retrieve(uploaded.id)
+    except Exception as error:
+        if getattr(error, "status_code", None) != 404:
+            raise RuntimeError(
+                "Python deleted file did not return an OpenAI-compatible 404"
+            ) from error
+    else:
+        raise RuntimeError("Python deleted file remained retrievable")
+finally:
+    if not deleted:
+        try:
+            client.files.delete(uploaded.id)
+        except Exception:
+            pass
 
 print("Official OpenAI Python client contracts passed")

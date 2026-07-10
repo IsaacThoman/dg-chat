@@ -63,9 +63,11 @@ import {
   beginInFlight,
   conversationForFirstSend,
   endInFlight,
+  mergeAttachmentIds,
   operationForMessage,
   refreshConversationGraph,
   type SendOperation,
+  tokenScopesFromSelection,
 } from "./chatWorkflow.ts";
 import {
   activeMessagePath,
@@ -82,7 +84,7 @@ import {
   conversationsForView,
   fallbackConversationId,
 } from "./conversationLifecycle.ts";
-import type { Conversation, Message, Model, Token, User } from "./types.ts";
+import type { Attachment, Conversation, Message, Model, Token, User } from "./types.ts";
 
 type View = "chat" | "archived" | "trash" | "settings" | "tokens" | "admin";
 type AdminSection =
@@ -126,6 +128,7 @@ function IconButton(
 ) {
   return (
     <button
+      type="button"
       className={cn("icon-button", className)}
       aria-label={label}
       title={label}
@@ -700,15 +703,19 @@ function MessageItem(
         <div className="message-inner">
           <div className="user-bubble">
             {message.attachments?.map((a) => (
-              <div className="attachment" key={a.name}>
+              <a
+                className="attachment"
+                key={a.id}
+                href={`/api/messages/${message.id}/attachments/${a.id}/content`}
+              >
                 <span>
                   <FileText size={19} />
                 </span>
                 <div>
-                  <strong>{a.name}</strong>
-                  <small>{a.type} · {a.size}</small>
+                  <strong>{a.filename}</strong>
+                  <small>{a.mimeType} · {Math.max(1, Math.ceil(a.sizeBytes / 1024))} KB</small>
                 </div>
-              </div>
+              </a>
             ))}
             <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
           </div>
@@ -786,23 +793,179 @@ function MessageItem(
 
 function Composer(
   { onSend, edit, cancelEdit, disabled }: {
-    onSend: (value: string) => Promise<boolean>;
+    onSend: (value: string, attachmentIds: string[]) => Promise<boolean>;
     edit?: Message;
     cancelEdit: () => void;
     disabled: boolean;
   },
 ) {
   const [value, setValue] = useState("");
+  const [dragging, setDragging] = useState(false);
+  const [selectionError, setSelectionError] = useState("");
+  type UploadState =
+    | "uploading"
+    | "ready"
+    | "failed"
+    | "cancelled"
+    | "not-ready"
+    | "removing"
+    | "delete-failed";
+  type UploadItem = {
+    key: string;
+    file: File;
+    status: UploadState;
+    progress: number;
+    attachment?: Attachment;
+    error?: string;
+  };
+  const [uploads, setUploads] = useState<UploadItem[]>([]);
+  const [excludedEditAttachments, setExcludedEditAttachments] = useState<Set<string>>(new Set());
+  const uploadControllers = useRef(new Map<string, AbortController>());
+  const fileRef = useRef<HTMLInputElement>(null);
+  useEffect(() => () => {
+    for (const controller of uploadControllers.current.values()) controller.abort();
+    uploadControllers.current.clear();
+  }, []);
   useEffect(() => {
+    setExcludedEditAttachments(new Set());
     if (edit) setValue(edit.content);
   }, [edit]);
+  const retainedAttachments = (edit?.attachments ?? []).filter((attachment) =>
+    !excludedEditAttachments.has(attachment.id)
+  );
+  const beginUpload = (key: string, file: File) => {
+    const controller = new AbortController();
+    uploadControllers.current.set(key, controller);
+    setUploads((current) =>
+      current.map((item) =>
+        item.key === key ? { ...item, status: "uploading", progress: 0, error: undefined } : item
+      )
+    );
+    void api.uploadAttachment(
+      file,
+      (progress) =>
+        setUploads((current) =>
+          current.map((item) => item.key === key ? { ...item, progress } : item)
+        ),
+      controller.signal,
+    ).then((attachment) => {
+      uploadControllers.current.delete(key);
+      setUploads((current) =>
+        current.map((item) =>
+          item.key === key
+            ? attachment.state === "ready"
+              ? { ...item, status: "ready", progress: 100, attachment }
+              : {
+                ...item,
+                status: "not-ready",
+                progress: 100,
+                attachment,
+                error: `Upload is ${attachment.state}; it is not ready to send.`,
+              }
+            : item
+        )
+      );
+    }).catch((error: unknown) => {
+      uploadControllers.current.delete(key);
+      setUploads((current) =>
+        current.map((item) =>
+          item.key === key
+            ? {
+              ...item,
+              status: controller.signal.aborted ? "cancelled" : "failed",
+              error: controller.signal.aborted
+                ? "Upload cancelled."
+                : error instanceof Error
+                ? error.message
+                : "Upload failed.",
+            }
+            : item
+        )
+      );
+    });
+  };
+  const addFiles = (files: File[]) => {
+    if (disabled || !files.length) return;
+    const allowed = files.filter((file) => file.size <= 25 * 1024 * 1024);
+    const selected = allowed.slice(
+      0,
+      Math.max(0, 10 - uploads.length - retainedAttachments.length),
+    );
+    if (allowed.length !== files.length) {
+      setSelectionError("Each attachment must be 25 MB or smaller.");
+    } else if (selected.length !== files.length) {
+      setSelectionError("You can attach up to 10 files to one message.");
+    } else {
+      setSelectionError("");
+    }
+    for (const file of selected) {
+      const key = crypto.randomUUID();
+      setUploads((current) => [
+        ...current,
+        { key, file, status: "uploading", progress: 0 },
+      ]);
+      queueMicrotask(() => beginUpload(key, file));
+    }
+  };
+  const removeUpload = async (item: UploadItem) => {
+    if (item.status === "uploading") {
+      uploadControllers.current.get(item.key)?.abort();
+      return;
+    }
+    if (!item.attachment) {
+      setUploads((current) => current.filter((candidate) => candidate.key !== item.key));
+      return;
+    }
+    setUploads((current) =>
+      current.map((candidate) =>
+        candidate.key === item.key
+          ? { ...candidate, status: "removing", error: undefined }
+          : candidate
+      )
+    );
+    try {
+      await api.deleteAttachment(item.attachment.id);
+      setUploads((current) => current.filter((candidate) => candidate.key !== item.key));
+    } catch {
+      setUploads((current) =>
+        current.map((candidate) =>
+          candidate.key === item.key
+            ? { ...candidate, status: "delete-failed", error: "Couldn’t remove this upload." }
+            : candidate
+        )
+      );
+    }
+  };
+  const blockedByUpload = uploads.some((item) => item.status !== "ready");
   const submit = async (e: FormEvent) => {
     e.preventDefault();
-    if (!value.trim() || disabled) return;
-    if (await onSend(value.trim())) setValue("");
+    if (!value.trim() || disabled || blockedByUpload) return;
+    const attachmentIds = mergeAttachmentIds(
+      retainedAttachments.map((attachment) => attachment.id),
+      uploads.flatMap((item) => item.attachment ? [item.attachment.id] : []),
+    );
+    if (await onSend(value.trim(), attachmentIds)) {
+      setValue("");
+      setUploads([]);
+    }
   };
   return (
-    <div className="composer-wrap">
+    <div
+      className={cn("composer-wrap", dragging && "dragging")}
+      onDragEnter={(event) => {
+        event.preventDefault();
+        if (!disabled) setDragging(true);
+      }}
+      onDragOver={(event) => event.preventDefault()}
+      onDragLeave={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node)) setDragging(false);
+      }}
+      onDrop={(event) => {
+        event.preventDefault();
+        setDragging(false);
+        addFiles([...event.dataTransfer.files]);
+      }}
+    >
       {edit && (
         <div className="edit-banner">
           <GitBranch size={16} />
@@ -815,12 +978,92 @@ function Composer(
           </IconButton>
         </div>
       )}
+      {(retainedAttachments.length > 0 || uploads.length > 0) && (
+        <div className="upload-list" aria-label="Selected attachments" aria-live="polite">
+          {retainedAttachments.map((attachment) => (
+            <div className="upload-chip upload-ready" key={`retained-${attachment.id}`}>
+              <FileText size={18} aria-hidden="true" />
+              <span>
+                <strong>{attachment.filename}</strong>
+                <small>Retained from the original branch</small>
+              </span>
+              <IconButton
+                label={`Exclude attachment ${attachment.filename} from edited branch`}
+                onClick={() =>
+                  setExcludedEditAttachments((current) =>
+                    new Set(current).add(attachment.id)
+                  )}
+              >
+                <X size={15} />
+              </IconButton>
+            </div>
+          ))}
+          {uploads.map((item) => (
+            <div className={cn("upload-chip", `upload-${item.status}`)} key={item.key}>
+              <FileText size={18} aria-hidden="true" />
+              <span>
+                <strong>{item.file.name}</strong>
+                <small>
+                  {item.status === "ready"
+                    ? `${Math.max(1, Math.ceil(item.file.size / 1024))} KB · Ready`
+                    : item.status === "uploading"
+                    ? `Uploading ${item.progress}%`
+                    : item.status === "removing"
+                    ? "Removing…"
+                    : item.error}
+                </small>
+                {item.status === "uploading" && (
+                  <progress
+                    max="100"
+                    value={item.progress}
+                    aria-label={`Upload ${item.file.name}`}
+                  />
+                )}
+              </span>
+              {(item.status === "failed" || item.status === "cancelled") && (
+                <IconButton
+                  label={`Retry upload ${item.file.name}`}
+                  onClick={() => beginUpload(item.key, item.file)}
+                >
+                  <RefreshCw size={15} />
+                </IconButton>
+              )}
+              {item.status === "delete-failed" && (
+                <IconButton
+                  label={`Retry removing ${item.file.name}`}
+                  onClick={() => removeUpload(item)}
+                >
+                  <RefreshCw size={15} />
+                </IconButton>
+              )}
+              <IconButton
+                label={item.status === "uploading"
+                  ? `Cancel upload ${item.file.name}`
+                  : `Remove attachment ${item.file.name}`}
+                disabled={item.status === "removing"}
+                onClick={() =>
+                  void removeUpload(item)}
+              >
+                <X size={15} />
+              </IconButton>
+            </div>
+          ))}
+        </div>
+      )}
+      {selectionError && <p className="form-error" role="alert">{selectionError}</p>}
       <form className="composer" onSubmit={submit}>
         <textarea
           rows={1}
           disabled={disabled}
           value={value}
           onChange={(e) => setValue(e.target.value)}
+          onPaste={(event) => {
+            const files = [...event.clipboardData.files];
+            if (files.length) {
+              event.preventDefault();
+              addFiles(files);
+            }
+          }}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) void submit(e);
           }}
@@ -828,9 +1071,20 @@ function Composer(
           aria-label="Message"
         />
         <div className="composer-tools">
+          <input
+            ref={fileRef}
+            type="file"
+            hidden
+            multiple
+            onChange={(event) => {
+              addFiles([...(event.target.files ?? [])]);
+              event.target.value = "";
+            }}
+          />
           <IconButton
-            label="Attach files (not available yet)"
-            disabled
+            label="Attach files"
+            disabled={disabled}
+            onClick={() => fileRef.current?.click()}
           >
             <Paperclip size={19} />
           </IconButton>
@@ -859,7 +1113,11 @@ function Composer(
           >
             <Mic size={19} />
           </IconButton>
-          <button className="send-button" aria-label="Send" disabled={!value.trim() || disabled}>
+          <button
+            className="send-button"
+            aria-label="Send"
+            disabled={!value.trim() || disabled || blockedByUpload}
+          >
             <ArrowDown size={19} />
           </button>
         </div>
@@ -1119,9 +1377,16 @@ function ChatView({
       setBranchBusy(false);
     }
   };
-  const send = async (content: string): Promise<boolean> => {
+  const send = async (content: string, attachmentIds: string[]): Promise<boolean> => {
     if (!beginInFlight(sendInFlightRef)) return false;
-    const operation = operationForMessage(pendingOperationRef.current, content);
+    const fingerprint = JSON.stringify({
+      content,
+      attachmentIds,
+      model: selectedModel,
+      parentId: edit ? edit.parentId : conversation?.activeLeafId ?? null,
+      supersedesId: edit?.id ?? null,
+    });
+    const operation = operationForMessage(pendingOperationRef.current, fingerprint);
     pendingOperationRef.current = operation;
     const edited = edit;
     setStreaming(true);
@@ -1133,7 +1398,14 @@ function ChatView({
       });
       const target = resolved.conversation;
       if (resolved.created) setConversation(target);
-      const result = await api.generate(target, content, selectedModel, edited, operation.id);
+      const result = await api.generate(
+        target,
+        content,
+        selectedModel,
+        edited,
+        operation.id,
+        attachmentIds,
+      );
       setLocalMessages((current) => {
         const next = [...current, result.user, result.assistant];
         queryClient.setQueryData(["messages", result.conversation.id], next);
@@ -1441,18 +1713,34 @@ function TokenSettings() {
   const [modal, setModal] = useState(false);
   const [revealed, setRevealed] = useState("");
   const [name, setName] = useState("");
+  const [chatScope, setChatScope] = useState(true);
+  const [modelsScope, setModelsScope] = useState(true);
+  const [filesReadScope, setFilesReadScope] = useState(false);
+  const [filesWriteScope, setFilesWriteScope] = useState(false);
   useEffect(() => {
     api.tokens().then(setTokens).catch(() => setTokens([]));
   }, []);
   const create = async () => {
-    const result = await api.createToken(name || "New token");
+    const scopes = tokenScopesFromSelection({
+      chat: chatScope,
+      models: modelsScope,
+      filesRead: filesReadScope,
+      filesWrite: filesWriteScope,
+    });
+    if (!scopes.length) return;
+    const result = await api.createToken(name || "New token", scopes);
     setTokens((
       x,
     ) => [...x, {
       id: crypto.randomUUID(),
       name: name || "New token",
       preview: "dg_sk_••••" + result.token.slice(-4).toUpperCase(),
-      scopes: ["chat", "models"],
+      scopes: [
+        ...(chatScope ? ["chat"] : []),
+        ...(modelsScope ? ["models"] : []),
+        ...(filesReadScope ? ["files:read"] : []),
+        ...(filesWriteScope ? ["files:write"] : []),
+      ],
       createdAt: "Just now",
     }]);
     setRevealed(result.token);
@@ -1480,7 +1768,10 @@ function TokenSettings() {
           <strong>OpenAI-compatible endpoint</strong>
           <code>{location.origin}/v1</code>
         </div>
-        <IconButton label="Copy endpoint">
+        <IconButton
+          label="Copy endpoint"
+          onClick={() => navigator.clipboard?.writeText(`${location.origin}/v1`)}
+        >
           <Copy size={16} />
         </IconButton>
       </div>
@@ -1496,7 +1787,7 @@ function TokenSettings() {
               <small>Created {t.createdAt}{t.lastUsed ? ` · Used ${t.lastUsed}` : ""}</small>
             </div>
             <span className="scope-list">{t.scopes.map((s) => <i key={s}>{s}</i>)}</span>
-            <IconButton label="Token options">
+            <IconButton label="Token options (not available yet)" disabled>
               <MoreHorizontal size={17} />
             </IconButton>
           </div>
@@ -1539,17 +1830,46 @@ function TokenSettings() {
                 </label>
                 <p className="form-label">SCOPES</p>
                 <label className="check-row">
-                  <input type="checkbox" defaultChecked /> Chat completions
+                  <input
+                    type="checkbox"
+                    checked={chatScope}
+                    onChange={(event) => setChatScope(event.target.checked)}
+                  />{" "}
+                  Chat completions
                 </label>
                 <label className="check-row">
-                  <input type="checkbox" defaultChecked /> List models
+                  <input
+                    type="checkbox"
+                    checked={modelsScope}
+                    onChange={(event) => setModelsScope(event.target.checked)}
+                  />{" "}
+                  List models
                 </label>
                 <label className="check-row">
-                  <input type="checkbox" /> Files
+                  <input
+                    type="checkbox"
+                    checked={filesReadScope}
+                    onChange={(event) => setFilesReadScope(event.target.checked)}
+                  />{" "}
+                  Read files
+                </label>
+                <label className="check-row">
+                  <input
+                    type="checkbox"
+                    checked={filesWriteScope}
+                    onChange={(event) => setFilesWriteScope(event.target.checked)}
+                  />{" "}
+                  Upload and delete files
                 </label>
                 <div className="modal-actions">
                   <button className="secondary" onClick={() => setModal(false)}>Cancel</button>
-                  <button className="primary" onClick={create}>Create token</button>
+                  <button
+                    className="primary"
+                    disabled={!chatScope && !modelsScope && !filesReadScope && !filesWriteScope}
+                    onClick={create}
+                  >
+                    Create token
+                  </button>
                 </div>
               </div>
             )}

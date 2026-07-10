@@ -4,6 +4,8 @@ import type { RateLimiter } from "./rate-limit.ts";
 import type { ChatCompletionRequest } from "@dg-chat/contracts";
 import { DomainError, MemoryRepository } from "@dg-chat/database";
 import { type IdentityMailer, TestIdentityMailer } from "./mail.ts";
+import { TestObjectStore } from "./test-object-store.ts";
+import { simulate } from "./models.ts";
 
 async function json(response: Response) {
   // deno-lint-ignore no-explicit-any
@@ -993,4 +995,389 @@ Deno.test("expired web generation ownership is reclaimed once and fences the old
   assertEquals((await json(completed)).assistant.content, "owned answer");
   const detail = await repository.detail(conversation.id, owner.id);
   assertEquals(detail.messages.filter((message) => message.role === "assistant").length, 1);
+});
+
+Deno.test("attachment and OpenAI Files routes enforce security, ownership, scopes, and immutable links", async () => {
+  const objectStore = new TestObjectStore();
+  const providerRequests: ChatCompletionRequest[] = [];
+  const { app } = createApp({
+    setupToken: "files-setup",
+    objectStore,
+    attachmentContextMaxRawBytes: 128,
+    webComplete: (request) => {
+      providerRequests.push(structuredClone(request));
+      const text = simulate(request);
+      return Promise.resolve({
+        text,
+        inputTokens: 1,
+        outputTokens: Math.max(1, Math.ceil(text.length / 4)),
+      });
+    },
+  });
+  const bootstrap = await app.request("/api/setup/bootstrap", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-setup-token": "files-setup" },
+    body: JSON.stringify({
+      email: "files-admin@example.com",
+      password: "correct horse battery",
+      name: "Files Admin",
+    }),
+  });
+  assertEquals(bootstrap.status, 201);
+  const admin = (await json(bootstrap)).user;
+  const adminLogin = await app.request("/api/auth/sign-in/email", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email: "files-admin@example.com",
+      password: "correct horse battery",
+    }),
+  });
+  const adminSession = {
+    cookie: sessionCookie(adminLogin),
+    origin: "http://localhost:5173",
+  };
+  const signup = await app.request("/api/auth/sign-up/email", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email: "files-other@example.com",
+      password: "correct horse battery",
+      name: "Other Files User",
+    }),
+  });
+  const other = (await json(signup)).user;
+  const otherSession = {
+    cookie: sessionCookie(signup),
+    origin: "http://localhost:5173",
+  };
+  assertEquals(
+    (await app.request(`/api/admin/users/${other.id}/approval`, {
+      method: "PATCH",
+      headers: { ...adminSession, "content-type": "application/json" },
+      body: JSON.stringify({ status: "approved" }),
+    })).status,
+    200,
+  );
+
+  const createToken = async (headers: Record<string, string>, scopes: string[]) => {
+    const response = await app.request("/api/tokens", {
+      method: "POST",
+      headers: { ...headers, "content-type": "application/json" },
+      body: JSON.stringify({ name: `Files ${scopes.join(" ")}`, scopes }),
+    });
+    assertEquals(response.status, 201);
+    return (await json(response)).token as string;
+  };
+  const readOnly = await createToken(adminSession, ["files:read"]);
+  const writeOnly = await createToken(adminSession, ["files:write"]);
+  const adminToken = await createToken(adminSession, ["files:read", "files:write"]);
+  const otherToken = await createToken(otherSession, ["files:read", "files:write"]);
+
+  const deniedWrite = new FormData();
+  deniedWrite.set("file", new File(["scope"], "scope.txt", { type: "text/plain" }));
+  assertEquals(
+    (await app.request("/v1/files", {
+      method: "POST",
+      headers: { authorization: `Bearer ${readOnly}` },
+      body: deniedWrite,
+    })).status,
+    403,
+  );
+  assertEquals(
+    (await app.request("/v1/files", {
+      headers: { authorization: `Bearer ${writeOnly}` },
+    })).status,
+    403,
+  );
+
+  const webText = "immutable attachment bytes";
+  const webForm = new FormData();
+  webForm.set("file", new File([webText], "notes.txt", { type: "text/plain" }));
+  const webUploadResponse = await app.request("/api/attachments", {
+    method: "POST",
+    headers: adminSession,
+    body: webForm,
+  });
+  assertEquals(webUploadResponse.status, 201);
+  const webUpload = (await json(webUploadResponse)).attachment;
+  assertEquals(webUpload.filename, "notes.txt");
+  assertEquals(webUpload.state, "ready");
+  assertEquals(JSON.stringify(webUpload).includes("objectKey"), false);
+  assertEquals(JSON.stringify(webUpload).includes("sha256"), false);
+  assertEquals(objectStore.objects.size, 1);
+
+  const pngBytes = Uint8Array.from(
+    atob(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    ),
+    (character) => character.charCodeAt(0),
+  );
+  const imageForm = new FormData();
+  imageForm.set("file", new File([pngBytes], "pixel.png", { type: "image/png" }));
+  const imageUploadResponse = await app.request("/api/attachments", {
+    method: "POST",
+    headers: adminSession,
+    body: imageForm,
+  });
+  assertEquals(imageUploadResponse.status, 201);
+  const imageUpload = (await json(imageUploadResponse)).attachment;
+  assertEquals(imageUpload.state, "ready");
+
+  const webContent = await app.request(`/api/attachments/${webUpload.id}/content`, {
+    headers: adminSession,
+  });
+  assertEquals(webContent.status, 200);
+  assertEquals(await webContent.text(), webText);
+  assertStringIncludes(webContent.headers.get("content-disposition") ?? "", "notes.txt");
+  assertEquals(webContent.headers.get("x-content-type-options"), "nosniff");
+
+  assertEquals(
+    (await app.request(`/api/attachments/${webUpload.id}`, { headers: otherSession })).status,
+    404,
+  );
+  assertEquals(
+    (await app.request(`/v1/files/${webUpload.id}`, {
+      headers: { authorization: `Bearer ${otherToken}` },
+    })).status,
+    404,
+  );
+  const otherFiles = await json(
+    await app.request("/v1/files", {
+      headers: { authorization: `Bearer ${otherToken}` },
+    }),
+  );
+  assertEquals(otherFiles.data.some((file: { id: string }) => file.id === webUpload.id), false);
+
+  const objectsBeforeRejectedUploads = objectStore.objects.size;
+  const malicious = new FormData();
+  malicious.set(
+    "file",
+    new File(["<!doctype html><script>alert(1)</script>"], "fake.txt", {
+      type: "text/plain",
+    }),
+  );
+  const maliciousResponse = await app.request("/api/attachments", {
+    method: "POST",
+    headers: adminSession,
+    body: malicious,
+  });
+  assertEquals(maliciousResponse.status, 415);
+  assertEquals((await json(maliciousResponse)).error.code, "unsupported_media_type");
+  assertEquals(objectStore.objects.size, objectsBeforeRejectedUploads);
+
+  const oversizeResponse = await app.request("/api/attachments", {
+    method: "POST",
+    headers: {
+      ...adminSession,
+      "content-type": "multipart/form-data; boundary=oversized-contract",
+      "content-length": String(27 * 1024 * 1024),
+    },
+    body: "--oversized-contract--\r\n",
+  });
+  assertEquals(oversizeResponse.status, 413);
+  assertEquals((await json(oversizeResponse)).error.code, "upload_too_large");
+  assertEquals(objectStore.objects.size, objectsBeforeRejectedUploads);
+
+  const conversationResponse = await app.request("/api/conversations", {
+    method: "POST",
+    headers: { ...adminSession, "content-type": "application/json" },
+    body: JSON.stringify({ title: "Attachment branch" }),
+  });
+  const conversation = await json(conversationResponse);
+  const generationBody = JSON.stringify({
+    content: "use the attachment",
+    model: "simulated/dg-chat",
+    parentId: null,
+    expectedVersion: 0,
+    idempotencyKey: "files-generation-link",
+    attachmentIds: [webUpload.id, imageUpload.id],
+  });
+  const requestGeneration = () =>
+    app.request(`/api/conversations/${conversation.id}/generate`, {
+      method: "POST",
+      headers: { ...adminSession, "content-type": "application/json" },
+      body: generationBody,
+    });
+  const generationResponse = await requestGeneration();
+  assertEquals(generationResponse.status, 201);
+  const generation = await json(generationResponse);
+  assertEquals(
+    generation.user.attachments.map((item: { id: string }) => item.id).sort(),
+    [webUpload.id, imageUpload.id].sort(),
+  );
+  assertEquals(JSON.stringify(generation.user.attachments).includes("objectKey"), false);
+  assertStringIncludes(generation.assistant.content, webText);
+  assertStringIncludes(generation.assistant.content, "[image]");
+  assertEquals(providerRequests.length, 1);
+  const immediateReplay = await requestGeneration();
+  assertEquals(immediateReplay.status, 200);
+  assertEquals(await json(immediateReplay), generation);
+
+  assertEquals(
+    (await app.request(`/api/attachments/${webUpload.id}`, {
+      method: "DELETE",
+      headers: adminSession,
+    })).status,
+    204,
+  );
+  assertEquals(
+    (await app.request(`/api/attachments/${webUpload.id}/content`, {
+      headers: adminSession,
+    })).status,
+    404,
+  );
+  const historicalContent = await app.request(
+    `/api/messages/${generation.user.id}/attachments/${webUpload.id}/content`,
+    { headers: adminSession },
+  );
+  assertEquals(historicalContent.status, 200);
+  assertEquals(await historicalContent.text(), webText);
+  const deletedAttachmentReplay = await requestGeneration();
+  assertEquals(deletedAttachmentReplay.status, 200);
+  const replayedAfterDelete = await json(deletedAttachmentReplay);
+  assertEquals(replayedAfterDelete.user.id, generation.user.id);
+  assertEquals(replayedAfterDelete.assistant.id, generation.assistant.id);
+  assertEquals(
+    replayedAfterDelete.user.attachments.find((item: { id: string }) => item.id === webUpload.id)
+      ?.state,
+    "deleted",
+  );
+
+  const followupResponse = await app.request(`/api/conversations/${conversation.id}/generate`, {
+    method: "POST",
+    headers: { ...adminSession, "content-type": "application/json" },
+    body: JSON.stringify({
+      content: "use the earlier attachment again",
+      model: "simulated/dg-chat",
+      parentId: generation.assistant.id,
+      expectedVersion: generation.conversation.version,
+      idempotencyKey: "files-generation-followup",
+      attachmentIds: [],
+    }),
+  });
+  assertEquals(followupResponse.status, 201);
+  const followup = await json(followupResponse);
+  assertEquals(providerRequests.length, 2);
+  assertStringIncludes(JSON.stringify(providerRequests[1].messages), webText);
+  assertStringIncludes(JSON.stringify(providerRequests[1].messages), "data:image/png;base64,");
+
+  const aggregateOverflow = await app.request(`/api/conversations/${conversation.id}/generate`, {
+    method: "POST",
+    headers: { ...adminSession, "content-type": "application/json" },
+    body: JSON.stringify({
+      content: "attach the image again",
+      model: "simulated/dg-chat",
+      parentId: followup.assistant.id,
+      expectedVersion: followup.conversation.version,
+      idempotencyKey: "files-generation-aggregate-overflow",
+      attachmentIds: [imageUpload.id],
+    }),
+  });
+  assertEquals(aggregateOverflow.status, 413);
+  assertEquals((await json(aggregateOverflow)).error.code, "attachment_context_too_large");
+  assertEquals(providerRequests.length, 2);
+
+  const overflowConversation = await json(
+    await app.request("/api/conversations", {
+      method: "POST",
+      headers: { ...adminSession, "content-type": "application/json" },
+      body: JSON.stringify({ title: "Context overflow" }),
+    }),
+  );
+  const contextOverflow = await app.request(
+    `/api/conversations/${overflowConversation.id}/generate`,
+    {
+      method: "POST",
+      headers: { ...adminSession, "content-type": "application/json" },
+      body: JSON.stringify({
+        content: "x".repeat(128_001),
+        model: "simulated/dg-chat",
+        parentId: null,
+        expectedVersion: 0,
+        idempotencyKey: "files-generation-context-overflow",
+        attachmentIds: [],
+      }),
+    },
+  );
+  assertEquals(contextOverflow.status, 422);
+  assertEquals((await json(contextOverflow)).error.code, "context_length_exceeded");
+  assertEquals(providerRequests.length, 2);
+
+  const openAIText = "OpenAI file lifecycle bytes";
+  const missingPurpose = new FormData();
+  missingPurpose.set(
+    "file",
+    new File([openAIText], "missing-purpose.txt", {
+      type: "text/plain",
+    }),
+  );
+  const missingPurposeResponse = await app.request("/v1/files", {
+    method: "POST",
+    headers: { authorization: `Bearer ${adminToken}` },
+    body: missingPurpose,
+  });
+  assertEquals(missingPurposeResponse.status, 400);
+  assertEquals((await json(missingPurposeResponse)).error.code, "missing_file_purpose");
+  const unsupportedPurpose = new FormData();
+  unsupportedPurpose.set("purpose", "fine-tune");
+  unsupportedPurpose.set(
+    "file",
+    new File([openAIText], "unsupported.txt", { type: "text/plain" }),
+  );
+  const unsupportedPurposeResponse = await app.request("/v1/files", {
+    method: "POST",
+    headers: { authorization: `Bearer ${adminToken}` },
+    body: unsupportedPurpose,
+  });
+  assertEquals(unsupportedPurposeResponse.status, 400);
+  assertEquals((await json(unsupportedPurposeResponse)).error.code, "unsupported_file_purpose");
+  const openAIForm = new FormData();
+  openAIForm.set("purpose", "assistants");
+  openAIForm.set("file", new File([openAIText], "openai.txt", { type: "text/plain" }));
+  const openAIUploadResponse = await app.request("/v1/files", {
+    method: "POST",
+    headers: { authorization: `Bearer ${adminToken}` },
+    body: openAIForm,
+  });
+  assertEquals(openAIUploadResponse.status, 201);
+  const openAIUpload = await json(openAIUploadResponse);
+  assertEquals(openAIUpload.object, "file");
+  assertEquals(openAIUpload.status, "processed");
+  assertEquals(openAIUpload.bytes, new TextEncoder().encode(openAIText).byteLength);
+  assertEquals(JSON.stringify(openAIUpload).includes("objectKey"), false);
+  assertEquals(JSON.stringify(openAIUpload).includes("sha256"), false);
+
+  const listed = await json(
+    await app.request("/v1/files", {
+      headers: { authorization: `Bearer ${adminToken}` },
+    }),
+  );
+  assertEquals(listed.object, "list");
+  assertEquals(listed.has_more, false);
+  assertEquals(listed.data.some((file: { id: string }) => file.id === openAIUpload.id), true);
+  const retrieved = await json(
+    await app.request(`/v1/files/${openAIUpload.id}`, {
+      headers: { authorization: `Bearer ${adminToken}` },
+    }),
+  );
+  assertEquals(retrieved.id, openAIUpload.id);
+  assertEquals(retrieved.filename, "openai.txt");
+  const openAIContent = await app.request(`/v1/files/${openAIUpload.id}/content`, {
+    headers: { authorization: `Bearer ${adminToken}` },
+  });
+  assertEquals(await openAIContent.text(), openAIText);
+  const deletion = await app.request(`/v1/files/${openAIUpload.id}`, {
+    method: "DELETE",
+    headers: { authorization: `Bearer ${adminToken}` },
+  });
+  assertEquals(deletion.status, 200);
+  assertEquals(await json(deletion), { id: openAIUpload.id, object: "file", deleted: true });
+  const afterDelete = await app.request(`/v1/files/${openAIUpload.id}/content`, {
+    headers: { authorization: `Bearer ${adminToken}` },
+  });
+  assertEquals(afterDelete.status, 404);
+  assertEquals((await json(afterDelete)).error.code, "not_found");
+  assertEquals(objectStore.objects.size, 3);
+  assertExists(admin.id);
 });
