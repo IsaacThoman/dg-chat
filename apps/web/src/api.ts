@@ -93,6 +93,18 @@ export function mapMessage(value: RawMessage): Message {
     ? value.metadata.reasoning
     : undefined;
   const toolCalls = Array.isArray(value.metadata?.toolCalls) ? value.metadata.toolCalls.length : 0;
+  const knowledgeSources = Array.isArray(value.metadata?.knowledgeSources)
+    ? value.metadata.knowledgeSources.filter((source): source is {
+      label: string;
+      collectionName: string;
+      filename: string;
+    } => {
+      if (!source || typeof source !== "object") return false;
+      const item = source as Record<string, unknown>;
+      return typeof item.label === "string" && typeof item.collectionName === "string" &&
+        typeof item.filename === "string";
+    })
+    : undefined;
   return {
     id: value.id,
     parentId: value.parentId,
@@ -109,6 +121,7 @@ export function mapMessage(value: RawMessage): Message {
     latency: [duration, tokens].filter(Boolean).join(" · ") || undefined,
     reasoning,
     toolStatus: toolCalls ? `${toolCalls} tool call${toolCalls === 1 ? "" : "s"}` : undefined,
+    knowledgeSources,
     status: value.status ?? "complete",
     attachments: value.attachments,
   };

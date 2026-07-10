@@ -821,6 +821,20 @@ function MessageItem(
             {message.content}
           </ReactMarkdown>
         </div>
+        {message.knowledgeSources?.length
+          ? (
+            <details className="reasoning-panel">
+              <summary>Sources ({message.knowledgeSources.length})</summary>
+              <ul>
+                {message.knowledgeSources.map((source) => (
+                  <li key={source.label}>
+                    <strong>[{source.label}]</strong> {source.collectionName} / {source.filename}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )
+          : null}
         <div className="message-actions">
           <IconButton label="Copy response" onClick={copy}>
             {copied ? <Check size={15} /> : <Copy size={15} />}
