@@ -9,9 +9,9 @@
     "npm:@types/react-dom@^19.1.6": "19.2.3_@types+react@19.2.17",
     "npm:@types/react@^19.1.8": "19.2.17",
     "npm:@vitejs/plugin-react@^4.6.0": "4.7.0_vite@7.3.6",
-    "npm:drizzle-kit@0.31.7": "0.31.7",
-    "npm:drizzle-orm@0.44.7": "0.44.7_postgres@3.4.7",
-    "npm:hono@4.9.8": "4.9.8",
+    "npm:drizzle-kit@0.31.10": "0.31.10",
+    "npm:drizzle-orm@0.45.2": "0.45.2_postgres@3.4.7",
+    "npm:hono@4.12.28": "4.12.28",
     "npm:lucide-react@0.468": "0.468.0_react@19.2.7",
     "npm:postgres@3.4.7": "3.4.7",
     "npm:react-dom@^19.1.0": "19.2.7_react@19.2.7",
@@ -1942,18 +1942,18 @@
         "dequal"
       ]
     },
-    "drizzle-kit@0.31.7": {
-      "integrity": "sha512-hOzRGSdyKIU4FcTSFYGKdXEjFsncVwHZ43gY3WU5Bz9j5Iadp6Rh6hxLSQ1IWXpKLBKt/d5y1cpSPcV+FcoQ1A==",
+    "drizzle-kit@0.31.10": {
+      "integrity": "sha512-7OZcmQUrdGI+DUNNsKBn1aW8qSoKuTH7d0mYgSP8bAzdFzKoovxEFnoGQp2dVs82EOJeYycqRtciopszwUf8bw==",
       "dependencies": [
         "@drizzle-team/brocli",
         "@esbuild-kit/esm-loader",
         "esbuild@0.25.12",
-        "esbuild-register"
+        "tsx"
       ],
       "bin": true
     },
-    "drizzle-orm@0.44.7_postgres@3.4.7": {
-      "integrity": "sha512-quIpnYznjU9lHshEOAYLoZ9s3jweleHlZIAWR/jX9gAWNg/JhQ1wj0KGRf7/Zm+obRrYd9GjPVJg790QY9N5AQ==",
+    "drizzle-orm@0.45.2_postgres@3.4.7": {
+      "integrity": "sha512-kY0BSaTNYWnoDMVoyY8uxmyHjpJW1geOmBMdSSicKo9CIIWkSxMIj2rkeSR51b8KAPB7m+qysjuHme5nKP+E5Q==",
       "dependencies": [
         "postgres"
       ],
@@ -2080,13 +2080,6 @@
         "is-callable",
         "is-date-object",
         "is-symbol"
-      ]
-    },
-    "esbuild-register@3.6.0_esbuild@0.25.12": {
-      "integrity": "sha512-H2/S7Pm8a9CL1uhp9OvjwrBh5Pvx0H8qVOxNu8Wed9Y7qv56MPtq+GGM8RJpq6glYJn9Wspr8uw7l55uyinNeg==",
-      "dependencies": [
-        "debug",
-        "esbuild@0.25.12"
       ]
     },
     "esbuild@0.18.20": {
@@ -2435,8 +2428,8 @@
     "highlight.js@11.11.1": {
       "integrity": "sha512-Xwwo44whKBVCYoliBQwaPvtd/2tYFkRQtXDWj1nackaV2JPXx3L0+Jvd8/qCJ2p+ML0/XVkJ2q+Mr+UVdpJK5w=="
     },
-    "hono@4.9.8": {
-      "integrity": "sha512-JW8Bb4RFWD9iOKxg5PbUarBYGM99IcxFl2FPBo2gSJO11jjUDqlP1Bmfyqt8Z/dGhIQ63PMA9LdcLefXyIasyg=="
+    "hono@4.12.28": {
+      "integrity": "sha512-YwUvVpSF7m1yOblFPrU3Hbo8XhPheBoiyfGuII6z19LnOr6JpDnyyp7LFNrfV56wS8tpvtBFGRISHN02pDdLOA=="
     },
     "html-url-attributes@3.0.1": {
       "integrity": "sha512-ol6UPyBWqsrO6EJySPz2O7ZSr856WDrEzM5zMqp+FJJLGMW35cLYmmZnl0vztAZxRUoNZJFTCohfjuIJ8I4QBQ=="
@@ -3759,6 +3752,16 @@
     "trough@2.2.0": {
       "integrity": "sha512-tmMpK00BjZiUyVyvrBK7knerNgmgvcV/KLVyuma/SC+TQN167GrMRciANTz09+k3zW8L8t60jWO1GpfkZdjTaw=="
     },
+    "tsx@4.23.0": {
+      "integrity": "sha512-eUdUIaCr963q2h5u3+QwvYp0+eqPvn+egeqZUm0hwERCqqx1E3kK5ehbGCvqSE5MQAULr67ww0cA3jKc3YkM1w==",
+      "dependencies": [
+        "esbuild@0.28.1"
+      ],
+      "optionalDependencies": [
+        "fsevents@2.3.3"
+      ],
+      "bin": true
+    },
     "type-fest@0.16.0": {
       "integrity": "sha512-eaBzG6MxNzEn9kiwvtre90cXaNLkmadMWa1zQMs3XORCXNbsH/OewwbxC5ia9dCxIxnTAsSxXJaa/p5y8DlvJg=="
     },
@@ -4225,7 +4228,7 @@
     "members": {
       "apps/api": {
         "dependencies": [
-          "npm:hono@4.9.8"
+          "npm:hono@4.12.28"
         ]
       },
       "apps/web": {
@@ -4261,8 +4264,8 @@
       },
       "packages/database": {
         "dependencies": [
-          "npm:drizzle-kit@0.31.7",
-          "npm:drizzle-orm@0.44.7",
+          "npm:drizzle-kit@0.31.10",
+          "npm:drizzle-orm@0.45.2",
           "npm:postgres@3.4.7"
         ]
       }

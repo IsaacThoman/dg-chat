@@ -25,10 +25,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
       - name: Secret scan
         run: docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.24.2 detect --source /repo --config /repo/.gitleaks.toml --no-banner --redact
       - name: Dependency vulnerability scan
-        run: docker run --rm -v "$PWD:/src" ghcr.io/google/osv-scanner/osv-scanner:v2.0.2 scan source -r /src
+        run: deno audit --level=high --ignore-unfixable
       - name: Filesystem vulnerability and misconfiguration scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:

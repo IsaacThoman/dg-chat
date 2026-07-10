@@ -1,10 +1,10 @@
-import { Hono } from "npm:hono@4.9.8";
-import { cors } from "npm:hono@4.9.8/cors";
-import { deleteCookie, getCookie, setCookie } from "npm:hono@4.9.8/cookie";
-import { logger } from "npm:hono@4.9.8/logger";
-import { secureHeaders } from "npm:hono@4.9.8/secure-headers";
-import { streamSSE } from "npm:hono@4.9.8/streaming";
-import type { Context, MiddlewareHandler } from "npm:hono@4.9.8";
+import { Hono } from "npm:hono@4.12.28";
+import { cors } from "npm:hono@4.12.28/cors";
+import { deleteCookie, getCookie, setCookie } from "npm:hono@4.12.28/cookie";
+import { logger } from "npm:hono@4.12.28/logger";
+import { secureHeaders } from "npm:hono@4.12.28/secure-headers";
+import { streamSSE } from "npm:hono@4.12.28/streaming";
+import type { Context, MiddlewareHandler } from "npm:hono@4.12.28";
 import {
   appendMessageSchema,
   approvalSchema,

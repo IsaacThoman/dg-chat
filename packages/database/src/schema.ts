@@ -12,7 +12,7 @@ import {
   uniqueIndex,
   uuid,
   vector,
-} from "npm:drizzle-orm@0.44.7/pg-core";
+} from "npm:drizzle-orm@0.45.2/pg-core";
 
 export const approvalStatus = pgEnum("approval_status", ["pending", "approved", "rejected"]);
 export const userRole = pgEnum("user_role", ["user", "admin"]);
