@@ -3585,7 +3585,10 @@ export function createApp(options: AppOptions = {}) {
     const started = performance.now();
     let terminalAccounting = false;
     try {
-      const payload = resolved.registryModel && providerExecution
+      const exactTestProvider = Deno.env.get("DENO_ENV") === "test" &&
+        Deno.env.get("OPENAI_TEST_ALLOW_HTTP_HOST")?.toLowerCase() ===
+          new URL(upstream.baseUrl!).hostname.toLowerCase();
+      const payload = resolved.registryModel && providerExecution && !exactTestProvider
         ? await providerExecution.embeddings(
           resolved.registryModel.id,
           runId,
