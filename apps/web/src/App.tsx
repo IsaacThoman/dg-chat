@@ -1,6 +1,7 @@
 import {
   type ChangeEvent,
   type FormEvent,
+  Fragment,
   type ReactNode,
   useEffect,
   useId,
@@ -720,19 +721,21 @@ function MessageItem(
         <div className="message-inner">
           <div className="user-bubble">
             {message.attachments?.map((a) => (
-              <a
-                className="attachment"
-                key={a.id}
-                href={`/api/messages/${message.id}/attachments/${a.id}/content`}
-              >
-                <span>
-                  <FileText size={19} />
-                </span>
-                <div>
-                  <strong>{a.filename}</strong>
-                  <small>{a.mimeType} · {Math.max(1, Math.ceil(a.sizeBytes / 1024))} KB</small>
-                </div>
-              </a>
+              <Fragment key={a.id}>
+                <a
+                  className="attachment"
+                  href={`/api/messages/${message.id}/attachments/${a.id}/content`}
+                >
+                  <span>
+                    <FileText size={19} />
+                  </span>
+                  <div>
+                    <strong>{a.filename}</strong>
+                    <small>{a.mimeType} · {Math.max(1, Math.ceil(a.sizeBytes / 1024))} KB</small>
+                  </div>
+                </a>
+                <AttachmentIngestionBadge attachment={a} />
+              </Fragment>
             ))}
             <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
           </div>
@@ -805,6 +808,44 @@ function MessageItem(
         </div>
       </div>
     </article>
+  );
+}
+
+function AttachmentIngestionBadge({ attachment }: { attachment: Attachment }) {
+  const queryClient = useQueryClient();
+  const [status, setStatus] = useState(attachment.ingestionStatus);
+  const [busy, setBusy] = useState(false);
+  const [retryError, setRetryError] = useState(false);
+  useEffect(() => setStatus(attachment.ingestionStatus), [attachment.ingestionStatus]);
+  useEffect(() => {
+    if (status !== "queued" && status !== "processing") return;
+    const timer = setInterval(
+      () => void queryClient.invalidateQueries({ queryKey: ["messages"] }),
+      2000,
+    );
+    return () => clearInterval(timer);
+  }, [queryClient, status]);
+  if (!status || status === "not_applicable") return null;
+  if (status !== "failed") return <small role="status">Knowledge: {status}</small>;
+  return (
+    <span>
+      <small>Knowledge ingestion failed.</small>{" "}
+      <button
+        type="button"
+        className="link-button"
+        disabled={busy}
+        onClick={() => {
+          setBusy(true);
+          setRetryError(false);
+          void api.retryAttachmentIngestion(attachment.id).then((updated) => {
+            setStatus(updated.ingestionStatus);
+          }).catch(() => setRetryError(true)).finally(() => setBusy(false));
+        }}
+      >
+        {busy ? "Retrying…" : "Retry knowledge ingestion"}
+      </button>
+      {retryError && <small role="alert">Retry failed. Try again.</small>}
+    </span>
   );
 }
 

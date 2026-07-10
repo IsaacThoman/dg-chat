@@ -380,6 +380,85 @@ Deno.test("generation atomically links only ready attachments and rejects attach
   assertEquals(repo.listMessageAttachments(started.message.id, owner.id).length, 1);
 });
 
+Deno.test("text ingestion is separate, idempotent, replaceable, retryable, and owner-isolated", () => {
+  const repo = new MemoryRepository();
+  const owner = repo.createUser({ email: "ingest@example.com", name: "Ingest", passwordHash: "x" });
+  const stranger = repo.createUser({
+    email: "stranger-ingest@example.com",
+    name: "No",
+    passwordHash: "x",
+  });
+  const created = repo.createAttachment({
+    ownerId: owner.id,
+    objectKey: `uploads/${owner.id}/ingest.txt`,
+    filename: "ingest.txt",
+    mimeType: "text/plain",
+    sizeBytes: 5,
+    sha256: "b".repeat(64),
+    state: "ready",
+  });
+  assertEquals(created.attachment.state, "ready");
+  assertEquals(created.attachment.ingestionStatus, "queued");
+  assertEquals(repo.listJobs().filter((job) => job.type === "attachment.ingest").length, 1);
+  const replay = repo.createAttachment({
+    ownerId: owner.id,
+    objectKey: `uploads/${owner.id}/duplicate.txt`,
+    filename: "ingest.txt",
+    mimeType: "text/plain",
+    sizeBytes: 5,
+    sha256: "b".repeat(64),
+    state: "ready",
+  });
+  assertEquals(replay.attachment.id, created.attachment.id);
+  assertEquals(repo.listJobs().filter((job) => job.type === "attachment.ingest").length, 1);
+  repo.beginAttachmentIngestion(created.attachment.id, owner.id);
+  const first = [{
+    id: "00000000-0000-8000-8000-000000000001",
+    ordinal: 0,
+    content: "hello",
+    metadata: { sourceAttachmentId: created.attachment.id, startLine: 1, endLine: 1 },
+  }];
+  repo.completeAttachmentIngestion(created.attachment.id, owner.id, first);
+  assertEquals(repo.listDocumentChunks(created.attachment.id, owner.id), [
+    { ...first[0], attachmentId: created.attachment.id },
+  ]);
+  assertThrows(
+    () => repo.listDocumentChunks(created.attachment.id, stranger.id),
+    DomainError,
+    "not found",
+  );
+  created.attachment.ingestionStatus = "processing";
+  assertThrows(
+    () =>
+      repo.completeAttachmentIngestion(created.attachment.id, owner.id, [{
+        ...first[0],
+        ordinal: 1,
+      }]),
+    DomainError,
+    "invalid",
+  );
+  assertEquals(repo.listDocumentChunks(created.attachment.id, owner.id)[0].content, "hello");
+  repo.failAttachmentIngestion(created.attachment.id, owner.id, "object missing");
+  assertThrows(
+    () => repo.retryAttachmentIngestion(created.attachment.id, stranger.id),
+    DomainError,
+    "not found",
+  );
+  created.attachment.ingestionStatus = "queued";
+  const ingestJob = repo.jobs.find((job) => job.type === "attachment.ingest")!;
+  ingestJob.status = "failed";
+  assertEquals(
+    repo.retryAttachmentIngestion(created.attachment.id, owner.id).ingestionStatus,
+    "queued",
+  );
+  repo.deleteAttachment(created.attachment.id, owner.id);
+  assertThrows(
+    () => repo.listDocumentChunks(created.attachment.id, owner.id),
+    DomainError,
+    "not found",
+  );
+});
+
 Deno.test("ledger reserve settle and refund are idempotent", () => {
   const repo = new MemoryRepository();
   const user = repo.createUser({ email: "u@example.com", name: "User", passwordHash: "x" });

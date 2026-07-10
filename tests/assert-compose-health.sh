@@ -36,4 +36,12 @@ if [[ "$restart_count" != "0" ]]; then
   exit 1
 fi
 
+worker_env="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$worker_id")"
+for name in S3_ENDPOINT S3_REGION S3_BUCKET S3_ACCESS_KEY S3_SECRET_KEY S3_FORCE_PATH_STYLE; do
+  if ! grep -q "^${name}=." <<<"$worker_env"; then
+    echo "worker is missing required object-storage environment: $name" >&2
+    exit 1
+  fi
+done
+
 echo "worker is healthy and started without restarts"

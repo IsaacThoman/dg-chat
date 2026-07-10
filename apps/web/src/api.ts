@@ -225,6 +225,11 @@ export const api = {
   uploadAttachment,
   deleteAttachment: (id: string) =>
     request<unknown>(`/attachments/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  retryAttachmentIngestion: (id: string) =>
+    request<{ attachment: Attachment }>(
+      `/attachments/${encodeURIComponent(id)}/ingestion/retry`,
+      { method: "POST" },
+    ).then((result) => result.attachment),
   updateConversation: async (
     id: string,
     patch: { title?: string; pinned?: boolean; archived?: boolean; deleted?: boolean },

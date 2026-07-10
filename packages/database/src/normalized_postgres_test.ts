@@ -981,3 +981,88 @@ Deno.test({
     }
   },
 });
+
+Deno.test({
+  name: "normalized text ingestion replaces chunks atomically and isolates owners",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 1 });
+    await sql`TRUNCATE audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
+    await sql.end();
+    const repo = await PostgresRepository.connect(databaseUrl!);
+    try {
+      const owner = await repo.bootstrapAdmin({
+        email: "ingestion@database.test",
+        name: "Ingestion",
+        passwordHash: "hash",
+      }, 1);
+      const stranger = await repo.createUser({
+        email: "ingestion-stranger@database.test",
+        name: "Stranger",
+        passwordHash: "hash",
+      });
+      const created = await repo.createAttachment({
+        ownerId: owner.id,
+        objectKey: `users/${owner.id}/objects/ingestion`,
+        filename: "notes.json",
+        mimeType: "application/json",
+        sizeBytes: 2,
+        sha256: "e".repeat(64),
+        state: "ready",
+      });
+      assertEquals(created.attachment.ingestionStatus, "queued");
+      const jobs = await repo.listJobs();
+      assertEquals(jobs.filter((job) => job.type === "attachment.ingest").length, 1);
+      const mutate = postgres(databaseUrl!, { max: 1 });
+      await mutate`UPDATE attachments SET ingestion_status='processing' WHERE id=${created.attachment.id}`;
+      await mutate.end();
+      const chunk = {
+        id: "00000000-0000-8000-8000-000000000002",
+        ordinal: 0,
+        content: "{}",
+        metadata: { sourceAttachmentId: created.attachment.id, startLine: 1, endLine: 1 },
+      };
+      await repo.completeAttachmentIngestion(created.attachment.id, owner.id, [chunk]);
+      assertEquals(
+        (await repo.listDocumentChunks(created.attachment.id, owner.id))[0].content,
+        "{}",
+      );
+      await assertRejects(
+        () => repo.listDocumentChunks(created.attachment.id, stranger.id),
+        DomainError,
+        "not found",
+      );
+      const mutateAgain = postgres(databaseUrl!, { max: 1 });
+      await mutateAgain`UPDATE attachments SET ingestion_status='processing' WHERE id=${created.attachment.id}`;
+      await mutateAgain.end();
+      await assertRejects(
+        () =>
+          repo.completeAttachmentIngestion(created.attachment.id, owner.id, [{
+            ...chunk,
+            ordinal: 1,
+          }]),
+        DomainError,
+        "invalid",
+      );
+      assertEquals(
+        (await repo.listDocumentChunks(created.attachment.id, owner.id))[0].content,
+        "{}",
+      );
+      await repo.failAttachmentIngestion(created.attachment.id, owner.id, "missing object");
+      const legacyRepair = postgres(databaseUrl!, { max: 1 });
+      await legacyRepair`UPDATE attachments SET ingestion_status='queued'
+        WHERE id=${created.attachment.id}`;
+      await legacyRepair`UPDATE jobs SET status='failed'
+        WHERE idempotency_key=${`attachment.ingest:${created.attachment.id}`}`;
+      await legacyRepair.end();
+      assertEquals(
+        (await repo.retryAttachmentIngestion(created.attachment.id, owner.id)).ingestionStatus,
+        "queued",
+      );
+    } finally {
+      await repo.close();
+    }
+  },
+});

@@ -1036,8 +1036,10 @@ Deno.test("expired web generation ownership is reclaimed once and fences the old
 
 Deno.test("attachment and OpenAI Files routes enforce security, ownership, scopes, and immutable links", async () => {
   const objectStore = new TestObjectStore();
+  const repository = new MemoryRepository();
   const providerRequests: ChatCompletionRequest[] = [];
   const { app } = createApp({
+    repository,
     setupToken: "files-setup",
     objectStore,
     attachmentContextMaxRawBytes: 128,
@@ -1140,9 +1142,35 @@ Deno.test("attachment and OpenAI Files routes enforce security, ownership, scope
   const webUpload = (await json(webUploadResponse)).attachment;
   assertEquals(webUpload.filename, "notes.txt");
   assertEquals(webUpload.state, "ready");
+  assertEquals(webUpload.ingestionStatus, "queued");
   assertEquals(JSON.stringify(webUpload).includes("objectKey"), false);
   assertEquals(JSON.stringify(webUpload).includes("sha256"), false);
   assertEquals(objectStore.objects.size, 1);
+  assertEquals(
+    (await app.request(`/api/attachments/${webUpload.id}/chunks`, { headers: adminSession }))
+      .status,
+    200,
+  );
+  assertEquals(
+    (await app.request(`/api/attachments/${webUpload.id}/chunks`, { headers: otherSession }))
+      .status,
+    404,
+  );
+  repository.beginAttachmentIngestion(webUpload.id, admin.id);
+  repository.failAttachmentIngestion(webUpload.id, admin.id, "missing object");
+  const retry = await app.request(`/api/attachments/${webUpload.id}/ingestion/retry`, {
+    method: "POST",
+    headers: adminSession,
+  });
+  assertEquals(retry.status, 200);
+  assertEquals((await json(retry)).attachment.ingestionStatus, "queued");
+  assertEquals(
+    (await app.request(`/api/attachments/${webUpload.id}/ingestion/retry`, {
+      method: "POST",
+      headers: otherSession,
+    })).status,
+    404,
+  );
 
   const pngBytes = Uint8Array.from(
     atob(

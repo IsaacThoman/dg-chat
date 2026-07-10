@@ -35,9 +35,10 @@ flowchart LR
   cannot break an earlier conversation branch; retention-aware object garbage collection remains
   planned.
 - The worker claims durable jobs using `FOR UPDATE SKIP LOCKED`. Handlers must be idempotent and
-  retry-safe. Its current attachment handler acknowledges upload-time inspection results; document
-  extraction, OCR, embedding, retrieval, malware scanning, and quarantined-file reprocessing remain
-  planned.
+  retry-safe. Text and JSON attachments use a separate, fenced ingestion state machine that streams
+  private objects through byte/time and UTF-8/JSON validation, then transactionally replaces stable,
+  citation-aware chunks. PDF/Office extraction, OCR, embeddings/vector retrieval, malware scanning,
+  and quarantined-file reprocessing remain planned.
 
 ## Core invariants
 

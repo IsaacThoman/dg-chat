@@ -12,8 +12,7 @@ test(
     await composer.focus();
     await expect(composer).toBeFocused();
     await expect(page.getByRole("button", { name: "New chat ⌘ K", exact: true })).toBeVisible();
-    await expect(page.getByRole("button", { name: "Attach files (not available yet)" }))
-      .toBeDisabled();
+    await expect(page.getByRole("button", { name: "Attach files" })).toBeEnabled();
     await expect(page.getByRole("button", { name: "Web search (not available yet)" }))
       .toBeDisabled();
     await expect(page.getByRole("button", { name: "Tools (not available yet)" })).toBeDisabled();

@@ -131,6 +131,9 @@ export const attachments = pgTable("attachments", {
   sha256: text("sha256").notNull(),
   state: text("state").notNull().default("pending"),
   inspectionError: text("inspection_error"),
+  ingestionStatus: text("ingestion_status").notNull().default("not_applicable"),
+  ingestionError: text("ingestion_error"),
+  ingestedAt: timestamp("ingested_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   deletedAt: timestamp("deleted_at", { withTimezone: true }),
@@ -235,7 +238,9 @@ export const documentChunks = pgTable("document_chunks", {
   content: text("content").notNull(),
   embedding: vector("embedding", { dimensions: 1536 }),
   metadata: jsonb("metadata").notNull().default({}),
-});
+}, (table) => [
+  uniqueIndex("document_chunks_attachment_ordinal_uq").on(table.attachmentId, table.ordinal),
+]);
 
 export const auditEvents = pgTable("audit_events", {
   id: uuid("id").primaryKey().defaultRandom(),
