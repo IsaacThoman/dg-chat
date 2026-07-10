@@ -555,7 +555,30 @@ function TreePanel({ messages, activeLeafId, close, onSelect, busy }: {
           Every edit creates a new path. Your original messages and responses are always
           recoverable.
         </p>
-        <div className="tree" role="tree" aria-label="Conversation branches">
+        <div
+          className="tree"
+          role="tree"
+          aria-label="Conversation branches"
+          onKeyDown={(event) => {
+            if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+            const items = [...event.currentTarget.querySelectorAll<HTMLElement>(
+              '[role="treeitem"]:not([aria-disabled="true"])',
+            )];
+            const current = (event.target as HTMLElement).closest<HTMLElement>('[role="treeitem"]');
+            const index = current ? items.indexOf(current) : -1;
+            const next = event.key === "Home"
+              ? items[0]
+              : event.key === "End"
+              ? items.at(-1)
+              : event.key === "ArrowDown"
+              ? items[Math.min(items.length - 1, index + 1)]
+              : items[Math.max(0, index - 1)];
+            if (next) {
+              event.preventDefault();
+              next.focus();
+            }
+          }}
+        >
           {roots.length
             ? roots.map((root) => (
               <TreeNode
@@ -801,11 +824,19 @@ const settingsNav = [
   { id: "tokens", label: "API tokens", icon: KeyRound },
   { id: "usage", label: "Usage & credits", icon: CircleDollarSign },
 ];
-function SettingsView({ user, initial = "account" }: { user: User; initial?: string }) {
+function SettingsView(
+  { user, initial = "account", onMenu }: { user: User; initial?: string; onMenu: () => void },
+) {
   const [section, setSection] = useState(initial);
   const [theme, setTheme] = useState("System");
   return (
     <main className="page-main">
+      <header className="admin-mobile-head">
+        <IconButton label="Open menu" onClick={onMenu}>
+          <Menu size={20} />
+        </IconButton>
+        <strong>Settings</strong>
+      </header>
       <PageHeader title="Settings" subtitle="Manage your account and workspace preferences" />
       <div className="settings-layout">
         <nav className="settings-nav">
@@ -1678,8 +1709,14 @@ export function App() {
           onConversationCreated={conversationCreated}
         />
       )}
-      {view === "settings" && <SettingsView user={user} />}
-      {view === "tokens" && <SettingsView user={user} initial="tokens" />}
+      {view === "settings" && <SettingsView user={user} onMenu={() => setMobile(true)} />}
+      {view === "tokens" && (
+        <SettingsView
+          user={user}
+          initial="tokens"
+          onMenu={() => setMobile(true)}
+        />
+      )}
       {view === "admin" && <AdminView onMenu={() => setMobile(true)} />}
     </div>
   );
