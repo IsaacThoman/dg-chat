@@ -277,7 +277,8 @@ export function createApp(options: AppOptions = {}) {
     return c.json({
       bootstrapRequired: !users.some((user) => user.role === "admin"),
       setupEnabled: Boolean(setupToken),
-      oidcEnabled: Boolean(Deno.env.get("OIDC_ISSUER") && Deno.env.get("OIDC_CLIENT_ID")),
+      // Do not advertise SSO until the callback/session exchange is mounted end-to-end.
+      oidcEnabled: false,
     });
   });
 

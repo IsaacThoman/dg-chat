@@ -2249,12 +2249,6 @@ kbd {
   .page-main {
     padding: 18px 14px 50px;
   }
-  .page-main::before {
-    content: "☰";
-    display: block;
-    margin-bottom: 17px;
-    color: var(--muted);
-  }
   .page-header {
     margin-bottom: 23px;
   }
