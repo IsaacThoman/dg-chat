@@ -574,7 +574,7 @@ Deno.test("provider aggregates authoritatively settle API failures and stale run
   });
 });
 
-Deno.test("paid provider generation failure remains an operation failure", () => {
+Deno.test("paid provider generation failure remains failed and replays durably", () => {
   const repo = new MemoryRepository();
   const user = repo.createUser({
     email: "provider-generation-failure@example.com",
@@ -618,7 +618,9 @@ Deno.test("paid provider generation failure remains an operation failure", () =>
     status: "failed",
     cost: 4,
   });
-  assertThrows(() => repo.beginGeneration(input), DomainError, "new idempotency key");
+  const replay = repo.beginGeneration(input);
+  assertEquals(replay.kind, "completed");
+  assertEquals(replay.usageRun.status, "failed");
 });
 
 Deno.test("message edits append immutable sibling branches", () => {
@@ -856,6 +858,7 @@ Deno.test("generation leases allow one owner and fence expired workers", () => {
   assertEquals(completed.usageRun.generationLeaseToken, null);
 
   const second = repo.createConversation(user.id, "Reaper");
+  const abandonedGenerationId = crypto.randomUUID();
   const abandoned = repo.beginGeneration({
     ...input,
     message: {
@@ -865,12 +868,484 @@ Deno.test("generation leases allow one owner and fence expired workers", () => {
       idempotencyKey: "reaper-user",
     },
     runId: "reaper-run",
+    generationId: abandonedGenerationId,
   });
   if (abandoned.kind !== "started") throw new Error("reaper generation did not start");
   abandoned.usageRun.generationLeaseExpiresAt = new Date(Date.now() - 1).toISOString();
+  assertThrows(
+    () => repo.requestGenerationStop(second.id, user.id, abandonedGenerationId),
+    DomainError,
+    "already complete",
+  );
   assertEquals(repo.reapStaleGenerations(), 1);
   assertEquals(repo.reapStaleGenerations(), 0);
   assertEquals(abandoned.usageRun.status, "failed");
+  const reapedAssistant = repo.detail(second.id, user.id).messages.find((message) =>
+    message.role === "assistant"
+  );
+  assertEquals(reapedAssistant?.status, "error");
+  assertEquals(reapedAssistant?.metadata.runId, "reaper-run");
+
+  const stoppedConversation = repo.createConversation(user.id, "Stopped reaper");
+  const stoppedGenerationId = crypto.randomUUID();
+  const stopped = repo.beginGeneration({
+    ...input,
+    message: {
+      ...input.message,
+      conversationId: stoppedConversation.id,
+      expectedVersion: 0,
+      idempotencyKey: "stopped-reaper-user",
+    },
+    runId: "stopped-reaper-run",
+    generationId: stoppedGenerationId,
+  });
+  if (stopped.kind !== "started") throw new Error("stopped reaper did not start");
+  repo.requestGenerationStop(stoppedConversation.id, user.id, stoppedGenerationId);
+  stopped.usageRun.generationLeaseExpiresAt = new Date(Date.now() - 1).toISOString();
+  assertEquals(repo.reapStaleGenerations(), 1);
+  const stoppedAssistant = repo.detail(stoppedConversation.id, user.id).messages.find((message) =>
+    message.role === "assistant"
+  );
+  assertEquals(stoppedAssistant?.status, "stopped");
+  assertEquals(stoppedAssistant?.metadata.stopReason, "user");
+});
+
+Deno.test("stream generation controls fence concurrent sends and preserve regenerate lineage", () => {
+  const repo = new MemoryRepository();
+  const owner = repo.createUser({
+    email: "stream-owner@example.com",
+    name: "Owner",
+    passwordHash: "x",
+  });
+  const stranger = repo.createUser({
+    email: "stream-other@example.com",
+    name: "Other",
+    passwordHash: "x",
+  });
+  repo.credit(owner.id, "stream-grant", "grant", 1_000_000);
+  const conversation = repo.createConversation(owner.id, "Streaming");
+  const generationId = crypto.randomUUID();
+  assertThrows(
+    () =>
+      repo.beginGeneration({
+        message: {
+          conversationId: conversation.id,
+          ownerId: owner.id,
+          parentId: null,
+          role: "assistant",
+          content: "invalid root role",
+          model: "simulated/dg-chat",
+          expectedVersion: 0,
+          idempotencyKey: "stream-invalid-role",
+        },
+        runId: "stream-invalid-role",
+        provider: "simulated",
+        reserveMicros: 100,
+      }),
+    DomainError,
+    "user message",
+  );
+  const started = repo.beginGeneration({
+    message: {
+      conversationId: conversation.id,
+      ownerId: owner.id,
+      parentId: null,
+      role: "user",
+      content: "original",
+      model: "simulated/dg-chat",
+      expectedVersion: 0,
+      idempotencyKey: "stream-user-original",
+    },
+    runId: "stream-run-original",
+    generationId,
+    provider: "simulated",
+    reserveMicros: 100,
+  });
+  if (started.kind !== "started") throw new Error("stream did not start");
+  assertThrows(
+    () =>
+      repo.beginGeneration({
+        message: {
+          conversationId: conversation.id,
+          ownerId: owner.id,
+          parentId: started.message.id,
+          role: "user",
+          content: "concurrent",
+          model: "simulated/dg-chat",
+          expectedVersion: started.conversation.version,
+          idempotencyKey: "stream-user-concurrent",
+        },
+        runId: "stream-run-concurrent",
+        provider: "simulated",
+        reserveMicros: 100,
+      }),
+    DomainError,
+    "already active",
+  );
+  assertThrows(
+    () => repo.requestGenerationStop(conversation.id, stranger.id, generationId),
+    DomainError,
+    "not found",
+  );
+  assertEquals(
+    repo.requestGenerationStop(conversation.id, owner.id, generationId).generationId,
+    generationId,
+  );
+  assertEquals(
+    repo.generationStopRequested("stream-run-original", owner.id, started.leaseToken),
+    true,
+  );
+  const original = repo.completeGeneration({
+    conversationId: conversation.id,
+    ownerId: owner.id,
+    userMessageId: started.message.id,
+    runId: "stream-run-original",
+    leaseToken: started.leaseToken,
+    idempotencyKey: "stream-assistant-original",
+    content: "first answer",
+    model: "simulated/dg-chat",
+    costMicros: 10,
+    inputTokens: 2,
+    outputTokens: 3,
+    latencyMs: 1,
+    status: "stopped",
+    metadata: { runId: "stream-run-original" },
+  });
+  assertEquals(original.message.status, "stopped");
+  assertThrows(
+    () =>
+      repo.beginGeneration({
+        message: {
+          conversationId: conversation.id,
+          ownerId: owner.id,
+          parentId: started.message.id,
+          role: "user",
+          content: "user messages cannot follow user messages",
+          model: "simulated/dg-chat",
+          expectedVersion: original.conversation.version,
+          idempotencyKey: "stream-invalid-user-parent",
+        },
+        runId: "stream-invalid-user-parent",
+        provider: "simulated",
+        reserveMicros: 100,
+      }),
+    DomainError,
+    "must follow an assistant",
+  );
+  assertThrows(
+    () =>
+      repo.beginGeneration({
+        message: {
+          conversationId: conversation.id,
+          ownerId: owner.id,
+          parentId: null,
+          role: "user",
+          content: "a second root requires explicit edit lineage",
+          model: "simulated/dg-chat",
+          expectedVersion: original.conversation.version,
+          idempotencyKey: "stream-invalid-extra-root",
+        },
+        runId: "stream-invalid-extra-root",
+        provider: "simulated",
+        reserveMicros: 100,
+      }),
+    DomainError,
+    "requires a parent",
+  );
+  const regenerated = repo.beginAssistantGeneration({
+    conversationId: conversation.id,
+    ownerId: owner.id,
+    sourceAssistantId: original.message.id,
+    mode: "regenerate",
+    model: "simulated/dg-chat",
+    expectedVersion: original.conversation.version,
+    idempotencyKey: "stream-regenerate",
+    runId: "stream-run-regenerate",
+    generationId: crypto.randomUUID(),
+    provider: "simulated",
+    reserveMicros: 100,
+  });
+  if (regenerated.kind !== "started") throw new Error("regenerate did not start");
+  assertEquals(regenerated.message.id, started.message.id);
+  const replacement = repo.completeGeneration({
+    conversationId: conversation.id,
+    ownerId: owner.id,
+    userMessageId: regenerated.message.id,
+    runId: "stream-run-regenerate",
+    leaseToken: regenerated.leaseToken,
+    idempotencyKey: "stream-assistant-regenerate",
+    content: "second answer",
+    model: "simulated/dg-chat",
+    costMicros: 10,
+    inputTokens: 2,
+    outputTokens: 3,
+    latencyMs: 1,
+    supersedesId: original.message.id,
+    metadata: { runId: "stream-run-regenerate" },
+  });
+  assertEquals(replacement.message.parentId, original.message.parentId);
+  assertEquals(replacement.message.supersedesId, original.message.id);
+  assertEquals(repo.detail(conversation.id, owner.id).messages.length, 3);
+});
+
+Deno.test("assistant generation fence is conversation-wide across different active-path sources", () => {
+  const repo = new MemoryRepository();
+  const owner = repo.createUser({
+    email: "source-fence@example.com",
+    name: "Owner",
+    passwordHash: "x",
+  });
+  repo.credit(owner.id, "source-fence-grant", "grant", 1_000_000);
+  const conversation = repo.createConversation(owner.id, "Sources");
+  const userOne = repo.appendMessage({
+    conversationId: conversation.id,
+    ownerId: owner.id,
+    parentId: null,
+    role: "user",
+    content: "one",
+    expectedVersion: 0,
+    idempotencyKey: "source-user-one",
+  });
+  const assistantOne = repo.appendMessage({
+    conversationId: conversation.id,
+    ownerId: owner.id,
+    parentId: userOne.id,
+    role: "assistant",
+    content: "one answer",
+    expectedVersion: 1,
+    idempotencyKey: "source-assistant-one",
+  });
+  const userTwo = repo.appendMessage({
+    conversationId: conversation.id,
+    ownerId: owner.id,
+    parentId: assistantOne.id,
+    role: "user",
+    content: "two",
+    expectedVersion: 2,
+    idempotencyKey: "source-user-two",
+  });
+  const assistantTwo = repo.appendMessage({
+    conversationId: conversation.id,
+    ownerId: owner.id,
+    parentId: userTwo.id,
+    role: "assistant",
+    content: "two answer",
+    expectedVersion: 3,
+    idempotencyKey: "source-assistant-two",
+  });
+  repo.beginAssistantGeneration({
+    conversationId: conversation.id,
+    ownerId: owner.id,
+    sourceAssistantId: assistantOne.id,
+    mode: "regenerate",
+    model: "simulated/dg-chat",
+    expectedVersion: 4,
+    idempotencyKey: "source-first-run",
+    runId: "source-first-run",
+    generationId: crypto.randomUUID(),
+    provider: "simulated",
+    reserveMicros: 10,
+  });
+  assertThrows(
+    () =>
+      repo.beginAssistantGeneration({
+        conversationId: conversation.id,
+        ownerId: owner.id,
+        sourceAssistantId: assistantTwo.id,
+        mode: "regenerate",
+        model: "simulated/dg-chat",
+        expectedVersion: 4,
+        idempotencyKey: "source-second-run",
+        runId: "source-second-run",
+        generationId: crypto.randomUUID(),
+        provider: "simulated",
+        reserveMicros: 10,
+      }),
+    DomainError,
+    "already being generated",
+  );
+});
+
+Deno.test("earlier assistant generation selects its branch and preserves a later explicit selection", () => {
+  const repo = new MemoryRepository();
+  const owner = repo.createUser({
+    email: "earlier-branch@example.com",
+    name: "Owner",
+    passwordHash: "x",
+  });
+  repo.credit(owner.id, "earlier-branch-grant", "grant", 1_000_000);
+  const conversation = repo.createConversation(owner.id, "Earlier branch");
+  const userOne = repo.appendMessage({
+    conversationId: conversation.id,
+    ownerId: owner.id,
+    parentId: null,
+    role: "user",
+    content: "one",
+    expectedVersion: 0,
+    idempotencyKey: "earlier-user-one",
+  });
+  const assistantOne = repo.appendMessage({
+    conversationId: conversation.id,
+    ownerId: owner.id,
+    parentId: userOne.id,
+    role: "assistant",
+    content: "one answer",
+    expectedVersion: 1,
+    idempotencyKey: "earlier-assistant-one",
+  });
+  const userTwo = repo.appendMessage({
+    conversationId: conversation.id,
+    ownerId: owner.id,
+    parentId: assistantOne.id,
+    role: "user",
+    content: "two",
+    expectedVersion: 2,
+    idempotencyKey: "earlier-user-two",
+  });
+  const assistantTwo = repo.appendMessage({
+    conversationId: conversation.id,
+    ownerId: owner.id,
+    parentId: userTwo.id,
+    role: "assistant",
+    content: "two answer",
+    expectedVersion: 3,
+    idempotencyKey: "earlier-assistant-two",
+  });
+  const begun = repo.beginAssistantGeneration({
+    conversationId: conversation.id,
+    ownerId: owner.id,
+    sourceAssistantId: assistantOne.id,
+    mode: "regenerate",
+    model: "simulated/dg-chat",
+    expectedVersion: 4,
+    idempotencyKey: "earlier-regenerate",
+    runId: "earlier-regenerate-run",
+    generationId: crypto.randomUUID(),
+    provider: "simulated",
+    reserveMicros: 10,
+  });
+  if (begun.kind !== "started") throw new Error("generation did not start");
+  assertEquals(begun.conversation.activeLeafId, assistantOne.id);
+  assertEquals(begun.conversation.version, 5);
+
+  const selected = repo.setActiveLeaf(conversation.id, owner.id, assistantTwo.id, 5);
+  assertEquals(selected.activeLeafId, assistantTwo.id);
+  const completed = repo.completeGeneration({
+    conversationId: conversation.id,
+    ownerId: owner.id,
+    userMessageId: userOne.id,
+    runId: "earlier-regenerate-run",
+    leaseToken: begun.leaseToken,
+    idempotencyKey: "earlier-regenerate-assistant",
+    content: "replacement",
+    model: "simulated/dg-chat",
+    costMicros: 1,
+    inputTokens: 1,
+    outputTokens: 1,
+    latencyMs: 1,
+    supersedesId: assistantOne.id,
+  });
+  assertEquals(completed.conversation.activeLeafId, assistantTwo.id);
+  assertEquals(completed.message.supersedesId, assistantOne.id);
+});
+
+Deno.test("earlier failed and reaped generations advance only an untouched branch selection", () => {
+  for (const terminal of ["failure", "reaper"] as const) {
+    for (const preserveLaterSelection of [false, true]) {
+      const suffix = `${terminal}-${preserveLaterSelection ? "selected" : "untouched"}`;
+      const repo = new MemoryRepository();
+      const owner = repo.createUser({
+        email: `earlier-${suffix}@example.com`,
+        name: "Owner",
+        passwordHash: "x",
+      });
+      repo.credit(owner.id, `earlier-${suffix}-grant`, "grant", 1_000_000);
+      const conversation = repo.createConversation(owner.id, `Earlier ${suffix}`);
+      const userOne = repo.appendMessage({
+        conversationId: conversation.id,
+        ownerId: owner.id,
+        parentId: null,
+        role: "user",
+        content: "one",
+        expectedVersion: 0,
+        idempotencyKey: `${suffix}-user-one`,
+      });
+      const assistantOne = repo.appendMessage({
+        conversationId: conversation.id,
+        ownerId: owner.id,
+        parentId: userOne.id,
+        role: "assistant",
+        content: "one answer",
+        expectedVersion: 1,
+        idempotencyKey: `${suffix}-assistant-one`,
+      });
+      const userTwo = repo.appendMessage({
+        conversationId: conversation.id,
+        ownerId: owner.id,
+        parentId: assistantOne.id,
+        role: "user",
+        content: "two",
+        expectedVersion: 2,
+        idempotencyKey: `${suffix}-user-two`,
+      });
+      const assistantTwo = repo.appendMessage({
+        conversationId: conversation.id,
+        ownerId: owner.id,
+        parentId: userTwo.id,
+        role: "assistant",
+        content: "two answer",
+        expectedVersion: 3,
+        idempotencyKey: `${suffix}-assistant-two`,
+      });
+      const runId = `${suffix}-run`;
+      const begun = repo.beginAssistantGeneration({
+        conversationId: conversation.id,
+        ownerId: owner.id,
+        sourceAssistantId: assistantOne.id,
+        mode: "regenerate",
+        model: "simulated/dg-chat",
+        expectedVersion: 4,
+        idempotencyKey: `${suffix}-regenerate`,
+        runId,
+        generationId: crypto.randomUUID(),
+        provider: "simulated",
+        reserveMicros: 10,
+      });
+      if (begun.kind !== "started") throw new Error("generation did not start");
+      if (preserveLaterSelection) {
+        repo.setActiveLeaf(conversation.id, owner.id, assistantTwo.id, begun.conversation.version);
+      }
+
+      let terminalMessageId: string;
+      if (terminal === "failure") {
+        terminalMessageId = repo.failGeneration({
+          conversationId: conversation.id,
+          ownerId: owner.id,
+          userMessageId: userOne.id,
+          runId,
+          leaseToken: begun.leaseToken,
+          idempotencyKey: `${suffix}-error`,
+          model: "simulated/dg-chat",
+          error: "provider failed",
+          supersedesId: assistantOne.id,
+        }).message.id;
+      } else {
+        begun.usageRun.generationLeaseExpiresAt = new Date(Date.now() - 1).toISOString();
+        assertEquals(repo.reapStaleGenerations(), 1);
+        const terminalMessage = repo.detail(conversation.id, owner.id).messages.find((message) =>
+          message.metadata.runId === runId
+        );
+        if (!terminalMessage) throw new Error("reaper terminal was not created");
+        terminalMessageId = terminalMessage.id;
+      }
+
+      assertEquals(
+        repo.detail(conversation.id, owner.id).activeLeafId,
+        preserveLaterSelection ? assistantTwo.id : terminalMessageId,
+        suffix,
+      );
+    }
+  }
 });
 
 Deno.test("attachments deduplicate, inspect, link immutably, and preserve tombstones", () => {

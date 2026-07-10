@@ -71,6 +71,13 @@
       "when": 1783656009000,
       "tag": "0009_provider_resilience",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1783656010000,
+      "tag": "0010_web_generation_controls",
+      "breakpoints": true
     }
   ]
 }

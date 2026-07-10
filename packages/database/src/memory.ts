@@ -23,6 +23,7 @@ import type {
   AuditQuery,
   BeginApiRequestInput,
   BeginApiRequestResult,
+  BeginAssistantGenerationInput,
   BeginGenerationInput,
   BeginGenerationResult,
   CompleteApiRequestInput,
@@ -40,6 +41,7 @@ import type {
   FailGenerationInput,
   FinalizeProviderUsageInput,
   FinishProviderAttemptInput,
+  GenerationControl,
   GenerationResult,
   IdentityTokenPurpose,
   ModelPriceVersion,
@@ -356,6 +358,7 @@ export class MemoryRepository {
   readonly idempotency = new Map<string, string>();
   readonly ledger: LedgerEntry[] = [];
   readonly usageRuns = new Map<string, UsageRun>();
+  readonly generationControls = new Map<string, GenerationControl>();
   readonly apiIdempotencyRequests = new Map<string, ApiIdempotencyRequest>();
   readonly apiIdempotencyKeys = new Map<string, string>();
   readonly jobs: Array<
@@ -827,6 +830,9 @@ export class MemoryRepository {
     if (conversation.archivedAt) {
       throw new DomainError("conversation_archived", "Archived conversations are read-only", 409);
     }
+    if (input.message.role !== "user") {
+      throw new DomainError("invalid_role", "A generation must begin with a user message", 422);
+    }
     const attachmentIds = [...(input.attachmentIds ?? [])].sort();
     if (new Set(attachmentIds).size !== attachmentIds.length || attachmentIds.length > 10) {
       throw new DomainError("validation_error", "Attachment identifiers are invalid", 422);
@@ -840,19 +846,16 @@ export class MemoryRepository {
       const priorAttachments = [...(this.messageAttachments.get(existing.id) ?? [])].sort();
       if (
         existing.content !== input.message.content ||
+        existing.parentId !== input.message.parentId ||
+        existing.supersedesId !== (input.message.supersedesId ?? null) ||
+        existing.role !== input.message.role ||
+        existing.model !== (input.message.model ?? null) ||
         existingRun.userId !== input.message.ownerId ||
         priorAttachments.join("\0") !== [...attachmentIds].sort().join("\0")
       ) {
         throw new DomainError("idempotency_conflict", "Generation replay payload differs", 409);
       }
-      if (existingRun.status === "failed") {
-        throw new DomainError(
-          "generation_failed_replay",
-          "Failed generations require a new idempotency key",
-          409,
-        );
-      }
-      if (existingRun.status === "completed") {
+      if (existingRun.status === "completed" || existingRun.status === "failed") {
         return { kind: "completed", message: existing, conversation, usageRun: existingRun };
       }
       if (
@@ -883,6 +886,44 @@ export class MemoryRepository {
         usageRun: existingRun,
       };
     }
+    if (
+      [...this.generationControls.values()].some((control) =>
+        control.conversationId === input.message.conversationId && !control.terminalAt
+      )
+    ) throw new DomainError("generation_in_progress", "A generation is already active", 409);
+    if (input.message.parentId) {
+      const parent = this.messages.get(input.message.parentId);
+      if (
+        !parent || parent.conversationId !== input.message.conversationId ||
+        parent.role !== "assistant"
+      ) {
+        throw new DomainError(
+          "invalid_parent",
+          "A new user turn must follow an assistant response",
+          422,
+        );
+      }
+    }
+    if (!input.message.parentId && conversation.activeLeafId && !input.message.supersedesId) {
+      throw new DomainError(
+        "invalid_parent",
+        "A non-empty conversation requires a parent or an explicit root edit",
+        422,
+      );
+    }
+    if (input.message.supersedesId) {
+      const superseded = this.messages.get(input.message.supersedesId);
+      if (
+        !superseded || superseded.conversationId !== input.message.conversationId ||
+        superseded.parentId !== input.message.parentId || superseded.role !== "user"
+      ) {
+        throw new DomainError(
+          "invalid_supersedes",
+          "Edited user messages must branch beside another user message",
+          422,
+        );
+      }
+    }
     const account = this.users.get(input.message.ownerId);
     if (!account || account.balanceMicros < input.reserveMicros) {
       throw new DomainError("insufficient_credit", "Insufficient credit", 402);
@@ -911,7 +952,141 @@ export class MemoryRepository {
       Date.now() + (input.leaseSeconds ?? 120) * 1000,
     ).toISOString();
     if (attachmentIds.length) this.messageAttachments.set(message.id, new Set(attachmentIds));
+    this.generationControls.set(input.runId, {
+      runId: input.runId,
+      generationId: input.generationId ?? crypto.randomUUID(),
+      conversationId: input.message.conversationId,
+      ownerId: input.message.ownerId,
+      userMessageId: message.id,
+      mode: "send",
+      sourceMessageId: null,
+      stopRequestedAt: null,
+      terminalAt: null,
+    });
     return { kind: "started", leaseToken, message, conversation, usageRun };
+  }
+
+  beginAssistantGeneration(input: BeginAssistantGenerationInput): BeginGenerationResult {
+    const conversation = this.conversations.get(input.conversationId);
+    const source = this.messages.get(input.sourceAssistantId);
+    const userMessage = source?.parentId ? this.messages.get(source.parentId) : undefined;
+    if (!conversation || conversation.ownerId !== input.ownerId || conversation.deletedAt) {
+      throw new DomainError("not_found", "Conversation not found", 404);
+    }
+    if (conversation.archivedAt) {
+      throw new DomainError("conversation_archived", "Archived conversations are read-only", 409);
+    }
+    if (
+      !source || source.conversationId !== input.conversationId || source.role !== "assistant" ||
+      !userMessage || userMessage.role !== "user"
+    ) {
+      throw new DomainError(
+        "invalid_generation_source",
+        "Source must be an assistant response",
+        422,
+      );
+    }
+    const existingRun = this.usageRuns.get(input.runId);
+    const existingControl = this.generationControls.get(input.runId);
+    if (existingRun && existingControl) {
+      if (
+        existingControl.sourceMessageId !== input.sourceAssistantId ||
+        existingControl.mode !== input.mode || existingRun.model !== input.model
+      ) throw new DomainError("idempotency_conflict", "Generation replay payload differs", 409);
+      if (existingRun.status === "completed" || existingRun.status === "failed") {
+        return { kind: "completed", message: userMessage, conversation, usageRun: existingRun };
+      }
+      if (
+        existingRun.generationLeaseToken && existingRun.generationLeaseExpiresAt &&
+        Date.parse(existingRun.generationLeaseExpiresAt) > Date.now()
+      ) {
+        return {
+          kind: "in_progress",
+          message: userMessage,
+          conversation,
+          usageRun: existingRun,
+          retryAfterSeconds: Math.max(
+            1,
+            Math.ceil((Date.parse(existingRun.generationLeaseExpiresAt) - Date.now()) / 1000),
+          ),
+        };
+      }
+      const leaseToken = crypto.randomUUID();
+      existingRun.generationLeaseToken = leaseToken;
+      existingRun.generationLeaseExpiresAt = new Date(
+        Date.now() + (input.leaseSeconds ?? 120) * 1000,
+      ).toISOString();
+      return {
+        kind: "claimed",
+        leaseToken,
+        message: userMessage,
+        conversation,
+        usageRun: existingRun,
+      };
+    }
+    if (existingRun || existingControl) {
+      throw new DomainError("idempotency_conflict", "Incomplete generation replay", 409);
+    }
+    if (
+      [...this.generationControls.values()].some((control) =>
+        control.conversationId === input.conversationId &&
+        !control.terminalAt
+      )
+    ) {
+      throw new DomainError(
+        "generation_in_progress",
+        "This response is already being generated",
+        409,
+      );
+    }
+    const activePath = new Set<string>();
+    let cursor = conversation.activeLeafId
+      ? this.messages.get(conversation.activeLeafId)
+      : undefined;
+    while (cursor && !activePath.has(cursor.id)) {
+      activePath.add(cursor.id);
+      cursor = cursor.parentId ? this.messages.get(cursor.parentId) : undefined;
+    }
+    if (!activePath.has(source.id)) {
+      throw new DomainError("invalid_generation_source", "Source is not on the active branch", 409);
+    }
+    if (conversation.version !== input.expectedVersion) {
+      throw new DomainError("version_conflict", "Conversation changed in another tab", 409);
+    }
+    const usageRun = this.reserve(
+      input.ownerId,
+      input.runId,
+      input.model,
+      input.reserveMicros,
+      input.provider,
+      undefined,
+      input.pricingSnapshot,
+    );
+    const leaseToken = crypto.randomUUID();
+    usageRun.runLeaseToken = null;
+    usageRun.runLeaseExpiresAt = null;
+    usageRun.generationLeaseToken = leaseToken;
+    usageRun.generationLeaseExpiresAt = new Date(
+      Date.now() + (input.leaseSeconds ?? 120) * 1000,
+    ).toISOString();
+    this.generationControls.set(input.runId, {
+      runId: input.runId,
+      generationId: input.generationId,
+      conversationId: input.conversationId,
+      ownerId: input.ownerId,
+      userMessageId: userMessage.id,
+      mode: input.mode,
+      sourceMessageId: source.id,
+      stopRequestedAt: null,
+      terminalAt: null,
+    });
+    // Starting from an earlier response is also an explicit branch selection. Fence that
+    // selection with the version check above so the eventual terminal node (or reaper)
+    // advances this branch, without overwriting a newer selection from another tab.
+    conversation.activeLeafId = source.id;
+    conversation.version++;
+    conversation.updatedAt = new Date().toISOString();
+    return { kind: "started", leaseToken, message: userMessage, conversation, usageRun };
   }
 
   heartbeatGeneration(
@@ -929,6 +1104,34 @@ export class MemoryRepository {
     run.generationLeaseExpiresAt = new Date(Date.now() + leaseSeconds * 1000).toISOString();
   }
 
+  requestGenerationStop(conversationId: string, ownerId: string, generationId: string) {
+    const control = [...this.generationControls.values()].find((candidate) =>
+      candidate.conversationId === conversationId && candidate.ownerId === ownerId &&
+      candidate.generationId === generationId
+    );
+    if (!control) throw new DomainError("not_found", "Active generation not found", 404);
+    const run = this.usageRuns.get(control.runId);
+    if (
+      !run || run.status !== "reserved" || control.terminalAt ||
+      !run.generationLeaseExpiresAt || Date.parse(run.generationLeaseExpiresAt) <= Date.now()
+    ) {
+      throw new DomainError("generation_terminal", "Generation is already complete", 409);
+    }
+    control.stopRequestedAt ??= new Date().toISOString();
+    return structuredClone(control);
+  }
+
+  generationStopRequested(runId: string, ownerId: string, leaseToken: string) {
+    const control = this.generationControls.get(runId);
+    const run = this.usageRuns.get(runId);
+    if (
+      !control || control.ownerId !== ownerId || !run || run.status !== "reserved" ||
+      control.terminalAt || run.generationLeaseToken !== leaseToken ||
+      !run.generationLeaseExpiresAt || Date.parse(run.generationLeaseExpiresAt) <= Date.now()
+    ) throw new DomainError("stale_lease", "Generation lease is no longer active", 409);
+    return control.stopRequestedAt !== null;
+  }
+
   completeGeneration(input: CompleteGenerationInput): GenerationResult {
     const conversation = this.conversations.get(input.conversationId);
     const parent = this.messages.get(input.userMessageId);
@@ -939,7 +1142,11 @@ export class MemoryRepository {
     const existingId = this.idempotency.get(`${input.conversationId}:${input.idempotencyKey}`);
     if (existingId) {
       const existing = this.messages.get(existingId)!;
-      if (existing.content !== input.content || existing.parentId !== input.userMessageId) {
+      if (
+        existing.content !== input.content || existing.parentId !== input.userMessageId ||
+        existing.status !== (input.status ?? "complete") ||
+        existing.supersedesId !== (input.supersedesId ?? null)
+      ) {
         throw new DomainError("idempotency_conflict", "Generation replay payload differs", 409);
       }
       if (usageRun.status !== "completed") {
@@ -964,6 +1171,7 @@ export class MemoryRepository {
       throw new DomainError("insufficient_credit", "Actual cost exceeds available credit", 402);
     }
     const previousActive = conversation.activeLeafId;
+    const generationControl = this.generationControls.get(input.runId);
     const settled = this.settle(
       input.runId,
       input.costMicros,
@@ -977,6 +1185,7 @@ export class MemoryRepository {
       conversationId: input.conversationId,
       ownerId: input.ownerId,
       parentId: input.userMessageId,
+      supersedesId: input.supersedesId ?? null,
       role: "assistant",
       content: input.content,
       model: input.model,
@@ -984,7 +1193,12 @@ export class MemoryRepository {
       idempotencyKey: input.idempotencyKey,
       metadata: input.metadata,
     });
-    if (previousActive !== input.userMessageId) conversation.activeLeafId = previousActive;
+    message.status = input.status ?? "complete";
+    if (generationControl) generationControl.terminalAt = new Date().toISOString();
+    if (
+      previousActive !== input.userMessageId &&
+      previousActive !== generationControl?.sourceMessageId
+    ) conversation.activeLeafId = previousActive;
     return { message, conversation, usageRun: settled };
   }
 
@@ -1002,6 +1216,7 @@ export class MemoryRepository {
       Date.parse(reserved.generationLeaseExpiresAt) <= Date.now()
     ) throw new DomainError("stale_lease", "Generation lease is no longer active", 409);
     const previousActive = conversation.activeLeafId;
+    const generationControl = this.generationControls.get(input.runId);
     const usageRun = this.refund(input.runId)!;
     usageRun.generationLeaseToken = null;
     usageRun.generationLeaseExpiresAt = null;
@@ -1009,15 +1224,20 @@ export class MemoryRepository {
       conversationId: input.conversationId,
       ownerId: input.ownerId,
       parentId: input.userMessageId,
+      supersedesId: input.supersedesId ?? null,
       role: "assistant",
-      content: input.error,
+      content: input.content ?? input.error,
       model: input.model,
       expectedVersion: conversation.version,
       idempotencyKey: input.idempotencyKey,
-      metadata: { generationError: input.error, retryable: true },
+      metadata: { generationError: input.error, retryable: true, ...input.metadata },
     });
     message.status = "error";
-    if (previousActive !== input.userMessageId) conversation.activeLeafId = previousActive;
+    if (generationControl) generationControl.terminalAt = new Date().toISOString();
+    if (
+      previousActive !== input.userMessageId &&
+      previousActive !== generationControl?.sourceMessageId
+    ) conversation.activeLeafId = previousActive;
     return { message, conversation, usageRun };
   }
 
@@ -1043,6 +1263,56 @@ export class MemoryRepository {
       if (refunded) {
         refunded.generationLeaseToken = null;
         refunded.generationLeaseExpiresAt = null;
+        const control = this.generationControls.get(run.id);
+        if (control) {
+          const conversation = this.conversations.get(control.conversationId);
+          const parent = this.messages.get(control.userMessageId);
+          const existing = [...this.messages.values()].find((message) =>
+            message.conversationId === control.conversationId &&
+            message.metadata.runId === run.id && message.role === "assistant"
+          );
+          if (conversation && parent && !existing) {
+            const previousActive = conversation.activeLeafId;
+            const createdAt = new Date().toISOString();
+            const terminal: MessageNode = {
+              id: crypto.randomUUID(),
+              conversationId: control.conversationId,
+              parentId: control.userMessageId,
+              supersedesId: control.sourceMessageId,
+              generationId: control.generationId,
+              siblingIndex: [...this.messages.values()].filter((message) =>
+                message.conversationId === control.conversationId &&
+                message.parentId === control.userMessageId
+              ).length,
+              role: "assistant",
+              content: control.stopRequestedAt
+                ? "Generation stopped."
+                : "Generation interrupted before completion.",
+              model: run.model,
+              status: control.stopRequestedAt ? "stopped" : "error",
+              metadata: control.stopRequestedAt ? { runId: run.id, stopReason: "user" } : {
+                runId: run.id,
+                generationError: "Generation lease expired",
+                retryable: true,
+              },
+              createdAt,
+            };
+            this.messages.set(terminal.id, terminal);
+            this.idempotency.set(
+              `${control.conversationId}:generation-reaper:${control.generationId}`,
+              terminal.id,
+            );
+            conversation.version++;
+            conversation.updatedAt = createdAt;
+            if (
+              previousActive === control.userMessageId ||
+              previousActive === control.sourceMessageId
+            ) {
+              conversation.activeLeafId = terminal.id;
+            }
+          }
+          control.terminalAt = new Date().toISOString();
+        }
         reaped++;
       }
     }

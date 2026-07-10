@@ -218,6 +218,22 @@ export interface BeginGenerationInput {
   pricingSnapshot?: UsagePricingSnapshot;
   tokenId?: string;
   leaseSeconds?: number;
+  generationId?: string;
+}
+export interface BeginAssistantGenerationInput {
+  conversationId: string;
+  ownerId: string;
+  sourceAssistantId: string;
+  mode: "regenerate" | "continue";
+  model: string;
+  expectedVersion: number;
+  idempotencyKey: string;
+  runId: string;
+  provider: string;
+  reserveMicros: number;
+  pricingSnapshot?: UsagePricingSnapshot;
+  leaseSeconds?: number;
+  generationId: string;
 }
 export interface CompleteGenerationInput {
   conversationId: string;
@@ -233,6 +249,8 @@ export interface CompleteGenerationInput {
   outputTokens: number;
   latencyMs: number;
   metadata?: Record<string, unknown>;
+  status?: "complete" | "stopped";
+  supersedesId?: string | null;
 }
 export interface FailGenerationInput {
   conversationId: string;
@@ -243,11 +261,25 @@ export interface FailGenerationInput {
   idempotencyKey: string;
   model: string;
   error: string;
+  content?: string;
+  metadata?: Record<string, unknown>;
+  supersedesId?: string | null;
 }
 export interface GenerationResult {
   message: MessageNode;
   conversation: Conversation;
   usageRun: UsageRun;
+}
+export interface GenerationControl {
+  runId: string;
+  generationId: string;
+  conversationId: string;
+  ownerId: string;
+  userMessageId: string;
+  mode: "send" | "regenerate" | "continue";
+  sourceMessageId: string | null;
+  stopRequestedAt: string | null;
+  terminalAt: string | null;
 }
 export type BeginGenerationResult =
   | (GenerationResult & { kind: "started" | "claimed"; leaseToken: string })
@@ -714,12 +746,25 @@ export interface DomainRepository {
   detail(id: string, ownerId: string): MaybePromise<ConversationDetail>;
   appendMessage(input: AppendMessageInput): MaybePromise<MessageNode>;
   beginGeneration(input: BeginGenerationInput): MaybePromise<BeginGenerationResult>;
+  beginAssistantGeneration(
+    input: BeginAssistantGenerationInput,
+  ): MaybePromise<BeginGenerationResult>;
   heartbeatGeneration(
     runId: string,
     ownerId: string,
     leaseToken: string,
     leaseSeconds?: number,
   ): MaybePromise<void>;
+  requestGenerationStop(
+    conversationId: string,
+    ownerId: string,
+    generationId: string,
+  ): MaybePromise<GenerationControl>;
+  generationStopRequested(
+    runId: string,
+    ownerId: string,
+    leaseToken: string,
+  ): MaybePromise<boolean>;
   completeGeneration(input: CompleteGenerationInput): MaybePromise<GenerationResult>;
   failGeneration(input: FailGenerationInput): MaybePromise<GenerationResult>;
   reapStaleGenerations(limit?: number): MaybePromise<number>;
