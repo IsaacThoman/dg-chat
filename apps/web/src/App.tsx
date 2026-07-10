@@ -55,10 +55,16 @@ import {
   Users,
   Volume2,
   X,
-  Zap,
 } from "lucide-react";
 import { api } from "./api.ts";
-import { conversationForFirstSend } from "./chatWorkflow.ts";
+import {
+  beginInFlight,
+  conversationForFirstSend,
+  endInFlight,
+  operationForMessage,
+  refreshConversationGraph,
+  type SendOperation,
+} from "./chatWorkflow.ts";
 import {
   activeMessagePath,
   conversationTree,
@@ -228,7 +234,7 @@ function Sidebar({
             className={view === "admin" ? "selected" : ""}
             onClick={() => select("admin")}
           >
-            <ShieldCheck size={17} /> Admin console <span className="badge">3</span>
+            <ShieldCheck size={17} /> Admin console
           </button>
         )}
         <button
@@ -444,10 +450,11 @@ function MessageItem(
 }
 
 function Composer(
-  { onSend, edit, cancelEdit }: {
-    onSend: (value: string) => void;
+  { onSend, edit, cancelEdit, disabled }: {
+    onSend: (value: string) => Promise<boolean>;
     edit?: Message;
     cancelEdit: () => void;
+    disabled: boolean;
   },
 ) {
   const [value, setValue] = useState("");
@@ -456,11 +463,10 @@ function Composer(
   useEffect(() => {
     if (edit) setValue(edit.content.replaceAll("**", ""));
   }, [edit]);
-  const submit = (e: FormEvent) => {
+  const submit = async (e: FormEvent) => {
     e.preventDefault();
-    if (!value.trim()) return;
-    onSend(value.trim());
-    setValue("");
+    if (!value.trim() || disabled) return;
+    if (await onSend(value.trim())) setValue("");
   };
   return (
     <div className="composer-wrap">
@@ -479,34 +485,40 @@ function Composer(
       <form className="composer" onSubmit={submit}>
         <textarea
           rows={1}
+          disabled={disabled}
           value={value}
           onChange={(e) => setValue(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) submit(e);
+            if (e.key === "Enter" && !e.shiftKey) void submit(e);
           }}
           placeholder="Message DG Chat…"
           aria-label="Message"
         />
         <div className="composer-tools">
           <input ref={fileRef} type="file" hidden multiple />
-          <IconButton label="Attach files" onClick={() => fileRef.current?.click()}>
+          <IconButton
+            label="Attach files"
+            disabled={disabled}
+            onClick={() => fileRef.current?.click()}
+          >
             <Paperclip size={19} />
           </IconButton>
-          <button type="button" className="tool-pill">
+          <button type="button" className="tool-pill" disabled={disabled}>
             <Globe2 size={16} /> Search
           </button>
-          <button type="button" className="tool-pill">
+          <button type="button" className="tool-pill" disabled={disabled}>
             <Code2 size={16} /> Tools
           </button>
           <span className="push" />
           <IconButton
             label={recording ? "Stop recording" : "Voice input"}
             className={recording ? "recording" : ""}
+            disabled={disabled}
             onClick={() => setRecording(!recording)}
           >
             {recording ? <Square size={17} /> : <Mic size={19} />}
           </IconButton>
-          <button className="send-button" aria-label="Send" disabled={!value.trim()}>
+          <button className="send-button" aria-label="Send" disabled={!value.trim() || disabled}>
             <ArrowDown size={19} />
           </button>
         </div>
@@ -548,7 +560,6 @@ function TreePanel({ messages, activeLeafId, close, onSelect, busy }: {
               <TreeNode
                 key={root.message.id}
                 node={root}
-                depth={0}
                 onSelect={onSelect}
                 busy={busy}
               />
@@ -567,9 +578,8 @@ function TreePanel({ messages, activeLeafId, close, onSelect, busy }: {
   );
 }
 function TreeNode(
-  { node, depth, onSelect, busy }: {
+  { node, onSelect, busy }: {
     node: MessageTreeNode;
-    depth: number;
     onSelect: (messageId: string) => void;
     busy: boolean;
   },
@@ -578,7 +588,6 @@ function TreeNode(
     <div className="tree-subtree" role="treeitem" aria-current={node.active ? "true" : undefined}>
       <button
         className={cn("tree-node", node.active && "active")}
-        style={{ marginLeft: `${depth * 18}px`, width: `calc(100% - ${depth * 18}px)` }}
         disabled={busy}
         onClick={() =>
           onSelect(node.message.id)}
@@ -596,7 +605,6 @@ function TreeNode(
             <TreeNode
               key={child.message.id}
               node={child}
-              depth={depth + 1}
               onSelect={onSelect}
               busy={busy}
             />
@@ -632,6 +640,8 @@ function ChatView({
   const [tree, setTree] = useState(false);
   const [edit, setEdit] = useState<Message>();
   const [streaming, setStreaming] = useState(false);
+  const sendInFlightRef = useRef(false);
+  const pendingOperationRef = useRef<SendOperation | null>(null);
   const [branchBusy, setBranchBusy] = useState(false);
   const [sendError, setSendError] = useState("");
   const initialConversation = conversations.find((c) => c.id === activeId);
@@ -658,29 +668,37 @@ function ChatView({
     try {
       setConversation(await api.setActiveLeaf(conversation, leafId));
     } catch {
-      const refreshed = await api.conversation(conversation.id);
-      setConversation(refreshed);
+      const refreshed = await refreshConversationGraph(conversation.id, {
+        load: api.conversationGraph,
+      });
+      setConversation(refreshed.conversation);
+      setLocalMessages(refreshed.messages);
       setSendError("That branch changed in another tab. The latest conversation has been loaded.");
     } finally {
       setBranchBusy(false);
     }
   };
-  const send = async (content: string) => {
+  const send = async (content: string): Promise<boolean> => {
+    if (!beginInFlight(sendInFlightRef)) return false;
+    const operation = operationForMessage(pendingOperationRef.current, content);
+    pendingOperationRef.current = operation;
     const edited = edit;
     setStreaming(true);
     setSendError("");
     try {
       const resolved = await conversationForFirstSend(activeId, conversation, {
         load: api.conversation,
-        create: () => api.createConversation(),
+        create: () => api.createConversation("New chat", operation.id),
       });
       const target = resolved.conversation;
       if (resolved.created) setConversation(target);
-      const result = await api.generate(target, content, selectedModel, edited);
+      const result = await api.generate(target, content, selectedModel, edited, operation.id);
       setLocalMessages((current) => [...current, result.user, result.assistant]);
       setConversation(result.conversation);
       setEdit(undefined);
       if (resolved.created) await onConversationCreated(result.conversation.id);
+      pendingOperationRef.current = null;
+      return true;
     } catch {
       if (activeId) {
         const [refreshedMessages, refreshedConversation] = await Promise.all([
@@ -691,7 +709,9 @@ function ChatView({
         setConversation(refreshedConversation);
       }
       setSendError("The message could not be sent. Refresh the conversation and try again.");
+      return false;
     } finally {
+      endInFlight(sendInFlightRef);
       setStreaming(false);
     }
   };
@@ -741,7 +761,12 @@ function ChatView({
         )}
         {sendError && <p className="form-error">{sendError}</p>}
       </div>
-      <Composer onSend={send} edit={edit} cancelEdit={() => setEdit(undefined)} />
+      <Composer
+        onSend={send}
+        edit={edit}
+        cancelEdit={() => setEdit(undefined)}
+        disabled={streaming}
+      />
       {tree && (
         <TreePanel
           messages={localMessages}
@@ -1073,13 +1098,13 @@ function UsageSettings() {
           <small>Credit enforcement is active</small>
         </div>
         <div className="mini-chart">
-          <i style={{ height: "30%" }} />
-          <i style={{ height: "55%" }} />
-          <i style={{ height: "42%" }} />
-          <i style={{ height: "78%" }} />
-          <i style={{ height: "63%" }} />
-          <i style={{ height: "90%" }} />
-          <i style={{ height: "45%" }} />
+          <i />
+          <i />
+          <i />
+          <i />
+          <i />
+          <i />
+          <i />
         </div>
       </div>
       <div className="setting-row">
@@ -1089,9 +1114,12 @@ function UsageSettings() {
         </span>
         <strong>${spent.toFixed(4)}</strong>
       </div>
-      <div className="usage-bar">
-        <i style={{ width: `${Math.min(100, spent / Math.max(0.01, balance + spent) * 100)}%` }} />
-      </div>
+      <progress
+        className="usage-bar-progress"
+        value={Math.min(100, spent / Math.max(0.01, balance + spent) * 100)}
+        max="100"
+        aria-label="Share of credits used"
+      />
     </>
   );
 }
@@ -1159,107 +1187,7 @@ function AdminSectionContent(
   { section, setSection }: { section: AdminSection; setSection: (s: AdminSection) => void },
 ) {
   if (section === "overview") {
-    return (
-      <>
-        <PageHeader
-          title="Good morning, Isaac"
-          subtitle="Here’s what’s happening across your workspace."
-        >
-          <div className="live-pill">
-            <span /> All systems operational
-          </div>
-        </PageHeader>
-        <div className="stats-grid">
-          <Stat icon={Users} label="Active users" value="128" trend="+12 this month" />
-          <Stat icon={MessageSquare} label="Requests today" value="1,842" trend="+18.4%" />
-          <Stat
-            icon={CircleDollarSign}
-            label="Cost today"
-            value="$12.48"
-            trend="$0.0068 / request"
-          />
-          <Stat icon={Zap} label="Success rate" value="99.6%" trend="7 failures" />
-        </div>
-        <div className="admin-grid">
-          <div className="chart-card">
-            <div className="card-title">
-              <div>
-                <h3>Request volume</h3>
-                <p>Requests and cost over the last 7 days</p>
-              </div>
-              <button className="select-button">
-                Last 7 days <ChevronDown size={15} />
-              </button>
-            </div>
-            <AreaChart />
-          </div>
-          <div className="health-card">
-            <div className="card-title">
-              <div>
-                <h3>Provider health</h3>
-                <p>Live endpoint status</p>
-              </div>
-              <Activity size={18} />
-            </div>
-            {demoModels.map((m) => (
-              <div className="provider-health" key={m.id}>
-                <span className={cn("provider-logo", !m.healthy && "warning")}>
-                  {m.provider[0]}
-                </span>
-                <span>
-                  <strong>{m.provider}</strong>
-                  <small>{m.name}</small>
-                </span>
-                <span className="push right">
-                  <strong>{m.healthy ? "Healthy" : "Degraded"}</strong>
-                  <small>{m.healthy ? "742ms" : "4.2s"}</small>
-                </span>
-                <span className={cn("health-dot", !m.healthy && "down")} />
-              </div>
-            ))}
-          </div>
-        </div>
-        <div className="admin-grid lower">
-          <div className="table-card">
-            <div className="card-title">
-              <div>
-                <h3>Pending applicants</h3>
-                <p>Review account requests awaiting a decision</p>
-              </div>
-              <button className="link-button" onClick={() => setSection("applicants")}>
-                View all <ArrowRight size={15} />
-              </button>
-            </div>
-            <Applicants compact />
-          </div>
-          <div className="activity-card">
-            <div className="card-title">
-              <div>
-                <h3>Recent activity</h3>
-                <p>Security and system events</p>
-              </div>
-            </div>
-            {[
-              ["User approved", "maya@studio.co", "8m"],
-              ["Provider updated", "OpenRouter", "24m"],
-              ["Token revoked", "dg_sk_••••91DA", "1h"],
-              ["Backup completed", "1.24 GB", "3h"],
-            ].map(([a, b, c]) => (
-              <div className="activity-row" key={a}>
-                <span className="activity-icon">
-                  <Check size={15} />
-                </span>
-                <span>
-                  <strong>{a}</strong>
-                  <small>{b}</small>
-                </span>
-                <time>{c}</time>
-              </div>
-            ))}
-          </div>
-        </div>
-      </>
-    );
+    return <AdminOverview setSection={setSection} />;
   }
   if (section === "applicants") {
     return (
@@ -1276,46 +1204,7 @@ function AdminSectionContent(
     );
   }
   if (section === "providers") {
-    return (
-      <>
-        <PageHeader title="Providers" subtitle="Configure OpenAI-compatible inference endpoints">
-          <button className="primary">
-            <Plus size={16} /> Add provider
-          </button>
-        </PageHeader>
-        <div className="provider-grid">
-          {demoModels.map((m) => (
-            <div className="provider-card" key={m.id}>
-              <div>
-                <span className="provider-logo">{m.provider[0]}</span>
-                <span className={cn("status-chip", !m.healthy && "warning")}>
-                  {m.healthy ? "Healthy" : "Degraded"}
-                </span>
-              </div>
-              <h3>{m.provider}</h3>
-              <p>
-                {m.id.includes("local")
-                  ? "http://ollama:11434/v1"
-                  : "Credentials encrypted ·•••• 7fA2"}
-              </p>
-              <div className="provider-stats">
-                <span>
-                  <small>Models</small>
-                  <strong>{m.provider === "OpenAI" ? "12" : "4"}</strong>
-                </span>
-                <span>
-                  <small>Latency</small>
-                  <strong>{m.healthy ? "742 ms" : "4.2 s"}</strong>
-                </span>
-              </div>
-              <button className="secondary wide">
-                <Settings size={15} /> Configure
-              </button>
-            </div>
-          ))}
-        </div>
-      </>
-    );
+    return <ProviderManagement />;
   }
   if (section === "models") {
     return (
@@ -1364,6 +1253,161 @@ function AdminSectionContent(
     />
   );
 }
+function AdminOverview({ setSection }: { setSection: (section: AdminSection) => void }) {
+  const users = useQuery({ queryKey: ["admin-users"], queryFn: api.adminUsers });
+  const usage = useQuery({ queryKey: ["admin-usage"], queryFn: api.adminUsage });
+  const providers = useQuery({ queryKey: ["admin-providers"], queryFn: api.adminProviders });
+  const activeUsers = users.data?.filter((user) => user.status === "approved").length;
+  const pendingUsers = users.data?.filter((user) => user.status === "pending").length;
+  const value = (number: number | undefined) =>
+    number === undefined ? "—" : number.toLocaleString();
+  return (
+    <>
+      <PageHeader
+        title="Workspace overview"
+        subtitle="Current values reported by this installation"
+      />
+      <div className="stats-grid">
+        <Stat
+          icon={Users}
+          label="Approved users"
+          value={value(activeUsers)}
+          trend="Current accounts"
+        />
+        <Stat
+          icon={MessageSquare}
+          label="Total requests"
+          value={value(usage.data?.calls)}
+          trend="All recorded usage"
+        />
+        <Stat
+          icon={UserCheck}
+          label="Pending applicants"
+          value={value(pendingUsers)}
+          trend="Awaiting a decision"
+        />
+        <Stat
+          icon={CircleDollarSign}
+          label="Available credits"
+          value={usage.data ? `$${(usage.data.balanceMicros / 1_000_000).toFixed(2)}` : "—"}
+          trend="Across all users"
+        />
+      </div>
+      <div className="admin-grid">
+        <div className="chart-card unavailable-card">
+          <BarChart3 size={24} />
+          <h3>Historical request chart unavailable</h3>
+          <p>The administration API currently reports totals, not time-series data.</p>
+        </div>
+        <div className="health-card">
+          <div className="card-title">
+            <div>
+              <h3>Provider configuration</h3>
+              <p>Current API-reported status</p>
+            </div>
+            <Activity size={18} />
+          </div>
+          {providers.isLoading && <div className="empty-mini">Loading providers…</div>}
+          {providers.isError && <div className="empty-mini">Provider status is unavailable</div>}
+          {!providers.isLoading && !providers.isError && !providers.data?.length && (
+            <div className="empty-mini">No providers configured</div>
+          )}
+          {providers.data?.map((provider) => (
+            <div className="provider-health" key={provider.id}>
+              <span className={cn("provider-logo", !provider.configured && "warning")}>
+                {provider.id[0]?.toUpperCase()}
+              </span>
+              <span>
+                <strong>{provider.id}</strong>
+                <small>{provider.configured ? "Configured" : "Not configured"}</small>
+              </span>
+              <span className="push right">
+                <strong>{provider.status}</strong>
+              </span>
+              <span className={cn("health-dot", provider.status !== "healthy" && "down")} />
+            </div>
+          ))}
+        </div>
+      </div>
+      <div className="admin-grid lower">
+        <div className="table-card">
+          <div className="card-title">
+            <div>
+              <h3>Pending applicants</h3>
+              <p>Review account requests awaiting a decision</p>
+            </div>
+            <button className="link-button" onClick={() => setSection("applicants")}>
+              View all <ArrowRight size={15} />
+            </button>
+          </div>
+          <Applicants compact />
+        </div>
+        <div className="activity-card unavailable-card">
+          <Shield size={24} />
+          <h3>Recent activity unavailable</h3>
+          <p>The API does not expose audit events yet. No example activity is shown.</p>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function ProviderManagement() {
+  const providers = useQuery({ queryKey: ["admin-providers"], queryFn: api.adminProviders });
+  return (
+    <>
+      <PageHeader title="Providers" subtitle="OpenAI-compatible endpoints reported by the server" />
+      {providers.isLoading && (
+        <div className="generic-admin">
+          <p>Loading providers…</p>
+        </div>
+      )}
+      {providers.isError && (
+        <div className="generic-admin">
+          <Cloud size={28} />
+          <h3>Provider status unavailable</h3>
+          <p>The server did not return provider configuration data.</p>
+        </div>
+      )}
+      {!providers.isLoading && !providers.isError && !providers.data?.length && (
+        <div className="generic-admin">
+          <Cloud size={28} />
+          <h3>No providers configured</h3>
+          <p>Add provider configuration on the server to make models available.</p>
+        </div>
+      )}
+      <div className="provider-grid">
+        {providers.data?.map((provider) => (
+          <div className="provider-card" key={provider.id}>
+            <div>
+              <span className="provider-logo">{provider.id[0]?.toUpperCase()}</span>
+              <span className={cn("status-chip", provider.status !== "healthy" && "warning")}>
+                {provider.status}
+              </span>
+            </div>
+            <h3>{provider.id}</h3>
+            <p>
+              {provider.configured
+                ? "Configured on this installation"
+                : "Credentials are not configured"}
+            </p>
+            <div className="provider-stats">
+              <span>
+                <small>Configuration</small>
+                <strong>{provider.configured ? "Enabled" : "Disabled"}</strong>
+              </span>
+              <span>
+                <small>Latency</small>
+                <strong>Unavailable</strong>
+              </span>
+            </div>
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
+
 function Stat(
   { icon: Icon, label, value, trend }: {
     icon: typeof Users;
@@ -1385,43 +1429,6 @@ function Stat(
     </div>
   );
 }
-function AreaChart() {
-  return (
-    <div className="area-chart">
-      <div className="chart-y">
-        <span>3k</span>
-        <span>2k</span>
-        <span>1k</span>
-        <span>0</span>
-      </div>
-      <svg viewBox="0 0 650 190" preserveAspectRatio="none">
-        <defs>
-          <linearGradient id="fill" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0" stopColor="#8465d4" stopOpacity=".28" />
-            <stop offset="1" stopColor="#8465d4" stopOpacity="0" />
-          </linearGradient>
-        </defs>
-        <path
-          className="area"
-          d="M0,140 C60,120 78,130 120,90 S210,105 260,65 S340,90 390,50 S490,72 530,34 S610,55 650,20 L650,190 L0,190Z"
-        />
-        <path
-          className="line"
-          d="M0,140 C60,120 78,130 120,90 S210,105 260,65 S340,90 390,50 S490,72 530,34 S610,55 650,20"
-        />
-      </svg>
-      <div className="chart-x">
-        <span>Thu</span>
-        <span>Fri</span>
-        <span>Sat</span>
-        <span>Sun</span>
-        <span>Mon</span>
-        <span>Tue</span>
-        <span>Wed</span>
-      </div>
-    </div>
-  );
-}
 function Applicants({ compact = false }: { compact?: boolean }) {
   const users = useQuery({ queryKey: ["admin-users"], queryFn: api.adminUsers });
   const applicants = users.data?.filter((user) => user.status === "pending") ?? [];
@@ -1439,7 +1446,8 @@ function Applicants({ compact = false }: { compact?: boolean }) {
           <span>ACTIONS</span>
         </div>
       )}
-      {!users.isLoading && !applicants.length && (
+      {users.isError && <div className="empty-mini">Applicant data is unavailable</div>}
+      {!users.isLoading && !users.isError && !applicants.length && (
         <div className="empty-mini">No pending applicants</div>
       )}
       {applicants.map((applicant) => (

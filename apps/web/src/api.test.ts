@@ -43,3 +43,34 @@ describe("active branch API", () => {
     );
   });
 });
+
+describe("conversation creation API", () => {
+  it("sends the stable operation id in both the header and body", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          id: "conversation-new",
+          title: "New chat",
+          activeLeafId: null,
+          version: 0,
+          pinned: false,
+          archivedAt: null,
+          updatedAt: "2026-07-10T00:00:00.000Z",
+        }),
+        { status: 201, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.createConversation("New chat", "operation-stable-1");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/conversations",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({ "Idempotency-Key": "operation-stable-1" }),
+        body: JSON.stringify({ title: "New chat", idempotencyKey: "operation-stable-1" }),
+      }),
+    );
+  });
+});

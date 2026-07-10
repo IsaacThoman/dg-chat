@@ -121,6 +121,13 @@ export const api = {
       : (await request<{ data: RawConversation[] }>("/conversations")).data.map(mapConversation),
   conversation: async (id: string) =>
     mapConversation(await request<RawConversation>(`/conversations/${id}`)),
+  conversationGraph: async (id: string) => {
+    const detail = await request<RawConversation>(`/conversations/${id}`);
+    return {
+      conversation: mapConversation(detail),
+      messages: detail.messages?.map(mapMessage) ?? [],
+    };
+  },
   messages: async (id: string) =>
     demoMode
       ? structuredClone(demoMessages)
@@ -175,11 +182,12 @@ export const api = {
       headers: { "x-setup-token": setupToken },
       body: JSON.stringify({ name, email, password }),
     }),
-  createConversation: async (title = "New chat") =>
+  createConversation: async (title = "New chat", idempotencyKey: string = crypto.randomUUID()) =>
     mapConversation(
       await request<RawConversation>("/conversations", {
         method: "POST",
-        body: JSON.stringify({ title }),
+        headers: { "Idempotency-Key": idempotencyKey },
+        body: JSON.stringify({ title, idempotencyKey }),
       }),
     ),
   createToken: (name: string) =>
@@ -187,7 +195,13 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ name, scopes: ["chat:write", "models:read"] }),
     }),
-  generate: async (conversation: Conversation, content: string, model: string, edit?: Message) => {
+  generate: async (
+    conversation: Conversation,
+    content: string,
+    model: string,
+    edit?: Message,
+    idempotencyKey: string = crypto.randomUUID(),
+  ) => {
     const result = await request<
       { user: RawMessage; assistant: RawMessage; conversation: RawConversation }
     >(`/conversations/${conversation.id}/generate`, {
@@ -198,7 +212,7 @@ export const api = {
         parentId: edit ? edit.parentId : conversation.activeLeafId,
         supersedesId: edit?.id ?? null,
         expectedVersion: conversation.version,
-        idempotencyKey: crypto.randomUUID(),
+        idempotencyKey,
       }),
     });
     return {
@@ -216,4 +230,13 @@ export const api = {
           body: JSON.stringify({ leafId, expectedVersion: conversation.version ?? 0 }),
         }),
       ),
+  adminUsage: () =>
+    request<{ calls: number; users: number; balanceMicros: number; ledger: unknown[] }>(
+      "/admin/usage",
+    ),
+  adminProviders: async () =>
+    (await request<{
+      data: Array<{ id: string; status: string; configured: boolean }>;
+    }>("/admin/providers")).data,
+  adminJobs: async () => (await request<{ data: unknown[] }>("/admin/jobs")).data,
 };
