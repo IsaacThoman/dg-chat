@@ -83,6 +83,8 @@ jobs:
         with:
           deno-version: v2.x
           cache: true
+      - name: Install test dependencies
+        run: deno install --frozen
       - name: Start disposable stack
         run: docker compose -f docker-compose.yml -f docker-compose.ci.yml up -d --build
       - name: Wait for readiness
