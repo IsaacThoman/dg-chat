@@ -25,15 +25,23 @@ function fixture(mode: "retrieval" | "full_context") {
     state: "ready",
   }).attachment;
   repo.beginAttachmentIngestion(attachment.id, owner.id);
+  const metadata = {
+    sourceAttachmentId: attachment.id,
+    filename: attachment.filename,
+    mimeType: attachment.mimeType,
+    sha256: attachment.sha256,
+    extractorVersion: "builtin-document-v1",
+    chunkerVersion: "character-overlap-v1",
+  };
   repo.completeAttachmentIngestion(attachment.id, owner.id, [
-    { id: crypto.randomUUID(), ordinal: 0, content: "Bananas are yellow fruit.", metadata: {} },
+    { id: crypto.randomUUID(), ordinal: 0, content: "Bananas are yellow fruit.", metadata },
     {
       id: crypto.randomUUID(),
       ordinal: 1,
       content: "The turbine reset lever is blue.",
-      metadata: {},
+      metadata,
     },
-    { id: crypto.randomUUID(), ordinal: 2, content: "Bananas are yellow fruit.", metadata: {} },
+    { id: crypto.randomUUID(), ordinal: 2, content: "Bananas are yellow fruit.", metadata },
   ]);
   repo.linkKnowledgeAttachment(collection.id, attachment.id, owner.id, 1);
   repo.bindKnowledgeCollection(conversation.id, collection.id, owner.id, mode);
