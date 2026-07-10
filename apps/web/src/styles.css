@@ -1942,6 +1942,24 @@ kbd {
 .auth-card > .brand {
   justify-content: center;
 }
+.discovery-card {
+  text-align: center;
+}
+.discovery-card .typing {
+  width: auto;
+  justify-content: center;
+  margin: 32px auto 14px;
+}
+.discovery-card h1 {
+  margin: 28px 0 8px;
+  font-size: 18px;
+}
+.discovery-card p {
+  margin: 0 0 20px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+}
 .auth-title {
   margin: 28px 0 22px;
   text-align: center;

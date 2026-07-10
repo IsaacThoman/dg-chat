@@ -1,5 +1,6 @@
 import type { Conversation, Message, Model, Token, User } from "./types.ts";
 import { demoConversations, demoMessages, demoModels, demoTokens, demoUser } from "./demo.ts";
+import type { SetupStatus } from "./setupDiscovery.ts";
 
 const json = { "Content-Type": "application/json" };
 const demoMode = import.meta.env.VITE_DEMO_MODE === "true";
@@ -112,6 +113,12 @@ async function request<T>(path: string, init?: RequestInit, fallback?: T): Promi
 }
 
 export const api = {
+  setupStatus: () =>
+    request<SetupStatus>("/setup/status", undefined, {
+      bootstrapRequired: false,
+      setupEnabled: true,
+      oidcEnabled: false,
+    }),
   me: async () =>
     demoMode ? demoUser : mapUser((await request<{ user: RawUser }>("/auth/me")).user),
   status: () => request<{ approvalStatus: string; state: string }>("/auth/status"),
