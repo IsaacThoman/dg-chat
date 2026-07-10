@@ -54,6 +54,50 @@ export interface ConversationDetail extends Conversation {
   messages: MessageNode[];
 }
 
+export type WebGenerationEvent =
+  | {
+    type: "generation.started";
+    generationId: string;
+    sequence: number;
+    user: MessageNode;
+    conversation: Conversation;
+    replay: boolean;
+  }
+  | {
+    type:
+      | "response.text.delta"
+      | "response.reasoning.delta"
+      | "response.refusal.delta";
+    generationId: string;
+    sequence: number;
+    delta: string;
+  }
+  | {
+    type: "response.tool_call.delta";
+    generationId: string;
+    sequence: number;
+    index: number;
+    id?: string;
+    name?: string;
+    arguments?: string;
+  }
+  | {
+    type: "response.usage";
+    generationId: string;
+    sequence: number;
+    inputTokens: number;
+    cachedInputTokens: number;
+    outputTokens: number;
+    reasoningTokens: number;
+  }
+  | {
+    type: "generation.completed" | "generation.stopped" | "generation.error";
+    generationId: string;
+    sequence: number;
+    assistant: MessageNode;
+    conversation: Conversation;
+  };
+
 export interface ApiTokenSummary {
   id: string;
   name: string;

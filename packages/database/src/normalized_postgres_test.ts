@@ -431,6 +431,15 @@ Deno.test({
       });
       assertEquals(edited.siblingIndex, 1);
       assertEquals((await repo.detail(chat.id, applicant.id)).messages.length, 2);
+      const assistant = await repo.appendMessage({
+        conversationId: chat.id,
+        ownerId: applicant.id,
+        parentId: edited.id,
+        role: "assistant",
+        content: "ready for the next turn",
+        expectedVersion: 2,
+        idempotencyKey: "message-assistant",
+      });
 
       await repo.reserve(applicant.id, "run-1", "test/model", 100_000, "test");
       await repo.settle("run-1", 25_000, 10, 20, 5);
@@ -445,7 +454,7 @@ Deno.test({
         message: {
           conversationId: chat.id,
           ownerId: applicant.id,
-          parentId: edited.id,
+          parentId: assistant.id,
           role: "user",
           content: "atomic",
           model: "test/model",
@@ -1280,6 +1289,117 @@ Deno.test({
 });
 
 Deno.test({
+  name: "Postgres web generation controls stop across owners and preserve regenerate siblings",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 1 });
+    await sql`TRUNCATE generation_controls, provider_attempts, ledger_entries, usage_runs,
+      messages, conversations, users RESTART IDENTITY CASCADE`;
+    await sql.end();
+    const repo = await PostgresRepository.connect(databaseUrl!);
+    try {
+      const owner = await repo.bootstrapAdmin({
+        email: "stream-control@database.test",
+        name: "Stream owner",
+        passwordHash: "hash",
+      }, 1_000_000);
+      const other = await repo.createUser({
+        email: "stream-other@database.test",
+        name: "Other",
+        passwordHash: "hash",
+        approvalStatus: "approved",
+      });
+      const conversation = await repo.createConversation(owner.id, "Streaming");
+      const generationId = crypto.randomUUID();
+      const started = await repo.beginGeneration({
+        message: {
+          conversationId: conversation.id,
+          ownerId: owner.id,
+          parentId: null,
+          role: "user",
+          content: "hello",
+          model: "simulated/dg-chat",
+          expectedVersion: 0,
+          idempotencyKey: "pg-stream-user",
+        },
+        runId: "pg-stream-run",
+        generationId,
+        provider: "simulated",
+        reserveMicros: 100,
+      });
+      if (started.kind !== "started") throw new Error("generation did not start");
+      await assertRejects(
+        () => repo.requestGenerationStop(conversation.id, other.id, generationId),
+        DomainError,
+        "not found",
+      );
+      assertEquals(
+        (await repo.requestGenerationStop(conversation.id, owner.id, generationId)).generationId,
+        generationId,
+      );
+      assertEquals(
+        await repo.generationStopRequested("pg-stream-run", owner.id, started.leaseToken),
+        true,
+      );
+      const original = await repo.completeGeneration({
+        conversationId: conversation.id,
+        ownerId: owner.id,
+        userMessageId: started.message.id,
+        runId: "pg-stream-run",
+        leaseToken: started.leaseToken,
+        idempotencyKey: "pg-stream-assistant",
+        content: "partial",
+        model: "simulated/dg-chat",
+        costMicros: 1,
+        inputTokens: 1,
+        outputTokens: 1,
+        latencyMs: 1,
+        status: "stopped",
+        metadata: { runId: "pg-stream-run" },
+      });
+      assertEquals(original.message.status, "stopped");
+      const regeneration = await repo.beginAssistantGeneration({
+        conversationId: conversation.id,
+        ownerId: owner.id,
+        sourceAssistantId: original.message.id,
+        mode: "regenerate",
+        model: "simulated/dg-chat",
+        expectedVersion: original.conversation.version,
+        idempotencyKey: "pg-stream-regenerate",
+        runId: "pg-stream-regenerate-run",
+        generationId: crypto.randomUUID(),
+        provider: "simulated",
+        reserveMicros: 100,
+      });
+      if (regeneration.kind !== "started") throw new Error("regeneration did not start");
+      const replacement = await repo.completeGeneration({
+        conversationId: conversation.id,
+        ownerId: owner.id,
+        userMessageId: regeneration.message.id,
+        runId: "pg-stream-regenerate-run",
+        leaseToken: regeneration.leaseToken,
+        idempotencyKey: "pg-stream-regenerated-assistant",
+        content: "replacement",
+        model: "simulated/dg-chat",
+        costMicros: 1,
+        inputTokens: 1,
+        outputTokens: 1,
+        latencyMs: 1,
+        supersedesId: original.message.id,
+        metadata: { runId: "pg-stream-regenerate-run" },
+      });
+      assertEquals(replacement.message.parentId, original.message.parentId);
+      assertEquals(replacement.message.supersedesId, original.message.id);
+      assertEquals((await repo.detail(conversation.id, owner.id)).messages.length, 3);
+    } finally {
+      await repo.close();
+    }
+  },
+});
+
+Deno.test({
   name: "normalized generation leases claim once and fence stale owners",
   ignore: !databaseUrl,
   sanitizeOps: false,
@@ -1311,6 +1431,20 @@ Deno.test({
         reserveMicros: 100,
         leaseSeconds: 60,
       };
+      await assertRejects(
+        () =>
+          repo.beginGeneration({
+            ...input,
+            message: {
+              ...input.message,
+              role: "assistant",
+              idempotencyKey: "postgres-invalid-generation-role",
+            },
+            runId: "postgres-invalid-generation-role",
+          }),
+        DomainError,
+        "user message",
+      );
       const started = await repo.beginGeneration(input);
       if (started.kind !== "started") throw new Error("generation did not start");
       await sql`UPDATE usage_runs SET generation_lease_expires_at=now()-interval '1 second' WHERE id=${input.runId}`;
@@ -1371,8 +1505,51 @@ Deno.test({
       });
       if (abandoned.kind !== "started") throw new Error("abandoned generation did not start");
       await sql`UPDATE usage_runs SET generation_lease_expires_at=now()-interval '1 second' WHERE id='postgres-generation-reaper'`;
+      const abandonedControls = await sql<{ generation_id: string }[]>`
+        SELECT generation_id::text FROM generation_controls
+        WHERE run_id='postgres-generation-reaper'
+      `;
+      await assertRejects(
+        () =>
+          repo.requestGenerationStop(
+            abandonedConversation.id,
+            owner.id,
+            abandonedControls[0].generation_id,
+          ),
+        DomainError,
+        "not found",
+      );
       assertEquals(await repo.reapStaleGenerations(), 1);
       assertEquals(await repo.reapStaleGenerations(), 0);
+      const reapedDetail = await repo.detail(abandonedConversation.id, owner.id);
+      const reapedAssistant = reapedDetail.messages.find((message) => message.role === "assistant");
+      assertEquals(reapedAssistant?.status, "error");
+      assertEquals(reapedAssistant?.metadata.runId, "postgres-generation-reaper");
+
+      const stoppedConversation = await repo.createConversation(owner.id, "Stopped reaper");
+      const stoppedGenerationId = crypto.randomUUID();
+      const stopped = await repo.beginGeneration({
+        ...input,
+        message: {
+          ...input.message,
+          conversationId: stoppedConversation.id,
+          expectedVersion: 0,
+          idempotencyKey: "postgres-stopped-reaper-user",
+        },
+        runId: "postgres-stopped-reaper",
+        generationId: stoppedGenerationId,
+      });
+      if (stopped.kind !== "started") throw new Error("stopped reaper did not start");
+      await repo.requestGenerationStop(stoppedConversation.id, owner.id, stoppedGenerationId);
+      await sql`UPDATE usage_runs SET generation_lease_expires_at=now()-interval '1 second'
+        WHERE id='postgres-stopped-reaper'`;
+      assertEquals(await repo.reapStaleGenerations(), 1);
+      const stoppedDetail = await repo.detail(stoppedConversation.id, owner.id);
+      const stoppedAssistant = stoppedDetail.messages.find((message) =>
+        message.role === "assistant"
+      );
+      assertEquals(stoppedAssistant?.status, "stopped");
+      assertEquals(stoppedAssistant?.metadata.stopReason, "user");
       await assertRejects(
         () =>
           repo.failGeneration({

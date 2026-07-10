@@ -60,6 +60,60 @@ export const generateMessageSchema = z.object({
   ).optional().default([]),
 });
 
+export const streamGenerationSchema = z.discriminatedUnion("mode", [
+  generateMessageSchema.extend({ mode: z.literal("send") }),
+  z.object({
+    mode: z.enum(["regenerate", "continue"]),
+    sourceMessageId: z.string().uuid(),
+    model: z.string().min(1).max(200),
+    expectedVersion: z.number().int().nonnegative(),
+    idempotencyKey: z.string().min(8).max(200),
+  }).strict(),
+]);
+
+const generationEventBase = {
+  generationId: z.string().uuid(),
+  sequence: z.number().int().nonnegative(),
+};
+export const webGenerationEventSchema = z.discriminatedUnion("type", [
+  z.object({
+    ...generationEventBase,
+    type: z.literal("generation.started"),
+    user: z.record(z.string(), z.unknown()),
+    conversation: z.record(z.string(), z.unknown()),
+    replay: z.boolean(),
+  }).strict(),
+  ...(["response.text.delta", "response.reasoning.delta", "response.refusal.delta"] as const)
+    .map((type) =>
+      z.object({ ...generationEventBase, type: z.literal(type), delta: z.string().max(1_048_576) })
+        .strict()
+    ),
+  z.object({
+    ...generationEventBase,
+    type: z.literal("response.tool_call.delta"),
+    index: z.number().int().min(0).max(127),
+    id: z.string().max(512).optional(),
+    name: z.string().max(512).optional(),
+    arguments: z.string().max(1_048_576).optional(),
+  }).strict(),
+  z.object({
+    ...generationEventBase,
+    type: z.literal("response.usage"),
+    inputTokens: z.number().int().nonnegative(),
+    cachedInputTokens: z.number().int().nonnegative(),
+    outputTokens: z.number().int().nonnegative(),
+    reasoningTokens: z.number().int().nonnegative(),
+  }).strict(),
+  ...(["generation.completed", "generation.stopped", "generation.error"] as const).map((type) =>
+    z.object({
+      ...generationEventBase,
+      type: z.literal(type),
+      assistant: z.record(z.string(), z.unknown()),
+      conversation: z.record(z.string(), z.unknown()),
+    }).strict()
+  ),
+]);
+
 export const createTokenSchema = z.object({
   name: z.string().trim().min(1).max(80),
   scopes: z.array(z.enum(["models:read", "chat:write", "files:read", "files:write"])).min(1),

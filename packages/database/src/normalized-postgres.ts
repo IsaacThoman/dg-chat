@@ -18,6 +18,7 @@ import type {
   AuditQuery,
   BeginApiRequestInput,
   BeginApiRequestResult,
+  BeginAssistantGenerationInput,
   BeginGenerationInput,
   CompleteApiRequestInput,
   CompleteGenerationInput,
@@ -1074,6 +1075,9 @@ export class PostgresRepository implements DomainRepository {
       if (c[0].archived_at) {
         throw new DomainError("conversation_archived", "Archived conversations are read-only", 409);
       }
+      if (input.message.role !== "user") {
+        throw new DomainError("invalid_role", "A generation must begin with a user message", 422);
+      }
       const prior = await tx<
         Row[]
       >`SELECT * FROM messages WHERE conversation_id=${input.message.conversationId} AND idempotency_key=${input.message.idempotencyKey}`;
@@ -1089,6 +1093,8 @@ export class PostgresRepository implements DomainRepository {
         `;
         if (
           replay.content !== input.message.content || replay.parentId !== input.message.parentId ||
+          replay.supersedesId !== (input.message.supersedesId ?? null) ||
+          replay.role !== input.message.role ||
           replay.model !== (input.message.model ?? null) ||
           String(priorRun[0].user_id) !== input.message.ownerId ||
           priorAttachments.map((row) => String(row.attachment_id)).join("\0") !==
@@ -1096,14 +1102,7 @@ export class PostgresRepository implements DomainRepository {
         ) {
           throw new DomainError("idempotency_conflict", "Generation replay payload differs", 409);
         }
-        if (priorRun[0].status === "failed") {
-          throw new DomainError(
-            "generation_failed_replay",
-            "Failed generations require a new idempotency key",
-            409,
-          );
-        }
-        if (priorRun[0].status === "completed") {
+        if (priorRun[0].status === "completed" || priorRun[0].status === "failed") {
           return {
             kind: "completed" as const,
             message: replay,
@@ -1138,20 +1137,37 @@ export class PostgresRepository implements DomainRepository {
       if (number(c[0].version) !== input.message.expectedVersion) {
         throw new DomainError("version_conflict", "Conversation changed in another tab", 409);
       }
+      const running = await tx`SELECT 1 FROM generation_controls
+        WHERE conversation_id=${input.message.conversationId} AND terminal_at IS NULL FOR UPDATE`;
+      if (running.length) {
+        throw new DomainError("generation_in_progress", "A generation is already active", 409);
+      }
       if (input.message.parentId) {
-        const p =
-          await tx`SELECT id FROM messages WHERE id=${input.message.parentId} AND conversation_id=${input.message.conversationId}`;
+        const p = await tx`SELECT id FROM messages WHERE id=${input.message.parentId}
+          AND conversation_id=${input.message.conversationId} AND role='assistant'`;
         if (!p.length) {
-          throw new DomainError("invalid_parent", "Parent is not in this conversation", 422);
+          throw new DomainError(
+            "invalid_parent",
+            "A new user turn must follow an assistant response",
+            422,
+          );
         }
       }
+      if (!input.message.parentId && c[0].active_leaf_id && !input.message.supersedesId) {
+        throw new DomainError(
+          "invalid_parent",
+          "A non-empty conversation requires a parent or an explicit root edit",
+          422,
+        );
+      }
       if (input.message.supersedesId) {
-        const s =
-          await tx`SELECT id FROM messages WHERE id=${input.message.supersedesId} AND conversation_id=${input.message.conversationId} AND parent_id IS NOT DISTINCT FROM ${input.message.parentId}`;
+        const s = await tx`SELECT id FROM messages WHERE id=${input.message.supersedesId}
+            AND conversation_id=${input.message.conversationId} AND role='user'
+            AND parent_id IS NOT DISTINCT FROM ${input.message.parentId}`;
         if (!s.length) {
           throw new DomainError(
             "invalid_supersedes",
-            "Edited messages must branch beside the original",
+            "Edited user messages must branch beside another user message",
             422,
           );
         }
@@ -1199,6 +1215,10 @@ export class PostgresRepository implements DomainRepository {
       },${pricing?.outputMicrosPerMillion ?? null},${pricing?.fixedCallMicros ?? null},${
         pricing?.source ?? null
       },${leaseToken},now()+${leaseSeconds}*interval '1 second') RETURNING *`;
+      await tx`INSERT INTO generation_controls(run_id,generation_id,conversation_id,owner_id,user_message_id)
+        VALUES(${input.runId},${
+        input.generationId ?? crypto.randomUUID()
+      },${input.message.conversationId},${input.message.ownerId},${String(nodes[0].id)})`;
       for (const attachmentId of attachmentIds) {
         await tx`
           INSERT INTO message_attachments(message_id,attachment_id)
@@ -1222,6 +1242,145 @@ export class PostgresRepository implements DomainRepository {
     });
   }
 
+  async beginAssistantGeneration(input: BeginAssistantGenerationInput) {
+    const leaseSeconds = input.leaseSeconds ?? 120;
+    return await this.#sql.begin(async (tx) => {
+      const conversations = await tx<Row[]>`
+        SELECT * FROM conversations WHERE id=${input.conversationId}
+          AND owner_id=${input.ownerId} FOR UPDATE
+      `;
+      const current = conversations[0];
+      if (!current || current.deleted_at) {
+        throw new DomainError("not_found", "Conversation not found", 404);
+      }
+      if (current.archived_at) {
+        throw new DomainError("conversation_archived", "Archived conversations are read-only", 409);
+      }
+      const sources = await tx<Row[]>`
+        SELECT source.*, parent.role AS parent_role, parent.id AS user_message_id
+        FROM messages source JOIN messages parent ON parent.id=source.parent_id
+        WHERE source.id=${input.sourceAssistantId}
+          AND source.conversation_id=${input.conversationId}
+          AND source.role='assistant' AND parent.role='user'
+      `;
+      const source = sources[0];
+      if (!source) {
+        throw new DomainError(
+          "invalid_generation_source",
+          "Source must be an assistant response",
+          422,
+        );
+      }
+      const sourceUserMessageId = String(source.user_message_id);
+      const priorRuns = await tx<Row[]>`SELECT *,generation_lease_expires_at>now() AS lease_active,
+        GREATEST(1,ceil(extract(epoch FROM (generation_lease_expires_at-now()))))::int AS retry_seconds
+        FROM usage_runs WHERE id=${input.runId} FOR UPDATE`;
+      const priorControls = await tx<Row[]>`SELECT * FROM generation_controls
+        WHERE run_id=${input.runId} FOR UPDATE`;
+      if (priorRuns[0] && priorControls[0]) {
+        const runRow = priorRuns[0];
+        const control = priorControls[0];
+        if (
+          String(control.source_message_id) !== input.sourceAssistantId ||
+          String(control.mode) !== input.mode || String(runRow.model) !== input.model ||
+          String(runRow.user_id) !== input.ownerId
+        ) throw new DomainError("idempotency_conflict", "Generation replay payload differs", 409);
+        const userRows = await tx<Row[]>`SELECT * FROM messages WHERE id=${sourceUserMessageId}`;
+        const user = message(userRows[0]);
+        if (runRow.status === "completed" || runRow.status === "failed") {
+          return {
+            kind: "completed" as const,
+            message: user,
+            conversation: conversation(current),
+            usageRun: run(runRow),
+          };
+        }
+        if (runRow.lease_active === true) {
+          return {
+            kind: "in_progress" as const,
+            message: user,
+            conversation: conversation(current),
+            usageRun: run(runRow),
+            retryAfterSeconds: number(runRow.retry_seconds),
+          };
+        }
+        const leaseToken = crypto.randomUUID();
+        const claimed = await tx<Row[]>`UPDATE usage_runs SET generation_lease_token=${leaseToken},
+          generation_lease_expires_at=now()+${leaseSeconds}*interval '1 second'
+          WHERE id=${input.runId} AND status='reserved' RETURNING *`;
+        return {
+          kind: "claimed" as const,
+          leaseToken,
+          message: user,
+          conversation: conversation(current),
+          usageRun: run(claimed[0]),
+        };
+      }
+      if (priorRuns[0] || priorControls[0]) {
+        throw new DomainError("idempotency_conflict", "Incomplete generation replay", 409);
+      }
+      const activeLeafId = String(current.active_leaf_id);
+      const active = await tx<{ found: boolean }[]>`
+        WITH RECURSIVE path AS (
+          SELECT id,parent_id FROM messages WHERE id=${activeLeafId}
+          UNION ALL
+          SELECT m.id,m.parent_id FROM messages m JOIN path p ON m.id=p.parent_id
+        ) SELECT EXISTS(SELECT 1 FROM path WHERE id=${input.sourceAssistantId}) AS found
+      `;
+      if (!active[0]?.found) {
+        throw new DomainError(
+          "invalid_generation_source",
+          "Source is not on the active branch",
+          409,
+        );
+      }
+      if (number(current.version) !== input.expectedVersion) {
+        throw new DomainError("version_conflict", "Conversation changed in another tab", 409);
+      }
+      const running =
+        await tx`SELECT 1 FROM generation_controls WHERE conversation_id=${input.conversationId} AND terminal_at IS NULL FOR UPDATE`;
+      if (running.length) {
+        throw new DomainError("generation_in_progress", "A generation is already active", 409);
+      }
+      const account = await tx<
+        Row[]
+      >`SELECT balance_micros FROM users WHERE id=${input.ownerId} FOR UPDATE`;
+      const balance = number(account[0].balance_micros);
+      if (balance < input.reserveMicros) {
+        throw new DomainError("insufficient_credit", "Insufficient credit", 402);
+      }
+      const leaseToken = crypto.randomUUID();
+      const pricing = input.pricingSnapshot;
+      const runs = await tx<
+        Row[]
+      >`INSERT INTO usage_runs(id,user_id,model,provider,status,reserved_micros,
+        pricing_version_id,pricing_input_micros_per_million,pricing_cached_input_micros_per_million,
+        pricing_reasoning_micros_per_million,pricing_output_micros_per_million,
+        pricing_fixed_call_micros,pricing_source,generation_lease_token,generation_lease_expires_at)
+        VALUES(${input.runId},${input.ownerId},${input.model},${input.provider},'reserved',${input.reserveMicros},${
+        pricing?.pricingVersionId ?? null
+      },${pricing?.inputMicrosPerMillion ?? null},${pricing?.cachedInputMicrosPerMillion ?? null},${
+        pricing?.reasoningMicrosPerMillion ?? null
+      },${pricing?.outputMicrosPerMillion ?? null},${pricing?.fixedCallMicros ?? null},${
+        pricing?.source ?? null
+      },${leaseToken},now()+${leaseSeconds}*interval '1 second') RETURNING *`;
+      await tx`INSERT INTO generation_controls(run_id,generation_id,conversation_id,owner_id,user_message_id,mode,source_message_id)
+        VALUES(${input.runId},${input.generationId},${input.conversationId},${input.ownerId},${sourceUserMessageId},${input.mode},${input.sourceAssistantId})`;
+      const after = balance - input.reserveMicros;
+      await tx`UPDATE users SET balance_micros=${after} WHERE id=${input.ownerId}`;
+      await tx`INSERT INTO ledger_entries(user_id,usage_run_id,kind,amount_micros,balance_after_micros)
+        VALUES(${input.ownerId},${input.runId},'reserve',${-input.reserveMicros},${after})`;
+      const userRows = await tx<Row[]>`SELECT * FROM messages WHERE id=${sourceUserMessageId}`;
+      return {
+        kind: "started" as const,
+        leaseToken,
+        message: message(userRows[0]),
+        conversation: conversation(current),
+        usageRun: run(runs[0]),
+      };
+    });
+  }
+
   async heartbeatGeneration(
     runId: string,
     ownerId: string,
@@ -1233,6 +1392,42 @@ export class PostgresRepository implements DomainRepository {
     if (!rows.length) {
       throw new DomainError("stale_lease", "Generation lease is no longer active", 409);
     }
+  }
+
+  async requestGenerationStop(conversationId: string, ownerId: string, generationId: string) {
+    const rows = await this.#sql<Row[]>`
+      UPDATE generation_controls gc SET stop_requested_at=COALESCE(stop_requested_at,now())
+      FROM usage_runs ur
+      WHERE gc.run_id=ur.id AND gc.conversation_id=${conversationId}
+        AND gc.owner_id=${ownerId} AND gc.generation_id=${generationId}
+        AND gc.terminal_at IS NULL AND ur.status='reserved'
+        AND ur.generation_lease_expires_at>now()
+      RETURNING gc.*
+    `;
+    if (!rows[0]) throw new DomainError("not_found", "Active generation not found", 404);
+    return {
+      runId: String(rows[0].run_id),
+      generationId: String(rows[0].generation_id),
+      conversationId: String(rows[0].conversation_id),
+      ownerId: String(rows[0].owner_id),
+      userMessageId: String(rows[0].user_message_id),
+      mode: String(rows[0].mode) as "send" | "regenerate" | "continue",
+      sourceMessageId: rows[0].source_message_id ? String(rows[0].source_message_id) : null,
+      stopRequestedAt: nullableIso(rows[0].stop_requested_at),
+      terminalAt: nullableIso(rows[0].terminal_at),
+    };
+  }
+
+  async generationStopRequested(runId: string, ownerId: string, leaseToken: string) {
+    const rows = await this.#sql<{ requested: boolean }[]>`
+      SELECT gc.stop_requested_at IS NOT NULL AS requested
+      FROM generation_controls gc JOIN usage_runs ur ON ur.id=gc.run_id
+      WHERE gc.run_id=${runId} AND gc.owner_id=${ownerId} AND gc.terminal_at IS NULL
+        AND ur.status='reserved' AND ur.generation_lease_token=${leaseToken}
+        AND ur.generation_lease_expires_at>now()
+    `;
+    if (!rows[0]) throw new DomainError("stale_lease", "Generation lease is no longer active", 409);
+    return rows[0].requested;
   }
 
   async completeGeneration(input: CompleteGenerationInput) {
@@ -1251,7 +1446,8 @@ export class PostgresRepository implements DomainRepository {
         const replay = message(existing[0]);
         if (
           replay.content !== input.content || replay.parentId !== input.userMessageId ||
-          replay.model !== input.model
+          replay.model !== input.model || replay.status !== (input.status ?? "complete") ||
+          replay.supersedesId !== (input.supersedesId ?? null)
         ) throw new DomainError("idempotency_conflict", "Generation replay payload differs", 409);
         return {
           message: replay,
@@ -1303,9 +1499,11 @@ export class PostgresRepository implements DomainRepository {
       >`SELECT count(*)::int next FROM messages WHERE conversation_id=${input.conversationId} AND parent_id=${input.userMessageId}`;
       const nodes = await tx<
         Row[]
-      >`INSERT INTO messages(conversation_id,parent_id,generation_id,sibling_index,role,content,model,metadata,idempotency_key) VALUES(${input.conversationId},${input.userMessageId},${crypto.randomUUID()},${
-        idx[0].next
-      },'assistant',${input.content},${input.model},${
+      >`INSERT INTO messages(conversation_id,parent_id,supersedes_id,generation_id,sibling_index,role,content,model,status,metadata,idempotency_key) VALUES(${input.conversationId},${input.userMessageId},${
+        input.supersedesId ?? null
+      },${crypto.randomUUID()},${idx[0].next},'assistant',${input.content},${input.model},${
+        input.status ?? "complete"
+      },${
         tx.json((input.metadata ?? {}) as postgres.JSONValue)
       },${input.idempotencyKey}) RETURNING *`;
       await tx`UPDATE users SET balance_micros=${after} WHERE id=${input.ownerId}`;
@@ -1317,9 +1515,11 @@ export class PostgresRepository implements DomainRepository {
       const finished = await tx<
         Row[]
       >`UPDATE usage_runs SET status='completed',generation_lease_token=NULL,generation_lease_expires_at=NULL,run_lease_token=NULL,run_lease_expires_at=NULL,cost_micros=${effectiveCost},input_tokens=${effectiveInputTokens},output_tokens=${effectiveOutputTokens},latency_ms=${input.latencyMs},completed_at=now() WHERE id=${input.runId} RETURNING *`;
+      await tx`UPDATE generation_controls SET terminal_at=now() WHERE run_id=${input.runId}`;
       const updated = await tx<
         Row[]
-      >`UPDATE conversations SET active_leaf_id=CASE WHEN active_leaf_id=${input.userMessageId} THEN ${
+      >`UPDATE conversations SET active_leaf_id=CASE WHEN active_leaf_id=${input.userMessageId}
+        OR active_leaf_id=${input.supersedesId ?? null} THEN ${
         String(nodes[0].id)
       } ELSE active_leaf_id END,version=version+1,updated_at=now() WHERE id=${input.conversationId} RETURNING *`;
       return {
@@ -1345,7 +1545,8 @@ export class PostgresRepository implements DomainRepository {
       if (existing[0] && runs[0].status === "failed") {
         const replay = message(existing[0]);
         if (
-          replay.content !== input.error || replay.parentId !== input.userMessageId ||
+          replay.content !== (input.content ?? input.error) ||
+          replay.parentId !== input.userMessageId ||
           replay.model !== input.model
         ) throw new DomainError("idempotency_conflict", "Generation replay payload differs", 409);
         return {
@@ -1387,10 +1588,12 @@ export class PostgresRepository implements DomainRepository {
       >`SELECT count(*)::int next FROM messages WHERE conversation_id=${input.conversationId} AND parent_id=${input.userMessageId}`;
       const nodes = await tx<
         Row[]
-      >`INSERT INTO messages(conversation_id,parent_id,generation_id,sibling_index,role,content,model,status,metadata,idempotency_key) VALUES(${input.conversationId},${input.userMessageId},${crypto.randomUUID()},${
-        idx[0].next
-      },'assistant',${input.error},${input.model},'error',${
-        tx.json({ generationError: input.error, retryable: true })
+      >`INSERT INTO messages(conversation_id,parent_id,supersedes_id,generation_id,sibling_index,role,content,model,status,metadata,idempotency_key) VALUES(${input.conversationId},${input.userMessageId},${
+        input.supersedesId ?? null
+      },${crypto.randomUUID()},${idx[0].next},'assistant',${
+        input.content ?? input.error
+      },${input.model},'error',${
+        tx.json({ generationError: input.error, retryable: true, ...input.metadata })
       },${input.idempotencyKey}) RETURNING *`;
       await tx`UPDATE users SET balance_micros=${after} WHERE id=${input.ownerId}`;
       if (delta !== 0) {
@@ -1405,9 +1608,11 @@ export class PostgresRepository implements DomainRepository {
       },output_tokens=${
         providerExecution ? number(runs[0].actual_provider_output_tokens) : 0
       },error=${input.error},completed_at=now() WHERE id=${input.runId} RETURNING *`;
+      await tx`UPDATE generation_controls SET terminal_at=now() WHERE run_id=${input.runId}`;
       const updated = await tx<
         Row[]
-      >`UPDATE conversations SET active_leaf_id=CASE WHEN active_leaf_id=${input.userMessageId} THEN ${
+      >`UPDATE conversations SET active_leaf_id=CASE WHEN active_leaf_id=${input.userMessageId}
+        OR active_leaf_id=${input.supersedesId ?? null} THEN ${
         String(nodes[0].id)
       } ELSE active_leaf_id END,version=version+1,updated_at=now() WHERE id=${input.conversationId} RETURNING *`;
       return {
@@ -1424,6 +1629,9 @@ export class PostgresRepository implements DomainRepository {
       >`SELECT * FROM usage_runs WHERE status='reserved' AND generation_lease_token IS NOT NULL AND generation_lease_expires_at<=now() ORDER BY generation_lease_expires_at FOR UPDATE SKIP LOCKED LIMIT ${limit}`;
       for (const row of rows) {
         const userId = String(row.user_id);
+        const controls = await tx<Row[]>`SELECT * FROM generation_controls
+          WHERE run_id=${String(row.id)} FOR UPDATE`;
+        const control = controls[0];
         const uncertainty = await tx<{ uncertain: boolean }[]>`SELECT EXISTS(SELECT 1
           FROM provider_attempts WHERE usage_run_id=${String(row.id)} AND status='running')
           AS uncertain`;
@@ -1455,6 +1663,45 @@ export class PostgresRepository implements DomainRepository {
         },generation_lease_token=NULL,generation_lease_expires_at=NULL,run_lease_token=NULL,run_lease_expires_at=NULL,error='generation lease expired',completed_at=now() WHERE id=${
           String(row.id)
         }`;
+        if (control) {
+          const existing = await tx`SELECT id FROM messages WHERE
+            conversation_id=${String(control.conversation_id)} AND role='assistant'
+            AND metadata->>'runId'=${String(row.id)} LIMIT 1`;
+          if (!existing.length) {
+            const idx = await tx<{ next: number }[]>`SELECT count(*)::int next FROM messages
+              WHERE conversation_id=${String(control.conversation_id)}
+                AND parent_id=${String(control.user_message_id)}`;
+            const nodes = await tx<Row[]>`INSERT INTO messages(
+              conversation_id,parent_id,supersedes_id,generation_id,sibling_index,role,content,
+              model,status,metadata,idempotency_key
+            ) VALUES(
+              ${String(control.conversation_id)},${String(control.user_message_id)},
+              ${control.source_message_id ? String(control.source_message_id) : null},
+              ${String(control.generation_id)},${idx[0].next},'assistant',
+              ${
+              control.stop_requested_at
+                ? "Generation stopped."
+                : "Generation interrupted before completion."
+            },${String(row.model)},${control.stop_requested_at ? "stopped" : "error"},
+              ${
+              tx.json({
+                runId: String(row.id),
+                ...(control.stop_requested_at
+                  ? { stopReason: "user" }
+                  : { generationError: "Generation lease expired", retryable: true }),
+              })
+            },${`generation-reaper:${String(control.generation_id)}`}
+            ) RETURNING id`;
+            await tx`UPDATE conversations SET
+              active_leaf_id=CASE WHEN active_leaf_id=${String(control.user_message_id)}
+                OR active_leaf_id=${
+              control.source_message_id ? String(control.source_message_id) : null
+            } THEN ${String(nodes[0].id)} ELSE active_leaf_id END,
+              version=version+1,updated_at=now()
+              WHERE id=${String(control.conversation_id)}`;
+          }
+        }
+        await tx`UPDATE generation_controls SET terminal_at=now() WHERE run_id=${String(row.id)}`;
       }
       return rows.length;
     });

@@ -271,6 +271,35 @@ export const usageRuns = pgTable("usage_runs", {
   ),
 ]);
 
+export const generationControls = pgTable("generation_controls", {
+  runId: text("run_id").primaryKey().references(() => usageRuns.id, { onDelete: "cascade" }),
+  generationId: uuid("generation_id").notNull(),
+  conversationId: uuid("conversation_id").notNull().references(() => conversations.id, {
+    onDelete: "cascade",
+  }),
+  ownerId: uuid("owner_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  userMessageId: uuid("user_message_id").notNull().references(() => messages.id, {
+    onDelete: "cascade",
+  }),
+  mode: text("mode").notNull().default("send"),
+  sourceMessageId: uuid("source_message_id").references(() => messages.id, {
+    onDelete: "restrict",
+  }),
+  stopRequestedAt: timestamp("stop_requested_at", { withTimezone: true }),
+  terminalAt: timestamp("terminal_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("generation_controls_generation_uq").on(table.generationId),
+  index("generation_controls_owner_idx").on(table.ownerId, table.conversationId),
+  uniqueIndex("generation_controls_active_source_uq").on(
+    table.conversationId,
+    table.sourceMessageId,
+  )
+    .where(sql`${table.terminalAt} IS NULL AND ${table.sourceMessageId} IS NOT NULL`),
+  uniqueIndex("generation_controls_active_conversation_uq").on(table.conversationId)
+    .where(sql`${table.terminalAt} IS NULL`),
+]);
+
 export const jobs = pgTable("jobs", {
   id: uuid("id").primaryKey().defaultRandom(),
   type: text("type").notNull(),
