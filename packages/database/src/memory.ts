@@ -955,8 +955,11 @@ export class MemoryRepository {
       !usageRun.generationLeaseExpiresAt ||
       Date.parse(usageRun.generationLeaseExpiresAt) <= Date.now()
     ) throw new DomainError("stale_lease", "Generation lease is no longer active", 409);
+    const effectiveCost = usageRun.executionEpoch > 0
+      ? usageRun.actualProviderCostMicros
+      : input.costMicros;
     const balanceAfterSettlement = this.users.get(input.ownerId)!.balanceMicros +
-      usageRun.reservedMicros - input.costMicros;
+      usageRun.reservedMicros - effectiveCost;
     if (balanceAfterSettlement < 0) {
       throw new DomainError("insufficient_credit", "Actual cost exceeds available credit", 402);
     }
@@ -1026,15 +1029,17 @@ export class MemoryRepository {
         run.status !== "reserved" || !run.generationLeaseToken ||
         !run.generationLeaseExpiresAt || Date.parse(run.generationLeaseExpiresAt) > Date.now()
       ) continue;
-      const refunded = run.actualProviderCostMicros > 0
-        ? this.settle(
-          run.id,
-          run.actualProviderCostMicros,
-          run.actualProviderInputTokens,
-          run.actualProviderOutputTokens,
-          run.latencyMs,
-        )
-        : this.refund(run.id);
+      for (const attempt of this.providerAttempts.values()) {
+        if (attempt.usageRunId !== run.id || attempt.status !== "running") continue;
+        attempt.status = "cancelled";
+        attempt.phase = "planning";
+        attempt.errorCode = "generation_lease_expired";
+        attempt.breakerAfter = "unavailable";
+        attempt.retryable = true;
+        attempt.latencyMs = Math.max(0, Date.now() - Date.parse(attempt.startedAt));
+        attempt.completedAt = new Date().toISOString();
+      }
+      const refunded = this.refund(run.id);
       if (refunded) {
         refunded.generationLeaseToken = null;
         refunded.generationLeaseExpiresAt = null;
@@ -1966,6 +1971,10 @@ export class MemoryRepository {
       ...[...this.providerAttempts.values()].filter((attempt) => attempt.usageRunId === usageRunId)
         .map((attempt) => attempt.attemptNumber + 1),
     );
+    const consumedAttempts =
+      [...this.providerAttempts.values()].filter((attempt) =>
+        attempt.usageRunId === usageRunId && attempt.status !== "skipped"
+      ).length;
     if (nextAttemptNumber > 16) {
       throw new DomainError(
         "execution_path_exhausted",
@@ -1977,12 +1986,17 @@ export class MemoryRepository {
       usageRunId,
       executionEpoch: run.executionEpoch,
       nextAttemptNumber,
+      consumedAttempts,
       reconciledAttemptIds,
     };
   }
 
   private exactAttemptCost(attempt: ProviderAttempt, input: FinishProviderAttemptInput): number {
     if (input.status === "skipped") return 0;
+    if (
+      input.costSource === "none" && input.costMicros === 0 && input.inputTokens === 0 &&
+      input.outputTokens === 0 && input.status !== "succeeded"
+    ) return 0;
     const uncached = input.inputTokens - input.cachedInputTokens;
     const ordinaryOutput = input.outputTokens - input.reasoningTokens;
     const numerator = BigInt(uncached) * BigInt(attempt.pricing.inputMicrosPerMillion) +
@@ -2278,16 +2292,19 @@ export class MemoryRepository {
     ) {
       throw new DomainError("stale_lease", "Provider execution epoch is stale", 409);
     }
-    if (refundOnly && run.actualProviderCostMicros === 0) {
+    if (refundOnly) {
       return structuredClone(this.refund(run.id)!);
     }
-    return structuredClone(this.settle(
+    const settled = this.settle(
       run.id,
       run.actualProviderCostMicros,
       run.actualProviderInputTokens,
       run.actualProviderOutputTokens,
       input.latencyMs,
-    ));
+    );
+    settled.runLeaseToken = null;
+    settled.runLeaseExpiresAt = null;
+    return structuredClone(settled);
   }
 
   settleProviderUsage(input: FinalizeProviderUsageInput): UsageRun {
@@ -2422,7 +2439,7 @@ export class MemoryRepository {
     const run = this.usageRuns.get(runId);
     if (!run) throw new DomainError("not_found", "Usage reservation not found", 404);
     if (run.status === "completed") return run;
-    if (run.actualProviderCostMicros > 0) {
+    if (run.executionEpoch > 0) {
       costMicros = run.actualProviderCostMicros;
       inputTokens = run.actualProviderInputTokens;
       outputTokens = run.actualProviderOutputTokens;
@@ -2437,20 +2454,27 @@ export class MemoryRepository {
     run.inputTokens = inputTokens;
     run.outputTokens = outputTokens;
     run.latencyMs = latencyMs;
+    run.runLeaseToken = null;
+    run.runLeaseExpiresAt = null;
+    run.generationLeaseToken = null;
+    run.generationLeaseExpiresAt = null;
     return run;
   }
 
   refund(runId: string) {
     const run = this.usageRuns.get(runId);
     if (!run || run.status !== "reserved") return run;
-    if (run.actualProviderCostMicros > 0) {
-      return this.settle(
-        runId,
-        run.actualProviderCostMicros,
-        run.actualProviderInputTokens,
-        run.actualProviderOutputTokens,
-        run.latencyMs,
-      );
+    if (run.executionEpoch > 0) {
+      const cost = run.actualProviderCostMicros;
+      const delta = run.reservedMicros - cost;
+      if (delta !== 0) this.credit(run.userId, runId, delta > 0 ? "refund" : "settle", delta);
+      run.status = "failed";
+      run.costMicros = cost;
+      run.inputTokens = run.actualProviderInputTokens;
+      run.outputTokens = run.actualProviderOutputTokens;
+      run.runLeaseToken = null;
+      run.runLeaseExpiresAt = null;
+      return run;
     }
     this.credit(run.userId, runId, "refund", run.reservedMicros);
     run.status = "failed";
@@ -2818,15 +2842,18 @@ export class MemoryRepository {
         Date.parse(request.leaseExpiresAt) > Date.now()
       ) continue;
       const usageRun = this.usageRuns.get(request.usageRunId);
-      const providerCost = usageRun?.actualProviderCostMicros ?? 0;
-      if (providerCost > 0) {
-        this.settle(
-          request.usageRunId,
-          providerCost,
-          usageRun!.actualProviderInputTokens,
-          usageRun!.actualProviderOutputTokens,
-          request.observedLatencyMs,
-        );
+      for (const attempt of this.providerAttempts.values()) {
+        if (attempt.usageRunId !== request.usageRunId || attempt.status !== "running") continue;
+        attempt.status = "cancelled";
+        attempt.phase = "planning";
+        attempt.errorCode = "api_lease_expired";
+        attempt.breakerAfter = "unavailable";
+        attempt.retryable = true;
+        attempt.latencyMs = Math.max(0, Date.now() - Date.parse(attempt.startedAt));
+        attempt.completedAt = new Date().toISOString();
+      }
+      if ((usageRun?.executionEpoch ?? 0) > 0) {
+        this.refund(request.usageRunId);
       } else if (request.observedCostMicros > 0) {
         this.settle(
           request.usageRunId,
@@ -2860,6 +2887,36 @@ export class MemoryRepository {
       request.leaseExpiresAt = null;
       request.completedAt = new Date().toISOString();
       request.expiresAt = new Date(Date.now() + request.retentionSeconds * 1000).toISOString();
+      count++;
+    }
+    return count;
+  }
+
+  reapStaleProviderExecutionLeases(limit = 100) {
+    let count = 0;
+    for (const run of this.usageRuns.values()) {
+      if (count >= limit) break;
+      const belongsToApiReplay = [...this.apiIdempotencyRequests.values()].some((request) =>
+        request.usageRunId === run.id
+      );
+      if (
+        run.status !== "reserved" || !run.runLeaseToken || !run.runLeaseExpiresAt ||
+        Date.parse(run.runLeaseExpiresAt) > Date.now() || run.generationLeaseToken ||
+        belongsToApiReplay
+      ) continue;
+      for (const attempt of this.providerAttempts.values()) {
+        if (attempt.usageRunId !== run.id || attempt.status !== "running") continue;
+        attempt.status = "cancelled";
+        attempt.phase = "planning";
+        attempt.errorCode = "execution_lease_expired";
+        attempt.breakerAfter = "unavailable";
+        attempt.retryable = true;
+        attempt.latencyMs = Math.max(0, Date.now() - Date.parse(attempt.startedAt));
+        attempt.completedAt = new Date().toISOString();
+      }
+      this.refund(run.id);
+      run.runLeaseToken = null;
+      run.runLeaseExpiresAt = null;
       count++;
     }
     return count;

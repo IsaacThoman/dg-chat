@@ -55,6 +55,37 @@ Deno.test("Responses accepts multimodal content items without stripping options"
   assertEquals(parsed.temperature, 0.2);
 });
 
+Deno.test("Responses accepts bounded developer and function-call history items", () => {
+  const parsed = responsesSchema.parse({
+    model: "openai/default",
+    input: [
+      { type: "message", role: "developer", content: "Use the tool" },
+      {
+        type: "function_call",
+        id: "fc_1",
+        call_id: "call_1",
+        name: "lookup",
+        arguments: '{"q":"x"}',
+        status: "completed",
+      },
+      { type: "function_call_output", call_id: "call_1", output: "result" },
+    ],
+  });
+  assertEquals(Array.isArray(parsed.input), true);
+  assertEquals(
+    responsesSchema.safeParse({
+      model: "openai/default",
+      input: [{
+        type: "function_call",
+        call_id: "call_1",
+        name: "x".repeat(129),
+        arguments: "{}",
+      }],
+    }).success,
+    false,
+  );
+});
+
 Deno.test("conversation patches are strict, bounded, and normalized", () => {
   assertEquals(updateConversationSchema.parse({ title: "  Renamed  " }), { title: "Renamed" });
   assertEquals(updateConversationSchema.safeParse({}).success, false);

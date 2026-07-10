@@ -1,5 +1,6 @@
 import type { ChatCompletionRequest, ModelInfo } from "@dg-chat/contracts";
 import { isSpecialUseIp, pinnedProviderFetch } from "./provider_transport.ts";
+import { ProviderAttemptError } from "./provider-resilience.ts";
 
 export const models: ModelInfo[] = [
   {
@@ -75,6 +76,17 @@ export interface UpstreamStreamOptions {
   timeoutMs?: number;
   maxResponseBytes?: number;
   fetch?: typeof fetch;
+}
+
+function retryAfterMs(headers: Headers): number | undefined {
+  const value = headers.get("retry-after")?.trim();
+  if (!value) return undefined;
+  const seconds = Number(value);
+  const delay = Number.isFinite(seconds)
+    ? Math.ceil(seconds * 1_000)
+    : Date.parse(value) - Date.now();
+  if (!Number.isSafeInteger(delay) || delay < 0) return undefined;
+  return Math.min(delay, 300_000);
 }
 
 const MAX_SSE_BUFFER_LENGTH = 1_048_576;
@@ -262,8 +274,21 @@ function validateOpenAIChunk(data: string, usageBounds?: UsageBounds): number {
     if (!chunk.error || typeof chunk.error !== "object" || Array.isArray(chunk.error)) {
       throw new Error("Upstream sent an invalid stream error");
     }
-    boundedString((chunk.error as Record<string, unknown>).message, "stream error message");
-    return 0;
+    const error = chunk.error as Record<string, unknown>;
+    const message = boundedString(error.message, "stream error message") ??
+      "Provider stream failed";
+    const code = boundedString(error.code, "stream error code");
+    const type = boundedString(error.type, "stream error type");
+    if (message.length > 500 || (code?.length ?? 0) > 120 || (type?.length ?? 0) > 120) {
+      throw new Error("Upstream sent an invalid stream error");
+    }
+    throw new ProviderAttemptError(
+      code ? `${message} (${code})` : type ? `${message} (${type})` : message,
+      {
+        category: "invalid_response",
+        transient: true,
+      },
+    );
   }
   if (!Array.isArray(chunk.choices) || chunk.choices.length > 128) {
     throw new Error("Upstream sent invalid chat completion choices");
@@ -401,7 +426,12 @@ export async function* streamChatCompletion(
   signal.throwIfAborted();
   const baseUrl = options.baseUrl ?? Deno.env.get("OPENAI_BASE_URL");
   const apiKey = options.apiKey ?? Deno.env.get("OPENAI_API_KEY");
-  if (!baseUrl || !apiKey) throw new Error("The OpenAI-compatible provider is not configured");
+  if (!baseUrl || !apiKey) {
+    throw new ProviderAttemptError("The OpenAI-compatible provider is not configured", {
+      category: "invalid_request",
+      transient: false,
+    });
+  }
   const upstreamModel = options.upstreamModel ??
     (request.model === "openai/default"
       ? (Deno.env.get("OPENAI_MODEL") ?? "gpt-4o-mini")
@@ -424,26 +454,70 @@ export async function* streamChatCompletion(
     const payload = await readBoundedBody(response, maxResponseBytes(options.maxResponseBytes));
     let message = `Provider returned ${response.status}`;
     try {
-      const parsed = JSON.parse(payload) as { error?: { message?: string } };
-      message = parsed.error?.message ?? message;
+      const parsed = JSON.parse(payload) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        const error = (parsed as Record<string, unknown>).error;
+        if (error !== undefined) {
+          if (!error || typeof error !== "object" || Array.isArray(error)) {
+            throw new Error("Upstream sent an invalid provider error");
+          }
+          const fields = error as Record<string, unknown>;
+          const upstreamMessage = boundedString(fields.message, "provider error message");
+          const type = boundedString(fields.type, "provider error type");
+          const code = boundedString(fields.code, "provider error code");
+          for (
+            const [name, value, limit] of [
+              ["message", upstreamMessage, 500],
+              ["type", type, 120],
+              ["code", code, 120],
+            ] as const
+          ) {
+            if (value != null && value.length > limit) {
+              throw new Error(`Upstream sent an invalid provider error ${name}`);
+            }
+          }
+          if (upstreamMessage) {
+            message = `${upstreamMessage}${code ? ` (${code})` : type ? ` (${type})` : ""}`;
+          }
+        }
+      }
     } catch {
-      // Non-JSON error bodies still retain the provider status without reflecting arbitrary HTML.
+      // Malformed error bodies retain only the authoritative provider status.
     }
-    throw new Error(message);
+    throw new ProviderAttemptError(message, {
+      status: response.status,
+      retryAfterMs: retryAfterMs(response.headers),
+    });
   }
   const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
   if (!contentType.startsWith("text/event-stream")) {
     await response.body?.cancel();
-    throw new Error("Provider returned a non-SSE response for a streaming request");
+    throw new ProviderAttemptError("Provider returned a non-SSE response for a streaming request", {
+      category: "invalid_response",
+      transient: true,
+    });
   }
-  if (!response.body) throw new Error("Provider returned an empty event stream");
-  yield* parseOpenAIEventStream(response.body, combinedSignal, {
-    promptTokens: new TextEncoder().encode(JSON.stringify(request)).length,
-    completionTokens: request.max_tokens ?? request.max_completion_tokens ?? 4096,
-  }, maxResponseBytes(options.maxResponseBytes));
+  if (!response.body) {
+    throw new ProviderAttemptError("Provider returned an empty event stream", {
+      category: "invalid_response",
+      transient: true,
+    });
+  }
+  try {
+    yield* parseOpenAIEventStream(response.body, combinedSignal, {
+      promptTokens: new TextEncoder().encode(JSON.stringify(request)).length,
+      completionTokens: request.max_tokens ?? request.max_completion_tokens ?? 4096,
+    }, maxResponseBytes(options.maxResponseBytes));
+  } catch (error) {
+    if (combinedSignal.aborted || error instanceof ProviderAttemptError) throw error;
+    throw new ProviderAttemptError(
+      error instanceof Error ? error.message : "Provider returned an invalid event stream",
+      { category: "invalid_response", transient: true },
+    );
+  }
 }
 
-export async function complete(
+async function completeAttempt(
   request: ChatCompletionRequest,
   signal: AbortSignal,
   options: UpstreamStreamOptions = {},
@@ -462,7 +536,12 @@ export async function complete(
   }
   const baseUrl = options.baseUrl ?? Deno.env.get("OPENAI_BASE_URL");
   const apiKey = options.apiKey ?? Deno.env.get("OPENAI_API_KEY");
-  if (!baseUrl || !apiKey) throw new Error("The OpenAI-compatible provider is not configured");
+  if (!baseUrl || !apiKey) {
+    throw new ProviderAttemptError("The OpenAI-compatible provider is not configured", {
+      category: "invalid_request",
+      transient: false,
+    });
+  }
   const upstreamModel = options.upstreamModel ??
     (request.model === "openai/default"
       ? (Deno.env.get("OPENAI_MODEL") ?? "gpt-4o-mini")
@@ -477,22 +556,33 @@ export async function complete(
     body: JSON.stringify({ ...request, model: upstreamModel, stream: false }),
   });
   const body = await readBoundedBody(response, maxResponseBytes(options.maxResponseBytes));
+  if (!response.ok) {
+    let message: string | undefined;
+    try {
+      const parsed = JSON.parse(body) as unknown;
+      const error = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>).error
+        : undefined;
+      message = error && typeof error === "object" && !Array.isArray(error)
+        ? boundedString((error as Record<string, unknown>).message, "provider error message") ??
+          undefined
+        : undefined;
+    } catch {
+      // Error bodies are advisory. HTTP status and Retry-After remain authoritative.
+    }
+    throw new ProviderAttemptError(message ?? `Provider returned ${response.status}`, {
+      status: response.status,
+      retryAfterMs: retryAfterMs(response.headers),
+    });
+  }
   let payload: unknown;
   try {
     payload = JSON.parse(body);
   } catch {
-    throw new Error("Provider returned malformed JSON");
-  }
-  if (!response.ok) {
-    const error = payload && typeof payload === "object" && !Array.isArray(payload)
-      ? (payload as Record<string, unknown>).error
-      : undefined;
-    const message = error && typeof error === "object" && !Array.isArray(error)
-      ? boundedString((error as Record<string, unknown>).message, "provider error message")
-      : undefined;
-    throw new Error(
-      message ?? `Provider returned ${response.status}`,
-    );
+    throw new ProviderAttemptError("Provider returned malformed JSON", {
+      category: "invalid_response",
+      transient: true,
+    });
   }
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     throw new Error("Provider returned a non-object chat completion");
@@ -527,8 +617,17 @@ export async function complete(
       throw new Error("Provider returned an invalid chat completion message");
     }
     const fields = message as Record<string, unknown>;
+    if (fields.role !== undefined && fields.role !== "assistant") {
+      throw new Error("Provider returned an invalid completion message role");
+    }
     const content = boundedString(fields.content, "message content", true);
     if (content) outputBytes += new TextEncoder().encode(content).length;
+    for (
+      const name of ["refusal", "reasoning_content", "reasoning", "reasoning_summary"] as const
+    ) {
+      const value = boundedString(fields[name], `message ${name}`, true);
+      if (value) outputBytes += new TextEncoder().encode(value).length;
+    }
     validateToolCalls(fields.tool_calls);
     if (fields.tool_calls !== undefined) {
       outputBytes += new TextEncoder().encode(JSON.stringify(fields.tool_calls)).length;
@@ -575,4 +674,23 @@ export async function complete(
     ...(reasoningTokens === undefined ? {} : { reasoningTokens }),
     upstream: payload,
   };
+}
+
+export async function complete(
+  request: ChatCompletionRequest,
+  signal: AbortSignal,
+  options: UpstreamStreamOptions = {},
+): ReturnType<typeof completeAttempt> {
+  try {
+    return await completeAttempt(request, signal, options);
+  } catch (error) {
+    if (
+      signal.aborted || error instanceof ProviderAttemptError || error instanceof TypeError ||
+      (error instanceof DOMException && ["AbortError", "TimeoutError"].includes(error.name))
+    ) throw error;
+    throw new ProviderAttemptError(
+      error instanceof Error ? error.message : "Provider returned an invalid completion",
+      { category: "invalid_response", transient: true },
+    );
+  }
 }

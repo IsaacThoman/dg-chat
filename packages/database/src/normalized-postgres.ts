@@ -495,6 +495,10 @@ function validateAttemptFinish(input: FinishProviderAttemptInput) {
 }
 function exactAttemptCost(attempt: ProviderAttempt, input: FinishProviderAttemptInput): number {
   if (input.status === "skipped") return 0;
+  if (
+    input.costSource === "none" && input.costMicros === 0 && input.inputTokens === 0 &&
+    input.outputTokens === 0 && input.status !== "succeeded"
+  ) return 0;
   const numerator = BigInt(input.inputTokens - input.cachedInputTokens) *
       BigInt(attempt.pricing.inputMicrosPerMillion) +
     BigInt(input.cachedInputTokens) * BigInt(attempt.pricing.cachedInputMicrosPerMillion) +
@@ -1268,12 +1272,13 @@ export class PostgresRepository implements DomainRepository {
       const account = await tx<
         Row[]
       >`SELECT balance_micros FROM users WHERE id=${input.ownerId} FOR UPDATE`;
+      const providerExecution = number(runs[0].execution_epoch) > 0;
       const actualCost = number(runs[0].actual_provider_cost_micros);
-      const effectiveCost = actualCost > 0 ? actualCost : input.costMicros;
-      const effectiveInputTokens = actualCost > 0
+      const effectiveCost = providerExecution ? actualCost : input.costMicros;
+      const effectiveInputTokens = providerExecution
         ? number(runs[0].actual_provider_input_tokens)
         : input.inputTokens;
-      const effectiveOutputTokens = actualCost > 0
+      const effectiveOutputTokens = providerExecution
         ? number(runs[0].actual_provider_output_tokens)
         : input.outputTokens;
       const delta = number(runs[0].reserved_micros) - effectiveCost;
@@ -1299,7 +1304,7 @@ export class PostgresRepository implements DomainRepository {
       }
       const finished = await tx<
         Row[]
-      >`UPDATE usage_runs SET status='completed',generation_lease_token=NULL,generation_lease_expires_at=NULL,cost_micros=${effectiveCost},input_tokens=${effectiveInputTokens},output_tokens=${effectiveOutputTokens},latency_ms=${input.latencyMs},completed_at=now() WHERE id=${input.runId} RETURNING *`;
+      >`UPDATE usage_runs SET status='completed',generation_lease_token=NULL,generation_lease_expires_at=NULL,run_lease_token=NULL,run_lease_expires_at=NULL,cost_micros=${effectiveCost},input_tokens=${effectiveInputTokens},output_tokens=${effectiveOutputTokens},latency_ms=${input.latencyMs},completed_at=now() WHERE id=${input.runId} RETURNING *`;
       const updated = await tx<
         Row[]
       >`UPDATE conversations SET active_leaf_id=CASE WHEN active_leaf_id=${input.userMessageId} THEN ${
@@ -1347,7 +1352,8 @@ export class PostgresRepository implements DomainRepository {
       const account = await tx<
         Row[]
       >`SELECT balance_micros FROM users WHERE id=${input.ownerId} FOR UPDATE`;
-      const actualCost = number(runs[0].actual_provider_cost_micros);
+      const providerExecution = number(runs[0].execution_epoch) > 0;
+      const actualCost = providerExecution ? number(runs[0].actual_provider_cost_micros) : 0;
       const delta = number(runs[0].reserved_micros) - actualCost;
       const after = number(account[0].balance_micros) + delta;
       const idx = await tx<
@@ -1368,12 +1374,10 @@ export class PostgresRepository implements DomainRepository {
       }
       const failed = await tx<
         Row[]
-      >`UPDATE usage_runs SET status=${
-        actualCost > 0 ? "completed" : "failed"
-      },generation_lease_token=NULL,generation_lease_expires_at=NULL,cost_micros=${actualCost},input_tokens=${
-        number(runs[0].actual_provider_input_tokens)
+      >`UPDATE usage_runs SET status='failed',generation_lease_token=NULL,generation_lease_expires_at=NULL,run_lease_token=NULL,run_lease_expires_at=NULL,cost_micros=${actualCost},input_tokens=${
+        providerExecution ? number(runs[0].actual_provider_input_tokens) : 0
       },output_tokens=${
-        number(runs[0].actual_provider_output_tokens)
+        providerExecution ? number(runs[0].actual_provider_output_tokens) : 0
       },error=${input.error},completed_at=now() WHERE id=${input.runId} RETURNING *`;
       const updated = await tx<
         Row[]
@@ -1394,10 +1398,15 @@ export class PostgresRepository implements DomainRepository {
       >`SELECT * FROM usage_runs WHERE status='reserved' AND generation_lease_token IS NOT NULL AND generation_lease_expires_at<=now() ORDER BY generation_lease_expires_at FOR UPDATE SKIP LOCKED LIMIT ${limit}`;
       for (const row of rows) {
         const userId = String(row.user_id);
+        await tx`UPDATE provider_attempts SET status='cancelled',phase='planning',
+          error_code='generation_lease_expired',breaker_after='unavailable',retryable=true,
+          latency_ms=GREATEST(0,floor(extract(epoch FROM (now()-started_at))*1000)::int),
+          completed_at=now() WHERE usage_run_id=${String(row.id)} AND status='running'`;
         const account = await tx<
           Row[]
         >`SELECT balance_micros FROM users WHERE id=${userId} FOR UPDATE`;
-        const actualCost = number(row.actual_provider_cost_micros);
+        const providerExecution = number(row.execution_epoch) > 0;
+        const actualCost = providerExecution ? number(row.actual_provider_cost_micros) : 0;
         const amount = number(row.reserved_micros) - actualCost;
         const after = number(account[0].balance_micros) + amount;
         await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${userId}`;
@@ -1406,13 +1415,11 @@ export class PostgresRepository implements DomainRepository {
             String(row.id)
           },${amount > 0 ? "refund" : "settle"},${amount},${after})`;
         }
-        await tx`UPDATE usage_runs SET status=${
-          actualCost > 0 ? "completed" : "failed"
-        },cost_micros=${actualCost},input_tokens=${
-          number(row.actual_provider_input_tokens)
+        await tx`UPDATE usage_runs SET status='failed',cost_micros=${actualCost},input_tokens=${
+          providerExecution ? number(row.actual_provider_input_tokens) : 0
         },output_tokens=${
-          number(row.actual_provider_output_tokens)
-        },generation_lease_token=NULL,generation_lease_expires_at=NULL,error='generation lease expired',completed_at=now() WHERE id=${
+          providerExecution ? number(row.actual_provider_output_tokens) : 0
+        },generation_lease_token=NULL,generation_lease_expires_at=NULL,run_lease_token=NULL,run_lease_expires_at=NULL,error='generation lease expired',completed_at=now() WHERE id=${
           String(row.id)
         }`;
       }
@@ -2337,6 +2344,8 @@ export class PostgresRepository implements DomainRepository {
       >`SELECT COALESCE(max(attempt_number),0)::int+1 AS next
         FROM provider_attempts WHERE usage_run_id=${usageRunId}`;
       const nextAttemptNumber = number(ordinals[0].next);
+      const consumed = await tx<{ count: number }[]>`SELECT count(*)::int count
+        FROM provider_attempts WHERE usage_run_id=${usageRunId} AND status<>'skipped'`;
       if (nextAttemptNumber > 16) {
         throw new DomainError(
           "execution_path_exhausted",
@@ -2344,7 +2353,13 @@ export class PostgresRepository implements DomainRepository {
           409,
         );
       }
-      return { usageRunId, executionEpoch: epoch, nextAttemptNumber, reconciledAttemptIds };
+      return {
+        usageRunId,
+        executionEpoch: epoch,
+        nextAttemptNumber,
+        consumedAttempts: number(consumed[0].count),
+        reconciledAttemptIds,
+      };
     });
   }
 
@@ -2639,14 +2654,15 @@ export class PostgresRepository implements DomainRepository {
           delta > 0 ? "refund" : "settle"
         },${delta},${after})`;
       }
-      const failedWithoutSpend = refundOnly && cost === 0;
       const updated = await tx<Row[]>`UPDATE usage_runs SET status=${
-        failedWithoutSpend ? "failed" : "completed"
+        refundOnly ? "failed" : "completed"
       },cost_micros=${cost},input_tokens=${number(rows[0].actual_provider_input_tokens)},
         output_tokens=${
         number(rows[0].actual_provider_output_tokens)
       },latency_ms=${input.latencyMs},
-        error=${input.error ?? null},completed_at=now() WHERE id=${input.usageRunId} RETURNING *`;
+        error=${input.error ?? null},run_lease_token=NULL,run_lease_expires_at=NULL,
+        generation_lease_token=NULL,generation_lease_expires_at=NULL,completed_at=now()
+        WHERE id=${input.usageRunId} RETURNING *`;
       return run(updated[0]);
     });
   }
@@ -2657,6 +2673,46 @@ export class PostgresRepository implements DomainRepository {
 
   refundProviderUsage(input: FinalizeProviderUsageInput): Promise<UsageRun> {
     return this.#finalizeProviderUsage(input, true);
+  }
+
+  async reapStaleProviderExecutionLeases(limit = 100): Promise<number> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) {
+      throw new DomainError("validation_error", "Provider lease reaper limit is invalid", 422);
+    }
+    return await this.#sql.begin(async (tx) => {
+      const rows = await tx<Row[]>`SELECT r.* FROM usage_runs r
+        WHERE r.status='reserved' AND r.run_lease_token IS NOT NULL
+          AND r.run_lease_expires_at<=now() AND r.generation_lease_token IS NULL
+          AND NOT EXISTS(SELECT 1 FROM api_idempotency_requests a WHERE a.usage_run_id=r.id)
+        ORDER BY r.run_lease_expires_at FOR UPDATE SKIP LOCKED LIMIT ${limit}`;
+      for (const row of rows) {
+        const runId = String(row.id);
+        await tx`UPDATE provider_attempts SET status='cancelled',phase='planning',
+          error_code='execution_lease_expired',breaker_after='unavailable',retryable=true,
+          latency_ms=GREATEST(0,floor(extract(epoch FROM (now()-started_at))*1000)::int),
+          completed_at=now() WHERE usage_run_id=${runId} AND status='running'`;
+        const userId = String(row.user_id);
+        const users = await tx<
+          Row[]
+        >`SELECT balance_micros FROM users WHERE id=${userId} FOR UPDATE`;
+        const providerExecution = number(row.execution_epoch) > 0;
+        const cost = providerExecution ? number(row.actual_provider_cost_micros) : 0;
+        const delta = number(row.reserved_micros) - cost;
+        const after = number(users[0].balance_micros) + delta;
+        await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${userId}`;
+        if (delta !== 0) {
+          await tx`INSERT INTO ledger_entries(user_id,usage_run_id,kind,amount_micros,balance_after_micros)
+            VALUES(${userId},${runId},${delta > 0 ? "refund" : "settle"},${delta},${after})`;
+        }
+        await tx`UPDATE usage_runs SET status='failed',cost_micros=${cost},input_tokens=${
+          providerExecution ? number(row.actual_provider_input_tokens) : 0
+        },output_tokens=${
+          providerExecution ? number(row.actual_provider_output_tokens) : 0
+        },run_lease_token=NULL,run_lease_expires_at=NULL,error='provider execution lease expired',
+          completed_at=now() WHERE id=${runId}`;
+      }
+      return rows.length;
+    });
   }
 
   async createApiToken(userId: string, input: CreateApiTokenInput) {
@@ -2751,7 +2807,7 @@ export class PostgresRepository implements DomainRepository {
       if (runs[0].status !== "reserved") {
         throw new DomainError("invalid_usage_state", "Usage run is not reserved", 409);
       }
-      if (number(runs[0].actual_provider_cost_micros) > 0) {
+      if (number(runs[0].execution_epoch) > 0) {
         cost = number(runs[0].actual_provider_cost_micros);
         inputTokens = number(runs[0].actual_provider_input_tokens);
         outputTokens = number(runs[0].actual_provider_output_tokens);
@@ -2772,7 +2828,7 @@ export class PostgresRepository implements DomainRepository {
       }
       const updated = await tx<
         Row[]
-      >`UPDATE usage_runs SET status='completed',cost_micros=${cost},input_tokens=${inputTokens},output_tokens=${outputTokens},latency_ms=${latencyMs},completed_at=now() WHERE id=${runId} RETURNING *`;
+      >`UPDATE usage_runs SET status='completed',cost_micros=${cost},input_tokens=${inputTokens},output_tokens=${outputTokens},latency_ms=${latencyMs},run_lease_token=NULL,run_lease_expires_at=NULL,completed_at=now() WHERE id=${runId} RETURNING *`;
       return run(updated[0]);
     });
   }
@@ -2783,7 +2839,8 @@ export class PostgresRepository implements DomainRepository {
       if (runs[0].status !== "reserved") return run(runs[0]);
       const userId = String(runs[0].user_id);
       const users = await tx<Row[]>`SELECT balance_micros FROM users WHERE id=${userId} FOR UPDATE`;
-      const actualCost = number(runs[0].actual_provider_cost_micros);
+      const providerExecution = number(runs[0].execution_epoch) > 0;
+      const actualCost = providerExecution ? number(runs[0].actual_provider_cost_micros) : 0;
       const delta = number(runs[0].reserved_micros) - actualCost;
       const after = number(users[0].balance_micros) + delta;
       await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${userId}`;
@@ -2792,13 +2849,15 @@ export class PostgresRepository implements DomainRepository {
           delta > 0 ? "refund" : "settle"
         },${delta},${after})`;
       }
-      const updated = await tx<Row[]>`UPDATE usage_runs SET status=${
-        actualCost > 0 ? "completed" : "failed"
-      },cost_micros=${actualCost},input_tokens=${
-        number(runs[0].actual_provider_input_tokens)
-      },output_tokens=${number(runs[0].actual_provider_output_tokens)},error=${
+      const updated = await tx<
+        Row[]
+      >`UPDATE usage_runs SET status='failed',cost_micros=${actualCost},input_tokens=${
+        providerExecution ? number(runs[0].actual_provider_input_tokens) : 0
+      },output_tokens=${
+        providerExecution ? number(runs[0].actual_provider_output_tokens) : 0
+      },error=${
         error ?? null
-      },completed_at=now() WHERE id=${runId} RETURNING *`;
+      },run_lease_token=NULL,run_lease_expires_at=NULL,completed_at=now() WHERE id=${runId} RETURNING *`;
       return run(updated[0]);
     });
   }
@@ -3165,8 +3224,18 @@ export class PostgresRepository implements DomainRepository {
       } FOR UPDATE`;
       if (!runs[0]) throw new DomainError("not_found", "Usage reservation not found", 404);
       if (runs[0].status === "reserved") {
+        const providerExecution = number(runs[0].execution_epoch) > 0;
+        const effectiveCost = providerExecution
+          ? number(runs[0].actual_provider_cost_micros)
+          : input.costMicros;
+        const effectiveInputTokens = providerExecution
+          ? number(runs[0].actual_provider_input_tokens)
+          : input.inputTokens;
+        const effectiveOutputTokens = providerExecution
+          ? number(runs[0].actual_provider_output_tokens)
+          : input.outputTokens;
         const reserved = number(runs[0].reserved_micros);
-        const delta = reserved - input.costMicros;
+        const delta = reserved - effectiveCost;
         const userId = String(row.user_id);
         const users = await tx<
           Row[]
@@ -3181,7 +3250,7 @@ export class PostgresRepository implements DomainRepository {
             String(row.usage_run_id)
           },${delta > 0 ? "refund" : "settle"},${delta},${after})`;
         }
-        await tx`UPDATE usage_runs SET status='completed',cost_micros=${input.costMicros},input_tokens=${input.inputTokens},output_tokens=${input.outputTokens},latency_ms=${input.latencyMs},completed_at=now() WHERE id=${
+        await tx`UPDATE usage_runs SET status='completed',cost_micros=${effectiveCost},input_tokens=${effectiveInputTokens},output_tokens=${effectiveOutputTokens},latency_ms=${input.latencyMs},run_lease_token=NULL,run_lease_expires_at=NULL,completed_at=now() WHERE id=${
           String(row.usage_run_id)
         }`;
       } else if (runs[0].status !== "completed") {
@@ -3254,14 +3323,22 @@ export class PostgresRepository implements DomainRepository {
         const users = await tx<
           Row[]
         >`SELECT balance_micros FROM users WHERE id=${userId} FOR UPDATE`;
-        if (input.billing.mode === "refund") {
-          const amount = number(runs[0].reserved_micros);
+        const providerExecution = number(runs[0].execution_epoch) > 0;
+        if (providerExecution || input.billing.mode === "refund") {
+          const effectiveCost = providerExecution ? number(runs[0].actual_provider_cost_micros) : 0;
+          const amount = number(runs[0].reserved_micros) - effectiveCost;
           const after = number(users[0].balance_micros) + amount;
           await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${userId}`;
-          await tx`INSERT INTO ledger_entries(user_id,usage_run_id,kind,amount_micros,balance_after_micros) VALUES(${userId},${
-            String(row.usage_run_id)
-          },'refund',${amount},${after})`;
-          await tx`UPDATE usage_runs SET status='failed',error='idempotent request failed',completed_at=now() WHERE id=${
+          if (amount !== 0) {
+            await tx`INSERT INTO ledger_entries(user_id,usage_run_id,kind,amount_micros,balance_after_micros) VALUES(${userId},${
+              String(row.usage_run_id)
+            },${amount > 0 ? "refund" : "settle"},${amount},${after})`;
+          }
+          await tx`UPDATE usage_runs SET status='failed',cost_micros=${effectiveCost},input_tokens=${
+            providerExecution ? number(runs[0].actual_provider_input_tokens) : 0
+          },output_tokens=${
+            providerExecution ? number(runs[0].actual_provider_output_tokens) : 0
+          },run_lease_token=NULL,run_lease_expires_at=NULL,error='idempotent request failed',completed_at=now() WHERE id=${
             String(row.usage_run_id)
           }`;
         } else {
@@ -3307,13 +3384,20 @@ export class PostgresRepository implements DomainRepository {
           String(row.usage_run_id)
         } FOR UPDATE`;
         if (runs[0]?.status === "reserved") {
+          await tx`UPDATE provider_attempts SET status='cancelled',phase='planning',
+            error_code='api_lease_expired',breaker_after='unavailable',retryable=true,
+            latency_ms=GREATEST(0,floor(extract(epoch FROM (now()-started_at))*1000)::int),
+            completed_at=now() WHERE usage_run_id=${String(row.usage_run_id)} AND status='running'`;
           const userId = String(row.user_id);
           const users = await tx<
             Row[]
           >`SELECT balance_micros FROM users WHERE id=${userId} FOR UPDATE`;
           const reserved = number(runs[0].reserved_micros);
-          const observedCost = number(row.observed_cost_micros);
-          const delta = observedCost > 0 ? reserved - observedCost : reserved;
+          const providerExecution = number(runs[0].execution_epoch) > 0;
+          const effectiveCost = providerExecution
+            ? number(runs[0].actual_provider_cost_micros)
+            : number(row.observed_cost_micros);
+          const delta = reserved - effectiveCost;
           const after = number(users[0].balance_micros) + delta;
           if (after < 0) {
             throw new DomainError(
@@ -3328,19 +3412,21 @@ export class PostgresRepository implements DomainRepository {
               String(row.usage_run_id)
             },${delta > 0 ? "refund" : "settle"},${delta},${after})`;
           }
-          if (observedCost > 0) {
-            await tx`UPDATE usage_runs SET status='completed',cost_micros=${observedCost},input_tokens=${
-              number(row.observed_input_tokens)
-            },output_tokens=${number(row.observed_output_tokens)},latency_ms=${
-              number(row.observed_latency_ms)
-            },error='request lease expired after partial usage',completed_at=now() WHERE id=${
-              String(row.usage_run_id)
-            }`;
-          } else {
-            await tx`UPDATE usage_runs SET status='failed',error='request lease expired',completed_at=now() WHERE id=${
-              String(row.usage_run_id)
-            }`;
-          }
+          await tx`UPDATE usage_runs SET status='failed',cost_micros=${effectiveCost},input_tokens=${
+            providerExecution
+              ? number(runs[0].actual_provider_input_tokens)
+              : number(row.observed_input_tokens)
+          },output_tokens=${
+            providerExecution
+              ? number(runs[0].actual_provider_output_tokens)
+              : number(row.observed_output_tokens)
+          },latency_ms=${
+            number(row.observed_latency_ms)
+          },run_lease_token=NULL,run_lease_expires_at=NULL,error=${
+            effectiveCost > 0
+              ? "request lease expired after partial usage"
+              : "request lease expired"
+          },completed_at=now() WHERE id=${String(row.usage_run_id)}`;
         }
         const stats = await tx<
           { count: number }[]

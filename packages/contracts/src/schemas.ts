@@ -70,7 +70,7 @@ export const chatCompletionSchema = z.object({
   model: z.string().min(1),
   messages: z.array(
     z.object({
-      role: z.enum(["system", "user", "assistant", "tool"]),
+      role: z.enum(["system", "developer", "user", "assistant", "tool"]),
       content: z.union([z.string(), z.array(z.record(z.string(), z.unknown())), z.null()]),
       name: z.string().optional(),
       tool_call_id: z.string().optional(),
@@ -99,13 +99,29 @@ export const responsesSchema = z.object({
   input: z.union([
     z.string().min(1).max(2_000_000),
     z.array(
-      z.object({
-        role: z.enum(["system", "user", "assistant"]),
-        content: z.union([
-          z.string().max(2_000_000),
-          z.array(z.record(z.string(), z.unknown())).max(256),
-        ]),
-      }).passthrough(),
+      z.union([
+        z.object({
+          type: z.literal("message").optional(),
+          role: z.enum(["system", "developer", "user", "assistant"]),
+          content: z.union([
+            z.string().max(2_000_000),
+            z.array(z.record(z.string(), z.unknown())).max(256),
+          ]),
+        }).passthrough(),
+        z.object({
+          type: z.literal("function_call"),
+          id: z.string().min(1).max(512).optional(),
+          call_id: z.string().min(1).max(512),
+          name: z.string().min(1).max(128),
+          arguments: z.string().max(1_000_000),
+          status: z.enum(["in_progress", "completed", "incomplete"]).optional(),
+        }).passthrough(),
+        z.object({
+          type: z.literal("function_call_output"),
+          call_id: z.string().min(1).max(512),
+          output: z.string().max(2_000_000),
+        }).passthrough(),
+      ]),
     ).min(1).max(256),
   ]),
   stream: z.boolean().optional(),

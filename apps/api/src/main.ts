@@ -7,6 +7,7 @@ import {
 } from "@dg-chat/database";
 import { MemoryRateLimiter, RedisRateLimiter } from "./rate-limit.ts";
 import { ProviderSecretKeyring } from "./provider-secrets.ts";
+import { MemoryCircuitBreaker, RedisCircuitBreaker } from "./provider-circuit.ts";
 
 const port = Number(Deno.env.get("PORT") ?? 8000);
 const providerKeyring = ProviderSecretKeyring.fromEnv();
@@ -30,19 +31,30 @@ const repository = databaseUrl
 const rateLimiter = Deno.env.get("REDIS_URL")
   ? new RedisRateLimiter(Deno.env.get("REDIS_URL")!)
   : new MemoryRateLimiter();
+const circuitBreaker = Deno.env.get("REDIS_URL")
+  ? new RedisCircuitBreaker(Deno.env.get("REDIS_URL")!)
+  : new MemoryCircuitBreaker();
 const objectStore = objectStoreFromEnv();
-const { app } = createApp({ repository, rateLimiter, objectStore, providerKeyring });
+const { app } = createApp({
+  repository,
+  rateLimiter,
+  objectStore,
+  providerKeyring,
+  circuitBreaker,
+});
 const replayMaintenance = setInterval(async () => {
   try {
     const reaped = await repository.reapStaleApiRequests(100);
     const reapedGenerations = await repository.reapStaleGenerations(100);
+    const reapedProviderRuns = await repository.reapStaleProviderExecutionLeases(100);
     const pruned = await repository.pruneExpiredApiRequests(100);
-    if (reaped || reapedGenerations || pruned) {
+    if (reaped || reapedGenerations || reapedProviderRuns || pruned) {
       console.log(JSON.stringify({
         level: "info",
         message: "Replay maintenance",
         reaped,
         reapedGenerations,
+        reapedProviderRuns,
         pruned,
       }));
     }
@@ -63,7 +75,12 @@ const shutdown = async (signal: string) => {
   clearInterval(replayMaintenance);
   console.log(JSON.stringify({ level: "info", message: "API shutting down", signal }));
   await server.shutdown();
-  await Promise.all([repository.close(), rateLimiter.close(), objectStore?.close()]);
+  await Promise.all([
+    repository.close(),
+    rateLimiter.close(),
+    circuitBreaker.close(),
+    objectStore?.close(),
+  ]);
 };
 for (const signal of ["SIGTERM", "SIGINT"] as const) {
   Deno.addSignalListener(signal, () => void shutdown(signal));
