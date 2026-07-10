@@ -4,6 +4,7 @@ services:
       DENO_ENV: test
       OPENAI_BASE_URL: http://mock-provider:4010/v1
       OPENAI_API_KEY: ci-mock-provider-key
+      OPENAI_ALLOWED_MODELS: mock-fast,mock-split,mock-error,mock-role-stall
       # This exact-name exception is honored only in DENO_ENV=test.
       OPENAI_TEST_ALLOW_HTTP_HOST: mock-provider
     depends_on:

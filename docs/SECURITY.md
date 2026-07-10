@@ -19,7 +19,11 @@ Sessions use secure, HTTP-only, same-site cookies in production. State-changing 
 requests enforce an exact Origin when one is present. Approval, role, suspension, and deletion are
 independent states; suspension invalidates sessions and API tokens. The final active approved
 administrator cannot be rejected, suspended, or deleted. Redis-backed distributed rate limiting,
-email verification, and OIDC remain required before exposing public registration to the internet.
+hash-only one-time email verification and password-reset tokens, transactional credential
+invalidation, session revocation, and immutable identity audit events are enforced. Email
+verification is opt-in with `REQUIRE_EMAIL_VERIFICATION=true`; leave it false for approval-only
+registration without SMTP. When verification is required, configure SMTP before exposing
+registration. Generic OIDC remains a follow-up integration.
 
 Markdown, Mermaid, citations, artifacts, filenames, provider errors, and tool results are rendered
 as hostile content under a restrictive Content Security Policy. Raw HTML is disabled unless passed

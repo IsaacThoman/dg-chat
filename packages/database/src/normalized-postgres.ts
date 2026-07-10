@@ -10,6 +10,8 @@ import type {
   ApiSseFrameInput,
   ApiUsageObservation,
   AppendMessageInput,
+  AuditEvent,
+  AuditEventInput,
   BeginApiRequestInput,
   BeginApiRequestResult,
   BeginGenerationInput,
@@ -21,6 +23,8 @@ import type {
   DomainRepository,
   FailApiRequestInput,
   FailGenerationInput,
+  IdentityTokenPurpose,
+  SessionSummary,
 } from "./repository.ts";
 
 type Row = Record<string, unknown>;
@@ -47,6 +51,7 @@ function user(row: Row): StoredUser {
     approvalStatus: row.approval_status as StoredUser["approvalStatus"],
     state: row.state as StoredUser["state"],
     balanceMicros: number(row.balance_micros),
+    emailVerifiedAt: nullableIso(row.email_verified_at),
     createdAt: iso(row.created_at),
   };
 }
@@ -110,6 +115,8 @@ function run(row: Row): UsageRun {
     inputTokens: number(row.input_tokens),
     outputTokens: number(row.output_tokens),
     latencyMs: number(row.latency_ms ?? 0),
+    generationLeaseToken: row.generation_lease_token ? String(row.generation_lease_token) : null,
+    generationLeaseExpiresAt: nullableIso(row.generation_lease_expires_at),
     createdAt: iso(row.created_at),
   };
 }
@@ -173,7 +180,7 @@ export class PostgresRepository implements DomainRepository {
       }
       const rows = await tx<
         Row[]
-      >`INSERT INTO users (email,name,password_hash,role,approval_status,state,balance_micros) VALUES (${input.email},${input.name},${input.passwordHash},'admin','approved','active',${credit}) RETURNING *`;
+      >`INSERT INTO users (email,name,password_hash,role,approval_status,state,balance_micros,email_verified_at) VALUES (${input.email},${input.name},${input.passwordHash},'admin','approved','active',${credit},now()) RETURNING *`;
       const userId = String(rows[0].id);
       await tx`INSERT INTO ledger_entries (user_id,usage_run_id,kind,amount_micros,balance_after_micros) VALUES (${userId},${`bootstrap:${userId}`},'grant',${credit},${credit})`;
       return user(rows[0]);
@@ -183,9 +190,11 @@ export class PostgresRepository implements DomainRepository {
     try {
       const rows = await this.#sql<
         Row[]
-      >`INSERT INTO users (email,name,password_hash,role,approval_status,state) VALUES (${input.email},${input.name},${input.passwordHash},${
+      >`INSERT INTO users (email,name,password_hash,role,approval_status,state,email_verified_at) VALUES (${input.email},${input.name},${input.passwordHash},${
         input.role ?? "user"
-      },${input.approvalStatus ?? "pending"},${input.state ?? "active"}) RETURNING *`;
+      },${input.approvalStatus ?? "pending"},${input.state ?? "active"},${
+        input.emailVerified || input.approvalStatus === "approved" ? new Date().toISOString() : null
+      }) RETURNING *`;
       return user(rows[0]);
     } catch (error) {
       if ((error as { code?: string }).code === "23505") {
@@ -212,10 +221,13 @@ export class PostgresRepository implements DomainRepository {
       Row[]
     >`INSERT INTO sessions (user_id,token_hash,limited,expires_at) VALUES (${userId},${tokenHash},${limited},now()+interval '30 days') RETURNING *`;
     return {
+      id: String(rows[0].id),
       tokenHash: String(rows[0].token_hash),
       userId: String(rows[0].user_id),
       limited: Boolean(rows[0].limited),
       expiresAt: new Date(rows[0].expires_at as string).getTime(),
+      createdAt: iso(rows[0].created_at),
+      invalidatedAt: nullableIso(rows[0].invalidated_at),
     };
   }
   async getSession(tokenHash: string): Promise<StoredSession | undefined> {
@@ -224,10 +236,13 @@ export class PostgresRepository implements DomainRepository {
     >`SELECT * FROM sessions WHERE token_hash=${tokenHash} AND invalidated_at IS NULL AND expires_at>now()`;
     return rows[0]
       ? {
+        id: String(rows[0].id),
         tokenHash,
         userId: String(rows[0].user_id),
         limited: Boolean(rows[0].limited),
         expiresAt: new Date(rows[0].expires_at as string).getTime(),
+        createdAt: iso(rows[0].created_at),
+        invalidatedAt: nullableIso(rows[0].invalidated_at),
       }
       : undefined;
   }
@@ -238,12 +253,122 @@ export class PostgresRepository implements DomainRepository {
   async deleteSession(tokenHash: string) {
     await this.#sql`UPDATE sessions SET invalidated_at=now() WHERE token_hash=${tokenHash}`;
   }
+  async listSessions(userId: string): Promise<SessionSummary[]> {
+    return (await this.#sql<
+      Row[]
+    >`SELECT * FROM sessions WHERE user_id=${userId} ORDER BY created_at DESC`).map((row) => ({
+      id: String(row.id),
+      userId: String(row.user_id),
+      limited: Boolean(row.limited),
+      expiresAt: iso(row.expires_at),
+      createdAt: iso(row.created_at),
+      invalidatedAt: nullableIso(row.invalidated_at),
+    }));
+  }
+  async revokeSession(id: string, ownerId?: string) {
+    const rows = ownerId
+      ? await this
+        .#sql`UPDATE sessions SET invalidated_at=now() WHERE id=${id} AND user_id=${ownerId} AND invalidated_at IS NULL RETURNING id`
+      : await this
+        .#sql`UPDATE sessions SET invalidated_at=now() WHERE id=${id} AND invalidated_at IS NULL RETURNING id`;
+    if (!rows.length) throw new DomainError("not_found", "Session not found", 404);
+  }
+  async createIdentityToken(
+    userId: string,
+    purpose: IdentityTokenPurpose,
+    tokenHash: string,
+    expiresAt: string,
+  ) {
+    await this
+      .#sql`INSERT INTO identity_tokens(user_id,purpose,token_hash,expires_at) VALUES(${userId},${purpose},${tokenHash},${expiresAt})`;
+  }
+  async verifyEmail(tokenHash: string) {
+    return await this.#sql.begin(async (tx) => {
+      const tokens = await tx<
+        Row[]
+      >`UPDATE identity_tokens SET consumed_at=now() WHERE token_hash=${tokenHash} AND purpose='email_verification' AND consumed_at IS NULL AND expires_at>now() RETURNING user_id`;
+      if (!tokens[0]) {
+        throw new DomainError(
+          "invalid_identity_token",
+          "Verification token is invalid or expired",
+          400,
+        );
+      }
+      const rows = await tx<
+        Row[]
+      >`UPDATE users SET email_verified_at=COALESCE(email_verified_at,now()),updated_at=now() WHERE id=${
+        String(tokens[0].user_id)
+      } RETURNING *`;
+      return user(rows[0]);
+    });
+  }
+  async resetPassword(tokenHash: string, passwordHash: string) {
+    return await this.#sql.begin(async (tx) => {
+      const tokens = await tx<
+        Row[]
+      >`UPDATE identity_tokens SET consumed_at=now() WHERE token_hash=${tokenHash} AND purpose='password_reset' AND consumed_at IS NULL AND expires_at>now() RETURNING user_id`;
+      if (!tokens[0]) {
+        throw new DomainError("invalid_identity_token", "Reset token is invalid or expired", 400);
+      }
+      const userId = String(tokens[0].user_id);
+      const rows = await tx<
+        Row[]
+      >`UPDATE users SET password_hash=${passwordHash},updated_at=now() WHERE id=${userId} RETURNING *`;
+      await tx`UPDATE sessions SET invalidated_at=now() WHERE user_id=${userId} AND invalidated_at IS NULL`;
+      await tx`UPDATE api_tokens SET revoked_at=now() WHERE user_id=${userId} AND revoked_at IS NULL`;
+      await tx`UPDATE identity_tokens SET consumed_at=now() WHERE user_id=${userId} AND consumed_at IS NULL`;
+      return user(rows[0]);
+    });
+  }
+  async recordAudit(input: AuditEventInput): Promise<AuditEvent> {
+    const rows = await this.#sql<
+      Row[]
+    >`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata) VALUES(${
+      input.actorId ?? null
+    },${input.action},${input.targetType},${input.targetId ?? null},${
+      this.#sql.json((input.metadata ?? {}) as postgres.JSONValue)
+    }) RETURNING *`;
+    const row = rows[0];
+    return {
+      id: String(row.id),
+      actorId: row.actor_id ? String(row.actor_id) : null,
+      action: String(row.action),
+      targetType: String(row.target_type),
+      targetId: row.target_id ? String(row.target_id) : null,
+      metadata: row.metadata as Record<string, unknown>,
+      createdAt: iso(row.created_at),
+    };
+  }
+  async listAudit(limit = 100): Promise<AuditEvent[]> {
+    const safeLimit = Math.max(1, Math.min(500, limit));
+    return (await this.#sql<
+      Row[]
+    >`SELECT * FROM audit_events ORDER BY created_at DESC,id DESC LIMIT ${safeLimit}`).map((
+      row,
+    ) => ({
+      id: String(row.id),
+      actorId: row.actor_id ? String(row.actor_id) : null,
+      action: String(row.action),
+      targetType: String(row.target_type),
+      targetId: row.target_id ? String(row.target_id) : null,
+      metadata: row.metadata as Record<string, unknown>,
+      createdAt: iso(row.created_at),
+    }));
+  }
 
-  async approveUser(id: string, status: "approved" | "rejected", credit: number) {
+  async approveUser(
+    id: string,
+    status: "approved" | "rejected",
+    credit: number,
+    requireEmailVerification = false,
+  ) {
     return await this.#sql.begin(async (tx) => {
       await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-final-admin'))`;
       const rows = await tx<Row[]>`SELECT * FROM users WHERE id=${id} FOR UPDATE`;
       if (!rows[0]) throw new DomainError("not_found", "User not found", 404);
+      if (status === "approved" && requireEmailVerification && !rows[0].email_verified_at) {
+        throw new DomainError("email_not_verified", "Email must be verified before approval", 409);
+      }
       if (rows[0].role === "admin" && status === "rejected") {
         const count = await tx<
           { count: number }[]
@@ -375,6 +500,12 @@ export class PostgresRepository implements DomainRepository {
         Row[]
       >`SELECT * FROM conversations WHERE id=${input.conversationId} AND owner_id=${input.ownerId} FOR UPDATE`;
       if (!conversations[0]) throw new DomainError("not_found", "Conversation not found", 404);
+      if (conversations[0].deleted_at) {
+        throw new DomainError("conversation_deleted", "Deleted conversations are read-only", 409);
+      }
+      if (conversations[0].archived_at) {
+        throw new DomainError("conversation_archived", "Archived conversations are read-only", 409);
+      }
       const existing = await tx<
         Row[]
       >`SELECT * FROM messages WHERE conversation_id=${input.conversationId} AND idempotency_key=${input.idempotencyKey}`;
@@ -435,15 +566,27 @@ export class PostgresRepository implements DomainRepository {
     });
   }
   async beginGeneration(input: BeginGenerationInput) {
+    const leaseSeconds = input.leaseSeconds ?? 120;
+    if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1) {
+      throw new DomainError("validation_error", "Generation lease duration is invalid", 422);
+    }
     return await this.#sql.begin(async (tx) => {
       const c = await tx<
         Row[]
       >`SELECT * FROM conversations WHERE id=${input.message.conversationId} AND owner_id=${input.message.ownerId} FOR UPDATE`;
       if (!c[0]) throw new DomainError("not_found", "Conversation not found", 404);
+      if (c[0].deleted_at) {
+        throw new DomainError("conversation_deleted", "Deleted conversations are read-only", 409);
+      }
+      if (c[0].archived_at) {
+        throw new DomainError("conversation_archived", "Archived conversations are read-only", 409);
+      }
       const prior = await tx<
         Row[]
       >`SELECT * FROM messages WHERE conversation_id=${input.message.conversationId} AND idempotency_key=${input.message.idempotencyKey}`;
-      const priorRun = await tx<Row[]>`SELECT * FROM usage_runs WHERE id=${input.runId}`;
+      const priorRun = await tx<
+        Row[]
+      >`SELECT *,generation_lease_expires_at>now() AS generation_lease_active,GREATEST(1,ceil(extract(epoch FROM (generation_lease_expires_at-now()))))::int AS generation_lease_retry_seconds FROM usage_runs WHERE id=${input.runId} FOR UPDATE`;
       if (prior[0] && priorRun[0]) {
         const replay = message(prior[0]);
         if (
@@ -460,11 +603,33 @@ export class PostgresRepository implements DomainRepository {
             409,
           );
         }
+        if (priorRun[0].status === "completed") {
+          return {
+            kind: "completed" as const,
+            message: replay,
+            conversation: conversation(c[0]),
+            usageRun: run(priorRun[0]),
+          };
+        }
+        if (priorRun[0].generation_lease_active === true) {
+          return {
+            kind: "in_progress" as const,
+            message: replay,
+            conversation: conversation(c[0]),
+            usageRun: run(priorRun[0]),
+            retryAfterSeconds: number(priorRun[0].generation_lease_retry_seconds),
+          };
+        }
+        const leaseToken = crypto.randomUUID();
+        const claimed = await tx<
+          Row[]
+        >`UPDATE usage_runs SET generation_lease_token=${leaseToken},generation_lease_expires_at=now()+${leaseSeconds}*interval '1 second' WHERE id=${input.runId} AND status='reserved' RETURNING *`;
         return {
+          kind: "claimed" as const,
+          leaseToken,
           message: replay,
           conversation: conversation(c[0]),
-          usageRun: run(priorRun[0]),
-          replayed: true,
+          usageRun: run(claimed[0]),
         };
       }
       if (prior[0] || priorRun[0]) {
@@ -510,13 +675,14 @@ export class PostgresRepository implements DomainRepository {
       },${
         tx.json((input.message.metadata ?? {}) as postgres.JSONValue)
       },${input.message.idempotencyKey}) RETURNING *`;
+      const leaseToken = crypto.randomUUID();
       const runs = await tx<
         Row[]
-      >`INSERT INTO usage_runs(id,user_id,token_id,model,provider,status,reserved_micros) VALUES(${input.runId},${input.message.ownerId},${
+      >`INSERT INTO usage_runs(id,user_id,token_id,model,provider,status,reserved_micros,generation_lease_token,generation_lease_expires_at) VALUES(${input.runId},${input.message.ownerId},${
         input.tokenId ?? null
       },${
         input.message.model ?? "unknown"
-      },${input.provider},'reserved',${input.reserveMicros}) RETURNING *`;
+      },${input.provider},'reserved',${input.reserveMicros},${leaseToken},now()+${leaseSeconds}*interval '1 second') RETURNING *`;
       const after = balance - input.reserveMicros;
       await tx`UPDATE users SET balance_micros=${after} WHERE id=${input.message.ownerId}`;
       await tx`INSERT INTO ledger_entries(user_id,usage_run_id,kind,amount_micros,balance_after_micros) VALUES(${input.message.ownerId},${input.runId},'reserve',${-input
@@ -525,12 +691,26 @@ export class PostgresRepository implements DomainRepository {
         String(nodes[0].id)
       },version=version+1,updated_at=now() WHERE id=${input.message.conversationId} RETURNING *`;
       return {
+        kind: "started" as const,
+        leaseToken,
         message: message(nodes[0]),
         conversation: conversation(updated[0]),
         usageRun: run(runs[0]),
-        replayed: false,
       };
     });
+  }
+
+  async heartbeatGeneration(
+    runId: string,
+    ownerId: string,
+    leaseToken: string,
+    leaseSeconds = 120,
+  ) {
+    const rows = await this
+      .#sql`UPDATE usage_runs SET generation_lease_expires_at=now()+${leaseSeconds}*interval '1 second' WHERE id=${runId} AND user_id=${ownerId} AND status='reserved' AND generation_lease_token=${leaseToken} AND generation_lease_expires_at>now() RETURNING id`;
+    if (!rows.length) {
+      throw new DomainError("stale_lease", "Generation lease is no longer active", 409);
+    }
   }
 
   async completeGeneration(input: CompleteGenerationInput) {
@@ -540,7 +720,7 @@ export class PostgresRepository implements DomainRepository {
       >`SELECT * FROM conversations WHERE id=${input.conversationId} AND owner_id=${input.ownerId} FOR UPDATE`;
       const runs = await tx<
         Row[]
-      >`SELECT * FROM usage_runs WHERE id=${input.runId} AND user_id=${input.ownerId} FOR UPDATE`;
+      >`SELECT *,generation_lease_expires_at>now() AS generation_lease_active FROM usage_runs WHERE id=${input.runId} AND user_id=${input.ownerId} FOR UPDATE`;
       if (!c[0] || !runs[0]) throw new DomainError("not_found", "Generation not found", 404);
       const existing = await tx<
         Row[]
@@ -560,6 +740,10 @@ export class PostgresRepository implements DomainRepository {
       if (runs[0].status !== "reserved") {
         throw new DomainError("invalid_usage_state", "Generation is not reserved", 409);
       }
+      if (
+        String(runs[0].generation_lease_token) !== input.leaseToken ||
+        runs[0].generation_lease_active !== true
+      ) throw new DomainError("stale_lease", "Generation lease is no longer active", 409);
       const parent =
         await tx`SELECT id FROM messages WHERE id=${input.userMessageId} AND conversation_id=${input.conversationId}`;
       if (!parent.length) throw new DomainError("not_found", "Generation message not found", 404);
@@ -589,7 +773,7 @@ export class PostgresRepository implements DomainRepository {
       }
       const finished = await tx<
         Row[]
-      >`UPDATE usage_runs SET status='completed',cost_micros=${input.costMicros},input_tokens=${input.inputTokens},output_tokens=${input.outputTokens},latency_ms=${input.latencyMs},completed_at=now() WHERE id=${input.runId} RETURNING *`;
+      >`UPDATE usage_runs SET status='completed',generation_lease_token=NULL,generation_lease_expires_at=NULL,cost_micros=${input.costMicros},input_tokens=${input.inputTokens},output_tokens=${input.outputTokens},latency_ms=${input.latencyMs},completed_at=now() WHERE id=${input.runId} RETURNING *`;
       const updated = await tx<
         Row[]
       >`UPDATE conversations SET active_leaf_id=CASE WHEN active_leaf_id=${input.userMessageId} THEN ${
@@ -610,7 +794,7 @@ export class PostgresRepository implements DomainRepository {
       >`SELECT * FROM conversations WHERE id=${input.conversationId} AND owner_id=${input.ownerId} FOR UPDATE`;
       const runs = await tx<
         Row[]
-      >`SELECT * FROM usage_runs WHERE id=${input.runId} AND user_id=${input.ownerId} FOR UPDATE`;
+      >`SELECT *,generation_lease_expires_at>now() AS generation_lease_active FROM usage_runs WHERE id=${input.runId} AND user_id=${input.ownerId} FOR UPDATE`;
       if (!c[0] || !runs[0]) throw new DomainError("not_found", "Generation not found", 404);
       const existing = await tx<
         Row[]
@@ -630,6 +814,10 @@ export class PostgresRepository implements DomainRepository {
       if (runs[0].status !== "reserved") {
         throw new DomainError("invalid_usage_state", "Generation is not reserved", 409);
       }
+      if (
+        String(runs[0].generation_lease_token) !== input.leaseToken ||
+        runs[0].generation_lease_active !== true
+      ) throw new DomainError("stale_lease", "Generation lease is no longer active", 409);
       const account = await tx<
         Row[]
       >`SELECT balance_micros FROM users WHERE id=${input.ownerId} FOR UPDATE`;
@@ -650,7 +838,7 @@ export class PostgresRepository implements DomainRepository {
       },${after})`;
       const failed = await tx<
         Row[]
-      >`UPDATE usage_runs SET status='failed',error=${input.error},completed_at=now() WHERE id=${input.runId} RETURNING *`;
+      >`UPDATE usage_runs SET status='failed',generation_lease_token=NULL,generation_lease_expires_at=NULL,error=${input.error},completed_at=now() WHERE id=${input.runId} RETURNING *`;
       const updated = await tx<
         Row[]
       >`UPDATE conversations SET active_leaf_id=CASE WHEN active_leaf_id=${input.userMessageId} THEN ${
@@ -661,6 +849,29 @@ export class PostgresRepository implements DomainRepository {
         conversation: conversation(updated[0]),
         usageRun: run(failed[0]),
       };
+    });
+  }
+  async reapStaleGenerations(limit = 100) {
+    return await this.#sql.begin(async (tx) => {
+      const rows = await tx<
+        Row[]
+      >`SELECT * FROM usage_runs WHERE status='reserved' AND generation_lease_token IS NOT NULL AND generation_lease_expires_at<=now() ORDER BY generation_lease_expires_at FOR UPDATE SKIP LOCKED LIMIT ${limit}`;
+      for (const row of rows) {
+        const userId = String(row.user_id);
+        const account = await tx<
+          Row[]
+        >`SELECT balance_micros FROM users WHERE id=${userId} FOR UPDATE`;
+        const amount = number(row.reserved_micros);
+        const after = number(account[0].balance_micros) + amount;
+        await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${userId}`;
+        await tx`INSERT INTO ledger_entries(user_id,usage_run_id,kind,amount_micros,balance_after_micros) VALUES(${userId},${
+          String(row.id)
+        },'refund',${amount},${after})`;
+        await tx`UPDATE usage_runs SET status='failed',generation_lease_token=NULL,generation_lease_expires_at=NULL,error='generation lease expired',completed_at=now() WHERE id=${
+          String(row.id)
+        }`;
+      }
+      return rows.length;
     });
   }
   async setActiveLeaf(
@@ -674,6 +885,12 @@ export class PostgresRepository implements DomainRepository {
         Row[]
       >`SELECT * FROM conversations WHERE id=${conversationId} AND owner_id=${ownerId} FOR UPDATE`;
       if (!rows[0]) throw new DomainError("not_found", "Conversation not found", 404);
+      if (rows[0].deleted_at) {
+        throw new DomainError("conversation_deleted", "Deleted conversations are read-only", 409);
+      }
+      if (rows[0].archived_at) {
+        throw new DomainError("conversation_archived", "Archived conversations are read-only", 409);
+      }
       if (number(rows[0].version) !== expectedVersion) {
         throw new DomainError("version_conflict", "Conversation changed in another tab", 409);
       }

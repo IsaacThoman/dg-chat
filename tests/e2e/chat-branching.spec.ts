@@ -46,3 +46,14 @@ test("composer supports keyboard submission and does not submit Shift+Enter", as
   await expect(page.locator("article.user-message").filter({ hasText: /first line\s*second line/ }))
     .toBeVisible();
 });
+
+test("editing preserves the original Markdown source exactly", async ({ page }) => {
+  const markdown = "**Bold** and `code` with _emphasis_";
+  const composer = page.getByRole("textbox", { name: /message/i });
+  await composer.fill(markdown);
+  await composer.press("Enter");
+
+  const prompt = page.locator("article.user-message").filter({ hasText: "Bold and code" });
+  await prompt.getByRole("button", { name: /edit/i }).click();
+  await expect(composer).toHaveValue(markdown);
+});

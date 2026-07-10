@@ -15,25 +15,33 @@ import type {
   ApiIdempotencyRequest,
   ApiReplayQuota,
   ApiUsageObservation,
+  AuditEvent,
+  AuditEventInput,
   BeginApiRequestInput,
   BeginApiRequestResult,
   BeginGenerationInput,
+  BeginGenerationResult,
   CompleteApiRequestInput,
   CompleteGenerationInput,
   CreateUserInput,
   FailApiRequestInput,
   FailGenerationInput,
   GenerationResult,
+  IdentityTokenPurpose,
+  SessionSummary,
 } from "./repository.ts";
 
 export interface StoredUser extends PublicUser {
   passwordHash: string;
 }
 export interface StoredSession {
+  id: string;
   tokenHash: string;
   userId: string;
   limited: boolean;
   expiresAt: number;
+  createdAt: string;
+  invalidatedAt: string | null;
 }
 export interface StoredApiToken extends ApiTokenSummary {
   userId: string;
@@ -58,6 +66,8 @@ export interface UsageRun {
   inputTokens: number;
   outputTokens: number;
   latencyMs: number;
+  generationLeaseToken: string | null;
+  generationLeaseExpiresAt: string | null;
   createdAt: string;
 }
 
@@ -72,6 +82,13 @@ export class MemoryRepository {
   readonly users = new Map<string, StoredUser>();
   readonly sessions = new Map<string, StoredSession>();
   readonly tokens = new Map<string, StoredApiToken>();
+  readonly identityTokens = new Map<string, {
+    userId: string;
+    purpose: IdentityTokenPurpose;
+    expiresAt: string;
+    consumedAt: string | null;
+  }>();
+  readonly auditEvents: AuditEvent[] = [];
   readonly conversations = new Map<string, Conversation>();
   readonly messages = new Map<string, MessageNode>();
   readonly idempotency = new Map<string, string>();
@@ -105,7 +122,12 @@ export class MemoryRepository {
     if ([...this.users.values()].some((user) => user.role === "admin")) {
       throw new DomainError("already_bootstrapped", "An administrator already exists", 409);
     }
-    const user = this.createUser({ ...input, role: "admin", approvalStatus: "approved" });
+    const user = this.createUser({
+      ...input,
+      role: "admin",
+      approvalStatus: "approved",
+      emailVerified: true,
+    });
     this.credit(user.id, `bootstrap:${user.id}`, "grant", startingCreditMicros);
     return user;
   }
@@ -118,6 +140,7 @@ export class MemoryRepository {
       role?: UserRole;
       approvalStatus?: ApprovalStatus;
       state?: AccountState;
+      emailVerified?: boolean;
     },
   ): StoredUser {
     if ([...this.users.values()].some((u) => u.email === input.email)) {
@@ -132,6 +155,9 @@ export class MemoryRepository {
       approvalStatus: input.approvalStatus ?? "pending",
       state: input.state ?? "active",
       balanceMicros: 0,
+      emailVerifiedAt: input.emailVerified || input.approvalStatus === "approved"
+        ? new Date().toISOString()
+        : null,
       createdAt: new Date().toISOString(),
     };
     this.users.set(user.id, user);
@@ -155,11 +181,15 @@ export class MemoryRepository {
   }
 
   createSession(userId: string, tokenHash: string, limited: boolean): StoredSession {
+    const now = new Date().toISOString();
     const session = {
+      id: crypto.randomUUID(),
       tokenHash,
       userId,
       limited,
       expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000,
+      createdAt: now,
+      invalidatedAt: null,
     };
     this.sessions.set(tokenHash, session);
     return session;
@@ -179,10 +209,100 @@ export class MemoryRepository {
   deleteSession(tokenHash: string) {
     this.sessions.delete(tokenHash);
   }
+  listSessions(userId: string): SessionSummary[] {
+    return [...this.sessions.values()].filter((session) => session.userId === userId).map((
+      session,
+    ) => ({
+      id: session.id,
+      userId: session.userId,
+      limited: session.limited,
+      expiresAt: new Date(session.expiresAt).toISOString(),
+      createdAt: session.createdAt,
+      invalidatedAt: session.invalidatedAt,
+    }));
+  }
+  revokeSession(id: string, ownerId?: string) {
+    const entry = [...this.sessions.entries()].find(([, session]) =>
+      session.id === id && (!ownerId || session.userId === ownerId)
+    );
+    if (!entry) throw new DomainError("not_found", "Session not found", 404);
+    this.sessions.delete(entry[0]);
+  }
+  createIdentityToken(
+    userId: string,
+    purpose: IdentityTokenPurpose,
+    tokenHash: string,
+    expiresAt: string,
+  ) {
+    this.identityTokens.set(tokenHash, { userId, purpose, expiresAt, consumedAt: null });
+  }
+  verifyEmail(tokenHash: string) {
+    const token = this.identityTokens.get(tokenHash);
+    if (
+      !token || token.purpose !== "email_verification" || token.consumedAt ||
+      Date.parse(token.expiresAt) <= Date.now()
+    ) {
+      throw new DomainError(
+        "invalid_identity_token",
+        "Verification token is invalid or expired",
+        400,
+      );
+    }
+    token.consumedAt = new Date().toISOString();
+    const user = this.users.get(token.userId)!;
+    user.emailVerifiedAt = new Date().toISOString();
+    return user;
+  }
+  resetPassword(tokenHash: string, passwordHash: string) {
+    const token = this.identityTokens.get(tokenHash);
+    if (
+      !token || token.purpose !== "password_reset" || token.consumedAt ||
+      Date.parse(token.expiresAt) <= Date.now()
+    ) throw new DomainError("invalid_identity_token", "Reset token is invalid or expired", 400);
+    token.consumedAt = new Date().toISOString();
+    const user = this.users.get(token.userId)!;
+    user.passwordHash = passwordHash;
+    this.invalidateUserSessions(user.id);
+    for (const apiToken of this.tokens.values()) {
+      if (apiToken.userId === user.id && !apiToken.revokedAt) {
+        apiToken.revokedAt = new Date().toISOString();
+      }
+    }
+    const consumedAt = new Date().toISOString();
+    for (const identityToken of this.identityTokens.values()) {
+      if (identityToken.userId === user.id && !identityToken.consumedAt) {
+        identityToken.consumedAt = consumedAt;
+      }
+    }
+    return user;
+  }
+  recordAudit(input: AuditEventInput): AuditEvent {
+    const event = {
+      ...input,
+      id: crypto.randomUUID(),
+      actorId: input.actorId ?? null,
+      targetId: input.targetId ?? null,
+      metadata: input.metadata ?? {},
+      createdAt: new Date().toISOString(),
+    };
+    this.auditEvents.push(event);
+    return event;
+  }
+  listAudit(limit = 100) {
+    return [...this.auditEvents].reverse().slice(0, limit);
+  }
 
-  approveUser(id: string, status: "approved" | "rejected", creditMicros: number): StoredUser {
+  approveUser(
+    id: string,
+    status: "approved" | "rejected",
+    creditMicros: number,
+    requireEmailVerification = false,
+  ): StoredUser {
     const user = this.users.get(id);
     if (!user) throw new DomainError("not_found", "User not found", 404);
+    if (status === "approved" && requireEmailVerification && !user.emailVerifiedAt) {
+      throw new DomainError("email_not_verified", "Email must be verified before approval", 409);
+    }
     if (user.role === "admin" && status === "rejected") {
       const availableAdmins = [...this.users.values()].filter((candidate) =>
         candidate.role === "admin" && candidate.state === "active" &&
@@ -323,6 +443,12 @@ export class MemoryRepository {
     if (!conversation || conversation.ownerId !== input.ownerId) {
       throw new DomainError("not_found", "Conversation not found", 404);
     }
+    if (conversation.deletedAt) {
+      throw new DomainError("conversation_deleted", "Deleted conversations are read-only", 409);
+    }
+    if (conversation.archivedAt) {
+      throw new DomainError("conversation_archived", "Archived conversations are read-only", 409);
+    }
     const idemKey = `${input.conversationId}:${input.idempotencyKey}`;
     const existing = this.idempotency.get(idemKey);
     if (existing) {
@@ -391,10 +517,16 @@ export class MemoryRepository {
     return message;
   }
 
-  beginGeneration(input: BeginGenerationInput): GenerationResult {
+  beginGeneration(input: BeginGenerationInput): BeginGenerationResult {
     const conversation = this.conversations.get(input.message.conversationId);
     if (!conversation || conversation.ownerId !== input.message.ownerId) {
       throw new DomainError("not_found", "Conversation not found", 404);
+    }
+    if (conversation.deletedAt) {
+      throw new DomainError("conversation_deleted", "Deleted conversations are read-only", 409);
+    }
+    if (conversation.archivedAt) {
+      throw new DomainError("conversation_archived", "Archived conversations are read-only", 409);
     }
     const existingId = this.idempotency.get(
       `${input.message.conversationId}:${input.message.idempotencyKey}`,
@@ -414,7 +546,36 @@ export class MemoryRepository {
           409,
         );
       }
-      return { message: existing, conversation, usageRun: existingRun, replayed: true };
+      if (existingRun.status === "completed") {
+        return { kind: "completed", message: existing, conversation, usageRun: existingRun };
+      }
+      if (
+        existingRun.generationLeaseToken && existingRun.generationLeaseExpiresAt &&
+        Date.parse(existingRun.generationLeaseExpiresAt) > Date.now()
+      ) {
+        return {
+          kind: "in_progress",
+          message: existing,
+          conversation,
+          usageRun: existingRun,
+          retryAfterSeconds: Math.max(
+            1,
+            Math.ceil((Date.parse(existingRun.generationLeaseExpiresAt) - Date.now()) / 1000),
+          ),
+        };
+      }
+      const leaseToken = crypto.randomUUID();
+      existingRun.generationLeaseToken = leaseToken;
+      existingRun.generationLeaseExpiresAt = new Date(
+        Date.now() + (input.leaseSeconds ?? 120) * 1000,
+      ).toISOString();
+      return {
+        kind: "claimed",
+        leaseToken,
+        message: existing,
+        conversation,
+        usageRun: existingRun,
+      };
     }
     const account = this.users.get(input.message.ownerId);
     if (!account || account.balanceMicros < input.reserveMicros) {
@@ -427,7 +588,27 @@ export class MemoryRepository {
       input.message.model ?? "unknown",
       input.reserveMicros,
     );
-    return { message, conversation, usageRun, replayed: false };
+    const leaseToken = crypto.randomUUID();
+    usageRun.generationLeaseToken = leaseToken;
+    usageRun.generationLeaseExpiresAt = new Date(
+      Date.now() + (input.leaseSeconds ?? 120) * 1000,
+    ).toISOString();
+    return { kind: "started", leaseToken, message, conversation, usageRun };
+  }
+
+  heartbeatGeneration(
+    runId: string,
+    ownerId: string,
+    leaseToken: string,
+    leaseSeconds = 120,
+  ) {
+    const run = this.usageRuns.get(runId);
+    if (
+      !run || run.userId !== ownerId || run.status !== "reserved" ||
+      run.generationLeaseToken !== leaseToken || !run.generationLeaseExpiresAt ||
+      Date.parse(run.generationLeaseExpiresAt) <= Date.now()
+    ) throw new DomainError("stale_lease", "Generation lease is no longer active", 409);
+    run.generationLeaseExpiresAt = new Date(Date.now() + leaseSeconds * 1000).toISOString();
   }
 
   completeGeneration(input: CompleteGenerationInput): GenerationResult {
@@ -451,6 +632,11 @@ export class MemoryRepository {
     if (usageRun.status !== "reserved") {
       throw new DomainError("invalid_usage_state", "Generation is not reserved", 409);
     }
+    if (
+      usageRun.generationLeaseToken !== input.leaseToken ||
+      !usageRun.generationLeaseExpiresAt ||
+      Date.parse(usageRun.generationLeaseExpiresAt) <= Date.now()
+    ) throw new DomainError("stale_lease", "Generation lease is no longer active", 409);
     const balanceAfterSettlement = this.users.get(input.ownerId)!.balanceMicros +
       usageRun.reservedMicros - input.costMicros;
     if (balanceAfterSettlement < 0) {
@@ -464,6 +650,8 @@ export class MemoryRepository {
       input.outputTokens,
       input.latencyMs,
     );
+    settled.generationLeaseToken = null;
+    settled.generationLeaseExpiresAt = null;
     const message = this.appendMessage({
       conversationId: input.conversationId,
       ownerId: input.ownerId,
@@ -485,8 +673,17 @@ export class MemoryRepository {
     if (!conversation || conversation.ownerId !== input.ownerId || !parent) {
       throw new DomainError("not_found", "Generation not found", 404);
     }
+    const reserved = this.usageRuns.get(input.runId);
+    if (
+      !reserved || reserved.status !== "reserved" ||
+      reserved.generationLeaseToken !== input.leaseToken ||
+      !reserved.generationLeaseExpiresAt ||
+      Date.parse(reserved.generationLeaseExpiresAt) <= Date.now()
+    ) throw new DomainError("stale_lease", "Generation lease is no longer active", 409);
     const previousActive = conversation.activeLeafId;
     const usageRun = this.refund(input.runId)!;
+    usageRun.generationLeaseToken = null;
+    usageRun.generationLeaseExpiresAt = null;
     const message = this.appendMessage({
       conversationId: input.conversationId,
       ownerId: input.ownerId,
@@ -503,6 +700,24 @@ export class MemoryRepository {
     return { message, conversation, usageRun };
   }
 
+  reapStaleGenerations(limit = 100) {
+    let reaped = 0;
+    for (const run of this.usageRuns.values()) {
+      if (reaped >= limit) break;
+      if (
+        run.status !== "reserved" || !run.generationLeaseToken ||
+        !run.generationLeaseExpiresAt || Date.parse(run.generationLeaseExpiresAt) > Date.now()
+      ) continue;
+      const refunded = this.refund(run.id);
+      if (refunded) {
+        refunded.generationLeaseToken = null;
+        refunded.generationLeaseExpiresAt = null;
+        reaped++;
+      }
+    }
+    return reaped;
+  }
+
   setActiveLeaf(conversationId: string, ownerId: string, leafId: string, expectedVersion: number) {
     const conversation = this.conversations.get(conversationId);
     const leaf = this.messages.get(leafId);
@@ -510,6 +725,12 @@ export class MemoryRepository {
       !conversation || conversation.ownerId !== ownerId || !leaf ||
       leaf.conversationId !== conversationId
     ) throw new DomainError("not_found", "Conversation or branch not found", 404);
+    if (conversation.deletedAt) {
+      throw new DomainError("conversation_deleted", "Deleted conversations are read-only", 409);
+    }
+    if (conversation.archivedAt) {
+      throw new DomainError("conversation_archived", "Archived conversations are read-only", 409);
+    }
     if (conversation.version !== expectedVersion) {
       throw new DomainError("version_conflict", "Conversation changed in another tab", 409);
     }
@@ -607,6 +828,8 @@ export class MemoryRepository {
       inputTokens: 0,
       outputTokens: 0,
       latencyMs: 0,
+      generationLeaseToken: null,
+      generationLeaseExpiresAt: null,
       createdAt: new Date().toISOString(),
     };
     this.usageRuns.set(runId, run);

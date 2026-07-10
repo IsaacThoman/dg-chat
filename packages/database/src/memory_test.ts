@@ -57,6 +57,152 @@ Deno.test("optimistic versioning prevents lost updates and idempotency replays s
   );
 });
 
+Deno.test("archived and deleted conversations reject new graph mutations", () => {
+  const repo = new MemoryRepository();
+  const user = repo.createUser({ email: "readonly@example.com", name: "User", passwordHash: "x" });
+  repo.credit(user.id, "readonly-grant", "grant", 1_000_000);
+  const conversation = repo.createConversation(user.id, "Read only");
+  const root = repo.appendMessage({
+    conversationId: conversation.id,
+    ownerId: user.id,
+    parentId: null,
+    role: "user",
+    content: "root",
+    expectedVersion: 0,
+    idempotencyKey: "readonly-root",
+  });
+
+  const assertReadOnly = () => {
+    assertThrows(
+      () =>
+        repo.appendMessage({
+          conversationId: conversation.id,
+          ownerId: user.id,
+          parentId: root.id,
+          role: "user",
+          content: "blocked",
+          expectedVersion: conversation.version,
+          idempotencyKey: `readonly-message-${conversation.version}`,
+        }),
+      DomainError,
+      "read-only",
+    );
+    assertThrows(
+      () =>
+        repo.beginGeneration({
+          message: {
+            conversationId: conversation.id,
+            ownerId: user.id,
+            parentId: root.id,
+            role: "user",
+            content: "blocked generation",
+            model: "simulated/dg-chat",
+            expectedVersion: conversation.version,
+            idempotencyKey: `readonly-generation-${conversation.version}`,
+          },
+          runId: `readonly-run-${conversation.version}`,
+          provider: "simulated",
+          reserveMicros: 1,
+        }),
+      DomainError,
+      "read-only",
+    );
+    assertThrows(
+      () => repo.setActiveLeaf(conversation.id, user.id, root.id, conversation.version),
+      DomainError,
+      "read-only",
+    );
+  };
+
+  repo.updateConversation(user.id, conversation.id, { archived: true });
+  assertReadOnly();
+  repo.updateConversation(user.id, conversation.id, { archived: false, deleted: true });
+  assertReadOnly();
+});
+
+Deno.test("generation leases allow one owner and fence expired workers", () => {
+  const repo = new MemoryRepository();
+  const user = repo.createUser({ email: "lease@example.com", name: "Lease", passwordHash: "x" });
+  repo.credit(user.id, "lease-grant", "grant", 1_000_000);
+  const conversation = repo.createConversation(user.id, "Lease");
+  const input = {
+    message: {
+      conversationId: conversation.id,
+      ownerId: user.id,
+      parentId: null,
+      role: "user" as const,
+      content: "generate once",
+      model: "simulated/dg-chat",
+      expectedVersion: 0,
+      idempotencyKey: "lease-user",
+    },
+    runId: "lease-run",
+    provider: "simulated",
+    reserveMicros: 100,
+    leaseSeconds: 60,
+  };
+  const started = repo.beginGeneration(input);
+  if (started.kind !== "started") throw new Error("generation did not start");
+  assertEquals(repo.beginGeneration(input).kind, "in_progress");
+  started.usageRun.generationLeaseExpiresAt = new Date(Date.now() - 1).toISOString();
+  const claimed = repo.beginGeneration(input);
+  if (claimed.kind !== "claimed") throw new Error("generation was not reclaimed");
+  assertEquals(repo.beginGeneration(input).kind, "in_progress");
+  assertThrows(
+    () =>
+      repo.completeGeneration({
+        conversationId: conversation.id,
+        ownerId: user.id,
+        userMessageId: started.message.id,
+        runId: input.runId,
+        leaseToken: started.leaseToken,
+        idempotencyKey: "lease-assistant-old",
+        content: "stale",
+        model: "simulated/dg-chat",
+        costMicros: 10,
+        inputTokens: 1,
+        outputTokens: 1,
+        latencyMs: 1,
+      }),
+    DomainError,
+    "lease",
+  );
+  repo.heartbeatGeneration(input.runId, user.id, claimed.leaseToken, 60);
+  const completed = repo.completeGeneration({
+    conversationId: conversation.id,
+    ownerId: user.id,
+    userMessageId: claimed.message.id,
+    runId: input.runId,
+    leaseToken: claimed.leaseToken,
+    idempotencyKey: "lease-assistant",
+    content: "owned",
+    model: "simulated/dg-chat",
+    costMicros: 10,
+    inputTokens: 1,
+    outputTokens: 1,
+    latencyMs: 1,
+  });
+  assertEquals(completed.message.content, "owned");
+  assertEquals(completed.usageRun.generationLeaseToken, null);
+
+  const second = repo.createConversation(user.id, "Reaper");
+  const abandoned = repo.beginGeneration({
+    ...input,
+    message: {
+      ...input.message,
+      conversationId: second.id,
+      expectedVersion: 0,
+      idempotencyKey: "reaper-user",
+    },
+    runId: "reaper-run",
+  });
+  if (abandoned.kind !== "started") throw new Error("reaper generation did not start");
+  abandoned.usageRun.generationLeaseExpiresAt = new Date(Date.now() - 1).toISOString();
+  assertEquals(repo.reapStaleGenerations(), 1);
+  assertEquals(repo.reapStaleGenerations(), 0);
+  assertEquals(abandoned.usageRun.status, "failed");
+});
+
 Deno.test("ledger reserve settle and refund are idempotent", () => {
   const repo = new MemoryRepository();
   const user = repo.createUser({ email: "u@example.com", name: "User", passwordHash: "x" });
@@ -132,6 +278,7 @@ Deno.test("approval grant is minted once and rejection revokes sessions and toke
     email: "approval@example.com",
     name: "Approval",
     passwordHash: "x",
+    emailVerified: true,
   });
   repo.approveUser(user.id, "approved", 100);
   repo.reserve(user.id, "spend", "model", 100);
@@ -149,6 +296,61 @@ Deno.test("approval grant is minted once and rejection revokes sessions and toke
   repo.approveUser(user.id, "rejected", 100);
   assertEquals(repo.getSession("session"), undefined);
   assertEquals(Boolean(token.revokedAt), true);
+});
+
+Deno.test("identity tokens are one-time and password reset invalidates credentials", () => {
+  const repo = new MemoryRepository();
+  const user = repo.createUser({
+    email: "identity@example.com",
+    name: "Identity",
+    passwordHash: "old",
+  });
+  assertThrows(() => repo.approveUser(user.id, "approved", 10, true), DomainError, "verified");
+  repo.createIdentityToken(
+    user.id,
+    "email_verification",
+    "verify-hash",
+    new Date(Date.now() + 60_000).toISOString(),
+  );
+  repo.createIdentityToken(
+    user.id,
+    "email_verification",
+    "verify-hash-concurrent",
+    new Date(Date.now() + 60_000).toISOString(),
+  );
+  assertEquals(repo.verifyEmail("verify-hash").emailVerifiedAt !== null, true);
+  assertEquals(repo.verifyEmail("verify-hash-concurrent").emailVerifiedAt !== null, true);
+  assertThrows(() => repo.verifyEmail("verify-hash"), DomainError, "invalid or expired");
+  const session = repo.createSession(user.id, "session-hash", false);
+  const token = repo.createApiToken(user.id, {
+    name: "token",
+    scopes: ["chat:write"],
+    tokenHash: "api-hash",
+    preview: "api…hash",
+  });
+  repo.createIdentityToken(
+    user.id,
+    "password_reset",
+    "reset-hash",
+    new Date(Date.now() + 60_000).toISOString(),
+  );
+  repo.createIdentityToken(
+    user.id,
+    "password_reset",
+    "reset-hash-concurrent",
+    new Date(Date.now() + 60_000).toISOString(),
+  );
+  repo.resetPassword("reset-hash", "new");
+  assertEquals(repo.getSession("session-hash"), undefined);
+  assertEquals(repo.findApiTokenByHash("api-hash")?.revokedAt !== null, true);
+  assertThrows(() => repo.resetPassword("reset-hash", "again"), DomainError, "invalid or expired");
+  assertThrows(
+    () => repo.resetPassword("reset-hash-concurrent", "again"),
+    DomainError,
+    "invalid or expired",
+  );
+  assertThrows(() => repo.revokeSession(session.id, user.id), DomainError, "not found");
+  assertEquals(token.userId, user.id);
 });
 
 Deno.test("durable API idempotency lifecycle reserves once, replays frames, and fences stale leases", () => {

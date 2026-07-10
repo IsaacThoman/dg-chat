@@ -13,7 +13,10 @@ import {
   createConversationSchema,
   createTokenSchema,
   generateMessageSchema,
+  identityTokenSchema,
   loginSchema,
+  passwordResetRequestSchema,
+  passwordResetSchema,
   registerSchema,
   responsesSchema,
   setActiveLeafSchema,
@@ -32,6 +35,7 @@ import { hashPassword, randomToken, sha256, sha256Hex, verifyPassword } from "./
 import { complete, models, simulate, streamChatCompletion } from "./models.ts";
 import { estimateInputTokens, priceUsage, reservationPrice } from "./pricing.ts";
 import { responseMessage, responseObject } from "./responses.ts";
+import { type IdentityMailer, smtpIdentityMailer } from "./mail.ts";
 import {
   authorizationCredentialIdentity,
   MemoryRateLimiter,
@@ -57,6 +61,11 @@ export interface AppOptions {
   replayQuota?: ApiReplayQuota;
   trustProxyHeaders?: boolean;
   authClientRateLimit?: number;
+  mailer?: IdentityMailer;
+  requireEmailVerification?: boolean;
+  generationHeartbeatMs?: number;
+  generationLeaseSeconds?: number;
+  webComplete?: typeof complete;
 }
 
 const openAIError = (message: string, code: string | null = null) => ({
@@ -125,6 +134,9 @@ export function createApp(options: AppOptions = {}) {
   const providerStream = options.providerStream ?? streamChatCompletion;
   const idempotencyHeartbeatMs = Math.max(10, options.idempotencyHeartbeatMs ?? 30_000);
   const idempotencyLeaseSeconds = Math.max(1, options.idempotencyLeaseSeconds ?? 120);
+  const generationHeartbeatMs = Math.max(10, options.generationHeartbeatMs ?? 30_000);
+  const generationLeaseSeconds = Math.max(1, options.generationLeaseSeconds ?? 120);
+  const webComplete = options.webComplete ?? complete;
   const setupToken = options.setupToken ?? Deno.env.get("SETUP_TOKEN") ?? "";
   const configuredStartingCredit = Deno.env.get("STARTING_CREDIT_MICROS");
   const configuredStartingUsd = Deno.env.get("DEFAULT_APPROVAL_CREDIT_USD");
@@ -140,6 +152,14 @@ export function createApp(options: AppOptions = {}) {
   const webOrigin = new URL(
     Deno.env.get("WEB_ORIGIN") ?? Deno.env.get("WEB_URL") ?? "http://localhost:5173",
   ).origin;
+  const mailer = options.mailer ?? (Deno.env.get("SMTP_URL")
+    ? smtpIdentityMailer(
+      Deno.env.get("SMTP_URL")!,
+      Deno.env.get("SMTP_FROM") ?? "DG Chat <no-reply@localhost>",
+    )
+    : undefined);
+  const requireEmailVerification = options.requireEmailVerification ??
+    Deno.env.get("REQUIRE_EMAIL_VERIFICATION") === "true";
   const production = Deno.env.get("DENO_ENV") === "production";
   const sessionCookie = production ? "__Host-dg_session" : "dg_session";
   const positiveInteger = (name: string, fallback: number) => {
@@ -165,6 +185,22 @@ export function createApp(options: AppOptions = {}) {
   };
   const trustProxyHeaders = options.trustProxyHeaders ??
     Deno.env.get("TRUST_PROXY_HEADERS") === "true";
+  const defaultOpenAIModel = models.find((model) => model.id === "openai/default")!;
+  const configuredUpstreamModels = (Deno.env.get("OPENAI_ALLOWED_MODELS") ?? "")
+    .split(",")
+    .map((model) => model.trim())
+    .filter((model, index, values) => model.length > 0 && values.indexOf(model) === index)
+    .map((model) => ({
+      ...defaultOpenAIModel,
+      id: `openai/${model}`,
+      displayName: model,
+    }));
+  const modelCatalog = [
+    ...models,
+    ...configuredUpstreamModels.filter((candidate) =>
+      !models.some((model) => model.id === candidate.id)
+    ),
+  ];
   let bootstrapInProgress = false;
   const app = new Hono<{ Variables: Variables }>();
   app.use("*", logger());
@@ -197,7 +233,8 @@ export function createApp(options: AppOptions = {}) {
     const authRoute = c.req.method === "POST" && (
       path === "/api/setup/bootstrap" || path === "/api/auth/sign-up/email" ||
       path === "/api/auth/register" || path === "/api/auth/sign-in/email" ||
-      path === "/api/auth/login"
+      path === "/api/auth/login" || path.startsWith("/api/auth/verify-email") ||
+      path.startsWith("/api/auth/password-reset")
     );
     const generationRoute = c.req.method === "POST" &&
       (path.endsWith("/generate") || path === "/v1/chat/completions" ||
@@ -316,6 +353,7 @@ export function createApp(options: AppOptions = {}) {
       const user = await repo.findUser(apiToken.userId);
       if (
         !user || user.state !== "active" || user.approvalStatus !== "approved" ||
+        (requireEmailVerification && !user.emailVerifiedAt) ||
         apiToken.revokedAt || (apiToken.expiresAt && Date.parse(apiToken.expiresAt) <= Date.now())
       ) return c.json(openAIError("Invalid or expired token", "unauthorized"), 401);
       c.set("user", publicUser(user)!);
@@ -344,6 +382,14 @@ export function createApp(options: AppOptions = {}) {
     return next();
   };
   const approved: MiddlewareHandler<{ Variables: Variables }> = async (c, next) => {
+    if (requireEmailVerification && !c.get("user").emailVerifiedAt) {
+      return c.json({
+        error: {
+          code: "email_verification_required",
+          message: "Verify your email before continuing",
+        },
+      }, 403);
+    }
     if (c.get("user").approvalStatus !== "approved") {
       return c.json({
         error: { code: "approval_required", message: "An administrator must approve this account" },
@@ -394,6 +440,8 @@ export function createApp(options: AppOptions = {}) {
       setupEnabled: Boolean(setupToken),
       // Do not advertise SSO until the callback/session exchange is mounted end-to-end.
       oidcEnabled: false,
+      emailEnabled: Boolean(mailer),
+      requireEmailVerification,
     });
   });
 
@@ -412,6 +460,12 @@ export function createApp(options: AppOptions = {}) {
         ...body,
         passwordHash: await hashPassword(body.password),
       }, startingCredit);
+      await repo.recordAudit({
+        actorId: user.id,
+        action: "identity.bootstrap_admin",
+        targetType: "user",
+        targetId: user.id,
+      });
       return c.json({ user: publicUser(user) }, 201);
     } catch (error) {
       bootstrapInProgress = false;
@@ -424,7 +478,37 @@ export function createApp(options: AppOptions = {}) {
     const user = await repo.createUser({
       ...body,
       passwordHash: await hashPassword(body.password),
+      emailVerified: false,
     });
+    await repo.recordAudit({ action: "identity.signup", targetType: "user", targetId: user.id });
+    if (mailer) {
+      const verificationToken = randomToken("verify_");
+      await repo.createIdentityToken(
+        user.id,
+        "email_verification",
+        await sha256(verificationToken),
+        new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+      );
+      try {
+        await mailer.send({
+          to: user.email,
+          kind: "email_verification",
+          token: verificationToken,
+          url: `${webOrigin}/verify-email?token=${encodeURIComponent(verificationToken)}`,
+        });
+        await repo.recordAudit({
+          action: "identity.verification_sent",
+          targetType: "user",
+          targetId: user.id,
+        });
+      } catch {
+        await repo.recordAudit({
+          action: "identity.verification_delivery_failed",
+          targetType: "user",
+          targetId: user.id,
+        });
+      }
+    }
     const token = randomToken("sess_");
     await repo.createSession(user.id, await sha256(token), true);
     setCookie(c, sessionCookie, token, {
@@ -438,6 +522,91 @@ export function createApp(options: AppOptions = {}) {
   };
   app.post("/api/auth/sign-up/email", signUp);
   app.post("/api/auth/register", signUp);
+  app.post("/api/auth/verify-email", async (c) => {
+    const body = await parseJson(c, identityTokenSchema);
+    const user = await repo.verifyEmail(await sha256(body.token));
+    await repo.recordAudit({
+      actorId: user.id,
+      action: "identity.email_verified",
+      targetType: "user",
+      targetId: user.id,
+    });
+    return c.json({ user: publicUser(user) });
+  });
+  app.post("/api/auth/verify-email/request", authenticate, async (c) => {
+    if (!mailer) {
+      throw new DomainError("smtp_not_configured", "Email delivery is not configured", 503);
+    }
+    const user = c.get("user");
+    if (user.emailVerifiedAt) return c.body(null, 204);
+    const token = randomToken("verify_");
+    await repo.createIdentityToken(
+      user.id,
+      "email_verification",
+      await sha256(token),
+      new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+    );
+    await mailer.send({
+      to: user.email,
+      kind: "email_verification",
+      token,
+      url: `${webOrigin}/verify-email?token=${encodeURIComponent(token)}`,
+    });
+    await repo.recordAudit({
+      actorId: user.id,
+      action: "identity.verification_sent",
+      targetType: "user",
+      targetId: user.id,
+    });
+    return c.body(null, 202);
+  });
+  app.post("/api/auth/password-reset/request", async (c) => {
+    const body = await parseJson(c, passwordResetRequestSchema);
+    const user = await repo.findUserByEmail(body.email);
+    if (user && mailer) {
+      const token = randomToken("reset_");
+      await repo.createIdentityToken(
+        user.id,
+        "password_reset",
+        await sha256(token),
+        new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      );
+      try {
+        await mailer.send({
+          to: user.email,
+          kind: "password_reset",
+          token,
+          url: `${webOrigin}/reset-password?token=${encodeURIComponent(token)}`,
+        });
+        await repo.recordAudit({
+          action: "identity.password_reset_requested",
+          targetType: "user",
+          targetId: user.id,
+        });
+      } catch {
+        await repo.recordAudit({
+          action: "identity.password_reset_delivery_failed",
+          targetType: "user",
+          targetId: user.id,
+        });
+      }
+    }
+    return c.body(null, 202);
+  });
+  app.post("/api/auth/password-reset", async (c) => {
+    const body = await parseJson(c, passwordResetSchema);
+    const user = await repo.resetPassword(
+      await sha256(body.token),
+      await hashPassword(body.password),
+    );
+    await repo.recordAudit({
+      actorId: user.id,
+      action: "identity.password_reset_completed",
+      targetType: "user",
+      targetId: user.id,
+    });
+    return c.body(null, 204);
+  });
   const signIn = async (c: Context) => {
     const body = await parseJson(c, loginSchema);
     const user = await repo.findUserByEmail(body.email);
@@ -446,6 +615,11 @@ export function createApp(options: AppOptions = {}) {
       user?.passwordHash ?? DUMMY_PASSWORD_HASH,
     );
     if (!user || !passwordValid) {
+      await repo.recordAudit({
+        action: "identity.login_failed",
+        targetType: "user",
+        targetId: user?.id ?? null,
+      });
       throw new DomainError("invalid_credentials", "Email or password is incorrect", 401);
     }
     if (user.state !== "active") {
@@ -454,9 +628,16 @@ export function createApp(options: AppOptions = {}) {
     if (user.approvalStatus === "rejected") {
       throw new DomainError("account_rejected", "This account was not approved", 403);
     }
-    const limited = user.approvalStatus !== "approved";
+    const limited = user.approvalStatus !== "approved" ||
+      (requireEmailVerification && !user.emailVerifiedAt);
     const token = randomToken("sess_");
     await repo.createSession(user.id, await sha256(token), limited);
+    await repo.recordAudit({
+      actorId: user.id,
+      action: "identity.login_succeeded",
+      targetType: "user",
+      targetId: user.id,
+    });
     setCookie(c, sessionCookie, token, {
       httpOnly: true,
       sameSite: "Lax",
@@ -471,7 +652,19 @@ export function createApp(options: AppOptions = {}) {
   app.post("/api/auth/sign-out", async (c) => {
     const currentToken = getCookie(c, sessionCookie);
     const legacyToken = production ? getCookie(c, "dg_session") : undefined;
-    if (currentToken) await repo.deleteSession(await sha256(currentToken));
+    if (currentToken) {
+      const hash = await sha256(currentToken);
+      const session = await repo.getSession(hash);
+      await repo.deleteSession(hash);
+      if (session) {
+        await repo.recordAudit({
+          actorId: session.userId,
+          action: "session.signed_out",
+          targetType: "session",
+          targetId: session.id,
+        });
+      }
+    }
     if (legacyToken && legacyToken !== currentToken) {
       await repo.deleteSession(await sha256(legacyToken));
     }
@@ -489,6 +682,22 @@ export function createApp(options: AppOptions = {}) {
     authenticate,
     (c) => c.json({ approvalStatus: c.get("user").approvalStatus, state: c.get("user").state }),
   );
+  app.get(
+    "/api/sessions",
+    authenticate,
+    sessionOnly,
+    async (c) => c.json({ data: await repo.listSessions(c.get("user").id) }),
+  );
+  app.delete("/api/sessions/:id", authenticate, sessionOnly, async (c) => {
+    await repo.revokeSession(c.req.param("id"), c.get("user").id);
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: "session.revoked",
+      targetType: "session",
+      targetId: c.req.param("id"),
+    });
+    return c.body(null, 204);
+  });
 
   app.use("/api/conversations/*", authenticate, approved, sessionOnly);
   app.use("/api/conversations", authenticate, approved, sessionOnly);
@@ -533,10 +742,7 @@ export function createApp(options: AppOptions = {}) {
     const body = await parseJson(c, generateMessageSchema);
     const conversationId = c.req.param("id");
     const ownerId = c.get("user").id;
-    const model = models.find((candidate) => candidate.id === body.model) ??
-      models.find((candidate) =>
-        body.model.startsWith("openai/") && candidate.provider === "openai-compatible"
-      );
+    const model = modelCatalog.find((candidate) => candidate.id === body.model);
     if (!model) {
       throw new DomainError("model_not_found", `Model '${body.model}' does not exist`, 404);
     }
@@ -567,8 +773,9 @@ export function createApp(options: AppOptions = {}) {
       runId,
       provider: model.provider,
       reserveMicros: webReservation,
+      leaseSeconds: generationLeaseSeconds,
     });
-    if (begun.replayed && begun.usageRun.status === "completed") {
+    if (begun.kind === "completed") {
       const detail = await repo.detail(conversationId, ownerId);
       const assistant = detail.messages.find((message) =>
         message.parentId === begun.message.id && message.metadata.runId === runId
@@ -582,30 +789,53 @@ export function createApp(options: AppOptions = {}) {
       }
       return c.json({ user: begun.message, assistant, conversation: detail }, 200);
     }
-    if (
-      begun.replayed && Date.now() - Date.parse(begun.usageRun.createdAt) < 3 * 60 * 1000
-    ) {
+    if (begun.kind === "in_progress") {
       throw new DomainError(
         "generation_in_progress",
         "This generation is already in progress",
         409,
       );
     }
+    let heartbeatError: unknown;
+    let heartbeatInFlight = Promise.resolve();
+    const heartbeat = () => {
+      heartbeatInFlight = heartbeatInFlight.then(async () => {
+        if (heartbeatError) return;
+        try {
+          await repo.heartbeatGeneration(
+            runId,
+            ownerId,
+            begun.leaseToken,
+            generationLeaseSeconds,
+          );
+        } catch (error) {
+          heartbeatError = error;
+        }
+      });
+      return heartbeatInFlight;
+    };
+    const heartbeatTimer = setInterval(() => void heartbeat(), generationHeartbeatMs);
+    const checkpoint = async () => {
+      await heartbeat();
+      if (heartbeatError) throw heartbeatError;
+    };
     const started = performance.now();
     let providerCompleted = false;
     try {
-      const result = await complete({
+      const result = await webComplete({
         model: body.model,
         messages: history,
         max_tokens: maxWebOutput,
       }, c.req.raw.signal);
       providerCompleted = true;
+      await checkpoint();
       const cost = priceUsage(model, result.inputTokens, result.outputTokens).costMicros;
       const completed = await repo.completeGeneration({
         conversationId,
         ownerId,
         userMessageId: begun.message.id,
         runId,
+        leaseToken: begun.leaseToken,
         idempotencyKey: `${body.idempotencyKey}:assistant`,
         content: result.text,
         model: body.model,
@@ -632,6 +862,7 @@ export function createApp(options: AppOptions = {}) {
           ownerId,
           userMessageId: begun.message.id,
           runId,
+          leaseToken: begun.leaseToken,
           idempotencyKey: `${body.idempotencyKey}:error`,
           model: body.model,
           error: "Generation failed. Retry with a new operation.",
@@ -643,6 +874,9 @@ export function createApp(options: AppOptions = {}) {
         "The model provider could not complete the request",
         502,
       );
+    } finally {
+      clearInterval(heartbeatTimer);
+      await heartbeatInFlight;
     }
   });
   app.post("/api/conversations/:id/active-leaf", async (c) => {
@@ -678,10 +912,22 @@ export function createApp(options: AppOptions = {}) {
       preview: `${secret.slice(0, 7)}…${secret.slice(-4)}`,
     });
     const { tokenHash: _h, userId: _u, ...summary } = record;
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: "api_token.created",
+      targetType: "api_token",
+      targetId: record.id,
+    });
     return c.json({ token: secret, ...summary }, 201);
   });
   app.delete("/api/tokens/:id", async (c) => {
     await repo.revokeApiToken(c.req.param("id"), c.get("user").id);
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: "api_token.revoked",
+      targetType: "api_token",
+      targetId: c.req.param("id"),
+    });
     return c.body(null, 204);
   });
   app.get(
@@ -691,7 +937,13 @@ export function createApp(options: AppOptions = {}) {
     sessionOnly,
     async (c) => c.json(await repo.usage(c.get("user").id)),
   );
-  app.get("/api/models", authenticate, approved, sessionOnly, (c) => c.json({ data: models }));
+  app.get(
+    "/api/models",
+    authenticate,
+    approved,
+    sessionOnly,
+    (c) => c.json({ data: modelCatalog }),
+  );
 
   app.use("/api/admin/*", authenticate, approved, sessionOnly, admin);
   app.get(
@@ -700,23 +952,55 @@ export function createApp(options: AppOptions = {}) {
   );
   app.patch("/api/admin/users/:id/approval", async (c) => {
     const body = await parseJson(c, approvalSchema);
-    return c.json(
-      publicUser(
-        await repo.approveUser(
-          c.req.param("id"),
-          body.status,
-          body.startingCreditMicros ?? startingCredit,
-        ),
-      ),
+    const updated = await repo.approveUser(
+      c.req.param("id"),
+      body.status,
+      body.startingCreditMicros ?? startingCredit,
+      requireEmailVerification,
     );
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: `user.approval.${body.status}`,
+      targetType: "user",
+      targetId: updated.id,
+    });
+    return c.json(publicUser(updated));
   });
   app.patch("/api/admin/users/:id/state", async (c) => {
     const body = await c.req.json<{ state: "active" | "suspended" | "deleted" }>();
     if (!["active", "suspended", "deleted"].includes(body.state)) {
       throw new DomainError("validation_error", "Invalid state", 422);
     }
-    return c.json(publicUser(await repo.setUserState(c.req.param("id"), body.state)));
+    const updated = await repo.setUserState(c.req.param("id"), body.state);
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: `user.state.${body.state}`,
+      targetType: "user",
+      targetId: updated.id,
+    });
+    return c.json(publicUser(updated));
   });
+  app.delete("/api/admin/sessions/:id", async (c) => {
+    await repo.revokeSession(c.req.param("id"));
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: "session.admin_revoked",
+      targetType: "session",
+      targetId: c.req.param("id"),
+    });
+    return c.body(null, 204);
+  });
+  app.get(
+    "/api/admin/audit",
+    async (c) => {
+      const rawLimit = c.req.query("limit");
+      const limit = rawLimit === undefined ? 100 : Number(rawLimit);
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
+        throw new DomainError("validation_error", "limit must be an integer from 1 to 200", 422);
+      }
+      return c.json({ data: await repo.listAudit(limit) });
+    },
+  );
   app.get(
     "/api/admin/usage",
     async (c) => c.json(await repo.adminSummary()),
@@ -868,7 +1152,7 @@ export function createApp(options: AppOptions = {}) {
     (c) =>
       c.json({
         object: "list",
-        data: models.map((m) => ({
+        data: modelCatalog.map((m) => ({
           id: m.id,
           object: "model",
           created: 0,
@@ -879,10 +1163,7 @@ export function createApp(options: AppOptions = {}) {
   );
   const chatHandler = async (c: Context<{ Variables: Variables }>) => {
     const request = await parseJson<ChatCompletionRequest>(c, chatCompletionSchema);
-    const model = models.find((m) => m.id === request.model) ??
-      (request.model.startsWith("openai/")
-        ? models.find((m) => m.provider === "openai-compatible")
-        : undefined);
+    const model = modelCatalog.find((candidate) => candidate.id === request.model);
     if (!model) {
       return c.json(openAIError(`Model '${request.model}' does not exist`, "model_not_found"), 404);
     }
@@ -1299,10 +1580,7 @@ export function createApp(options: AppOptions = {}) {
         content: m.content,
       }));
     const request = { model: body.model, messages, stream: false };
-    const model = models.find((candidate) => candidate.id === body.model) ??
-      models.find((candidate) =>
-        body.model.startsWith("openai/") && candidate.provider === "openai-compatible"
-      );
+    const model = modelCatalog.find((candidate) => candidate.id === body.model);
     if (!model) {
       return c.json(openAIError(`Model '${body.model}' does not exist`, "model_not_found"), 404);
     }

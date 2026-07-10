@@ -26,9 +26,16 @@ const { app } = createApp({ repository, rateLimiter });
 const replayMaintenance = setInterval(async () => {
   try {
     const reaped = await repository.reapStaleApiRequests(100);
+    const reapedGenerations = await repository.reapStaleGenerations(100);
     const pruned = await repository.pruneExpiredApiRequests(100);
-    if (reaped || pruned) {
-      console.log(JSON.stringify({ level: "info", message: "Replay maintenance", reaped, pruned }));
+    if (reaped || reapedGenerations || pruned) {
+      console.log(JSON.stringify({
+        level: "info",
+        message: "Replay maintenance",
+        reaped,
+        reapedGenerations,
+        pruned,
+      }));
     }
   } catch (error) {
     console.error(JSON.stringify({

@@ -10,6 +10,12 @@ export const registerSchema = z.object({
 });
 
 export const loginSchema = z.object({ email: emailSchema, password: z.string().min(1).max(128) });
+export const identityTokenSchema = z.object({ token: z.string().min(32).max(512) }).strict();
+export const passwordResetRequestSchema = z.object({ email: emailSchema }).strict();
+export const passwordResetSchema = z.object({
+  token: z.string().min(32).max(512),
+  password: passwordSchema,
+}).strict();
 
 export const createConversationSchema = z.object({
   title: z.string().trim().min(1).max(200).default("New chat"),

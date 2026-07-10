@@ -49,7 +49,6 @@ import {
   ShieldCheck,
   SlidersHorizontal,
   Sparkles,
-  Square,
   Sun,
   Terminal,
   Trash2,
@@ -758,15 +757,15 @@ function MessageItem(
           <IconButton label="Copy response" onClick={copy}>
             {copied ? <Check size={15} /> : <Copy size={15} />}
           </IconButton>
-          <IconButton label="Read aloud">
+          <IconButton label="Read aloud (not available yet)" disabled>
             <Volume2 size={15} />
           </IconButton>
           {!readOnly && (
-            <IconButton label="Regenerate">
+            <IconButton label="Regenerate response (not available yet)" disabled>
               <RefreshCw size={15} />
             </IconButton>
           )}
-          <IconButton label="More">
+          <IconButton label="More response actions (not available yet)" disabled>
             <MoreHorizontal size={15} />
           </IconButton>
           {branch && (
@@ -794,10 +793,8 @@ function Composer(
   },
 ) {
   const [value, setValue] = useState("");
-  const [recording, setRecording] = useState(false);
-  const fileRef = useRef<HTMLInputElement>(null);
   useEffect(() => {
-    if (edit) setValue(edit.content.replaceAll("**", ""));
+    if (edit) setValue(edit.content);
   }, [edit]);
   const submit = async (e: FormEvent) => {
     e.preventDefault();
@@ -831,28 +828,36 @@ function Composer(
           aria-label="Message"
         />
         <div className="composer-tools">
-          <input ref={fileRef} type="file" hidden multiple />
           <IconButton
-            label="Attach files"
-            disabled={disabled}
-            onClick={() => fileRef.current?.click()}
+            label="Attach files (not available yet)"
+            disabled
           >
             <Paperclip size={19} />
           </IconButton>
-          <button type="button" className="tool-pill" disabled={disabled}>
+          <button
+            type="button"
+            className="tool-pill"
+            disabled
+            aria-label="Web search (not available yet)"
+            title="Web search (not available yet)"
+          >
             <Globe2 size={16} /> Search
           </button>
-          <button type="button" className="tool-pill" disabled={disabled}>
+          <button
+            type="button"
+            className="tool-pill"
+            disabled
+            aria-label="Tools (not available yet)"
+            title="Tools (not available yet)"
+          >
             <Code2 size={16} /> Tools
           </button>
           <span className="push" />
           <IconButton
-            label={recording ? "Stop recording" : "Voice input"}
-            className={recording ? "recording" : ""}
-            disabled={disabled}
-            onClick={() => setRecording(!recording)}
+            label="Voice input (not available yet)"
+            disabled
           >
-            {recording ? <Square size={17} /> : <Mic size={19} />}
+            <Mic size={19} />
           </IconButton>
           <button className="send-button" aria-label="Send" disabled={!value.trim() || disabled}>
             <ArrowDown size={19} />
@@ -1167,10 +1172,10 @@ function ChatView({
           <span className="balance-pill">
             <CircleDollarSign size={15} /> ${balance.toFixed(2)}
           </span>
-          <IconButton label="Share">
+          <IconButton label="Share conversation (not available yet)" disabled>
             <Upload size={18} />
           </IconButton>
-          <IconButton label="Conversation options">
+          <IconButton label="Conversation options (not available yet)" disabled>
             <MoreHorizontal size={19} />
           </IconButton>
         </div>
@@ -1630,7 +1635,14 @@ function AdminView({ onMenu }: { onMenu: () => void }) {
         <IconButton label="Open menu" onClick={onMenu}>
           <Menu size={20} />
         </IconButton>
-        <strong>Admin console</strong>
+        <select
+          className="admin-mobile-section"
+          aria-label="Admin section"
+          value={section}
+          onChange={(event) => setSection(event.target.value as AdminSection)}
+        >
+          {adminNav.map(({ id, label }) => <option key={id} value={id}>{label}</option>)}
+        </select>
       </header>
       <div className="admin-layout">
         <nav className="admin-nav">
