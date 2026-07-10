@@ -3649,6 +3649,9 @@ export function createApp(options: AppOptions = {}) {
       return new Response(responseBody, { headers: { "content-type": "application/json" } });
     } catch (error) {
       if (terminalAccounting) throw error;
+      if (Deno.env.get("DENO_ENV") === "test") {
+        console.error("Embeddings contract request failed", error);
+      }
       const responseStatus = error instanceof EmbeddingsProviderError ? error.status : 502;
       const code = error instanceof EmbeddingsProviderError ? error.code : "provider_error";
       const responseBody = JSON.stringify(
