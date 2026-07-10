@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { DOCX_MIME_TYPE, INGESTIBLE_DOCUMENT_MIME_TYPES } from "@dg-chat/database";
 
 export type UploadDecision =
   | { state: "ready"; reason: "validated" }
@@ -51,9 +52,7 @@ const DEFAULT_ALLOWED_TYPES = new Set([
   "image/jpeg",
   "image/gif",
   "image/webp",
-  "application/pdf",
-  "text/plain",
-  "application/json",
+  ...INGESTIBLE_DOCUMENT_MIME_TYPES,
   "audio/mpeg",
   "audio/wav",
   "audio/ogg",
@@ -74,6 +73,7 @@ const EXTENSIONS: Record<string, string> = {
   "application/pdf": "pdf",
   "text/plain": "txt",
   "application/json": "json",
+  [DOCX_MIME_TYPE]: "docx",
   "audio/mpeg": "mp3",
   "audio/wav": "wav",
   "audio/ogg": "ogg",
@@ -92,7 +92,76 @@ function ascii(bytes: Uint8Array, start: number, length: number): string {
   return String.fromCharCode(...bytes.subarray(start, start + length));
 }
 
-function sniffMime(bytes: Uint8Array): string | undefined {
+function u16(bytes: Uint8Array, offset: number): number {
+  return bytes[offset] | bytes[offset + 1] << 8;
+}
+
+function u32(bytes: Uint8Array, offset: number): number {
+  return (bytes[offset] | bytes[offset + 1] << 8 | bytes[offset + 2] << 16 |
+    bytes[offset + 3] << 24) >>> 0;
+}
+
+function docxFromCentralDirectory(
+  prefix: Uint8Array,
+  suffix: Uint8Array,
+  totalBytes: number,
+): boolean {
+  if (!startsWith(prefix, [0x50, 0x4b, 0x03, 0x04])) return false;
+  let eocd = -1;
+  for (let offset = suffix.length - 22; offset >= Math.max(0, suffix.length - 65_557); offset--) {
+    if (u32(suffix, offset) === 0x06054b50) {
+      eocd = offset;
+      break;
+    }
+  }
+  if (eocd < 0 || eocd + 22 + u16(suffix, eocd + 20) !== suffix.length) return false;
+  const count = u16(suffix, eocd + 10);
+  if (
+    u16(suffix, eocd + 4) !== 0 || u16(suffix, eocd + 6) !== 0 ||
+    u16(suffix, eocd + 8) !== count || count === 0xffff
+  ) return false;
+  const size = u32(suffix, eocd + 12);
+  const absoluteOffset = u32(suffix, eocd + 16);
+  if (size === 0xffffffff || absoluteOffset === 0xffffffff) return false;
+  const suffixStart = totalBytes - suffix.length;
+  const directoryOffset = absoluteOffset - suffixStart;
+  if (directoryOffset < 0 || directoryOffset + size !== eocd) return false;
+  const names = new Set<string>();
+  let offset = directoryOffset;
+  try {
+    for (let index = 0; index < count; index++) {
+      if (offset + 46 > eocd || u32(suffix, offset) !== 0x02014b50) return false;
+      const nameLength = u16(suffix, offset + 28);
+      const extraLength = u16(suffix, offset + 30);
+      const commentLength = u16(suffix, offset + 32);
+      const end = offset + 46 + nameLength + extraLength + commentLength;
+      if (end > eocd) return false;
+      const name = new TextDecoder("utf-8", { fatal: true }).decode(
+        suffix.subarray(offset + 46, offset + 46 + nameLength),
+      ).toLowerCase();
+      if (!name || names.has(name)) return false;
+      names.add(name);
+      offset = end;
+    }
+  } catch {
+    return false;
+  }
+  if (offset !== eocd) return false;
+  const forbidden = [...names].some((name) =>
+    name.startsWith("ppt/") || name.startsWith("xl/") ||
+    name.endsWith("vbaproject.bin") || name.startsWith("word/activex/") ||
+    name.startsWith("word/embeddings/") || name.startsWith("customui/") ||
+    /\.(?:exe|dll|com|bat|cmd|ps1|js|jse|vbs|vbe|wsf|wsh|scr|msi)$/.test(name)
+  );
+  return !forbidden && names.has("[content_types].xml") && names.has("word/document.xml");
+}
+
+function sniffMime(
+  prefix: Uint8Array,
+  suffix: Uint8Array,
+  totalBytes: number,
+): string | undefined {
+  const bytes = prefix;
   if (startsWith(bytes, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) return "image/png";
   if (startsWith(bytes, [0xff, 0xd8, 0xff])) return "image/jpeg";
   if (ascii(bytes, 0, 6) === "GIF87a" || ascii(bytes, 0, 6) === "GIF89a") return "image/gif";
@@ -101,7 +170,10 @@ function sniffMime(bytes: Uint8Array): string | undefined {
   if (ascii(bytes, 0, 3) === "ID3" || startsWith(bytes, [0xff, 0xfb])) return "audio/mpeg";
   if (ascii(bytes, 0, 4) === "RIFF" && ascii(bytes, 8, 4) === "WAVE") return "audio/wav";
   if (ascii(bytes, 0, 4) === "OggS") return "audio/ogg";
-  if (startsWith(bytes, [0x50, 0x4b, 0x03, 0x04]) || startsWith(bytes, [0x4d, 0x5a])) {
+  if (startsWith(bytes, [0x50, 0x4b, 0x03, 0x04])) {
+    return docxFromCentralDirectory(prefix, suffix, totalBytes) ? DOCX_MIME_TYPE : undefined;
+  }
+  if (startsWith(bytes, [0x4d, 0x5a])) {
     return undefined;
   }
   if (bytes.includes(0)) return undefined;
@@ -123,13 +195,16 @@ function sniffMime(bytes: Uint8Array): string | undefined {
   }
 }
 
-function hasPolyglotMarkers(bytes: Uint8Array, mime: string): boolean {
+interface StreamMarkers {
+  dangerousMarkup: boolean;
+  secondaryZip: boolean;
+  executable: boolean;
+}
+
+function hasPolyglotMarkers(markers: StreamMarkers, mime: string): boolean {
   if (mime === "text/plain" || mime === "application/json") return false;
-  const text = new TextDecoder("latin1").decode(bytes).toLowerCase();
-  const dangerousMarkup = ["<script", "<!doctype html", "<html", "<?php", "<svg"];
-  if (dangerousMarkup.some((marker) => text.includes(marker))) return true;
-  const secondarySignatures = ["pk\x03\x04", "mz"];
-  return secondarySignatures.some((signature) => text.indexOf(signature, 8) >= 0);
+  if (mime === DOCX_MIME_TYPE) return false;
+  return markers.dangerousMarkup || markers.secondaryZip || markers.executable;
 }
 
 function builtInImageDimensions(mime: string, bytes: Uint8Array): ImageGuardResult {
@@ -269,8 +344,16 @@ export function secureUploadStream(
   }
   const hash = createHash("sha256");
   const prefixChunks: Uint8Array[] = [];
+  const suffixChunks: Uint8Array[] = [];
   let prefixSize = 0;
+  let suffixSize = 0;
   let total = 0;
+  const markers: StreamMarkers = {
+    dangerousMarkup: false,
+    secondaryZip: false,
+    executable: false,
+  };
+  let markerCarry = new Uint8Array();
   let resolveInspection!: (value: UploadInspection) => void;
   let rejectInspection!: (reason: unknown) => void;
   let settled = false;
@@ -298,11 +381,41 @@ export function secureUploadStream(
           fail(new UploadSecurityError("upload_too_large", "Upload exceeds the byte limit", 413));
         }
         hash.update(chunk);
+        const scan = new Uint8Array(markerCarry.length + chunk.length);
+        scan.set(markerCarry);
+        scan.set(chunk, markerCarry.length);
+        const scanStart = total - chunk.length - markerCarry.length;
+        const scanText = new TextDecoder("latin1").decode(scan).toLowerCase();
+        markers.dangerousMarkup ||= ["<script", "<!doctype html", "<html", "<?php", "<svg"]
+          .some((marker) => scanText.includes(marker));
+        for (
+          const [signature, key] of [["pk\x03\x04", "secondaryZip"], ["mz", "executable"]] as const
+        ) {
+          let found = scanText.indexOf(signature);
+          while (found >= 0) {
+            if (scanStart + found >= 8) markers[key] = true;
+            found = scanText.indexOf(signature, found + 1);
+          }
+        }
+        markerCarry = scan.slice(Math.max(0, scan.length - 32));
         const remaining = inspectionBytes - prefixSize;
         if (remaining > 0) {
           const part = chunk.slice(0, remaining);
           prefixChunks.push(part);
           prefixSize += part.byteLength;
+        }
+        suffixChunks.push(chunk.slice());
+        suffixSize += chunk.byteLength;
+        while (suffixSize > inspectionBytes && suffixChunks.length) {
+          const excess = suffixSize - inspectionBytes;
+          const first = suffixChunks[0];
+          if (first.byteLength <= excess) {
+            suffixSize -= first.byteLength;
+            suffixChunks.shift();
+          } else {
+            suffixChunks[0] = first.slice(excess);
+            suffixSize -= excess;
+          }
         }
         controller.enqueue(chunk);
       } catch (error) {
@@ -318,7 +431,13 @@ export function secureUploadStream(
           prefix.set(chunk, offset);
           offset += chunk.byteLength;
         }
-        const sniffed = sniffMime(prefix);
+        const suffix = new Uint8Array(suffixSize);
+        offset = 0;
+        for (const chunk of suffixChunks) {
+          suffix.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        const sniffed = sniffMime(prefix, suffix, total);
         if (!sniffed) {
           fail(
             new UploadSecurityError("unsupported_media_type", "File signature is not allowed", 415),
@@ -339,7 +458,7 @@ export function secureUploadStream(
             ),
           );
         }
-        if (hasPolyglotMarkers(prefix, validatedMime)) {
+        if (hasPolyglotMarkers(markers, validatedMime)) {
           fail(
             new UploadSecurityError(
               "polyglot_detected",
