@@ -1,0 +1,27 @@
+[
+  {
+    "status": "todo",
+    "endpoint": "POST /v1/embeddings",
+    "reason": "Embedding provider integration is not implemented"
+  },
+  {
+    "status": "todo",
+    "endpoint": "POST /v1/files",
+    "reason": "File upload and object storage integration are not implemented"
+  },
+  {
+    "status": "todo",
+    "endpoint": "GET /v1/files/{id}, GET /v1/files/{id}/content, DELETE /v1/files/{id}",
+    "reason": "File persistence is not implemented; lifecycle routes can only return not_found"
+  },
+  {
+    "status": "todo",
+    "endpoint": "POST /v1/images/generations",
+    "reason": "Image provider integration is not implemented"
+  },
+  {
+    "status": "todo",
+    "endpoint": "POST /v1/audio/transcriptions, translations, speech",
+    "reason": "Audio provider integrations are not implemented"
+  }
+]
