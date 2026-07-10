@@ -104,7 +104,7 @@ export class PostgresStateRepository extends MemoryRepository {
     this.#lastPayload = payload;
   }
 
-  async close() {
+  override async close() {
     if (this.#timer) clearInterval(this.#timer);
     await this.flush();
     await this.#sql.end({ timeout: 5 });

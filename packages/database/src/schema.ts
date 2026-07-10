@@ -171,6 +171,7 @@ export const usageRuns = pgTable("usage_runs", {
   model: text("model").notNull(),
   provider: text("provider").notNull(),
   status: text("status").notNull(),
+  reservedMicros: bigint("reserved_micros", { mode: "number" }).notNull().default(0),
   inputTokens: integer("input_tokens").notNull().default(0),
   outputTokens: integer("output_tokens").notNull().default(0),
   costMicros: bigint("cost_micros", { mode: "number" }).notNull().default(0),

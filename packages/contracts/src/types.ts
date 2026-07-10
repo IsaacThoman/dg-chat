@@ -14,7 +14,6 @@ export interface PublicUser {
 }
 
 export interface SessionResponse {
-  token: string;
   user: PublicUser;
   limited: boolean;
 }
@@ -43,6 +42,7 @@ export interface Conversation {
   activeLeafId: string | null;
   version: number;
   pinned: boolean;
+  temporary: boolean;
   archivedAt: string | null;
   deletedAt: string | null;
   createdAt: string;

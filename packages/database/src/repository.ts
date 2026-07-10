@@ -1,0 +1,172 @@
+import type {
+  AccountState,
+  ApiTokenSummary,
+  ApprovalStatus,
+  Conversation,
+  ConversationDetail,
+  MessageNode,
+  MessageRole,
+  PublicUser,
+  UsageSummary,
+  UserRole,
+} from "@dg-chat/contracts";
+import type { LedgerEntry, StoredApiToken, StoredSession, StoredUser, UsageRun } from "./memory.ts";
+
+export type MaybePromise<T> = T | Promise<T>;
+
+export interface CreateUserInput {
+  email: string;
+  name: string;
+  passwordHash: string;
+  role?: UserRole;
+  approvalStatus?: ApprovalStatus;
+  state?: AccountState;
+}
+
+export interface AppendMessageInput {
+  conversationId: string;
+  ownerId: string;
+  parentId: string | null;
+  supersedesId?: string | null;
+  role: MessageRole;
+  content: string;
+  model?: string;
+  expectedVersion: number;
+  idempotencyKey: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface CreateApiTokenInput {
+  name: string;
+  scopes: string[];
+  tokenHash: string;
+  preview: string;
+  expiresAt?: string | null;
+}
+
+export interface BeginGenerationInput {
+  message: AppendMessageInput;
+  runId: string;
+  provider: string;
+  reserveMicros: number;
+  tokenId?: string;
+}
+export interface CompleteGenerationInput {
+  conversationId: string;
+  ownerId: string;
+  userMessageId: string;
+  runId: string;
+  idempotencyKey: string;
+  content: string;
+  model: string;
+  costMicros: number;
+  inputTokens: number;
+  outputTokens: number;
+  latencyMs: number;
+  metadata?: Record<string, unknown>;
+}
+export interface FailGenerationInput {
+  conversationId: string;
+  ownerId: string;
+  userMessageId: string;
+  runId: string;
+  idempotencyKey: string;
+  model: string;
+  error: string;
+}
+export interface GenerationResult {
+  message: MessageNode;
+  conversation: Conversation;
+  usageRun: UsageRun;
+  replayed?: boolean;
+}
+export interface ConversationPatch {
+  title?: string;
+  pinned?: boolean;
+  archived?: boolean;
+  deleted?: boolean;
+}
+export interface AdminSummary {
+  calls: number;
+  users: number;
+  balanceMicros: number;
+  ledger: LedgerEntry[];
+}
+export interface JobSummary {
+  id: string;
+  type: string;
+  payload: unknown;
+  status: string;
+  attempts: number;
+  createdAt: string;
+}
+
+/** Persistence boundary shared by synchronous test stores and async production stores. */
+export interface DomainRepository {
+  readonly storageKind: "postgres" | "memory";
+  close(): MaybePromise<void>;
+  bootstrapAdmin(input: CreateUserInput, startingCreditMicros: number): MaybePromise<StoredUser>;
+  createUser(input: CreateUserInput): MaybePromise<StoredUser>;
+  findUser(id: string): MaybePromise<StoredUser | undefined>;
+  findUserByEmail(email: string): MaybePromise<StoredUser | undefined>;
+  listUsers(): MaybePromise<PublicUser[]>;
+  createSession(userId: string, tokenHash: string, limited: boolean): MaybePromise<StoredSession>;
+  getSession(tokenHash: string): MaybePromise<StoredSession | undefined>;
+  invalidateUserSessions(userId: string): MaybePromise<void>;
+  deleteSession(tokenHash: string): MaybePromise<void>;
+  approveUser(
+    id: string,
+    status: "approved" | "rejected",
+    creditMicros: number,
+  ): MaybePromise<StoredUser>;
+  setUserState(id: string, state: AccountState): MaybePromise<StoredUser>;
+  createConversation(
+    ownerId: string,
+    title: string,
+    temporary?: boolean,
+    idempotencyKey?: string,
+  ): MaybePromise<Conversation>;
+  listConversations(ownerId: string, includeDeleted?: boolean): MaybePromise<Conversation[]>;
+  updateConversation(
+    ownerId: string,
+    id: string,
+    patch: ConversationPatch,
+  ): MaybePromise<Conversation>;
+  detail(id: string, ownerId: string): MaybePromise<ConversationDetail>;
+  appendMessage(input: AppendMessageInput): MaybePromise<MessageNode>;
+  beginGeneration(input: BeginGenerationInput): MaybePromise<GenerationResult>;
+  completeGeneration(input: CompleteGenerationInput): MaybePromise<GenerationResult>;
+  failGeneration(input: FailGenerationInput): MaybePromise<GenerationResult>;
+  setActiveLeaf(
+    conversationId: string,
+    ownerId: string,
+    leafId: string,
+    expectedVersion: number,
+  ): MaybePromise<Conversation>;
+  createApiToken(userId: string, input: CreateApiTokenInput): MaybePromise<StoredApiToken>;
+  findApiTokenByHash(hash: string): MaybePromise<StoredApiToken | undefined>;
+  listApiTokens(userId: string): MaybePromise<ApiTokenSummary[]>;
+  revokeApiToken(id: string, userId: string): MaybePromise<void>;
+  reserve(
+    userId: string,
+    runId: string,
+    model: string,
+    amountMicros: number,
+    provider?: string,
+    tokenId?: string,
+  ): MaybePromise<UsageRun>;
+  settle(
+    runId: string,
+    costMicros: number,
+    inputTokens: number,
+    outputTokens: number,
+    latencyMs: number,
+  ): MaybePromise<UsageRun>;
+  refund(runId: string, error?: string): MaybePromise<UsageRun | undefined>;
+  usage(userId: string): MaybePromise<UsageSummary>;
+  listLedger(userId: string): MaybePromise<LedgerEntry[]>;
+  enqueueJob(type: string, payload: unknown, availableAt?: string): MaybePromise<string>;
+  adminSummary(): MaybePromise<AdminSummary>;
+  listJobs(): MaybePromise<JobSummary[]>;
+  readiness(): MaybePromise<{ ready: boolean; storage: string }>;
+}
