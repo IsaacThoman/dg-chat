@@ -25,8 +25,15 @@ test("editing a prompt creates a recoverable branch", async ({ page }) => {
   await page.getByRole("button", { name: /send|save/i }).click();
 
   await expect(page.getByText("Edited branch prompt", { exact: true })).toBeVisible();
+  await expect(page.getByText("Original branch prompt", { exact: true })).toBeHidden();
+
+  await page.getByRole("button", { name: "Previous branch" }).click();
   await expect(page.getByText("Original branch prompt", { exact: true })).toBeVisible();
+  await expect(page.getByText("Edited branch prompt", { exact: true })).toBeHidden();
+
+  await page.getByRole("button", { name: "Next branch" }).click();
   await expect(page.getByText("Edited branch prompt", { exact: true })).toBeVisible();
+  await expect(page.getByText("Original branch prompt", { exact: true })).toBeHidden();
 });
 
 test("composer supports keyboard submission and does not submit Shift+Enter", async ({ page }) => {
