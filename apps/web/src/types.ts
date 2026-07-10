@@ -124,6 +124,26 @@ export interface Attachment {
   createdAt: string;
 }
 
+export interface KnowledgeCollection {
+  id: string;
+  name: string;
+  description?: string | null;
+  attachmentCount?: number;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type KnowledgeMode = "retrieval" | "full_context";
+
+export interface ConversationKnowledge {
+  bindings: Array<{
+    collectionId: string;
+    mode: KnowledgeMode;
+    version: number;
+  }>;
+}
+
 export interface AuditEvent {
   id: string;
   actorId: string | null;
