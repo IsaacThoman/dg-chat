@@ -39,11 +39,21 @@ import {
   DomainError,
   type DomainRepository,
   MemoryRepository,
+  type ModelPriceVersion,
   ObjectAlreadyExistsError,
   type ObjectStore,
+  type ProviderModelRecord,
+  type ProviderRecord,
+  type UsagePricingSnapshot,
 } from "@dg-chat/database";
 import { hashPassword, randomToken, sha256, sha256Hex, verifyPassword } from "./crypto.ts";
-import { complete, models, simulate, streamChatCompletion } from "./models.ts";
+import {
+  complete,
+  models,
+  simulate,
+  streamChatCompletion,
+  type UpstreamStreamOptions,
+} from "./models.ts";
 import { estimateInputTokens, priceUsage, reservationPrice } from "./pricing.ts";
 import { responseMessage, responseObject } from "./responses.ts";
 import { type IdentityMailer, smtpIdentityMailer } from "./mail.ts";
@@ -60,6 +70,18 @@ import {
   type UploadInspection,
   UploadSecurityError,
 } from "./upload-security.ts";
+import { discoverProviderModels, ProviderTestError } from "./provider-admin.ts";
+import { type ProviderSecretEnvelope, ProviderSecretKeyring } from "./provider-secrets.ts";
+import {
+  modelPriceCreate,
+  providerCreate,
+  providerCredential,
+  providerExpectedVersion,
+  providerModelCreate,
+  providerModelPatch,
+  providerPatch,
+  ProviderValidationError,
+} from "./provider-validation.ts";
 
 type Variables = {
   user: PublicUser;
@@ -73,6 +95,7 @@ export interface AppOptions {
   startingCreditMicros?: number;
   rateLimiter?: RateLimiter;
   providerStream?: typeof streamChatCompletion;
+  providerComplete?: typeof complete;
   idempotencyHeartbeatMs?: number;
   idempotencyLeaseSeconds?: number;
   replayQuota?: ApiReplayQuota;
@@ -85,6 +108,8 @@ export interface AppOptions {
   webComplete?: typeof complete;
   objectStore?: ObjectStore;
   attachmentContextMaxRawBytes?: number;
+  providerKeyring?: ProviderSecretKeyring;
+  providerDiscoveryFetch?: typeof fetch;
 }
 
 interface StagedUpload {
@@ -464,6 +489,7 @@ export function createApp(options: AppOptions = {}) {
   const objectStore = options.objectStore;
   const rateLimiter = options.rateLimiter ?? new MemoryRateLimiter();
   const providerStream = options.providerStream ?? streamChatCompletion;
+  const providerComplete = options.providerComplete ?? complete;
   const idempotencyHeartbeatMs = Math.max(10, options.idempotencyHeartbeatMs ?? 30_000);
   const idempotencyLeaseSeconds = Math.max(1, options.idempotencyLeaseSeconds ?? 120);
   const generationHeartbeatMs = Math.max(10, options.generationHeartbeatMs ?? 30_000);
@@ -509,6 +535,7 @@ export function createApp(options: AppOptions = {}) {
   }
   const configuredGenerationLimit = positiveInteger("GENERATION_RATE_LIMIT", 30);
   const configuredOpenAILimit = positiveInteger("OPENAI_RATE_LIMIT", 120);
+  const configuredProviderAdminLimit = positiveInteger("PROVIDER_ADMIN_RATE_LIMIT", 30);
   const configuredRateWindow = positiveInteger("RATE_LIMIT_WINDOW_SECONDS", 60);
   const uploadMaxBytes = positiveInteger("UPLOAD_MAX_BYTES", 25 * 1024 * 1024);
   const uploadMaxConcurrent = positiveInteger("UPLOAD_MAX_CONCURRENT", 4);
@@ -530,22 +557,120 @@ export function createApp(options: AppOptions = {}) {
   };
   const trustProxyHeaders = options.trustProxyHeaders ??
     Deno.env.get("TRUST_PROXY_HEADERS") === "true";
+  const builtInProviderConfigured = Boolean(
+    (Deno.env.get("OPENAI_BASE_URL") && Deno.env.get("OPENAI_API_KEY")) ||
+      options.providerStream || options.providerComplete || options.webComplete,
+  );
   const defaultOpenAIModel = models.find((model) => model.id === "openai/default")!;
-  const configuredUpstreamModels = (Deno.env.get("OPENAI_ALLOWED_MODELS") ?? "")
-    .split(",")
-    .map((model) => model.trim())
-    .filter((model, index, values) => model.length > 0 && values.indexOf(model) === index)
-    .map((model) => ({
-      ...defaultOpenAIModel,
-      id: `openai/${model}`,
-      displayName: model,
-    }));
+  const configuredUpstreamModels = builtInProviderConfigured
+    ? (Deno.env.get("OPENAI_ALLOWED_MODELS") ?? "")
+      .split(",")
+      .map((model) => model.trim())
+      .filter((model, index, values) => model.length > 0 && values.indexOf(model) === index)
+      .map((model) => ({
+        ...defaultOpenAIModel,
+        id: `openai/${model}`,
+        displayName: model,
+      }))
+    : [];
   const modelCatalog = [
-    ...models,
+    ...models.filter((model) => model.id !== "openai/default" || builtInProviderConfigured),
     ...configuredUpstreamModels.filter((candidate) =>
       !models.some((model) => model.id === candidate.id)
     ),
   ];
+  const providerKeyring = options.providerKeyring ?? ProviderSecretKeyring.fromEnv();
+  type RuntimeModel = {
+    info: ModelInfo;
+    provider?: ProviderRecord;
+    registryModel?: ProviderModelRecord;
+    upstream?: UpstreamStreamOptions;
+    price?: ModelPriceVersion;
+  };
+  const registryModelInfo = async (
+    model: ProviderModelRecord,
+    provider: ProviderRecord,
+  ): Promise<RuntimeModel> => {
+    const price = await repo.effectiveModelPrice(model.id);
+    return {
+      info: {
+        id: model.publicModelId,
+        displayName: model.displayName,
+        provider: provider.slug,
+        capabilities: model.capabilities,
+        contextWindow: model.contextWindow,
+        inputMicrosPerMillion: price?.inputMicrosPerMillion ?? 0,
+        cachedInputMicrosPerMillion: price?.cachedInputMicrosPerMillion ?? 0,
+        reasoningMicrosPerMillion: price?.reasoningMicrosPerMillion ?? 0,
+        outputMicrosPerMillion: price?.outputMicrosPerMillion ?? 0,
+        fixedCallMicros: price?.fixedCallMicros ?? 0,
+        pricingVersionId: price?.id,
+      },
+      provider,
+      registryModel: model,
+      price,
+    };
+  };
+  const pricingSnapshot = (
+    price?: ModelPriceVersion,
+  ): UsagePricingSnapshot | undefined =>
+    price
+      ? {
+        pricingVersionId: price.id,
+        inputMicrosPerMillion: price.inputMicrosPerMillion,
+        cachedInputMicrosPerMillion: price.cachedInputMicrosPerMillion,
+        reasoningMicrosPerMillion: price.reasoningMicrosPerMillion,
+        outputMicrosPerMillion: price.outputMicrosPerMillion,
+        fixedCallMicros: price.fixedCallMicros,
+        source: price.source,
+      }
+      : undefined;
+  const runtimeModelCatalog = async (): Promise<ModelInfo[]> => {
+    const registry = await Promise.all(
+      (await repo.listProviderModels(undefined, true)).map(async (model) => {
+        const resolved = await resolveRuntimeModel(model.publicModelId);
+        return resolved?.registryModel ? resolved.info : undefined;
+      }),
+    );
+    return [
+      ...modelCatalog,
+      ...registry.filter((model): model is ModelInfo =>
+        Boolean(model) && !modelCatalog.some((builtIn) => builtIn.id === model!.id)
+      ),
+    ];
+  };
+  const resolveRuntimeModel = async (id: string): Promise<RuntimeModel | undefined> => {
+    const builtIn = modelCatalog.find((candidate) => candidate.id === id);
+    if (builtIn) return { info: builtIn };
+    const model = await repo.findProviderModel(id);
+    if (!model?.enabled) return undefined;
+    const provider = await repo.findProvider(model.providerId);
+    if (
+      !provider?.enabled || !provider.hasCredential || provider.protocol !== "chat_completions" ||
+      !providerKeyring
+    ) return undefined;
+    const credential = await repo.getProviderCredential(provider.id);
+    if (!credential) return undefined;
+    let apiKey: string;
+    try {
+      apiKey = await providerKeyring.decrypt(
+        provider.id,
+        credential.envelope as unknown as ProviderSecretEnvelope,
+      );
+    } catch {
+      return undefined;
+    }
+    const resolved = await registryModelInfo(model, provider);
+    if (!resolved.price) return undefined;
+    return {
+      ...resolved,
+      upstream: {
+        baseUrl: provider.baseUrl,
+        apiKey,
+        upstreamModel: model.upstreamModelId,
+      },
+    };
+  };
   let bootstrapInProgress = false;
   const app = new Hono<{ Variables: Variables }>();
   app.use("*", logger());
@@ -593,8 +718,17 @@ export function createApp(options: AppOptions = {}) {
     const generationRoute = c.req.method === "POST" &&
       (path.endsWith("/generate") || path === "/v1/chat/completions" ||
         path === "/v1/responses" || path.endsWith("/active-leaf"));
+    const providerAdminRoute = c.req.method !== "GET" && (
+      path.startsWith("/api/admin/providers") || path.startsWith("/api/admin/models")
+    );
     const policy = authRoute
       ? { name: "auth", limit: configuredAuthLimit, window: configuredRateWindow }
+      : providerAdminRoute
+      ? {
+        name: "provider-admin",
+        limit: configuredProviderAdminLimit,
+        window: configuredRateWindow,
+      }
       : generationRoute
       ? { name: "generation", limit: configuredGenerationLimit, window: configuredRateWindow }
       : path.startsWith("/v1/")
@@ -1407,7 +1541,8 @@ export function createApp(options: AppOptions = {}) {
     const body = await parseJson(c, generateMessageSchema);
     const conversationId = c.req.param("id");
     const ownerId = c.get("user").id;
-    const model = modelCatalog.find((candidate) => candidate.id === body.model);
+    const resolvedModel = await resolveRuntimeModel(body.model);
+    const model = resolvedModel?.info;
     if (!model) {
       throw new DomainError("model_not_found", `Model '${body.model}' does not exist`, 404);
     }
@@ -1424,7 +1559,13 @@ export function createApp(options: AppOptions = {}) {
     // remains available even after its library attachment has been tombstoned.
     const webReservation = Math.max(
       priceUsage(model, model.contextWindow, 0).costMicros,
+      priceUsage(model, model.contextWindow, 0, {
+        cachedInputTokens: model.contextWindow,
+      }).costMicros,
       priceUsage(model, 0, model.contextWindow).costMicros,
+      priceUsage(model, 0, model.contextWindow, {
+        reasoningTokens: model.contextWindow,
+      }).costMicros,
     );
     const begun = await repo.beginGeneration({
       message: {
@@ -1441,6 +1582,7 @@ export function createApp(options: AppOptions = {}) {
       runId,
       provider: model.provider,
       reserveMicros: webReservation,
+      pricingSnapshot: pricingSnapshot(resolvedModel.price),
       leaseSeconds: generationLeaseSeconds,
       attachmentIds: body.attachmentIds,
     });
@@ -1546,14 +1688,21 @@ export function createApp(options: AppOptions = {}) {
         );
       }
       const maxWebOutput = model.contextWindow - estimatedInputTokens;
-      const result = await webComplete({
-        model: body.model,
-        messages: history,
-        max_tokens: maxWebOutput,
-      }, c.req.raw.signal);
+      const result = await webComplete(
+        {
+          model: body.model,
+          messages: history,
+          max_tokens: maxWebOutput,
+        },
+        c.req.raw.signal,
+        resolvedModel.upstream,
+      );
       providerCompleted = true;
       await checkpoint();
-      const cost = priceUsage(model, result.inputTokens, result.outputTokens).costMicros;
+      const cost = priceUsage(model, result.inputTokens, result.outputTokens, {
+        cachedInputTokens: result.cachedInputTokens,
+        reasoningTokens: result.reasoningTokens,
+      }).costMicros;
       await repo.completeGeneration({
         conversationId,
         ownerId,
@@ -1662,7 +1811,7 @@ export function createApp(options: AppOptions = {}) {
     authenticate,
     approved,
     sessionOnly,
-    (c) => c.json({ data: modelCatalog }),
+    async (c) => c.json({ data: await runtimeModelCatalog() }),
   );
 
   app.use("/api/admin/*", authenticate, approved, sessionOnly, admin);
@@ -1733,17 +1882,228 @@ export function createApp(options: AppOptions = {}) {
     async (c) => c.json(await repo.adminSummary()),
   );
   app.get("/api/admin/jobs", async (c) => c.json({ data: await repo.listJobs() }));
-  app.get(
-    "/api/admin/providers",
-    (c) =>
-      c.json({
-        data: [{ id: "simulated", status: "healthy", configured: true }, {
-          id: "openai-compatible",
-          status: Deno.env.get("OPENAI_API_KEY") ? "configured" : "disabled",
-          configured: Boolean(Deno.env.get("OPENAI_API_KEY")),
-        }],
-      }),
-  );
+  const parseProviderAdminBody = async <T>(
+    c: Context<{ Variables: Variables }>,
+    parse: (value: unknown) => T,
+  ): Promise<T> => {
+    let value: unknown;
+    try {
+      value = await c.req.json();
+      return parse(value);
+    } catch (error) {
+      if (error instanceof ProviderValidationError || error instanceof TypeError) {
+        throw new DomainError("validation_error", error.message, 422);
+      }
+      throw new DomainError("validation_error", "Request body must be valid JSON", 422);
+    }
+  };
+  const providerNoStore = (c: Context<{ Variables: Variables }>) => {
+    c.header("Cache-Control", "private, no-store");
+  };
+  const registryMutation = (c: Context<{ Variables: Variables }>, action: string) => ({
+    actorId: c.get("user").id,
+    action,
+  });
+  const requireProviderKeyring = () => {
+    if (!providerKeyring) {
+      throw new DomainError(
+        "provider_encryption_unavailable",
+        "Provider credential encryption is not configured",
+        503,
+      );
+    }
+    return providerKeyring;
+  };
+  const providerForAdmin = async (id: string) => {
+    const provider = await repo.findProvider(id);
+    if (!provider) throw new DomainError("not_found", "Provider not found", 404);
+    return provider;
+  };
+  const providerApiKey = async (provider: ProviderRecord) => {
+    const stored = await repo.getProviderCredential(provider.id);
+    if (!stored) {
+      throw new DomainError("provider_credential_missing", "Provider credential is missing", 409);
+    }
+    try {
+      return await requireProviderKeyring().decrypt(
+        provider.id,
+        stored.envelope as unknown as ProviderSecretEnvelope,
+      );
+    } catch {
+      throw new DomainError(
+        "provider_credential_unavailable",
+        "Provider credential is unavailable",
+        503,
+      );
+    }
+  };
+  const runProviderDiscovery = async (
+    c: Context<{ Variables: Variables }>,
+    includeModels: boolean,
+  ) => {
+    providerNoStore(c);
+    const expectedVersion = await parseProviderAdminBody(c, providerExpectedVersion);
+    const provider = await providerForAdmin(c.req.param("id")!);
+    if (provider.version !== expectedVersion) {
+      throw new DomainError("version_conflict", "Provider changed in another session", 409);
+    }
+    const apiKey = await providerApiKey(provider);
+    try {
+      const result = await discoverProviderModels(provider.baseUrl, apiKey, {
+        fetch: options.providerDiscoveryFetch,
+        signal: c.req.raw.signal,
+      });
+      c.req.raw.signal.throwIfAborted();
+      const updated = await repo.updateProvider(provider.id, expectedVersion, {
+        healthStatus: "healthy",
+        healthCheckedAt: new Date().toISOString(),
+        healthLatencyMs: result.latencyMs,
+        healthError: null,
+      }, registryMutation(c, includeModels ? "provider.discovered" : "provider.tested"));
+      return c.json({
+        provider: updated,
+        latencyMs: result.latencyMs,
+        ...(includeModels ? { models: result.models } : { modelCount: result.models.length }),
+      });
+    } catch (error) {
+      if (!(error instanceof ProviderTestError)) throw error;
+      await repo.updateProvider(provider.id, expectedVersion, {
+        healthStatus: "unhealthy",
+        healthCheckedAt: new Date().toISOString(),
+        healthLatencyMs: null,
+        healthError: error.category,
+      }, registryMutation(c, includeModels ? "provider.discovery_failed" : "provider.test_failed"));
+      throw new DomainError(
+        `provider_${error.category}`,
+        `Provider connection failed (${error.category.replaceAll("_", " ")})`,
+        502,
+      );
+    }
+  };
+  app.get("/api/admin/providers", async (c) => {
+    providerNoStore(c);
+    const providers = await repo.listProviders();
+    const modelCounts = new Map<string, number>();
+    for (const model of await repo.listProviderModels()) {
+      modelCounts.set(model.providerId, (modelCounts.get(model.providerId) ?? 0) + 1);
+    }
+    return c.json({
+      data: providers.map((provider) => ({
+        ...provider,
+        modelCount: modelCounts.get(provider.id) ?? 0,
+      })),
+    });
+  });
+  app.post("/api/admin/providers", async (c) => {
+    providerNoStore(c);
+    const input = await parseProviderAdminBody(c, providerCreate);
+    if (["simulated", "openai"].includes(input.slug)) {
+      throw new DomainError("provider_slug_reserved", "Provider slug is reserved", 409);
+    }
+    return c.json(
+      await repo.createProvider(input, registryMutation(c, "provider.created")),
+      201,
+    );
+  });
+  app.patch("/api/admin/providers/:id", async (c) => {
+    providerNoStore(c);
+    const { expectedVersion, patch } = await parseProviderAdminBody(c, providerPatch);
+    const current = await providerForAdmin(c.req.param("id"));
+    if (
+      (patch.baseUrl !== undefined && patch.baseUrl !== current.baseUrl) ||
+      (patch.protocol !== undefined && patch.protocol !== current.protocol)
+    ) {
+      patch.healthStatus = "unknown";
+      patch.healthCheckedAt = null;
+      patch.healthLatencyMs = null;
+      patch.healthError = null;
+    }
+    return c.json(
+      await repo.updateProvider(
+        c.req.param("id"),
+        expectedVersion,
+        patch,
+        registryMutation(c, "provider.updated"),
+      ),
+    );
+  });
+  app.put("/api/admin/providers/:id/credential", async (c) => {
+    providerNoStore(c);
+    const { expectedVersion, secret } = await parseProviderAdminBody(c, providerCredential);
+    const provider = await providerForAdmin(c.req.param("id"));
+    if (provider.version !== expectedVersion) {
+      throw new DomainError("version_conflict", "Provider changed in another session", 409);
+    }
+    const envelope = await requireProviderKeyring().encrypt(
+      provider.id,
+      expectedVersion + 1,
+      secret,
+    );
+    return c.json(
+      await repo.setProviderCredential(
+        provider.id,
+        expectedVersion,
+        { envelope },
+        registryMutation(c, "provider.credential_replaced"),
+      ),
+    );
+  });
+  app.post("/api/admin/providers/:id/test", (c) => runProviderDiscovery(c, false));
+  app.post("/api/admin/providers/:id/discover", (c) => runProviderDiscovery(c, true));
+  app.get("/api/admin/models", async (c) => {
+    providerNoStore(c);
+    const data = await Promise.all((await repo.listProviderModels()).map(async (model) => ({
+      ...model,
+      prices: await repo.listModelPriceVersions(model.id),
+    })));
+    return c.json({ data });
+  });
+  app.post("/api/admin/models", async (c) => {
+    providerNoStore(c);
+    const input = await parseProviderAdminBody(c, providerModelCreate);
+    const provider = await providerForAdmin(input.providerId);
+    if (modelCatalog.some((model) => model.id === input.publicModelId)) {
+      throw new DomainError("model_id_reserved", "Public model ID is reserved", 409);
+    }
+    if (!input.publicModelId.startsWith(`${provider.slug}/`)) {
+      throw new DomainError(
+        "validation_error",
+        `Public model ID must start with '${provider.slug}/'`,
+        422,
+      );
+    }
+    return c.json(
+      await repo.createProviderModel(input, registryMutation(c, "provider_model.created")),
+      201,
+    );
+  });
+  app.patch("/api/admin/models/:id", async (c) => {
+    providerNoStore(c);
+    const { expectedVersion, patch } = await parseProviderAdminBody(c, providerModelPatch);
+    return c.json(
+      await repo.updateProviderModel(
+        c.req.param("id"),
+        expectedVersion,
+        patch,
+        registryMutation(c, "provider_model.updated"),
+      ),
+    );
+  });
+  app.get("/api/admin/models/:id/prices", async (c) => {
+    providerNoStore(c);
+    return c.json({ data: await repo.listModelPriceVersions(c.req.param("id")) });
+  });
+  app.post("/api/admin/models/:id/prices", async (c) => {
+    providerNoStore(c);
+    const input = await parseProviderAdminBody(c, modelPriceCreate);
+    if (input.providerModelId !== c.req.param("id")) {
+      throw new DomainError("validation_error", "Provider model ID does not match the route", 422);
+    }
+    return c.json(
+      await repo.createModelPriceVersion(input, registryMutation(c, "model_price.created")),
+      201,
+    );
+  });
 
   app.use("/v1/*", authenticate, approved);
   const replayResponse = (request: ApiIdempotencyRequest) => {
@@ -1811,6 +2171,7 @@ export function createApp(options: AppOptions = {}) {
     request: unknown,
     model: ModelInfo,
     reserveMicros: number,
+    price?: ModelPriceVersion,
   ) => {
     const idempotencyKey = c.req.header("idempotency-key");
     const runId = `${c.get("user").id}:${endpoint}:${crypto.randomUUID()}`;
@@ -1822,6 +2183,7 @@ export function createApp(options: AppOptions = {}) {
         reserveMicros,
         model.provider,
         c.get("tokenId"),
+        pricingSnapshot(price),
       );
       return { kind: "started" as const, runId };
     }
@@ -1842,6 +2204,7 @@ export function createApp(options: AppOptions = {}) {
       model: model.id,
       runId,
       reserveMicros,
+      pricingSnapshot: pricingSnapshot(price),
       provider: model.provider,
       tokenId: c.get("tokenId"),
       leaseSeconds: idempotencyLeaseSeconds,
@@ -1876,10 +2239,10 @@ export function createApp(options: AppOptions = {}) {
   app.get(
     "/v1/models",
     requireScope("models:read"),
-    (c) =>
+    async (c) =>
       c.json({
         object: "list",
-        data: modelCatalog.map((m) => ({
+        data: (await runtimeModelCatalog()).map((m) => ({
           id: m.id,
           object: "model",
           created: 0,
@@ -1890,13 +2253,21 @@ export function createApp(options: AppOptions = {}) {
   );
   const chatHandler = async (c: Context<{ Variables: Variables }>) => {
     const request = await parseJson<ChatCompletionRequest>(c, chatCompletionSchema);
-    const model = modelCatalog.find((candidate) => candidate.id === request.model);
+    const resolvedModel = await resolveRuntimeModel(request.model);
+    const model = resolvedModel?.info;
     if (!model) {
       return c.json(openAIError(`Model '${request.model}' does not exist`, "model_not_found"), 404);
     }
     const maxOutput = request.max_tokens ?? request.max_completion_tokens ?? 4096;
     const reserveMicros = reservationPrice(model, request, maxOutput).costMicros;
-    const usage = await beginOpenAIUsage(c, "chat.completions", request, model, reserveMicros);
+    const usage = await beginOpenAIUsage(
+      c,
+      "chat.completions",
+      request,
+      model,
+      reserveMicros,
+      resolvedModel.price,
+    );
     if (usage.kind === "replay") return usage.response;
     const { runId, idempotency } = usage;
     const lease = keepApiLeaseAlive(idempotency);
@@ -2058,14 +2429,21 @@ export function createApp(options: AppOptions = {}) {
         let toolOutput = "";
         let inputTokens = estimateInputTokens(request);
         let outputTokens = 0;
+        let cachedInputTokens = 0;
+        let reasoningTokens = 0;
         let settled = false;
         let sequence = 0;
         try {
-          for await (const data of providerStream(request, upstreamSignal)) {
+          for await (
+            const data of providerStream(request, upstreamSignal, resolvedModel.upstream)
+          ) {
             if (data === "[DONE]") {
               const finalOutput = outputTokens ||
                 Math.ceil((deliveredText + toolOutput).length / 4);
-              const cost = priceUsage(model, inputTokens, finalOutput).costMicros;
+              const cost = priceUsage(model, inputTokens, finalOutput, {
+                cachedInputTokens,
+                reasoningTokens,
+              }).costMicros;
               if (idempotency) {
                 await repo.completeApiStream({
                   id: idempotency.id,
@@ -2099,12 +2477,21 @@ export function createApp(options: AppOptions = {}) {
             }
             const chunk = JSON.parse(data) as {
               choices?: Array<{ delta?: { content?: string; tool_calls?: unknown } }>;
-              usage?: { prompt_tokens?: number; completion_tokens?: number };
+              usage?: {
+                prompt_tokens?: number;
+                completion_tokens?: number;
+                prompt_tokens_details?: { cached_tokens?: number };
+                completion_tokens_details?: { reasoning_tokens?: number };
+              };
               error?: { message?: string };
             };
             if (chunk.error) throw new Error(chunk.error.message ?? "Provider stream failed");
             inputTokens = chunk.usage?.prompt_tokens ?? inputTokens;
             outputTokens = chunk.usage?.completion_tokens ?? outputTokens;
+            cachedInputTokens = chunk.usage?.prompt_tokens_details?.cached_tokens ??
+              cachedInputTokens;
+            reasoningTokens = chunk.usage?.completion_tokens_details?.reasoning_tokens ??
+              reasoningTokens;
             const chunkText = chunk.choices?.map((choice) =>
               choice.delta?.content ?? ""
             ).join("") ?? "";
@@ -2127,7 +2514,10 @@ export function createApp(options: AppOptions = {}) {
                 {
                   inputTokens,
                   outputTokens: observedOutput,
-                  costMicros: priceUsage(model, inputTokens, observedOutput).costMicros,
+                  costMicros: priceUsage(model, inputTokens, observedOutput, {
+                    cachedInputTokens,
+                    reasoningTokens,
+                  }).costMicros,
                   latencyMs: Math.round(performance.now() - started),
                 },
                 replayQuota,
@@ -2146,7 +2536,10 @@ export function createApp(options: AppOptions = {}) {
             if (finalOutput > 0) {
               await repo.settle(
                 runId,
-                priceUsage(model, inputTokens, finalOutput).costMicros,
+                priceUsage(model, inputTokens, finalOutput, {
+                  cachedInputTokens,
+                  reasoningTokens,
+                }).costMicros,
                 inputTokens,
                 finalOutput,
                 Math.round(performance.now() - started),
@@ -2177,19 +2570,25 @@ export function createApp(options: AppOptions = {}) {
               billing: finalOutput > 0
                 ? {
                   mode: "settle",
-                  costMicros: priceUsage(model, inputTokens, finalOutput).costMicros,
+                  costMicros: priceUsage(model, inputTokens, finalOutput, {
+                    cachedInputTokens,
+                    reasoningTokens,
+                  }).costMicros,
                   inputTokens,
                   outputTokens: finalOutput,
                   latencyMs,
                 }
                 : { mode: "refund" },
             });
-          } else if (!settled && deliveredText.length > 0) {
+          } else if (!settled && deliveredText.length + toolOutput.length > 0) {
             const finalOutput = outputTokens ||
               Math.ceil((deliveredText + toolOutput).length / 4);
             await repo.settle(
               runId,
-              priceUsage(model, inputTokens, finalOutput).costMicros,
+              priceUsage(model, inputTokens, finalOutput, {
+                cachedInputTokens,
+                reasoningTokens,
+              }).costMicros,
               inputTokens,
               finalOutput,
               Math.round(performance.now() - started),
@@ -2208,9 +2607,12 @@ export function createApp(options: AppOptions = {}) {
     }
     let providerCompleted = false;
     try {
-      const result = await complete(request, c.req.raw.signal);
+      const result = await providerComplete(request, c.req.raw.signal, resolvedModel.upstream);
       providerCompleted = true;
-      const cost = priceUsage(model, result.inputTokens, result.outputTokens).costMicros;
+      const cost = priceUsage(model, result.inputTokens, result.outputTokens, {
+        cachedInputTokens: result.cachedInputTokens,
+        reasoningTokens: result.reasoningTokens,
+      }).costMicros;
       await lease.checkpoint({
         inputTokens: result.inputTokens,
         outputTokens: result.outputTokens,
@@ -2307,7 +2709,8 @@ export function createApp(options: AppOptions = {}) {
         content: m.content,
       }));
     const request = { model: body.model, messages, stream: false };
-    const model = modelCatalog.find((candidate) => candidate.id === body.model);
+    const resolvedModel = await resolveRuntimeModel(body.model);
+    const model = resolvedModel?.info;
     if (!model) {
       return c.json(openAIError(`Model '${body.model}' does not exist`, "model_not_found"), 404);
     }
@@ -2322,7 +2725,14 @@ export function createApp(options: AppOptions = {}) {
       { ...request, max_tokens: maxResponseOutput },
       maxResponseOutput,
     ).costMicros;
-    const usage = await beginOpenAIUsage(c, "responses", body, model, responseReservation);
+    const usage = await beginOpenAIUsage(
+      c,
+      "responses",
+      body,
+      model,
+      responseReservation,
+      resolvedModel.price,
+    );
     if (usage.kind === "replay") return usage.response;
     const { runId, idempotency } = usage;
     const lease = keepApiLeaseAlive(idempotency);
@@ -2330,7 +2740,11 @@ export function createApp(options: AppOptions = {}) {
     let result;
     let providerCompleted = false;
     try {
-      result = await complete({ ...request, max_tokens: maxResponseOutput }, c.req.raw.signal);
+      result = await providerComplete(
+        { ...request, max_tokens: maxResponseOutput },
+        c.req.raw.signal,
+        resolvedModel.upstream,
+      );
       providerCompleted = true;
     } catch (error) {
       if (!providerCompleted && idempotency) {
@@ -2368,7 +2782,10 @@ export function createApp(options: AppOptions = {}) {
         text: result.text,
         usage: { inputTokens: result.inputTokens, outputTokens: result.outputTokens },
       });
-      const responseCost = priceUsage(model, result.inputTokens, result.outputTokens).costMicros;
+      const responseCost = priceUsage(model, result.inputTokens, result.outputTokens, {
+        cachedInputTokens: result.cachedInputTokens,
+        reasoningTokens: result.reasoningTokens,
+      }).costMicros;
       const latencyMs = Math.round(performance.now() - started);
       await lease.checkpoint({
         inputTokens: result.inputTokens,

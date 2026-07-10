@@ -94,6 +94,8 @@ import {
   conversationsForView,
   fallbackConversationId,
 } from "./conversationLifecycle.ts";
+import { Modal } from "./Modal.tsx";
+import { AdminModels, AdminProviders } from "./AdminRegistry.tsx";
 import type {
   Attachment,
   AuditFilters,
@@ -2068,16 +2070,10 @@ function AdminSectionContent(
     );
   }
   if (section === "providers") {
-    return <ProviderManagement />;
+    return <AdminProviders />;
   }
   if (section === "models") {
-    return (
-      <GenericAdmin
-        title="Models & pricing"
-        subtitle="Manage capabilities, aliases, access, and effective pricing"
-        icon={Bot}
-      />
-    );
+    return <AdminModels />;
   }
   if (section === "users") {
     return <UserManagement />;
@@ -2176,17 +2172,22 @@ function AdminOverview({ setSection }: { setSection: (section: AdminSection) => 
           )}
           {providers.data?.map((provider) => (
             <div className="provider-health" key={provider.id}>
-              <span className={cn("provider-logo", !provider.configured && "warning")}>
-                {provider.id[0]?.toUpperCase()}
+              <span className={cn("provider-logo", !provider.hasCredential && "warning")}>
+                {provider.displayName[0]?.toUpperCase()}
               </span>
               <span>
-                <strong>{provider.id}</strong>
-                <small>{provider.configured ? "Configured" : "Not configured"}</small>
+                <strong>{provider.displayName}</strong>
+                <small>{provider.hasCredential ? "Credential stored" : "Credential missing"}</small>
               </span>
               <span className="push right">
-                <strong>{provider.status}</strong>
+                <strong>{provider.enabled ? provider.healthStatus : "disabled"}</strong>
               </span>
-              <span className={cn("health-dot", provider.status !== "healthy" && "down")} />
+              <span
+                className={cn(
+                  "health-dot",
+                  (!provider.enabled || provider.healthStatus !== "healthy") && "down",
+                )}
+              />
             </div>
           ))}
         </div>
@@ -2230,62 +2231,6 @@ function AdminOverview({ setSection }: { setSection: (section: AdminSection) => 
             <div className="empty-mini">No audit events recorded yet</div>
           )}
         </div>
-      </div>
-    </>
-  );
-}
-
-function ProviderManagement() {
-  const providers = useQuery({ queryKey: ["admin-providers"], queryFn: api.adminProviders });
-  return (
-    <>
-      <PageHeader title="Providers" subtitle="OpenAI-compatible endpoints reported by the server" />
-      {providers.isLoading && (
-        <div className="generic-admin">
-          <p>Loading providers…</p>
-        </div>
-      )}
-      {providers.isError && (
-        <div className="generic-admin">
-          <Cloud size={28} />
-          <h3>Provider status unavailable</h3>
-          <p>The server did not return provider configuration data.</p>
-        </div>
-      )}
-      {!providers.isLoading && !providers.isError && !providers.data?.length && (
-        <div className="generic-admin">
-          <Cloud size={28} />
-          <h3>No providers configured</h3>
-          <p>Add provider configuration on the server to make models available.</p>
-        </div>
-      )}
-      <div className="provider-grid">
-        {providers.data?.map((provider) => (
-          <div className="provider-card" key={provider.id}>
-            <div>
-              <span className="provider-logo">{provider.id[0]?.toUpperCase()}</span>
-              <span className={cn("status-chip", provider.status !== "healthy" && "warning")}>
-                {provider.status}
-              </span>
-            </div>
-            <h3>{provider.id}</h3>
-            <p>
-              {provider.configured
-                ? "Configured on this installation"
-                : "Credentials are not configured"}
-            </p>
-            <div className="provider-stats">
-              <span>
-                <small>Configuration</small>
-                <strong>{provider.configured ? "Enabled" : "Disabled"}</strong>
-              </span>
-              <span>
-                <small>Latency</small>
-                <strong>Unavailable</strong>
-              </span>
-            </div>
-          </div>
-        ))}
       </div>
     </>
   );
@@ -2598,79 +2543,6 @@ function GenericAdmin(
         <div className="skeleton-table">{[1, 2, 3, 4, 5].map((x) => <i key={x} />)}</div>
       </div>
     </>
-  );
-}
-
-function Modal(
-  { title, close, children, dismissible = true }: {
-    title: string;
-    close: () => void;
-    children: ReactNode;
-    dismissible?: boolean;
-  },
-) {
-  const titleId = useId();
-  const dialogRef = useRef<HTMLDivElement>(null);
-  const previousFocus = useRef<HTMLElement | null>(null);
-  const closeRef = useRef(close);
-  const dismissibleRef = useRef(dismissible);
-  closeRef.current = close;
-  dismissibleRef.current = dismissible;
-  useEffect(() => {
-    previousFocus.current = document.activeElement as HTMLElement;
-    const dialog = dialogRef.current;
-    dialog?.querySelector<HTMLElement>("[autofocus], input, button")?.focus();
-    const keydown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && dismissibleRef.current) {
-        event.preventDefault();
-        closeRef.current();
-        return;
-      }
-      if (event.key !== "Tab" || !dialog) return;
-      const items = [
-        ...dialog.querySelectorAll<HTMLElement>(
-          'button:not(:disabled), input:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])',
-        ),
-      ];
-      if (!items.length) return;
-      const first = items[0];
-      const last = items.at(-1)!;
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-    document.addEventListener("keydown", keydown);
-    return () => {
-      document.removeEventListener("keydown", keydown);
-      requestAnimationFrame(() => previousFocus.current?.focus());
-    };
-  }, []);
-  return (
-    <div
-      className="modal-overlay"
-      onMouseDown={() => dismissibleRef.current && closeRef.current()}
-    >
-      <div
-        ref={dialogRef}
-        className="modal"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby={titleId}
-        onMouseDown={(e) => e.stopPropagation()}
-      >
-        <div className="modal-head">
-          <h2 id={titleId}>{title}</h2>
-          <IconButton label="Close" disabled={!dismissible} onClick={close}>
-            <X size={19} />
-          </IconButton>
-        </div>
-        {children}
-      </div>
-    </div>
   );
 }
 

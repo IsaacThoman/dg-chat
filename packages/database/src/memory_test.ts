@@ -1,6 +1,177 @@
 import { assertEquals, assertThrows } from "jsr:@std/assert@1.0.14";
 import { DomainError, MemoryRepository } from "./memory.ts";
 
+Deno.test("provider registry hides credentials, versions mutations, and preserves price history", () => {
+  const repo = new MemoryRepository();
+  const actor = repo.createUser({
+    email: "registry-admin@example.com",
+    name: "Registry Admin",
+    passwordHash: "hash",
+    role: "admin",
+    approvalStatus: "approved",
+  });
+  const created = repo.createProvider({
+    slug: "primary",
+    displayName: "Primary",
+    baseUrl: "https://provider.example/v1/",
+    protocol: "responses",
+  }, { actorId: actor.id, action: "provider.create" });
+  assertEquals(created.baseUrl, "https://provider.example/v1");
+  assertEquals(created.version, 1);
+  assertEquals("credentialEnvelope" in created, false);
+
+  const envelope = {
+    version: 1 as const,
+    algorithm: "AES-256-GCM" as const,
+    keyId: "primary-2026",
+    credentialVersion: 1,
+    wrappedKeyNonce: "bm9uY2U=",
+    wrappedKey: "d3JhcHBlZA==",
+    contentNonce: "bm9uY2U=",
+    ciphertext: "Y2lwaGVydGV4dA==",
+  };
+  const credentialed = repo.setProviderCredential(created.id, 1, {
+    envelope,
+  }, { actorId: actor.id, action: "provider.credential.replace" });
+  envelope.ciphertext = "mutated-by-caller";
+  assertEquals(credentialed.hasCredential, true);
+  assertEquals(typeof credentialed.credentialUpdatedAt, "string");
+  assertEquals("credentialEnvelope" in credentialed, false);
+  assertEquals(repo.getProviderCredential(created.id)?.envelope.ciphertext, "Y2lwaGVydGV4dA==");
+  assertThrows(
+    () =>
+      repo.updateProvider(created.id, 1, { displayName: "Stale" }, {
+        actorId: actor.id,
+        action: "provider.update",
+      }),
+    DomainError,
+    "reload",
+  );
+  const healthy = repo.updateProvider(created.id, credentialed.version, {
+    healthStatus: "healthy",
+    healthCheckedAt: new Date().toISOString(),
+    healthLatencyMs: 12,
+  }, { actorId: actor.id, action: "provider.test" });
+  const rotated = repo.setProviderCredential(healthy.id, healthy.version, {
+    envelope: { ...envelope, credentialVersion: 2, ciphertext: "cm90YXRlZA==" },
+  }, { actorId: actor.id, action: "provider.credential.replace" });
+  assertEquals(rotated.healthStatus, "unknown");
+  assertEquals(rotated.healthCheckedAt, null);
+  assertEquals(rotated.healthLatencyMs, null);
+
+  const model = repo.createProviderModel({
+    providerId: created.id,
+    publicModelId: "primary/reasoner",
+    upstreamModelId: "reasoner-v1",
+    displayName: "Reasoner",
+    capabilities: ["chat", "streaming", "reasoning"],
+    contextWindow: 128_000,
+    customParams: { temperature: 0.2 },
+  }, { actorId: actor.id, action: "provider_model.create" });
+  const first = repo.createModelPriceVersion({
+    providerModelId: model.id,
+    expectedModelVersion: model.version,
+    effectiveAt: "2026-01-01T00:00:00Z",
+    inputMicrosPerMillion: 1_000_000,
+    cachedInputMicrosPerMillion: 100_000,
+    reasoningMicrosPerMillion: 2_000_000,
+    outputMicrosPerMillion: 3_000_000,
+    fixedCallMicros: 500,
+    source: "contract-2026",
+  }, { actorId: actor.id, action: "model_price.create" });
+  repo.credit(actor.id, "pricing-snapshot-grant", "grant", 10_000);
+  const snapshotted = repo.reserve(
+    actor.id,
+    "pricing-snapshot-run",
+    model.publicModelId,
+    1,
+    created.slug,
+    undefined,
+    {
+      pricingVersionId: first.id,
+      inputMicrosPerMillion: first.inputMicrosPerMillion,
+      cachedInputMicrosPerMillion: first.cachedInputMicrosPerMillion,
+      reasoningMicrosPerMillion: first.reasoningMicrosPerMillion,
+      outputMicrosPerMillion: first.outputMicrosPerMillion,
+      fixedCallMicros: first.fixedCallMicros,
+      source: first.source,
+    },
+  );
+  assertThrows(
+    () =>
+      repo.createModelPriceVersion({
+        providerModelId: model.id,
+        expectedModelVersion: model.version,
+        effectiveAt: "2026-02-01T00:00:00Z",
+        inputMicrosPerMillion: 1,
+        cachedInputMicrosPerMillion: 1,
+        reasoningMicrosPerMillion: 1,
+        outputMicrosPerMillion: 1,
+        fixedCallMicros: 1,
+        source: "stale",
+      }, { actorId: actor.id, action: "model_price.create" }),
+    DomainError,
+    "reload",
+  );
+  const repricedModel = repo.findProviderModel(model.id)!;
+  const second = repo.createModelPriceVersion({
+    providerModelId: model.id,
+    expectedModelVersion: repricedModel.version,
+    effectiveAt: "2026-07-01T00:00:00Z",
+    inputMicrosPerMillion: 1_200_000,
+    cachedInputMicrosPerMillion: 120_000,
+    reasoningMicrosPerMillion: 2_200_000,
+    outputMicrosPerMillion: 3_200_000,
+    fixedCallMicros: 600,
+    source: "contract-2026-h2",
+  }, { actorId: actor.id, action: "model_price.create" });
+  assertEquals(
+    repo.effectiveModelPrice(model.id, "2026-06-30T23:59:59Z")?.id,
+    first.id,
+  );
+  assertEquals(repo.effectiveModelPrice(model.id, "2026-07-01T00:00:00Z")?.id, second.id);
+  assertEquals(repo.listModelPriceVersions(model.id).length, 2);
+  assertEquals(snapshotted.pricingSnapshot, {
+    pricingVersionId: first.id,
+    inputMicrosPerMillion: 1_000_000,
+    cachedInputMicrosPerMillion: 100_000,
+    reasoningMicrosPerMillion: 2_000_000,
+    outputMicrosPerMillion: 3_000_000,
+    fixedCallMicros: 500,
+    source: "contract-2026",
+  });
+  assertEquals(repo.usageRuns.get("pricing-snapshot-run")?.pricingSnapshot, {
+    pricingVersionId: first.id,
+    inputMicrosPerMillion: 1_000_000,
+    cachedInputMicrosPerMillion: 100_000,
+    reasoningMicrosPerMillion: 2_000_000,
+    outputMicrosPerMillion: 3_000_000,
+    fixedCallMicros: 500,
+    source: "contract-2026",
+  });
+
+  const disabled = repo.updateProvider(created.id, rotated.version, { enabled: false }, {
+    actorId: actor.id,
+    action: "provider.disable",
+  });
+  assertEquals(disabled.enabled, false);
+  assertEquals(disabled.healthStatus, "disabled");
+  assertEquals(repo.findProvider(created.id)?.id, created.id);
+  assertEquals(repo.listProviders(true), []);
+  assertEquals(repo.listAudit({ targetType: "provider" }).data.length, 5);
+  assertThrows(
+    () =>
+      repo.createProvider({
+        slug: "unsafe",
+        displayName: "Unsafe",
+        baseUrl: "https://provider.example/v1?token=secret",
+        protocol: "responses",
+      }, { actorId: actor.id, action: "provider.create" }),
+    DomainError,
+    "URL",
+  );
+});
+
 Deno.test("message edits append immutable sibling branches", () => {
   const repo = new MemoryRepository();
   const user = repo.createUser({

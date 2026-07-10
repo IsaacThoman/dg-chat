@@ -1276,23 +1276,25 @@ kbd {
   gap: 7px;
   margin-bottom: 16px;
   color: #504e49;
-  font-size: 10px;
+  font-size: 13px;
   font-weight: 600;
 }
 .field input,
-.field textarea {
+.field textarea,
+.field select {
   width: 100%;
   border: 1px solid #dedbd4;
   background: #fff;
   border-radius: 8px;
   padding: 10px 11px;
   color: var(--ink);
-  font-size: 11px;
+  font-size: 14px;
   outline: 0;
   resize: vertical;
 }
 .field input:focus,
-.field textarea:focus {
+.field textarea:focus,
+.field select:focus {
   border-color: #9584c6;
   box-shadow: 0 0 0 2px #ebe7f5;
 }
@@ -2026,6 +2028,75 @@ kbd {
   grid-template-columns: repeat(3,minmax(220px,1fr));
   gap: 12px;
 }
+.registry-state {
+  min-height: 220px;
+  display: grid;
+  place-items: center;
+  padding: 32px;
+  border: 1px dashed var(--line);
+  border-radius: 12px;
+  color: var(--muted);
+  background: var(--card);
+  font-size: 14px;
+}
+.registry-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+  padding: 11px 13px;
+  border: 1px solid #e4d5a8;
+  border-radius: 10px;
+  color: #705822;
+  background: #fff8e6;
+  font-size: 13px;
+  line-height: 1.45;
+}
+.registry-banner.error {
+  border-color: color-mix(in srgb, var(--danger) 35%, var(--line));
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 8%, var(--card));
+}
+.discovery-list .discovery-error {
+  display: block;
+  margin-top: 3px;
+  color: var(--danger);
+  overflow-wrap: anywhere;
+}
+.model-blockers {
+  margin: 8px 0 0;
+  color: var(--danger);
+  font-size: 12px;
+  line-height: 1.4;
+}
+.registry-help {
+  margin: -20px 0 16px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.registry-search {
+  width: min(420px, 100%);
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 16px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--card);
+}
+.registry-search input {
+  min-width: 0;
+  flex: 1;
+  border: 0;
+  outline: 0;
+  background: transparent;
+}
+.provider-card {
+  min-width: 0;
+}
 .provider-card {
   padding: 16px;
 }
@@ -2039,7 +2110,7 @@ kbd {
   align-self: center;
   border-radius: 10px;
   padding: 4px 7px;
-  font-size: 7px;
+  font-size: 12px;
   color: #3d8063;
   background: #e8f5ef;
 }
@@ -2055,11 +2126,13 @@ kbd {
   margin: 0 0 15px;
   color: var(--muted);
   font-family: 'DM Mono',monospace;
-  font-size: 7px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
 }
 .provider-stats {
   display: grid;
   grid-template-columns: 1fr 1fr;
+  gap: 12px;
   padding: 11px 0;
   margin-bottom: 11px;
   border-top: 1px solid var(--line);
@@ -2070,10 +2143,145 @@ kbd {
 }
 .provider-stats small {
   color: var(--muted);
-  font-size: 7px;
+  font-size: 12px;
 }
 .provider-stats strong {
+  font-size: 13px;
+}
+.provider-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.provider-actions button {
+  min-height: 40px;
+  flex: 1 1 auto;
+}
+.provider-error {
+  padding: 8px;
+  border-radius: 8px;
+  color: var(--danger) !important;
+  background: #fbeded;
+}
+.credential-field {
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+.field small {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.45;
+}
+.discovery-list {
+  max-height: min(45vh, 420px);
+  overflow: auto;
+  margin: 15px 0;
+  border-block: 1px solid var(--line);
+}
+.discovery-list .check-row {
+  min-height: 46px;
+  margin: 0;
+  padding: 8px 4px;
+  border-bottom: 1px solid var(--line);
+}
+.discovery-list .check-row span {
+  display: grid;
+  gap: 2px;
+  overflow-wrap: anywhere;
+}
+.discovery-list small {
+  color: var(--muted);
+}
+.model-registry {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(280px, 1fr));
+  gap: 12px;
+}
+.model-card {
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--card);
+}
+.model-card-head {
+  display: flex;
+  justify-content: space-between;
+}
+.model-card h3 {
+  margin: 14px 0 4px;
+}
+.model-card > code {
+  display: block;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+.model-card > p {
+  color: var(--muted);
+  font-size: 12px;
+}
+.model-facts {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin: 15px 0;
+  padding: 12px 0;
+  border-block: 1px solid var(--line);
+}
+.model-facts div {
+  min-width: 0;
+}
+.model-facts dt {
+  color: var(--muted);
   font-size: 11px;
+}
+.model-facts dd {
+  margin: 3px 0 0;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  font-weight: 600;
+}
+.price-history {
+  margin: 0 0 14px;
+  font-size: 12px;
+}
+.price-history summary {
+  min-height: 38px;
+  cursor: pointer;
+  font-weight: 600;
+}
+.price-history > div {
+  display: grid;
+  gap: 2px;
+  padding: 9px 0;
+  border-top: 1px solid var(--line);
+}
+.price-history small {
+  color: var(--muted);
+}
+.capability-field {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin: 0 0 16px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+}
+.capability-field legend {
+  padding: 0 5px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.capability-field .check-row {
+  margin: 0;
+}
+.price-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0 12px;
 }
 .generic-admin {
   min-height: 520px;
@@ -2132,11 +2340,14 @@ kbd {
 
 .modal-overlay {
   display: grid;
-  place-items: center;
+  place-items: start center;
   padding: 20px;
+  overflow-y: auto;
 }
 .modal {
   width: min(440px,100%);
+  max-height: calc(100dvh - 40px);
+  overflow-y: auto;
   border-radius: 14px;
   background: #fff;
   padding: 19px;
@@ -2169,7 +2380,7 @@ kbd {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 10px;
+  font-size: 13px;
 }
 .secret-created {
   text-align: center;
@@ -2637,6 +2848,17 @@ kbd {
   }
   .provider-grid {
     grid-template-columns: 1fr;
+  }
+  .model-registry,
+  .price-grid {
+    grid-template-columns: 1fr;
+  }
+  .registry-banner {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .model-facts {
+    grid-template-columns: 1fr 1fr;
   }
   .page-header {
     flex-wrap: wrap;

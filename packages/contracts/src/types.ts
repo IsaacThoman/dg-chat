@@ -80,7 +80,11 @@ export interface ModelInfo {
   capabilities: string[];
   contextWindow: number;
   inputMicrosPerMillion: number;
+  cachedInputMicrosPerMillion?: number;
+  reasoningMicrosPerMillion?: number;
   outputMicrosPerMillion: number;
+  fixedCallMicros?: number;
+  pricingVersionId?: string;
 }
 
 export interface OpenAIMessage {

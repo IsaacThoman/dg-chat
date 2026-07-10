@@ -1,10 +1,15 @@
 import type {
+  AdminModel,
+  AdminProvider,
   Attachment,
   AuditEvent,
   AuditFilters,
   Conversation,
+  DiscoveredProviderModel,
   Message,
   Model,
+  ModelPriceVersion,
+  ProviderProtocol,
   Token,
   User,
 } from "./types.ts";
@@ -110,6 +115,33 @@ function mapModel(value: RawModel): Model {
   };
 }
 
+export class ApiError extends Error {
+  constructor(public status: number, public code: string, message: string) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+async function responseError(response: Response): Promise<ApiError> {
+  const fallback = `Request failed (${response.status})`;
+  const contentType = response.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
+  if (contentType !== "application/json") {
+    return new ApiError(response.status, "request_failed", fallback);
+  }
+  try {
+    const value = await response.json() as { error?: { code?: unknown; message?: unknown } };
+    const code = typeof value.error?.code === "string" && value.error.code.length <= 120
+      ? value.error.code
+      : "request_failed";
+    const message = typeof value.error?.message === "string" && value.error.message.length <= 500
+      ? value.error.message
+      : fallback;
+    return new ApiError(response.status, code, message);
+  } catch {
+    return new ApiError(response.status, "request_failed", fallback);
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit, fallback?: T): Promise<T> {
   try {
     const response = await fetch(`/api${path}`, {
@@ -117,7 +149,7 @@ async function request<T>(path: string, init?: RequestInit, fallback?: T): Promi
       ...init,
       headers: { ...json, ...init?.headers },
     });
-    if (!response.ok) throw new Error(`${response.status}`);
+    if (!response.ok) throw await responseError(response);
     if (response.status === 204) return undefined as T;
     return await response.json() as T;
   } catch (error) {
@@ -357,10 +389,67 @@ export const api = {
     request<{ calls: number; users: number; balanceMicros: number; ledger: unknown[] }>(
       "/admin/usage",
     ),
-  adminProviders: async () =>
-    (await request<{
-      data: Array<{ id: string; status: string; configured: boolean }>;
-    }>("/admin/providers")).data,
+  adminProviders: async () => (await request<{ data: AdminProvider[] }>("/admin/providers")).data,
+  createAdminProvider: (input: {
+    slug: string;
+    displayName: string;
+    baseUrl: string;
+    protocol: ProviderProtocol;
+    enabled: boolean;
+  }) => request<AdminProvider>("/admin/providers", { method: "POST", body: JSON.stringify(input) }),
+  updateAdminProvider: (
+    provider: AdminProvider,
+    patch: Partial<Pick<AdminProvider, "displayName" | "baseUrl" | "protocol" | "enabled">>,
+  ) =>
+    request<AdminProvider>(`/admin/providers/${encodeURIComponent(provider.id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ expectedVersion: provider.version, ...patch }),
+    }),
+  replaceAdminProviderCredential: (provider: AdminProvider, credential: string) =>
+    request<AdminProvider>(`/admin/providers/${encodeURIComponent(provider.id)}/credential`, {
+      method: "PUT",
+      body: JSON.stringify({ expectedVersion: provider.version, credential }),
+    }),
+  testAdminProvider: (provider: AdminProvider) =>
+    request<{ provider: AdminProvider; latencyMs: number; modelCount: number }>(
+      `/admin/providers/${encodeURIComponent(provider.id)}/test`,
+      { method: "POST", body: JSON.stringify({ expectedVersion: provider.version }) },
+    ),
+  discoverAdminProvider: (provider: AdminProvider) =>
+    request<{ provider: AdminProvider; latencyMs: number; models: DiscoveredProviderModel[] }>(
+      `/admin/providers/${encodeURIComponent(provider.id)}/discover`,
+      { method: "POST", body: JSON.stringify({ expectedVersion: provider.version }) },
+    ),
+  adminModels: async () => (await request<{ data: AdminModel[] }>("/admin/models")).data,
+  createAdminModel: (input: {
+    providerId: string;
+    publicModelId: string;
+    upstreamModelId: string;
+    displayName: string;
+    capabilities: string[];
+    contextWindow: number;
+    enabled: boolean;
+  }) => request<AdminModel>("/admin/models", { method: "POST", body: JSON.stringify(input) }),
+  updateAdminModel: (
+    model: AdminModel,
+    patch: Partial<Pick<AdminModel, "displayName" | "capabilities" | "contextWindow" | "enabled">>,
+  ) =>
+    request<AdminModel>(`/admin/models/${encodeURIComponent(model.id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ expectedVersion: model.version, ...patch }),
+    }),
+  createModelPrice: (
+    model: AdminModel,
+    input: Omit<ModelPriceVersion, "id" | "providerModelId" | "createdAt">,
+  ) =>
+    request<ModelPriceVersion>(`/admin/models/${encodeURIComponent(model.id)}/prices`, {
+      method: "POST",
+      body: JSON.stringify({
+        ...input,
+        providerModelId: model.id,
+        expectedModelVersion: model.version,
+      }),
+    }),
   adminJobs: async () => (await request<{ data: unknown[] }>("/admin/jobs")).data,
   adminAudit: (filters: AuditFilters = {}, cursor?: string, limit = 50) =>
     request<{ data: AuditEvent[]; nextCursor: string | null }>(

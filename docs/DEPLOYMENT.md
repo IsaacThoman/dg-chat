@@ -11,11 +11,18 @@ MINIO_ROOT_PASSWORD=...
 S3_ACCESS_KEY=... # bucket-scoped application identity, different from the root user
 S3_SECRET_KEY=...
 APP_SECRET=... # at least 32 random bytes
-ENCRYPTION_KEY=... # keyring value documented by the application
+ENCRYPTION_KEY=... # exactly 32 random bytes encoded as base64
 SETUP_TOKEN=... # one-time bootstrap secret
 APP_URL=https://chat.example.com
 WEB_URL=https://chat.example.com
 ```
+
+Generate a single installation key with `openssl rand -base64 32`. For rolling provider-secret
+rotation, set `ENCRYPTION_KEYRING` to a JSON object mapping stable key IDs to base64 keys and set
+`ENCRYPTION_PRIMARY_KEY_ID` to the key used for new credentials. Keep old keys in the keyring until
+each provider credential has been explicitly replaced through the admin console under the new
+primary key; an online bulk rewrap command is not yet shipped. `ENCRYPTION_KEY` remains the
+supported single-key form.
 
 The bundled `minio-init` service creates the private bucket and provisions this application identity
 with only list, location, read, write, and delete permissions for that bucket. Never set
@@ -91,8 +98,18 @@ table's free storage. Deploy the new app, run migrations once, then deploy worke
 when the old binary is compatible with the migrated schema; otherwise forward-fix or restore the
 recovery set.
 
+Migration `0008` adds the usage pricing-snapshot check as `NOT VALID`, so existing accounting rows
+are not scanned under the deployment transaction while every new row is still enforced. Validate it
+later during a maintenance window with
+`ALTER TABLE usage_runs VALIDATE CONSTRAINT usage_runs_pricing_snapshot_check`; installations that
+need reverse price-to-usage lookups may then add a partial pricing-version index concurrently.
+
 ## Monitoring
 
 Alert on readiness, HTTP error ratio, stream starts without first tokens, queue age, failed jobs,
 credit settlement backlog, database saturation, Redis availability, object-store errors, and disk
 growth. Provider health is a degraded dependency and should not make `/health` fail.
+
+Provider connection tests and discovery are limited by `PROVIDER_ADMIN_RATE_LIMIT` (30 mutations per
+minute by default). Registry models are not published to users until the provider is enabled, has an
+encrypted credential, the model is enabled, and an effective price revision exists.

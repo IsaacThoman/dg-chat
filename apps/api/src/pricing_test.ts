@@ -31,6 +31,41 @@ Deno.test("usage pricing has a one-micro minimum and rounds token counts safely"
   assertEquals(priceUsage(model, 0.1, 0.1).outputTokens, 1);
 });
 
+Deno.test("usage pricing applies an effective fixed per-call charge", () => {
+  assertEquals(priceUsage({ ...model, fixedCallMicros: 17 }, 0, 0).costMicros, 17);
+  assertEquals(priceUsage({ ...model, fixedCallMicros: 17 }, 10_000, 20_000).costMicros, 7_017);
+});
+
+Deno.test("usage pricing separates cached input and reasoning tokens", () => {
+  const detailed = {
+    ...model,
+    cachedInputMicrosPerMillion: 10_000,
+    reasoningMicrosPerMillion: 900_000,
+  };
+  assertEquals(
+    priceUsage(detailed, 10_000, 20_000, {
+      cachedInputTokens: 4_000,
+      reasoningTokens: 5_000,
+    }).costMicros,
+    9_640,
+  );
+  assertEquals(reservationPrice(detailed, {}, 20_000).costMicros >= 18_000, true);
+});
+
+Deno.test("pricing fails closed before unsafe integer accounting", () => {
+  assertEquals(
+    (() => {
+      try {
+        priceUsage({ ...model, inputMicrosPerMillion: Number.MAX_SAFE_INTEGER }, 4_000_000, 0);
+        return false;
+      } catch (error) {
+        return error instanceof RangeError;
+      }
+    })(),
+    true,
+  );
+});
+
 Deno.test("input reservations conservatively count UTF-8 bytes", () => {
   const messages = [{ role: "user" as const, content: "😀漢字" }];
   assertEquals(

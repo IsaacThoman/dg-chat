@@ -180,12 +180,42 @@ export interface CreateApiTokenInput {
   expiresAt?: string | null;
 }
 
+/** Immutable effective pricing copied onto a usage run when credit is reserved. */
+export interface UsagePricingSnapshot {
+  pricingVersionId: string;
+  inputMicrosPerMillion: number;
+  cachedInputMicrosPerMillion: number;
+  reasoningMicrosPerMillion: number;
+  outputMicrosPerMillion: number;
+  fixedCallMicros: number;
+  source: string;
+}
+
+export function isUsagePricingSnapshot(value: unknown): value is UsagePricingSnapshot {
+  if (!value || typeof value !== "object") return false;
+  const snapshot = value as Record<string, unknown>;
+  const amounts = [
+    snapshot.inputMicrosPerMillion,
+    snapshot.cachedInputMicrosPerMillion,
+    snapshot.reasoningMicrosPerMillion,
+    snapshot.outputMicrosPerMillion,
+    snapshot.fixedCallMicros,
+  ];
+  return typeof snapshot.pricingVersionId === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      snapshot.pricingVersionId,
+    ) && amounts.every((amount) => Number.isSafeInteger(amount) && Number(amount) >= 0) &&
+    typeof snapshot.source === "string" && snapshot.source.length >= 1 &&
+    snapshot.source.length <= 120;
+}
+
 export interface BeginGenerationInput {
   message: AppendMessageInput;
   attachmentIds?: string[];
   runId: string;
   provider: string;
   reserveMicros: number;
+  pricingSnapshot?: UsagePricingSnapshot;
   tokenId?: string;
   leaseSeconds?: number;
 }
@@ -300,6 +330,7 @@ export interface BeginApiRequestInput {
   model: string;
   runId: string;
   reserveMicros: number;
+  pricingSnapshot?: UsagePricingSnapshot;
   provider: string;
   tokenId?: string;
   leaseSeconds?: number;
@@ -338,6 +369,124 @@ export interface FailApiRequestInput {
     outputTokens: number;
     latencyMs: number;
   };
+}
+
+export type ProviderProtocol = "chat_completions" | "responses";
+export type ProviderHealthStatus = "unknown" | "healthy" | "unhealthy" | "disabled";
+export interface RegistryMutationContext {
+  actorId?: string | null;
+  action: string;
+  metadata?: Record<string, unknown>;
+}
+/** Public provider shape. The encrypted credential envelope is intentionally absent. */
+export interface ProviderRecord {
+  id: string;
+  slug: string;
+  displayName: string;
+  baseUrl: string;
+  protocol: ProviderProtocol;
+  enabled: boolean;
+  version: number;
+  hasCredential: boolean;
+  credentialUpdatedAt: string | null;
+  healthStatus: ProviderHealthStatus;
+  healthCheckedAt: string | null;
+  healthLatencyMs: number | null;
+  healthError: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+export interface CreateProviderInput {
+  slug: string;
+  displayName: string;
+  baseUrl: string;
+  protocol: ProviderProtocol;
+  enabled?: boolean;
+}
+export interface UpdateProviderInput {
+  slug?: string;
+  displayName?: string;
+  baseUrl?: string;
+  protocol?: ProviderProtocol;
+  enabled?: boolean;
+  healthStatus?: ProviderHealthStatus;
+  healthCheckedAt?: string | null;
+  healthLatencyMs?: number | null;
+  healthError?: string | null;
+}
+export interface ProviderCredentialEnvelope {
+  version: 1;
+  algorithm: "AES-256-GCM";
+  keyId: string;
+  credentialVersion: number;
+  wrappedKeyNonce: string;
+  wrappedKey: string;
+  contentNonce: string;
+  ciphertext: string;
+}
+export interface ProviderCredentialMutation {
+  envelope: ProviderCredentialEnvelope;
+}
+/** Privileged persistence-only credential accessor. Never serialize this value to clients. */
+export interface StoredProviderCredential {
+  providerId: string;
+  envelope: ProviderCredentialEnvelope;
+}
+export interface ProviderModelRecord {
+  id: string;
+  providerId: string;
+  publicModelId: string;
+  upstreamModelId: string;
+  displayName: string;
+  capabilities: string[];
+  contextWindow: number;
+  enabled: boolean;
+  version: number;
+  customParams: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+}
+export interface CreateProviderModelInput {
+  providerId: string;
+  publicModelId: string;
+  upstreamModelId: string;
+  displayName: string;
+  capabilities: string[];
+  contextWindow: number;
+  enabled?: boolean;
+  customParams?: Record<string, unknown>;
+}
+export interface UpdateProviderModelInput {
+  publicModelId?: string;
+  upstreamModelId?: string;
+  displayName?: string;
+  capabilities?: string[];
+  contextWindow?: number;
+  enabled?: boolean;
+  customParams?: Record<string, unknown>;
+}
+export interface ModelPriceVersion {
+  id: string;
+  providerModelId: string;
+  effectiveAt: string;
+  inputMicrosPerMillion: number;
+  cachedInputMicrosPerMillion: number;
+  reasoningMicrosPerMillion: number;
+  outputMicrosPerMillion: number;
+  fixedCallMicros: number;
+  source: string;
+  createdAt: string;
+}
+export interface CreateModelPriceVersionInput {
+  providerModelId: string;
+  expectedModelVersion: number;
+  effectiveAt: string;
+  inputMicrosPerMillion: number;
+  cachedInputMicrosPerMillion: number;
+  reasoningMicrosPerMillion: number;
+  outputMicrosPerMillion: number;
+  fixedCallMicros: number;
+  source: string;
 }
 
 /** Persistence boundary shared by synchronous test stores and async production stores. */
@@ -440,6 +589,49 @@ export interface DomainRepository {
   findApiTokenByHash(hash: string): MaybePromise<StoredApiToken | undefined>;
   listApiTokens(userId: string): MaybePromise<ApiTokenSummary[]>;
   revokeApiToken(id: string, userId: string): MaybePromise<void>;
+  createProvider(
+    input: CreateProviderInput,
+    mutation: RegistryMutationContext,
+  ): MaybePromise<ProviderRecord>;
+  updateProvider(
+    id: string,
+    expectedVersion: number,
+    input: UpdateProviderInput,
+    mutation: RegistryMutationContext,
+  ): MaybePromise<ProviderRecord>;
+  listProviders(enabledOnly?: boolean): MaybePromise<ProviderRecord[]>;
+  findProvider(idOrSlug: string): MaybePromise<ProviderRecord | undefined>;
+  setProviderCredential(
+    id: string,
+    expectedVersion: number,
+    credential: ProviderCredentialMutation | null,
+    mutation: RegistryMutationContext,
+  ): MaybePromise<ProviderRecord>;
+  getProviderCredential(id: string): MaybePromise<StoredProviderCredential | undefined>;
+  createProviderModel(
+    input: CreateProviderModelInput,
+    mutation: RegistryMutationContext,
+  ): MaybePromise<ProviderModelRecord>;
+  updateProviderModel(
+    id: string,
+    expectedVersion: number,
+    input: UpdateProviderModelInput,
+    mutation: RegistryMutationContext,
+  ): MaybePromise<ProviderModelRecord>;
+  listProviderModels(
+    providerId?: string,
+    enabledOnly?: boolean,
+  ): MaybePromise<ProviderModelRecord[]>;
+  findProviderModel(idOrPublicModelId: string): MaybePromise<ProviderModelRecord | undefined>;
+  createModelPriceVersion(
+    input: CreateModelPriceVersionInput,
+    mutation: RegistryMutationContext,
+  ): MaybePromise<ModelPriceVersion>;
+  listModelPriceVersions(providerModelId: string): MaybePromise<ModelPriceVersion[]>;
+  effectiveModelPrice(
+    providerModelId: string,
+    at?: string,
+  ): MaybePromise<ModelPriceVersion | undefined>;
   reserve(
     userId: string,
     runId: string,
@@ -447,6 +639,7 @@ export interface DomainRepository {
     amountMicros: number,
     provider?: string,
     tokenId?: string,
+    pricingSnapshot?: UsagePricingSnapshot,
   ): MaybePromise<UsageRun>;
   settle(
     runId: string,

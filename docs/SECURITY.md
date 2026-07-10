@@ -53,8 +53,11 @@ limits before those features are enabled.
 ## Secrets and privacy
 
 API token plaintext is revealed once and never logged; only its SHA-256 hash and preview persist.
-The current provider credential is supplied by environment variable and is never exposed through an
-admin API. A future provider registry must add envelope encryption before accepting credentials.
+Provider credentials use randomized per-credential AES-256-GCM data keys wrapped by an
+environment-supplied keyring. Envelopes are bound to the provider and credential version, public
+admin responses expose only credential presence/update time, and plaintext is never revealed after
+replacement. Provider discovery reuses the DNS-pinned, HTTPS-only, no-redirect transport and stores
+only bounded failure categories.
 
 Public chat snapshots are not implemented in the current release. Conversations remain private to
 their owner. A future sharing implementation must be revocable, read-only, pinned to an immutable

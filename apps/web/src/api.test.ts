@@ -23,6 +23,80 @@ describe("setup discovery API", () => {
   });
 });
 
+describe("safe API errors", () => {
+  it("surfaces bounded structured messages without reflecting non-JSON bodies", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValueOnce(
+        Response.json({ error: { code: "version_conflict", message: "Provider changed" } }, {
+          status: 409,
+        }),
+      ),
+    );
+    await expect(api.adminProviders()).rejects.toMatchObject({
+      status: 409,
+      code: "version_conflict",
+      message: "Provider changed",
+    });
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValueOnce(
+        new Response("<html>unsafe upstream error</html>", {
+          status: 502,
+          headers: { "Content-Type": "text/html" },
+        }),
+      ),
+    );
+    await expect(api.adminProviders()).rejects.toMatchObject({
+      status: 502,
+      code: "request_failed",
+      message: "Request failed (502)",
+    });
+  });
+});
+
+describe("provider registry API", () => {
+  it("sends credential replacement only to the write-only credential route", async () => {
+    const provider = {
+      id: "00000000-0000-4000-8000-000000000001",
+      slug: "example",
+      displayName: "Example",
+      baseUrl: "https://example.test/v1",
+      protocol: "chat_completions" as const,
+      enabled: false,
+      version: 3,
+      hasCredential: false,
+      credentialUpdatedAt: null,
+      healthStatus: "unknown" as const,
+      healthCheckedAt: null,
+      healthLatencyMs: null,
+      healthError: null,
+      modelCount: 0,
+      createdAt: "2026-07-10T00:00:00.000Z",
+      updatedAt: "2026-07-10T00:00:00.000Z",
+    };
+    const fetchMock = vi.fn().mockResolvedValue(Response.json({
+      ...provider,
+      version: 4,
+      hasCredential: true,
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const saved = await api.replaceAdminProviderCredential(provider, "transient-secret");
+
+    expect(saved).not.toHaveProperty("credential");
+    expect(saved).not.toHaveProperty("ciphertext");
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/admin/providers/${provider.id}/credential`,
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({ expectedVersion: 3, credential: "transient-secret" }),
+      }),
+    );
+  });
+});
+
 describe("admin audit API", () => {
   it("encodes bounded filters and cursor for the typed audit page", async () => {
     const page = {

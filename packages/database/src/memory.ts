@@ -29,6 +29,9 @@ import type {
   CompleteGenerationInput,
   CreateAttachmentInput,
   CreateAttachmentResult,
+  CreateModelPriceVersionInput,
+  CreateProviderInput,
+  CreateProviderModelInput,
   CreateUserInput,
   DocumentChunk,
   DocumentChunkInput,
@@ -36,9 +39,19 @@ import type {
   FailGenerationInput,
   GenerationResult,
   IdentityTokenPurpose,
+  ModelPriceVersion,
+  ProviderCredentialEnvelope,
+  ProviderCredentialMutation,
+  ProviderModelRecord,
+  ProviderRecord,
+  RegistryMutationContext,
   SessionSummary,
+  StoredProviderCredential,
+  UpdateProviderInput,
+  UpdateProviderModelInput,
+  UsagePricingSnapshot,
 } from "./repository.ts";
-import { decodeAuditCursor, encodeAuditCursor } from "./repository.ts";
+import { decodeAuditCursor, encodeAuditCursor, isUsagePricingSnapshot } from "./repository.ts";
 
 export interface StoredUser extends PublicUser {
   passwordHash: string;
@@ -75,6 +88,7 @@ export interface UsageRun {
   inputTokens: number;
   outputTokens: number;
   latencyMs: number;
+  pricingSnapshot: UsagePricingSnapshot | null;
   generationLeaseToken: string | null;
   generationLeaseExpiresAt: string | null;
   createdAt: string;
@@ -101,6 +115,133 @@ function validateDocumentChunks(chunks: DocumentChunkInput[]) {
   }
 }
 
+interface StoredProvider extends ProviderRecord {
+  credentialEnvelope: ProviderCredentialEnvelope | null;
+}
+
+const registryConflict = () =>
+  new DomainError("version_conflict", "The registry record changed; reload and try again", 409);
+
+function normalizeProviderBaseUrl(value: string): string {
+  if (value !== value.trim() || value.length > 2048) {
+    throw new DomainError("validation_error", "Provider base URL is invalid", 422);
+  }
+  try {
+    const url = new URL(value);
+    if (
+      url.protocol !== "https:" || url.username || url.password || url.search || url.hash ||
+      url.port === "0"
+    ) {
+      throw new Error();
+    }
+    const path = url.pathname.replace(/\/+$/, "");
+    return `${url.origin}${path}`;
+  } catch {
+    throw new DomainError("validation_error", "Provider base URL is invalid", 422);
+  }
+}
+
+function validateProviderInput(input: Partial<CreateProviderInput & UpdateProviderInput>) {
+  if (input.slug !== undefined && !/^[a-z0-9][a-z0-9-]{0,62}$/.test(input.slug)) {
+    throw new DomainError("validation_error", "Provider slug is invalid", 422);
+  }
+  if (
+    input.displayName !== undefined &&
+    (input.displayName.trim().length < 1 || input.displayName.trim().length > 120)
+  ) throw new DomainError("validation_error", "Provider display name is invalid", 422);
+  if (input.baseUrl !== undefined) normalizeProviderBaseUrl(input.baseUrl);
+  if (input.protocol !== undefined && !["chat_completions", "responses"].includes(input.protocol)) {
+    throw new DomainError("validation_error", "Provider protocol is invalid", 422);
+  }
+  if (
+    input.healthStatus !== undefined &&
+    !["unknown", "healthy", "unhealthy", "disabled"].includes(input.healthStatus)
+  ) throw new DomainError("validation_error", "Provider health status is invalid", 422);
+  if (
+    input.healthLatencyMs !== undefined && input.healthLatencyMs !== null &&
+    (!Number.isSafeInteger(input.healthLatencyMs) || input.healthLatencyMs < 0)
+  ) throw new DomainError("validation_error", "Provider health latency is invalid", 422);
+  if (
+    input.healthError !== undefined && input.healthError !== null && input.healthError.length > 1000
+  ) {
+    throw new DomainError("validation_error", "Provider health error is too long", 422);
+  }
+  if (
+    input.healthCheckedAt !== undefined && input.healthCheckedAt !== null &&
+    !Number.isFinite(Date.parse(input.healthCheckedAt))
+  ) throw new DomainError("validation_error", "Provider health timestamp is invalid", 422);
+}
+
+function validateProviderModelInput(
+  input: Partial<CreateProviderModelInput & UpdateProviderModelInput>,
+) {
+  if (
+    input.publicModelId !== undefined &&
+    (input.publicModelId.length < 3 || input.publicModelId.length > 255 ||
+      input.publicModelId.indexOf("/") < 1)
+  ) throw new DomainError("validation_error", "Public model ID must be namespaced", 422);
+  for (
+    const [value, maximum] of [[input.upstreamModelId, 255], [input.displayName, 120]] as const
+  ) {
+    if (value !== undefined && (value.trim().length < 1 || value.length > maximum)) {
+      throw new DomainError("validation_error", "Provider model text is invalid", 422);
+    }
+  }
+  if (
+    input.contextWindow !== undefined &&
+    (!Number.isSafeInteger(input.contextWindow) || input.contextWindow < 1)
+  ) throw new DomainError("validation_error", "Model context window is invalid", 422);
+  if (
+    input.capabilities !== undefined &&
+    (input.capabilities.length > 64 ||
+      new Set(input.capabilities).size !== input.capabilities.length ||
+      input.capabilities.some((value) => !value || value.length > 64))
+  ) throw new DomainError("validation_error", "Model capabilities are invalid", 422);
+  if (
+    input.customParams !== undefined &&
+    (input.customParams === null || Array.isArray(input.customParams))
+  ) throw new DomainError("validation_error", "Model custom parameters are invalid", 422);
+}
+
+function validatePriceInput(input: CreateModelPriceVersionInput) {
+  if (!Number.isFinite(Date.parse(input.effectiveAt))) {
+    throw new DomainError("validation_error", "Price effective timestamp is invalid", 422);
+  }
+  for (
+    const value of [
+      input.inputMicrosPerMillion,
+      input.cachedInputMicrosPerMillion,
+      input.reasoningMicrosPerMillion,
+      input.outputMicrosPerMillion,
+      input.fixedCallMicros,
+    ]
+  ) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new DomainError("validation_error", "Price amounts must be non-negative integers", 422);
+    }
+  }
+  if (!input.source.trim() || input.source.length > 120) {
+    throw new DomainError("validation_error", "Price source is invalid", 422);
+  }
+}
+
+function validateCredentialEnvelope(envelope: ProviderCredentialEnvelope) {
+  const strings = [
+    envelope.wrappedKeyNonce,
+    envelope.wrappedKey,
+    envelope.contentNonce,
+    envelope.ciphertext,
+  ];
+  if (
+    envelope.version !== 1 || envelope.algorithm !== "AES-256-GCM" ||
+    !/^[A-Za-z0-9._-]{1,64}$/.test(envelope.keyId) ||
+    !Number.isSafeInteger(envelope.credentialVersion) || envelope.credentialVersion < 1 ||
+    strings.some((value) =>
+      typeof value !== "string" || !/^[A-Za-z0-9+/]+={0,2}$/.test(value) || value.length > 65_536
+    )
+  ) throw new DomainError("validation_error", "Provider credential envelope is invalid", 422);
+}
+
 export class MemoryRepository {
   readonly storageKind: "memory" | "postgres" = "memory";
   readonly users = new Map<string, StoredUser>();
@@ -116,6 +257,9 @@ export class MemoryRepository {
   readonly attachments = new Map<string, AttachmentRecord>();
   readonly messageAttachments = new Map<string, Set<string>>();
   readonly documentChunks = new Map<string, DocumentChunk[]>();
+  readonly providers = new Map<string, StoredProvider>();
+  readonly providerModels = new Map<string, ProviderModelRecord>();
+  readonly modelPriceVersions = new Map<string, ModelPriceVersion[]>();
   readonly conversations = new Map<string, Conversation>();
   readonly messages = new Map<string, MessageNode>();
   readonly idempotency = new Map<string, string>();
@@ -579,6 +723,9 @@ export class MemoryRepository {
   }
 
   beginGeneration(input: BeginGenerationInput): BeginGenerationResult {
+    if (input.pricingSnapshot !== undefined && !isUsagePricingSnapshot(input.pricingSnapshot)) {
+      throw new DomainError("validation_error", "Usage pricing snapshot is invalid", 422);
+    }
     const conversation = this.conversations.get(input.message.conversationId);
     if (!conversation || conversation.ownerId !== input.message.ownerId) {
       throw new DomainError("not_found", "Conversation not found", 404);
@@ -661,6 +808,9 @@ export class MemoryRepository {
       input.runId,
       input.message.model ?? "unknown",
       input.reserveMicros,
+      input.provider,
+      input.tokenId,
+      input.pricingSnapshot,
     );
     const leaseToken = crypto.randomUUID();
     usageRun.generationLeaseToken = leaseToken;
@@ -1085,6 +1235,309 @@ export class MemoryRepository {
     ) throw new DomainError("validation_error", "Attachment metadata is invalid", 422);
   }
 
+  private publicProvider(value: StoredProvider): ProviderRecord {
+    const { credentialEnvelope: _credentialEnvelope, ...safe } = value;
+    return structuredClone(safe);
+  }
+
+  private registryAudit(
+    mutation: RegistryMutationContext,
+    targetType: "provider" | "provider_model" | "model_price_version",
+    targetId: string,
+    metadata: Record<string, unknown>,
+  ) {
+    this.recordAudit({
+      actorId: mutation.actorId,
+      action: mutation.action,
+      targetType,
+      targetId,
+      metadata: { ...mutation.metadata, ...metadata },
+    });
+  }
+
+  private validateRegistryMutation(mutation: RegistryMutationContext) {
+    if (!mutation.action.trim() || mutation.action.length > 255) {
+      throw new DomainError("validation_error", "Registry audit action is invalid", 422);
+    }
+    if (mutation.actorId && !this.users.has(mutation.actorId)) {
+      throw new DomainError("not_found", "Registry actor not found", 404);
+    }
+  }
+
+  createProvider(input: CreateProviderInput, mutation: RegistryMutationContext): ProviderRecord {
+    this.validateRegistryMutation(mutation);
+    validateProviderInput(input);
+    if ([...this.providers.values()].some((provider) => provider.slug === input.slug)) {
+      throw new DomainError("provider_slug_taken", "Provider slug already exists", 409);
+    }
+    const now = new Date().toISOString();
+    const stored: StoredProvider = {
+      id: crypto.randomUUID(),
+      slug: input.slug,
+      displayName: input.displayName.trim(),
+      baseUrl: normalizeProviderBaseUrl(input.baseUrl),
+      protocol: input.protocol,
+      enabled: input.enabled ?? true,
+      version: 1,
+      credentialEnvelope: null,
+      hasCredential: false,
+      credentialUpdatedAt: null,
+      healthStatus: input.enabled === false ? "disabled" : "unknown",
+      healthCheckedAt: null,
+      healthLatencyMs: null,
+      healthError: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.providers.set(stored.id, stored);
+    this.registryAudit(mutation, "provider", stored.id, { version: stored.version });
+    return this.publicProvider(stored);
+  }
+
+  updateProvider(
+    id: string,
+    expectedVersion: number,
+    input: UpdateProviderInput,
+    mutation: RegistryMutationContext,
+  ): ProviderRecord {
+    this.validateRegistryMutation(mutation);
+    validateProviderInput(input);
+    const stored = this.providers.get(id);
+    if (!stored) throw new DomainError("not_found", "Provider not found", 404);
+    if (stored.version !== expectedVersion) throw registryConflict();
+    if (
+      input.slug !== undefined &&
+      [...this.providers.values()].some((provider) =>
+        provider.id !== id && provider.slug === input.slug
+      )
+    ) throw new DomainError("provider_slug_taken", "Provider slug already exists", 409);
+    if (input.slug !== undefined) stored.slug = input.slug;
+    if (input.displayName !== undefined) stored.displayName = input.displayName.trim();
+    if (input.baseUrl !== undefined) stored.baseUrl = normalizeProviderBaseUrl(input.baseUrl);
+    if (input.protocol !== undefined) stored.protocol = input.protocol;
+    if (input.enabled !== undefined) {
+      stored.enabled = input.enabled;
+      if (!input.enabled) stored.healthStatus = "disabled";
+      else if (stored.healthStatus === "disabled") stored.healthStatus = "unknown";
+    }
+    if (input.healthStatus !== undefined) stored.healthStatus = input.healthStatus;
+    if (input.healthCheckedAt !== undefined) {
+      stored.healthCheckedAt = input.healthCheckedAt === null
+        ? null
+        : new Date(input.healthCheckedAt).toISOString();
+    }
+    if (input.healthLatencyMs !== undefined) stored.healthLatencyMs = input.healthLatencyMs;
+    if (input.healthError !== undefined) stored.healthError = input.healthError;
+    if (!stored.enabled) stored.healthStatus = "disabled";
+    stored.version += 1;
+    stored.updatedAt = new Date().toISOString();
+    this.registryAudit(mutation, "provider", stored.id, { version: stored.version });
+    return this.publicProvider(stored);
+  }
+
+  listProviders(enabledOnly = false): ProviderRecord[] {
+    return [...this.providers.values()]
+      .filter((provider) => !enabledOnly || provider.enabled)
+      .sort((left, right) =>
+        left.displayName.localeCompare(right.displayName) ||
+        left.id.localeCompare(right.id)
+      )
+      .map((provider) => this.publicProvider(provider));
+  }
+
+  findProvider(idOrSlug: string): ProviderRecord | undefined {
+    const stored = this.providers.get(idOrSlug) ??
+      [...this.providers.values()].find((provider) => provider.slug === idOrSlug);
+    return stored ? this.publicProvider(stored) : undefined;
+  }
+
+  setProviderCredential(
+    id: string,
+    expectedVersion: number,
+    credential: ProviderCredentialMutation | null,
+    mutation: RegistryMutationContext,
+  ): ProviderRecord {
+    this.validateRegistryMutation(mutation);
+    const stored = this.providers.get(id);
+    if (!stored) throw new DomainError("not_found", "Provider not found", 404);
+    if (stored.version !== expectedVersion) throw registryConflict();
+    if (credential) validateCredentialEnvelope(credential.envelope);
+    stored.credentialEnvelope = credential ? structuredClone(credential.envelope) : null;
+    stored.credentialUpdatedAt = credential ? new Date().toISOString() : null;
+    stored.hasCredential = credential !== null;
+    stored.healthStatus = stored.enabled ? "unknown" : "disabled";
+    stored.healthCheckedAt = null;
+    stored.healthLatencyMs = null;
+    stored.healthError = null;
+    stored.version += 1;
+    stored.updatedAt = new Date().toISOString();
+    this.registryAudit(mutation, "provider", stored.id, {
+      version: stored.version,
+      credentialChanged: true,
+      hasCredential: stored.hasCredential,
+    });
+    return this.publicProvider(stored);
+  }
+
+  getProviderCredential(id: string): StoredProviderCredential | undefined {
+    const stored = this.providers.get(id);
+    if (!stored?.credentialEnvelope) return undefined;
+    return {
+      providerId: stored.id,
+      envelope: structuredClone(stored.credentialEnvelope),
+    };
+  }
+
+  createProviderModel(
+    input: CreateProviderModelInput,
+    mutation: RegistryMutationContext,
+  ): ProviderModelRecord {
+    this.validateRegistryMutation(mutation);
+    validateProviderModelInput(input);
+    if (!this.providers.has(input.providerId)) {
+      throw new DomainError("not_found", "Provider not found", 404);
+    }
+    if (
+      [...this.providerModels.values()].some((model) => model.publicModelId === input.publicModelId)
+    ) {
+      throw new DomainError("model_id_taken", "Public model ID already exists", 409);
+    }
+    const now = new Date().toISOString();
+    const model: ProviderModelRecord = {
+      id: crypto.randomUUID(),
+      providerId: input.providerId,
+      publicModelId: input.publicModelId,
+      upstreamModelId: input.upstreamModelId.trim(),
+      displayName: input.displayName.trim(),
+      capabilities: [...input.capabilities],
+      contextWindow: input.contextWindow,
+      enabled: input.enabled ?? true,
+      version: 1,
+      customParams: structuredClone(input.customParams ?? {}),
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.providerModels.set(model.id, model);
+    this.registryAudit(mutation, "provider_model", model.id, {
+      providerId: model.providerId,
+      version: model.version,
+    });
+    return structuredClone(model);
+  }
+
+  updateProviderModel(
+    id: string,
+    expectedVersion: number,
+    input: UpdateProviderModelInput,
+    mutation: RegistryMutationContext,
+  ): ProviderModelRecord {
+    this.validateRegistryMutation(mutation);
+    validateProviderModelInput(input);
+    const model = this.providerModels.get(id);
+    if (!model) throw new DomainError("not_found", "Provider model not found", 404);
+    if (model.version !== expectedVersion) throw registryConflict();
+    if (
+      input.publicModelId !== undefined &&
+      [...this.providerModels.values()].some((candidate) =>
+        candidate.id !== id && candidate.publicModelId === input.publicModelId
+      )
+    ) throw new DomainError("model_id_taken", "Public model ID already exists", 409);
+    if (input.publicModelId !== undefined) model.publicModelId = input.publicModelId;
+    if (input.upstreamModelId !== undefined) model.upstreamModelId = input.upstreamModelId.trim();
+    if (input.displayName !== undefined) model.displayName = input.displayName.trim();
+    if (input.capabilities !== undefined) model.capabilities = [...input.capabilities];
+    if (input.contextWindow !== undefined) model.contextWindow = input.contextWindow;
+    if (input.enabled !== undefined) model.enabled = input.enabled;
+    if (input.customParams !== undefined) model.customParams = structuredClone(input.customParams);
+    model.version += 1;
+    model.updatedAt = new Date().toISOString();
+    this.registryAudit(mutation, "provider_model", model.id, {
+      providerId: model.providerId,
+      version: model.version,
+    });
+    return structuredClone(model);
+  }
+
+  listProviderModels(providerId?: string, enabledOnly = false): ProviderModelRecord[] {
+    return [...this.providerModels.values()]
+      .filter((model) =>
+        (!providerId || model.providerId === providerId) && (!enabledOnly || model.enabled)
+      )
+      .sort((left, right) =>
+        left.displayName.localeCompare(right.displayName) ||
+        left.id.localeCompare(right.id)
+      )
+      .map((model) => structuredClone(model));
+  }
+
+  findProviderModel(idOrPublicModelId: string): ProviderModelRecord | undefined {
+    const model = this.providerModels.get(idOrPublicModelId) ??
+      [...this.providerModels.values()].find((candidate) =>
+        candidate.publicModelId === idOrPublicModelId
+      );
+    return model ? structuredClone(model) : undefined;
+  }
+
+  createModelPriceVersion(
+    input: CreateModelPriceVersionInput,
+    mutation: RegistryMutationContext,
+  ): ModelPriceVersion {
+    this.validateRegistryMutation(mutation);
+    validatePriceInput(input);
+    const model = this.providerModels.get(input.providerModelId);
+    if (!model) throw new DomainError("not_found", "Provider model not found", 404);
+    if (model.version !== input.expectedModelVersion) throw registryConflict();
+    const effectiveAt = new Date(input.effectiveAt).toISOString();
+    const versions = this.modelPriceVersions.get(model.id) ?? [];
+    if (versions.some((price) => price.effectiveAt === effectiveAt)) {
+      throw new DomainError("price_effective_at_taken", "A price already starts at that time", 409);
+    }
+    const price: ModelPriceVersion = {
+      id: crypto.randomUUID(),
+      providerModelId: model.id,
+      effectiveAt,
+      inputMicrosPerMillion: input.inputMicrosPerMillion,
+      cachedInputMicrosPerMillion: input.cachedInputMicrosPerMillion,
+      reasoningMicrosPerMillion: input.reasoningMicrosPerMillion,
+      outputMicrosPerMillion: input.outputMicrosPerMillion,
+      fixedCallMicros: input.fixedCallMicros,
+      source: input.source.trim(),
+      createdAt: new Date().toISOString(),
+    };
+    versions.push(price);
+    this.modelPriceVersions.set(model.id, versions);
+    model.version += 1;
+    model.updatedAt = new Date().toISOString();
+    this.registryAudit(mutation, "model_price_version", price.id, {
+      providerModelId: model.id,
+      effectiveAt,
+      modelVersion: model.version,
+    });
+    return structuredClone(price);
+  }
+
+  listModelPriceVersions(providerModelId: string): ModelPriceVersion[] {
+    if (!this.providerModels.has(providerModelId)) {
+      throw new DomainError("not_found", "Provider model not found", 404);
+    }
+    return [...(this.modelPriceVersions.get(providerModelId) ?? [])]
+      .sort((left, right) =>
+        right.effectiveAt.localeCompare(left.effectiveAt) ||
+        right.id.localeCompare(left.id)
+      )
+      .map((price) => structuredClone(price));
+  }
+
+  effectiveModelPrice(providerModelId: string, at = new Date().toISOString()) {
+    if (!Number.isFinite(Date.parse(at))) {
+      throw new DomainError("validation_error", "Price lookup timestamp is invalid", 422);
+    }
+    const lookup = new Date(at).toISOString();
+    return this.listModelPriceVersions(providerModelId).find((price) =>
+      price.effectiveAt <= lookup
+    );
+  }
+
   createApiToken(
     userId: string,
     input: {
@@ -1150,7 +1603,18 @@ export class MemoryRepository {
     return entry;
   }
 
-  reserve(userId: string, runId: string, model: string, amountMicros: number) {
+  reserve(
+    userId: string,
+    runId: string,
+    model: string,
+    amountMicros: number,
+    _provider = "unknown",
+    _tokenId?: string,
+    pricingSnapshot?: UsagePricingSnapshot,
+  ) {
+    if (pricingSnapshot !== undefined && !isUsagePricingSnapshot(pricingSnapshot)) {
+      throw new DomainError("validation_error", "Usage pricing snapshot is invalid", 422);
+    }
     const existing = this.usageRuns.get(runId);
     if (existing) {
       throw new DomainError(
@@ -1170,6 +1634,7 @@ export class MemoryRepository {
       inputTokens: 0,
       outputTokens: 0,
       latencyMs: 0,
+      pricingSnapshot: pricingSnapshot ? structuredClone(pricingSnapshot) : null,
       generationLeaseToken: null,
       generationLeaseExpiresAt: null,
       createdAt: new Date().toISOString(),
@@ -1291,6 +1756,9 @@ export class MemoryRepository {
       input.runId,
       input.model,
       input.reserveMicros,
+      input.provider,
+      input.tokenId,
+      input.pricingSnapshot,
     );
     const now = new Date();
     const leaseToken = crypto.randomUUID();
