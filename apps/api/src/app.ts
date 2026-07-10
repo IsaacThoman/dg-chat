@@ -104,6 +104,12 @@ import {
   publicChatStreamChunk,
   responsesRequestToChatCompletions,
 } from "./provider-protocol.ts";
+import {
+  completeSimulatedProvider,
+  SimulatedProviderError,
+  SimulatedScenarioValidationError,
+  validateSimulatedProviderScenario,
+} from "./provider-simulator.ts";
 
 type Variables = {
   user: PublicUser;
@@ -134,6 +140,10 @@ export interface AppOptions {
   providerDiscoveryFetch?: typeof fetch;
   circuitBreaker?: CircuitBreaker;
   breakerPolicy?: BreakerPolicy;
+  providerSlowStream?: {
+    windowMs: number;
+    minimumVisibleUnitsPerSecond: number;
+  };
 }
 
 interface StagedUpload {
@@ -757,6 +767,19 @@ export function createApp(options: AppOptions = {}) {
     openSeconds: positiveInteger("PROVIDER_BREAKER_OPEN_SECONDS", 30),
     halfOpenLeaseSeconds: positiveInteger("PROVIDER_BREAKER_HALF_OPEN_LEASE_SECONDS", 10),
   };
+  const slowWindowValue = Deno.env.get("PROVIDER_SLOW_STREAM_WINDOW_MS");
+  const slowRateValue = Deno.env.get("PROVIDER_MIN_VISIBLE_UNITS_PER_SECOND");
+  if ((slowWindowValue === undefined) !== (slowRateValue === undefined)) {
+    throw new Error(
+      "PROVIDER_SLOW_STREAM_WINDOW_MS and PROVIDER_MIN_VISIBLE_UNITS_PER_SECOND must be set together",
+    );
+  }
+  const providerSlowStream = options.providerSlowStream ?? (slowWindowValue
+    ? {
+      windowMs: Number(slowWindowValue),
+      minimumVisibleUnitsPerSecond: Number(slowRateValue),
+    }
+    : undefined);
   const providerExecution = providerKeyring
     ? new ProviderExecutionEngine({
       repository: repo,
@@ -765,6 +788,7 @@ export function createApp(options: AppOptions = {}) {
       breakerPolicy,
       complete: providerComplete,
       stream: providerStream,
+      slowStream: providerSlowStream,
     })
     : undefined;
   type RuntimeModel = {
@@ -2402,6 +2426,36 @@ export function createApp(options: AppOptions = {}) {
     }
     return c.json({ data: await repo.listProviderAttempts(usageRunId) });
   });
+  app.post("/api/admin/resilience/playground", async (c) => {
+    providerNoStore(c);
+    let scenario;
+    try {
+      scenario = validateSimulatedProviderScenario(await c.req.json());
+    } catch (error) {
+      if (error instanceof SimulatedScenarioValidationError || error instanceof SyntaxError) {
+        throw new DomainError("validation_error", "Simulator scenario is invalid", 422);
+      }
+      throw error;
+    }
+    try {
+      return c.json({
+        ok: true,
+        completion: await completeSimulatedProvider(scenario, c.req.raw.signal),
+      });
+    } catch (error) {
+      if (error instanceof SimulatedProviderError) {
+        return c.json({
+          ok: false,
+          error: {
+            kind: error.kind,
+            message: error.message,
+            details: error.details,
+          },
+        });
+      }
+      throw error;
+    }
+  });
 
   app.use("/v1/*", authenticate, approved);
   const replayResponse = (request: ApiIdempotencyRequest) => {
@@ -2774,6 +2828,7 @@ export function createApp(options: AppOptions = {}) {
         let cachedInputTokens = 0;
         let reasoningTokens = 0;
         let settled = false;
+        let sawDone = false;
         let sequence = 0;
         try {
           const providerEvents = resolvedModel.registryModel && providerExecution
@@ -2788,41 +2843,8 @@ export function createApp(options: AppOptions = {}) {
             : providerStream(request, upstreamSignal, resolvedModel.upstream);
           for await (const data of providerEvents) {
             if (data === "[DONE]") {
-              const finalOutput = Math.max(outputTokens, Math.ceil(visibleOutputBytes / 4));
-              const cost = priceUsage(model, inputTokens, finalOutput, {
-                cachedInputTokens,
-                reasoningTokens,
-              }).costMicros;
-              if (idempotency) {
-                await repo.completeApiStream({
-                  id: idempotency.id,
-                  leaseToken: idempotency.leaseToken,
-                  responseStatus: 200,
-                  responseHeaders: {
-                    "content-type": "text/event-stream",
-                    "cache-control": "no-cache",
-                  },
-                  terminalFrame: sseData("[DONE]"),
-                  costMicros: cost,
-                  inputTokens,
-                  outputTokens: finalOutput,
-                  latencyMs: Math.round(performance.now() - started),
-                  quota: replayQuota,
-                });
-              } else {
-                await repo.settle(
-                  runId,
-                  cost,
-                  inputTokens,
-                  finalOutput,
-                  Math.round(performance.now() - started),
-                );
-              }
-              settled = true;
-              if (!stream.aborted && !upstreamSignal.aborted) {
-                await stream.writeSSE({ data: "[DONE]" });
-              }
-              return;
+              sawDone = true;
+              continue;
             }
             const chunk = publicChatStreamChunk(
               JSON.parse(data),
@@ -2898,7 +2920,42 @@ export function createApp(options: AppOptions = {}) {
               throw upstreamSignal.reason ?? new DOMException("Client disconnected", "AbortError");
             }
           }
-          if (!settled && !idempotency) {
+          if (sawDone) {
+            const finalOutput = Math.max(outputTokens, Math.ceil(visibleOutputBytes / 4));
+            const cost = priceUsage(model, inputTokens, finalOutput, {
+              cachedInputTokens,
+              reasoningTokens,
+            }).costMicros;
+            if (idempotency) {
+              await repo.completeApiStream({
+                id: idempotency.id,
+                leaseToken: idempotency.leaseToken,
+                responseStatus: 200,
+                responseHeaders: {
+                  "content-type": "text/event-stream",
+                  "cache-control": "no-cache",
+                },
+                terminalFrame: sseData("[DONE]"),
+                costMicros: cost,
+                inputTokens,
+                outputTokens: finalOutput,
+                latencyMs: Math.round(performance.now() - started),
+                quota: replayQuota,
+              });
+            } else {
+              await repo.settle(
+                runId,
+                cost,
+                inputTokens,
+                finalOutput,
+                Math.round(performance.now() - started),
+              );
+            }
+            settled = true;
+            if (!stream.aborted && !upstreamSignal.aborted) {
+              await stream.writeSSE({ data: "[DONE]" });
+            }
+          } else if (!settled && !idempotency) {
             const finalOutput = Math.max(outputTokens, Math.ceil(visibleOutputBytes / 4));
             if (finalOutput > 0) {
               await repo.settle(

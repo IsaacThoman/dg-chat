@@ -201,4 +201,29 @@ Deno.test("admin resilience policies and routes are versioned, cycle-safe, and n
     routes.data.find((item: { model: { id: string } }) => item.model.id === primary.id).route.id,
     route.id,
   );
+
+  const playground = await app.request("/api/admin/resilience/playground", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      id: "admin-preview",
+      name: "Admin preview",
+      seed: 7,
+      steps: [
+        { type: "reasoning", text: "inspect", delayMs: 0, jitterMs: 0 },
+        { type: "text", text: "ready", delayMs: 0, jitterMs: 0 },
+      ],
+    }),
+  });
+  assertEquals(playground.status, 200);
+  const playgroundBody = await json(playground);
+  assertEquals(playgroundBody.ok, true);
+  assertEquals(playgroundBody.completion.text, "ready");
+  assertEquals(playgroundBody.completion.reasoning, "inspect");
+  const invalidPlayground = await app.request("/api/admin/resilience/playground", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ id: "bad", name: "Bad", seed: 1, steps: [] }),
+  });
+  assertEquals(invalidPlayground.status, 422);
 });

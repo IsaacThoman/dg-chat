@@ -134,7 +134,7 @@ export async function discoverProviderModels(
 ): Promise<ProviderDiscoveryResult> {
   if (!apiKey || apiKey.length > 32_768) throw new ProviderTestError("authentication_failed");
   const started = performance.now();
-  const timeout = AbortSignal.timeout(options.timeoutMs ?? 10_000);
+  const timeout = AbortSignal.timeout(options.timeoutMs ?? 5_000);
   const signal = options.signal ? AbortSignal.any([timeout, options.signal]) : timeout;
   let response: Response;
   try {

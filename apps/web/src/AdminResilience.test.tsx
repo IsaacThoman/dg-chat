@@ -81,6 +81,22 @@ describe("admin resilience policy forms", () => {
       name: "Reliable",
     });
   });
+
+  it("runs playground scenarios through the isolated admin endpoint", async () => {
+    const result = { ok: true as const, completion: { text: "ready" } };
+    const fetchMock = vi.fn().mockResolvedValue(Response.json(result));
+    vi.stubGlobal("fetch", fetchMock);
+    const scenario = { id: "preview", name: "Preview", seed: 1, steps: [] };
+    expect(await resilienceAdminClient.runPlayground(scenario)).toEqual(result);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/admin/resilience/playground",
+      expect.objectContaining({
+        method: "POST",
+        credentials: "include",
+        body: JSON.stringify(scenario),
+      }),
+    );
+  });
 });
 
 describe("admin resilience routes", () => {
@@ -118,6 +134,7 @@ describe("admin resilience routes", () => {
             updatePolicy: never,
             listRoutes: never,
             setRoute: never,
+            runPlayground: never,
           }}
         />
       </QueryClientProvider>,

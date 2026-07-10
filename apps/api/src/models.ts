@@ -290,7 +290,10 @@ function validateOpenAIChunk(data: string, usageBounds?: UsageBounds): number {
       },
     );
   }
-  if (!Array.isArray(chunk.choices) || chunk.choices.length > 128) {
+  // The public contract only supports n=1. Empty choice arrays remain valid for
+  // usage-only stream chunks, but multiple choices would otherwise leak an
+  // unsupported response shape after the request has already been accepted.
+  if (!Array.isArray(chunk.choices) || chunk.choices.length > 1) {
     throw new Error("Upstream sent invalid chat completion choices");
   }
   let outputBytes = 0;
@@ -599,7 +602,7 @@ async function completeAttempt(
     promptTokens: new TextEncoder().encode(JSON.stringify(request)).length,
     completionTokens: request.max_tokens ?? request.max_completion_tokens ?? 4096,
   });
-  if (!Array.isArray(data.choices) || data.choices.length < 1 || data.choices.length > 128) {
+  if (!Array.isArray(data.choices) || data.choices.length !== 1) {
     throw new Error("Provider returned invalid chat completion choices");
   }
   let outputBytes = 0;

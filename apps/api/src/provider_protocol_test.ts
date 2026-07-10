@@ -170,6 +170,15 @@ Deno.test("chat nonstream normalization preserves reasoning, tools, finish, and 
         message: {
           role: "assistant",
           content: "answer",
+          annotations: [{
+            type: "url_citation",
+            url_citation: {
+              start_index: 0,
+              end_index: 6,
+              title: "Source",
+              url: "https://example.com/source",
+            },
+          }],
           reasoning_content: "thinking",
           reasoning_summary: "summary",
           tool_calls: [{
@@ -194,6 +203,13 @@ Deno.test("chat nonstream normalization preserves reasoning, tools, finish, and 
       createdAt: 12,
       content: [{ type: "text", text: "answer" }],
       text: "answer",
+      annotations: [{
+        type: "url_citation",
+        startIndex: 0,
+        endIndex: 6,
+        title: "Source",
+        url: "https://example.com/source",
+      }],
       reasoning: { content: "thinking", summary: "summary" },
       toolCalls: [{ id: "call", name: "lookup", arguments: "{}" }],
       finishState: "tool_calls",

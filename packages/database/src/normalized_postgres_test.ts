@@ -54,12 +54,117 @@ Deno.test({
       const stale = await repo.reserve(user.id, "postgres-provider-stale", "provider/model", 100);
       await sql`UPDATE usage_runs SET execution_epoch=1,actual_provider_cost_micros=5,
         run_lease_expires_at=now()-interval '1 second' WHERE id=${stale.id}`;
+      const providers = await sql<{ id: string }[]>`INSERT INTO providers
+        (slug,display_name,base_url,protocol) VALUES
+        ('uncertain-provider','Uncertain provider','https://uncertain.example/v1','chat_completions')
+        RETURNING id`;
+      const models = await sql<{ id: string }[]>`INSERT INTO provider_models
+        (provider_id,public_model_id,upstream_model_id,display_name,capabilities,context_window)
+        VALUES(${providers[0].id},'uncertain/model','upstream','Uncertain model','["chat"]',8192)
+        RETURNING id`;
+      const prices = await sql<{ id: string }[]>`INSERT INTO model_price_versions
+        (provider_model_id,effective_at,input_micros_per_million,
+          cached_input_micros_per_million,reasoning_micros_per_million,
+          output_micros_per_million,fixed_call_micros,source)
+        VALUES(${models[0].id},now(),100000,50000,200000,300000,10,'test') RETURNING id`;
+      const insertUncertainAttempt = (runId: string) =>
+        sql`INSERT INTO provider_attempts
+          (usage_run_id,attempt_number,execution_epoch,target_ordinal,retry_number,reason,
+            breaker_before,provider_id,provider_slug,provider_version,protocol,provider_model_id,
+            public_model_id,upstream_model_id,model_version,pricing_version_id,
+            pricing_input_micros_per_million,pricing_cached_input_micros_per_million,
+            pricing_reasoning_micros_per_million,pricing_output_micros_per_million,
+            pricing_fixed_call_micros,pricing_source)
+          VALUES(${runId},1,1,0,0,'primary','closed',${providers[0].id},
+            'uncertain-provider',1,'chat_completions',${
+          models[0].id
+        },'uncertain/model','upstream',1,
+            ${prices[0].id},100000,50000,200000,300000,10,'test')`;
+      await insertUncertainAttempt(stale.id);
       assertEquals(await repo.reapStaleProviderExecutionLeases(), 1);
       assertEquals(await repo.reapStaleProviderExecutionLeases(), 0);
       const reaped = await sql<
         { status: string; cost: string; run_lease_token: string | null }[]
       >`SELECT status,cost_micros::text cost,run_lease_token::text FROM usage_runs WHERE id=${stale.id}`;
-      assertEquals(reaped[0], { status: "failed", cost: "5", run_lease_token: null });
+      assertEquals(reaped[0], { status: "failed", cost: "100", run_lease_token: null });
+      const attempts = await sql<
+        { status: string; error_code: string | null }[]
+      >`SELECT status,error_code FROM provider_attempts WHERE usage_run_id=${stale.id}`;
+      assertEquals([...attempts], [{ status: "cancelled", error_code: "execution_lease_expired" }]);
+
+      const api = await repo.beginApiRequest({
+        userId: user.id,
+        endpoint: "chat.completions",
+        idempotencyKey: "postgres-uncertain-api-reaper",
+        requestHash: "e".repeat(64),
+        stream: false,
+        model: "uncertain/model",
+        provider: "uncertain-provider",
+        runId: "postgres-uncertain-api-run",
+        reserveMicros: 100,
+      });
+      if (api.kind !== "started") throw new Error("API request did not start");
+      await sql`UPDATE usage_runs SET execution_epoch=1 WHERE id=${api.usageRun.id}`;
+      await sql`UPDATE api_idempotency_requests SET lease_expires_at=now()-interval '1 second'
+        WHERE id=${api.request.id}`;
+      await insertUncertainAttempt(api.usageRun.id);
+      const apiBalanceBefore = await sql<
+        { balance: string }[]
+      >`SELECT balance_micros::text balance FROM users WHERE id=${user.id}`;
+      assertEquals(await repo.reapStaleApiRequests(), 1);
+      const apiRun = await sql<
+        { status: string; cost: string }[]
+      >`SELECT status,cost_micros::text cost FROM usage_runs WHERE id=${api.usageRun.id}`;
+      const apiBalanceAfter = await sql<
+        { balance: string }[]
+      >`SELECT balance_micros::text balance FROM users WHERE id=${user.id}`;
+      const apiAttempts = await sql<
+        { status: string; error_code: string | null }[]
+      >`SELECT status,error_code FROM provider_attempts WHERE usage_run_id=${api.usageRun.id}`;
+      assertEquals([...apiRun], [{ status: "failed", cost: "100" }]);
+      assertEquals([...apiBalanceAfter], [...apiBalanceBefore]);
+      assertEquals([...apiAttempts], [{ status: "cancelled", error_code: "api_lease_expired" }]);
+
+      const conversation = await repo.createConversation(user.id, "Uncertain generation");
+      const generation = await repo.beginGeneration({
+        message: {
+          conversationId: conversation.id,
+          ownerId: user.id,
+          parentId: null,
+          role: "user",
+          content: "hello",
+          model: "uncertain/model",
+          expectedVersion: conversation.version,
+          idempotencyKey: "postgres-uncertain-generation-user",
+        },
+        runId: "postgres-uncertain-generation-run",
+        provider: "uncertain-provider",
+        reserveMicros: 100,
+      });
+      if (generation.kind !== "started") throw new Error("generation did not start");
+      await sql`UPDATE usage_runs SET execution_epoch=1,
+        generation_lease_expires_at=now()-interval '1 second' WHERE id=${generation.usageRun.id}`;
+      await insertUncertainAttempt(generation.usageRun.id);
+      const generationBalanceBefore = await sql<
+        { balance: string }[]
+      >`SELECT balance_micros::text balance FROM users WHERE id=${user.id}`;
+      assertEquals(await repo.reapStaleGenerations(), 1);
+      const generationRun = await sql<
+        { status: string; cost: string }[]
+      >`SELECT status,cost_micros::text cost FROM usage_runs WHERE id=${generation.usageRun.id}`;
+      const generationBalanceAfter = await sql<
+        { balance: string }[]
+      >`SELECT balance_micros::text balance FROM users WHERE id=${user.id}`;
+      const generationAttempts = await sql<
+        { status: string; error_code: string | null }[]
+      >`SELECT status,error_code FROM provider_attempts
+        WHERE usage_run_id=${generation.usageRun.id}`;
+      assertEquals([...generationRun], [{ status: "failed", cost: "100" }]);
+      assertEquals([...generationBalanceAfter], [...generationBalanceBefore]);
+      assertEquals([...generationAttempts], [{
+        status: "cancelled",
+        error_code: "generation_lease_expired",
+      }]);
     } finally {
       await repo.close();
     }

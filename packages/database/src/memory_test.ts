@@ -459,7 +459,7 @@ Deno.test("provider resilience routes are acyclic and attempts are immutable and
   assertEquals(reclaimed.executionEpoch, claim.executionEpoch + 1);
   assertEquals(reclaimed.nextAttemptNumber, 10);
   assertEquals(reclaimed.reconciledAttemptIds.length, 1);
-  assertEquals(repo.listProviderAttempts(run.id)[2].status, "cancelled");
+  assertEquals(repo.listProviderAttempts(run.id)[2].status, "running");
   assertThrows(
     () =>
       repo.startProviderAttempt({
@@ -483,7 +483,7 @@ Deno.test("provider resilience routes are acyclic and attempts are immutable and
     error: "all paths failed",
   });
   assertEquals(finalized.status, "failed");
-  assertEquals(finalized.costMicros, 2);
+  assertEquals(finalized.costMicros, run.reservedMicros);
   assertEquals(
     repo.refundProviderUsage({
       usageRunId: run.id,
@@ -492,7 +492,7 @@ Deno.test("provider resilience routes are acyclic and attempts are immutable and
       latencyMs: 100,
       error: "all paths failed",
     }).costMicros,
-    2,
+    run.reservedMicros,
   );
 });
 

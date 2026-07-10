@@ -10,6 +10,13 @@ export type CanonicalRole = "system" | "developer" | "user" | "assistant" | "too
 export type CanonicalContentPart =
   | { type: "text"; text: string }
   | { type: "image"; url: string; detail?: "auto" | "low" | "high" };
+export interface CanonicalUrlCitation {
+  type: "url_citation";
+  startIndex: number;
+  endIndex: number;
+  title: string;
+  url: string;
+}
 export interface CanonicalToolCall {
   id: string;
   name: string;
@@ -50,6 +57,7 @@ export interface CanonicalResult {
   createdAt?: number;
   content: CanonicalContentPart[];
   text: string;
+  annotations?: CanonicalUrlCitation[];
   refusal?: string;
   error?: { code: string; message: string };
   reasoning?: { content?: string; summary?: string };
@@ -764,6 +772,19 @@ export function normalizeChatCompletionResult(input: unknown): CanonicalResult {
     message.reasoning_summary,
     "response.choices[0].message.reasoning_summary",
   );
+  const text = content.flatMap((part) => part.type === "text" ? [part.text] : []).join("");
+  const annotations = message.annotations === undefined
+    ? []
+    : array(message.annotations, "response.choices[0].message.annotations", 256).map(
+      (annotation, index) =>
+        canonicalChatCitation(annotation, `response.choices[0].message.annotations[${index}]`),
+    );
+  if (annotations.some((annotation) => annotation.endIndex > text.length)) {
+    fail(
+      "Citation range exceeds the assistant message content",
+      "response.choices[0].message.annotations",
+    );
+  }
   return {
     id: string(body.id, "response.id", MAX_ID_BYTES, false),
     model: string(body.model, "response.model", 200, false),
@@ -771,7 +792,8 @@ export function normalizeChatCompletionResult(input: unknown): CanonicalResult {
       ? {}
       : { createdAt: integer(body.created, "response.created", 4_294_967_295) }),
     content,
-    text: content.flatMap((part) => part.type === "text" ? [part.text] : []).join(""),
+    text,
+    ...(annotations.length ? { annotations } : {}),
     ...(message.refusal === undefined || message.refusal === null
       ? {}
       : { refusal: string(message.refusal, "response.choices[0].message.refusal") }),
@@ -1000,7 +1022,7 @@ function publicUsage(value: unknown, path: string) {
   };
 }
 
-function publicCitation(value: unknown, path: string): Record<string, unknown> {
+function canonicalChatCitation(value: unknown, path: string): CanonicalUrlCitation {
   const annotation = object(value, path);
   allowedKeys(annotation, ["type", "url_citation"], path);
   if (annotation.type !== "url_citation") unsupported(`${path}.type`);
@@ -1021,11 +1043,22 @@ function publicCitation(value: unknown, path: string): Record<string, unknown> {
   }
   return {
     type: "url_citation",
+    startIndex,
+    endIndex,
+    title: string(citation.title, `${path}.url_citation.title`, 8_192),
+    url,
+  };
+}
+
+function publicCitation(value: unknown, path: string): Record<string, unknown> {
+  const citation = canonicalChatCitation(value, path);
+  return {
+    type: citation.type,
     url_citation: {
-      start_index: startIndex,
-      end_index: endIndex,
-      title: string(citation.title, `${path}.url_citation.title`, 8_192),
-      url,
+      start_index: citation.startIndex,
+      end_index: citation.endIndex,
+      title: citation.title,
+      url: citation.url,
     },
   };
 }

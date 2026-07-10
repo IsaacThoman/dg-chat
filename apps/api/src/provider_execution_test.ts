@@ -169,7 +169,7 @@ Deno.test("provider execution retries through the breaker, falls back, and persi
         reason: "primary",
         status: "failed",
         breakerBefore: "closed",
-        breakerAfter: null,
+        breakerAfter: "open",
         retryable: true,
       },
       {
@@ -187,7 +187,7 @@ Deno.test("provider execution retries through the breaker, falls back, and persi
         reason: "fallback",
         status: "succeeded",
         breakerBefore: "closed",
-        breakerAfter: null,
+        breakerAfter: "closed",
         retryable: false,
       },
     ],
@@ -412,6 +412,106 @@ Deno.test("provider execution retries through the breaker, falls back, and persi
   assertEquals(providerUsageAttempt.cachedInputTokens, 4);
   assertEquals(providerUsageAttempt.outputTokens, 9);
   assertEquals(providerUsageAttempt.reasoningTokens, 3);
+
+  const reservePartialRun = (runId: string) => {
+    const run = repo.reserve(
+      user.id,
+      runId,
+      fallback.model.publicModelId,
+      1_000_000,
+      fallback.provider.slug,
+      undefined,
+      {
+        pricingVersionId: fallback.price.id,
+        inputMicrosPerMillion: fallback.price.inputMicrosPerMillion,
+        cachedInputMicrosPerMillion: fallback.price.cachedInputMicrosPerMillion,
+        reasoningMicrosPerMillion: fallback.price.reasoningMicrosPerMillion,
+        outputMicrosPerMillion: fallback.price.outputMicrosPerMillion,
+        fixedCallMicros: fallback.price.fixedCallMicros,
+        source: fallback.price.source,
+      },
+    );
+    if (!run.runLeaseToken) throw new Error("partial usage execution lease missing");
+    return run.runLeaseToken;
+  };
+
+  const partialStreamRun = "provider-partial-stream-usage";
+  const partialStreamLease = reservePartialRun(partialStreamRun);
+  const partialStreamEngine = new ProviderExecutionEngine({
+    repository: repo,
+    keyring,
+    circuitBreaker: new MemoryCircuitBreaker(),
+    breakerPolicy: {
+      failureThreshold: 3,
+      failureWindowSeconds: 60,
+      openSeconds: 30,
+      halfOpenLeaseSeconds: 5,
+    },
+    stream: async function* () {
+      yield JSON.stringify({
+        choices: [],
+        usage: { prompt_tokens: 23, completion_tokens: 1 },
+      });
+      yield JSON.stringify({ choices: [{ delta: { content: "output after early usage" } }] });
+      yield "[DONE]";
+    },
+  });
+  for await (
+    const _chunk of partialStreamEngine.stream(
+      fallback.model.id,
+      partialStreamRun,
+      partialStreamLease,
+      {
+        model: fallback.model.publicModelId,
+        messages: [{ role: "user", content: "partial stream" }],
+        stream: true,
+      },
+      new AbortController().signal,
+    )
+  ) { /* consume */ }
+  const partialStreamAttempt = repo.listProviderAttempts(partialStreamRun)[0];
+  assertEquals(partialStreamAttempt.inputTokens, 23);
+  assertEquals(partialStreamAttempt.outputTokens > 1, true);
+  assertEquals(partialStreamAttempt.tokenSource, "estimated");
+
+  const partialCompleteRun = "provider-partial-complete-usage";
+  const partialCompleteLease = reservePartialRun(partialCompleteRun);
+  const partialCompleteEngine = new ProviderExecutionEngine({
+    repository: repo,
+    keyring,
+    circuitBreaker: new MemoryCircuitBreaker(),
+    breakerPolicy: {
+      failureThreshold: 3,
+      failureWindowSeconds: 60,
+      openSeconds: 30,
+      halfOpenLeaseSeconds: 5,
+    },
+    complete: () =>
+      Promise.resolve({
+        text: "completion estimated from output",
+        inputTokens: 19,
+        outputTokens: 8,
+        upstream: {
+          id: "partial-complete",
+          choices: [{ message: { content: "completion estimated from output" } }],
+          usage: { prompt_tokens: 19 },
+        },
+      }),
+  });
+  await partialCompleteEngine.complete(
+    fallback.model.id,
+    partialCompleteRun,
+    partialCompleteLease,
+    {
+      model: fallback.model.publicModelId,
+      messages: [{ role: "user", content: "partial complete" }],
+    },
+    new AbortController().signal,
+  );
+  const partialCompleteAttempt = repo.listProviderAttempts(partialCompleteRun)[0];
+  assertEquals(partialCompleteAttempt.inputTokens, 19);
+  assertEquals(partialCompleteAttempt.outputTokens, 8);
+  assertEquals(partialCompleteAttempt.tokenSource, "estimated");
 
   const dispatchTarget = await createTarget("dispatch-fence");
   const dispatchRun = "provider-dispatch-fence";
@@ -746,4 +846,186 @@ Deno.test("exhausted terminal accounting persistence is distinct and never redis
   );
   assertEquals(providerCalls, 1);
   assertEquals(fixture.repo.usageRuns.get(fixture.runId)?.status, "reserved");
+  const runningAttempt = structuredClone(fixture.repo.listProviderAttempts(fixture.runId)[0]);
+  const balanceBeforeReap = fixture.repo.users.get(fixture.user.id)!.balanceMicros;
+  fixture.repo.usageRuns.get(fixture.runId)!.runLeaseExpiresAt = new Date(
+    Date.now() - 1,
+  ).toISOString();
+  assertEquals(fixture.repo.reapStaleProviderExecutionLeases(), 1);
+  const reaped = fixture.repo.usageRuns.get(fixture.runId)!;
+  assertEquals({ status: reaped.status, costMicros: reaped.costMicros }, {
+    status: "failed",
+    costMicros: reaped.reservedMicros,
+  });
+  assertEquals(fixture.repo.users.get(fixture.user.id)!.balanceMicros, balanceBeforeReap);
+  assertEquals(
+    fixture.repo.listProviderAttempts(fixture.runId).map((attempt) => ({
+      status: attempt.status,
+      errorCode: attempt.errorCode,
+    })),
+    [{ status: "cancelled", errorCode: "accounting_unknown" }],
+  );
+
+  const api = fixture.repo.beginApiRequest({
+    userId: fixture.user.id,
+    endpoint: "chat.completions",
+    idempotencyKey: "uncertain-api-reaper",
+    requestHash: "d".repeat(64),
+    stream: false,
+    model: fixture.model.publicModelId,
+    provider: fixture.provider.slug,
+    runId: "uncertain-api-run",
+    reserveMicros: 100,
+  });
+  if (api.kind !== "started") throw new Error("API request did not start");
+  fixture.repo.usageRuns.get(api.usageRun.id)!.executionEpoch = 1;
+  fixture.repo.providerAttempts.set(crypto.randomUUID(), {
+    ...structuredClone(runningAttempt),
+    id: crypto.randomUUID(),
+    usageRunId: api.usageRun.id,
+    executionEpoch: 1,
+  });
+  fixture.repo.apiIdempotencyRequests.get(api.request.id)!.leaseExpiresAt = new Date(
+    Date.now() - 1,
+  ).toISOString();
+  const apiBalance = fixture.repo.users.get(fixture.user.id)!.balanceMicros;
+  assertEquals(fixture.repo.reapStaleApiRequests(), 1);
+  assertEquals(fixture.repo.usageRuns.get(api.usageRun.id)?.costMicros, 100);
+  assertEquals(fixture.repo.users.get(fixture.user.id)!.balanceMicros, apiBalance);
+
+  const conversation = fixture.repo.createConversation(fixture.user.id, "Uncertain generation");
+  const generation = fixture.repo.beginGeneration({
+    message: {
+      conversationId: conversation.id,
+      ownerId: fixture.user.id,
+      parentId: null,
+      role: "user",
+      content: "hello",
+      model: fixture.model.publicModelId,
+      expectedVersion: conversation.version,
+      idempotencyKey: "uncertain-generation-user",
+    },
+    runId: "uncertain-generation-run",
+    provider: fixture.provider.slug,
+    reserveMicros: 100,
+  });
+  if (generation.kind !== "started") throw new Error("generation did not start");
+  generation.usageRun.executionEpoch = 1;
+  fixture.repo.providerAttempts.set(crypto.randomUUID(), {
+    ...structuredClone(runningAttempt),
+    id: crypto.randomUUID(),
+    usageRunId: generation.usageRun.id,
+    executionEpoch: 1,
+  });
+  generation.usageRun.generationLeaseExpiresAt = new Date(Date.now() - 1).toISOString();
+  const generationBalance = fixture.repo.users.get(fixture.user.id)!.balanceMicros;
+  assertEquals(fixture.repo.reapStaleGenerations(), 1);
+  assertEquals(fixture.repo.usageRuns.get(generation.usageRun.id)?.costMicros, 100);
+  assertEquals(fixture.repo.users.get(fixture.user.id)!.balanceMicros, generationBalance);
+});
+
+Deno.test("engine slow-stream policy cuts off visible streams without retry", async () => {
+  const fixture = await singleProviderFixture("chat_completions");
+  const policy = fixture.repo.createProviderRetryPolicy({
+    name: "Slow stream integration",
+    maxAttempts: 2,
+    maxRetries: 1,
+    baseDelayMs: 0,
+    maxDelayMs: 0,
+    backoffMultiplierBps: 10_000,
+    jitterBps: 0,
+    firstTokenTimeoutMs: 1_000,
+    idleTimeoutMs: 1_000,
+    totalTimeoutMs: 5_000,
+    retryableStatuses: [504],
+  }, { actorId: fixture.user.id, action: "test.slow-stream" });
+  fixture.repo.setProviderModelRoute({
+    sourceModelId: fixture.model.id,
+    expectedVersion: 0,
+    retryPolicyId: policy.id,
+    fallbackModelIds: [],
+  }, { actorId: fixture.user.id, action: "test.slow-stream-route" });
+  let calls = 0;
+  const engine = new ProviderExecutionEngine({
+    repository: fixture.repo,
+    keyring: fixture.keyring,
+    circuitBreaker: new MemoryCircuitBreaker(),
+    breakerPolicy: {
+      failureThreshold: 1,
+      failureWindowSeconds: 60,
+      openSeconds: 30,
+      halfOpenLeaseSeconds: 5,
+    },
+    slowStream: { windowMs: 250, minimumVisibleUnitsPerSecond: 1_000 },
+    stream: async function* () {
+      calls++;
+      yield JSON.stringify({ choices: [{ delta: { content: "a" } }] });
+      await new Promise((resolve) => setTimeout(resolve, 275));
+      yield JSON.stringify({ choices: [{ delta: { content: "b" } }] });
+    },
+  });
+  await assertRejects(
+    async () => {
+      for await (
+        const _chunk of engine.stream(
+          fixture.model.id,
+          fixture.runId,
+          fixture.run.runLeaseToken!,
+          {
+            model: fixture.model.publicModelId,
+            messages: [{ role: "user", content: "slow" }],
+            stream: true,
+          },
+          new AbortController().signal,
+        )
+      ) { /* consume first visible chunk */ }
+    },
+    ProviderAttemptError,
+    "minimum throughput",
+  );
+  assertEquals(calls, 1);
+  const attempt = fixture.repo.listProviderAttempts(fixture.runId)[0];
+  assertEquals(attempt.visibleOutput, true);
+  assertEquals(attempt.breakerAfter, "open");
+});
+
+Deno.test("engine persists a truthful half-open transition after a successful probe", async () => {
+  const fixture = await singleProviderFixture("chat_completions");
+  let now = 0;
+  const breaker = new MemoryCircuitBreaker({ now: () => now });
+  const breakerPolicy = {
+    failureThreshold: 1,
+    failureWindowSeconds: 60,
+    openSeconds: 1,
+    halfOpenLeaseSeconds: 5,
+  };
+  const closedPermit = await breaker.beforeAttempt(fixture.provider.id, breakerPolicy);
+  await breaker.recordFailure(fixture.provider.id, closedPermit, breakerPolicy);
+  now = 1_001;
+  const engine = new ProviderExecutionEngine({
+    repository: fixture.repo,
+    keyring: fixture.keyring,
+    circuitBreaker: breaker,
+    breakerPolicy,
+    complete: () =>
+      Promise.resolve({
+        text: "probe recovered",
+        inputTokens: 4,
+        outputTokens: 3,
+        upstream: {
+          id: "chatcmpl_probe",
+          usage: { prompt_tokens: 4, completion_tokens: 3 },
+        },
+      }),
+  });
+  await engine.complete(
+    fixture.model.id,
+    fixture.runId,
+    fixture.run.runLeaseToken!,
+    { model: fixture.model.publicModelId, messages: [{ role: "user", content: "probe" }] },
+    new AbortController().signal,
+  );
+  const attempt = fixture.repo.listProviderAttempts(fixture.runId)[0];
+  assertEquals(attempt.breakerBefore, "half_open");
+  assertEquals(attempt.breakerAfter, "closed");
 });
