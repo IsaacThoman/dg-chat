@@ -211,6 +211,8 @@ Deno.test("streaming rejects unsafe usage, content, and tool delta fields", asyn
     '{"choices":[],"usage":{"completion_tokens":1000000001}}',
     '{"choices":[],"usage":{"total_tokens":1e309}}',
     '{"choices":[],"usage":{"completion_tokens_details":{"reasoning_tokens":-1}}}',
+    '{"choices":[],"usage":{"prompt_tokens_details":{"cached_tokens":1}}}',
+    '{"choices":[],"usage":{"completion_tokens_details":{"reasoning_tokens":1}}}',
     '{"choices":[{"delta":{"content":42}}]}',
     '{"choices":[{"delta":{"tool_calls":{}}}]}',
     '{"choices":[{"delta":{"tool_calls":[{"index":999}]}}]}',
@@ -235,6 +237,14 @@ Deno.test("non-stream completions validate shapes and bounded usage", async () =
     { choices: [{ message: { content: "ok" } }], usage: { completion_tokens: 1_000_000_001 } },
     { choices: [{ message: { content: 7 } }] },
     { choices: [{ message: { content: null, tool_calls: [{}] } }], usage: "NaN" },
+    {
+      choices: [{ message: { content: "ok" } }],
+      usage: { prompt_tokens_details: { cached_tokens: 1 } },
+    },
+    {
+      choices: [{ message: { content: "ok" } }],
+      usage: { completion_tokens_details: { reasoning_tokens: 1 } },
+    },
   ];
   for (const payload of invalidPayloads) {
     const fetchMock = (() => Promise.resolve(Response.json(payload))) as typeof fetch;
@@ -284,6 +294,40 @@ Deno.test("non-stream completions validate shapes and bounded usage", async () =
       "exceeds",
     );
   }
+
+  const detailedUsageFetch = (() =>
+    Promise.resolve(Response.json({
+      choices: [{ message: { content: "priced response" } }],
+      usage: {
+        prompt_tokens: 10,
+        completion_tokens: 20,
+        prompt_tokens_details: { cached_tokens: 4 },
+        completion_tokens_details: { reasoning_tokens: 5 },
+      },
+    }))) as typeof fetch;
+  assertEquals(
+    await complete(request, new AbortController().signal, {
+      baseUrl: "https://provider.example/v1",
+      apiKey: "secret",
+      fetch: detailedUsageFetch,
+    }),
+    {
+      text: "priced response",
+      inputTokens: 10,
+      outputTokens: 20,
+      cachedInputTokens: 4,
+      reasoningTokens: 5,
+      upstream: {
+        choices: [{ message: { content: "priced response" } }],
+        usage: {
+          prompt_tokens: 10,
+          completion_tokens: 20,
+          prompt_tokens_details: { cached_tokens: 4 },
+          completion_tokens_details: { reasoning_tokens: 5 },
+        },
+      },
+    },
+  );
 });
 
 Deno.test("non-stream success and error bodies enforce byte caps", async () => {

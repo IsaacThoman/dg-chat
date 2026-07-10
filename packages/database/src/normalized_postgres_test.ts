@@ -502,6 +502,174 @@ Deno.test({
 });
 
 Deno.test({
+  name: "Postgres provider registry fences stale writes and atomically audits immutable prices",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 1 });
+    await sql`TRUNCATE model_price_versions, provider_models, providers, audit_events,
+      document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs,
+      api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
+    await sql.end();
+    const repo = await PostgresRepository.connect(databaseUrl!);
+    try {
+      const actor = await repo.bootstrapAdmin({
+        email: "registry@database.test",
+        name: "Registry",
+        passwordHash: "hash",
+      }, 1);
+      const created = await repo.createProvider({
+        slug: "database-provider",
+        displayName: "Database Provider",
+        baseUrl: "https://provider.database.test/v1/",
+        protocol: "chat_completions",
+      }, { actorId: actor.id, action: "provider.create" });
+      const credentialed = await repo.setProviderCredential(created.id, created.version, {
+        envelope: {
+          version: 1,
+          algorithm: "AES-256-GCM",
+          keyId: "key-1",
+          credentialVersion: 1,
+          wrappedKeyNonce: "bm9uY2U=",
+          wrappedKey: "d3JhcHBlZA==",
+          contentNonce: "bm9uY2U=",
+          ciphertext: "c2VjcmV0LWNpcGhlcnRleHQ=",
+        },
+      }, { actorId: actor.id, action: "provider.credential.replace" });
+      assertEquals(credentialed.hasCredential, true);
+      assertEquals(typeof credentialed.credentialUpdatedAt, "string");
+      assertEquals("credentialEnvelope" in credentialed, false);
+      assertEquals(
+        (await repo.getProviderCredential(created.id))?.envelope.ciphertext,
+        "c2VjcmV0LWNpcGhlcnRleHQ=",
+      );
+      await assertRejects(
+        () =>
+          repo.updateProvider(created.id, created.version, { displayName: "Stale" }, {
+            actorId: actor.id,
+            action: "provider.update",
+          }),
+        DomainError,
+        "reload",
+      );
+
+      const model = await repo.createProviderModel({
+        providerId: created.id,
+        publicModelId: "database/reasoner",
+        upstreamModelId: "reasoner",
+        displayName: "Reasoner",
+        capabilities: ["chat", "streaming"],
+        contextWindow: 64_000,
+      }, { actorId: actor.id, action: "provider_model.create" });
+      const first = await repo.createModelPriceVersion({
+        providerModelId: model.id,
+        expectedModelVersion: model.version,
+        effectiveAt: "2026-01-01T00:00:00Z",
+        inputMicrosPerMillion: 10,
+        cachedInputMicrosPerMillion: 2,
+        reasoningMicrosPerMillion: 20,
+        outputMicrosPerMillion: 30,
+        fixedCallMicros: 1,
+        source: "test-contract",
+      }, { actorId: actor.id, action: "model_price.create" });
+      const snapshotted = await repo.reserve(
+        actor.id,
+        "postgres-pricing-snapshot",
+        model.publicModelId,
+        1,
+        created.slug,
+        undefined,
+        {
+          pricingVersionId: first.id,
+          inputMicrosPerMillion: first.inputMicrosPerMillion,
+          cachedInputMicrosPerMillion: first.cachedInputMicrosPerMillion,
+          reasoningMicrosPerMillion: first.reasoningMicrosPerMillion,
+          outputMicrosPerMillion: first.outputMicrosPerMillion,
+          fixedCallMicros: first.fixedCallMicros,
+          source: first.source,
+        },
+      );
+      assertEquals(snapshotted.pricingSnapshot?.pricingVersionId, first.id);
+      await assertRejects(
+        () =>
+          repo.createModelPriceVersion({
+            providerModelId: model.id,
+            expectedModelVersion: model.version,
+            effectiveAt: "2026-02-01T00:00:00Z",
+            inputMicrosPerMillion: 1,
+            cachedInputMicrosPerMillion: 1,
+            reasoningMicrosPerMillion: 1,
+            outputMicrosPerMillion: 1,
+            fixedCallMicros: 1,
+            source: "stale",
+          }, { actorId: actor.id, action: "model_price.create" }),
+        DomainError,
+        "reload",
+      );
+      const repricedModel = (await repo.findProviderModel(model.id))!;
+      const second = await repo.createModelPriceVersion({
+        providerModelId: model.id,
+        expectedModelVersion: repricedModel.version,
+        effectiveAt: "2026-07-01T00:00:00Z",
+        inputMicrosPerMillion: 11,
+        cachedInputMicrosPerMillion: 3,
+        reasoningMicrosPerMillion: 21,
+        outputMicrosPerMillion: 31,
+        fixedCallMicros: 2,
+        source: "test-contract-h2",
+      }, { actorId: actor.id, action: "model_price.create" });
+      assertEquals(
+        (await repo.effectiveModelPrice(model.id, "2026-06-30T23:59:59Z"))?.id,
+        first.id,
+      );
+      assertEquals(
+        (await repo.effectiveModelPrice(model.id, "2026-07-01T00:00:00Z"))?.id,
+        second.id,
+      );
+      assertEquals((await repo.listModelPriceVersions(model.id)).length, 2);
+      const settledSnapshot = await repo.settle("postgres-pricing-snapshot", 1, 1, 1, 1);
+      assertEquals(settledSnapshot.pricingSnapshot, {
+        pricingVersionId: first.id,
+        inputMicrosPerMillion: 10,
+        cachedInputMicrosPerMillion: 2,
+        reasoningMicrosPerMillion: 20,
+        outputMicrosPerMillion: 30,
+        fixedCallMicros: 1,
+        source: "test-contract",
+      });
+
+      const disabled = await repo.updateProvider(
+        created.id,
+        credentialed.version,
+        { enabled: false },
+        { actorId: actor.id, action: "provider.disable" },
+      );
+      assertEquals(disabled.healthStatus, "disabled");
+      assertEquals((await repo.listProviders(true)).length, 0);
+      const audits = await repo.listAudit({ targetType: "provider" });
+      assertEquals(audits.data.map((event) => event.action), [
+        "provider.disable",
+        "provider.credential.replace",
+        "provider.create",
+      ]);
+
+      const invalidActor = crypto.randomUUID();
+      await assertRejects(
+        () =>
+          repo.updateProvider(disabled.id, disabled.version, { displayName: "Must Roll Back" }, {
+            actorId: invalidActor,
+            action: "provider.update",
+          }),
+      );
+      assertEquals((await repo.findProvider(disabled.id))?.displayName, "Database Provider");
+    } finally {
+      await repo.close();
+    }
+  },
+});
+
+Deno.test({
   name: "legacy runtime snapshot backfill preserves all domain collections and is idempotent",
   ignore: !databaseUrl,
   sanitizeOps: false,

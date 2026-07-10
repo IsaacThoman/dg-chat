@@ -52,8 +52,11 @@ refunds exactly once using an idempotency key. Derived balances are cacheable, w
 remain authoritative.
 
 API token plaintext is shown once. Only a cryptographic hash, a short preview, scope metadata, and
-usage timestamps persist. The current provider credential is environment-only; an admin-managed
-provider registry must use envelope encryption before it can be enabled.
+usage timestamps persist. Admin-managed provider credentials use per-version envelope encryption;
+the API decrypts them only while resolving an enabled, effectively priced runtime model. Provider,
+model, credential, and append-only price mutations use optimistic versions and atomic audit writes.
+Usage reservations snapshot the exact effective price version and all rate categories so later
+administrative price changes cannot rewrite historical accounting.
 
 ## Trust boundaries
 

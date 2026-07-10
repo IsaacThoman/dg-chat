@@ -42,7 +42,7 @@ jobs:
           MINIO_ROOT_USER: ci-minio-user
           MINIO_ROOT_PASSWORD: ci-minio-password
           APP_SECRET: ci-app-secret-at-least-thirty-two-bytes
-          ENCRYPTION_KEY: Y2ktZW5jcnlwdGlvbi1rZXktMzItYnl0ZXMtbG9uZw==
+          ENCRYPTION_KEY: Y2ktZW5jcnlwdGlvbi1rZXktMzItYnl0ZXMtbG9uZyE=
           SETUP_TOKEN: e2e-setup-token
         run: |
           docker compose -f docker-compose.yml -f docker-compose.ci.yml config --quiet
@@ -160,7 +160,7 @@ jobs:
       MINIO_ROOT_USER: ci-minio-user
       MINIO_ROOT_PASSWORD: ci-minio-password
       APP_SECRET: ci-app-secret-at-least-thirty-two-bytes
-      ENCRYPTION_KEY: Y2ktZW5jcnlwdGlvbi1rZXktMzItYnl0ZXMtbG9uZw==
+      ENCRYPTION_KEY: Y2ktZW5jcnlwdGlvbi1rZXktMzItYnl0ZXMtbG9uZyE=
       SETUP_TOKEN: e2e-setup-token
       E2E_BASE_URL: http://localhost:8000
       E2E_API_URL: http://localhost:8000

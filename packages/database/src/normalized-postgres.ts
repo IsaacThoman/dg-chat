@@ -25,6 +25,9 @@ import type {
   CreateApiTokenInput,
   CreateAttachmentInput,
   CreateAttachmentResult,
+  CreateModelPriceVersionInput,
+  CreateProviderInput,
+  CreateProviderModelInput,
   CreateUserInput,
   DocumentChunk,
   DocumentChunkInput,
@@ -32,9 +35,23 @@ import type {
   FailApiRequestInput,
   FailGenerationInput,
   IdentityTokenPurpose,
+  ModelPriceVersion,
+  ProviderCredentialEnvelope,
+  ProviderCredentialMutation,
+  ProviderModelRecord,
+  ProviderRecord,
+  RegistryMutationContext,
   SessionSummary,
+  StoredProviderCredential,
+  UpdateProviderInput,
+  UpdateProviderModelInput,
+  UsagePricingSnapshot,
 } from "./repository.ts";
-import { decodeAuditCursor, encodeAuditPostgresCursor } from "./repository.ts";
+import {
+  decodeAuditCursor,
+  encodeAuditPostgresCursor,
+  isUsagePricingSnapshot,
+} from "./repository.ts";
 
 type Row = Record<string, unknown>;
 const iso = (value: unknown) => value instanceof Date ? value.toISOString() : String(value);
@@ -114,6 +131,17 @@ function token(row: Row): StoredApiToken {
   };
 }
 function run(row: Row): UsageRun {
+  const pricingSnapshot = row.pricing_version_id
+    ? {
+      pricingVersionId: String(row.pricing_version_id),
+      inputMicrosPerMillion: number(row.pricing_input_micros_per_million),
+      cachedInputMicrosPerMillion: number(row.pricing_cached_input_micros_per_million),
+      reasoningMicrosPerMillion: number(row.pricing_reasoning_micros_per_million),
+      outputMicrosPerMillion: number(row.pricing_output_micros_per_million),
+      fixedCallMicros: number(row.pricing_fixed_call_micros),
+      source: String(row.pricing_source),
+    }
+    : null;
   return {
     id: String(row.id),
     userId: String(row.user_id),
@@ -124,6 +152,7 @@ function run(row: Row): UsageRun {
     inputTokens: number(row.input_tokens),
     outputTokens: number(row.output_tokens),
     latencyMs: number(row.latency_ms ?? 0),
+    pricingSnapshot,
     generationLeaseToken: row.generation_lease_token ? String(row.generation_lease_token) : null,
     generationLeaseExpiresAt: nullableIso(row.generation_lease_expires_at),
     createdAt: iso(row.created_at),
@@ -158,6 +187,181 @@ function documentChunk(row: Row): DocumentChunk {
     content: String(row.content),
     metadata: row.metadata as Record<string, unknown>,
   };
+}
+
+function provider(row: Row): ProviderRecord {
+  return {
+    id: String(row.id),
+    slug: String(row.slug),
+    displayName: String(row.display_name),
+    baseUrl: String(row.base_url),
+    protocol: row.protocol as ProviderRecord["protocol"],
+    enabled: Boolean(row.enabled),
+    version: number(row.version),
+    hasCredential: row.credential_envelope != null,
+    credentialUpdatedAt: nullableIso(row.credential_updated_at),
+    healthStatus: row.health_status as ProviderRecord["healthStatus"],
+    healthCheckedAt: nullableIso(row.health_checked_at),
+    healthLatencyMs: row.health_latency_ms == null ? null : number(row.health_latency_ms),
+    healthError: row.health_error == null ? null : String(row.health_error),
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+  };
+}
+function providerModel(row: Row): ProviderModelRecord {
+  return {
+    id: String(row.id),
+    providerId: String(row.provider_id),
+    publicModelId: String(row.public_model_id),
+    upstreamModelId: String(row.upstream_model_id),
+    displayName: String(row.display_name),
+    capabilities: [...(row.capabilities as string[])],
+    contextWindow: number(row.context_window),
+    enabled: Boolean(row.enabled),
+    version: number(row.version),
+    customParams: structuredClone((row.custom_params ?? {}) as Record<string, unknown>),
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+  };
+}
+function modelPrice(row: Row): ModelPriceVersion {
+  return {
+    id: String(row.id),
+    providerModelId: String(row.provider_model_id),
+    effectiveAt: iso(row.effective_at),
+    inputMicrosPerMillion: number(row.input_micros_per_million),
+    cachedInputMicrosPerMillion: number(row.cached_input_micros_per_million),
+    reasoningMicrosPerMillion: number(row.reasoning_micros_per_million),
+    outputMicrosPerMillion: number(row.output_micros_per_million),
+    fixedCallMicros: number(row.fixed_call_micros),
+    source: String(row.source),
+    createdAt: iso(row.created_at),
+  };
+}
+
+const registryConflict = () =>
+  new DomainError("version_conflict", "The registry record changed; reload and try again", 409);
+
+function normalizeProviderBaseUrl(value: string): string {
+  if (value !== value.trim() || value.length > 2048) {
+    throw new DomainError("validation_error", "Provider base URL is invalid", 422);
+  }
+  try {
+    const url = new URL(value);
+    if (
+      url.protocol !== "https:" || url.username || url.password || url.search || url.hash ||
+      url.port === "0"
+    ) {
+      throw new Error();
+    }
+    const path = url.pathname.replace(/\/+$/, "");
+    return `${url.origin}${path}`;
+  } catch {
+    throw new DomainError("validation_error", "Provider base URL is invalid", 422);
+  }
+}
+
+function validateProviderInput(input: Partial<CreateProviderInput & UpdateProviderInput>) {
+  if (input.slug !== undefined && !/^[a-z0-9][a-z0-9-]{0,62}$/.test(input.slug)) {
+    throw new DomainError("validation_error", "Provider slug is invalid", 422);
+  }
+  if (
+    input.displayName !== undefined &&
+    (input.displayName.trim().length < 1 || input.displayName.trim().length > 120)
+  ) throw new DomainError("validation_error", "Provider display name is invalid", 422);
+  if (input.baseUrl !== undefined) normalizeProviderBaseUrl(input.baseUrl);
+  if (input.protocol !== undefined && !["chat_completions", "responses"].includes(input.protocol)) {
+    throw new DomainError("validation_error", "Provider protocol is invalid", 422);
+  }
+  if (
+    input.healthStatus !== undefined &&
+    !["unknown", "healthy", "unhealthy", "disabled"].includes(input.healthStatus)
+  ) throw new DomainError("validation_error", "Provider health status is invalid", 422);
+  if (
+    input.healthLatencyMs !== undefined && input.healthLatencyMs !== null &&
+    (!Number.isSafeInteger(input.healthLatencyMs) || input.healthLatencyMs < 0)
+  ) throw new DomainError("validation_error", "Provider health latency is invalid", 422);
+  if (
+    input.healthError !== undefined && input.healthError !== null && input.healthError.length > 1000
+  ) {
+    throw new DomainError("validation_error", "Provider health error is too long", 422);
+  }
+  if (
+    input.healthCheckedAt !== undefined && input.healthCheckedAt !== null &&
+    !Number.isFinite(Date.parse(input.healthCheckedAt))
+  ) throw new DomainError("validation_error", "Provider health timestamp is invalid", 422);
+}
+function validateProviderModelInput(
+  input: Partial<CreateProviderModelInput & UpdateProviderModelInput>,
+) {
+  if (
+    input.publicModelId !== undefined &&
+    (input.publicModelId.length < 3 || input.publicModelId.length > 255 ||
+      input.publicModelId.indexOf("/") < 1)
+  ) throw new DomainError("validation_error", "Public model ID must be namespaced", 422);
+  for (
+    const [value, maximum] of [[input.upstreamModelId, 255], [input.displayName, 120]] as const
+  ) {
+    if (value !== undefined && (value.trim().length < 1 || value.length > maximum)) {
+      throw new DomainError("validation_error", "Provider model text is invalid", 422);
+    }
+  }
+  if (
+    input.contextWindow !== undefined &&
+    (!Number.isSafeInteger(input.contextWindow) || input.contextWindow < 1)
+  ) throw new DomainError("validation_error", "Model context window is invalid", 422);
+  if (
+    input.capabilities !== undefined &&
+    (input.capabilities.length > 64 ||
+      new Set(input.capabilities).size !== input.capabilities.length ||
+      input.capabilities.some((value) => !value || value.length > 64))
+  ) throw new DomainError("validation_error", "Model capabilities are invalid", 422);
+  if (
+    input.customParams !== undefined &&
+    (input.customParams === null || Array.isArray(input.customParams))
+  ) throw new DomainError("validation_error", "Model custom parameters are invalid", 422);
+}
+function validatePriceInput(input: CreateModelPriceVersionInput) {
+  if (!Number.isFinite(Date.parse(input.effectiveAt))) {
+    throw new DomainError("validation_error", "Price effective timestamp is invalid", 422);
+  }
+  for (
+    const value of [
+      input.inputMicrosPerMillion,
+      input.cachedInputMicrosPerMillion,
+      input.reasoningMicrosPerMillion,
+      input.outputMicrosPerMillion,
+      input.fixedCallMicros,
+    ]
+  ) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new DomainError("validation_error", "Price amounts must be non-negative integers", 422);
+    }
+  }
+  if (!input.source.trim() || input.source.length > 120) {
+    throw new DomainError("validation_error", "Price source is invalid", 422);
+  }
+}
+function validateCredentialEnvelope(envelope: ProviderCredentialEnvelope) {
+  const strings = [
+    envelope.wrappedKeyNonce,
+    envelope.wrappedKey,
+    envelope.contentNonce,
+    envelope.ciphertext,
+  ];
+  if (
+    envelope.version !== 1 || envelope.algorithm !== "AES-256-GCM" ||
+    !/^[A-Za-z0-9._-]{1,64}$/.test(envelope.keyId) ||
+    !Number.isSafeInteger(envelope.credentialVersion) || envelope.credentialVersion < 1 ||
+    strings.some((value) =>
+      typeof value !== "string" || !/^[A-Za-z0-9+/]+={0,2}$/.test(value) || value.length > 65_536
+    )
+  ) throw new DomainError("validation_error", "Provider credential envelope is invalid", 422);
+}
+function validateRegistryMutation(mutation: RegistryMutationContext) {
+  if (!mutation.action.trim() || mutation.action.length > 255) {
+    throw new DomainError("validation_error", "Registry audit action is invalid", 422);
+  }
 }
 
 const isIngestibleMime = (mime: string) => mime === "text/plain" || mime === "application/json";
@@ -679,6 +883,9 @@ export class PostgresRepository implements DomainRepository {
     if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1) {
       throw new DomainError("validation_error", "Generation lease duration is invalid", 422);
     }
+    if (input.pricingSnapshot !== undefined && !isUsagePricingSnapshot(input.pricingSnapshot)) {
+      throw new DomainError("validation_error", "Usage pricing snapshot is invalid", 422);
+    }
     const attachmentIds = [...(input.attachmentIds ?? [])].sort();
     if (new Set(attachmentIds).size !== attachmentIds.length || attachmentIds.length > 10) {
       throw new DomainError("validation_error", "Attachment identifiers are invalid", 422);
@@ -807,13 +1014,18 @@ export class PostgresRepository implements DomainRepository {
         tx.json((input.message.metadata ?? {}) as postgres.JSONValue)
       },${input.message.idempotencyKey}) RETURNING *`;
       const leaseToken = crypto.randomUUID();
+      const pricing = input.pricingSnapshot;
       const runs = await tx<
         Row[]
-      >`INSERT INTO usage_runs(id,user_id,token_id,model,provider,status,reserved_micros,generation_lease_token,generation_lease_expires_at) VALUES(${input.runId},${input.message.ownerId},${
+      >`INSERT INTO usage_runs(id,user_id,token_id,model,provider,status,reserved_micros,pricing_version_id,pricing_input_micros_per_million,pricing_cached_input_micros_per_million,pricing_reasoning_micros_per_million,pricing_output_micros_per_million,pricing_fixed_call_micros,pricing_source,generation_lease_token,generation_lease_expires_at) VALUES(${input.runId},${input.message.ownerId},${
         input.tokenId ?? null
-      },${
-        input.message.model ?? "unknown"
-      },${input.provider},'reserved',${input.reserveMicros},${leaseToken},now()+${leaseSeconds}*interval '1 second') RETURNING *`;
+      },${input.message.model ?? "unknown"},${input.provider},'reserved',${input.reserveMicros},${
+        pricing?.pricingVersionId ?? null
+      },${pricing?.inputMicrosPerMillion ?? null},${pricing?.cachedInputMicrosPerMillion ?? null},${
+        pricing?.reasoningMicrosPerMillion ?? null
+      },${pricing?.outputMicrosPerMillion ?? null},${pricing?.fixedCallMicros ?? null},${
+        pricing?.source ?? null
+      },${leaseToken},now()+${leaseSeconds}*interval '1 second') RETURNING *`;
       for (const attachmentId of attachmentIds) {
         await tx`
           INSERT INTO message_attachments(message_id,attachment_id)
@@ -1283,6 +1495,303 @@ export class PostgresRepository implements DomainRepository {
       .map(documentChunk);
   }
 
+  async createProvider(input: CreateProviderInput, mutation: RegistryMutationContext) {
+    validateRegistryMutation(mutation);
+    validateProviderInput(input);
+    try {
+      return await this.#sql.begin(async (tx) => {
+        const rows = await tx<Row[]>`
+          INSERT INTO providers(slug,display_name,base_url,protocol,enabled,health_status)
+          VALUES(${input.slug},${input.displayName.trim()},${
+          normalizeProviderBaseUrl(input.baseUrl)
+        },
+            ${input.protocol},${input.enabled ?? true},${
+          input.enabled === false ? "disabled" : "unknown"
+        })
+          RETURNING *`;
+        const value = provider(rows[0]);
+        await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+          VALUES(${mutation.actorId ?? null},${mutation.action},'provider',${value.id},${
+          tx.json({ ...mutation.metadata, version: value.version })
+        })`;
+        return value;
+      });
+    } catch (error) {
+      if ((error as { code?: string }).code === "23505") {
+        throw new DomainError("provider_slug_taken", "Provider slug already exists", 409);
+      }
+      throw error;
+    }
+  }
+
+  async updateProvider(
+    id: string,
+    expectedVersion: number,
+    input: UpdateProviderInput,
+    mutation: RegistryMutationContext,
+  ) {
+    validateRegistryMutation(mutation);
+    validateProviderInput(input);
+    try {
+      return await this.#sql.begin(async (tx) => {
+        const currentRows = await tx<Row[]>`SELECT * FROM providers WHERE id=${id} FOR UPDATE`;
+        if (!currentRows[0]) throw new DomainError("not_found", "Provider not found", 404);
+        const current = provider(currentRows[0]);
+        if (current.version !== expectedVersion) throw registryConflict();
+        const enabled = input.enabled ?? current.enabled;
+        let healthStatus = input.healthStatus ?? current.healthStatus;
+        if (!enabled) healthStatus = "disabled";
+        else if (input.enabled === true && healthStatus === "disabled") healthStatus = "unknown";
+        const rows = await tx<Row[]>`
+          UPDATE providers SET
+            slug=${input.slug ?? current.slug},
+            display_name=${input.displayName?.trim() ?? current.displayName},
+            base_url=${
+          input.baseUrl === undefined ? current.baseUrl : normalizeProviderBaseUrl(input.baseUrl)
+        },
+            protocol=${input.protocol ?? current.protocol},
+            enabled=${enabled},
+            health_status=${healthStatus},
+            health_checked_at=${
+          input.healthCheckedAt === undefined ? current.healthCheckedAt : input.healthCheckedAt
+        },
+            health_latency_ms=${
+          input.healthLatencyMs === undefined ? current.healthLatencyMs : input.healthLatencyMs
+        },
+            health_error=${
+          input.healthError === undefined ? current.healthError : input.healthError
+        },
+            version=version+1,updated_at=now()
+          WHERE id=${id} RETURNING *`;
+        const value = provider(rows[0]);
+        await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+          VALUES(${mutation.actorId ?? null},${mutation.action},'provider',${value.id},${
+          tx.json({ ...mutation.metadata, version: value.version })
+        })`;
+        return value;
+      });
+    } catch (error) {
+      if ((error as { code?: string }).code === "23505") {
+        throw new DomainError("provider_slug_taken", "Provider slug already exists", 409);
+      }
+      throw error;
+    }
+  }
+
+  async listProviders(enabledOnly = false) {
+    const rows = enabledOnly
+      ? await this.#sql<Row[]>`SELECT * FROM providers WHERE enabled ORDER BY display_name,id`
+      : await this.#sql<Row[]>`SELECT * FROM providers ORDER BY display_name,id`;
+    return rows.map(provider);
+  }
+
+  async findProvider(idOrSlug: string) {
+    const rows = await this.#sql<Row[]>`
+      SELECT * FROM providers WHERE id::text=${idOrSlug} OR slug=${idOrSlug} LIMIT 1`;
+    return rows[0] ? provider(rows[0]) : undefined;
+  }
+
+  async setProviderCredential(
+    id: string,
+    expectedVersion: number,
+    credential: ProviderCredentialMutation | null,
+    mutation: RegistryMutationContext,
+  ) {
+    validateRegistryMutation(mutation);
+    if (credential) validateCredentialEnvelope(credential.envelope);
+    return await this.#sql.begin(async (tx) => {
+      const current = await tx<Row[]>`SELECT version FROM providers WHERE id=${id} FOR UPDATE`;
+      if (!current[0]) throw new DomainError("not_found", "Provider not found", 404);
+      if (number(current[0].version) !== expectedVersion) throw registryConflict();
+      const rows = await tx<Row[]>`
+        UPDATE providers SET credential_envelope=${
+        credential ? tx.json(credential.envelope as never) : null
+      },credential_updated_at=${credential ? new Date().toISOString() : null},
+          health_status=CASE WHEN enabled THEN 'unknown' ELSE 'disabled' END,
+          health_checked_at=NULL,health_latency_ms=NULL,health_error=NULL,
+          version=version+1,updated_at=now()
+        WHERE id=${id} RETURNING *`;
+      const value = provider(rows[0]);
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${mutation.actorId ?? null},${mutation.action},'provider',${value.id},${
+        tx.json({
+          ...mutation.metadata,
+          version: value.version,
+          credentialChanged: true,
+          hasCredential: value.hasCredential,
+        })
+      })`;
+      return value;
+    });
+  }
+
+  async getProviderCredential(id: string): Promise<StoredProviderCredential | undefined> {
+    const rows = await this.#sql<Row[]>`
+      SELECT id,credential_envelope FROM providers WHERE id=${id}`;
+    if (!rows[0]?.credential_envelope) return undefined;
+    return {
+      providerId: String(rows[0].id),
+      envelope: structuredClone(rows[0].credential_envelope as ProviderCredentialEnvelope),
+    };
+  }
+
+  async createProviderModel(input: CreateProviderModelInput, mutation: RegistryMutationContext) {
+    validateRegistryMutation(mutation);
+    validateProviderModelInput(input);
+    try {
+      return await this.#sql.begin(async (tx) => {
+        const providerRows = await tx`SELECT id FROM providers WHERE id=${input.providerId}`;
+        if (!providerRows.length) throw new DomainError("not_found", "Provider not found", 404);
+        const rows = await tx<Row[]>`
+          INSERT INTO provider_models(provider_id,public_model_id,upstream_model_id,display_name,
+            capabilities,context_window,enabled,custom_params)
+          VALUES(${input.providerId},${input.publicModelId},${input.upstreamModelId.trim()},
+            ${input.displayName.trim()},${tx.json(input.capabilities)},${input.contextWindow},
+            ${input.enabled ?? true},${tx.json((input.customParams ?? {}) as never)}) RETURNING *`;
+        const value = providerModel(rows[0]);
+        await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+          VALUES(${mutation.actorId ?? null},${mutation.action},'provider_model',${value.id},${
+          tx.json({ ...mutation.metadata, providerId: value.providerId, version: value.version })
+        })`;
+        return value;
+      });
+    } catch (error) {
+      if ((error as { code?: string }).code === "23505") {
+        throw new DomainError("model_id_taken", "Public model ID already exists", 409);
+      }
+      throw error;
+    }
+  }
+
+  async updateProviderModel(
+    id: string,
+    expectedVersion: number,
+    input: UpdateProviderModelInput,
+    mutation: RegistryMutationContext,
+  ) {
+    validateRegistryMutation(mutation);
+    validateProviderModelInput(input);
+    try {
+      return await this.#sql.begin(async (tx) => {
+        const currentRows = await tx<
+          Row[]
+        >`SELECT * FROM provider_models WHERE id=${id} FOR UPDATE`;
+        if (!currentRows[0]) throw new DomainError("not_found", "Provider model not found", 404);
+        const current = providerModel(currentRows[0]);
+        if (current.version !== expectedVersion) throw registryConflict();
+        const rows = await tx<Row[]>`
+          UPDATE provider_models SET public_model_id=${
+          input.publicModelId ?? current.publicModelId
+        },
+            upstream_model_id=${input.upstreamModelId?.trim() ?? current.upstreamModelId},
+            display_name=${input.displayName?.trim() ?? current.displayName},
+            capabilities=${tx.json(input.capabilities ?? current.capabilities)},
+            context_window=${input.contextWindow ?? current.contextWindow},
+            enabled=${input.enabled ?? current.enabled},
+            custom_params=${tx.json((input.customParams ?? current.customParams) as never)},
+            version=version+1,updated_at=now() WHERE id=${id} RETURNING *`;
+        const value = providerModel(rows[0]);
+        await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+          VALUES(${mutation.actorId ?? null},${mutation.action},'provider_model',${value.id},${
+          tx.json({ ...mutation.metadata, providerId: value.providerId, version: value.version })
+        })`;
+        return value;
+      });
+    } catch (error) {
+      if ((error as { code?: string }).code === "23505") {
+        throw new DomainError("model_id_taken", "Public model ID already exists", 409);
+      }
+      throw error;
+    }
+  }
+
+  async listProviderModels(providerId?: string, enabledOnly = false) {
+    const rows = providerId && enabledOnly
+      ? await this.#sql<Row[]>`SELECT * FROM provider_models WHERE provider_id=${providerId}
+          AND enabled ORDER BY display_name,id`
+      : providerId
+      ? await this.#sql<Row[]>`SELECT * FROM provider_models WHERE provider_id=${providerId}
+          ORDER BY display_name,id`
+      : enabledOnly
+      ? await this.#sql<Row[]>`SELECT * FROM provider_models WHERE enabled ORDER BY display_name,id`
+      : await this.#sql<Row[]>`SELECT * FROM provider_models ORDER BY display_name,id`;
+    return rows.map(providerModel);
+  }
+
+  async findProviderModel(idOrPublicModelId: string) {
+    const rows = await this.#sql<Row[]>`
+      SELECT * FROM provider_models WHERE id::text=${idOrPublicModelId}
+        OR public_model_id=${idOrPublicModelId} LIMIT 1`;
+    return rows[0] ? providerModel(rows[0]) : undefined;
+  }
+
+  async createModelPriceVersion(
+    input: CreateModelPriceVersionInput,
+    mutation: RegistryMutationContext,
+  ) {
+    validateRegistryMutation(mutation);
+    validatePriceInput(input);
+    try {
+      return await this.#sql.begin(async (tx) => {
+        const models = await tx<Row[]>`
+          SELECT version FROM provider_models WHERE id=${input.providerModelId} FOR UPDATE`;
+        if (!models[0]) throw new DomainError("not_found", "Provider model not found", 404);
+        if (number(models[0].version) !== input.expectedModelVersion) throw registryConflict();
+        const rows = await tx<Row[]>`
+          INSERT INTO model_price_versions(provider_model_id,effective_at,input_micros_per_million,
+            cached_input_micros_per_million,reasoning_micros_per_million,
+            output_micros_per_million,fixed_call_micros,source)
+          VALUES(${input.providerModelId},${input.effectiveAt},${input.inputMicrosPerMillion},
+            ${input.cachedInputMicrosPerMillion},${input.reasoningMicrosPerMillion},
+            ${input.outputMicrosPerMillion},${input.fixedCallMicros},${input.source.trim()})
+          RETURNING *`;
+        const value = modelPrice(rows[0]);
+        const modelRows = await tx<Row[]>`
+          UPDATE provider_models SET version=version+1,updated_at=now()
+          WHERE id=${input.providerModelId} RETURNING version`;
+        await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+          VALUES(${mutation.actorId ?? null},${mutation.action},'model_price_version',${value.id},${
+          tx.json({
+            ...mutation.metadata,
+            providerModelId: value.providerModelId,
+            effectiveAt: value.effectiveAt,
+            modelVersion: number(modelRows[0].version),
+          })
+        })`;
+        return value;
+      });
+    } catch (error) {
+      if ((error as { code?: string }).code === "23505") {
+        throw new DomainError(
+          "price_effective_at_taken",
+          "A price already starts at that time",
+          409,
+        );
+      }
+      throw error;
+    }
+  }
+
+  async listModelPriceVersions(providerModelId: string) {
+    const exists = await this.#sql`SELECT id FROM provider_models WHERE id=${providerModelId}`;
+    if (!exists.length) throw new DomainError("not_found", "Provider model not found", 404);
+    return (await this.#sql<Row[]>`
+      SELECT * FROM model_price_versions WHERE provider_model_id=${providerModelId}
+      ORDER BY effective_at DESC,id DESC`).map(modelPrice);
+  }
+
+  async effectiveModelPrice(providerModelId: string, at = new Date().toISOString()) {
+    if (!Number.isFinite(Date.parse(at))) {
+      throw new DomainError("validation_error", "Price lookup timestamp is invalid", 422);
+    }
+    const exists = await this.#sql`SELECT id FROM provider_models WHERE id=${providerModelId}`;
+    if (!exists.length) throw new DomainError("not_found", "Provider model not found", 404);
+    const rows = await this.#sql<Row[]>`
+      SELECT * FROM model_price_versions WHERE provider_model_id=${providerModelId}
+        AND effective_at <= ${at} ORDER BY effective_at DESC,id DESC LIMIT 1`;
+    return rows[0] ? modelPrice(rows[0]) : undefined;
+  }
+
   async createApiToken(userId: string, input: CreateApiTokenInput) {
     const rows = await this.#sql<
       Row[]
@@ -1318,7 +1827,11 @@ export class PostgresRepository implements DomainRepository {
     amount: number,
     provider = "unknown",
     tokenId?: string,
+    pricingSnapshot?: UsagePricingSnapshot,
   ) {
+    if (pricingSnapshot !== undefined && !isUsagePricingSnapshot(pricingSnapshot)) {
+      throw new DomainError("validation_error", "Usage pricing snapshot is invalid", 422);
+    }
     return await this.#sql.begin(async (tx) => {
       const users = await tx<Row[]>`SELECT balance_micros FROM users WHERE id=${userId} FOR UPDATE`;
       if (!users[0]) throw new DomainError("not_found", "User not found", 404);
@@ -1329,9 +1842,15 @@ export class PostgresRepository implements DomainRepository {
       try {
         const runs = await tx<
           Row[]
-        >`INSERT INTO usage_runs(id,user_id,token_id,model,provider,status,reserved_micros) VALUES(${runId},${userId},${
+        >`INSERT INTO usage_runs(id,user_id,token_id,model,provider,status,reserved_micros,pricing_version_id,pricing_input_micros_per_million,pricing_cached_input_micros_per_million,pricing_reasoning_micros_per_million,pricing_output_micros_per_million,pricing_fixed_call_micros,pricing_source) VALUES(${runId},${userId},${
           tokenId ?? null
-        },${model},${provider},'reserved',${amount}) RETURNING *`;
+        },${model},${provider},'reserved',${amount},${pricingSnapshot?.pricingVersionId ?? null},${
+          pricingSnapshot?.inputMicrosPerMillion ?? null
+        },${pricingSnapshot?.cachedInputMicrosPerMillion ?? null},${
+          pricingSnapshot?.reasoningMicrosPerMillion ?? null
+        },${pricingSnapshot?.outputMicrosPerMillion ?? null},${
+          pricingSnapshot?.fixedCallMicros ?? null
+        },${pricingSnapshot?.source ?? null}) RETURNING *`;
         const after = balance - amount;
         await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${userId}`;
         await tx`INSERT INTO ledger_entries(user_id,usage_run_id,kind,amount_micros,balance_after_micros) VALUES(${userId},${runId},'reserve',${-amount},${after})`;
@@ -1413,6 +1932,9 @@ export class PostgresRepository implements DomainRepository {
       input.reserveMicros < 0 || leaseSeconds < 1 || retentionSeconds < 60 ||
       retentionSeconds > 2_592_000
     ) throw new DomainError("validation_error", "Invalid idempotent request parameters", 422);
+    if (input.pricingSnapshot !== undefined && !isUsagePricingSnapshot(input.pricingSnapshot)) {
+      throw new DomainError("validation_error", "Usage pricing snapshot is invalid", 422);
+    }
     return await this.#sql.begin(async (tx) => {
       const users = await tx<
         Row[]
@@ -1461,11 +1983,18 @@ export class PostgresRepository implements DomainRepository {
       if (balance < input.reserveMicros) {
         throw new DomainError("insufficient_credit", "Insufficient credit", 402);
       }
+      const pricing = input.pricingSnapshot;
       const runs = await tx<
         Row[]
-      >`INSERT INTO usage_runs(id,user_id,token_id,model,provider,status,reserved_micros) VALUES(${input.runId},${input.userId},${
+      >`INSERT INTO usage_runs(id,user_id,token_id,model,provider,status,reserved_micros,pricing_version_id,pricing_input_micros_per_million,pricing_cached_input_micros_per_million,pricing_reasoning_micros_per_million,pricing_output_micros_per_million,pricing_fixed_call_micros,pricing_source) VALUES(${input.runId},${input.userId},${
         input.tokenId ?? null
-      },${input.model},${input.provider},'reserved',${input.reserveMicros}) RETURNING *`;
+      },${input.model},${input.provider},'reserved',${input.reserveMicros},${
+        pricing?.pricingVersionId ?? null
+      },${pricing?.inputMicrosPerMillion ?? null},${pricing?.cachedInputMicrosPerMillion ?? null},${
+        pricing?.reasoningMicrosPerMillion ?? null
+      },${pricing?.outputMicrosPerMillion ?? null},${pricing?.fixedCallMicros ?? null},${
+        pricing?.source ?? null
+      }) RETURNING *`;
       const after = balance - input.reserveMicros;
       await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${input.userId}`;
       await tx`INSERT INTO ledger_entries(user_id,usage_run_id,kind,amount_micros,balance_after_micros) VALUES(${input.userId},${input.runId},'reserve',${-input

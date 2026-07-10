@@ -193,6 +193,30 @@ function validateUsage(value: unknown, bounds?: UsageBounds) {
       if (name.endsWith("_tokens")) tokenCount(count, `${detailsName}.${name}`);
     }
   }
+  const promptDetails = usage.prompt_tokens_details as Record<string, unknown> | undefined;
+  const completionDetails = usage.completion_tokens_details as Record<string, unknown> | undefined;
+  const cachedTokens = promptDetails
+    ? tokenCount(promptDetails.cached_tokens, "prompt_tokens_details.cached_tokens")
+    : undefined;
+  const reasoningTokens = completionDetails
+    ? tokenCount(completionDetails.reasoning_tokens, "completion_tokens_details.reasoning_tokens")
+    : undefined;
+  if (cachedTokens !== undefined) {
+    if (promptTokens === undefined) {
+      throw new Error("Upstream sent invalid usage: cached tokens require prompt tokens");
+    }
+    if (cachedTokens > promptTokens) {
+      throw new Error("Upstream cached token usage exceeds prompt token usage");
+    }
+  }
+  if (reasoningTokens !== undefined) {
+    if (completionTokens === undefined) {
+      throw new Error("Upstream sent invalid usage: reasoning tokens require completion tokens");
+    }
+    if (reasoningTokens > completionTokens) {
+      throw new Error("Upstream reasoning token usage exceeds completion token usage");
+    }
+  }
 }
 function providerTimeoutMs(override?: number): number {
   const value = override ?? Number(Deno.env.get("OPENAI_TIMEOUT_MS") ?? 120_000);
@@ -423,7 +447,14 @@ export async function complete(
   request: ChatCompletionRequest,
   signal: AbortSignal,
   options: UpstreamStreamOptions = {},
-): Promise<{ text: string; inputTokens: number; outputTokens: number; upstream?: unknown }> {
+): Promise<{
+  text: string;
+  inputTokens: number;
+  outputTokens: number;
+  cachedInputTokens?: number;
+  reasoningTokens?: number;
+  upstream?: unknown;
+}> {
   const inputTokens = Math.max(1, Math.ceil(JSON.stringify(request.messages).length / 4));
   if (request.model.startsWith("simulated/")) {
     const text = simulate(request);
@@ -516,6 +547,23 @@ export async function complete(
   const usage = data.usage && typeof data.usage === "object" && !Array.isArray(data.usage)
     ? data.usage as Record<string, unknown>
     : {};
+  const promptDetails = usage.prompt_tokens_details &&
+      typeof usage.prompt_tokens_details === "object" && !Array.isArray(usage.prompt_tokens_details)
+    ? usage.prompt_tokens_details as Record<string, unknown>
+    : {};
+  const completionDetails = usage.completion_tokens_details &&
+      typeof usage.completion_tokens_details === "object" &&
+      !Array.isArray(usage.completion_tokens_details)
+    ? usage.completion_tokens_details as Record<string, unknown>
+    : {};
+  const cachedInputTokens = tokenCount(
+    promptDetails.cached_tokens,
+    "prompt_tokens_details.cached_tokens",
+  );
+  const reasoningTokens = tokenCount(
+    completionDetails.reasoning_tokens,
+    "completion_tokens_details.reasoning_tokens",
+  );
   return {
     text,
     inputTokens: tokenCount(usage.prompt_tokens, "prompt token usage") ?? inputTokens,
@@ -523,6 +571,8 @@ export async function complete(
       tokenCount(usage.completion_tokens, "completion token usage") ?? 0,
       estimatedOutputTokens,
     ),
+    ...(cachedInputTokens === undefined ? {} : { cachedInputTokens }),
+    ...(reasoningTokens === undefined ? {} : { reasoningTokens }),
     upstream: payload,
   };
 }

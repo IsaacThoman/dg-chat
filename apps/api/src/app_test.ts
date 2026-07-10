@@ -834,13 +834,33 @@ Deno.test("idempotent provider calls heartbeat while waiting for a slow first to
   assertStringIncludes(await body, "slow result");
 });
 
-Deno.test("disconnecting after a role-only provider chunk refunds the reservation", async () => {
-  const providerStream = async function* (_request: ChatCompletionRequest, signal: AbortSignal) {
-    yield JSON.stringify({
-      id: "chatcmpl-role-only",
-      object: "chat.completion.chunk",
-      choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
-    });
+Deno.test("disconnect settlement distinguishes role-only and tool-output streams", async () => {
+  const providerStream = async function* (request: ChatCompletionRequest, signal: AbortSignal) {
+    const toolOnly = JSON.stringify(request.messages).includes("tool output");
+    yield JSON.stringify(
+      toolOnly
+        ? {
+          id: "chatcmpl-tool-only",
+          object: "chat.completion.chunk",
+          choices: [{
+            index: 0,
+            delta: {
+              tool_calls: [{
+                index: 0,
+                id: "call_1",
+                type: "function",
+                function: { name: "lookup", arguments: '{"query":"weather"}' },
+              }],
+            },
+            finish_reason: null,
+          }],
+        }
+        : {
+          id: "chatcmpl-role-only",
+          object: "chat.completion.chunk",
+          choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+        },
+    );
     await new Promise<void>((resolve) =>
       signal.addEventListener("abort", () => resolve(), {
         once: true,
@@ -899,61 +919,117 @@ Deno.test("disconnecting after a role-only provider chunk refunds the reservatio
   const after = await repository.usage(me.user.id);
   assertEquals(after.balanceMicros, before.balanceMicros);
   assertEquals(after.calls, before.calls);
+
+  const toolResponse = await app.request("/v1/chat/completions", {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "openai/default",
+      messages: [{ role: "user", content: "disconnect after tool output" }],
+      stream: true,
+    }),
+  });
+  const toolReader = toolResponse.body?.getReader();
+  assertExists(toolReader);
+  assertEquals((await toolReader.read()).done, false);
+  await toolReader.cancel();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const afterTool = await repository.usage(me.user.id);
+  assertEquals(afterTool.calls, after.calls + 1);
+  assertEquals(afterTool.balanceMicros < after.balanceMicros, true);
 });
 
 Deno.test("OpenAI routes reject upstream models that are not explicitly configured", async () => {
-  const { app } = createApp({ setupToken: "model-allowlist-setup" });
-  await app.request("/api/setup/bootstrap", {
-    method: "POST",
-    headers: {
+  const previousAllowedModels = Deno.env.get("OPENAI_ALLOWED_MODELS");
+  const previousBaseUrl = Deno.env.get("OPENAI_BASE_URL");
+  const previousApiKey = Deno.env.get("OPENAI_API_KEY");
+  Deno.env.set("OPENAI_ALLOWED_MODELS", "advertised-but-unconfigured");
+  Deno.env.delete("OPENAI_BASE_URL");
+  Deno.env.delete("OPENAI_API_KEY");
+  try {
+    const { app } = createApp({ setupToken: "model-allowlist-setup" });
+    await app.request("/api/setup/bootstrap", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-setup-token": "model-allowlist-setup",
+      },
+      body: JSON.stringify({
+        email: "model-allowlist@example.com",
+        password: "correct horse battery",
+        name: "Model Admin",
+      }),
+    });
+    const login = await app.request("/api/auth/sign-in/email", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        email: "model-allowlist@example.com",
+        password: "correct horse battery",
+      }),
+    });
+    const auth = {
+      cookie: sessionCookie(login),
+      origin: "http://localhost:5173",
       "content-type": "application/json",
-      "x-setup-token": "model-allowlist-setup",
-    },
-    body: JSON.stringify({
-      email: "model-allowlist@example.com",
-      password: "correct horse battery",
-      name: "Model Admin",
-    }),
-  });
-  const login = await app.request("/api/auth/sign-in/email", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      email: "model-allowlist@example.com",
-      password: "correct horse battery",
-    }),
-  });
-  const auth = {
-    cookie: sessionCookie(login),
-    origin: "http://localhost:5173",
-    "content-type": "application/json",
-  };
-  const tokenResponse = await app.request("/api/tokens", {
-    method: "POST",
-    headers: auth,
-    body: JSON.stringify({ name: "allowlist", scopes: ["models:read", "chat:write"] }),
-  });
-  const token = (await json(tokenResponse)).token as string;
-  const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
+    };
+    const tokenResponse = await app.request("/api/tokens", {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ name: "allowlist", scopes: ["models:read", "chat:write"] }),
+    });
+    const token = (await json(tokenResponse)).token as string;
+    const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
 
-  const completion = await app.request("/v1/chat/completions", {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      model: "openai/not-configured",
-      messages: [{ role: "user", content: "must not reach the provider" }],
-    }),
-  });
-  assertEquals(completion.status, 404);
-  assertEquals((await json(completion)).error.code, "model_not_found");
+    const webCatalog = await json(await app.request("/api/models", { headers: auth }));
+    assertEquals(
+      webCatalog.data.some((model: { id: string }) => model.id === "openai/default"),
+      false,
+    );
+    const openAICatalog = await json(await app.request("/v1/models", { headers }));
+    assertEquals(
+      openAICatalog.data.some((model: { id: string }) => model.id === "openai/default"),
+      false,
+    );
+    assertEquals(
+      openAICatalog.data.some((model: { id: string }) =>
+        model.id === "openai/advertised-but-unconfigured"
+      ),
+      false,
+    );
 
-  const responses = await app.request("/v1/responses", {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ model: "openai/not-configured", input: "must not reach the provider" }),
-  });
-  assertEquals(responses.status, 404);
-  assertEquals((await json(responses)).error.code, "model_not_found");
+    const completion = await app.request("/v1/chat/completions", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "openai/not-configured",
+        messages: [{ role: "user", content: "must not reach the provider" }],
+      }),
+    });
+    assertEquals(completion.status, 404);
+    assertEquals((await json(completion)).error.code, "model_not_found");
+
+    const responses = await app.request("/v1/responses", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "openai/not-configured",
+        input: "must not reach the provider",
+      }),
+    });
+    assertEquals(responses.status, 404);
+    assertEquals((await json(responses)).error.code, "model_not_found");
+  } finally {
+    previousAllowedModels === undefined
+      ? Deno.env.delete("OPENAI_ALLOWED_MODELS")
+      : Deno.env.set("OPENAI_ALLOWED_MODELS", previousAllowedModels);
+    previousBaseUrl === undefined
+      ? Deno.env.delete("OPENAI_BASE_URL")
+      : Deno.env.set("OPENAI_BASE_URL", previousBaseUrl);
+    previousApiKey === undefined
+      ? Deno.env.delete("OPENAI_API_KEY")
+      : Deno.env.set("OPENAI_API_KEY", previousApiKey);
+  }
 });
 
 Deno.test("expired web generation ownership is reclaimed once and fences the old worker", async () => {

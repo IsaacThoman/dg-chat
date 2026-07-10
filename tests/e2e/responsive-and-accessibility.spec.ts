@@ -77,6 +77,49 @@ test("health and readiness distinguish process and dependencies", async ({ reque
   expect(ready.ok()).toBeTruthy();
 });
 
+test("provider credentials, failures, and modal focus are safely managed", async ({
+  page,
+  request,
+}, testInfo) => {
+  await bootstrap(request);
+  await login(page);
+  const mobile = testInfo.project.name.includes("mobile");
+  if (mobile) await page.getByRole("button", { name: "Open menu", exact: true }).click();
+  await page.getByRole("button", { name: "Admin console", exact: true }).click();
+  if (mobile) {
+    await page.getByRole("combobox", { name: "Admin section" }).selectOption("providers");
+  } else {
+    await page.getByRole("button", { name: "Providers", exact: true }).click();
+  }
+
+  const addProvider = page.getByRole("button", { name: "Add provider", exact: true });
+  await addProvider.click();
+  const displayName = page.getByLabel("Display name", { exact: true });
+  await expect(displayName).toBeFocused();
+  await displayName.press("Escape");
+  await expect(addProvider).toBeFocused();
+
+  await addProvider.click();
+  const suffix = crypto.randomUUID().slice(0, 8);
+  const providerName = `E2E Provider ${suffix}`;
+  await page.getByLabel("Display name", { exact: true }).fill(providerName);
+  await page.getByLabel(/Provider ID/).fill(`e2e-${suffix}`);
+  await page.getByLabel(/Base URL/).fill("https://provider.invalid/v1");
+  await page.getByLabel(/API credential/).fill(`e2e-secret-${suffix}`);
+  await page.getByRole("button", { name: "Save provider", exact: true }).click();
+  await expect(page.getByRole("heading", { name: providerName, exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: `Manage ${providerName}`, exact: true }).click();
+  const replacement = page.getByLabel(/Replace credential/);
+  await expect(replacement).toHaveValue("");
+  await expect(replacement).toHaveAttribute("autocomplete", "new-password");
+  await page.getByRole("button", { name: "Cancel", exact: true }).click();
+
+  await page.getByRole("button", { name: `Test ${providerName}`, exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText("Provider connection failed");
+  await expect(page.locator("body")).not.toContainText(`e2e-secret-${suffix}`);
+});
+
 test(
   "audit log filters real events and exports a bounded CSV page",
   async ({ page, request }, testInfo) => {

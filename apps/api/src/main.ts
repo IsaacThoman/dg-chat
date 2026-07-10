@@ -6,8 +6,15 @@ import {
   PostgresRepository,
 } from "@dg-chat/database";
 import { MemoryRateLimiter, RedisRateLimiter } from "./rate-limit.ts";
+import { ProviderSecretKeyring } from "./provider-secrets.ts";
 
 const port = Number(Deno.env.get("PORT") ?? 8000);
+const providerKeyring = ProviderSecretKeyring.fromEnv();
+if (Deno.env.get("DENO_ENV") === "production" && !providerKeyring) {
+  throw new Error(
+    "Production requires ENCRYPTION_KEY or ENCRYPTION_KEYRING with ENCRYPTION_PRIMARY_KEY_ID",
+  );
+}
 const databaseUrl = Deno.env.get("DATABASE_URL");
 if (databaseUrl) {
   const backfill = await backfillLegacyRuntimeSnapshot(databaseUrl);
@@ -24,7 +31,7 @@ const rateLimiter = Deno.env.get("REDIS_URL")
   ? new RedisRateLimiter(Deno.env.get("REDIS_URL")!)
   : new MemoryRateLimiter();
 const objectStore = objectStoreFromEnv();
-const { app } = createApp({ repository, rateLimiter, objectStore });
+const { app } = createApp({ repository, rateLimiter, objectStore, providerKeyring });
 const replayMaintenance = setInterval(async () => {
   try {
     const reaped = await repository.reapStaleApiRequests(100);
