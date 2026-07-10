@@ -19,6 +19,7 @@ if (!models.data.some((candidate) => candidate.id === embeddingModel)) {
 const embeddings = await client.embeddings.create({
   model: embeddingModel,
   input: ["JavaScript embeddings one", "JavaScript embeddings two"],
+  encoding_format: "float",
 });
 if (
   embeddings.object !== "list" || embeddings.model !== embeddingModel ||

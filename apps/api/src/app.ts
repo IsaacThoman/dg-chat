@@ -3585,10 +3585,7 @@ export function createApp(options: AppOptions = {}) {
     const started = performance.now();
     let terminalAccounting = false;
     try {
-      const exactTestProvider = Deno.env.get("DENO_ENV") === "test" &&
-        Deno.env.get("OPENAI_TEST_ALLOW_HTTP_HOST")?.toLowerCase() ===
-          new URL(upstream.baseUrl!).hostname.toLowerCase();
-      const payload = resolved.registryModel && providerExecution && !exactTestProvider
+      const payload = resolved.registryModel && providerExecution
         ? await providerExecution.embeddings(
           resolved.registryModel.id,
           runId,
@@ -3649,9 +3646,6 @@ export function createApp(options: AppOptions = {}) {
       return new Response(responseBody, { headers: { "content-type": "application/json" } });
     } catch (error) {
       if (terminalAccounting) throw error;
-      if (Deno.env.get("DENO_ENV") === "test") {
-        console.error("Embeddings contract request failed", error);
-      }
       const responseStatus = error instanceof EmbeddingsProviderError ? error.status : 502;
       const code = error instanceof EmbeddingsProviderError ? error.code : "provider_error";
       const responseBody = JSON.stringify(

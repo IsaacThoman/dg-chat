@@ -23,6 +23,7 @@ if not any(candidate.id == embedding_model for candidate in models.data):
 embeddings = client.embeddings.create(
     model=embedding_model,
     input=["Python embeddings one", "Python embeddings two"],
+    encoding_format="float",
 )
 if (
     embeddings.object != "list"
