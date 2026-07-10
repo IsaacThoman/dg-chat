@@ -6,6 +6,11 @@ export const adminEmail = env("E2E_ADMIN_EMAIL") ?? "admin@e2e.invalid";
 export const adminPassword = env("E2E_ADMIN_PASSWORD") ?? "Correct-Horse-42-Battery!";
 
 export async function bootstrap(request: APIRequestContext): Promise<void> {
+  const status = await request.get(`${apiURL}/api/setup/status`);
+  expect(status.ok()).toBeTruthy();
+  const setup = await status.json() as { bootstrapRequired?: boolean };
+  if (setup.bootstrapRequired === false) return;
+
   const response = await request.post(`${apiURL}/api/setup/bootstrap`, {
     headers: { "x-setup-token": env("SETUP_TOKEN") ?? "e2e-setup-token" },
     data: { name: "E2E Administrator", email: adminEmail, password: adminPassword },
