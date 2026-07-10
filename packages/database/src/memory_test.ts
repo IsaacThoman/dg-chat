@@ -172,6 +172,330 @@ Deno.test("provider registry hides credentials, versions mutations, and preserve
   );
 });
 
+Deno.test("provider resilience routes are acyclic and attempts are immutable and idempotent", () => {
+  const repo = new MemoryRepository();
+  const actor = repo.bootstrapAdmin({
+    email: "resilience@example.com",
+    name: "Resilience",
+    passwordHash: "x",
+  }, 1_000_000);
+  const policy = repo.createProviderRetryPolicy({
+    name: "transient",
+    maxAttempts: 3,
+    maxRetries: 1,
+    baseDelayMs: 100,
+    maxDelayMs: 2_000,
+    backoffMultiplierBps: 20_000,
+    jitterBps: 1_000,
+    firstTokenTimeoutMs: 10_000,
+    idleTimeoutMs: 20_000,
+    totalTimeoutMs: 60_000,
+    retryableStatuses: [429, 500, 503],
+  }, { actorId: actor.id, action: "retry_policy.create" });
+  const provider = repo.createProvider({
+    slug: "route",
+    displayName: "Route",
+    baseUrl: "https://route.example/v1",
+    protocol: "chat_completions",
+  }, { actorId: actor.id, action: "provider.create" });
+  const credentialed = repo.setProviderCredential(provider.id, provider.version, {
+    envelope: {
+      version: 1,
+      algorithm: "AES-256-GCM",
+      keyId: "test",
+      credentialVersion: 1,
+      wrappedKeyNonce: "bm9uY2U=",
+      wrappedKey: "d3JhcA==",
+      contentNonce: "bm9uY2U=",
+      ciphertext: "Y2lwaGVy",
+    },
+  }, { actorId: actor.id, action: "provider.credential" });
+  const makeModel = (name: string) => {
+    const model = repo.createProviderModel({
+      providerId: provider.id,
+      publicModelId: `route/${name}`,
+      upstreamModelId: name,
+      displayName: name,
+      capabilities: ["chat"],
+      contextWindow: 1_000,
+    }, { actorId: actor.id, action: "model.create" });
+    const price = repo.createModelPriceVersion({
+      providerModelId: model.id,
+      expectedModelVersion: model.version,
+      effectiveAt: "2026-01-01T00:00:00Z",
+      inputMicrosPerMillion: 10,
+      cachedInputMicrosPerMillion: 5,
+      reasoningMicrosPerMillion: 30,
+      outputMicrosPerMillion: 20,
+      fixedCallMicros: 1,
+      source: "route-test",
+    }, { actorId: actor.id, action: "price.create" });
+    return { model: repo.findProviderModel(model.id)!, price };
+  };
+  const a = makeModel("a"), b = makeModel("b"), c = makeModel("c");
+  const routeA = repo.setProviderModelRoute({
+    sourceModelId: a.model.id,
+    expectedVersion: 0,
+    retryPolicyId: policy.id,
+    fallbackModelIds: [b.model.id],
+  }, { actorId: actor.id, action: "route.set" });
+  assertEquals(routeA.version, 1);
+  repo.setProviderModelRoute({
+    sourceModelId: b.model.id,
+    expectedVersion: 0,
+    fallbackModelIds: [c.model.id],
+  }, { actorId: actor.id, action: "route.set" });
+  assertThrows(
+    () =>
+      repo.setProviderModelRoute({
+        sourceModelId: c.model.id,
+        expectedVersion: 0,
+        fallbackModelIds: [a.model.id],
+      }, { actorId: actor.id, action: "route.set" }),
+    DomainError,
+    "acyclic",
+  );
+  const plan = repo.resolveProviderExecutionPlan(a.model.id, "2026-06-01T00:00:00Z");
+  assertEquals(plan.targets.map((target) => target.providerModelId), [
+    a.model.id,
+    b.model.id,
+    c.model.id,
+  ]);
+  assertEquals(plan.retryPolicy?.id, policy.id);
+  assertEquals(plan.retryPolicy?.maxRetries, 1);
+  repo.updateProviderModel(c.model.id, c.model.version, { enabled: false }, {
+    actorId: actor.id,
+    action: "model.disable",
+  });
+  assertThrows(
+    () =>
+      repo.setProviderModelRoute({
+        sourceModelId: a.model.id,
+        expectedVersion: routeA.version,
+        fallbackModelIds: [c.model.id],
+      }, { actorId: actor.id, action: "route.set" }),
+    DomainError,
+    "compatible",
+  );
+  assertEquals(
+    repo.resolveProviderExecutionPlan(a.model.id, "2026-06-01T00:00:00Z").targets.map((target) =>
+      target.providerModelId
+    ),
+    [a.model.id, b.model.id],
+  );
+  const requested = plan.targets[0].pricing;
+  const run = repo.reserve(
+    actor.id,
+    "resilience-run",
+    a.model.publicModelId,
+    100,
+    credentialed.slug,
+    undefined,
+    requested,
+  );
+  const ownerLeaseToken = run.runLeaseToken!;
+  const claim = repo.claimProviderExecution(run.id, ownerLeaseToken);
+  const ownership = { ownerLeaseToken, executionEpoch: claim.executionEpoch };
+  const attempt = repo.startProviderAttempt({
+    ...ownership,
+    usageRunId: run.id,
+    attemptNumber: 1,
+    targetOrdinal: 1,
+    retryNumber: 0,
+    reason: "fallback",
+    breakerBefore: "closed",
+    ...plan.targets[1],
+  });
+  assertEquals(
+    repo.startProviderAttempt({
+      ...ownership,
+      usageRunId: run.id,
+      attemptNumber: 1,
+      targetOrdinal: 1,
+      retryNumber: 0,
+      reason: "fallback",
+      breakerBefore: "closed",
+      ...plan.targets[1],
+    }).id,
+    attempt.id,
+  );
+  assertThrows(
+    () =>
+      repo.startProviderAttempt({
+        ...ownership,
+        usageRunId: run.id,
+        attemptNumber: 1,
+        targetOrdinal: 1,
+        retryNumber: 0,
+        reason: "fallback",
+        breakerBefore: "closed",
+        ...plan.targets[2],
+      }),
+    DomainError,
+    "different target",
+  );
+  const terminal = repo.finishProviderAttempt({
+    ...ownership,
+    id: attempt.id,
+    status: "failed",
+    phase: "headers",
+    errorCode: "http_503",
+    httpStatus: 503,
+    visibleOutput: false,
+    inputTokens: 10,
+    cachedInputTokens: 2,
+    reasoningTokens: 0,
+    outputTokens: 0,
+    costMicros: 2,
+    tokenSource: "provider",
+    costSource: "calculated",
+    latencyMs: 25,
+    ttftMs: null,
+    breakerAfter: "open",
+    retryable: true,
+    upstreamRequestId: "req_provider_1",
+    tokensPerSecond: 400,
+  });
+  assertEquals(
+    repo.finishProviderAttempt({
+      ...ownership,
+      id: attempt.id,
+      status: "failed",
+      phase: "headers",
+      errorCode: "http_503",
+      httpStatus: 503,
+      visibleOutput: false,
+      inputTokens: 10,
+      cachedInputTokens: 2,
+      reasoningTokens: 0,
+      outputTokens: 0,
+      costMicros: 2,
+      tokenSource: "provider",
+      costSource: "calculated",
+      latencyMs: 25,
+      ttftMs: null,
+      breakerAfter: "open",
+      retryable: true,
+      upstreamRequestId: "req_provider_1",
+      tokensPerSecond: 400,
+    }).completedAt,
+    terminal.completedAt,
+  );
+  assertThrows(
+    () =>
+      repo.finishProviderAttempt({
+        ...ownership,
+        id: attempt.id,
+        status: "cancelled",
+        phase: "headers",
+        errorCode: "caller_abort",
+        visibleOutput: false,
+        inputTokens: 0,
+        cachedInputTokens: 0,
+        reasoningTokens: 0,
+        outputTokens: 0,
+        costMicros: 0,
+        tokenSource: "none",
+        costSource: "none",
+        latencyMs: 25,
+        breakerAfter: "unavailable",
+        retryable: false,
+      }),
+    DomainError,
+    "terminal",
+  );
+  const skipped = repo.startProviderAttempt({
+    ...ownership,
+    usageRunId: run.id,
+    attemptNumber: 8,
+    targetOrdinal: 2,
+    retryNumber: 0,
+    reason: "circuit_skip",
+    breakerBefore: "open",
+    ...plan.targets[2],
+  });
+  repo.finishProviderAttempt({
+    ...ownership,
+    id: skipped.id,
+    status: "skipped",
+    phase: "planning",
+    errorCode: "circuit_open",
+    visibleOutput: false,
+    inputTokens: 0,
+    cachedInputTokens: 0,
+    reasoningTokens: 0,
+    outputTokens: 0,
+    costMicros: 0,
+    tokenSource: "none",
+    costSource: "none",
+    latencyMs: 0,
+    breakerAfter: "open",
+    retryable: true,
+  });
+  repo.startProviderAttempt({
+    ...ownership,
+    usageRunId: run.id,
+    attemptNumber: 9,
+    targetOrdinal: 1,
+    retryNumber: 1,
+    reason: "retry",
+    breakerBefore: "closed",
+    ...plan.targets[1],
+  });
+  assertEquals(repo.listProviderAttempts(run.id).map((item) => item.attemptNumber), [1, 8, 9]);
+  assertEquals(repo.usageRuns.get(run.id)?.pricingSnapshot?.pricingVersionId, a.price.id);
+  assertEquals(repo.listProviderAttempts(run.id)[0].pricing.pricingVersionId, b.price.id);
+  assertEquals(repo.usageRuns.get(run.id)?.actualProviderCostMicros, 2);
+  const renewed = repo.heartbeatProviderExecutionLease(run.id, ownerLeaseToken, 60);
+  assertEquals(renewed.leaseToken, ownerLeaseToken);
+  repo.usageRuns.get(run.id)!.runLeaseExpiresAt = new Date(Date.now() - 1_000).toISOString();
+  assertThrows(
+    () => repo.heartbeatProviderExecutionLease(run.id, ownerLeaseToken),
+    DomainError,
+    "no longer active",
+  );
+  const replacement = repo.reclaimProviderExecutionLease(run.id, ownerLeaseToken);
+  const reclaimed = repo.claimProviderExecution(run.id, replacement.leaseToken);
+  assertEquals(reclaimed.executionEpoch, claim.executionEpoch + 1);
+  assertEquals(reclaimed.nextAttemptNumber, 10);
+  assertEquals(reclaimed.reconciledAttemptIds.length, 1);
+  assertEquals(repo.listProviderAttempts(run.id)[2].status, "cancelled");
+  assertThrows(
+    () =>
+      repo.startProviderAttempt({
+        ...ownership,
+        usageRunId: run.id,
+        attemptNumber: 10,
+        targetOrdinal: 1,
+        retryNumber: 1,
+        reason: "retry",
+        breakerBefore: "closed",
+        ...plan.targets[1],
+      }),
+    DomainError,
+    "stale",
+  );
+  const finalized = repo.refundProviderUsage({
+    usageRunId: run.id,
+    ownerLeaseToken: replacement.leaseToken,
+    executionEpoch: reclaimed.executionEpoch,
+    latencyMs: 100,
+    error: "all paths failed",
+  });
+  assertEquals(finalized.status, "completed");
+  assertEquals(finalized.costMicros, 2);
+  assertEquals(
+    repo.refundProviderUsage({
+      usageRunId: run.id,
+      ownerLeaseToken: replacement.leaseToken,
+      executionEpoch: reclaimed.executionEpoch,
+      latencyMs: 100,
+      error: "all paths failed",
+    }).costMicros,
+    2,
+  );
+});
+
 Deno.test("message edits append immutable sibling branches", () => {
   const repo = new MemoryRepository();
   const user = repo.createUser({

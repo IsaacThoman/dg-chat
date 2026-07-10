@@ -28,23 +28,34 @@ import type {
   CreateModelPriceVersionInput,
   CreateProviderInput,
   CreateProviderModelInput,
+  CreateProviderRetryPolicyInput,
   CreateUserInput,
   DocumentChunk,
   DocumentChunkInput,
   DomainRepository,
   FailApiRequestInput,
   FailGenerationInput,
+  FinalizeProviderUsageInput,
+  FinishProviderAttemptInput,
   IdentityTokenPurpose,
   ModelPriceVersion,
+  ProviderAttempt,
   ProviderCredentialEnvelope,
   ProviderCredentialMutation,
+  ProviderExecutionClaim,
+  ProviderExecutionPlan,
   ProviderModelRecord,
+  ProviderModelRoute,
   ProviderRecord,
+  ProviderRetryPolicy,
   RegistryMutationContext,
   SessionSummary,
+  SetProviderModelRouteInput,
+  StartProviderAttemptInput,
   StoredProviderCredential,
   UpdateProviderInput,
   UpdateProviderModelInput,
+  UpdateProviderRetryPolicyInput,
   UsagePricingSnapshot,
 } from "./repository.ts";
 import {
@@ -152,6 +163,17 @@ function run(row: Row): UsageRun {
     inputTokens: number(row.input_tokens),
     outputTokens: number(row.output_tokens),
     latencyMs: number(row.latency_ms ?? 0),
+    executionEpoch: number(row.execution_epoch ?? 0),
+    executionOwnerLeaseToken: row.execution_owner_lease_token
+      ? String(row.execution_owner_lease_token)
+      : null,
+    runLeaseToken: row.run_lease_token ? String(row.run_lease_token) : null,
+    runLeaseExpiresAt: iso(row.run_lease_expires_at),
+    actualProviderCostMicros: number(row.actual_provider_cost_micros ?? 0),
+    actualProviderInputTokens: number(row.actual_provider_input_tokens ?? 0),
+    actualProviderCachedInputTokens: number(row.actual_provider_cached_input_tokens ?? 0),
+    actualProviderReasoningTokens: number(row.actual_provider_reasoning_tokens ?? 0),
+    actualProviderOutputTokens: number(row.actual_provider_output_tokens ?? 0),
     pricingSnapshot,
     generationLeaseToken: row.generation_lease_token ? String(row.generation_lease_token) : null,
     generationLeaseExpiresAt: nullableIso(row.generation_lease_expires_at),
@@ -236,6 +258,79 @@ function modelPrice(row: Row): ModelPriceVersion {
     fixedCallMicros: number(row.fixed_call_micros),
     source: String(row.source),
     createdAt: iso(row.created_at),
+  };
+}
+function retryPolicy(row: Row): ProviderRetryPolicy {
+  return {
+    id: String(row.id),
+    name: String(row.name),
+    enabled: Boolean(row.enabled),
+    maxAttempts: number(row.max_attempts),
+    maxRetries: number(row.max_retries),
+    baseDelayMs: number(row.base_delay_ms),
+    maxDelayMs: number(row.max_delay_ms),
+    backoffMultiplierBps: number(row.backoff_multiplier_bps),
+    jitterBps: number(row.jitter_bps),
+    firstTokenTimeoutMs: number(row.first_token_timeout_ms),
+    idleTimeoutMs: number(row.idle_timeout_ms),
+    totalTimeoutMs: number(row.total_timeout_ms),
+    retryableStatuses: [...(row.retryable_statuses as number[])],
+    version: number(row.version),
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+  };
+}
+function providerAttempt(row: Row): ProviderAttempt {
+  return {
+    id: String(row.id),
+    usageRunId: String(row.usage_run_id),
+    attemptNumber: number(row.attempt_number),
+    executionEpoch: number(row.execution_epoch),
+    targetOrdinal: number(row.target_ordinal),
+    retryNumber: number(row.retry_number),
+    reason: row.reason as ProviderAttempt["reason"],
+    breakerBefore: row.breaker_before == null
+      ? null
+      : row.breaker_before as ProviderAttempt["breakerBefore"],
+    breakerAfter: row.breaker_after == null
+      ? null
+      : row.breaker_after as ProviderAttempt["breakerAfter"],
+    retryable: Boolean(row.retryable),
+    providerId: String(row.provider_id),
+    providerSlug: String(row.provider_slug),
+    providerVersion: number(row.provider_version),
+    protocol: row.protocol as ProviderAttempt["protocol"],
+    providerModelId: String(row.provider_model_id),
+    publicModelId: String(row.public_model_id),
+    upstreamModelId: String(row.upstream_model_id),
+    modelVersion: number(row.model_version),
+    pricing: {
+      pricingVersionId: String(row.pricing_version_id),
+      inputMicrosPerMillion: number(row.pricing_input_micros_per_million),
+      cachedInputMicrosPerMillion: number(row.pricing_cached_input_micros_per_million),
+      reasoningMicrosPerMillion: number(row.pricing_reasoning_micros_per_million),
+      outputMicrosPerMillion: number(row.pricing_output_micros_per_million),
+      fixedCallMicros: number(row.pricing_fixed_call_micros),
+      source: String(row.pricing_source),
+    },
+    status: row.status as ProviderAttempt["status"],
+    phase: row.phase as ProviderAttempt["phase"],
+    errorCode: row.error_code == null ? null : String(row.error_code),
+    httpStatus: row.http_status == null ? null : number(row.http_status),
+    visibleOutput: Boolean(row.visible_output),
+    inputTokens: number(row.input_tokens),
+    cachedInputTokens: number(row.cached_input_tokens),
+    reasoningTokens: number(row.reasoning_tokens),
+    outputTokens: number(row.output_tokens),
+    costMicros: number(row.cost_micros),
+    tokenSource: row.token_source as ProviderAttempt["tokenSource"],
+    costSource: row.cost_source as ProviderAttempt["costSource"],
+    latencyMs: row.latency_ms == null ? null : number(row.latency_ms),
+    ttftMs: row.ttft_ms == null ? null : number(row.ttft_ms),
+    upstreamRequestId: row.upstream_request_id == null ? null : String(row.upstream_request_id),
+    tokensPerSecond: row.tokens_per_second == null ? null : number(row.tokens_per_second),
+    startedAt: iso(row.started_at),
+    completedAt: nullableIso(row.completed_at),
   };
 }
 
@@ -341,6 +436,80 @@ function validatePriceInput(input: CreateModelPriceVersionInput) {
   if (!input.source.trim() || input.source.length > 120) {
     throw new DomainError("validation_error", "Price source is invalid", 422);
   }
+}
+function validateRetryPolicy(input: CreateProviderRetryPolicyInput) {
+  const valid = (value: number, min: number, max: number) =>
+    Number.isSafeInteger(value) && value >= min && value <= max;
+  if (
+    !input.name.trim() || input.name.length > 120 || !valid(input.maxAttempts, 1, 8) ||
+    !valid(input.maxRetries, 0, 3) || input.maxRetries >= input.maxAttempts ||
+    !valid(input.baseDelayMs, 0, 60_000) || !valid(input.maxDelayMs, input.baseDelayMs, 300_000) ||
+    !valid(input.backoffMultiplierBps, 10_000, 40_000) || !valid(input.jitterBps, 0, 10_000) ||
+    !valid(input.firstTokenTimeoutMs, 250, 300_000) || !valid(input.idleTimeoutMs, 250, 300_000) ||
+    !valid(
+      input.totalTimeoutMs,
+      Math.max(input.firstTokenTimeoutMs, input.idleTimeoutMs),
+      900_000,
+    ) ||
+    input.retryableStatuses.length > 32 ||
+    new Set(input.retryableStatuses).size !== input.retryableStatuses.length ||
+    input.retryableStatuses.some((status) => ![408, 425, 429, 500, 502, 503, 504].includes(status))
+  ) {
+    throw new DomainError("validation_error", "Provider retry policy is invalid", 422);
+  }
+}
+function validateAttemptFinish(input: FinishProviderAttemptInput) {
+  const count = (value: number) =>
+    Number.isSafeInteger(value) && value >= 0 && value <= 1_000_000_000;
+  if (
+    ![input.inputTokens, input.cachedInputTokens, input.reasoningTokens, input.outputTokens].every(
+      count,
+    ) ||
+    input.cachedInputTokens > input.inputTokens || input.reasoningTokens > input.outputTokens ||
+    !Number.isSafeInteger(input.costMicros) || input.costMicros < 0 ||
+    !Number.isSafeInteger(input.latencyMs) || input.latencyMs < 0 ||
+    (input.ttftMs != null &&
+      (!Number.isSafeInteger(input.ttftMs) || input.ttftMs < 0 ||
+        input.ttftMs > input.latencyMs)) ||
+    (input.httpStatus != null &&
+      (!Number.isSafeInteger(input.httpStatus) || input.httpStatus < 100 ||
+        input.httpStatus > 599)) ||
+    (input.errorCode != null && !/^[a-z0-9][a-z0-9_.-]{0,119}$/.test(input.errorCode)) ||
+    (input.status === "succeeded" &&
+      (input.phase !== "complete" || input.errorCode != null ||
+        (input.httpStatus != null && (input.httpStatus < 200 || input.httpStatus > 299)))) ||
+    (["failed", "cancelled", "skipped"].includes(input.status) && input.errorCode == null) ||
+    (input.status === "skipped" &&
+      (input.visibleOutput || input.inputTokens + input.outputTokens + input.costMicros !== 0 ||
+        input.tokenSource !== "none" || input.costSource !== "none")) ||
+    (input.breakerAfter != null &&
+      !["closed", "open", "half_open", "unavailable"].includes(input.breakerAfter)) ||
+    (input.upstreamRequestId != null &&
+      !/^[A-Za-z0-9._:-]{1,255}$/.test(input.upstreamRequestId)) ||
+    (input.tokensPerSecond != null &&
+      (!Number.isFinite(input.tokensPerSecond) || input.tokensPerSecond < 0 ||
+        input.tokensPerSecond > 1_000_000))
+  ) {
+    throw new DomainError("validation_error", "Provider attempt telemetry is invalid", 422);
+  }
+}
+function exactAttemptCost(attempt: ProviderAttempt, input: FinishProviderAttemptInput): number {
+  if (input.status === "skipped") return 0;
+  const numerator = BigInt(input.inputTokens - input.cachedInputTokens) *
+      BigInt(attempt.pricing.inputMicrosPerMillion) +
+    BigInt(input.cachedInputTokens) * BigInt(attempt.pricing.cachedInputMicrosPerMillion) +
+    BigInt(input.reasoningTokens) * BigInt(attempt.pricing.reasoningMicrosPerMillion) +
+    BigInt(input.outputTokens - input.reasoningTokens) *
+      BigInt(attempt.pricing.outputMicrosPerMillion);
+  const cost = BigInt(attempt.pricing.fixedCallMicros) + (numerator + 999_999n) / 1_000_000n;
+  if (cost > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new DomainError(
+      "accounting_overflow",
+      "Provider attempt cost exceeds accounting bounds",
+      422,
+    );
+  }
+  return Number(cost);
 }
 function validateCredentialEnvelope(envelope: ProviderCredentialEnvelope) {
   const strings = [
@@ -1099,7 +1268,15 @@ export class PostgresRepository implements DomainRepository {
       const account = await tx<
         Row[]
       >`SELECT balance_micros FROM users WHERE id=${input.ownerId} FOR UPDATE`;
-      const delta = number(runs[0].reserved_micros) - input.costMicros;
+      const actualCost = number(runs[0].actual_provider_cost_micros);
+      const effectiveCost = actualCost > 0 ? actualCost : input.costMicros;
+      const effectiveInputTokens = actualCost > 0
+        ? number(runs[0].actual_provider_input_tokens)
+        : input.inputTokens;
+      const effectiveOutputTokens = actualCost > 0
+        ? number(runs[0].actual_provider_output_tokens)
+        : input.outputTokens;
+      const delta = number(runs[0].reserved_micros) - effectiveCost;
       const after = number(account[0].balance_micros) + delta;
       if (after < 0) {
         throw new DomainError("insufficient_credit", "Actual cost exceeds available credit", 402);
@@ -1122,7 +1299,7 @@ export class PostgresRepository implements DomainRepository {
       }
       const finished = await tx<
         Row[]
-      >`UPDATE usage_runs SET status='completed',generation_lease_token=NULL,generation_lease_expires_at=NULL,cost_micros=${input.costMicros},input_tokens=${input.inputTokens},output_tokens=${input.outputTokens},latency_ms=${input.latencyMs},completed_at=now() WHERE id=${input.runId} RETURNING *`;
+      >`UPDATE usage_runs SET status='completed',generation_lease_token=NULL,generation_lease_expires_at=NULL,cost_micros=${effectiveCost},input_tokens=${effectiveInputTokens},output_tokens=${effectiveOutputTokens},latency_ms=${input.latencyMs},completed_at=now() WHERE id=${input.runId} RETURNING *`;
       const updated = await tx<
         Row[]
       >`UPDATE conversations SET active_leaf_id=CASE WHEN active_leaf_id=${input.userMessageId} THEN ${
@@ -1170,7 +1347,9 @@ export class PostgresRepository implements DomainRepository {
       const account = await tx<
         Row[]
       >`SELECT balance_micros FROM users WHERE id=${input.ownerId} FOR UPDATE`;
-      const after = number(account[0].balance_micros) + number(runs[0].reserved_micros);
+      const actualCost = number(runs[0].actual_provider_cost_micros);
+      const delta = number(runs[0].reserved_micros) - actualCost;
+      const after = number(account[0].balance_micros) + delta;
       const idx = await tx<
         { next: number }[]
       >`SELECT count(*)::int next FROM messages WHERE conversation_id=${input.conversationId} AND parent_id=${input.userMessageId}`;
@@ -1182,12 +1361,20 @@ export class PostgresRepository implements DomainRepository {
         tx.json({ generationError: input.error, retryable: true })
       },${input.idempotencyKey}) RETURNING *`;
       await tx`UPDATE users SET balance_micros=${after} WHERE id=${input.ownerId}`;
-      await tx`INSERT INTO ledger_entries(user_id,usage_run_id,kind,amount_micros,balance_after_micros) VALUES(${input.ownerId},${input.runId},'refund',${
-        number(runs[0].reserved_micros)
-      },${after})`;
+      if (delta !== 0) {
+        await tx`INSERT INTO ledger_entries(user_id,usage_run_id,kind,amount_micros,balance_after_micros) VALUES(${input.ownerId},${input.runId},${
+          delta > 0 ? "refund" : "settle"
+        },${delta},${after})`;
+      }
       const failed = await tx<
         Row[]
-      >`UPDATE usage_runs SET status='failed',generation_lease_token=NULL,generation_lease_expires_at=NULL,error=${input.error},completed_at=now() WHERE id=${input.runId} RETURNING *`;
+      >`UPDATE usage_runs SET status=${
+        actualCost > 0 ? "completed" : "failed"
+      },generation_lease_token=NULL,generation_lease_expires_at=NULL,cost_micros=${actualCost},input_tokens=${
+        number(runs[0].actual_provider_input_tokens)
+      },output_tokens=${
+        number(runs[0].actual_provider_output_tokens)
+      },error=${input.error},completed_at=now() WHERE id=${input.runId} RETURNING *`;
       const updated = await tx<
         Row[]
       >`UPDATE conversations SET active_leaf_id=CASE WHEN active_leaf_id=${input.userMessageId} THEN ${
@@ -1210,13 +1397,22 @@ export class PostgresRepository implements DomainRepository {
         const account = await tx<
           Row[]
         >`SELECT balance_micros FROM users WHERE id=${userId} FOR UPDATE`;
-        const amount = number(row.reserved_micros);
+        const actualCost = number(row.actual_provider_cost_micros);
+        const amount = number(row.reserved_micros) - actualCost;
         const after = number(account[0].balance_micros) + amount;
         await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${userId}`;
-        await tx`INSERT INTO ledger_entries(user_id,usage_run_id,kind,amount_micros,balance_after_micros) VALUES(${userId},${
-          String(row.id)
-        },'refund',${amount},${after})`;
-        await tx`UPDATE usage_runs SET status='failed',generation_lease_token=NULL,generation_lease_expires_at=NULL,error='generation lease expired',completed_at=now() WHERE id=${
+        if (amount !== 0) {
+          await tx`INSERT INTO ledger_entries(user_id,usage_run_id,kind,amount_micros,balance_after_micros) VALUES(${userId},${
+            String(row.id)
+          },${amount > 0 ? "refund" : "settle"},${amount},${after})`;
+        }
+        await tx`UPDATE usage_runs SET status=${
+          actualCost > 0 ? "completed" : "failed"
+        },cost_micros=${actualCost},input_tokens=${
+          number(row.actual_provider_input_tokens)
+        },output_tokens=${
+          number(row.actual_provider_output_tokens)
+        },generation_lease_token=NULL,generation_lease_expires_at=NULL,error='generation lease expired',completed_at=now() WHERE id=${
           String(row.id)
         }`;
       }
@@ -1792,6 +1988,677 @@ export class PostgresRepository implements DomainRepository {
     return rows[0] ? modelPrice(rows[0]) : undefined;
   }
 
+  async createProviderRetryPolicy(
+    input: CreateProviderRetryPolicyInput,
+    mutation: RegistryMutationContext,
+  ) {
+    validateRegistryMutation(mutation);
+    validateRetryPolicy(input);
+    try {
+      return await this.#sql.begin(async (tx) => {
+        const rows = await tx<
+          Row[]
+        >`INSERT INTO provider_retry_policies(name,enabled,max_attempts,max_retries,
+          base_delay_ms,max_delay_ms,backoff_multiplier_bps,jitter_bps,first_token_timeout_ms,
+          idle_timeout_ms,total_timeout_ms,retryable_statuses)
+          VALUES(${input.name.trim()},${
+          input.enabled ?? true
+        },${input.maxAttempts},${input.maxRetries},${input.baseDelayMs},
+          ${input.maxDelayMs},${input.backoffMultiplierBps},${input.jitterBps},${input.firstTokenTimeoutMs},
+          ${input.idleTimeoutMs},${input.totalTimeoutMs},${
+          tx.json([...input.retryableStatuses].sort((a, b) => a - b))
+        }) RETURNING *`;
+        const value = retryPolicy(rows[0]);
+        await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+          VALUES(${
+          mutation.actorId ?? null
+        },${mutation.action},'provider_retry_policy',${value.id},${
+          tx.json({ ...mutation.metadata, version: value.version })
+        })`;
+        return value;
+      });
+    } catch (error) {
+      if ((error as { code?: string }).code === "23505") {
+        throw new DomainError("retry_policy_name_taken", "Retry policy name already exists", 409);
+      }
+      throw error;
+    }
+  }
+
+  async updateProviderRetryPolicy(
+    id: string,
+    expectedVersion: number,
+    input: UpdateProviderRetryPolicyInput,
+    mutation: RegistryMutationContext,
+  ) {
+    validateRegistryMutation(mutation);
+    try {
+      return await this.#sql.begin(async (tx) => {
+        const rows = await tx<
+          Row[]
+        >`SELECT * FROM provider_retry_policies WHERE id=${id} FOR UPDATE`;
+        if (!rows[0]) throw new DomainError("not_found", "Retry policy not found", 404);
+        const current = retryPolicy(rows[0]);
+        if (current.version !== expectedVersion) throw registryConflict();
+        const next = { ...current, ...input, name: input.name?.trim() ?? current.name };
+        validateRetryPolicy(next);
+        const updated = await tx<
+          Row[]
+        >`UPDATE provider_retry_policies SET name=${next.name},enabled=${next.enabled},
+          max_attempts=${next.maxAttempts},max_retries=${next.maxRetries},base_delay_ms=${next.baseDelayMs},max_delay_ms=${next.maxDelayMs},
+          backoff_multiplier_bps=${next.backoffMultiplierBps},jitter_bps=${next.jitterBps},
+          first_token_timeout_ms=${next.firstTokenTimeoutMs},idle_timeout_ms=${next.idleTimeoutMs},
+          total_timeout_ms=${next.totalTimeoutMs},retryable_statuses=${
+          tx.json([...next.retryableStatuses].sort((a, b) => a - b))
+        },
+          version=version+1,updated_at=now() WHERE id=${id} RETURNING *`;
+        const value = retryPolicy(updated[0]);
+        await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+          VALUES(${
+          mutation.actorId ?? null
+        },${mutation.action},'provider_retry_policy',${value.id},${
+          tx.json({ ...mutation.metadata, version: value.version })
+        })`;
+        return value;
+      });
+    } catch (error) {
+      if ((error as { code?: string }).code === "23505") {
+        throw new DomainError("retry_policy_name_taken", "Retry policy name already exists", 409);
+      }
+      throw error;
+    }
+  }
+
+  async listProviderRetryPolicies(enabledOnly = false) {
+    const rows = enabledOnly
+      ? await this.#sql<Row[]>`SELECT * FROM provider_retry_policies WHERE enabled ORDER BY name,id`
+      : await this.#sql<Row[]>`SELECT * FROM provider_retry_policies ORDER BY name,id`;
+    return rows.map(retryPolicy);
+  }
+
+  async setProviderModelRoute(
+    input: SetProviderModelRouteInput,
+    mutation: RegistryMutationContext,
+  ): Promise<ProviderModelRoute> {
+    validateRegistryMutation(mutation);
+    if (
+      input.fallbackModelIds.length > 8 ||
+      new Set(input.fallbackModelIds).size !== input.fallbackModelIds.length ||
+      input.fallbackModelIds.includes(input.sourceModelId)
+    ) {
+      throw new DomainError("validation_error", "Fallback targets are invalid", 422);
+    }
+    return await this.#sql.begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtextextended('provider_model_routes',0))`;
+      const source = await tx<Row[]>`SELECT m.*,p.protocol FROM provider_models m
+        JOIN providers p ON p.id=m.provider_id WHERE m.id=${input.sourceModelId}`;
+      if (!source.length) throw new DomainError("not_found", "Source model not found", 404);
+      if (input.retryPolicyId != null) {
+        const policy =
+          await tx`SELECT id FROM provider_retry_policies WHERE id=${input.retryPolicyId}`;
+        if (!policy.length) throw new DomainError("not_found", "Retry policy not found", 404);
+      }
+      const targets = input.fallbackModelIds.length
+        ? await tx<
+          Row[]
+        >`SELECT m.*,p.protocol,p.enabled AS provider_enabled,p.credential_envelope,
+            EXISTS(SELECT 1 FROM model_price_versions mp WHERE mp.provider_model_id=m.id AND mp.effective_at<=now()) AS priced
+          FROM provider_models m JOIN providers p ON p.id=m.provider_id
+          WHERE m.id = ANY(${input.fallbackModelIds}::uuid[])`
+        : [];
+      if (targets.length !== input.fallbackModelIds.length) {
+        throw new DomainError("validation_error", "Fallback targets are invalid", 422);
+      }
+      const sourceRow = source[0];
+      const sourceCapabilities = sourceRow.capabilities as string[];
+      if (
+        targets.some((target) =>
+          !target.enabled || !target.provider_enabled || target.credential_envelope == null ||
+          !target.priced || target.protocol !== sourceRow.protocol ||
+          number(target.context_window) < number(sourceRow.context_window) ||
+          sourceCapabilities.some((capability) =>
+            !(target.capabilities as string[]).includes(capability)
+          )
+        )
+      ) {
+        throw new DomainError(
+          "fallback_incompatible",
+          "Fallback targets must be available and compatible with the source model",
+          422,
+        );
+      }
+      const currentRows = await tx<
+        Row[]
+      >`SELECT * FROM provider_model_routes WHERE source_model_id=${input.sourceModelId} FOR UPDATE`;
+      const currentVersion = currentRows[0] ? number(currentRows[0].version) : 0;
+      if (currentVersion !== input.expectedVersion) throw registryConflict();
+      let routeRows: Row[];
+      if (currentRows[0]) {
+        const routeId = String(currentRows[0].id);
+        routeRows = await tx<Row[]>`UPDATE provider_model_routes SET retry_policy_id=${
+          input.retryPolicyId ?? null
+        },version=version+1,updated_at=now() WHERE id=${routeId} RETURNING *`;
+      } else {
+        routeRows = await tx<
+          Row[]
+        >`INSERT INTO provider_model_routes(source_model_id,retry_policy_id) VALUES(${input.sourceModelId},${
+          input.retryPolicyId ?? null
+        }) RETURNING *`;
+      }
+      const route = routeRows[0];
+      const routeId = String(route.id);
+      await tx`DELETE FROM provider_model_route_targets WHERE route_id=${routeId}`;
+      for (const [index, target] of input.fallbackModelIds.entries()) {
+        await tx`INSERT INTO provider_model_route_targets(route_id,target_model_id,ordinal) VALUES(${routeId},${target},${
+          index + 1
+        })`;
+      }
+      const cycle = await tx`WITH RECURSIVE edges AS (
+          SELECT r.source_model_id AS source,p.target_model_id AS target
+          FROM provider_model_routes r JOIN provider_model_route_targets p ON p.route_id=r.id
+        ), walk(root,node,path,cycle) AS (
+          SELECT source,target,ARRAY[source,target],target=source FROM edges
+          UNION ALL
+          SELECT w.root,e.target,w.path||e.target,e.target=ANY(w.path)
+          FROM walk w JOIN edges e ON e.source=w.node WHERE NOT w.cycle
+        ) SELECT 1 FROM walk WHERE cycle LIMIT 1`;
+      if (cycle.length) {
+        throw new DomainError("fallback_cycle", "Fallback routes must be acyclic", 422);
+      }
+      const tooDeep = await tx`WITH RECURSIVE edges AS (
+          SELECT r.source_model_id AS source,p.target_model_id AS target
+          FROM provider_model_routes r JOIN provider_model_route_targets p ON p.route_id=r.id
+        ), reach(root,node) AS (
+          SELECT source,source FROM edges UNION SELECT source,target FROM edges
+          UNION SELECT r.root,e.target FROM reach r JOIN edges e ON e.source=r.node
+        ) SELECT root FROM reach GROUP BY root HAVING count(DISTINCT node)>8 LIMIT 1`;
+      if (tooDeep.length) {
+        throw new DomainError(
+          "fallback_depth",
+          "Execution plans may contain at most eight targets",
+          422,
+        );
+      }
+      const value: ProviderModelRoute = {
+        id: String(route.id),
+        sourceModelId: String(route.source_model_id),
+        retryPolicyId: route.retry_policy_id == null ? null : String(route.retry_policy_id),
+        fallbackModelIds: [...input.fallbackModelIds],
+        version: number(route.version),
+        createdAt: iso(route.created_at),
+        updatedAt: iso(route.updated_at),
+      };
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${mutation.actorId ?? null},${mutation.action},'provider_model_route',${value.id},${
+        tx.json({
+          ...mutation.metadata,
+          sourceModelId: value.sourceModelId,
+          version: value.version,
+          fallbackCount: value.fallbackModelIds.length,
+        })
+      })`;
+      return value;
+    });
+  }
+
+  async findProviderModelRoute(sourceModelId: string): Promise<ProviderModelRoute | undefined> {
+    const rows = await this.#sql<
+      Row[]
+    >`SELECT r.*,COALESCE(jsonb_agg(t.target_model_id ORDER BY t.ordinal) FILTER (WHERE t.target_model_id IS NOT NULL),'[]'::jsonb) AS targets
+      FROM provider_model_routes r LEFT JOIN provider_model_route_targets t ON t.route_id=r.id
+      WHERE r.source_model_id=${sourceModelId} GROUP BY r.id`;
+    if (!rows[0]) return undefined;
+    return {
+      id: String(rows[0].id),
+      sourceModelId: String(rows[0].source_model_id),
+      retryPolicyId: rows[0].retry_policy_id == null ? null : String(rows[0].retry_policy_id),
+      fallbackModelIds: (rows[0].targets as unknown[]).map(String),
+      version: number(rows[0].version),
+      createdAt: iso(rows[0].created_at),
+      updatedAt: iso(rows[0].updated_at),
+    };
+  }
+
+  async resolveProviderExecutionPlan(
+    sourceModelId: string,
+    at = new Date().toISOString(),
+  ): Promise<ProviderExecutionPlan> {
+    if (!Number.isFinite(Date.parse(at))) {
+      throw new DomainError("validation_error", "Plan timestamp is invalid", 422);
+    }
+    const route = await this.findProviderModelRoute(sourceModelId);
+    const ids: string[] = [];
+    const seen = new Set<string>();
+    const flatten = async (id: string): Promise<void> => {
+      if (seen.has(id)) return;
+      seen.add(id);
+      ids.push(id);
+      const nested = await this.findProviderModelRoute(id);
+      for (const fallback of nested?.fallbackModelIds ?? []) await flatten(fallback);
+    };
+    await flatten(sourceModelId);
+    const targets = [];
+    let sourceRow: Row | undefined;
+    for (const id of ids) {
+      const rows = await this.#sql<
+        Row[]
+      >`SELECT m.*,p.slug,p.version AS provider_version,p.protocol,p.enabled AS provider_enabled,
+          p.credential_envelope,mp.id AS price_id,mp.input_micros_per_million,mp.cached_input_micros_per_million,
+          mp.reasoning_micros_per_million,mp.output_micros_per_million,mp.fixed_call_micros,mp.source
+        FROM provider_models m JOIN providers p ON p.id=m.provider_id
+        LEFT JOIN LATERAL (SELECT * FROM model_price_versions WHERE provider_model_id=m.id AND effective_at<=${at} ORDER BY effective_at DESC,id DESC LIMIT 1) mp ON true
+        WHERE m.id=${id}`;
+      const row = rows[0];
+      if (id === sourceModelId) sourceRow = row;
+      const compatible = row && sourceRow && row.protocol === sourceRow.protocol &&
+        number(row.context_window) >= number(sourceRow.context_window) &&
+        (sourceRow.capabilities as string[]).every((capability) =>
+          (row.capabilities as string[]).includes(capability)
+        );
+      const unavailable = !row || !row.enabled || !row.provider_enabled ||
+        row.credential_envelope == null ||
+        row.price_id == null || !compatible;
+      if (unavailable) {
+        if (id !== sourceModelId) continue;
+        throw new DomainError(
+          "execution_plan_unavailable",
+          "Provider execution target is unavailable",
+          409,
+        );
+      }
+      targets.push({
+        ordinal: targets.length,
+        providerId: String(row.provider_id),
+        providerSlug: String(row.slug),
+        providerVersion: number(row.provider_version),
+        protocol: row.protocol as ProviderExecutionPlan["targets"][number]["protocol"],
+        providerModelId: String(row.id),
+        publicModelId: String(row.public_model_id),
+        upstreamModelId: String(row.upstream_model_id),
+        modelVersion: number(row.version),
+        pricing: {
+          pricingVersionId: String(row.price_id),
+          inputMicrosPerMillion: number(row.input_micros_per_million),
+          cachedInputMicrosPerMillion: number(row.cached_input_micros_per_million),
+          reasoningMicrosPerMillion: number(row.reasoning_micros_per_million),
+          outputMicrosPerMillion: number(row.output_micros_per_million),
+          fixedCallMicros: number(row.fixed_call_micros),
+          source: String(row.source),
+        },
+      });
+    }
+    const policies = route?.retryPolicyId
+      ? await this.#sql<
+        Row[]
+      >`SELECT * FROM provider_retry_policies WHERE id=${route.retryPolicyId}`
+      : [];
+    return {
+      sourceModelId,
+      routeId: route?.id ?? null,
+      routeVersion: route?.version ?? 0,
+      retryPolicy: policies[0] && policies[0].enabled ? retryPolicy(policies[0]) : null,
+      targets,
+      resolvedAt: new Date(at).toISOString(),
+    };
+  }
+
+  async claimProviderExecution(
+    usageRunId: string,
+    ownerLeaseToken: string,
+  ): Promise<ProviderExecutionClaim> {
+    return await this.#sql.begin(async (tx) => {
+      const runs = await tx<Row[]>`SELECT *,(
+          (generation_lease_token=${ownerLeaseToken} AND generation_lease_expires_at>now()) OR
+          (run_lease_token=${ownerLeaseToken} AND run_lease_expires_at>now()) OR
+          EXISTS(SELECT 1 FROM api_idempotency_requests a WHERE a.usage_run_id=usage_runs.id
+            AND a.state='in_progress' AND a.lease_token=${ownerLeaseToken} AND a.lease_expires_at>now())
+        ) AS lease_valid FROM usage_runs WHERE id=${usageRunId} FOR UPDATE`;
+      if (!runs[0]) throw new DomainError("not_found", "Usage run not found", 404);
+      if (runs[0].status !== "reserved") {
+        throw new DomainError("invalid_usage_state", "Usage run is not reserved", 409);
+      }
+      if (runs[0].lease_valid !== true) {
+        throw new DomainError("stale_lease", "Provider execution lease is stale", 409);
+      }
+      let epoch = number(runs[0].execution_epoch ?? 0);
+      const reconciledAttemptIds: string[] = [];
+      if (String(runs[0].execution_owner_lease_token ?? "") !== ownerLeaseToken) {
+        epoch += 1;
+        const reconciled = await tx<Row[]>`UPDATE provider_attempts SET status='cancelled',
+          phase='planning',error_code='execution_reclaimed',breaker_after='unavailable',
+          retryable=true,latency_ms=GREATEST(0,floor(extract(epoch FROM (now()-started_at))*1000)::int),
+          completed_at=now() WHERE usage_run_id=${usageRunId} AND status='running' RETURNING id`;
+        reconciledAttemptIds.push(...reconciled.map((row) => String(row.id)));
+        await tx`UPDATE usage_runs SET execution_epoch=${epoch},
+          execution_owner_lease_token=${ownerLeaseToken} WHERE id=${usageRunId}`;
+      }
+      const ordinals = await tx<
+        { next: number }[]
+      >`SELECT COALESCE(max(attempt_number),0)::int+1 AS next
+        FROM provider_attempts WHERE usage_run_id=${usageRunId}`;
+      const nextAttemptNumber = number(ordinals[0].next);
+      if (nextAttemptNumber > 16) {
+        throw new DomainError(
+          "execution_path_exhausted",
+          "Provider execution path is exhausted",
+          409,
+        );
+      }
+      return { usageRunId, executionEpoch: epoch, nextAttemptNumber, reconciledAttemptIds };
+    });
+  }
+
+  async heartbeatProviderExecutionLease(
+    usageRunId: string,
+    ownerLeaseToken: string,
+    leaseSeconds = 120,
+  ) {
+    if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1 || leaseSeconds > 900) {
+      throw new DomainError(
+        "validation_error",
+        "Provider execution lease duration is invalid",
+        422,
+      );
+    }
+    const rows = await this.#sql<Row[]>`UPDATE usage_runs SET
+      run_lease_expires_at=now()+${leaseSeconds}*interval '1 second'
+      WHERE id=${usageRunId} AND status='reserved' AND run_lease_token=${ownerLeaseToken}
+        AND run_lease_expires_at>now()
+      RETURNING run_lease_token,run_lease_expires_at`;
+    if (!rows[0]) {
+      throw new DomainError("stale_lease", "Provider execution lease is no longer active", 409);
+    }
+    return {
+      leaseToken: String(rows[0].run_lease_token),
+      leaseExpiresAt: iso(rows[0].run_lease_expires_at)!,
+    };
+  }
+
+  async reclaimProviderExecutionLease(
+    usageRunId: string,
+    expiredLeaseToken: string,
+    leaseSeconds = 120,
+  ) {
+    if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1 || leaseSeconds > 900) {
+      throw new DomainError(
+        "validation_error",
+        "Provider execution lease duration is invalid",
+        422,
+      );
+    }
+    const replacement = crypto.randomUUID();
+    const rows = await this.#sql<Row[]>`UPDATE usage_runs SET run_lease_token=${replacement},
+      run_lease_expires_at=now()+${leaseSeconds}*interval '1 second'
+      WHERE id=${usageRunId} AND status='reserved' AND run_lease_token=${expiredLeaseToken}
+        AND run_lease_expires_at<=now()
+      RETURNING run_lease_token,run_lease_expires_at`;
+    if (!rows[0]) {
+      throw new DomainError(
+        "lease_not_reclaimable",
+        "Provider execution lease cannot be reclaimed",
+        409,
+      );
+    }
+    return {
+      leaseToken: String(rows[0].run_lease_token),
+      leaseExpiresAt: iso(rows[0].run_lease_expires_at)!,
+    };
+  }
+
+  async startProviderAttempt(input: StartProviderAttemptInput): Promise<ProviderAttempt> {
+    if (
+      !Number.isSafeInteger(input.attemptNumber) || input.attemptNumber < 1 ||
+      input.attemptNumber > 16 || !isUsagePricingSnapshot(input.pricing) ||
+      !Number.isSafeInteger(input.executionEpoch) || input.executionEpoch < 1 ||
+      !/^[0-9a-f-]{36}$/i.test(input.ownerLeaseToken) ||
+      !/^[a-z0-9][a-z0-9-]{0,62}$/.test(input.providerSlug) ||
+      input.publicModelId.length < 3 || input.publicModelId.length > 255 ||
+      !input.upstreamModelId || input.upstreamModelId.length > 255 ||
+      !Number.isSafeInteger(input.providerVersion) || input.providerVersion < 1 ||
+      !Number.isSafeInteger(input.modelVersion) || input.modelVersion < 1 ||
+      !["chat_completions", "responses"].includes(input.protocol) ||
+      !Number.isSafeInteger(input.targetOrdinal) || input.targetOrdinal < 0 ||
+      input.targetOrdinal > 7 || !Number.isSafeInteger(input.retryNumber) ||
+      input.retryNumber < 0 || input.retryNumber > 3 ||
+      !["primary", "retry", "fallback", "circuit_skip", "half_open"].includes(input.reason) ||
+      (input.breakerBefore != null &&
+        !["closed", "open", "half_open", "unavailable"].includes(input.breakerBefore))
+    ) throw new DomainError("validation_error", "Provider attempt start is invalid", 422);
+    return await this.#sql.begin(async (tx) => {
+      const runs = await tx<Row[]>`SELECT *,(
+          (generation_lease_token=${input.ownerLeaseToken} AND generation_lease_expires_at>now()) OR
+          (run_lease_token=${input.ownerLeaseToken} AND run_lease_expires_at>now()) OR
+          EXISTS(SELECT 1 FROM api_idempotency_requests a WHERE a.usage_run_id=usage_runs.id
+            AND a.state='in_progress' AND a.lease_token=${input.ownerLeaseToken} AND a.lease_expires_at>now())
+        ) AS lease_valid FROM usage_runs WHERE id=${input.usageRunId} FOR UPDATE`;
+      if (!runs[0] || runs[0].status !== "reserved") {
+        throw new DomainError("invalid_usage_state", "Usage run is not reserved", 409);
+      }
+      if (
+        runs[0].lease_valid !== true || number(runs[0].execution_epoch) !== input.executionEpoch ||
+        String(runs[0].execution_owner_lease_token ?? "") !== input.ownerLeaseToken
+      ) {
+        throw new DomainError("stale_lease", "Provider execution epoch is stale", 409);
+      }
+      const prior = await tx<
+        Row[]
+      >`SELECT * FROM provider_attempts WHERE usage_run_id=${input.usageRunId} AND attempt_number=${input.attemptNumber} FOR UPDATE`;
+      if (prior[0]) {
+        const existing = providerAttempt(prior[0]);
+        const same = existing.providerId === input.providerId &&
+          existing.targetOrdinal === input.targetOrdinal &&
+          existing.executionEpoch === input.executionEpoch &&
+          existing.retryNumber === input.retryNumber && existing.reason === input.reason &&
+          existing.breakerBefore === (input.breakerBefore ?? null) &&
+          existing.providerSlug === input.providerSlug &&
+          existing.providerVersion === input.providerVersion &&
+          existing.protocol === input.protocol &&
+          existing.providerModelId === input.providerModelId &&
+          existing.publicModelId === input.publicModelId &&
+          existing.upstreamModelId === input.upstreamModelId &&
+          existing.modelVersion === input.modelVersion &&
+          JSON.stringify(existing.pricing) === JSON.stringify(input.pricing);
+        if (!same) {
+          throw new DomainError(
+            "idempotency_conflict",
+            "Attempt number already has different target data",
+            409,
+          );
+        }
+        return existing;
+      }
+      const p = input.pricing;
+      const snapshots = await tx<Row[]>`SELECT mp.*,m.provider_id FROM model_price_versions mp
+        JOIN provider_models m ON m.id=mp.provider_model_id
+        WHERE mp.id=${p.pricingVersionId} AND mp.provider_model_id=${input.providerModelId}`;
+      const snapshot = snapshots[0];
+      if (
+        !snapshot || String(snapshot.provider_id) !== input.providerId ||
+        number(snapshot.input_micros_per_million) !== p.inputMicrosPerMillion ||
+        number(snapshot.cached_input_micros_per_million) !== p.cachedInputMicrosPerMillion ||
+        number(snapshot.reasoning_micros_per_million) !== p.reasoningMicrosPerMillion ||
+        number(snapshot.output_micros_per_million) !== p.outputMicrosPerMillion ||
+        number(snapshot.fixed_call_micros) !== p.fixedCallMicros ||
+        String(snapshot.source) !== p.source
+      ) {
+        throw new DomainError(
+          "validation_error",
+          "Provider attempt target snapshot is invalid",
+          422,
+        );
+      }
+      const rows = await tx<
+        Row[]
+      >`INSERT INTO provider_attempts(usage_run_id,attempt_number,execution_epoch,target_ordinal,retry_number,reason,breaker_before,provider_id,provider_slug,provider_version,protocol,provider_model_id,public_model_id,upstream_model_id,model_version,pricing_version_id,pricing_input_micros_per_million,pricing_cached_input_micros_per_million,pricing_reasoning_micros_per_million,pricing_output_micros_per_million,pricing_fixed_call_micros,pricing_source)
+        VALUES(${input.usageRunId},${input.attemptNumber},${input.executionEpoch},${input.targetOrdinal},${input.retryNumber},${input.reason},${
+        input.breakerBefore ?? null
+      },${input.providerId},${input.providerSlug},${input.providerVersion},${input.protocol},${input.providerModelId},${input.publicModelId},${input.upstreamModelId},${input.modelVersion},${p.pricingVersionId},${p.inputMicrosPerMillion},${p.cachedInputMicrosPerMillion},${p.reasoningMicrosPerMillion},${p.outputMicrosPerMillion},${p.fixedCallMicros},${p.source}) RETURNING *`;
+      return providerAttempt(rows[0]);
+    });
+  }
+
+  async finishProviderAttempt(input: FinishProviderAttemptInput): Promise<ProviderAttempt> {
+    validateAttemptFinish(input);
+    return await this.#sql.begin(async (tx) => {
+      const lookup = await tx<
+        Row[]
+      >`SELECT usage_run_id FROM provider_attempts WHERE id=${input.id}`;
+      if (!lookup[0]) throw new DomainError("not_found", "Provider attempt not found", 404);
+      const runs = await tx<Row[]>`SELECT *,(
+          (generation_lease_token=${input.ownerLeaseToken} AND generation_lease_expires_at>now()) OR
+          (run_lease_token=${input.ownerLeaseToken} AND run_lease_expires_at>now()) OR
+          EXISTS(SELECT 1 FROM api_idempotency_requests a WHERE a.usage_run_id=usage_runs.id
+            AND a.state='in_progress' AND a.lease_token=${input.ownerLeaseToken} AND a.lease_expires_at>now())
+        ) AS lease_valid FROM usage_runs WHERE id=${String(lookup[0].usage_run_id)} FOR UPDATE`;
+      if (!runs[0] || runs[0].status !== "reserved") {
+        throw new DomainError("invalid_usage_state", "Usage run is not reserved", 409);
+      }
+      const prior = await tx<
+        Row[]
+      >`SELECT * FROM provider_attempts WHERE id=${input.id} FOR UPDATE`;
+      if (!prior[0]) throw new DomainError("not_found", "Provider attempt not found", 404);
+      const existing = providerAttempt(prior[0]);
+      if (
+        runs[0].lease_valid !== true || existing.executionEpoch !== input.executionEpoch ||
+        number(runs[0].execution_epoch) !== input.executionEpoch ||
+        String(runs[0].execution_owner_lease_token ?? "") !== input.ownerLeaseToken
+      ) {
+        throw new DomainError("stale_lease", "Provider execution epoch is stale", 409);
+      }
+      const terminal = {
+        ...input,
+        errorCode: input.errorCode ?? null,
+        httpStatus: input.httpStatus ?? null,
+        ttftMs: input.ttftMs ?? null,
+        breakerAfter: input.breakerAfter ?? null,
+        upstreamRequestId: input.upstreamRequestId ?? null,
+        tokensPerSecond: input.tokensPerSecond ?? null,
+      };
+      if (existing.status !== "running") {
+        const same = existing.status === terminal.status && existing.phase === terminal.phase &&
+          existing.errorCode === terminal.errorCode &&
+          existing.httpStatus === terminal.httpStatus &&
+          existing.visibleOutput === terminal.visibleOutput &&
+          existing.inputTokens === terminal.inputTokens &&
+          existing.cachedInputTokens === terminal.cachedInputTokens &&
+          existing.reasoningTokens === terminal.reasoningTokens &&
+          existing.outputTokens === terminal.outputTokens &&
+          existing.costMicros === terminal.costMicros &&
+          existing.tokenSource === terminal.tokenSource &&
+          existing.costSource === terminal.costSource &&
+          existing.latencyMs === terminal.latencyMs && existing.ttftMs === terminal.ttftMs;
+        const telemetrySame = existing.breakerAfter === terminal.breakerAfter &&
+          existing.retryable === terminal.retryable &&
+          existing.upstreamRequestId === terminal.upstreamRequestId &&
+          existing.tokensPerSecond === terminal.tokensPerSecond;
+        if (!same || !telemetrySame) {
+          throw new DomainError(
+            "attempt_terminal_conflict",
+            "Provider attempt is already terminal",
+            409,
+          );
+        }
+        return existing;
+      }
+      const exactCost = exactAttemptCost(existing, input);
+      if (input.costMicros !== exactCost) {
+        throw new DomainError(
+          "invalid_attempt_cost",
+          "Provider attempt cost does not match its pricing snapshot",
+          422,
+        );
+      }
+      const rows = await tx<
+        Row[]
+      >`UPDATE provider_attempts SET status=${terminal.status},phase=${terminal.phase},error_code=${terminal.errorCode},http_status=${terminal.httpStatus},visible_output=${terminal.visibleOutput},input_tokens=${terminal.inputTokens},cached_input_tokens=${terminal.cachedInputTokens},reasoning_tokens=${terminal.reasoningTokens},output_tokens=${terminal.outputTokens},cost_micros=${terminal.costMicros},token_source=${terminal.tokenSource},cost_source=${terminal.costSource},latency_ms=${terminal.latencyMs},ttft_ms=${terminal.ttftMs},breaker_after=${terminal.breakerAfter},retryable=${terminal.retryable},upstream_request_id=${terminal.upstreamRequestId},tokens_per_second=${terminal.tokensPerSecond},completed_at=now() WHERE id=${input.id} RETURNING *`;
+      await tx`UPDATE usage_runs SET
+        actual_provider_cost_micros=actual_provider_cost_micros+${exactCost},
+        actual_provider_input_tokens=actual_provider_input_tokens+${input.inputTokens},
+        actual_provider_cached_input_tokens=actual_provider_cached_input_tokens+${input.cachedInputTokens},
+        actual_provider_reasoning_tokens=actual_provider_reasoning_tokens+${input.reasoningTokens},
+        actual_provider_output_tokens=actual_provider_output_tokens+${input.outputTokens}
+        WHERE id=${existing.usageRunId}`;
+      return providerAttempt(rows[0]);
+    });
+  }
+
+  async listProviderAttempts(usageRunId: string) {
+    return (await this.#sql<
+      Row[]
+    >`SELECT * FROM provider_attempts WHERE usage_run_id=${usageRunId} ORDER BY attempt_number`)
+      .map(providerAttempt);
+  }
+
+  async #finalizeProviderUsage(
+    input: FinalizeProviderUsageInput,
+    refundOnly: boolean,
+  ): Promise<UsageRun> {
+    if (
+      !Number.isSafeInteger(input.executionEpoch) || input.executionEpoch < 1 ||
+      !Number.isSafeInteger(input.latencyMs) || input.latencyMs < 0 ||
+      (input.error != null && input.error.length > 1_000)
+    ) {
+      throw new DomainError("validation_error", "Provider usage finalization is invalid", 422);
+    }
+    return await this.#sql.begin(async (tx) => {
+      const rows = await tx<Row[]>`SELECT *,(
+          (generation_lease_token=${input.ownerLeaseToken} AND generation_lease_expires_at>now()) OR
+          (run_lease_token=${input.ownerLeaseToken} AND run_lease_expires_at>now()) OR
+          EXISTS(SELECT 1 FROM api_idempotency_requests a WHERE a.usage_run_id=usage_runs.id
+            AND a.state='in_progress' AND a.lease_token=${input.ownerLeaseToken} AND a.lease_expires_at>now())
+        ) AS lease_valid FROM usage_runs WHERE id=${input.usageRunId} FOR UPDATE`;
+      if (!rows[0]) throw new DomainError("not_found", "Usage run not found", 404);
+      if (rows[0].status !== "reserved") {
+        if (
+          number(rows[0].execution_epoch) === input.executionEpoch &&
+          String(rows[0].execution_owner_lease_token ?? "") === input.ownerLeaseToken
+        ) {
+          return run(rows[0]);
+        }
+        throw new DomainError("invalid_usage_state", "Usage run is already terminal", 409);
+      }
+      if (
+        rows[0].lease_valid !== true || number(rows[0].execution_epoch) !== input.executionEpoch ||
+        String(rows[0].execution_owner_lease_token ?? "") !== input.ownerLeaseToken
+      ) {
+        throw new DomainError("stale_lease", "Provider execution epoch is stale", 409);
+      }
+      const cost = number(rows[0].actual_provider_cost_micros);
+      const userId = String(rows[0].user_id);
+      const users = await tx<Row[]>`SELECT balance_micros FROM users WHERE id=${userId} FOR UPDATE`;
+      const reserved = number(rows[0].reserved_micros);
+      const delta = reserved - cost;
+      const after = number(users[0].balance_micros) + delta;
+      if (!Number.isSafeInteger(after) || after < 0) {
+        throw new DomainError("insufficient_credit", "Provider cost exceeds available credit", 402);
+      }
+      await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${userId}`;
+      if (delta !== 0) {
+        await tx`INSERT INTO ledger_entries(user_id,usage_run_id,kind,amount_micros,balance_after_micros)
+          VALUES(${userId},${input.usageRunId},${
+          delta > 0 ? "refund" : "settle"
+        },${delta},${after})`;
+      }
+      const failedWithoutSpend = refundOnly && cost === 0;
+      const updated = await tx<Row[]>`UPDATE usage_runs SET status=${
+        failedWithoutSpend ? "failed" : "completed"
+      },cost_micros=${cost},input_tokens=${number(rows[0].actual_provider_input_tokens)},
+        output_tokens=${
+        number(rows[0].actual_provider_output_tokens)
+      },latency_ms=${input.latencyMs},
+        error=${input.error ?? null},completed_at=now() WHERE id=${input.usageRunId} RETURNING *`;
+      return run(updated[0]);
+    });
+  }
+
+  settleProviderUsage(input: FinalizeProviderUsageInput): Promise<UsageRun> {
+    return this.#finalizeProviderUsage(input, false);
+  }
+
+  refundProviderUsage(input: FinalizeProviderUsageInput): Promise<UsageRun> {
+    return this.#finalizeProviderUsage(input, true);
+  }
+
   async createApiToken(userId: string, input: CreateApiTokenInput) {
     const rows = await this.#sql<
       Row[]
@@ -1840,17 +2707,20 @@ export class PostgresRepository implements DomainRepository {
         throw new DomainError("insufficient_credit", "Insufficient credit", 402);
       }
       try {
+        const runLeaseToken = crypto.randomUUID();
         const runs = await tx<
           Row[]
-        >`INSERT INTO usage_runs(id,user_id,token_id,model,provider,status,reserved_micros,pricing_version_id,pricing_input_micros_per_million,pricing_cached_input_micros_per_million,pricing_reasoning_micros_per_million,pricing_output_micros_per_million,pricing_fixed_call_micros,pricing_source) VALUES(${runId},${userId},${
+        >`INSERT INTO usage_runs(id,user_id,token_id,model,provider,status,reserved_micros,run_lease_token,run_lease_expires_at,pricing_version_id,pricing_input_micros_per_million,pricing_cached_input_micros_per_million,pricing_reasoning_micros_per_million,pricing_output_micros_per_million,pricing_fixed_call_micros,pricing_source) VALUES(${runId},${userId},${
           tokenId ?? null
-        },${model},${provider},'reserved',${amount},${pricingSnapshot?.pricingVersionId ?? null},${
-          pricingSnapshot?.inputMicrosPerMillion ?? null
-        },${pricingSnapshot?.cachedInputMicrosPerMillion ?? null},${
-          pricingSnapshot?.reasoningMicrosPerMillion ?? null
-        },${pricingSnapshot?.outputMicrosPerMillion ?? null},${
-          pricingSnapshot?.fixedCallMicros ?? null
-        },${pricingSnapshot?.source ?? null}) RETURNING *`;
+        },${model},${provider},'reserved',${amount},${runLeaseToken},now()+120*interval '1 second',${
+          pricingSnapshot?.pricingVersionId ?? null
+        },${pricingSnapshot?.inputMicrosPerMillion ?? null},${
+          pricingSnapshot?.cachedInputMicrosPerMillion ?? null
+        },${pricingSnapshot?.reasoningMicrosPerMillion ?? null},${
+          pricingSnapshot?.outputMicrosPerMillion ?? null
+        },${pricingSnapshot?.fixedCallMicros ?? null},${
+          pricingSnapshot?.source ?? null
+        }) RETURNING *`;
         const after = balance - amount;
         await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${userId}`;
         await tx`INSERT INTO ledger_entries(user_id,usage_run_id,kind,amount_micros,balance_after_micros) VALUES(${userId},${runId},'reserve',${-amount},${after})`;
@@ -1881,6 +2751,11 @@ export class PostgresRepository implements DomainRepository {
       if (runs[0].status !== "reserved") {
         throw new DomainError("invalid_usage_state", "Usage run is not reserved", 409);
       }
+      if (number(runs[0].actual_provider_cost_micros) > 0) {
+        cost = number(runs[0].actual_provider_cost_micros);
+        inputTokens = number(runs[0].actual_provider_input_tokens);
+        outputTokens = number(runs[0].actual_provider_output_tokens);
+      }
       const reserved = number(runs[0].reserved_micros);
       const delta = reserved - cost;
       const userId = String(runs[0].user_id);
@@ -1908,12 +2783,20 @@ export class PostgresRepository implements DomainRepository {
       if (runs[0].status !== "reserved") return run(runs[0]);
       const userId = String(runs[0].user_id);
       const users = await tx<Row[]>`SELECT balance_micros FROM users WHERE id=${userId} FOR UPDATE`;
-      const after = number(users[0].balance_micros) + number(runs[0].reserved_micros);
+      const actualCost = number(runs[0].actual_provider_cost_micros);
+      const delta = number(runs[0].reserved_micros) - actualCost;
+      const after = number(users[0].balance_micros) + delta;
       await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${userId}`;
-      await tx`INSERT INTO ledger_entries(user_id,usage_run_id,kind,amount_micros,balance_after_micros) VALUES(${userId},${runId},'refund',${
-        number(runs[0].reserved_micros)
-      },${after})`;
-      const updated = await tx<Row[]>`UPDATE usage_runs SET status='failed',error=${
+      if (delta !== 0) {
+        await tx`INSERT INTO ledger_entries(user_id,usage_run_id,kind,amount_micros,balance_after_micros) VALUES(${userId},${runId},${
+          delta > 0 ? "refund" : "settle"
+        },${delta},${after})`;
+      }
+      const updated = await tx<Row[]>`UPDATE usage_runs SET status=${
+        actualCost > 0 ? "completed" : "failed"
+      },cost_micros=${actualCost},input_tokens=${
+        number(runs[0].actual_provider_input_tokens)
+      },output_tokens=${number(runs[0].actual_provider_output_tokens)},error=${
         error ?? null
       },completed_at=now() WHERE id=${runId} RETURNING *`;
       return run(updated[0]);

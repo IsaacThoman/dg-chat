@@ -2,6 +2,7 @@ import {
   bigint,
   boolean,
   check,
+  doublePrecision,
   index,
   integer,
   jsonb,
@@ -213,6 +214,20 @@ export const usageRuns = pgTable("usage_runs", {
   pricingOutputMicrosPerMillion: bigint("pricing_output_micros_per_million", { mode: "number" }),
   pricingFixedCallMicros: bigint("pricing_fixed_call_micros", { mode: "number" }),
   pricingSource: text("pricing_source"),
+  executionEpoch: integer("execution_epoch").notNull().default(0),
+  executionOwnerLeaseToken: uuid("execution_owner_lease_token"),
+  runLeaseToken: uuid("run_lease_token"),
+  runLeaseExpiresAt: timestamp("run_lease_expires_at", { withTimezone: true }),
+  actualProviderCostMicros: bigint("actual_provider_cost_micros", { mode: "number" }).notNull()
+    .default(0),
+  actualProviderInputTokens: bigint("actual_provider_input_tokens", { mode: "number" }).notNull()
+    .default(0),
+  actualProviderCachedInputTokens: bigint("actual_provider_cached_input_tokens", { mode: "number" })
+    .notNull().default(0),
+  actualProviderReasoningTokens: bigint("actual_provider_reasoning_tokens", { mode: "number" })
+    .notNull().default(0),
+  actualProviderOutputTokens: bigint("actual_provider_output_tokens", { mode: "number" }).notNull()
+    .default(0),
   inputTokens: integer("input_tokens").notNull().default(0),
   outputTokens: integer("output_tokens").notNull().default(0),
   costMicros: bigint("cost_micros", { mode: "number" }).notNull().default(0),
@@ -249,6 +264,10 @@ export const usageRuns = pgTable("usage_runs", {
         ${table.pricingFixedCallMicros} BETWEEN 0 AND 9007199254740991 AND
         char_length(${table.pricingSource}) BETWEEN 1 AND 120)
     )`,
+  ),
+  check(
+    "usage_runs_provider_execution_check",
+    sql`${table.executionEpoch} >= 0 AND ${table.actualProviderCostMicros} BETWEEN 0 AND 9007199254740991 AND ${table.actualProviderInputTokens} BETWEEN 0 AND 9007199254740991 AND ${table.actualProviderCachedInputTokens} BETWEEN 0 AND ${table.actualProviderInputTokens} AND ${table.actualProviderReasoningTokens} BETWEEN 0 AND ${table.actualProviderOutputTokens} AND ${table.actualProviderOutputTokens} BETWEEN 0 AND 9007199254740991`,
   ),
 ]);
 
@@ -460,5 +479,204 @@ export const modelPriceVersions = pgTable("model_price_versions", {
   check(
     "model_price_versions_amounts_check",
     sql`${table.inputMicrosPerMillion} BETWEEN 0 AND 9007199254740991 AND ${table.cachedInputMicrosPerMillion} BETWEEN 0 AND 9007199254740991 AND ${table.reasoningMicrosPerMillion} BETWEEN 0 AND 9007199254740991 AND ${table.outputMicrosPerMillion} BETWEEN 0 AND 9007199254740991 AND ${table.fixedCallMicros} BETWEEN 0 AND 9007199254740991`,
+  ),
+]);
+
+export const providerRetryPolicies = pgTable("provider_retry_policies", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: text("name").notNull(),
+  enabled: boolean("enabled").notNull().default(true),
+  maxAttempts: integer("max_attempts").notNull(),
+  maxRetries: integer("max_retries").notNull(),
+  baseDelayMs: integer("base_delay_ms").notNull(),
+  maxDelayMs: integer("max_delay_ms").notNull(),
+  backoffMultiplierBps: integer("backoff_multiplier_bps").notNull(),
+  jitterBps: integer("jitter_bps").notNull(),
+  firstTokenTimeoutMs: integer("first_token_timeout_ms").notNull(),
+  idleTimeoutMs: integer("idle_timeout_ms").notNull(),
+  totalTimeoutMs: integer("total_timeout_ms").notNull(),
+  retryableStatuses: jsonb("retryable_statuses").$type<number[]>().notNull().default([]),
+  version: integer("version").notNull().default(1),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("provider_retry_policies_name_uq").on(table.name),
+  index("provider_retry_policies_enabled_name_idx").on(table.enabled, table.name, table.id),
+  check(
+    "provider_retry_policies_name_check",
+    sql`char_length(btrim(${table.name})) BETWEEN 1 AND 120`,
+  ),
+  check(
+    "provider_retry_policies_attempts_check",
+    sql`${table.maxAttempts} BETWEEN 1 AND 8 AND ${table.maxRetries} BETWEEN 0 AND 3 AND ${table.maxRetries} < ${table.maxAttempts}`,
+  ),
+  check(
+    "provider_retry_policies_delay_check",
+    sql`${table.baseDelayMs} BETWEEN 0 AND 60000 AND ${table.maxDelayMs} BETWEEN ${table.baseDelayMs} AND 300000`,
+  ),
+  check(
+    "provider_retry_policies_backoff_check",
+    sql`${table.backoffMultiplierBps} BETWEEN 10000 AND 40000 AND ${table.jitterBps} BETWEEN 0 AND 10000`,
+  ),
+  check(
+    "provider_retry_policies_timeout_check",
+    sql`${table.firstTokenTimeoutMs} BETWEEN 250 AND 300000 AND ${table.idleTimeoutMs} BETWEEN 250 AND 300000 AND ${table.totalTimeoutMs} BETWEEN GREATEST(${table.firstTokenTimeoutMs},${table.idleTimeoutMs}) AND 900000`,
+  ),
+  check(
+    "provider_retry_policies_statuses_check",
+    sql`jsonb_typeof(${table.retryableStatuses}) = 'array' AND jsonb_array_length(${table.retryableStatuses}) <= 7 AND ${table.retryableStatuses} <@ '[408,425,429,500,502,503,504]'::jsonb`,
+  ),
+  check("provider_retry_policies_version_check", sql`${table.version} >= 1`),
+]);
+
+export const providerModelRoutes = pgTable("provider_model_routes", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  sourceModelId: uuid("source_model_id").notNull().references(() => providerModels.id, {
+    onDelete: "restrict",
+  }),
+  retryPolicyId: uuid("retry_policy_id").references(() => providerRetryPolicies.id, {
+    onDelete: "restrict",
+  }),
+  version: integer("version").notNull().default(1),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("provider_model_routes_source_uq").on(table.sourceModelId),
+  check("provider_model_routes_version_check", sql`${table.version} >= 1`),
+]);
+
+export const providerModelRouteTargets = pgTable("provider_model_route_targets", {
+  routeId: uuid("route_id").notNull().references(() => providerModelRoutes.id, {
+    onDelete: "cascade",
+  }),
+  targetModelId: uuid("target_model_id").notNull().references(() => providerModels.id, {
+    onDelete: "restrict",
+  }),
+  ordinal: integer("ordinal").notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.routeId, table.ordinal] }),
+  unique("provider_model_route_targets_route_target_uq").on(table.routeId, table.targetModelId),
+  index("provider_model_route_targets_target_idx").on(table.targetModelId),
+  check("provider_model_route_targets_ordinal_check", sql`${table.ordinal} BETWEEN 1 AND 8`),
+]);
+
+export const providerAttempts = pgTable("provider_attempts", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  usageRunId: text("usage_run_id").notNull().references(() => usageRuns.id, {
+    onDelete: "restrict",
+  }),
+  attemptNumber: integer("attempt_number").notNull(),
+  executionEpoch: integer("execution_epoch").notNull(),
+  targetOrdinal: integer("target_ordinal").notNull(),
+  retryNumber: integer("retry_number").notNull(),
+  reason: text("reason").notNull(),
+  breakerBefore: text("breaker_before"),
+  breakerAfter: text("breaker_after"),
+  retryable: boolean("retryable").notNull().default(false),
+  providerId: uuid("provider_id").notNull().references(() => providers.id, {
+    onDelete: "restrict",
+  }),
+  providerSlug: text("provider_slug").notNull(),
+  providerVersion: integer("provider_version").notNull(),
+  protocol: text("protocol").notNull(),
+  providerModelId: uuid("provider_model_id").notNull().references(() => providerModels.id, {
+    onDelete: "restrict",
+  }),
+  publicModelId: text("public_model_id").notNull(),
+  upstreamModelId: text("upstream_model_id").notNull(),
+  modelVersion: integer("model_version").notNull(),
+  pricingVersionId: uuid("pricing_version_id").notNull().references(() => modelPriceVersions.id, {
+    onDelete: "restrict",
+  }),
+  pricingInputMicrosPerMillion: bigint("pricing_input_micros_per_million", { mode: "number" })
+    .notNull(),
+  pricingCachedInputMicrosPerMillion: bigint("pricing_cached_input_micros_per_million", {
+    mode: "number",
+  }).notNull(),
+  pricingReasoningMicrosPerMillion: bigint("pricing_reasoning_micros_per_million", {
+    mode: "number",
+  }).notNull(),
+  pricingOutputMicrosPerMillion: bigint("pricing_output_micros_per_million", { mode: "number" })
+    .notNull(),
+  pricingFixedCallMicros: bigint("pricing_fixed_call_micros", { mode: "number" }).notNull(),
+  pricingSource: text("pricing_source").notNull(),
+  status: text("status").notNull().default("running"),
+  phase: text("phase").notNull().default("planning"),
+  errorCode: text("error_code"),
+  httpStatus: integer("http_status"),
+  visibleOutput: boolean("visible_output").notNull().default(false),
+  inputTokens: integer("input_tokens").notNull().default(0),
+  cachedInputTokens: integer("cached_input_tokens").notNull().default(0),
+  reasoningTokens: integer("reasoning_tokens").notNull().default(0),
+  outputTokens: integer("output_tokens").notNull().default(0),
+  costMicros: bigint("cost_micros", { mode: "number" }).notNull().default(0),
+  tokenSource: text("token_source").notNull().default("none"),
+  costSource: text("cost_source").notNull().default("none"),
+  latencyMs: integer("latency_ms"),
+  ttftMs: integer("ttft_ms"),
+  upstreamRequestId: text("upstream_request_id"),
+  tokensPerSecond: doublePrecision("tokens_per_second"),
+  startedAt: timestamp("started_at", { withTimezone: true }).notNull().defaultNow(),
+  completedAt: timestamp("completed_at", { withTimezone: true }),
+}, (table) => [
+  unique("provider_attempts_run_number_uq").on(table.usageRunId, table.attemptNumber),
+  index("provider_attempts_run_idx").on(table.usageRunId, table.attemptNumber),
+  check("provider_attempts_attempt_number_check", sql`${table.attemptNumber} BETWEEN 1 AND 16`),
+  check("provider_attempts_execution_epoch_check", sql`${table.executionEpoch} >= 1`),
+  check(
+    "provider_attempts_position_check",
+    sql`${table.targetOrdinal} BETWEEN 0 AND 7 AND ${table.retryNumber} BETWEEN 0 AND 3`,
+  ),
+  check(
+    "provider_attempts_reason_check",
+    sql`${table.reason} IN ('primary','retry','fallback','circuit_skip','half_open')`,
+  ),
+  check(
+    "provider_attempts_breaker_check",
+    sql`(${table.breakerBefore} IS NULL OR ${table.breakerBefore} IN ('closed','open','half_open','unavailable')) AND (${table.breakerAfter} IS NULL OR ${table.breakerAfter} IN ('closed','open','half_open','unavailable'))`,
+  ),
+  check(
+    "provider_attempts_versions_check",
+    sql`${table.providerVersion} >= 1 AND ${table.modelVersion} >= 1`,
+  ),
+  check(
+    "provider_attempts_status_check",
+    sql`${table.status} IN ('running','succeeded','failed','cancelled','skipped')`,
+  ),
+  check(
+    "provider_attempts_phase_check",
+    sql`${table.phase} IN ('planning','connect','headers','first_token','streaming','complete')`,
+  ),
+  check(
+    "provider_attempts_sources_check",
+    sql`${table.tokenSource} IN ('provider','estimated','none') AND ${table.costSource} IN ('provider','calculated','none')`,
+  ),
+  check(
+    "provider_attempts_token_check",
+    sql`${table.inputTokens} >= 0 AND ${table.cachedInputTokens} BETWEEN 0 AND ${table.inputTokens} AND ${table.outputTokens} >= 0 AND ${table.reasoningTokens} BETWEEN 0 AND ${table.outputTokens}`,
+  ),
+  check(
+    "provider_attempts_terminal_check",
+    sql`(${table.status} = 'running' AND ${table.completedAt} IS NULL) OR (${table.status} <> 'running' AND ${table.completedAt} IS NOT NULL)`,
+  ),
+  check(
+    "provider_attempts_metrics_check",
+    sql`${table.costMicros} BETWEEN 0 AND 9007199254740991 AND (${table.latencyMs} IS NULL OR ${table.latencyMs} >= 0) AND (${table.ttftMs} IS NULL OR (${table.latencyMs} IS NOT NULL AND ${table.ttftMs} >= 0 AND ${table.ttftMs} <= ${table.latencyMs}))`,
+  ),
+  check(
+    "provider_attempts_snapshot_text_check",
+    sql`char_length(${table.providerSlug}) BETWEEN 1 AND 63 AND char_length(${table.publicModelId}) BETWEEN 3 AND 255 AND char_length(${table.upstreamModelId}) BETWEEN 1 AND 255 AND char_length(${table.pricingSource}) BETWEEN 1 AND 120 AND (${table.upstreamRequestId} IS NULL OR ${table.upstreamRequestId} ~ '^[A-Za-z0-9._:-]{1,255}$')`,
+  ),
+  check(
+    "provider_attempts_throughput_check",
+    sql`${table.tokensPerSecond} IS NULL OR (${table.tokensPerSecond} >= 0 AND ${table.tokensPerSecond} <= 1000000)`,
+  ),
+  check(
+    "provider_attempts_terminal_semantics_check",
+    sql`(${table.status}='succeeded' AND ${table.phase}='complete' AND ${table.errorCode} IS NULL AND (${table.httpStatus} IS NULL OR ${table.httpStatus} BETWEEN 200 AND 299)) OR (${table.status}='running') OR (${table.status} IN ('failed','cancelled','skipped') AND ${table.errorCode} IS NOT NULL)`,
+  ),
+  check(
+    "provider_attempts_skipped_check",
+    sql`${table.status}<>'skipped' OR (NOT ${table.visibleOutput} AND ${table.inputTokens}=0 AND ${table.outputTokens}=0 AND ${table.costMicros}=0 AND ${table.tokenSource}='none' AND ${table.costSource}='none')`,
   ),
 ]);
