@@ -3171,8 +3171,20 @@ export class MemoryRepository {
     return { kind: "started", request: structuredClone(request), leaseToken, usageRun };
   }
   getApiRequest(userId: string, endpoint: ApiIdempotencyEndpoint, idempotencyKey: string) {
-    const id = this.apiIdempotencyKeys.get(this.#apiKey(userId, endpoint, idempotencyKey));
-    return id ? structuredClone(this.#apiRequest(id)) : undefined;
+    const key = this.#apiKey(userId, endpoint, idempotencyKey);
+    const id = this.apiIdempotencyKeys.get(key);
+    if (!id) return undefined;
+    const request = this.apiIdempotencyRequests.get(id);
+    if (!request) {
+      this.apiIdempotencyKeys.delete(key);
+      return undefined;
+    }
+    if (Date.parse(request.expiresAt) <= Date.now()) {
+      this.apiIdempotencyRequests.delete(id);
+      this.apiIdempotencyKeys.delete(key);
+      return undefined;
+    }
+    return structuredClone(request);
   }
   appendApiSseFrame(
     id: string,

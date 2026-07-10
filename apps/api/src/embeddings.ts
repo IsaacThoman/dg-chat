@@ -35,9 +35,17 @@ export class EmbeddingsProviderError extends Error {
 
 function endpoint(baseUrl: string): URL {
   const url = new URL(baseUrl);
-  if (url.protocol !== "https:" || url.username || url.password || url.hash || url.search) {
+  const testHost = Deno.env.get("DENO_ENV") === "test" &&
+    Deno.env.get("OPENAI_TEST_ALLOW_HTTP_HOST")?.toLowerCase() === url.hostname.toLowerCase();
+  if (
+    url.protocol !== "https:" || url.username || url.password || url.hash ||
+    url.search
+  ) {
     throw new EmbeddingsProviderError("Provider base URL is invalid", 500, "provider_config_error");
   }
+  // Contract tests use an isolated in-network mock without TLS. Only the exact explicitly allowed
+  // test hostname is downgraded after the persisted provider URL has passed production validation.
+  if (testHost) url.protocol = "http:";
   url.pathname = `${url.pathname.replace(/\/$/, "")}/embeddings`;
   return url;
 }
@@ -200,7 +208,17 @@ export async function createEmbeddings(
 ): Promise<EmbeddingsResponse> {
   options.signal.throwIfAborted();
   const upstreamRequest = { ...request, model: options.upstreamModel };
-  const response = await (options.fetch ?? pinnedProviderFetch)(endpoint(options.baseUrl), {
+  const url = endpoint(options.baseUrl);
+  const testHttp = Deno.env.get("DENO_ENV") === "test" && url.protocol === "http:" &&
+    Deno.env.get("OPENAI_TEST_ALLOW_HTTP_HOST")?.toLowerCase() === url.hostname.toLowerCase();
+  if (testHttp) {
+    const [address] = await Deno.resolveDns(url.hostname, "A");
+    if (!address) {
+      throw new EmbeddingsProviderError("Test provider hostname did not resolve");
+    }
+    url.hostname = address;
+  }
+  const response = await (options.fetch ?? (testHttp ? fetch : pinnedProviderFetch))(url, {
     method: "POST",
     headers: {
       authorization: `Bearer ${options.apiKey}`,

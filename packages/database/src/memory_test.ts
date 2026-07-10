@@ -1945,7 +1945,13 @@ Deno.test("durable API idempotency lifecycle reserves once, replays frames, and 
     "payload differs",
   );
   repo.apiIdempotencyRequests.get(completed.id)!.expiresAt = new Date(0).toISOString();
-  assertEquals(repo.pruneExpiredApiRequests(), 1);
+  assertEquals(repo.getApiRequest(user.id, input.endpoint, input.idempotencyKey), undefined);
+  assertEquals(repo.apiIdempotencyRequests.has(completed.id), false);
+  assertEquals(
+    repo.apiIdempotencyKeys.has(`${user.id}:${input.endpoint}:${input.idempotencyKey}`),
+    false,
+  );
+  assertEquals(repo.pruneExpiredApiRequests(), 0);
   const reused = repo.beginApiRequest({ ...input, runId: "replay-run-1-reused" });
   assertEquals(reused.kind, "started");
   if (reused.kind !== "started") throw new Error("expected reused key to start");

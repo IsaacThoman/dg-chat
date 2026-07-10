@@ -85,6 +85,13 @@
       "when": 1783656011000,
       "tag": "0011_knowledge_collections",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1783656012000,
+      "tag": "0012_embeddings_idempotency",
+      "breakpoints": true
     }
   ]
 }

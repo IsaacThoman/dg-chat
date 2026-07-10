@@ -340,7 +340,7 @@ export interface JobSummary {
   attempts: number;
   createdAt: string;
 }
-export type ApiIdempotencyEndpoint = "chat.completions" | "responses";
+export type ApiIdempotencyEndpoint = "chat.completions" | "responses" | "embeddings";
 export type ApiIdempotencyState = "in_progress" | "completed" | "failed";
 export interface ApiIdempotencyFrame {
   sequence: number;
