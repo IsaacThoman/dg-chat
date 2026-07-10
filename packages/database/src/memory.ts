@@ -10,6 +10,13 @@ import type {
   UsageSummary,
   UserRole,
 } from "@dg-chat/contracts";
+import type {
+  BeginGenerationInput,
+  CompleteGenerationInput,
+  CreateUserInput,
+  FailGenerationInput,
+  GenerationResult,
+} from "./repository.ts";
 
 export interface StoredUser extends PublicUser {
   passwordHash: string;
@@ -53,7 +60,7 @@ export class DomainError extends Error {
 }
 
 export class MemoryRepository {
-  readonly storageKind: string = "memory";
+  readonly storageKind: "memory" | "postgres" = "memory";
   readonly users = new Map<string, StoredUser>();
   readonly sessions = new Map<string, StoredSession>();
   readonly tokens = new Map<string, StoredApiToken>();
@@ -75,6 +82,22 @@ export class MemoryRepository {
 
   async flush(): Promise<void> {
     // Memory mode is intentionally ephemeral; durable adapters override this hook.
+  }
+
+  async close(): Promise<void> {
+    await this.flush();
+  }
+
+  bootstrapAdmin(
+    input: CreateUserInput,
+    startingCreditMicros: number,
+  ): StoredUser {
+    if ([...this.users.values()].some((user) => user.role === "admin")) {
+      throw new DomainError("already_bootstrapped", "An administrator already exists", 409);
+    }
+    const user = this.createUser({ ...input, role: "admin", approvalStatus: "approved" });
+    this.credit(user.id, `bootstrap:${user.id}`, "grant", startingCreditMicros);
+    return user;
   }
 
   createUser(
@@ -117,6 +140,10 @@ export class MemoryRepository {
     return this.users.get(id);
   }
 
+  listUsers(): PublicUser[] {
+    return [...this.users.values()].map((user) => this.publicUser(user));
+  }
+
   createSession(userId: string, tokenHash: string, limited: boolean): StoredSession {
     const session = {
       tokenHash,
@@ -139,6 +166,9 @@ export class MemoryRepository {
       if (session.userId === userId) this.sessions.delete(hash);
     }
   }
+  deleteSession(tokenHash: string) {
+    this.sessions.delete(tokenHash);
+  }
 
   approveUser(id: string, status: "approved" | "rejected", creditMicros: number): StoredUser {
     const user = this.users.get(id);
@@ -153,10 +183,18 @@ export class MemoryRepository {
       }
     }
     user.approvalStatus = status;
-    if (status === "approved" && creditMicros > 0 && user.balanceMicros === 0) {
+    const alreadyGranted = this.ledger.some((entry) =>
+      entry.usageRunId === `approval:${id}` && entry.kind === "grant"
+    );
+    if (status === "approved" && creditMicros > 0 && !alreadyGranted) {
       this.credit(id, `approval:${id}`, "grant", creditMicros);
     }
-    if (status === "rejected") this.invalidateUserSessions(id);
+    if (status === "rejected") {
+      this.invalidateUserSessions(id);
+      for (const token of this.tokens.values()) {
+        if (token.userId === id && !token.revokedAt) token.revokedAt = new Date().toISOString();
+      }
+    }
     return user;
   }
 
@@ -181,7 +219,22 @@ export class MemoryRepository {
     return user;
   }
 
-  createConversation(ownerId: string, title: string): Conversation {
+  createConversation(
+    ownerId: string,
+    title: string,
+    temporary = false,
+    idempotencyKey?: string,
+  ): Conversation {
+    if (idempotencyKey) {
+      const priorId = this.idempotency.get(`conversation:${ownerId}:${idempotencyKey}`);
+      if (priorId) {
+        const prior = this.conversations.get(priorId)!;
+        if (prior.title !== title || prior.temporary !== temporary) {
+          throw new DomainError("idempotency_conflict", "Conversation replay payload differs", 409);
+        }
+        return prior;
+      }
+    }
     const now = new Date().toISOString();
     const conversation: Conversation = {
       id: crypto.randomUUID(),
@@ -190,12 +243,16 @@ export class MemoryRepository {
       activeLeafId: null,
       version: 0,
       pinned: false,
+      temporary,
       archivedAt: null,
       deletedAt: null,
       createdAt: now,
       updatedAt: now,
     };
     this.conversations.set(conversation.id, conversation);
+    if (idempotencyKey) {
+      this.idempotency.set(`conversation:${ownerId}:${idempotencyKey}`, conversation.id);
+    }
     return conversation;
   }
 
@@ -203,6 +260,27 @@ export class MemoryRepository {
     return [...this.conversations.values()].filter((c) =>
       c.ownerId === ownerId && (includeDeleted || !c.deletedAt)
     ).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+  updateConversation(
+    ownerId: string,
+    id: string,
+    patch: import("./repository.ts").ConversationPatch,
+  ) {
+    const value = this.conversations.get(id);
+    if (!value || value.ownerId !== ownerId) {
+      throw new DomainError("not_found", "Conversation not found", 404);
+    }
+    if (patch.title !== undefined) value.title = patch.title.trim().slice(0, 200);
+    if (patch.pinned !== undefined) value.pinned = patch.pinned;
+    if (patch.archived !== undefined) {
+      value.archivedAt = patch.archived ? new Date().toISOString() : null;
+    }
+    if (patch.deleted !== undefined) {
+      value.deletedAt = patch.deleted ? new Date().toISOString() : null;
+    }
+    value.version++;
+    value.updatedAt = new Date().toISOString();
+    return value;
   }
 
   detail(id: string, ownerId: string): ConversationDetail {
@@ -237,7 +315,21 @@ export class MemoryRepository {
     }
     const idemKey = `${input.conversationId}:${input.idempotencyKey}`;
     const existing = this.idempotency.get(idemKey);
-    if (existing) return this.messages.get(existing)!;
+    if (existing) {
+      const prior = this.messages.get(existing)!;
+      if (
+        prior.parentId !== input.parentId ||
+        prior.supersedesId !== (input.supersedesId ?? null) || prior.role !== input.role ||
+        prior.content !== input.content || prior.model !== (input.model ?? null)
+      ) {
+        throw new DomainError(
+          "idempotency_conflict",
+          "This idempotency key was used with a different message",
+          409,
+        );
+      }
+      return prior;
+    }
     if (conversation.version !== input.expectedVersion) {
       throw new DomainError(
         "version_conflict",
@@ -289,6 +381,118 @@ export class MemoryRepository {
     return message;
   }
 
+  beginGeneration(input: BeginGenerationInput): GenerationResult {
+    const conversation = this.conversations.get(input.message.conversationId);
+    if (!conversation || conversation.ownerId !== input.message.ownerId) {
+      throw new DomainError("not_found", "Conversation not found", 404);
+    }
+    const existingId = this.idempotency.get(
+      `${input.message.conversationId}:${input.message.idempotencyKey}`,
+    );
+    const existingRun = this.usageRuns.get(input.runId);
+    if (existingId && existingRun) {
+      const existing = this.messages.get(existingId)!;
+      if (
+        existing.content !== input.message.content || existingRun.userId !== input.message.ownerId
+      ) {
+        throw new DomainError("idempotency_conflict", "Generation replay payload differs", 409);
+      }
+      if (existingRun.status === "failed") {
+        throw new DomainError(
+          "generation_failed_replay",
+          "Failed generations require a new idempotency key",
+          409,
+        );
+      }
+      return { message: existing, conversation, usageRun: existingRun, replayed: true };
+    }
+    const account = this.users.get(input.message.ownerId);
+    if (!account || account.balanceMicros < input.reserveMicros) {
+      throw new DomainError("insufficient_credit", "Insufficient credit", 402);
+    }
+    const message = this.appendMessage(input.message);
+    const usageRun = this.reserve(
+      input.message.ownerId,
+      input.runId,
+      input.message.model ?? "unknown",
+      input.reserveMicros,
+    );
+    return { message, conversation, usageRun, replayed: false };
+  }
+
+  completeGeneration(input: CompleteGenerationInput): GenerationResult {
+    const conversation = this.conversations.get(input.conversationId);
+    const parent = this.messages.get(input.userMessageId);
+    const usageRun = this.usageRuns.get(input.runId);
+    if (!conversation || conversation.ownerId !== input.ownerId || !parent || !usageRun) {
+      throw new DomainError("not_found", "Generation not found", 404);
+    }
+    const existingId = this.idempotency.get(`${input.conversationId}:${input.idempotencyKey}`);
+    if (existingId) {
+      const existing = this.messages.get(existingId)!;
+      if (existing.content !== input.content || existing.parentId !== input.userMessageId) {
+        throw new DomainError("idempotency_conflict", "Generation replay payload differs", 409);
+      }
+      if (usageRun.status !== "completed") {
+        throw new DomainError("invalid_usage_state", "Generation is not completed", 409);
+      }
+      return { message: existing, conversation, usageRun };
+    }
+    if (usageRun.status !== "reserved") {
+      throw new DomainError("invalid_usage_state", "Generation is not reserved", 409);
+    }
+    const balanceAfterSettlement = this.users.get(input.ownerId)!.balanceMicros +
+      usageRun.reservedMicros - input.costMicros;
+    if (balanceAfterSettlement < 0) {
+      throw new DomainError("insufficient_credit", "Actual cost exceeds available credit", 402);
+    }
+    const previousActive = conversation.activeLeafId;
+    const settled = this.settle(
+      input.runId,
+      input.costMicros,
+      input.inputTokens,
+      input.outputTokens,
+      input.latencyMs,
+    );
+    const message = this.appendMessage({
+      conversationId: input.conversationId,
+      ownerId: input.ownerId,
+      parentId: input.userMessageId,
+      role: "assistant",
+      content: input.content,
+      model: input.model,
+      expectedVersion: conversation.version,
+      idempotencyKey: input.idempotencyKey,
+      metadata: input.metadata,
+    });
+    if (previousActive !== input.userMessageId) conversation.activeLeafId = previousActive;
+    return { message, conversation, usageRun: settled };
+  }
+
+  failGeneration(input: FailGenerationInput): GenerationResult {
+    const conversation = this.conversations.get(input.conversationId);
+    const parent = this.messages.get(input.userMessageId);
+    if (!conversation || conversation.ownerId !== input.ownerId || !parent) {
+      throw new DomainError("not_found", "Generation not found", 404);
+    }
+    const previousActive = conversation.activeLeafId;
+    const usageRun = this.refund(input.runId)!;
+    const message = this.appendMessage({
+      conversationId: input.conversationId,
+      ownerId: input.ownerId,
+      parentId: input.userMessageId,
+      role: "assistant",
+      content: input.error,
+      model: input.model,
+      expectedVersion: conversation.version,
+      idempotencyKey: input.idempotencyKey,
+      metadata: { generationError: input.error, retryable: true },
+    });
+    message.status = "error";
+    if (previousActive !== input.userMessageId) conversation.activeLeafId = previousActive;
+    return { message, conversation, usageRun };
+  }
+
   setActiveLeaf(conversationId: string, ownerId: string, leafId: string, expectedVersion: number) {
     const conversation = this.conversations.get(conversationId);
     const leaf = this.messages.get(leafId);
@@ -298,6 +502,9 @@ export class MemoryRepository {
     ) throw new DomainError("not_found", "Conversation or branch not found", 404);
     if (conversation.version !== expectedVersion) {
       throw new DomainError("version_conflict", "Conversation changed in another tab", 409);
+    }
+    if ([...this.messages.values()].some((message) => message.parentId === leafId)) {
+      throw new DomainError("invalid_leaf", "Active branch must end at a leaf", 422);
     }
     conversation.activeLeafId = leafId;
     conversation.version++;
@@ -346,7 +553,6 @@ export class MemoryRepository {
       throw new DomainError("not_found", "Token not found", 404);
     }
     token.revokedAt = new Date().toISOString();
-    return token;
   }
 
   credit(userId: string, usageRunId: string, kind: LedgerEntry["kind"], amountMicros: number) {
@@ -441,5 +647,36 @@ export class MemoryRepository {
       outputTokens: runs.reduce((n, r) => n + r.outputTokens, 0),
       spentMicros: runs.reduce((n, r) => n + r.costMicros, 0),
     };
+  }
+  adminSummary() {
+    return {
+      calls: this.usageRuns.size,
+      users: this.users.size,
+      balanceMicros: [...this.users.values()].reduce((sum, value) => sum + value.balanceMicros, 0),
+      ledger: [...this.ledger],
+    };
+  }
+  listJobs() {
+    return [...this.jobs];
+  }
+  readiness() {
+    return { ready: true, storage: this.storageKind };
+  }
+
+  listLedger(userId: string): LedgerEntry[] {
+    return this.ledger.filter((entry) => entry.userId === userId);
+  }
+
+  enqueueJob(type: string, payload: unknown): string {
+    const id = crypto.randomUUID();
+    this.jobs.push({
+      id,
+      type,
+      payload,
+      status: "queued",
+      attempts: 0,
+      createdAt: new Date().toISOString(),
+    });
+    return id;
   }
 }

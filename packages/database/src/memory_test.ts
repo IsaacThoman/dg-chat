@@ -67,3 +67,86 @@ Deno.test("ledger reserve settle and refund are idempotent", () => {
   assertEquals(user.balanceMicros, 4_999_900);
   assertEquals(repo.usage(user.id).spentMicros, 100);
 });
+
+Deno.test("replays authorize and reject payload mismatch; active leaf must be terminal", () => {
+  const repo = new MemoryRepository();
+  const owner = repo.createUser({ email: "owner@example.com", name: "Owner", passwordHash: "x" });
+  const stranger = repo.createUser({
+    email: "stranger@example.com",
+    name: "Stranger",
+    passwordHash: "x",
+  });
+  const chat = repo.createConversation(owner.id, "Chat", false, "create-key");
+  assertEquals(repo.createConversation(owner.id, "Chat", false, "create-key").id, chat.id);
+  assertThrows(() => repo.createConversation(owner.id, "Other", false, "create-key"), DomainError);
+  const root = repo.appendMessage({
+    conversationId: chat.id,
+    ownerId: owner.id,
+    parentId: null,
+    role: "user",
+    content: "one",
+    expectedVersion: 0,
+    idempotencyKey: "message-key",
+  });
+  assertThrows(
+    () =>
+      repo.appendMessage({
+        conversationId: chat.id,
+        ownerId: stranger.id,
+        parentId: null,
+        role: "user",
+        content: "one",
+        expectedVersion: 1,
+        idempotencyKey: "message-key",
+      }),
+    DomainError,
+  );
+  assertThrows(
+    () =>
+      repo.appendMessage({
+        conversationId: chat.id,
+        ownerId: owner.id,
+        parentId: null,
+        role: "user",
+        content: "different",
+        expectedVersion: 1,
+        idempotencyKey: "message-key",
+      }),
+    DomainError,
+  );
+  repo.appendMessage({
+    conversationId: chat.id,
+    ownerId: owner.id,
+    parentId: root.id,
+    role: "assistant",
+    content: "two",
+    expectedVersion: 1,
+    idempotencyKey: "child-key",
+  });
+  assertThrows(() => repo.setActiveLeaf(chat.id, owner.id, root.id, 2), DomainError, "leaf");
+});
+
+Deno.test("approval grant is minted once and rejection revokes sessions and tokens", () => {
+  const repo = new MemoryRepository();
+  const user = repo.createUser({
+    email: "approval@example.com",
+    name: "Approval",
+    passwordHash: "x",
+  });
+  repo.approveUser(user.id, "approved", 100);
+  repo.reserve(user.id, "spend", "model", 100);
+  repo.settle("spend", 100, 1, 1, 1);
+  repo.approveUser(user.id, "rejected", 100);
+  repo.approveUser(user.id, "approved", 100);
+  assertEquals(user.balanceMicros, 0);
+  repo.createSession(user.id, "session", false);
+  const token = repo.createApiToken(user.id, {
+    name: "token",
+    scopes: ["chat:write"],
+    tokenHash: "hash",
+    preview: "hash",
+  });
+  repo.approveUser(user.id, "rejected", 100);
+  assertEquals(repo.getSession("session"), undefined);
+  assertEquals(Boolean(token.revokedAt), true);
+});
