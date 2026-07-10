@@ -22,6 +22,47 @@ import type { Attachment, KnowledgeCollection, KnowledgeMode } from "./types.ts"
 const errorMessage = (error: unknown) =>
   error instanceof ApiError || error instanceof Error ? error.message : "Something went wrong";
 
+const ACTIVE_INGESTION_STATES = new Set(["queued", "processing"]);
+
+export function hasActiveIngestion(files: Attachment[] | undefined): boolean {
+  return files?.some((file) => ACTIVE_INGESTION_STATES.has(file.ingestionStatus ?? "")) ?? false;
+}
+
+export function ingestionStatusText(file: Attachment): string {
+  switch (file.ingestionStatus) {
+    case "ready":
+      return file.ingestedAt
+        ? `Extraction ready · completed ${new Date(file.ingestedAt).toLocaleString()}`
+        : "Extraction ready";
+    case "queued":
+      return "Extraction queued — waiting for a worker";
+    case "processing":
+      return "Extracting and indexing content…";
+    case "failed":
+      return file.ingestionError
+        ? `Extraction failed: ${file.ingestionError}`
+        : "Extraction failed. Retry to process this file again.";
+    default:
+      return `Extraction unavailable · ${file.state.replaceAll("_", " ")}`;
+  }
+}
+
+function AttachmentIngestionStatus(
+  { file, retry, busy }: { file: Attachment; retry?: () => void; busy?: boolean },
+) {
+  const failed = file.ingestionStatus === "failed";
+  return (
+    <span className={`knowledge-ingestion-status ${failed ? "failed" : ""}`}>
+      <small role={failed ? "alert" : "status"}>{ingestionStatusText(file)}</small>
+      {failed && retry && (
+        <button className="link-button" disabled={busy} onClick={retry}>
+          <RefreshCw size={13} /> {busy ? "Retrying…" : "Retry extraction"}
+        </button>
+      )}
+    </span>
+  );
+}
+
 function StateMessage(
   { title, detail, retry }: { title: string; detail?: string; retry?: () => void },
 ) {
@@ -146,7 +187,11 @@ function AttachmentPicker(
     changed: () => Promise<void>;
   },
 ) {
-  const files = useQuery({ queryKey: ["attachments"], queryFn: api.attachments });
+  const files = useQuery({
+    queryKey: ["attachments"],
+    queryFn: api.attachments,
+    refetchInterval: (query) => hasActiveIngestion(query.state.data) ? 2_000 : false,
+  });
   const [selected, setSelected] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -189,13 +234,7 @@ function AttachmentPicker(
               <FileText size={18} />
               <span>
                 <strong>{file.filename}</strong>
-                <small>
-                  {isReady(file)
-                    ? "Ready to use"
-                    : file.ingestionStatus === "failed"
-                    ? `Processing failed${file.ingestionError ? `: ${file.ingestionError}` : ""}`
-                    : `Not ready — ${file.ingestionStatus?.replace("_", " ") ?? file.state}`}
-                </small>
+                <AttachmentIngestionStatus file={file} />
               </span>
               {selected === file.id && <Check size={17} className="push" />}
             </label>
@@ -233,6 +272,7 @@ export function KnowledgeView({ onMenu }: { onMenu: () => void }) {
   const [query, setQuery] = useState("");
   const [dialog, setDialog] = useState<"create" | "rename" | "delete" | "attach" | null>(null);
   const [actionError, setActionError] = useState("");
+  const [retryingAttachmentId, setRetryingAttachmentId] = useState("");
   const filtered = (collections.data ?? []).filter((item) =>
     item.name.toLowerCase().includes(query.toLowerCase())
   );
@@ -245,6 +285,8 @@ export function KnowledgeView({ onMenu }: { onMenu: () => void }) {
     queryKey: ["collections", selected?.id],
     queryFn: () => api.collection(selected!.id),
     enabled: Boolean(selected),
+    refetchInterval: (query) =>
+      hasActiveIngestion(query.state.data?.attachments) ? 2_000 : false,
   });
   const refresh = async () => {
     await Promise.all([collections.refetch(), detail.refetch()]);
@@ -378,11 +420,20 @@ export function KnowledgeView({ onMenu }: { onMenu: () => void }) {
                     </span>
                     <span>
                       <strong>{file.filename}</strong>
-                      <small>
-                        {file.ingestionStatus?.replace("_", " ") ?? file.state} ·{" "}
-                        {(file.sizeBytes / 1024).toFixed(0)} KB
-                      </small>
-                      {file.ingestionError && <em>{file.ingestionError}</em>}
+                      <small>{(file.sizeBytes / 1024).toFixed(0)} KB · {file.mimeType}</small>
+                      <AttachmentIngestionStatus
+                        file={file}
+                        busy={retryingAttachmentId === file.id}
+                        retry={() => {
+                          setRetryingAttachmentId(file.id);
+                          setActionError("");
+                          void api.retryAttachmentIngestion(file.id).then(async () => {
+                            await refresh();
+                          }).catch((caught) => {
+                            setActionError(errorMessage(caught));
+                          }).finally(() => setRetryingAttachmentId(""));
+                        }}
+                      />
                     </span>
                     <button
                       className="icon-button push"
