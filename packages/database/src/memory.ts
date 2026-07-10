@@ -10,6 +10,8 @@ import type {
   UsageSummary,
   UserRole,
 } from "@dg-chat/contracts";
+import { isIngestibleDocumentMime } from "./attachment-policy.ts";
+import { validateDocumentChunkInputs } from "./repository.ts";
 import type {
   ApiIdempotencyEndpoint,
   ApiIdempotencyRequest,
@@ -128,18 +130,14 @@ export class DomainError extends Error {
   }
 }
 
-const isIngestibleMime = (mime: string) => mime === "text/plain" || mime === "application/json";
-
-function validateDocumentChunks(chunks: DocumentChunkInput[]) {
-  const ids = new Set<string>();
-  for (const [index, chunk] of chunks.entries()) {
-    if (
-      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-        chunk.id,
-      ) || chunk.ordinal !== index || !chunk.content || chunk.content.length > 20_000 ||
-      ids.has(chunk.id)
-    ) throw new DomainError("invalid_document_chunks", "Document chunks are invalid", 422);
-    ids.add(chunk.id);
+function validateDocumentChunks(
+  chunks: DocumentChunkInput[],
+  attachmentId: string,
+): DocumentChunkInput[] {
+  try {
+    return validateDocumentChunkInputs(chunks, attachmentId);
+  } catch {
+    throw new DomainError("invalid_document_chunks", "Document chunks are invalid", 422);
   }
 }
 
@@ -1393,7 +1391,7 @@ export class MemoryRepository {
       id: crypto.randomUUID(),
       state: input.state ?? "pending",
       inspectionError: input.inspectionError ?? null,
-      ingestionStatus: input.state === "ready" && isIngestibleMime(input.mimeType)
+      ingestionStatus: input.state === "ready" && isIngestibleDocumentMime(input.mimeType)
         ? "queued"
         : "not_applicable",
       ingestionError: null,
@@ -1466,7 +1464,7 @@ export class MemoryRepository {
     attachment.inspectionError = inspectionError;
     attachment.updatedAt = new Date().toISOString();
     if (nextState === "deleted") attachment.deletedAt = attachment.updatedAt;
-    if (nextState === "ready" && isIngestibleMime(attachment.mimeType)) {
+    if (nextState === "ready" && isIngestibleDocumentMime(attachment.mimeType)) {
       attachment.ingestionStatus = "queued";
       attachment.ingestionError = null;
       this.enqueueAttachmentIngestion(attachment);
@@ -1502,7 +1500,7 @@ export class MemoryRepository {
 
   beginAttachmentIngestion(id: string, ownerId: string) {
     const attachment = this.getAttachment(id, ownerId);
-    if (!isIngestibleMime(attachment.mimeType) || attachment.state !== "ready") {
+    if (!isIngestibleDocumentMime(attachment.mimeType) || attachment.state !== "ready") {
       throw new DomainError("attachment_not_ingestible", "Attachment cannot be ingested", 422);
     }
     if (!["queued", "processing"].includes(attachment.ingestionStatus)) {
@@ -1527,8 +1525,8 @@ export class MemoryRepository {
         409,
       );
     }
-    validateDocumentChunks(chunks);
-    const next = chunks.map((chunk) => ({ ...chunk, attachmentId: id }));
+    const validatedChunks = validateDocumentChunks(chunks, id);
+    const next = validatedChunks.map((chunk) => ({ ...chunk, attachmentId: id }));
     this.documentChunks.set(id, next);
     const now = new Date().toISOString();
     attachment.ingestionStatus = "ready";

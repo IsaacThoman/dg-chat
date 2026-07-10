@@ -1,6 +1,8 @@
 import postgres from "npm:postgres@3.4.7";
 import type { AccountState, Conversation, MessageNode, PublicUser } from "@dg-chat/contracts";
 import { DomainError } from "./memory.ts";
+import { INGESTIBLE_DOCUMENT_MIME_TYPES, isIngestibleDocumentMime } from "./attachment-policy.ts";
+import { validateDocumentChunkInputs } from "./repository.ts";
 import type { LedgerEntry, StoredApiToken, StoredSession, StoredUser, UsageRun } from "./memory.ts";
 import type {
   ApiIdempotencyEndpoint,
@@ -563,18 +565,14 @@ function validateRegistryMutation(mutation: RegistryMutationContext) {
   }
 }
 
-const isIngestibleMime = (mime: string) => mime === "text/plain" || mime === "application/json";
-
-function validateDocumentChunks(chunks: DocumentChunkInput[]) {
-  const ids = new Set<string>();
-  for (const [index, chunk] of chunks.entries()) {
-    if (
-      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-        chunk.id,
-      ) || chunk.ordinal !== index || !chunk.content || chunk.content.length > 20_000 ||
-      ids.has(chunk.id)
-    ) throw new DomainError("invalid_document_chunks", "Document chunks are invalid", 422);
-    ids.add(chunk.id);
+function validateDocumentChunks(
+  chunks: DocumentChunkInput[],
+  attachmentId: string,
+): DocumentChunkInput[] {
+  try {
+    return validateDocumentChunkInputs(chunks, attachmentId);
+  } catch {
+    throw new DomainError("invalid_document_chunks", "Document chunks are invalid", 422);
   }
 }
 function validateAttachmentInput(input: CreateAttachmentInput) {
@@ -1789,7 +1787,9 @@ export class PostgresRepository implements DomainRepository {
       >`INSERT INTO attachments(owner_id,object_key,filename,mime_type,size_bytes,sha256,state,inspection_error,ingestion_status) VALUES(${input.ownerId},${input.objectKey},${input.filename},${input.mimeType},${input.sizeBytes},${input.sha256},${
         input.state ?? "pending"
       },${input.inspectionError ?? null},${
-        input.state === "ready" && isIngestibleMime(input.mimeType) ? "queued" : "not_applicable"
+        input.state === "ready" && isIngestibleDocumentMime(input.mimeType)
+          ? "queued"
+          : "not_applicable"
       }) ON CONFLICT DO NOTHING RETURNING *`;
       let record = inserted[0];
       const deduplicated = !record;
@@ -1887,11 +1887,13 @@ export class PostgresRepository implements DomainRepository {
       const rows = await tx<
         Row[]
       >`UPDATE attachments SET state=${nextState},inspection_error=${inspectionError},
-        ingestion_status=CASE WHEN ${nextState}='ready' AND mime_type IN ('text/plain','application/json') THEN 'queued' ELSE ingestion_status END,
+        ingestion_status=CASE WHEN ${nextState}='ready' AND mime_type = ANY(${[
+        ...INGESTIBLE_DOCUMENT_MIME_TYPES,
+      ]}) THEN 'queued' ELSE ingestion_status END,
         ingestion_error=CASE WHEN ${nextState}='ready' THEN NULL ELSE ingestion_error END,
         deleted_at=CASE WHEN ${nextState}='deleted' THEN COALESCE(deleted_at,now()) ELSE deleted_at END,
         updated_at=now() WHERE id=${id} AND owner_id=${ownerId} AND state=${expectedState} RETURNING *`;
-      if (rows[0] && nextState === "ready" && isIngestibleMime(String(rows[0].mime_type))) {
+      if (rows[0] && nextState === "ready" && isIngestibleDocumentMime(String(rows[0].mime_type))) {
         await tx`INSERT INTO jobs(type,payload,idempotency_key) VALUES('attachment.ingest',${
           tx.json({ attachmentId: id, ownerId })
         },${`attachment.ingest:${id}`}) ON CONFLICT(idempotency_key) DO NOTHING`;
@@ -1927,7 +1929,7 @@ export class PostgresRepository implements DomainRepository {
     const rows = await this.#sql<Row[]>`
       UPDATE attachments SET ingestion_status='processing',ingestion_error=NULL,updated_at=now()
       WHERE id=${id} AND owner_id=${ownerId} AND deleted_at IS NULL AND state='ready'
-        AND mime_type IN ('text/plain','application/json')
+        AND mime_type = ANY(${[...INGESTIBLE_DOCUMENT_MIME_TYPES]})
         AND ingestion_status IN ('queued','processing') RETURNING *`;
     if (rows[0]) return attachment(rows[0]);
     const exists = await this
@@ -1941,7 +1943,7 @@ export class PostgresRepository implements DomainRepository {
     ownerId: string,
     chunks: DocumentChunkInput[],
   ) {
-    validateDocumentChunks(chunks);
+    const validatedChunks = validateDocumentChunks(chunks, id);
     return await this.#sql.begin(async (tx) => {
       const rows = await tx<Row[]>`
         SELECT * FROM attachments WHERE id=${id} AND owner_id=${ownerId}
@@ -1954,7 +1956,7 @@ export class PostgresRepository implements DomainRepository {
         );
       }
       await tx`DELETE FROM document_chunks WHERE attachment_id=${id}`;
-      for (const chunk of chunks) {
+      for (const chunk of validatedChunks) {
         await tx`INSERT INTO document_chunks(id,attachment_id,ordinal,content,metadata)
           VALUES(${chunk.id},${id},${chunk.ordinal},${chunk.content},${
           tx.json(chunk.metadata as never)

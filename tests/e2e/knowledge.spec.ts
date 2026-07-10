@@ -1,5 +1,46 @@
 import { expect, test } from "@playwright/test";
+import { strToU8, zipSync } from "fflate";
 import { apiURL, bootstrap, createChat, login } from "./helpers.ts";
+
+const DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+
+function documentPdf(text: string): Buffer {
+  const escaped = text.replaceAll("\\", "\\\\").replaceAll("(", "\\(").replaceAll(")", "\\)");
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [5 0 R] /Count 1 >>",
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    `<< /Length ${
+      `BT /F1 12 Tf 72 720 Td (${escaped}) Tj ET`.length
+    } >>\nstream\nBT /F1 12 Tf 72 720 Td (${escaped}) Tj ET\nendstream`,
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 4 0 R >>",
+  ];
+  let output = "%PDF-1.4\n";
+  const offsets = [0];
+  for (const [index, body] of objects.entries()) {
+    offsets.push(output.length);
+    output += `${index + 1} 0 obj\n${body}\nendobj\n`;
+  }
+  const xref = output.length;
+  output += `xref\n0 6\n0000000000 65535 f \n${
+    offsets.slice(1).map((offset) => `${String(offset).padStart(10, "0")} 00000 n \n`).join("")
+  }trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
+  return Buffer.from(output);
+}
+
+function documentDocx(first: string, second: string): Buffer {
+  return Buffer.from(zipSync({
+    "[Content_Types].xml": strToU8(
+      `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>`,
+    ),
+    "_rels/.rels": strToU8(
+      `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>`,
+    ),
+    "word/document.xml": strToU8(
+      `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>${first}</w:t></w:r></w:p><w:sectPr><w:pgSz w:w="12240" w:h="15840"/></w:sectPr><w:p><w:r><w:t>${second}</w:t></w:r></w:p></w:body></w:document>`,
+    ),
+  }, { level: 6 }));
+}
 
 test.beforeEach(async ({ page, request }) => {
   await bootstrap(request);
@@ -108,4 +149,58 @@ test("manages a collection and persists conversation knowledge", async ({ page }
   await expect(deleteDialog).toContainText("cannot be undone");
   await deleteDialog.getByRole("button", { name: "Delete collection" }).click();
   await expect(page.getByRole("heading", { name: renamedName })).toBeHidden();
+});
+
+test("extracts uploaded PDF pages and DOCX sections with persisted provenance", async ({
+  page,
+}, testInfo) => {
+  const suffix = `${Date.now()}-${testInfo.project.name}`;
+  const pdfName = `manual-${suffix}.pdf`;
+  const docxName = `handbook-${suffix}.docx`;
+  const pdfText = `PDF browser extraction ${suffix}`;
+  const firstSection = `DOCX first section ${suffix}`;
+  const secondSection = `DOCX second section ${suffix}`;
+  const input = page.locator('input[type="file"]');
+  await input.setInputFiles({
+    name: pdfName,
+    mimeType: "application/pdf",
+    buffer: documentPdf(pdfText),
+  });
+  await input.setInputFiles({
+    name: docxName,
+    mimeType: DOCX_MIME,
+    buffer: documentDocx(firstSection, secondSection),
+  });
+
+  type Attachment = { id: string; filename: string; ingestionStatus?: string };
+  const attachment = async (filename: string): Promise<Attachment | undefined> => {
+    const response = await page.request.get(`${apiURL}/api/attachments`);
+    if (!response.ok()) return undefined;
+    return ((await response.json()) as { data: Attachment[] }).data.find((item) =>
+      item.filename === filename
+    );
+  };
+  await expect.poll(async () => (await attachment(pdfName))?.ingestionStatus ?? "missing", {
+    timeout: 30_000,
+  }).toBe("ready");
+  await expect.poll(async () => (await attachment(docxName))?.ingestionStatus ?? "missing", {
+    timeout: 30_000,
+  }).toBe("ready");
+
+  const pdf = await attachment(pdfName);
+  const docx = await attachment(docxName);
+  expect(pdf).toBeTruthy();
+  expect(docx).toBeTruthy();
+  const pdfChunks = await (await page.request.get(`${apiURL}/api/attachments/${pdf!.id}/chunks`))
+    .json() as { data: Array<{ content: string; metadata: Record<string, unknown> }> };
+  const docxChunks = await (await page.request.get(`${apiURL}/api/attachments/${docx!.id}/chunks`))
+    .json() as { data: Array<{ content: string; metadata: Record<string, unknown> }> };
+  expect(pdfChunks.data.map((chunk) => chunk.content).join(" ")).toContain(pdfText);
+  expect(pdfChunks.data[0].metadata.pageNumber).toBe(1);
+  expect(pdfChunks.data[0].metadata.extractorVersion).toBe("builtin-document-v1");
+  expect(docxChunks.data.map((chunk) => chunk.content).join(" ")).toContain(firstSection);
+  expect(docxChunks.data.map((chunk) => chunk.content).join(" ")).toContain(secondSection);
+  expect(new Set(docxChunks.data.map((chunk) => chunk.metadata.section))).toEqual(
+    new Set(["1", "2"]),
+  );
 });

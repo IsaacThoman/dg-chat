@@ -1,5 +1,11 @@
 import postgres from "npm:postgres@3.4.7";
-import { type ObjectStore, objectStoreFromEnv } from "@dg-chat/database";
+import {
+  INGESTIBLE_DOCUMENT_MIME_TYPES,
+  type ObjectStore,
+  objectStoreFromEnv,
+  parseDocumentProcessingConfig,
+  validateDocumentChunkInputs,
+} from "@dg-chat/database";
 import {
   assertAttachmentInspectionTerminal,
   AttachmentInspectionPendingError,
@@ -7,22 +13,52 @@ import {
 } from "./attachment-inspection.ts";
 import { claimJob, completeJob, deferJob, failOrRetryJob } from "./job-queue.ts";
 import {
-  deterministicChunks,
   parseAttachmentIngestionPayload,
-  readIngestionText,
   recordIngestionFailure,
   requireIngestionObject,
 } from "./attachment-ingestion.ts";
+import { buildDocumentChunks } from "./document-pipeline.ts";
+import type { DocumentExtractionLimits } from "./document-extraction.ts";
 
 const databaseUrl = Deno.env.get("DATABASE_URL");
 const workerId = Deno.env.get("WORKER_ID") ?? `worker-${crypto.randomUUID().slice(0, 8)}`;
 const pollMs = Number(Deno.env.get("WORKER_POLL_MS") ?? 1000);
 const jobLeaseSeconds = Number(Deno.env.get("WORKER_JOB_LEASE_SECONDS") ?? 120);
+const documentProcessingConfig = parseDocumentProcessingConfig({
+  DOCUMENT_CHUNK_SIZE_CHARS: Deno.env.get("DOCUMENT_CHUNK_SIZE_CHARS"),
+  DOCUMENT_CHUNK_OVERLAP_CHARS: Deno.env.get("DOCUMENT_CHUNK_OVERLAP_CHARS"),
+  DOCUMENT_EXTRACTOR_VERSION: Deno.env.get("DOCUMENT_EXTRACTOR_VERSION"),
+  DOCUMENT_CHUNKER_VERSION: Deno.env.get("DOCUMENT_CHUNKER_VERSION"),
+});
+function positiveInteger(name: string, fallback: number, minimum = 1): number {
+  const raw = Deno.env.get(name);
+  const value = raw === undefined ? fallback : Number(raw);
+  if (!Number.isSafeInteger(value) || value < minimum) {
+    throw new Error(`${name} must be an integer of at least ${minimum}`);
+  }
+  return value;
+}
+const documentExtractionLimits: DocumentExtractionLimits = {
+  maxRawBytes: positiveInteger("DOCUMENT_EXTRACTION_MAX_RAW_BYTES", 20 * 1024 * 1024),
+  timeoutMs: positiveInteger("DOCUMENT_EXTRACTION_TIMEOUT_MS", 30_000),
+  maxOutputCharacters: positiveInteger("DOCUMENT_EXTRACTION_MAX_OUTPUT_CHARACTERS", 2_000_000),
+  maxPdfPages: positiveInteger("DOCUMENT_EXTRACTION_MAX_PDF_PAGES", 1_000),
+  maxZipEntries: positiveInteger("DOCUMENT_EXTRACTION_MAX_ZIP_ENTRIES", 2_000),
+  maxZipEntryBytes: positiveInteger("DOCUMENT_EXTRACTION_MAX_ZIP_ENTRY_BYTES", 25 * 1024 * 1024),
+  maxZipExpandedBytes: positiveInteger(
+    "DOCUMENT_EXTRACTION_MAX_ZIP_EXPANDED_BYTES",
+    100 * 1024 * 1024,
+  ),
+  maxZipCompressionRatio: positiveInteger("DOCUMENT_EXTRACTION_MAX_ZIP_RATIO", 200),
+};
 if (!Number.isSafeInteger(pollMs) || pollMs < 10) {
   throw new Error("WORKER_POLL_MS must be an integer of at least 10 milliseconds");
 }
 if (!Number.isSafeInteger(jobLeaseSeconds) || jobLeaseSeconds < 1) {
   throw new Error("WORKER_JOB_LEASE_SECONDS must be a positive integer");
+}
+if (documentExtractionLimits.timeoutMs! >= jobLeaseSeconds * 1000) {
+  throw new Error("DOCUMENT_EXTRACTION_TIMEOUT_MS must be shorter than WORKER_JOB_LEASE_SECONDS");
 }
 let stopping = false;
 
@@ -83,7 +119,7 @@ async function processJob(
         UPDATE attachments a SET ingestion_status='processing',ingestion_error=NULL,updated_at=now()
         FROM jobs j WHERE a.id=${attachmentId} AND a.owner_id=${ownerId}
           AND a.deleted_at IS NULL AND a.state='ready'
-          AND a.mime_type IN ('text/plain','application/json')
+          AND a.mime_type = ANY(${[...INGESTIBLE_DOCUMENT_MIME_TYPES]})
           AND a.ingestion_status IN ('queued','processing')
           AND j.id=${job.id} AND j.status='running' AND j.locked_by=${job.claimToken}
         RETURNING a.object_key,a.mime_type,a.filename,a.sha256,a.size_bytes`;
@@ -99,20 +135,20 @@ async function processJob(
       if (object.metadata.owner && object.metadata.owner !== ownerId) {
         throw new Error("Attachment object owner metadata does not match its record");
       }
-      const text = await readIngestionText(
-        object,
-        source.mime_type,
-        4 * 1024 * 1024,
-        30_000,
-        source.sha256,
-      );
-      const chunks = await deterministicChunks({
+      const chunks = validateDocumentChunkInputs(
+        await buildDocumentChunks(
+          {
+            attachmentId,
+            filename: source.filename,
+            mimeType: source.mime_type,
+            sha256: source.sha256,
+            object,
+          },
+          documentProcessingConfig,
+          documentExtractionLimits,
+        ),
         attachmentId,
-        filename: source.filename,
-        mimeType: source.mime_type,
-        sha256: source.sha256,
-        text,
-      });
+      );
       const committed = await sql.begin(async (tx) => {
         const fence = await tx`SELECT id FROM jobs WHERE id=${job.id} AND status='running'
           AND locked_by=${job.claimToken} FOR UPDATE`;
