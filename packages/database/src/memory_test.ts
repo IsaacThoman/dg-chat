@@ -57,6 +57,56 @@ Deno.test("optimistic versioning prevents lost updates and idempotency replays s
   );
 });
 
+Deno.test("audit listing filters and paginates with a stable tuple cursor", () => {
+  const repo = new MemoryRepository();
+  const actor = crypto.randomUUID();
+  const target = crypto.randomUUID();
+  const events = [
+    repo.recordAudit({
+      actorId: actor,
+      action: "user.approve",
+      targetType: "user",
+      targetId: target,
+    }),
+    repo.recordAudit({
+      actorId: actor,
+      action: "user.reject",
+      targetType: "user",
+      targetId: target,
+    }),
+    repo.recordAudit({ action: "system.cleanup", targetType: "job" }),
+  ];
+  events[0].createdAt = "2026-01-01T00:00:00.000Z";
+  events[0].id = "00000000-0000-4000-8000-000000000001";
+  events[1].createdAt = "2026-01-02T00:00:00.000Z";
+  events[1].id = "00000000-0000-4000-8000-000000000002";
+  events[2].createdAt = "2026-01-02T00:00:00.000Z";
+  events[2].id = "00000000-0000-4000-8000-000000000003";
+
+  const first = repo.listAudit({ limit: 2 });
+  assertEquals(first.data.map((event) => event.id), [events[2].id, events[1].id]);
+  assertEquals(typeof first.nextCursor, "string");
+  const second = repo.listAudit({ limit: 2, cursor: first.nextCursor! });
+  assertEquals(second.data.map((event) => event.id), [events[0].id]);
+  assertEquals(second.nextCursor, null);
+
+  assertEquals(repo.listAudit({ action: "user.approve" }).data.map((event) => event.id), [
+    events[0].id,
+  ]);
+  assertEquals(
+    repo.listAudit({
+      actorId: actor,
+      targetType: "user",
+      targetId: target,
+      from: "2026-01-02T00:00:00.000Z",
+      to: "2026-01-02T00:00:00.000Z",
+    }).data.map((event) => event.id),
+    [events[1].id],
+  );
+  assertThrows(() => repo.listAudit({ limit: 201 }), DomainError, "between 1 and 200");
+  assertThrows(() => repo.listAudit({ cursor: "not-a-cursor" }), DomainError, "cursor");
+});
+
 Deno.test("archived and deleted conversations reject new graph mutations", () => {
   const repo = new MemoryRepository();
   const user = repo.createUser({ email: "readonly@example.com", name: "User", passwordHash: "x" });

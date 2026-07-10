@@ -29,13 +29,22 @@ Markdown, Mermaid, citations, artifacts, filenames, provider errors, and tool re
 as hostile content under a restrictive Content Security Policy. Raw HTML is disabled unless passed
 through a maintained sanitizer. Spreadsheet formulas are escaped in CSV exports.
 
-File upload routes are deliberately unavailable in the current release. Do not enable them until
-streaming limits, MIME sniffing, quarantine scanning, immutable object keys, signed access, and
-ownership checks are implemented and tested.
+File upload routes stream multipart bodies through byte and concurrency limits, MIME sniffing,
+filename normalization, immutable object keys, ownership checks, and image dimension/decompression
+guards. Objects are private in S3-compatible storage; direct reads require ownership, while
+tombstoned objects remain available only through an immutable historical message link. PNG and JPEG
+files receive a bounded full decode before becoming ready. GIF and WebP files remain quarantined
+because a trusted full decoder is not yet configured.
+
+The current attachment worker acknowledges terminal inspection states; it is not an antivirus,
+content-disarm, PDF, Office, audio, or archive scanner. PDF and audio acceptance currently relies on
+bounded upload handling and MIME/signature checks, so deployments requiring malware scanning must
+add an external quarantine scanner before allowing those formats. Office uploads, OCR, document
+extraction, ingestion, object garbage collection, and retention-aware deletion are not implemented.
 
 The current OpenAI-compatible provider transport resolves every A and AAAA answer, rejects
 special-use destinations, and pins the approved address while preserving TLS hostname validation. It
-rejects redirects and bounds response and streaming bytes. Future OCR, search, tool, upload, and
+rejects redirects and bounds response and streaming bytes. Future OCR, search, tool, ingestion, and
 sandbox fetchers must independently enforce redirect, decompression, image-dimension, and duration
 limits before those features are enabled.
 

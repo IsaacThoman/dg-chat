@@ -43,6 +43,66 @@ export interface AuditEvent extends AuditEventInput {
   id: string;
   createdAt: string;
 }
+export interface AuditQuery {
+  limit?: number;
+  cursor?: string;
+  action?: string;
+  actorId?: string;
+  targetType?: string;
+  targetId?: string;
+  from?: string;
+  to?: string;
+}
+export interface AuditPage {
+  data: AuditEvent[];
+  nextCursor: string | null;
+}
+
+export function encodeAuditCursor(event: Pick<AuditEvent, "createdAt" | "id">): string {
+  return encodeAuditCursorTuple(event.createdAt, event.id);
+}
+
+/** PostgreSQL ordering cursor that preserves the database timestamp's full microsecond precision. */
+export function encodeAuditPostgresCursor(timestamp: string, id: string): string {
+  if (!Number.isFinite(Date.parse(timestamp))) {
+    throw new TypeError("Invalid audit timestamp cursor");
+  }
+  return encodeAuditCursorTuple(`pg:${timestamp}`, id);
+}
+
+function encodeAuditCursorTuple(timestamp: string, id: string): string {
+  return btoa(JSON.stringify([timestamp, id]))
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replace(/=+$/, "");
+}
+
+export type DecodedAuditCursor =
+  | { kind: "timestamp"; createdAt: string; id: string }
+  | { kind: "postgres_timestamp"; timestamp: string; id: string };
+
+export function decodeAuditCursor(cursor: string): DecodedAuditCursor | undefined {
+  try {
+    const base64 = cursor.replaceAll("-", "+").replaceAll("_", "/");
+    const decoded = JSON.parse(atob(base64.padEnd(Math.ceil(base64.length / 4) * 4, "=")));
+    if (
+      !Array.isArray(decoded) || decoded.length !== 2 ||
+      typeof decoded[0] !== "string" ||
+      typeof decoded[1] !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(decoded[1])
+    ) return undefined;
+    if (decoded[0].startsWith("pg:")) {
+      const timestamp = decoded[0].slice(3);
+      return Number.isFinite(Date.parse(timestamp))
+        ? { kind: "postgres_timestamp", timestamp, id: decoded[1] }
+        : undefined;
+    }
+    if (!Number.isFinite(Date.parse(decoded[0]))) return undefined;
+    return { kind: "timestamp", createdAt: new Date(decoded[0]).toISOString(), id: decoded[1] };
+  } catch {
+    return undefined;
+  }
+}
 
 export type AttachmentState =
   | "pending"
@@ -286,7 +346,7 @@ export interface DomainRepository {
   verifyEmail(tokenHash: string): MaybePromise<StoredUser>;
   resetPassword(tokenHash: string, passwordHash: string): MaybePromise<StoredUser>;
   recordAudit(input: AuditEventInput): MaybePromise<AuditEvent>;
-  listAudit(limit?: number): MaybePromise<AuditEvent[]>;
+  listAudit(query?: AuditQuery): MaybePromise<AuditPage>;
   approveUser(
     id: string,
     status: "approved" | "rejected",

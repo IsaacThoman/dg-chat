@@ -19,6 +19,8 @@ import type {
   AttachmentState,
   AuditEvent,
   AuditEventInput,
+  AuditPage,
+  AuditQuery,
   BeginApiRequestInput,
   BeginApiRequestResult,
   BeginGenerationInput,
@@ -34,6 +36,7 @@ import type {
   IdentityTokenPurpose,
   SessionSummary,
 } from "./repository.ts";
+import { decodeAuditCursor, encodeAuditCursor } from "./repository.ts";
 
 export interface StoredUser extends PublicUser {
   passwordHash: string;
@@ -295,8 +298,41 @@ export class MemoryRepository {
     this.auditEvents.push(event);
     return event;
   }
-  listAudit(limit = 100) {
-    return [...this.auditEvents].reverse().slice(0, limit);
+  listAudit(query: AuditQuery = {}): AuditPage {
+    const limit = query.limit ?? 100;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
+      throw new DomainError("validation_error", "Audit limit must be between 1 and 200", 422);
+    }
+    const cursor = query.cursor ? decodeAuditCursor(query.cursor) : undefined;
+    if (query.cursor && (!cursor || cursor.kind !== "timestamp")) {
+      throw new DomainError("validation_error", "Invalid audit cursor", 422);
+    }
+    const timestampCursor = cursor?.kind === "timestamp" ? cursor : undefined;
+    const from = query.from ? Date.parse(query.from) : undefined;
+    const to = query.to ? Date.parse(query.to) : undefined;
+    if ((query.from && !Number.isFinite(from)) || (query.to && !Number.isFinite(to))) {
+      throw new DomainError("validation_error", "Invalid audit date range", 422);
+    }
+    if (from !== undefined && to !== undefined && from > to) {
+      throw new DomainError("validation_error", "Audit date range is reversed", 422);
+    }
+    const matches = this.auditEvents
+      .filter((event) =>
+        (!query.action || event.action === query.action) &&
+        (!query.actorId || event.actorId === query.actorId) &&
+        (!query.targetType || event.targetType === query.targetType) &&
+        (!query.targetId || event.targetId === query.targetId) &&
+        (from === undefined || Date.parse(event.createdAt) >= from) &&
+        (to === undefined || Date.parse(event.createdAt) <= to) &&
+        (!timestampCursor || event.createdAt < timestampCursor.createdAt ||
+          (event.createdAt === timestampCursor.createdAt && event.id < timestampCursor.id))
+      )
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
+    const data = matches.slice(0, limit);
+    return {
+      data,
+      nextCursor: matches.length > limit ? encodeAuditCursor(data[data.length - 1]) : null,
+    };
   }
 
   approveUser(

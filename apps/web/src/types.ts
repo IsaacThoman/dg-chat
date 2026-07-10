@@ -66,3 +66,22 @@ export interface Attachment {
   state: string;
   createdAt: string;
 }
+
+export interface AuditEvent {
+  id: string;
+  actorId: string | null;
+  action: string;
+  targetType: string;
+  targetId: string | null;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+}
+
+export interface AuditFilters {
+  action?: string;
+  actorId?: string;
+  targetType?: string;
+  targetId?: string;
+  from?: string;
+  to?: string;
+}

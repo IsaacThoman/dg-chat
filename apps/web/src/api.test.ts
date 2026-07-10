@@ -23,6 +23,46 @@ describe("setup discovery API", () => {
   });
 });
 
+describe("admin audit API", () => {
+  it("encodes bounded filters and cursor for the typed audit page", async () => {
+    const page = {
+      data: [{
+        id: "audit-1",
+        actorId: null,
+        action: "identity.signup",
+        targetType: "user",
+        targetId: "user-1",
+        metadata: {},
+        createdAt: "2026-07-10T00:00:00.000Z",
+      }],
+      nextCursor: "next/page",
+    };
+    const fetchMock = vi.fn().mockResolvedValue(
+      Response.json(page),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(api.adminAudit(
+      {
+        action: "identity.signup",
+        actorId: "00000000-0000-4000-8000-000000000001",
+        from: "2026-07-01T00:00:00.000Z",
+      },
+      "cursor/value",
+      25,
+    )).resolves.toEqual(page);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/admin/audit?limit=25&action=identity.signup&actorId=00000000-0000-4000-8000-000000000001&from=2026-07-01T00%3A00%3A00.000Z&cursor=cursor%2Fvalue",
+      expect.objectContaining({ credentials: "include" }),
+    );
+  });
+
+  it("builds a same-origin CSV URL without embedding credentials", () => {
+    expect(api.adminAuditCsvUrl({ targetType: "user", targetId: "target:1" }))
+      .toBe("/api/admin/audit.csv?limit=50&targetType=user&targetId=target%3A1");
+  });
+});
+
 describe("active branch API", () => {
   it("persists a selected leaf with the current conversation version", async () => {
     const conversation: Conversation = {

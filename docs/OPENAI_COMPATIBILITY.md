@@ -9,11 +9,14 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{"model":"provider/model","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-The implemented surface is models, chat completions, and non-streaming Responses. Simulated-model
-chat streams use SSE and terminate with `[DONE]`; configured upstream calls currently use
-non-streaming passthrough. Embeddings, files, images, and audio routes return explicit OpenAI-shaped
-`501 provider_not_configured` responses until their adapters are configured in a later milestone.
-Assistants, batches, fine-tuning, and realtime are not supported.
+The implemented surface is models, chat completions, non-streaming Responses, and the Files
+lifecycle. Simulated-model chat streams use SSE and terminate with `[DONE]`; configured upstream
+calls currently use non-streaming passthrough. Files support upload, list, retrieve, content, and
+delete through the official JavaScript and Python clients. Uploads currently accept only the
+`assistants` purpose, and list responses do not yet implement cursor pagination. Embeddings, image
+generation, and audio routes return explicit OpenAI-shaped `501 provider_not_configured` responses
+until their adapters are configured in a later milestone. Assistants, batches, fine-tuning, and
+realtime are not supported.
 
 Use a unique `Idempotency-Key` for each request. Keys are scoped to the authenticated user and
 endpoint; this release rejects reuse instead of replaying a cached response. Client disconnects

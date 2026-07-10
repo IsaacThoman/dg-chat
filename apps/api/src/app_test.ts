@@ -414,7 +414,10 @@ Deno.test("bootstrap, signup, approval, immutable chat, API token and OpenAI com
     })).status,
     204,
   );
-  const audit = await json(await app.request("/api/admin/audit", { headers: adminAuth }));
+  const auditResponse = await app.request("/api/admin/audit", { headers: adminAuth });
+  assertEquals(auditResponse.headers.get("cache-control"), "private, no-store");
+  const audit = await json(auditResponse);
+  assertEquals(typeof audit.nextCursor === "string" || audit.nextCursor === null, true);
   assertEquals(
     audit.data.some((event: { action: string }) =>
       event.action === "identity.password_reset_completed"
@@ -429,6 +432,40 @@ Deno.test("bootstrap, signup, approval, immutable chat, API token and OpenAI com
     (await app.request("/api/admin/audit?limit=201", { headers: adminAuth })).status,
     422,
   );
+  const filteredAudit = await json(
+    await app.request(
+      `/api/admin/audit?limit=1&action=identity.password_reset_completed&targetId=${signed.user.id}`,
+      { headers: adminAuth },
+    ),
+  );
+  assertEquals(filteredAudit.data.length, 1);
+  assertEquals(filteredAudit.data[0].action, "identity.password_reset_completed");
+  assertEquals(filteredAudit.data[0].targetId, signed.user.id);
+  assertEquals(
+    (await app.request("/api/admin/audit?actorId=not-a-uuid", { headers: adminAuth })).status,
+    422,
+  );
+  assertEquals(
+    (await app.request("/api/admin/audit?from=2026-02-01&to=2026-01-01", {
+      headers: adminAuth,
+    })).status,
+    422,
+  );
+  assertEquals(
+    (await app.request("/api/admin/audit?cursor=not-a-cursor", { headers: adminAuth })).status,
+    422,
+  );
+  await repository.recordAudit({
+    action: '=HYPERLINK("https://invalid")',
+    targetType: "+formula",
+  });
+  const csv = await app.request("/api/admin/audit.csv?limit=1", { headers: adminAuth });
+  assertEquals(csv.status, 200);
+  assertEquals(csv.headers.get("content-type"), "text/csv; charset=utf-8");
+  assertStringIncludes(csv.headers.get("content-disposition") ?? "", "dg-chat-audit.csv");
+  const csvBody = await csv.text();
+  assertStringIncludes(csvBody, '"\'=HYPERLINK(""https://invalid"")"');
+  assertStringIncludes(csvBody, '"\'+formula"');
 
   const missingOrigin = await app.request("/api/conversations", {
     method: "POST",
@@ -523,7 +560,7 @@ Deno.test("email verification defaults off and SMTP failures do not break identi
     202,
   );
   assertEquals(
-    (await repository.listAudit()).some((event) =>
+    (await repository.listAudit()).data.some((event) =>
       event.action === "identity.password_reset_delivery_failed"
     ),
     true,
