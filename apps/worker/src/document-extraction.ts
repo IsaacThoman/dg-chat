@@ -1,0 +1,586 @@
+import { Inflate, unzip } from "fflate";
+import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
+import type { PDFDocumentProxy } from "pdfjs-dist/types/src/display/api.d.ts";
+
+export type DocumentExtractionErrorCode =
+  | "unsupported_type"
+  | "raw_bytes_exceeded"
+  | "time_exceeded"
+  | "output_exceeded"
+  | "invalid_pdf"
+  | "pdf_pages_exceeded"
+  | "invalid_docx"
+  | "zip_entries_exceeded"
+  | "zip_entry_exceeded"
+  | "zip_expansion_exceeded"
+  | "zip_ratio_exceeded"
+  | "zip_path_traversal"
+  | "zip_encrypted"
+  | "docx_macro"
+  | "docx_active_content"
+  | "docx_external_reference";
+
+export class DocumentExtractionError extends Error {
+  override name = "DocumentExtractionError";
+
+  constructor(
+    public readonly code: DocumentExtractionErrorCode,
+    message: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+  }
+}
+
+export interface ExtractedDocumentUnit {
+  kind: "page" | "section";
+  index: number;
+  text: string;
+  metadata: Record<string, string | number>;
+}
+
+export interface ExtractedDocument {
+  mimeType:
+    | "application/pdf"
+    | "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  text: string;
+  units: ExtractedDocumentUnit[];
+  metadata: Record<string, string | number>;
+}
+
+export interface DocumentExtractionLimits {
+  maxRawBytes?: number;
+  timeoutMs?: number;
+  maxOutputCharacters?: number;
+  maxPdfPages?: number;
+  maxZipEntries?: number;
+  maxZipEntryBytes?: number;
+  maxZipExpandedBytes?: number;
+  maxZipCompressionRatio?: number;
+}
+
+type PdfTextItem = { str: string; hasEOL: boolean; transform: number[] };
+
+/** Reconstructs PDF.js text items. `hasEOL` describes the break *after* its item. */
+export function reconstructPdfText(items: readonly PdfTextItem[]): string {
+  let text = "";
+  let previousY: number | undefined;
+  let previousEndedLine = false;
+  for (const item of items) {
+    const y = item.transform[5];
+    const movedLine = previousY !== undefined && Math.abs(y - previousY) > 2;
+    if (text && !text.endsWith("\n") && movedLine) text += "\n";
+    else if (text && !text.endsWith("\n") && item.str && !previousEndedLine) text += " ";
+    text += item.str;
+    if (item.hasEOL && text && !text.endsWith("\n")) text += "\n";
+    previousEndedLine = item.hasEOL;
+    previousY = y;
+  }
+  return text.trim();
+}
+
+interface RequiredLimits {
+  maxRawBytes: number;
+  timeoutMs: number;
+  maxOutputCharacters: number;
+  maxPdfPages: number;
+  maxZipEntries: number;
+  maxZipEntryBytes: number;
+  maxZipExpandedBytes: number;
+  maxZipCompressionRatio: number;
+}
+
+const DEFAULTS: RequiredLimits = {
+  maxRawBytes: 20 * 1024 * 1024,
+  timeoutMs: 30_000,
+  maxOutputCharacters: 2_000_000,
+  maxPdfPages: 1_000,
+  maxZipEntries: 2_000,
+  maxZipEntryBytes: 25 * 1024 * 1024,
+  maxZipExpandedBytes: 100 * 1024 * 1024,
+  maxZipCompressionRatio: 200,
+};
+
+const DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+const decoder = new TextDecoder();
+
+function limits(input: DocumentExtractionLimits): RequiredLimits {
+  const result = { ...DEFAULTS, ...input };
+  for (const [name, value] of Object.entries(result)) {
+    if (!Number.isFinite(value) || value < 0) throw new TypeError(`${name} must be non-negative`);
+  }
+  return result;
+}
+
+function deadline(limits: RequiredLimits): () => void {
+  const end = performance.now() + limits.timeoutMs;
+  return () => {
+    if (performance.now() >= end) {
+      throw new DocumentExtractionError("time_exceeded", "Document extraction timed out");
+    }
+  };
+}
+
+function assertRawSize(bytes: Uint8Array, value: RequiredLimits): void {
+  if (bytes.byteLength > value.maxRawBytes) {
+    throw new DocumentExtractionError("raw_bytes_exceeded", "Document exceeds the raw byte limit");
+  }
+}
+
+function boundedText(parts: string[], value: RequiredLimits): string {
+  const text = parts.filter(Boolean).join("\n\n");
+  if (text.length > value.maxOutputCharacters) {
+    throw new DocumentExtractionError("output_exceeded", "Extracted text exceeds the output limit");
+  }
+  return text;
+}
+
+function raceDeadline<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  if (timeoutMs <= 0) {
+    return Promise.reject(
+      new DocumentExtractionError("time_exceeded", "Document extraction timed out"),
+    );
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new DocumentExtractionError("time_exceeded", "Document extraction timed out")),
+      timeoutMs,
+    );
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+export async function extractPdf(
+  bytes: Uint8Array,
+  options: DocumentExtractionLimits = {},
+): Promise<ExtractedDocument> {
+  const value = limits(options);
+  assertRawSize(bytes, value);
+  const started = performance.now();
+  let document: PDFDocumentProxy | undefined;
+  let loadingTask: ReturnType<typeof getDocument> | undefined;
+  try {
+    loadingTask = getDocument({ data: bytes.slice(), useSystemFonts: false });
+    document = await raceDeadline(loadingTask.promise, value.timeoutMs);
+    if (document.numPages > value.maxPdfPages) {
+      throw new DocumentExtractionError(
+        "pdf_pages_exceeded",
+        `PDF has ${document.numPages} pages; the limit is ${value.maxPdfPages}`,
+      );
+    }
+    const pageLabels = await raceDeadline(
+      document.getPageLabels(),
+      value.timeoutMs - (performance.now() - started),
+    );
+    const units: ExtractedDocumentUnit[] = [];
+    const texts: string[] = [];
+    for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber++) {
+      const remaining = value.timeoutMs - (performance.now() - started);
+      const page = await raceDeadline(document.getPage(pageNumber), remaining);
+      const content = await raceDeadline(page.getTextContent(), remaining);
+      const text = reconstructPdfText(content.items.filter((item) => "str" in item));
+      texts.push(text);
+      boundedText(texts, value);
+      const viewport = page.getViewport({ scale: 1 });
+      const metadata: Record<string, string | number> = {
+        pageNumber,
+        width: viewport.width,
+        height: viewport.height,
+        rotation: viewport.rotation,
+      };
+      const pageLabel = pageLabels?.[pageNumber - 1];
+      if (pageLabel) metadata.pageLabel = pageLabel;
+      units.push({
+        kind: "page",
+        index: pageNumber,
+        text,
+        metadata,
+      });
+      page.cleanup();
+    }
+    return {
+      mimeType: "application/pdf",
+      text: boundedText(texts, value),
+      units,
+      metadata: { pageCount: document.numPages },
+    };
+  } catch (error) {
+    if (error instanceof DocumentExtractionError) throw error;
+    throw new DocumentExtractionError("invalid_pdf", "PDF could not be safely parsed", {
+      cause: error,
+    });
+  } finally {
+    await loadingTask?.destroy().catch(() => undefined);
+  }
+}
+
+interface ZipEntry {
+  name: string;
+  compressed: number;
+  expanded: number;
+  flags: number;
+  method: number;
+  localOffset: number;
+}
+
+function u16(bytes: Uint8Array, offset: number): number {
+  return bytes[offset] | (bytes[offset + 1] << 8);
+}
+
+function u32(bytes: Uint8Array, offset: number): number {
+  return (bytes[offset] | (bytes[offset + 1] << 8) | (bytes[offset + 2] << 16) |
+    (bytes[offset + 3] << 24)) >>> 0;
+}
+
+function zipEntries(bytes: Uint8Array, value: RequiredLimits): ZipEntry[] {
+  let eocd = -1;
+  for (let offset = bytes.length - 22; offset >= Math.max(0, bytes.length - 65_557); offset--) {
+    if (u32(bytes, offset) === 0x06054b50) {
+      eocd = offset;
+      break;
+    }
+  }
+  if (eocd < 0) throw new DocumentExtractionError("invalid_docx", "DOCX ZIP directory is missing");
+  const count = u16(bytes, eocd + 10);
+  const disk = u16(bytes, eocd + 4);
+  const directoryDisk = u16(bytes, eocd + 6);
+  const diskCount = u16(bytes, eocd + 8);
+  const directorySize = u32(bytes, eocd + 12);
+  const directoryOffset = u32(bytes, eocd + 16);
+  const commentLength = u16(bytes, eocd + 20);
+  if (disk !== 0 || directoryDisk !== 0 || diskCount !== count) {
+    throw new DocumentExtractionError("invalid_docx", "Multi-disk DOCX archives are not supported");
+  }
+  if (eocd + 22 + commentLength !== bytes.length) {
+    throw new DocumentExtractionError("invalid_docx", "DOCX ZIP footer is malformed");
+  }
+  if (count === 0xffff || directorySize === 0xffffffff || directoryOffset === 0xffffffff) {
+    throw new DocumentExtractionError("invalid_docx", "ZIP64 DOCX archives are not supported");
+  }
+  if (count > value.maxZipEntries) {
+    throw new DocumentExtractionError("zip_entries_exceeded", "DOCX has too many ZIP entries");
+  }
+  if (directoryOffset + directorySize > eocd || directoryOffset > bytes.length) {
+    throw new DocumentExtractionError("invalid_docx", "DOCX ZIP directory is malformed");
+  }
+  const entries: ZipEntry[] = [];
+  const names = new Set<string>();
+  let offset = directoryOffset;
+  let total = 0;
+  for (let index = 0; index < count; index++) {
+    if (offset + 46 > bytes.length || u32(bytes, offset) !== 0x02014b50) {
+      throw new DocumentExtractionError("invalid_docx", "DOCX ZIP entry is malformed");
+    }
+    const flags = u16(bytes, offset + 8);
+    const method = u16(bytes, offset + 10);
+    const compressed = u32(bytes, offset + 20);
+    const expanded = u32(bytes, offset + 24);
+    const nameLength = u16(bytes, offset + 28);
+    const extraLength = u16(bytes, offset + 30);
+    const commentLength = u16(bytes, offset + 32);
+    const localOffset = u32(bytes, offset + 42);
+    const end = offset + 46 + nameLength + extraLength + commentLength;
+    if (end > bytes.length) {
+      throw new DocumentExtractionError("invalid_docx", "DOCX ZIP entry is truncated");
+    }
+    const name = decoder.decode(bytes.subarray(offset + 46, offset + 46 + nameLength));
+    if (
+      !name || name.includes("\\") || name.startsWith("/") || /^[a-zA-Z]:/.test(name) ||
+      name.split("/").some((part) => part === ".." || part === ".")
+    ) {
+      throw new DocumentExtractionError("zip_path_traversal", "DOCX contains an unsafe ZIP path");
+    }
+    if (name.includes("\0") || names.has(name)) {
+      throw new DocumentExtractionError(
+        "invalid_docx",
+        "DOCX contains a duplicate or invalid ZIP entry name",
+      );
+    }
+    names.add(name);
+    if (flags & 1) {
+      throw new DocumentExtractionError("zip_encrypted", "Encrypted DOCX entries are not allowed");
+    }
+    if (flags & 8) {
+      throw new DocumentExtractionError(
+        "invalid_docx",
+        "DOCX ZIP data descriptors are not supported",
+      );
+    }
+    if (expanded > value.maxZipEntryBytes) {
+      throw new DocumentExtractionError("zip_entry_exceeded", "A DOCX ZIP entry is too large");
+    }
+    total += expanded;
+    if (total > value.maxZipExpandedBytes) {
+      throw new DocumentExtractionError(
+        "zip_expansion_exceeded",
+        "DOCX expanded data exceeds the limit",
+      );
+    }
+    if (expanded > 0 && expanded / Math.max(1, compressed) > value.maxZipCompressionRatio) {
+      throw new DocumentExtractionError("zip_ratio_exceeded", "DOCX compression ratio is unsafe");
+    }
+    if (localOffset + 30 > bytes.length || u32(bytes, localOffset) !== 0x04034b50) {
+      throw new DocumentExtractionError("invalid_docx", "DOCX ZIP local entry is malformed");
+    }
+    const localNameLength = u16(bytes, localOffset + 26);
+    const localExtraLength = u16(bytes, localOffset + 28);
+    const localEnd = localOffset + 30 + localNameLength + localExtraLength + compressed;
+    const localName = decoder.decode(
+      bytes.subarray(localOffset + 30, localOffset + 30 + localNameLength),
+    );
+    if (
+      localEnd > directoryOffset || localName !== name || u16(bytes, localOffset + 6) !== flags ||
+      u32(bytes, localOffset + 18) !== compressed || u32(bytes, localOffset + 22) !== expanded
+    ) {
+      throw new DocumentExtractionError(
+        "invalid_docx",
+        "DOCX ZIP local and central entries disagree",
+      );
+    }
+    entries.push({ name, compressed, expanded, flags, method, localOffset });
+    offset = end;
+  }
+  if (offset !== directoryOffset + directorySize) {
+    throw new DocumentExtractionError("invalid_docx", "DOCX ZIP directory size is inconsistent");
+  }
+  return entries;
+}
+
+function assertActualInflation(
+  archive: Uint8Array,
+  entries: ZipEntry[],
+  value: RequiredLimits,
+): void {
+  let total = 0;
+  for (const entry of entries) {
+    const nameLength = u16(archive, entry.localOffset + 26);
+    const extraLength = u16(archive, entry.localOffset + 28);
+    const start = entry.localOffset + 30 + nameLength + extraLength;
+    const end = start + entry.compressed;
+    let expanded = 0;
+    const count = (length: number) => {
+      expanded += length;
+      if (expanded > value.maxZipEntryBytes) {
+        throw new DocumentExtractionError("zip_entry_exceeded", "A DOCX ZIP entry is too large");
+      }
+      if (expanded / Math.max(1, entry.compressed) > value.maxZipCompressionRatio) {
+        throw new DocumentExtractionError("zip_ratio_exceeded", "DOCX compression ratio is unsafe");
+      }
+    };
+    if (entry.method === 0) {
+      count(entry.compressed);
+    } else if (entry.method === 8) {
+      const inflater = new Inflate((chunk) => count(chunk.byteLength));
+      for (let cursor = start; cursor < end; cursor += 64 * 1024) {
+        inflater.push(
+          archive.subarray(cursor, Math.min(end, cursor + 64 * 1024)),
+          cursor + 64 * 1024 >= end,
+        );
+      }
+    } else {
+      throw new DocumentExtractionError(
+        "invalid_docx",
+        "DOCX uses an unsupported compression method",
+      );
+    }
+    if (expanded !== entry.expanded) {
+      throw new DocumentExtractionError(
+        "invalid_docx",
+        "DOCX ZIP entry size does not match its directory metadata",
+      );
+    }
+    total += expanded;
+    if (total > value.maxZipExpandedBytes) {
+      throw new DocumentExtractionError(
+        "zip_expansion_exceeded",
+        "DOCX expanded data exceeds the limit",
+      );
+    }
+  }
+}
+
+function xmlText(value: string): string {
+  return value
+    .replace(/<w:tab\b[^>]*\/?\s*>/gi, "\t")
+    .replace(/<w:(?:br|cr)\b[^>]*\/?\s*>/gi, "\n")
+    .replace(/<\/w:p\s*>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&#(\d+);/g, (_, number: string) => String.fromCodePoint(Number(number)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, number: string) => String.fromCodePoint(parseInt(number, 16)))
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&apos;", "'")
+    .replaceAll("&amp;", "&")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function assertSafeDocx(entries: ZipEntry[], files: Record<string, Uint8Array>): void {
+  const lowerNames = entries.map((entry) => entry.name.toLowerCase());
+  if (lowerNames.some((name) => name.endsWith("vbaproject.bin") || name.includes("/macros/"))) {
+    throw new DocumentExtractionError("docx_macro", "Macro-enabled DOCX files are not allowed");
+  }
+  const contentTypes = files["[Content_Types].xml"];
+  if (contentTypes && /macroEnabled|vbaProject/i.test(decoder.decode(contentTypes))) {
+    throw new DocumentExtractionError("docx_macro", "Macro-enabled DOCX files are not allowed");
+  }
+  const activePart = lowerNames.some((name) =>
+    name.startsWith("word/embeddings/") ||
+    name.startsWith("word/activex/") ||
+    name.startsWith("customui/") ||
+    /(?:^|\/)(?:oleobject|package)(?:\.|\/|$)/i.test(name) ||
+    /\.(?:exe|dll|com|bat|cmd|ps1|js|jse|vbs|vbe|wsf|wsh|scr|msi)$/i.test(name)
+  );
+  const activeContentType = contentTypes &&
+    /(?:activeX|oleObject|customUI|vnd\.microsoft\.portable-executable)/i.test(
+      decoder.decode(contentTypes),
+    );
+  if (activePart || activeContentType) {
+    throw new DocumentExtractionError(
+      "docx_active_content",
+      "Embedded or active DOCX content is not allowed",
+    );
+  }
+  for (const [name, bytes] of Object.entries(files)) {
+    if (!name.toLowerCase().endsWith(".rels")) continue;
+    const relationships = decoder.decode(bytes);
+    if (/TargetMode\s*=\s*["']External["']/i.test(relationships)) {
+      throw new DocumentExtractionError(
+        "docx_external_reference",
+        "External DOCX relationships are not allowed",
+      );
+    }
+  }
+}
+
+function assertActualZipLimits(
+  entries: ZipEntry[],
+  files: Record<string, Uint8Array>,
+  value: RequiredLimits,
+): void {
+  const expected = new Map(entries.map((entry) => [entry.name, entry]));
+  let total = 0;
+  for (const [name, bytes] of Object.entries(files)) {
+    const entry = expected.get(name);
+    if (!entry) {
+      throw new DocumentExtractionError("invalid_docx", "DOCX inflated an undeclared ZIP entry");
+    }
+    if (bytes.byteLength !== entry.expanded) {
+      throw new DocumentExtractionError(
+        "invalid_docx",
+        "DOCX ZIP entry size does not match its directory metadata",
+      );
+    }
+    if (bytes.byteLength > value.maxZipEntryBytes) {
+      throw new DocumentExtractionError("zip_entry_exceeded", "A DOCX ZIP entry is too large");
+    }
+    total += bytes.byteLength;
+    if (total > value.maxZipExpandedBytes) {
+      throw new DocumentExtractionError(
+        "zip_expansion_exceeded",
+        "DOCX expanded data exceeds the limit",
+      );
+    }
+    if (
+      bytes.byteLength > 0 &&
+      bytes.byteLength / Math.max(1, entry.compressed) > value.maxZipCompressionRatio
+    ) {
+      throw new DocumentExtractionError("zip_ratio_exceeded", "DOCX compression ratio is unsafe");
+    }
+    expected.delete(name);
+  }
+  if (expected.size !== 0) {
+    throw new DocumentExtractionError("invalid_docx", "DOCX ZIP entries are incomplete");
+  }
+}
+
+function unzipWithDeadline(
+  bytes: Uint8Array,
+  timeoutMs: number,
+): Promise<Record<string, Uint8Array>> {
+  if (timeoutMs <= 0) {
+    return Promise.reject(
+      new DocumentExtractionError("time_exceeded", "Document extraction timed out"),
+    );
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const state: { terminate?: () => void } = {};
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      state.terminate?.();
+      reject(new DocumentExtractionError("time_exceeded", "Document extraction timed out"));
+    }, timeoutMs);
+    state.terminate = unzip(bytes, (error, files) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error);
+      else resolve(files);
+    });
+  });
+}
+
+export async function extractDocx(
+  bytes: Uint8Array,
+  options: DocumentExtractionLimits = {},
+): Promise<ExtractedDocument> {
+  const value = limits(options);
+  assertRawSize(bytes, value);
+  const started = performance.now();
+  const checkDeadline = deadline(value);
+  try {
+    const entries = zipEntries(bytes, value);
+    checkDeadline();
+    assertActualInflation(bytes, entries, value);
+    checkDeadline();
+    const files = await unzipWithDeadline(bytes, value.timeoutMs - (performance.now() - started));
+    checkDeadline();
+    assertActualZipLimits(entries, files, value);
+    assertSafeDocx(entries, files);
+    const documentBytes = files["word/document.xml"];
+    if (!documentBytes) {
+      throw new DocumentExtractionError("invalid_docx", "DOCX is missing word/document.xml");
+    }
+    const xml = decoder.decode(documentBytes);
+    if (!/<w:document\b/i.test(xml)) {
+      throw new DocumentExtractionError("invalid_docx", "DOCX document XML is malformed");
+    }
+    const rawSections = xml.split(/<w:sectPr\b[\s\S]*?<\/w:sectPr\s*>/gi);
+    const sectionTexts = rawSections.map(xmlText).filter(Boolean);
+    const text = boundedText(sectionTexts, value);
+    const units = sectionTexts.map((sectionText, index): ExtractedDocumentUnit => ({
+      kind: "section",
+      index: index + 1,
+      text: sectionText,
+      metadata: { sectionNumber: index + 1 },
+    }));
+    return {
+      mimeType: DOCX_MIME,
+      text,
+      units,
+      metadata: { sectionCount: units.length, zipEntryCount: entries.length },
+    };
+  } catch (error) {
+    if (error instanceof DocumentExtractionError) throw error;
+    throw new DocumentExtractionError("invalid_docx", "DOCX could not be safely parsed", {
+      cause: error,
+    });
+  }
+}
+
+export function extractDocument(
+  bytes: Uint8Array,
+  mimeType: string,
+  options: DocumentExtractionLimits = {},
+): Promise<ExtractedDocument> {
+  if (mimeType === "application/pdf") return extractPdf(bytes, options);
+  if (mimeType === DOCX_MIME) return extractDocx(bytes, options);
+  return Promise.reject(
+    new DocumentExtractionError("unsupported_type", `Unsupported document type: ${mimeType}`),
+  );
+}

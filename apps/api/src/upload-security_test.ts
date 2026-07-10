@@ -5,6 +5,8 @@ import {
   secureUploadStream,
   UploadSecurityError,
 } from "./upload-security.ts";
+import { DOCX_MIME_TYPE } from "@dg-chat/database";
+import { strToU8, zipSync } from "fflate";
 
 const bytes = (...values: number[]) => new Uint8Array(values);
 const stream = (...chunks: Uint8Array[]) =>
@@ -71,6 +73,86 @@ Deno.test("rejects MIME spoofing, executable headers, and HTML disguised as text
     await assertRejects(() => drain(upload.stream), UploadSecurityError);
     await assertRejects(() => upload.inspection, UploadSecurityError);
   }
+});
+
+Deno.test("accepts DOCX packages but rejects other and macro-enabled Office ZIPs", async () => {
+  const zipPackage = (entries: string[]) =>
+    zipSync(Object.fromEntries(entries.map((entry) => [entry, strToU8("content")])));
+  const docx = secureUploadStream(
+    stream(zipPackage(["[Content_Types].xml", "_rels/.rels", "word/document.xml"])),
+    "notes.docx",
+    DOCX_MIME_TYPE,
+    { maxBytes: 4096 },
+  );
+  await drain(docx.stream);
+  assertEquals((await docx.inspection).mime, DOCX_MIME_TYPE);
+  assertMatch(safeUploadObjectKey("user_123", DOCX_MIME_TYPE), /\.docx$/);
+
+  for (
+    const [entries, declared] of [
+      [
+        ["[Content_Types].xml", "ppt/presentation.xml"],
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+      ],
+      [
+        ["[Content_Types].xml", "xl/workbook.xml"],
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      ],
+    ] as const
+  ) {
+    assertThrows(
+      () =>
+        secureUploadStream(stream(zipPackage([...entries])), "office.zip", declared, {
+          maxBytes: 4096,
+        }),
+      UploadSecurityError,
+    );
+  }
+  const macro = secureUploadStream(
+    stream(zipPackage(["[Content_Types].xml", "word/document.xml", "word/vbaProject.bin"])),
+    "macro.docx",
+    DOCX_MIME_TYPE,
+    { maxBytes: 4096 },
+  );
+  await assertRejects(() => drain(macro.stream), UploadSecurityError);
+  await assertRejects(() => macro.inspection, UploadSecurityError);
+});
+
+Deno.test("recognizes DOCX from its central directory when local entries exceed the prefix", async () => {
+  const packageBytes = zipSync({
+    "large-padding.bin": new Uint8Array(90_000).fill(65),
+    "word/document.xml": strToU8("<w:document/>"),
+    "[Content_Types].xml": strToU8("<Types/>"),
+  }, { level: 0 });
+  const upload = secureUploadStream(
+    stream(packageBytes.slice(0, 31_000), packageBytes.slice(31_000)),
+    "ordered.docx",
+    DOCX_MIME_TYPE,
+    { maxBytes: 100_000, inspectionBytes: 64 * 1024 },
+  );
+  await drain(upload.stream);
+  assertEquals((await upload.inspection).mime, DOCX_MIME_TYPE);
+});
+
+Deno.test("detects polyglot markers in the middle of a streamed upload across chunks", async () => {
+  const prefix = new Uint8Array(24);
+  prefix.set(bytes(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a));
+  new DataView(prefix.buffer).setUint32(16, 1);
+  new DataView(prefix.buffer).setUint32(20, 1);
+  const upload = secureUploadStream(
+    stream(
+      prefix,
+      new Uint8Array(80_000),
+      strToU8("<scr"),
+      strToU8("ipt>alert(1)</script>"),
+      new Uint8Array(80_000),
+    ),
+    "polyglot.png",
+    "image/png",
+    { maxBytes: 200_000, inspectionBytes: 512 },
+  );
+  await assertRejects(() => drain(upload.stream), UploadSecurityError, "Conflicting");
+  await assertRejects(() => upload.inspection, UploadSecurityError, "Conflicting");
 });
 
 Deno.test("rejects binary polyglots and malformed image dimensions", async () => {
