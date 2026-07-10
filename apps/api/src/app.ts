@@ -17,17 +17,22 @@ import {
   approvalSchema,
   chatCompletionSchema,
   createConversationSchema,
+  createKnowledgeCollectionSchema,
   createTokenSchema,
   generateMessageSchema,
   identityTokenSchema,
+  knowledgeBindingSchema,
+  knowledgeExpectedVersionSchema,
   loginSchema,
   passwordResetRequestSchema,
   passwordResetSchema,
   registerSchema,
+  replaceConversationKnowledgeSchema,
   responsesSchema,
   setActiveLeafSchema,
   streamGenerationSchema,
   updateConversationSchema,
+  updateKnowledgeCollectionSchema,
 } from "@dg-chat/contracts";
 import type {
   ChatCompletionRequest,
@@ -44,6 +49,8 @@ import {
   type AuditQuery,
   DomainError,
   type DomainRepository,
+  type KnowledgeCollection,
+  type KnowledgeConversationBinding,
   MemoryRepository,
   type ModelPriceVersion,
   ObjectAlreadyExistsError,
@@ -207,6 +214,25 @@ const publicAttachment = (attachment: AttachmentRecord) => ({
   ingestedAt: attachment.ingestedAt,
   createdAt: attachment.createdAt,
   updatedAt: attachment.updatedAt,
+});
+
+const publicKnowledgeCollection = (collection: KnowledgeCollection, attachmentCount = 0) => ({
+  id: collection.id,
+  name: collection.name,
+  description: collection.description,
+  version: collection.version,
+  createdAt: collection.createdAt,
+  updatedAt: collection.updatedAt,
+  attachmentCount,
+});
+
+const publicKnowledgeBinding = (binding: KnowledgeConversationBinding) => ({
+  conversationId: binding.conversationId,
+  collectionId: binding.collectionId,
+  mode: binding.mode,
+  version: binding.version,
+  createdAt: binding.createdAt,
+  updatedAt: binding.updatedAt,
 });
 
 async function stableGenerationId(runId: string): Promise<string> {
@@ -515,6 +541,13 @@ const parseJson = async <T>(
   const result = schema.safeParse(body);
   if (!result.success) throw new DomainError("validation_error", "Request validation failed", 422);
   return result.data!;
+};
+
+const requireUuid = (value: string, field: string): string => {
+  if (!auditUuid.test(value)) {
+    throw new DomainError("validation_error", `${field} must be a valid UUID`, 422);
+  }
+  return value;
 };
 
 async function stageMultipartUpload(
@@ -1746,6 +1779,122 @@ export function createApp(options: AppOptions = {}) {
     return await attachmentContent(attachment, true);
   });
 
+  app.use("/api/collections/*", authenticate, approved, sessionOnly);
+  app.use("/api/collections", authenticate, approved, sessionOnly);
+  const noStore = async (c: Context, next: () => Promise<void>) => {
+    c.header("Cache-Control", "private, no-store");
+    await next();
+  };
+  app.use("/api/collections/*", noStore);
+  app.use("/api/collections", noStore);
+  app.get("/api/collections", async (c) =>
+    c.json({
+      data: await Promise.all((await repo.listKnowledgeCollections(c.get("user").id)).map(
+        async (collection) =>
+          publicKnowledgeCollection(
+            collection,
+            (await repo.listKnowledgeAttachments(collection.id, c.get("user").id)).length,
+          ),
+      )),
+    }));
+  app.post("/api/collections", async (c) => {
+    const parsed = await parseJson(c, createKnowledgeCollectionSchema);
+    const headerKey = c.req.header("idempotency-key");
+    if (parsed.idempotencyKey && headerKey && parsed.idempotencyKey !== headerKey) {
+      throw new DomainError(
+        "idempotency_conflict",
+        "Body and header idempotency keys differ",
+        409,
+      );
+    }
+    const completed = createKnowledgeCollectionSchema.safeParse({
+      ...parsed,
+      idempotencyKey: parsed.idempotencyKey ?? headerKey ?? crypto.randomUUID(),
+    });
+    if (!completed.success) {
+      throw new DomainError("validation_error", "Idempotency key is invalid", 422);
+    }
+    const body = completed.data;
+    return c.json(
+      publicKnowledgeCollection(
+        await repo.createKnowledgeCollection(c.get("user").id, {
+          name: body.name,
+          description: body.description,
+          idempotencyKey: body.idempotencyKey!,
+        }),
+      ),
+      201,
+    );
+  });
+  app.get("/api/collections/:id", async (c) => {
+    const id = requireUuid(c.req.param("id"), "collectionId");
+    const ownerId = c.get("user").id;
+    return c.json({
+      collection: publicKnowledgeCollection(
+        await repo.getKnowledgeCollection(id, ownerId),
+        (await repo.listKnowledgeAttachments(id, ownerId)).length,
+      ),
+      attachments: (await repo.listKnowledgeAttachments(id, ownerId)).map(publicAttachment),
+    });
+  });
+  app.patch("/api/collections/:id", async (c) => {
+    const body = await parseJson(c, updateKnowledgeCollectionSchema);
+    const id = requireUuid(c.req.param("id"), "collectionId");
+    const ownerId = c.get("user").id;
+    return c.json(publicKnowledgeCollection(
+      await repo.updateKnowledgeCollection(id, ownerId, body),
+      (await repo.listKnowledgeAttachments(id, ownerId)).length,
+    ));
+  });
+  app.delete("/api/collections/:id", async (c) => {
+    const body = await parseJson(c, knowledgeExpectedVersionSchema);
+    await repo.deleteKnowledgeCollection(
+      requireUuid(c.req.param("id"), "collectionId"),
+      c.get("user").id,
+      body.expectedVersion,
+    );
+    return c.body(null, 204);
+  });
+  app.get("/api/collections/:id/attachments", async (c) =>
+    c.json({
+      data: (await repo.listKnowledgeAttachments(
+        requireUuid(c.req.param("id"), "collectionId"),
+        c.get("user").id,
+      )).map(publicAttachment),
+    }));
+  app.post("/api/collections/:id/attachments/:attachmentId", async (c) => {
+    const body = await parseJson(c, knowledgeExpectedVersionSchema);
+    const collectionId = requireUuid(c.req.param("id"), "collectionId");
+    const collection = await repo.linkKnowledgeAttachment(
+      collectionId,
+      requireUuid(c.req.param("attachmentId"), "attachmentId"),
+      c.get("user").id,
+      body.expectedVersion,
+    );
+    return c.json({
+      collection: publicKnowledgeCollection(
+        collection,
+        (await repo.listKnowledgeAttachments(collectionId, c.get("user").id)).length,
+      ),
+    });
+  });
+  app.delete("/api/collections/:id/attachments/:attachmentId", async (c) => {
+    const body = await parseJson(c, knowledgeExpectedVersionSchema);
+    const collectionId = requireUuid(c.req.param("id"), "collectionId");
+    const collection = await repo.unlinkKnowledgeAttachment(
+      collectionId,
+      requireUuid(c.req.param("attachmentId"), "attachmentId"),
+      c.get("user").id,
+      body.expectedVersion,
+    );
+    return c.json({
+      collection: publicKnowledgeCollection(
+        collection,
+        (await repo.listKnowledgeAttachments(collectionId, c.get("user").id)).length,
+      ),
+    });
+  });
+
   app.use("/api/conversations/*", authenticate, approved, sessionOnly);
   app.use("/api/conversations", authenticate, approved, sessionOnly);
   app.get(
@@ -1774,6 +1923,60 @@ export function createApp(options: AppOptions = {}) {
     "/api/conversations/:id",
     async (c) => c.json(await detailWithAttachments(c.req.param("id"), c.get("user").id)),
   );
+  app.get("/api/conversations/:id/knowledge", async (c) => {
+    c.header("Cache-Control", "private, no-store");
+    const bindings = await repo.listConversationKnowledge(
+      requireUuid(c.req.param("id"), "conversationId"),
+      c.get("user").id,
+    );
+    return c.json({
+      bindings: bindings.map(publicKnowledgeBinding),
+      collectionIds: bindings.map((binding) => binding.collectionId),
+      mode: bindings[0]?.mode ?? "retrieval",
+    });
+  });
+  app.put("/api/conversations/:id/knowledge", async (c) => {
+    c.header("Cache-Control", "private, no-store");
+    const conversationId = requireUuid(c.req.param("id"), "conversationId");
+    const ownerId = c.get("user").id;
+    const body = await parseJson(c, replaceConversationKnowledgeSchema);
+    const collectionIds = body.collectionIds.map((id) => requireUuid(id, "collectionId"));
+    const bindings = await repo.replaceConversationKnowledge(conversationId, ownerId, {
+      collectionIds,
+      mode: body.mode,
+    });
+    return c.json({
+      bindings: bindings.map(publicKnowledgeBinding),
+      collectionIds: bindings.map((binding) => binding.collectionId),
+      mode: body.mode,
+    });
+  });
+  app.patch("/api/conversations/:id/knowledge/:collectionId", async (c) => {
+    c.header("Cache-Control", "private, no-store");
+    const body = await parseJson(c, knowledgeBindingSchema);
+    return c.json({
+      binding: publicKnowledgeBinding(
+        await repo.bindKnowledgeCollection(
+          requireUuid(c.req.param("id"), "conversationId"),
+          requireUuid(c.req.param("collectionId"), "collectionId"),
+          c.get("user").id,
+          body.mode,
+          body.expectedVersion,
+        ),
+      ),
+    });
+  });
+  app.delete("/api/conversations/:id/knowledge/:collectionId", async (c) => {
+    c.header("Cache-Control", "private, no-store");
+    const body = await parseJson(c, knowledgeExpectedVersionSchema);
+    await repo.unbindKnowledgeCollection(
+      requireUuid(c.req.param("id"), "conversationId"),
+      requireUuid(c.req.param("collectionId"), "collectionId"),
+      c.get("user").id,
+      body.expectedVersion,
+    );
+    return c.body(null, 204);
+  });
   app.post("/api/conversations/:id/messages", async (c) => {
     const body = await parseJson(c, appendMessageSchema);
     return c.json(
@@ -1914,7 +2117,12 @@ export function createApp(options: AppOptions = {}) {
         history.push({
           role: message.role,
           content: historicalParts.length
-            ? [{ type: "text", text: message.content }, ...historicalParts]
+            ? [
+              ...(message.content.trim().length
+                ? [{ type: "text" as const, text: message.content }]
+                : []),
+              ...historicalParts,
+            ]
             : message.content,
         });
       }
@@ -1934,7 +2142,10 @@ export function createApp(options: AppOptions = {}) {
       history.push({
         role: "user",
         content: attachmentParts.length
-          ? [{ type: "text", text: body.content }, ...attachmentParts]
+          ? [
+            ...(body.content.trim().length ? [{ type: "text" as const, text: body.content }] : []),
+            ...attachmentParts,
+          ]
           : body.content,
       });
       const estimatedInputTokens = estimateWebContextTokens(history);
@@ -2246,7 +2457,12 @@ export function createApp(options: AppOptions = {}) {
           history.push({
             role: message.role,
             content: parts.length
-              ? [{ type: "text", text: message.content }, ...parts]
+              ? [
+                ...(message.content.trim().length
+                  ? [{ type: "text" as const, text: message.content }]
+                  : []),
+                ...parts,
+              ]
               : message.content,
           });
         }
@@ -2259,7 +2475,14 @@ export function createApp(options: AppOptions = {}) {
           hasAttachmentContext ||= parts.length > 0;
           history.push({
             role: "user",
-            content: parts.length ? [{ type: "text", text: body.content }, ...parts] : body.content,
+            content: parts.length
+              ? [
+                ...(body.content.trim().length
+                  ? [{ type: "text" as const, text: body.content }]
+                  : []),
+                ...parts,
+              ]
+              : body.content,
           });
         } else if (body.mode === "continue") {
           history.push({

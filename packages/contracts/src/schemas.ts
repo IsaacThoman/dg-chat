@@ -31,6 +31,42 @@ export const updateConversationSchema = z.object({
   message: "At least one conversation field is required",
 });
 
+const knowledgeIdempotencyKeySchema = z.string().min(8).max(160).regex(
+  /^[A-Za-z0-9._:-]+$/,
+  "Idempotency key contains unsupported characters",
+);
+
+export const createKnowledgeCollectionSchema = z.object({
+  name: z.string().trim().min(1).max(120),
+  description: z.string().trim().max(2000).optional(),
+  idempotencyKey: knowledgeIdempotencyKeySchema.optional(),
+}).strict();
+
+export const updateKnowledgeCollectionSchema = z.object({
+  name: z.string().trim().min(1).max(120).optional(),
+  description: z.string().trim().max(2000).optional(),
+  expectedVersion: z.number().int().positive(),
+}).strict().refine((value) => value.name !== undefined || value.description !== undefined, {
+  message: "At least one collection field is required",
+});
+
+export const knowledgeExpectedVersionSchema = z.object({
+  expectedVersion: z.number().int().positive(),
+}).strict();
+
+export const knowledgeBindingSchema = z.object({
+  mode: z.enum(["retrieval", "full_context"]),
+  expectedVersion: z.number().int().nonnegative().optional(),
+}).strict();
+
+export const replaceConversationKnowledgeSchema = z.object({
+  collectionIds: z.array(z.string().uuid()).max(50).refine(
+    (ids) => new Set(ids).size === ids.length,
+    "Collection identifiers must be unique",
+  ),
+  mode: z.enum(["retrieval", "full_context"]),
+}).strict();
+
 export const setActiveLeafSchema = z.object({
   leafId: z.string().uuid(),
   expectedVersion: z.number().int().nonnegative(),
@@ -47,10 +83,10 @@ export const appendMessageSchema = z.object({
   metadata: z.record(z.string(), z.unknown()).optional(),
 });
 
-export const generateMessageSchema = z.object({
+const generateMessageObjectSchema = z.object({
   parentId: z.string().uuid().nullable(),
   supersedesId: z.string().uuid().nullable().optional(),
-  content: z.string().trim().min(1).max(2_000_000),
+  content: z.string().trim().max(2_000_000),
   model: z.string().min(1).max(200),
   expectedVersion: z.number().int().nonnegative(),
   idempotencyKey: z.string().min(8).max(200),
@@ -60,8 +96,25 @@ export const generateMessageSchema = z.object({
   ).optional().default([]),
 });
 
+const requireMessageContent = (
+  value: { content: string; attachmentIds: string[] },
+  context: z.RefinementCtx,
+) => {
+  if (value.content.length === 0 && value.attachmentIds.length === 0) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["content"],
+      message: "Message content or at least one attachment is required",
+    });
+  }
+};
+
+export const generateMessageSchema = generateMessageObjectSchema.superRefine(requireMessageContent);
+
 export const streamGenerationSchema = z.discriminatedUnion("mode", [
-  generateMessageSchema.extend({ mode: z.literal("send") }),
+  generateMessageObjectSchema.extend({ mode: z.literal("send") }).superRefine(
+    requireMessageContent,
+  ),
   z.object({
     mode: z.enum(["regenerate", "continue"]),
     sourceMessageId: z.string().uuid(),
@@ -181,6 +234,23 @@ export const responsesSchema = z.object({
   stream: z.boolean().optional(),
   max_output_tokens: z.number().int().positive().max(131_072).optional(),
 }).passthrough();
+
+const embeddingTokenArraySchema = z.array(z.number().int().min(0).max(4_294_967_295))
+  .min(1).max(131_072);
+
+/** OpenAI-compatible embeddings request, bounded before provider dispatch. */
+export const embeddingsSchema = z.object({
+  model: z.string().trim().min(1).max(200),
+  input: z.union([
+    z.string().max(2_000_000),
+    z.array(z.string().max(2_000_000)).min(1).max(2_048),
+    embeddingTokenArraySchema,
+    z.array(embeddingTokenArraySchema).min(1).max(2_048),
+  ]),
+  encoding_format: z.enum(["float", "base64"]).optional(),
+  dimensions: z.number().int().min(1).max(65_536).optional(),
+  user: z.string().max(512).optional(),
+}).strict();
 
 export const approvalSchema = z.object({
   status: z.enum(["approved", "rejected"]),

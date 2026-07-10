@@ -1114,6 +1114,7 @@ Deno.test("attachment and OpenAI Files routes enforce security, ownership, scope
   const objectStore = new TestObjectStore();
   const repository = new MemoryRepository();
   const providerRequests: ChatCompletionRequest[] = [];
+  const streamProviderRequests: ChatCompletionRequest[] = [];
   const { app } = createApp({
     repository,
     setupToken: "files-setup",
@@ -1127,6 +1128,16 @@ Deno.test("attachment and OpenAI Files routes enforce security, ownership, scope
         inputTokens: 1,
         outputTokens: Math.max(1, Math.ceil(text.length / 4)),
       });
+    },
+    providerStream: async function* (request) {
+      streamProviderRequests.push(structuredClone(request));
+      yield JSON.stringify({
+        id: "attachment-stream",
+        model: request.model,
+        choices: [{ index: 0, delta: { content: "streamed" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 1, completion_tokens: 1 },
+      });
+      yield "[DONE]";
     },
   });
   const bootstrap = await app.request("/api/setup/bootstrap", {
@@ -1326,6 +1337,148 @@ Deno.test("attachment and OpenAI Files routes enforce security, ownership, scope
     body: JSON.stringify({ title: "Attachment branch" }),
   });
   const conversation = await json(conversationResponse);
+  const emptyTextOnly = await app.request(`/api/conversations/${conversation.id}/generate`, {
+    method: "POST",
+    headers: { ...adminSession, "content-type": "application/json" },
+    body: JSON.stringify({
+      content: "   ",
+      model: "simulated/dg-chat",
+      parentId: null,
+      expectedVersion: 0,
+      idempotencyKey: "files-empty-text-only",
+      attachmentIds: [],
+    }),
+  });
+  assertEquals(emptyTextOnly.status, 422);
+
+  const attachmentOnlyConversation = await json(
+    await app.request("/api/conversations", {
+      method: "POST",
+      headers: { ...adminSession, "content-type": "application/json" },
+      body: JSON.stringify({ title: "Attachment only" }),
+    }),
+  );
+  const attachmentOnlyResponse = await app.request(
+    `/api/conversations/${attachmentOnlyConversation.id}/generate`,
+    {
+      method: "POST",
+      headers: { ...adminSession, "content-type": "application/json" },
+      body: JSON.stringify({
+        content: "   ",
+        model: "simulated/dg-chat",
+        parentId: null,
+        expectedVersion: 0,
+        idempotencyKey: "files-attachment-only",
+        attachmentIds: [webUpload.id],
+      }),
+    },
+  );
+  assertEquals(attachmentOnlyResponse.status, 201);
+  const attachmentOnly = await json(attachmentOnlyResponse);
+  assertEquals(attachmentOnly.user.content, "");
+  assertEquals(attachmentOnly.user.attachments.map((item: { id: string }) => item.id), [
+    webUpload.id,
+  ]);
+  const attachmentOnlyParts = providerRequests[0].messages.at(-1)?.content;
+  assertEquals(Array.isArray(attachmentOnlyParts), true);
+  assertEquals(
+    (attachmentOnlyParts as Array<{ type: string; text?: string }>).some((part) =>
+      part.type === "text" && part.text === ""
+    ),
+    false,
+  );
+  const attachmentOnlyFollowup = await app.request(
+    `/api/conversations/${attachmentOnlyConversation.id}/generate`,
+    {
+      method: "POST",
+      headers: { ...adminSession, "content-type": "application/json" },
+      body: JSON.stringify({
+        content: "What is in it?",
+        model: "simulated/dg-chat",
+        parentId: attachmentOnly.assistant.id,
+        expectedVersion: attachmentOnly.conversation.version,
+        idempotencyKey: "files-attachment-only-followup",
+        attachmentIds: [],
+      }),
+    },
+  );
+  assertEquals(attachmentOnlyFollowup.status, 201);
+  const historicalAttachmentParts = providerRequests[1].messages.find((message) =>
+    message.role === "user" && Array.isArray(message.content)
+  )?.content;
+  assertEquals(Array.isArray(historicalAttachmentParts), true);
+  assertEquals(
+    (historicalAttachmentParts as Array<{ type: string; text?: string }>).some((part) =>
+      part.type === "text" && part.text === ""
+    ),
+    false,
+  );
+
+  const streamConversation = await json(
+    await app.request("/api/conversations", {
+      method: "POST",
+      headers: { ...adminSession, "content-type": "application/json" },
+      body: JSON.stringify({ title: "Stream attachment only" }),
+    }),
+  );
+  const streamAttachmentOnly = await app.request(
+    `/api/conversations/${streamConversation.id}/generate/stream`,
+    {
+      method: "POST",
+      headers: { ...adminSession, "content-type": "application/json" },
+      body: JSON.stringify({
+        mode: "send",
+        content: "   ",
+        model: "simulated/dg-chat",
+        parentId: null,
+        expectedVersion: 0,
+        idempotencyKey: "files-stream-attachment-only",
+        attachmentIds: [webUpload.id],
+      }),
+    },
+  );
+  assertEquals(streamAttachmentOnly.status, 200);
+  const streamEvents = (await streamAttachmentOnly.text()).split("\n")
+    .filter((line) => line.startsWith("data: {")).map((line) => JSON.parse(line.slice(6)));
+  const streamTerminal = streamEvents.at(-1);
+  assertEquals(streamTerminal.type, "generation.completed");
+  const streamCurrentParts = streamProviderRequests[0].messages.at(-1)?.content;
+  assertEquals(Array.isArray(streamCurrentParts), true);
+  assertEquals(
+    (streamCurrentParts as Array<{ type: string; text?: string }>).some((part) =>
+      part.type === "text" && part.text === ""
+    ),
+    false,
+  );
+  const streamFollowup = await app.request(
+    `/api/conversations/${streamConversation.id}/generate/stream`,
+    {
+      method: "POST",
+      headers: { ...adminSession, "content-type": "application/json" },
+      body: JSON.stringify({
+        mode: "send",
+        content: "Describe it",
+        model: "simulated/dg-chat",
+        parentId: streamTerminal.assistant.id,
+        expectedVersion: streamTerminal.conversation.version,
+        idempotencyKey: "files-stream-attachment-followup",
+        attachmentIds: [],
+      }),
+    },
+  );
+  assertEquals(streamFollowup.status, 200);
+  await streamFollowup.text();
+  const streamHistoricalParts = streamProviderRequests[1].messages.find((message) =>
+    message.role === "user" && Array.isArray(message.content)
+  )?.content;
+  assertEquals(Array.isArray(streamHistoricalParts), true);
+  assertEquals(
+    (streamHistoricalParts as Array<{ type: string; text?: string }>).some((part) =>
+      part.type === "text" && part.text === ""
+    ),
+    false,
+  );
+
   const generationBody = JSON.stringify({
     content: "use the attachment",
     model: "simulated/dg-chat",
@@ -1350,7 +1503,7 @@ Deno.test("attachment and OpenAI Files routes enforce security, ownership, scope
   assertEquals(JSON.stringify(generation.user.attachments).includes("objectKey"), false);
   assertStringIncludes(generation.assistant.content, webText);
   assertStringIncludes(generation.assistant.content, "[image]");
-  assertEquals(providerRequests.length, 1);
+  assertEquals(providerRequests.length, 3);
   const immediateReplay = await requestGeneration();
   assertEquals(immediateReplay.status, 200);
   assertEquals(await json(immediateReplay), generation);
@@ -1399,9 +1552,9 @@ Deno.test("attachment and OpenAI Files routes enforce security, ownership, scope
   });
   assertEquals(followupResponse.status, 201);
   const followup = await json(followupResponse);
-  assertEquals(providerRequests.length, 2);
-  assertStringIncludes(JSON.stringify(providerRequests[1].messages), webText);
-  assertStringIncludes(JSON.stringify(providerRequests[1].messages), "data:image/png;base64,");
+  assertEquals(providerRequests.length, 4);
+  assertStringIncludes(JSON.stringify(providerRequests[3].messages), webText);
+  assertStringIncludes(JSON.stringify(providerRequests[3].messages), "data:image/png;base64,");
 
   const aggregateOverflow = await app.request(`/api/conversations/${conversation.id}/generate`, {
     method: "POST",
@@ -1417,7 +1570,7 @@ Deno.test("attachment and OpenAI Files routes enforce security, ownership, scope
   });
   assertEquals(aggregateOverflow.status, 413);
   assertEquals((await json(aggregateOverflow)).error.code, "attachment_context_too_large");
-  assertEquals(providerRequests.length, 2);
+  assertEquals(providerRequests.length, 4);
 
   const overflowConversation = await json(
     await app.request("/api/conversations", {
@@ -1443,7 +1596,7 @@ Deno.test("attachment and OpenAI Files routes enforce security, ownership, scope
   );
   assertEquals(contextOverflow.status, 422);
   assertEquals((await json(contextOverflow)).error.code, "context_length_exceeded");
-  assertEquals(providerRequests.length, 2);
+  assertEquals(providerRequests.length, 4);
 
   const openAIText = "OpenAI file lifecycle bytes";
   const missingPurpose = new FormData();

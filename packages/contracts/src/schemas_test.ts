@@ -1,10 +1,34 @@
 import { assertEquals } from "jsr:@std/assert@1.0.14";
 import {
   chatCompletionSchema,
+  generateMessageSchema,
   responsesSchema,
   setActiveLeafSchema,
+  streamGenerationSchema,
   updateConversationSchema,
 } from "./schemas.ts";
+
+Deno.test("web generation accepts attachment-only sends but rejects empty text-only sends", () => {
+  const attachmentId = crypto.randomUUID();
+  const base = {
+    parentId: null,
+    content: "   ",
+    model: "simulated/dg-chat",
+    expectedVersion: 0,
+    idempotencyKey: "attachment-only-send",
+  };
+  assertEquals(generateMessageSchema.safeParse(base).success, false);
+  assertEquals(generateMessageSchema.parse({ ...base, attachmentIds: [attachmentId] }).content, "");
+  assertEquals(
+    streamGenerationSchema.safeParse({ ...base, mode: "send", attachmentIds: [] }).success,
+    false,
+  );
+  assertEquals(
+    streamGenerationSchema.safeParse({ ...base, mode: "send", attachmentIds: [attachmentId] })
+      .success,
+    true,
+  );
+});
 
 Deno.test("Chat Completions rejects unsupported multi-choice accounting", () => {
   assertEquals(
