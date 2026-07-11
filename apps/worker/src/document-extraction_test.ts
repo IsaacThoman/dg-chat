@@ -396,6 +396,46 @@ Deno.test("DOCX relationship graph requires canonical root, rejects traversal, a
   assertEquals(cyclic.mimeType, DOCX);
 });
 
+Deno.test("DOCX parser honors Unicode prefixes and namespace rebinding without comment false positives", async () => {
+  await rejectsCode(
+    () =>
+      extractDocx(docx(undefined, {
+        "word/header-unicode.xml": strToU8(
+          `<文:hdr xmlns:文="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><文:instrText>DDEAUTO command</文:instrText></文:hdr>`,
+        ),
+        "word/_rels/document.xml.rels": strToU8(
+          rels(`<Relationship Target="header-unicode.xml"/>`),
+        ),
+      })),
+    "docx_active_content",
+  );
+  const safe = await extractDocx(docx(undefined, {
+    "word/header-safe.xml": strToU8(
+      `<x:hdr xmlns:x="http://schemas.openxmlformats.org/wordprocessingml/2006/main">` +
+        `<!-- <x:instrText>DDEAUTO comment</x:instrText> -->` +
+        `<safe xmlns:x="urn:unrelated"><x:instrText>DDEAUTO data</x:instrText><x:object/></safe>` +
+        `</x:hdr>`,
+    ),
+    "word/_rels/document.xml.rels": strToU8(rels(`<Relationship Target="header-safe.xml"/>`)),
+  }));
+  assertEquals(safe.mimeType, DOCX);
+});
+
+Deno.test("DOCX parser rejects malformed reachable XML", async () => {
+  await rejectsCode(
+    () =>
+      extractDocx(docx(undefined, {
+        "word/header-broken.xml": strToU8(
+          `<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p>`,
+        ),
+        "word/_rels/document.xml.rels": strToU8(
+          rels(`<Relationship Target="header-broken.xml"/>`),
+        ),
+      })),
+    "invalid_docx",
+  );
+});
+
 Deno.test("DOCX rejects active internal relationship types regardless of target filename", async () => {
   for (const type of ["oleObject", "package", "attachedTemplate", "control"]) {
     const relationshipXml = rels(
