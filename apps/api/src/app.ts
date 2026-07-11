@@ -127,6 +127,17 @@ import {
   validateSimulatedProviderScenario,
 } from "./provider-simulator.ts";
 import { buildKnowledgeContext } from "./knowledge-context.ts";
+import {
+  type KnowledgeQueryEmbedder,
+  knowledgeQueryEmbedderFromEnv,
+} from "./knowledge-query-embedding.ts";
+import {
+  MemoryToolExecutionStore,
+  ToolExecutionError,
+  ToolExecutionService,
+} from "./tool-execution.ts";
+import { SearxngSearchAdapter } from "./web-search.ts";
+import { WebSearchToolAdapter } from "./search-tool.ts";
 
 type Variables = {
   user: PublicUser;
@@ -159,6 +170,7 @@ export interface AppOptions {
   attachmentContextMaxRawBytes?: number;
   knowledgeContextMaxCharacters?: number;
   knowledgeRetrievalTopK?: number;
+  knowledgeQueryEmbedder?: KnowledgeQueryEmbedder;
   providerKeyring?: ProviderSecretKeyring;
   providerDiscoveryFetch?: typeof fetch;
   embeddingsFetch?: ProviderFetch;
@@ -168,6 +180,7 @@ export interface AppOptions {
     windowMs: number;
     minimumVisibleUnitsPerSecond: number;
   };
+  toolExecutionService?: ToolExecutionService;
 }
 
 interface StagedUpload {
@@ -864,6 +877,43 @@ export function createApp(options: AppOptions = {}) {
       slowStream: providerSlowStream,
     })
     : undefined;
+  const knowledgeQueryEmbedder = options.knowledgeQueryEmbedder ?? knowledgeQueryEmbedderFromEnv({
+    KNOWLEDGE_EMBEDDING_BASE_URL: Deno.env.get("KNOWLEDGE_EMBEDDING_BASE_URL"),
+    KNOWLEDGE_EMBEDDING_API_KEY: Deno.env.get("KNOWLEDGE_EMBEDDING_API_KEY"),
+    KNOWLEDGE_EMBEDDING_MODEL: Deno.env.get("KNOWLEDGE_EMBEDDING_MODEL"),
+    KNOWLEDGE_EMBEDDING_UPSTREAM_MODEL: Deno.env.get("KNOWLEDGE_EMBEDDING_UPSTREAM_MODEL"),
+    KNOWLEDGE_EMBEDDING_VERSION: Deno.env.get("KNOWLEDGE_EMBEDDING_VERSION"),
+    KNOWLEDGE_EMBEDDING_QUERY_TIMEOUT_MS: Deno.env.get("KNOWLEDGE_EMBEDDING_QUERY_TIMEOUT_MS"),
+  }, options.embeddingsFetch);
+  const embedKnowledgeQuery = async (query: string, signal?: AbortSignal) => {
+    if (!knowledgeQueryEmbedder || !query.trim()) return undefined;
+    try {
+      return await knowledgeQueryEmbedder(query, signal);
+    } catch (error) {
+      console.warn(JSON.stringify({
+        level: "warn",
+        message: "Knowledge query embedding failed; using lexical retrieval",
+        error: error instanceof Error ? error.message : String(error),
+      }));
+      return undefined;
+    }
+  };
+  const configuredSearxngUrl = Deno.env.get("SEARXNG_URL")?.trim();
+  const toolExecution = options.toolExecutionService ?? new ToolExecutionService(
+    new MemoryToolExecutionStore(),
+    configuredSearxngUrl
+      ? [
+        new WebSearchToolAdapter(
+          new SearxngSearchAdapter({
+            baseUrl: configuredSearxngUrl,
+            allowPrivateEndpoint: Deno.env.get("SEARXNG_ALLOW_PRIVATE_NETWORK") === "true",
+            timeoutMs: positiveInteger("SEARXNG_TIMEOUT_MS", 8_000),
+            maxResponseBytes: positiveInteger("SEARXNG_MAX_RESPONSE_BYTES", 2_000_000),
+          }),
+        ),
+      ]
+      : [],
+  );
   type RuntimeModel = {
     info: ModelInfo;
     provider?: ProviderRecord;
@@ -2189,9 +2239,12 @@ export function createApp(options: AppOptions = {}) {
           ]
           : body.content,
       });
+      const queryEmbedding = await embedKnowledgeQuery(body.content);
       knowledgeContext = await buildKnowledgeContext(repo, conversationId, ownerId, body.content, {
         maxCharacters: knowledgeContextMaxCharacters,
         retrievalTopK: knowledgeRetrievalTopK,
+        queryEmbedding: queryEmbedding?.embedding,
+        embeddingVersion: queryEmbedding?.version,
       });
       if (knowledgeContext.message) history.unshift(knowledgeContext.message);
       const estimatedInputTokens = estimateWebContextTokens(history);
@@ -2559,6 +2612,7 @@ export function createApp(options: AppOptions = {}) {
         const knowledgeQuery = body.mode === "send"
           ? body.content
           : [...activePath].reverse().find((message) => message.role === "user")?.content ?? "";
+        const queryEmbedding = await embedKnowledgeQuery(knowledgeQuery, controller.signal);
         knowledgeContext = await buildKnowledgeContext(
           repo,
           conversationId,
@@ -2567,6 +2621,8 @@ export function createApp(options: AppOptions = {}) {
           {
             maxCharacters: knowledgeContextMaxCharacters,
             retrievalTopK: knowledgeRetrievalTopK,
+            queryEmbedding: queryEmbedding?.embedding,
+            embeddingVersion: queryEmbedding?.version,
           },
         );
         if (knowledgeContext.message) history.unshift(knowledgeContext.message);
@@ -2929,7 +2985,113 @@ export function createApp(options: AppOptions = {}) {
     async (c) => c.json({ data: await runtimeModelCatalog() }),
   );
 
+  app.use("/api/tools/*", authenticate, approved, sessionOnly);
+  app.use("/api/tools", authenticate, approved, sessionOnly);
+  app.get("/api/tools", async (c) => {
+    const available = (await toolExecution.listPolicies())
+      .filter(({ definition, policy }) => definition.enabled && policy?.allowed)
+      .map(({ definition }) => definition);
+    return c.json({ data: available });
+  });
+  app.post("/api/tools/executions", async (c) => {
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      throw new ToolExecutionError("invalid_input", "Request body must be valid JSON", 422);
+    }
+    if (
+      !body || typeof body !== "object" || Array.isArray(body) ||
+      Object.keys(body).some((key) => !["toolId", "input"].includes(key)) ||
+      typeof (body as { toolId?: unknown }).toolId !== "string" ||
+      !(body as { toolId: string }).toolId.match(/^[a-z0-9][a-z0-9_-]{0,63}$/)
+    ) throw new ToolExecutionError("invalid_input", "Tool request is invalid", 422);
+    const execution = await toolExecution.request(
+      c.get("user").id,
+      (body as { toolId: string }).toolId,
+      (body as { input?: unknown }).input ?? {},
+    );
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: "tool.execution.requested",
+      targetType: "tool_execution",
+      targetId: execution.id,
+      metadata: { toolId: execution.toolId },
+    });
+    return c.json(execution, 201);
+  });
+  app.get(
+    "/api/tools/executions/:id",
+    async (c) => c.json(await toolExecution.get(c.get("user").id, c.req.param("id"))),
+  );
+  app.post("/api/tools/executions/:id/approve", async (c) => {
+    const execution = await toolExecution.approve(c.get("user").id, c.req.param("id"));
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: "tool.execution.approved",
+      targetType: "tool_execution",
+      targetId: execution.id,
+      metadata: { toolId: execution.toolId },
+    });
+    return c.json(execution, 202);
+  });
+  app.delete("/api/tools/executions/:id", async (c) => {
+    const execution = await toolExecution.cancel(c.get("user").id, c.req.param("id"));
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: "tool.execution.cancelled",
+      targetType: "tool_execution",
+      targetId: execution.id,
+      metadata: { toolId: execution.toolId },
+    });
+    return c.json(execution);
+  });
+
   app.use("/api/admin/*", authenticate, approved, sessionOnly, admin);
+  app.get("/api/admin/tools", async (c) => c.json({ data: await toolExecution.listPolicies() }));
+  app.put("/api/admin/tools/:toolId/policy", async (c) => {
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      throw new ToolExecutionError("invalid_input", "Request body must be valid JSON", 422);
+    }
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      throw new ToolExecutionError("invalid_input", "Tool policy is invalid", 422);
+    }
+    const value = body as Record<string, unknown>;
+    if (
+      Object.keys(value).some((key) =>
+        !["allowed", "allowedDomains", "allowPrivateNetwork", "expectedVersion"].includes(key)
+      ) || typeof value.allowed !== "boolean" ||
+      (value.allowedDomains !== undefined &&
+        (!Array.isArray(value.allowedDomains) ||
+          value.allowedDomains.some((domain) => typeof domain !== "string"))) ||
+      (value.allowPrivateNetwork !== undefined && typeof value.allowPrivateNetwork !== "boolean") ||
+      (value.expectedVersion !== undefined &&
+        (!Number.isSafeInteger(value.expectedVersion) || Number(value.expectedVersion) < 0))
+    ) throw new ToolExecutionError("invalid_input", "Tool policy is invalid", 422);
+    const policy = await toolExecution.setPolicy({
+      toolId: c.req.param("toolId"),
+      allowed: value.allowed,
+      allowedDomains: value.allowedDomains as string[] | undefined,
+      allowPrivateNetwork: value.allowPrivateNetwork as boolean | undefined,
+      expectedVersion: value.expectedVersion as number | undefined,
+      actorId: c.get("user").id,
+    });
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: policy.allowed ? "tool.policy.allowed" : "tool.policy.denied",
+      targetType: "tool_policy",
+      targetId: policy.toolId,
+      metadata: {
+        version: policy.version,
+        allowedDomains: policy.allowedDomains,
+        allowPrivateNetwork: policy.allowPrivateNetwork,
+      },
+    });
+    return c.json(policy);
+  });
   app.get(
     "/api/admin/users",
     async (c) => c.json({ data: await repo.listUsers() }),
@@ -4531,6 +4693,12 @@ export function createApp(options: AppOptions = {}) {
   );
 
   app.onError((error, c) => {
+    if (error instanceof ToolExecutionError) {
+      return c.json(
+        { error: { code: error.code, message: error.message } },
+        error.status as 400,
+      );
+    }
     if (error instanceof UploadSecurityError) {
       return c.req.path.startsWith("/v1/")
         ? c.json(openAIError(error.message, error.code), error.status as 400)
@@ -4549,5 +4717,5 @@ export function createApp(options: AppOptions = {}) {
     return c.json(openAIError(`Internal server error (${correlationId})`, "internal_error"), 500);
   });
   app.notFound((c) => c.json(openAIError("Route not found", "not_found"), 404));
-  return { app, repository: repo, circuitBreaker };
+  return { app, repository: repo, circuitBreaker, toolExecutionService: toolExecution };
 }

@@ -19,6 +19,12 @@ import {
 } from "./attachment-ingestion.ts";
 import { buildDocumentChunks, raceJobDeadline } from "./document-pipeline.ts";
 import type { DocumentExtractionLimits } from "./document-extraction.ts";
+import {
+  embedKnowledgeChunks,
+  parseDocumentEmbeddingPayload,
+  parseKnowledgeEmbeddingConfig,
+  sha256,
+} from "./knowledge-embedding.ts";
 
 const databaseUrl = Deno.env.get("DATABASE_URL");
 const workerId = Deno.env.get("WORKER_ID") ?? `worker-${crypto.randomUUID().slice(0, 8)}`;
@@ -29,6 +35,14 @@ const documentProcessingConfig = parseDocumentProcessingConfig({
   DOCUMENT_CHUNK_OVERLAP_CHARS: Deno.env.get("DOCUMENT_CHUNK_OVERLAP_CHARS"),
   DOCUMENT_EXTRACTOR_VERSION: Deno.env.get("DOCUMENT_EXTRACTOR_VERSION"),
   DOCUMENT_CHUNKER_VERSION: Deno.env.get("DOCUMENT_CHUNKER_VERSION"),
+});
+const knowledgeEmbeddingConfig = parseKnowledgeEmbeddingConfig({
+  KNOWLEDGE_EMBEDDING_BASE_URL: Deno.env.get("KNOWLEDGE_EMBEDDING_BASE_URL"),
+  KNOWLEDGE_EMBEDDING_API_KEY: Deno.env.get("KNOWLEDGE_EMBEDDING_API_KEY"),
+  KNOWLEDGE_EMBEDDING_MODEL: Deno.env.get("KNOWLEDGE_EMBEDDING_MODEL"),
+  KNOWLEDGE_EMBEDDING_UPSTREAM_MODEL: Deno.env.get("KNOWLEDGE_EMBEDDING_UPSTREAM_MODEL"),
+  KNOWLEDGE_EMBEDDING_VERSION: Deno.env.get("KNOWLEDGE_EMBEDDING_VERSION"),
+  KNOWLEDGE_EMBEDDING_BATCH_SIZE: Deno.env.get("KNOWLEDGE_EMBEDDING_BATCH_SIZE"),
 });
 function positiveInteger(name: string, fallback: number, minimum = 1): number {
   const raw = Deno.env.get(name);
@@ -85,6 +99,25 @@ if (!discoveredObjectStore) {
 }
 const objectStore: ObjectStore = discoveredObjectStore;
 console.log(JSON.stringify({ level: "info", message: "Worker started", workerId }));
+if (knowledgeEmbeddingConfig) {
+  await sql`INSERT INTO jobs(type,payload,idempotency_key,status,attempts,available_at)
+    SELECT 'document.embed',jsonb_build_object(
+      'attachmentId',a.id,'ownerId',a.owner_id,'version',${knowledgeEmbeddingConfig.version}
+    ),'document.embed:' || a.id || ':' || ${knowledgeEmbeddingConfig.version},'queued',0,now()
+    FROM attachments a
+    WHERE a.deleted_at IS NULL AND a.state='ready' AND a.ingestion_status='ready'
+      AND EXISTS (SELECT 1 FROM document_chunks dc WHERE dc.attachment_id=a.id)
+      AND EXISTS (
+        SELECT 1 FROM document_chunks dc WHERE dc.attachment_id=a.id AND NOT EXISTS (
+          SELECT 1 FROM document_chunk_embeddings dce WHERE dce.chunk_id=dc.id
+            AND dce.owner_id=a.owner_id
+            AND dce.embedding_version=${knowledgeEmbeddingConfig.version}
+        )
+      )
+    ON CONFLICT(idempotency_key) DO UPDATE SET status='queued',attempts=0,available_at=now(),
+      last_error=NULL,locked_at=NULL,locked_by=NULL,completed_at=NULL
+      WHERE jobs.status IN ('completed','failed')`;
+}
 
 async function processJob(
   job: { id: string; type: string; payload: unknown; attempts: number; claimToken: string },
@@ -176,11 +209,95 @@ async function processJob(
         }
         await tx`UPDATE attachments SET ingestion_status='ready',ingestion_error=NULL,
           ingested_at=now(),updated_at=now() WHERE id=${attachmentId}`;
+        if (knowledgeEmbeddingConfig) {
+          const idempotencyKey =
+            `document.embed:${attachmentId}:${knowledgeEmbeddingConfig.version}`;
+          await tx`INSERT INTO jobs(type,payload,idempotency_key,status,attempts,available_at)
+            VALUES('document.embed',${
+            tx.json({ attachmentId, ownerId, version: knowledgeEmbeddingConfig.version })
+          },
+              ${idempotencyKey},'queued',0,now())
+            ON CONFLICT(idempotency_key) DO UPDATE SET status='queued',attempts=0,
+              available_at=now(),last_error=NULL,locked_at=NULL,locked_by=NULL,completed_at=NULL`;
+        }
         await tx`UPDATE jobs SET status='completed',completed_at=now(),locked_at=NULL,locked_by=NULL
           WHERE id=${job.id}`;
         return true;
       });
       if (!committed) throw new Error("Attachment ingestion claim was reclaimed");
+      return true;
+    }
+    case "document.embed": {
+      if (!knowledgeEmbeddingConfig) {
+        throw new Error("Knowledge embedding provider is not configured");
+      }
+      const payload = parseDocumentEmbeddingPayload(job.payload);
+      if (payload.version !== knowledgeEmbeddingConfig.version) {
+        throw new Error("Document embedding job version is no longer active");
+      }
+      const deadlineAt = Date.now() + jobLeaseSeconds * 1000 - jobDeadlineMarginMs;
+      const rows = await sql<{ id: string; content: string }[]>`
+        SELECT dc.id,dc.content FROM document_chunks dc
+        JOIN attachments a ON a.id=dc.attachment_id
+        JOIN jobs j ON j.id=${job.id} AND j.status='running' AND j.locked_by=${job.claimToken}
+        WHERE dc.attachment_id=${payload.attachmentId} AND a.owner_id=${payload.ownerId}
+          AND a.deleted_at IS NULL AND a.state='ready' AND a.ingestion_status='ready'
+        ORDER BY dc.ordinal,dc.id`;
+      if (!rows.length) throw new Error("Document embedding source is stale or unavailable");
+      const values: Array<{ id: string; contentSha256: string; embedding: number[] }> = [];
+      for (let offset = 0; offset < rows.length; offset += knowledgeEmbeddingConfig.batchSize) {
+        const batch = rows.slice(offset, offset + knowledgeEmbeddingConfig.batchSize);
+        const remaining = deadlineAt - Date.now();
+        if (remaining <= 0) throw new Error("Document embedding deadline exceeded");
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), remaining);
+        try {
+          const embeddings = await embedKnowledgeChunks(
+            batch.map((row) => row.content),
+            knowledgeEmbeddingConfig,
+            controller.signal,
+          );
+          const hashes = await Promise.all(batch.map((row) => sha256(row.content)));
+          batch.forEach((row, index) =>
+            values.push({ id: row.id, contentSha256: hashes[index], embedding: embeddings[index] })
+          );
+        } finally {
+          clearTimeout(timeout);
+        }
+      }
+      const committed = await sql.begin(async (tx) => {
+        if (Date.now() >= deadlineAt) return false;
+        const fence = await tx`SELECT id FROM jobs WHERE id=${job.id} AND status='running'
+          AND locked_by=${job.claimToken}
+          AND locked_at > now() - ${jobLeaseSeconds} * interval '1 second' FOR UPDATE`;
+        if (!fence.length) return false;
+        const current = await tx<{ id: string; content: string }[]>`
+          SELECT dc.id,dc.content FROM document_chunks dc JOIN attachments a ON a.id=dc.attachment_id
+          WHERE dc.attachment_id=${payload.attachmentId} AND a.owner_id=${payload.ownerId}
+            AND a.deleted_at IS NULL AND a.ingestion_status='ready' ORDER BY dc.ordinal,dc.id
+          FOR UPDATE OF dc`;
+        if (current.length !== values.length) return false;
+        for (let index = 0; index < current.length; index++) {
+          if (
+            current[index].id !== values[index].id ||
+            await sha256(current[index].content) !== values[index].contentSha256
+          ) return false;
+        }
+        for (const value of values) {
+          await tx`INSERT INTO document_chunk_embeddings(
+            chunk_id,owner_id,model,embedding_version,content_sha256,embedding
+          ) VALUES(${value.id},${payload.ownerId},${knowledgeEmbeddingConfig.model},
+            ${knowledgeEmbeddingConfig.version},${value.contentSha256},
+            ${JSON.stringify(value.embedding)}::vector)
+          ON CONFLICT(chunk_id,embedding_version) DO UPDATE SET model=EXCLUDED.model,
+            owner_id=EXCLUDED.owner_id,content_sha256=EXCLUDED.content_sha256,
+            embedding=EXCLUDED.embedding,updated_at=now()`;
+        }
+        await tx`UPDATE jobs SET status='completed',completed_at=now(),locked_at=NULL,locked_by=NULL
+          WHERE id=${job.id} AND status='running' AND locked_by=${job.claimToken}`;
+        return true;
+      });
+      if (!committed) throw new Error("Document embedding claim was reclaimed or changed");
       return true;
     }
     default:
