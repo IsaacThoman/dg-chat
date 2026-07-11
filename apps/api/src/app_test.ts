@@ -24,6 +24,30 @@ function sessionCookie(response: Response): string {
   return cookie;
 }
 
+Deno.test("OpenAI endpoint registrations are unique", () => {
+  const { app } = createApp({ setupToken: "route-uniqueness" });
+  const openAIRoutes = app.routes.filter((route) =>
+    route.method !== "ALL" && route.path.startsWith("/v1/")
+  );
+  const counts = new Map<string, number>();
+  for (const route of openAIRoutes) {
+    const key = `${route.method} ${route.path}`;
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  for (const [key, count] of counts) {
+    // Every endpoint has exactly one scope middleware and one terminal handler. A second route
+    // declaration creates four entries and can silently shadow the newer implementation.
+    assertEquals(count, 2, `Duplicate or incomplete OpenAI route registration: ${key}`);
+  }
+  for (
+    const expected of [
+      "POST /v1/embeddings",
+      "POST /v1/audio/transcriptions",
+      "POST /v1/audio/translations",
+    ]
+  ) assertEquals(counts.has(expected), true, `Missing OpenAI route registration: ${expected}`);
+});
+
 Deno.test("bootstrap, signup, approval, immutable chat, API token and OpenAI completion", async () => {
   const mailer = new TestIdentityMailer();
   const { app, repository } = createApp({

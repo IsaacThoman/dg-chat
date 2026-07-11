@@ -8,8 +8,8 @@ compatibility endpoints live under `/v1/*`.
 
 The Compose stack provisions the full dependency topology. PostgreSQL is authoritative for the
 normalized domain model, durable jobs, accounting, and OpenAI replay state. Redis is on the request
-path for distributed rate limits. MinIO is provisioned, but S3-backed uploads are not yet on the
-request path.
+path for distributed rate limits and shared provider circuit breakers. MinIO provides the default
+S3-compatible private object store for uploads, OpenAI Files, and ingestion jobs.
 
 ```mermaid
 flowchart LR
@@ -27,8 +27,9 @@ flowchart LR
 
 - PostgreSQL is authoritative for identity, immutable conversations, accounting, durable jobs,
   configuration, and audit records.
-- Redis currently contains disposable rate-limit windows. Circuit breakers, presence, and ephemeral
-  stream coordination remain planned; correctness must not depend on Redis persistence.
+- Redis currently contains disposable rate-limit windows and shared provider circuit-breaker state.
+  Presence and ephemeral stream coordination remain planned; correctness must not depend on Redis
+  persistence.
 - S3-compatible storage owns immutable upload objects. Browser attachment routes and the
   OpenAI-compatible Files lifecycle stream uploads into private objects and authorize every read by
   owner or immutable historical message link. Attachment deletion is a logical tombstone so edits
@@ -42,10 +43,11 @@ flowchart LR
   isolate. Text and JSON use strict UTF-8 parsing; PDF extraction is page-bounded and DOCX
   extraction rejects unsafe archives, macros, encryption, traversal, excessive expansion, and
   external relationships before decompression. Chunk and extractor versions are persisted with page
-  or section provenance. Conversation-bound collections support deterministic lexical retrieval or
+  or section provenance. Conversation-bound collections support hybrid lexical/vector retrieval or
   bounded full-context injection with persisted source provenance. The OpenAI-compatible embeddings
-  endpoint is implemented for capable provider-registry models, but vector persistence/retrieval,
-  other Office formats, OCR, malware scanning, and quarantined-file reprocessing remain planned.
+  endpoint and durable pgvector indexing are implemented for capable provider-registry models. OCR
+  interception is implemented with bounded image fetching and a hashed TTL cache. Other Office
+  formats, malware scanning, and quarantined-file reprocessing remain planned.
 
 ## Core invariants
 

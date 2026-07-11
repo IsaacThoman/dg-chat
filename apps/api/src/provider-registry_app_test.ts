@@ -563,6 +563,15 @@ Deno.test("OpenAI embeddings route enforces capability, billing, safe failures, 
     body: JSON.stringify({ model: "embedvendor/chat", input: "hello" }),
   });
   assertEquals(rejected.status, 404);
+  const nonChatRejected = await app.request("/v1/chat/completions", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model: "embedvendor/embed",
+      messages: [{ role: "user", content: "This model is embeddings-only" }],
+    }),
+  });
+  assertEquals(nonChatRejected.status, 404);
   malformed = true;
   const failed = await app.request("/v1/embeddings", {
     method: "POST",

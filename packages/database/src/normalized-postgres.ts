@@ -1,5 +1,12 @@
 import postgres from "npm:postgres@3.4.7";
-import type { AccountState, Conversation, MessageNode, PublicUser } from "@dg-chat/contracts";
+import { isModelCapability } from "@dg-chat/contracts";
+import type {
+  AccountState,
+  Conversation,
+  MessageNode,
+  ModelCapability,
+  PublicUser,
+} from "@dg-chat/contracts";
 import { DomainError } from "./memory.ts";
 import { INGESTIBLE_DOCUMENT_MIME_TYPES, isIngestibleDocumentMime } from "./attachment-policy.ts";
 import {
@@ -273,6 +280,23 @@ function provider(row: Row): ProviderRecord {
     updatedAt: iso(row.updated_at),
   };
 }
+export function parseStoredModelCapabilities(
+  value: unknown,
+  modelId = "unknown",
+): ModelCapability[] {
+  if (
+    !Array.isArray(value) || value.length > 64 ||
+    value.some((capability) => typeof capability !== "string" || !isModelCapability(capability)) ||
+    new Set(value).size !== value.length
+  ) {
+    throw new DomainError(
+      "data_integrity_error",
+      `Provider model '${modelId}' contains invalid persisted capabilities; run database migrations and repair the row`,
+      500,
+    );
+  }
+  return [...value] as ModelCapability[];
+}
 function providerModel(row: Row): ProviderModelRecord {
   return {
     id: String(row.id),
@@ -280,7 +304,7 @@ function providerModel(row: Row): ProviderModelRecord {
     publicModelId: String(row.public_model_id),
     upstreamModelId: String(row.upstream_model_id),
     displayName: String(row.display_name),
-    capabilities: [...(row.capabilities as string[])],
+    capabilities: parseStoredModelCapabilities(row.capabilities, String(row.public_model_id)),
     contextWindow: number(row.context_window),
     enabled: Boolean(row.enabled),
     version: number(row.version),
@@ -452,7 +476,7 @@ function validateProviderModelInput(
     input.capabilities !== undefined &&
     (input.capabilities.length > 64 ||
       new Set(input.capabilities).size !== input.capabilities.length ||
-      input.capabilities.some((value) => !value || value.length > 64))
+      input.capabilities.some((value) => !isModelCapability(value)))
   ) throw new DomainError("validation_error", "Model capabilities are invalid", 422);
   if (
     input.customParams !== undefined &&

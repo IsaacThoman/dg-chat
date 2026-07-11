@@ -1,3 +1,4 @@
+import { isModelCapability } from "@dg-chat/contracts";
 import type {
   AccountState,
   ApiTokenSummary,
@@ -263,7 +264,7 @@ function validateProviderModelInput(
     input.capabilities !== undefined &&
     (input.capabilities.length > 64 ||
       new Set(input.capabilities).size !== input.capabilities.length ||
-      input.capabilities.some((value) => !value || value.length > 64))
+      input.capabilities.some((value) => !isModelCapability(value)))
   ) throw new DomainError("validation_error", "Model capabilities are invalid", 422);
   if (
     input.customParams !== undefined &&

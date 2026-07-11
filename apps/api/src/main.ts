@@ -10,6 +10,10 @@ import { MemoryRateLimiter, RedisRateLimiter } from "./rate-limit.ts";
 import { ProviderSecretKeyring } from "./provider-secrets.ts";
 import { MemoryCircuitBreaker, RedisCircuitBreaker } from "./provider-circuit.ts";
 import { ocrCacheFailureModeFromEnv, RedisOcrCache } from "./ocr-cache.ts";
+import {
+  MemoryAudioConcurrencyLimiter,
+  RedisAudioConcurrencyLimiter,
+} from "./audio-concurrency.ts";
 
 const port = Number(Deno.env.get("PORT") ?? 8000);
 const providerKeyring = ProviderSecretKeyring.fromEnv();
@@ -44,6 +48,14 @@ const ocrCache = Deno.env.get("REDIS_URL")
     failureMode: ocrCacheFailureModeFromEnv(Deno.env.get("OCR_CACHE_FAILURE_MODE")),
   })
   : undefined;
+const audioConcurrencyLeaseMs = Number(
+  Deno.env.get("AUDIO_CONCURRENCY_LEASE_SECONDS") ?? 120,
+) * 1_000;
+const audioConcurrencyLimiter = Deno.env.get("REDIS_URL")
+  ? new RedisAudioConcurrencyLimiter(Deno.env.get("REDIS_URL")!, {
+    leaseMs: audioConcurrencyLeaseMs,
+  })
+  : new MemoryAudioConcurrencyLimiter({ leaseMs: audioConcurrencyLeaseMs });
 const objectStore = objectStoreFromEnv();
 const { app, toolExecutionService } = createApp({
   repository,
@@ -53,6 +65,7 @@ const { app, toolExecutionService } = createApp({
   circuitBreaker,
   ocrCache,
   toolExecutionStore,
+  audioConcurrencyLimiter,
 });
 await toolExecutionService.recover();
 const replayMaintenance = setInterval(async () => {
@@ -96,6 +109,7 @@ const shutdown = async (signal: string) => {
     rateLimiter.close(),
     circuitBreaker.close(),
     ocrCache?.close(),
+    audioConcurrencyLimiter.close(),
     objectStore?.close(),
   ]);
 };

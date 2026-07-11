@@ -1,5 +1,6 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.14";
 import { MemoryRepository } from "@dg-chat/database";
+import type { ModelCapability } from "@dg-chat/contracts";
 import { MemoryCircuitBreaker } from "./provider-circuit.ts";
 import {
   ProviderExecutionEngine,
@@ -671,7 +672,10 @@ Deno.test("provider execution retries through the breaker, falls back, and persi
   }
 });
 
-async function singleProviderFixture(protocol: "chat_completions" | "responses") {
+async function singleProviderFixture(
+  protocol: "chat_completions" | "responses",
+  capabilities: ModelCapability[] = ["chat"],
+) {
   const repo = new MemoryRepository();
   const user = repo.bootstrapAdmin({
     email: `${protocol}@example.com`,
@@ -697,7 +701,7 @@ async function singleProviderFixture(protocol: "chat_completions" | "responses")
     publicModelId: `single/${protocol}`,
     upstreamModelId: "single-upstream",
     displayName: "Single",
-    capabilities: ["chat"],
+    capabilities,
     contextWindow: 8_192,
   }, mutation);
   const price = repo.createModelPriceVersion({
@@ -716,6 +720,278 @@ async function singleProviderFixture(protocol: "chat_completions" | "responses")
   if (!run.runLeaseToken) throw new Error("execution lease missing");
   return { repo, user, keyring, provider, model, price, runId, run };
 }
+
+Deno.test("audio streaming attempts remain active through final usage and persist truthful telemetry", async () => {
+  const fixture = await singleProviderFixture("chat_completions", ["transcription"]);
+  const engine = new ProviderExecutionEngine({
+    repository: fixture.repo,
+    keyring: fixture.keyring,
+    circuitBreaker: new MemoryCircuitBreaker(),
+    breakerPolicy: {
+      failureThreshold: 1,
+      failureWindowSeconds: 60,
+      openSeconds: 30,
+      halfOpenLeaseSeconds: 5,
+    },
+    audioFetch: () =>
+      Promise.resolve(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode(
+                'data: {"type":"transcript.text.delta","delta":"hello"}\n\n',
+              ));
+              setTimeout(() => {
+                controller.enqueue(new TextEncoder().encode(
+                  'data: {"type":"transcript.text.done","text":"hello","usage":{"input_tokens":11,"output_tokens":4}}\n\n',
+                ));
+                controller.close();
+              }, 20);
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        ),
+      ),
+  });
+  const response = await engine.audio(
+    "transcriptions",
+    fixture.model.id,
+    fixture.runId,
+    fixture.run.runLeaseToken!,
+    {
+      model: fixture.model.publicModelId,
+      file: new Uint8Array([1]),
+      filename: "sample.wav",
+      mime: "audio/wav",
+      fileSha256: "a".repeat(64),
+      responseFormat: "json",
+      stream: true,
+    },
+    new AbortController().signal,
+  );
+  const iterator = response.stream![Symbol.asyncIterator]();
+  const frames: Uint8Array[] = [];
+  const first = await iterator.next();
+  if (!first.done) frames.push(first.value);
+  assertEquals(fixture.repo.listProviderAttempts(fixture.runId)[0]?.status, "running");
+  while (true) {
+    const item = await iterator.next();
+    if (item.done) break;
+    frames.push(item.value);
+  }
+  assertEquals(frames.length, 1);
+  assertEquals(await response.usage, {
+    inputTokens: 11,
+    outputTokens: 4,
+    source: "provider_tokens",
+  });
+  assertEquals(
+    new TextDecoder().decode(await response.terminalFrame).includes("transcript.text.done"),
+    true,
+  );
+  const attempt = fixture.repo.listProviderAttempts(fixture.runId)[0];
+  assertEquals(attempt.status, "succeeded");
+  assertEquals(attempt.visibleOutput, true);
+  assertEquals(attempt.inputTokens, 11);
+  assertEquals(attempt.outputTokens, 4);
+  assertEquals(attempt.tokenSource, "provider");
+  assertEquals(attempt.ttftMs !== null, true);
+});
+
+Deno.test("non-stream audio persists provider-reported usage in attempt telemetry", async () => {
+  const fixture = await singleProviderFixture("chat_completions", ["transcription"]);
+  const engine = new ProviderExecutionEngine({
+    repository: fixture.repo,
+    keyring: fixture.keyring,
+    circuitBreaker: new MemoryCircuitBreaker(),
+    breakerPolicy: {
+      failureThreshold: 1,
+      failureWindowSeconds: 60,
+      openSeconds: 30,
+      halfOpenLeaseSeconds: 5,
+    },
+    audioFetch: () =>
+      Promise.resolve(Response.json({
+        text: "complete",
+        usage: { type: "tokens", input_tokens: 13, output_tokens: 6, total_tokens: 19 },
+      })),
+  });
+  await engine.audio(
+    "transcriptions",
+    fixture.model.id,
+    fixture.runId,
+    fixture.run.runLeaseToken!,
+    {
+      model: fixture.model.publicModelId,
+      file: new Uint8Array([1]),
+      filename: "sample.wav",
+      mime: "audio/wav",
+      fileSha256: "a".repeat(64),
+      responseFormat: "json",
+    },
+    new AbortController().signal,
+  );
+  const attempt = fixture.repo.listProviderAttempts(fixture.runId)[0];
+  assertEquals(attempt.status, "succeeded");
+  assertEquals(attempt.inputTokens, 13);
+  assertEquals(attempt.outputTokens, 6);
+  assertEquals(attempt.tokenSource, "provider");
+});
+
+Deno.test("audio streaming retries when terminal-tail validation fails before visible output", async () => {
+  const fixture = await singleProviderFixture("chat_completions", ["transcription"]);
+  const policy = fixture.repo.createProviderRetryPolicy({
+    name: "Audio first-event retry",
+    maxAttempts: 2,
+    maxRetries: 1,
+    baseDelayMs: 0,
+    maxDelayMs: 0,
+    backoffMultiplierBps: 10_000,
+    jitterBps: 0,
+    firstTokenTimeoutMs: 1_000,
+    idleTimeoutMs: 1_000,
+    totalTimeoutMs: 5_000,
+    retryableStatuses: [502],
+  }, { actorId: fixture.user.id, action: "test.audio-retry" });
+  fixture.repo.setProviderModelRoute({
+    sourceModelId: fixture.model.id,
+    expectedVersion: 0,
+    retryPolicyId: policy.id,
+    fallbackModelIds: [],
+  }, { actorId: fixture.user.id, action: "test.audio-retry" });
+  let calls = 0;
+  const engine = new ProviderExecutionEngine({
+    repository: fixture.repo,
+    keyring: fixture.keyring,
+    circuitBreaker: new MemoryCircuitBreaker(),
+    breakerPolicy: {
+      failureThreshold: 2,
+      failureWindowSeconds: 60,
+      openSeconds: 30,
+      halfOpenLeaseSeconds: 5,
+    },
+    audioFetch: () => {
+      calls++;
+      return Promise.resolve(
+        new Response(
+          calls === 1
+            ? 'data: {"type":"transcript.text.done","text":"discarded"}\n\n' +
+              'data: {"type":"transcript.text.delta","delta":"invalid tail"}\n\n'
+            : 'data: {"type":"transcript.text.done","text":"recovered","usage":{"input_tokens":5,"output_tokens":2}}\n\n',
+          { headers: { "content-type": "text/event-stream" } },
+        ),
+      );
+    },
+  });
+  const response = await engine.audio(
+    "transcriptions",
+    fixture.model.id,
+    fixture.runId,
+    fixture.run.runLeaseToken!,
+    {
+      model: fixture.model.publicModelId,
+      file: new Uint8Array([1]),
+      filename: "sample.wav",
+      mime: "audio/wav",
+      fileSha256: "a".repeat(64),
+      responseFormat: "json",
+      stream: true,
+    },
+    new AbortController().signal,
+  );
+  const frames: string[] = [];
+  for await (const frame of response.stream!) frames.push(new TextDecoder().decode(frame));
+  assertEquals(calls, 2);
+  assertEquals(frames.length, 0);
+  assertEquals(await response.usage, {
+    inputTokens: 5,
+    outputTokens: 2,
+    source: "provider_tokens",
+  });
+  assertEquals(
+    new TextDecoder().decode(await response.terminalFrame).includes("recovered"),
+    true,
+  );
+  const attempts = fixture.repo.listProviderAttempts(fixture.runId);
+  assertEquals(attempts.map((attempt) => attempt.status), ["failed", "succeeded"]);
+  assertEquals(attempts[0].visibleOutput, false);
+  assertEquals(attempts[1].visibleOutput, false);
+});
+
+Deno.test("audio resilience preserves upstream 429 and honors Retry-After before retry", async () => {
+  const fixture = await singleProviderFixture("chat_completions", ["transcription"]);
+  const policy = fixture.repo.createProviderRetryPolicy({
+    name: "Audio rate limit retry",
+    maxAttempts: 2,
+    maxRetries: 1,
+    baseDelayMs: 0,
+    maxDelayMs: 0,
+    backoffMultiplierBps: 10_000,
+    jitterBps: 0,
+    firstTokenTimeoutMs: 1_000,
+    idleTimeoutMs: 1_000,
+    totalTimeoutMs: 5_000,
+    retryableStatuses: [429],
+  }, { actorId: fixture.user.id, action: "test.audio-rate-limit" });
+  fixture.repo.setProviderModelRoute({
+    sourceModelId: fixture.model.id,
+    expectedVersion: 0,
+    retryPolicyId: policy.id,
+    fallbackModelIds: [],
+  }, { actorId: fixture.user.id, action: "test.audio-rate-limit" });
+  const callTimes: number[] = [];
+  const engine = new ProviderExecutionEngine({
+    repository: fixture.repo,
+    keyring: fixture.keyring,
+    circuitBreaker: new MemoryCircuitBreaker(),
+    breakerPolicy: {
+      failureThreshold: 2,
+      failureWindowSeconds: 60,
+      openSeconds: 30,
+      halfOpenLeaseSeconds: 5,
+    },
+    audioFetch: () => {
+      callTimes.push(performance.now());
+      if (callTimes.length === 1) {
+        return Promise.resolve(
+          new Response("rate limited", {
+            status: 429,
+            headers: { "retry-after": "0.01" },
+          }),
+        );
+      }
+      return Promise.resolve(
+        new Response(
+          'data: {"type":"transcript.text.done","text":"ok","usage":{"input_tokens":1,"output_tokens":1}}\n\n',
+          { headers: { "content-type": "text/event-stream" } },
+        ),
+      );
+    },
+  });
+  const response = await engine.audio(
+    "transcriptions",
+    fixture.model.id,
+    fixture.runId,
+    fixture.run.runLeaseToken!,
+    {
+      model: fixture.model.publicModelId,
+      file: new Uint8Array([1]),
+      filename: "sample.wav",
+      mime: "audio/wav",
+      fileSha256: "a".repeat(64),
+      responseFormat: "json",
+      stream: true,
+    },
+    new AbortController().signal,
+  );
+  for await (const _frame of response.stream!) { /* consume */ }
+  await response.terminalFrame;
+  assertEquals(callTimes.length, 2);
+  assertEquals(callTimes[1] - callTimes[0] >= 8, true);
+  const attempts = fixture.repo.listProviderAttempts(fixture.runId);
+  assertEquals(attempts[0].httpStatus, 429);
+  assertEquals(attempts.map((attempt) => attempt.status), ["failed", "succeeded"]);
+});
 
 Deno.test("provider execution rejects native Responses targets before dispatch", async () => {
   const fixture = await singleProviderFixture("responses");

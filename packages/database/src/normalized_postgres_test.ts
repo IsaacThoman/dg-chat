@@ -1,10 +1,24 @@
-import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.14";
+import { assertEquals, assertRejects, assertThrows } from "jsr:@std/assert@1.0.14";
 import postgres from "npm:postgres@3.4.7";
 import { DomainError } from "./memory.ts";
-import { PostgresRepository } from "./normalized-postgres.ts";
+import { parseStoredModelCapabilities, PostgresRepository } from "./normalized-postgres.ts";
 import { backfillLegacyRuntimeSnapshot } from "./legacy-backfill.ts";
 
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
+
+Deno.test("persisted provider capabilities reject legacy or malformed values explicitly", () => {
+  assertEquals(parseStoredModelCapabilities(["chat", "transcription"], "valid/model"), [
+    "chat",
+    "transcription",
+  ]);
+  for (const capabilities of [["chat", "legacy-custom"], ["chat", "chat"], "chat", [1]]) {
+    assertThrows(
+      () => parseStoredModelCapabilities(capabilities, "broken/model"),
+      DomainError,
+      "invalid persisted capabilities",
+    );
+  }
+});
 
 Deno.test({
   name: "Postgres OCR child reservation is atomic and fenced by its parent lease",

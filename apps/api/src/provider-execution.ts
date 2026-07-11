@@ -45,6 +45,20 @@ import {
   type OcrRecognize,
   parseOcrInterceptionConfig,
 } from "./ocr-interception.ts";
+import {
+  type AudioEndpoint,
+  AudioProviderError,
+  type AudioProviderResponse,
+  type AudioProviderUsage,
+  type AudioRequest,
+  createAudioTranscription,
+  estimateAudioInputTokens,
+} from "./audio.ts";
+import {
+  type AudioTranscriptVisibility,
+  createAudioTranscriptVisibility,
+  observeAudioTranscriptFrame,
+} from "./audio-stream-accounting.ts";
 
 const OCR_MAX_OUTPUT_TOKENS = 4_096;
 
@@ -70,6 +84,7 @@ interface AttemptMetrics {
   visibleCharacters: number;
   reasoningCharacters: number;
   tokenSource: "provider" | "estimated" | "none";
+  audioVisibility: AudioTranscriptVisibility;
 }
 
 export interface ProviderExecutionOptions {
@@ -80,6 +95,7 @@ export interface ProviderExecutionOptions {
   complete?: typeof complete;
   stream?: typeof streamChatCompletion;
   embeddingsFetch?: ProviderFetch;
+  audioFetch?: typeof fetch;
   now?: () => number;
   ocrCache?: OcrCache;
   ocrFetch?: typeof fetch;
@@ -213,6 +229,7 @@ function emptyMetrics(estimatedInput = 0): AttemptMetrics {
     visibleCharacters: 0,
     reasoningCharacters: 0,
     tokenSource: estimatedInput > 0 ? "estimated" : "none",
+    audioVisibility: createAudioTranscriptVisibility(),
   };
 }
 
@@ -299,6 +316,42 @@ function observeChunk(metrics: AttemptMetrics, data: string, now: number) {
   }
 }
 
+function audioFrameVisibleUnits(frame: Uint8Array, state: AudioTranscriptVisibility): number {
+  try {
+    return observeAudioTranscriptFrame(
+      new TextDecoder("utf-8", { fatal: true }).decode(frame),
+      state,
+    ).newVisibleCharacters;
+  } catch {
+    return 0;
+  }
+}
+
+function audioFrameType(frame: Uint8Array): unknown {
+  try {
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(frame).trim();
+    const event = JSON.parse(text.replace(/^data:\s*/, ""));
+    return event && typeof event === "object" ? event.type : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function validateAudioUsagePricing(usage: AudioProviderUsage, pricing: UsagePricingSnapshot): void {
+  if (
+    usage.source === "provider_duration" &&
+    (pricing.fixedCallMicros <= 0 || pricing.inputMicrosPerMillion > 0 ||
+      pricing.cachedInputMicrosPerMillion > 0 || pricing.reasoningMicrosPerMillion > 0 ||
+      pricing.outputMicrosPerMillion > 0)
+  ) {
+    throw new AudioProviderError(
+      "Duration usage requires fixed-call-only model pricing",
+      502,
+      "unsupported_audio_usage",
+    );
+  }
+}
+
 function completionMetrics(result: Completion): AttemptMetrics {
   const upstream = result.upstream && typeof result.upstream === "object" &&
       !Array.isArray(result.upstream)
@@ -331,6 +384,7 @@ function completionMetrics(result: Completion): AttemptMetrics {
     visibleCharacters: result.text.length,
     reasoningCharacters: 0,
     tokenSource: fullyProviderCounted ? "provider" : "estimated",
+    audioVisibility: createAudioTranscriptVisibility(),
   };
 }
 
@@ -342,6 +396,7 @@ export class ProviderExecutionEngine {
   readonly #complete: typeof complete;
   readonly #stream: typeof streamChatCompletion;
   readonly #embeddingsFetch?: ProviderFetch;
+  readonly #audioFetch?: typeof fetch;
   readonly #now: () => number;
   readonly #slowStream?: ProviderExecutionOptions["slowStream"];
   readonly #ocrCache: OcrCache;
@@ -356,6 +411,7 @@ export class ProviderExecutionEngine {
     this.#complete = options.complete ?? complete;
     this.#stream = options.stream ?? streamChatCompletion;
     this.#embeddingsFetch = options.embeddingsFetch;
+    this.#audioFetch = options.audioFetch;
     this.#now = options.now ?? Date.now;
     this.#slowStream = options.slowStream;
     this.#ocrCache = options.ocrCache ?? new MemoryOcrCache(options.now);
@@ -531,7 +587,7 @@ export class ProviderExecutionEngine {
   async #prepare(
     sourceModelId: string,
     frozenPlan?: ProviderExecutionPlan,
-    capability: "chat" | "embeddings" = "chat",
+    capability: "chat" | "embeddings" | "transcription" | "translation" = "chat",
   ): Promise<{
     plan: ProviderExecutionPlan;
     candidates: Map<string, RuntimeCandidate>;
@@ -853,6 +909,14 @@ export class ProviderExecutionEngine {
   }
 
   #normalizeError(error: unknown, plan: ProviderExecutionPlan): never {
+    if (error instanceof AudioProviderError && error.providerStatus !== undefined) {
+      const retryable = plan.retryPolicy?.retryableStatuses ?? defaultRetryableStatuses;
+      if (!retryable.includes(error.providerStatus)) throw error;
+      error = new ProviderAttemptError(error.message, {
+        status: error.providerStatus,
+        retryAfterMs: error.retryAfterMs,
+      });
+    }
     if (error instanceof ProviderAttemptError && error.options.status !== undefined) {
       const retryable = plan.retryPolicy?.retryableStatuses ?? defaultRetryableStatuses;
       if (!retryable.includes(error.options.status)) {
@@ -990,6 +1054,216 @@ export class ProviderExecutionEngine {
             observed.outputTokens = 0;
             observed.tokenSource = "provider";
             metrics.set(key(candidate.id, context), observed);
+            return result;
+          } catch (error) {
+            this.#normalizeError(error, plan);
+          }
+        },
+      });
+    } catch (error) {
+      this.#normalizeError(error, plan);
+    }
+  }
+
+  async audio(
+    endpoint: AudioEndpoint,
+    sourceModelId: string,
+    usageRunId: string,
+    ownerLeaseToken: string,
+    request: AudioRequest,
+    signal: AbortSignal,
+    frozenPlan?: ProviderExecutionPlan,
+  ): Promise<AudioProviderResponse> {
+    const capability = endpoint === "transcriptions" ? "transcription" : "translation";
+    const { plan, candidates } = await this.#prepare(sourceModelId, frozenPlan, capability);
+    const claim = await this.#repository.claimProviderExecution(usageRunId, ownerLeaseToken);
+    const remainingAttempts = policyFor(plan, undefined, this.#slowStream).maxAttempts -
+      claim.consumedAttempts;
+    const metrics = new Map<string, AttemptMetrics>();
+    const upstreams = new Map<string, UpstreamStreamOptions>();
+    const onAttempt = this.#telemetry(
+      usageRunId,
+      ownerLeaseToken,
+      claim,
+      plan,
+      metrics,
+      estimateAudioInputTokens(request),
+    );
+    if (request.stream) {
+      let resilienceVisibility = createAudioTranscriptVisibility();
+      let resolveUsage!: (usage: AudioProviderUsage) => void;
+      let rejectUsage!: (error: unknown) => void;
+      let resolveTerminal!: (frame: Uint8Array) => void;
+      let rejectTerminal!: (error: unknown) => void;
+      const usage = new Promise<AudioProviderUsage>(
+        (resolve, reject) => {
+          resolveUsage = resolve;
+          rejectUsage = reject;
+        },
+      );
+      void usage.catch(() => undefined);
+      const terminalFrame = new Promise<Uint8Array>((resolve, reject) => {
+        resolveTerminal = resolve;
+        rejectTerminal = reject;
+      });
+      void terminalFrame.catch(() => undefined);
+      let finalUsage: AudioProviderUsage = {
+        inputTokens: 0,
+        outputTokens: 0,
+        source: "estimated",
+      };
+      const stream = (async function* (engine: ProviderExecutionEngine) {
+        let usageSettled = false;
+        let terminalSettled = false;
+        let terminal: Uint8Array | undefined;
+        try {
+          const orchestrated = streamProviderRequest<Uint8Array>({
+            initialCandidateId: plan.targets[0].providerModelId,
+            resolveCandidate: (id) => candidates.get(id),
+            policy: policyFor(plan, remainingAttempts, engine.#slowStream),
+            signal,
+            circuitStore: engine.#circuitStore(candidates),
+            onAttempt,
+            visibleUnits: (frame) => audioFrameVisibleUnits(frame, resilienceVisibility),
+            allowNoVisibleOutput: true,
+            beforeAttempt: async (candidate, _signal, context) => {
+              resilienceVisibility = createAudioTranscriptVisibility();
+              upstreams.set(
+                key(candidate.id, context),
+                await engine.#upstreamFor(candidates.get(candidate.id)!),
+              );
+            },
+            attempt: async function* (candidate, attemptSignal, context) {
+              try {
+                const upstream = upstreams.get(key(candidate.id, context));
+                upstreams.delete(key(candidate.id, context));
+                if (!upstream?.baseUrl || !upstream.apiKey || !upstream.upstreamModel) {
+                  throw new Error("Provider dispatch options are missing");
+                }
+                const observed = metrics.get(key(candidate.id, context)) ?? emptyMetrics(0);
+                observed.dispatched = true;
+                metrics.set(key(candidate.id, context), observed);
+                const result = await createAudioTranscription(endpoint, request, {
+                  baseUrl: upstream.baseUrl,
+                  apiKey: upstream.apiKey,
+                  upstreamModel: upstream.upstreamModel,
+                  signal: attemptSignal,
+                  fetch: engine.#audioFetch,
+                });
+                if (!result.stream || !result.usage) {
+                  throw new Error("Provider dispatch did not return an audio stream");
+                }
+                for await (const frame of result.stream) {
+                  const visibility = observeAudioTranscriptFrame(
+                    new TextDecoder("utf-8", { fatal: true }).decode(frame),
+                    observed.audioVisibility,
+                  );
+                  const visibleUnits = visibility.newVisibleCharacters;
+                  if (visibleUnits > 0 && observed.firstVisibleAt === null) {
+                    observed.firstVisibleAt = engine.#now();
+                  }
+                  observed.visibleCharacters = visibility.totalCharacters;
+                  reconcileObservedTokens(observed);
+                  yield frame;
+                }
+                const providerUsage = await result.usage;
+                validateAudioUsagePricing(
+                  providerUsage,
+                  candidates.get(candidate.id)!.target.pricing,
+                );
+                observed.providerInputTokens = providerUsage.inputTokens;
+                observed.providerOutputTokens = providerUsage.outputTokens;
+                observed.inputTokens = providerUsage.inputTokens;
+                observed.outputTokens = providerUsage.outputTokens;
+                observed.tokenSource = providerUsage.source === "estimated"
+                  ? "estimated"
+                  : providerUsage.source === "provider_tokens"
+                  ? "provider"
+                  : "none";
+                finalUsage = providerUsage;
+              } catch (error) {
+                engine.#normalizeError(error, plan);
+              }
+            },
+          });
+          for await (const frame of orchestrated) {
+            if (audioFrameType(frame) === "transcript.text.done") terminal = frame;
+            else yield frame;
+          }
+          if (!terminal) throw new Error("Provider stream terminal event is missing");
+          usageSettled = true;
+          resolveUsage(finalUsage);
+          terminalSettled = true;
+          resolveTerminal(terminal);
+        } catch (error) {
+          usageSettled = true;
+          rejectUsage(error);
+          terminalSettled = true;
+          rejectTerminal(error);
+          throw error;
+        } finally {
+          if (!usageSettled) {
+            rejectUsage(new DOMException("Audio stream consumer disconnected", "AbortError"));
+          }
+          if (!terminalSettled) {
+            rejectTerminal(new DOMException("Audio stream consumer disconnected", "AbortError"));
+          }
+        }
+      })(this);
+      return { contentType: "text/event-stream", stream, terminalFrame, usage };
+    }
+    try {
+      return await executeProviderRequest({
+        initialCandidateId: plan.targets[0].providerModelId,
+        resolveCandidate: (id) => candidates.get(id),
+        policy: policyFor(plan, remainingAttempts, this.#slowStream),
+        signal,
+        circuitStore: this.#circuitStore(candidates),
+        onAttempt,
+        beforeAttempt: async (candidate, _signal, context) => {
+          upstreams.set(
+            key(candidate.id, context),
+            await this.#upstreamFor(candidates.get(candidate.id)!),
+          );
+        },
+        attempt: async (candidate, attemptSignal, context) => {
+          try {
+            const upstream = upstreams.get(key(candidate.id, context));
+            upstreams.delete(key(candidate.id, context));
+            if (!upstream?.baseUrl || !upstream.apiKey || !upstream.upstreamModel) {
+              throw new Error("Provider dispatch options are missing");
+            }
+            const observed = metrics.get(key(candidate.id, context)) ?? emptyMetrics(0);
+            observed.dispatched = true;
+            observed.inputTokens = 0;
+            observed.outputTokens = 0;
+            observed.tokenSource = "none";
+            metrics.set(key(candidate.id, context), observed);
+            const result = await createAudioTranscription(endpoint, request, {
+              baseUrl: upstream.baseUrl,
+              apiKey: upstream.apiKey,
+              upstreamModel: upstream.upstreamModel,
+              signal: attemptSignal,
+              fetch: this.#audioFetch,
+            });
+            const providerUsage = await result.usage ?? {
+              inputTokens: 0,
+              outputTokens: 0,
+              source: "estimated" as const,
+            };
+            validateAudioUsagePricing(
+              providerUsage,
+              candidates.get(candidate.id)!.target.pricing,
+            );
+            observed.providerInputTokens = providerUsage.inputTokens;
+            observed.providerOutputTokens = providerUsage.outputTokens;
+            observed.inputTokens = providerUsage.inputTokens;
+            observed.outputTokens = providerUsage.outputTokens;
+            observed.tokenSource = providerUsage.source === "estimated"
+              ? "estimated"
+              : providerUsage.source === "provider_tokens"
+              ? "provider"
+              : "none";
             return result;
           } catch (error) {
             this.#normalizeError(error, plan);

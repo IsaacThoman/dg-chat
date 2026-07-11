@@ -13,12 +13,92 @@ if not api_key:
 client = OpenAI(api_key=api_key, base_url=base_url, max_retries=0)
 model = "openai/mock-fast"
 embedding_model = "contracts/mock-embedding"
+audio_model = "contracts/mock-transcribe"
+
+
+def wav_file() -> bytes:
+    # Minimal PCM WAV with one 16-bit sample; enough to exercise MIME sniffing and multipart clients.
+    return (
+        b"RIFF" + (38).to_bytes(4, "little") + b"WAVEfmt "
+        + (16).to_bytes(4, "little") + (1).to_bytes(2, "little")
+        + (1).to_bytes(2, "little") + (8000).to_bytes(4, "little")
+        + (16000).to_bytes(4, "little") + (2).to_bytes(2, "little")
+        + (16).to_bytes(2, "little") + b"data" + (2).to_bytes(4, "little")
+        + b"\x00\x00"
+    )
 
 models = client.models.list()
 if not any(candidate.id == "openai/default" for candidate in models.data):
     raise RuntimeError("Official Python client did not receive the configured upstream model")
 if not any(candidate.id == embedding_model for candidate in models.data):
     raise RuntimeError("Official Python client did not receive the embeddings model")
+if not any(candidate.id == audio_model for candidate in models.data):
+    raise RuntimeError("Official Python client did not receive the transcription model")
+
+transcription = client.audio.transcriptions.create(
+    file=("python-contract.wav", io.BytesIO(wav_file()), "audio/wav"),
+    model=audio_model,
+)
+if transcription.text != "Mock transcription":
+    raise RuntimeError("Python audio.transcriptions.create() returned an invalid response")
+
+transcription_stream = client.audio.transcriptions.create(
+    file=("python-stream.wav", io.BytesIO(wav_file()), "audio/wav"),
+    model=audio_model,
+    stream=True,
+    include=["logprobs"],
+)
+streamed_transcription = ""
+transcription_usage = 0
+for event in transcription_stream:
+    if event.type == "transcript.text.delta":
+        streamed_transcription += event.delta
+    elif event.type == "transcript.text.done":
+        transcription_usage = event.usage.total_tokens if event.usage else 0
+if streamed_transcription != "Mock " or transcription_usage != 5:
+    raise RuntimeError("Python streaming transcription contract was invalid")
+
+diarized = client.audio.transcriptions.create(
+    file=("python-diarized.wav", io.BytesIO(wav_file()), "audio/wav"),
+    model=audio_model,
+    response_format="diarized_json",
+    chunking_strategy="auto",
+    extra_body={
+        "known_speaker_names": ["agent"],
+        "known_speaker_references": ["data:audio/wav;base64,UklGRg=="],
+    },
+)
+if diarized.text != "Mock transcription" or diarized.segments[0].speaker != "agent":
+    raise RuntimeError("Python diarized transcription contract was invalid")
+
+replay_key = f"python-audio-{uuid.uuid4()}"
+def create_translation():
+    return client.audio.translations.create(
+        file=("python-translation.wav", io.BytesIO(wav_file()), "audio/wav"),
+        model=audio_model,
+        extra_headers={"Idempotency-Key": replay_key},
+    )
+
+first_translation = create_translation()
+replayed_translation = create_translation()
+if (
+    first_translation.text != "Mock translation"
+    or replayed_translation.text != first_translation.text
+):
+    raise RuntimeError("Python audio.translations.create() or its idempotent replay was invalid")
+try:
+    client.audio.transcriptions.create(
+        file=("python-invalid.wav", io.BytesIO(wav_file()), "audio/wav"),
+        model=audio_model,
+        language="not_a_language",
+    )
+except Exception as error:
+    if getattr(error, "status_code", None) != 422:
+        raise RuntimeError(
+            "Python malformed audio request did not return a compatible 422"
+        ) from error
+else:
+    raise RuntimeError("Python malformed audio request was accepted")
 
 embeddings = client.embeddings.create(
     model=embedding_model,

@@ -82,6 +82,17 @@ curl --fail --silent --show-error --request POST \
   --header "origin: $web_origin" --cookie "$CONTRACT_SESSION_COOKIE" \
   --data "{\"providerModelId\":\"$model_id\",\"expectedModelVersion\":$model_version,\"effectiveAt\":\"2020-01-01T00:00:00.000Z\",\"inputMicrosPerMillion\":100000,\"cachedInputMicrosPerMillion\":100000,\"reasoningMicrosPerMillion\":0,\"outputMicrosPerMillion\":0,\"fixedCallMicros\":10,\"source\":\"contract\"}" >/dev/null
 
+audio_model="$(curl --fail --silent --show-error --request POST \
+  "$api_url/api/admin/models" --header 'content-type: application/json' \
+  --header "origin: $web_origin" --cookie "$CONTRACT_SESSION_COOKIE" \
+  --data "{\"providerId\":\"$provider_id\",\"publicModelId\":\"contracts/mock-transcribe\",\"upstreamModelId\":\"mock-transcribe\",\"displayName\":\"Contract Mock Audio\",\"capabilities\":[\"transcription\",\"translation\"],\"contextWindow\":8192}")"
+audio_model_id="$(jq --raw-output '.id' <<<"$audio_model")"
+audio_model_version="$(jq --raw-output '.version' <<<"$audio_model")"
+curl --fail --silent --show-error --request POST \
+  "$api_url/api/admin/models/$audio_model_id/prices" --header 'content-type: application/json' \
+  --header "origin: $web_origin" --cookie "$CONTRACT_SESSION_COOKIE" \
+  --data "{\"providerModelId\":\"$audio_model_id\",\"expectedModelVersion\":$audio_model_version,\"effectiveAt\":\"2020-01-01T00:00:00.000Z\",\"inputMicrosPerMillion\":0,\"cachedInputMicrosPerMillion\":0,\"reasoningMicrosPerMillion\":0,\"outputMicrosPerMillion\":0,\"fixedCallMicros\":10,\"source\":\"contract\"}" >/dev/null
+
 echo "Explicitly unsupported contract TODOs:"
 jq --raw-output '.[] | "TODO  \(.endpoint): \(.reason)"' \
   tests/contracts/unsupported-contracts.json
@@ -93,6 +104,19 @@ venv="${CONTRACT_PYTHON_VENV:-/tmp/dg-chat-openai-contract-venv}"
 python3 -m venv "$venv"
 "$venv/bin/python" -m pip install --quiet --disable-pip-version-check openai==2.15.0
 "$venv/bin/python" tests/contracts/openai_python.py
+
+audio_state="$(mock_request GET /__test/state)"
+jq -e '
+  .audio.calls == 8 and
+  .audio.sawStream == true and
+  .audio.sawDiarization == true and
+  .audio.lastAuthorized == true and
+  .audio.lastEndpoint == "translations" and
+  .audio.lastModel == "mock-transcribe" and
+  .audio.lastMime == "audio/wav" and
+  .audio.lastBytes == 46
+' <<<"$audio_state" >/dev/null
+echo "Official SDK audio multipart and idempotent replay contracts passed"
 
 deno run --no-config --allow-env --allow-net \
   tests/contracts/upstream-stream.ts

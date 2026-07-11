@@ -39,6 +39,13 @@ Uploads default to 25 MiB with at most four concurrent uploads per application r
 user. Tune `UPLOAD_MAX_BYTES`, `UPLOAD_MAX_CONCURRENT`, and `UPLOAD_MAX_CONCURRENT_PER_USER` while
 keeping the application `/tmp` tmpfs large enough for the resulting worst-case staged bytes.
 
+Audio transcription is independently bounded to 25 MiB per request and defaults to four active
+requests across all API replicas, with two per user. Tune `AUDIO_MAX_CONCURRENT` and
+`AUDIO_MAX_CONCURRENT_PER_USER` together; the per-user value must not exceed the global value.
+Redis-backed admission uses renewable, crash-safe leases. `AUDIO_CONCURRENCY_LEASE_SECONDS` defaults
+to 120 seconds; keep it comfortably longer than transient Redis outages. Each active request keeps a
+validated audio body and a bounded retry body in memory.
+
 For an external object store, set `S3_ENDPOINT`, `S3_REGION`, and `S3_FORCE_PATH_STYLE` as required
 by that service in addition to the bucket and scoped credentials.
 

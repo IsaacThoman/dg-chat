@@ -63,6 +63,16 @@ import {
 } from "@dg-chat/database";
 import { hashPassword, randomToken, sha256, sha256Hex, verifyPassword } from "./crypto.ts";
 import { createEmbeddings, EmbeddingsProviderError, type ProviderFetch } from "./embeddings.ts";
+import { AudioProviderError, type AudioRequest, estimateAudioInputTokens } from "./audio.ts";
+import {
+  createAudioTranscriptVisibility,
+  observeAudioTranscriptFrame,
+} from "./audio-stream-accounting.ts";
+import { parseAudioMultipart } from "./audio-multipart.ts";
+import {
+  type AudioConcurrencyLimiter,
+  MemoryAudioConcurrencyLimiter,
+} from "./audio-concurrency.ts";
 import {
   complete,
   models,
@@ -179,6 +189,8 @@ export interface AppOptions {
   providerKeyring?: ProviderSecretKeyring;
   providerDiscoveryFetch?: typeof fetch;
   embeddingsFetch?: ProviderFetch;
+  audioFetch?: typeof fetch;
+  audioConcurrencyLimiter?: AudioConcurrencyLimiter;
   circuitBreaker?: CircuitBreaker;
   breakerPolicy?: BreakerPolicy;
   providerSlowStream?: {
@@ -382,6 +394,24 @@ const canonicalJson = (value: unknown): string => {
 };
 const sseData = (data: string, event?: string) =>
   `${event ? `event: ${event}\n` : ""}data: ${data}\n\n`;
+
+const assertPublicAudioUsagePricing = (
+  model: ModelInfo,
+  usage: { source: string },
+) => {
+  if (
+    usage.source === "provider_duration" &&
+    ((model.fixedCallMicros ?? 0) <= 0 || model.inputMicrosPerMillion > 0 ||
+      (model.cachedInputMicrosPerMillion ?? 0) > 0 ||
+      (model.reasoningMicrosPerMillion ?? 0) > 0 || model.outputMicrosPerMillion > 0)
+  ) {
+    throw new AudioProviderError(
+      "Duration usage requires fixed-call-only public model pricing",
+      502,
+      "unsupported_audio_usage",
+    );
+  }
+};
 const chunkUtf8 = (value: string, maxBytes = 16 * 1024, maxChunks = 512): string[] => {
   const bytes = new TextEncoder().encode(value);
   if (bytes.length === 0) return [];
@@ -751,6 +781,8 @@ export function createApp(options: AppOptions = {}) {
   const repo = options.repository ?? new MemoryRepository();
   const objectStore = options.objectStore;
   const rateLimiter = options.rateLimiter ?? new MemoryRateLimiter();
+  const audioConcurrencyLimiter = options.audioConcurrencyLimiter ??
+    new MemoryAudioConcurrencyLimiter();
   const providerStream = options.providerStream ?? streamChatCompletion;
   const providerComplete = options.providerComplete ?? complete;
   const idempotencyHeartbeatMs = Math.max(10, options.idempotencyHeartbeatMs ?? 30_000);
@@ -816,6 +848,25 @@ export function createApp(options: AppOptions = {}) {
   }
   let activeUploads = 0;
   const activeUploadsByUser = new Map<string, number>();
+  const audioMaxConcurrent = positiveInteger("AUDIO_MAX_CONCURRENT", 4);
+  const audioMaxConcurrentPerUser = positiveInteger("AUDIO_MAX_CONCURRENT_PER_USER", 2);
+  if (audioMaxConcurrentPerUser > audioMaxConcurrent) {
+    throw new Error("AUDIO_MAX_CONCURRENT_PER_USER cannot exceed AUDIO_MAX_CONCURRENT");
+  }
+  const claimAudioSlot = async (ownerId: string) => {
+    const lease = await audioConcurrencyLimiter.acquire(ownerId, {
+      global: audioMaxConcurrent,
+      perUser: audioMaxConcurrentPerUser,
+    });
+    if (!lease) {
+      throw new DomainError(
+        "audio_capacity_exceeded",
+        "Too many audio requests are in progress",
+        429,
+      );
+    }
+    return lease;
+  };
   const attachmentContextMaxRawBytes = options.attachmentContextMaxRawBytes ??
     positiveInteger("ATTACHMENT_CONTEXT_MAX_RAW_BYTES", 16 * 1024 * 1024);
   if (!Number.isSafeInteger(attachmentContextMaxRawBytes) || attachmentContextMaxRawBytes < 1) {
@@ -884,6 +935,7 @@ export function createApp(options: AppOptions = {}) {
       complete: providerComplete,
       stream: providerStream,
       embeddingsFetch: options.embeddingsFetch,
+      audioFetch: options.audioFetch,
       slowStream: providerSlowStream,
       ocrCache: options.ocrCache,
     })
@@ -1061,7 +1113,9 @@ export function createApp(options: AppOptions = {}) {
     const registry = await Promise.all(
       (await repo.listProviderModels(undefined, true)).map(async (model) => {
         const resolved = await resolveRuntimeModel(model.publicModelId) ??
-          await resolveEmbeddingsRuntimeModel(model.publicModelId);
+          await resolveEmbeddingsRuntimeModel(model.publicModelId) ??
+          await resolveAudioRuntimeModel(model.publicModelId, "transcription") ??
+          await resolveAudioRuntimeModel(model.publicModelId, "translation");
         return resolved?.registryModel ? resolved.info : undefined;
       }),
     );
@@ -1076,7 +1130,7 @@ export function createApp(options: AppOptions = {}) {
     const builtIn = modelCatalog.find((candidate) => candidate.id === id);
     if (builtIn) return { info: builtIn };
     const model = await repo.findProviderModel(id);
-    if (!model?.enabled) return undefined;
+    if (!model?.enabled || !model.capabilities.includes("chat")) return undefined;
     const provider = await repo.findProvider(model.providerId);
     if (
       !provider?.enabled || !provider.hasCredential || provider.protocol !== "chat_completions" ||
@@ -1129,6 +1183,28 @@ export function createApp(options: AppOptions = {}) {
       upstream: { baseUrl: provider.baseUrl, apiKey, upstreamModel: model.upstreamModelId },
     };
   };
+  const resolveAudioRuntimeModel = async (
+    id: string,
+    capability: "transcription" | "translation",
+  ): Promise<RuntimeModel | undefined> => {
+    const model = await repo.findProviderModel(id);
+    if (!model?.enabled || !model.capabilities.includes(capability)) return undefined;
+    const provider = await repo.findProvider(model.providerId);
+    if (!provider?.enabled || !provider.hasCredential || !providerKeyring) return undefined;
+    const credential = await repo.getProviderCredential(provider.id);
+    if (!credential) return undefined;
+    try {
+      await providerKeyring.decrypt(
+        provider.id,
+        credential.envelope as unknown as ProviderSecretEnvelope,
+      );
+    } catch {
+      return undefined;
+    }
+    const resolved = await registryModelInfo(model, provider);
+    if (!resolved.price) return undefined;
+    return resolved;
+  };
   let bootstrapInProgress = false;
   const app = new Hono<{ Variables: Variables }>();
   app.use("*", logger());
@@ -1154,7 +1230,13 @@ export function createApp(options: AppOptions = {}) {
   app.use(
     "/v1/*",
     (c, next) =>
-      c.req.path === "/v1/files" && c.req.method === "POST" ? next() : openAIBodyLimit(c, next),
+      c.req.method === "POST" && [
+          "/v1/files",
+          "/v1/audio/transcriptions",
+          "/v1/audio/translations",
+        ].includes(c.req.path)
+        ? next()
+        : openAIBodyLimit(c, next),
   );
   app.use(
     "*",
@@ -1175,7 +1257,8 @@ export function createApp(options: AppOptions = {}) {
     );
     const generationRoute = c.req.method === "POST" &&
       (path.endsWith("/generate") || path === "/v1/chat/completions" ||
-        path === "/v1/responses" || path.endsWith("/active-leaf"));
+        path === "/v1/responses" || path.startsWith("/v1/audio/") ||
+        path.endsWith("/active-leaf"));
     const providerAdminRoute = c.req.method !== "GET" && (
       path.startsWith("/api/admin/providers") || path.startsWith("/api/admin/models") ||
       path.startsWith("/api/admin/resilience")
@@ -4721,17 +4804,6 @@ export function createApp(options: AppOptions = {}) {
     }
   });
   app.post(
-    "/v1/embeddings",
-    requireScope("chat:write"),
-    (c) =>
-      c.json({
-        object: "list",
-        data: [],
-        model: "not-configured",
-        usage: { prompt_tokens: 0, total_tokens: 0 },
-      }, 501),
-  );
-  app.post(
     "/v1/images/generations",
     requireScope("chat:write"),
     (c) =>
@@ -4740,20 +4812,451 @@ export function createApp(options: AppOptions = {}) {
         501,
       ),
   );
+  const audioHandler = (endpoint: "transcriptions" | "translations") =>
+  async (
+    c: Context<{ Variables: Variables }>,
+  ) => {
+    let audioSlot: Awaited<ReturnType<typeof claimAudioSlot>> | undefined;
+    let audioSignal = c.req.raw.signal;
+    let audioSlotDeferred = false;
+    try {
+      const request = await parseAudioMultipart(c.req.raw, endpoint);
+      const capability = endpoint === "transcriptions" ? "transcription" : "translation";
+      const requestIdentity: Omit<AudioRequest, "file" | "filename"> = {
+        model: request.model,
+        mime: request.mime,
+        fileSha256: request.fileSha256,
+        responseFormat: request.responseFormat,
+        ...(request.language !== undefined ? { language: request.language } : {}),
+        ...(request.prompt !== undefined ? { prompt: request.prompt } : {}),
+        ...(request.temperature !== undefined ? { temperature: request.temperature } : {}),
+        ...(request.timestampGranularities !== undefined
+          ? { timestampGranularities: request.timestampGranularities }
+          : {}),
+        ...(request.stream !== undefined ? { stream: request.stream } : {}),
+        ...(request.include !== undefined ? { include: request.include } : {}),
+        ...(request.chunkingStrategy !== undefined
+          ? { chunkingStrategy: request.chunkingStrategy }
+          : {}),
+        ...(request.knownSpeakerNames !== undefined
+          ? { knownSpeakerNames: request.knownSpeakerNames }
+          : {}),
+        ...(request.knownSpeakerReferences !== undefined
+          ? { knownSpeakerReferences: request.knownSpeakerReferences }
+          : {}),
+      };
+      const endpointKey = endpoint === "transcriptions"
+        ? "audio.transcriptions"
+        : "audio.translations";
+      const idempotencyKey = c.req.header("idempotency-key");
+      if (idempotencyKey) {
+        if (idempotencyKey.length < 8 || idempotencyKey.length > 200) {
+          throw new DomainError(
+            "invalid_idempotency_key",
+            "Idempotency-Key must contain between 8 and 200 characters",
+            400,
+          );
+        }
+        const existing = await repo.getApiRequest(
+          c.get("user").id,
+          endpointKey,
+          idempotencyKey,
+        );
+        if (existing) {
+          const requestHash = await sha256Hex(canonicalJson({
+            endpoint: endpointKey,
+            request: requestIdentity,
+          }));
+          if (existing.requestHash !== requestHash || existing.stream !== Boolean(request.stream)) {
+            throw new DomainError("idempotency_conflict", "Idempotency key payload differs", 409);
+          }
+          if (existing.state !== "in_progress") return replayResponse(existing);
+          return new Response(
+            JSON.stringify(
+              openAIError("An identical request is still in progress", "idempotency_in_progress"),
+            ),
+            {
+              status: 409,
+              headers: {
+                "content-type": "application/json",
+                "retry-after": String(Math.max(
+                  1,
+                  Math.ceil((Date.parse(existing.leaseExpiresAt ?? "") - Date.now()) / 1_000) || 1,
+                )),
+              },
+            },
+          );
+        }
+      }
+      const resolved = await resolveAudioRuntimeModel(request.model, capability);
+      const model = resolved?.info;
+      if (!model || !resolved?.registryModel || !providerExecution) {
+        return c.json(
+          openAIError(`Model '${request.model}' does not exist`, "model_not_found"),
+          404,
+        );
+      }
+      const providerPlan = await providerExecution.resolvePlan(resolved.registryModel.id);
+      // Audio token counts are only known after transcription. Reserve against the configured
+      // model ceiling so provider-reported usage can never create an unreserved debit.
+      const reserveMicros = providerExecution.reservationMicros(
+        providerPlan,
+        Math.max(model.contextWindow, estimateAudioInputTokens(request)),
+        model.contextWindow,
+      );
+      const usage = await beginOpenAIUsage(
+        c,
+        endpointKey,
+        requestIdentity,
+        model,
+        reserveMicros,
+        resolved.price,
+      );
+      if (usage.kind === "replay") return usage.response;
+      const { runId, idempotency, executionLeaseToken, runLease } = usage;
+      try {
+        audioSlot = await claimAudioSlot(c.get("user").id);
+      } catch (error) {
+        const domain = error instanceof DomainError ? error : undefined;
+        const status = domain?.status === 429 ? 429 : 503;
+        const code = status === 429
+          ? domain?.code ?? "audio_capacity_exceeded"
+          : "service_unavailable";
+        const message = status === 429
+          ? domain?.message ?? "Too many audio requests are in progress"
+          : "Audio admission is temporarily unavailable";
+        const responseBody = JSON.stringify(openAIError(message, code));
+        if (idempotency) {
+          await repo.failApiRequest({
+            id: idempotency.id,
+            leaseToken: idempotency.leaseToken,
+            responseStatus: status,
+            responseHeaders: { "content-type": "application/json", "retry-after": "5" },
+            responseBody,
+            billing: { mode: "refund" },
+          });
+        } else await repo.refund(runId);
+        return new Response(responseBody, {
+          status,
+          headers: { "content-type": "application/json", "retry-after": "5" },
+        });
+      }
+      const activeAudioSlot = audioSlot;
+      audioSignal = AbortSignal.any([c.req.raw.signal, activeAudioSlot.signal]);
+      if (activeAudioSlot.signal.aborted) {
+        const responseBody = JSON.stringify(
+          openAIError(
+            "Audio admission lease expired before provider dispatch",
+            "service_unavailable",
+          ),
+        );
+        if (idempotency) {
+          await repo.failApiRequest({
+            id: idempotency.id,
+            leaseToken: idempotency.leaseToken,
+            responseStatus: 503,
+            responseHeaders: { "content-type": "application/json", "retry-after": "5" },
+            responseBody,
+            billing: { mode: "refund" },
+          });
+        } else await repo.refund(runId);
+        return new Response(responseBody, {
+          status: 503,
+          headers: { "content-type": "application/json", "retry-after": "5" },
+        });
+      }
+      const lease = keepApiLeaseAlive(
+        idempotency,
+        runLease ? { runId, leaseToken: executionLeaseToken } : undefined,
+      );
+      let leaseDeferred = false;
+      const started = performance.now();
+      let terminalAccounting = false;
+      try {
+        const result = await providerExecution.audio(
+          endpoint,
+          resolved.registryModel.id,
+          runId,
+          executionLeaseToken,
+          request,
+          audioSignal,
+          providerPlan,
+        );
+        if (request.stream) {
+          if (!result.stream || !result.usage || !result.terminalFrame) {
+            throw new AudioProviderError("Audio provider did not return a stream");
+          }
+          leaseDeferred = true;
+          audioSlotDeferred = true;
+          return streamSSE(c, async (stream) => {
+            let sequence = 0;
+            let settled = false;
+            let visibleCharacters = 0;
+            const transcriptVisibility = createAudioTranscriptVisibility();
+            try {
+              for await (const frameBytes of result.stream!) {
+                if (stream.aborted || audioSignal.aborted) {
+                  throw new DOMException("Client disconnected", "AbortError");
+                }
+                const frame = new TextDecoder("utf-8", { fatal: true }).decode(frameBytes);
+                visibleCharacters = observeAudioTranscriptFrame(frame, transcriptVisibility)
+                  .totalCharacters;
+                if (idempotency) {
+                  await repo.appendApiSseFrame(
+                    idempotency.id,
+                    idempotency.leaseToken,
+                    sequence++,
+                    frame,
+                    undefined,
+                    undefined,
+                    replayQuota,
+                  );
+                }
+                await stream.write(frame);
+              }
+              const observed = await result.usage!;
+              assertPublicAudioUsagePricing(model, observed);
+              const terminalFrame = new TextDecoder("utf-8", { fatal: true }).decode(
+                await result.terminalFrame!,
+              );
+              const latencyMs = Math.round(performance.now() - started);
+              const costMicros = priceUsage(
+                model,
+                observed.inputTokens,
+                observed.outputTokens,
+              ).costMicros;
+              await lease.checkpoint({ ...observed, costMicros, latencyMs });
+              if (idempotency) {
+                await repo.completeApiStream({
+                  id: idempotency.id,
+                  leaseToken: idempotency.leaseToken,
+                  responseStatus: 200,
+                  responseHeaders: {
+                    "content-type": "text/event-stream",
+                    "cache-control": "no-cache",
+                  },
+                  terminalFrame,
+                  costMicros,
+                  inputTokens: observed.inputTokens,
+                  outputTokens: observed.outputTokens,
+                  latencyMs,
+                  quota: replayQuota,
+                });
+              } else {
+                await repo.settle(
+                  runId,
+                  costMicros,
+                  observed.inputTokens,
+                  observed.outputTokens,
+                  latencyMs,
+                );
+              }
+              terminalAccounting = true;
+              settled = true;
+              if (!stream.aborted && !c.req.raw.signal.aborted) {
+                await stream.write(terminalFrame);
+              }
+            } catch {
+              if (!settled) {
+                const cancelled = c.req.raw.signal.aborted || stream.aborted;
+                const leaseLost = activeAudioSlot.signal.aborted && !c.req.raw.signal.aborted;
+                const partialInputTokens = estimateAudioInputTokens(request);
+                const partialOutputTokens = Math.ceil(visibleCharacters / 4);
+                const partialCostMicros = priceUsage(
+                  model,
+                  partialInputTokens,
+                  partialOutputTokens,
+                ).costMicros;
+                const latencyMs = Math.round(performance.now() - started);
+                const errorFrame = `data: ${
+                  JSON.stringify(openAIError(
+                    cancelled
+                      ? "Request cancelled"
+                      : leaseLost
+                      ? "Audio admission lease was lost"
+                      : "Audio provider stream failed",
+                    cancelled
+                      ? "request_cancelled"
+                      : leaseLost
+                      ? "service_unavailable"
+                      : "provider_error",
+                  ))
+                }\n\n`;
+                if (idempotency) {
+                  await repo.failApiRequest({
+                    id: idempotency.id,
+                    leaseToken: idempotency.leaseToken,
+                    // Hono has committed the SSE response before this callback begins. Persist
+                    // the same public status and terminal event even when every upstream fails
+                    // before producing its first valid transcription event.
+                    responseStatus: 200,
+                    responseHeaders: {
+                      "content-type": "text/event-stream",
+                      "cache-control": "no-cache",
+                    },
+                    responseBody: JSON.stringify(openAIError(
+                      cancelled
+                        ? "Request cancelled"
+                        : leaseLost
+                        ? "Audio admission lease was lost"
+                        : "Audio provider stream failed",
+                      cancelled
+                        ? "request_cancelled"
+                        : leaseLost
+                        ? "service_unavailable"
+                        : "provider_error",
+                    )),
+                    terminalFrame: errorFrame,
+                    billing: visibleCharacters > 0
+                      ? {
+                        mode: "settle",
+                        costMicros: partialCostMicros,
+                        inputTokens: partialInputTokens,
+                        outputTokens: partialOutputTokens,
+                        latencyMs,
+                      }
+                      : { mode: "refund" },
+                  });
+                } else if (visibleCharacters > 0) {
+                  await repo.settle(
+                    runId,
+                    partialCostMicros,
+                    partialInputTokens,
+                    partialOutputTokens,
+                    latencyMs,
+                  );
+                } else await repo.refund(runId);
+                terminalAccounting = true;
+                if (!cancelled) await stream.write(errorFrame);
+              }
+            } finally {
+              await lease.stop();
+              await activeAudioSlot.release().catch(() => undefined);
+            }
+          });
+        }
+        const latencyMs = Math.round(performance.now() - started);
+        const observed = await result.usage ?? {
+          inputTokens: estimateAudioInputTokens(request),
+          outputTokens: 0,
+          source: "estimated" as const,
+        };
+        assertPublicAudioUsagePricing(model, observed);
+        const costMicros =
+          priceUsage(model, observed.inputTokens, observed.outputTokens).costMicros;
+        await lease.checkpoint({ ...observed, costMicros, latencyMs });
+        if (!result.body) throw new AudioProviderError("Audio provider returned an empty response");
+        const responseBody = new TextDecoder("utf-8", { fatal: true }).decode(result.body);
+        if (idempotency) {
+          try {
+            await repo.completeApiJson({
+              id: idempotency.id,
+              leaseToken: idempotency.leaseToken,
+              responseStatus: 200,
+              responseHeaders: { "content-type": result.contentType },
+              responseBody,
+              costMicros,
+              inputTokens: observed.inputTokens,
+              outputTokens: observed.outputTokens,
+              latencyMs,
+              quota: replayQuota,
+            });
+            terminalAccounting = true;
+          } catch (persistenceError) {
+            await repo.failApiRequest({
+              id: idempotency.id,
+              leaseToken: idempotency.leaseToken,
+              responseStatus: 500,
+              responseHeaders: { "content-type": "application/json" },
+              responseBody: JSON.stringify(
+                openAIError("Response replay persistence failed", "replay_persistence_error"),
+              ),
+              billing: {
+                mode: "settle",
+                costMicros,
+                inputTokens: observed.inputTokens,
+                outputTokens: observed.outputTokens,
+                latencyMs,
+              },
+            });
+            terminalAccounting = true;
+            throw persistenceError;
+          }
+        } else {
+          await repo.settle(
+            runId,
+            costMicros,
+            observed.inputTokens,
+            observed.outputTokens,
+            latencyMs,
+          );
+          terminalAccounting = true;
+        }
+        return new Response(result.body.slice().buffer, {
+          headers: { "content-type": result.contentType },
+        });
+      } catch (error) {
+        if (terminalAccounting) throw error;
+        if (error instanceof TerminalAccountingPersistenceError) throw error;
+        const cancelled = c.req.raw.signal.aborted;
+        const leaseLost = activeAudioSlot.signal.aborted && !cancelled;
+        const status = cancelled
+          ? 499
+          : leaseLost
+          ? 503
+          : error instanceof AudioProviderError
+          ? error.status
+          : 502;
+        const code = cancelled
+          ? "request_cancelled"
+          : leaseLost
+          ? "service_unavailable"
+          : error instanceof AudioProviderError
+          ? error.code
+          : "provider_error";
+        const responseBody = JSON.stringify(openAIError(
+          cancelled
+            ? "Request cancelled"
+            : leaseLost
+            ? "Audio admission lease was lost"
+            : "Audio provider request failed",
+          code,
+        ));
+        if (idempotency) {
+          await repo.failApiRequest({
+            id: idempotency.id,
+            leaseToken: idempotency.leaseToken,
+            responseStatus: status,
+            responseHeaders: { "content-type": "application/json" },
+            responseBody,
+            billing: { mode: "refund" },
+          });
+        } else await repo.refund(runId);
+        return new Response(responseBody, {
+          status,
+          headers: {
+            "content-type": "application/json",
+            ...(leaseLost ? { "retry-after": "5" } : {}),
+          },
+        });
+      } finally {
+        if (!leaseDeferred) await lease.stop();
+      }
+    } finally {
+      // Admission is already protected by an expiring lease. A transient Redis failure while
+      // releasing must not replace a successfully persisted provider response.
+      if (!audioSlotDeferred) await audioSlot?.release().catch(() => undefined);
+    }
+  };
   app.post(
     "/v1/audio/transcriptions",
     requireScope("chat:write"),
-    (c) =>
-      c.json(
-        openAIError("Transcription provider is not configured", "provider_not_configured"),
-        501,
-      ),
+    audioHandler("transcriptions"),
   );
   app.post(
     "/v1/audio/translations",
     requireScope("chat:write"),
-    (c) =>
-      c.json(openAIError("Translation provider is not configured", "provider_not_configured"), 501),
+    audioHandler("translations"),
   );
   app.post(
     "/v1/audio/speech",

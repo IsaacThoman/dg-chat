@@ -2,6 +2,25 @@ export type ApprovalStatus = "pending" | "approved" | "rejected";
 export type UserRole = "user" | "admin";
 export type AccountState = "active" | "suspended" | "deleted";
 
+/** Canonical provider-model capabilities shared by persistence, API validation, and clients. */
+export const MODEL_CAPABILITIES = [
+  "chat",
+  "streaming",
+  "vision",
+  "tools",
+  "reasoning",
+  "embeddings",
+  "audio_input",
+  "transcription",
+  "translation",
+  "speech",
+  "image_generation",
+  "image_edit",
+] as const;
+export type ModelCapability = (typeof MODEL_CAPABILITIES)[number];
+export const isModelCapability = (value: string): value is ModelCapability =>
+  (MODEL_CAPABILITIES as readonly string[]).includes(value);
+
 export interface PublicUser {
   id: string;
   email: string;
@@ -121,7 +140,7 @@ export interface ModelInfo {
   id: string;
   displayName: string;
   provider: string;
-  capabilities: string[];
+  capabilities: ModelCapability[];
   contextWindow: number;
   inputMicrosPerMillion: number;
   cachedInputMicrosPerMillion?: number;
