@@ -2140,13 +2140,16 @@ export class PostgresRepository implements DomainRepository {
           to_tsvector('simple',content),plainto_tsquery('simple',${query}),32
         )::double precision END DESC,collection_id,id
         LIMIT ${candidateLimit}
-      ), vector_candidates AS (
-        SELECT s.collection_id,s.id
-        FROM document_chunk_embeddings dce JOIN scoped s ON s.id=dce.chunk_id
+      ), vector_nearest AS MATERIALIZED (
+        SELECT dce.chunk_id
+        FROM document_chunk_embeddings dce
         WHERE ${vectorLiteral}::text IS NOT NULL AND dce.owner_id=${input.ownerId}
           AND dce.embedding_version=${input.embeddingVersion ?? ""}
-        ORDER BY dce.embedding <=> ${vectorLiteral}::vector,s.collection_id,s.id
+        ORDER BY dce.embedding <=> ${vectorLiteral}::vector
         LIMIT ${candidateLimit}
+      ), vector_candidates AS (
+        SELECT s.collection_id,s.id FROM vector_nearest vn
+        JOIN scoped s ON s.id=vn.chunk_id
       ), candidate_ids AS (
         SELECT collection_id,id FROM lexical_candidates
         UNION SELECT collection_id,id FROM vector_candidates
