@@ -111,7 +111,7 @@ console.log(JSON.stringify({ level: "info", message: "Worker started", workerId 
 if (knowledgeEmbeddingConfig) {
   await sql`INSERT INTO jobs(type,payload,idempotency_key,status,attempts,available_at)
     SELECT 'document.embed',jsonb_build_object(
-      'attachmentId',a.id,'ownerId',a.owner_id,'version',${knowledgeEmbeddingConfig.version}
+      'attachmentId',a.id,'ownerId',a.owner_id,'version',${knowledgeEmbeddingConfig.version}::text
     ),'document.embed:' || a.id || ':' || ${knowledgeEmbeddingConfig.version},'queued',0,now()
     FROM attachments a
     WHERE a.deleted_at IS NULL AND a.state='ready' AND a.ingestion_status='ready'
@@ -120,7 +120,8 @@ if (knowledgeEmbeddingConfig) {
         SELECT 1 FROM document_chunks dc WHERE dc.attachment_id=a.id AND NOT EXISTS (
           SELECT 1 FROM document_chunk_embeddings dce WHERE dce.chunk_id=dc.id
             AND dce.owner_id=a.owner_id
-            AND dce.embedding_version=${knowledgeEmbeddingConfig.version}
+            AND dce.model=${knowledgeEmbeddingConfig.model}::text
+            AND dce.embedding_version=${knowledgeEmbeddingConfig.version}::text
         )
       )
     ON CONFLICT(idempotency_key) DO UPDATE SET status='queued',attempts=0,available_at=now(),
@@ -317,7 +318,8 @@ async function processJob(
             owner_id=EXCLUDED.owner_id,content_sha256=EXCLUDED.content_sha256,
             embedding=EXCLUDED.embedding,updated_at=now()`;
         }
-        await tx`UPDATE jobs SET status='completed',completed_at=now(),locked_at=NULL,locked_by=NULL
+        await tx`UPDATE jobs SET status='completed',completed_at=now(),locked_at=NULL,locked_by=NULL,
+          last_error=NULL
           WHERE id=${job.id} AND status='running' AND locked_by=${job.claimToken}`;
         return true;
       });

@@ -36,21 +36,9 @@ export async function runAccountedEmbeddingCall<T>(options: {
     itemCount: options.content.length,
   });
   const started = performance.now();
+  let result: { value: T; inputTokens: number };
   try {
-    const result = await options.call();
-    const cost = embeddingCostMicros(result.inputTokens, options.billing);
-    const latency = Math.max(0, Math.round(performance.now() - started));
-    await options.repository.finishEmbeddingProviderAttempt({
-      usageRunId: options.usageRunId,
-      status: "succeeded",
-      inputTokens: result.inputTokens,
-      costMicros: cost,
-      tokenSource: "provider",
-      costSource: "calculated",
-      latencyMs: latency,
-    });
-    await options.repository.settle(options.usageRunId, cost, result.inputTokens, 0, latency);
-    return result.value;
+    result = await options.call();
   } catch (error) {
     const latency = Math.max(0, Math.round(performance.now() - started));
     await Promise.resolve(options.repository.finishEmbeddingProviderAttempt({
@@ -66,4 +54,19 @@ export async function runAccountedEmbeddingCall<T>(options: {
     await Promise.resolve(options.repository.refund(options.usageRunId)).catch(() => undefined);
     throw error;
   }
+  // Once the provider returned successfully, never enter the refund path. A terminal persistence
+  // error leaves the reservation intact so stale-run reconciliation charges conservatively.
+  const cost = Math.min(reserved, embeddingCostMicros(result.inputTokens, options.billing));
+  const latency = Math.max(0, Math.round(performance.now() - started));
+  await options.repository.settle(options.usageRunId, cost, result.inputTokens, 0, latency);
+  await options.repository.finishEmbeddingProviderAttempt({
+    usageRunId: options.usageRunId,
+    status: "succeeded",
+    inputTokens: result.inputTokens,
+    costMicros: cost,
+    tokenSource: "provider",
+    costSource: "calculated",
+    latencyMs: latency,
+  });
+  return result.value;
 }

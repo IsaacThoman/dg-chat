@@ -1,6 +1,7 @@
 import {
   type EmbeddingBillingConfig,
   KNOWLEDGE_EMBEDDING_DIMENSIONS,
+  knowledgeEmbeddingIdentityVersion,
   parseEmbeddingBillingConfig,
 } from "@dg-chat/database";
 import { createEmbeddings, type ProviderFetch } from "./embeddings.ts";
@@ -36,9 +37,9 @@ export function knowledgeQueryEmbedderFromEnv(
   const apiKey = env.KNOWLEDGE_EMBEDDING_API_KEY?.trim();
   const model = env.KNOWLEDGE_EMBEDDING_MODEL?.trim();
   const upstreamModel = env.KNOWLEDGE_EMBEDDING_UPSTREAM_MODEL?.trim() || model;
-  const version = env.KNOWLEDGE_EMBEDDING_VERSION?.trim() || model;
+  const baseVersion = env.KNOWLEDGE_EMBEDDING_VERSION?.trim() || model;
   if (!baseUrl && !apiKey && !model) return undefined;
-  if (!baseUrl || !apiKey || !model || !upstreamModel || !version) {
+  if (!baseUrl || !apiKey || !model || !upstreamModel || !baseVersion) {
     throw new Error("Knowledge embedding configuration is incomplete");
   }
   const timeoutMs = Number(env.KNOWLEDGE_EMBEDDING_QUERY_TIMEOUT_MS ?? 10_000);
@@ -47,6 +48,7 @@ export function knowledgeQueryEmbedderFromEnv(
   }
   const billing = parseEmbeddingBillingConfig(env);
   const provider = new URL(baseUrl).host;
+  const version = knowledgeEmbeddingIdentityVersion({ baseVersion, baseUrl, model, upstreamModel });
   const embed = async (query: string, signal?: AbortSignal) => {
     const normalized = query.trim().slice(0, 8_000);
     if (!normalized) throw new Error("Knowledge embedding query is empty");

@@ -2,6 +2,7 @@ import { createEmbeddings } from "../../api/src/embeddings.ts";
 import {
   type EmbeddingBillingConfig,
   KNOWLEDGE_EMBEDDING_DIMENSIONS,
+  knowledgeEmbeddingIdentityVersion,
   parseEmbeddingBillingConfig,
 } from "@dg-chat/database";
 
@@ -31,11 +32,11 @@ export function parseKnowledgeEmbeddingConfig(
   const apiKey = env.KNOWLEDGE_EMBEDDING_API_KEY?.trim();
   const model = env.KNOWLEDGE_EMBEDDING_MODEL?.trim();
   const upstreamModel = env.KNOWLEDGE_EMBEDDING_UPSTREAM_MODEL?.trim() || model;
-  const version = env.KNOWLEDGE_EMBEDDING_VERSION?.trim() || model;
+  const baseVersion = env.KNOWLEDGE_EMBEDDING_VERSION?.trim() || model;
   if (!baseUrl && !apiKey && !model) return undefined;
   const batchSize = Number(env.KNOWLEDGE_EMBEDDING_BATCH_SIZE ?? 64);
   if (
-    !baseUrl || !apiKey || !model || !upstreamModel || !version || !VERSION.test(version) ||
+    !baseUrl || !apiKey || !model || !upstreamModel || !baseVersion || !VERSION.test(baseVersion) ||
     model.length > 200 || upstreamModel.length > 200 ||
     !Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > 256
   ) throw new Error("Knowledge embedding configuration is incomplete or invalid");
@@ -43,6 +44,7 @@ export function parseKnowledgeEmbeddingConfig(
   if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) {
     throw new Error("KNOWLEDGE_EMBEDDING_BASE_URL must be a credential-free HTTPS URL");
   }
+  const version = knowledgeEmbeddingIdentityVersion({ baseVersion, baseUrl, model, upstreamModel });
   return {
     baseUrl,
     apiKey,
@@ -104,5 +106,8 @@ export async function embedKnowledgeChunks(
     if (!Array.isArray(item.embedding)) throw new Error("Embedding provider returned base64 data");
     return item.embedding;
   });
+  if (embeddings.length !== content.length) {
+    throw new Error("Embedding provider returned the wrong number of vectors");
+  }
   return { embeddings, inputTokens: response.usage.prompt_tokens };
 }

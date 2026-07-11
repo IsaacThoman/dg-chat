@@ -27,7 +27,7 @@ Deno.test("query embedder sends bounded version-compatible requests", async () =
     dimensions: 1536,
     encoding_format: "float",
   });
-  assertEquals(result.version, "embed-v3");
+  assertEquals(result.version.startsWith("embed-v3-"), true);
   assertEquals(result.inputTokens, 2);
   assertEquals(result.billing, { inputMicrosPerMillion: 0, fixedCallMicros: 0 });
   assertEquals(result.embedding.length, 1536);

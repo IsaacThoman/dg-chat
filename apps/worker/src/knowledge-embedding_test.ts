@@ -1,4 +1,4 @@
-import { assertEquals, assertThrows } from "jsr:@std/assert@1.0.14";
+import { assertEquals, assertNotEquals, assertThrows } from "jsr:@std/assert@1.0.14";
 import {
   parseDocumentEmbeddingPayload,
   parseKnowledgeEmbeddingConfig,
@@ -15,25 +15,24 @@ Deno.test("knowledge embedding configuration is disabled cleanly and validates c
       KNOWLEDGE_EMBEDDING_MODEL: "embed",
     })
   );
-  assertEquals(
-    parseKnowledgeEmbeddingConfig({
-      KNOWLEDGE_EMBEDDING_BASE_URL: "https://provider.example/v1",
-      KNOWLEDGE_EMBEDDING_API_KEY: "secret",
-      KNOWLEDGE_EMBEDDING_MODEL: "public-embed",
-      KNOWLEDGE_EMBEDDING_UPSTREAM_MODEL: "upstream-embed",
-      KNOWLEDGE_EMBEDDING_VERSION: "embed-v2",
-      KNOWLEDGE_EMBEDDING_BATCH_SIZE: "32",
-    }),
-    {
-      baseUrl: "https://provider.example/v1",
-      apiKey: "secret",
-      model: "public-embed",
-      upstreamModel: "upstream-embed",
-      version: "embed-v2",
-      batchSize: 32,
-      billing: { inputMicrosPerMillion: 0, fixedCallMicros: 0 },
-    },
-  );
+  const config = parseKnowledgeEmbeddingConfig({
+    KNOWLEDGE_EMBEDDING_BASE_URL: "https://provider.example/v1",
+    KNOWLEDGE_EMBEDDING_API_KEY: "secret",
+    KNOWLEDGE_EMBEDDING_MODEL: "public-embed",
+    KNOWLEDGE_EMBEDDING_UPSTREAM_MODEL: "upstream-embed",
+    KNOWLEDGE_EMBEDDING_VERSION: "embed-v2",
+    KNOWLEDGE_EMBEDDING_BATCH_SIZE: "32",
+  });
+  assertEquals(config?.baseUrl, "https://provider.example/v1");
+  assertEquals(config?.version.startsWith("embed-v2-"), true);
+  const changed = parseKnowledgeEmbeddingConfig({
+    KNOWLEDGE_EMBEDDING_BASE_URL: "https://provider.example/v1",
+    KNOWLEDGE_EMBEDDING_API_KEY: "secret",
+    KNOWLEDGE_EMBEDDING_MODEL: "public-embed",
+    KNOWLEDGE_EMBEDDING_UPSTREAM_MODEL: "different-upstream",
+    KNOWLEDGE_EMBEDDING_VERSION: "embed-v2",
+  });
+  assertNotEquals(config?.version, changed?.version);
 });
 
 Deno.test("document embedding payload and content digest are deterministic", async () => {

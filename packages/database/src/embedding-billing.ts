@@ -47,3 +47,23 @@ export function embeddingCostMicros(
   if (result > BigInt(Number.MAX_SAFE_INTEGER)) throw new RangeError("Embedding cost is too large");
   return Number(result);
 }
+
+/** Binds persisted vectors to every non-secret provider/model input that affects their meaning. */
+export function knowledgeEmbeddingIdentityVersion(input: {
+  baseVersion: string;
+  baseUrl: string;
+  model: string;
+  upstreamModel: string;
+}): string {
+  const canonical = JSON.stringify({
+    baseUrl: new URL(input.baseUrl).toString().replace(/\/$/, ""),
+    model: input.model,
+    upstreamModel: input.upstreamModel,
+  });
+  let digest = 0xcbf29ce484222325n;
+  for (const byte of new TextEncoder().encode(canonical)) {
+    digest ^= BigInt(byte);
+    digest = BigInt.asUintN(64, digest * 0x100000001b3n);
+  }
+  return `${input.baseVersion.slice(0, 46)}-${digest.toString(16).padStart(16, "0")}`;
+}
