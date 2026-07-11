@@ -55,12 +55,11 @@ test("image generation is capability-aware, durable, and keyboard accessible", a
   let editOrdinal = 0;
   let deleted = false;
   const lazySource: { asset?: Record<string, unknown> } = {};
-  let lazySourceAttempts = 0;
+  let allowLazySource = false;
   await page.route("**/api/images**", async (route) => {
     const url = new URL(route.request().url());
     if (url.pathname.startsWith("/api/images/by-attachment/")) {
-      lazySourceAttempts++;
-      if (lazySourceAttempts <= 2) {
+      if (!allowLazySource) {
         await route.fulfill({
           status: 503,
           contentType: "application/json",
@@ -211,6 +210,10 @@ test("image generation is capability-aware, durable, and keyboard accessible", a
 
   await page.getByRole("button", { name: "Open image history" }).click();
   const firstEdit = historyAssets[0] as { id: string; attachmentId: string };
+  lazySource.asset = {
+    ...firstEdit,
+    attachmentId: lazySourceAttachmentId,
+  };
   await page.locator(`[data-generated-asset-id="${firstEdit.id}"]`)
     .getByRole("button", { name: "Edit", exact: true }).click();
   await page.getByRole("dialog", { name: "Edit image" }).getByRole("combobox").first()
@@ -231,10 +234,6 @@ test("image generation is capability-aware, durable, and keyboard accessible", a
   });
   await page.getByRole("dialog", { name: "Edit image" })
     .getByRole("button", { name: "Close", exact: true }).last().click();
-  lazySource.asset = {
-    ...historyAssets.find((item) => item.id === firstEdit.id),
-    attachmentId: lazySourceAttachmentId,
-  };
   historyAssets.splice(historyAssets.findIndex((item) => item.id === firstEdit.id), 1);
   await page.getByRole("button", { name: "Open image history" }).click();
   const secondEdit = historyAssets[0] as { id: string };
@@ -247,6 +246,7 @@ test("image generation is capability-aware, durable, and keyboard accessible", a
   await expect(page.getByRole("status")).toContainText(
     "Source 1 unavailable. Retry is available.",
   );
+  allowLazySource = true;
   await page.getByRole("button", { name: "Retry", exact: true }).click();
   await expect(page.getByRole("button", { name: "Source 1" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Source 2" })).toHaveCount(0);
