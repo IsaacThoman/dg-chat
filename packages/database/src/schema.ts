@@ -276,6 +276,7 @@ export const usageRuns = pgTable("usage_runs", {
   inputTokens: integer("input_tokens").notNull().default(0),
   outputTokens: integer("output_tokens").notNull().default(0),
   costMicros: bigint("cost_micros", { mode: "number" }).notNull().default(0),
+  uncoveredCostMicros: bigint("uncovered_cost_micros", { mode: "number" }).notNull().default(0),
   latencyMs: integer("latency_ms"),
   ttftMs: integer("ttft_ms"),
   error: text("error"),

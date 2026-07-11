@@ -21,7 +21,11 @@ CREATE TABLE document_embedding_executions (
   CHECK ((status IN ('result_ready','completed') AND result_cost_micros IS NOT NULL
     AND result_provider_cost_micros IS NOT NULL AND result_input_tokens IS NOT NULL
     AND result_latency_ms IS NOT NULL)
-    OR (status NOT IN ('result_ready','completed') AND result_cost_micros IS NULL
+    OR (status='failed' AND ((result_cost_micros IS NULL AND result_provider_cost_micros IS NULL
+      AND result_input_tokens IS NULL AND result_latency_ms IS NULL)
+      OR (result_cost_micros IS NOT NULL AND result_provider_cost_micros IS NOT NULL
+        AND result_input_tokens IS NOT NULL AND result_latency_ms IS NOT NULL)))
+    OR (status NOT IN ('result_ready','completed','failed') AND result_cost_micros IS NULL
       AND result_provider_cost_micros IS NULL AND result_input_tokens IS NULL
       AND result_latency_ms IS NULL)),
   CHECK ((status IN ('completed','failed') AND completed_at IS NOT NULL) OR

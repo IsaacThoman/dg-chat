@@ -195,6 +195,8 @@ function run(row: Row): UsageRun {
     status: row.status as UsageRun["status"],
     reservedMicros: number(row.reserved_micros),
     costMicros: number(row.cost_micros),
+    uncoveredCostMicros: number(row.uncovered_cost_micros ?? 0),
+    error: row.error == null ? null : String(row.error),
     inputTokens: number(row.input_tokens),
     outputTokens: number(row.output_tokens),
     latencyMs: number(row.latency_ms ?? 0),
@@ -2398,7 +2400,9 @@ export class PostgresRepository implements DomainRepository {
       const all = await tx<Row[]>`SELECT * FROM document_embedding_executions
         WHERE job_id=${jobId} FOR UPDATE`;
       if (!all[0]) throw new DomainError("not_found", "Embedding execution not found", 404);
-      if (all[0].status === "completed") return documentEmbeddingExecution(all[0]);
+      if (all[0].status === "completed" || all[0].status === "failed") {
+        return documentEmbeddingExecution(all[0]);
+      }
       const executionId = String(all[0].id);
       const attachmentId = String(all[0].attachment_id);
       const usageRunId = String(all[0].usage_run_id);
@@ -2427,7 +2431,29 @@ export class PostgresRepository implements DomainRepository {
       const runRows = await tx<Row[]>`SELECT * FROM usage_runs WHERE id=${usageRunId} FOR UPDATE`;
       if (!runRows[0]) throw new DomainError("not_found", "Usage run not found", 404);
       const cost = number(all[0].result_cost_micros);
+      const providerCost = number(all[0].result_provider_cost_micros);
       const inputTokens = number(all[0].result_input_tokens);
+      if (providerCost > cost) {
+        if (!["reserved", "completed"].includes(String(runRows[0].status))) {
+          throw new DomainError("invalid_usage_state", "Embedding usage is already terminal", 409);
+        }
+        const uncovered = providerCost - cost;
+        await tx`UPDATE usage_runs SET status='failed',cost_micros=${providerCost},
+          uncovered_cost_micros=${uncovered},input_tokens=${inputTokens},output_tokens=0,
+          latency_ms=${number(all[0].result_latency_ms)},error='provider_usage_overage',
+          run_lease_token=NULL,run_lease_expires_at=NULL,completed_at=now()
+          WHERE id=${usageRunId}`;
+        await tx`UPDATE document_chunks d SET embedding=NULL,embedding_status='failed',
+          embedding_model_id=${modelId},embedding_config_version=${configVersion},embedded_at=NULL,
+          embedding_error='Provider usage exceeded reserved and available credit'
+          FROM document_embedding_execution_chunks ec WHERE ec.execution_id=${executionId}
+            AND ec.chunk_id=d.id AND d.attachment_id=${attachmentId}`;
+        await tx`UPDATE jobs SET status='failed',last_error='provider_usage_overage',
+          completed_at=now(),locked_at=NULL,locked_by=NULL WHERE id=${jobId}`;
+        const failed = await tx<Row[]>`UPDATE document_embedding_executions SET status='failed',
+          completed_at=now(),run_lease_token=NULL WHERE id=${executionId} RETURNING *`;
+        return documentEmbeddingExecution(failed[0]);
+      }
       if (runRows[0].status === "completed") {
         if (
           number(runRows[0].cost_micros) !== cost ||

@@ -2557,6 +2557,72 @@ Deno.test({
         WHERE usage_run_id='embedding-failed-run'`).length,
         2,
       );
+
+      const overage = await repo.beginDocumentEmbedding({
+        ownerId: owner.id,
+        attachmentId: attachment.id,
+        chunkSetDigest: "e".repeat(64),
+        modelId: "provider/embed-1536",
+        configVersion: "knowledge-v3",
+        provider: "provider",
+        usageRunId: "embedding-overage-run",
+        reserveMicros: 850,
+        planSnapshot: embeddingPlan(),
+      });
+      await sql`UPDATE jobs SET status='running',locked_by='claim-overage',locked_at=now()
+        WHERE id=${overage.jobId}`;
+      const overageClaim = await repo.claimDocumentEmbeddingExecution(
+        overage.jobId,
+        "claim-overage",
+      );
+      await repo.persistDocumentEmbeddingResult({
+        jobId: overage.jobId,
+        jobClaimToken: "claim-overage",
+        runLeaseToken: overageClaim.runLeaseToken,
+        vectors: [{ chunkId: chunk.id, embedding: vector }],
+        costMicros: 900,
+        inputTokens: 11,
+        latencyMs: 20,
+      });
+      assertEquals(
+        (await repo.finalizeDocumentEmbedding(overage.jobId, "claim-overage")).status,
+        "failed",
+      );
+      const overageState = await sql<{
+        balance: number;
+        status: string;
+        cost: number;
+        uncovered: number;
+        error: string;
+        provider_cost: number;
+        job_status: string;
+      }[]>`SELECT u.balance_micros::int AS balance,r.status,r.cost_micros::int AS cost,
+        r.uncovered_cost_micros::int AS uncovered,r.error,
+        e.result_provider_cost_micros::int AS provider_cost,j.status AS job_status
+        FROM users u JOIN usage_runs r ON r.user_id=u.id
+        JOIN document_embedding_executions e ON e.usage_run_id=r.id
+        JOIN jobs j ON j.id=e.job_id WHERE r.id='embedding-overage-run'`;
+      assertEquals(overageState[0], {
+        balance: 0,
+        status: "failed",
+        cost: 900,
+        uncovered: 50,
+        error: "provider_usage_overage",
+        provider_cost: 900,
+        job_status: "failed",
+      });
+      assertEquals(
+        (await sql`SELECT kind,amount_micros FROM ledger_entries
+        WHERE usage_run_id='embedding-overage-run' ORDER BY created_at`).map((row) => ({
+          kind: String(row.kind),
+          amount: Number(row.amount_micros),
+        })),
+        [{ kind: "reserve", amount: -850 }],
+      );
+      assertEquals(
+        (await repo.listDocumentChunks(attachment.id, owner.id))[0].embeddingStatus,
+        "failed",
+      );
     } finally {
       await repo.close();
       await sql.end();

@@ -113,6 +113,8 @@ export interface UsageRun {
   status: "reserved" | "completed" | "failed";
   reservedMicros: number;
   costMicros: number;
+  uncoveredCostMicros: number;
+  error: string | null;
   inputTokens: number;
   outputTokens: number;
   latencyMs: number;
@@ -1986,7 +1988,9 @@ export class MemoryRepository {
   finalizeDocumentEmbedding(jobId: string, jobClaimToken: string) {
     const execution = this.documentEmbeddingExecutions.get(jobId);
     if (!execution) throw new DomainError("not_found", "Embedding execution not found", 404);
-    if (execution.status === "completed") return embeddingExecutionProjection(execution);
+    if (execution.status === "completed" || execution.status === "failed") {
+      return embeddingExecutionProjection(execution);
+    }
     const job = this.jobs.find((value) => value.id === jobId);
     if (!job || job.status !== "running" || job.lockedBy !== jobClaimToken) {
       throw new DomainError("stale_lease", "Embedding job claim is stale", 409);
@@ -2003,6 +2007,35 @@ export class MemoryRepository {
     const cost = execution.resultCostMicros!;
     const run = this.usageRuns.get(execution.usageRunId);
     if (!run) throw new DomainError("not_found", "Embedding usage is missing", 404);
+    const providerCost = execution.resultProviderCostMicros!;
+    if (providerCost > cost) {
+      run.status = "failed";
+      run.costMicros = providerCost;
+      run.uncoveredCostMicros = providerCost - cost;
+      run.error = "provider_usage_overage";
+      run.inputTokens = execution.resultInputTokens!;
+      run.outputTokens = 0;
+      run.latencyMs = execution.resultLatencyMs!;
+      run.runLeaseToken = null;
+      run.runLeaseExpiresAt = null;
+      for (const chunk of chunks) {
+        if (!execution.chunkIds.includes(chunk.id)) continue;
+        this.documentChunkEmbeddings.delete(chunk.id);
+        Object.assign(chunk, {
+          embeddingStatus: "failed" as const,
+          embeddingModelId: execution.modelId,
+          embeddingConfigVersion: execution.configVersion,
+          embeddedAt: null,
+          embeddingError: "Provider usage exceeded reserved and available credit",
+        });
+      }
+      job.status = "failed";
+      job.lockedBy = null;
+      execution.status = "failed";
+      execution.completedAt = new Date().toISOString();
+      execution.runLeaseToken = null;
+      return embeddingExecutionProjection(execution);
+    }
     if (run.status === "completed") {
       if (
         run.costMicros !== cost || run.inputTokens !== execution.resultInputTokens ||
@@ -3530,6 +3563,8 @@ export class MemoryRepository {
       status: "reserved",
       reservedMicros: amountMicros,
       costMicros: 0,
+      uncoveredCostMicros: 0,
+      error: null,
       inputTokens: 0,
       outputTokens: 0,
       latencyMs: 0,
