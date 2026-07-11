@@ -706,6 +706,13 @@ export class MemoryRepository {
     if (status === "approved" && creditMicros > 0 && !alreadyGranted) {
       this.credit(id, `approval:${id}`, "grant", creditMicros);
     }
+    if (status === "approved") {
+      for (const [hash, session] of this.sessions) {
+        if (session.userId === id && session.limited) {
+          this.sessions.delete(hash);
+        }
+      }
+    }
     if (status === "rejected") {
       this.invalidateUserSessions(id);
       for (const token of this.tokens.values()) {

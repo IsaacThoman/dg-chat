@@ -93,7 +93,7 @@ Deno.test("bootstrap, signup, approval, immutable chat, API token and OpenAI com
   assertEquals(signed.user.approvalStatus, "pending");
   assertEquals(signed.token, undefined);
   assertStringIncludes(signup.headers.get("set-cookie") ?? "", "HttpOnly");
-  const userAuth = {
+  let userAuth = {
     cookie: sessionCookie(signup),
     origin: "http://localhost:5173",
     "content-type": "application/json",
@@ -114,6 +114,21 @@ Deno.test("bootstrap, signup, approval, immutable chat, API token and OpenAI com
     body: JSON.stringify({ status: "approved" }),
   });
   assertEquals(approval.status, 200);
+  const staleLimitedSession = await app.request("/api/conversations", {
+    headers: userAuth,
+  });
+  assertEquals(staleLimitedSession.status, 401);
+  const approvedLogin = await app.request("/api/auth/sign-in/email", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email: "person@example.com", password: "correct horse battery" }),
+  });
+  assertEquals(approvedLogin.status, 200);
+  assertEquals((await approvedLogin.clone().json()).limited, false);
+  userAuth = {
+    ...userAuth,
+    cookie: sessionCookie(approvedLogin),
+  };
   const conversationResponse = await app.request("/api/conversations", {
     method: "POST",
     headers: { ...userAuth, "idempotency-key": "conversation-create-0001" },

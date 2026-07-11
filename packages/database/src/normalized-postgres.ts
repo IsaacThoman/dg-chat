@@ -1026,6 +1026,10 @@ export class PostgresRepository implements DomainRepository {
       const updated = await tx<
         Row[]
       >`UPDATE users SET approval_status=${status},balance_micros=${balance},updated_at=now() WHERE id=${id} RETURNING *`;
+      if (status === "approved") {
+        await tx`UPDATE sessions SET invalidated_at=now()
+          WHERE user_id=${id} AND limited=true AND invalidated_at IS NULL`;
+      }
       if (status === "rejected") {
         await tx`UPDATE sessions SET invalidated_at=now() WHERE user_id=${id} AND invalidated_at IS NULL`;
         await tx`UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,now()) WHERE user_id=${id}`;

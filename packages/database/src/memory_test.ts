@@ -2044,7 +2044,9 @@ Deno.test("approval grant is minted once and rejection revokes sessions and toke
     passwordHash: "x",
     emailVerified: true,
   });
+  repo.createSession(user.id, "limited-session", true);
   repo.approveUser(user.id, "approved", 100);
+  assertEquals(repo.getSession("limited-session"), undefined);
   repo.reserve(user.id, "spend", "model", 100);
   repo.settle("spend", 100, 1, 1, 1);
   repo.approveUser(user.id, "rejected", 100);

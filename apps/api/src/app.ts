@@ -187,6 +187,7 @@ import type { OcrCache } from "./ocr-interception.ts";
 type Variables = {
   user: PublicUser;
   authType: "session" | "token";
+  sessionLimited?: boolean;
   tokenId?: string;
   tokenScopes?: string[];
   imageAssetOwnerId?: string;
@@ -1567,6 +1568,7 @@ export function createApp(options: AppOptions = {}) {
     }
     c.set("user", publicUser(user)!);
     c.set("authType", "session");
+    c.set("sessionLimited", session.limited);
     if (legacySession && raw === legacySession) {
       setCookie(c, sessionCookie, legacySession, {
         httpOnly: true,
@@ -1580,6 +1582,14 @@ export function createApp(options: AppOptions = {}) {
     return next();
   };
   const approved: MiddlewareHandler<{ Variables: Variables }> = async (c, next) => {
+    if (c.get("authType") === "session" && c.get("sessionLimited")) {
+      return c.json({
+        error: {
+          code: "session_refresh_required",
+          message: "Sign in again to enter the approved workspace",
+        },
+      }, 403);
+    }
     if (requireEmailVerification && !c.get("user").emailVerifiedAt) {
       return c.json({
         error: {
@@ -2311,7 +2321,13 @@ export function createApp(options: AppOptions = {}) {
   app.get(
     "/api/auth/me",
     authenticate,
-    (c) => c.json({ user: c.get("user"), limited: c.get("user").approvalStatus !== "approved" }),
+    (c) =>
+      c.json({
+        user: c.get("user"),
+        limited: Boolean(c.get("sessionLimited")) ||
+          c.get("user").approvalStatus !== "approved" ||
+          (requireEmailVerification && !c.get("user").emailVerifiedAt),
+      }),
   );
   app.get(
     "/api/auth/status",
