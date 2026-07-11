@@ -140,7 +140,7 @@ function user(row: Row): StoredUser {
     id: String(row.id),
     email: String(row.email),
     name: String(row.name),
-    passwordHash: String(row.password_hash),
+    passwordHash: row.password_hash == null ? null : String(row.password_hash),
     role: row.role as StoredUser["role"],
     approvalStatus: row.approval_status as StoredUser["approvalStatus"],
     state: row.state as StoredUser["state"],
@@ -767,6 +767,10 @@ export class PostgresRepository implements DomainRepository {
   }
 
   async bootstrapAdmin(input: CreateUserInput, credit: number) {
+    if (!input.passwordHash) {
+      throw new DomainError("validation_error", "Bootstrap requires a local password", 422);
+    }
+    const passwordHash = input.passwordHash;
     return await this.#sql.begin(async (tx) => {
       await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-bootstrap'))`;
       const existing = await tx<Row[]>`SELECT id FROM users WHERE role = 'admin' LIMIT 1`;
@@ -775,7 +779,7 @@ export class PostgresRepository implements DomainRepository {
       }
       const rows = await tx<
         Row[]
-      >`INSERT INTO users (email,name,password_hash,role,approval_status,state,balance_micros,email_verified_at) VALUES (${input.email},${input.name},${input.passwordHash},'admin','approved','active',${credit},now()) RETURNING *`;
+      >`INSERT INTO users (email,name,password_hash,role,approval_status,state,balance_micros,email_verified_at) VALUES (${input.email},${input.name},${passwordHash},'admin','approved','active',${credit},now()) RETURNING *`;
       const userId = String(rows[0].id);
       await tx`INSERT INTO ledger_entries (user_id,usage_run_id,kind,amount_micros,balance_after_micros) VALUES (${userId},${`bootstrap:${userId}`},'grant',${credit},${credit})`;
       return user(rows[0]);
@@ -785,9 +789,9 @@ export class PostgresRepository implements DomainRepository {
     try {
       const rows = await this.#sql<
         Row[]
-      >`INSERT INTO users (email,name,password_hash,role,approval_status,state,email_verified_at) VALUES (${input.email},${input.name},${input.passwordHash},${
-        input.role ?? "user"
-      },${input.approvalStatus ?? "pending"},${input.state ?? "active"},${
+      >`INSERT INTO users (email,name,password_hash,role,approval_status,state,email_verified_at) VALUES (${input.email},${input.name},${
+        input.passwordHash ?? null
+      },${input.role ?? "user"},${input.approvalStatus ?? "pending"},${input.state ?? "active"},${
         input.emailVerified || input.approvalStatus === "approved" ? new Date().toISOString() : null
       }) RETURNING *`;
       return user(rows[0]);

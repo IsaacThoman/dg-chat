@@ -23,7 +23,7 @@ export type MaybePromise<T> = T | Promise<T>;
 export interface CreateUserInput {
   email: string;
   name: string;
-  passwordHash: string;
+  passwordHash?: string | null;
   role?: UserRole;
   approvalStatus?: ApprovalStatus;
   state?: AccountState;

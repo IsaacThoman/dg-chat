@@ -101,7 +101,7 @@ import {
 } from "./repository.ts";
 
 export interface StoredUser extends PublicUser {
-  passwordHash: string;
+  passwordHash: string | null;
 }
 export interface StoredSession {
   id: string;
@@ -473,6 +473,9 @@ export class MemoryRepository {
     input: CreateUserInput,
     startingCreditMicros: number,
   ): StoredUser {
+    if (!input.passwordHash) {
+      throw new DomainError("validation_error", "Bootstrap requires a local password", 422);
+    }
     if ([...this.users.values()].some((user) => user.role === "admin")) {
       throw new DomainError("already_bootstrapped", "An administrator already exists", 409);
     }
@@ -490,7 +493,7 @@ export class MemoryRepository {
     input: {
       email: string;
       name: string;
-      passwordHash: string;
+      passwordHash?: string | null;
       role?: UserRole;
       approvalStatus?: ApprovalStatus;
       state?: AccountState;
@@ -504,7 +507,7 @@ export class MemoryRepository {
       id: crypto.randomUUID(),
       email: input.email,
       name: input.name,
-      passwordHash: input.passwordHash,
+      passwordHash: input.passwordHash ?? null,
       role: input.role ?? "user",
       approvalStatus: input.approvalStatus ?? "pending",
       state: input.state ?? "active",

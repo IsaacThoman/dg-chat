@@ -2,6 +2,17 @@ import { assertEquals, assertThrows } from "jsr:@std/assert@1.0.14";
 import { DomainError, MemoryRepository } from "./memory.ts";
 import { decodeApiResponseBody, InvalidApiResponseBodyError } from "./repository.ts";
 
+Deno.test("passwordless domain users are represented without a local credential", () => {
+  const repo = new MemoryRepository();
+  const user = repo.createUser({ email: "oidc@example.com", name: "OIDC user" });
+  assertEquals(user.passwordHash, null);
+  assertThrows(
+    () => repo.bootstrapAdmin({ email: "admin@example.com", name: "Admin" }, 5_000_000),
+    DomainError,
+    "local password",
+  );
+});
+
 Deno.test("binary API replay validates Base64 and charges quota by decoded bytes", () => {
   const repo = new MemoryRepository();
   const user = repo.createUser({

@@ -481,6 +481,12 @@ Deno.test({
         passwordHash: "hash",
         emailVerified: true,
       });
+      const oidcOnly = await repo.createUser({
+        email: "oidc-only@database.test",
+        name: "OIDC only",
+        emailVerified: true,
+      });
+      assertEquals(oidcOnly.passwordHash, null);
       const limitedSession = await repo.createSession(applicant.id, "limited-session-hash", true);
       await repo.approveUser(applicant.id, "approved", 1_000_000);
       assertEquals(await repo.getSession(limitedSession.tokenHash), undefined);
