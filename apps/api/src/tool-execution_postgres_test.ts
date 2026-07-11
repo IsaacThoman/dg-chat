@@ -73,6 +73,56 @@ Deno.test({
         WHERE usage_run_id=${`tool:${requested.id}`} ORDER BY id`;
       assertEquals([...entries], [{ kind: "reserve", amount: "-1000" }]);
       assertEquals((await repo.usage(user.id)).balanceMicros, 9_000);
+
+      let reserveCalls = 0;
+      let firstReserveStarted!: () => void;
+      let releaseFirst!: () => void;
+      const started = new Promise<void>((resolve) => firstReserveStarted = resolve);
+      const release = new Promise<void>((resolve) => releaseFirst = resolve);
+      const racingControls = {
+        reserve: async (execution: { id: string; ownerId: string; toolId: string }) => {
+          await repo.ensureIdempotentReservation({
+            userId: execution.ownerId,
+            usageRunId: `tool:${execution.id}`,
+            model: `tool/${execution.toolId}`,
+            provider: "tool",
+            reservedMicros: reserveMicros,
+          });
+          if (++reserveCalls === 1) {
+            firstReserveStarted();
+            await release;
+          }
+        },
+        settle: (execution: { id: string }) =>
+          repo.settle(`tool:${execution.id}`, reserveMicros, 0, 0, 0).then(() => undefined),
+        refund: (execution: { id: string }, error?: string) =>
+          repo.refund(`tool:${execution.id}`, error).then((run) => run !== undefined),
+      };
+      const approver = new ToolExecutionService(store, [adapter], racingControls);
+      const recoverer = new ToolExecutionService(store, [adapter], racingControls);
+      const raced = await approver.request(user.id, "echo", {});
+      const approval = approver.approve(user.id, raced.id);
+      await started;
+      const recovery = recoverer.recover();
+      for (let attempt = 0; attempt < 100; attempt++) {
+        if (
+          (await store.getExecution(raced.id, user.id))?.status !== "queued_pending_reservation"
+        ) {
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      }
+      releaseFirst();
+      await approval;
+      await recovery;
+      for (let attempt = 0; attempt < 100; attempt++) {
+        if ((await approver.get(user.id, raced.id)).status === "succeeded") break;
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      }
+      assertEquals((await approver.get(user.id, raced.id)).status, "succeeded");
+      const racedEntries = await sql<{ kind: string }[]>`
+        SELECT kind FROM ledger_entries WHERE usage_run_id=${`tool:${raced.id}`} ORDER BY id`;
+      assertEquals([...racedEntries], [{ kind: "reserve" }]);
     } finally {
       await store.close();
       await repo.close();

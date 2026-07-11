@@ -376,3 +376,45 @@ Deno.test("recovery finalizes cancellation after refund committed before tool tr
   assertEquals(refunds, 1);
   assertEquals(reserves, 0);
 });
+
+Deno.test("approve does not refund when a concurrent recoverer advances its reservation", async () => {
+  const store = new MemoryToolExecutionStore();
+  let reserveCalls = 0;
+  let firstReserveStarted!: () => void;
+  let releaseFirst!: () => void;
+  let refunds = 0;
+  const started = new Promise<void>((resolve) => firstReserveStarted = resolve);
+  const release = new Promise<void>((resolve) => releaseFirst = resolve);
+  const controls = {
+    reserve: async () => {
+      reserveCalls++;
+      if (reserveCalls === 1) {
+        firstReserveStarted();
+        await release;
+      }
+    },
+    settle: () => Promise.resolve(),
+    refund: () => {
+      refunds++;
+      return Promise.resolve(true);
+    },
+  };
+  const approver = new ToolExecutionService(store, [echoAdapter], controls);
+  const recoverer = new ToolExecutionService(store, [echoAdapter], controls);
+  await approver.setPolicy({ toolId: "echo", allowed: true, actorId: "admin" });
+  const requested = await approver.request("user", "echo", {});
+  const approval = approver.approve("user", requested.id);
+  await started;
+  const recovery = recoverer.recover();
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const current = await store.getExecution(requested.id, "user");
+    if (current?.status !== "queued_pending_reservation") break;
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  releaseFirst();
+  const approved = await approval;
+  await recovery;
+  assertEquals(["queued", "running", "succeeded"].includes(approved.status), true);
+  await waitFor(approver, "user", requested.id, "succeeded");
+  assertEquals(refunds, 0);
+});

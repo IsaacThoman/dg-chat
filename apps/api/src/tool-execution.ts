@@ -453,7 +453,18 @@ export class ToolExecutionService {
       throw error;
     }
     if (!queued) {
-      await this.controls?.refund(execution, "tool execution changed before approval");
+      const current = await this.store.getExecution(id, ownerId);
+      if (
+        current && ["queued", "running", "succeeded_pending_settlement", "succeeded"].includes(
+          current.status,
+        )
+      ) {
+        void this.recover();
+        return current;
+      }
+      if (current?.status === "cancelled" || current?.cancellationRequestedAt) {
+        await this.controls?.refund(execution, "tool execution cancelled during approval");
+      }
       throw new ToolExecutionError("execution_terminal", "Tool execution changed", 409);
     }
     void this.recover();
