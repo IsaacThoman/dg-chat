@@ -138,22 +138,28 @@ Deno.test("breaker policy and target identifiers are strictly bounded", () => {
   assertThrows(() => breaker.beforeAttempt("unsafe:key", policy), TypeError);
 });
 
-Deno.test("Redis breaker fails open within a bounded interval when unavailable", async () => {
-  const breaker = new RedisCircuitBreaker("redis://127.0.0.1:1", {
-    connectTimeoutMs: 100,
-    commandTimeoutMs: 100,
-  });
-  const started = performance.now();
-  try {
-    const permit = await breaker.beforeAttempt(target, policy);
-    assertEquals({ allowed: permit.allowed, state: permit.state }, {
-      allowed: true,
-      state: "unavailable",
+Deno.test({
+  name: "Redis breaker fails open within a bounded interval when unavailable",
+  // ioredis intentionally retains a two-second socket-destroy fallback after disconnect.
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const breaker = new RedisCircuitBreaker("redis://127.0.0.1:1", {
+      connectTimeoutMs: 100,
+      commandTimeoutMs: 100,
     });
-    assertEquals(performance.now() - started < 1_000, true);
-  } finally {
-    await breaker.close();
-  }
+    const started = performance.now();
+    try {
+      const permit = await breaker.beforeAttempt(target, policy);
+      assertEquals({ allowed: permit.allowed, state: permit.state }, {
+        allowed: true,
+        state: "unavailable",
+      });
+      assertEquals(performance.now() - started < 1_000, true);
+    } finally {
+      await breaker.close();
+    }
+  },
 });
 
 const redisUrl = Deno.env.get("TEST_REDIS_URL");

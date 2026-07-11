@@ -1,3 +1,4 @@
+// @ts-types="./nodemailer.d.ts"
 import nodemailer from "npm:nodemailer@9.0.3";
 
 export type IdentityMailKind = "email_verification" | "password_reset";

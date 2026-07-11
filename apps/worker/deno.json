@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "exports": "./src/main.ts",
   "imports": {
+    "@napi-rs/canvas/geometry": "npm:@napi-rs/canvas@1.0.2/geometry.js",
     "@xmldom/xmldom": "npm:@xmldom/xmldom@0.9.10",
     "fflate": "npm:fflate@0.8.3",
     "pdfjs-dist": "npm:pdfjs-dist@6.1.200",

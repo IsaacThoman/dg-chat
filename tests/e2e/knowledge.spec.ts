@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { strToU8, zipSync } from "fflate";
+import { Buffer } from "node:buffer";
 import { apiURL, bootstrap, createChat, login } from "./helpers.ts";
 
 const DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";

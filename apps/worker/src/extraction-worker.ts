@@ -6,12 +6,21 @@ interface RequestMessage {
   limits: Record<string, number>;
 }
 
-self.onmessage = async (event: MessageEvent<RequestMessage>) => {
+interface ExtractionWorkerScope {
+  onmessage: ((event: MessageEvent<RequestMessage>) => void | Promise<void>) | null;
+  postMessage(message: unknown): void;
+}
+
+// The file is included in the compiled worker binary but executes only inside a Web Worker.
+// Keep the worker-global boundary explicit because Deno compile otherwise supplies Window types.
+const scope = self as unknown as ExtractionWorkerScope;
+
+scope.onmessage = async (event) => {
   try {
     const result = await extractDocument(event.data.bytes, event.data.mimeType, event.data.limits);
-    self.postMessage({ ok: true, result });
+    scope.postMessage({ ok: true, result });
   } catch (error) {
-    self.postMessage({
+    scope.postMessage({
       ok: false,
       error: {
         name: error instanceof Error ? error.name : "Error",
