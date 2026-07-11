@@ -104,7 +104,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: dependencies
+      target: source
     command: ["task", "db:migrate"]
     environment:
       DENO_ENV: production
