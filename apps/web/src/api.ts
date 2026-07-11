@@ -86,6 +86,7 @@ export type ToolExecution = {
   input: unknown;
   status:
     | "pending_approval"
+    | "queued_pending_reservation"
     | "queued"
     | "running"
     | "succeeded_pending_settlement"

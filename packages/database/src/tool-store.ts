@@ -2,6 +2,7 @@ import postgres from "npm:postgres@3.4.7";
 
 export type StoredToolExecutionStatus =
   | "pending_approval"
+  | "queued_pending_reservation"
   | "queued"
   | "running"
   | "succeeded_pending_settlement"
@@ -225,6 +226,11 @@ export class PostgresToolExecutionStore {
   async listPendingSettlement(limit: number): Promise<StoredToolExecution[]> {
     return (await this.#sql`SELECT * FROM tool_executions
       WHERE status='succeeded_pending_settlement' ORDER BY updated_at LIMIT ${limit}`)
+      .map(execution);
+  }
+  async listPendingReservation(limit: number): Promise<StoredToolExecution[]> {
+    return (await this.#sql`SELECT * FROM tool_executions
+      WHERE status='queued_pending_reservation' ORDER BY updated_at LIMIT ${limit}`)
       .map(execution);
   }
 }

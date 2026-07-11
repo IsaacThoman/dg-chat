@@ -1,6 +1,6 @@
 ALTER TABLE tool_executions DROP CONSTRAINT tool_executions_status_check;
 ALTER TABLE tool_executions ADD CONSTRAINT tool_executions_status_check CHECK (
-  status IN ('pending_approval', 'queued', 'running', 'succeeded_pending_settlement',
+  status IN ('pending_approval', 'queued_pending_reservation', 'queued', 'running', 'succeeded_pending_settlement',
     'succeeded', 'failed', 'cancelled')
 );
 ALTER TABLE tool_executions ADD COLUMN claim_token uuid;

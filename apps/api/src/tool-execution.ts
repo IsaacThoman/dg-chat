@@ -1,5 +1,6 @@
 export type ToolExecutionStatus =
   | "pending_approval"
+  | "queued_pending_reservation"
   | "queued"
   | "running"
   | "succeeded_pending_settlement"
@@ -64,6 +65,7 @@ export interface ToolExecutionStore {
   ): Promise<void>;
   claimRecoverable?(limit: number): Promise<ToolExecution[]>;
   listPendingSettlement?(limit: number): Promise<ToolExecution[]>;
+  listPendingReservation?(limit: number): Promise<ToolExecution[]>;
 }
 
 export interface ToolAdapterContext {
@@ -183,6 +185,13 @@ export class MemoryToolExecutionStore implements ToolExecutionStore {
     return Promise.resolve(
       [...this.#executions.values()]
         .filter((execution) => execution.status === "succeeded_pending_settlement")
+        .slice(0, limit).map(clone),
+    );
+  }
+  listPendingReservation(limit: number) {
+    return Promise.resolve(
+      [...this.#executions.values()]
+        .filter((execution) => execution.status === "queued_pending_reservation")
         .slice(0, limit).map(clone),
     );
   }
@@ -337,6 +346,17 @@ export class ToolExecutionService {
   }
 
   async recover(limit = 25) {
+    const pendingReservation = await this.store.listPendingReservation?.(limit) ?? [];
+    for (const execution of pendingReservation) {
+      try {
+        await this.controls?.reserve(execution);
+        await this.store.transitionExecution(execution.id, ["queued_pending_reservation"], {
+          status: "queued",
+        });
+      } catch {
+        // Retain the durable pending state. A later maintenance pass retries idempotently.
+      }
+    }
     const pendingSettlement = await this.store.listPendingSettlement?.(limit) ?? [];
     for (const execution of pendingSettlement) await this.get(execution.ownerId, execution.id);
     const executions = await this.store.claimRecoverable?.(limit) ?? [];
@@ -353,7 +373,7 @@ export class ToolExecutionService {
         await this.controls?.refund(execution, "tool policy changed before execution");
       }
     }
-    return executions.length + pendingSettlement.length;
+    return executions.length + pendingSettlement.length + pendingReservation.length;
   }
 
   async approve(ownerId: string, id: string): Promise<ToolExecution> {
@@ -372,16 +392,25 @@ export class ToolExecutionService {
       throw new ToolExecutionError("tool_not_allowed", "Tool is no longer allowlisted", 403);
     }
     const now = new Date().toISOString();
-    await this.controls?.reserve(execution);
     let queued: ToolExecution | undefined;
     try {
-      queued = await this.store.transitionExecution(id, ["pending_approval"], {
-        status: "queued",
+      const pending = await this.store.transitionExecution(id, ["pending_approval"], {
+        status: "queued_pending_reservation",
         approvedAt: now,
         approvedBy: ownerId,
       });
+      if (!pending) throw new Error("Tool execution changed");
+      await this.controls?.reserve(execution);
+      queued = await this.store.transitionExecution(id, ["queued_pending_reservation"], {
+        status: "queued",
+      });
     } catch (error) {
       await this.controls?.refund(execution, "failed to persist tool approval");
+      await this.store.transitionExecution(id, ["queued_pending_reservation"], {
+        status: "pending_approval",
+        approvedAt: null,
+        approvedBy: null,
+      });
       throw error;
     }
     if (!queued) {
@@ -400,7 +429,7 @@ export class ToolExecutionService {
     const now = new Date().toISOString();
     const cancelled = await this.store.transitionExecution(
       id,
-      ["pending_approval", "queued", "running"],
+      ["pending_approval", "queued_pending_reservation", "queued", "running"],
       { status: "cancelled", cancellationRequestedAt: now },
     );
     if (!cancelled) {
