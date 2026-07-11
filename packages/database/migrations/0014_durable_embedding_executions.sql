@@ -9,16 +9,21 @@ CREATE TABLE document_embedding_executions (
   usage_run_id text NOT NULL UNIQUE REFERENCES usage_runs(id) ON DELETE RESTRICT,
   status text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','running','result_ready','completed','failed')),
   run_lease_token uuid,
+  job_claim_token text,
+  plan_snapshot jsonb NOT NULL CHECK (jsonb_typeof(plan_snapshot)='object'),
   result_cost_micros bigint CHECK (result_cost_micros BETWEEN 0 AND 9007199254740991),
+  result_provider_cost_micros bigint CHECK (result_provider_cost_micros BETWEEN 0 AND 9007199254740991),
   result_input_tokens integer CHECK (result_input_tokens >= 0),
   result_latency_ms integer CHECK (result_latency_ms >= 0),
   created_at timestamptz NOT NULL DEFAULT now(),
   completed_at timestamptz,
   UNIQUE(attachment_id,chunk_set_digest,model_id,config_version),
   CHECK ((status IN ('result_ready','completed') AND result_cost_micros IS NOT NULL
-    AND result_input_tokens IS NOT NULL AND result_latency_ms IS NOT NULL)
+    AND result_provider_cost_micros IS NOT NULL AND result_input_tokens IS NOT NULL
+    AND result_latency_ms IS NOT NULL)
     OR (status NOT IN ('result_ready','completed') AND result_cost_micros IS NULL
-      AND result_input_tokens IS NULL AND result_latency_ms IS NULL)),
+      AND result_provider_cost_micros IS NULL AND result_input_tokens IS NULL
+      AND result_latency_ms IS NULL)),
   CHECK ((status IN ('completed','failed') AND completed_at IS NOT NULL) OR
     (status NOT IN ('completed','failed') AND completed_at IS NULL))
 );

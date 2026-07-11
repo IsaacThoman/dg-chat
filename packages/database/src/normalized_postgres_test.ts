@@ -6,6 +6,34 @@ import { backfillLegacyRuntimeSnapshot } from "./legacy-backfill.ts";
 
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
 
+const embeddingPlan = (modelId = "provider/embed-1536") => ({
+  sourceModelId: modelId,
+  routeId: "00000000-0000-8000-8000-000000000090",
+  routeVersion: 1,
+  retryPolicy: null,
+  targets: [{
+    ordinal: 0,
+    providerId: "00000000-0000-8000-8000-000000000091",
+    providerSlug: "provider",
+    providerVersion: 1,
+    protocol: "chat_completions" as const,
+    providerModelId: "00000000-0000-8000-8000-000000000092",
+    publicModelId: modelId,
+    upstreamModelId: "embed-1536",
+    modelVersion: 1,
+    pricing: {
+      pricingVersionId: "00000000-0000-8000-8000-000000000093",
+      inputMicrosPerMillion: 1,
+      cachedInputMicrosPerMillion: 0,
+      reasoningMicrosPerMillion: 0,
+      outputMicrosPerMillion: 0,
+      fixedCallMicros: 0,
+      source: "test",
+    },
+  }],
+  resolvedAt: "2026-07-11T00:00:00.000Z",
+});
+
 Deno.test({
   name: "Postgres provider accounting is authoritative for API failure and stale run leases",
   ignore: !databaseUrl,
@@ -2383,6 +2411,7 @@ Deno.test({
             provider: "provider",
             usageRunId: "embedding-insufficient",
             reserveMicros: 2_000,
+            planSnapshot: embeddingPlan(),
           }),
         DomainError,
         "Insufficient credit",
@@ -2396,6 +2425,7 @@ Deno.test({
       assertEquals(deniedChunk.embeddingStatus, "failed");
       assertEquals(deniedChunk.embeddingError, "Insufficient credit for document embeddings");
 
+      const frozenPlan = embeddingPlan();
       const begun = await repo.beginDocumentEmbedding({
         ownerId: owner.id,
         attachmentId: attachment.id,
@@ -2405,10 +2435,21 @@ Deno.test({
         provider: "provider",
         usageRunId: "embedding-durable-run",
         reserveMicros: 100,
+        planSnapshot: frozenPlan,
       });
+      frozenPlan.routeVersion = 99;
       await sql`UPDATE jobs SET status='running',locked_by='claim-a',locked_at=now()
         WHERE id=${begun.jobId}`;
       const claimed = await repo.claimDocumentEmbeddingExecution(begun.jobId, "claim-a");
+      assertEquals(claimed.planSnapshot.routeVersion, 1);
+      await sql`UPDATE jobs SET locked_by='claim-live-reclaim',locked_at=now()
+        WHERE id=${begun.jobId}`;
+      await assertRejects(
+        () => repo.claimDocumentEmbeddingExecution(begun.jobId, "claim-live-reclaim"),
+        DomainError,
+        "live lease",
+      );
+      await sql`UPDATE jobs SET locked_by='claim-a',locked_at=now() WHERE id=${begun.jobId}`;
       const vector = [1, ...Array(1535).fill(0)];
       assertEquals(
         (await repo.persistDocumentEmbeddingResult({
@@ -2416,14 +2457,14 @@ Deno.test({
           jobClaimToken: "claim-a",
           runLeaseToken: claimed.runLeaseToken,
           vectors: [{ chunkId: chunk.id, embedding: vector }],
-          costMicros: 40,
+          costMicros: 150,
           inputTokens: 7,
           latencyMs: 12,
         })).status,
         "result_ready",
       );
       // Simulate terminal accounting committing before vector/job finalization.
-      await repo.settle("embedding-durable-run", 40, 7, 0, 12);
+      await repo.settle("embedding-durable-run", 150, 7, 0, 12);
 
       await sql`UPDATE jobs SET locked_by='claim-b',locked_at=now() WHERE id=${begun.jobId}`;
       await assertRejects(
@@ -2449,7 +2490,7 @@ Deno.test({
         SELECT u.balance_micros::int AS balance,r.status,j.status AS job_status FROM users u
         JOIN usage_runs r ON r.user_id=u.id JOIN document_embedding_executions e
           ON e.usage_run_id=r.id JOIN jobs j ON j.id=e.job_id WHERE r.id='embedding-durable-run'`;
-      assertEquals(state[0], { balance: 960, status: "completed", job_status: "completed" });
+      assertEquals(state[0], { balance: 850, status: "completed", job_status: "completed" });
       assertEquals(
         (await sql`SELECT id FROM ledger_entries
         WHERE usage_run_id='embedding-durable-run'`).length,
@@ -2465,6 +2506,7 @@ Deno.test({
         provider: "provider",
         usageRunId: "embedding-failed-run",
         reserveMicros: 100,
+        planSnapshot: embeddingPlan(),
       });
       await sql`UPDATE jobs SET status='running',locked_by='claim-c',locked_at=now()
         WHERE id=${failing.jobId}`;
@@ -2481,6 +2523,8 @@ Deno.test({
         DomainError,
         "stale",
       );
+      await sql`UPDATE usage_runs SET run_lease_expires_at=now()-interval '1 second'
+        WHERE id='embedding-failed-run'`;
       await repo.claimDocumentEmbeddingExecution(failing.jobId, "claim-d");
       assertEquals(
         (await repo.failDocumentEmbedding({
@@ -2507,7 +2551,7 @@ Deno.test({
         SELECT u.balance_micros::int AS balance,r.status,j.status AS job_status FROM users u
         JOIN usage_runs r ON r.user_id=u.id JOIN document_embedding_executions e
           ON e.usage_run_id=r.id JOIN jobs j ON j.id=e.job_id WHERE r.id='embedding-failed-run'`;
-      assertEquals(failureState[0], { balance: 960, status: "failed", job_status: "failed" });
+      assertEquals(failureState[0], { balance: 850, status: "failed", job_status: "failed" });
       assertEquals(
         (await sql`SELECT id FROM ledger_entries
         WHERE usage_run_id='embedding-failed-run'`).length,

@@ -211,6 +211,7 @@ export interface BeginDocumentEmbeddingInput {
   usageRunId: string;
   reserveMicros: number;
   pricingSnapshot?: UsagePricingSnapshot;
+  planSnapshot?: ProviderExecutionPlan;
 }
 
 export interface DocumentEmbeddingExecution {
@@ -222,6 +223,7 @@ export interface DocumentEmbeddingExecution {
   modelId: string;
   configVersion: string;
   usageRunId: string;
+  planSnapshot: ProviderExecutionPlan;
   status: "queued" | "running" | "result_ready" | "completed" | "failed";
   createdAt: string;
   completedAt: string | null;

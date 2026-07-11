@@ -192,6 +192,24 @@ function validateKnowledgeRetrievalInput(input: KnowledgeRetrievalInput) {
   ) throw new DomainError("validation_error", "Knowledge retrieval input is invalid", 422);
 }
 
+function validateEmbeddingPlan(
+  modelId: string,
+  plan: ProviderExecutionPlan | undefined,
+  pricing?: UsagePricingSnapshot,
+) {
+  if (
+    !plan || plan.sourceModelId !== modelId || !Number.isSafeInteger(plan.routeVersion) ||
+    plan.routeVersion < 0 || !Number.isFinite(Date.parse(plan.resolvedAt)) ||
+    !Array.isArray(plan.targets) || plan.targets.length < 1 || plan.targets.length > 8 ||
+    plan.targets.some((target, index) =>
+      target.ordinal !== index || !Number.isSafeInteger(target.providerVersion) ||
+      target.providerVersion < 1 || !Number.isSafeInteger(target.modelVersion) ||
+      target.modelVersion < 1 || !isUsagePricingSnapshot(target.pricing)
+    ) || JSON.stringify(plan).length > 65_536 ||
+    (pricing !== undefined && JSON.stringify(pricing) !== JSON.stringify(plan.targets[0]?.pricing))
+  ) throw new DomainError("validation_error", "Embedding provider plan is invalid", 422);
+}
+
 const knowledgeWords = (value: string) =>
   new Set(value.toLocaleLowerCase().match(/[\p{L}\p{N}]{2,}/gu) ?? []);
 
@@ -255,6 +273,7 @@ function embeddingExecutionProjection(
     modelId: value.modelId,
     configVersion: value.configVersion,
     usageRunId: value.usageRunId,
+    planSnapshot: structuredClone(value.planSnapshot),
     status: value.status,
     createdAt: value.createdAt,
     completedAt: value.completedAt,
@@ -476,7 +495,9 @@ export class MemoryRepository {
     string,
     DocumentEmbeddingExecution & {
       runLeaseToken: string | null;
+      jobClaimToken: string | null;
       resultCostMicros: number | null;
+      resultProviderCostMicros: number | null;
       resultInputTokens: number | null;
       resultLatencyMs: number | null;
       chunkIds: string[];
@@ -1743,6 +1764,7 @@ export class MemoryRepository {
   }
 
   beginDocumentEmbedding(input: BeginDocumentEmbeddingInput) {
+    validateEmbeddingPlan(input.modelId, input.planSnapshot, input.pricingSnapshot);
     if (
       !/^[0-9a-f]{64}$/.test(input.chunkSetDigest) || !input.modelId ||
       input.modelId.length > 255 || !EMBEDDING_CONFIG_PATTERN.test(input.configVersion) ||
@@ -1840,11 +1862,14 @@ export class MemoryRepository {
       modelId: input.modelId,
       configVersion: input.configVersion,
       usageRunId: input.usageRunId,
+      planSnapshot: structuredClone(input.planSnapshot!),
       status: "queued" as const,
       createdAt,
       completedAt: null,
       runLeaseToken: null,
+      jobClaimToken: null,
       resultCostMicros: null,
+      resultProviderCostMicros: null,
       resultInputTokens: null,
       resultLatencyMs: null,
       chunkIds: chunks.map((chunk) => chunk.id),
@@ -1875,18 +1900,33 @@ export class MemoryRepository {
     ) throw new DomainError("stale_embedding_chunks", "Embedding chunk set changed", 409);
     const run = this.usageRuns.get(execution.usageRunId);
     if (!run) throw new DomainError("not_found", "Embedding usage is missing", 404);
-    const runLeaseToken = crypto.randomUUID();
-    if (run.status === "reserved") {
+    const liveLease = run.status === "reserved" && run.runLeaseToken && run.runLeaseExpiresAt &&
+      Date.parse(run.runLeaseExpiresAt) > Date.now();
+    let runLeaseToken = execution.runLeaseToken;
+    if (execution.status === "running" && liveLease) {
+      if (execution.jobClaimToken !== jobClaimToken) {
+        throw new DomainError(
+          "embedding_execution_active",
+          "Embedding provider execution still has a live lease",
+          409,
+        );
+      }
+      runLeaseToken = run.runLeaseToken;
+    } else if (execution.status === "result_ready") {
+      runLeaseToken ??= run.runLeaseToken ?? crypto.randomUUID();
+    } else if (run.status === "reserved") {
+      runLeaseToken = crypto.randomUUID();
       run.runLeaseToken = runLeaseToken;
       run.runLeaseExpiresAt = new Date(Date.now() + leaseSeconds * 1000).toISOString();
-    } else if (!(execution.status === "result_ready" && run.status === "completed")) {
+    } else {
       throw new DomainError("invalid_usage_state", "Embedding usage is terminal", 409);
     }
-    execution.runLeaseToken = runLeaseToken;
+    execution.runLeaseToken = runLeaseToken!;
+    execution.jobClaimToken = jobClaimToken;
     if (execution.status !== "result_ready") execution.status = "running";
     return {
       ...embeddingExecutionProjection(execution),
-      runLeaseToken,
+      runLeaseToken: runLeaseToken!,
       chunks: chunks.map(({ id, ordinal, content }) => ({ id, ordinal, content })),
     };
   }
@@ -1901,7 +1941,7 @@ export class MemoryRepository {
     validateEmbeddingReplacement(chunks, execution.modelId, execution.configVersion, input.vectors);
     if (execution.status === "result_ready" || execution.status === "completed") {
       if (
-        execution.resultCostMicros !== input.costMicros ||
+        execution.resultProviderCostMicros !== input.costMicros ||
         execution.resultInputTokens !== input.inputTokens ||
         execution.resultLatencyMs !== input.latencyMs
       ) throw new DomainError("idempotency_conflict", "Embedding result differs", 409);
@@ -1917,8 +1957,27 @@ export class MemoryRepository {
       execution.id,
       new Map(input.vectors.map((item) => [item.chunkId, [...item.embedding]])),
     );
+    const user = this.users.get(execution.ownerId)!;
+    const extension = Math.min(
+      Math.max(0, input.costMicros - run.reservedMicros),
+      user.balanceMicros,
+    );
+    if (extension > 0) {
+      user.balanceMicros -= extension;
+      run.reservedMicros += extension;
+      this.ledger.push({
+        id: crypto.randomUUID(),
+        userId: execution.ownerId,
+        usageRunId: execution.usageRunId,
+        kind: "adjustment",
+        amountMicros: -extension,
+        balanceAfterMicros: user.balanceMicros,
+        createdAt: new Date().toISOString(),
+      });
+    }
     execution.status = "result_ready";
-    execution.resultCostMicros = input.costMicros;
+    execution.resultCostMicros = Math.min(input.costMicros, run.reservedMicros);
+    execution.resultProviderCostMicros = input.costMicros;
     execution.resultInputTokens = input.inputTokens;
     execution.resultLatencyMs = input.latencyMs;
     return embeddingExecutionProjection(execution);

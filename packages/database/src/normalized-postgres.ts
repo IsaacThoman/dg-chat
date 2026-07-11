@@ -263,6 +263,7 @@ function documentEmbeddingExecution(row: Row): DocumentEmbeddingExecution {
     modelId: String(row.model_id),
     configVersion: String(row.config_version),
     usageRunId: String(row.usage_run_id),
+    planSnapshot: structuredClone(row.plan_snapshot as ProviderExecutionPlan),
     status: row.status as DocumentEmbeddingExecution["status"],
     createdAt: iso(row.created_at),
     completedAt: nullableIso(row.completed_at),
@@ -311,6 +312,25 @@ function validateKnowledgeRetrievalInput(input: KnowledgeRetrievalInput) {
     (input.embeddingConfigVersion !== undefined &&
       !EMBEDDING_CONFIG_PATTERN.test(input.embeddingConfigVersion))
   ) throw new DomainError("validation_error", "Knowledge retrieval input is invalid", 422);
+}
+
+function validateEmbeddingPlan(
+  modelId: string,
+  plan: ProviderExecutionPlan | undefined,
+  pricing?: UsagePricingSnapshot,
+) {
+  if (
+    !plan || plan.sourceModelId !== modelId || !Number.isSafeInteger(plan.routeVersion) ||
+    plan.routeVersion < 0 || !Number.isFinite(Date.parse(plan.resolvedAt)) ||
+    !Array.isArray(plan.targets) || plan.targets.length < 1 || plan.targets.length > 8 ||
+    plan.targets.some((target, index) =>
+      target.ordinal !== index || target.publicModelId.length < 3 ||
+      !Number.isSafeInteger(target.providerVersion) || target.providerVersion < 1 ||
+      !Number.isSafeInteger(target.modelVersion) || target.modelVersion < 1 ||
+      !isUsagePricingSnapshot(target.pricing)
+    ) || JSON.stringify(plan).length > 65_536 ||
+    (pricing !== undefined && JSON.stringify(pricing) !== JSON.stringify(plan.targets[0]?.pricing))
+  ) throw new DomainError("validation_error", "Embedding provider plan is invalid", 422);
 }
 
 function provider(row: Row): ProviderRecord {
@@ -2121,6 +2141,7 @@ export class PostgresRepository implements DomainRepository {
   }
 
   async beginDocumentEmbedding(input: BeginDocumentEmbeddingInput) {
+    validateEmbeddingPlan(input.modelId, input.planSnapshot, input.pricingSnapshot);
     if (
       !/^[0-9a-f]{64}$/.test(input.chunkSetDigest) || !input.modelId ||
       input.modelId.length > 255 || !EMBEDDING_CONFIG_PATTERN.test(input.configVersion) ||
@@ -2211,9 +2232,11 @@ export class PostgresRepository implements DomainRepository {
         })
       },${`document.embed:${input.attachmentId}:${input.chunkSetDigest}:${input.modelId}:${input.configVersion}`})`;
       const executions = await tx<Row[]>`INSERT INTO document_embedding_executions(
-        job_id,owner_id,attachment_id,chunk_set_digest,model_id,config_version,usage_run_id)
+        job_id,owner_id,attachment_id,chunk_set_digest,model_id,config_version,usage_run_id,plan_snapshot)
         VALUES(${jobId},${input.ownerId},${input.attachmentId},${input.chunkSetDigest},
-          ${input.modelId},${input.configVersion},${input.usageRunId}) RETURNING *`;
+          ${input.modelId},${input.configVersion},${input.usageRunId},${
+        tx.json(structuredClone(input.planSnapshot!) as never)
+      }) RETURNING *`;
       const executionId = String(executions[0].id);
       for (const chunk of chunks) {
         await tx`INSERT INTO document_embedding_execution_chunks(execution_id,chunk_id,ordinal)
@@ -2254,19 +2277,38 @@ export class PostgresRepository implements DomainRepository {
       if (!current.length || exact[0]?.exact !== true) {
         throw new DomainError("stale_embedding_chunks", "Embedding chunk set changed", 409);
       }
-      const runLeaseToken = crypto.randomUUID();
-      const usageState = await tx<Row[]>`SELECT status FROM usage_runs WHERE id=${usageRunId}
+      const usageState = await tx<Row[]>`SELECT status,run_lease_token,run_lease_expires_at
+        FROM usage_runs WHERE id=${usageRunId}
         FOR UPDATE`;
       if (!usageState[0]) throw new DomainError("not_found", "Embedding usage is missing", 404);
-      if (usageState[0].status === "reserved") {
+      const liveLease = usageState[0].status === "reserved" &&
+        usageState[0].run_lease_token != null && usageState[0].run_lease_expires_at != null &&
+        Date.parse(iso(usageState[0].run_lease_expires_at)) > Date.now();
+      let runLeaseToken = rows[0].run_lease_token == null ? null : String(rows[0].run_lease_token);
+      if (rows[0].status === "running" && liveLease) {
+        if (String(rows[0].job_claim_token ?? "") !== jobClaimToken) {
+          throw new DomainError(
+            "embedding_execution_active",
+            "Embedding provider execution still has a live lease",
+            409,
+          );
+        }
+        runLeaseToken = String(usageState[0].run_lease_token);
+      } else if (rows[0].status === "result_ready") {
+        runLeaseToken ??= usageState[0].run_lease_token == null
+          ? crypto.randomUUID()
+          : String(usageState[0].run_lease_token);
+      } else if (usageState[0].status === "reserved") {
+        runLeaseToken = crypto.randomUUID();
         await tx`UPDATE usage_runs SET run_lease_token=${runLeaseToken},
           run_lease_expires_at=now()+${leaseSeconds}*interval '1 second' WHERE id=${usageRunId}`;
-      } else if (!(rows[0].status === "result_ready" && usageState[0].status === "completed")) {
+      } else {
         throw new DomainError("invalid_usage_state", "Embedding usage is terminal", 409);
       }
       const updated = await tx<Row[]>`UPDATE document_embedding_executions SET
         status=CASE WHEN status='result_ready' THEN status ELSE 'running' END,
-        run_lease_token=${runLeaseToken} WHERE id=${executionId} RETURNING *`;
+        run_lease_token=${runLeaseToken},job_claim_token=${jobClaimToken}
+        WHERE id=${executionId} RETURNING *`;
       return {
         ...documentEmbeddingExecution(updated[0]),
         runLeaseToken,
@@ -2303,7 +2345,7 @@ export class PostgresRepository implements DomainRepository {
       );
       if (rows[0].status === "result_ready" || rows[0].status === "completed") {
         if (
-          number(rows[0].result_cost_micros) !== input.costMicros ||
+          number(rows[0].result_provider_cost_micros) !== input.costMicros ||
           number(rows[0].result_input_tokens) !== input.inputTokens ||
           number(rows[0].result_latency_ms) !== input.latencyMs
         ) throw new DomainError("idempotency_conflict", "Embedding result differs", 409);
@@ -2312,7 +2354,7 @@ export class PostgresRepository implements DomainRepository {
       if (rows[0].status !== "running" || String(rows[0].run_lease_token) !== input.runLeaseToken) {
         throw new DomainError("stale_lease", "Embedding execution lease is stale", 409);
       }
-      const usage = await tx`SELECT id FROM usage_runs WHERE id=${usageRunId}
+      const usage = await tx<Row[]>`SELECT * FROM usage_runs WHERE id=${usageRunId}
         AND status='reserved' AND run_lease_token=${input.runLeaseToken}
         AND run_lease_expires_at>now() FOR UPDATE`;
       if (!usage.length) {
@@ -2323,8 +2365,28 @@ export class PostgresRepository implements DomainRepository {
         await tx`INSERT INTO document_embedding_results(execution_id,chunk_id,embedding)
           VALUES(${executionId},${item.chunkId},${value}::vector)`;
       }
+      const reserved = number(usage[0].reserved_micros);
+      let billableCost = Math.min(input.costMicros, reserved);
+      if (input.costMicros > reserved) {
+        const ownerId = String(rows[0].owner_id);
+        const users = await tx<
+          Row[]
+        >`SELECT balance_micros FROM users WHERE id=${ownerId} FOR UPDATE`;
+        const available = Math.max(0, number(users[0].balance_micros));
+        const extension = Math.min(input.costMicros - reserved, available);
+        if (extension > 0) {
+          const after = available - extension;
+          await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${ownerId}`;
+          await tx`INSERT INTO ledger_entries(user_id,usage_run_id,kind,amount_micros,balance_after_micros)
+            VALUES(${ownerId},${usageRunId},'adjustment',${-extension},${after})`;
+          await tx`UPDATE usage_runs SET reserved_micros=reserved_micros+${extension}
+            WHERE id=${usageRunId}`;
+          billableCost += extension;
+        }
+      }
       const updated = await tx<Row[]>`UPDATE document_embedding_executions SET
-        status='result_ready',result_cost_micros=${input.costMicros},
+        status='result_ready',result_cost_micros=${billableCost},
+        result_provider_cost_micros=${input.costMicros},
         result_input_tokens=${input.inputTokens},result_latency_ms=${input.latencyMs}
         WHERE id=${executionId} RETURNING *`;
       return documentEmbeddingExecution(updated[0]);

@@ -1,6 +1,34 @@
 import { assertEquals, assertThrows } from "jsr:@std/assert@1.0.14";
 import { DomainError, MemoryRepository } from "./memory.ts";
 
+const embeddingPlan = (modelId = "provider/embed-1536") => ({
+  sourceModelId: modelId,
+  routeId: null,
+  routeVersion: 1,
+  retryPolicy: null,
+  targets: [{
+    ordinal: 0,
+    providerId: "00000000-0000-8000-8000-000000000091",
+    providerSlug: "provider",
+    providerVersion: 1,
+    protocol: "chat_completions" as const,
+    providerModelId: "00000000-0000-8000-8000-000000000092",
+    publicModelId: modelId,
+    upstreamModelId: "embed-1536",
+    modelVersion: 1,
+    pricing: {
+      pricingVersionId: "00000000-0000-8000-8000-000000000093",
+      inputMicrosPerMillion: 1,
+      cachedInputMicrosPerMillion: 0,
+      reasoningMicrosPerMillion: 0,
+      outputMicrosPerMillion: 0,
+      fixedCallMicros: 0,
+      source: "test",
+    },
+  }],
+  resolvedAt: "2026-07-11T00:00:00.000Z",
+});
+
 Deno.test("provider registry hides credentials, versions mutations, and preserves price history", () => {
   const repo = new MemoryRepository();
   const actor = repo.createUser({
@@ -261,6 +289,7 @@ Deno.test("knowledge retrieval fuses same-config vectors with lexical rank and i
     provider: "provider",
     usageRunId: "memory-embedding-seam",
     reserveMicros: 100,
+    planSnapshot: embeddingPlan(),
   });
   const claimed = repo.claimDocumentEmbeddingExecution(execution.jobId, "memory-claim");
   repo.persistDocumentEmbeddingResult({
