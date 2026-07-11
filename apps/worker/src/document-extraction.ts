@@ -1,7 +1,26 @@
 import { Inflate, unzip } from "fflate";
 import { type Document, DOMParser } from "@xmldom/xmldom";
-import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
+import { createRequire } from "node:module";
 import type { PDFDocumentProxy } from "pdfjs-dist/types/src/display/api.d.ts";
+
+type PdfJs = typeof import("pdfjs-dist/legacy/build/pdf.mjs");
+let pdfJs: Promise<PdfJs> | undefined;
+
+function loadPdfJs(): Promise<PdfJs> {
+  // PDF.js needs DOMMatrix at module load even for text-only extraction. Use the canvas package's
+  // complete pure-JavaScript geometry implementation without loading its optional native renderer.
+  const geometry = createRequire(import.meta.url)("@napi-rs/canvas/geometry.js") as {
+    DOMMatrix: unknown;
+  };
+  if (!("DOMMatrix" in globalThis)) {
+    Object.defineProperty(globalThis, "DOMMatrix", {
+      configurable: true,
+      value: geometry.DOMMatrix,
+      writable: true,
+    });
+  }
+  return pdfJs ??= import("pdfjs-dist/legacy/build/pdf.mjs");
+}
 
 export type DocumentExtractionErrorCode =
   | "unsupported_type"
@@ -160,8 +179,9 @@ export async function extractPdf(
   assertRawSize(bytes, value);
   const started = performance.now();
   let document: PDFDocumentProxy | undefined;
-  let loadingTask: ReturnType<typeof getDocument> | undefined;
+  let loadingTask: ReturnType<PdfJs["getDocument"]> | undefined;
   try {
+    const { getDocument } = await loadPdfJs();
     loadingTask = getDocument({ data: bytes.slice(), useSystemFonts: false });
     document = await raceDeadline(loadingTask.promise, value.timeoutMs);
     if (document.numPages > value.maxPdfPages) {

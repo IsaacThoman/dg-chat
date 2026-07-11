@@ -12,6 +12,12 @@ async function json(response: Response) {
   return await response.json() as Record<string, any>;
 }
 
+// Deno's RequestInit and the Node-compatible FormData ambient types are structurally distinct,
+// even though the runtime accepts the standards-compatible FormData object.
+function formBody<T>(value: FormData): T {
+  return value as unknown as T;
+}
+
 function sessionCookie(response: Response): string {
   const cookie = response.headers.get("set-cookie")?.split(";", 1)[0];
   assertExists(cookie);
@@ -1206,7 +1212,7 @@ Deno.test("attachment and OpenAI Files routes enforce security, ownership, scope
     (await app.request("/v1/files", {
       method: "POST",
       headers: { authorization: `Bearer ${readOnly}` },
-      body: deniedWrite,
+      body: formBody(deniedWrite),
     })).status,
     403,
   );
@@ -1223,7 +1229,7 @@ Deno.test("attachment and OpenAI Files routes enforce security, ownership, scope
   const webUploadResponse = await app.request("/api/attachments", {
     method: "POST",
     headers: adminSession,
-    body: webForm,
+    body: formBody(webForm),
   });
   assertEquals(webUploadResponse.status, 201);
   const webUpload = (await json(webUploadResponse)).attachment;
@@ -1270,7 +1276,7 @@ Deno.test("attachment and OpenAI Files routes enforce security, ownership, scope
   const imageUploadResponse = await app.request("/api/attachments", {
     method: "POST",
     headers: adminSession,
-    body: imageForm,
+    body: formBody(imageForm),
   });
   assertEquals(imageUploadResponse.status, 201);
   const imageUpload = (await json(imageUploadResponse)).attachment;
@@ -1288,7 +1294,7 @@ Deno.test("attachment and OpenAI Files routes enforce security, ownership, scope
   const scanFloodResponse = await app.request("/api/attachments", {
     method: "POST",
     headers: adminSession,
-    body: scanFloodForm,
+    body: formBody(scanFloodForm),
   });
   assertEquals(scanFloodResponse.status, 201);
   const scanFloodAttachment = (await json(scanFloodResponse)).attachment;
@@ -1331,7 +1337,7 @@ Deno.test("attachment and OpenAI Files routes enforce security, ownership, scope
   const maliciousResponse = await app.request("/api/attachments", {
     method: "POST",
     headers: adminSession,
-    body: malicious,
+    body: formBody(malicious),
   });
   assertEquals(maliciousResponse.status, 415);
   assertEquals((await json(maliciousResponse)).error.code, "unsupported_media_type");
@@ -1628,7 +1634,7 @@ Deno.test("attachment and OpenAI Files routes enforce security, ownership, scope
   const missingPurposeResponse = await app.request("/v1/files", {
     method: "POST",
     headers: { authorization: `Bearer ${adminToken}` },
-    body: missingPurpose,
+    body: formBody(missingPurpose),
   });
   assertEquals(missingPurposeResponse.status, 400);
   assertEquals((await json(missingPurposeResponse)).error.code, "missing_file_purpose");
@@ -1641,7 +1647,7 @@ Deno.test("attachment and OpenAI Files routes enforce security, ownership, scope
   const unsupportedPurposeResponse = await app.request("/v1/files", {
     method: "POST",
     headers: { authorization: `Bearer ${adminToken}` },
-    body: unsupportedPurpose,
+    body: formBody(unsupportedPurpose),
   });
   assertEquals(unsupportedPurposeResponse.status, 400);
   assertEquals((await json(unsupportedPurposeResponse)).error.code, "unsupported_file_purpose");
@@ -1651,7 +1657,7 @@ Deno.test("attachment and OpenAI Files routes enforce security, ownership, scope
   const openAIUploadResponse = await app.request("/v1/files", {
     method: "POST",
     headers: { authorization: `Bearer ${adminToken}` },
-    body: openAIForm,
+    body: formBody(openAIForm),
   });
   assertEquals(openAIUploadResponse.status, 201);
   const openAIUpload = await json(openAIUploadResponse);

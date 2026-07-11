@@ -8,6 +8,7 @@
     "dev:web": "deno task dev:web",
     "check": "deno task check",
     "test": "deno task test",
+    "test:web": "deno task test:web",
     "build": "deno task build"
   },
   "engines": {
