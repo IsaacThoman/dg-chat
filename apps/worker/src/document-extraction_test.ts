@@ -12,6 +12,16 @@ const DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.doc
 const rels = (body: string) =>
   `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${body}</Relationships>`;
 
+function utf16(value: string, endian: "le" | "be"): Uint8Array {
+  const bytes = new Uint8Array(2 + value.length * 2);
+  bytes.set(endian === "le" ? [0xff, 0xfe] : [0xfe, 0xff]);
+  const view = new DataView(bytes.buffer);
+  for (let index = 0; index < value.length; index++) {
+    view.setUint16(2 + index * 2, value.charCodeAt(index), endian === "le");
+  }
+  return bytes;
+}
+
 function docx(
   documentXml = `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
     <w:body><w:p><w:r><w:t>First page &amp; notes</w:t></w:r></w:p>
@@ -432,6 +442,66 @@ Deno.test("DOCX parser rejects malformed reachable XML", async () => {
           rels(`<Relationship Target="header-broken.xml"/>`),
         ),
       })),
+    "invalid_docx",
+  );
+});
+
+Deno.test("DOCX parser supports fatal UTF-16LE and UTF-16BE package XML", async () => {
+  const root = `<?xml version="1.0" encoding="UTF-16"?>` + rels(
+    `<Relationship Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>`,
+  );
+  const document = `<?xml version="1.0" encoding="UTF-16LE"?>` +
+    `<document xmlns="http://schemas.openxmlformats.org/wordprocessingml/2006/main">` +
+    `<body><p><r><t>UTF sixteen text</t></r></p></body></document>`;
+  const result = await extractDocx(docx(undefined, {
+    "_rels/.rels": utf16(root, "be"),
+    "word/document.xml": utf16(document, "le"),
+  }));
+  assertEquals(result.text, "UTF sixteen text");
+
+  const mismatch = docx(undefined, {
+    "word/document.xml": utf16(document.replace("UTF-16LE", "UTF-8"), "le"),
+  });
+  await rejectsCode(() => extractDocx(mismatch), "invalid_docx");
+});
+
+Deno.test("DOCX rejects dense, deeply nested, and excessive aggregate XML before retention", async () => {
+  const dense = docx(undefined, {
+    "custom/dense.xml": strToU8(`<root>${"<x/>".repeat(100_001)}</root>`),
+  });
+  await rejectsCode(
+    () => extractDocx(dense, { maxZipCompressionRatio: 1_000_000 }),
+    "invalid_docx",
+  );
+
+  const deep = `<root>${"<x>".repeat(300)}value${"</x>".repeat(300)}</root>`;
+  await rejectsCode(
+    () =>
+      extractDocx(
+        docx(undefined, {
+          "custom/deep.xml": strToU8(deep),
+          "word/_rels/document.xml.rels": strToU8(
+            rels(`<Relationship Target="../custom/deep.xml"/>`),
+          ),
+        }),
+        {
+          maxZipCompressionRatio: 1_000_000,
+        },
+      ),
+    "invalid_docx",
+  );
+
+  const largeParts: Record<string, Uint8Array> = {};
+  for (let index = 0; index < 5; index++) {
+    largeParts[`custom/large-${index}.xml`] = strToU8(`<root>${"x".repeat(3_500_000)}</root>`);
+  }
+  await rejectsCode(
+    () =>
+      extractDocx(docx(undefined, largeParts), {
+        maxRawBytes: 25 * 1024 * 1024,
+        maxZipEntryBytes: 5 * 1024 * 1024,
+        maxZipCompressionRatio: 1_000_000,
+      }),
     "invalid_docx",
   );
 });

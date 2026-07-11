@@ -423,24 +423,6 @@ function assertActualInflation(
   }
 }
 
-function xmlText(value: string): string {
-  return value
-    .replace(/<w:tab\b[^>]*\/?\s*>/gi, "\t")
-    .replace(/<w:(?:br|cr)\b[^>]*\/?\s*>/gi, "\n")
-    .replace(/<\/w:p\s*>/gi, "\n")
-    .replace(/<[^>]+>/g, "")
-    .replace(/&#(\d+);/g, (_, number: string) => String.fromCodePoint(Number(number)))
-    .replace(/&#x([0-9a-f]+);/gi, (_, number: string) => String.fromCodePoint(parseInt(number, 16)))
-    .replaceAll("&lt;", "<")
-    .replaceAll("&gt;", ">")
-    .replaceAll("&quot;", '"')
-    .replaceAll("&apos;", "'")
-    .replaceAll("&amp;", "&")
-    .replace(/[ \t]+\n/g, "\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
-
 function decodeXmlEntities(value: string): string {
   return value
     .replace(/&#(\d+);/g, (_, number: string) => String.fromCodePoint(Number(number)))
@@ -465,19 +447,111 @@ const PACKAGE_RELATIONSHIP_NAMESPACES = new Set([
   "http://purl.oclc.org/ooxml/package/relationships",
 ]);
 
-const MAX_XML_CHARACTERS = 10_000_000;
+const MAX_XML_PART_BYTES = 4 * 1024 * 1024;
+const MAX_XML_ARCHIVE_BYTES = 16 * 1024 * 1024;
+const MAX_XML_MARKERS = 100_000;
+const MAX_XML_NODES = 150_000;
+const MAX_XML_DEPTH = 256;
 
-function parsePackageXml(bytes: Uint8Array, name: string): Document {
-  if (bytes.byteLength > MAX_XML_CHARACTERS) {
+function bytePrefix(bytes: Uint8Array, signature: readonly number[]): boolean {
+  return signature.every((byte, index) => bytes[index] === byte);
+}
+
+function decodePackageXml(bytes: Uint8Array, name: string): string {
+  if (bytes.byteLength > MAX_XML_PART_BYTES) {
     throw new DocumentExtractionError("invalid_docx", `DOCX XML part is too large: ${name}`);
   }
-  const xml = decoder.decode(bytes);
+  let encoding: "utf-8" | "utf-16le" | "utf-16be" = "utf-8";
+  if (
+    bytePrefix(bytes, [0xff, 0xfe]) ||
+    bytePrefix(bytes, [0x3c, 0x00, 0x3f, 0x00])
+  ) encoding = "utf-16le";
+  else if (
+    bytePrefix(bytes, [0xfe, 0xff]) ||
+    bytePrefix(bytes, [0x00, 0x3c, 0x00, 0x3f])
+  ) encoding = "utf-16be";
+  let xml: string;
+  try {
+    xml = new TextDecoder(encoding, { fatal: true }).decode(bytes);
+  } catch {
+    throw new DocumentExtractionError("invalid_docx", `DOCX XML encoding is invalid: ${name}`);
+  }
+  const declaration = xml.slice(0, 512).match(
+    /^\uFEFF?\s*<\?xml\b[^>]*\bencoding\s*=\s*["']([^"']+)["']/i,
+  )?.[1].toLowerCase().replaceAll("_", "-");
+  const allowed = encoding === "utf-8"
+    ? new Set(["utf-8", "utf8"])
+    : encoding === "utf-16le"
+    ? new Set(["utf-16", "utf-16le"])
+    : new Set(["utf-16", "utf-16be"]);
+  if (declaration && !allowed.has(declaration)) {
+    throw new DocumentExtractionError(
+      "invalid_docx",
+      `DOCX XML declaration conflicts with its byte encoding: ${name}`,
+    );
+  }
   if (/<!DOCTYPE\b|<!ENTITY\b/i.test(xml)) {
     throw new DocumentExtractionError(
       "docx_active_content",
       "DOCX document type and entity declarations are not allowed",
     );
   }
+  let markers = 0;
+  for (let index = xml.indexOf("<"); index >= 0; index = xml.indexOf("<", index + 1)) {
+    if (++markers > MAX_XML_MARKERS) {
+      throw new DocumentExtractionError(
+        "invalid_docx",
+        `DOCX XML part has too many nodes: ${name}`,
+      );
+    }
+  }
+  return xml;
+}
+
+function assertXmlArchiveBudget(files: Record<string, Uint8Array>): void {
+  let total = 0;
+  for (const [name, bytes] of Object.entries(files)) {
+    if (!name.toLowerCase().endsWith(".xml") && !name.toLowerCase().endsWith(".rels")) continue;
+    total += bytes.byteLength;
+    if (total > MAX_XML_ARCHIVE_BYTES) {
+      throw new DocumentExtractionError(
+        "invalid_docx",
+        "DOCX XML data exceeds the aggregate limit",
+      );
+    }
+    // Decode and preflight before DOM allocation; the resulting string is released each iteration.
+    decodePackageXml(bytes, name);
+  }
+}
+
+interface TraversalNode {
+  firstChild: TraversalNode | null;
+  nextSibling: TraversalNode | null;
+  attributes?: { length: number };
+}
+
+function assertDomBudget(document: Document, name: string): void {
+  const stack: Array<{ node: TraversalNode; depth: number }> = [
+    { node: document as unknown as TraversalNode, depth: 0 },
+  ];
+  let nodes = 0;
+  while (stack.length) {
+    const { node, depth } = stack.pop()!;
+    nodes += 1 + (node.attributes?.length ?? 0);
+    if (nodes > MAX_XML_NODES || depth > MAX_XML_DEPTH) {
+      throw new DocumentExtractionError(
+        "invalid_docx",
+        `DOCX XML structure is too complex: ${name}`,
+      );
+    }
+    for (let child = node.firstChild; child; child = child.nextSibling) {
+      stack.push({ node: child, depth: depth + 1 });
+    }
+  }
+}
+
+function parsePackageXml(bytes: Uint8Array, name: string): Document {
+  const xml = decodePackageXml(bytes, name);
   const errors: string[] = [];
   const document = new DOMParser({
     onError: (level, message) => {
@@ -487,6 +561,7 @@ function parsePackageXml(bytes: Uint8Array, name: string): Document {
   if (!document || !document.documentElement || errors.length) {
     throw new DocumentExtractionError("invalid_docx", `DOCX XML part is malformed: ${name}`);
   }
+  assertDomBudget(document, name);
   return document;
 }
 
@@ -536,7 +611,6 @@ function resolveRelationshipTarget(part: string, target: string): string | undef
 
 function reachableXmlParts(
   files: Record<string, Uint8Array>,
-  documents: Map<string, Document>,
 ): Set<string> {
   const reached = new Set<string>();
   const queue = ["word/document.xml"];
@@ -544,8 +618,10 @@ function reachableXmlParts(
     const part = queue.shift()!;
     if (reached.has(part)) continue;
     reached.add(part);
-    const relationships = documents.get(relationshipPath(part));
-    if (!relationships) continue;
+    const relationshipName = relationshipPath(part);
+    const relationshipBytes = files[relationshipName];
+    if (!relationshipBytes) continue;
+    const relationships = parsePackageXml(relationshipBytes, relationshipName);
     for (const relationship of packageRelationships(relationships)) {
       if (relationship.external || !relationship.target) continue;
       let resolved: string | undefined;
@@ -597,6 +673,47 @@ function assertNoActiveOfficeXml(document: Document): void {
   }
 }
 
+interface OfficeXmlNode extends TraversalNode {
+  localName?: string | null;
+  namespaceURI?: string | null;
+  textContent?: string | null;
+}
+
+function wordDocumentSections(document: Document): string[] {
+  const sections: string[] = [];
+  let text = "";
+  const append = (value: string) => {
+    text += value;
+  };
+  const flush = () => {
+    const normalized = text.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+    if (normalized) sections.push(normalized);
+    text = "";
+  };
+  const walk = (node: OfficeXmlNode): void => {
+    const word = node.namespaceURI !== null && node.namespaceURI !== undefined &&
+      WORDPROCESSING_NAMESPACES.has(node.namespaceURI);
+    if (word && node.localName === "t") {
+      append(node.textContent ?? "");
+      return;
+    }
+    if (word && node.localName === "tab") append("\t");
+    else if (word && (node.localName === "br" || node.localName === "cr")) append("\n");
+    for (
+      let child = node.firstChild as OfficeXmlNode | null;
+      child;
+      child = child.nextSibling as OfficeXmlNode | null
+    ) {
+      walk(child);
+    }
+    if (word && node.localName === "p") append("\n");
+    if (word && node.localName === "sectPr") flush();
+  };
+  walk(document as unknown as OfficeXmlNode);
+  flush();
+  return sections;
+}
+
 function assertSafeDocx(entries: ZipEntry[], files: Record<string, Uint8Array>): void {
   const names = new Set(entries.map((entry) => entry.name));
   const lowerNames = entries.map((entry) => entry.name.toLowerCase());
@@ -606,6 +723,7 @@ function assertSafeDocx(entries: ZipEntry[], files: Record<string, Uint8Array>):
       "DOCX required package parts must use canonical names",
     );
   }
+  assertXmlArchiveBudget(files);
   const rootRelationships = files["_rels/.rels"];
   if (!rootRelationships) {
     throw new DocumentExtractionError("invalid_docx", "DOCX root relationships are missing");
@@ -625,7 +743,10 @@ function assertSafeDocx(entries: ZipEntry[], files: Record<string, Uint8Array>):
     throw new DocumentExtractionError("docx_macro", "Macro-enabled DOCX files are not allowed");
   }
   const contentTypes = files["[Content_Types].xml"];
-  const decodedContentTypes = decodeXmlEntities(decoder.decode(contentTypes));
+  const decodedContentTypes = decodeXmlEntities(
+    decodePackageXml(contentTypes, "[Content_Types].xml"),
+  );
+  parsePackageXml(contentTypes, "[Content_Types].xml");
   if (/macroEnabled|vbaProject/i.test(decodedContentTypes)) {
     throw new DocumentExtractionError("docx_macro", "Macro-enabled DOCX files are not allowed");
   }
@@ -646,19 +767,15 @@ function assertSafeDocx(entries: ZipEntry[], files: Record<string, Uint8Array>):
       "Embedded or active DOCX content is not allowed",
     );
   }
-  const documents = new Map<string, Document>();
+  for (const name of reachableXmlParts(files)) {
+    const bytes = files[name];
+    if (bytes) assertNoActiveOfficeXml(parsePackageXml(bytes, name));
+  }
   for (const [name, bytes] of Object.entries(files)) {
-    if (name.toLowerCase().endsWith(".xml") || name.toLowerCase().endsWith(".rels")) {
-      documents.set(name, name === "_rels/.rels" ? rootDocument : parsePackageXml(bytes, name));
-    }
-  }
-  for (const name of reachableXmlParts(files, documents)) {
-    const document = documents.get(name);
-    if (document) assertNoActiveOfficeXml(document);
-  }
-  for (const [name] of Object.entries(files)) {
     if (!name.toLowerCase().endsWith(".rels")) continue;
-    const relationships = packageRelationships(documents.get(name)!);
+    const relationships = packageRelationships(
+      name === "_rels/.rels" ? rootDocument : parsePackageXml(bytes, name),
+    );
     if (relationships.some((relationship) => relationship.external)) {
       throw new DocumentExtractionError(
         "docx_external_reference",
@@ -770,12 +887,15 @@ export async function extractDocx(
     if (!documentBytes) {
       throw new DocumentExtractionError("invalid_docx", "DOCX is missing word/document.xml");
     }
-    const xml = decoder.decode(documentBytes);
-    if (!/<w:document\b/i.test(xml)) {
+    const document = parsePackageXml(documentBytes, "word/document.xml");
+    const documentElement = document.documentElement!;
+    if (
+      !WORDPROCESSING_NAMESPACES.has(documentElement.namespaceURI ?? "") ||
+      documentElement.localName !== "document"
+    ) {
       throw new DocumentExtractionError("invalid_docx", "DOCX document XML is malformed");
     }
-    const rawSections = xml.split(/<w:sectPr\b[\s\S]*?<\/w:sectPr\s*>/gi);
-    const sectionTexts = rawSections.map(xmlText).filter(Boolean);
+    const sectionTexts = wordDocumentSections(document);
     const text = boundedText(sectionTexts, value);
     const units = sectionTexts.map((sectionText, index): ExtractedDocumentUnit => ({
       kind: "section",
