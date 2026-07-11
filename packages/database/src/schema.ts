@@ -386,6 +386,64 @@ export const documentChunks = pgTable("document_chunks", {
     .where(sql`${table.embeddingStatus} = 'ready' AND ${table.embedding} IS NOT NULL`),
 ]);
 
+export const documentEmbeddingExecutions = pgTable("document_embedding_executions", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  jobId: uuid("job_id").notNull().unique().references(() => jobs.id, { onDelete: "restrict" }),
+  ownerId: uuid("owner_id").notNull().references(() => users.id, { onDelete: "restrict" }),
+  attachmentId: uuid("attachment_id").notNull().references(() => attachments.id, {
+    onDelete: "restrict",
+  }),
+  chunkSetDigest: text("chunk_set_digest").notNull(),
+  modelId: text("model_id").notNull(),
+  configVersion: text("config_version").notNull(),
+  usageRunId: text("usage_run_id").notNull().unique().references(() => usageRuns.id, {
+    onDelete: "restrict",
+  }),
+  status: text("status").notNull().default("queued"),
+  runLeaseToken: uuid("run_lease_token"),
+  resultCostMicros: bigint("result_cost_micros", { mode: "number" }),
+  resultInputTokens: integer("result_input_tokens"),
+  resultLatencyMs: integer("result_latency_ms"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  completedAt: timestamp("completed_at", { withTimezone: true }),
+}, (table) => [
+  uniqueIndex("document_embedding_execution_identity_uq").on(
+    table.attachmentId,
+    table.chunkSetDigest,
+    table.modelId,
+    table.configVersion,
+  ),
+  index("document_embedding_execution_owner_idx").on(table.ownerId, table.createdAt),
+]);
+
+export const documentEmbeddingResults = pgTable("document_embedding_results", {
+  executionId: uuid("execution_id").notNull().references(() => documentEmbeddingExecutions.id, {
+    onDelete: "cascade",
+  }),
+  chunkId: uuid("chunk_id").notNull().references(() => documentChunks.id, {
+    onDelete: "cascade",
+  }),
+  embedding: vector("embedding", { dimensions: 1536 }).notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.executionId, table.chunkId] }),
+]);
+
+export const documentEmbeddingExecutionChunks = pgTable("document_embedding_execution_chunks", {
+  executionId: uuid("execution_id").notNull().references(() => documentEmbeddingExecutions.id, {
+    onDelete: "cascade",
+  }),
+  chunkId: uuid("chunk_id").notNull().references(() => documentChunks.id, {
+    onDelete: "cascade",
+  }),
+  ordinal: integer("ordinal").notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.executionId, table.chunkId] }),
+  uniqueIndex("document_embedding_execution_chunk_ordinal_uq").on(
+    table.executionId,
+    table.ordinal,
+  ),
+]);
+
 export const auditEvents = pgTable("audit_events", {
   id: uuid("id").primaryKey().defaultRandom(),
   actorId: uuid("actor_id").references(() => users.id),

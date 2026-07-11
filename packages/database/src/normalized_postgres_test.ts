@@ -2334,3 +2334,127 @@ Deno.test({
     }
   },
 });
+
+Deno.test({
+  name: "durable embedding results survive reclaim and finalize accounting exactly once",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 1 });
+    await sql`TRUNCATE document_embedding_results,document_embedding_execution_chunks,
+      document_embedding_executions,conversation_knowledge_bindings,
+      knowledge_collection_attachments,knowledge_collections,audit_events,document_chunks,
+      message_attachments,attachments,jobs,ledger_entries,usage_runs,api_tokens,sessions,
+      messages,conversations,users RESTART IDENTITY CASCADE`;
+    const repo = await PostgresRepository.connect(databaseUrl!);
+    try {
+      const owner = await repo.bootstrapAdmin({
+        email: "embedding-seam@database.test",
+        name: "Embedding seam",
+        passwordHash: "x",
+      }, 1_000);
+      const attachment = (await repo.createAttachment({
+        ownerId: owner.id,
+        objectKey: `users/${owner.id}/embedding-seam.txt`,
+        filename: "embedding-seam.txt",
+        mimeType: "text/plain",
+        sizeBytes: 10,
+        sha256: "9".repeat(64),
+        state: "ready",
+      })).attachment;
+      await sql`UPDATE attachments SET ingestion_status='processing' WHERE id=${attachment.id}`;
+      const chunk = {
+        id: crypto.randomUUID(),
+        ordinal: 0,
+        content: "durable vector",
+        metadata: { sourceAttachmentId: attachment.id },
+      };
+      await repo.completeAttachmentIngestion(attachment.id, owner.id, [chunk]);
+
+      await assertRejects(
+        () =>
+          repo.beginDocumentEmbedding({
+            ownerId: owner.id,
+            attachmentId: attachment.id,
+            chunkSetDigest: "a".repeat(64),
+            modelId: "provider/embed-1536",
+            configVersion: "knowledge-v1",
+            provider: "provider",
+            usageRunId: "embedding-insufficient",
+            reserveMicros: 2_000,
+          }),
+        DomainError,
+        "Insufficient credit",
+      );
+      assertEquals(
+        (await sql`SELECT id FROM usage_runs WHERE id='embedding-insufficient'`).length,
+        0,
+      );
+      assertEquals((await sql`SELECT id FROM jobs WHERE type='document.embed'`).length, 0);
+
+      const begun = await repo.beginDocumentEmbedding({
+        ownerId: owner.id,
+        attachmentId: attachment.id,
+        chunkSetDigest: "b".repeat(64),
+        modelId: "provider/embed-1536",
+        configVersion: "knowledge-v1",
+        provider: "provider",
+        usageRunId: "embedding-durable-run",
+        reserveMicros: 100,
+      });
+      await sql`UPDATE jobs SET status='running',locked_by='claim-a',locked_at=now()
+        WHERE id=${begun.jobId}`;
+      const claimed = await repo.claimDocumentEmbeddingExecution(begun.jobId, "claim-a");
+      const vector = [1, ...Array(1535).fill(0)];
+      assertEquals(
+        (await repo.persistDocumentEmbeddingResult({
+          jobId: begun.jobId,
+          jobClaimToken: "claim-a",
+          runLeaseToken: claimed.runLeaseToken,
+          vectors: [{ chunkId: chunk.id, embedding: vector }],
+          costMicros: 40,
+          inputTokens: 7,
+          latencyMs: 12,
+        })).status,
+        "result_ready",
+      );
+      // Simulate terminal accounting committing before vector/job finalization.
+      await repo.settle("embedding-durable-run", 40, 7, 0, 12);
+
+      await sql`UPDATE jobs SET locked_by='claim-b',locked_at=now() WHERE id=${begun.jobId}`;
+      await assertRejects(
+        () => repo.finalizeDocumentEmbedding(begun.jobId, "claim-a"),
+        DomainError,
+        "stale",
+      );
+      const reclaimed = await repo.claimDocumentEmbeddingExecution(begun.jobId, "claim-b");
+      assertEquals(reclaimed.status, "result_ready");
+      const completed = await Promise.all([
+        repo.finalizeDocumentEmbedding(begun.jobId, "claim-b"),
+        repo.finalizeDocumentEmbedding(begun.jobId, "claim-b"),
+      ]);
+      assertEquals(completed.map((item) => item.status), ["completed", "completed"]);
+      assertEquals(
+        (await repo.finalizeDocumentEmbedding(begun.jobId, "obsolete")).status,
+        "completed",
+      );
+      const stored = await repo.listDocumentChunks(attachment.id, owner.id);
+      assertEquals(stored[0].embeddingStatus, "ready");
+      assertEquals("embedding" in stored[0], false);
+      const state = await sql<{ balance: number; status: string; job_status: string }[]>`
+        SELECT u.balance_micros::int AS balance,r.status,j.status AS job_status FROM users u
+        JOIN usage_runs r ON r.user_id=u.id JOIN document_embedding_executions e
+          ON e.usage_run_id=r.id JOIN jobs j ON j.id=e.job_id WHERE r.id='embedding-durable-run'`;
+      assertEquals(state[0], { balance: 960, status: "completed", job_status: "completed" });
+      assertEquals(
+        (await sql`SELECT id FROM ledger_entries
+        WHERE usage_run_id='embedding-durable-run'`).length,
+        2,
+      );
+    } finally {
+      await repo.close();
+      await sql.end();
+    }
+  },
+});

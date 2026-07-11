@@ -21,6 +21,7 @@ import type {
   BeginApiRequestInput,
   BeginApiRequestResult,
   BeginAssistantGenerationInput,
+  BeginDocumentEmbeddingInput,
   BeginGenerationInput,
   CompleteApiRequestInput,
   CompleteGenerationInput,
@@ -37,6 +38,7 @@ import type {
   DocumentChunk,
   DocumentChunkEmbeddingInput,
   DocumentChunkInput,
+  DocumentEmbeddingExecution,
   DomainRepository,
   FailApiRequestInput,
   FailGenerationInput,
@@ -50,6 +52,7 @@ import type {
   KnowledgeRetrievalInput,
   KnowledgeRetrievalMode,
   ModelPriceVersion,
+  PersistDocumentEmbeddingResultInput,
   ProviderAttempt,
   ProviderCredentialEnvelope,
   ProviderCredentialMutation,
@@ -246,6 +249,22 @@ function documentChunk(row: Row): DocumentChunk {
       : String(row.embedding_config_version),
     embeddedAt: nullableIso(row.embedded_at),
     embeddingError: row.embedding_error == null ? null : String(row.embedding_error),
+  };
+}
+
+function documentEmbeddingExecution(row: Row): DocumentEmbeddingExecution {
+  return {
+    id: String(row.id),
+    jobId: String(row.job_id),
+    ownerId: String(row.owner_id),
+    attachmentId: String(row.attachment_id),
+    chunkSetDigest: String(row.chunk_set_digest),
+    modelId: String(row.model_id),
+    configVersion: String(row.config_version),
+    usageRunId: String(row.usage_run_id),
+    status: row.status as DocumentEmbeddingExecution["status"],
+    createdAt: iso(row.created_at),
+    completedAt: nullableIso(row.completed_at),
   };
 }
 
@@ -2095,6 +2114,263 @@ export class PostgresRepository implements DomainRepository {
       }
       return (await tx<Row[]>`SELECT * FROM document_chunks
         WHERE attachment_id=${id} ORDER BY ordinal`).map(documentChunk);
+    });
+  }
+
+  async beginDocumentEmbedding(input: BeginDocumentEmbeddingInput) {
+    if (
+      !/^[0-9a-f]{64}$/.test(input.chunkSetDigest) || !input.modelId ||
+      input.modelId.length > 255 || !EMBEDDING_CONFIG_PATTERN.test(input.configVersion) ||
+      !input.usageRunId || input.usageRunId.length > 255 || !input.provider ||
+      input.provider.length > 255 || !Number.isSafeInteger(input.reserveMicros) ||
+      input.reserveMicros < 0 ||
+      (input.pricingSnapshot !== undefined && !isUsagePricingSnapshot(input.pricingSnapshot))
+    ) throw new DomainError("validation_error", "Document embedding request is invalid", 422);
+    return await this.#sql.begin(async (tx) => {
+      const replay = await tx<Row[]>`SELECT * FROM document_embedding_executions
+        WHERE attachment_id=${input.attachmentId} AND chunk_set_digest=${input.chunkSetDigest}
+          AND model_id=${input.modelId} AND config_version=${input.configVersion}`;
+      if (replay[0]) return documentEmbeddingExecution(replay[0]);
+      const attachment = await tx<Row[]>`SELECT id FROM attachments
+        WHERE id=${input.attachmentId} AND owner_id=${input.ownerId} AND deleted_at IS NULL
+          AND state='ready' AND ingestion_status='ready' FOR UPDATE`;
+      if (!attachment[0]) throw new DomainError("not_found", "Ready attachment not found", 404);
+      const chunks = await tx<Row[]>`SELECT id,ordinal FROM document_chunks
+        WHERE attachment_id=${input.attachmentId} ORDER BY ordinal FOR UPDATE`;
+      if (!chunks.length) {
+        throw new DomainError("embedding_chunks_missing", "Attachment has no chunks", 409);
+      }
+      const users = await tx<
+        Row[]
+      >`SELECT balance_micros FROM users WHERE id=${input.ownerId} FOR UPDATE`;
+      if (!users[0]) throw new DomainError("not_found", "User not found", 404);
+      const balance = number(users[0].balance_micros);
+      if (balance < input.reserveMicros) {
+        throw new DomainError("insufficient_credit", "Insufficient credit", 402);
+      }
+      const runLeaseToken = crypto.randomUUID();
+      await tx`INSERT INTO usage_runs(id,user_id,model,provider,status,reserved_micros,
+        run_lease_token,run_lease_expires_at,pricing_version_id,
+        pricing_input_micros_per_million,pricing_cached_input_micros_per_million,
+        pricing_reasoning_micros_per_million,pricing_output_micros_per_million,
+        pricing_fixed_call_micros,pricing_source)
+        VALUES(${input.usageRunId},${input.ownerId},${input.modelId},${input.provider},'reserved',
+          ${input.reserveMicros},${runLeaseToken},now(),${
+        input.pricingSnapshot?.pricingVersionId ?? null
+      },
+          ${input.pricingSnapshot?.inputMicrosPerMillion ?? null},
+          ${input.pricingSnapshot?.cachedInputMicrosPerMillion ?? null},
+          ${input.pricingSnapshot?.reasoningMicrosPerMillion ?? null},
+          ${input.pricingSnapshot?.outputMicrosPerMillion ?? null},
+          ${input.pricingSnapshot?.fixedCallMicros ?? null},${
+        input.pricingSnapshot?.source ?? null
+      })`;
+      const after = balance - input.reserveMicros;
+      await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${input.ownerId}`;
+      await tx`INSERT INTO ledger_entries(user_id,usage_run_id,kind,amount_micros,balance_after_micros)
+        VALUES(${input.ownerId},${input.usageRunId},'reserve',${-input.reserveMicros},${after})`;
+      const jobId = crypto.randomUUID();
+      await tx`INSERT INTO jobs(id,type,payload,idempotency_key) VALUES(${jobId},'document.embed',${
+        tx.json({
+          attachmentId: input.attachmentId,
+          ownerId: input.ownerId,
+          chunkSetDigest: input.chunkSetDigest,
+          modelId: input.modelId,
+          configVersion: input.configVersion,
+        })
+      },${`document.embed:${input.attachmentId}:${input.chunkSetDigest}:${input.modelId}:${input.configVersion}`})`;
+      const executions = await tx<Row[]>`INSERT INTO document_embedding_executions(
+        job_id,owner_id,attachment_id,chunk_set_digest,model_id,config_version,usage_run_id)
+        VALUES(${jobId},${input.ownerId},${input.attachmentId},${input.chunkSetDigest},
+          ${input.modelId},${input.configVersion},${input.usageRunId}) RETURNING *`;
+      const executionId = String(executions[0].id);
+      for (const chunk of chunks) {
+        await tx`INSERT INTO document_embedding_execution_chunks(execution_id,chunk_id,ordinal)
+          VALUES(${executionId},${String(chunk.id)},${number(chunk.ordinal)})`;
+      }
+      return documentEmbeddingExecution(executions[0]);
+    });
+  }
+
+  async claimDocumentEmbeddingExecution(jobId: string, jobClaimToken: string, leaseSeconds = 120) {
+    if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1 || leaseSeconds > 900) {
+      throw new DomainError("validation_error", "Embedding lease duration is invalid", 422);
+    }
+    return await this.#sql.begin(async (tx) => {
+      const rows = await tx<Row[]>`SELECT e.* FROM document_embedding_executions e
+        JOIN jobs j ON j.id=e.job_id WHERE e.job_id=${jobId} AND j.status='running'
+          AND j.locked_by=${jobClaimToken} FOR UPDATE OF e,j`;
+      if (!rows[0]) throw new DomainError("stale_lease", "Embedding job claim is stale", 409);
+      const executionId = String(rows[0].id);
+      const attachmentId = String(rows[0].attachment_id);
+      const usageRunId = String(rows[0].usage_run_id);
+      if (rows[0].status === "completed") {
+        throw new DomainError("invalid_embedding_state", "Embedding execution is complete", 409);
+      }
+      const current = await tx<Row[]>`SELECT ec.chunk_id AS id,ec.ordinal,d.content
+        FROM document_embedding_execution_chunks ec JOIN document_chunks d ON d.id=ec.chunk_id
+        WHERE ec.execution_id=${executionId} AND d.attachment_id=${attachmentId}
+        ORDER BY ec.ordinal`;
+      const exact = await tx<{ exact: boolean }[]>`SELECT NOT EXISTS(
+        SELECT id FROM document_chunks WHERE attachment_id=${attachmentId}
+        EXCEPT SELECT chunk_id FROM document_embedding_execution_chunks WHERE execution_id=${executionId}
+      ) AND NOT EXISTS(
+        SELECT chunk_id FROM document_embedding_execution_chunks WHERE execution_id=${executionId}
+        EXCEPT SELECT id FROM document_chunks WHERE attachment_id=${attachmentId}
+      ) AS exact`;
+      if (!current.length || exact[0]?.exact !== true) {
+        throw new DomainError("stale_embedding_chunks", "Embedding chunk set changed", 409);
+      }
+      const runLeaseToken = crypto.randomUUID();
+      const usageState = await tx<Row[]>`SELECT status FROM usage_runs WHERE id=${usageRunId}
+        FOR UPDATE`;
+      if (!usageState[0]) throw new DomainError("not_found", "Embedding usage is missing", 404);
+      if (usageState[0].status === "reserved") {
+        await tx`UPDATE usage_runs SET run_lease_token=${runLeaseToken},
+          run_lease_expires_at=now()+${leaseSeconds}*interval '1 second' WHERE id=${usageRunId}`;
+      } else if (!(rows[0].status === "result_ready" && usageState[0].status === "completed")) {
+        throw new DomainError("invalid_usage_state", "Embedding usage is terminal", 409);
+      }
+      const updated = await tx<Row[]>`UPDATE document_embedding_executions SET
+        status=CASE WHEN status='result_ready' THEN status ELSE 'running' END,
+        run_lease_token=${runLeaseToken} WHERE id=${executionId} RETURNING *`;
+      return {
+        ...documentEmbeddingExecution(updated[0]),
+        runLeaseToken,
+        chunks: current.map((row) => ({
+          id: String(row.id),
+          ordinal: number(row.ordinal),
+          content: String(row.content),
+        })),
+      };
+    });
+  }
+
+  async persistDocumentEmbeddingResult(input: PersistDocumentEmbeddingResultInput) {
+    if (
+      !Number.isSafeInteger(input.costMicros) || input.costMicros < 0 ||
+      !Number.isSafeInteger(input.inputTokens) || input.inputTokens < 0 ||
+      !Number.isSafeInteger(input.latencyMs) || input.latencyMs < 0
+    ) throw new DomainError("validation_error", "Embedding result metrics are invalid", 422);
+    return await this.#sql.begin(async (tx) => {
+      const rows = await tx<Row[]>`SELECT e.* FROM document_embedding_executions e
+        JOIN jobs j ON j.id=e.job_id WHERE e.job_id=${input.jobId} AND j.status='running'
+          AND j.locked_by=${input.jobClaimToken} FOR UPDATE OF e,j`;
+      if (!rows[0]) throw new DomainError("stale_lease", "Embedding job claim is stale", 409);
+      const executionId = String(rows[0].id);
+      const usageRunId = String(rows[0].usage_run_id);
+      const chunks = (await tx<Row[]>`SELECT d.* FROM document_embedding_execution_chunks ec
+        JOIN document_chunks d ON d.id=ec.chunk_id WHERE ec.execution_id=${executionId}
+        ORDER BY ec.ordinal FOR UPDATE OF d`).map(documentChunk);
+      validateEmbeddingReplacement(
+        chunks,
+        String(rows[0].model_id),
+        String(rows[0].config_version),
+        input.vectors,
+      );
+      if (rows[0].status === "result_ready" || rows[0].status === "completed") {
+        if (
+          number(rows[0].result_cost_micros) !== input.costMicros ||
+          number(rows[0].result_input_tokens) !== input.inputTokens ||
+          number(rows[0].result_latency_ms) !== input.latencyMs
+        ) throw new DomainError("idempotency_conflict", "Embedding result differs", 409);
+        return documentEmbeddingExecution(rows[0]);
+      }
+      if (rows[0].status !== "running" || String(rows[0].run_lease_token) !== input.runLeaseToken) {
+        throw new DomainError("stale_lease", "Embedding execution lease is stale", 409);
+      }
+      const usage = await tx`SELECT id FROM usage_runs WHERE id=${usageRunId}
+        AND status='reserved' AND run_lease_token=${input.runLeaseToken}
+        AND run_lease_expires_at>now() FOR UPDATE`;
+      if (!usage.length) {
+        throw new DomainError("stale_lease", "Embedding usage lease is stale", 409);
+      }
+      for (const item of input.vectors) {
+        const value = `[${item.embedding.join(",")}]`;
+        await tx`INSERT INTO document_embedding_results(execution_id,chunk_id,embedding)
+          VALUES(${executionId},${item.chunkId},${value}::vector)`;
+      }
+      const updated = await tx<Row[]>`UPDATE document_embedding_executions SET
+        status='result_ready',result_cost_micros=${input.costMicros},
+        result_input_tokens=${input.inputTokens},result_latency_ms=${input.latencyMs}
+        WHERE id=${executionId} RETURNING *`;
+      return documentEmbeddingExecution(updated[0]);
+    });
+  }
+
+  async finalizeDocumentEmbedding(jobId: string, jobClaimToken: string) {
+    return await this.#sql.begin(async (tx) => {
+      const all = await tx<Row[]>`SELECT * FROM document_embedding_executions
+        WHERE job_id=${jobId} FOR UPDATE`;
+      if (!all[0]) throw new DomainError("not_found", "Embedding execution not found", 404);
+      if (all[0].status === "completed") return documentEmbeddingExecution(all[0]);
+      const executionId = String(all[0].id);
+      const attachmentId = String(all[0].attachment_id);
+      const usageRunId = String(all[0].usage_run_id);
+      const ownerId = String(all[0].owner_id);
+      const modelId = String(all[0].model_id);
+      const configVersion = String(all[0].config_version);
+      const job = await tx`SELECT id FROM jobs WHERE id=${jobId} AND status='running'
+        AND locked_by=${jobClaimToken} FOR UPDATE`;
+      if (!job.length) throw new DomainError("stale_lease", "Embedding job claim is stale", 409);
+      if (all[0].status !== "result_ready") {
+        throw new DomainError("invalid_embedding_state", "Embedding result is not durable", 409);
+      }
+      const exact = await tx<{ exact: boolean }[]>`SELECT NOT EXISTS(
+        SELECT id FROM document_chunks WHERE attachment_id=${attachmentId}
+        EXCEPT SELECT chunk_id FROM document_embedding_execution_chunks WHERE execution_id=${executionId}
+      ) AND NOT EXISTS(
+        SELECT chunk_id FROM document_embedding_execution_chunks WHERE execution_id=${executionId}
+        EXCEPT SELECT id FROM document_chunks WHERE attachment_id=${attachmentId}
+      ) AND NOT EXISTS(
+        SELECT chunk_id FROM document_embedding_execution_chunks WHERE execution_id=${executionId}
+        EXCEPT SELECT chunk_id FROM document_embedding_results WHERE execution_id=${executionId}
+      ) AS exact`;
+      if (exact[0]?.exact !== true) {
+        throw new DomainError("stale_embedding_chunks", "Embedding chunk set changed", 409);
+      }
+      const runRows = await tx<Row[]>`SELECT * FROM usage_runs WHERE id=${usageRunId} FOR UPDATE`;
+      if (!runRows[0]) throw new DomainError("not_found", "Usage run not found", 404);
+      const cost = number(all[0].result_cost_micros);
+      const inputTokens = number(all[0].result_input_tokens);
+      if (runRows[0].status === "completed") {
+        if (
+          number(runRows[0].cost_micros) !== cost ||
+          number(runRows[0].input_tokens) !== inputTokens || number(runRows[0].output_tokens) !== 0
+        ) throw new DomainError("idempotency_conflict", "Settled embedding usage differs", 409);
+      } else {
+        if (runRows[0].status !== "reserved") {
+          throw new DomainError("invalid_usage_state", "Embedding usage is already terminal", 409);
+        }
+        const reserved = number(runRows[0].reserved_micros);
+        const delta = reserved - cost;
+        const users = await tx<Row[]>`SELECT balance_micros FROM users
+          WHERE id=${ownerId} FOR UPDATE`;
+        const after = number(users[0].balance_micros) + delta;
+        if (after < 0) {
+          throw new DomainError("insufficient_credit", "Actual cost exceeds credit", 402);
+        }
+        await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${ownerId}`;
+        if (delta !== 0) {
+          await tx`INSERT INTO ledger_entries(user_id,usage_run_id,kind,amount_micros,balance_after_micros)
+            VALUES(${ownerId},${usageRunId},${delta > 0 ? "refund" : "settle"},${delta},${after})`;
+        }
+        await tx`UPDATE usage_runs SET status='completed',cost_micros=${cost},
+          input_tokens=${inputTokens},output_tokens=0,latency_ms=${
+          number(all[0].result_latency_ms)
+        },
+          run_lease_token=NULL,run_lease_expires_at=NULL,completed_at=now()
+          WHERE id=${usageRunId}`;
+      }
+      await tx`UPDATE document_chunks d SET embedding=r.embedding,embedding_status='ready',
+        embedding_model_id=${modelId},embedding_config_version=${configVersion},
+        embedded_at=now(),embedding_error=NULL FROM document_embedding_results r
+        WHERE r.execution_id=${executionId} AND r.chunk_id=d.id`;
+      await tx`UPDATE jobs SET status='completed',completed_at=now(),locked_at=NULL,locked_by=NULL
+        WHERE id=${jobId}`;
+      const updated = await tx<Row[]>`UPDATE document_embedding_executions SET status='completed',
+        completed_at=now(),run_lease_token=NULL WHERE id=${executionId} RETURNING *`;
+      return documentEmbeddingExecution(updated[0]);
     });
   }
 

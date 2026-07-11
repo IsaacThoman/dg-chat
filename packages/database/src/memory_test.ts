@@ -251,6 +251,33 @@ Deno.test("knowledge retrieval fuses same-config vectors with lexical rank and i
     embeddingConfigVersion: "knowledge-v2",
   });
   assertEquals(wrongConfig.map((item) => item.chunkId), [chunks[0].id]);
+  repo.credit(owner.id, "embedding-seam-grant", "grant", 1_000);
+  const execution = repo.beginDocumentEmbedding({
+    ownerId: owner.id,
+    attachmentId: attachment.id,
+    chunkSetDigest: "c".repeat(64),
+    modelId: "provider/embed-1536",
+    configVersion: "knowledge-v2",
+    provider: "provider",
+    usageRunId: "memory-embedding-seam",
+    reserveMicros: 100,
+  });
+  const claimed = repo.claimDocumentEmbeddingExecution(execution.jobId, "memory-claim");
+  repo.persistDocumentEmbeddingResult({
+    jobId: execution.jobId,
+    jobClaimToken: "memory-claim",
+    runLeaseToken: claimed.runLeaseToken,
+    vectors: [
+      { chunkId: chunks[0].id, embedding: axis(1, 0) },
+      { chunkId: chunks[1].id, embedding: axis(0, 1) },
+    ],
+    costMicros: 40,
+    inputTokens: 7,
+    latencyMs: 12,
+  });
+  assertEquals(repo.finalizeDocumentEmbedding(execution.jobId, "memory-claim").status, "completed");
+  assertEquals(repo.finalizeDocumentEmbedding(execution.jobId, "obsolete").status, "completed");
+  assertEquals(repo.findUser(owner.id)?.balanceMicros, 960);
   assertThrows(
     () =>
       repo.retrieveConversationKnowledge({

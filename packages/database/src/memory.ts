@@ -26,6 +26,7 @@ import type {
   BeginApiRequestInput,
   BeginApiRequestResult,
   BeginAssistantGenerationInput,
+  BeginDocumentEmbeddingInput,
   BeginGenerationInput,
   BeginGenerationResult,
   CompleteApiRequestInput,
@@ -41,6 +42,7 @@ import type {
   DocumentChunk,
   DocumentChunkEmbeddingInput,
   DocumentChunkInput,
+  DocumentEmbeddingExecution,
   FailApiRequestInput,
   FailGenerationInput,
   FinalizeProviderUsageInput,
@@ -55,6 +57,7 @@ import type {
   KnowledgeRetrievalInput,
   KnowledgeRetrievalMode,
   ModelPriceVersion,
+  PersistDocumentEmbeddingResultInput,
   ProviderAttempt,
   ProviderCredentialEnvelope,
   ProviderCredentialMutation,
@@ -235,6 +238,24 @@ function rankKnowledgeCandidates(
       .sort((a, b) => b.score - a.score || stable(a, b)),
   ].slice(0, limit);
   return ordered.map(({ lexical: _lexical, vector: _vector, ...item }) => item);
+}
+
+function embeddingExecutionProjection(
+  value: DocumentEmbeddingExecution & { runLeaseToken?: string | null },
+): DocumentEmbeddingExecution {
+  return {
+    id: value.id,
+    jobId: value.jobId,
+    ownerId: value.ownerId,
+    attachmentId: value.attachmentId,
+    chunkSetDigest: value.chunkSetDigest,
+    modelId: value.modelId,
+    configVersion: value.configVersion,
+    usageRunId: value.usageRunId,
+    status: value.status,
+    createdAt: value.createdAt,
+    completedAt: value.completedAt,
+  };
 }
 
 interface StoredProvider extends ProviderRecord {
@@ -448,6 +469,17 @@ export class MemoryRepository {
   readonly messageAttachments = new Map<string, Set<string>>();
   readonly documentChunks = new Map<string, DocumentChunk[]>();
   readonly documentChunkEmbeddings = new Map<string, number[]>();
+  readonly documentEmbeddingExecutions = new Map<
+    string,
+    DocumentEmbeddingExecution & {
+      runLeaseToken: string | null;
+      resultCostMicros: number | null;
+      resultInputTokens: number | null;
+      resultLatencyMs: number | null;
+      chunkIds: string[];
+    }
+  >();
+  readonly documentEmbeddingResults = new Map<string, Map<string, number[]>>();
   readonly knowledgeCollections = new Map<string, KnowledgeCollection>();
   readonly knowledgeAttachments = new Map<string, Set<string>>();
   readonly knowledgeBindings = new Map<string, KnowledgeConversationBinding>();
@@ -474,6 +506,7 @@ export class MemoryRepository {
       status: string;
       attempts: number;
       idempotencyKey?: string;
+      lockedBy?: string | null;
       createdAt: string;
     }
   > = [];
@@ -1704,6 +1737,203 @@ export class MemoryRepository {
       chunk.embeddingError = null;
     }
     return structuredClone(chunks);
+  }
+
+  beginDocumentEmbedding(input: BeginDocumentEmbeddingInput) {
+    if (
+      !/^[0-9a-f]{64}$/.test(input.chunkSetDigest) || !input.modelId ||
+      input.modelId.length > 255 || !EMBEDDING_CONFIG_PATTERN.test(input.configVersion) ||
+      !input.usageRunId || !input.provider || !Number.isSafeInteger(input.reserveMicros) ||
+      input.reserveMicros < 0 ||
+      (input.pricingSnapshot !== undefined && !isUsagePricingSnapshot(input.pricingSnapshot))
+    ) throw new DomainError("validation_error", "Document embedding request is invalid", 422);
+    const replay = [...this.documentEmbeddingExecutions.values()].find((value) =>
+      value.attachmentId === input.attachmentId && value.chunkSetDigest === input.chunkSetDigest &&
+      value.modelId === input.modelId && value.configVersion === input.configVersion
+    );
+    if (replay) return embeddingExecutionProjection(replay);
+    const attachment = this.getAttachment(input.attachmentId, input.ownerId);
+    if (attachment.state !== "ready" || attachment.ingestionStatus !== "ready") {
+      throw new DomainError("not_found", "Ready attachment not found", 404);
+    }
+    const chunks = this.documentChunks.get(attachment.id) ?? [];
+    if (!chunks.length) {
+      throw new DomainError("embedding_chunks_missing", "Attachment has no chunks", 409);
+    }
+    this.reserve(
+      input.ownerId,
+      input.usageRunId,
+      input.modelId,
+      input.reserveMicros,
+      input.provider,
+      undefined,
+      input.pricingSnapshot,
+    );
+    const jobId = crypto.randomUUID();
+    const createdAt = new Date().toISOString();
+    this.jobs.push({
+      id: jobId,
+      type: "document.embed",
+      payload: {
+        attachmentId: attachment.id,
+        ownerId: input.ownerId,
+        chunkSetDigest: input.chunkSetDigest,
+        modelId: input.modelId,
+        configVersion: input.configVersion,
+      },
+      status: "queued",
+      attempts: 0,
+      idempotencyKey:
+        `document.embed:${attachment.id}:${input.chunkSetDigest}:${input.modelId}:${input.configVersion}`,
+      createdAt,
+    });
+    const execution = {
+      id: crypto.randomUUID(),
+      jobId,
+      ownerId: input.ownerId,
+      attachmentId: attachment.id,
+      chunkSetDigest: input.chunkSetDigest,
+      modelId: input.modelId,
+      configVersion: input.configVersion,
+      usageRunId: input.usageRunId,
+      status: "queued" as const,
+      createdAt,
+      completedAt: null,
+      runLeaseToken: null,
+      resultCostMicros: null,
+      resultInputTokens: null,
+      resultLatencyMs: null,
+      chunkIds: chunks.map((chunk) => chunk.id),
+    };
+    this.documentEmbeddingExecutions.set(jobId, execution);
+    return embeddingExecutionProjection(execution);
+  }
+
+  claimDocumentEmbeddingExecution(jobId: string, jobClaimToken: string, leaseSeconds = 120) {
+    if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1 || leaseSeconds > 900) {
+      throw new DomainError("validation_error", "Embedding lease duration is invalid", 422);
+    }
+    const execution = this.documentEmbeddingExecutions.get(jobId);
+    const job = this.jobs.find((value) => value.id === jobId);
+    if (!execution || !job || execution.status === "completed") {
+      throw new DomainError("stale_lease", "Embedding job claim is stale", 409);
+    }
+    if (job.status === "queued") {
+      job.status = "running";
+      job.lockedBy = jobClaimToken;
+    } else if (job.status !== "running" || job.lockedBy !== jobClaimToken) {
+      throw new DomainError("stale_lease", "Embedding job claim is stale", 409);
+    }
+    const chunks = this.documentChunks.get(execution.attachmentId) ?? [];
+    if (
+      chunks.length !== execution.chunkIds.length ||
+      chunks.some((chunk, index) => chunk.id !== execution.chunkIds[index])
+    ) throw new DomainError("stale_embedding_chunks", "Embedding chunk set changed", 409);
+    const run = this.usageRuns.get(execution.usageRunId);
+    if (!run) throw new DomainError("not_found", "Embedding usage is missing", 404);
+    const runLeaseToken = crypto.randomUUID();
+    if (run.status === "reserved") {
+      run.runLeaseToken = runLeaseToken;
+      run.runLeaseExpiresAt = new Date(Date.now() + leaseSeconds * 1000).toISOString();
+    } else if (!(execution.status === "result_ready" && run.status === "completed")) {
+      throw new DomainError("invalid_usage_state", "Embedding usage is terminal", 409);
+    }
+    execution.runLeaseToken = runLeaseToken;
+    if (execution.status !== "result_ready") execution.status = "running";
+    return {
+      ...embeddingExecutionProjection(execution),
+      runLeaseToken,
+      chunks: chunks.map(({ id, ordinal, content }) => ({ id, ordinal, content })),
+    };
+  }
+
+  persistDocumentEmbeddingResult(input: PersistDocumentEmbeddingResultInput) {
+    const execution = this.documentEmbeddingExecutions.get(input.jobId);
+    const job = this.jobs.find((value) => value.id === input.jobId);
+    if (!execution || !job || job.status !== "running" || job.lockedBy !== input.jobClaimToken) {
+      throw new DomainError("stale_lease", "Embedding job claim is stale", 409);
+    }
+    const chunks = this.documentChunks.get(execution.attachmentId) ?? [];
+    validateEmbeddingReplacement(chunks, execution.modelId, execution.configVersion, input.vectors);
+    if (execution.status === "result_ready" || execution.status === "completed") {
+      if (
+        execution.resultCostMicros !== input.costMicros ||
+        execution.resultInputTokens !== input.inputTokens ||
+        execution.resultLatencyMs !== input.latencyMs
+      ) throw new DomainError("idempotency_conflict", "Embedding result differs", 409);
+      return embeddingExecutionProjection(execution);
+    }
+    const run = this.usageRuns.get(execution.usageRunId);
+    if (
+      execution.status !== "running" || execution.runLeaseToken !== input.runLeaseToken ||
+      !run || run.status !== "reserved" || run.runLeaseToken !== input.runLeaseToken ||
+      !run.runLeaseExpiresAt || Date.parse(run.runLeaseExpiresAt) <= Date.now()
+    ) throw new DomainError("stale_lease", "Embedding execution lease is stale", 409);
+    this.documentEmbeddingResults.set(
+      execution.id,
+      new Map(input.vectors.map((item) => [item.chunkId, [...item.embedding]])),
+    );
+    execution.status = "result_ready";
+    execution.resultCostMicros = input.costMicros;
+    execution.resultInputTokens = input.inputTokens;
+    execution.resultLatencyMs = input.latencyMs;
+    return embeddingExecutionProjection(execution);
+  }
+
+  finalizeDocumentEmbedding(jobId: string, jobClaimToken: string) {
+    const execution = this.documentEmbeddingExecutions.get(jobId);
+    if (!execution) throw new DomainError("not_found", "Embedding execution not found", 404);
+    if (execution.status === "completed") return embeddingExecutionProjection(execution);
+    const job = this.jobs.find((value) => value.id === jobId);
+    if (!job || job.status !== "running" || job.lockedBy !== jobClaimToken) {
+      throw new DomainError("stale_lease", "Embedding job claim is stale", 409);
+    }
+    const vectors = this.documentEmbeddingResults.get(execution.id);
+    const chunks = this.documentChunks.get(execution.attachmentId) ?? [];
+    if (
+      execution.status !== "result_ready" || !vectors ||
+      chunks.length !== execution.chunkIds.length ||
+      chunks.some((chunk, index) =>
+        chunk.id !== execution.chunkIds[index] || !vectors.has(chunk.id)
+      )
+    ) throw new DomainError("invalid_embedding_state", "Embedding result is not durable", 409);
+    const cost = execution.resultCostMicros!;
+    const run = this.usageRuns.get(execution.usageRunId);
+    if (!run) throw new DomainError("not_found", "Embedding usage is missing", 404);
+    if (run.status === "completed") {
+      if (
+        run.costMicros !== cost || run.inputTokens !== execution.resultInputTokens ||
+        run.outputTokens !== 0
+      ) throw new DomainError("idempotency_conflict", "Settled embedding usage differs", 409);
+    } else {
+      if (run.status !== "reserved") {
+        throw new DomainError("invalid_usage_state", "Embedding usage is already terminal", 409);
+      }
+      const user = this.users.get(execution.ownerId)!;
+      if (user.balanceMicros + run.reservedMicros - cost < 0) {
+        throw new DomainError("insufficient_credit", "Actual cost exceeds credit", 402);
+      }
+      this.settle(
+        execution.usageRunId,
+        cost,
+        execution.resultInputTokens!,
+        0,
+        execution.resultLatencyMs!,
+      );
+    }
+    this.completeDocumentChunkEmbeddings(
+      execution.attachmentId,
+      execution.ownerId,
+      execution.modelId,
+      execution.configVersion,
+      chunks.map((chunk) => ({ chunkId: chunk.id, embedding: vectors.get(chunk.id)! })),
+    );
+    job.status = "completed";
+    job.lockedBy = null;
+    execution.status = "completed";
+    execution.completedAt = new Date().toISOString();
+    execution.runLeaseToken = null;
+    return embeddingExecutionProjection(execution);
   }
 
   retrieveConversationKnowledge(input: KnowledgeRetrievalInput) {

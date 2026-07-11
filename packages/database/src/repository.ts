@@ -201,6 +201,47 @@ export interface KnowledgeRetrievalCandidate {
   score: number;
 }
 
+export interface BeginDocumentEmbeddingInput {
+  ownerId: string;
+  attachmentId: string;
+  chunkSetDigest: string;
+  modelId: string;
+  configVersion: string;
+  provider: string;
+  usageRunId: string;
+  reserveMicros: number;
+  pricingSnapshot?: UsagePricingSnapshot;
+}
+
+export interface DocumentEmbeddingExecution {
+  id: string;
+  jobId: string;
+  ownerId: string;
+  attachmentId: string;
+  chunkSetDigest: string;
+  modelId: string;
+  configVersion: string;
+  usageRunId: string;
+  status: "queued" | "running" | "result_ready" | "completed" | "failed";
+  createdAt: string;
+  completedAt: string | null;
+}
+
+export interface ClaimedDocumentEmbeddingExecution extends DocumentEmbeddingExecution {
+  runLeaseToken: string;
+  chunks: Array<{ id: string; ordinal: number; content: string }>;
+}
+
+export interface PersistDocumentEmbeddingResultInput {
+  jobId: string;
+  jobClaimToken: string;
+  runLeaseToken: string;
+  vectors: DocumentChunkEmbeddingInput[];
+  costMicros: number;
+  inputTokens: number;
+  latencyMs: number;
+}
+
 const DOCUMENT_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const DOCUMENT_UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -999,6 +1040,21 @@ export interface DomainRepository {
   retrieveConversationKnowledge(
     input: KnowledgeRetrievalInput,
   ): MaybePromise<KnowledgeRetrievalCandidate[]>;
+  beginDocumentEmbedding(
+    input: BeginDocumentEmbeddingInput,
+  ): MaybePromise<DocumentEmbeddingExecution>;
+  claimDocumentEmbeddingExecution(
+    jobId: string,
+    jobClaimToken: string,
+    leaseSeconds?: number,
+  ): MaybePromise<ClaimedDocumentEmbeddingExecution>;
+  persistDocumentEmbeddingResult(
+    input: PersistDocumentEmbeddingResultInput,
+  ): MaybePromise<DocumentEmbeddingExecution>;
+  finalizeDocumentEmbedding(
+    jobId: string,
+    jobClaimToken: string,
+  ): MaybePromise<DocumentEmbeddingExecution>;
   createKnowledgeCollection(
     ownerId: string,
     input: CreateKnowledgeCollectionInput,

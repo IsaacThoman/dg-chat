@@ -99,6 +99,13 @@
       "when": 1783656013000,
       "tag": "0013_vector_knowledge_retrieval",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1783656014000,
+      "tag": "0014_durable_embedding_executions",
+      "breakpoints": true
     }
   ]
 }
