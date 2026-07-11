@@ -204,3 +204,34 @@ Deno.test("successful upstream result survives settlement failure and repairs wi
   assertEquals((await service.get("user", requested.id)).status, "succeeded");
   assertEquals(settlementAttempts, 2);
 });
+
+Deno.test("startup recovery completes a persisted approval reservation before dispatch", async () => {
+  const store = new MemoryToolExecutionStore();
+  let reserves = 0;
+  let calls = 0;
+  const service = new ToolExecutionService(store, [{
+    ...echoAdapter,
+    execute: async () => {
+      calls++;
+      return { recovered: true };
+    },
+  }], {
+    reserve: () => {
+      reserves++;
+      return Promise.resolve();
+    },
+    settle: () => Promise.resolve(),
+    refund: () => Promise.resolve(),
+  });
+  await service.setPolicy({ toolId: "echo", allowed: true, actorId: "admin" });
+  const requested = await service.request("user", "echo", {});
+  await store.transitionExecution(requested.id, ["pending_approval"], {
+    status: "queued_pending_reservation",
+    approvedAt: new Date().toISOString(),
+    approvedBy: "user",
+  });
+  assertEquals(await service.recover(), 2);
+  await waitFor(service, "user", requested.id, "succeeded");
+  assertEquals(reserves, 1);
+  assertEquals(calls, 1);
+});
