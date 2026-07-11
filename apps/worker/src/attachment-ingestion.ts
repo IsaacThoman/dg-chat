@@ -181,6 +181,7 @@ export async function deterministicChunks(input: {
       sectionPath?: string[];
     };
   }>;
+  deadlineAt?: number;
 }): Promise<DocumentChunkInput[]> {
   const chunkChars = input.chunkChars ?? 4000;
   const overlap = input.overlapChars ?? 400;
@@ -195,6 +196,9 @@ export async function deterministicChunks(input: {
   for (const [unitIndex, unit] of sourceUnits.entries()) {
     const newlines = newlineOffsets(unit.text);
     for (let start = 0; start < unit.text.length;) {
+      if (input.deadlineAt !== undefined && Date.now() >= input.deadlineAt) {
+        throw new Error("Document processing timed out");
+      }
       let end = codePointBoundary(unit.text, Math.min(unit.text.length, start + chunkChars));
       if (end < unit.text.length) {
         const newline = unit.text.lastIndexOf("\n", end);
@@ -222,6 +226,9 @@ export async function deterministicChunks(input: {
           charEnd: end,
         },
       });
+      if (input.deadlineAt !== undefined && Date.now() >= input.deadlineAt) {
+        throw new Error("Document processing timed out");
+      }
       if (end === unit.text.length) break;
       const overlapped = codePointBoundary(unit.text, end - overlap);
       start = overlapped > start

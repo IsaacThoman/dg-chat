@@ -17,7 +17,7 @@ import {
   recordIngestionFailure,
   requireIngestionObject,
 } from "./attachment-ingestion.ts";
-import { buildDocumentChunks } from "./document-pipeline.ts";
+import { buildDocumentChunks, raceJobDeadline } from "./document-pipeline.ts";
 import type { DocumentExtractionLimits } from "./document-extraction.ts";
 
 const databaseUrl = Deno.env.get("DATABASE_URL");
@@ -51,14 +51,15 @@ const documentExtractionLimits: DocumentExtractionLimits = {
   ),
   maxZipCompressionRatio: positiveInteger("DOCUMENT_EXTRACTION_MAX_ZIP_RATIO", 200),
 };
+const jobDeadlineMarginMs = positiveInteger("WORKER_JOB_DEADLINE_MARGIN_MS", 5_000);
 if (!Number.isSafeInteger(pollMs) || pollMs < 10) {
   throw new Error("WORKER_POLL_MS must be an integer of at least 10 milliseconds");
 }
 if (!Number.isSafeInteger(jobLeaseSeconds) || jobLeaseSeconds < 1) {
   throw new Error("WORKER_JOB_LEASE_SECONDS must be a positive integer");
 }
-if (documentExtractionLimits.timeoutMs! >= jobLeaseSeconds * 1000) {
-  throw new Error("DOCUMENT_EXTRACTION_TIMEOUT_MS must be shorter than WORKER_JOB_LEASE_SECONDS");
+if (jobDeadlineMarginMs >= jobLeaseSeconds * 1000) {
+  throw new Error("WORKER_JOB_DEADLINE_MARGIN_MS must be shorter than WORKER_JOB_LEASE_SECONDS");
 }
 let stopping = false;
 
@@ -108,6 +109,10 @@ async function processJob(
       break;
     }
     case "attachment.ingest": {
+      const deadlineAt = Date.now() + Math.min(
+        documentExtractionLimits.timeoutMs!,
+        jobLeaseSeconds * 1000 - jobDeadlineMarginMs,
+      );
       const { attachmentId, ownerId } = parseAttachmentIngestionPayload(job.payload);
       const rows = await sql<{
         object_key: string;
@@ -125,7 +130,10 @@ async function processJob(
         RETURNING a.object_key,a.mime_type,a.filename,a.sha256,a.size_bytes`;
       const source = rows[0];
       if (!source) throw new Error("Attachment ingestion claim is stale or invalid");
-      const object = await requireIngestionObject(objectStore, source.object_key);
+      const object = await raceJobDeadline(
+        requireIngestionObject(objectStore, source.object_key),
+        deadlineAt,
+      );
       if (object.contentLength !== null && object.contentLength !== Number(source.size_bytes)) {
         throw new Error("Attachment object size does not match its record");
       }
@@ -146,12 +154,15 @@ async function processJob(
           },
           documentProcessingConfig,
           documentExtractionLimits,
+          deadlineAt,
         ),
         attachmentId,
       );
       const committed = await sql.begin(async (tx) => {
+        if (Date.now() >= deadlineAt) return false;
         const fence = await tx`SELECT id FROM jobs WHERE id=${job.id} AND status='running'
-          AND locked_by=${job.claimToken} FOR UPDATE`;
+          AND locked_by=${job.claimToken}
+          AND locked_at > now() - ${jobLeaseSeconds} * interval '1 second' FOR UPDATE`;
         if (!fence.length) return false;
         const current = await tx`SELECT id FROM attachments WHERE id=${attachmentId}
           AND owner_id=${ownerId} AND deleted_at IS NULL AND ingestion_status='processing' FOR UPDATE`;

@@ -40,7 +40,8 @@ The current attachment worker acknowledges terminal inspection states; it is not
 content-disarm scanner. Audio acceptance still relies on bounded upload handling and MIME/signature
 checks, so deployments requiring malware scanning must add an external quarantine scanner. Bounded,
 strict UTF-8 ingestion is implemented for `text/plain` and fully validated JSON. PDF extraction has
-raw-byte, deadline, page-count, and output limits. DOCX extraction preflights the ZIP directory and
+raw-byte, page-count, and output limits. PDF and DOCX parsing runs in a terminable worker isolate
+under one absolute, lease-margined job deadline. DOCX extraction preflights the ZIP directory and
 rejects ZIP64/multidisk archives, traversal, encryption, macros, external relationships, excessive
 entries, per-entry size, aggregate expansion, and suspicious compression ratios before extraction.
 Other Office formats, OCR, vector persistence/retrieval, object garbage collection, and
