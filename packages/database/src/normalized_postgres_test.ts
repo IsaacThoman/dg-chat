@@ -452,7 +452,7 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
-    await sql`TRUNCATE audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
+    await sql`TRUNCATE auth_verifications, auth_sessions, auth_accounts, auth_users, audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
     await sql.end();
 
     const repo = await PostgresRepository.connect(databaseUrl!);
@@ -481,7 +481,15 @@ Deno.test({
         passwordHash: "hash",
         emailVerified: true,
       });
+      const oidcOnly = await repo.createUser({
+        email: "oidc-only@database.test",
+        name: "OIDC only",
+        emailVerified: true,
+      });
+      assertEquals(oidcOnly.passwordHash, null);
+      const limitedSession = await repo.createSession(applicant.id, "limited-session-hash", true);
       await repo.approveUser(applicant.id, "approved", 1_000_000);
+      assertEquals(await repo.getSession(limitedSession.tokenHash), undefined);
       const session = await repo.createSession(applicant.id, "session-hash", false);
       assertEquals((await repo.getSession(session.tokenHash))?.userId, applicant.id);
       assertEquals((await repo.listSessions(applicant.id))[0].id, session.id);
@@ -491,6 +499,16 @@ Deno.test({
         name: "Identity",
         passwordHash: "old-hash",
       });
+      const identitySql = postgres(databaseUrl!, { max: 1 });
+      await identitySql.begin(async (tx) => {
+        await tx`INSERT INTO auth_users
+          (id,name,email,email_verified,created_at,updated_at)
+          VALUES (${identityUser.id},${identityUser.name},${identityUser.email},false,now(),now())`;
+        await tx`INSERT INTO auth_accounts
+          (id,account_id,provider_id,user_id,password,created_at,updated_at)
+          VALUES (${crypto.randomUUID()},${identityUser.id},'credential',${identityUser.id},'old-hash',now(),now())`;
+      });
+      await identitySql.end();
       await assertRejects(
         () => repo.approveUser(identityUser.id, "approved", 10, true),
         DomainError,
@@ -543,6 +561,14 @@ Deno.test({
         ),
       ]);
       await repo.resetPassword("reset-db-hash", "new-hash");
+      const resetSql = postgres(databaseUrl!, { max: 1 });
+      const [resetCredential] = await resetSql<
+        { password: string; password_hash: string | null }[]
+      >`SELECT a.password,u.password_hash FROM auth_accounts a
+        JOIN users u ON u.id=a.user_id
+        WHERE a.provider_id='credential' AND a.user_id=${identityUser.id}`;
+      await resetSql.end();
+      assertEquals(resetCredential, { password: "new-hash", password_hash: null });
       assertEquals(await repo.getSession(identitySession.tokenHash), undefined);
       assertEquals((await repo.findApiTokenByHash("identity-api-hash"))?.revokedAt !== null, true);
       assertEquals(identityApiToken.userId, identityUser.id);
@@ -1355,7 +1381,7 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
-    await sql`TRUNCATE repository_migrations, operation_idempotency, audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users, runtime_snapshots RESTART IDENTITY CASCADE`;
+    await sql`TRUNCATE auth_verifications, auth_sessions, auth_accounts, auth_users, repository_migrations, operation_idempotency, audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users, runtime_snapshots RESTART IDENTITY CASCADE`;
     const userId = crypto.randomUUID(),
       conversationId = crypto.randomUUID(),
       messageId = crypto.randomUUID();
@@ -1491,7 +1517,7 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
-    await sql`TRUNCATE audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
+    await sql`TRUNCATE auth_verifications, auth_sessions, auth_accounts, auth_users, audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
     await sql.end();
     const repo = await PostgresRepository.connect(databaseUrl!);
     try {
@@ -1859,7 +1885,7 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 2 });
-    await sql`TRUNCATE audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
+    await sql`TRUNCATE auth_verifications, auth_sessions, auth_accounts, auth_users, audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
     const repo = await PostgresRepository.connect(databaseUrl!);
     try {
       const owner = await repo.bootstrapAdmin({
@@ -2116,7 +2142,7 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
-    await sql`TRUNCATE audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
+    await sql`TRUNCATE auth_verifications, auth_sessions, auth_accounts, auth_users, audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
     await sql.end();
     const repo = await PostgresRepository.connect(databaseUrl!);
     try {
@@ -2452,7 +2478,7 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
-    await sql`TRUNCATE audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
+    await sql`TRUNCATE auth_verifications, auth_sessions, auth_accounts, auth_users, audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
     await sql.end();
     const repo = await PostgresRepository.connect(databaseUrl!);
     try {
@@ -2548,7 +2574,7 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
-    await sql`TRUNCATE audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
+    await sql`TRUNCATE auth_verifications, auth_sessions, auth_accounts, auth_users, audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
     await sql.end();
     const repo = await PostgresRepository.connect(databaseUrl!);
     try {
@@ -2656,7 +2682,7 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
-    await sql`TRUNCATE audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
+    await sql`TRUNCATE auth_verifications, auth_sessions, auth_accounts, auth_users, audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
     await sql.end();
     const repo = await PostgresRepository.connect(databaseUrl!);
     try {

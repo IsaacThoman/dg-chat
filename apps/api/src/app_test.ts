@@ -93,7 +93,7 @@ Deno.test("bootstrap, signup, approval, immutable chat, API token and OpenAI com
   assertEquals(signed.user.approvalStatus, "pending");
   assertEquals(signed.token, undefined);
   assertStringIncludes(signup.headers.get("set-cookie") ?? "", "HttpOnly");
-  const userAuth = {
+  let userAuth = {
     cookie: sessionCookie(signup),
     origin: "http://localhost:5173",
     "content-type": "application/json",
@@ -114,6 +114,21 @@ Deno.test("bootstrap, signup, approval, immutable chat, API token and OpenAI com
     body: JSON.stringify({ status: "approved" }),
   });
   assertEquals(approval.status, 200);
+  const staleLimitedSession = await app.request("/api/conversations", {
+    headers: userAuth,
+  });
+  assertEquals(staleLimitedSession.status, 401);
+  const approvedLogin = await app.request("/api/auth/sign-in/email", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email: "person@example.com", password: "correct horse battery" }),
+  });
+  assertEquals(approvedLogin.status, 200);
+  assertEquals((await approvedLogin.clone().json()).limited, false);
+  userAuth = {
+    ...userAuth,
+    cookie: sessionCookie(approvedLogin),
+  };
   const conversationResponse = await app.request("/api/conversations", {
     method: "POST",
     headers: { ...userAuth, "idempotency-key": "conversation-create-0001" },
@@ -645,6 +660,67 @@ Deno.test("rate limiter uses one bucket for equivalent Bearer header spellings",
   await app.request("/v1/models", { headers: { authorization: "bearer    dg_same-token" } });
   assertEquals(keys.length, 2);
   assertEquals(keys[0], keys[1]);
+});
+
+Deno.test("browser audio uses the generation bucket and ignores irrelevant bearer rotation", async () => {
+  const keys: string[] = [];
+  const limiter: RateLimiter = {
+    consume: (key, limit) => {
+      keys.push(key);
+      return Promise.resolve({ allowed: true, limit, remaining: limit - 1, retryAfterSeconds: 60 });
+    },
+    health: () => Promise.resolve(true),
+    close: () => Promise.resolve(),
+  };
+  const { app } = createApp({ rateLimiter: limiter });
+  for (const bearer of ["first", "second"]) {
+    await app.request("/api/audio/speech", {
+      method: "POST",
+      headers: {
+        cookie: "dg_chat.session_token=stable-browser-session",
+        authorization: `Bearer ${bearer}`,
+        "content-type": "application/json",
+      },
+      body: "{}",
+    });
+  }
+  assertEquals(keys.length, 2);
+  assertEquals(keys[0].startsWith("generation:"), true);
+  assertEquals(keys[0], keys[1]);
+});
+
+Deno.test("OIDC initiation and callbacks avoid the shared unknown-account auth bucket", async () => {
+  const consumed: Array<{ key: string; limit: number }> = [];
+  const limiter: RateLimiter = {
+    consume: (key, limit) => {
+      consumed.push({ key, limit });
+      return Promise.resolve({ allowed: true, limit, remaining: limit - 1, retryAfterSeconds: 60 });
+    },
+    health: () => Promise.resolve(true),
+    close: () => Promise.resolve(),
+  };
+  const { app } = createApp({ rateLimiter: limiter });
+  for (let index = 0; index < 6; index++) {
+    await app.request("/api/auth/sign-in/oidc", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+  }
+  await app.request("/api/auth/oidc/callback?state=first-browser-state", { method: "GET" });
+  await app.request("/api/auth/oidc/callback?state=second-browser-state", { method: "GET" });
+  assertEquals(consumed.length, 10);
+  assertEquals(
+    consumed.every(({ key }) => key.startsWith("oidc:") && !key.includes("account")),
+    true,
+  );
+  assertEquals(consumed.slice(0, 6).every(({ limit }) => limit === 100), true);
+  assertEquals(consumed[6].limit, 10);
+  assertEquals(consumed[7].limit, 100);
+  assertEquals(consumed[8].limit, 10);
+  assertEquals(consumed[9].limit, 100);
+  assertEquals(consumed[6].key === consumed[8].key, false);
+  assertEquals(consumed[7].key, consumed[9].key);
 });
 
 Deno.test("authentication rate limits isolate account identities behind one proxy", async () => {
@@ -1203,7 +1279,7 @@ Deno.test("attachment and OpenAI Files routes enforce security, ownership, scope
     }),
   });
   const other = (await json(signup)).user;
-  const otherSession = {
+  let otherSession = {
     cookie: sessionCookie(signup),
     origin: "http://localhost:5173",
   };
@@ -1215,6 +1291,19 @@ Deno.test("attachment and OpenAI Files routes enforce security, ownership, scope
     })).status,
     200,
   );
+  const approvedOtherSignin = await app.request("/api/auth/sign-in/email", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email: "files-other@example.com",
+      password: "correct horse battery",
+    }),
+  });
+  assertEquals(approvedOtherSignin.status, 200);
+  otherSession = {
+    cookie: sessionCookie(approvedOtherSignin),
+    origin: "http://localhost:5173",
+  };
 
   const createToken = async (headers: Record<string, string>, scopes: string[]) => {
     const response = await app.request("/api/tokens", {

@@ -4,24 +4,28 @@ FROM denoland/deno:alpine AS dependencies
 WORKDIR /workspace
 ENV DENO_DIR=/deno-dir
 COPY deno.json package.json deno.lock ./
-COPY apps ./apps
-COPY packages ./packages
+COPY apps/api/deno.json apps/api/deno.json
+COPY apps/mock-oidc/deno.json apps/mock-oidc/deno.json
+COPY apps/worker/deno.json apps/worker/deno.json
+COPY apps/web/deno.json apps/web/package.json apps/web/
+COPY packages/contracts/deno.json packages/contracts/deno.json
+COPY packages/database/deno.json packages/database/deno.json
 # Keep the resolved dependency cache in the image. Runtime containers are read-only
 # and must never need network access or mutate workspace links during startup.
 RUN deno install --frozen
 
-FROM dependencies AS web-build
-RUN deno task build
-
-FROM denoland/deno:alpine AS service-build
-WORKDIR /service
-COPY deno.json package.json deno.lock ./
+FROM dependencies AS source
 COPY apps ./apps
 COPY packages ./packages
-RUN deno compile --frozen -A --node-modules-dir=none --output /service/dg-chat-api apps/api/src/main.ts \
+
+FROM source AS web-build
+RUN deno task build
+
+FROM source AS service-build
+RUN deno compile --frozen -A --node-modules-dir=none --output /workspace/dg-chat-api apps/api/src/main.ts \
     && deno compile --unstable-worker-options --frozen -A --node-modules-dir=none \
       --include apps/worker/src/extraction-worker.ts \
-      --output /service/dg-chat-worker apps/worker/src/main.ts
+      --output /workspace/dg-chat-worker apps/worker/src/main.ts
 
 FROM nginxinc/nginx-unprivileged:1.27-alpine AS web
 COPY --from=web-build /workspace/apps/web/dist /usr/share/nginx/html
@@ -73,7 +77,7 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*; \
     groupadd --system dgchat; \
     useradd --system --gid dgchat --no-create-home dgchat
-COPY --from=service-build /service/dg-chat-api /usr/local/bin/dg-chat-api
+COPY --from=service-build /workspace/dg-chat-api /usr/local/bin/dg-chat-api
 ENV DENO_ENV=production \
     PORT=8000
 EXPOSE 8000
@@ -105,11 +109,11 @@ exec psql "$DATABASE_URL" --no-psqlrc --tuples-only --command "SELECT 1 FROM job
 SCRIPT
 chmod 0755 /usr/local/bin/worker-healthcheck
 EOF
-COPY --from=service-build /service/dg-chat-worker /usr/local/bin/dg-chat-worker
+COPY --from=service-build /workspace/dg-chat-worker /usr/local/bin/dg-chat-worker
 ENV DENO_ENV=production
 USER dgchat
 CMD ["/usr/local/bin/dg-chat-worker"]
 
-FROM dependencies AS development
+FROM source AS development
 USER deno
 CMD ["task", "dev"]

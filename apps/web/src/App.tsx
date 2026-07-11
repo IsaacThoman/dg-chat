@@ -3890,9 +3890,19 @@ export function App() {
           </h2>
           <p>
             {view === "chat"
-              ? "Choose New chat to begin."
+              ? "Create a chat to start a conversation."
               : "Conversations moved here will appear in this view."}
           </p>
+          {view === "chat" && (
+            <button
+              className="primary"
+              type="button"
+              onClick={() => void open("new")}
+            >
+              <Plus size={16} aria-hidden="true" />
+              New chat
+            </button>
+          )}
         </main>
       )}
       {view === "settings" && <SettingsView user={user} onMenu={() => setMobile(true)} />}
@@ -3965,7 +3975,14 @@ export function AuthScreen() {
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [error, setError] = useState("");
+  const oidcError = new URLSearchParams(location.search).get("error");
+  const [error, setError] = useState(() =>
+    oidcError
+      ? oidcError === "oidc_account_not_linked"
+        ? "That SSO identity is not linked to this account. Sign in with your existing method."
+        : "Organization SSO could not complete. Please try again or use email and password."
+      : ""
+  );
   const [busy, setBusy] = useState(false);
   useEffect(() => {
     const destination = setupDestination("/login", setupQuery.data);
@@ -3983,6 +4000,17 @@ export function AuthScreen() {
     } catch {
       setError("We couldn't sign you in. Check your details and try again.");
     } finally {
+      setBusy(false);
+    }
+  };
+  const startOidc = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const result = await api.startOidc();
+      location.assign(result.url);
+    } catch {
+      setError("Organization SSO is temporarily unavailable. Please try again.");
       setBusy(false);
     }
   };
@@ -4041,7 +4069,7 @@ export function AuthScreen() {
           <div className="divider">
             <span>or</span>
           </div>
-          <button className="oidc-button" type="button">
+          <button className="oidc-button" type="button" onClick={startOidc} disabled={busy}>
             <span>SSO</span> Continue with organization SSO
           </button>
         </>

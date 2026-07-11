@@ -140,7 +140,8 @@ function user(row: Row): StoredUser {
     id: String(row.id),
     email: String(row.email),
     name: String(row.name),
-    passwordHash: String(row.password_hash),
+    passwordHash: row.password_hash == null ? null : String(row.password_hash),
+    passwordResetPending: row.password_reset_pending === true,
     role: row.role as StoredUser["role"],
     approvalStatus: row.approval_status as StoredUser["approvalStatus"],
     state: row.state as StoredUser["state"],
@@ -767,6 +768,11 @@ export class PostgresRepository implements DomainRepository {
   }
 
   async bootstrapAdmin(input: CreateUserInput, credit: number) {
+    if (!input.passwordHash) {
+      throw new DomainError("validation_error", "Bootstrap requires a local password", 422);
+    }
+    const passwordHash = input.passwordHash;
+    const id = input.id ?? crypto.randomUUID();
     return await this.#sql.begin(async (tx) => {
       await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-bootstrap'))`;
       const existing = await tx<Row[]>`SELECT id FROM users WHERE role = 'admin' LIMIT 1`;
@@ -775,19 +781,31 @@ export class PostgresRepository implements DomainRepository {
       }
       const rows = await tx<
         Row[]
-      >`INSERT INTO users (email,name,password_hash,role,approval_status,state,balance_micros,email_verified_at) VALUES (${input.email},${input.name},${input.passwordHash},'admin','approved','active',${credit},now()) RETURNING *`;
+      >`INSERT INTO users (id,email,name,password_hash,role,approval_status,state,balance_micros,email_verified_at) VALUES (${id},${input.email},${input.name},null,'admin','approved','active',${credit},now()) RETURNING *`;
       const userId = String(rows[0].id);
+      await tx`
+        INSERT INTO auth_users(id,name,email,email_verified,created_at,updated_at)
+        VALUES(${userId},${input.name},${input.email},true,now(),now())
+      `;
+      await tx`
+        INSERT INTO auth_accounts(
+          id,account_id,provider_id,user_id,password,created_at,updated_at
+        ) VALUES(
+          ${crypto.randomUUID()},${userId},'credential',${userId},${passwordHash},now(),now()
+        )
+      `;
       await tx`INSERT INTO ledger_entries (user_id,usage_run_id,kind,amount_micros,balance_after_micros) VALUES (${userId},${`bootstrap:${userId}`},'grant',${credit},${credit})`;
       return user(rows[0]);
     });
   }
   async createUser(input: CreateUserInput) {
     try {
+      const id = input.id ?? crypto.randomUUID();
       const rows = await this.#sql<
         Row[]
-      >`INSERT INTO users (email,name,password_hash,role,approval_status,state,email_verified_at) VALUES (${input.email},${input.name},${input.passwordHash},${
-        input.role ?? "user"
-      },${input.approvalStatus ?? "pending"},${input.state ?? "active"},${
+      >`INSERT INTO users (id,email,name,password_hash,role,approval_status,state,email_verified_at) VALUES (${id},${input.email},${input.name},${
+        input.passwordHash ?? null
+      },${input.role ?? "user"},${input.approvalStatus ?? "pending"},${input.state ?? "active"},${
         input.emailVerified || input.approvalStatus === "approved" ? new Date().toISOString() : null
       }) RETURNING *`;
       return user(rows[0]);
@@ -894,8 +912,23 @@ export class PostgresRepository implements DomainRepository {
       >`UPDATE users SET email_verified_at=COALESCE(email_verified_at,now()),updated_at=now() WHERE id=${
         String(tokens[0].user_id)
       } RETURNING *`;
+      await tx`
+        UPDATE auth_users SET email_verified=true,updated_at=now()
+        WHERE id=${String(tokens[0].user_id)}
+      `;
+      await tx`DELETE FROM auth_sessions WHERE user_id=${String(tokens[0].user_id)}`;
       return user(rows[0]);
     });
+  }
+  async markUserEmailVerified(userId: string) {
+    const rows = await this.#sql<Row[]>`
+      UPDATE users
+      SET email_verified_at=COALESCE(email_verified_at,now()),updated_at=now()
+      WHERE id=${userId}
+      RETURNING *
+    `;
+    if (!rows[0]) throw new DomainError("not_found", "User not found", 404);
+    return user(rows[0]);
   }
   async resetPassword(tokenHash: string, passwordHash: string) {
     return await this.#sql.begin(async (tx) => {
@@ -906,13 +939,76 @@ export class PostgresRepository implements DomainRepository {
         throw new DomainError("invalid_identity_token", "Reset token is invalid or expired", 400);
       }
       const userId = String(tokens[0].user_id);
+      const credentials = await tx`
+        UPDATE auth_accounts SET password=${passwordHash},updated_at=now()
+        WHERE provider_id='credential' AND account_id=${userId} AND user_id=${userId}
+        RETURNING id
+      `;
+      if (!credentials.length) {
+        throw new DomainError("credential_not_found", "Local credential is unavailable", 409);
+      }
       const rows = await tx<
         Row[]
-      >`UPDATE users SET password_hash=${passwordHash},updated_at=now() WHERE id=${userId} RETURNING *`;
+      >`UPDATE users SET password_hash=NULL,updated_at=now() WHERE id=${userId} RETURNING *`;
       await tx`UPDATE sessions SET invalidated_at=now() WHERE user_id=${userId} AND invalidated_at IS NULL`;
+      await tx`DELETE FROM auth_sessions WHERE user_id=${userId}`;
       await tx`UPDATE api_tokens SET revoked_at=now() WHERE user_id=${userId} AND revoked_at IS NULL`;
       await tx`UPDATE identity_tokens SET consumed_at=now() WHERE user_id=${userId} AND consumed_at IS NULL`;
       return user(rows[0]);
+    });
+  }
+  async prepareBetterAuthPasswordReset(token: string) {
+    await this.#sql.begin(async (tx) => {
+      const verifications = await tx<{ value: string }[]>`
+        SELECT value FROM auth_verifications
+        WHERE identifier=${`reset-password:${token}`} AND expires_at>now()
+        FOR UPDATE
+      `;
+      if (!verifications[0]) {
+        throw new DomainError("invalid_identity_token", "Reset token is invalid or expired", 400);
+      }
+      const userId = verifications[0].value;
+      const users = await tx<Row[]>`SELECT * FROM users WHERE id=${userId} FOR UPDATE`;
+      if (!users[0] || users[0].state !== "active") {
+        throw new DomainError("account_unavailable", "Account is unavailable", 403);
+      }
+      const identifier = `reset-password:${token}`;
+      if (
+        users[0].password_reset_pending === true &&
+        users[0].password_reset_token_identifier !== identifier
+      ) {
+        await tx`DELETE FROM auth_verifications
+          WHERE identifier=${String(users[0].password_reset_token_identifier)}`;
+      }
+      // Fail closed before Better Auth changes the credential. If any later
+      // reset step fails, authorization remains denied and all old authority
+      // stays revoked. The same unconsumed token may retry safely.
+      await tx`UPDATE users SET password_reset_pending=true,
+        password_reset_token_identifier=${identifier},password_hash=NULL,updated_at=now()
+        WHERE id=${userId}`;
+      await tx`UPDATE sessions SET invalidated_at=now()
+        WHERE user_id=${userId} AND invalidated_at IS NULL`;
+      await tx`DELETE FROM auth_sessions WHERE user_id=${userId}`;
+      await tx`UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,now()) WHERE user_id=${userId}`;
+      await tx`UPDATE identity_tokens SET consumed_at=COALESCE(consumed_at,now()) WHERE user_id=${userId}`;
+    });
+  }
+  async secureAfterPasswordReset(userId: string, token: string) {
+    await this.#sql.begin(async (tx) => {
+      const users = await tx`UPDATE users SET password_hash=NULL,
+        password_reset_pending=false,password_reset_token_identifier=NULL,
+        updated_at=now()
+        WHERE id=${userId} AND password_reset_pending=true
+          AND password_reset_token_identifier=${`reset-password:${token}`} RETURNING id`;
+      if (!users.length) {
+        throw new DomainError("password_reset_guard_mismatch", "Password reset guard changed", 409);
+      }
+      await tx`UPDATE sessions SET invalidated_at=now()
+        WHERE user_id=${userId} AND invalidated_at IS NULL`;
+      await tx`DELETE FROM auth_sessions WHERE user_id=${userId}`;
+      await tx`UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,now()) WHERE user_id=${userId}`;
+      await tx`UPDATE identity_tokens SET consumed_at=COALESCE(consumed_at,now())
+        WHERE user_id=${userId}`;
     });
   }
   async recordAudit(input: AuditEventInput): Promise<AuditEvent> {
@@ -1018,16 +1114,28 @@ export class PostgresRepository implements DomainRepository {
       }
       let balance = number(rows[0].balance_micros);
       if (status === "approved" && credit > 0) {
-        const balanceAfterGrant = balance + credit;
-        const grant =
-          await tx`INSERT INTO ledger_entries (user_id,usage_run_id,kind,amount_micros,balance_after_micros) VALUES (${id},${`approval:${id}`},'grant',${credit},${balanceAfterGrant}) ON CONFLICT DO NOTHING RETURNING id`;
-        if (grant.length) balance = balanceAfterGrant;
+        const approvalRunId = `approval:${id}`;
+        const priorGrant = await tx`SELECT id FROM ledger_entries
+          WHERE usage_run_id=${approvalRunId} AND kind='grant' LIMIT 1`;
+        if (!priorGrant.length) {
+          const balanceAfterGrant = balance + credit;
+          await tx`INSERT INTO ledger_entries
+            (user_id,usage_run_id,kind,amount_micros,balance_after_micros)
+            VALUES (${id},${approvalRunId},'grant',${credit},${balanceAfterGrant})`;
+          balance = balanceAfterGrant;
+        }
       }
       const updated = await tx<
         Row[]
       >`UPDATE users SET approval_status=${status},balance_micros=${balance},updated_at=now() WHERE id=${id} RETURNING *`;
+      if (status === "approved") {
+        await tx`UPDATE sessions SET invalidated_at=now()
+          WHERE user_id=${id} AND limited=true AND invalidated_at IS NULL`;
+        await tx`DELETE FROM auth_sessions WHERE user_id=${id} AND limited=true`;
+      }
       if (status === "rejected") {
         await tx`UPDATE sessions SET invalidated_at=now() WHERE user_id=${id} AND invalidated_at IS NULL`;
+        await tx`DELETE FROM auth_sessions WHERE user_id=${id}`;
         await tx`UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,now()) WHERE user_id=${id}`;
       }
       return user(updated[0]);
@@ -1046,11 +1154,14 @@ export class PostgresRepository implements DomainRepository {
           throw new DomainError("final_admin", "The final active administrator is protected", 409);
         }
       }
-      const updated = await tx<Row[]>`UPDATE users SET state=${state},deleted_at=${
+      const updated = await tx<
+        Row[]
+      >`UPDATE users SET state=${state},deleted_at=${
         state === "deleted" ? new Date() : null
       },updated_at=now() WHERE id=${id} RETURNING *`;
       if (state !== "active") {
         await tx`UPDATE sessions SET invalidated_at=now() WHERE user_id=${id}`;
+        await tx`DELETE FROM auth_sessions WHERE user_id=${id}`;
         await tx`UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,now()) WHERE user_id=${id}`;
       }
       return user(updated[0]);

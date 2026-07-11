@@ -85,7 +85,7 @@ test("voice recording previews, retries transcription, and inserts without sendi
   });
   let attempts = 0;
   let multipart = "";
-  await page.route("**/v1/audio/transcriptions", async (route) => {
+  await page.route("**/api/audio/transcriptions", async (route) => {
     attempts++;
     multipart = route.request().postDataBuffer()?.toString("utf8") ?? "";
     if (attempts === 1) {

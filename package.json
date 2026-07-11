@@ -14,6 +14,10 @@
   "engines": {
     "deno": ">=2.9"
   },
+  "dependencies": {
+    "better-auth": "1.6.23",
+    "jose": "6.2.3"
+  },
   "devDependencies": {
     "@playwright/test": "1.58.2",
     "openai": "6.16.0"

@@ -1,8 +1,35 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { api, uploadAttachment } from "./api.ts";
+import { api, responseError, uploadAttachment } from "./api.ts";
 import type { Conversation, KnowledgeCollection } from "./types.ts";
 
 afterEach(() => vi.unstubAllGlobals());
+
+describe("authentication errors", () => {
+  it("normalizes Better Auth's top-level error envelope", async () => {
+    const error = await responseError(
+      new Response(
+        JSON.stringify({ code: "INVALID_EMAIL_OR_PASSWORD", message: "Invalid credentials" }),
+        { status: 401, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    expect(error).toMatchObject({
+      status: 401,
+      code: "INVALID_EMAIL_OR_PASSWORD",
+      message: "Invalid credentials",
+    });
+  });
+
+  it("starts OIDC through the same-origin authenticated gateway", async () => {
+    const payload = { url: "https://idp.example/authorize?state=opaque", redirect: true as const };
+    const fetchMock = vi.fn().mockResolvedValue(Response.json(payload));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(api.startOidc()).resolves.toEqual(payload);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/auth/sign-in/oidc",
+      expect.objectContaining({ method: "POST", credentials: "include", body: "{}" }),
+    );
+  });
+});
 
 describe("setup discovery API", () => {
   it("reads bootstrap and OIDC capabilities from the public status endpoint", async () => {

@@ -41,7 +41,9 @@ export const users = pgTable("users", {
   id: uuid("id").primaryKey().defaultRandom(),
   email: text("email").notNull(),
   name: text("name").notNull(),
-  passwordHash: text("password_hash").notNull(),
+  passwordHash: text("password_hash"),
+  passwordResetPending: boolean("password_reset_pending").notNull().default(false),
+  passwordResetTokenIdentifier: text("password_reset_token_identifier"),
   role: userRole("role").notNull().default("user"),
   approvalStatus: approvalStatus("approval_status").notNull().default("pending"),
   state: accountState("state").notNull().default("active"),
@@ -51,6 +53,63 @@ export const users = pgTable("users", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   deletedAt: timestamp("deleted_at", { withTimezone: true }),
 }, (table) => [uniqueIndex("users_email_uq").on(table.email)]);
+
+// Better Auth owns credentials and browser sessions. These tables intentionally remain
+// separate from the domain users/sessions above: domain users are the sole authority for
+// approval, role, account state, credits, and API-token eligibility. Auth user IDs mirror
+// domain user IDs, and request middleware fails closed when the domain row is missing.
+export const authUsers = pgTable("auth_users", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: text("name").notNull(),
+  email: text("email").notNull(),
+  emailVerified: boolean("email_verified").notNull().default(false),
+  image: text("image"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [uniqueIndex("auth_users_email_uq").on(table.email)]);
+
+export const authSessions = pgTable("auth_sessions", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  token: text("token").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull(),
+  ipAddress: text("ip_address"),
+  userAgent: text("user_agent"),
+  userId: uuid("user_id").notNull().references(() => authUsers.id, { onDelete: "cascade" }),
+  limited: boolean("limited").notNull().default(true),
+}, (table) => [
+  uniqueIndex("auth_sessions_token_uq").on(table.token),
+  index("auth_sessions_user_idx").on(table.userId),
+]);
+
+export const authAccounts = pgTable("auth_accounts", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  accountId: text("account_id").notNull(),
+  providerId: text("provider_id").notNull(),
+  userId: uuid("user_id").notNull().references(() => authUsers.id, { onDelete: "cascade" }),
+  accessToken: text("access_token"),
+  refreshToken: text("refresh_token"),
+  idToken: text("id_token"),
+  accessTokenExpiresAt: timestamp("access_token_expires_at", { withTimezone: true }),
+  refreshTokenExpiresAt: timestamp("refresh_token_expires_at", { withTimezone: true }),
+  scope: text("scope"),
+  password: text("password"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull(),
+}, (table) => [
+  index("auth_accounts_user_idx").on(table.userId),
+  uniqueIndex("auth_accounts_provider_account_uq").on(table.providerId, table.accountId),
+]);
+
+export const authVerifications = pgTable("auth_verifications", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  identifier: text("identifier").notNull(),
+  value: text("value").notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [index("auth_verifications_identifier_idx").on(table.identifier)]);
 
 export const sessions = pgTable(
   "sessions",

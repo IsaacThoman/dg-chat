@@ -21,9 +21,10 @@ export {
 export type MaybePromise<T> = T | Promise<T>;
 
 export interface CreateUserInput {
+  id?: string;
   email: string;
   name: string;
-  passwordHash: string;
+  passwordHash?: string | null;
   role?: UserRole;
   approvalStatus?: ApprovalStatus;
   state?: AccountState;
@@ -1249,7 +1250,10 @@ export interface DomainRepository {
     expiresAt: string,
   ): MaybePromise<void>;
   verifyEmail(tokenHash: string): MaybePromise<StoredUser>;
+  markUserEmailVerified(userId: string): MaybePromise<StoredUser>;
   resetPassword(tokenHash: string, passwordHash: string): MaybePromise<StoredUser>;
+  prepareBetterAuthPasswordReset(token: string): MaybePromise<void>;
+  secureAfterPasswordReset(userId: string, token: string): MaybePromise<void>;
   recordAudit(input: AuditEventInput): MaybePromise<AuditEvent>;
   listAudit(query?: AuditQuery): MaybePromise<AuditPage>;
   approveUser(

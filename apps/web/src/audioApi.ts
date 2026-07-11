@@ -25,7 +25,7 @@ export async function transcribeAudio(input: TranscriptionInput): Promise<string
   );
   form.append("model", input.model);
   form.append("response_format", "json");
-  const response = await fetch("/v1/audio/transcriptions", {
+  const response = await fetch("/api/audio/transcriptions", {
     method: "POST",
     body: form,
     credentials: "include",

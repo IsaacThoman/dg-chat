@@ -101,7 +101,8 @@ import {
 } from "./repository.ts";
 
 export interface StoredUser extends PublicUser {
-  passwordHash: string;
+  passwordHash: string | null;
+  passwordResetPending?: boolean;
 }
 export interface StoredSession {
   id: string;
@@ -473,6 +474,9 @@ export class MemoryRepository {
     input: CreateUserInput,
     startingCreditMicros: number,
   ): StoredUser {
+    if (!input.passwordHash) {
+      throw new DomainError("validation_error", "Bootstrap requires a local password", 422);
+    }
     if ([...this.users.values()].some((user) => user.role === "admin")) {
       throw new DomainError("already_bootstrapped", "An administrator already exists", 409);
     }
@@ -488,23 +492,31 @@ export class MemoryRepository {
 
   createUser(
     input: {
+      id?: string;
       email: string;
       name: string;
-      passwordHash: string;
+      passwordHash?: string | null;
       role?: UserRole;
       approvalStatus?: ApprovalStatus;
       state?: AccountState;
       emailVerified?: boolean;
     },
   ): StoredUser {
+    if (input.id && this.users.has(input.id)) {
+      throw new DomainError(
+        "identity_conflict",
+        "An account with that identity already exists",
+        409,
+      );
+    }
     if ([...this.users.values()].some((u) => u.email === input.email)) {
       throw new DomainError("email_taken", "An account with that email already exists", 409);
     }
     const user: StoredUser = {
-      id: crypto.randomUUID(),
+      id: input.id ?? crypto.randomUUID(),
       email: input.email,
       name: input.name,
-      passwordHash: input.passwordHash,
+      passwordHash: input.passwordHash ?? null,
       role: input.role ?? "user",
       approvalStatus: input.approvalStatus ?? "pending",
       state: input.state ?? "active",
@@ -607,6 +619,12 @@ export class MemoryRepository {
     user.emailVerifiedAt = new Date().toISOString();
     return user;
   }
+  markUserEmailVerified(userId: string) {
+    const user = this.users.get(userId);
+    if (!user) throw new DomainError("not_found", "User not found", 404);
+    user.emailVerifiedAt ??= new Date().toISOString();
+    return user;
+  }
   resetPassword(tokenHash: string, passwordHash: string) {
     const token = this.identityTokens.get(tokenHash);
     if (
@@ -629,6 +647,27 @@ export class MemoryRepository {
       }
     }
     return user;
+  }
+  prepareBetterAuthPasswordReset(_token: string) {
+    throw new DomainError(
+      "better_auth_storage_required",
+      "Better Auth password reset requires durable authentication storage",
+      503,
+    );
+  }
+  secureAfterPasswordReset(userId: string, _token: string) {
+    const user = this.users.get(userId);
+    if (!user) throw new DomainError("not_found", "User not found", 404);
+    user.passwordHash = null;
+    this.invalidateUserSessions(userId);
+    for (const token of this.tokens.values()) {
+      if (token.userId === userId && !token.revokedAt) token.revokedAt = new Date().toISOString();
+    }
+    for (const identityToken of this.identityTokens.values()) {
+      if (identityToken.userId === userId && !identityToken.consumedAt) {
+        identityToken.consumedAt = new Date().toISOString();
+      }
+    }
   }
   recordAudit(input: AuditEventInput): AuditEvent {
     const event = {
@@ -705,6 +744,13 @@ export class MemoryRepository {
     );
     if (status === "approved" && creditMicros > 0 && !alreadyGranted) {
       this.credit(id, `approval:${id}`, "grant", creditMicros);
+    }
+    if (status === "approved") {
+      for (const [hash, session] of this.sessions) {
+        if (session.userId === id && session.limited) {
+          this.sessions.delete(hash);
+        }
+      }
     }
     if (status === "rejected") {
       this.invalidateUserSessions(id);

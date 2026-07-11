@@ -196,12 +196,16 @@ export async function responseError(response: Response): Promise<ApiError> {
     return new ApiError(response.status, "request_failed", fallback);
   }
   try {
-    const value = await response.json() as { error?: { code?: unknown; message?: unknown } };
-    const code = typeof value.error?.code === "string" && value.error.code.length <= 120
-      ? value.error.code
-      : "request_failed";
-    const message = typeof value.error?.message === "string" && value.error.message.length <= 500
-      ? value.error.message
+    const value = await response.json() as {
+      code?: unknown;
+      message?: unknown;
+      error?: { code?: unknown; message?: unknown };
+    };
+    const rawCode = value.error?.code ?? value.code;
+    const rawMessage = value.error?.message ?? value.message;
+    const code = typeof rawCode === "string" && rawCode.length <= 120 ? rawCode : "request_failed";
+    const message = typeof rawMessage === "string" && rawMessage.length <= 500
+      ? rawMessage
       : fallback;
     return new ApiError(response.status, code, message);
   } catch {
@@ -432,21 +436,26 @@ export const api = {
         body: JSON.stringify({ state }),
       }),
     ),
-  signIn: async (email: string, password: string) =>
-    mapUser(
-      (await request<{ user: RawUser }>("/auth/sign-in/email", {
-        method: "POST",
-        body: JSON.stringify({ email, password }),
-      })).user,
-    ),
-  signUp: async (name: string, email: string, password: string) =>
-    mapUser(
-      (await request<{ user: RawUser }>("/auth/sign-up/email", {
-        method: "POST",
-        body: JSON.stringify({ name, email, password }),
-      })).user,
-    ),
+  signIn: async (email: string, password: string) => {
+    await request<{ user: { id: string } }>("/auth/sign-in/email", {
+      method: "POST",
+      body: JSON.stringify({ email, password }),
+    });
+    return await api.me();
+  },
+  signUp: async (name: string, email: string, password: string) => {
+    await request<{ user: { id: string } }>("/auth/sign-up/email", {
+      method: "POST",
+      body: JSON.stringify({ name, email, password }),
+    });
+    return await api.me();
+  },
   signOut: () => request<void>("/auth/sign-out", { method: "POST" }),
+  startOidc: () =>
+    request<{ url: string; redirect: true }>("/auth/sign-in/oidc", {
+      method: "POST",
+      body: "{}",
+    }),
   setup: (setupToken: string, name: string, email: string, password: string) =>
     request<{ user: RawUser }>("/setup/bootstrap", {
       method: "POST",
