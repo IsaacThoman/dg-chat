@@ -42,6 +42,7 @@ import {
   interceptOcrImages,
   MemoryOcrCache,
   type OcrCache,
+  type OcrRecognize,
   parseOcrInterceptionConfig,
 } from "./ocr-interception.ts";
 
@@ -80,6 +81,14 @@ export interface ProviderExecutionOptions {
   now?: () => number;
   ocrCache?: OcrCache;
   ocrFetch?: typeof fetch;
+  /** Accounting-aware installations can replace the direct OCR provider call with a child run. */
+  ocrRecognize?: (
+    input: Parameters<OcrRecognize>[0] & {
+      sourceModelId: string;
+      parentUsageRunId: string;
+      ownerLeaseToken: string;
+    },
+  ) => ReturnType<OcrRecognize>;
   slowStream?: {
     windowMs: number;
     minimumVisibleUnitsPerSecond: number;
@@ -335,6 +344,7 @@ export class ProviderExecutionEngine {
   readonly #slowStream?: ProviderExecutionOptions["slowStream"];
   readonly #ocrCache: OcrCache;
   readonly #ocrFetch?: typeof fetch;
+  readonly #ocrRecognize?: ProviderExecutionOptions["ocrRecognize"];
 
   constructor(options: ProviderExecutionOptions) {
     this.#repository = options.repository;
@@ -348,6 +358,7 @@ export class ProviderExecutionEngine {
     this.#slowStream = options.slowStream;
     this.#ocrCache = options.ocrCache ?? new MemoryOcrCache(options.now);
     this.#ocrFetch = options.ocrFetch;
+    this.#ocrRecognize = options.ocrRecognize;
     if (this.#slowStream) {
       if (
         !Number.isSafeInteger(this.#slowStream.windowMs) || this.#slowStream.windowMs < 250 ||
@@ -365,6 +376,8 @@ export class ProviderExecutionEngine {
 
   async #interceptOcr(
     sourceModelId: string,
+    parentUsageRunId: string,
+    ownerLeaseToken: string,
     request: ChatCompletionRequest,
     signal: AbortSignal,
   ): Promise<ChatCompletionRequest> {
@@ -374,7 +387,16 @@ export class ProviderExecutionEngine {
     return await interceptOcrImages(request, config, {
       cache: this.#ocrCache,
       ...(this.#ocrFetch ? { fetch: this.#ocrFetch } : {}),
-      recognize: async ({ providerId, model, prompt, image, signal }) => {
+      recognize: async (input) => {
+        if (this.#ocrRecognize) {
+          return await this.#ocrRecognize({
+            ...input,
+            sourceModelId,
+            parentUsageRunId,
+            ownerLeaseToken,
+          });
+        }
+        const { providerId, model, prompt, image, signal } = input;
         const provider = await this.#repository.findProvider(providerId);
         const ocrModel = await this.#repository.findProviderModel(model);
         if (
@@ -797,7 +819,13 @@ export class ProviderExecutionEngine {
     frozenPlan?: ProviderExecutionPlan,
   ): Promise<Completion> {
     const { plan, candidates } = await this.#prepare(sourceModelId, frozenPlan);
-    request = await this.#interceptOcr(sourceModelId, request, signal);
+    request = await this.#interceptOcr(
+      sourceModelId,
+      usageRunId,
+      ownerLeaseToken,
+      request,
+      signal,
+    );
     const claim = await this.#repository.claimProviderExecution(usageRunId, ownerLeaseToken);
     const remainingAttempts = policyFor(plan, undefined, this.#slowStream).maxAttempts -
       claim.consumedAttempts;
@@ -941,7 +969,13 @@ export class ProviderExecutionEngine {
     frozenPlan?: ProviderExecutionPlan,
   ): AsyncGenerator<string> {
     const { plan, candidates } = await this.#prepare(sourceModelId, frozenPlan);
-    request = await this.#interceptOcr(sourceModelId, request, signal);
+    request = await this.#interceptOcr(
+      sourceModelId,
+      usageRunId,
+      ownerLeaseToken,
+      request,
+      signal,
+    );
     const claim = await this.#repository.claimProviderExecution(usageRunId, ownerLeaseToken);
     const remainingAttempts = policyFor(plan, undefined, this.#slowStream).maxAttempts -
       claim.consumedAttempts;
