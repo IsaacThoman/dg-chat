@@ -999,6 +999,7 @@ export function Composer(
     transcriptionModel,
     setTranscriptionModel,
     imageModels,
+    imageEditModels,
     disabledReason,
   }: {
     onSend: (
@@ -1017,6 +1018,7 @@ export function Composer(
     transcriptionModel?: string;
     setTranscriptionModel: (id: string) => void;
     imageModels: Model[];
+    imageEditModels: Model[];
     disabledReason?: string;
   },
 ) {
@@ -1026,6 +1028,7 @@ export function Composer(
   const [dragging, setDragging] = useState(false);
   const [selectionError, setSelectionError] = useState("");
   const [imagePanel, setImagePanel] = useState<"create" | "gallery" | null>(null);
+  const [imageEditSource, setImageEditSource] = useState<GeneratedAsset>();
   const [generatedAssets, setGeneratedAssets] = useState<GeneratedAsset[]>([]);
   const [selectedGeneratedAssets, setSelectedGeneratedAssets] = useState<GeneratedAsset[]>([]);
   const [imageHistoryLoading, setImageHistoryLoading] = useState(false);
@@ -1040,6 +1043,7 @@ export function Composer(
   const imageHistoryFiltersRef = useRef<GeneratedAssetFilters>(imageHistoryFilters);
   const imageHistoryAbort = useRef<AbortController | null>(null);
   const imageMutationRef = useRef(new Set<string>());
+  const imageModalHandoff = useRef(false);
   const imageGeneration = useImageGeneration();
   imageHistoryFiltersRef.current = imageHistoryFilters;
   type UploadState =
@@ -1172,6 +1176,13 @@ export function Composer(
     setSelectedGeneratedAssets((current) =>
       current.some((item) => item.id === asset.id) ? current : [...current, asset]
     );
+  };
+  const openImageEditorFromGallery = (asset?: GeneratedAsset) => {
+    imageModalHandoff.current = true;
+    document.querySelector<HTMLButtonElement>('[aria-label="Open image history"]')?.focus();
+    imageGeneration.reset();
+    setImageEditSource(asset);
+    setImagePanel("create");
   };
   const beginUpload = (key: string, file: File) => {
     const controller = new AbortController();
@@ -1501,6 +1512,7 @@ export function Composer(
               aria-label="Create images"
               onClick={() => {
                 imageGeneration.reset();
+                setImageEditSource(undefined);
                 setImagePanel("create");
               }}
             >
@@ -1588,12 +1600,14 @@ export function Composer(
       />
       {imagePanel === "create" && (
         <ImageGenerationSheet
-          models={imageModels.map((model) => ({
+          models={(imageEditSource ? imageEditModels : imageModels).map((model) => ({
             id: model.id,
             name: model.name,
           }))}
+          source={imageEditSource}
           state={imageGeneration.state}
           close={() => {
+            imageModalHandoff.current = false;
             imageGeneration.cancel();
             setImagePanel(null);
           }}
@@ -1609,6 +1623,8 @@ export function Composer(
           cancel={imageGeneration.cancel}
           add={addGeneratedAsset}
           selectedIds={new Set(selectedGeneratedAssets.map((asset) => asset.id))}
+          uploadMask={(file, progress, signal) => api.uploadAttachment(file, progress, signal)}
+          removeMask={(attachmentId) => api.deleteAttachment(attachmentId).then(() => undefined)}
         />
       )}
       {imagePanel === "gallery" && (
@@ -1616,6 +1632,7 @@ export function Composer(
           title="Image history"
           close={() => setImagePanel(null)}
           variant="wide"
+          restoreFocus={() => !imageModalHandoff.current}
         >
           <GeneratedAssetGallery
             assets={generatedAssets}
@@ -1648,6 +1665,11 @@ export function Composer(
             restore={(asset) => {
               void mutateImage(asset, "restore");
             }}
+            edit={imageEditModels.length > 0
+              ? (asset) => {
+                openImageEditorFromGallery(asset);
+              }
+              : undefined}
             retry={() => {
               imageHistoryQueryGeneration.current++;
               setImageHistoryCursor(null);
@@ -1664,8 +1686,7 @@ export function Composer(
                 type="button"
                 className="primary"
                 onClick={() => {
-                  imageGeneration.reset();
-                  setImagePanel("create");
+                  openImageEditorFromGallery();
                 }}
               >
                 <Plus size={16} /> Create image
@@ -1916,6 +1937,10 @@ function ChatView({
   );
   const imageModels = useMemo(
     () => models.filter((model) => model.capabilities.includes("image_generation")),
+    [models],
+  );
+  const imageEditModels = useMemo(
+    () => models.filter((model) => model.capabilities.includes("image_editing")),
     [models],
   );
   const speechVoices = [
@@ -2586,6 +2611,7 @@ function ChatView({
               transcriptionModel={transcriptionModel}
               setTranscriptionModel={setTranscriptionModel}
               imageModels={imageModels}
+              imageEditModels={imageEditModels}
               onStop={() => {
                 if (activeStream?.phase === "stopping") return;
                 setActiveStream((current) => current ? { ...current, phase: "stopping" } : current);

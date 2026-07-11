@@ -28,8 +28,12 @@ fixed-call-only pricing because raw binary responses do not carry portable usage
 retries and fallback remain available until the first visible audio or transcript event; provider
 usage is extracted from terminal events. Image generation supports strict OpenAI-compatible JSON,
 base64 PNG/JPEG/WebP outputs, immutable object-storage-backed history, and exact idempotent replay.
-Image models require fixed-call-only pricing when their provider supplies no authoritative token
-usage. Assistants, batches, fine-tuning, and realtime are not supported.
+Image editing accepts official multipart image arrays and owned JSON file references, including
+canonical `image_edit.*` streams. Edits require an explicit `model`: OpenAI permits a hosted
+default, but a self-hosted installation can expose multiple unrelated providers and has no
+unambiguous global default. Omission returns HTTP 422 with `model_required`. Image models require
+fixed-call-only pricing when their provider supplies no authoritative token usage. Assistants,
+batches, fine-tuning, and realtime are not supported.
 
 Audio pricing supports token-reported usage and fixed per-call charges. Duration-only usage is
 accepted only for models configured with fixed-call-only pricing; mixing duration usage with token

@@ -108,4 +108,54 @@ describe("image components", () => {
     expect(detail).toContain("Back to images");
     expect(detail).not.toContain('role="dialog"');
   });
+  it("shows immutable edit lineage and links loaded source versions", () => {
+    const edited = {
+      ...asset,
+      id: "asset-edit",
+      attachmentId: "attachment-edit",
+      operation: "edit" as const,
+      sourceAttachmentIds: [asset.attachmentId],
+      createdAt: "2026-01-02T00:00:00Z",
+    };
+    const duplicateHistoricalAsset = {
+      ...asset,
+      id: "asset-duplicate",
+      createdAt: "2025-12-31T00:00:00Z",
+    };
+    const detail = renderToStaticMarkup(
+      <ImageLightbox
+        embedded
+        assets={[duplicateHistoricalAsset, asset, edited]}
+        activeId={edited.id}
+        close={() => {}}
+        select={() => {}}
+      />,
+    );
+    expect(detail).toContain("Version lineage");
+    expect(detail).toContain("new immutable asset");
+    expect(detail).toContain("Source 1");
+    expect(detail).not.toContain("Source 2");
+  });
+  it("preserves source ordinals when an earlier lineage input is not loaded", () => {
+    const secondSource = { ...asset, id: "asset-second", attachmentId: "attachment-second" };
+    const edited = {
+      ...asset,
+      id: "asset-multi-edit",
+      operation: "edit" as const,
+      sourceAttachmentIds: ["attachment-not-loaded", secondSource.attachmentId],
+      createdAt: "2026-01-02T00:00:00Z",
+    };
+    const detail = renderToStaticMarkup(
+      <ImageLightbox
+        embedded
+        assets={[secondSource, edited]}
+        activeId={edited.id}
+        close={() => {}}
+        select={() => {}}
+      />,
+    );
+    expect(detail).toContain("Source 2");
+    expect(detail).not.toContain("Source 1</button>");
+    expect(detail).toContain("Loading preserved source version");
+  });
 });

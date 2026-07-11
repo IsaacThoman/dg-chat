@@ -1,5 +1,6 @@
 import os
 import io
+import io
 import uuid
 import base64
 
@@ -58,6 +59,20 @@ if not image_base64 or replayed_image.data[0].b64_json != image_base64:
     raise RuntimeError("Python images.generate() or its exact replay was invalid")
 if base64.b64decode(image_base64)[1:4] != b"PNG":
     raise RuntimeError("Python images.generate() did not return a valid PNG signature")
+alternate_image = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
+edited_image = client.images.edit(
+    model=image_model,
+    prompt="Python image edit contract",
+    image=[
+        ("edit-source-one.png", io.BytesIO(base64.b64decode(image_base64)), "image/png"),
+        ("edit-source-two.png", io.BytesIO(alternate_image), "image/png"),
+    ],
+    response_format="b64_json",
+)
+if edited_image.data[0].b64_json != image_base64:
+    raise RuntimeError("Python images.edit() did not return a valid edited image")
 try:
     client.images.generate(
         model=image_model,

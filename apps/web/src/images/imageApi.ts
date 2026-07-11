@@ -49,6 +49,17 @@ function generationBody(input: ImageGenerationInput | ImageEditInput) {
   return { ...rest, ...(count === undefined ? {} : { n: count }) };
 }
 
+function editBody(input: ImageEditInput) {
+  const { count, sourceAssetId: _sourceAssetId, sourceAttachmentId, maskAttachmentId, ...rest } =
+    input;
+  return {
+    ...rest,
+    images: [{ file_id: sourceAttachmentId }],
+    ...(maskAttachmentId ? { mask: { file_id: maskAttachmentId } } : {}),
+    ...(count === undefined ? {} : { n: count }),
+  };
+}
+
 export function createImageApi(request: ImageRequest = imageRequest) {
   return {
     generate: (input: ImageGenerationInput, idempotencyKey: string, signal?: AbortSignal) =>
@@ -59,7 +70,7 @@ export function createImageApi(request: ImageRequest = imageRequest) {
     edit: (input: ImageEditInput, idempotencyKey: string, signal?: AbortSignal) =>
       request<ImageGenerationResult>(
         "/api/images/edits",
-        jsonBody(generationBody(input), idempotencyKey, signal),
+        jsonBody(editBody(input), idempotencyKey, signal),
       ),
     list: (filters: GeneratedAssetFilters = {}, signal?: AbortSignal) => {
       const query = new URLSearchParams();
@@ -72,6 +83,12 @@ export function createImageApi(request: ImageRequest = imageRequest) {
       return request<GeneratedAssetPage>(`/api/images${suffix}`, { signal });
     },
     retrieve: (id: string) => request<GeneratedAsset>(`/api/images/${encodeURIComponent(id)}`),
+    retrieveSource: (attachmentId: string, before: string, exclude: string) =>
+      request<GeneratedAsset>(
+        `/api/images/by-attachment/${encodeURIComponent(attachmentId)}?before=${
+          encodeURIComponent(before)
+        }&exclude=${encodeURIComponent(exclude)}`,
+      ),
     remove: (id: string) =>
       request<void>(`/api/images/${encodeURIComponent(id)}`, { method: "DELETE" }),
     restore: (id: string) =>

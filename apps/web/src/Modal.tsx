@@ -1,15 +1,16 @@
 import { type ReactNode, useEffect, useId, useRef } from "react";
 import { createPortal } from "react-dom";
 import { X } from "lucide-react";
-import { modalFocusableElements } from "./modalFocus.ts";
+import { modalFocusableElements, modalShouldRestoreFocus } from "./modalFocus.ts";
 
 export function Modal(
-  { title, close, children, dismissible = true, variant = "default" }: {
+  { title, close, children, dismissible = true, variant = "default", restoreFocus = true }: {
     title: string;
     close: () => void;
     children: ReactNode;
     dismissible?: boolean;
     variant?: "default" | "wide";
+    restoreFocus?: boolean | (() => boolean);
   },
 ) {
   const titleId = useId();
@@ -20,8 +21,10 @@ export function Modal(
   const closeRef = useRef(close);
   const dismissibleRef = useRef(dismissible);
   const restoreFrame = useRef<number | null>(null);
+  const restoreFocusRef = useRef(restoreFocus);
   closeRef.current = close;
   dismissibleRef.current = dismissible;
+  restoreFocusRef.current = restoreFocus;
   useEffect(() => {
     if (restoreFrame.current !== null) {
       cancelAnimationFrame(restoreFrame.current);
@@ -55,6 +58,8 @@ export function Modal(
     document.addEventListener("keydown", keydown);
     return () => {
       document.removeEventListener("keydown", keydown);
+      const shouldRestore = modalShouldRestoreFocus(restoreFocusRef.current);
+      if (!shouldRestore) return;
       restoreFrame.current = requestAnimationFrame(() => {
         restoreFrame.current = null;
         previousFocus.current?.focus();

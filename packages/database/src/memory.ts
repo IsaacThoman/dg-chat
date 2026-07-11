@@ -395,7 +395,8 @@ function validateGeneratedObjectStage(input: StageGeneratedObjectInput) {
   if (
     !/^[0-9a-f-]{36}$/i.test(input.ownerId) || !input.usageRunId ||
     input.usageRunId.length > 200 || !Number.isSafeInteger(input.ordinal) || input.ordinal < 0 ||
-    input.ordinal > 9 || !input.objectKey || input.objectKey.length > 1024 ||
+    input.ordinal > 16 || !input.objectKey || input.objectKey.length > 1024 ||
+    (input.purpose !== undefined && !["output", "edit_input"].includes(input.purpose)) ||
     input.objectKey.startsWith("/") ||
     input.objectKey.split("/").some((part) => !part || part === "..") ||
     !/^[\w.+-]+\/[\w.+-]+$/.test(input.mimeType) || input.mimeType.length > 255 ||
@@ -1642,7 +1643,11 @@ export class MemoryRepository {
       }
       for (const source of candidate.inputs ?? []) {
         const sourceAttachment = this.getAttachment(source.attachmentId, input.ownerId);
-        if (sourceAttachment.state !== "ready") {
+        if (
+          sourceAttachment.state !== "ready" ||
+          !sourceAttachment.mimeType.toLowerCase().startsWith("image/") ||
+          (source.role === "mask" && sourceAttachment.mimeType.toLowerCase() !== "image/png")
+        ) {
           throw new DomainError("attachment_not_ready", "Generated asset input is not ready", 409);
         }
       }
@@ -1673,13 +1678,16 @@ export class MemoryRepository {
     });
     const stages = created.map((asset) =>
       [...this.generatedObjectStages.values()].find((candidate) =>
-        candidate.usageRunId === input.usageRunId && candidate.ordinal === asset.ordinal
+        candidate.usageRunId === input.usageRunId && candidate.ordinal === asset.ordinal &&
+        candidate.purpose === "output"
       )
     );
     for (let index = 0; index < created.length; index++) {
       const stage = stages[index];
       if (
-        stage && (stage.state !== "attached" || stage.attachmentId !== created[index].attachmentId)
+        (input.operation === "edit" && !stage) ||
+        (stage &&
+          (stage.state !== "attached" || stage.attachmentId !== created[index].attachmentId))
       ) {
         throw new DomainError(
           "generated_stage_conflict",
@@ -1688,12 +1696,37 @@ export class MemoryRepository {
         );
       }
     }
+    const editStages = [...this.generatedObjectStages.values()].filter((stage) =>
+      stage.usageRunId === input.usageRunId && stage.purpose === "edit_input"
+    );
+    const editInputIds = new Set(
+      input.assets[0]?.inputs?.map((source) => source.attachmentId) ?? [],
+    );
+    if (
+      editStages.length > 0 &&
+      (editStages.length !== editInputIds.size ||
+        editStages.some((stage) =>
+          stage.state !== "attached" || !stage.attachmentId || !editInputIds.has(stage.attachmentId)
+        ))
+    ) {
+      throw new DomainError("generated_stage_conflict", "Edit input stage is not ready", 409);
+    }
     for (const asset of created) this.generatedAssets.set(asset.id, asset);
     for (let index = 0; index < created.length; index++) {
       const stage = stages[index];
       if (!stage) continue;
-      stage.state = "finalized";
+      stage.state = stage.cleanupAttachment ? "finalized" : "cleanup_pending";
       stage.updatedAt = now;
+      if (!stage.cleanupAttachment) {
+        this.enqueueJob("generated_object.cleanup", { stageId: stage.id, ownerId: input.ownerId });
+      }
+    }
+    for (const stage of editStages) {
+      stage.state = stage.cleanupAttachment ? "finalized" : "cleanup_pending";
+      stage.updatedAt = now;
+      if (!stage.cleanupAttachment) {
+        this.enqueueJob("generated_object.cleanup", { stageId: stage.id, ownerId: input.ownerId });
+      }
     }
     return created;
   }
@@ -1702,6 +1735,18 @@ export class MemoryRepository {
     return [...this.generatedAssets.values()].filter((asset) =>
       asset.ownerId === ownerId && (includeDeleted || !asset.deletedAt)
     ).sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
+  }
+
+  findGeneratedAssetByAttachment(
+    ownerId: string,
+    attachmentId: string,
+    before?: string,
+    excludeId?: string,
+  ) {
+    return [...this.generatedAssets.values()].filter((asset) =>
+      asset.ownerId === ownerId && asset.attachmentId === attachmentId &&
+      asset.id !== excludeId && (before === undefined || asset.createdAt <= before)
+    ).sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id))[0];
   }
 
   findGeneratedAssetsByIdempotency(ownerId: string, idempotencyKey: string) {
@@ -1740,7 +1785,8 @@ export class MemoryRepository {
       throw new DomainError("not_found", "Usage run not found", 404);
     }
     const prior = [...this.generatedObjectStages.values()].find((stage) =>
-      stage.usageRunId === input.usageRunId && stage.ordinal === input.ordinal
+      stage.usageRunId === input.usageRunId && stage.ordinal === input.ordinal &&
+      stage.purpose === (input.purpose ?? "output")
     );
     if (prior) {
       if (
@@ -1758,8 +1804,10 @@ export class MemoryRepository {
     const now = new Date().toISOString();
     const stage: GeneratedObjectStage = {
       ...input,
+      purpose: input.purpose ?? "output",
       id: crypto.randomUUID(),
       attachmentId: null,
+      cleanupAttachment: true,
       state: "pending",
       cleanupError: null,
       createdAt: now,
@@ -1782,7 +1830,12 @@ export class MemoryRepository {
     return structuredClone(stage);
   }
 
-  attachGeneratedObject(id: string, ownerId: string, attachmentId: string) {
+  attachGeneratedObject(
+    id: string,
+    ownerId: string,
+    attachmentId: string,
+    cleanupAttachment = true,
+  ) {
     const stage = this.generatedObjectStages.get(id);
     const attachment = this.getAttachment(attachmentId, ownerId);
     if (!stage || stage.ownerId !== ownerId) {
@@ -1794,7 +1847,11 @@ export class MemoryRepository {
     if (stage.state === "stored") {
       stage.state = "attached";
       stage.attachmentId = attachmentId;
-    } else if (stage.state !== "attached" || stage.attachmentId !== attachmentId) {
+      stage.cleanupAttachment = cleanupAttachment;
+    } else if (
+      stage.state !== "attached" || stage.attachmentId !== attachmentId ||
+      stage.cleanupAttachment !== cleanupAttachment
+    ) {
       throw new DomainError("generated_stage_conflict", "Generated object stage changed", 409);
     }
     stage.updatedAt = new Date().toISOString();

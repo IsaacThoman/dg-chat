@@ -1,5 +1,6 @@
 import { assertEquals, assertThrows } from "jsr:@std/assert@1.0.14";
 import { DomainError, MemoryRepository } from "./memory.ts";
+import { validateGeneratedAssetFinalization } from "./repository.ts";
 
 function fixture() {
   const repo = new MemoryRepository();
@@ -100,8 +101,21 @@ Deno.test("generated assets preserve immutable lineage, ownership, and message a
       height: 1024,
       revisedPrompt: "A safer revised prompt",
       inputs: [
-        { attachmentId: source.id, role: "source" as const, ordinal: 0 },
-        { attachmentId: mask.id, role: "mask" as const, ordinal: 0 },
+        {
+          attachmentId: source.id,
+          role: "source" as const,
+          ordinal: 0,
+          width: 1024,
+          height: 1024,
+        },
+        {
+          attachmentId: mask.id,
+          role: "mask" as const,
+          ordinal: 0,
+          width: 1024,
+          height: 1024,
+          hasAlpha: true,
+        },
       ],
     }],
   };
@@ -116,8 +130,34 @@ Deno.test("generated assets preserve immutable lineage, ownership, and message a
   });
   repo.markGeneratedObjectStored(stage.id, owner.id);
   repo.attachGeneratedObject(stage.id, owner.id, output.id);
+  const inputStage = repo.stageGeneratedObject({
+    ownerId: owner.id,
+    usageRunId: input.usageRunId,
+    purpose: "edit_input",
+    ordinal: 0,
+    objectKey: source.objectKey,
+    mimeType: source.mimeType,
+    sizeBytes: source.sizeBytes,
+    sha256: source.sha256,
+  });
+  repo.markGeneratedObjectStored(inputStage.id, owner.id);
+  repo.attachGeneratedObject(inputStage.id, owner.id, source.id);
+  const maskStage = repo.stageGeneratedObject({
+    ownerId: owner.id,
+    usageRunId: input.usageRunId,
+    purpose: "edit_input",
+    ordinal: 1,
+    objectKey: mask.objectKey,
+    mimeType: mask.mimeType,
+    sizeBytes: mask.sizeBytes,
+    sha256: mask.sha256,
+  });
+  repo.markGeneratedObjectStored(maskStage.id, owner.id);
+  repo.attachGeneratedObject(maskStage.id, owner.id, mask.id);
   const first = repo.finalizeGeneratedAssets(input);
   assertEquals(repo.generatedObjectStages.get(stage.id)?.state, "finalized");
+  assertEquals(repo.generatedObjectStages.get(inputStage.id)?.state, "finalized");
+  assertEquals(repo.generatedObjectStages.get(maskStage.id)?.state, "finalized");
   assertEquals(repo.finalizeGeneratedAssets(input), first);
   repo.updateProvider(provider.id, provider.version, { slug: "renamed-images" }, {
     actorId: owner.id,
@@ -157,6 +197,60 @@ Deno.test("generated assets preserve immutable lineage, ownership, and message a
   assertEquals(repo.restoreGeneratedAsset(first[0].id, owner.id).deletedAt, null);
 });
 
+Deno.test("image edit lineage accepts sixteen ordered sources but not seventeen", () => {
+  const base = {
+    ownerId: crypto.randomUUID(),
+    usageRunId: "sixteen-source-edit",
+    providerModelId: crypto.randomUUID(),
+    publicModelId: "images/editor",
+    upstreamModelId: "editor",
+    providerSlug: "images",
+    pricingSnapshot: {
+      pricingVersionId: crypto.randomUUID(),
+      inputMicrosPerMillion: 0,
+      cachedInputMicrosPerMillion: 0,
+      reasoningMicrosPerMillion: 0,
+      outputMicrosPerMillion: 0,
+      fixedCallMicros: 1,
+      source: "test",
+    },
+    idempotencyKey: "sixteen-source-edit-key",
+    requestHash: "a".repeat(64),
+    operation: "edit" as const,
+    prompt: "Edit sixteen images",
+    providerCreatedAt: 1,
+  };
+  const lineage = Array.from({ length: 16 }, (_, ordinal) => ({
+    attachmentId: crypto.randomUUID(),
+    role: "source" as const,
+    ordinal,
+    width: 1,
+    height: 1,
+  }));
+  const input = {
+    ...base,
+    assets: [{
+      attachmentId: crypto.randomUUID(),
+      ordinal: 0,
+      width: 1,
+      height: 1,
+      inputs: lineage,
+    }],
+  };
+  validateGeneratedAssetFinalization(input);
+  assertThrows(
+    () =>
+      validateGeneratedAssetFinalization({
+        ...input,
+        assets: [{
+          ...input.assets[0],
+          inputs: [...lineage, { ...lineage[0], attachmentId: crypto.randomUUID(), ordinal: 16 }],
+        }],
+      }),
+    TypeError,
+  );
+});
+
 Deno.test("generated object crash stages are durably queued for cleanup", () => {
   for (const terminal of ["pending", "stored", "attached"] as const) {
     const { repo, owner, createAttachment } = fixture();
@@ -174,7 +268,10 @@ Deno.test("generated object crash stages are durably queued for cleanup", () => 
       sha256: attachment.sha256,
     });
     if (terminal !== "pending") repo.markGeneratedObjectStored(stage.id, owner.id);
-    if (terminal === "attached") repo.attachGeneratedObject(stage.id, owner.id, attachment.id);
+    if (terminal === "attached") {
+      repo.attachGeneratedObject(stage.id, owner.id, attachment.id, false);
+      assertEquals(repo.generatedObjectStages.get(stage.id)?.cleanupAttachment, false);
+    }
     assertEquals(repo.requestGeneratedObjectCleanup(owner.id, "asset-run-0001", "crash"), 1);
     assertEquals(repo.generatedObjectStages.get(stage.id)?.state, "cleanup_pending");
     assertEquals(
@@ -185,6 +282,91 @@ Deno.test("generated object crash stages are durably queued for cleanup", () => 
       true,
     );
   }
+});
+
+Deno.test("image edit lineage enforces ownership, image masks, dimensions, and staged outputs", () => {
+  const { repo, owner, stranger, model, identitySnapshot, createAttachment } = fixture();
+  const source = createAttachment("edit-source", "1");
+  const output = createAttachment("edit-output", "2");
+  const strangerSource = repo.createAttachment({
+    ownerId: stranger.id,
+    objectKey: `generated/${stranger.id}/${crypto.randomUUID()}.png`,
+    filename: "stranger.png",
+    mimeType: "image/png",
+    sizeBytes: 100,
+    sha256: "3".repeat(64),
+    state: "ready",
+  }).attachment;
+  const jpegMask = repo.createAttachment({
+    ownerId: owner.id,
+    objectKey: `generated/${owner.id}/${crypto.randomUUID()}.jpg`,
+    filename: "mask.jpg",
+    mimeType: "image/jpeg",
+    sizeBytes: 100,
+    sha256: "4".repeat(64),
+    state: "ready",
+  }).attachment;
+  const base = {
+    ownerId: owner.id,
+    usageRunId: "asset-run-0001",
+    providerModelId: model.id,
+    ...identitySnapshot,
+    idempotencyKey: "generated-edit-security",
+    requestHash: "5".repeat(64),
+    operation: "edit" as const,
+    prompt: "Securely edit this image",
+    providerCreatedAt: 1_700_000_010,
+    assets: [{
+      attachmentId: output.id,
+      ordinal: 0,
+      width: 1024,
+      height: 1024,
+      inputs: [{
+        attachmentId: source.id,
+        role: "source" as const,
+        ordinal: 0,
+        width: 1024,
+        height: 1024,
+      }],
+    }],
+  };
+  assertThrows(
+    () => repo.finalizeGeneratedAssets({ ...base, assets: [{ ...base.assets[0], inputs: [] }] }),
+    TypeError,
+  );
+  assertThrows(
+    () =>
+      repo.finalizeGeneratedAssets({
+        ...base,
+        assets: [{
+          ...base.assets[0],
+          inputs: [{ ...base.assets[0].inputs[0], attachmentId: strangerSource.id }],
+        }],
+      }),
+    DomainError,
+  );
+  assertThrows(
+    () =>
+      repo.finalizeGeneratedAssets({
+        ...base,
+        assets: [{
+          ...base.assets[0],
+          inputs: [
+            ...base.assets[0].inputs,
+            {
+              attachmentId: jpegMask.id,
+              role: "mask" as const,
+              ordinal: 0,
+              width: 1024,
+              height: 1024,
+              hasAlpha: true,
+            },
+          ],
+        }],
+      }),
+    DomainError,
+  );
+  assertThrows(() => repo.finalizeGeneratedAssets(base), DomainError, "stage");
 });
 
 Deno.test("stale API reaper preserves finalized image requests for recovery", () => {

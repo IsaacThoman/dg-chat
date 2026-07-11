@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { MODAL_FOCUSABLE_SELECTOR, modalFocusableElements } from "./modalFocus.ts";
+import {
+  MODAL_FOCUSABLE_SELECTOR,
+  modalFocusableElements,
+  modalShouldRestoreFocus,
+} from "./modalFocus.ts";
 
 type FakeElement = {
   tabIndex: number;
@@ -26,6 +30,12 @@ describe("modal focus targets", () => {
     expect(MODAL_FOCUSABLE_SELECTOR).toContain("textarea:not([disabled])");
     expect(MODAL_FOCUSABLE_SELECTOR).toContain("[contenteditable]");
     expect(MODAL_FOCUSABLE_SELECTOR).toContain('[tabindex]:not([tabindex="-1"])');
+  });
+  it("suppresses focus restoration during an internal modal handoff", () => {
+    let handoff = true;
+    expect(modalShouldRestoreFocus(() => !handoff)).toBe(false);
+    handoff = false;
+    expect(modalShouldRestoreFocus(() => !handoff)).toBe(true);
   });
 
   it("filters disabled, hidden, inert, and negative-tab-index matches", () => {

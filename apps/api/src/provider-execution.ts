@@ -70,8 +70,10 @@ import {
 } from "./speech.ts";
 import {
   assertImageUsagePricing,
+  createImageEdit,
   createImageGeneration,
   estimateImageInputTokens,
+  type ImageEditRequest,
   type ImageExecutionTarget,
   imageFrameDecodedBytes,
   type ImageGenerationRequest,
@@ -618,7 +620,8 @@ export class ProviderExecutionEngine {
       | "transcription"
       | "translation"
       | "speech"
-      | "image_generation" = "chat",
+      | "image_generation"
+      | "image_editing" = "chat",
   ): Promise<{
     plan: ProviderExecutionPlan;
     candidates: Map<string, RuntimeCandidate>;
@@ -1499,11 +1502,13 @@ export class ProviderExecutionEngine {
     request: ImageGenerationRequest,
     signal: AbortSignal,
     frozenPlan?: ProviderExecutionPlan,
+    dispatch: typeof createImageGeneration = createImageGeneration,
+    capability: "image_generation" | "image_editing" = "image_generation",
   ): Promise<ImageProviderResponse> {
     const { plan, candidates } = await this.#prepare(
       sourceModelId,
       frozenPlan,
-      "image_generation",
+      capability,
     );
     const claim = await this.#repository.claimProviderExecution(usageRunId, ownerLeaseToken);
     const remainingAttempts = policyFor(plan, undefined, this.#slowStream).maxAttempts -
@@ -1574,7 +1579,7 @@ export class ProviderExecutionEngine {
                 observed.inputTokens = estimatedInput;
                 observed.tokenSource = "estimated";
                 metrics.set(key(candidate.id, context), observed);
-                const result = await createImageGeneration(request, {
+                const result = await dispatch(request, {
                   baseUrl: upstream.baseUrl,
                   apiKey: upstream.apiKey,
                   upstreamModel: upstream.upstreamModel,
@@ -1672,7 +1677,7 @@ export class ProviderExecutionEngine {
             observed.inputTokens = estimatedInput;
             observed.tokenSource = "estimated";
             metrics.set(key(candidate.id, context), observed);
-            const result = await createImageGeneration(request, {
+            const result = await dispatch(request, {
               baseUrl: upstream.baseUrl,
               apiKey: upstream.apiKey,
               upstreamModel: upstream.upstreamModel,
@@ -1720,6 +1725,26 @@ export class ProviderExecutionEngine {
     } catch (error) {
       this.#normalizeError(error, plan);
     }
+  }
+
+  imageEdit(
+    sourceModelId: string,
+    usageRunId: string,
+    ownerLeaseToken: string,
+    request: ImageEditRequest,
+    signal: AbortSignal,
+    frozenPlan?: ProviderExecutionPlan,
+  ) {
+    return this.imageGenerate(
+      sourceModelId,
+      usageRunId,
+      ownerLeaseToken,
+      request,
+      signal,
+      frozenPlan,
+      createImageEdit as unknown as typeof createImageGeneration,
+      "image_editing",
+    );
   }
 
   async *#observeStream(

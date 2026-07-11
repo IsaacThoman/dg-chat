@@ -351,6 +351,9 @@ export interface GeneratedAssetInput {
   attachmentId: string;
   role: GeneratedAssetInputRole;
   ordinal: number;
+  width: number;
+  height: number;
+  hasAlpha?: boolean | null;
 }
 export interface GeneratedAssetRecord {
   id: string;
@@ -412,11 +415,13 @@ export interface GeneratedObjectStage {
   ownerId: string;
   usageRunId: string;
   ordinal: number;
+  purpose: "output" | "edit_input";
   objectKey: string;
   mimeType: string;
   sizeBytes: number;
   sha256: string;
   attachmentId: string | null;
+  cleanupAttachment: boolean;
   state: GeneratedObjectStageState;
   cleanupError: string | null;
   createdAt: string;
@@ -426,6 +431,7 @@ export interface StageGeneratedObjectInput {
   ownerId: string;
   usageRunId: string;
   ordinal: number;
+  purpose?: "output" | "edit_input";
   objectKey: string;
   mimeType: string;
   sizeBytes: number;
@@ -450,6 +456,7 @@ export function validateGeneratedAssetFinalization(input: FinalizeGeneratedAsset
     unicodeScalarLength(input.prompt) > 32_000 || input.assets.length < 1 ||
     input.assets.length > 10
   ) throw new TypeError("Generated asset finalization is invalid");
+  let canonicalInputs: string | undefined;
   for (let index = 0; index < input.assets.length; index++) {
     const asset = input.assets[index];
     if (
@@ -462,16 +469,61 @@ export function validateGeneratedAssetFinalization(input: FinalizeGeneratedAsset
           unicodeScalarLength(asset.revisedPrompt) > 32_000))
     ) throw new TypeError("Generated asset finalization is invalid");
     const inputKeys = new Set<string>();
+    const attachmentIds = new Set<string>();
+    const byRole = new Map<GeneratedAssetInputRole, number[]>();
     for (const source of asset.inputs ?? []) {
       const key = `${source.role}:${source.ordinal}`;
       if (
         !DOCUMENT_UUID_PATTERN.test(source.attachmentId) ||
         !["source", "mask", "reference"].includes(source.role) ||
-        !Number.isSafeInteger(source.ordinal) || source.ordinal < 0 || source.ordinal > 9 ||
-        inputKeys.has(key)
+        !Number.isSafeInteger(source.ordinal) || source.ordinal < 0 || source.ordinal > 15 ||
+        inputKeys.has(key) || attachmentIds.has(source.attachmentId)
+      ) throw new TypeError("Generated asset finalization is invalid");
+      if (
+        !Number.isSafeInteger(source.width) || source.width < 1 || source.width > 65_535 ||
+        !Number.isSafeInteger(source.height) || source.height < 1 || source.height > 65_535 ||
+        (source.role === "mask"
+          ? source.hasAlpha !== true
+          : source.hasAlpha !== undefined && source.hasAlpha !== null)
       ) throw new TypeError("Generated asset finalization is invalid");
       inputKeys.add(key);
+      attachmentIds.add(source.attachmentId);
+      const ordinals = byRole.get(source.role) ?? [];
+      ordinals.push(source.ordinal);
+      byRole.set(source.role, ordinals);
     }
+    for (const ordinals of byRole.values()) {
+      ordinals.sort((a, b) => a - b);
+      if (ordinals.some((ordinal, ordinalIndex) => ordinal !== ordinalIndex)) {
+        throw new TypeError("Generated asset finalization is invalid");
+      }
+    }
+    const sources = byRole.get("source") ?? [];
+    const masks = byRole.get("mask") ?? [];
+    if (
+      (input.operation === "generation" && inputKeys.size !== 0) ||
+      (input.operation === "edit" &&
+        (sources.length < 1 || sources.length > 16 || masks.length > 1))
+    ) throw new TypeError("Generated asset finalization is invalid");
+    if (input.operation === "edit") {
+      const orderedSources = (asset.inputs ?? []).filter((source) => source.role === "source")
+        .sort((a, b) => a.ordinal - b.ordinal);
+      const first = orderedSources[0];
+      if (
+        orderedSources.some((source) =>
+          source.width !== first.width || source.height !== first.height
+        ) ||
+        (asset.inputs ?? []).some((source) =>
+          source.role === "mask" &&
+          (source.width !== first.width || source.height !== first.height)
+        )
+      ) throw new TypeError("Generated asset finalization is invalid");
+    }
+    const serialized = JSON.stringify([...(asset.inputs ?? [])].sort(generatedInputOrder));
+    if (canonicalInputs !== undefined && serialized !== canonicalInputs) {
+      throw new TypeError("Generated asset finalization is invalid");
+    }
+    canonicalInputs = serialized;
   }
 }
 
@@ -498,7 +550,9 @@ export function sameGeneratedAssetFinalization(
       .every((source, sourceIndex) => {
         const expected = [...sources].sort(generatedInputOrder)[sourceIndex];
         return source.attachmentId === expected.attachmentId && source.role === expected.role &&
-          source.ordinal === expected.ordinal;
+          source.ordinal === expected.ordinal && source.width === expected.width &&
+          source.height === expected.height &&
+          (source.hasAlpha ?? null) === (expected.hasAlpha ?? null);
       });
   });
 }
@@ -706,6 +760,7 @@ export type ApiIdempotencyEndpoint =
   | "responses"
   | "embeddings"
   | "images.generations"
+  | "images.edits"
   | "audio.transcriptions"
   | "audio.translations"
   | "audio.speech";
@@ -1275,6 +1330,12 @@ export interface DomainRepository {
     ownerId: string,
     includeDeleted?: boolean,
   ): MaybePromise<GeneratedAssetRecord[]>;
+  findGeneratedAssetByAttachment(
+    ownerId: string,
+    attachmentId: string,
+    before?: string,
+    excludeId?: string,
+  ): MaybePromise<GeneratedAssetRecord | undefined>;
   findGeneratedAssetsByIdempotency(
     ownerId: string,
     idempotencyKey: string,
@@ -1292,6 +1353,7 @@ export interface DomainRepository {
     id: string,
     ownerId: string,
     attachmentId: string,
+    cleanupAttachment?: boolean,
   ): MaybePromise<GeneratedObjectStage>;
   requestGeneratedObjectCleanup(
     ownerId: string,

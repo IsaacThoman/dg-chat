@@ -12,6 +12,8 @@ import { isModelCapability, MODEL_CAPABILITIES } from "./types.ts";
 Deno.test("model capabilities are canonical and reject near-miss values", () => {
   assertEquals(new Set(MODEL_CAPABILITIES).size, MODEL_CAPABILITIES.length);
   assertEquals(isModelCapability("transcription"), true);
+  assertEquals(isModelCapability("image_editing"), true);
+  assertEquals(isModelCapability("image_edit"), false);
   assertEquals(isModelCapability("transcripton"), false);
 });
 

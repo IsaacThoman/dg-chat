@@ -15,7 +15,7 @@ export const MODEL_CAPABILITIES = [
   "translation",
   "speech",
   "image_generation",
-  "image_edit",
+  "image_editing",
 ] as const;
 export type ModelCapability = (typeof MODEL_CAPABILITIES)[number];
 export const isModelCapability = (value: string): value is ModelCapability =>

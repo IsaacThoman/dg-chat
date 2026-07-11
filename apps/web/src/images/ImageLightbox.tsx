@@ -1,7 +1,8 @@
 import { ArrowLeft, ChevronLeft, ChevronRight, Download, Pencil } from "lucide-react";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Modal } from "../Modal.tsx";
 import { assetAlt } from "./ImageCard.tsx";
+import { imageApi } from "./imageApi.ts";
 import type { GeneratedAsset } from "./types.ts";
 
 export function ImageLightbox({ assets, activeId, close, select, edit, embedded = false }: {
@@ -12,8 +13,68 @@ export function ImageLightbox({ assets, activeId, close, select, edit, embedded 
   edit?: (asset: GeneratedAsset) => void;
   embedded?: boolean;
 }) {
-  const index = assets.findIndex((asset) => asset.id === activeId);
-  const asset = assets[index];
+  const [resolvedSources, setResolvedSources] = useState<GeneratedAsset[]>([]);
+  const [sourceFailures, setSourceFailures] = useState<ReadonlySet<string>>(new Set());
+  const [sourceRetryVersion, setSourceRetryVersion] = useState(0);
+  const [lineageActiveId, setLineageActiveId] = useState(activeId);
+  useEffect(() => setLineageActiveId(activeId), [activeId]);
+  const viewAssets = [
+    ...assets,
+    ...resolvedSources.filter((resolved) =>
+      !assets.some((candidate) => candidate.id === resolved.id)
+    ),
+  ];
+  const index = viewAssets.findIndex((asset) => asset.id === lineageActiveId);
+  const asset = viewAssets[index];
+  const sourceVersions = asset
+    ? asset.sourceAttachmentIds.map((attachmentId, sourceIndex) => {
+      const candidates = viewAssets.filter((candidate) =>
+        candidate.id !== asset.id && candidate.attachmentId === attachmentId &&
+        candidate.createdAt <= asset.createdAt
+      ).sort((left, right) =>
+        right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id)
+      );
+      return { attachmentId, sourceIndex, source: candidates[0] };
+    })
+    : [];
+  useEffect(() => {
+    if (!asset) return;
+    const sourceKey = (attachmentId: string) => `${asset.id}:${attachmentId}`;
+    const missing = sourceVersions.filter((entry) =>
+      !entry.source && !sourceFailures.has(sourceKey(entry.attachmentId))
+    );
+    if (!missing.length) return;
+    let cancelled = false;
+    void Promise.allSettled(
+      missing.map((entry) =>
+        imageApi.retrieveSource(entry.attachmentId, asset.createdAt, asset.id)
+      ),
+    ).then((results) => {
+      if (cancelled) return;
+      const found = results.flatMap((result) =>
+        result.status === "fulfilled" ? [result.value] : []
+      );
+      if (found.length) {
+        setResolvedSources((current) => [
+          ...current,
+          ...found.filter((item) => !current.some((existing) => existing.id === item.id)),
+        ]);
+      }
+      const failed = results.flatMap((result, index) =>
+        result.status === "rejected" ? [sourceKey(missing[index].attachmentId)] : []
+      );
+      if (failed.length) {
+        setSourceFailures((current) => new Set([...current, ...failed]));
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [asset?.id, asset?.createdAt, asset?.sourceAttachmentIds.join("|"), sourceRetryVersion]);
+  const choose = (id: string) => {
+    setLineageActiveId(id);
+    if (assets.some((candidate) => candidate.id === id)) select(id);
+  };
   useEffect(() => {
     const keydown = (event: KeyboardEvent) => {
       const target = event.target;
@@ -23,16 +84,16 @@ export function ImageLightbox({ assets, activeId, close, select, edit, embedded 
       ) return;
       if (event.key === "ArrowLeft" && index > 0) {
         event.preventDefault();
-        select(assets[index - 1].id);
+        choose(viewAssets[index - 1].id);
       }
-      if (event.key === "ArrowRight" && index >= 0 && index < assets.length - 1) {
+      if (event.key === "ArrowRight" && index >= 0 && index < viewAssets.length - 1) {
         event.preventDefault();
-        select(assets[index + 1].id);
+        choose(viewAssets[index + 1].id);
       }
     };
     document.addEventListener("keydown", keydown);
     return () => document.removeEventListener("keydown", keydown);
-  }, [assets, index, select]);
+  }, [viewAssets, index, select]);
   if (!asset) return null;
   const content = (
     <div className="image-lightbox">
@@ -47,16 +108,16 @@ export function ImageLightbox({ assets, activeId, close, select, edit, embedded 
           type="button"
           aria-label="Previous image"
           disabled={index <= 0}
-          onClick={() => select(assets[index - 1].id)}
+          onClick={() => choose(viewAssets[index - 1].id)}
         >
           <ChevronLeft />
         </button>
-        <span aria-live="polite">{index + 1} of {assets.length}</span>
+        <span aria-live="polite">{index + 1} of {viewAssets.length}</span>
         <button
           type="button"
           aria-label="Next image"
-          disabled={index >= assets.length - 1}
-          onClick={() => select(assets[index + 1].id)}
+          disabled={index >= viewAssets.length - 1}
+          onClick={() => choose(viewAssets[index + 1].id)}
         >
           <ChevronRight />
         </button>
@@ -78,8 +139,74 @@ export function ImageLightbox({ assets, activeId, close, select, edit, embedded 
           <dd>{new Date(asset.createdAt).toLocaleString()}</dd>
         </div>
       </dl>
+      {asset.operation === "edit" && (
+        <section className="image-lineage" aria-labelledby={`image-lineage-${asset.id}`}>
+          <h3 id={`image-lineage-${asset.id}`}>Version lineage</h3>
+          <p>
+            This edit is a new immutable asset. Its {asset.sourceAttachmentIds.length} input
+            {asset.sourceAttachmentIds.length === 1 ? " remains" : "s remain"} unchanged.
+          </p>
+          {sourceVersions.length > 0 && (
+            <div aria-label="Source versions">
+              {sourceVersions.map(({ attachmentId, source, sourceIndex }) => {
+                const failureKey = `${asset.id}:${attachmentId}`;
+                if (source) {
+                  return (
+                    <button
+                      type="button"
+                      key={source.id}
+                      onClick={() => choose(source.id)}
+                    >
+                      <ArrowLeft size={14} /> Source {sourceIndex + 1}
+                    </button>
+                  );
+                }
+                if (sourceFailures.has(failureKey)) {
+                  return (
+                    <span key={failureKey} className="image-lineage-source-error">
+                      Source {sourceIndex + 1} unavailable.
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSourceFailures((current) => {
+                            const next = new Set(current);
+                            next.delete(failureKey);
+                            return next;
+                          });
+                          setSourceRetryVersion((value) => value + 1);
+                        }}
+                      >
+                        Retry
+                      </button>
+                    </span>
+                  );
+                }
+                return <span key={failureKey}>Loading source {sourceIndex + 1}…</span>;
+              })}
+            </div>
+          )}
+          {sourceVersions.some((entry) =>
+            !entry.source && !sourceFailures.has(`${asset.id}:${entry.attachmentId}`)
+          ) && (
+            <p className="image-lineage-unavailable" role="status" aria-live="polite">
+              Loading preserved source versions…
+            </p>
+          )}
+          {sourceVersions.some((entry) =>
+            !entry.source && sourceFailures.has(`${asset.id}:${entry.attachmentId}`)
+          ) && (
+            <p className="sr-only" role="status" aria-live="polite">
+              {sourceVersions.filter((entry) =>
+                !entry.source && sourceFailures.has(`${asset.id}:${entry.attachmentId}`)
+              ).map((entry) => `Source ${entry.sourceIndex + 1} unavailable. Retry is available.`)
+                .join(" ")}
+            </p>
+          )}
+        </section>
+      )}
       <div className="modal-actions">
-        {edit && asset.status === "ready" && (
+        {edit && asset.status === "ready" && asset.attachmentId &&
+          asset.mimeType?.startsWith("image/") && (
           <button
             type="button"
             className="secondary"
