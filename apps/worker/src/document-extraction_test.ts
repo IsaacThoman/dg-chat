@@ -222,6 +222,22 @@ Deno.test("DOCX validates actual inflated sizes rather than trusting forged smal
   );
 });
 
+Deno.test("DOCX verifies local compression methods and actual CRC integrity", async () => {
+  const methodMismatch = docx().slice();
+  const methodCentral = centralOffsetForName(methodMismatch, "word/document.xml");
+  setU16(methodMismatch, methodCentral + 10, 0);
+  await rejectsCode(() => extractDocx(methodMismatch), "invalid_docx");
+
+  const badCrc = docx().slice();
+  const crcCentral = centralOffsetForName(badCrc, "word/document.xml");
+  const local = (badCrc[crcCentral + 42] | badCrc[crcCentral + 43] << 8 |
+    badCrc[crcCentral + 44] << 16 | badCrc[crcCentral + 45] << 24) >>> 0;
+  const forgedCrc = 0x12345678;
+  setU32(badCrc, crcCentral + 16, forgedCrc);
+  setU32(badCrc, local + 14, forgedCrc);
+  await rejectsCode(() => extractDocx(badCrc), "invalid_docx");
+});
+
 Deno.test("DOCX rejects macros declared by files or content types", async () => {
   await rejectsCode(
     () => extractDocx(docx(undefined, { "word/vbaProject.bin": strToU8("macro") })),
@@ -247,6 +263,26 @@ Deno.test("DOCX rejects embedded, ActiveX, executable, and custom UI parts", asy
   ) {
     await rejectsCode(
       () => extractDocx(docx(undefined, { [name]: strToU8("active") })),
+      "docx_active_content",
+    );
+  }
+});
+
+Deno.test("DOCX requires canonical package names and rejects DDE field instructions", async () => {
+  const alternateCase = zipSync({
+    "[CONTENT_TYPES].XML": strToU8("<Types/>"),
+    "word/document.xml": strToU8("<w:document><w:body/></w:document>"),
+  });
+  await rejectsCode(() => extractDocx(alternateCase), "invalid_docx");
+
+  for (
+    const field of [
+      '<w:instrText xml:space="preserve"> DDEAUTO c:\\windows\\system32\\cmd.exe </w:instrText>',
+      '<w:fldSimple w:instr="DDE server topic"/>',
+    ]
+  ) {
+    await rejectsCode(
+      () => extractDocx(docx(`<w:document><w:body>${field}</w:body></w:document>`)),
       "docx_active_content",
     );
   }

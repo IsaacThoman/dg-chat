@@ -127,6 +127,7 @@ function docxFromCentralDirectory(
   const directoryOffset = absoluteOffset - suffixStart;
   if (directoryOffset < 0 || directoryOffset + size !== eocd) return false;
   const names = new Set<string>();
+  const lowerNames = new Set<string>();
   let offset = directoryOffset;
   try {
     for (let index = 0; index < count; index++) {
@@ -138,22 +139,24 @@ function docxFromCentralDirectory(
       if (end > eocd) return false;
       const name = new TextDecoder("utf-8", { fatal: true }).decode(
         suffix.subarray(offset + 46, offset + 46 + nameLength),
-      ).toLowerCase();
-      if (!name || names.has(name)) return false;
+      );
+      const lowerName = name.toLowerCase();
+      if (!name || names.has(name) || lowerNames.has(lowerName)) return false;
       names.add(name);
+      lowerNames.add(lowerName);
       offset = end;
     }
   } catch {
     return false;
   }
   if (offset !== eocd) return false;
-  const forbidden = [...names].some((name) =>
+  const forbidden = [...lowerNames].some((name) =>
     name.startsWith("ppt/") || name.startsWith("xl/") ||
     name.endsWith("vbaproject.bin") || name.startsWith("word/activex/") ||
     name.startsWith("word/embeddings/") || name.startsWith("customui/") ||
     /\.(?:exe|dll|com|bat|cmd|ps1|js|jse|vbs|vbe|wsf|wsh|scr|msi)$/.test(name)
   );
-  return !forbidden && names.has("[content_types].xml") && names.has("word/document.xml");
+  return !forbidden && names.has("[Content_Types].xml") && names.has("word/document.xml");
 }
 
 function sniffMime(
@@ -199,6 +202,23 @@ interface StreamMarkers {
   dangerousMarkup: boolean;
   secondaryZip: boolean;
   executable: boolean;
+}
+
+function containsEmbeddedPe(bytes: Uint8Array, absoluteStart: number): boolean {
+  for (let offset = 0; offset + 64 <= bytes.length; offset++) {
+    if (absoluteStart + offset < 8 || bytes[offset] !== 0x4d || bytes[offset + 1] !== 0x5a) {
+      continue;
+    }
+    const peOffset = u32(bytes, offset + 0x3c);
+    if (
+      peOffset < 64 || peOffset > 4096 || offset + peOffset + 4 > bytes.length
+    ) continue;
+    if (
+      bytes[offset + peOffset] === 0x50 && bytes[offset + peOffset + 1] === 0x45 &&
+      bytes[offset + peOffset + 2] === 0 && bytes[offset + peOffset + 3] === 0
+    ) return true;
+  }
+  return false;
 }
 
 function hasPolyglotMarkers(markers: StreamMarkers, mime: string): boolean {
@@ -345,6 +365,7 @@ export function secureUploadStream(
   const hash = createHash("sha256");
   const prefixChunks: Uint8Array[] = [];
   const suffixChunks: Uint8Array[] = [];
+  const completeValidationChunks: Uint8Array[] = [];
   let prefixSize = 0;
   let suffixSize = 0;
   let total = 0;
@@ -388,16 +409,16 @@ export function secureUploadStream(
         const scanText = new TextDecoder("latin1").decode(scan).toLowerCase();
         markers.dangerousMarkup ||= ["<script", "<!doctype html", "<html", "<?php", "<svg"]
           .some((marker) => scanText.includes(marker));
-        for (
-          const [signature, key] of [["pk\x03\x04", "secondaryZip"], ["mz", "executable"]] as const
-        ) {
-          let found = scanText.indexOf(signature);
-          while (found >= 0) {
-            if (scanStart + found >= 8) markers[key] = true;
-            found = scanText.indexOf(signature, found + 1);
-          }
+        let found = scanText.indexOf("pk\x03\x04");
+        while (found >= 0) {
+          if (scanStart + found >= 8) markers.secondaryZip = true;
+          found = scanText.indexOf("pk\x03\x04", found + 1);
         }
-        markerCarry = scan.slice(Math.max(0, scan.length - 32));
+        markers.executable ||= containsEmbeddedPe(scan, scanStart);
+        markerCarry = scan.slice(Math.max(0, scan.length - 4096));
+        if (declared === "application/json" || declared === "application/octet-stream") {
+          completeValidationChunks.push(chunk.slice());
+        }
         const remaining = inspectionBytes - prefixSize;
         if (remaining > 0) {
           const part = chunk.slice(0, remaining);
@@ -457,6 +478,19 @@ export function secureUploadStream(
               415,
             ),
           );
+        }
+        if (validatedMime === "application/json") {
+          const body = new Uint8Array(total);
+          let bodyOffset = 0;
+          for (const chunk of completeValidationChunks) {
+            body.set(chunk, bodyOffset);
+            bodyOffset += chunk.byteLength;
+          }
+          try {
+            JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body));
+          } catch {
+            fail(new UploadSecurityError("invalid_json", "JSON upload is malformed", 422));
+          }
         }
         if (hasPolyglotMarkers(markers, validatedMime)) {
           fail(
