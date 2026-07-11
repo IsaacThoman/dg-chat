@@ -496,22 +496,25 @@ function assertSafeDocx(entries: ZipEntry[], files: Record<string, Uint8Array>):
       "Embedded or active DOCX content is not allowed",
     );
   }
-  const documentXml = decoder.decode(files["word/document.xml"]);
-  const complexInstruction = [...documentXml.matchAll(
-    /<w:instrText\b[^>]*>([\s\S]*?)<\/w:instrText\s*>/gi,
-  )].map((match) => decodeXmlEntities(match[1]).replace(/<[^>]*>/g, "")).join("");
-  const simpleInstructions = [...documentXml.matchAll(
-    /<w:fldSimple\b[^>]*\bw:instr\s*=\s*["']([^"']*)["']/gi,
-  )].map((match) => decodeXmlEntities(match[1]));
-  if (
-    [complexInstruction, ...simpleInstructions].some((instruction) =>
-      /\bDDE(?:AUTO)?\b/i.test(instruction)
-    ) || /<(?:\w+:)?(?:OLEObject|object)\b/i.test(documentXml)
-  ) {
-    throw new DocumentExtractionError(
-      "docx_active_content",
-      "DDE-enabled DOCX fields are not allowed",
-    );
+  for (const [name, bytes] of Object.entries(files)) {
+    if (!name.startsWith("word/") || !name.toLowerCase().endsWith(".xml")) continue;
+    const wordXml = decoder.decode(bytes);
+    const complexInstruction = [...wordXml.matchAll(
+      /<(?:[A-Za-z_][\w.-]*:)?instrText\b[^>]*>([\s\S]*?)<\/(?:[A-Za-z_][\w.-]*:)?instrText\s*>/gi,
+    )].map((match) => decodeXmlEntities(match[1]).replace(/<[^>]*>/g, "")).join("");
+    const simpleInstructions = [...wordXml.matchAll(
+      /<(?:[A-Za-z_][\w.-]*:)?fldSimple\b[^>]*\b(?:[A-Za-z_][\w.-]*:)?instr\s*=\s*["']([^"']*)["']/gi,
+    )].map((match) => decodeXmlEntities(match[1]));
+    if (
+      [complexInstruction, ...simpleInstructions].some((instruction) =>
+        /\bDDE(?:AUTO)?\b/i.test(instruction)
+      ) || /<(?:\w+:)?(?:OLEObject|object)\b/i.test(wordXml)
+    ) {
+      throw new DocumentExtractionError(
+        "docx_active_content",
+        "DDE-enabled DOCX fields are not allowed",
+      );
+    }
   }
   for (const [name, bytes] of Object.entries(files)) {
     if (!name.toLowerCase().endsWith(".rels")) continue;

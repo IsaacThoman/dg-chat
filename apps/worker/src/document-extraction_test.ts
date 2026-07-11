@@ -290,6 +290,27 @@ Deno.test("DOCX requires canonical package names and rejects DDE field instructi
   }
 });
 
+Deno.test("DOCX rejects split active fields and objects in every Word XML story part", async () => {
+  for (
+    const [name, xml] of [
+      [
+        "word/header1.xml",
+        `<w:hdr><w:instrText>DD</w:instrText><w:instrText>EAUTO command</w:instrText></w:hdr>`,
+      ],
+      [
+        "word/footer1.xml",
+        `<x:ftr><x:fldSimple x:instr="D&#68;E command"/></x:ftr>`,
+      ],
+      ["word/footnotes.xml", `<w:footnotes><w:object/></w:footnotes>`],
+    ] as const
+  ) {
+    await rejectsCode(
+      () => extractDocx(docx(undefined, { [name]: strToU8(xml) })),
+      "docx_active_content",
+    );
+  }
+});
+
 Deno.test("DOCX rejects active internal relationship types regardless of target filename", async () => {
   for (const type of ["oleObject", "package", "attachedTemplate", "control"]) {
     const rels = `<Relationships><Relationship ` +

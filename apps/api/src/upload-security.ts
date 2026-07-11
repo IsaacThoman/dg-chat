@@ -207,53 +207,80 @@ interface StreamMarkers {
 interface PeCandidate {
   offset: number;
   header: number[];
-  signatureOffset?: number;
-  signature: number[];
+}
+
+interface PeScanState {
+  headers: PeCandidate[];
+  signatures: Map<number, number[]>;
+  candidates: number;
+  seen: number;
+  terminal: boolean;
 }
 
 function scanEmbeddedPe(
   bytes: Uint8Array,
   absoluteStart: number,
-  candidates: PeCandidate[],
+  state: PeScanState,
   previousByte: number | undefined,
   maxBytes: number,
 ): { detected: boolean; previousByte: number } {
+  if (state.terminal) return { detected: true, previousByte: bytes.at(-1) ?? previousByte! };
   let detected = false;
   for (let index = 0; index < bytes.length; index++) {
     const absolute = absoluteStart + index;
     const byte = bytes[index];
-    for (let candidateIndex = candidates.length - 1; candidateIndex >= 0; candidateIndex--) {
-      const candidate = candidates[candidateIndex];
+    const signatures = state.signatures.get(absolute);
+    if (signatures) {
+      state.signatures.delete(absolute);
+      for (const progress of signatures) {
+        const expected = [0x50, 0x45, 0, 0];
+        if (byte !== expected[progress]) state.candidates--;
+        else if (progress + 1 === expected.length) {
+          detected = true;
+          state.candidates--;
+        } else {
+          const next = state.signatures.get(absolute + 1) ?? [];
+          next.push(progress + 1);
+          state.signatures.set(absolute + 1, next);
+        }
+      }
+    }
+    for (let candidateIndex = state.headers.length - 1; candidateIndex >= 0; candidateIndex--) {
+      const candidate = state.headers[candidateIndex];
       if (candidate.header.length < 64 && absolute === candidate.offset + candidate.header.length) {
         candidate.header.push(byte);
         if (candidate.header.length === 64) {
           const header = new Uint8Array(candidate.header);
           const relative = u32(header, 0x3c);
           if (relative < 64 || candidate.offset + relative + 4 > maxBytes) {
-            candidates.splice(candidateIndex, 1);
+            state.headers.splice(candidateIndex, 1);
+            state.candidates--;
             continue;
           }
-          candidate.signatureOffset = candidate.offset + relative;
-        }
-      } else if (
-        candidate.signatureOffset !== undefined &&
-        absolute === candidate.signatureOffset + candidate.signature.length
-      ) {
-        candidate.signature.push(byte);
-        const expected = [0x50, 0x45, 0, 0];
-        if (byte !== expected[candidate.signature.length - 1]) {
-          candidates.splice(candidateIndex, 1);
-        } else if (candidate.signature.length === expected.length) {
-          detected = true;
-          candidates.splice(candidateIndex, 1);
+          const signatureOffset = candidate.offset + relative;
+          const pending = state.signatures.get(signatureOffset) ?? [];
+          pending.push(0);
+          state.signatures.set(signatureOffset, pending);
+          state.headers.splice(candidateIndex, 1);
         }
       }
     }
     if (previousByte === 0x4d && byte === 0x5a && absolute - 1 >= 8) {
-      if (candidates.length >= 1024) detected = true;
-      else candidates.push({ offset: absolute - 1, header: [0x4d, 0x5a], signature: [] });
+      if (state.seen >= 1024) detected = true;
+      else {
+        state.headers.push({ offset: absolute - 1, header: [0x4d, 0x5a] });
+        state.candidates++;
+        state.seen++;
+      }
     }
     previousByte = byte;
+    if (detected) {
+      state.terminal = true;
+      state.headers.length = 0;
+      state.signatures.clear();
+      state.candidates = 0;
+      break;
+    }
   }
   return { detected, previousByte: previousByte! };
 }
@@ -412,7 +439,13 @@ export function secureUploadStream(
     executable: false,
   };
   let markerCarry = new Uint8Array();
-  const peCandidates: PeCandidate[] = [];
+  const peState: PeScanState = {
+    headers: [],
+    signatures: new Map(),
+    candidates: 0,
+    seen: 0,
+    terminal: false,
+  };
   let previousByte: number | undefined;
   let resolveInspection!: (value: UploadInspection) => void;
   let rejectInspection!: (reason: unknown) => void;
@@ -453,15 +486,17 @@ export function secureUploadStream(
           if (scanStart + found >= 8) markers.secondaryZip = true;
           found = scanText.indexOf("pk\x03\x04", found + 1);
         }
-        const peScan = scanEmbeddedPe(
-          chunk,
-          total - chunk.length,
-          peCandidates,
-          previousByte,
-          options.maxBytes,
-        );
-        markers.executable ||= peScan.detected;
-        previousByte = peScan.previousByte;
+        if (!markers.executable) {
+          const peScan = scanEmbeddedPe(
+            chunk,
+            total - chunk.length,
+            peState,
+            previousByte,
+            options.maxBytes,
+          );
+          markers.executable ||= peScan.detected;
+          previousByte = peScan.previousByte;
+        }
         markerCarry = scan.slice(Math.max(0, scan.length - 32));
         if (declared === "application/json" || declared === "application/octet-stream") {
           completeValidationChunks.push(chunk.slice());

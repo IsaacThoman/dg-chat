@@ -213,6 +213,30 @@ Deno.test("PE polyglot detection follows large DOS offsets across stream boundar
   await assertRejects(() => hostile.inspection, UploadSecurityError, "Conflicting");
 });
 
+Deno.test("PE candidate saturation short-circuits without scanning the remaining upload", async () => {
+  const body = new Uint8Array(200_000);
+  body.set(bytes(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a));
+  new DataView(body.buffer).setUint32(16, 1);
+  new DataView(body.buffer).setUint32(20, 1);
+  for (let index = 0; index < 1_025; index++) {
+    const offset = 64 + index * 64;
+    body.set(bytes(0x4d, 0x5a), offset);
+    new DataView(body.buffer).setUint32(offset + 0x3c, body.length - offset - 4, true);
+  }
+  const started = performance.now();
+  const hostile = secureUploadStream(
+    stream(body.slice(0, 70_000), body.slice(70_000)),
+    "candidate-flood.png",
+    "image/png",
+    { maxBytes: body.length },
+  );
+  await assertRejects(() => drain(hostile.stream), UploadSecurityError, "Conflicting");
+  await assertRejects(() => hostile.inspection, UploadSecurityError, "Conflicting");
+  if (performance.now() - started > 1_000) {
+    throw new Error("PE candidate saturation did not terminate in bounded time");
+  }
+});
+
 Deno.test("validates the complete JSON document instead of only its prefix", async () => {
   const valid = secureUploadStream(
     stream(strToU8('{"safe":'), strToU8("true}")),
