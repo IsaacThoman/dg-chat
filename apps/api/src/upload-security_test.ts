@@ -1,7 +1,9 @@
 import { assertEquals, assertMatch, assertRejects, assertThrows } from "jsr:@std/assert@1.0.14";
 import {
+  createPeScanState,
   normalizeUploadFilename,
   safeUploadObjectKey,
+  scanEmbeddedPe,
   secureUploadStream,
   UploadSecurityError,
 } from "./upload-security.ts";
@@ -223,7 +225,18 @@ Deno.test("PE candidate saturation short-circuits without scanning the remaining
     body.set(bytes(0x4d, 0x5a), offset);
     new DataView(body.buffer).setUint32(offset + 0x3c, body.length - offset - 4, true);
   }
-  const started = performance.now();
+  const state = createPeScanState();
+  const first = body.slice(0, 70_000);
+  const second = body.slice(70_000);
+  let previous = scanEmbeddedPe(first, 0, state, undefined, body.length).previousByte;
+  previous = scanEmbeddedPe(second, first.length, state, previous, body.length).previousByte;
+  assertEquals(state.terminal, true);
+  assertEquals(state.headers.length, 0);
+  assertEquals(state.signatures.size, 0);
+  if (state.work > body.length + 1_024 * 70) {
+    throw new Error(`PE scan exceeded its deterministic work budget: ${state.work}`);
+  }
+  assertEquals(previous, second.at(-1));
   const hostile = secureUploadStream(
     stream(body.slice(0, 70_000), body.slice(70_000)),
     "candidate-flood.png",
@@ -232,9 +245,6 @@ Deno.test("PE candidate saturation short-circuits without scanning the remaining
   );
   await assertRejects(() => drain(hostile.stream), UploadSecurityError, "Conflicting");
   await assertRejects(() => hostile.inspection, UploadSecurityError, "Conflicting");
-  if (performance.now() - started > 1_000) {
-    throw new Error("PE candidate saturation did not terminate in bounded time");
-  }
 });
 
 Deno.test("validates the complete JSON document instead of only its prefix", async () => {
