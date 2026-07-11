@@ -7,6 +7,16 @@ Deno.test("passwordless domain users are represented without a local credential"
   const user = repo.createUser({ email: "oidc@example.com", name: "OIDC user" });
   assertEquals(user.passwordHash, null);
   assertThrows(
+    () =>
+      repo.createUser({
+        id: user.id,
+        email: "collision@example.com",
+        name: "Collision",
+      }),
+    DomainError,
+    "identity already exists",
+  );
+  assertThrows(
     () => repo.bootstrapAdmin({ email: "admin@example.com", name: "Admin" }, 5_000_000),
     DomainError,
     "local password",

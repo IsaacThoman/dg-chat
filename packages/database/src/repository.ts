@@ -21,6 +21,7 @@ export {
 export type MaybePromise<T> = T | Promise<T>;
 
 export interface CreateUserInput {
+  id?: string;
   email: string;
   name: string;
   passwordHash?: string | null;
@@ -1249,6 +1250,7 @@ export interface DomainRepository {
     expiresAt: string,
   ): MaybePromise<void>;
   verifyEmail(tokenHash: string): MaybePromise<StoredUser>;
+  markUserEmailVerified(userId: string): MaybePromise<StoredUser>;
   resetPassword(tokenHash: string, passwordHash: string): MaybePromise<StoredUser>;
   recordAudit(input: AuditEventInput): MaybePromise<AuditEvent>;
   listAudit(query?: AuditQuery): MaybePromise<AuditPage>;

@@ -787,9 +787,10 @@ export class PostgresRepository implements DomainRepository {
   }
   async createUser(input: CreateUserInput) {
     try {
+      const id = input.id ?? crypto.randomUUID();
       const rows = await this.#sql<
         Row[]
-      >`INSERT INTO users (email,name,password_hash,role,approval_status,state,email_verified_at) VALUES (${input.email},${input.name},${
+      >`INSERT INTO users (id,email,name,password_hash,role,approval_status,state,email_verified_at) VALUES (${id},${input.email},${input.name},${
         input.passwordHash ?? null
       },${input.role ?? "user"},${input.approvalStatus ?? "pending"},${input.state ?? "active"},${
         input.emailVerified || input.approvalStatus === "approved" ? new Date().toISOString() : null
@@ -900,6 +901,16 @@ export class PostgresRepository implements DomainRepository {
       } RETURNING *`;
       return user(rows[0]);
     });
+  }
+  async markUserEmailVerified(userId: string) {
+    const rows = await this.#sql<Row[]>`
+      UPDATE users
+      SET email_verified_at=COALESCE(email_verified_at,now()),updated_at=now()
+      WHERE id=${userId}
+      RETURNING *
+    `;
+    if (!rows[0]) throw new DomainError("not_found", "User not found", 404);
+    return user(rows[0]);
   }
   async resetPassword(tokenHash: string, passwordHash: string) {
     return await this.#sql.begin(async (tx) => {

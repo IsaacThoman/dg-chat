@@ -491,6 +491,7 @@ export class MemoryRepository {
 
   createUser(
     input: {
+      id?: string;
       email: string;
       name: string;
       passwordHash?: string | null;
@@ -500,11 +501,18 @@ export class MemoryRepository {
       emailVerified?: boolean;
     },
   ): StoredUser {
+    if (input.id && this.users.has(input.id)) {
+      throw new DomainError(
+        "identity_conflict",
+        "An account with that identity already exists",
+        409,
+      );
+    }
     if ([...this.users.values()].some((u) => u.email === input.email)) {
       throw new DomainError("email_taken", "An account with that email already exists", 409);
     }
     const user: StoredUser = {
-      id: crypto.randomUUID(),
+      id: input.id ?? crypto.randomUUID(),
       email: input.email,
       name: input.name,
       passwordHash: input.passwordHash ?? null,
@@ -608,6 +616,12 @@ export class MemoryRepository {
     token.consumedAt = new Date().toISOString();
     const user = this.users.get(token.userId)!;
     user.emailVerifiedAt = new Date().toISOString();
+    return user;
+  }
+  markUserEmailVerified(userId: string) {
+    const user = this.users.get(userId);
+    if (!user) throw new DomainError("not_found", "User not found", 404);
+    user.emailVerifiedAt ??= new Date().toISOString();
     return user;
   }
   resetPassword(tokenHash: string, passwordHash: string) {
