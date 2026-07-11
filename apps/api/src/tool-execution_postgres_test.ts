@@ -148,6 +148,23 @@ Deno.test({
         SELECT kind FROM ledger_entries
         WHERE usage_run_id=${`tool:${crashedCancellation.id}`} ORDER BY id`;
       assertEquals(cancellationEntries.map((entry) => entry.kind).sort(), ["refund", "reserve"]);
+
+      const balance = (await repo.usage(user.id)).balanceMicros;
+      await repo.reserve(user.id, "tool-test-credit-drain", "test/drain", balance, "test");
+      const noReservation = await service.request(user.id, "echo", {});
+      await store.transitionExecution(noReservation.id, ["pending_approval"], {
+        status: "queued_pending_reservation",
+        approvedAt: new Date().toISOString(),
+        approvedBy: user.id,
+        cancellationRequestedAt: new Date().toISOString(),
+      });
+      await restarted.recover();
+      assertEquals((await restarted.get(user.id, noReservation.id)).status, "cancelled");
+      assertEquals(
+        (await sql`SELECT 1 FROM usage_runs WHERE id=${`tool:${noReservation.id}`}`).length,
+        0,
+      );
+      await repo.refund("tool-test-credit-drain");
     } finally {
       await store.close();
       await repo.close();

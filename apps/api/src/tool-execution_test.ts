@@ -505,6 +505,28 @@ Deno.test("fresh-service recovery finalizes a crashed queued cancellation marker
   assertEquals(adapterCalls, 0);
 });
 
+Deno.test("recovery cancels a marked execution when no reservation can be created", async () => {
+  const store = new MemoryToolExecutionStore();
+  const denial = Object.assign(new Error("insufficient credit"), {
+    code: "insufficient_credit",
+  });
+  const service = new ToolExecutionService(store, [echoAdapter], {
+    reserve: () => Promise.reject(denial),
+    settle: () => Promise.resolve(),
+    refund: () => Promise.resolve(false),
+  });
+  await service.setPolicy({ toolId: "echo", allowed: true, actorId: "admin" });
+  const requested = await service.request("user", "echo", {});
+  await store.transitionExecution(requested.id, ["pending_approval"], {
+    status: "queued_pending_reservation",
+    approvedAt: new Date().toISOString(),
+    approvedBy: "user",
+    cancellationRequestedAt: new Date().toISOString(),
+  });
+  await service.recover();
+  assertEquals((await service.get("user", requested.id)).status, "cancelled");
+});
+
 Deno.test("pre-debit approval failure finalizes a concurrent cancellation marker", async () => {
   const store = new MemoryToolExecutionStore();
   let reserveCalls = 0;
@@ -531,7 +553,7 @@ Deno.test("pre-debit approval failure finalizes a concurrent cancellation marker
   const requested = await service.request("user", "echo", {});
   const approval = service.approve("user", requested.id);
   await started;
-  await assertRejects(() => service.cancel("user", requested.id), Error, "insufficient credit");
+  assertEquals((await service.cancel("user", requested.id)).status, "cancelled");
   releaseFirstReserve();
   await assertRejects(() => approval, Error, "insufficient credit");
   assertEquals((await service.get("user", requested.id)).status, "cancelled");
@@ -567,7 +589,7 @@ Deno.test("approval rollback observes a cancellation marker written after its re
   const requested = await service.request("user", "echo", {});
   const approval = service.approve("user", requested.id);
   await store.atCatchRead;
-  await assertRejects(() => service.cancel("user", requested.id), Error, "insufficient credit");
+  assertEquals((await service.cancel("user", requested.id)).status, "cancelled");
   store.releaseCatchRead();
   await assertRejects(() => approval, Error, "insufficient credit");
   assertEquals((await service.get("user", requested.id)).status, "cancelled");
