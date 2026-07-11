@@ -934,6 +934,7 @@ function Composer(
 ) {
   const [value, setValue] = useState("");
   const [toolsOpen, setToolsOpen] = useState(false);
+  const [toolContexts, setToolContexts] = useState<Array<{ id: string; content: string }>>([]);
   const [dragging, setDragging] = useState(false);
   const [selectionError, setSelectionError] = useState("");
   type UploadState =
@@ -1077,14 +1078,18 @@ function Composer(
       item.status === "ready" && item.attachment ? [item.attachment.id] : []
     ),
   );
-  const canSubmit = (value.trim().length > 0 || readyAttachmentIds.length > 0) &&
+  const canSubmit =
+    (value.trim().length > 0 || readyAttachmentIds.length > 0 || toolContexts.length > 0) &&
     !disabled && !blockedByUpload;
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     if (!canSubmit) return;
-    if (await onSend(value.trim(), readyAttachmentIds)) {
+    const content = [value.trim(), ...toolContexts.map((context) => context.content)]
+      .filter(Boolean).join("\n");
+    if (await onSend(content, readyAttachmentIds)) {
       setValue("");
       setUploads([]);
+      setToolContexts([]);
     }
   };
   return (
@@ -1188,6 +1193,28 @@ function Composer(
           ))}
         </div>
       )}
+      {toolContexts.length > 0 && (
+        <div className="upload-list" aria-label="Approved tool results" aria-live="polite">
+          {toolContexts.map((context) => (
+            <div className="upload-chip upload-ready" key={context.id}>
+              <Globe2 size={18} aria-hidden="true" />
+              <span>
+                <strong>Approved web search</strong>
+                <small>Will be added to this new branch</small>
+              </span>
+              <IconButton
+                label="Remove approved web search result"
+                onClick={() =>
+                  setToolContexts((current) =>
+                    current.filter((item) => item.id !== context.id)
+                  )}
+              >
+                <X size={15} />
+              </IconButton>
+            </div>
+          ))}
+        </div>
+      )}
       {selectionError && <p className="form-error" role="alert">{selectionError}</p>}
       <form className="composer" onSubmit={submit}>
         <textarea
@@ -1274,7 +1301,8 @@ function Composer(
       <ToolLauncher
         open={toolsOpen}
         close={() => setToolsOpen(false)}
-        insert={(text) => setValue((current) => `${current}${text}`)}
+        insert={(content) =>
+          setToolContexts((current) => [...current, { id: crypto.randomUUID(), content }])}
       />
       <p className="composer-note">
         AI can make mistakes. Check important information.{" "}
