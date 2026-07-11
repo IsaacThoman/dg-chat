@@ -1636,7 +1636,7 @@ function ChatView({
           sourceMessageId: item.sourceMessageId,
           operationId: item.operationId,
           attachmentIds: item.attachmentIds,
-          toolExecutionIds: item.toolExecutionIds,
+          toolExecutionIds: item.toolExecutionIds ?? [],
           mode: item.mode,
         }, controller.signal)
       ) {
