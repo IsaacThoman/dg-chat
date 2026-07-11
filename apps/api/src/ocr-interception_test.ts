@@ -57,6 +57,20 @@ Deno.test("OCR configuration is explicit, bounded, and does not contain credenti
         prompt: "x",
       },
     }), TypeError);
+  assertThrows(
+    () =>
+      parseOcrInterceptionConfig({
+        ocr: {
+          enabled: true,
+          providerId: "provider",
+          model: "model",
+          prompt: "read",
+          apiKey: "must-never-live-in-model-settings",
+        },
+      }),
+    TypeError,
+    "unsupported field",
+  );
 });
 
 Deno.test("OCR replaces images without mutating the caller and caches by image and settings", async () => {

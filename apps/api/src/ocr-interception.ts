@@ -74,6 +74,21 @@ export function parseOcrInterceptionConfig(value: unknown): OcrInterceptionConfi
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const ocr = raw as Record<string, unknown>;
   if (ocr.enabled !== true) return null;
+  const allowed = new Set([
+    "enabled",
+    "providerId",
+    "model",
+    "prompt",
+    "cacheTtlSeconds",
+    "timeoutMs",
+    "maxBytes",
+    "maxPixels",
+    "maxDimension",
+    "maxRedirects",
+  ]);
+  if (Object.keys(ocr).some((key) => !allowed.has(key))) {
+    throw new TypeError("OCR configuration contains an unsupported field");
+  }
   if (typeof ocr.providerId !== "string" || !ocr.providerId.trim() || ocr.providerId.length > 200) {
     throw new TypeError("OCR providerId must be a bounded non-empty string");
   }
