@@ -166,6 +166,9 @@ Deno.test("policy revision is fenced immediately before dispatch and reserved cr
   const initial = await service.setPolicy({ toolId: "echo", allowed: true, actorId: "admin" });
   const execution = await service.request("user", "echo", {});
   await service.approve("user", execution.id);
+  for (let attempt = 0; attempt < 100 && !store.release; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
   await service.setPolicy({
     toolId: "echo",
     allowed: false,
@@ -464,5 +467,40 @@ Deno.test("approve finalizes a concurrent cancellation marker without dispatch",
   assertEquals((await cancellation).status, "cancelled");
   await service.recover();
   assertEquals((await service.get("user", requested.id)).status, "cancelled");
+  assertEquals(adapterCalls, 0);
+});
+
+Deno.test("fresh-service recovery finalizes a crashed queued cancellation marker", async () => {
+  const store = new MemoryToolExecutionStore();
+  let adapterCalls = 0;
+  let refunds = 0;
+  const adapter: ToolAdapter = {
+    ...echoAdapter,
+    execute: () => {
+      adapterCalls++;
+      return Promise.resolve({ forbidden: true });
+    },
+  };
+  const service = new ToolExecutionService(store, [adapter], {
+    reserve: () => Promise.resolve(),
+    settle: () => Promise.resolve(),
+    refund: () => {
+      refunds++;
+      return Promise.resolve(true);
+    },
+  });
+  await service.setPolicy({ toolId: "echo", allowed: true, actorId: "admin" });
+  const requested = await service.request("user", "echo", {});
+  await store.transitionExecution(requested.id, ["pending_approval"], {
+    status: "queued",
+    approvedAt: new Date().toISOString(),
+    approvedBy: "user",
+    cancellationRequestedAt: new Date().toISOString(),
+  });
+  // Simulates a process crash after pending->queued but before refund/final cancellation.
+  const restarted = new ToolExecutionService(store, [adapter], service.controls);
+  await restarted.recover();
+  assertEquals((await restarted.get("user", requested.id)).status, "cancelled");
+  assertEquals(refunds, 1);
   assertEquals(adapterCalls, 0);
 });

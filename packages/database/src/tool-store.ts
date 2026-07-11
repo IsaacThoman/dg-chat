@@ -231,7 +231,14 @@ export class PostgresToolExecutionStore {
   }
   async listPendingReservation(limit: number): Promise<StoredToolExecution[]> {
     return (await this.#sql`SELECT * FROM tool_executions
-      WHERE status='queued_pending_reservation' ORDER BY updated_at LIMIT ${limit}`)
+      WHERE status='queued_pending_reservation' AND cancellation_requested_at IS NULL
+      ORDER BY updated_at LIMIT ${limit}`)
+      .map(execution);
+  }
+  async listPendingCancellation(limit: number): Promise<StoredToolExecution[]> {
+    return (await this.#sql`SELECT * FROM tool_executions
+      WHERE status IN ('queued_pending_reservation','queued')
+        AND cancellation_requested_at IS NOT NULL ORDER BY updated_at LIMIT ${limit}`)
       .map(execution);
   }
 }

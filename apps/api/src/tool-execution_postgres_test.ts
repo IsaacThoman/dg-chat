@@ -123,6 +123,31 @@ Deno.test({
       const racedEntries = await sql<{ kind: string }[]>`
         SELECT kind FROM ledger_entries WHERE usage_run_id=${`tool:${raced.id}`} ORDER BY id`;
       assertEquals([...racedEntries], [{ kind: "reserve" }]);
+
+      const crashedCancellation = await service.request(user.id, "echo", {});
+      await store.transitionExecution(crashedCancellation.id, ["pending_approval"], {
+        status: "queued",
+        approvedAt: new Date().toISOString(),
+        approvedBy: user.id,
+        cancellationRequestedAt: new Date().toISOString(),
+      });
+      await repo.ensureIdempotentReservation({
+        userId: user.id,
+        usageRunId: `tool:${crashedCancellation.id}`,
+        model: "tool/echo",
+        provider: "tool",
+        reservedMicros: reserveMicros,
+      });
+      const restarted = new ToolExecutionService(store, [adapter], service.controls);
+      await restarted.recover();
+      assertEquals(
+        (await restarted.get(user.id, crashedCancellation.id)).status,
+        "cancelled",
+      );
+      const cancellationEntries = await sql<{ kind: string }[]>`
+        SELECT kind FROM ledger_entries
+        WHERE usage_run_id=${`tool:${crashedCancellation.id}`} ORDER BY id`;
+      assertEquals(cancellationEntries.map((entry) => entry.kind).sort(), ["refund", "reserve"]);
     } finally {
       await store.close();
       await repo.close();

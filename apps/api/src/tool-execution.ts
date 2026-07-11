@@ -66,6 +66,7 @@ export interface ToolExecutionStore {
   claimRecoverable?(limit: number): Promise<ToolExecution[]>;
   listPendingSettlement?(limit: number): Promise<ToolExecution[]>;
   listPendingReservation?(limit: number): Promise<ToolExecution[]>;
+  listPendingCancellation?(limit: number): Promise<ToolExecution[]>;
 }
 
 export interface ToolAdapterContext {
@@ -194,7 +195,20 @@ export class MemoryToolExecutionStore implements ToolExecutionStore {
   listPendingReservation(limit: number) {
     return Promise.resolve(
       [...this.#executions.values()]
-        .filter((execution) => execution.status === "queued_pending_reservation")
+        .filter((execution) =>
+          execution.status === "queued_pending_reservation" &&
+          !execution.cancellationRequestedAt
+        )
+        .slice(0, limit).map(clone),
+    );
+  }
+  listPendingCancellation(limit: number) {
+    return Promise.resolve(
+      [...this.#executions.values()]
+        .filter((execution) =>
+          execution.cancellationRequestedAt &&
+          ["queued_pending_reservation", "queued"].includes(execution.status)
+        )
         .slice(0, limit).map(clone),
     );
   }
@@ -350,6 +364,26 @@ export class ToolExecutionService {
   }
 
   async recover(limit = 25) {
+    const pendingCancellation = await this.store.listPendingCancellation?.(limit) ?? [];
+    for (const execution of pendingCancellation) {
+      try {
+        const refunded = await this.controls?.refund(
+          execution,
+          "tool execution cancelled before dispatch",
+        );
+        if (refunded === false) {
+          await this.controls?.reserve(execution);
+          await this.controls?.refund(execution, "tool execution cancelled before dispatch");
+        }
+        await this.store.transitionExecution(
+          execution.id,
+          ["queued_pending_reservation", "queued"],
+          { status: "cancelled" },
+        );
+      } catch {
+        // The cancellation marker remains durable for the next maintenance pass.
+      }
+    }
     const pendingReservation = await this.store.listPendingReservation?.(limit) ?? [];
     for (const execution of pendingReservation) {
       try {
@@ -408,7 +442,8 @@ export class ToolExecutionService {
         await this.controls?.refund(execution, "tool policy changed before execution");
       }
     }
-    return executions.length + pendingSettlement.length + pendingReservation.length;
+    return executions.length + pendingSettlement.length + pendingReservation.length +
+      pendingCancellation.length;
   }
 
   async approve(ownerId: string, id: string): Promise<ToolExecution> {
