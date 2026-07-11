@@ -204,21 +204,58 @@ interface StreamMarkers {
   executable: boolean;
 }
 
-function containsEmbeddedPe(bytes: Uint8Array, absoluteStart: number): boolean {
-  for (let offset = 0; offset + 64 <= bytes.length; offset++) {
-    if (absoluteStart + offset < 8 || bytes[offset] !== 0x4d || bytes[offset + 1] !== 0x5a) {
-      continue;
+interface PeCandidate {
+  offset: number;
+  header: number[];
+  signatureOffset?: number;
+  signature: number[];
+}
+
+function scanEmbeddedPe(
+  bytes: Uint8Array,
+  absoluteStart: number,
+  candidates: PeCandidate[],
+  previousByte: number | undefined,
+  maxBytes: number,
+): { detected: boolean; previousByte: number } {
+  let detected = false;
+  for (let index = 0; index < bytes.length; index++) {
+    const absolute = absoluteStart + index;
+    const byte = bytes[index];
+    for (let candidateIndex = candidates.length - 1; candidateIndex >= 0; candidateIndex--) {
+      const candidate = candidates[candidateIndex];
+      if (candidate.header.length < 64 && absolute === candidate.offset + candidate.header.length) {
+        candidate.header.push(byte);
+        if (candidate.header.length === 64) {
+          const header = new Uint8Array(candidate.header);
+          const relative = u32(header, 0x3c);
+          if (relative < 64 || candidate.offset + relative + 4 > maxBytes) {
+            candidates.splice(candidateIndex, 1);
+            continue;
+          }
+          candidate.signatureOffset = candidate.offset + relative;
+        }
+      } else if (
+        candidate.signatureOffset !== undefined &&
+        absolute === candidate.signatureOffset + candidate.signature.length
+      ) {
+        candidate.signature.push(byte);
+        const expected = [0x50, 0x45, 0, 0];
+        if (byte !== expected[candidate.signature.length - 1]) {
+          candidates.splice(candidateIndex, 1);
+        } else if (candidate.signature.length === expected.length) {
+          detected = true;
+          candidates.splice(candidateIndex, 1);
+        }
+      }
     }
-    const peOffset = u32(bytes, offset + 0x3c);
-    if (
-      peOffset < 64 || peOffset > 4096 || offset + peOffset + 4 > bytes.length
-    ) continue;
-    if (
-      bytes[offset + peOffset] === 0x50 && bytes[offset + peOffset + 1] === 0x45 &&
-      bytes[offset + peOffset + 2] === 0 && bytes[offset + peOffset + 3] === 0
-    ) return true;
+    if (previousByte === 0x4d && byte === 0x5a && absolute - 1 >= 8) {
+      if (candidates.length >= 1024) detected = true;
+      else candidates.push({ offset: absolute - 1, header: [0x4d, 0x5a], signature: [] });
+    }
+    previousByte = byte;
   }
-  return false;
+  return { detected, previousByte: previousByte! };
 }
 
 function hasPolyglotMarkers(markers: StreamMarkers, mime: string): boolean {
@@ -375,6 +412,8 @@ export function secureUploadStream(
     executable: false,
   };
   let markerCarry = new Uint8Array();
+  const peCandidates: PeCandidate[] = [];
+  let previousByte: number | undefined;
   let resolveInspection!: (value: UploadInspection) => void;
   let rejectInspection!: (reason: unknown) => void;
   let settled = false;
@@ -414,8 +453,16 @@ export function secureUploadStream(
           if (scanStart + found >= 8) markers.secondaryZip = true;
           found = scanText.indexOf("pk\x03\x04", found + 1);
         }
-        markers.executable ||= containsEmbeddedPe(scan, scanStart);
-        markerCarry = scan.slice(Math.max(0, scan.length - 4096));
+        const peScan = scanEmbeddedPe(
+          chunk,
+          total - chunk.length,
+          peCandidates,
+          previousByte,
+          options.maxBytes,
+        );
+        markers.executable ||= peScan.detected;
+        previousByte = peScan.previousByte;
+        markerCarry = scan.slice(Math.max(0, scan.length - 32));
         if (declared === "application/json" || declared === "application/octet-stream") {
           completeValidationChunks.push(chunk.slice());
         }

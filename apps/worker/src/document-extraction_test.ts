@@ -279,6 +279,8 @@ Deno.test("DOCX requires canonical package names and rejects DDE field instructi
     const field of [
       '<w:instrText xml:space="preserve"> DDEAUTO c:\\windows\\system32\\cmd.exe </w:instrText>',
       '<w:fldSimple w:instr="DDE server topic"/>',
+      "<w:instrText>DD</w:instrText><w:instrText>EAUTO command</w:instrText>",
+      "<w:instrText>D&#68;E command</w:instrText>",
     ]
   ) {
     await rejectsCode(
@@ -286,6 +288,33 @@ Deno.test("DOCX requires canonical package names and rejects DDE field instructi
       "docx_active_content",
     );
   }
+});
+
+Deno.test("DOCX rejects active internal relationship types regardless of target filename", async () => {
+  for (const type of ["oleObject", "package", "attachedTemplate", "control"]) {
+    const rels = `<Relationships><Relationship ` +
+      `Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/${type}" ` +
+      `Target="../media/innocent.bin"/></Relationships>`;
+    await rejectsCode(
+      () =>
+        extractDocx(docx(undefined, {
+          "word/_rels/document.xml.rels": strToU8(rels),
+          "word/media/innocent.bin": strToU8("payload"),
+        })),
+      "docx_active_content",
+    );
+  }
+});
+
+Deno.test("DOCX rejects entity declarations that could obscure active instructions", async () => {
+  await rejectsCode(
+    () =>
+      extractDocx(docx(
+        `<!DOCTYPE w:document [<!ENTITY cmd "DDEAUTO">]>` +
+          `<w:document><w:body><w:instrText>&cmd; command</w:instrText></w:body></w:document>`,
+      )),
+    "docx_active_content",
+  );
 });
 
 Deno.test("DOCX rejects external relationships regardless of target scheme", async () => {
