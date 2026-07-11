@@ -115,6 +115,18 @@ Deno.test("OCR rejects provider text beyond the bounded parent-prompt volume", a
     OcrInterceptionError,
     "invalid text",
   );
+  await assertRejects(
+    () =>
+      interceptOcrImages(request(), config, {
+        cache: {
+          get: () => Promise.resolve("x".repeat(65_537)),
+          set: () => Promise.resolve(),
+        },
+        recognize: () => Promise.reject(new Error("cache hit must not dispatch")),
+      }, new AbortController().signal),
+    OcrInterceptionError,
+    "invalid text",
+  );
 });
 
 Deno.test("OCR cache expires and prompt changes invalidate its hashed key", async () => {

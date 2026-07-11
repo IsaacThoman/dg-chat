@@ -335,6 +335,9 @@ export async function interceptOcrImages(
           }
           await dependencies.cache.set(key, text, config.cacheTtlSeconds);
         }
+        if (!text || new TextEncoder().encode(text).length > OCR_MAX_TEXT_BYTES) {
+          throw new Error("OCR provider returned invalid text");
+        }
         message.content.splice(partIndex, 1, {
           type: "text",
           text: `[OCR image ${messageIndex + 1}.${partIndex + 1}]\n${text}`,
