@@ -536,3 +536,39 @@ Deno.test("pre-debit approval failure finalizes a concurrent cancellation marker
   await assertRejects(() => approval, Error, "insufficient credit");
   assertEquals((await service.get("user", requested.id)).status, "cancelled");
 });
+
+Deno.test("approval rollback observes a cancellation marker written after its read", async () => {
+  class RollbackReadStore extends MemoryToolExecutionStore {
+    reads = 0;
+    catchRead!: () => void;
+    releaseCatchRead!: () => void;
+    readonly atCatchRead = new Promise<void>((resolve) => this.catchRead = resolve);
+    readonly catchReadRelease = new Promise<void>((resolve) => this.releaseCatchRead = resolve);
+    override async getExecution(id: string, ownerId?: string) {
+      const value = await super.getExecution(id, ownerId);
+      if (++this.reads === 2) {
+        this.catchRead();
+        await this.catchReadRelease;
+      }
+      return value;
+    }
+  }
+  const store = new RollbackReadStore();
+  const denial = () =>
+    Object.assign(new Error("insufficient credit"), {
+      code: "insufficient_credit",
+    });
+  const service = new ToolExecutionService(store, [echoAdapter], {
+    reserve: () => Promise.reject(denial()),
+    settle: () => Promise.resolve(),
+    refund: () => Promise.resolve(false),
+  });
+  await service.setPolicy({ toolId: "echo", allowed: true, actorId: "admin" });
+  const requested = await service.request("user", "echo", {});
+  const approval = service.approve("user", requested.id);
+  await store.atCatchRead;
+  await assertRejects(() => service.cancel("user", requested.id), Error, "insufficient credit");
+  store.releaseCatchRead();
+  await assertRejects(() => approval, Error, "insufficient credit");
+  assertEquals((await service.get("user", requested.id)).status, "cancelled");
+});

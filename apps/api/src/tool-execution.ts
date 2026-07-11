@@ -488,11 +488,20 @@ export class ToolExecutionService {
             status: "cancelled",
           });
         } else {
-          await this.store.transitionExecution(id, ["queued_pending_reservation"], {
+          const rolledBack = await this.store.transitionExecution(id, [
+            "queued_pending_reservation",
+          ], {
             status: "pending_approval",
             approvedAt: null,
             approvedBy: null,
           });
+          // A cancellation marker can be written after the read above but before this status CAS.
+          // The transition preserves it, so finalize rather than strand a marked pending row.
+          if (rolledBack?.cancellationRequestedAt) {
+            await this.store.transitionExecution(id, ["pending_approval"], {
+              status: "cancelled",
+            });
+          }
         }
       }
       throw error;
