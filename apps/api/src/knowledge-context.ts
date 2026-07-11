@@ -42,7 +42,9 @@ export async function buildKnowledgeContext(
   const ordered = await repo.retrieveConversationKnowledge({
     conversationId,
     ownerId,
-    query,
+    // Retrieval terms are bounded independently from the chat message. The full message still
+    // reaches the normal context-window validator after knowledge injection.
+    query: query.slice(0, 20_000),
     limit: 200,
   });
   const seen = new Set<string>();
