@@ -182,6 +182,25 @@ Deno.test("pinned transport rejects unsafe URLs, redirects, and aborted requests
   );
   assert(redirect.destroyed);
 
+  const manualRedirect = new FakeResponse();
+  manualRedirect.statusCode = 307;
+  manualRedirect.headers.location = "https://cdn.example/image.png";
+  const manual = await pinnedProviderFetch(
+    "https://provider.example/image",
+    { redirect: "manual" },
+    {
+      resolveDns: (_host, type) => Promise.resolve(type === "A" ? ["93.184.216.34"] : []),
+      request: (_url, _options, callback) => {
+        const request = new FakeRequest();
+        queueMicrotask(() => callback(manualRedirect as unknown as IncomingMessage));
+        return request;
+      },
+    },
+  );
+  assertEquals(manual.status, 307);
+  assertEquals(manual.headers.get("location"), "https://cdn.example/image.png");
+  assert(manualRedirect.destroyed);
+
   const controller = new AbortController();
   controller.abort(new DOMException("cancelled", "AbortError"));
   await assertRejects(

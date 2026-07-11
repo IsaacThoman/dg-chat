@@ -11,6 +11,7 @@ import type {
 } from "@dg-chat/database";
 import { DomainError } from "@dg-chat/database";
 import type { ChatCompletionRequest } from "@dg-chat/contracts";
+import { Buffer } from "node:buffer";
 import { type ProviderSecretEnvelope, ProviderSecretKeyring } from "./provider-secrets.ts";
 import { complete, streamChatCompletion, type UpstreamStreamOptions } from "./models.ts";
 import {
@@ -37,6 +38,12 @@ import {
   type EmbeddingsResponse,
   type ProviderFetch,
 } from "./embeddings.ts";
+import {
+  interceptOcrImages,
+  MemoryOcrCache,
+  type OcrCache,
+  parseOcrInterceptionConfig,
+} from "./ocr-interception.ts";
 
 type Completion = Awaited<ReturnType<typeof complete>>;
 
@@ -71,6 +78,8 @@ export interface ProviderExecutionOptions {
   stream?: typeof streamChatCompletion;
   embeddingsFetch?: ProviderFetch;
   now?: () => number;
+  ocrCache?: OcrCache;
+  ocrFetch?: typeof fetch;
   slowStream?: {
     windowMs: number;
     minimumVisibleUnitsPerSecond: number;
@@ -324,6 +333,8 @@ export class ProviderExecutionEngine {
   readonly #embeddingsFetch?: ProviderFetch;
   readonly #now: () => number;
   readonly #slowStream?: ProviderExecutionOptions["slowStream"];
+  readonly #ocrCache: OcrCache;
+  readonly #ocrFetch?: typeof fetch;
 
   constructor(options: ProviderExecutionOptions) {
     this.#repository = options.repository;
@@ -335,6 +346,8 @@ export class ProviderExecutionEngine {
     this.#embeddingsFetch = options.embeddingsFetch;
     this.#now = options.now ?? Date.now;
     this.#slowStream = options.slowStream;
+    this.#ocrCache = options.ocrCache ?? new MemoryOcrCache(options.now);
+    this.#ocrFetch = options.ocrFetch;
     if (this.#slowStream) {
       if (
         !Number.isSafeInteger(this.#slowStream.windowMs) || this.#slowStream.windowMs < 250 ||
@@ -348,6 +361,57 @@ export class ProviderExecutionEngine {
 
   async resolvePlan(sourceModelId: string): Promise<ProviderExecutionPlan> {
     return await this.#repository.resolveProviderExecutionPlan(sourceModelId);
+  }
+
+  async #interceptOcr(
+    sourceModelId: string,
+    request: ChatCompletionRequest,
+    signal: AbortSignal,
+  ): Promise<ChatCompletionRequest> {
+    const source = await this.#repository.findProviderModel(sourceModelId);
+    const config = parseOcrInterceptionConfig(source?.customParams);
+    if (!config) return request;
+    return await interceptOcrImages(request, config, {
+      cache: this.#ocrCache,
+      ...(this.#ocrFetch ? { fetch: this.#ocrFetch } : {}),
+      recognize: async ({ providerId, model, prompt, image, signal }) => {
+        const provider = await this.#repository.findProvider(providerId);
+        const ocrModel = await this.#repository.findProviderModel(model);
+        if (
+          !provider?.enabled || !ocrModel?.enabled || ocrModel.providerId !== provider.id ||
+          !ocrModel.capabilities.includes("vision")
+        ) throw new Error("Configured OCR provider/model is unavailable or lacks vision support");
+        const credential = await this.#repository.getProviderCredential(provider.id);
+        if (!credential) throw new Error("Configured OCR provider credential is unavailable");
+        const apiKey = await this.#keyring.decrypt(
+          provider.id,
+          credential.envelope as unknown as ProviderSecretEnvelope,
+        );
+        const encoded = Buffer.from(image.bytes).toString("base64");
+        const result = await this.#complete(
+          {
+            model: ocrModel.publicModelId,
+            messages: [{
+              role: "user",
+              content: [
+                { type: "text", text: prompt },
+                {
+                  type: "image_url",
+                  image_url: { url: `data:${image.mime};base64,${encoded}`, detail: "high" },
+                },
+              ],
+            }],
+          },
+          signal,
+          {
+            baseUrl: provider.baseUrl,
+            apiKey,
+            upstreamModel: ocrModel.upstreamModelId,
+          },
+        );
+        return result.text;
+      },
+    }, signal);
   }
 
   reservationMicros(
@@ -733,6 +797,7 @@ export class ProviderExecutionEngine {
     frozenPlan?: ProviderExecutionPlan,
   ): Promise<Completion> {
     const { plan, candidates } = await this.#prepare(sourceModelId, frozenPlan);
+    request = await this.#interceptOcr(sourceModelId, request, signal);
     const claim = await this.#repository.claimProviderExecution(usageRunId, ownerLeaseToken);
     const remainingAttempts = policyFor(plan, undefined, this.#slowStream).maxAttempts -
       claim.consumedAttempts;
@@ -876,6 +941,7 @@ export class ProviderExecutionEngine {
     frozenPlan?: ProviderExecutionPlan,
   ): AsyncGenerator<string> {
     const { plan, candidates } = await this.#prepare(sourceModelId, frozenPlan);
+    request = await this.#interceptOcr(sourceModelId, request, signal);
     const claim = await this.#repository.claimProviderExecution(usageRunId, ownerLeaseToken);
     const remainingAttempts = policyFor(plan, undefined, this.#slowStream).maxAttempts -
       claim.consumedAttempts;

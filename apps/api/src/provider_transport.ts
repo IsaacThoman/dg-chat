@@ -215,6 +215,16 @@ export async function pinnedProviderFetch(
         cleanupAbort();
         response.destroy();
         settled = true;
+        if (init.redirect === "manual") {
+          resolve(
+            new Response(null, {
+              status,
+              statusText: response.statusMessage,
+              headers: responseHeaders(response),
+            }),
+          );
+          return;
+        }
         reject(new Error("Provider redirects are not allowed"));
         return;
       }
