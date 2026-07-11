@@ -34,7 +34,7 @@ function documentDocx(first: string, second: string): Buffer {
       `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>`,
     ),
     "_rels/.rels": strToU8(
-      `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>`,
+      `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>`,
     ),
     "word/document.xml": strToU8(
       `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>${first}</w:t></w:r></w:p><w:sectPr><w:pgSz w:w="12240" w:h="15840"/></w:sectPr><w:p><w:r><w:t>${second}</w:t></w:r></w:p></w:body></w:document>`,
