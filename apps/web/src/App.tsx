@@ -828,7 +828,22 @@ function MessageItem(
               <ul>
                 {message.knowledgeSources.map((source) => (
                   <li key={source.label}>
-                    <strong>[{source.label}]</strong> {source.collectionName} / {source.filename}
+                    <details className="source-detail">
+                      <summary>
+                        <strong>[{source.label}]</strong> {source.collectionName} /{" "}
+                        {source.filename}
+                      </summary>
+                      <p className="muted">
+                        {source.pageLabel
+                          ? `Page ${source.pageLabel}`
+                          : source.pageNumber
+                          ? `Page ${source.pageNumber}`
+                          : `Chunk ${source.ordinal + 1}`}
+                        {source.section ? ` · ${source.section}` : ""}
+                        {source.retrievalMethod ? ` · ${source.retrievalMethod}` : ""}
+                      </p>
+                      <blockquote>{source.snippet}</blockquote>
+                    </details>
                   </li>
                 ))}
               </ul>

@@ -11,6 +11,11 @@ export interface LocalKnowledgeSource {
   chunkId: string;
   ordinal: number;
   score?: number;
+  retrievalMethod?: "lexical" | "vector" | "hybrid";
+  pageNumber?: number;
+  pageLabel?: string;
+  section?: string;
+  snippet: string;
 }
 
 export interface KnowledgeContext {
@@ -72,7 +77,24 @@ export async function buildKnowledgeContext(
       filename: item.filename,
       chunkId: item.chunkId,
       ordinal: item.ordinal,
+      snippet: content.slice(0, 500),
+      ...(typeof item.metadata.pageNumber === "number"
+        ? { pageNumber: item.metadata.pageNumber }
+        : {}),
+      ...(typeof item.metadata.pageLabel === "string"
+        ? { pageLabel: item.metadata.pageLabel }
+        : {}),
+      ...(typeof item.metadata.section === "string" ? { section: item.metadata.section } : {}),
       ...(item.mode === "retrieval" ? { score: item.score } : {}),
+      ...(item.mode === "retrieval"
+        ? {
+          retrievalMethod: item.lexicalRank && item.vectorRank
+            ? "hybrid" as const
+            : item.vectorRank
+            ? "vector" as const
+            : "lexical" as const,
+        }
+        : {}),
     });
     if (item.mode === "retrieval") retrievalIncluded++;
     if (included.length < content.length) break;

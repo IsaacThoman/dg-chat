@@ -1,8 +1,51 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { api, uploadAttachment } from "./api.ts";
+import { api, mapMessage, uploadAttachment } from "./api.ts";
 import type { Conversation, KnowledgeCollection } from "./types.ts";
 
 afterEach(() => vi.unstubAllGlobals());
+
+describe("message knowledge provenance", () => {
+  const raw = (knowledgeSources: unknown[]) => ({
+    id: "message-1",
+    parentId: null,
+    supersedesId: null,
+    siblingIndex: 0,
+    role: "assistant" as const,
+    content: "Grounded [source-1]",
+    model: "provider/chat",
+    metadata: { knowledgeSources },
+    createdAt: "2026-07-11T00:00:00.000Z",
+  });
+
+  it("preserves rich source provenance and safely maps historical source records", () => {
+    const rich = mapMessage(raw([{
+      label: "source-1",
+      collectionName: "Manuals",
+      filename: "runbook.pdf",
+      ordinal: 3,
+      snippet: "Reset the turbine with the blue lever.",
+      retrievalMethod: "hybrid",
+      pageNumber: 7,
+      section: "Recovery",
+    }]));
+    expect(rich.knowledgeSources?.[0]).toMatchObject({
+      ordinal: 3,
+      retrievalMethod: "hybrid",
+      pageNumber: 7,
+      section: "Recovery",
+    });
+
+    const historical = mapMessage(raw([{
+      label: "source-1",
+      collectionName: "Manuals",
+      filename: "legacy.txt",
+    }]));
+    expect(historical.knowledgeSources?.[0]).toMatchObject({
+      ordinal: 0,
+      snippet: "Source preview unavailable.",
+    });
+  });
+});
 
 describe("setup discovery API", () => {
   it("reads bootstrap and OIDC capabilities from the public status endpoint", async () => {

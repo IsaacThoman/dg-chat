@@ -94,15 +94,29 @@ export function mapMessage(value: RawMessage): Message {
     : undefined;
   const toolCalls = Array.isArray(value.metadata?.toolCalls) ? value.metadata.toolCalls.length : 0;
   const knowledgeSources = Array.isArray(value.metadata?.knowledgeSources)
-    ? value.metadata.knowledgeSources.filter((source): source is {
-      label: string;
-      collectionName: string;
-      filename: string;
-    } => {
-      if (!source || typeof source !== "object") return false;
+    ? value.metadata.knowledgeSources.flatMap((source) => {
+      if (!source || typeof source !== "object") return [];
       const item = source as Record<string, unknown>;
-      return typeof item.label === "string" && typeof item.collectionName === "string" &&
-        typeof item.filename === "string";
+      if (
+        typeof item.label !== "string" || typeof item.collectionName !== "string" ||
+        typeof item.filename !== "string"
+      ) return [];
+      const retrievalMethod = ["lexical", "vector", "hybrid"].includes(
+          String(item.retrievalMethod),
+        )
+        ? item.retrievalMethod as "lexical" | "vector" | "hybrid"
+        : undefined;
+      return [{
+        label: item.label,
+        collectionName: item.collectionName,
+        filename: item.filename,
+        ordinal: Number.isSafeInteger(item.ordinal) ? Number(item.ordinal) : 0,
+        snippet: typeof item.snippet === "string" ? item.snippet : "Source preview unavailable.",
+        ...(retrievalMethod ? { retrievalMethod } : {}),
+        ...(Number.isSafeInteger(item.pageNumber) ? { pageNumber: Number(item.pageNumber) } : {}),
+        ...(typeof item.pageLabel === "string" ? { pageLabel: item.pageLabel } : {}),
+        ...(typeof item.section === "string" ? { section: item.section } : {}),
+      }];
     })
     : undefined;
   return {

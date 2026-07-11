@@ -36,7 +36,17 @@ export interface Message {
   latency?: string;
   reasoning?: string;
   toolStatus?: string;
-  knowledgeSources?: Array<{ label: string; collectionName: string; filename: string }>;
+  knowledgeSources?: Array<{
+    label: string;
+    collectionName: string;
+    filename: string;
+    ordinal: number;
+    snippet: string;
+    retrievalMethod?: "lexical" | "vector" | "hybrid";
+    pageNumber?: number;
+    pageLabel?: string;
+    section?: string;
+  }>;
   status?: "complete" | "stopped" | "error";
   branch?: Branch;
   attachments?: Attachment[];
