@@ -46,8 +46,9 @@ Deno.test({
       const mutate = postgres(databaseUrl!, { max: 1 });
       await mutate`UPDATE attachments SET ingestion_status='processing' WHERE id=${attachment.id}`;
       await mutate.end();
+      const chunkId = crypto.randomUUID();
       await repo.completeAttachmentIngestion(attachment.id, owner.id, [{
-        id: crypto.randomUUID(),
+        id: chunkId,
         ordinal: 0,
         content: "Postgres turbine runbook",
         metadata: {
@@ -60,10 +61,38 @@ Deno.test({
         },
       }]);
       await repo.linkKnowledgeAttachment(collection.id, attachment.id, owner.id, 1);
-      await repo.bindKnowledgeCollection(conversation.id, collection.id, owner.id, "full_context");
+      await repo.bindKnowledgeCollection(conversation.id, collection.id, owner.id, "retrieval");
       const context = await buildKnowledgeContext(repo, conversation.id, owner.id, "turbine");
       assertEquals(context.sources.length, 1);
       assertStringIncludes(String(context.message?.content), "Postgres turbine runbook");
+      const vector = Array(1536).fill(0);
+      vector[11] = 1;
+      await repo.upsertDocumentChunkEmbeddings([{
+        chunkId,
+        ownerId: owner.id,
+        model: "embed-test",
+        version: "embed-v1",
+        contentSha256: "e".repeat(64),
+        embedding: vector,
+      }]);
+      const semantic = await buildKnowledgeContext(repo, conversation.id, owner.id, "spaceship", {
+        queryEmbedding: vector,
+        embeddingVersion: "embed-v1",
+      });
+      assertEquals(semantic.sources.map((source) => source.chunkId), [chunkId]);
+      await assertRejects(
+        () =>
+          repo.upsertDocumentChunkEmbeddings([{
+            chunkId,
+            ownerId: stranger.id,
+            model: "embed-test",
+            version: "embed-v1",
+            contentSha256: "e".repeat(64),
+            embedding: vector,
+          }]),
+        DomainError,
+        "not found",
+      );
       await assertRejects(
         () => buildKnowledgeContext(repo, conversation.id, stranger.id, "turbine"),
         DomainError,

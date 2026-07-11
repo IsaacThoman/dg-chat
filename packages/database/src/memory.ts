@@ -11,7 +11,11 @@ import type {
   UserRole,
 } from "@dg-chat/contracts";
 import { isIngestibleDocumentMime } from "./attachment-policy.ts";
-import { validateDocumentChunkInputs } from "./repository.ts";
+import {
+  normalizeKnowledgeSearchLimit,
+  validateChunkEmbeddings,
+  validateDocumentChunkInputs,
+} from "./repository.ts";
 import type {
   ApiIdempotencyEndpoint,
   ApiIdempotencyRequest,
@@ -39,6 +43,7 @@ import type {
   CreateProviderRetryPolicyInput,
   CreateUserInput,
   DocumentChunk,
+  DocumentChunkEmbeddingInput,
   DocumentChunkInput,
   FailApiRequestInput,
   FailGenerationInput,
@@ -51,6 +56,7 @@ import type {
   KnowledgeCollectionPatch,
   KnowledgeConversationBinding,
   KnowledgeRetrievalMode,
+  KnowledgeSearchHit,
   ModelPriceVersion,
   ProviderAttempt,
   ProviderCredentialEnvelope,
@@ -63,6 +69,7 @@ import type {
   ProviderRetryPolicy,
   RegistryMutationContext,
   ReplaceConversationKnowledgeInput,
+  SearchConversationKnowledgeInput,
   SessionSummary,
   SetProviderModelRouteInput,
   StartProviderAttemptInput,
@@ -139,6 +146,34 @@ function validateDocumentChunks(
   } catch {
     throw new DomainError("invalid_document_chunks", "Document chunks are invalid", 422);
   }
+}
+
+const knowledgeTerms = (value: string) =>
+  new Set(value.toLocaleLowerCase().match(/[\p{L}\p{N}]{2,}/gu) ?? []);
+
+function memoryLexicalScore(query: Set<string>, content: string): number {
+  if (!query.size) return 1;
+  const contentTerms = knowledgeTerms(content);
+  let matches = 0;
+  for (const term of query) if (contentTerms.has(term)) matches++;
+  return matches / Math.sqrt(Math.max(1, contentTerms.size));
+}
+
+function cosineSimilarity(left: number[], right: number[]): number | null {
+  if (left.length !== right.length || !left.length) return null;
+  let dot = 0;
+  let leftNorm = 0;
+  let rightNorm = 0;
+  for (let index = 0; index < left.length; index++) {
+    dot += left[index] * right[index];
+    leftNorm += left[index] ** 2;
+    rightNorm += right[index] ** 2;
+  }
+  return leftNorm && rightNorm ? dot / Math.sqrt(leftNorm * rightNorm) : null;
+}
+
+function hybridScore(lexical: number, vector: number | null): number {
+  return lexical * 0.45 + (vector === null ? 0 : Math.max(0, vector) * 0.55);
 }
 
 interface StoredProvider extends ProviderRecord {
@@ -351,6 +386,7 @@ export class MemoryRepository {
   readonly attachments = new Map<string, AttachmentRecord>();
   readonly messageAttachments = new Map<string, Set<string>>();
   readonly documentChunks = new Map<string, DocumentChunk[]>();
+  readonly documentChunkEmbeddings = new Map<string, DocumentChunkEmbeddingInput>();
   readonly knowledgeCollections = new Map<string, KnowledgeCollection>();
   readonly knowledgeAttachments = new Map<string, Set<string>>();
   readonly knowledgeBindings = new Map<string, KnowledgeConversationBinding>();
@@ -1573,6 +1609,61 @@ export class MemoryRepository {
   listDocumentChunks(id: string, ownerId: string) {
     this.getAttachment(id, ownerId);
     return [...(this.documentChunks.get(id) ?? [])].sort((a, b) => a.ordinal - b.ordinal);
+  }
+
+  upsertDocumentChunkEmbeddings(values: DocumentChunkEmbeddingInput[]) {
+    const validated = validateChunkEmbeddings(values);
+    for (const value of validated) {
+      const chunk = [...this.documentChunks.values()].flat().find((item) =>
+        item.id === value.chunkId
+      );
+      if (!chunk) throw new DomainError("not_found", "Document chunk not found", 404);
+      const attachment = this.getAttachment(chunk.attachmentId, value.ownerId);
+      if (attachment.ownerId !== value.ownerId) {
+        throw new DomainError("not_found", "Document chunk not found", 404);
+      }
+      this.documentChunkEmbeddings.set(`${value.chunkId}:${value.version}`, {
+        ...value,
+        embedding: [...value.embedding],
+      });
+    }
+    return validated.length;
+  }
+
+  searchConversationKnowledge(input: SearchConversationKnowledgeInput): KnowledgeSearchHit[] {
+    const limit = normalizeKnowledgeSearchLimit(input.limit);
+    const terms = knowledgeTerms(input.query);
+    const hits: KnowledgeSearchHit[] = [];
+    for (const binding of this.listConversationKnowledge(input.conversationId, input.ownerId)) {
+      if (binding.mode !== "retrieval") continue;
+      const collection = this.getKnowledgeCollection(binding.collectionId, input.ownerId);
+      for (const attachment of this.listKnowledgeAttachments(collection.id, input.ownerId)) {
+        for (const chunk of this.listDocumentChunks(attachment.id, input.ownerId)) {
+          const lexicalScore = memoryLexicalScore(terms, chunk.content);
+          const stored = input.embeddingVersion
+            ? this.documentChunkEmbeddings.get(`${chunk.id}:${input.embeddingVersion}`)
+            : undefined;
+          const vectorScore = stored && input.queryEmbedding
+            ? cosineSimilarity(input.queryEmbedding, stored.embedding)
+            : null;
+          if (lexicalScore <= 0 && vectorScore === null) continue;
+          hits.push({
+            ...chunk,
+            collectionId: collection.id,
+            collectionName: collection.name,
+            filename: attachment.filename,
+            lexicalScore,
+            vectorScore,
+            score: hybridScore(lexicalScore, vectorScore),
+          });
+        }
+      }
+    }
+    return hits.sort((a, b) =>
+      b.score - a.score || a.collectionId.localeCompare(b.collectionId) ||
+      a.attachmentId.localeCompare(b.attachmentId) || a.ordinal - b.ordinal ||
+      a.id.localeCompare(b.id)
+    ).slice(0, limit);
   }
 
   createKnowledgeCollection(ownerId: string, input: CreateKnowledgeCollectionInput) {

@@ -2,7 +2,12 @@ import postgres from "npm:postgres@3.4.7";
 import type { AccountState, Conversation, MessageNode, PublicUser } from "@dg-chat/contracts";
 import { DomainError } from "./memory.ts";
 import { INGESTIBLE_DOCUMENT_MIME_TYPES, isIngestibleDocumentMime } from "./attachment-policy.ts";
-import { validateDocumentChunkInputs } from "./repository.ts";
+import {
+  KNOWLEDGE_EMBEDDING_DIMENSIONS,
+  normalizeKnowledgeSearchLimit,
+  validateChunkEmbeddings,
+  validateDocumentChunkInputs,
+} from "./repository.ts";
 import type { LedgerEntry, StoredApiToken, StoredSession, StoredUser, UsageRun } from "./memory.ts";
 import type {
   ApiIdempotencyEndpoint,
@@ -35,6 +40,7 @@ import type {
   CreateProviderRetryPolicyInput,
   CreateUserInput,
   DocumentChunk,
+  DocumentChunkEmbeddingInput,
   DocumentChunkInput,
   DomainRepository,
   FailApiRequestInput,
@@ -46,6 +52,7 @@ import type {
   KnowledgeCollectionPatch,
   KnowledgeConversationBinding,
   KnowledgeRetrievalMode,
+  KnowledgeSearchHit,
   ModelPriceVersion,
   ProviderAttempt,
   ProviderCredentialEnvelope,
@@ -58,6 +65,7 @@ import type {
   ProviderRetryPolicy,
   RegistryMutationContext,
   ReplaceConversationKnowledgeInput,
+  SearchConversationKnowledgeInput,
   SessionSummary,
   SetProviderModelRouteInput,
   StartProviderAttemptInput,
@@ -2018,6 +2026,92 @@ export class PostgresRepository implements DomainRepository {
     return (await this.#sql<Row[]>`
       SELECT dc.* FROM document_chunks dc WHERE dc.attachment_id=${id} ORDER BY dc.ordinal`)
       .map(documentChunk);
+  }
+
+  async upsertDocumentChunkEmbeddings(values: DocumentChunkEmbeddingInput[]) {
+    let validated: DocumentChunkEmbeddingInput[];
+    try {
+      validated = validateChunkEmbeddings(values);
+    } catch {
+      throw new DomainError("validation_error", "Document chunk embeddings are invalid", 422);
+    }
+    return await this.#sql.begin(async (tx) => {
+      for (const value of validated) {
+        const owned = await tx`SELECT 1 FROM document_chunks dc
+          JOIN attachments a ON a.id=dc.attachment_id
+          WHERE dc.id=${value.chunkId} AND a.owner_id=${value.ownerId}
+            AND a.deleted_at IS NULL FOR UPDATE OF dc`;
+        if (!owned.length) throw new DomainError("not_found", "Document chunk not found", 404);
+        await tx`INSERT INTO document_chunk_embeddings(
+          chunk_id,owner_id,model,embedding_version,content_sha256,embedding
+        ) VALUES(
+          ${value.chunkId},${value.ownerId},${value.model},${value.version},
+          ${value.contentSha256},${JSON.stringify(value.embedding)}::vector
+        ) ON CONFLICT(chunk_id,embedding_version) DO UPDATE SET
+          owner_id=EXCLUDED.owner_id,model=EXCLUDED.model,
+          content_sha256=EXCLUDED.content_sha256,embedding=EXCLUDED.embedding,updated_at=now()`;
+      }
+      return validated.length;
+    });
+  }
+
+  async searchConversationKnowledge(
+    input: SearchConversationKnowledgeInput,
+  ): Promise<KnowledgeSearchHit[]> {
+    let limit: number;
+    try {
+      limit = normalizeKnowledgeSearchLimit(input.limit);
+    } catch {
+      throw new DomainError("validation_error", "Knowledge search input is invalid", 422);
+    }
+    const query = input.query.trim().slice(0, 8_000);
+    const vector = input.queryEmbedding;
+    if (
+      (vector !== undefined &&
+        (vector.length !== KNOWLEDGE_EMBEDDING_DIMENSIONS ||
+          vector.some((part) => typeof part !== "number" || !Number.isFinite(part)))) ||
+      (vector !== undefined && !input.embeddingVersion)
+    ) throw new DomainError("validation_error", "Knowledge search input is invalid", 422);
+
+    const vectorLiteral = vector ? JSON.stringify(vector) : null;
+    const rows = await this.#sql<Row[]>`
+      WITH candidates AS (
+        SELECT dc.*, k.id AS collection_id, k.name AS collection_name, a.filename,
+          CASE WHEN ${query} = '' THEN 1::double precision ELSE ts_rank_cd(
+            to_tsvector('simple', dc.content), plainto_tsquery('simple', ${query}), 32
+          )::double precision END AS lexical_score,
+          CASE WHEN ${vectorLiteral}::text IS NULL THEN NULL
+            ELSE (1 - (dce.embedding <=> ${vectorLiteral}::vector))::double precision
+          END AS vector_score
+        FROM conversation_knowledge_bindings b
+        JOIN conversations c ON c.id=b.conversation_id AND c.owner_id=b.owner_id
+          AND c.deleted_at IS NULL
+        JOIN knowledge_collections k ON k.id=b.collection_id AND k.owner_id=b.owner_id
+          AND k.deleted_at IS NULL
+        JOIN knowledge_collection_attachments ka ON ka.collection_id=k.id
+        JOIN attachments a ON a.id=ka.attachment_id AND a.owner_id=b.owner_id
+          AND a.deleted_at IS NULL AND a.state='ready' AND a.ingestion_status='ready'
+        JOIN document_chunks dc ON dc.attachment_id=a.id
+        LEFT JOIN document_chunk_embeddings dce ON dce.chunk_id=dc.id
+          AND dce.owner_id=b.owner_id AND dce.embedding_version=${input.embeddingVersion ?? ""}
+        WHERE b.conversation_id=${input.conversationId} AND b.owner_id=${input.ownerId}
+          AND b.mode='retrieval'
+      )
+      SELECT *, lexical_score * 0.45 +
+        CASE WHEN vector_score IS NULL THEN 0 ELSE GREATEST(0,vector_score) * 0.55 END AS score
+      FROM candidates
+      WHERE lexical_score > 0 OR vector_score IS NOT NULL
+      ORDER BY score DESC,collection_id,attachment_id,ordinal,id
+      LIMIT ${limit}`;
+    return rows.map((row) => ({
+      ...documentChunk(row),
+      collectionId: String(row.collection_id),
+      collectionName: String(row.collection_name),
+      filename: String(row.filename),
+      lexicalScore: number(row.lexical_score),
+      vectorScore: row.vector_score == null ? null : number(row.vector_score),
+      score: number(row.score),
+    }));
   }
 
   async createKnowledgeCollection(ownerId: string, input: CreateKnowledgeCollectionInput) {

@@ -376,6 +376,26 @@ export const documentChunks = pgTable("document_chunks", {
   uniqueIndex("document_chunks_attachment_ordinal_uq").on(table.attachmentId, table.ordinal),
 ]);
 
+export const documentChunkEmbeddings = pgTable("document_chunk_embeddings", {
+  chunkId: uuid("chunk_id").notNull().references(() => documentChunks.id, {
+    onDelete: "cascade",
+  }),
+  ownerId: uuid("owner_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  model: text("model").notNull(),
+  embeddingVersion: text("embedding_version").notNull(),
+  contentSha256: text("content_sha256").notNull(),
+  embedding: vector("embedding", { dimensions: 1536 }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  primaryKey({ columns: [table.chunkId, table.embeddingVersion] }),
+  index("document_chunk_embeddings_owner_version_idx").on(
+    table.ownerId,
+    table.embeddingVersion,
+    table.chunkId,
+  ),
+]);
+
 export const auditEvents = pgTable("audit_events", {
   id: uuid("id").primaryKey().defaultRandom(),
   actorId: uuid("actor_id").references(() => users.id),
