@@ -71,8 +71,9 @@ Deno.test({
       const conversations = await sql<{ id: string }[]>`INSERT INTO conversations(owner_id,title)
         VALUES(${users[0].id},'Tool linkage') RETURNING id`;
       const messages = await sql<{ id: string }[]>`INSERT INTO messages
-        (conversation_id,parent_id,sibling_index,role,content,idempotency_key)
-        VALUES(${conversations[0].id},NULL,0,'user','linked','tool-link') RETURNING id`;
+        (conversation_id,parent_id,sibling_index,role,content,idempotency_key,metadata)
+        VALUES(${conversations[0].id},NULL,0,'user','linked','tool-link',
+          ${sql.json({ toolExecutionIds: [created.id] })}) RETURNING id`;
       await store.linkExecutions(users[0].id, messages[0].id, [created.id]);
       await assertRejects(
         () => store.linkExecutions(users[1].id, messages[0].id, [created.id]),
@@ -80,6 +81,26 @@ Deno.test({
         "invalid",
       );
       assertEquals((await sql`SELECT 1 FROM message_tool_executions`).length, 1);
+      const foreign = await store.createExecution({
+        ...created,
+        id: crypto.randomUUID(),
+        ownerId: users[1].id,
+        status: "succeeded",
+        result: { foreign: true },
+      });
+      await assertRejects(
+        () =>
+          sql`INSERT INTO messages
+          (conversation_id,parent_id,sibling_index,role,content,idempotency_key,metadata)
+          VALUES(${conversations[0].id},NULL,1,'user','forbidden','tool-link-forbidden',
+            ${sql.json({ toolExecutionIds: [foreign.id] })})`,
+        Error,
+        "invalid",
+      );
+      assertEquals(
+        (await sql`SELECT 1 FROM messages WHERE idempotency_key='tool-link-forbidden'`).length,
+        0,
+      );
       const audits = await sql<{ action: string }[]>`
         SELECT action FROM audit_events WHERE target_id IN ('web_search', ${created.id})
         ORDER BY created_at, id`;
