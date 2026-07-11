@@ -2229,6 +2229,7 @@ export function createApp(options: AppOptions = {}) {
         model: body.model,
         expectedVersion: body.expectedVersion,
         idempotencyKey: `${body.idempotencyKey}:user`,
+        metadata: { toolExecutionIds: body.toolExecutionIds },
       },
       runId,
       provider: model.provider,
@@ -2237,7 +2238,6 @@ export function createApp(options: AppOptions = {}) {
       leaseSeconds: generationLeaseSeconds,
       attachmentIds: body.attachmentIds,
     });
-    await toolExecution.linkToMessage(ownerId, begun.message.id, body.toolExecutionIds);
     const completedPayload = async () => {
       const detail = await detailWithAttachments(conversationId, ownerId);
       const user = detail.messages.find((message) => message.id === begun.message.id);
@@ -2497,6 +2497,7 @@ export function createApp(options: AppOptions = {}) {
           model: body.model,
           expectedVersion: body.expectedVersion,
           idempotencyKey: `${body.idempotencyKey}:user`,
+          metadata: { toolExecutionIds: body.toolExecutionIds },
         },
         runId,
         provider: model.provider,
@@ -2521,9 +2522,6 @@ export function createApp(options: AppOptions = {}) {
         leaseSeconds: generationLeaseSeconds,
         generationId,
       });
-    if (body.mode === "send") {
-      await toolExecution.linkToMessage(ownerId, begun.message.id, body.toolExecutionIds);
-    }
     const completedPayload = async () => {
       const detail = await detailWithAttachments(conversationId, ownerId);
       const user = detail.messages.find((message) => message.id === begun.message.id);

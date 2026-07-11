@@ -18,3 +18,27 @@ CREATE TABLE message_tool_executions (
 );
 
 CREATE INDEX message_tool_executions_execution_idx ON message_tool_executions(execution_id);
+
+CREATE FUNCTION link_message_tool_executions() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE expected_count integer;
+DECLARE matched_count integer;
+BEGIN
+  IF NOT (NEW.metadata ? 'toolExecutionIds') THEN RETURN NEW; END IF;
+  IF jsonb_typeof(NEW.metadata->'toolExecutionIds') <> 'array' THEN
+    RAISE EXCEPTION 'tool execution linkage must be an array';
+  END IF;
+  expected_count := jsonb_array_length(NEW.metadata->'toolExecutionIds');
+  SELECT count(*) INTO matched_count FROM tool_executions e
+    JOIN conversations c ON c.id=NEW.conversation_id
+    WHERE e.id IN (SELECT jsonb_array_elements_text(NEW.metadata->'toolExecutionIds')::uuid)
+      AND e.owner_id=c.owner_id AND e.status='succeeded';
+  IF matched_count <> expected_count THEN
+    RAISE EXCEPTION 'tool execution linkage is invalid';
+  END IF;
+  INSERT INTO message_tool_executions(message_id,execution_id)
+    SELECT NEW.id,jsonb_array_elements_text(NEW.metadata->'toolExecutionIds')::uuid;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER messages_link_tool_executions
+  AFTER INSERT ON messages FOR EACH ROW EXECUTE FUNCTION link_message_tool_executions();
