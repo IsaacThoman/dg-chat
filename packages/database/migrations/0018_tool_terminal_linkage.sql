@@ -5,6 +5,10 @@ ALTER TABLE tool_executions ADD CONSTRAINT tool_executions_status_check CHECK (
 );
 ALTER TABLE tool_executions ADD COLUMN claim_token uuid;
 ALTER TABLE tool_executions ADD COLUMN claim_expires_at timestamptz;
+ALTER TABLE tool_executions DROP CONSTRAINT tool_executions_check;
+ALTER TABLE tool_executions ADD CONSTRAINT tool_executions_result_status_check CHECK (
+  result IS NULL OR status IN ('succeeded_pending_settlement', 'succeeded')
+);
 
 CREATE TABLE message_tool_executions (
   message_id uuid NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
