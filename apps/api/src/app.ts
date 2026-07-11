@@ -62,10 +62,24 @@ import {
   type ProviderModelRecord,
   type ProviderRecord,
   type UsagePricingSnapshot,
+  usagePricingSnapshotsEqual,
 } from "@dg-chat/database";
 import { hashPassword, randomToken, sha256, sha256Hex, verifyPassword } from "./crypto.ts";
 import { createEmbeddings, EmbeddingsProviderError, type ProviderFetch } from "./embeddings.ts";
 import { AudioProviderError, type AudioRequest, estimateAudioInputTokens } from "./audio.ts";
+import {
+  assertImageUsagePricing,
+  decodeImage,
+  estimateImageInputTokens,
+  IMAGE_MAX_BYTES,
+  IMAGE_MAX_TOTAL_BYTES,
+  type ImageGenerationRequest,
+  type ImageOutput,
+  ImageProviderError,
+  imageTerminalOutput,
+  maximumImageStreamReplayBytes,
+  parseImageGenerationRequest,
+} from "./images.ts";
 import {
   assertSpeechFixedPricing,
   estimateSpeechInputTokens,
@@ -169,10 +183,22 @@ type Variables = {
   authType: "session" | "token";
   tokenId?: string;
   tokenScopes?: string[];
+  imageAssetOwnerId?: string;
 };
 type WebGenerationEventInput = WebGenerationEvent extends infer Event
   ? Event extends { sequence: number } ? Omit<Event, "sequence"> : never
   : never;
+
+export function redactRequestLog(message: string): string {
+  return message
+    // URL parsers accept percent-encoded key names, so suppress the entire capability query.
+    .replace(
+      /(\/v1\/images\/assets\/[^?\s]+\/content)\?[^\s]*/g,
+      "$1?[REDACTED]",
+    )
+    .replace(/([?&]token=)[^&\s]+/g, "$1[REDACTED]");
+}
+
 export interface AppOptions {
   repository?: DomainRepository;
   setupToken?: string;
@@ -201,7 +227,10 @@ export interface AppOptions {
   embeddingsFetch?: ProviderFetch;
   audioFetch?: typeof fetch;
   speechFetch?: typeof fetch;
+  imageFetch?: typeof fetch;
+  imageUrlSigningSecret?: string;
   audioConcurrencyLimiter?: AudioConcurrencyLimiter;
+  imageConcurrencyLimiter?: AudioConcurrencyLimiter;
   circuitBreaker?: CircuitBreaker;
   breakerPolicy?: BreakerPolicy;
   providerSlowStream?: {
@@ -267,6 +296,52 @@ const publicAttachment = (attachment: AttachmentRecord) => ({
   createdAt: attachment.createdAt,
   updatedAt: attachment.updatedAt,
 });
+
+const publicGeneratedAsset = (
+  asset: Awaited<ReturnType<DomainRepository["getGeneratedAsset"]>>,
+  attachment?: AttachmentRecord,
+) => ({
+  id: asset.id,
+  attachmentId: asset.attachmentId,
+  contentUrl: asset.deletedAt ? null : `/api/images/${asset.id}/content`,
+  thumbnailUrl: null,
+  sourceAttachmentIds: asset.inputs.map((input) => input.attachmentId),
+  operation: asset.operation,
+  prompt: asset.prompt,
+  model: asset.publicModelId,
+  width: asset.width,
+  height: asset.height,
+  mimeType: attachment?.mimeType ?? null,
+  sizeBytes: attachment?.sizeBytes ?? null,
+  status: asset.deletedAt ? "deleted" : "ready",
+  revisedPrompt: asset.revisedPrompt,
+  costMicros: null,
+  createdAt: asset.createdAt,
+  deletedAt: asset.deletedAt,
+});
+
+const encodeGeneratedAssetCursor = (asset: { createdAt: string; id: string }) =>
+  Buffer.from(JSON.stringify([asset.createdAt, asset.id]), "utf8").toString("base64url");
+
+const decodeGeneratedAssetCursor = (value: string) => {
+  try {
+    if (!/^[A-Za-z0-9_-]{8,512}$/.test(value)) throw new Error();
+    const decoded = Buffer.from(value, "base64url").toString("utf8");
+    if (Buffer.from(decoded, "utf8").toString("base64url") !== value) throw new Error();
+    const tuple = JSON.parse(decoded);
+    if (
+      !Array.isArray(tuple) || tuple.length !== 2 || typeof tuple[0] !== "string" ||
+      !Number.isFinite(Date.parse(tuple[0])) || new Date(tuple[0]).toISOString() !== tuple[0] ||
+      typeof tuple[1] !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+        tuple[1],
+      )
+    ) throw new Error();
+    return { createdAt: tuple[0] as string, id: tuple[1] as string };
+  } catch {
+    throw new DomainError("validation_error", "cursor is not valid", 422);
+  }
+};
 
 const publicKnowledgeCollection = (collection: KnowledgeCollection, attachmentCount = 0) => ({
   id: collection.id,
@@ -794,6 +869,7 @@ export function createApp(options: AppOptions = {}) {
   const rateLimiter = options.rateLimiter ?? new MemoryRateLimiter();
   const audioConcurrencyLimiter = options.audioConcurrencyLimiter ??
     new MemoryAudioConcurrencyLimiter();
+  const imageConcurrencyLimiter = options.imageConcurrencyLimiter ?? audioConcurrencyLimiter;
   const providerStream = options.providerStream ?? streamChatCompletion;
   const providerComplete = options.providerComplete ?? complete;
   const idempotencyHeartbeatMs = Math.max(10, options.idempotencyHeartbeatMs ?? 30_000);
@@ -824,6 +900,25 @@ export function createApp(options: AppOptions = {}) {
   const webOrigin = new URL(
     Deno.env.get("WEB_ORIGIN") ?? Deno.env.get("WEB_URL") ?? "http://localhost:5173",
   ).origin;
+  const configuredPublicApiOrigin = new URL(
+    Deno.env.get("PUBLIC_API_ORIGIN") ?? "http://localhost:8000",
+  );
+  if (
+    !["http:", "https:"].includes(configuredPublicApiOrigin.protocol) ||
+    configuredPublicApiOrigin.username || configuredPublicApiOrigin.password ||
+    configuredPublicApiOrigin.pathname !== "/" || configuredPublicApiOrigin.search ||
+    configuredPublicApiOrigin.hash
+  ) throw new Error("PUBLIC_API_ORIGIN must be an HTTP(S) origin without credentials or a path");
+  const publicApiOrigin = configuredPublicApiOrigin.origin;
+  const imageUrlSigningSecret = options.imageUrlSigningSecret ??
+    Deno.env.get("IMAGE_URL_SIGNING_SECRET") ?? Deno.env.get("APP_SECRET");
+  const imageUrlSigningSecretBytes = imageUrlSigningSecret === undefined
+    ? undefined
+    : new TextEncoder().encode(imageUrlSigningSecret);
+  if (
+    imageUrlSigningSecretBytes &&
+    (imageUrlSigningSecretBytes.byteLength < 32 || imageUrlSigningSecretBytes.byteLength > 256)
+  ) throw new Error("IMAGE_URL_SIGNING_SECRET must contain between 32 and 256 bytes");
   const mailer = options.mailer ?? (Deno.env.get("SMTP_URL")
     ? smtpIdentityMailer(
       Deno.env.get("SMTP_URL")!,
@@ -873,6 +968,25 @@ export function createApp(options: AppOptions = {}) {
       throw new DomainError(
         "audio_capacity_exceeded",
         "Too many audio requests are in progress",
+        429,
+      );
+    }
+    return lease;
+  };
+  const imageMaxConcurrent = positiveInteger("IMAGE_MAX_CONCURRENT", 2);
+  const imageMaxConcurrentPerUser = positiveInteger("IMAGE_MAX_CONCURRENT_PER_USER", 1);
+  if (imageMaxConcurrentPerUser > imageMaxConcurrent) {
+    throw new Error("IMAGE_MAX_CONCURRENT_PER_USER cannot exceed IMAGE_MAX_CONCURRENT");
+  }
+  const claimImageSlot = async (ownerId: string) => {
+    const lease = await imageConcurrencyLimiter.acquire(ownerId, {
+      global: imageMaxConcurrent,
+      perUser: imageMaxConcurrentPerUser,
+    }, "image");
+    if (!lease) {
+      throw new DomainError(
+        "image_capacity_exceeded",
+        "Too many image requests are in progress",
         429,
       );
     }
@@ -948,6 +1062,7 @@ export function createApp(options: AppOptions = {}) {
       embeddingsFetch: options.embeddingsFetch,
       audioFetch: options.audioFetch,
       speechFetch: options.speechFetch,
+      imageFetch: options.imageFetch,
       slowStream: providerSlowStream,
       ocrCache: options.ocrCache,
     })
@@ -1128,7 +1243,8 @@ export function createApp(options: AppOptions = {}) {
           await resolveEmbeddingsRuntimeModel(model.publicModelId) ??
           await resolveAudioRuntimeModel(model.publicModelId, "transcription") ??
           await resolveAudioRuntimeModel(model.publicModelId, "translation") ??
-          await resolveAudioRuntimeModel(model.publicModelId, "speech");
+          await resolveAudioRuntimeModel(model.publicModelId, "speech") ??
+          await resolveImageRuntimeModel(model.publicModelId);
         return resolved?.registryModel ? resolved.info : undefined;
       }),
     );
@@ -1218,9 +1334,31 @@ export function createApp(options: AppOptions = {}) {
     if (!resolved.price) return undefined;
     return resolved;
   };
+  const resolveImageRuntimeModel = async (id: string): Promise<RuntimeModel | undefined> => {
+    const model = await repo.findProviderModel(id);
+    if (!model?.enabled || !model.capabilities.includes("image_generation")) return undefined;
+    const provider = await repo.findProvider(model.providerId);
+    if (!provider?.enabled || !provider.hasCredential || !providerKeyring) return undefined;
+    const credential = await repo.getProviderCredential(provider.id);
+    if (!credential) return undefined;
+    try {
+      await providerKeyring.decrypt(
+        provider.id,
+        credential.envelope as unknown as ProviderSecretEnvelope,
+      );
+    } catch {
+      return undefined;
+    }
+    const resolved = await registryModelInfo(model, provider);
+    if (!resolved.price) return undefined;
+    return resolved;
+  };
   let bootstrapInProgress = false;
   const app = new Hono<{ Variables: Variables }>();
-  app.use("*", logger());
+  app.use(
+    "*",
+    logger((message, ...rest) => console.log(redactRequestLog(message), ...rest)),
+  );
   app.use(
     "*",
     secureHeaders({
@@ -1273,7 +1411,8 @@ export function createApp(options: AppOptions = {}) {
     );
     const generationRoute = c.req.method === "POST" &&
       (path.endsWith("/generate") || path === "/v1/chat/completions" ||
-        path === "/v1/responses" || path.startsWith("/v1/audio/") ||
+        path === "/v1/responses" || path === "/v1/images/generations" ||
+        path === "/api/images/generations" || path.startsWith("/v1/audio/") ||
         path.endsWith("/active-leaf"));
     const providerAdminRoute = c.req.method !== "GET" && (
       path.startsWith("/api/admin/providers") || path.startsWith("/api/admin/models") ||
@@ -1596,6 +1735,173 @@ export function createApp(options: AppOptions = {}) {
       },
     });
   };
+  const verifiedGeneratedImage = async (
+    asset: Awaited<ReturnType<DomainRepository["getGeneratedAsset"]>>,
+    attachment: AttachmentRecord,
+  ) => {
+    if (!objectStore) {
+      throw new DomainError("storage_not_configured", "Object storage is not configured", 503);
+    }
+    const object = await objectStore.get(attachment.objectKey);
+    if (
+      !object || attachment.sizeBytes < 1 || attachment.sizeBytes > IMAGE_MAX_BYTES ||
+      object.contentLength !== attachment.sizeBytes || object.contentType !== attachment.mimeType
+    ) throw new DomainError("generated_asset_corrupt", "Stored generated image is invalid", 503);
+    const reader = object.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let length = 0;
+    try {
+      while (true) {
+        const next = await reader.read();
+        if (next.done) break;
+        length += next.value.byteLength;
+        if (length > attachment.sizeBytes || length > IMAGE_MAX_BYTES) {
+          throw new DomainError(
+            "generated_asset_corrupt",
+            "Stored generated image is invalid",
+            503,
+          );
+        }
+        chunks.push(next.value);
+      }
+    } finally {
+      await reader.cancel().catch(() => undefined);
+      reader.releaseLock();
+    }
+    if (length !== attachment.sizeBytes) {
+      throw new DomainError("generated_asset_corrupt", "Stored generated image is invalid", 503);
+    }
+    const bytes = new Uint8Array(length);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    const digest = await imageBytesSha256(bytes);
+    if (digest !== attachment.sha256 || object.metadata.sha256 !== attachment.sha256) {
+      throw new DomainError("generated_asset_corrupt", "Stored generated image is invalid", 503);
+    }
+    let decoded: ImageOutput;
+    try {
+      decoded = decodeImage(Buffer.from(bytes).toString("base64"));
+    } catch {
+      throw new DomainError("generated_asset_corrupt", "Stored generated image is invalid", 503);
+    }
+    if (
+      decoded.width !== asset.width || decoded.height !== asset.height ||
+      imageMime(decoded.format) !== attachment.mimeType
+    ) throw new DomainError("generated_asset_corrupt", "Stored generated image is invalid", 503);
+    return { bytes, decoded };
+  };
+  const generatedImageContent = async (
+    asset: Awaited<ReturnType<DomainRepository["getGeneratedAsset"]>>,
+    attachment: AttachmentRecord,
+  ) => {
+    const { bytes } = await verifiedGeneratedImage(asset, attachment);
+    return new Response(bytes.slice().buffer, {
+      headers: {
+        "Content-Type": attachment.mimeType,
+        "Content-Length": String(bytes.byteLength),
+        "Content-Disposition": `attachment; filename*=UTF-8''${
+          encodeURIComponent(attachment.filename)
+        }`,
+        "Cache-Control": "private, no-store",
+        "X-Content-Type-Options": "nosniff",
+      },
+    });
+  };
+  const generatedAssetView = async (
+    asset: Awaited<ReturnType<DomainRepository["getGeneratedAsset"]>>,
+  ) =>
+    publicGeneratedAsset(
+      asset,
+      await repo.getAttachment(asset.attachmentId, asset.ownerId, true),
+    );
+  const imageSigningKey = imageUrlSigningSecretBytes
+    ? crypto.subtle.importKey(
+      "raw",
+      imageUrlSigningSecretBytes,
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"],
+    )
+    : undefined;
+  const signImageAssetUrl = async (assetId: string, ownerId: string) => {
+    if (!imageSigningKey) {
+      throw new ImageProviderError(
+        "URL image responses require IMAGE_URL_SIGNING_SECRET",
+        501,
+        "signed_image_urls_not_configured",
+      );
+    }
+    const expires = Math.floor(Date.now() / 1000) + 300;
+    const payload = Buffer.from(JSON.stringify({ a: assetId, o: ownerId, e: expires }))
+      .toString("base64url");
+    const signature = Buffer.from(
+      await crypto.subtle.sign("HMAC", await imageSigningKey, new TextEncoder().encode(payload)),
+    ).toString("base64url");
+    return `${publicApiOrigin}/v1/images/assets/${assetId}/content?token=${payload}.${signature}`;
+  };
+  const verifyImageAssetToken = async (assetId: string, token: string | undefined) => {
+    if (!imageSigningKey || !token || token.length > 1_024) return undefined;
+    const [payload, supplied, extra] = token.split(".");
+    if (
+      extra !== undefined || !payload || !supplied ||
+      !/^[A-Za-z0-9_-]+$/.test(payload) || !/^[A-Za-z0-9_-]{43}$/.test(supplied)
+    ) return undefined;
+    const expected = new Uint8Array(
+      await crypto.subtle.sign("HMAC", await imageSigningKey, new TextEncoder().encode(payload)),
+    );
+    let suppliedBytes: Uint8Array;
+    try {
+      suppliedBytes = new Uint8Array(Buffer.from(supplied, "base64url"));
+    } catch {
+      return undefined;
+    }
+    if (Buffer.from(suppliedBytes).toString("base64url") !== supplied) return undefined;
+    let mismatch = expected.byteLength ^ suppliedBytes.byteLength;
+    for (let index = 0; index < expected.byteLength; index++) {
+      mismatch |= expected[index] ^ (suppliedBytes[index] ?? 0);
+    }
+    if (mismatch !== 0) return undefined;
+    let value: unknown;
+    try {
+      value = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    } catch {
+      return undefined;
+    }
+    if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+    const { a, o, e } = value as Record<string, unknown>;
+    const now = Math.floor(Date.now() / 1000);
+    if (
+      a !== assetId || typeof o !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(o) ||
+      !Number.isSafeInteger(e) || Number(e) < now || Number(e) > now + 600
+    ) return undefined;
+    return o;
+  };
+
+  // A short-lived, object-scoped capability URL can be followed by browsers and SDK clients
+  // without copying the caller's broad API bearer token into a query string.
+  app.get(
+    "/v1/images/assets/:id/content",
+    async (c, next) => {
+      const ownerId = await verifyImageAssetToken(c.req.param("id"), c.req.query("token"));
+      if (!ownerId) {
+        return c.json(openAIError("Image URL is invalid or expired", "invalid_image_url"), 403);
+      }
+      c.set("imageAssetOwnerId", ownerId);
+      await next();
+    },
+    async (c) => {
+      const ownerId = c.get("imageAssetOwnerId")!;
+      const asset = await repo.getGeneratedAsset(c.req.param("id"), ownerId);
+      return await generatedImageContent(
+        asset,
+        await repo.getAttachment(asset.attachmentId, ownerId, true),
+      );
+    },
+  );
 
   const detailWithAttachments = async (conversationId: string, ownerId: string) => {
     const detail = await repo.detail(conversationId, ownerId);
@@ -2053,6 +2359,78 @@ export function createApp(options: AppOptions = {}) {
         await repo.retryAttachmentIngestion(c.req.param("id"), c.get("user").id),
       ),
     }));
+  app.use("/api/images/*", authenticate, approved, sessionOnly);
+  app.use("/api/images", authenticate, approved, sessionOnly);
+  app.get("/api/images", async (c) => {
+    const deleted = c.req.query("deleted");
+    if (deleted !== undefined && !["true", "false"].includes(deleted)) {
+      throw new DomainError("validation_error", "deleted must be a boolean", 422);
+    }
+    const rawLimit = c.req.query("limit");
+    const limit = rawLimit === undefined ? 50 : Number(rawLimit);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new DomainError("validation_error", "limit must be an integer from 1 to 100", 422);
+    }
+    const cursor = c.req.query("cursor");
+    const after = cursor === undefined ? undefined : decodeGeneratedAssetCursor(cursor);
+    const includeDeleted = deleted === "true" || c.req.query("include_deleted") === "true";
+    let data = await Promise.all(
+      (await repo.listGeneratedAssets(c.get("user").id, includeDeleted)).map(generatedAssetView),
+    );
+    if (deleted === "true") data = data.filter((asset) => asset.deletedAt !== null);
+    const operation = c.req.query("operation");
+    if (operation !== undefined) {
+      if (!["generation", "edit"].includes(operation)) {
+        throw new DomainError("validation_error", "operation is invalid", 422);
+      }
+      data = data.filter((asset) => asset.operation === operation);
+    }
+    const model = c.req.query("model")?.trim();
+    if (model) data = data.filter((asset) => asset.model === model);
+    const query = c.req.query("query")?.trim().toLocaleLowerCase();
+    if (query) {
+      data = data.filter((asset) =>
+        asset.prompt.toLocaleLowerCase().includes(query) ||
+        asset.revisedPrompt?.toLocaleLowerCase().includes(query)
+      );
+    }
+    if (after) {
+      data = data.filter((asset) =>
+        asset.createdAt < after.createdAt ||
+        (asset.createdAt === after.createdAt && asset.id < after.id)
+      );
+    }
+    const page = data.slice(0, limit);
+    return c.json({
+      data: page,
+      nextCursor: data.length > limit && page.length
+        ? encodeGeneratedAssetCursor(page[page.length - 1])
+        : null,
+    });
+  });
+  app.get("/api/images/:id", async (c) =>
+    c.json(
+      await generatedAssetView(
+        await repo.getGeneratedAsset(c.req.param("id"), c.get("user").id, true),
+      ),
+    ));
+  app.get("/api/images/:id/content", async (c) => {
+    const asset = await repo.getGeneratedAsset(c.req.param("id"), c.get("user").id);
+    return await generatedImageContent(
+      asset,
+      await repo.getAttachment(asset.attachmentId, c.get("user").id, true),
+    );
+  });
+  app.delete("/api/images/:id", async (c) => {
+    await repo.deleteGeneratedAsset(c.req.param("id"), c.get("user").id);
+    return c.body(null, 204);
+  });
+  app.post("/api/images/:id/restore", async (c) =>
+    c.json(
+      await generatedAssetView(
+        await repo.restoreGeneratedAsset(c.req.param("id"), c.get("user").id),
+      ),
+    ));
   app.use("/api/messages/*", authenticate, approved, sessionOnly);
   app.get("/api/messages/:messageId/attachments/:attachmentId/content", async (c) => {
     const ownerId = c.get("user").id;
@@ -3883,6 +4261,802 @@ export function createApp(options: AppOptions = {}) {
     }
     return { kind: "replay" as const, response: replayResponse(result.request) };
   };
+  const imageBytesSha256 = async (bytes: Uint8Array) =>
+    [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes.slice().buffer))]
+      .map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  const imageMime = (format: ImageOutput["format"]) =>
+    format === "jpeg" ? "image/jpeg" : `image/${format}`;
+  const persistGeneratedImage = async (
+    ownerId: string,
+    runId: string,
+    ordinal: number,
+    output: ImageOutput,
+  ) => {
+    if (!objectStore) {
+      throw new DomainError("storage_not_configured", "Object storage is not configured", 503);
+    }
+    const digest = await imageBytesSha256(output.bytes);
+    const mimeType = imageMime(output.format);
+    const extension = output.format === "jpeg" ? "jpg" : output.format;
+    const objectKey = `users/${ownerId}/generated/${await sha256Hex(
+      runId,
+    )}/${ordinal}.${extension}`;
+    const stage = await repo.stageGeneratedObject({
+      ownerId,
+      usageRunId: runId,
+      ordinal,
+      objectKey,
+      mimeType,
+      sizeBytes: output.bytes.byteLength,
+      sha256: digest,
+    });
+    let stored = false;
+    try {
+      await objectStore.put({
+        key: objectKey,
+        body: new Blob([output.bytes.slice().buffer]).stream(),
+        contentLength: output.bytes.byteLength,
+        contentType: mimeType,
+        metadata: { sha256: digest, owner: ownerId, usage_run: runId },
+      });
+      stored = true;
+    } catch (error) {
+      if (!(error instanceof ObjectAlreadyExistsError)) throw error;
+      // A reclaimed idempotent execution can encounter an object written before a crash.
+      // Verify the stored body, not just caller-controlled metadata, before binding it.
+      const existing = await objectStore.get(objectKey);
+      if (
+        !existing || existing.contentLength !== output.bytes.byteLength ||
+        existing.contentType !== mimeType || existing.metadata.sha256 !== digest ||
+        existing.metadata.owner !== ownerId
+      ) throw new DomainError("object_key_conflict", "Generated object collision", 409);
+      const existingBytes = new Uint8Array(await new Response(existing.body).arrayBuffer());
+      if (
+        existingBytes.byteLength !== output.bytes.byteLength ||
+        await imageBytesSha256(existingBytes) !== digest
+      ) throw new DomainError("object_key_conflict", "Generated object collision", 409);
+    }
+    await repo.markGeneratedObjectStored(stage.id, ownerId);
+    try {
+      const created = await repo.createAttachment({
+        ownerId,
+        objectKey,
+        filename: `generated-${ordinal + 1}.${extension}`,
+        mimeType,
+        sizeBytes: output.bytes.byteLength,
+        sha256: digest,
+        state: "ready",
+        inspectionError: null,
+        inspectionComplete: true,
+      });
+      if (created.deduplicated && stored) {
+        await objectStore.delete(objectKey).catch(() => undefined);
+      }
+      await repo.attachGeneratedObject(stage.id, ownerId, created.attachment.id);
+      return created.attachment;
+    } catch (error) {
+      if (stored) await objectStore.delete(objectKey).catch(() => undefined);
+      throw error;
+    }
+  };
+  const imageGenerationHandler = async (
+    c: Context<{ Variables: Variables }>,
+    richApi: boolean,
+  ): Promise<Response> => {
+    let request: ImageGenerationRequest;
+    try {
+      let value: unknown;
+      try {
+        value = await c.req.json();
+      } catch {
+        throw new ImageProviderError("Request body must be valid JSON", 400, "invalid_json");
+      }
+      if (richApi && value && typeof value === "object" && !Array.isArray(value)) {
+        const rich = { ...(value as Record<string, unknown>) };
+        if (rich.count !== undefined && rich.n !== undefined) {
+          throw new ImageProviderError(
+            "count and n cannot both be provided",
+            422,
+            "validation_error",
+          );
+        }
+        if (rich.count !== undefined) {
+          rich.n = rich.count;
+          delete rich.count;
+        }
+        value = rich;
+      }
+      request = parseImageGenerationRequest(value);
+      if (!richApi && request.responseFormat === "url" && !imageSigningKey) {
+        throw new ImageProviderError(
+          "URL image responses require IMAGE_URL_SIGNING_SECRET",
+          501,
+          "signed_image_urls_not_configured",
+        );
+      }
+      if (!richApi && request.responseFormat === "url" && c.req.header("idempotency-key")) {
+        throw new ImageProviderError(
+          "Idempotency-Key cannot be combined with expiring image URLs; use b64_json",
+          422,
+          "idempotent_image_url_unsupported",
+        );
+      }
+    } catch (error) {
+      if (!(error instanceof ImageProviderError)) throw error;
+      return c.json(openAIError(error.message, error.code), error.status as 400);
+    }
+    const requestHash = await sha256Hex(canonicalJson({
+      endpoint: "images.generations",
+      request,
+    }));
+    const suppliedIdempotencyKey = c.req.header("idempotency-key");
+    const existing = suppliedIdempotencyKey
+      ? await repo.getApiRequest(
+        c.get("user").id,
+        "images.generations",
+        suppliedIdempotencyKey,
+      )
+      : undefined;
+    if (existing && existing.requestHash !== requestHash) {
+      return c.json(
+        openAIError("Idempotency key payload differs", "idempotency_conflict"),
+        409,
+      );
+    }
+    if (existing && existing.state !== "in_progress") return replayResponse(existing);
+    if (
+      request.stream && suppliedIdempotencyKey &&
+      maximumImageStreamReplayBytes(request) > replayQuota.maxBytes
+    ) {
+      return c.json(
+        openAIError(
+          "Image stream can exceed the configured idempotency replay capacity; reduce partial_images or omit Idempotency-Key",
+          "response_too_large_for_idempotency",
+        ),
+        413,
+      );
+    }
+    const finalized = suppliedIdempotencyKey
+      ? await repo.findGeneratedAssetsByIdempotency(c.get("user").id, suppliedIdempotencyKey)
+      : [];
+    const recoverableFinalization = Boolean(
+      existing?.state === "in_progress" && existing.leaseToken && existing.leaseExpiresAt &&
+        Date.parse(existing.leaseExpiresAt) <= Date.now() && finalized.length,
+    );
+    const resolved = await resolveImageRuntimeModel(request.model);
+    const recoveryPricing = finalized[0]?.pricingSnapshot;
+    const model = resolved?.info ?? (recoveryPricing && finalized[0]
+      ? {
+        id: finalized[0].publicModelId,
+        displayName: finalized[0].publicModelId,
+        provider: finalized[0].providerSlug,
+        capabilities: ["image_generation" as const],
+        contextWindow: 1,
+        inputMicrosPerMillion: recoveryPricing.inputMicrosPerMillion,
+        cachedInputMicrosPerMillion: recoveryPricing.cachedInputMicrosPerMillion,
+        reasoningMicrosPerMillion: recoveryPricing.reasoningMicrosPerMillion,
+        outputMicrosPerMillion: recoveryPricing.outputMicrosPerMillion,
+        fixedCallMicros: recoveryPricing.fixedCallMicros,
+        pricingVersionId: recoveryPricing.pricingVersionId,
+      }
+      : undefined);
+    const sourcePricing = pricingSnapshot(resolved?.price) ?? recoveryPricing;
+    if (
+      !model || !providerExecution || !sourcePricing ||
+      (!recoverableFinalization && !resolved?.registryModel)
+    ) {
+      return c.json(openAIError(`Model '${request.model}' does not exist`, "model_not_found"), 404);
+    }
+    if (!objectStore) {
+      return c.json(openAIError("Object storage is not configured", "storage_not_configured"), 503);
+    }
+    const providerPlan = recoverableFinalization
+      ? undefined
+      : await providerExecution.resolvePlan(resolved!.registryModel!.id);
+    const estimatedInput = estimateImageInputTokens(request);
+    const maximumOutputTokens = model.contextWindow * request.n;
+    if (!Number.isSafeInteger(maximumOutputTokens) || maximumOutputTokens < 1) {
+      return c.json(
+        openAIError("Image reservation exceeds accounting bounds", "reservation_too_large"),
+        422,
+      );
+    }
+    const reserveMicros = recoverableFinalization ? 0 : providerExecution.reservationMicros(
+      providerPlan!,
+      model.contextWindow,
+      maximumOutputTokens,
+    );
+    let usage: Awaited<ReturnType<typeof beginOpenAIUsage>>;
+    if (recoverableFinalization && existing?.leaseToken) {
+      const reclaimed = await repo.reclaimApiRequest(
+        existing.id,
+        existing.leaseToken,
+        idempotencyLeaseSeconds,
+      );
+      usage = {
+        kind: "started",
+        runId: existing.usageRunId,
+        idempotency: { id: existing.id, leaseToken: reclaimed.leaseToken },
+        executionLeaseToken: reclaimed.leaseToken,
+        runLease: false,
+      };
+    } else {
+      usage = await beginOpenAIUsage(
+        c,
+        "images.generations",
+        request,
+        model,
+        reserveMicros,
+        resolved!.price,
+      );
+    }
+    if (usage.kind === "replay") return usage.response;
+    const { runId, idempotency, executionLeaseToken, runLease } = usage;
+    const assetIdempotencyKey = suppliedIdempotencyKey ?? `run:${runId}`;
+    const lease = keepApiLeaseAlive(
+      idempotency,
+      runLease ? { runId, leaseToken: executionLeaseToken } : undefined,
+    );
+    const started = performance.now();
+    let imageSlot: Awaited<ReturnType<typeof claimImageSlot>> | undefined;
+    let streamOwnsLease = false;
+    let terminal = false;
+    let providerCompleted = false;
+    let observedInputTokens = estimatedInput;
+    let observedOutputTokens = 0;
+    let observedCostMicros = reserveMicros;
+    try {
+      // Object storage and generated-assets finalization can succeed immediately before the
+      // idempotency/accounting transaction is interrupted. A reclaimed lease must finish that
+      // durable result instead of paying for and colliding with a second stochastic generation.
+      if (idempotency) {
+        const prior = await repo.findGeneratedAssetsByIdempotency(
+          c.get("user").id,
+          assetIdempotencyKey,
+        );
+        if (prior.length) {
+          providerCompleted = true;
+          if (
+            prior.some((asset) =>
+              asset.requestHash !== requestHash || asset.usageRunId !== runId ||
+              asset.publicModelId !== request.model || asset.deletedAt !== null ||
+              !usagePricingSnapshotsEqual(asset.pricingSnapshot, prior[0].pricingSnapshot)
+            ) || prior.length !== request.n
+          ) {
+            throw new DomainError(
+              "idempotency_conflict",
+              "Recovered image assets do not match the request",
+              409,
+            );
+          }
+          let aggregateBytes = 0;
+          const recovered = [] as Array<{
+            asset: typeof prior[number];
+            attachment: AttachmentRecord;
+            b64Json: string;
+          }>;
+          for (const asset of prior) {
+            const attachment = await repo.getAttachment(asset.attachmentId, asset.ownerId, true);
+            const { bytes } = await verifiedGeneratedImage(asset, attachment);
+            aggregateBytes += bytes.byteLength;
+            if (aggregateBytes > IMAGE_MAX_TOTAL_BYTES) {
+              throw new DomainError(
+                "generated_asset_corrupt",
+                "Stored generated image failed validation",
+                503,
+              );
+            }
+            recovered.push({
+              asset,
+              attachment,
+              b64Json: Buffer.from(bytes).toString("base64"),
+            });
+          }
+          const attempts = await repo.listProviderAttempts(runId);
+          const succeeded = attempts.filter((attempt) => attempt.status === "succeeded").at(-1);
+          const inputTokens = succeeded?.inputTokens ?? estimatedInput;
+          const outputTokens = succeeded?.outputTokens ?? 0;
+          const recoveryPricing = prior[0].pricingSnapshot;
+          const costMicros = priceUsage(
+            {
+              ...model,
+              inputMicrosPerMillion: recoveryPricing.inputMicrosPerMillion,
+              cachedInputMicrosPerMillion: recoveryPricing.cachedInputMicrosPerMillion,
+              reasoningMicrosPerMillion: recoveryPricing.reasoningMicrosPerMillion,
+              outputMicrosPerMillion: recoveryPricing.outputMicrosPerMillion,
+              fixedCallMicros: recoveryPricing.fixedCallMicros,
+              pricingVersionId: recoveryPricing.pricingVersionId,
+            },
+            inputTokens,
+            outputTokens,
+          ).costMicros;
+          observedInputTokens = inputTokens;
+          observedOutputTokens = outputTokens;
+          observedCostMicros = costMicros;
+          const created = prior[0].providerCreatedAt;
+          if (prior.some((asset) => asset.providerCreatedAt !== created)) {
+            throw new DomainError(
+              "generated_asset_corrupt",
+              "Recovered image timestamp metadata differs",
+              503,
+            );
+          }
+          const data = await Promise.all(
+            recovered.map(async ({ asset, b64Json }) =>
+              request.responseFormat === "url"
+                ? {
+                  url: await signImageAssetUrl(asset.id, c.get("user").id),
+                  revised_prompt: asset.revisedPrompt ?? undefined,
+                }
+                : { b64_json: b64Json, revised_prompt: asset.revisedPrompt ?? undefined }
+            ),
+          );
+          const assetViews = await Promise.all(prior.map(generatedAssetView));
+          const body = richApi
+            ? JSON.stringify({
+              created,
+              assets: assetViews.map((asset) => ({ ...asset, costMicros })),
+              costMicros,
+              usage: {
+                input_tokens: inputTokens,
+                output_tokens: outputTokens,
+                total_tokens: inputTokens + outputTokens,
+              },
+            })
+            : JSON.stringify({
+              created,
+              data,
+              ...(succeeded?.tokenSource === "provider"
+                ? {
+                  usage: {
+                    input_tokens: inputTokens,
+                    output_tokens: outputTokens,
+                    total_tokens: inputTokens + outputTokens,
+                  },
+                }
+                : {}),
+            });
+          if (request.stream) {
+            const terminalFrame = `event: image_generation.completed\ndata: ${
+              JSON.stringify({
+                type: "image_generation.completed",
+                b64_json: recovered[0].b64Json,
+                created_at: created,
+                size: request.size,
+                quality: request.quality,
+                background: request.background,
+                output_format: request.outputFormat,
+                ...(succeeded?.tokenSource === "provider"
+                  ? {
+                    usage: {
+                      input_tokens: inputTokens,
+                      output_tokens: outputTokens,
+                      total_tokens: inputTokens + outputTokens,
+                    },
+                  }
+                  : {}),
+              })
+            }\n\n`;
+            const completed = await repo.completeApiStream({
+              id: idempotency.id,
+              leaseToken: idempotency.leaseToken,
+              responseStatus: 200,
+              responseHeaders: {
+                "content-type": "text/event-stream",
+                "cache-control": "no-cache",
+              },
+              terminalFrame,
+              costMicros,
+              inputTokens,
+              outputTokens,
+              latencyMs: Math.round(performance.now() - started),
+              quota: replayQuota,
+            });
+            terminal = true;
+            return replayResponse(completed);
+          }
+          await repo.completeApiJson({
+            id: idempotency.id,
+            leaseToken: idempotency.leaseToken,
+            responseStatus: 200,
+            responseHeaders: { "content-type": "application/json" },
+            responseBody: body,
+            costMicros,
+            inputTokens,
+            outputTokens,
+            latencyMs: Math.round(performance.now() - started),
+            quota: replayQuota,
+          });
+          terminal = true;
+          return new Response(body, {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+      }
+      imageSlot = await claimImageSlot(c.get("user").id);
+      const downstreamImageAbort = new AbortController();
+      const imageSignal = AbortSignal.any([
+        c.req.raw.signal,
+        imageSlot.signal,
+        downstreamImageAbort.signal,
+      ]);
+      const result = await providerExecution.imageGenerate(
+        resolved!.registryModel!.id,
+        runId,
+        executionLeaseToken,
+        request,
+        imageSignal,
+        providerPlan!,
+      );
+      if (request.stream) {
+        if (!result.stream || !result.usage || !result.terminalFrame || result.data) {
+          throw new ImageProviderError("Image provider did not return an image stream");
+        }
+        streamOwnsLease = true;
+        const activeImageSlot = imageSlot;
+        return streamSSE(c, async (stream) => {
+          stream.onAbort(() =>
+            downstreamImageAbort.abort(
+              new DOMException("Downstream image stream disconnected", "AbortError"),
+            )
+          );
+          let sequence = 0;
+          let exposedPartial = false;
+          let terminalAccounting = false;
+          try {
+            for await (const frameBytes of result.stream!) {
+              if (stream.aborted || imageSignal.aborted) {
+                throw imageSignal.reason ?? new DOMException("Client disconnected", "AbortError");
+              }
+              const frame = new TextDecoder("utf-8", { fatal: true }).decode(frameBytes);
+              if (idempotency) {
+                await repo.appendApiSseFrame(
+                  idempotency.id,
+                  idempotency.leaseToken,
+                  sequence++,
+                  frame,
+                  undefined,
+                  undefined,
+                  replayQuota,
+                );
+              }
+              exposedPartial = true;
+              await stream.write(frame);
+            }
+            const providerUsage = await result.usage!;
+            const terminalBytes = await result.terminalFrame!;
+            const terminalFrame = new TextDecoder("utf-8", { fatal: true }).decode(terminalBytes);
+            const { created: providerCreatedAt, output } = imageTerminalOutput(terminalBytes);
+            const executionTarget = await result.executionTarget;
+            if (!executionTarget) {
+              throw new ImageProviderError("Image execution target is missing");
+            }
+            providerCompleted = true;
+            observedInputTokens = providerUsage.inputTokens;
+            observedOutputTokens = providerUsage.outputTokens;
+            assertImageUsagePricing(providerUsage, sourcePricing);
+            if (
+              providerUsage.inputTokens > model.contextWindow ||
+              providerUsage.outputTokens > maximumOutputTokens
+            ) {
+              observedCostMicros = reserveMicros;
+              throw new ImageProviderError(
+                "Image provider usage exceeds the reserved bounds",
+                502,
+                "invalid_provider_usage",
+              );
+            }
+            observedCostMicros = priceUsage(
+              model,
+              providerUsage.inputTokens,
+              providerUsage.outputTokens,
+            ).costMicros;
+            const attachment = await persistGeneratedImage(c.get("user").id, runId, 0, output);
+            await repo.finalizeGeneratedAssets({
+              ownerId: c.get("user").id,
+              usageRunId: runId,
+              providerModelId: executionTarget.providerModelId,
+              publicModelId: request.model,
+              upstreamModelId: executionTarget.upstreamModelId,
+              providerSlug: executionTarget.providerSlug,
+              pricingSnapshot: sourcePricing,
+              idempotencyKey: assetIdempotencyKey,
+              requestHash,
+              operation: "generation",
+              prompt: request.prompt,
+              providerCreatedAt,
+              assets: [{
+                attachmentId: attachment.id,
+                ordinal: 0,
+                width: output.width,
+                height: output.height,
+                revisedPrompt: output.revisedPrompt,
+              }],
+            });
+            const latencyMs = Math.round(performance.now() - started);
+            await lease.checkpoint({
+              inputTokens: providerUsage.inputTokens,
+              outputTokens: providerUsage.outputTokens,
+              costMicros: observedCostMicros,
+              latencyMs,
+            });
+            if (idempotency) {
+              await repo.completeApiStream({
+                id: idempotency.id,
+                leaseToken: idempotency.leaseToken,
+                responseStatus: 200,
+                responseHeaders: {
+                  "content-type": "text/event-stream",
+                  "cache-control": "no-cache",
+                },
+                terminalFrame,
+                costMicros: observedCostMicros,
+                inputTokens: providerUsage.inputTokens,
+                outputTokens: providerUsage.outputTokens,
+                latencyMs,
+                quota: replayQuota,
+              });
+            } else {
+              await repo.settle(
+                runId,
+                observedCostMicros,
+                providerUsage.inputTokens,
+                providerUsage.outputTokens,
+                latencyMs,
+              );
+            }
+            terminalAccounting = true;
+            terminal = true;
+            // The completed event contains the final image. It is intentionally withheld until
+            // immutable storage and ledger settlement have both committed.
+            if (!stream.aborted && !imageSignal.aborted) await stream.write(terminalFrame);
+          } catch {
+            const cancelled = c.req.raw.signal.aborted || stream.aborted;
+            if (!terminalAccounting) {
+              const message = cancelled ? "Request cancelled" : "Image provider stream failed";
+              const errorFrame = `data: ${
+                JSON.stringify(openAIError(
+                  message,
+                  cancelled ? "request_cancelled" : "provider_error",
+                ))
+              }\n\n`;
+              const latencyMs = Math.round(performance.now() - started);
+              // A visible partial proves upstream work was performed. Conservatively settle the
+              // authorized reservation when exact terminal usage is unavailable.
+              const shouldSettle = providerCompleted || exposedPartial;
+              const costMicros = providerCompleted ? observedCostMicros : reserveMicros;
+              const inputTokens = providerCompleted ? observedInputTokens : model.contextWindow;
+              const outputTokens = providerCompleted ? observedOutputTokens : maximumOutputTokens;
+              if (idempotency) {
+                await repo.failApiRequest({
+                  id: idempotency.id,
+                  leaseToken: idempotency.leaseToken,
+                  responseStatus: 200,
+                  responseHeaders: {
+                    "content-type": "text/event-stream",
+                    "cache-control": "no-cache",
+                  },
+                  responseBody: JSON.stringify(openAIError(
+                    message,
+                    cancelled ? "request_cancelled" : "provider_error",
+                  )),
+                  terminalFrame: errorFrame,
+                  billing: shouldSettle
+                    ? { mode: "settle", costMicros, inputTokens, outputTokens, latencyMs }
+                    : { mode: "refund" },
+                });
+              } else if (shouldSettle) {
+                await repo.settle(runId, costMicros, inputTokens, outputTokens, latencyMs);
+              } else await repo.refund(runId, message);
+              await repo.requestGeneratedObjectCleanup(c.get("user").id, runId, message);
+              terminalAccounting = true;
+              if (!cancelled) await stream.write(errorFrame);
+            }
+          } finally {
+            await lease.stop();
+            await activeImageSlot?.release().catch(() => undefined);
+          }
+        });
+      }
+      if (!result.data || result.stream) {
+        throw new ImageProviderError("Image provider did not return buffered image data");
+      }
+      const providerUsage = await result.usage;
+      const executionTarget = await result.executionTarget;
+      if (!executionTarget) throw new ImageProviderError("Image execution target is missing");
+      providerCompleted = true;
+      observedInputTokens = providerUsage.inputTokens;
+      observedOutputTokens = providerUsage.outputTokens;
+      assertImageUsagePricing(providerUsage, sourcePricing);
+      if (
+        providerUsage.inputTokens > model.contextWindow ||
+        providerUsage.outputTokens > maximumOutputTokens
+      ) {
+        // The provider has reported usage outside the bounded reservation domain. Do not expose
+        // or persist the output, but charge the already-authorized reservation because work ran.
+        observedCostMicros = reserveMicros;
+        throw new ImageProviderError(
+          "Image provider usage exceeds the reserved bounds",
+          502,
+          "invalid_provider_usage",
+        );
+      }
+      observedCostMicros = priceUsage(
+        model,
+        observedInputTokens,
+        observedOutputTokens,
+      ).costMicros;
+      if (idempotency && !richApi && request.responseFormat === "b64_json") {
+        const candidateBody = JSON.stringify({
+          created: result.created,
+          data: result.data.map((output) => ({
+            b64_json: output.b64Json,
+            revised_prompt: output.revisedPrompt,
+          })),
+        });
+        if (new TextEncoder().encode(candidateBody).byteLength > replayQuota.maxBytes) {
+          throw new ImageProviderError(
+            "Image response is too large for idempotent replay; retry without Idempotency-Key",
+            413,
+            "response_too_large_for_idempotency",
+          );
+        }
+      }
+      const attachments: AttachmentRecord[] = [];
+      for (let ordinal = 0; ordinal < result.data.length; ordinal++) {
+        attachments.push(
+          await persistGeneratedImage(
+            c.get("user").id,
+            runId,
+            ordinal,
+            result.data[ordinal],
+          ),
+        );
+      }
+      const assets = await repo.finalizeGeneratedAssets({
+        ownerId: c.get("user").id,
+        usageRunId: runId,
+        providerModelId: executionTarget.providerModelId,
+        publicModelId: request.model,
+        upstreamModelId: executionTarget.upstreamModelId,
+        providerSlug: executionTarget.providerSlug,
+        pricingSnapshot: sourcePricing,
+        idempotencyKey: assetIdempotencyKey,
+        requestHash,
+        operation: "generation",
+        prompt: request.prompt,
+        providerCreatedAt: result.created,
+        assets: result.data.map((output, ordinal) => ({
+          attachmentId: attachments[ordinal].id,
+          ordinal,
+          width: output.width,
+          height: output.height,
+          revisedPrompt: output.revisedPrompt,
+        })),
+      });
+      const latencyMs = Math.round(performance.now() - started);
+      const costMicros = observedCostMicros;
+      const data = await Promise.all(
+        result.data.map(async (output, ordinal) =>
+          request.responseFormat === "url"
+            ? {
+              url: await signImageAssetUrl(assets[ordinal].id, c.get("user").id),
+              revised_prompt: output.revisedPrompt,
+            }
+            : { b64_json: output.b64Json, revised_prompt: output.revisedPrompt }
+        ),
+      );
+      const assetViews = await Promise.all(assets.map(generatedAssetView));
+      const body = richApi
+        ? JSON.stringify({
+          created: result.created,
+          assets: assetViews.map((asset) => ({ ...asset, costMicros })),
+          costMicros,
+          usage: {
+            input_tokens: providerUsage.inputTokens,
+            output_tokens: providerUsage.outputTokens,
+            total_tokens: providerUsage.inputTokens + providerUsage.outputTokens,
+          },
+        })
+        : JSON.stringify({
+          created: result.created,
+          data,
+          ...(providerUsage.source === "provider_tokens"
+            ? {
+              usage: {
+                input_tokens: providerUsage.inputTokens,
+                output_tokens: providerUsage.outputTokens,
+                total_tokens: providerUsage.inputTokens + providerUsage.outputTokens,
+              },
+            }
+            : {}),
+        });
+      await lease.checkpoint({
+        inputTokens: providerUsage.inputTokens,
+        outputTokens: providerUsage.outputTokens,
+        costMicros,
+        latencyMs,
+      });
+      if (idempotency) {
+        await repo.completeApiJson({
+          id: idempotency.id,
+          leaseToken: idempotency.leaseToken,
+          responseStatus: 200,
+          responseHeaders: { "content-type": "application/json" },
+          responseBody: body,
+          costMicros,
+          inputTokens: providerUsage.inputTokens,
+          outputTokens: providerUsage.outputTokens,
+          latencyMs,
+          quota: replayQuota,
+        });
+      } else {
+        await repo.settle(
+          runId,
+          costMicros,
+          providerUsage.inputTokens,
+          providerUsage.outputTokens,
+          latencyMs,
+        );
+      }
+      terminal = true;
+      return new Response(body, { status: 200, headers: { "content-type": "application/json" } });
+    } catch (error) {
+      if (!terminal) {
+        const providerError = error instanceof ImageProviderError ? error : undefined;
+        const domainError = error instanceof DomainError ? error : undefined;
+        const status = providerError?.status ?? domainError?.status ??
+          (c.req.raw.signal.aborted ? 499 : 502);
+        const code = providerError?.code ?? domainError?.code ??
+          (c.req.raw.signal.aborted ? "request_cancelled" : "provider_error");
+        const message = providerError?.message ?? domainError?.message ??
+          (c.req.raw.signal.aborted ? "Request cancelled" : "Image generation failed");
+        const responseBody = JSON.stringify(openAIError(message, code));
+        try {
+          if (idempotency) {
+            await repo.failApiRequest({
+              id: idempotency.id,
+              leaseToken: idempotency.leaseToken,
+              responseStatus: status,
+              responseHeaders: { "content-type": "application/json" },
+              responseBody,
+              billing: providerCompleted
+                ? {
+                  mode: "settle",
+                  costMicros: observedCostMicros,
+                  inputTokens: observedInputTokens,
+                  outputTokens: observedOutputTokens,
+                  latencyMs: Math.round(performance.now() - started),
+                }
+                : { mode: "refund" },
+            });
+          } else if (providerCompleted) {
+            await repo.settle(
+              runId,
+              observedCostMicros,
+              observedInputTokens,
+              observedOutputTokens,
+              Math.round(performance.now() - started),
+            );
+          } else await repo.refund(runId, message);
+          await repo.requestGeneratedObjectCleanup(c.get("user").id, runId, message);
+        } catch (persistenceError) {
+          throw new TerminalAccountingPersistenceError(persistenceError);
+        }
+        return new Response(responseBody, {
+          status,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      throw error;
+    } finally {
+      if (!streamOwnsLease) {
+        await imageSlot?.release();
+        await lease.stop();
+      }
+    }
+  };
   app.get(
     "/v1/models",
     requireScope("models:read"),
@@ -4830,12 +6004,9 @@ export function createApp(options: AppOptions = {}) {
   app.post(
     "/v1/images/generations",
     requireScope("chat:write"),
-    (c) =>
-      c.json(
-        openAIError("Image generation provider is not configured", "provider_not_configured"),
-        501,
-      ),
+    async (c) => await imageGenerationHandler(c, false),
   );
+  app.post("/api/images/generations", async (c) => await imageGenerationHandler(c, true));
   const audioHandler = (endpoint: "transcriptions" | "translations") =>
   async (
     c: Context<{ Variables: Variables }>,

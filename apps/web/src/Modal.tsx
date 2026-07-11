@@ -4,11 +4,12 @@ import { X } from "lucide-react";
 import { modalFocusableElements } from "./modalFocus.ts";
 
 export function Modal(
-  { title, close, children, dismissible = true }: {
+  { title, close, children, dismissible = true, variant = "default" }: {
     title: string;
     close: () => void;
     children: ReactNode;
     dismissible?: boolean;
+    variant?: "default" | "wide";
   },
 ) {
   const titleId = useId();
@@ -67,7 +68,7 @@ export function Modal(
     >
       <div
         ref={dialogRef}
-        className="modal"
+        className={`modal${variant === "wide" ? " modal-wide" : ""}`}
         role="dialog"
         tabIndex={-1}
         aria-modal="true"

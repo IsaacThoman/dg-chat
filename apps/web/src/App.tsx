@@ -39,6 +39,7 @@ import {
   GitBranch,
   Globe2,
   HardDrive,
+  Image as ImageIcon,
   KeyRound,
   LayoutDashboard,
   Lock,
@@ -110,6 +111,15 @@ import { SpeechPlaybackControl } from "./speech/SpeechPlaybackControl.tsx";
 import { speechTextForMarkdown } from "./speech/speechText.ts";
 import { useSpeechPlayback } from "./speech/useSpeechPlayback.ts";
 import type { SpeechPlaybackController, SpeechPlaybackState } from "./speech/playback.ts";
+import {
+  type GeneratedAsset,
+  type GeneratedAssetFilters,
+  GeneratedAssetGallery,
+  imageApi,
+  ImageGenerationSheet,
+  imageMutationBelongsToQuery,
+  useImageGeneration,
+} from "./images/index.ts";
 import type {
   Attachment,
   AuditFilters,
@@ -778,12 +788,27 @@ function MessageItem(
             {message.attachments?.map((a) => (
               <Fragment key={a.id}>
                 <a
-                  className="attachment"
+                  className={cn(
+                    "attachment",
+                    a.mimeType.startsWith("image/") && "image-attachment",
+                  )}
                   href={`/api/messages/${message.id}/attachments/${a.id}/content`}
+                  target={a.mimeType.startsWith("image/") ? "_blank" : undefined}
+                  rel={a.mimeType.startsWith("image/") ? "noreferrer" : undefined}
                 >
-                  <span>
-                    <FileText size={19} />
-                  </span>
+                  {a.mimeType.startsWith("image/")
+                    ? (
+                      <img
+                        src={`/api/messages/${message.id}/attachments/${a.id}/content`}
+                        alt={a.filename}
+                        loading="lazy"
+                      />
+                    )
+                    : (
+                      <span>
+                        <FileText size={19} />
+                      </span>
+                    )}
                   <div>
                     <strong>{a.filename}</strong>
                     <small>{a.mimeType} · {Math.max(1, Math.ceil(a.sizeBytes / 1024))} KB</small>
@@ -960,7 +985,7 @@ function AttachmentIngestionBadge({ attachment }: { attachment: Attachment }) {
   );
 }
 
-function Composer(
+export function Composer(
   {
     onSend,
     edit,
@@ -973,6 +998,7 @@ function Composer(
     transcriptionModels,
     transcriptionModel,
     setTranscriptionModel,
+    imageModels,
     disabledReason,
   }: {
     onSend: (
@@ -990,6 +1016,7 @@ function Composer(
     transcriptionModels: Model[];
     transcriptionModel?: string;
     setTranscriptionModel: (id: string) => void;
+    imageModels: Model[];
     disabledReason?: string;
   },
 ) {
@@ -998,6 +1025,23 @@ function Composer(
   const [toolContexts, setToolContexts] = useState<Array<{ id: string }>>([]);
   const [dragging, setDragging] = useState(false);
   const [selectionError, setSelectionError] = useState("");
+  const [imagePanel, setImagePanel] = useState<"create" | "gallery" | null>(null);
+  const [generatedAssets, setGeneratedAssets] = useState<GeneratedAsset[]>([]);
+  const [selectedGeneratedAssets, setSelectedGeneratedAssets] = useState<GeneratedAsset[]>([]);
+  const [imageHistoryLoading, setImageHistoryLoading] = useState(false);
+  const [imageHistoryError, setImageHistoryError] = useState("");
+  const [imageHistoryCursor, setImageHistoryCursor] = useState<string | null>(null);
+  const [imageHistoryFilters, setImageHistoryFilters] = useState<GeneratedAssetFilters>({
+    deleted: false,
+  });
+  const [imageMutationIds, setImageMutationIds] = useState<ReadonlySet<string>>(new Set());
+  const imageHistoryRequest = useRef(0);
+  const imageHistoryQueryGeneration = useRef(0);
+  const imageHistoryFiltersRef = useRef<GeneratedAssetFilters>(imageHistoryFilters);
+  const imageHistoryAbort = useRef<AbortController | null>(null);
+  const imageMutationRef = useRef(new Set<string>());
+  const imageGeneration = useImageGeneration();
+  imageHistoryFiltersRef.current = imageHistoryFilters;
   type UploadState =
     | "uploading"
     | "ready"
@@ -1033,6 +1077,102 @@ function Composer(
   const retainedAttachments = (edit?.attachments ?? []).filter((attachment) =>
     !excludedEditAttachments.has(attachment.id)
   );
+  const loadImageHistory = (
+    filters = imageHistoryFilters,
+    cursor?: string,
+    replace = false,
+  ) => {
+    const requestId = ++imageHistoryRequest.current;
+    imageHistoryAbort.current?.abort();
+    const controller = new AbortController();
+    imageHistoryAbort.current = controller;
+    setImageHistoryLoading(true);
+    setImageHistoryError("");
+    void imageApi.list({ ...filters, limit: 24, cursor }, controller.signal).then((page) => {
+      if (requestId !== imageHistoryRequest.current) return;
+      setGeneratedAssets((current) => {
+        const merged = replace ? page.data : [...current, ...page.data];
+        return [...new Map(merged.map((asset) => [asset.id, asset])).values()];
+      });
+      setImageHistoryCursor(page.nextCursor);
+    }).catch((error: unknown) => {
+      if (requestId !== imageHistoryRequest.current) return;
+      if (controller.signal.aborted) return;
+      setImageHistoryError(error instanceof Error ? error.message : "Couldn’t load image history.");
+    }).finally(() => {
+      if (requestId === imageHistoryRequest.current) setImageHistoryLoading(false);
+    });
+  };
+  const openImageGallery = () => {
+    setImagePanel("gallery");
+    setImageHistoryCursor(null);
+    loadImageHistory(imageHistoryFilters, undefined, true);
+  };
+  useEffect(() => () => imageHistoryAbort.current?.abort(), []);
+  const mutateImage = async (asset: GeneratedAsset, operation: "delete" | "restore") => {
+    if (imageMutationRef.current.has(asset.id)) return;
+    imageMutationRef.current.add(asset.id);
+    setImageMutationIds(new Set(imageMutationRef.current));
+    setImageHistoryError("");
+    const queryGeneration = imageHistoryQueryGeneration.current;
+    try {
+      if (operation === "delete") {
+        await imageApi.remove(asset.id);
+        setSelectedGeneratedAssets((current) => current.filter((item) => item.id !== asset.id));
+        if (
+          !imageMutationBelongsToQuery(queryGeneration, imageHistoryQueryGeneration.current)
+        ) {
+          loadImageHistory(imageHistoryFiltersRef.current, undefined, true);
+          return;
+        }
+        setGeneratedAssets((current) =>
+          imageHistoryFilters.deleted
+            ? current.map((item) =>
+              item.id === asset.id
+                ? {
+                  ...item,
+                  contentUrl: null,
+                  thumbnailUrl: null,
+                  status: "deleted" as const,
+                  deletedAt: new Date().toISOString(),
+                }
+                : item
+            )
+            : current.filter((item) => item.id !== asset.id)
+        );
+      } else {
+        const restored = await imageApi.restore(asset.id);
+        if (
+          !imageMutationBelongsToQuery(queryGeneration, imageHistoryQueryGeneration.current)
+        ) {
+          loadImageHistory(imageHistoryFiltersRef.current, undefined, true);
+          return;
+        }
+        setGeneratedAssets((current) =>
+          imageHistoryFilters.deleted
+            ? current.filter((item) => item.id !== restored.id)
+            : current.map((item) => item.id === restored.id ? restored : item)
+        );
+      }
+    } catch (error) {
+      setImageHistoryError(
+        error instanceof Error
+          ? error.message
+          : operation === "delete"
+          ? "Couldn’t delete image."
+          : "Couldn’t restore image.",
+      );
+    } finally {
+      imageMutationRef.current.delete(asset.id);
+      setImageMutationIds(new Set(imageMutationRef.current));
+    }
+  };
+  const addGeneratedAsset = (asset: GeneratedAsset) => {
+    if (!asset.attachmentId || asset.status !== "ready") return;
+    setSelectedGeneratedAssets((current) =>
+      current.some((item) => item.id === asset.id) ? current : [...current, asset]
+    );
+  };
   const beginUpload = (key: string, file: File) => {
     const controller = new AbortController();
     uploadControllers.current.set(key, controller);
@@ -1139,9 +1279,12 @@ function Composer(
   const blockedByUpload = uploads.some((item) => item.status !== "ready");
   const readyAttachmentIds = mergeAttachmentIds(
     retainedAttachments.map((attachment) => attachment.id),
-    uploads.flatMap((item) =>
-      item.status === "ready" && item.attachment ? [item.attachment.id] : []
-    ),
+    [
+      ...uploads.flatMap((item) =>
+        item.status === "ready" && item.attachment ? [item.attachment.id] : []
+      ),
+      ...selectedGeneratedAssets.flatMap((asset) => asset.attachmentId ? [asset.attachmentId] : []),
+    ],
   );
   const canSubmit =
     (value.trim().length > 0 || readyAttachmentIds.length > 0 || toolContexts.length > 0) &&
@@ -1152,6 +1295,7 @@ function Composer(
     if (await onSend(value.trim(), readyAttachmentIds, toolContexts.map((context) => context.id))) {
       setValue("");
       setUploads([]);
+      setSelectedGeneratedAssets([]);
       setToolContexts([]);
     }
   };
@@ -1184,7 +1328,8 @@ function Composer(
           </IconButton>
         </div>
       )}
-      {(retainedAttachments.length > 0 || uploads.length > 0) && (
+      {(retainedAttachments.length > 0 || uploads.length > 0 ||
+        selectedGeneratedAssets.length > 0) && (
         <div className="upload-list" aria-label="Selected attachments" aria-live="polite">
           {retainedAttachments.map((attachment) => (
             <div className="upload-chip upload-ready" key={`retained-${attachment.id}`}>
@@ -1249,6 +1394,28 @@ function Composer(
                 disabled={item.status === "removing"}
                 onClick={() =>
                   void removeUpload(item)}
+              >
+                <X size={15} />
+              </IconButton>
+            </div>
+          ))}
+          {selectedGeneratedAssets.map((asset) => (
+            <div className="upload-chip upload-ready generated-attachment-chip" key={asset.id}>
+              {asset.thumbnailUrl || asset.contentUrl
+                ? <img src={asset.thumbnailUrl ?? asset.contentUrl ?? ""} alt="" />
+                : <ImageIcon size={18} aria-hidden="true" />}
+              <span>
+                <strong>Generated image</strong>
+                <small>Ready · remains in image history</small>
+              </span>
+              <IconButton
+                label="Remove generated image from this message"
+                onClick={() =>
+                  setSelectedGeneratedAssets((current) =>
+                    current.filter((item) =>
+                      item.id !== asset.id
+                    )
+                  )}
               >
                 <X size={15} />
               </IconButton>
@@ -1327,6 +1494,27 @@ function Composer(
           >
             <Globe2 size={16} /> Search
           </button>
+          {imageModels.length > 0 && (
+            <button
+              type="button"
+              className="tool-pill"
+              aria-label="Create images"
+              onClick={() => {
+                imageGeneration.reset();
+                setImagePanel("create");
+              }}
+            >
+              <ImageIcon size={16} /> Create image
+            </button>
+          )}
+          <button
+            type="button"
+            className="tool-pill"
+            aria-label="Open image history"
+            onClick={openImageGallery}
+          >
+            <Boxes size={16} /> Images
+          </button>
           <button
             type="button"
             className="tool-pill"
@@ -1398,6 +1586,94 @@ function Composer(
         close={() => setToolsOpen(false)}
         insert={(execution) => setToolContexts((current) => [...current, { id: execution.id }])}
       />
+      {imagePanel === "create" && (
+        <ImageGenerationSheet
+          models={imageModels.map((model) => ({
+            id: model.id,
+            name: model.name,
+          }))}
+          state={imageGeneration.state}
+          close={() => {
+            imageGeneration.cancel();
+            setImagePanel(null);
+          }}
+          submit={(input) => {
+            void imageGeneration.run(input).then((result) => {
+              if (!result) return;
+              setGeneratedAssets((current) => [
+                ...result.assets,
+                ...current.filter((item) => !result.assets.some((asset) => asset.id === item.id)),
+              ]);
+            });
+          }}
+          cancel={imageGeneration.cancel}
+          add={addGeneratedAsset}
+          selectedIds={new Set(selectedGeneratedAssets.map((asset) => asset.id))}
+        />
+      )}
+      {imagePanel === "gallery" && (
+        <Modal
+          title="Image history"
+          close={() => setImagePanel(null)}
+          variant="wide"
+        >
+          <GeneratedAssetGallery
+            assets={generatedAssets}
+            filters={imageHistoryFilters}
+            models={[...new Set(imageModels.map((model) => model.id))]}
+            loading={imageHistoryLoading}
+            error={imageHistoryError}
+            hasMore={imageHistoryCursor !== null}
+            loadMore={() => {
+              if (imageHistoryCursor && !imageHistoryLoading) {
+                loadImageHistory(imageHistoryFilters, imageHistoryCursor);
+              }
+            }}
+            changeFilters={(filters) => {
+              imageHistoryQueryGeneration.current++;
+              imageHistoryFiltersRef.current = filters;
+              setImageHistoryFilters(filters);
+              setImageHistoryCursor(null);
+              setGeneratedAssets([]);
+              loadImageHistory(filters, undefined, true);
+            }}
+            pendingIds={imageMutationIds}
+            selectedIds={new Set(selectedGeneratedAssets.map((asset) => asset.id))}
+            add={(asset) => {
+              addGeneratedAsset(asset);
+            }}
+            remove={(asset) => {
+              void mutateImage(asset, "delete");
+            }}
+            restore={(asset) => {
+              void mutateImage(asset, "restore");
+            }}
+            retry={() => {
+              imageHistoryQueryGeneration.current++;
+              setImageHistoryCursor(null);
+              setGeneratedAssets([]);
+              loadImageHistory(imageHistoryFiltersRef.current, undefined, true);
+            }}
+          />
+          <div className="modal-actions">
+            <button type="button" className="secondary" onClick={() => setImagePanel(null)}>
+              Close
+            </button>
+            {imageModels.length > 0 && (
+              <button
+                type="button"
+                className="primary"
+                onClick={() => {
+                  imageGeneration.reset();
+                  setImagePanel("create");
+                }}
+              >
+                <Plus size={16} /> Create image
+              </button>
+            )}
+          </div>
+        </Modal>
+      )}
       <p className="composer-note">
         AI can make mistakes. Check important information.{" "}
         <span>
@@ -1636,6 +1912,10 @@ function ChatView({
   );
   const speechModels = useMemo(
     () => models.filter((model) => model.capabilities.includes("speech")),
+    [models],
+  );
+  const imageModels = useMemo(
+    () => models.filter((model) => model.capabilities.includes("image_generation")),
     [models],
   );
   const speechVoices = [
@@ -2305,6 +2585,7 @@ function ChatView({
               transcriptionModels={transcriptionModels}
               transcriptionModel={transcriptionModel}
               setTranscriptionModel={setTranscriptionModel}
+              imageModels={imageModels}
               onStop={() => {
                 if (activeStream?.phase === "stopping") return;
                 setActiveStream((current) => current ? { ...current, phase: "stopping" } : current);

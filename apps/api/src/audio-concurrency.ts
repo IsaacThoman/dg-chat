@@ -13,7 +13,11 @@ export interface AudioConcurrencyLease {
 }
 
 export interface AudioConcurrencyLimiter {
-  acquire(ownerId: string, limits: AudioConcurrencyLimits): Promise<AudioConcurrencyLease | null>;
+  acquire(
+    ownerId: string,
+    limits: AudioConcurrencyLimits,
+    namespace?: string,
+  ): Promise<AudioConcurrencyLease | null>;
   close(): Promise<void>;
 }
 
@@ -24,6 +28,12 @@ function validate(ownerId: string, limits: AudioConcurrencyLimits): void {
     !Number.isSafeInteger(limits.perUser) || limits.perUser < 1 ||
     limits.perUser > limits.global
   ) throw new TypeError("audio concurrency limits are invalid");
+}
+
+function validateNamespace(namespace: string): void {
+  if (!/^[a-z][a-z0-9_-]{0,31}$/.test(namespace)) {
+    throw new TypeError("concurrency namespace is invalid");
+  }
 }
 
 export class MemoryAudioConcurrencyLimiter implements AudioConcurrencyLimiter {
@@ -60,16 +70,25 @@ export class MemoryAudioConcurrencyLimiter implements AudioConcurrencyLimiter {
     }
   }
 
-  acquire(ownerId: string, limits: AudioConcurrencyLimits): Promise<AudioConcurrencyLease | null> {
+  acquire(
+    ownerId: string,
+    limits: AudioConcurrencyLimits,
+    namespace = "audio",
+  ): Promise<AudioConcurrencyLease | null> {
     validate(ownerId, limits);
+    validateNamespace(namespace);
     const now = this.#now();
     this.#purge(now);
     let ownerCount = 0;
-    for (const lease of this.#leases.values()) if (lease.ownerId === ownerId) ownerCount++;
-    if (this.#leases.size >= limits.global || ownerCount >= limits.perUser) {
+    for (const [leaseId, lease] of this.#leases) {
+      if (leaseId.startsWith(`${namespace}:`) && lease.ownerId === ownerId) ownerCount++;
+    }
+    const namespaceCount =
+      [...this.#leases.keys()].filter((id) => id.startsWith(`${namespace}:`)).length;
+    if (namespaceCount >= limits.global || ownerCount >= limits.perUser) {
       return Promise.resolve(null);
     }
-    const id = crypto.randomUUID();
+    const id = `${namespace}:${crypto.randomUUID()}`;
     const controller = new AbortController();
     const record: {
       ownerId: string;
@@ -199,12 +218,14 @@ export class RedisAudioConcurrencyLimiter implements AudioConcurrencyLimiter {
   async acquire(
     ownerId: string,
     limits: AudioConcurrencyLimits,
+    namespace = "audio",
   ): Promise<AudioConcurrencyLease | null> {
     validate(ownerId, limits);
+    validateNamespace(namespace);
     await this.#ensureConnected();
     const id = crypto.randomUUID();
-    const globalKey = "dg-chat:audio:{concurrency}:global";
-    const userKey = `dg-chat:audio:{concurrency}:user:${ownerId}`;
+    const globalKey = `dg-chat:${namespace}:{concurrency}:global`;
+    const userKey = `dg-chat:${namespace}:{concurrency}:user:${ownerId}`;
     // Start the local fencing deadline before the round trip. Redis computes its expiry while
     // executing the script, so using response time could let this holder outlive Redis by one RTT.
     const acquisitionStartedAt = Date.now();

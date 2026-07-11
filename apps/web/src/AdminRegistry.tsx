@@ -161,6 +161,7 @@ function ProviderForm({ provider, close }: { provider?: AdminProvider; close: ()
             )
             : [...current, { ...saved, modelCount: 0 }],
       );
+      await queryClient.invalidateQueries({ queryKey: ["models"] });
       close();
     } catch (reason) {
       setError(errorMessage(reason));
@@ -391,7 +392,10 @@ export function AdminProviders() {
     } catch (error) {
       setNotice({ message: errorMessage(error), error: true });
     } finally {
-      await queryClient.invalidateQueries({ queryKey: ["admin-providers"] });
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["admin-providers"] }),
+        queryClient.invalidateQueries({ queryKey: ["models"] }),
+      ]);
       setBusy(undefined);
     }
   };
@@ -590,11 +594,17 @@ function ModelForm(
           enabled: draft.enabled,
         });
       } else await api.createAdminModel({ ...draft, contextWindow: Number(draft.contextWindow) });
-      await queryClient.invalidateQueries({ queryKey: ["admin-models"] });
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["admin-models"] }),
+        queryClient.invalidateQueries({ queryKey: ["models"] }),
+      ]);
       close();
     } catch (reason) {
       setError(errorMessage(reason));
-      await queryClient.invalidateQueries({ queryKey: ["admin-models"] });
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["admin-models"] }),
+        queryClient.invalidateQueries({ queryKey: ["models"] }),
+      ]);
     } finally {
       setBusy(false);
     }
@@ -735,7 +745,10 @@ function PriceForm({ model, close }: { model: AdminModel; close: () => void }) {
         fixedCallMicros: usdToMicros(values.fixed),
         source: values.source,
       });
-      await queryClient.invalidateQueries({ queryKey: ["admin-models"] });
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["admin-models"] }),
+        queryClient.invalidateQueries({ queryKey: ["models"] }),
+      ]);
       close();
     } catch (reason) {
       setError(errorMessage(reason));

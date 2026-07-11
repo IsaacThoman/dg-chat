@@ -1,4 +1,4 @@
-import { assertEquals, assertRejects, assertThrows } from "jsr:@std/assert@1.0.14";
+import { assertEquals, assertExists, assertRejects, assertThrows } from "jsr:@std/assert@1.0.14";
 import postgres from "npm:postgres@3.4.7";
 import { DomainError } from "./memory.ts";
 import { parseStoredModelCapabilities, PostgresRepository } from "./normalized-postgres.ts";
@@ -2184,6 +2184,205 @@ Deno.test({
       assertEquals(replacement.attachment.id === attachment.id, false);
     } finally {
       await repo.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "generated assets finalize concurrently with immutable owner-scoped lineage",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 1 });
+    await sql`TRUNCATE generated_asset_inputs,generated_assets,audit_events,document_chunks,
+      message_attachments,attachments,jobs,ledger_entries,usage_runs,model_price_versions,
+      provider_models,providers,api_tokens,sessions,messages,conversations,users
+      RESTART IDENTITY CASCADE`;
+    const first = await PostgresRepository.connect(databaseUrl!);
+    const second = await PostgresRepository.connect(databaseUrl!);
+    try {
+      const owner = await first.bootstrapAdmin({
+        email: "generated-assets@database.test",
+        name: "Generated assets",
+        passwordHash: "hash",
+      }, 1_000_000);
+      const stranger = await first.createUser({
+        email: "generated-assets-stranger@database.test",
+        name: "Stranger",
+        passwordHash: "hash",
+      });
+      const provider = await first.createProvider({
+        slug: "generated-images",
+        displayName: "Generated images",
+        baseUrl: "https://images.example/v1",
+        protocol: "responses",
+      }, { actorId: owner.id, action: "provider.create" });
+      const model = await first.createProviderModel({
+        providerId: provider.id,
+        publicModelId: "generated-images/artist",
+        upstreamModelId: "artist-v1",
+        displayName: "Artist",
+        capabilities: ["image_generation"],
+        contextWindow: 1,
+      }, { actorId: owner.id, action: "provider_model.create" });
+      const price = await first.createModelPriceVersion({
+        providerModelId: model.id,
+        expectedModelVersion: model.version,
+        effectiveAt: "2020-01-01T00:00:00.000Z",
+        inputMicrosPerMillion: 1,
+        cachedInputMicrosPerMillion: 2,
+        reasoningMicrosPerMillion: 3,
+        outputMicrosPerMillion: 4,
+        fixedCallMicros: 5,
+        source: "asset-postgres-test",
+      }, { actorId: owner.id, action: "model_price.create" });
+      const pricingSnapshot = {
+        pricingVersionId: price.id,
+        inputMicrosPerMillion: price.inputMicrosPerMillion,
+        cachedInputMicrosPerMillion: price.cachedInputMicrosPerMillion,
+        reasoningMicrosPerMillion: price.reasoningMicrosPerMillion,
+        outputMicrosPerMillion: price.outputMicrosPerMillion,
+        fixedCallMicros: price.fixedCallMicros,
+        source: price.source,
+      };
+      await first.reserve(
+        owner.id,
+        "generated-asset-run",
+        model.publicModelId,
+        100,
+        provider.slug,
+        undefined,
+        pricingSnapshot,
+      );
+      const createAttachment = async (name: string, digest: string) =>
+        (await first.createAttachment({
+          ownerId: owner.id,
+          objectKey: `generated/${owner.id}/${name}.png`,
+          filename: `${name}.png`,
+          mimeType: "image/png",
+          sizeBytes: 100,
+          sha256: digest.repeat(64).slice(0, 64),
+          state: "ready",
+        })).attachment;
+      const source = await createAttachment("source", "a");
+      const output = await createAttachment("output", "b");
+      const input = {
+        ownerId: owner.id,
+        usageRunId: "generated-asset-run",
+        providerModelId: model.id,
+        publicModelId: model.publicModelId,
+        upstreamModelId: model.upstreamModelId,
+        providerSlug: provider.slug,
+        pricingSnapshot,
+        idempotencyKey: "generated-assets-postgres",
+        requestHash: "c".repeat(64),
+        operation: "edit" as const,
+        prompt: "Revise the generated image",
+        providerCreatedAt: 1_700_000_000,
+        assets: [{
+          attachmentId: output.id,
+          ordinal: 0,
+          width: 1024,
+          height: 1024,
+          inputs: [{ attachmentId: source.id, role: "source" as const, ordinal: 0 }],
+        }],
+      };
+      const stage = await first.stageGeneratedObject({
+        ownerId: owner.id,
+        usageRunId: input.usageRunId,
+        ordinal: 0,
+        objectKey: output.objectKey,
+        mimeType: output.mimeType,
+        sizeBytes: output.sizeBytes,
+        sha256: output.sha256,
+      });
+      await first.markGeneratedObjectStored(stage.id, owner.id);
+      await first.attachGeneratedObject(stage.id, owner.id, output.id);
+      const concurrent = await Promise.all([
+        first.finalizeGeneratedAssets(input),
+        second.finalizeGeneratedAssets(input),
+      ]);
+      assertEquals(concurrent[0][0].id, concurrent[1][0].id);
+      assertEquals(concurrent[0][0].inputs[0].attachmentId, source.id);
+      assertEquals(
+        (await sql<{ state: string }[]>`SELECT state FROM generated_object_staging
+          WHERE id=${stage.id}`)[0].state,
+        "finalized",
+      );
+      await first.updateProvider(provider.id, provider.version, { slug: "renamed-images" }, {
+        actorId: owner.id,
+        action: "provider.update",
+      });
+      const currentModel = await first.findProviderModel(model.id);
+      assertExists(currentModel);
+      await first.updateProviderModel(model.id, currentModel.version, {
+        publicModelId: "renamed-images/new-artist",
+        upstreamModelId: "artist-v2",
+      }, { actorId: owner.id, action: "provider_model.update" });
+      const historical = await first.getGeneratedAsset(concurrent[0][0].id, owner.id);
+      assertEquals({
+        publicModelId: historical.publicModelId,
+        upstreamModelId: historical.upstreamModelId,
+        providerSlug: historical.providerSlug,
+        pricingSnapshot: historical.pricingSnapshot,
+      }, {
+        publicModelId: model.publicModelId,
+        upstreamModelId: model.upstreamModelId,
+        providerSlug: provider.slug,
+        pricingSnapshot,
+      });
+      assertEquals((await first.finalizeGeneratedAssets(input))[0].id, concurrent[0][0].id);
+      await assertRejects(
+        () => first.getGeneratedAsset(concurrent[0][0].id, stranger.id),
+        DomainError,
+        "not found",
+      );
+      const conversation = await first.createConversation(owner.id, "Generated output");
+      const message = await first.appendMessage({
+        conversationId: conversation.id,
+        ownerId: owner.id,
+        parentId: null,
+        role: "user",
+        content: "preserve",
+        expectedVersion: 0,
+        idempotencyKey: "generated-output-message",
+      });
+      await first.linkAttachmentToMessage(message.id, output.id, owner.id);
+      await first.deleteGeneratedAsset(concurrent[0][0].id, owner.id);
+      assertEquals((await first.listGeneratedAssets(owner.id)).length, 0);
+      assertEquals((await first.listMessageAttachments(message.id, owner.id))[0].id, output.id);
+      assertEquals((await first.getAttachment(output.id, owner.id)).state, "ready");
+      assertEquals(
+        (await first.restoreGeneratedAsset(concurrent[0][0].id, owner.id)).deletedAt,
+        null,
+      );
+      await assertRejects(
+        () =>
+          first.finalizeGeneratedAssets({
+            ...input,
+            requestHash: "d".repeat(64),
+          }),
+        DomainError,
+        "differs",
+      );
+      await assertRejects(
+        () =>
+          first.finalizeGeneratedAssets({
+            ...input,
+            idempotencyKey: "generated-assets-other-key",
+          }),
+        DomainError,
+        "already has generated assets",
+      );
+      assertEquals(
+        (await sql`SELECT count(*)::int count FROM generated_assets`)[0].count,
+        1,
+      );
+    } finally {
+      await first.close();
+      await second.close();
+      await sql.end();
     }
   },
 });

@@ -74,6 +74,8 @@ const documentExtractionLimits: DocumentExtractionLimits = {
   maxZipCompressionRatio: positiveInteger("DOCUMENT_EXTRACTION_MAX_ZIP_RATIO", 200),
 };
 const jobDeadlineMarginMs = positiveInteger("WORKER_JOB_DEADLINE_MARGIN_MS", 5_000);
+const generatedCleanupGraceSeconds = positiveInteger("GENERATED_OBJECT_CLEANUP_GRACE_SECONDS", 600);
+const generatedCleanupSweepMs = positiveInteger("GENERATED_OBJECT_CLEANUP_SWEEP_MS", 60_000);
 if (!Number.isSafeInteger(pollMs) || pollMs < 10) {
   throw new Error("WORKER_POLL_MS must be an integer of at least 10 milliseconds");
 }
@@ -108,6 +110,32 @@ if (!discoveredObjectStore) {
 }
 const objectStore: ObjectStore = discoveredObjectStore;
 console.log(JSON.stringify({ level: "info", message: "Worker started", workerId }));
+async function enqueueStaleGeneratedObjectCleanup() {
+  await sql.begin(async (tx) => {
+    const rows = await tx<{ id: string; owner_id: string }[]>`
+      UPDATE generated_object_staging s SET state='cleanup_pending',
+        cleanup_error=COALESCE(cleanup_error,'stale generated object stage'),updated_at=now()
+      WHERE s.state IN ('pending','stored','attached','cleaning')
+        AND s.updated_at < now() - ${generatedCleanupGraceSeconds} * interval '1 second'
+        AND NOT EXISTS(SELECT 1 FROM generated_assets ga WHERE ga.usage_run_id=s.usage_run_id)
+        AND NOT EXISTS(SELECT 1 FROM api_idempotency_requests r
+          WHERE r.usage_run_id=s.usage_run_id AND r.state='in_progress'
+            AND r.lease_expires_at>now())
+        AND NOT EXISTS(SELECT 1 FROM usage_runs u WHERE u.id=s.usage_run_id
+          AND u.status='reserved' AND u.run_lease_expires_at>now())
+      RETURNING s.id,s.owner_id`;
+    for (const row of rows) {
+      await tx`INSERT INTO jobs(type,payload,idempotency_key,status,attempts,available_at)
+        VALUES('generated_object.cleanup',${
+        tx.json({ stageId: String(row.id), ownerId: String(row.owner_id) })
+      },${`generated_object.cleanup:${String(row.id)}`},'queued',0,now())
+        ON CONFLICT(idempotency_key) DO UPDATE SET status='queued',attempts=0,available_at=now(),
+          last_error=NULL,locked_at=NULL,locked_by=NULL,completed_at=NULL
+          WHERE jobs.status IN ('completed','failed')`;
+    }
+  });
+}
+await enqueueStaleGeneratedObjectCleanup();
 if (knowledgeEmbeddingConfig) {
   await sql`INSERT INTO jobs(type,payload,idempotency_key,status,attempts,available_at)
     SELECT 'document.embed',jsonb_build_object(
@@ -326,12 +354,90 @@ async function processJob(
       if (!committed) throw new Error("Document embedding claim was reclaimed or changed");
       return true;
     }
+    case "generated_object.cleanup": {
+      const value = job.payload as { stageId?: unknown; ownerId?: unknown };
+      if (
+        !value || typeof value !== "object" || typeof value.stageId !== "string" ||
+        typeof value.ownerId !== "string" || !/^[0-9a-f-]{36}$/i.test(value.stageId) ||
+        !/^[0-9a-f-]{36}$/i.test(value.ownerId)
+      ) throw new Error("Generated object cleanup payload is invalid");
+      const stageId = value.stageId as string;
+      const ownerId = value.ownerId as string;
+      const claimed = await sql.begin(async (tx) => {
+        const candidates = await tx<{
+          state: string;
+          object_key: string;
+          attachment_id: string | null;
+        }[]>`SELECT state,object_key,attachment_id FROM generated_object_staging
+          WHERE id=${stageId} AND owner_id=${ownerId}`;
+        const candidate = candidates[0];
+        if (candidate?.attachment_id) {
+          // Reference writers take the same attachment row lock and require ready/not-deleted.
+          // Fencing the attachment before the external delete closes the check/delete race.
+          await tx`SELECT id FROM attachments WHERE id=${candidate.attachment_id}
+            AND owner_id=${ownerId} FOR UPDATE`;
+        }
+        const rows = await tx<{ object_key: string; attachment_id: string | null }[]>`
+          UPDATE generated_object_staging s SET state='cleaning',updated_at=now()
+          FROM jobs j WHERE s.id=${stageId} AND s.owner_id=${ownerId}
+            AND s.state IN ('cleanup_pending','cleaning')
+            AND j.id=${job.id} AND j.status='running' AND j.locked_by=${job.claimToken}
+            AND NOT EXISTS(SELECT 1 FROM generated_assets ga
+              WHERE ga.usage_run_id=s.usage_run_id OR ga.attachment_id=s.attachment_id)
+            AND NOT EXISTS(SELECT 1 FROM message_attachments ma
+              WHERE ma.attachment_id=s.attachment_id)
+          RETURNING s.object_key,s.attachment_id`;
+        if (rows[0]) {
+          if (rows[0].attachment_id) {
+            const fenced = await tx`UPDATE attachments SET state='deleted',
+              deleted_at=COALESCE(deleted_at,now()),updated_at=now()
+              WHERE id=${rows[0].attachment_id} AND owner_id=${ownerId}
+                AND state='ready' AND deleted_at IS NULL RETURNING id`;
+            if (!fenced.length) {
+              throw new Error("Generated object cleanup attachment is not ready to fence");
+            }
+          }
+          return rows[0];
+        }
+        const stage = candidate ? [candidate] : [];
+        if (!stage.length || ["finalized", "cleaned"].includes(stage[0].state)) {
+          await tx`UPDATE jobs SET status='completed',completed_at=now(),locked_at=NULL,
+            locked_by=NULL,last_error=NULL WHERE id=${job.id} AND status='running'
+            AND locked_by=${job.claimToken}`;
+          return null;
+        }
+        throw new Error("Generated object cleanup is fenced by a durable reference");
+      });
+      if (!claimed) return true;
+      await objectStore.delete(claimed.object_key);
+      const committed = await sql.begin(async (tx) => {
+        const fence = await tx`SELECT id FROM jobs WHERE id=${job.id} AND status='running'
+          AND locked_by=${job.claimToken} FOR UPDATE`;
+        if (!fence.length) return false;
+        const stages = await tx`SELECT id FROM generated_object_staging
+          WHERE id=${stageId} AND owner_id=${ownerId} AND state='cleaning'
+          FOR UPDATE`;
+        if (!stages.length) return false;
+        await tx`UPDATE generated_object_staging SET state='cleaned',cleanup_error=NULL,
+          updated_at=now() WHERE id=${stageId}`;
+        await tx`UPDATE jobs SET status='completed',completed_at=now(),locked_at=NULL,
+          locked_by=NULL,last_error=NULL WHERE id=${job.id}`;
+        return true;
+      });
+      if (!committed) throw new Error("Generated object cleanup claim was reclaimed");
+      return true;
+    }
     default:
       throw new Error(`Unsupported job type: ${job.type}`);
   }
 }
 
+let nextGeneratedCleanupSweep = Date.now() + generatedCleanupSweepMs;
 while (!stopping) {
+  if (Date.now() >= nextGeneratedCleanupSweep) {
+    await enqueueStaleGeneratedObjectCleanup();
+    nextGeneratedCleanupSweep = Date.now() + generatedCleanupSweepMs;
+  }
   const job = await claimJob(sql, workerId, jobLeaseSeconds);
   if (!job) {
     await new Promise((resolve) => setTimeout(resolve, pollMs));

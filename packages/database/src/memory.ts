@@ -53,9 +53,12 @@ import type {
   FailApiRequestInput,
   FailGenerationInput,
   FinalizeEmbeddingProviderUsageInput,
+  FinalizeGeneratedAssetsInput,
   FinalizeProviderUsageInput,
   FinishEmbeddingProviderAttemptInput,
   FinishProviderAttemptInput,
+  GeneratedAssetRecord,
+  GeneratedObjectStage,
   GenerationControl,
   GenerationResult,
   IdentityTokenPurpose,
@@ -80,6 +83,7 @@ import type {
   SearchConversationKnowledgeInput,
   SessionSummary,
   SetProviderModelRouteInput,
+  StageGeneratedObjectInput,
   StartProviderAttemptInput,
   StoredProviderCredential,
   UpdateProviderInput,
@@ -87,7 +91,14 @@ import type {
   UpdateProviderRetryPolicyInput,
   UsagePricingSnapshot,
 } from "./repository.ts";
-import { decodeAuditCursor, encodeAuditCursor, isUsagePricingSnapshot } from "./repository.ts";
+import {
+  decodeAuditCursor,
+  encodeAuditCursor,
+  isUsagePricingSnapshot,
+  sameGeneratedAssetFinalization,
+  usagePricingSnapshotsEqual,
+  validateGeneratedAssetFinalization,
+} from "./repository.ts";
 
 export interface StoredUser extends PublicUser {
   passwordHash: string;
@@ -380,6 +391,19 @@ function validateCredentialEnvelope(envelope: ProviderCredentialEnvelope) {
   ) throw new DomainError("validation_error", "Provider credential envelope is invalid", 422);
 }
 
+function validateGeneratedObjectStage(input: StageGeneratedObjectInput) {
+  if (
+    !/^[0-9a-f-]{36}$/i.test(input.ownerId) || !input.usageRunId ||
+    input.usageRunId.length > 200 || !Number.isSafeInteger(input.ordinal) || input.ordinal < 0 ||
+    input.ordinal > 9 || !input.objectKey || input.objectKey.length > 1024 ||
+    input.objectKey.startsWith("/") ||
+    input.objectKey.split("/").some((part) => !part || part === "..") ||
+    !/^[\w.+-]+\/[\w.+-]+$/.test(input.mimeType) || input.mimeType.length > 255 ||
+    !Number.isSafeInteger(input.sizeBytes) || input.sizeBytes < 1 ||
+    input.sizeBytes > 25 * 1024 * 1024 || !/^[0-9a-f]{64}$/.test(input.sha256)
+  ) throw new DomainError("validation_error", "Generated object stage is invalid", 422);
+}
+
 export class MemoryRepository {
   readonly storageKind: "memory" | "postgres" = "memory";
   readonly users = new Map<string, StoredUser>();
@@ -393,6 +417,8 @@ export class MemoryRepository {
   }>();
   readonly auditEvents: AuditEvent[] = [];
   readonly attachments = new Map<string, AttachmentRecord>();
+  readonly generatedAssets = new Map<string, GeneratedAssetRecord>();
+  readonly generatedObjectStages = new Map<string, GeneratedObjectStage>();
   readonly messageAttachments = new Map<string, Set<string>>();
   readonly documentChunks = new Map<string, DocumentChunk[]>();
   readonly documentChunkEmbeddings = new Map<string, DocumentChunkEmbeddingInput>();
@@ -1429,7 +1455,7 @@ export class MemoryRepository {
       }
       return {
         attachment: prior,
-        inspectionJobId: this.enqueueAttachmentInspection(prior),
+        inspectionJobId: input.inspectionComplete ? null : this.enqueueAttachmentInspection(prior),
         deduplicated: true,
       };
     }
@@ -1457,7 +1483,9 @@ export class MemoryRepository {
     this.enqueueAttachmentIngestion(attachment);
     return {
       attachment,
-      inspectionJobId: this.enqueueAttachmentInspection(attachment),
+      inspectionJobId: input.inspectionComplete
+        ? null
+        : this.enqueueAttachmentInspection(attachment),
       deduplicated: false,
     };
   }
@@ -1549,6 +1577,245 @@ export class MemoryRepository {
     return [...(this.messageAttachments.get(messageId) ?? [])].map((id) =>
       this.getAttachment(id, ownerId, true)
     );
+  }
+
+  finalizeGeneratedAssets(input: FinalizeGeneratedAssetsInput): GeneratedAssetRecord[] {
+    validateGeneratedAssetFinalization(input);
+    const prior = [...this.generatedAssets.values()].filter((asset) =>
+      asset.ownerId === input.ownerId && asset.idempotencyKey === input.idempotencyKey
+    ).sort((a, b) => a.ordinal - b.ordinal);
+    if (prior.length) {
+      if (!sameGeneratedAssetFinalization(prior, input)) {
+        throw new DomainError(
+          "idempotency_conflict",
+          "Generated asset replay payload differs",
+          409,
+        );
+      }
+      return prior;
+    }
+    const run = this.usageRuns.get(input.usageRunId);
+    if (!run || run.userId !== input.ownerId) {
+      throw new DomainError("not_found", "Usage run not found", 404);
+    }
+    const model = this.providerModels.get(input.providerModelId);
+    const provider = model ? this.providers.get(model.providerId) : undefined;
+    const price = [...this.modelPriceVersions.values()].flat().find((candidate) =>
+      candidate.id === input.pricingSnapshot.pricingVersionId
+    );
+    if (!model || !provider) {
+      throw new DomainError("not_found", "Provider model not found", 404);
+    }
+    if (
+      run.model !== input.publicModelId || model.upstreamModelId !== input.upstreamModelId ||
+      provider.slug !== input.providerSlug ||
+      !price ||
+      !usagePricingSnapshotsEqual({
+        pricingVersionId: price.id,
+        inputMicrosPerMillion: price.inputMicrosPerMillion,
+        cachedInputMicrosPerMillion: price.cachedInputMicrosPerMillion,
+        reasoningMicrosPerMillion: price.reasoningMicrosPerMillion,
+        outputMicrosPerMillion: price.outputMicrosPerMillion,
+        fixedCallMicros: price.fixedCallMicros,
+        source: price.source,
+      }, input.pricingSnapshot) ||
+      !usagePricingSnapshotsEqual(run.pricingSnapshot ?? undefined, input.pricingSnapshot)
+    ) {
+      throw new DomainError(
+        "snapshot_conflict",
+        "Generated asset registry snapshot does not match the usage run",
+        409,
+      );
+    }
+    if ([...this.generatedAssets.values()].some((asset) => asset.usageRunId === input.usageRunId)) {
+      throw new DomainError("idempotency_conflict", "Usage run already has generated assets", 409);
+    }
+    const now = new Date().toISOString();
+    const created = input.assets.map((candidate) => {
+      const attachment = this.getAttachment(candidate.attachmentId, input.ownerId);
+      if (attachment.state !== "ready") {
+        throw new DomainError(
+          "attachment_not_ready",
+          "Generated asset attachment is not ready",
+          409,
+        );
+      }
+      for (const source of candidate.inputs ?? []) {
+        const sourceAttachment = this.getAttachment(source.attachmentId, input.ownerId);
+        if (sourceAttachment.state !== "ready") {
+          throw new DomainError("attachment_not_ready", "Generated asset input is not ready", 409);
+        }
+      }
+      return {
+        id: crypto.randomUUID(),
+        ownerId: input.ownerId,
+        usageRunId: input.usageRunId,
+        providerModelId: input.providerModelId,
+        publicModelId: input.publicModelId,
+        upstreamModelId: input.upstreamModelId,
+        providerSlug: input.providerSlug,
+        pricingSnapshot: structuredClone(input.pricingSnapshot),
+        attachmentId: candidate.attachmentId,
+        idempotencyKey: input.idempotencyKey,
+        requestHash: input.requestHash,
+        operation: input.operation,
+        prompt: input.prompt,
+        providerCreatedAt: input.providerCreatedAt,
+        ordinal: candidate.ordinal,
+        width: candidate.width,
+        height: candidate.height,
+        revisedPrompt: candidate.revisedPrompt ?? null,
+        inputs: (candidate.inputs ?? []).map((source) => ({ ...source })),
+        createdAt: now,
+        updatedAt: now,
+        deletedAt: null,
+      } satisfies GeneratedAssetRecord;
+    });
+    const stages = created.map((asset) =>
+      [...this.generatedObjectStages.values()].find((candidate) =>
+        candidate.usageRunId === input.usageRunId && candidate.ordinal === asset.ordinal
+      )
+    );
+    for (let index = 0; index < created.length; index++) {
+      const stage = stages[index];
+      if (
+        stage && (stage.state !== "attached" || stage.attachmentId !== created[index].attachmentId)
+      ) {
+        throw new DomainError(
+          "generated_stage_conflict",
+          "Generated object stage is not ready",
+          409,
+        );
+      }
+    }
+    for (const asset of created) this.generatedAssets.set(asset.id, asset);
+    for (let index = 0; index < created.length; index++) {
+      const stage = stages[index];
+      if (!stage) continue;
+      stage.state = "finalized";
+      stage.updatedAt = now;
+    }
+    return created;
+  }
+
+  listGeneratedAssets(ownerId: string, includeDeleted = false) {
+    return [...this.generatedAssets.values()].filter((asset) =>
+      asset.ownerId === ownerId && (includeDeleted || !asset.deletedAt)
+    ).sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
+  }
+
+  findGeneratedAssetsByIdempotency(ownerId: string, idempotencyKey: string) {
+    return [...this.generatedAssets.values()].filter((asset) =>
+      asset.ownerId === ownerId && asset.idempotencyKey === idempotencyKey
+    ).sort((a, b) => a.ordinal - b.ordinal).map((asset) => structuredClone(asset));
+  }
+
+  getGeneratedAsset(id: string, ownerId: string, includeDeleted = false) {
+    const asset = this.generatedAssets.get(id);
+    if (!asset || asset.ownerId !== ownerId || (!includeDeleted && asset.deletedAt)) {
+      throw new DomainError("not_found", "Generated asset not found", 404);
+    }
+    return asset;
+  }
+
+  deleteGeneratedAsset(id: string, ownerId: string) {
+    const asset = this.getGeneratedAsset(id, ownerId, true);
+    if (!asset.deletedAt) asset.deletedAt = asset.updatedAt = new Date().toISOString();
+    return asset;
+  }
+
+  restoreGeneratedAsset(id: string, ownerId: string) {
+    const asset = this.getGeneratedAsset(id, ownerId, true);
+    if (asset.deletedAt) {
+      asset.deletedAt = null;
+      asset.updatedAt = new Date().toISOString();
+    }
+    return asset;
+  }
+
+  stageGeneratedObject(input: StageGeneratedObjectInput) {
+    validateGeneratedObjectStage(input);
+    const run = this.usageRuns.get(input.usageRunId);
+    if (!run || run.userId !== input.ownerId) {
+      throw new DomainError("not_found", "Usage run not found", 404);
+    }
+    const prior = [...this.generatedObjectStages.values()].find((stage) =>
+      stage.usageRunId === input.usageRunId && stage.ordinal === input.ordinal
+    );
+    if (prior) {
+      if (
+        prior.ownerId !== input.ownerId || prior.objectKey !== input.objectKey ||
+        prior.mimeType !== input.mimeType || prior.sizeBytes !== input.sizeBytes ||
+        prior.sha256 !== input.sha256
+      ) throw new DomainError("idempotency_conflict", "Generated object stage differs", 409);
+      return structuredClone(prior);
+    }
+    if (
+      [...this.generatedObjectStages.values()].some((stage) => stage.objectKey === input.objectKey)
+    ) {
+      throw new DomainError("object_key_taken", "Generated object key already exists", 409);
+    }
+    const now = new Date().toISOString();
+    const stage: GeneratedObjectStage = {
+      ...input,
+      id: crypto.randomUUID(),
+      attachmentId: null,
+      state: "pending",
+      cleanupError: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.generatedObjectStages.set(stage.id, stage);
+    return structuredClone(stage);
+  }
+
+  markGeneratedObjectStored(id: string, ownerId: string) {
+    const stage = this.generatedObjectStages.get(id);
+    if (!stage || stage.ownerId !== ownerId) {
+      throw new DomainError("not_found", "Generated object stage not found", 404);
+    }
+    if (stage.state === "pending") stage.state = "stored";
+    else if (stage.state !== "stored") {
+      throw new DomainError("generated_stage_conflict", "Generated object stage changed", 409);
+    }
+    stage.updatedAt = new Date().toISOString();
+    return structuredClone(stage);
+  }
+
+  attachGeneratedObject(id: string, ownerId: string, attachmentId: string) {
+    const stage = this.generatedObjectStages.get(id);
+    const attachment = this.getAttachment(attachmentId, ownerId);
+    if (!stage || stage.ownerId !== ownerId) {
+      throw new DomainError("not_found", "Generated object stage not found", 404);
+    }
+    if (attachment.state !== "ready") {
+      throw new DomainError("attachment_not_ready", "Generated attachment is not ready", 409);
+    }
+    if (stage.state === "stored") {
+      stage.state = "attached";
+      stage.attachmentId = attachmentId;
+    } else if (stage.state !== "attached" || stage.attachmentId !== attachmentId) {
+      throw new DomainError("generated_stage_conflict", "Generated object stage changed", 409);
+    }
+    stage.updatedAt = new Date().toISOString();
+    return structuredClone(stage);
+  }
+
+  requestGeneratedObjectCleanup(ownerId: string, usageRunId: string, reason: string) {
+    let count = 0;
+    for (const stage of this.generatedObjectStages.values()) {
+      if (
+        stage.ownerId !== ownerId || stage.usageRunId !== usageRunId ||
+        stage.state === "finalized" ||
+        stage.state === "cleaned"
+      ) continue;
+      stage.state = "cleanup_pending";
+      stage.cleanupError = reason.slice(0, 1000);
+      stage.updatedAt = new Date().toISOString();
+      this.enqueueJob("generated_object.cleanup", { stageId: stage.id, ownerId });
+      count++;
+    }
+    return count;
   }
 
   beginAttachmentIngestion(id: string, ownerId: string) {
@@ -3563,6 +3830,20 @@ export class MemoryRepository {
     }
     request.leaseExpiresAt = new Date(Date.now() + leaseSeconds * 1000).toISOString();
   }
+  reclaimApiRequest(id: string, expiredLeaseToken: string, leaseSeconds = 120) {
+    if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1) {
+      throw new DomainError("validation_error", "Lease duration is invalid", 422);
+    }
+    const request = this.#apiRequest(id);
+    if (
+      request.state !== "in_progress" || request.leaseToken !== expiredLeaseToken ||
+      !request.leaseExpiresAt || Date.parse(request.leaseExpiresAt) > Date.now()
+    ) throw new DomainError("stale_lease", "Idempotent request cannot be reclaimed", 409);
+    const leaseToken = crypto.randomUUID();
+    request.leaseToken = leaseToken;
+    request.leaseExpiresAt = new Date(Date.now() + leaseSeconds * 1_000).toISOString();
+    return { request: structuredClone(request), leaseToken };
+  }
   #completeApi(input: CompleteApiRequestInput, stream: boolean) {
     const request = this.#apiRequest(input.id);
     const responseBodyEncoding = input.responseBodyEncoding ?? "utf8";
@@ -3716,6 +3997,10 @@ export class MemoryRepository {
       if (
         request.state !== "in_progress" || !request.leaseExpiresAt ||
         Date.parse(request.leaseExpiresAt) > Date.now()
+      ) continue;
+      if (
+        request.endpoint === "images.generations" &&
+        [...this.generatedAssets.values()].some((asset) => asset.usageRunId === request.usageRunId)
       ) continue;
       if (request.observedCostMicros > 0) {
         this.settle(
