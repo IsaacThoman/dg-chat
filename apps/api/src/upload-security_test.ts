@@ -134,6 +134,18 @@ Deno.test("recognizes DOCX from its central directory when local entries exceed 
   assertEquals((await upload.inspection).mime, DOCX_MIME_TYPE);
 });
 
+Deno.test("DOCX sniffing requires canonical package part casing", async () => {
+  const packageBytes = zipSync({
+    "[CONTENT_TYPES].XML": strToU8("<Types/>"),
+    "word/document.xml": strToU8("<w:document/>"),
+  });
+  const upload = secureUploadStream(stream(packageBytes), "case.docx", DOCX_MIME_TYPE, {
+    maxBytes: 4096,
+  });
+  await assertRejects(() => drain(upload.stream), UploadSecurityError);
+  await assertRejects(() => upload.inspection, UploadSecurityError);
+});
+
 Deno.test("detects polyglot markers in the middle of a streamed upload across chunks", async () => {
   const prefix = new Uint8Array(24);
   prefix.set(bytes(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a));
@@ -153,6 +165,48 @@ Deno.test("detects polyglot markers in the middle of a streamed upload across ch
   );
   await assertRejects(() => drain(upload.stream), UploadSecurityError, "Conflicting");
   await assertRejects(() => upload.inspection, UploadSecurityError, "Conflicting");
+});
+
+Deno.test("PE polyglot detection validates a DOS and PE header without mz false positives", async () => {
+  const png = new Uint8Array(256);
+  png.set(bytes(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a));
+  new DataView(png.buffer).setUint32(16, 1);
+  new DataView(png.buffer).setUint32(20, 1);
+  png.set(strToU8("ordinary amazing image metadata"), 32);
+  const valid = secureUploadStream(stream(png), "valid.png", "image/png", { maxBytes: 1024 });
+  await drain(valid.stream);
+  assertEquals((await valid.inspection).mime, "image/png");
+
+  const pe = png.slice();
+  pe[64] = 0x4d;
+  pe[65] = 0x5a;
+  new DataView(pe.buffer).setUint32(64 + 0x3c, 0x50, true);
+  pe.set(bytes(0x50, 0x45, 0, 0), 64 + 0x50);
+  const hostile = secureUploadStream(stream(pe.slice(0, 90), pe.slice(90)), "pe.png", "image/png", {
+    maxBytes: 1024,
+  });
+  await assertRejects(() => drain(hostile.stream), UploadSecurityError, "Conflicting");
+  await assertRejects(() => hostile.inspection, UploadSecurityError, "Conflicting");
+});
+
+Deno.test("validates the complete JSON document instead of only its prefix", async () => {
+  const valid = secureUploadStream(
+    stream(strToU8('{"safe":'), strToU8("true}")),
+    "valid.json",
+    "application/json",
+    { maxBytes: 1024 },
+  );
+  await drain(valid.stream);
+  assertEquals((await valid.inspection).mime, "application/json");
+
+  const hostile = secureUploadStream(
+    stream(strToU8('{"safe":true}'), strToU8("<script>alert(1)</script>")),
+    "hostile.json",
+    "application/json",
+    { maxBytes: 1024 },
+  );
+  await assertRejects(() => drain(hostile.stream), UploadSecurityError, "malformed");
+  await assertRejects(() => hostile.inspection, UploadSecurityError, "malformed");
 });
 
 Deno.test("rejects binary polyglots and malformed image dimensions", async () => {

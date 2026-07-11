@@ -221,6 +221,7 @@ interface ZipEntry {
   expanded: number;
   flags: number;
   method: number;
+  crc32: number;
   localOffset: number;
 }
 
@@ -274,6 +275,7 @@ function zipEntries(bytes: Uint8Array, value: RequiredLimits): ZipEntry[] {
     }
     const flags = u16(bytes, offset + 8);
     const method = u16(bytes, offset + 10);
+    const crc32 = u32(bytes, offset + 16);
     const compressed = u32(bytes, offset + 20);
     const expanded = u32(bytes, offset + 24);
     const nameLength = u16(bytes, offset + 28);
@@ -331,6 +333,7 @@ function zipEntries(bytes: Uint8Array, value: RequiredLimits): ZipEntry[] {
     );
     if (
       localEnd > directoryOffset || localName !== name || u16(bytes, localOffset + 6) !== flags ||
+      u16(bytes, localOffset + 8) !== method || u32(bytes, localOffset + 14) !== crc32 ||
       u32(bytes, localOffset + 18) !== compressed || u32(bytes, localOffset + 22) !== expanded
     ) {
       throw new DocumentExtractionError(
@@ -338,13 +341,24 @@ function zipEntries(bytes: Uint8Array, value: RequiredLimits): ZipEntry[] {
         "DOCX ZIP local and central entries disagree",
       );
     }
-    entries.push({ name, compressed, expanded, flags, method, localOffset });
+    entries.push({ name, compressed, expanded, flags, method, crc32, localOffset });
     offset = end;
   }
   if (offset !== directoryOffset + directorySize) {
     throw new DocumentExtractionError("invalid_docx", "DOCX ZIP directory size is inconsistent");
   }
   return entries;
+}
+
+const CRC32_TABLE = new Uint32Array(256).map((_, index) => {
+  let value = index;
+  for (let bit = 0; bit < 8; bit++) value = value & 1 ? 0xedb88320 ^ value >>> 1 : value >>> 1;
+  return value >>> 0;
+});
+
+function updateCrc32(crc: number, bytes: Uint8Array): number {
+  for (const byte of bytes) crc = CRC32_TABLE[(crc ^ byte) & 0xff] ^ crc >>> 8;
+  return crc >>> 0;
 }
 
 function assertActualInflation(
@@ -359,8 +373,10 @@ function assertActualInflation(
     const start = entry.localOffset + 30 + nameLength + extraLength;
     const end = start + entry.compressed;
     let expanded = 0;
-    const count = (length: number) => {
-      expanded += length;
+    let crc = 0xffffffff;
+    const count = (chunk: Uint8Array) => {
+      expanded += chunk.byteLength;
+      crc = updateCrc32(crc, chunk);
       if (expanded > value.maxZipEntryBytes) {
         throw new DocumentExtractionError("zip_entry_exceeded", "A DOCX ZIP entry is too large");
       }
@@ -369,13 +385,16 @@ function assertActualInflation(
       }
     };
     if (entry.method === 0) {
-      count(entry.compressed);
+      count(archive.subarray(start, end));
     } else if (entry.method === 8) {
-      const inflater = new Inflate((chunk) => count(chunk.byteLength));
-      for (let cursor = start; cursor < end; cursor += 64 * 1024) {
+      const inflater = new Inflate((chunk) => count(chunk));
+      // Small input increments bound the amount a hostile stream can inflate before
+      // the output callback enforces limits. Hard timeout isolation is layered above.
+      const inputIncrement = 128;
+      for (let cursor = start; cursor < end; cursor += inputIncrement) {
         inflater.push(
-          archive.subarray(cursor, Math.min(end, cursor + 64 * 1024)),
-          cursor + 64 * 1024 >= end,
+          archive.subarray(cursor, Math.min(end, cursor + inputIncrement)),
+          cursor + inputIncrement >= end,
         );
       }
     } else {
@@ -389,6 +408,9 @@ function assertActualInflation(
         "invalid_docx",
         "DOCX ZIP entry size does not match its directory metadata",
       );
+    }
+    if ((crc ^ 0xffffffff) >>> 0 !== entry.crc32) {
+      throw new DocumentExtractionError("invalid_docx", "DOCX ZIP entry checksum is invalid");
     }
     total += expanded;
     if (total > value.maxZipExpandedBytes) {
@@ -419,7 +441,14 @@ function xmlText(value: string): string {
 }
 
 function assertSafeDocx(entries: ZipEntry[], files: Record<string, Uint8Array>): void {
+  const names = new Set(entries.map((entry) => entry.name));
   const lowerNames = entries.map((entry) => entry.name.toLowerCase());
+  if (!names.has("[Content_Types].xml") || !names.has("word/document.xml")) {
+    throw new DocumentExtractionError(
+      "invalid_docx",
+      "DOCX required package parts must use canonical names",
+    );
+  }
   if (lowerNames.some((name) => name.endsWith("vbaproject.bin") || name.includes("/macros/"))) {
     throw new DocumentExtractionError("docx_macro", "Macro-enabled DOCX files are not allowed");
   }
@@ -442,6 +471,17 @@ function assertSafeDocx(entries: ZipEntry[], files: Record<string, Uint8Array>):
     throw new DocumentExtractionError(
       "docx_active_content",
       "Embedded or active DOCX content is not allowed",
+    );
+  }
+  const documentXml = decoder.decode(files["word/document.xml"]);
+  const fieldInstructions = [
+    ...documentXml.matchAll(/<w:instrText\b[^>]*>([\s\S]*?)<\/w:instrText\s*>/gi),
+    ...documentXml.matchAll(/<w:fldSimple\b[^>]*\bw:instr\s*=\s*["']([^"']*)["']/gi),
+  ];
+  if (fieldInstructions.some((match) => /\bDDE(?:AUTO)?\b/i.test(match[1]))) {
+    throw new DocumentExtractionError(
+      "docx_active_content",
+      "DDE-enabled DOCX fields are not allowed",
     );
   }
   for (const [name, bytes] of Object.entries(files)) {
