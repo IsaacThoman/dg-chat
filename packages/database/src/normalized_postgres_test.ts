@@ -2050,12 +2050,26 @@ Deno.test({
         id: "00000000-0000-8000-8000-000000000002",
         ordinal: 0,
         content: "{}",
-        metadata: { sourceAttachmentId: created.attachment.id, startLine: 1, endLine: 1 },
+        metadata: {
+          sourceAttachmentId: created.attachment.id,
+          extractorVersion: "json-v2",
+          chunkerVersion: "semantic-v3",
+          pageNumber: 3,
+          pageLabel: "A-3",
+          section: "Configuration",
+          sectionPath: ["Manual", "Configuration"],
+          startLine: 1,
+          endLine: 1,
+        },
       };
       await repo.completeAttachmentIngestion(created.attachment.id, owner.id, [chunk]);
       assertEquals(
         (await repo.listDocumentChunks(created.attachment.id, owner.id))[0].content,
         "{}",
+      );
+      assertEquals(
+        (await repo.listDocumentChunks(created.attachment.id, owner.id))[0].metadata,
+        chunk.metadata,
       );
       await assertRejects(
         () => repo.listDocumentChunks(created.attachment.id, stranger.id),
@@ -2074,6 +2088,15 @@ Deno.test({
         DomainError,
         "invalid",
       );
+      await assertRejects(
+        () =>
+          repo.completeAttachmentIngestion(created.attachment.id, owner.id, [{
+            ...chunk,
+            metadata: { ...chunk.metadata, sectionPath: ["x".repeat(501)] },
+          }]),
+        DomainError,
+        "invalid",
+      );
       assertEquals(
         (await repo.listDocumentChunks(created.attachment.id, owner.id))[0].content,
         "{}",
@@ -2088,6 +2111,116 @@ Deno.test({
       assertEquals(
         (await repo.retryAttachmentIngestion(created.attachment.id, owner.id)).ingestionStatus,
         "queued",
+      );
+    } finally {
+      await repo.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "normalized PDF and DOCX eligibility queues and retries with owner isolation",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 1 });
+    await sql`TRUNCATE audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
+    await sql.end();
+    const repo = await PostgresRepository.connect(databaseUrl!);
+    try {
+      const owner = await repo.bootstrapAdmin({
+        email: "formats@database.test",
+        name: "Formats",
+        passwordHash: "hash",
+      }, 1);
+      const stranger = await repo.createUser({
+        email: "formats-stranger@database.test",
+        name: "Stranger",
+        passwordHash: "hash",
+      });
+      const eligible = [
+        ["application/pdf", "document.pdf"],
+        [
+          "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+          "document.docx",
+        ],
+      ] as const;
+      for (const [index, [mimeType, filename]] of eligible.entries()) {
+        let attachment = (await repo.createAttachment({
+          ownerId: owner.id,
+          objectKey: `users/${owner.id}/objects/${filename}`,
+          filename,
+          mimeType,
+          sizeBytes: 10,
+          sha256: String(index + 1).repeat(64),
+          state: index === 0 ? "ready" : "pending",
+        })).attachment;
+        if (index === 1) {
+          await repo.transitionAttachment(attachment.id, owner.id, "pending", "inspecting");
+          attachment = await repo.transitionAttachment(
+            attachment.id,
+            owner.id,
+            "inspecting",
+            "ready",
+          );
+        }
+        assertEquals(attachment.ingestionStatus, "queued");
+        await assertRejects(
+          () => repo.beginAttachmentIngestion(attachment.id, stranger.id),
+          DomainError,
+          "not found",
+        );
+        assertEquals(
+          (await repo.beginAttachmentIngestion(attachment.id, owner.id)).ingestionStatus,
+          "processing",
+        );
+        assertEquals(
+          (await repo.failAttachmentIngestion(attachment.id, owner.id, "extract failed"))
+            .ingestionStatus,
+          "failed",
+        );
+        await assertRejects(
+          () => repo.retryAttachmentIngestion(attachment.id, stranger.id),
+          DomainError,
+          "not found",
+        );
+        assertEquals(
+          (await repo.retryAttachmentIngestion(attachment.id, owner.id)).ingestionStatus,
+          "queued",
+        );
+      }
+      assertEquals(
+        (await repo.listJobs()).filter((job) => job.type === "attachment.ingest").length,
+        2,
+      );
+
+      for (
+        const [index, mimeType] of [
+          "application/vnd.ms-word.document.macroEnabled.12",
+          "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ].entries()
+      ) {
+        const attachment = (await repo.createAttachment({
+          ownerId: owner.id,
+          objectKey: `users/${owner.id}/objects/unsupported-${index}`,
+          filename: "unsupported.office",
+          mimeType,
+          sizeBytes: 10,
+          sha256: String(index + 3).repeat(64),
+          state: "ready",
+        })).attachment;
+        assertEquals(attachment.ingestionStatus, "not_applicable");
+        await assertRejects(
+          () => repo.beginAttachmentIngestion(attachment.id, owner.id),
+          DomainError,
+          "not queued",
+        );
+      }
+      assertEquals(
+        (await repo.listJobs()).filter((job) => job.type === "attachment.ingest").length,
+        2,
       );
     } finally {
       await repo.close();

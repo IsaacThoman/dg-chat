@@ -36,12 +36,15 @@ tombstoned objects remain available only through an immutable historical message
 files receive a bounded full decode before becoming ready. GIF and WebP files remain quarantined
 because a trusted full decoder is not yet configured.
 
-The current attachment worker acknowledges terminal inspection states; it is not an antivirus,
-content-disarm, PDF, Office, audio, or archive scanner. PDF and audio acceptance currently relies on
-bounded upload handling and MIME/signature checks, so deployments requiring malware scanning must
-add an external quarantine scanner before allowing those formats. Bounded, strict UTF-8 ingestion is
-implemented only for `text/plain` and fully validated JSON, with deterministic citation chunks.
-Office and PDF extraction, OCR, vector persistence/retrieval, object garbage collection, and
+The current attachment worker acknowledges terminal inspection states; it is not an antivirus or
+content-disarm scanner. Audio acceptance still relies on bounded upload handling and MIME/signature
+checks, so deployments requiring malware scanning must add an external quarantine scanner. Bounded,
+strict UTF-8 ingestion is implemented for `text/plain` and fully validated JSON. PDF extraction has
+raw-byte, page-count, and output limits. PDF and DOCX parsing runs in a terminable worker isolate
+under one absolute, lease-margined job deadline. DOCX extraction preflights the ZIP directory and
+rejects ZIP64/multidisk archives, traversal, encryption, macros, external relationships, excessive
+entries, per-entry size, aggregate expansion, and suspicious compression ratios before extraction.
+Other Office formats, OCR, vector persistence/retrieval, object garbage collection, and
 retention-aware deletion are not implemented. The embeddings proxy is implemented with the same
 DNS-pinned, private-network-blocking provider transport and strict bounded response validation used
 by other provider calls; conversation knowledge currently uses local lexical ranking.

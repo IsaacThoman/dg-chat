@@ -3368,6 +3368,37 @@ kbd {
   cursor: not-allowed;
   opacity: .62;
 }
+.knowledge-file-picker-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: stretch;
+  gap: 6px;
+}
+.knowledge-file-picker-row > label {
+  min-width: 0;
+}
+.knowledge-picker-retry {
+  align-self: stretch;
+  min-height: 44px;
+}
+.knowledge-ingestion-status {
+  display: grid;
+  min-width: 0;
+  justify-items: start;
+  gap: 2px;
+}
+.knowledge-ingestion-status small {
+  max-width: 100%;
+  overflow: visible !important;
+  text-overflow: clip !important;
+  white-space: normal !important;
+  overflow-wrap: anywhere;
+  line-height: 1.4;
+}
+.knowledge-ingestion-status .link-button {
+  min-height: 44px;
+  padding: 0 8px;
+}
 .knowledge-mode:disabled label,
 .knowledge-checks input:disabled {
   cursor: not-allowed;

@@ -82,7 +82,7 @@ jobs:
       - name: Run database integration, concurrency, and backfill tests
         run: |
           deno test packages/database --allow-env --allow-net --allow-read --allow-write
-          deno test apps/worker --allow-env --allow-net --allow-read --allow-write
+          deno test --unstable-worker-options apps/worker --allow-env --allow-net --allow-read --allow-write
 
   containers:
     name: Container build

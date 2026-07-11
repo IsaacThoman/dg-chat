@@ -11,6 +11,11 @@ import type {
   UserRole,
 } from "@dg-chat/contracts";
 import type { LedgerEntry, StoredApiToken, StoredSession, StoredUser, UsageRun } from "./memory.ts";
+export {
+  DOCX_MIME_TYPE,
+  INGESTIBLE_DOCUMENT_MIME_TYPES,
+  isIngestibleDocumentMime,
+} from "./attachment-policy.ts";
 
 export type MaybePromise<T> = T | Promise<T>;
 
@@ -134,14 +139,119 @@ export interface AttachmentRecord {
   updatedAt: string;
   deletedAt: string | null;
 }
+export interface DocumentChunkMetadata extends Record<string, unknown> {
+  sourceAttachmentId?: string;
+  filename?: string;
+  mimeType?: string;
+  sha256?: string;
+  extractorVersion?: string;
+  chunkerVersion?: string;
+  pageNumber?: number;
+  pageLabel?: string;
+  section?: string;
+  sectionPath?: string[];
+  startLine?: number;
+  endLine?: number;
+  charStart?: number;
+  charEnd?: number;
+}
 export interface DocumentChunkInput {
   id: string;
   ordinal: number;
   content: string;
-  metadata: Record<string, unknown>;
+  metadata: DocumentChunkMetadata;
 }
 export interface DocumentChunk extends DocumentChunkInput {
   attachmentId: string;
+}
+
+const DOCUMENT_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const DOCUMENT_UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function isJsonValue(value: unknown, depth = 0): boolean {
+  if (depth > 8) return false;
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (Array.isArray(value)) {
+    return value.length <= 100 && value.every((item) => isJsonValue(item, depth + 1));
+  }
+  if (!value || typeof value !== "object" || Object.getPrototypeOf(value) !== Object.prototype) {
+    return false;
+  }
+  const entries = Object.entries(value as Record<string, unknown>);
+  return entries.length <= 100 &&
+    entries.every(([key, item]) => key.length <= 128 && isJsonValue(item, depth + 1));
+}
+
+/** Validates and JSON-clones chunk metadata so memory and PostgreSQL persist identical values. */
+export function normalizeDocumentChunkMetadata(
+  metadata: DocumentChunkMetadata,
+): DocumentChunkMetadata {
+  if (!isJsonValue(metadata)) {
+    throw new TypeError("Document chunk metadata is invalid");
+  }
+  const serialized = JSON.stringify(metadata);
+  if (serialized.length > 32_768) {
+    throw new TypeError("Document chunk metadata is too large");
+  }
+  if (
+    (metadata.sourceAttachmentId !== undefined &&
+      (typeof metadata.sourceAttachmentId !== "string" ||
+        !DOCUMENT_UUID_PATTERN.test(metadata.sourceAttachmentId))) ||
+    (metadata.extractorVersion !== undefined &&
+      (typeof metadata.extractorVersion !== "string" ||
+        !DOCUMENT_VERSION_PATTERN.test(metadata.extractorVersion))) ||
+    (metadata.chunkerVersion !== undefined &&
+      (typeof metadata.chunkerVersion !== "string" ||
+        !DOCUMENT_VERSION_PATTERN.test(metadata.chunkerVersion))) ||
+    (metadata.filename !== undefined &&
+      (typeof metadata.filename !== "string" || metadata.filename.length > 255)) ||
+    (metadata.mimeType !== undefined &&
+      (typeof metadata.mimeType !== "string" || metadata.mimeType.length > 255)) ||
+    (metadata.sha256 !== undefined &&
+      (typeof metadata.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(metadata.sha256))) ||
+    (metadata.pageNumber !== undefined &&
+      (!Number.isSafeInteger(metadata.pageNumber) || metadata.pageNumber < 1)) ||
+    (metadata.pageLabel !== undefined &&
+      (typeof metadata.pageLabel !== "string" || metadata.pageLabel.length > 120)) ||
+    (metadata.section !== undefined &&
+      (typeof metadata.section !== "string" || metadata.section.length > 500)) ||
+    (metadata.sectionPath !== undefined &&
+      (!Array.isArray(metadata.sectionPath) || metadata.sectionPath.length > 32 ||
+        metadata.sectionPath.some((part) => typeof part !== "string" || part.length > 500))) ||
+    ([metadata.startLine, metadata.endLine].some((value) =>
+      value !== undefined && (!Number.isSafeInteger(value) || Number(value) < 1)
+    )) ||
+    ([metadata.charStart, metadata.charEnd].some((value) =>
+      value !== undefined && (!Number.isSafeInteger(value) || Number(value) < 0)
+    )) ||
+    (metadata.startLine !== undefined && metadata.endLine !== undefined &&
+      metadata.endLine < metadata.startLine) ||
+    (metadata.charStart !== undefined && metadata.charEnd !== undefined &&
+      metadata.charEnd < metadata.charStart)
+  ) throw new TypeError("Document chunk metadata is invalid");
+  return JSON.parse(serialized) as DocumentChunkMetadata;
+}
+
+/** Validates a complete replacement set before any existing chunks are removed. */
+export function validateDocumentChunkInputs(
+  chunks: readonly DocumentChunkInput[],
+  attachmentId?: string,
+): DocumentChunkInput[] {
+  const ids = new Set<string>();
+  return chunks.map((chunk, index) => {
+    if (
+      !DOCUMENT_UUID_PATTERN.test(chunk.id) || chunk.ordinal !== index || !chunk.content ||
+      chunk.content.length > 20_000 || ids.has(chunk.id)
+    ) throw new TypeError("Document chunks are invalid");
+    ids.add(chunk.id);
+    const metadata = normalizeDocumentChunkMetadata(chunk.metadata);
+    if (attachmentId && metadata.sourceAttachmentId !== attachmentId) {
+      throw new TypeError("Document chunks are invalid");
+    }
+    return { ...chunk, metadata };
+  });
 }
 export interface CreateAttachmentInput {
   ownerId: string;

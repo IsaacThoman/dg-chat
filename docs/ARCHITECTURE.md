@@ -36,11 +36,16 @@ flowchart LR
   planned.
 - The worker claims durable jobs using `FOR UPDATE SKIP LOCKED`. Handlers must be idempotent and
   retry-safe. Text and JSON attachments use a separate, fenced ingestion state machine that streams
-  private objects through byte/time and UTF-8/JSON validation, then transactionally replaces stable,
-  citation-aware chunks. Conversation-bound collections support deterministic lexical retrieval or
+  private objects through byte/time and format validation, then transactionally replaces stable,
+  citation-aware chunks. One absolute deadline spans object acquisition, extraction, and chunking,
+  leaves a safety margin before lease expiry, and runs PDF/DOCX parsers in a terminable worker
+  isolate. Text and JSON use strict UTF-8 parsing; PDF extraction is page-bounded and DOCX
+  extraction rejects unsafe archives, macros, encryption, traversal, excessive expansion, and
+  external relationships before decompression. Chunk and extractor versions are persisted with page
+  or section provenance. Conversation-bound collections support deterministic lexical retrieval or
   bounded full-context injection with persisted source provenance. The OpenAI-compatible embeddings
   endpoint is implemented for capable provider-registry models, but vector persistence/retrieval,
-  PDF/Office extraction, OCR, malware scanning, and quarantined-file reprocessing remain planned.
+  other Office formats, OCR, malware scanning, and quarantined-file reprocessing remain planned.
 
 ## Core invariants
 

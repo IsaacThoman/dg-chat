@@ -56,51 +56,12 @@ export async function readIngestionText(
   timeoutMs = 30_000,
   expectedSha256?: string,
 ): Promise<string> {
-  if (object.contentLength !== null && object.contentLength > maxBytes) {
-    throw new Error("Attachment exceeds the ingestion byte limit");
-  }
-  const reader = object.body.getReader();
-  const decoder = new TextDecoder("utf-8", { fatal: true });
-  let timedOut = false;
-  const deadline = setTimeout(() => {
-    timedOut = true;
-    void reader.cancel("Ingestion timed out");
-  }, timeoutMs);
-  let text = "";
-  let bytes = 0;
-  const rawChunks: Uint8Array[] = [];
+  const raw = await readIngestionBytes(object, maxBytes, timeoutMs, expectedSha256);
+  let text: string;
   try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (timedOut) throw new Error("Attachment ingestion timed out");
-      if (done) break;
-      bytes += value.byteLength;
-      if (bytes > maxBytes) throw new Error("Attachment exceeds the ingestion byte limit");
-      rawChunks.push(value.slice());
-      text += decoder.decode(value, { stream: true });
-    }
-    text += decoder.decode();
-    if (timedOut) throw new Error("Attachment ingestion timed out");
-  } catch (error) {
-    if (error instanceof TypeError) throw new Error("Attachment is not valid UTF-8 text");
-    throw error;
-  } finally {
-    clearTimeout(deadline);
-    await reader.cancel().catch(() => undefined);
-    reader.releaseLock();
-  }
-  if (expectedSha256) {
-    const raw = new Uint8Array(bytes);
-    let offset = 0;
-    for (const chunk of rawChunks) {
-      raw.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", raw));
-    const actual = [...digest].map((value) => value.toString(16).padStart(2, "0")).join("");
-    if (actual !== expectedSha256) {
-      throw new Error("Attachment object digest does not match its record");
-    }
+    text = new TextDecoder("utf-8", { fatal: true }).decode(raw);
+  } catch {
+    throw new Error("Attachment is not valid UTF-8 text");
   }
   text = text.replaceAll("\r\n", "\n").replaceAll("\r", "\n");
   if (mimeType === "application/json") {
@@ -111,6 +72,54 @@ export async function readIngestionText(
     }
   }
   return text;
+}
+
+export async function readIngestionBytes(
+  object: StoredObject,
+  maxBytes: number,
+  timeoutMs: number,
+  expectedSha256?: string,
+): Promise<Uint8Array> {
+  if (object.contentLength !== null && object.contentLength > maxBytes) {
+    throw new Error("Attachment exceeds the ingestion byte limit");
+  }
+  const reader = object.body.getReader();
+  let timedOut = false;
+  const deadline = setTimeout(() => {
+    timedOut = true;
+    void reader.cancel("Ingestion timed out");
+  }, timeoutMs);
+  let bytes = 0;
+  const rawChunks: Uint8Array[] = [];
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (timedOut) throw new Error("Attachment ingestion timed out");
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > maxBytes) throw new Error("Attachment exceeds the ingestion byte limit");
+      rawChunks.push(value.slice());
+    }
+    if (timedOut) throw new Error("Attachment ingestion timed out");
+  } finally {
+    clearTimeout(deadline);
+    await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
+  const raw = new Uint8Array(bytes);
+  let offset = 0;
+  for (const chunk of rawChunks) {
+    raw.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  if (expectedSha256) {
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", raw));
+    const actual = [...digest].map((value) => value.toString(16).padStart(2, "0")).join("");
+    if (actual !== expectedSha256) {
+      throw new Error("Attachment object digest does not match its record");
+    }
+  }
+  return raw;
 }
 
 async function stableChunkId(seed: string): Promise<string> {
@@ -161,42 +170,71 @@ export async function deterministicChunks(input: {
   text: string;
   chunkChars?: number;
   overlapChars?: number;
+  extractorVersion?: string;
+  chunkerVersion?: string;
+  sourceUnits?: Array<{
+    text: string;
+    metadata?: {
+      pageNumber?: number;
+      pageLabel?: string;
+      section?: string;
+      sectionPath?: string[];
+    };
+  }>;
+  deadlineAt?: number;
 }): Promise<DocumentChunkInput[]> {
   const chunkChars = input.chunkChars ?? 4000;
   const overlap = input.overlapChars ?? 400;
   if (chunkChars < 2 || overlap < 0 || overlap >= chunkChars) {
     throw new TypeError("Invalid chunk bounds");
   }
-  if (!input.text) return [];
+  const sourceUnits = input.sourceUnits?.length
+    ? input.sourceUnits
+    : [{ text: input.text, metadata: undefined }];
+  if (!sourceUnits.some((unit) => unit.text)) return [];
   const chunks: DocumentChunkInput[] = [];
-  const newlines = newlineOffsets(input.text);
-  for (let start = 0, ordinal = 0; start < input.text.length; ordinal++) {
-    let end = codePointBoundary(input.text, Math.min(input.text.length, start + chunkChars));
-    if (end < input.text.length) {
-      const newline = input.text.lastIndexOf("\n", end);
-      if (newline > start + Math.floor(chunkChars / 2)) end = newline + 1;
+  for (const [unitIndex, unit] of sourceUnits.entries()) {
+    const newlines = newlineOffsets(unit.text);
+    for (let start = 0; start < unit.text.length;) {
+      if (input.deadlineAt !== undefined && Date.now() >= input.deadlineAt) {
+        throw new Error("Document processing timed out");
+      }
+      let end = codePointBoundary(unit.text, Math.min(unit.text.length, start + chunkChars));
+      if (end < unit.text.length) {
+        const newline = unit.text.lastIndexOf("\n", end);
+        if (newline > start + Math.floor(chunkChars / 2)) end = newline + 1;
+      }
+      const ordinal = chunks.length;
+      const content = unit.text.slice(start, end);
+      chunks.push({
+        id: await stableChunkId(
+          `${input.attachmentId}:${input.sha256}:${unitIndex}:${ordinal}:${start}:${end}`,
+        ),
+        ordinal,
+        content,
+        metadata: {
+          sourceAttachmentId: input.attachmentId,
+          filename: input.filename,
+          mimeType: input.mimeType,
+          sha256: input.sha256,
+          extractorVersion: input.extractorVersion,
+          chunkerVersion: input.chunkerVersion,
+          ...unit.metadata,
+          startLine: lineAt(newlines, start),
+          endLine: lineAt(newlines, Math.max(start, end - 1)),
+          charStart: start,
+          charEnd: end,
+        },
+      });
+      if (input.deadlineAt !== undefined && Date.now() >= input.deadlineAt) {
+        throw new Error("Document processing timed out");
+      }
+      if (end === unit.text.length) break;
+      const overlapped = codePointBoundary(unit.text, end - overlap);
+      start = overlapped > start
+        ? overlapped
+        : start + (unit.text.codePointAt(start)! > 0xffff ? 2 : 1);
     }
-    const content = input.text.slice(start, end);
-    chunks.push({
-      id: await stableChunkId(`${input.attachmentId}:${input.sha256}:${ordinal}:${start}:${end}`),
-      ordinal,
-      content,
-      metadata: {
-        sourceAttachmentId: input.attachmentId,
-        filename: input.filename,
-        mimeType: input.mimeType,
-        sha256: input.sha256,
-        startLine: lineAt(newlines, start),
-        endLine: lineAt(newlines, Math.max(start, end - 1)),
-        charStart: start,
-        charEnd: end,
-      },
-    });
-    if (end === input.text.length) break;
-    const overlapped = codePointBoundary(input.text, end - overlap);
-    start = overlapped > start
-      ? overlapped
-      : start + (input.text.codePointAt(start)! > 0xffff ? 2 : 1);
   }
   return chunks;
 }

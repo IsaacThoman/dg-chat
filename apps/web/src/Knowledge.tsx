@@ -22,6 +22,56 @@ import type { Attachment, KnowledgeCollection, KnowledgeMode } from "./types.ts"
 const errorMessage = (error: unknown) =>
   error instanceof ApiError || error instanceof Error ? error.message : "Something went wrong";
 
+const ACTIVE_INGESTION_STATES = new Set(["queued", "processing"]);
+
+export function hasActiveIngestion(files: Attachment[] | undefined): boolean {
+  return files?.some((file) => ACTIVE_INGESTION_STATES.has(file.ingestionStatus ?? "")) ?? false;
+}
+
+export function ingestionStatusText(file: Attachment): string {
+  switch (file.ingestionStatus) {
+    case "ready":
+      return file.ingestedAt
+        ? `Extraction ready · completed ${new Date(file.ingestedAt).toLocaleString()}`
+        : "Extraction ready";
+    case "queued":
+      return "Extraction queued — waiting for a worker";
+    case "processing":
+      return "Extracting and indexing content…";
+    case "failed":
+      return file.ingestionError
+        ? `Extraction failed: ${file.ingestionError}`
+        : "Extraction failed. Retry to process this file again.";
+    default:
+      return `Extraction unavailable · ${file.state.replaceAll("_", " ")}`;
+  }
+}
+
+export async function retryIngestionAndRefresh(
+  attachmentId: string,
+  retry: (id: string) => Promise<Attachment>,
+  refresh: () => Promise<unknown>,
+): Promise<void> {
+  await retry(attachmentId);
+  await refresh();
+}
+
+function AttachmentIngestionStatus(
+  { file, retry, busy }: { file: Attachment; retry?: () => void; busy?: boolean },
+) {
+  const failed = file.ingestionStatus === "failed";
+  return (
+    <span className={`knowledge-ingestion-status ${failed ? "failed" : ""}`}>
+      <small role={failed ? "alert" : "status"}>{ingestionStatusText(file)}</small>
+      {failed && retry && (
+        <button className="link-button" disabled={busy} onClick={retry}>
+          <RefreshCw size={13} /> {busy ? "Retrying…" : "Retry extraction"}
+        </button>
+      )}
+    </span>
+  );
+}
+
 function StateMessage(
   { title, detail, retry }: { title: string; detail?: string; retry?: () => void },
 ) {
@@ -146,9 +196,14 @@ function AttachmentPicker(
     changed: () => Promise<void>;
   },
 ) {
-  const files = useQuery({ queryKey: ["attachments"], queryFn: api.attachments });
+  const files = useQuery({
+    queryKey: ["attachments"],
+    queryFn: api.attachments,
+    refetchInterval: (query) => hasActiveIngestion(query.state.data) ? 2_000 : false,
+  });
   const [selected, setSelected] = useState("");
   const [busy, setBusy] = useState(false);
+  const [retryingId, setRetryingId] = useState("");
   const [error, setError] = useState("");
   const available = files.data?.filter((file) => !current.some((item) => item.id === file.id)) ??
     [];
@@ -172,33 +227,49 @@ function AttachmentPicker(
       {available.length > 0 && (
         <div className="knowledge-file-picker" role="radiogroup" aria-label="Uploaded files">
           {available.map((file) => (
-            <label
-              key={file.id}
-              className={`${selected === file.id ? "selected" : ""} ${
-                isReady(file) ? "" : "disabled"
-              }`}
-            >
-              <input
-                type="radio"
-                name="attachment"
-                value={file.id}
-                checked={selected === file.id}
-                disabled={!isReady(file)}
-                onChange={() => setSelected(file.id)}
-              />
-              <FileText size={18} />
-              <span>
-                <strong>{file.filename}</strong>
-                <small>
-                  {isReady(file)
-                    ? "Ready to use"
-                    : file.ingestionStatus === "failed"
-                    ? `Processing failed${file.ingestionError ? `: ${file.ingestionError}` : ""}`
-                    : `Not ready — ${file.ingestionStatus?.replace("_", " ") ?? file.state}`}
-                </small>
-              </span>
-              {selected === file.id && <Check size={17} className="push" />}
-            </label>
+            <div className="knowledge-file-picker-row" key={file.id}>
+              <label
+                className={`${selected === file.id ? "selected" : ""} ${
+                  isReady(file) ? "" : "disabled"
+                }`}
+              >
+                <input
+                  type="radio"
+                  name="attachment"
+                  value={file.id}
+                  checked={selected === file.id}
+                  disabled={!isReady(file)}
+                  onChange={() => setSelected(file.id)}
+                />
+                <FileText size={18} />
+                <span>
+                  <strong>{file.filename}</strong>
+                  <AttachmentIngestionStatus file={file} />
+                </span>
+                {selected === file.id && <Check size={17} className="push" />}
+              </label>
+              {file.ingestionStatus === "failed" && (
+                <button
+                  type="button"
+                  className="secondary knowledge-picker-retry"
+                  disabled={Boolean(retryingId)}
+                  aria-label={`Retry extraction for ${file.filename}`}
+                  onClick={() => {
+                    setRetryingId(file.id);
+                    setError("");
+                    void retryIngestionAndRefresh(
+                      file.id,
+                      api.retryAttachmentIngestion,
+                      files.refetch,
+                    ).catch((caught) => setError(errorMessage(caught))).finally(() =>
+                      setRetryingId("")
+                    );
+                  }}
+                >
+                  <RefreshCw size={14} /> {retryingId === file.id ? "Retrying…" : "Retry"}
+                </button>
+              )}
+            </div>
           ))}
         </div>
       )}
@@ -229,22 +300,41 @@ function AttachmentPicker(
 
 export function KnowledgeView({ onMenu }: { onMenu: () => void }) {
   const collections = useQuery({ queryKey: ["collections"], queryFn: api.collections });
-  const [selectedId, setSelectedId] = useState("");
+  const [selectedId, setSelectedId] = useState(() => {
+    try {
+      return sessionStorage.getItem("dg-chat.active-knowledge-collection") ?? "";
+    } catch {
+      return "";
+    }
+  });
   const [query, setQuery] = useState("");
   const [dialog, setDialog] = useState<"create" | "rename" | "delete" | "attach" | null>(null);
   const [actionError, setActionError] = useState("");
+  const [retryingAttachmentId, setRetryingAttachmentId] = useState("");
   const filtered = (collections.data ?? []).filter((item) =>
     item.name.toLowerCase().includes(query.toLowerCase())
   );
   const selected = collections.data?.find((item) => item.id === selectedId) ??
     collections.data?.[0];
   useEffect(() => {
-    if (!selectedId && collections.data?.[0]) setSelectedId(collections.data[0].id);
+    if (!collections.data) return;
+    if (!collections.data.some((collection) => collection.id === selectedId)) {
+      setSelectedId(collections.data[0]?.id ?? "");
+    }
+  }, [collections.data, selectedId]);
+  useEffect(() => {
+    try {
+      if (selectedId) sessionStorage.setItem("dg-chat.active-knowledge-collection", selectedId);
+      else if (collections.data) sessionStorage.removeItem("dg-chat.active-knowledge-collection");
+    } catch {
+      // In-memory selection remains available when browser storage is disabled.
+    }
   }, [collections.data, selectedId]);
   const detail = useQuery({
     queryKey: ["collections", selected?.id],
     queryFn: () => api.collection(selected!.id),
     enabled: Boolean(selected),
+    refetchInterval: (query) => hasActiveIngestion(query.state.data?.attachments) ? 2_000 : false,
   });
   const refresh = async () => {
     await Promise.all([collections.refetch(), detail.refetch()]);
@@ -378,11 +468,20 @@ export function KnowledgeView({ onMenu }: { onMenu: () => void }) {
                     </span>
                     <span>
                       <strong>{file.filename}</strong>
-                      <small>
-                        {file.ingestionStatus?.replace("_", " ") ?? file.state} ·{" "}
-                        {(file.sizeBytes / 1024).toFixed(0)} KB
-                      </small>
-                      {file.ingestionError && <em>{file.ingestionError}</em>}
+                      <small>{(file.sizeBytes / 1024).toFixed(0)} KB · {file.mimeType}</small>
+                      <AttachmentIngestionStatus
+                        file={file}
+                        busy={retryingAttachmentId === file.id}
+                        retry={() => {
+                          setRetryingAttachmentId(file.id);
+                          setActionError("");
+                          void api.retryAttachmentIngestion(file.id).then(async () => {
+                            await refresh();
+                          }).catch((caught) => {
+                            setActionError(errorMessage(caught));
+                          }).finally(() => setRetryingAttachmentId(""));
+                        }}
+                      />
                     </span>
                     <button
                       className="icon-button push"

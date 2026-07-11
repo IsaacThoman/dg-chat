@@ -19,7 +19,9 @@ COPY deno.json package.json deno.lock ./
 COPY apps ./apps
 COPY packages ./packages
 RUN deno compile --frozen -A --node-modules-dir=none --output /service/dg-chat-api apps/api/src/main.ts \
-    && deno compile --frozen -A --node-modules-dir=none --output /service/dg-chat-worker apps/worker/src/main.ts
+    && deno compile --unstable-worker-options --frozen -A --node-modules-dir=none \
+      --include apps/worker/src/extraction-worker.ts \
+      --output /service/dg-chat-worker apps/worker/src/main.ts
 
 FROM nginxinc/nginx-unprivileged:1.27-alpine AS web
 COPY --from=web-build /workspace/apps/web/dist /usr/share/nginx/html
