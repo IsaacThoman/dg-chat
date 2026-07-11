@@ -85,36 +85,41 @@ Deno.test("shared validation rejects a replacement set before persistence", () =
   );
 });
 
-Deno.test("document pipeline applies one timeout budget across object read and extraction", async () => {
-  const bytes = encoder.encode("slow input");
-  const digest = await sha256(bytes);
-  const slowObject: StoredObject = {
-    ...object(bytes),
-    body: new ReadableStream({
-      async start(controller) {
-        await new Promise((resolve) => setTimeout(resolve, 20));
-        controller.enqueue(bytes);
-        controller.close();
-      },
-    }),
-  };
-  await assertRejects(
-    () =>
-      buildDocumentChunks({
-        attachmentId: "00000000-0000-8000-8000-000000000001",
-        filename: "notes.txt",
-        mimeType: "text/plain",
-        sha256: digest,
-        object: slowObject,
-      }, {
-        chunkSizeChars: 256,
-        chunkOverlapChars: 32,
-        extractorVersion: "document-v2",
-        chunkerVersion: "window-v3",
-      }, { timeoutMs: 5 }),
-    Error,
-    "timed out",
-  );
+Deno.test({
+  name: "document pipeline applies one timeout budget across object read and extraction",
+  async fn() {
+    const bytes = encoder.encode("slow input");
+    const digest = await sha256(bytes);
+    const slowObject: StoredObject = {
+      ...object(bytes),
+      body: new ReadableStream({
+        async start(controller) {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          controller.enqueue(bytes);
+          controller.close();
+        },
+      }),
+    };
+    await assertRejects(
+      () =>
+        buildDocumentChunks({
+          attachmentId: "00000000-0000-8000-8000-000000000001",
+          filename: "notes.txt",
+          mimeType: "text/plain",
+          sha256: digest,
+          object: slowObject,
+        }, {
+          chunkSizeChars: 256,
+          chunkOverlapChars: 32,
+          extractorVersion: "document-v2",
+          chunkerVersion: "window-v3",
+        }, { timeoutMs: 5 }),
+      Error,
+      "timed out",
+    );
+    // Let the synthetic source finish so its timer cannot spill into the following worker test.
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  },
 });
 
 Deno.test("isolated extraction preemptively terminates CPU-bound worker code", async () => {

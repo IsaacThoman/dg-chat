@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { Buffer } from "node:buffer";
 import { bootstrap, createChat, login } from "./helpers.ts";
 
 test.beforeEach(async ({ page, request }) => {
