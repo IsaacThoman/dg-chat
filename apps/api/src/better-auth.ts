@@ -11,6 +11,7 @@ import {
   type DomainRepository,
 } from "@dg-chat/database";
 import { hashPassword, verifyPassword } from "./crypto.ts";
+import { type OidcConfig, oidcPlugin } from "./oidc.ts";
 
 export interface BetterAuthServiceOptions {
   databaseUrl: string;
@@ -18,6 +19,7 @@ export interface BetterAuthServiceOptions {
   secret: string;
   appUrl: string;
   webOrigin: string;
+  oidc?: Omit<OidcConfig, "appUrl" | "webOrigin">;
   requireEmailVerification?: boolean;
   sendVerificationEmail?: (input: {
     email: string;
@@ -125,6 +127,16 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
       storeStateStrategy: "database",
       accountLinking: { enabled: false, disableImplicitLinking: true },
     },
+    plugins: options.oidc
+      ? [oidcPlugin({
+        ...options.oidc,
+        appUrl: options.appUrl,
+        webOrigin: options.webOrigin,
+        pruneExpiredState: async () => {
+          await sql`DELETE FROM auth_verifications WHERE expires_at<=now()`;
+        },
+      })]
+      : [],
     session: {
       additionalFields: {
         limited: {
@@ -218,6 +230,7 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
 
   return {
     auth,
+    oidcEnabled: Boolean(options.oidc),
     handler: (request: Request) => auth.handler(request),
     presentedSessionToken(headers: Headers): string | undefined {
       const cookie = headers.get("cookie");

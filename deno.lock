@@ -22,6 +22,7 @@
     "npm:hono@4.12.28": "4.12.28",
     "npm:imagescript@1.3.1": "1.3.1",
     "npm:ioredis@5.8.2": "5.8.2",
+    "npm:jose@6.2.3": "6.2.3",
     "npm:lucide-react@0.468": "0.468.0_react@19.2.7",
     "npm:nodemailer@9.0.3": "9.0.3",
     "npm:openai@6.16.0": "6.16.0_zod@4.1.12",
@@ -4808,6 +4809,7 @@
       "dependencies": [
         "npm:@playwright/test@1.58.2",
         "npm:better-auth@1.6.23",
+        "npm:jose@6.2.3",
         "npm:openai@6.16.0"
       ]
     },

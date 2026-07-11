@@ -1,6 +1,7 @@
 {
   "workspace": [
     "./apps/api",
+    "./apps/mock-oidc",
     "./apps/worker",
     "./apps/web",
     "./packages/contracts",

@@ -1427,10 +1427,13 @@ export function createApp(options: AppOptions = {}) {
   app.use("*", async (c, next) => {
     if (c.req.method === "OPTIONS") return next();
     const path = c.req.path;
+    const oidcRoute = (c.req.method === "POST" && path === "/api/auth/sign-in/oidc") ||
+      (c.req.method === "GET" && path === "/api/auth/oidc/callback");
     const authRoute = c.req.method === "POST" && (
       path === "/api/setup/bootstrap" || path === "/api/auth/sign-up/email" ||
       path === "/api/auth/register" || path === "/api/auth/sign-in/email" ||
-      path === "/api/auth/login" || path.startsWith("/api/auth/verify-email") ||
+      path === "/api/auth/login" ||
+      path.startsWith("/api/auth/verify-email") ||
       path.startsWith("/api/auth/password-reset")
     );
     const generationRoute = c.req.method === "POST" &&
@@ -1444,7 +1447,9 @@ export function createApp(options: AppOptions = {}) {
       path.startsWith("/api/admin/providers") || path.startsWith("/api/admin/models") ||
       path.startsWith("/api/admin/resilience")
     );
-    const policy = authRoute
+    const policy = oidcRoute
+      ? { name: "oidc", limit: configuredAuthClientLimit, window: configuredRateWindow }
+      : authRoute
       ? { name: "auth", limit: configuredAuthLimit, window: configuredRateWindow }
       : providerAdminRoute
       ? {
@@ -1460,7 +1465,32 @@ export function createApp(options: AppOptions = {}) {
     if (!policy) return next();
     let result;
     try {
-      if (authRoute) {
+      if (oidcRoute) {
+        const state = c.req.method === "GET" ? new URL(c.req.url).searchParams.get("state") : null;
+        const trustedClient = requestTrustedClientKey(c.req.raw.headers, trustProxyHeaders);
+        const clientIdentity = trustedClient ?? "untrusted-deployment";
+        const results = c.req.method === "GET" && state && state.length <= 4_096
+          ? [
+            await rateLimiter.consume(
+              `oidc:state:${await sha256(state)}`,
+              configuredAuthLimit,
+              configuredRateWindow,
+            ),
+            await rateLimiter.consume(
+              `oidc:client:${clientIdentity}`,
+              configuredAuthClientLimit,
+              configuredRateWindow,
+            ),
+          ]
+          : [
+            await rateLimiter.consume(
+              `oidc:client:${clientIdentity}`,
+              configuredAuthClientLimit,
+              configuredRateWindow,
+            ),
+          ];
+        result = results.find((candidate) => !candidate.allowed) ?? results[0];
+      } else if (authRoute) {
         let accountIdentity = "unknown-account";
         try {
           const candidate = await c.req.raw.clone().json() as { email?: unknown };
@@ -1726,8 +1756,7 @@ export function createApp(options: AppOptions = {}) {
     return c.json({
       bootstrapRequired: !users.some((user) => user.role === "admin"),
       setupEnabled: Boolean(setupToken),
-      // Do not advertise SSO until the callback/session exchange is mounted end-to-end.
-      oidcEnabled: false,
+      oidcEnabled: browserAuth?.oidcEnabled ?? false,
       emailEnabled: Boolean(mailer),
       requireEmailVerification,
     });

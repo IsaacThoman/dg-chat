@@ -689,6 +689,40 @@ Deno.test("browser audio uses the generation bucket and ignores irrelevant beare
   assertEquals(keys[0], keys[1]);
 });
 
+Deno.test("OIDC initiation and callbacks avoid the shared unknown-account auth bucket", async () => {
+  const consumed: Array<{ key: string; limit: number }> = [];
+  const limiter: RateLimiter = {
+    consume: (key, limit) => {
+      consumed.push({ key, limit });
+      return Promise.resolve({ allowed: true, limit, remaining: limit - 1, retryAfterSeconds: 60 });
+    },
+    health: () => Promise.resolve(true),
+    close: () => Promise.resolve(),
+  };
+  const { app } = createApp({ rateLimiter: limiter });
+  for (let index = 0; index < 6; index++) {
+    await app.request("/api/auth/sign-in/oidc", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+  }
+  await app.request("/api/auth/oidc/callback?state=first-browser-state", { method: "GET" });
+  await app.request("/api/auth/oidc/callback?state=second-browser-state", { method: "GET" });
+  assertEquals(consumed.length, 10);
+  assertEquals(
+    consumed.every(({ key }) => key.startsWith("oidc:") && !key.includes("account")),
+    true,
+  );
+  assertEquals(consumed.slice(0, 6).every(({ limit }) => limit === 100), true);
+  assertEquals(consumed[6].limit, 10);
+  assertEquals(consumed[7].limit, 100);
+  assertEquals(consumed[8].limit, 10);
+  assertEquals(consumed[9].limit, 100);
+  assertEquals(consumed[6].key === consumed[8].key, false);
+  assertEquals(consumed[7].key, consumed[9].key);
+});
+
 Deno.test("authentication rate limits isolate account identities behind one proxy", async () => {
   const keys: string[] = [];
   const limiter: RateLimiter = {

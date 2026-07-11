@@ -451,6 +451,11 @@ export const api = {
     return await api.me();
   },
   signOut: () => request<void>("/auth/sign-out", { method: "POST" }),
+  startOidc: () =>
+    request<{ url: string; redirect: true }>("/auth/sign-in/oidc", {
+      method: "POST",
+      body: "{}",
+    }),
   setup: (setupToken: string, name: string, email: string, password: string) =>
     request<{ user: RawUser }>("/setup/bootstrap", {
       method: "POST",

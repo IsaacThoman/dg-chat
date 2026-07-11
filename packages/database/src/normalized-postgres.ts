@@ -1114,10 +1114,16 @@ export class PostgresRepository implements DomainRepository {
       }
       let balance = number(rows[0].balance_micros);
       if (status === "approved" && credit > 0) {
-        const balanceAfterGrant = balance + credit;
-        const grant =
-          await tx`INSERT INTO ledger_entries (user_id,usage_run_id,kind,amount_micros,balance_after_micros) VALUES (${id},${`approval:${id}`},'grant',${credit},${balanceAfterGrant}) ON CONFLICT DO NOTHING RETURNING id`;
-        if (grant.length) balance = balanceAfterGrant;
+        const approvalRunId = `approval:${id}`;
+        const priorGrant = await tx`SELECT id FROM ledger_entries
+          WHERE usage_run_id=${approvalRunId} AND kind='grant' LIMIT 1`;
+        if (!priorGrant.length) {
+          const balanceAfterGrant = balance + credit;
+          await tx`INSERT INTO ledger_entries
+            (user_id,usage_run_id,kind,amount_micros,balance_after_micros)
+            VALUES (${id},${approvalRunId},'grant',${credit},${balanceAfterGrant})`;
+          balance = balanceAfterGrant;
+        }
       }
       const updated = await tx<
         Row[]

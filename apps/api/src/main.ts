@@ -91,6 +91,33 @@ const appUrl = new URL(
   Deno.env.get("PUBLIC_API_ORIGIN") ?? Deno.env.get("APP_URL") ??
     "http://localhost:8000",
 ).origin;
+const oidcValues = {
+  discoveryUrl: Deno.env.get("OIDC_DISCOVERY_URL")?.trim(),
+  expectedIssuer: Deno.env.get("OIDC_ISSUER")?.trim(),
+  clientId: Deno.env.get("OIDC_CLIENT_ID")?.trim(),
+  clientSecret: Deno.env.get("OIDC_CLIENT_SECRET")?.trim(),
+};
+const oidcConfiguredCount = Object.values(oidcValues).filter(Boolean).length;
+if (oidcConfiguredCount !== 0 && oidcConfiguredCount !== Object.keys(oidcValues).length) {
+  throw new Error(
+    "OIDC_DISCOVERY_URL, OIDC_ISSUER, OIDC_CLIENT_ID, and OIDC_CLIENT_SECRET must be configured together",
+  );
+}
+const oidc = oidcConfiguredCount === Object.keys(oidcValues).length
+  ? {
+    providerId: Deno.env.get("OIDC_PROVIDER_ID")?.trim() || "organization",
+    discoveryUrl: oidcValues.discoveryUrl!,
+    expectedIssuer: oidcValues.expectedIssuer!,
+    clientId: oidcValues.clientId!,
+    clientSecret: oidcValues.clientSecret!,
+    allowedAlgorithms: (Deno.env.get("OIDC_ALLOWED_ALGORITHMS") ?? "RS256").split(",")
+      .map((value) => value.trim()).filter(Boolean),
+    allowInsecureHttp: Deno.env.get("OIDC_ALLOW_INSECURE_HTTP") === "true",
+    allowPrivateNetwork: Deno.env.get("OIDC_ALLOW_PRIVATE_NETWORK") === "true",
+    allowedEndpointOrigins: (Deno.env.get("OIDC_ALLOWED_ENDPOINT_ORIGINS") ?? "").split(",")
+      .map((value) => value.trim()).filter(Boolean),
+  }
+  : undefined;
 const browserAuth = databaseUrl
   ? createBetterAuthService({
     databaseUrl,
@@ -98,6 +125,7 @@ const browserAuth = databaseUrl
     secret: appSecret!,
     appUrl,
     webOrigin,
+    oidc,
     requireEmailVerification,
     sendVerificationEmail: mailer
       ? ({ email, url, token }) =>

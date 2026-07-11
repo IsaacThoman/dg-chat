@@ -1,0 +1,51 @@
+services:
+  app:
+    environment:
+      OIDC_DISCOVERY_URL: http://mock-oidc:4020/.well-known/openid-configuration
+      OIDC_ISSUER: http://localhost:4020
+      OIDC_CLIENT_ID: dg-chat-e2e
+      OIDC_CLIENT_SECRET: dg-chat-e2e-secret
+      OIDC_ALLOWED_ALGORITHMS: ES256
+      OIDC_ALLOW_INSECURE_HTTP: "true"
+      OIDC_ALLOW_PRIVATE_NETWORK: "true"
+    depends_on:
+      mock-oidc:
+        condition: service_healthy
+
+  mock-oidc:
+    image: denoland/deno:alpine
+    working_dir: /workspace/apps/mock-oidc
+    command: ["task", "start"]
+    environment:
+      MOCK_OIDC_PORT: "4020"
+      MOCK_OIDC_PUBLIC_ISSUER: http://localhost:4020
+      MOCK_OIDC_INTERNAL_BASE_URL: http://mock-oidc:4020
+      MOCK_OIDC_CLIENT_ID: dg-chat-e2e
+      MOCK_OIDC_CLIENT_SECRET: dg-chat-e2e-secret
+      MOCK_OIDC_REDIRECT_URI: http://localhost:8000/api/auth/oidc/callback
+      MOCK_OIDC_CONTROL_TOKEN: ci-mock-oidc-control-token
+    volumes:
+      - ./apps/mock-oidc:/workspace/apps/mock-oidc:ro
+    ports:
+      - "4020:4020"
+    networks:
+      - backend
+      - egress
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "deno",
+          "eval",
+          "fetch('http://127.0.0.1:4020/health').then(r=>{if(!r.ok)Deno.exit(1)}).catch(()=>Deno.exit(1))",
+        ]
+      interval: 3s
+      timeout: 2s
+      retries: 20

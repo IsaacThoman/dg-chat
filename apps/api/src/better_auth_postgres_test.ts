@@ -4,6 +4,7 @@ import { PostgresRepository } from "@dg-chat/database";
 import { createBetterAuthService } from "./better-auth.ts";
 import { hashPassword } from "./crypto.ts";
 import { createApp } from "./app.ts";
+import { createMockOidcProvider } from "../../mock-oidc/src/provider.ts";
 
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
 
@@ -107,12 +108,32 @@ Deno.test({
       await adminSql.unsafe(migration);
 
       repository = await PostgresRepository.connect(schemaDatabaseUrl(databaseUrl!, schema));
+      const mockOidc = await createMockOidcProvider({
+        publicIssuer: "http://localhost:4020",
+        internalBaseUrl: "http://mock-oidc:4020",
+        clientId: "dg-chat-test",
+        clientSecret: "dg-chat-test-secret",
+        redirectUri: "http://localhost:8000/api/auth/oidc/callback",
+        controlToken: "test-control-token",
+      });
       service = createBetterAuthService({
         databaseUrl: schemaDatabaseUrl(databaseUrl!, schema),
         repository,
         secret: "test-secret-that-is-at-least-thirty-two-bytes-long",
         appUrl: "http://localhost:8000",
         webOrigin: "http://localhost:5173",
+        oidc: {
+          providerId: "organization",
+          discoveryUrl: "http://mock-oidc:4020/.well-known/openid-configuration",
+          expectedIssuer: "http://localhost:4020",
+          clientId: "dg-chat-test",
+          clientSecret: "dg-chat-test-secret",
+          allowedAlgorithms: ["ES256"],
+          allowInsecureHttp: true,
+          allowPrivateNetwork: true,
+          fetch: (input, init) =>
+            mockOidc.fetch(input instanceof Request ? input : new Request(input, init)),
+        },
         requireEmailVerification: true,
         sendVerificationEmail: (delivery) => {
           verificationDeliveries.push(delivery);
@@ -128,6 +149,70 @@ Deno.test({
         browserAuth: service,
         requireEmailVerification: true,
       });
+
+      const oidcStart = await service.handler(
+        new Request("http://localhost:8000/api/auth/sign-in/oidc", {
+          method: "POST",
+          headers: { origin: "http://localhost:5173", "content-type": "application/json" },
+          body: "{}",
+        }),
+      );
+      assertEquals(oidcStart.status, 200, await oidcStart.clone().text());
+      const oidcStartBody = await oidcStart.json() as { url: string; redirect: boolean };
+      assertEquals(oidcStartBody.redirect, true);
+      const authorizeUrl = new URL(oidcStartBody.url);
+      assert(authorizeUrl.searchParams.get("nonce"));
+      assertEquals(authorizeUrl.searchParams.get("code_challenge_method"), "S256");
+      const authorize = await mockOidc.fetch(new Request(authorizeUrl));
+      const requestId = (await authorize.text()).match(/name="request_id" value="([^"]+)"/)?.[1];
+      assert(requestId);
+      const decision = await mockOidc.fetch(
+        new Request("http://localhost:4020/authorize/decision", {
+          method: "POST",
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({ request_id: requestId, persona: "new_verified" }),
+        }),
+      );
+      assertEquals(decision.status, 302);
+      const stateCookie = oidcStart.headers.getSetCookie().map((value) => value.split(";", 1)[0])
+        .join("; ");
+      assert(stateCookie);
+      const oidcCallback = await service.handler(
+        new Request(decision.headers.get("location")!, {
+          headers: { cookie: stateCookie },
+          redirect: "manual",
+        }),
+      );
+      assertEquals(oidcCallback.status, 302, await oidcCallback.clone().text());
+      assertEquals(oidcCallback.headers.get("location"), "http://localhost:5173/pending");
+      const oidcSessionCookie = oidcCallback.headers.getSetCookie()
+        .find((value) => value.startsWith("dg_chat.session_token="))?.split(";", 1)[0];
+      assert(oidcSessionCookie);
+      const oidcMe = await app.request("/api/auth/me", { headers: { cookie: oidcSessionCookie } });
+      assertEquals(oidcMe.status, 200, await oidcMe.clone().text());
+      const oidcIdentity = await oidcMe.json() as {
+        user: { id: string; email: string; approvalStatus: string };
+        limited: boolean;
+      };
+      assertEquals(oidcIdentity.user.email, "oidc-new@e2e.invalid");
+      assertEquals(oidcIdentity.user.approvalStatus, "pending");
+      assertEquals(oidcIdentity.limited, true);
+      const firstOidcApproval = await repository.approveUser(
+        oidcIdentity.user.id,
+        "approved",
+        5_000_000,
+      );
+      const repeatedOidcApproval = await repository.approveUser(
+        oidcIdentity.user.id,
+        "approved",
+        5_000_000,
+      );
+      assertEquals(firstOidcApproval.balanceMicros, 5_000_000);
+      assertEquals(repeatedOidcApproval.balanceMicros, 5_000_000);
+      assertEquals(
+        (await app.request("/api/auth/me", { headers: { cookie: oidcSessionCookie } })).status,
+        401,
+      );
 
       const legacySignin = await service.handler(
         new Request("http://localhost:8000/api/auth/sign-in/email", {

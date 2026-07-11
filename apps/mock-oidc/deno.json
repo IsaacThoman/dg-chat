@@ -1,0 +1,9 @@
+{
+  "name": "@dg-chat/mock-oidc",
+  "version": "0.1.0",
+  "exports": "./src/provider.ts",
+  "tasks": {
+    "start": "deno run --allow-env --allow-net src/main.ts",
+    "test": "deno test"
+  }
+}
