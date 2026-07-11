@@ -9,6 +9,8 @@ import {
 } from "./document-extraction.ts";
 
 const DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+const rels = (body: string) =>
+  `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${body}</Relationships>`;
 
 function docx(
   documentXml = `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
@@ -25,7 +27,9 @@ function docx(
        </Types>`,
     ),
     "_rels/.rels": strToU8(
-      `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>`,
+      `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+        `<Relationship Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>` +
+        `</Relationships>`,
     ),
     "word/document.xml": strToU8(documentXml),
     ...extra,
@@ -245,7 +249,7 @@ Deno.test("DOCX rejects macros declared by files or content types", async () => 
   );
   const macroTypes =
     `<Types><Override ContentType="application/vnd.ms-word.document.macroEnabled.main+xml"/></Types>`;
-  const hostile = zipSync({
+  const hostile = docx(undefined, {
     "[Content_Types].xml": strToU8(macroTypes),
     "word/document.xml": strToU8(`<w:document><w:body/></w:document>`),
   });
@@ -284,7 +288,10 @@ Deno.test("DOCX requires canonical package names and rejects DDE field instructi
     ]
   ) {
     await rejectsCode(
-      () => extractDocx(docx(`<w:document><w:body>${field}</w:body></w:document>`)),
+      () =>
+        extractDocx(docx(
+          `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>${field}</w:body></w:document>`,
+        )),
       "docx_active_content",
     );
   }
@@ -295,46 +302,111 @@ Deno.test("DOCX rejects split active fields and objects in every Word XML story 
     const [name, xml] of [
       [
         "word/header1.xml",
-        `<w:hdr><w:instrText>DD</w:instrText><w:instrText>EAUTO command</w:instrText></w:hdr>`,
+        `<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:instrText>DD</w:instrText><w:instrText>EAUTO command</w:instrText></w:hdr>`,
       ],
       [
         "word/footer1.xml",
-        `<x:ftr><x:fldSimple x:instr="D&#68;E command"/></x:ftr>`,
+        `<x:ftr xmlns:x="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><x:fldSimple x:instr="D&#68;E command"/></x:ftr>`,
       ],
-      ["word/footnotes.xml", `<w:footnotes><w:object/></w:footnotes>`],
+      [
+        "word/footnotes.xml",
+        `<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:object/></w:footnotes>`,
+      ],
     ] as const
   ) {
     await rejectsCode(
-      () => extractDocx(docx(undefined, { [name]: strToU8(xml) })),
+      () =>
+        extractDocx(docx(undefined, {
+          [name]: strToU8(xml),
+          "word/_rels/document.xml.rels": strToU8(
+            rels(`<Relationship Target="${name.slice("word/".length)}"/>`),
+          ),
+        })),
       "docx_active_content",
     );
   }
 });
 
-Deno.test("DOCX rejects active XML at relationship-selected custom paths and XML prefixes", async () => {
+Deno.test("DOCX scans relationship-selected Office XML without flagging unrelated custom XML", async () => {
+  const unrelated = await extractDocx(docx(undefined, {
+    "custom/unrelated.xml": strToU8(
+      `<x:data xmlns:x="urn:example"><x:instrText>DDEAUTO harmless data</x:instrText><x:object/></x:data>`,
+    ),
+  }));
+  assertEquals(unrelated.mimeType, DOCX);
   for (
     const [name, xml] of [
-      ["custom/story.xml", `<x:story><x:instrText>DDEAUTO command</x:instrText></x:story>`],
-      ["Stories/header.xml", `<prefix-with-dash:object/>`],
-      ["custom/footer.xml", `<prefix.with.dot:OLEObject/>`],
+      [
+        "custom/story.xml",
+        `<x:story xmlns:x="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><x:instrText>DDEAUTO command</x:instrText></x:story>`,
+      ],
+      [
+        "Stories/header.xml",
+        `<prefix-with-dash:object xmlns:prefix-with-dash="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>`,
+      ],
+      [
+        "custom/footer.xml",
+        `<prefix.with.dot:OLEObject xmlns:prefix.with.dot="urn:schemas-microsoft-com:office:office"/>`,
+      ],
     ] as const
   ) {
     await rejectsCode(
-      () => extractDocx(docx(undefined, { [name]: strToU8(xml) })),
+      () =>
+        extractDocx(docx(undefined, {
+          [name]: strToU8(xml),
+          "word/_rels/document.xml.rels": strToU8(
+            rels(`<Relationship Target="../${name}"/>`),
+          ),
+        })),
       "docx_active_content",
     );
   }
+});
+
+Deno.test("DOCX relationship graph requires canonical root, rejects traversal, and bounds cycles", async () => {
+  await rejectsCode(
+    () =>
+      extractDocx(docx(undefined, {
+        "_rels/.rels": strToU8(
+          rels(`<Relationship Type="urn:test/officeDocument" Target="custom/main.xml"/>`),
+        ),
+      })),
+    "invalid_docx",
+  );
+  await rejectsCode(
+    () =>
+      extractDocx(docx(undefined, {
+        "word/_rels/document.xml.rels": strToU8(
+          rels(`<Relationship Target="../../outside.xml"/>`),
+        ),
+      })),
+    "invalid_docx",
+  );
+  const cyclic = await extractDocx(docx(undefined, {
+    "word/_rels/document.xml.rels": strToU8(
+      rels(`<Relationship Target="header1.xml"/>`),
+    ),
+    "word/header1.xml": strToU8(
+      `<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">safe</w:hdr>`,
+    ),
+    "word/_rels/header1.xml.rels": strToU8(
+      rels(`<Relationship Target="document.xml"/>`),
+    ),
+  }));
+  assertEquals(cyclic.mimeType, DOCX);
 });
 
 Deno.test("DOCX rejects active internal relationship types regardless of target filename", async () => {
   for (const type of ["oleObject", "package", "attachedTemplate", "control"]) {
-    const rels = `<Relationships><Relationship ` +
-      `Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/${type}" ` +
-      `Target="../media/innocent.bin"/></Relationships>`;
+    const relationshipXml = rels(
+      `<Relationship ` +
+        `Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/${type}" ` +
+        `Target="../media/innocent.bin"/>`,
+    );
     await rejectsCode(
       () =>
         extractDocx(docx(undefined, {
-          "word/_rels/document.xml.rels": strToU8(rels),
+          "word/_rels/document.xml.rels": strToU8(relationshipXml),
           "word/media/innocent.bin": strToU8("payload"),
         })),
       "docx_active_content",
@@ -355,10 +427,14 @@ Deno.test("DOCX rejects entity declarations that could obscure active instructio
 
 Deno.test("DOCX rejects external relationships regardless of target scheme", async () => {
   for (const target of ["https://attacker.invalid/x", "file:///etc/passwd", "\\\\server\\share"]) {
-    const rels =
-      `<Relationships><Relationship Target="${target}" TargetMode="External"/></Relationships>`;
+    const relationshipXml = rels(
+      `<Relationship Target="${target}" TargetMode="External"/>`,
+    );
     await rejectsCode(
-      () => extractDocx(docx(undefined, { "word/_rels/document.xml.rels": strToU8(rels) })),
+      () =>
+        extractDocx(docx(undefined, {
+          "word/_rels/document.xml.rels": strToU8(relationshipXml),
+        })),
       "docx_external_reference",
     );
   }

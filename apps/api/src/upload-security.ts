@@ -213,7 +213,7 @@ interface PeCandidate {
 }
 
 export interface PeScanState {
-  headers: PeCandidate[];
+  headers: Map<number, PeCandidate[]>;
   signatures: Map<number, number[]>;
   candidates: number;
   terminal: boolean;
@@ -223,7 +223,7 @@ export interface PeScanState {
 
 export function createPeScanState(): PeScanState {
   return {
-    headers: [],
+    headers: new Map(),
     signatures: new Map(),
     candidates: 0,
     terminal: false,
@@ -240,15 +240,9 @@ export function scanEmbeddedPe(
   maxBytes: number,
 ): { detected: boolean; previousByte: number } {
   if (state.terminal) return { detected: false, previousByte: bytes.at(-1) ?? previousByte! };
-  const maxWork = Math.min(Number.MAX_SAFE_INTEGER, maxBytes * 70 + 1024);
+  const maxWork = 100_000;
   let detected = false;
   for (let index = 0; index < bytes.length; index++) {
-    state.work++;
-    if (state.work > maxWork) {
-      state.inconclusive = true;
-      state.terminal = true;
-      break;
-    }
     const absolute = absoluteStart + index;
     const byte = bytes[index];
     const signatures = state.signatures.get(absolute);
@@ -274,21 +268,21 @@ export function scanEmbeddedPe(
       }
     }
     if (state.terminal) break;
-    for (let candidateIndex = state.headers.length - 1; candidateIndex >= 0; candidateIndex--) {
-      state.work++;
-      if (state.work > maxWork) {
-        state.inconclusive = true;
-        state.terminal = true;
-        break;
-      }
-      const candidate = state.headers[candidateIndex];
-      if (candidate.header.length < 64 && absolute === candidate.offset + candidate.header.length) {
+    const headers = state.headers.get(absolute);
+    if (headers) {
+      state.headers.delete(absolute);
+      for (const candidate of headers) {
+        state.work++;
+        if (state.work > maxWork) {
+          state.inconclusive = true;
+          state.terminal = true;
+          break;
+        }
         candidate.header.push(byte);
         if (candidate.header.length === 64) {
           const header = new Uint8Array(candidate.header);
           const relative = u32(header, 0x3c);
           if (relative < 64 || candidate.offset + relative + 4 > maxBytes) {
-            state.headers.splice(candidateIndex, 1);
             state.candidates--;
             continue;
           }
@@ -296,7 +290,10 @@ export function scanEmbeddedPe(
           const pending = state.signatures.get(signatureOffset) ?? [];
           pending.push(0);
           state.signatures.set(signatureOffset, pending);
-          state.headers.splice(candidateIndex, 1);
+        } else {
+          const next = state.headers.get(absolute + 1) ?? [];
+          next.push(candidate);
+          state.headers.set(absolute + 1, next);
         }
       }
     }
@@ -306,21 +303,23 @@ export function scanEmbeddedPe(
         state.inconclusive = true;
         state.terminal = true;
       } else {
-        state.headers.push({ offset: absolute - 1, header: [0x4d, 0x5a] });
+        const next = state.headers.get(absolute + 1) ?? [];
+        next.push({ offset: absolute - 1, header: [0x4d, 0x5a] });
+        state.headers.set(absolute + 1, next);
         state.candidates++;
       }
     }
     previousByte = byte;
     if (detected || state.inconclusive) {
       state.terminal = true;
-      state.headers.length = 0;
+      state.headers.clear();
       state.signatures.clear();
       state.candidates = 0;
       break;
     }
   }
   if (state.inconclusive) {
-    state.headers.length = 0;
+    state.headers.clear();
     state.signatures.clear();
     state.candidates = 0;
   }

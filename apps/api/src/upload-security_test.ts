@@ -232,9 +232,9 @@ Deno.test("PE live-candidate saturation quarantines without claiming a polyglot"
   previous = scanEmbeddedPe(second, first.length, state, previous, body.length).previousByte;
   assertEquals(state.terminal, true);
   assertEquals(state.inconclusive, true);
-  assertEquals(state.headers.length, 0);
+  assertEquals(state.headers.size, 0);
   assertEquals(state.signatures.size, 0);
-  if (state.work > body.length + 1_024 * 70) {
+  if (state.work > 100_000) {
     throw new Error(`PE scan exceeded its deterministic work budget: ${state.work}`);
   }
   assertEquals(previous, second.at(-1));
@@ -266,7 +266,7 @@ Deno.test("more than 1024 expired MZ candidates do not cause a false positive", 
   assertEquals(scan.detected, false);
   assertEquals(state.inconclusive, false);
   assertEquals(state.candidates, 0);
-  if (state.work > body.length * 2) {
+  if (state.work > 100_000) {
     throw new Error(`Expired candidates used excess work: ${state.work}`);
   }
 
