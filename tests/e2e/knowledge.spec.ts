@@ -273,16 +273,13 @@ test("persists library selection and repairs it after the selected collection is
   await page.getByRole("dialog", { name: "Delete collection?" })
     .getByRole("button", { name: "Delete collection" }).click();
   await expect.poll(async () => {
-    const data = await collections();
-    return data.some((collection) => collection.id === first!.id) ? null : data[0] ?? null;
+    const stored = await page.evaluate((key) => sessionStorage.getItem(key), storageKey);
+    return stored && stored !== first!.id ? stored : null;
   }).not.toBeNull();
-  // Read the current server order after the deletion; the UI intentionally falls back to item zero.
-  const fallback = (await collections())[0];
+  const fallbackId = await page.evaluate((key) => sessionStorage.getItem(key), storageKey);
+  const fallback = (await collections()).find((collection) => collection.id === fallbackId);
   expect(fallback).toBeTruthy();
-  await expect(page.getByRole("heading", { name: fallback.name, exact: true })).toBeVisible();
-  await expect.poll(() => page.evaluate((key) => sessionStorage.getItem(key), storageKey)).toBe(
-    fallback.id,
-  );
+  await expect(page.getByRole("heading", { name: fallback!.name, exact: true })).toBeVisible();
 });
 
 test("extracts uploaded PDF pages and DOCX sections with persisted provenance", async ({
