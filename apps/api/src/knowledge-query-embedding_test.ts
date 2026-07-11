@@ -11,14 +11,14 @@ const env = {
 
 Deno.test("query embedder sends bounded version-compatible requests", async () => {
   let observed: Record<string, unknown> | undefined;
-  const embed = knowledgeQueryEmbedderFromEnv(env, async (_url, init) => {
+  const embed = knowledgeQueryEmbedderFromEnv(env, (_url, init) => {
     observed = JSON.parse(String(init?.body));
-    return Response.json({
+    return Promise.resolve(Response.json({
       object: "list",
       data: [{ object: "embedding", embedding: Array(1536).fill(0.25), index: 0 }],
       model: "ignored",
       usage: { prompt_tokens: 2, total_tokens: 2 },
-    });
+    }));
   })!;
   const result = await embed("  turbine reset  ");
   assertEquals(observed, {
