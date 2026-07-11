@@ -311,6 +311,21 @@ Deno.test("DOCX rejects split active fields and objects in every Word XML story 
   }
 });
 
+Deno.test("DOCX rejects active XML at relationship-selected custom paths and XML prefixes", async () => {
+  for (
+    const [name, xml] of [
+      ["custom/story.xml", `<x:story><x:instrText>DDEAUTO command</x:instrText></x:story>`],
+      ["Stories/header.xml", `<prefix-with-dash:object/>`],
+      ["custom/footer.xml", `<prefix.with.dot:OLEObject/>`],
+    ] as const
+  ) {
+    await rejectsCode(
+      () => extractDocx(docx(undefined, { [name]: strToU8(xml) })),
+      "docx_active_content",
+    );
+  }
+});
+
 Deno.test("DOCX rejects active internal relationship types regardless of target filename", async () => {
   for (const type of ["oleObject", "package", "attachedTemplate", "control"]) {
     const rels = `<Relationships><Relationship ` +

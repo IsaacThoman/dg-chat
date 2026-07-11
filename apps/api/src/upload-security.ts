@@ -3,7 +3,10 @@ import { DOCX_MIME_TYPE, INGESTIBLE_DOCUMENT_MIME_TYPES } from "@dg-chat/databas
 
 export type UploadDecision =
   | { state: "ready"; reason: "validated" }
-  | { state: "quarantine"; reason: "image_guard_pending" | "manual_review_required" };
+  | {
+    state: "quarantine";
+    reason: "image_guard_pending" | "manual_review_required" | "security_scan_inconclusive";
+  };
 
 export interface ImageGuardResult {
   width?: number;
@@ -213,8 +216,8 @@ export interface PeScanState {
   headers: PeCandidate[];
   signatures: Map<number, number[]>;
   candidates: number;
-  seen: number;
   terminal: boolean;
+  inconclusive: boolean;
   work: number;
 }
 
@@ -223,8 +226,8 @@ export function createPeScanState(): PeScanState {
     headers: [],
     signatures: new Map(),
     candidates: 0,
-    seen: 0,
     terminal: false,
+    inconclusive: false,
     work: 0,
   };
 }
@@ -236,10 +239,16 @@ export function scanEmbeddedPe(
   previousByte: number | undefined,
   maxBytes: number,
 ): { detected: boolean; previousByte: number } {
-  if (state.terminal) return { detected: true, previousByte: bytes.at(-1) ?? previousByte! };
+  if (state.terminal) return { detected: false, previousByte: bytes.at(-1) ?? previousByte! };
+  const maxWork = Math.min(Number.MAX_SAFE_INTEGER, maxBytes * 70 + 1024);
   let detected = false;
   for (let index = 0; index < bytes.length; index++) {
     state.work++;
+    if (state.work > maxWork) {
+      state.inconclusive = true;
+      state.terminal = true;
+      break;
+    }
     const absolute = absoluteStart + index;
     const byte = bytes[index];
     const signatures = state.signatures.get(absolute);
@@ -247,6 +256,11 @@ export function scanEmbeddedPe(
       state.signatures.delete(absolute);
       for (const progress of signatures) {
         state.work++;
+        if (state.work > maxWork) {
+          state.inconclusive = true;
+          state.terminal = true;
+          break;
+        }
         const expected = [0x50, 0x45, 0, 0];
         if (byte !== expected[progress]) state.candidates--;
         else if (progress + 1 === expected.length) {
@@ -259,8 +273,14 @@ export function scanEmbeddedPe(
         }
       }
     }
+    if (state.terminal) break;
     for (let candidateIndex = state.headers.length - 1; candidateIndex >= 0; candidateIndex--) {
       state.work++;
+      if (state.work > maxWork) {
+        state.inconclusive = true;
+        state.terminal = true;
+        break;
+      }
       const candidate = state.headers[candidateIndex];
       if (candidate.header.length < 64 && absolute === candidate.offset + candidate.header.length) {
         candidate.header.push(byte);
@@ -280,22 +300,29 @@ export function scanEmbeddedPe(
         }
       }
     }
+    if (state.terminal) break;
     if (previousByte === 0x4d && byte === 0x5a && absolute - 1 >= 8) {
-      if (state.seen >= 1024) detected = true;
-      else {
+      if (state.candidates >= 1024) {
+        state.inconclusive = true;
+        state.terminal = true;
+      } else {
         state.headers.push({ offset: absolute - 1, header: [0x4d, 0x5a] });
         state.candidates++;
-        state.seen++;
       }
     }
     previousByte = byte;
-    if (detected) {
+    if (detected || state.inconclusive) {
       state.terminal = true;
       state.headers.length = 0;
       state.signatures.clear();
       state.candidates = 0;
       break;
     }
+  }
+  if (state.inconclusive) {
+    state.headers.length = 0;
+    state.signatures.clear();
+    state.candidates = 0;
   }
   return { detected, previousByte: previousByte! };
 }
@@ -606,6 +633,9 @@ export function secureUploadStream(
           } else if (!image.width || !image.height || image.decompressedBytes === undefined) {
             decision = { state: "quarantine", reason: "image_guard_pending" };
           }
+        }
+        if (peState.inconclusive) {
+          decision = { state: "quarantine", reason: "security_scan_inconclusive" };
         }
         settled = true;
         resolveInspection({
