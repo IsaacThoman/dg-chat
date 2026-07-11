@@ -172,6 +172,97 @@ Deno.test("provider registry hides credentials, versions mutations, and preserve
   );
 });
 
+Deno.test("knowledge retrieval fuses same-config vectors with lexical rank and isolates owners", () => {
+  const repo = new MemoryRepository();
+  const owner = repo.createUser({
+    email: "vector-owner@example.com",
+    name: "Owner",
+    passwordHash: "x",
+  });
+  const stranger = repo.createUser({
+    email: "vector-other@example.com",
+    name: "Other",
+    passwordHash: "x",
+  });
+  const conversation = repo.createConversation(owner.id, "Vector knowledge");
+  const collection = repo.createKnowledgeCollection(owner.id, {
+    name: "Runbooks",
+    idempotencyKey: "vector-runbooks",
+  });
+  const attachment = repo.createAttachment({
+    ownerId: owner.id,
+    objectKey: `users/${owner.id}/vector.txt`,
+    filename: "vector.txt",
+    mimeType: "text/plain",
+    sizeBytes: 20,
+    sha256: "7".repeat(64),
+    state: "ready",
+  }).attachment;
+  repo.beginAttachmentIngestion(attachment.id, owner.id);
+  const chunks = [
+    {
+      id: crypto.randomUUID(),
+      ordinal: 0,
+      content: "lexical turbine reset",
+      metadata: { sourceAttachmentId: attachment.id },
+    },
+    {
+      id: crypto.randomUUID(),
+      ordinal: 1,
+      content: "semantic procedure",
+      metadata: { sourceAttachmentId: attachment.id },
+    },
+  ];
+  repo.completeAttachmentIngestion(attachment.id, owner.id, chunks);
+  const axis = (first: number, second: number) => [first, second, ...Array(1534).fill(0)];
+  const embedded = repo.completeDocumentChunkEmbeddings(
+    attachment.id,
+    owner.id,
+    "provider/embed-1536",
+    "knowledge-v1",
+    [
+      { chunkId: chunks[0].id, embedding: axis(0, 1) },
+      { chunkId: chunks[1].id, embedding: axis(1, 0) },
+    ],
+  );
+  assertEquals(embedded.every((chunk) => chunk.embeddingStatus === "ready"), true);
+  assertEquals("embedding" in embedded[0], false);
+  repo.linkKnowledgeAttachment(collection.id, attachment.id, owner.id, 1);
+  repo.bindKnowledgeCollection(conversation.id, collection.id, owner.id, "retrieval");
+
+  const hybrid = repo.retrieveConversationKnowledge({
+    conversationId: conversation.id,
+    ownerId: owner.id,
+    query: "turbine",
+    queryEmbedding: axis(1, 0),
+    embeddingModelId: "provider/embed-1536",
+    embeddingConfigVersion: "knowledge-v1",
+  });
+  assertEquals(hybrid.map((item) => item.chunkId), [chunks[0].id, chunks[1].id]);
+  assertEquals(hybrid[0].lexicalRank, 1);
+  assertEquals(hybrid[1].vectorRank, 1);
+  assertEquals(hybrid.every((item) => !("embedding" in item)), true);
+  const wrongConfig = repo.retrieveConversationKnowledge({
+    conversationId: conversation.id,
+    ownerId: owner.id,
+    query: "turbine",
+    queryEmbedding: axis(1, 0),
+    embeddingModelId: "provider/embed-1536",
+    embeddingConfigVersion: "knowledge-v2",
+  });
+  assertEquals(wrongConfig.map((item) => item.chunkId), [chunks[0].id]);
+  assertThrows(
+    () =>
+      repo.retrieveConversationKnowledge({
+        conversationId: conversation.id,
+        ownerId: stranger.id,
+        query: "turbine",
+      }),
+    DomainError,
+    "not found",
+  );
+});
+
 Deno.test("knowledge collections isolate owners and version membership and bindings", () => {
   const repo = new MemoryRepository();
   const owner = repo.createUser({
@@ -1719,7 +1810,15 @@ Deno.test("text ingestion is separate, idempotent, replaceable, retryable, and o
   }];
   repo.completeAttachmentIngestion(created.attachment.id, owner.id, first);
   assertEquals(repo.listDocumentChunks(created.attachment.id, owner.id), [
-    { ...first[0], attachmentId: created.attachment.id },
+    {
+      ...first[0],
+      attachmentId: created.attachment.id,
+      embeddingStatus: "pending",
+      embeddingModelId: null,
+      embeddingConfigVersion: null,
+      embeddedAt: null,
+      embeddingError: null,
+    },
   ]);
   first[0].metadata.section = "mutated by caller";
   assertEquals(

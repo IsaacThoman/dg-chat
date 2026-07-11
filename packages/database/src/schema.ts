@@ -371,9 +371,19 @@ export const documentChunks = pgTable("document_chunks", {
   ordinal: integer("ordinal").notNull(),
   content: text("content").notNull(),
   embedding: vector("embedding", { dimensions: 1536 }),
+  embeddingStatus: text("embedding_status").notNull().default("pending"),
+  embeddingModelId: text("embedding_model_id"),
+  embeddingConfigVersion: text("embedding_config_version"),
+  embeddedAt: timestamp("embedded_at", { withTimezone: true }),
+  embeddingError: text("embedding_error"),
   metadata: jsonb("metadata").notNull().default({}),
 }, (table) => [
   uniqueIndex("document_chunks_attachment_ordinal_uq").on(table.attachmentId, table.ordinal),
+  index("document_chunks_embedding_ready_idx").using(
+    "hnsw",
+    table.embedding.op("vector_cosine_ops"),
+  )
+    .where(sql`${table.embeddingStatus} = 'ready' AND ${table.embedding} IS NOT NULL`),
 ]);
 
 export const auditEvents = pgTable("audit_events", {

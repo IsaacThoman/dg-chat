@@ -35,6 +35,7 @@ import type {
   CreateProviderRetryPolicyInput,
   CreateUserInput,
   DocumentChunk,
+  DocumentChunkEmbeddingInput,
   DocumentChunkInput,
   DomainRepository,
   FailApiRequestInput,
@@ -45,6 +46,8 @@ import type {
   KnowledgeCollection,
   KnowledgeCollectionPatch,
   KnowledgeConversationBinding,
+  KnowledgeRetrievalCandidate,
+  KnowledgeRetrievalInput,
   KnowledgeRetrievalMode,
   ModelPriceVersion,
   ProviderAttempt,
@@ -236,7 +239,56 @@ function documentChunk(row: Row): DocumentChunk {
     ordinal: number(row.ordinal),
     content: String(row.content),
     metadata: row.metadata as Record<string, unknown>,
+    embeddingStatus: String(row.embedding_status ?? "pending") as DocumentChunk["embeddingStatus"],
+    embeddingModelId: row.embedding_model_id == null ? null : String(row.embedding_model_id),
+    embeddingConfigVersion: row.embedding_config_version == null
+      ? null
+      : String(row.embedding_config_version),
+    embeddedAt: nullableIso(row.embedded_at),
+    embeddingError: row.embedding_error == null ? null : String(row.embedding_error),
   };
+}
+
+const EMBEDDING_DIMENSIONS = 1536;
+const EMBEDDING_CONFIG_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+function validateEmbeddingReplacement(
+  chunks: readonly DocumentChunk[],
+  modelId: string,
+  configVersion: string,
+  embeddings: readonly DocumentChunkEmbeddingInput[],
+) {
+  if (
+    !modelId || modelId.length > 255 || !EMBEDDING_CONFIG_PATTERN.test(configVersion) ||
+    embeddings.length !== chunks.length
+  ) throw new DomainError("validation_error", "Document embeddings are invalid", 422);
+  const expected = new Set(chunks.map((chunk) => chunk.id));
+  for (const item of embeddings) {
+    if (
+      !expected.delete(item.chunkId) || item.embedding.length !== EMBEDDING_DIMENSIONS ||
+      item.embedding.some((value) => !Number.isFinite(value))
+    ) throw new DomainError("validation_error", "Document embeddings are invalid", 422);
+  }
+  if (expected.size) {
+    throw new DomainError("validation_error", "Document embeddings are invalid", 422);
+  }
+}
+
+function validateKnowledgeRetrievalInput(input: KnowledgeRetrievalInput) {
+  const limit = input.limit ?? 50;
+  const vectorFields = [input.queryEmbedding, input.embeddingModelId, input.embeddingConfigVersion];
+  if (
+    input.query.length > 20_000 || !Number.isSafeInteger(limit) || limit < 1 ||
+    limit > 200 || (vectorFields.some((value) => value !== undefined) &&
+      vectorFields.some((value) => value === undefined)) ||
+    (input.queryEmbedding !== undefined &&
+      (input.queryEmbedding.length !== EMBEDDING_DIMENSIONS ||
+        input.queryEmbedding.some((value) => !Number.isFinite(value)))) ||
+    (input.embeddingModelId !== undefined &&
+      (!input.embeddingModelId || input.embeddingModelId.length > 255)) ||
+    (input.embeddingConfigVersion !== undefined &&
+      !EMBEDDING_CONFIG_PATTERN.test(input.embeddingConfigVersion))
+  ) throw new DomainError("validation_error", "Knowledge retrieval input is invalid", 422);
 }
 
 function provider(row: Row): ProviderRecord {
@@ -2018,6 +2070,138 @@ export class PostgresRepository implements DomainRepository {
     return (await this.#sql<Row[]>`
       SELECT dc.* FROM document_chunks dc WHERE dc.attachment_id=${id} ORDER BY dc.ordinal`)
       .map(documentChunk);
+  }
+
+  async completeDocumentChunkEmbeddings(
+    id: string,
+    ownerId: string,
+    modelId: string,
+    configVersion: string,
+    embeddings: DocumentChunkEmbeddingInput[],
+  ) {
+    return await this.#sql.begin(async (tx) => {
+      const attachment = await tx`SELECT id FROM attachments WHERE id=${id}
+        AND owner_id=${ownerId} AND deleted_at IS NULL FOR UPDATE`;
+      if (!attachment.length) throw new DomainError("not_found", "Attachment not found", 404);
+      const rows = (await tx<Row[]>`SELECT * FROM document_chunks
+        WHERE attachment_id=${id} ORDER BY ordinal FOR UPDATE`).map(documentChunk);
+      validateEmbeddingReplacement(rows, modelId, configVersion, embeddings);
+      for (const item of embeddings) {
+        const value = `[${item.embedding.join(",")}]`;
+        await tx`UPDATE document_chunks SET embedding=${value}::vector,
+          embedding_status='ready',embedding_model_id=${modelId},
+          embedding_config_version=${configVersion},embedded_at=now(),embedding_error=NULL
+          WHERE id=${item.chunkId} AND attachment_id=${id}`;
+      }
+      return (await tx<Row[]>`SELECT * FROM document_chunks
+        WHERE attachment_id=${id} ORDER BY ordinal`).map(documentChunk);
+    });
+  }
+
+  async retrieveConversationKnowledge(
+    input: KnowledgeRetrievalInput,
+  ): Promise<KnowledgeRetrievalCandidate[]> {
+    validateKnowledgeRetrievalInput(input);
+    const authorized = await this.#sql`SELECT id FROM conversations WHERE id=${input.conversationId}
+      AND owner_id=${input.ownerId} AND deleted_at IS NULL`;
+    if (!authorized.length) throw new DomainError("not_found", "Conversation not found", 404);
+    const limit = input.limit ?? 50;
+    const candidateLimit = Math.min(800, limit * 4);
+    const queryVector = input.queryEmbedding ? `[${input.queryEmbedding.join(",")}]` : undefined;
+    const embeddingModelId = input.embeddingModelId;
+    const embeddingConfigVersion = input.embeddingConfigVersion;
+    let rows: Row[];
+    if (queryVector && embeddingModelId && embeddingConfigVersion) {
+      rows = await this.#sql<Row[]>`
+        WITH scoped AS MATERIALIZED (
+          SELECT d.id,d.attachment_id,d.ordinal,d.content,d.metadata,a.filename,
+            kc.id AS collection_id,kc.name AS collection_name,kb.mode,d.embedding,
+            d.embedding_status,d.embedding_model_id,d.embedding_config_version
+          FROM conversations c
+          JOIN conversation_knowledge_bindings kb ON kb.conversation_id=c.id
+            AND kb.owner_id=c.owner_id
+          JOIN knowledge_collections kc ON kc.id=kb.collection_id
+            AND kc.owner_id=c.owner_id AND kc.deleted_at IS NULL
+          JOIN knowledge_collection_attachments kca ON kca.collection_id=kc.id
+          JOIN attachments a ON a.id=kca.attachment_id AND a.owner_id=c.owner_id
+            AND a.deleted_at IS NULL AND a.state='ready' AND a.ingestion_status='ready'
+          JOIN document_chunks d ON d.attachment_id=a.id
+          WHERE c.id=${input.conversationId} AND c.owner_id=${input.ownerId}
+            AND c.deleted_at IS NULL
+        ), lexical AS (
+          SELECT id,row_number() OVER (ORDER BY lexical_score DESC,collection_id,attachment_id,ordinal,id) AS rank
+          FROM (SELECT *,CASE WHEN btrim(${input.query})='' THEN 1::float4 ELSE
+            ts_rank_cd(to_tsvector('simple',content),
+              websearch_to_tsquery('simple',${input.query})) END AS lexical_score FROM scoped
+            WHERE mode='retrieval') ranked WHERE lexical_score > 0
+          ORDER BY lexical_score DESC,collection_id,attachment_id,ordinal,id LIMIT ${candidateLimit}
+        ), vector_matches AS (
+          SELECT id,row_number() OVER (ORDER BY embedding <=> ${queryVector}::vector,
+            collection_id,attachment_id,ordinal,id) AS rank
+          FROM scoped WHERE mode='retrieval' AND embedding IS NOT NULL
+            AND embedding_status='ready' AND embedding_model_id=${embeddingModelId}
+            AND embedding_config_version=${embeddingConfigVersion}
+          ORDER BY embedding <=> ${queryVector}::vector,collection_id,attachment_id,ordinal,id
+          LIMIT ${candidateLimit}
+        ), fused AS (
+          SELECT COALESCE(l.id,v.id) AS id,l.rank AS lexical_rank,v.rank AS vector_rank,
+            COALESCE(1.0/(60+l.rank),0)+COALESCE(1.0/(60+v.rank),0) AS score
+          FROM lexical l FULL JOIN vector_matches v ON v.id=l.id
+        ), selected AS (
+          SELECT s.*,NULL::bigint AS lexical_rank,NULL::bigint AS vector_rank,0::float8 AS score
+          FROM scoped s WHERE mode='full_context'
+          UNION ALL
+          SELECT s.*,f.lexical_rank,f.vector_rank,f.score FROM fused f JOIN scoped s ON s.id=f.id
+        ) SELECT * FROM selected ORDER BY CASE WHEN mode='full_context' THEN 0 ELSE 1 END,
+          CASE WHEN mode='full_context' THEN 0 ELSE score END DESC,
+          collection_id,attachment_id,ordinal,id LIMIT ${limit}`;
+    } else {
+      rows = await this.#sql<Row[]>`
+        WITH scoped AS MATERIALIZED (
+          SELECT d.id,d.attachment_id,d.ordinal,d.content,d.metadata,a.filename,
+            kc.id AS collection_id,kc.name AS collection_name,kb.mode
+          FROM conversations c
+          JOIN conversation_knowledge_bindings kb ON kb.conversation_id=c.id
+            AND kb.owner_id=c.owner_id
+          JOIN knowledge_collections kc ON kc.id=kb.collection_id
+            AND kc.owner_id=c.owner_id AND kc.deleted_at IS NULL
+          JOIN knowledge_collection_attachments kca ON kca.collection_id=kc.id
+          JOIN attachments a ON a.id=kca.attachment_id AND a.owner_id=c.owner_id
+            AND a.deleted_at IS NULL AND a.state='ready' AND a.ingestion_status='ready'
+          JOIN document_chunks d ON d.attachment_id=a.id
+          WHERE c.id=${input.conversationId} AND c.owner_id=${input.ownerId}
+            AND c.deleted_at IS NULL
+        ), lexical AS (
+          SELECT id,row_number() OVER (ORDER BY lexical_score DESC,collection_id,attachment_id,ordinal,id) AS lexical_rank
+          FROM (SELECT *,CASE WHEN btrim(${input.query})='' THEN 1::float4 ELSE
+            ts_rank_cd(to_tsvector('simple',content),
+              websearch_to_tsquery('simple',${input.query})) END AS lexical_score FROM scoped
+            WHERE mode='retrieval') ranked WHERE lexical_score > 0
+          ORDER BY lexical_score DESC,collection_id,attachment_id,ordinal,id LIMIT ${candidateLimit}
+        ), selected AS (
+          SELECT s.*,NULL::bigint AS lexical_rank,NULL::bigint AS vector_rank,0::float8 AS score FROM scoped s
+            WHERE mode='full_context'
+          UNION ALL
+          SELECT s.*,l.lexical_rank,NULL::bigint AS vector_rank,
+            1.0/(60+l.lexical_rank) AS score FROM lexical l JOIN scoped s ON s.id=l.id
+        ) SELECT * FROM selected ORDER BY CASE WHEN mode='full_context' THEN 0 ELSE 1 END,
+          CASE WHEN mode='full_context' THEN 0 ELSE score END DESC,
+          collection_id,attachment_id,ordinal,id LIMIT ${limit}`;
+    }
+    return rows.map((row) => ({
+      mode: row.mode as KnowledgeRetrievalMode,
+      collectionId: String(row.collection_id),
+      collectionName: String(row.collection_name),
+      attachmentId: String(row.attachment_id),
+      filename: String(row.filename),
+      chunkId: String(row.id),
+      ordinal: number(row.ordinal),
+      content: String(row.content),
+      metadata: structuredClone((row.metadata ?? {}) as Record<string, unknown>),
+      lexicalRank: row.lexical_rank == null ? null : number(row.lexical_rank),
+      vectorRank: row.vector_rank == null ? null : number(row.vector_rank),
+      score: number(row.score),
+    }));
   }
 
   async createKnowledgeCollection(ownerId: string, input: CreateKnowledgeCollectionInput) {

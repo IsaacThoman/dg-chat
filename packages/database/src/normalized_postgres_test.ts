@@ -2227,3 +2227,110 @@ Deno.test({
     }
   },
 });
+
+Deno.test({
+  name: "Postgres hybrid knowledge retrieval is owner scoped and model-config fenced",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 1 });
+    await sql`TRUNCATE conversation_knowledge_bindings, knowledge_collection_attachments,
+      knowledge_collections, audit_events, document_chunks, message_attachments, attachments,
+      jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users
+      RESTART IDENTITY CASCADE`;
+    await sql.end();
+    const repo = await PostgresRepository.connect(databaseUrl!);
+    try {
+      const owner = await repo.bootstrapAdmin({
+        email: "hybrid-owner@database.test",
+        name: "Hybrid owner",
+        passwordHash: "x",
+      }, 1);
+      const stranger = await repo.createUser({
+        email: "hybrid-other@database.test",
+        name: "Hybrid other",
+        passwordHash: "x",
+      });
+      const conversation = await repo.createConversation(owner.id, "Hybrid knowledge");
+      const collection = await repo.createKnowledgeCollection(owner.id, {
+        name: "Hybrid runbooks",
+        idempotencyKey: "hybrid-runbooks",
+      });
+      const attachment = (await repo.createAttachment({
+        ownerId: owner.id,
+        objectKey: `users/${owner.id}/hybrid.txt`,
+        filename: "hybrid.txt",
+        mimeType: "text/plain",
+        sizeBytes: 20,
+        sha256: "8".repeat(64),
+        state: "ready",
+      })).attachment;
+      const mutate = postgres(databaseUrl!, { max: 1 });
+      await mutate`UPDATE attachments SET ingestion_status='processing' WHERE id=${attachment.id}`;
+      await mutate.end();
+      const chunks = [
+        {
+          id: crypto.randomUUID(),
+          ordinal: 0,
+          content: "lexical turbine reset",
+          metadata: { sourceAttachmentId: attachment.id },
+        },
+        {
+          id: crypto.randomUUID(),
+          ordinal: 1,
+          content: "semantic procedure",
+          metadata: { sourceAttachmentId: attachment.id },
+        },
+      ];
+      await repo.completeAttachmentIngestion(attachment.id, owner.id, chunks);
+      const axis = (first: number, second: number) => [first, second, ...Array(1534).fill(0)];
+      const embedded = await repo.completeDocumentChunkEmbeddings(
+        attachment.id,
+        owner.id,
+        "provider/embed-1536",
+        "knowledge-v1",
+        [
+          { chunkId: chunks[0].id, embedding: axis(0, 1) },
+          { chunkId: chunks[1].id, embedding: axis(1, 0) },
+        ],
+      );
+      assertEquals(embedded.every((chunk) => chunk.embeddingStatus === "ready"), true);
+      assertEquals("embedding" in embedded[0], false);
+      await repo.linkKnowledgeAttachment(collection.id, attachment.id, owner.id, 1);
+      await repo.bindKnowledgeCollection(conversation.id, collection.id, owner.id, "retrieval");
+      const hybrid = await repo.retrieveConversationKnowledge({
+        conversationId: conversation.id,
+        ownerId: owner.id,
+        query: "turbine",
+        queryEmbedding: axis(1, 0),
+        embeddingModelId: "provider/embed-1536",
+        embeddingConfigVersion: "knowledge-v1",
+      });
+      assertEquals(hybrid.map((item) => item.chunkId), [chunks[0].id, chunks[1].id]);
+      assertEquals(hybrid[0].lexicalRank, 1);
+      assertEquals(hybrid[1].vectorRank, 1);
+      const wrongConfig = await repo.retrieveConversationKnowledge({
+        conversationId: conversation.id,
+        ownerId: owner.id,
+        query: "turbine",
+        queryEmbedding: axis(1, 0),
+        embeddingModelId: "provider/embed-1536",
+        embeddingConfigVersion: "knowledge-v2",
+      });
+      assertEquals(wrongConfig.map((item) => item.chunkId), [chunks[0].id]);
+      await assertRejects(
+        () =>
+          repo.retrieveConversationKnowledge({
+            conversationId: conversation.id,
+            ownerId: stranger.id,
+            query: "turbine",
+          }),
+        DomainError,
+        "not found",
+      );
+    } finally {
+      await repo.close();
+    }
+  },
+});

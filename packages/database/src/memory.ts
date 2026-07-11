@@ -39,6 +39,7 @@ import type {
   CreateProviderRetryPolicyInput,
   CreateUserInput,
   DocumentChunk,
+  DocumentChunkEmbeddingInput,
   DocumentChunkInput,
   FailApiRequestInput,
   FailGenerationInput,
@@ -50,6 +51,8 @@ import type {
   KnowledgeCollection,
   KnowledgeCollectionPatch,
   KnowledgeConversationBinding,
+  KnowledgeRetrievalCandidate,
+  KnowledgeRetrievalInput,
   KnowledgeRetrievalMode,
   ModelPriceVersion,
   ProviderAttempt,
@@ -139,6 +142,99 @@ function validateDocumentChunks(
   } catch {
     throw new DomainError("invalid_document_chunks", "Document chunks are invalid", 422);
   }
+}
+
+const EMBEDDING_CONFIG_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const EMBEDDING_DIMENSIONS = 1536;
+
+function validateEmbeddingReplacement(
+  chunks: readonly DocumentChunk[],
+  modelId: string,
+  configVersion: string,
+  embeddings: readonly DocumentChunkEmbeddingInput[],
+) {
+  if (
+    !modelId || modelId.length > 255 || !EMBEDDING_CONFIG_PATTERN.test(configVersion) ||
+    embeddings.length !== chunks.length
+  ) throw new DomainError("validation_error", "Document embeddings are invalid", 422);
+  const expected = new Set(chunks.map((chunk) => chunk.id));
+  for (const item of embeddings) {
+    if (
+      !expected.delete(item.chunkId) || item.embedding.length !== EMBEDDING_DIMENSIONS ||
+      item.embedding.some((value) => !Number.isFinite(value))
+    ) throw new DomainError("validation_error", "Document embeddings are invalid", 422);
+  }
+  if (expected.size) {
+    throw new DomainError("validation_error", "Document embeddings are invalid", 422);
+  }
+}
+
+function validateKnowledgeRetrievalInput(input: KnowledgeRetrievalInput) {
+  const limit = input.limit ?? 50;
+  const vectorFields = [input.queryEmbedding, input.embeddingModelId, input.embeddingConfigVersion];
+  if (
+    input.query.length > 20_000 || !Number.isSafeInteger(limit) || limit < 1 ||
+    limit > 200 || (vectorFields.some((value) => value !== undefined) &&
+      vectorFields.some((value) => value === undefined)) ||
+    (input.queryEmbedding !== undefined &&
+      (input.queryEmbedding.length !== EMBEDDING_DIMENSIONS ||
+        input.queryEmbedding.some((value) => !Number.isFinite(value)))) ||
+    (input.embeddingModelId !== undefined &&
+      (!input.embeddingModelId || input.embeddingModelId.length > 255)) ||
+    (input.embeddingConfigVersion !== undefined &&
+      !EMBEDDING_CONFIG_PATTERN.test(input.embeddingConfigVersion))
+  ) throw new DomainError("validation_error", "Knowledge retrieval input is invalid", 422);
+}
+
+const knowledgeWords = (value: string) =>
+  new Set(value.toLocaleLowerCase().match(/[\p{L}\p{N}]{2,}/gu) ?? []);
+
+function lexicalKnowledgeScore(query: string, content: string) {
+  const terms = knowledgeWords(query);
+  if (!terms.size) return 1;
+  const contentTerms = knowledgeWords(content);
+  let matches = 0;
+  for (const term of terms) if (contentTerms.has(term)) matches++;
+  return matches / Math.sqrt(Math.max(1, contentTerms.size));
+}
+
+function cosineSimilarity(left: readonly number[], right: readonly number[]) {
+  let dot = 0;
+  let leftNorm = 0;
+  let rightNorm = 0;
+  for (let index = 0; index < left.length; index++) {
+    dot += left[index] * right[index];
+    leftNorm += left[index] ** 2;
+    rightNorm += right[index] ** 2;
+  }
+  return leftNorm && rightNorm ? dot / Math.sqrt(leftNorm * rightNorm) : 0;
+}
+
+function rankKnowledgeCandidates(
+  candidates: Array<KnowledgeRetrievalCandidate & { lexical: number; vector: number }>,
+  limit: number,
+): KnowledgeRetrievalCandidate[] {
+  const stable = (left: KnowledgeRetrievalCandidate, right: KnowledgeRetrievalCandidate) =>
+    left.collectionId.localeCompare(right.collectionId) ||
+    left.attachmentId.localeCompare(right.attachmentId) || left.ordinal - right.ordinal ||
+    left.chunkId.localeCompare(right.chunkId);
+  const retrieval = candidates.filter((item) => item.mode === "retrieval");
+  const lexical = retrieval.filter((item) => item.lexical > 0)
+    .sort((a, b) => b.lexical - a.lexical || stable(a, b));
+  const vector = retrieval.filter((item) => Number.isFinite(item.vector))
+    .sort((a, b) => b.vector - a.vector || stable(a, b));
+  lexical.forEach((item, index) => item.lexicalRank = index + 1);
+  vector.forEach((item, index) => item.vectorRank = index + 1);
+  for (const item of retrieval) {
+    item.score = (item.lexicalRank ? 1 / (60 + item.lexicalRank) : 0) +
+      (item.vectorRank ? 1 / (60 + item.vectorRank) : 0);
+  }
+  const ordered = [
+    ...candidates.filter((item) => item.mode === "full_context").sort(stable),
+    ...retrieval.filter((item) => item.score > 0)
+      .sort((a, b) => b.score - a.score || stable(a, b)),
+  ].slice(0, limit);
+  return ordered.map(({ lexical: _lexical, vector: _vector, ...item }) => item);
 }
 
 interface StoredProvider extends ProviderRecord {
@@ -351,6 +447,7 @@ export class MemoryRepository {
   readonly attachments = new Map<string, AttachmentRecord>();
   readonly messageAttachments = new Map<string, Set<string>>();
   readonly documentChunks = new Map<string, DocumentChunk[]>();
+  readonly documentChunkEmbeddings = new Map<string, number[]>();
   readonly knowledgeCollections = new Map<string, KnowledgeCollection>();
   readonly knowledgeAttachments = new Map<string, Set<string>>();
   readonly knowledgeBindings = new Map<string, KnowledgeConversationBinding>();
@@ -1526,7 +1623,18 @@ export class MemoryRepository {
       );
     }
     const validatedChunks = validateDocumentChunks(chunks, id);
-    const next = validatedChunks.map((chunk) => ({ ...chunk, attachmentId: id }));
+    for (const prior of this.documentChunks.get(id) ?? []) {
+      this.documentChunkEmbeddings.delete(prior.id);
+    }
+    const next = validatedChunks.map((chunk) => ({
+      ...chunk,
+      attachmentId: id,
+      embeddingStatus: "pending" as const,
+      embeddingModelId: null,
+      embeddingConfigVersion: null,
+      embeddedAt: null,
+      embeddingError: null,
+    }));
     this.documentChunks.set(id, next);
     const now = new Date().toISOString();
     attachment.ingestionStatus = "ready";
@@ -1573,6 +1681,77 @@ export class MemoryRepository {
   listDocumentChunks(id: string, ownerId: string) {
     this.getAttachment(id, ownerId);
     return [...(this.documentChunks.get(id) ?? [])].sort((a, b) => a.ordinal - b.ordinal);
+  }
+
+  completeDocumentChunkEmbeddings(
+    id: string,
+    ownerId: string,
+    modelId: string,
+    configVersion: string,
+    embeddings: DocumentChunkEmbeddingInput[],
+  ) {
+    this.getAttachment(id, ownerId);
+    const chunks = this.documentChunks.get(id) ?? [];
+    validateEmbeddingReplacement(chunks, modelId, configVersion, embeddings);
+    const byId = new Map(embeddings.map((item) => [item.chunkId, item.embedding]));
+    const embeddedAt = new Date().toISOString();
+    for (const chunk of chunks) {
+      this.documentChunkEmbeddings.set(chunk.id, [...byId.get(chunk.id)!]);
+      chunk.embeddingStatus = "ready";
+      chunk.embeddingModelId = modelId;
+      chunk.embeddingConfigVersion = configVersion;
+      chunk.embeddedAt = embeddedAt;
+      chunk.embeddingError = null;
+    }
+    return structuredClone(chunks);
+  }
+
+  retrieveConversationKnowledge(input: KnowledgeRetrievalInput) {
+    validateKnowledgeRetrievalInput(input);
+    const conversation = this.conversations.get(input.conversationId);
+    if (!conversation || conversation.ownerId !== input.ownerId || conversation.deletedAt) {
+      throw new DomainError("not_found", "Conversation not found", 404);
+    }
+    const candidates: Array<KnowledgeRetrievalCandidate & { lexical: number; vector: number }> = [];
+    for (const binding of this.knowledgeBindings.values()) {
+      if (binding.conversationId !== input.conversationId || binding.ownerId !== input.ownerId) {
+        continue;
+      }
+      const collection = this.knowledgeCollections.get(binding.collectionId);
+      if (!collection || collection.ownerId !== input.ownerId || collection.deletedAt) continue;
+      for (const attachmentId of this.knowledgeAttachments.get(collection.id) ?? []) {
+        const attachment = this.attachments.get(attachmentId);
+        if (
+          !attachment || attachment.ownerId !== input.ownerId || attachment.deletedAt ||
+          attachment.ingestionStatus !== "ready"
+        ) continue;
+        for (const chunk of this.documentChunks.get(attachment.id) ?? []) {
+          const stored = this.documentChunkEmbeddings.get(chunk.id);
+          const vector = input.queryEmbedding && stored && chunk.embeddingStatus === "ready" &&
+              chunk.embeddingModelId === input.embeddingModelId &&
+              chunk.embeddingConfigVersion === input.embeddingConfigVersion
+            ? cosineSimilarity(input.queryEmbedding, stored)
+            : Number.NEGATIVE_INFINITY;
+          candidates.push({
+            mode: binding.mode,
+            collectionId: collection.id,
+            collectionName: collection.name,
+            attachmentId: attachment.id,
+            filename: attachment.filename,
+            chunkId: chunk.id,
+            ordinal: chunk.ordinal,
+            content: chunk.content,
+            metadata: structuredClone(chunk.metadata),
+            lexicalRank: null,
+            vectorRank: null,
+            score: 0,
+            lexical: lexicalKnowledgeScore(input.query, chunk.content),
+            vector,
+          });
+        }
+      }
+    }
+    return rankKnowledgeCandidates(candidates, input.limit ?? 50);
   }
 
   createKnowledgeCollection(ownerId: string, input: CreateKnowledgeCollectionInput) {

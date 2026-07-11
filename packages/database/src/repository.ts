@@ -163,6 +163,42 @@ export interface DocumentChunkInput {
 }
 export interface DocumentChunk extends DocumentChunkInput {
   attachmentId: string;
+  embeddingStatus: "pending" | "ready" | "failed";
+  embeddingModelId: string | null;
+  embeddingConfigVersion: string | null;
+  embeddedAt: string | null;
+  embeddingError: string | null;
+}
+
+export interface DocumentChunkEmbeddingInput {
+  chunkId: string;
+  embedding: number[];
+}
+
+export interface KnowledgeRetrievalInput {
+  conversationId: string;
+  ownerId: string;
+  query: string;
+  queryEmbedding?: number[];
+  embeddingModelId?: string;
+  embeddingConfigVersion?: string;
+  limit?: number;
+}
+
+/** A bounded retrieval projection. Raw persisted/query vectors never cross this boundary. */
+export interface KnowledgeRetrievalCandidate {
+  mode: KnowledgeRetrievalMode;
+  collectionId: string;
+  collectionName: string;
+  attachmentId: string;
+  filename: string;
+  chunkId: string;
+  ordinal: number;
+  content: string;
+  metadata: DocumentChunkMetadata;
+  lexicalRank: number | null;
+  vectorRank: number | null;
+  score: number;
 }
 
 const DOCUMENT_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
@@ -953,6 +989,16 @@ export interface DomainRepository {
   ): MaybePromise<AttachmentRecord>;
   retryAttachmentIngestion(id: string, ownerId: string): MaybePromise<AttachmentRecord>;
   listDocumentChunks(id: string, ownerId: string): MaybePromise<DocumentChunk[]>;
+  completeDocumentChunkEmbeddings(
+    id: string,
+    ownerId: string,
+    modelId: string,
+    configVersion: string,
+    embeddings: DocumentChunkEmbeddingInput[],
+  ): MaybePromise<DocumentChunk[]>;
+  retrieveConversationKnowledge(
+    input: KnowledgeRetrievalInput,
+  ): MaybePromise<KnowledgeRetrievalCandidate[]>;
   createKnowledgeCollection(
     ownerId: string,
     input: CreateKnowledgeCollectionInput,
