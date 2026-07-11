@@ -49,6 +49,7 @@ export interface QueuedPrompt {
   mode: ChatStreamMode;
   operationId: string;
   reuseOperationOnRetry?: boolean;
+  versionRetryCount?: number;
 }
 
 export function enqueuePrompt(queue: QueuedPrompt[], item: QueuedPrompt): QueuedPrompt[] {

@@ -80,6 +80,19 @@ test("admin enables web search and a user explicitly reviews and cancels a tool 
   await page.reload();
   await expect(page.getByText("Summarize the attached verified search result.", { exact: true }))
     .toBeVisible();
+  const conversationId = await page.locator(
+    ".conversation-row.active [data-conversation-actions]",
+  ).getAttribute("data-conversation-actions");
+  if (!conversationId) throw new Error("Active conversation ID was not available");
+  const concurrentEditRename = await authenticatedRequest(
+    page,
+    `/api/conversations/${conversationId}`,
+    {
+      method: "PATCH",
+      body: { title: "Concurrent edit retry test" },
+    },
+  );
+  expect(concurrentEditRename.status).toBe(200);
   const original = page.getByText("Summarize the attached verified search result.", {
     exact: true,
   });
@@ -93,10 +106,6 @@ test("admin enables web search and a user explicitly reviews and cancels a tool 
   await expect(page.getByText("Edited summary that retains verified search provenance.", {
     exact: true,
   })).toBeVisible();
-  const conversationId = await page.locator(
-    ".conversation-row.active [data-conversation-actions]",
-  ).getAttribute("data-conversation-actions");
-  if (!conversationId) throw new Error("Active conversation ID was not available");
   await expect.poll(
     async () => {
       const detail = await authenticatedRequest(page, `/api/conversations/${conversationId}`);

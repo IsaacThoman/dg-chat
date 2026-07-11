@@ -1754,7 +1754,7 @@ function ChatView({
           if (resolved.created) await onConversationCreated(event.conversation.id);
         }
       }
-    } catch {
+    } catch (error) {
       if (controller.signal.aborted) {
         setSendError(
           "Generation stopped. Your saved conversation and previous branches are intact.",
@@ -1773,9 +1773,11 @@ function ChatView({
           : acceptedUserId
           ? undefined
           : { ...item, reuseOperationOnRetry: true };
+        let refreshedAfterFailure = false;
         if (targetConversationId) {
           try {
             const refreshed = await api.conversationGraph(targetConversationId);
+            refreshedAfterFailure = true;
             queryClient.setQueryData(["messages", targetConversationId], refreshed.messages);
             setLocalMessages(refreshed.messages);
             setConversation(refreshed.conversation);
@@ -1799,6 +1801,18 @@ function ChatView({
           } catch {
             // Keep the local immutable path visible when recovery is temporarily unavailable.
           }
+        }
+        if (
+          error instanceof ApiError && error.code === "version_conflict" && !acceptedUserId &&
+          refreshedAfterFailure && (item.versionRetryCount ?? 0) < 1
+        ) {
+          setQueue((current) => [{
+            ...item,
+            id: crypto.randomUUID(),
+            reuseOperationOnRetry: true,
+            versionRetryCount: (item.versionRetryCount ?? 0) + 1,
+          }, ...current]);
+          return;
         }
         setFailedPrompt(retryPrompt);
         setSendError(
