@@ -4,6 +4,30 @@ const controlToken = Deno.env.get("MOCK_PROVIDER_CONTROL_TOKEN") ?? "ci-mock-con
 const encoder = new TextEncoder();
 const attempts = new Map<string, number>();
 
+interface AudioState {
+  calls: number;
+  lastAuthorized: boolean;
+  lastEndpoint: string | null;
+  lastModel: string | null;
+  lastFilename: string | null;
+  lastMime: string | null;
+  lastBytes: number;
+  sawStream: boolean;
+  sawDiarization: boolean;
+}
+
+const audio: AudioState = {
+  calls: 0,
+  lastAuthorized: false,
+  lastEndpoint: null,
+  lastModel: null,
+  lastFilename: null,
+  lastMime: null,
+  lastBytes: 0,
+  sawStream: false,
+  sawDiarization: false,
+};
+
 interface ScenarioState {
   opened: number;
   completed: number;
@@ -311,6 +335,17 @@ Deno.serve({ port }, async (request) => {
     if (!controlAuthorized(request)) return error("Invalid control token", 401, "unauthorized");
     attempts.clear();
     scenarios.clear();
+    Object.assign(audio, {
+      calls: 0,
+      lastAuthorized: false,
+      lastEndpoint: null,
+      lastModel: null,
+      lastFilename: null,
+      lastMime: null,
+      lastBytes: 0,
+      sawStream: false,
+      sawDiarization: false,
+    });
     return json({ reset: true });
   }
   if (url.pathname === "/__test/state" && request.method === "GET") {
@@ -318,6 +353,7 @@ Deno.serve({ port }, async (request) => {
     return json({
       attempts: Object.fromEntries(attempts),
       scenarios: Object.fromEntries(scenarios),
+      audio,
     });
   }
   if (url.pathname === "/v1/models" && request.method === "GET") {
@@ -379,7 +415,49 @@ Deno.serve({ port }, async (request) => {
         headers: { "content-type": "audio/mpeg" },
       });
     }
-    return json({ text: "Mock transcription" });
+    const form = await request.formData();
+    const file = form.get("file");
+    audio.calls++;
+    audio.lastAuthorized = authorized(request, apiKey);
+    audio.lastEndpoint = url.pathname.split("/").at(-1) ?? null;
+    audio.lastModel = typeof form.get("model") === "string" ? String(form.get("model")) : null;
+    audio.lastFilename = file instanceof File ? file.name : null;
+    audio.lastMime = file instanceof File ? file.type : null;
+    audio.lastBytes = file instanceof File ? file.size : 0;
+    if (!(file instanceof File) || !file.size || !audio.lastModel) {
+      return error("Invalid audio multipart body", 400, "invalid_multipart");
+    }
+    const streaming = form.get("stream") === "true";
+    const diarized = form.get("response_format") === "diarized_json";
+    audio.sawStream ||= streaming;
+    audio.sawDiarization ||= diarized && form.get("chunking_strategy") === "auto" &&
+      form.get("known_speaker_names[]") === "agent" &&
+      form.get("known_speaker_references[]") === "data:audio/wav;base64,UklGRg==";
+    if (streaming) {
+      return new Response(
+        'data: {"type":"transcript.text.delta","delta":"Mock "}\n\n' +
+          'data: {"type":"transcript.text.done","text":"Mock transcription","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}\n\n',
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    }
+    if (diarized) {
+      return json({
+        task: "transcribe",
+        duration: 1,
+        text: "Mock transcription",
+        segments: [{
+          type: "transcript.text.segment",
+          id: "seg_1",
+          start: 0,
+          end: 1,
+          text: "Mock transcription",
+          speaker: "agent",
+        }],
+      });
+    }
+    return json({
+      text: audio.lastEndpoint === "translations" ? "Mock translation" : "Mock transcription",
+    });
   }
   return error(`No mock route for ${request.method} ${url.pathname}`, 404, "not_found");
 });

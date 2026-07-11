@@ -57,13 +57,17 @@ const DEFAULT_ALLOWED_TYPES = new Set([
   "image/webp",
   ...INGESTIBLE_DOCUMENT_MIME_TYPES,
   "audio/mpeg",
+  "audio/flac",
+  "audio/mp4",
   "audio/wav",
   "audio/ogg",
+  "audio/webm",
 ]);
 
 const MIME_ALIASES: Record<string, string> = {
   "image/jpg": "image/jpeg",
   "audio/x-wav": "audio/wav",
+  "audio/x-flac": "audio/flac",
   "application/x-pdf": "application/pdf",
   "text/json": "application/json",
 };
@@ -78,8 +82,11 @@ const EXTENSIONS: Record<string, string> = {
   "application/json": "json",
   [DOCX_MIME_TYPE]: "docx",
   "audio/mpeg": "mp3",
+  "audio/flac": "flac",
+  "audio/mp4": "m4a",
   "audio/wav": "wav",
   "audio/ogg": "ogg",
+  "audio/webm": "webm",
 };
 
 function canonicalMime(value: string): string {
@@ -93,6 +100,274 @@ function startsWith(bytes: Uint8Array, signature: readonly number[], offset = 0)
 
 function ascii(bytes: Uint8Array, start: number, length: number): string {
   return String.fromCharCode(...bytes.subarray(start, start + length));
+}
+
+function containsAscii(bytes: Uint8Array, marker: string): boolean {
+  if (!marker.length || bytes.length < marker.length) return false;
+  const first = marker.charCodeAt(0);
+  outer: for (let offset = 0; offset <= bytes.length - marker.length; offset++) {
+    if (bytes[offset] !== first) continue;
+    for (let index = 1; index < marker.length; index++) {
+      if (bytes[offset + index] !== marker.charCodeAt(index)) continue outer;
+    }
+    return true;
+  }
+  return false;
+}
+
+function mpegAudioFrameLength(bytes: Uint8Array, offset: number): number | undefined {
+  if (offset + 4 > bytes.length || bytes[offset] !== 0xff || (bytes[offset + 1] & 0xe0) !== 0xe0) {
+    return undefined;
+  }
+  const versionBits = (bytes[offset + 1] >> 3) & 0x03;
+  const layerBits = (bytes[offset + 1] >> 1) & 0x03;
+  const bitrateIndex = (bytes[offset + 2] >> 4) & 0x0f;
+  const sampleRateIndex = (bytes[offset + 2] >> 2) & 0x03;
+  if (
+    versionBits === 0x01 || layerBits === 0 || bitrateIndex === 0 || bitrateIndex === 0x0f ||
+    sampleRateIndex === 0x03
+  ) return undefined;
+
+  const version = versionBits === 0x03 ? 1 : versionBits === 0x02 ? 2 : 2.5;
+  const layer = 4 - layerBits;
+  const mpeg1Bitrates = layer === 1
+    ? [32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448]
+    : layer === 2
+    ? [32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384]
+    : [32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320];
+  const mpeg2Bitrates = layer === 1
+    ? [32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256]
+    : [8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+  const bitrateKbps = (version === 1 ? mpeg1Bitrates : mpeg2Bitrates)[bitrateIndex - 1];
+  const baseSampleRates = [44_100, 48_000, 32_000];
+  const sampleRate = baseSampleRates[sampleRateIndex] / (version === 1 ? 1 : version === 2 ? 2 : 4);
+  const padding = (bytes[offset + 2] >> 1) & 1;
+  const length = layer === 1
+    ? Math.floor((12 * bitrateKbps * 1_000 / sampleRate) + padding) * 4
+    : Math.floor(
+      ((layer === 3 && version !== 1 ? 72 : 144) * bitrateKbps * 1_000 / sampleRate) + padding,
+    );
+  return Number.isSafeInteger(length) && length >= 4 ? length : undefined;
+}
+
+function mp3Audio(bytes: Uint8Array, totalBytes: number): boolean {
+  let frameOffset = 0;
+  if (ascii(bytes, 0, 3) === "ID3") {
+    if (bytes.length < 10) return false;
+    const version = bytes[3];
+    if (version < 2 || version > 4 || bytes[4] === 0xff) return false;
+    const sizeBytes = bytes.subarray(6, 10);
+    if (sizeBytes.some((value) => (value & 0x80) !== 0)) return false;
+    const tagSize = sizeBytes.reduce((size, value) => size * 128 + value, 0);
+    const footerSize = version === 4 && (bytes[5] & 0x10) !== 0 ? 10 : 0;
+    frameOffset = 10 + tagSize + footerSize;
+    if (
+      !Number.isSafeInteger(frameOffset) || frameOffset > totalBytes || frameOffset > bytes.length
+    ) {
+      return false;
+    }
+  }
+  const frameLength = mpegAudioFrameLength(bytes, frameOffset);
+  return frameLength !== undefined && frameOffset + frameLength <= bytes.length &&
+    frameOffset + frameLength <= totalBytes;
+}
+
+function ebmlVint(bytes: Uint8Array, offset: number, maximumLength: number): {
+  length: number;
+  value: number;
+  unknown: boolean;
+} | undefined {
+  const first = bytes[offset];
+  if (first === undefined || first === 0) return undefined;
+  let marker = 0x80;
+  let length = 1;
+  while (!(first & marker) && length <= maximumLength) {
+    marker >>= 1;
+    length++;
+  }
+  if (length > maximumLength || offset + length > bytes.length) return undefined;
+  let value = first & (marker - 1);
+  let unknown = value === marker - 1;
+  for (let index = 1; index < length; index++) {
+    value = value * 256 + bytes[offset + index];
+    unknown &&= bytes[offset + index] === 0xff;
+    if (!Number.isSafeInteger(value)) return undefined;
+  }
+  return { length, value, unknown };
+}
+
+function ebmlElement(bytes: Uint8Array, offset: number, end: number): {
+  id: string;
+  dataStart: number;
+  dataEnd: number;
+} | undefined {
+  const idVint = ebmlVint(bytes, offset, 4);
+  if (!idVint) return undefined;
+  const idBytes = bytes.subarray(offset, offset + idVint.length);
+  const id = [...idBytes].map((value) => value.toString(16).padStart(2, "0")).join("");
+  const size = ebmlVint(bytes, offset + idVint.length, 8);
+  if (!size || size.unknown) return undefined;
+  const dataStart = offset + idVint.length + size.length;
+  const dataEnd = dataStart + size.value;
+  return dataEnd <= end ? { id, dataStart, dataEnd } : undefined;
+}
+
+function webmAudioContainer(bytes: Uint8Array): boolean {
+  if (!startsWith(bytes, [0x1a, 0x45, 0xdf, 0xa3])) return false;
+  const headerSize = ebmlVint(bytes, 4, 8);
+  if (!headerSize || headerSize.unknown) return false;
+  const headerStart = 4 + headerSize.length;
+  const headerEnd = headerStart + headerSize.value;
+  if (headerEnd > bytes.length) return false;
+  let docType = false;
+  for (let offset = headerStart; offset < headerEnd;) {
+    const element = ebmlElement(bytes, offset, headerEnd);
+    if (!element) return false;
+    if (element.id === "4282") {
+      docType = ascii(bytes, element.dataStart, element.dataEnd - element.dataStart) === "webm";
+    }
+    offset = element.dataEnd;
+  }
+  if (!docType || !startsWith(bytes, [0x18, 0x53, 0x80, 0x67], headerEnd)) return false;
+  const segmentSize = ebmlVint(bytes, headerEnd + 4, 8);
+  if (!segmentSize) return false;
+  let offset = headerEnd + 4 + segmentSize.length;
+  const segmentEnd = segmentSize.unknown
+    ? bytes.length
+    : Math.min(bytes.length, offset + segmentSize.value);
+  while (offset < segmentEnd) {
+    const element = ebmlElement(bytes, offset, segmentEnd);
+    if (!element) return false;
+    if (element.id === "1654ae6b") {
+      for (let trackOffset = element.dataStart; trackOffset < element.dataEnd;) {
+        const track = ebmlElement(bytes, trackOffset, element.dataEnd);
+        if (!track) return false;
+        if (track.id === "ae") {
+          let audio = false;
+          let codec = false;
+          for (let fieldOffset = track.dataStart; fieldOffset < track.dataEnd;) {
+            const field = ebmlElement(bytes, fieldOffset, track.dataEnd);
+            if (!field) return false;
+            if (field.id === "83" && field.dataEnd - field.dataStart === 1) {
+              audio = bytes[field.dataStart] === 2;
+            }
+            if (field.id === "86") {
+              const value = ascii(bytes, field.dataStart, field.dataEnd - field.dataStart);
+              codec = ["A_OPUS", "A_VORBIS", "A_FLAC", "A_AAC", "A_MPEG/L3"]
+                .includes(value) || value.startsWith("A_PCM/");
+            }
+            fieldOffset = field.dataEnd;
+          }
+          if (audio && codec) return true;
+        }
+        trackOffset = track.dataEnd;
+      }
+    }
+    offset = element.dataEnd;
+  }
+  return false;
+}
+
+function u32be(bytes: Uint8Array, offset: number): number {
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(offset);
+}
+
+interface Mp4Box {
+  type: string;
+  dataStart: number;
+  end: number;
+}
+
+function mp4Children(bytes: Uint8Array, start: number, end: number): Mp4Box[] | undefined {
+  const result: Mp4Box[] = [];
+  let offset = start;
+  while (offset < end) {
+    if (offset + 8 > end) return undefined;
+    const size = u32be(bytes, offset);
+    // Extended-size boxes are unnecessary for bounded metadata and complicate safe arithmetic.
+    if (size === 1 || size < 8 || offset + size > end) return undefined;
+    result.push({ type: ascii(bytes, offset + 4, 4), dataStart: offset + 8, end: offset + size });
+    offset += size;
+  }
+  return result;
+}
+
+function mp4SoundTrack(bytes: Uint8Array): boolean {
+  const moov = mp4Children(bytes, 8, bytes.length);
+  if (!moov) return false;
+  for (const trak of moov.filter((box) => box.type === "trak")) {
+    const trakChildren = mp4Children(bytes, trak.dataStart, trak.end);
+    if (!trakChildren) continue;
+    for (const mdia of trakChildren.filter((box) => box.type === "mdia")) {
+      const mediaChildren = mp4Children(bytes, mdia.dataStart, mdia.end);
+      if (!mediaChildren) continue;
+      for (const handler of mediaChildren.filter((box) => box.type === "hdlr")) {
+        // hdlr is a FullBox: version/flags, pre-defined, then the four-byte handler type.
+        if (
+          handler.dataStart + 12 <= handler.end &&
+          ascii(bytes, handler.dataStart + 8, 4) === "soun"
+        ) return true;
+      }
+    }
+  }
+  return false;
+}
+
+function mp4Window(
+  prefix: Uint8Array,
+  suffix: Uint8Array,
+  totalBytes: number,
+  absoluteOffset: number,
+  length: number,
+): Uint8Array | undefined {
+  if (!Number.isSafeInteger(absoluteOffset) || !Number.isSafeInteger(length) || length < 0) {
+    return undefined;
+  }
+  if (absoluteOffset >= 0 && absoluteOffset + length <= prefix.length) {
+    return prefix.subarray(absoluteOffset, absoluteOffset + length);
+  }
+  const suffixStart = totalBytes - suffix.length;
+  if (absoluteOffset >= suffixStart && absoluteOffset + length <= totalBytes) {
+    const local = absoluteOffset - suffixStart;
+    return suffix.subarray(local, local + length);
+  }
+  return undefined;
+}
+
+function mp4AudioContainer(
+  prefix: Uint8Array,
+  suffix: Uint8Array,
+  totalBytes: number,
+): boolean {
+  const first = mp4Window(prefix, suffix, totalBytes, 0, 16);
+  if (!first || ascii(first, 4, 4) !== "ftyp") return false;
+  const ftypSize = u32be(first, 0);
+  if (ftypSize < 16 || ftypSize > totalBytes) return false;
+  const brand = ascii(prefix, 8, 4);
+  const knownBrand = ["M4A ", "M4B ", "M4P ", "isom", "iso2", "mp41", "mp42"]
+    .includes(brand);
+  if (!knownBrand) return false;
+  // Walk declared top-level boxes by absolute offset. This lets us jump over a large `mdat` while
+  // still inspecting a tail `moov`, without accepting forged box names embedded in media bytes.
+  let offset = 0;
+  let boxes = 0;
+  while (offset < totalBytes && boxes++ < 4096) {
+    const header = mp4Window(prefix, suffix, totalBytes, offset, 8);
+    if (!header) return false;
+    const size = u32be(header, 0);
+    const type = ascii(header, 4, 4);
+    // Extended-size boxes are rejected rather than performing arithmetic on attacker-controlled
+    // 64-bit values. A zero size consumes the rest of the file and therefore cannot precede moov.
+    if (size === 1 || (size !== 0 && size < 8)) return false;
+    const boxSize = size === 0 ? totalBytes - offset : size;
+    if (!Number.isSafeInteger(boxSize) || offset + boxSize > totalBytes) return false;
+    if (type === "moov") {
+      const box = mp4Window(prefix, suffix, totalBytes, offset, boxSize);
+      return !!box && mp4SoundTrack(box);
+    }
+    offset += boxSize;
+  }
+  return false;
 }
 
 function u16(bytes: Uint8Array, offset: number): number {
@@ -173,9 +448,18 @@ function sniffMime(
   if (ascii(bytes, 0, 6) === "GIF87a" || ascii(bytes, 0, 6) === "GIF89a") return "image/gif";
   if (ascii(bytes, 0, 4) === "RIFF" && ascii(bytes, 8, 4) === "WEBP") return "image/webp";
   if (ascii(bytes, 0, 5) === "%PDF-") return "application/pdf";
-  if (ascii(bytes, 0, 3) === "ID3" || startsWith(bytes, [0xff, 0xfb])) return "audio/mpeg";
-  if (ascii(bytes, 0, 4) === "RIFF" && ascii(bytes, 8, 4) === "WAVE") return "audio/wav";
-  if (ascii(bytes, 0, 4) === "OggS") return "audio/ogg";
+  if (mp3Audio(bytes, totalBytes)) return "audio/mpeg";
+  if (ascii(bytes, 0, 4) === "fLaC" && bytes.length >= 8) return "audio/flac";
+  if (mp4AudioContainer(bytes, suffix, totalBytes)) return "audio/mp4";
+  if (webmAudioContainer(bytes)) return "audio/webm";
+  if (
+    ascii(bytes, 0, 4) === "RIFF" && ascii(bytes, 8, 4) === "WAVE" &&
+    containsAscii(bytes, "fmt ") && containsAscii(bytes, "data")
+  ) return "audio/wav";
+  if (
+    ascii(bytes, 0, 4) === "OggS" &&
+    ["OpusHead", "vorbis", "Speex   ", "fLaC"].some((marker) => containsAscii(bytes, marker))
+  ) return "audio/ogg";
   if (startsWith(bytes, [0x50, 0x4b, 0x03, 0x04])) {
     return docxFromCentralDirectory(prefix, suffix, totalBytes) ? DOCX_MIME_TYPE : undefined;
   }

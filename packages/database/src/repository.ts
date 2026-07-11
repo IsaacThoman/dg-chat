@@ -6,6 +6,7 @@ import type {
   ConversationDetail,
   MessageNode,
   MessageRole,
+  ModelCapability,
   PublicUser,
   UsageSummary,
   UserRole,
@@ -524,7 +525,12 @@ export interface JobSummary {
   attempts: number;
   createdAt: string;
 }
-export type ApiIdempotencyEndpoint = "chat.completions" | "responses" | "embeddings";
+export type ApiIdempotencyEndpoint =
+  | "chat.completions"
+  | "responses"
+  | "embeddings"
+  | "audio.transcriptions"
+  | "audio.translations";
 export type ApiIdempotencyState = "in_progress" | "completed" | "failed";
 export interface ApiIdempotencyFrame {
   sequence: number;
@@ -689,7 +695,7 @@ export interface ProviderModelRecord {
   publicModelId: string;
   upstreamModelId: string;
   displayName: string;
-  capabilities: string[];
+  capabilities: ModelCapability[];
   contextWindow: number;
   enabled: boolean;
   version: number;
@@ -702,7 +708,7 @@ export interface CreateProviderModelInput {
   publicModelId: string;
   upstreamModelId: string;
   displayName: string;
-  capabilities: string[];
+  capabilities: ModelCapability[];
   contextWindow: number;
   enabled?: boolean;
   customParams?: Record<string, unknown>;
@@ -711,7 +717,7 @@ export interface UpdateProviderModelInput {
   publicModelId?: string;
   upstreamModelId?: string;
   displayName?: string;
-  capabilities?: string[];
+  capabilities?: ModelCapability[];
   contextWindow?: number;
   enabled?: boolean;
   customParams?: Record<string, unknown>;

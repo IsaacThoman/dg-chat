@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Activity, Bot, Cloud, Plus, RefreshCw, Search } from "lucide-react";
 import { api, ApiError } from "./api.ts";
 import { Modal } from "./Modal.tsx";
+import { MODEL_CAPABILITIES, type ModelCapability } from "../../../packages/contracts/src/types.ts";
 import type {
   AdminModel,
   AdminProvider,
@@ -11,7 +12,7 @@ import type {
   ProviderProtocol,
 } from "./types.ts";
 
-const capabilities = ["chat", "streaming", "tools", "vision", "reasoning"];
+const capabilities = MODEL_CAPABILITIES;
 const errorMessage = (error: unknown) =>
   error instanceof ApiError || error instanceof Error ? error.message : "The request failed";
 const dateTime = (value: string | null) => value ? new Date(value).toLocaleString() : "Never";
@@ -553,7 +554,7 @@ type ModelDraft = {
   displayName: string;
   contextWindow: string;
   enabled: boolean;
-  capabilities: string[];
+  capabilities: ModelCapability[];
 };
 function ModelForm(
   { model, providers, close }: {

@@ -885,6 +885,13 @@ kbd {
   font-weight: 700;
   pointer-events: none;
 }
+.composer-status {
+  width: min(780px, calc(100% - 16px));
+  margin: 0 auto 8px;
+  color: var(--muted);
+  font-size: 11px;
+  text-align: center;
+}
 .upload-list {
   width: min(780px, calc(100% - 16px));
   margin: 0 auto 8px;
@@ -993,6 +1000,96 @@ kbd {
   color: #c14b4b;
   background: #f8e9e9;
   animation: pulse 1.5s infinite;
+}
+.voice-input {
+  position: relative;
+  display: flex;
+}
+
+.voice-model-select {
+  max-width: 10rem;
+  min-height: 2.25rem;
+  border: 1px solid var(--line);
+  border-radius: 0.65rem;
+  background: var(--panel);
+  color: var(--ink);
+  padding: 0 1.8rem 0 0.6rem;
+  font-size: 0.75rem;
+}
+@media (max-width: 800px) {
+  .voice-model-select {
+    width: 6.5rem;
+    max-width: 6.5rem;
+    padding-right: 1.25rem;
+  }
+}
+.voice-panel {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 12px);
+  z-index: 5;
+  width: min(440px, calc(100vw - 32px));
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--panel);
+  box-shadow: 0 14px 38px #30291f24;
+}
+.voice-status {
+  min-height: 20px;
+  display: flex;
+  align-items: center;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 650;
+}
+.voice-status span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.voice-status b {
+  color: var(--ink);
+  font-family: "DM Mono", monospace;
+  font-size: 10px;
+}
+.recording-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--danger);
+  box-shadow: 0 0 0 4px #c14b4b1f;
+  animation: pulse 1.5s infinite;
+}
+.voice-panel audio {
+  width: 100%;
+  height: 36px;
+}
+.voice-panel > p {
+  margin: 0;
+  color: var(--danger);
+  font-size: 11px;
+}
+.voice-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
+}
+.voice-actions button {
+  min-height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .recording-dot,
+  .recording {
+    animation: none;
+  }
 }
 .send-button {
   width: 32px;

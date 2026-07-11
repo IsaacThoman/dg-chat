@@ -5,6 +5,7 @@ import type {
   UpdateProviderInput,
   UpdateProviderModelInput,
 } from "@dg-chat/database";
+import { isModelCapability, type ModelCapability } from "@dg-chat/contracts";
 import { normalizeProviderBaseUrl } from "./provider-admin.ts";
 
 export class ProviderValidationError extends Error {}
@@ -114,7 +115,7 @@ export function providerExpectedVersion(value: unknown): number {
   return integer(body.expectedVersion, "expectedVersion", 1);
 }
 
-function capabilities(value: unknown): string[] {
+function capabilities(value: unknown): ModelCapability[] {
   if (!Array.isArray(value) || value.length > 32) {
     throw new ProviderValidationError("capabilities are invalid");
   }
@@ -122,7 +123,10 @@ function capabilities(value: unknown): string[] {
   if (new Set(result).size !== result.length) {
     throw new ProviderValidationError("capabilities must be unique");
   }
-  return result;
+  if (result.some((item) => !isModelCapability(item))) {
+    throw new ProviderValidationError("capabilities contain an unsupported value");
+  }
+  return result as ModelCapability[];
 }
 
 function customParams(value: unknown): Record<string, unknown> {

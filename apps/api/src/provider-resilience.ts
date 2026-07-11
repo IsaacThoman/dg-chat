@@ -603,6 +603,8 @@ export async function* streamProviderRequest<T>(
       context: AttemptContext,
     ) => AsyncIterable<T> | Promise<AsyncIterable<T>>;
     visibleUnits?: (chunk: T) => number;
+    /** Accept a validated stream whose buffered events contain no user-visible units. */
+    allowNoVisibleOutput?: boolean;
   },
 ): AsyncGenerator<T> {
   const policy = validateResiliencePolicy(options.policy);
@@ -648,10 +650,14 @@ export async function* streamProviderRequest<T>(
         );
         if (item.done) {
           if (!visible) {
-            throw new ProviderAttemptError("Provider stream ended before visible output", {
-              category: "invalid_response",
-              transient: true,
-            });
+            if (!options.allowNoVisibleOutput) {
+              throw new ProviderAttemptError("Provider stream ended before visible output", {
+                category: "invalid_response",
+                transient: true,
+              });
+            }
+            for (const chunk of buffered) queue.push(chunk);
+            buffered.length = 0;
           }
           break;
         }

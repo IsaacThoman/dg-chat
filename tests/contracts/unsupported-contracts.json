@@ -6,7 +6,7 @@
   },
   {
     "status": "todo",
-    "endpoint": "POST /v1/audio/transcriptions, translations, speech",
-    "reason": "Audio provider integrations are not implemented"
+    "endpoint": "POST /v1/audio/speech",
+    "reason": "Speech synthesis provider integration is not implemented"
   }
 ]

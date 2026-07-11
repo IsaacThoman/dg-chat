@@ -87,6 +87,19 @@ Deno.test("model and price validation reject duplicates and unsafe numbers", () 
     () =>
       providerModelCreate({
         providerId: "provider",
+        publicModelId: "provider/model",
+        upstreamModelId: "model",
+        displayName: "Model",
+        capabilities: ["chat", "transcripton"],
+        contextWindow: 10,
+      }),
+    ProviderValidationError,
+    "unsupported value",
+  );
+  assertThrows(
+    () =>
+      providerModelCreate({
+        providerId: "provider",
         publicModelId: "provider/model\nunsafe",
         upstreamModelId: "model",
         displayName: "Model",

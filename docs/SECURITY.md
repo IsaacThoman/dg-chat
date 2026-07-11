@@ -44,16 +44,17 @@ raw-byte, page-count, and output limits. PDF and DOCX parsing runs in a terminab
 under one absolute, lease-margined job deadline. DOCX extraction preflights the ZIP directory and
 rejects ZIP64/multidisk archives, traversal, encryption, macros, external relationships, excessive
 entries, per-entry size, aggregate expansion, and suspicious compression ratios before extraction.
-Other Office formats, OCR, vector persistence/retrieval, object garbage collection, and
-retention-aware deletion are not implemented. The embeddings proxy is implemented with the same
-DNS-pinned, private-network-blocking provider transport and strict bounded response validation used
-by other provider calls; conversation knowledge currently uses local lexical ranking.
+Other Office formats, object garbage collection, and retention-aware deletion are not implemented.
+OCR interception, PostgreSQL vector persistence, and hybrid lexical/vector retrieval are implemented
+with bounded inputs, owner scoping, cache keys derived from content hashes, and durable accounting.
+Embeddings and audio provider calls use the same DNS-pinned, private-network-blocking transport and
+strict bounded response validation as chat providers.
 
 The current OpenAI-compatible provider transport resolves every A and AAAA answer, rejects
 special-use destinations, and pins the approved address while preserving TLS hostname validation. It
-rejects redirects and bounds response and streaming bytes. Future OCR, search, tool, ingestion, and
-sandbox fetchers must independently enforce redirect, decompression, image-dimension, and duration
-limits before those features are enabled.
+rejects redirects and bounds response and streaming bytes. OCR, SearXNG search, approved tools, and
+ingestion each enforce their own network, redirect, byte, MIME, and relevant image/archive limits.
+Any future sandbox fetcher must preserve those controls independently.
 
 ## Secrets and privacy
 
@@ -95,7 +96,6 @@ runs with a read-only root filesystem. It is registered as an adapter, not autom
 allowlisted: an administrator must allow the `searxng` domain and private-network access before
 users can request searches.
 
-`MemoryToolExecutionStore` is intended for development and tests. Production deployments must inject
-a durable `ToolExecutionStore` implementation before tool execution is considered production-ready;
-the interface includes atomic state transitions and optimistic policy versions so PostgreSQL can be
-added without changing API or execution semantics.
+Production uses the PostgreSQL-backed `ToolExecutionStore` with atomic state transitions, optimistic
+policy versions, durable reservations, startup recovery, and cancellation fencing.
+`MemoryToolExecutionStore` remains limited to development and tests.

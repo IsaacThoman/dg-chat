@@ -45,7 +45,6 @@ import {
   LogOut,
   Menu,
   MessageSquare,
-  Mic,
   MoreHorizontal,
   Paperclip,
   Pencil,
@@ -105,6 +104,8 @@ import { AdminResilience } from "./AdminResilience.tsx";
 import { AdminTools } from "./AdminTools.tsx";
 import { ToolLauncher } from "./ToolLauncher.tsx";
 import { ConversationKnowledgePicker, KnowledgeView } from "./Knowledge.tsx";
+import { VoiceRecorder } from "./voice/VoiceRecorder.tsx";
+import { insertTranscript } from "./voice/voiceState.ts";
 import type {
   Attachment,
   AuditFilters,
@@ -650,7 +651,12 @@ function ModelPicker(
   const model = models.find((m) => m.id === selected) ?? models[0];
   return (
     <div className="model-picker">
-      <button className="model-trigger" onClick={() => setOpen(!open)}>
+      <button
+        type="button"
+        className="model-trigger"
+        aria-expanded={open}
+        onClick={() => setOpen(!open)}
+      >
         <span className="model-glyph">{model?.provider[0]}</span>
         <span>
           <strong>{model?.name ?? "Select model"}</strong>
@@ -659,12 +665,14 @@ function ModelPicker(
         <ChevronDown size={16} />
       </button>
       {open && (
-        <div className="model-popover">
+        <div className="model-popover" role="group" aria-label="Chat model choices">
           <div className="popover-title">
             Choose a model <SlidersHorizontal size={15} />
           </div>
           {models.map((m) => (
             <button
+              type="button"
+              aria-pressed={selected === m.id}
               key={m.id}
               onClick={() => {
                 setSelected(m.id);
@@ -921,7 +929,20 @@ function AttachmentIngestionBadge({ attachment }: { attachment: Attachment }) {
 }
 
 function Composer(
-  { onSend, edit, cancelEdit, disabled, streaming, stopping, queuedCount, onStop }: {
+  {
+    onSend,
+    edit,
+    cancelEdit,
+    disabled,
+    streaming,
+    stopping,
+    queuedCount,
+    onStop,
+    transcriptionModels,
+    transcriptionModel,
+    setTranscriptionModel,
+    disabledReason,
+  }: {
     onSend: (
       value: string,
       attachmentIds: string[],
@@ -934,6 +955,10 @@ function Composer(
     stopping: boolean;
     queuedCount: number;
     onStop: () => void;
+    transcriptionModels: Model[];
+    transcriptionModel?: string;
+    setTranscriptionModel: (id: string) => void;
+    disabledReason?: string;
   },
 ) {
   const [value, setValue] = useState("");
@@ -961,6 +986,7 @@ function Composer(
   const [excludedEditAttachments, setExcludedEditAttachments] = useState<Set<string>>(new Set());
   const uploadControllers = useRef(new Map<string, AbortController>());
   const fileRef = useRef<HTMLInputElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   useEffect(() => () => {
     for (const controller of uploadControllers.current.values()) controller.abort();
     uploadControllers.current.clear();
@@ -1221,8 +1247,10 @@ function Composer(
         </div>
       )}
       {selectionError && <p className="form-error" role="alert">{selectionError}</p>}
+      {disabledReason && <p className="composer-status" role="status">{disabledReason}</p>}
       <form className="composer" onSubmit={submit}>
         <textarea
+          ref={textareaRef}
           rows={1}
           disabled={disabled}
           value={value}
@@ -1277,12 +1305,42 @@ function Composer(
             <Code2 size={16} /> Tools
           </button>
           <span className="push" />
-          <IconButton
-            label="Voice input (not available yet)"
-            disabled
-          >
-            <Mic size={19} />
-          </IconButton>
+          {transcriptionModels.length > 1 && (
+            <select
+              className="voice-model-select"
+              aria-label="Voice transcription model"
+              value={transcriptionModel}
+              onChange={(event) => setTranscriptionModel(event.target.value)}
+            >
+              {transcriptionModels.map((model) => (
+                <option key={model.id} value={model.id}>{model.name}</option>
+              ))}
+            </select>
+          )}
+          <VoiceRecorder
+            model={transcriptionModel}
+            disabled={disabled}
+            onTranscript={(transcript) => {
+              const textarea = textareaRef.current;
+              const selectionStart = textarea?.selectionStart;
+              const selectionEnd = textarea?.selectionEnd;
+              let caret = selectionStart ?? 0;
+              setValue((current) => {
+                const result = insertTranscript(
+                  current,
+                  transcript,
+                  selectionStart ?? current.length,
+                  selectionEnd ?? current.length,
+                );
+                caret = result.caret;
+                return result.value;
+              });
+              requestAnimationFrame(() => {
+                textarea?.focus();
+                textarea?.setSelectionRange(caret, caret);
+              });
+            }}
+          />
           {streaming && (
             <button
               type="button"
@@ -1536,6 +1594,38 @@ function ChatView({
   readOnly?: boolean;
 }) {
   const queryClient = useQueryClient();
+  const chatModels = useMemo(
+    () => models.filter((model) => model.capabilities.includes("chat")),
+    [models],
+  );
+  const transcriptionModels = useMemo(
+    () => models.filter((model) => model.capabilities.includes("transcription")),
+    [models],
+  );
+  const [transcriptionModel, setTranscriptionModelState] = useState(() => {
+    try {
+      return localStorage.getItem("dg-chat.transcription-model") ?? "";
+    } catch {
+      return "";
+    }
+  });
+  useEffect(() => {
+    // Preserve the stored preference while the asynchronous catalog is still loading.
+    if (models.length === 0) return;
+    const selected = transcriptionModels.some((model) => model.id === transcriptionModel)
+      ? transcriptionModel
+      : transcriptionModels[0]?.id ?? "";
+    if (selected !== transcriptionModel) setTranscriptionModelState(selected);
+    try {
+      if (selected) localStorage.setItem("dg-chat.transcription-model", selected);
+      else localStorage.removeItem("dg-chat.transcription-model");
+    } catch {
+      // Hardened/private browser contexts can use the in-memory selection.
+    }
+  }, [models.length, transcriptionModel, transcriptionModels]);
+  const setTranscriptionModel = (id: string) => {
+    if (transcriptionModels.some((model) => model.id === id)) setTranscriptionModelState(id);
+  };
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const followStreamRef = useRef(true);
   const [localMessages, setLocalMessages] = useState(messages);
@@ -1890,7 +1980,7 @@ function ChatView({
         <IconButton label="Open menu" className="mobile-only" onClick={onMenu}>
           <Menu size={20} />
         </IconButton>
-        <ModelPicker models={models} selected={selectedModel} setSelected={setSelectedModel} />
+        <ModelPicker models={chatModels} selected={selectedModel} setSelected={setSelectedModel} />
         <div className="header-actions">
           {conversation && (
             <ConversationKnowledgePicker
@@ -2053,10 +2143,16 @@ function ChatView({
               onSend={send}
               edit={edit}
               cancelEdit={() => setEdit(undefined)}
-              disabled={false}
+              disabled={chatModels.length === 0}
+              disabledReason={chatModels.length === 0
+                ? "No chat-capable model is available."
+                : undefined}
               streaming={streaming}
               stopping={activeStream?.phase === "stopping"}
               queuedCount={queue.length}
+              transcriptionModels={transcriptionModels}
+              transcriptionModel={transcriptionModel}
+              setTranscriptionModel={setTranscriptionModel}
               onStop={() => {
                 if (activeStream?.phase === "stopping") return;
                 setActiveStream((current) => current ? { ...current, phase: "stopping" } : current);
@@ -3146,8 +3242,9 @@ export function App() {
     }
   }, [activeId, lifecycleQuery.isLoading]);
   useEffect(() => {
-    if (models.length && !models.some((model) => model.id === selectedModel)) {
-      setSelectedModel(models[0].id);
+    const chatModels = models.filter((model) => model.capabilities.includes("chat"));
+    if (chatModels.length && !chatModels.some((model) => model.id === selectedModel)) {
+      setSelectedModel(chatModels[0].id);
     }
   }, [models, selectedModel]);
   const open = async (id: string) => {

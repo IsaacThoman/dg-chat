@@ -7,6 +7,13 @@ import {
   streamGenerationSchema,
   updateConversationSchema,
 } from "./schemas.ts";
+import { isModelCapability, MODEL_CAPABILITIES } from "./types.ts";
+
+Deno.test("model capabilities are canonical and reject near-miss values", () => {
+  assertEquals(new Set(MODEL_CAPABILITIES).size, MODEL_CAPABILITIES.length);
+  assertEquals(isModelCapability("transcription"), true);
+  assertEquals(isModelCapability("transcripton"), false);
+});
 
 Deno.test("web generation accepts attachment-only sends but rejects empty text-only sends", () => {
   const attachmentId = crypto.randomUUID();

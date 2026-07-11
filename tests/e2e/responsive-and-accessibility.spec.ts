@@ -1,12 +1,13 @@
 import { expect, test } from "@playwright/test";
 import { env } from "./env.ts";
-import { bootstrap, login } from "./helpers.ts";
+import { bootstrap, createChat, login } from "./helpers.ts";
 
 test(
   "primary chat controls remain usable at the project viewport",
   async ({ page, request }, testInfo) => {
     await bootstrap(request);
     await login(page);
+    await createChat(page);
     const composer = page.getByRole("textbox", { name: /message/i });
     await expect(composer).toBeVisible();
     await composer.focus();
@@ -15,8 +16,9 @@ test(
     await expect(page.getByRole("button", { name: "Attach files" })).toBeEnabled();
     await expect(page.getByRole("button", { name: "Open web search" })).toBeEnabled();
     await expect(page.getByRole("button", { name: "Tools (not available yet)" })).toBeDisabled();
-    await expect(page.getByRole("button", { name: "Voice input (not available yet)" }))
-      .toBeDisabled();
+    await expect(page.getByRole("button", {
+      name: /^(Start voice input|Voice input unavailable:)/,
+    })).toBeVisible();
 
     if (testInfo.project.name.includes("mobile")) {
       await expect(page.locator("body")).not.toHaveCSS("overflow-x", "scroll");

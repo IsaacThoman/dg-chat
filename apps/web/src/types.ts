@@ -1,3 +1,5 @@
+import type { ModelCapability } from "../../../packages/contracts/src/types.ts";
+
 export type Role = "user" | "admin";
 export type UserStatus = "pending" | "approved" | "suspended" | "rejected" | "deleted";
 export interface User {
@@ -50,7 +52,7 @@ export interface Model {
   name: string;
   provider: string;
   context: string;
-  capabilities: string[];
+  capabilities: ModelCapability[];
   healthy: boolean;
 }
 export type ProviderProtocol = "chat_completions" | "responses";
@@ -95,7 +97,7 @@ export interface AdminModel {
   publicModelId: string;
   upstreamModelId: string;
   displayName: string;
-  capabilities: string[];
+  capabilities: ModelCapability[];
   contextWindow: number;
   enabled: boolean;
   version: number;

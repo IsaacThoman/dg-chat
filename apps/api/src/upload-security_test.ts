@@ -77,6 +77,39 @@ Deno.test("rejects MIME spoofing, executable headers, and HTML disguised as text
   }
 });
 
+Deno.test("MP3 sniffing requires bounded synchsafe ID3 metadata and a complete MPEG frame", async () => {
+  // MPEG-1 Layer III, 128 kbps, 44.1 kHz: floor(144 * 128000 / 44100) = 417 bytes.
+  const frame = new Uint8Array(417);
+  frame.set(bytes(0xff, 0xfb, 0x90, 0x00));
+  const tagged = new Uint8Array(10 + 4 + frame.length);
+  tagged.set(bytes(0x49, 0x44, 0x33, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04));
+  tagged.set(bytes(1, 2, 3, 4), 10);
+  tagged.set(frame, 14);
+
+  for (const body of [frame, tagged]) {
+    const upload = secureUploadStream(stream(body), "recording.mp3", "audio/mpeg", {
+      maxBytes: 2048,
+    });
+    await drain(upload.stream);
+    assertEquals((await upload.inspection).mime, "audio/mpeg");
+  }
+
+  const malformedSynchsafe = tagged.slice();
+  malformedSynchsafe[6] = 0x80;
+  const outOfBoundsTag = tagged.slice(0, 32);
+  outOfBoundsTag.set(bytes(0x00, 0x00, 0x7f, 0x7f), 6);
+  const fakeFrame = new Uint8Array(417);
+  fakeFrame.set(bytes(0xff, 0xe0, 0x00, 0x00)); // reserved layer and free bitrate
+  const truncatedFrame = frame.slice(0, 32);
+  for (const body of [malformedSynchsafe, outOfBoundsTag, fakeFrame, truncatedFrame]) {
+    const upload = secureUploadStream(stream(body), "spoof.mp3", "audio/mpeg", {
+      maxBytes: 2048,
+    });
+    await assertRejects(() => drain(upload.stream), UploadSecurityError);
+    await assertRejects(() => upload.inspection, UploadSecurityError);
+  }
+});
+
 Deno.test("accepts DOCX packages but rejects other and macro-enabled Office ZIPs", async () => {
   const zipPackage = (entries: string[]) =>
     zipSync(Object.fromEntries(entries.map((entry) => [entry, strToU8("content")])));

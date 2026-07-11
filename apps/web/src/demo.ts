@@ -121,7 +121,7 @@ export const demoModels: Model[] = [
     name: "GPT-4.1",
     provider: "OpenAI",
     context: "1M",
-    capabilities: ["Vision", "Tools"],
+    capabilities: ["chat", "streaming", "vision", "tools"],
     healthy: true,
   },
   {
@@ -129,7 +129,7 @@ export const demoModels: Model[] = [
     name: "Claude Sonnet 4",
     provider: "OpenRouter",
     context: "200K",
-    capabilities: ["Vision", "Reasoning"],
+    capabilities: ["chat", "streaming", "vision", "reasoning"],
     healthy: true,
   },
   {
@@ -137,7 +137,7 @@ export const demoModels: Model[] = [
     name: "Qwen 3 32B",
     provider: "Local",
     context: "128K",
-    capabilities: ["Tools"],
+    capabilities: ["chat", "streaming", "tools"],
     healthy: false,
   },
 ];

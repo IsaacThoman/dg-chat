@@ -18,6 +18,7 @@ import type {
 } from "./types.ts";
 import { demoConversations, demoMessages, demoModels, demoTokens, demoUser } from "./demo.ts";
 import type { SetupStatus } from "./setupDiscovery.ts";
+import type { ModelCapability } from "../../../packages/contracts/src/types.ts";
 
 const json = { "Content-Type": "application/json" };
 const demoMode = import.meta.env.VITE_DEMO_MODE === "true";
@@ -59,7 +60,7 @@ type RawModel = {
   id: string;
   displayName: string;
   provider: string;
-  capabilities: string[];
+  capabilities: ModelCapability[];
   contextWindow: number;
 };
 export type ToolDefinition = {
