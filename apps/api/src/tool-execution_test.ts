@@ -504,3 +504,35 @@ Deno.test("fresh-service recovery finalizes a crashed queued cancellation marker
   assertEquals(refunds, 1);
   assertEquals(adapterCalls, 0);
 });
+
+Deno.test("pre-debit approval failure finalizes a concurrent cancellation marker", async () => {
+  const store = new MemoryToolExecutionStore();
+  let reserveCalls = 0;
+  let firstReserveStarted!: () => void;
+  let releaseFirstReserve!: () => void;
+  const started = new Promise<void>((resolve) => firstReserveStarted = resolve);
+  const release = new Promise<void>((resolve) => releaseFirstReserve = resolve);
+  const denial = () =>
+    Object.assign(new Error("insufficient credit"), {
+      code: "insufficient_credit",
+    });
+  const service = new ToolExecutionService(store, [echoAdapter], {
+    reserve: async () => {
+      if (++reserveCalls === 1) {
+        firstReserveStarted();
+        await release;
+      }
+      throw denial();
+    },
+    settle: () => Promise.resolve(),
+    refund: () => Promise.resolve(false),
+  });
+  await service.setPolicy({ toolId: "echo", allowed: true, actorId: "admin" });
+  const requested = await service.request("user", "echo", {});
+  const approval = service.approve("user", requested.id);
+  await started;
+  await assertRejects(() => service.cancel("user", requested.id), Error, "insufficient credit");
+  releaseFirstReserve();
+  await assertRejects(() => approval, Error, "insufficient credit");
+  assertEquals((await service.get("user", requested.id)).status, "cancelled");
+});

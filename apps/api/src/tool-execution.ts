@@ -482,11 +482,18 @@ export class ToolExecutionService {
       // durable reconciliation state; only failures known to happen before a debit are retryable by
       // the user as a fresh approval.
       if (code === "insufficient_credit" || code === "rate_limited") {
-        await this.store.transitionExecution(id, ["queued_pending_reservation"], {
-          status: "pending_approval",
-          approvedAt: null,
-          approvedBy: null,
-        });
+        const current = await this.store.getExecution(id, ownerId);
+        if (current?.cancellationRequestedAt) {
+          await this.store.transitionExecution(id, ["queued_pending_reservation"], {
+            status: "cancelled",
+          });
+        } else {
+          await this.store.transitionExecution(id, ["queued_pending_reservation"], {
+            status: "pending_approval",
+            approvedAt: null,
+            approvedBy: null,
+          });
+        }
       }
       throw error;
     }
