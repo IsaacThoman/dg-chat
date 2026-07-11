@@ -159,31 +159,34 @@ export class PostgresToolExecutionStore {
     expected: readonly StoredToolExecutionStatus[],
     patch: Partial<Omit<StoredToolExecution, "id" | "ownerId" | "toolId" | "input" | "createdAt">>,
   ): Promise<StoredToolExecution | undefined> {
-    const [row] = await this.#sql`
-      UPDATE tool_executions SET
+    const row = await this.#sql.begin(async (tx) => {
+      const [updated] = await tx`
+        UPDATE tool_executions SET
         status = COALESCE(${patch.status ?? null}, status),
         result = CASE WHEN ${patch.result === undefined} THEN result
-          ELSE ${patch.result == null ? null : this.#sql.json(patch.result as never)} END,
+          ELSE ${patch.result == null ? null : tx.json(patch.result as never)} END,
         error = CASE WHEN ${patch.error === undefined} THEN error
-          ELSE ${patch.error == null ? null : this.#sql.json(patch.error)} END,
+          ELSE ${patch.error == null ? null : tx.json(patch.error)} END,
         approved_at = CASE WHEN ${patch.approvedAt === undefined} THEN approved_at
           ELSE ${patch.approvedAt ?? null}::timestamptz END,
         approved_by = CASE WHEN ${patch.approvedBy === undefined} THEN approved_by
           ELSE ${patch.approvedBy ?? null}::uuid END,
         cancellation_requested_at = CASE WHEN ${patch.cancellationRequestedAt === undefined}
           THEN cancellation_requested_at ELSE ${
-      patch.cancellationRequestedAt ?? null
-    }::timestamptz END,
+        patch.cancellationRequestedAt ?? null
+      }::timestamptz END,
         updated_at = now()
       WHERE id = ${id}::uuid AND status = ANY(${expected as string[]})
       RETURNING *`;
+      if (updated && patch.status && patch.status !== "running") {
+        await tx`
+          INSERT INTO audit_events(actor_id, action, target_type, target_id, metadata)
+          VALUES (${String(updated.owner_id)}::uuid, ${`tool.execution.${patch.status}`},
+            'tool_execution', ${id}, ${tx.json({ toolId: String(updated.tool_id) })})`;
+      }
+      return updated;
+    });
     if (!row) return undefined;
-    if (patch.status && patch.status !== "running") {
-      await this.#sql`
-        INSERT INTO audit_events(actor_id, action, target_type, target_id, metadata)
-        VALUES (${String(row.owner_id)}::uuid, ${`tool.execution.${patch.status}`},
-          'tool_execution', ${id}, ${this.#sql.json({ toolId: String(row.tool_id) })})`;
-    }
     return execution(row);
   }
 }
