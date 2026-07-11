@@ -3002,7 +3002,13 @@ export function App() {
     ),
   ];
   const models = modelQuery.data ?? (demoMode ? demoModels : []);
-  const [activeId, setActiveId] = useState("");
+  const [activeId, setActiveId] = useState(() => {
+    try {
+      return sessionStorage.getItem("dg-chat.active-conversation") ?? "";
+    } catch {
+      return "";
+    }
+  });
   const [view, setView] = useState<View>("chat");
   const lifecycleQuery = view === "trash" ? deletedConversationQuery : conversationQuery;
   const lifecycleLoading = lifecycleQuery.isLoading;
@@ -3026,11 +3032,20 @@ export function App() {
   }, [userQuery.isError, setupQuery.data, demoMode]);
   useEffect(() => {
     if (view !== "chat" && view !== "archived" && view !== "trash") return;
+    if (lifecycleQuery.isLoading) return;
     const visible = conversationsForView(allConversations, view);
     if (!visible.some((conversation) => conversation.id === activeId)) {
       setActiveId(visible[0]?.id ?? "");
     }
-  }, [activeId, allConversations, view]);
+  }, [activeId, allConversations, lifecycleQuery.isLoading, view]);
+  useEffect(() => {
+    try {
+      if (activeId) sessionStorage.setItem("dg-chat.active-conversation", activeId);
+      else if (!lifecycleQuery.isLoading) sessionStorage.removeItem("dg-chat.active-conversation");
+    } catch {
+      // Storage can be unavailable in hardened/private browser contexts; in-memory selection works.
+    }
+  }, [activeId, lifecycleQuery.isLoading]);
   useEffect(() => {
     if (models.length && !models.some((model) => model.id === selectedModel)) {
       setSelectedModel(models[0].id);

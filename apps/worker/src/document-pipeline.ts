@@ -64,9 +64,9 @@ export async function buildDocumentChunks(
       metadata: unit.kind === "page"
         ? {
           pageNumber: unit.index,
-          pageLabel: typeof unit.metadata.pageLabel === "string"
-            ? unit.metadata.pageLabel
-            : undefined,
+          ...(typeof unit.metadata.pageLabel === "string"
+            ? { pageLabel: unit.metadata.pageLabel }
+            : {}),
         }
         : { section: String(unit.index), sectionPath: [String(unit.index)] },
     })),
