@@ -69,7 +69,7 @@ import {
   Volume2,
   X,
 } from "lucide-react";
-import { api } from "./api.ts";
+import { api, ApiError } from "./api.ts";
 import {
   conversationForFirstSend,
   mergeAttachmentIds,
@@ -1552,6 +1552,7 @@ function ChatView({
   const [failedPrompt, setFailedPrompt] = useState<QueuedPrompt>();
   const streamAbortRef = useRef<AbortController | null>(null);
   const runPromptRef = useRef<(item: QueuedPrompt) => Promise<void>>(() => Promise.resolve());
+  const branchInFlightRef = useRef(false);
   const [branchBusy, setBranchBusy] = useState(false);
   const [sendError, setSendError] = useState("");
   const [renaming, setRenaming] = useState(false);
@@ -1572,22 +1573,47 @@ function ChatView({
     });
   }, [activeStream?.assistant.content]);
   const selectBranch = async (messageId: string) => {
-    if (!conversation || branchBusy || readOnly) return;
+    if (!conversation || branchInFlightRef.current || readOnly) return;
     const leafId = preferredLeaf(localMessages, messageId);
     if (leafId === conversation.activeLeafId) return;
+    branchInFlightRef.current = true;
     setBranchBusy(true);
     setSendError("");
     try {
       setConversation(await api.setActiveLeaf(conversation, leafId));
-    } catch {
-      const refreshed = await refreshConversationGraph(conversation.id, {
-        load: api.conversationGraph,
-      });
+    } catch (error) {
+      let refreshed: Awaited<ReturnType<typeof api.conversationGraph>>;
+      try {
+        refreshed = await refreshConversationGraph(conversation.id, {
+          load: api.conversationGraph,
+        });
+      } catch (refreshError) {
+        setSendError(
+          refreshError instanceof Error
+            ? refreshError.message
+            : "The latest conversation could not be loaded. Try again.",
+        );
+        return;
+      }
       queryClient.setQueryData(["messages", conversation.id], refreshed.messages);
       setConversation(refreshed.conversation);
       setLocalMessages(refreshed.messages);
+      if (error instanceof ApiError && error.code === "version_conflict") {
+        const refreshedLeafId = preferredLeaf(refreshed.messages, messageId);
+        if (refreshedLeafId === refreshed.conversation.activeLeafId) return;
+        try {
+          setConversation(await api.setActiveLeaf(refreshed.conversation, refreshedLeafId));
+          return;
+        } catch (retryError) {
+          if (retryError instanceof ApiError && retryError.code !== "version_conflict") {
+            setSendError(retryError.message);
+            return;
+          }
+        }
+      }
       setSendError("That branch changed in another tab. The latest conversation has been loaded.");
     } finally {
+      branchInFlightRef.current = false;
       setBranchBusy(false);
     }
   };

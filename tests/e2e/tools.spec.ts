@@ -110,6 +110,15 @@ test("admin enables web search and a user explicitly reviews and cancels a tool 
   await expect(page.getByText("Edited summary that retains verified search provenance.", {
     exact: true,
   })).toBeVisible();
+  const concurrentRename = await authenticatedRequest(
+    page,
+    `/api/conversations/${conversationId}`,
+    {
+      method: "PATCH",
+      body: { title: "Concurrent branch navigation test" },
+    },
+  );
+  expect(concurrentRename.status).toBe(200);
   await page.getByRole("button", { name: "Previous branch" }).click();
   await expect(original).toBeVisible();
   await page.getByRole("button", { name: "Next branch" }).click();
