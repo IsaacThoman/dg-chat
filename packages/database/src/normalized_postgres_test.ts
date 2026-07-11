@@ -7,6 +7,76 @@ import { backfillLegacyRuntimeSnapshot } from "./legacy-backfill.ts";
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
 
 Deno.test({
+  name: "Postgres OCR child reservation is atomic and fenced by its parent lease",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 1 });
+    await sql`TRUNCATE provider_attempts, provider_model_route_targets, provider_model_routes,
+      provider_retry_policies, model_price_versions, provider_models, providers,
+      api_idempotency_events, api_idempotency_requests, ledger_entries, usage_runs,
+      api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
+    const repo = await PostgresRepository.connect(databaseUrl!);
+    try {
+      const user = await repo.bootstrapAdmin({
+        email: "ocr-child-pg@example.com",
+        name: "OCR child",
+        passwordHash: "hash",
+      }, 250);
+      const provider = await sql<{ id: string }[]>`INSERT INTO providers
+        (slug,display_name,base_url,protocol) VALUES
+        ('ocr-child','OCR child','https://ocr.example/v1','chat_completions') RETURNING id`;
+      const model = await sql<{ id: string }[]>`INSERT INTO provider_models
+        (provider_id,public_model_id,upstream_model_id,display_name,capabilities,context_window)
+        VALUES(${provider[0].id},'ocr/child','vision','OCR child','["chat","vision"]',8192)
+        RETURNING id`;
+      const price = await sql<{ id: string }[]>`INSERT INTO model_price_versions
+        (provider_model_id,input_micros_per_million,cached_input_micros_per_million,
+          reasoning_micros_per_million,output_micros_per_million,fixed_call_micros,source,
+          effective_at)
+        VALUES(${model[0].id},1,1,1,1,0,'test',now()-interval '1 minute') RETURNING id`;
+      const parent = await repo.reserve(user.id, "ocr-pg-parent", "chat/model", 50);
+      const reserve = (runId: string) =>
+        repo.reserveChildProviderUsage({
+          parentUsageRunId: parent.id,
+          parentOwnerLeaseToken: parent.runLeaseToken!,
+          runId,
+          model: "ocr/child",
+          provider: "ocr:child",
+          reserveMicros: 150,
+          pricingSnapshot: {
+            pricingVersionId: price[0].id,
+            inputMicrosPerMillion: 1,
+            cachedInputMicrosPerMillion: 1,
+            reasoningMicrosPerMillion: 1,
+            outputMicrosPerMillion: 1,
+            fixedCallMicros: 0,
+            source: "test",
+          },
+        });
+      const results = await Promise.allSettled([reserve("ocr-pg-a"), reserve("ocr-pg-b")]);
+      assertEquals(results.filter((result) => result.status === "fulfilled").length, 1);
+      const ledger = await sql<{ kind: string; amount: string }[]>`SELECT kind,
+        amount_micros::text amount FROM ledger_entries ORDER BY id`;
+      assertEquals(
+        ledger.filter((entry) => entry.kind === "reserve").map((entry) => entry.amount).sort(),
+        ["-150", "-50"],
+      );
+      await repo.refund(parent.id);
+      await assertRejects(
+        () => reserve("ocr-pg-stale"),
+        DomainError,
+        "stale",
+      );
+    } finally {
+      await repo.close();
+      await sql.end();
+    }
+  },
+});
+
+Deno.test({
   name: "Postgres provider accounting is authoritative for API failure and stale run leases",
   ignore: !databaseUrl,
   sanitizeOps: false,
