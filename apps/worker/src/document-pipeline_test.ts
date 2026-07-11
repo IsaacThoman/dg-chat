@@ -145,9 +145,13 @@ Deno.test("real extraction worker returns a structured document", async () => {
       `<Types><Override PartName="/word/document.xml" ` +
         `ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>`,
     ),
-    "_rels/.rels": strToU8("<Relationships/>"),
+    "_rels/.rels": strToU8(
+      `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+        `<Relationship Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>` +
+        `</Relationships>`,
+    ),
     "word/document.xml": strToU8(
-      `<w:document><w:body><w:p><w:r><w:t>isolated text</w:t></w:r></w:p></w:body></w:document>`,
+      `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>isolated text</w:t></w:r></w:p></w:body></w:document>`,
     ),
   });
   const result = await extractDocumentIsolated(

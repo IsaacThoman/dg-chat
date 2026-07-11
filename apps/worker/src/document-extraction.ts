@@ -1,4 +1,5 @@
 import { Inflate, unzip } from "fflate";
+import { type Document, DOMParser } from "@xmldom/xmldom";
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 import type { PDFDocumentProxy } from "pdfjs-dist/types/src/display/api.d.ts";
 
@@ -464,24 +465,29 @@ const PACKAGE_RELATIONSHIP_NAMESPACES = new Set([
   "http://purl.oclc.org/ooxml/package/relationships",
 ]);
 
-function xmlNamespaces(xml: string): Map<string, Set<string>> {
-  const namespaces = new Map<string, Set<string>>();
-  for (const match of xml.matchAll(/\bxmlns(?::([A-Za-z_][\w.-]*))?\s*=\s*["']([^"']+)["']/gi)) {
-    const prefix = match[1] ?? "";
-    const values = namespaces.get(prefix) ?? new Set<string>();
-    values.add(decodeXmlEntities(match[2]));
-    namespaces.set(prefix, values);
-  }
-  return namespaces;
-}
+const MAX_XML_CHARACTERS = 10_000_000;
 
-function prefixUses(
-  namespaces: Map<string, Set<string>>,
-  prefix: string | undefined,
-  allowed: Set<string>,
-): boolean {
-  const values = namespaces.get(prefix ?? "");
-  return Boolean(values && [...values].some((value) => allowed.has(value)));
+function parsePackageXml(bytes: Uint8Array, name: string): Document {
+  if (bytes.byteLength > MAX_XML_CHARACTERS) {
+    throw new DocumentExtractionError("invalid_docx", `DOCX XML part is too large: ${name}`);
+  }
+  const xml = decoder.decode(bytes);
+  if (/<!DOCTYPE\b|<!ENTITY\b/i.test(xml)) {
+    throw new DocumentExtractionError(
+      "docx_active_content",
+      "DOCX document type and entity declarations are not allowed",
+    );
+  }
+  const errors: string[] = [];
+  const document = new DOMParser({
+    onError: (level, message) => {
+      errors.push(`${level}: ${message}`);
+    },
+  }).parseFromString(xml, "application/xml");
+  if (!document || !document.documentElement || errors.length) {
+    throw new DocumentExtractionError("invalid_docx", `DOCX XML part is malformed: ${name}`);
+  }
+  return document;
 }
 
 function relationshipPath(part: string): string {
@@ -491,13 +497,26 @@ function relationshipPath(part: string): string {
   return `${directory}_rels/${basename}.rels`;
 }
 
-function relationshipAttributes(xml: string): string[] {
-  const namespaces = xmlNamespaces(xml);
-  return [...xml.matchAll(
-    /<([A-Za-z_][\w.-]*:)?Relationship\b([^>]*)\/?\s*>/gi,
-  )].filter((match) =>
-    prefixUses(namespaces, match[1]?.slice(0, -1), PACKAGE_RELATIONSHIP_NAMESPACES)
-  ).map((match) => match[2]);
+interface PackageRelationship {
+  type: string;
+  target: string;
+  external: boolean;
+}
+
+function packageRelationships(document: Document): PackageRelationship[] {
+  const relationships: PackageRelationship[] = [];
+  for (const namespace of PACKAGE_RELATIONSHIP_NAMESPACES) {
+    const nodes = document.getElementsByTagNameNS(namespace, "Relationship");
+    for (let index = 0; index < nodes.length; index++) {
+      const element = nodes.item(index)!;
+      relationships.push({
+        type: element.getAttribute("Type") ?? "",
+        target: element.getAttribute("Target") ?? "",
+        external: (element.getAttribute("TargetMode") ?? "").toLowerCase() === "external",
+      });
+    }
+  }
+  return relationships;
 }
 
 function resolveRelationshipTarget(part: string, target: string): string | undefined {
@@ -515,23 +534,23 @@ function resolveRelationshipTarget(part: string, target: string): string | undef
   return base.join("/");
 }
 
-function reachableXmlParts(files: Record<string, Uint8Array>): Set<string> {
+function reachableXmlParts(
+  files: Record<string, Uint8Array>,
+  documents: Map<string, Document>,
+): Set<string> {
   const reached = new Set<string>();
   const queue = ["word/document.xml"];
   while (queue.length) {
     const part = queue.shift()!;
     if (reached.has(part)) continue;
     reached.add(part);
-    const relationships = files[relationshipPath(part)];
+    const relationships = documents.get(relationshipPath(part));
     if (!relationships) continue;
-    const xml = decodeXmlEntities(decoder.decode(relationships));
-    for (const attributes of relationshipAttributes(xml)) {
-      if (/\bTargetMode\s*=\s*["']External["']/i.test(attributes)) continue;
-      const target = attributes.match(/\bTarget\s*=\s*["']([^"']+)["']/i)?.[1];
-      if (!target) continue;
+    for (const relationship of packageRelationships(relationships)) {
+      if (relationship.external || !relationship.target) continue;
       let resolved: string | undefined;
       try {
-        resolved = resolveRelationshipTarget(part, target);
+        resolved = resolveRelationshipTarget(part, relationship.target);
       } catch {
         throw new DocumentExtractionError("invalid_docx", "DOCX relationship target is invalid");
       }
@@ -549,39 +568,25 @@ function reachableXmlParts(files: Record<string, Uint8Array>): Set<string> {
   return reached;
 }
 
-function assertNoActiveOfficeXml(xml: string): void {
-  const namespaces = xmlNamespaces(xml);
+function assertNoActiveOfficeXml(document: Document): void {
   const complex: string[] = [];
-  for (
-    const match of xml.matchAll(
-      /<([A-Za-z_][\w.-]*:)?instrText\b[^>]*>([\s\S]*?)<\/([A-Za-z_][\w.-]*:)?instrText\s*>/gi,
-    )
-  ) {
-    const prefix = match[1]?.slice(0, -1);
-    if (prefixUses(namespaces, prefix, WORDPROCESSING_NAMESPACES)) {
-      complex.push(decodeXmlEntities(match[2]).replace(/<[^>]*>/g, ""));
-    }
-  }
   const simple: string[] = [];
-  for (
-    const match of xml.matchAll(
-      /<([A-Za-z_][\w.-]*:)?fldSimple\b([^>]*)>/gi,
-    )
-  ) {
-    const elementPrefix = match[1]?.slice(0, -1);
-    if (!prefixUses(namespaces, elementPrefix, WORDPROCESSING_NAMESPACES)) continue;
-    const instruction = match[2].match(
-      /\b([A-Za-z_][\w.-]*:)?instr\s*=\s*["']([^"']*)["']/i,
-    );
-    if (!instruction) continue;
-    const attributePrefix = instruction[1]?.slice(0, -1);
-    if (prefixUses(namespaces, attributePrefix, WORDPROCESSING_NAMESPACES)) {
-      simple.push(decodeXmlEntities(instruction[2]));
+  let activeObject = false;
+  for (const namespace of WORDPROCESSING_NAMESPACES) {
+    const instructions = document.getElementsByTagNameNS(namespace, "instrText");
+    for (let index = 0; index < instructions.length; index++) {
+      complex.push(instructions.item(index)?.textContent ?? "");
     }
+    const fields = document.getElementsByTagNameNS(namespace, "fldSimple");
+    for (let index = 0; index < fields.length; index++) {
+      const value = fields.item(index)?.getAttributeNS(namespace, "instr");
+      if (value) simple.push(value);
+    }
+    activeObject ||= document.getElementsByTagNameNS(namespace, "object").length > 0;
   }
-  const activeObject = [...xml.matchAll(
-    /<([A-Za-z_][\w.-]*:)?(?:OLEObject|object)\b/gi,
-  )].some((match) => prefixUses(namespaces, match[1]?.slice(0, -1), OFFICE_NAMESPACES));
+  for (const namespace of OFFICE_NAMESPACES) {
+    activeObject ||= document.getElementsByTagNameNS(namespace, "OLEObject").length > 0;
+  }
   if (
     [complex.join(""), ...simple].some((value) => /\bDDE(?:AUTO)?\b/i.test(value)) || activeObject
   ) {
@@ -605,29 +610,16 @@ function assertSafeDocx(entries: ZipEntry[], files: Record<string, Uint8Array>):
   if (!rootRelationships) {
     throw new DocumentExtractionError("invalid_docx", "DOCX root relationships are missing");
   }
-  const rootXml = decodeXmlEntities(decoder.decode(rootRelationships));
-  const mainTargets = relationshipAttributes(rootXml).filter((attributes) =>
-    /\bType\s*=\s*["'][^"']*\/officeDocument["']/i.test(attributes) &&
-    !/\bTargetMode\s*=\s*["']External["']/i.test(attributes)
-  ).map((attributes) => attributes.match(/\bTarget\s*=\s*["']([^"']+)["']/i)?.[1])
-    .filter((target): target is string => Boolean(target))
+  const rootDocument = parsePackageXml(rootRelationships, "_rels/.rels");
+  const mainTargets = packageRelationships(rootDocument).filter((relationship) =>
+    /\/officeDocument$/i.test(relationship.type) && !relationship.external && relationship.target
+  ).map((relationship) => relationship.target)
     .map((target) => resolveRelationshipTarget("", target));
   if (mainTargets.length !== 1 || mainTargets[0] !== "word/document.xml") {
     throw new DocumentExtractionError(
       "invalid_docx",
       "DOCX must have one canonical main document relationship",
     );
-  }
-  for (const [name, bytes] of Object.entries(files)) {
-    if (
-      (name.toLowerCase().endsWith(".xml") || name.toLowerCase().endsWith(".rels")) &&
-      /<!DOCTYPE\b|<!ENTITY\b/i.test(decoder.decode(bytes))
-    ) {
-      throw new DocumentExtractionError(
-        "docx_active_content",
-        "DOCX document type and entity declarations are not allowed",
-      );
-    }
   }
   if (lowerNames.some((name) => name.endsWith("vbaproject.bin") || name.includes("/macros/"))) {
     throw new DocumentExtractionError("docx_macro", "Macro-enabled DOCX files are not allowed");
@@ -654,22 +646,26 @@ function assertSafeDocx(entries: ZipEntry[], files: Record<string, Uint8Array>):
       "Embedded or active DOCX content is not allowed",
     );
   }
-  for (const name of reachableXmlParts(files)) {
-    if (files[name]) assertNoActiveOfficeXml(decoder.decode(files[name]));
-  }
+  const documents = new Map<string, Document>();
   for (const [name, bytes] of Object.entries(files)) {
+    if (name.toLowerCase().endsWith(".xml") || name.toLowerCase().endsWith(".rels")) {
+      documents.set(name, name === "_rels/.rels" ? rootDocument : parsePackageXml(bytes, name));
+    }
+  }
+  for (const name of reachableXmlParts(files, documents)) {
+    const document = documents.get(name);
+    if (document) assertNoActiveOfficeXml(document);
+  }
+  for (const [name] of Object.entries(files)) {
     if (!name.toLowerCase().endsWith(".rels")) continue;
-    const relationships = decodeXmlEntities(decoder.decode(bytes));
-    const attributes = relationshipAttributes(relationships);
-    if (attributes.some((value) => /\bTargetMode\s*=\s*["']External["']/i.test(value))) {
+    const relationships = packageRelationships(documents.get(name)!);
+    if (relationships.some((relationship) => relationship.external)) {
       throw new DocumentExtractionError(
         "docx_external_reference",
         "External DOCX relationships are not allowed",
       );
     }
-    const relationshipTypes = attributes.map((value) =>
-      value.match(/\bType\s*=\s*["']([^"']+)["']/i)?.[1].toLowerCase()
-    ).filter((value): value is string => Boolean(value));
+    const relationshipTypes = relationships.map((relationship) => relationship.type.toLowerCase());
     if (
       relationshipTypes.some((type) =>
         /\/(?:oleobject|package|embeddedpackage|attachedtemplate|attachedtoolbars|control|activex|customui|vbaproject)$/i

@@ -13,6 +13,7 @@
     "npm:@types/react-dom@^19.1.6": "19.2.3_@types+react@19.2.17",
     "npm:@types/react@^19.1.8": "19.2.17",
     "npm:@vitejs/plugin-react@^4.6.0": "4.7.0_vite@7.3.6__@types+node@22.15.3_@types+node@22.15.3",
+    "npm:@xmldom/xmldom@0.9.10": "0.9.10",
     "npm:drizzle-kit@0.31.10": "0.31.10",
     "npm:drizzle-orm@0.45.2": "0.45.2_postgres@3.4.7",
     "npm:fflate@0.8.3": "0.8.3",
@@ -2006,6 +2007,9 @@
         "loupe",
         "tinyrainbow"
       ]
+    },
+    "@xmldom/xmldom@0.9.10": {
+      "integrity": "sha512-A9gOqLdi6cV4ibazAjcQufGj0B1y/vDqYrcuP6d/6x8P27gRS8643Dj9o1dEKtB6O7fwxb2FgBmJS2mX7gpvdw=="
     },
     "acorn@8.17.0": {
       "integrity": "sha512-xRQbDb9BnwDafYNn6Vwl839DYVjqXYb1XVGtWAZ1kcDc6iwAL4hg3B1dZlRiuENFeO2H53gFG3in621AdERVAg==",
@@ -4667,6 +4671,7 @@
       },
       "apps/worker": {
         "dependencies": [
+          "npm:@xmldom/xmldom@0.9.10",
           "npm:fflate@0.8.3",
           "npm:pdfjs-dist@6.1.200",
           "npm:postgres@3.4.7"
