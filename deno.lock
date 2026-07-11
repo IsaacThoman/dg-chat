@@ -23,6 +23,7 @@
     "npm:ioredis@5.8.2": "5.8.2",
     "npm:lucide-react@0.468": "0.468.0_react@19.2.7",
     "npm:nodemailer@9.0.3": "9.0.3",
+    "npm:openai@6.16.0": "6.16.0_zod@4.1.12",
     "npm:pdfjs-dist@6.1.200": "6.1.200",
     "npm:postgres@3.4.7": "3.4.7",
     "npm:react-dom@^19.1.0": "19.2.7_react@19.2.7",
@@ -3556,6 +3557,16 @@
         "object-keys"
       ]
     },
+    "openai@6.16.0_zod@4.1.12": {
+      "integrity": "sha512-fZ1uBqjFUjXzbGc35fFtYKEOxd20kd9fDpFeqWtsOZWiubY8CZ1NAlXHW3iathaFvqmNtCWMIsosCuyeI7Joxg==",
+      "dependencies": [
+        "zod"
+      ],
+      "optionalPeers": [
+        "zod"
+      ],
+      "bin": true
+    },
     "own-keys@1.0.1": {
       "integrity": "sha512-qFOyK5PjiWZd+QQIh+1jhdb9LpxTF0qs7Pm8o5QHYZ0M3vKqSqzsZaEB6oWlxZ+q2sJBMI/Ktgd2N5ZwQoRHfg==",
       "dependencies": [
@@ -4638,7 +4649,8 @@
   "workspace": {
     "packageJson": {
       "dependencies": [
-        "npm:@playwright/test@1.58.2"
+        "npm:@playwright/test@1.58.2",
+        "npm:openai@6.16.0"
       ]
     },
     "members": {
