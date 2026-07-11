@@ -35,6 +35,13 @@ Compose stack passes them to both services and holds startup until `minio-init` 
 bucket-scoped identity. Custom deployments must preserve that ordering because text/JSON ingestion
 reads immutable objects directly from the worker.
 
+Document embeddings are disabled by default. To opt in, set both `DOCUMENT_EMBEDDING_MODEL_ID` (an
+enabled registry model with the `embeddings` capability) and `DOCUMENT_EMBEDDING_CONFIG_VERSION` (an
+operator-chosen version such as `knowledge-v1`) on the worker. The worker needs the same encryption
+keyring as the API, and production embedding workers require Redis for shared circuit-breaker state.
+Startup logs report whether embeddings are enabled. `DOCUMENT_EMBEDDING_RECOVERY_INTERVAL_MS`
+controls bounded reconciliation of pending documents.
+
 Uploads default to 25 MiB with at most four concurrent uploads per application replica and two per
 user. Tune `UPLOAD_MAX_BYTES`, `UPLOAD_MAX_CONCURRENT`, and `UPLOAD_MAX_CONCURRENT_PER_USER` while
 keeping the application `/tmp` tmpfs large enough for the resulting worst-case staged bytes.
@@ -55,8 +62,9 @@ curl --fail https://chat.example.com/ready
 Wait for both `app` and `worker` to report healthy. The worker health check verifies that its
 process is running and that the migrated durable-job table is queryable. A worker restart during
 initial deployment indicates a migration-ordering or database-connectivity fault and should block
-rollout. `WORKER_JOB_LEASE_SECONDS` defaults to 120 seconds. Keep it longer than the maximum
-synchronous job handler duration; expired claims are fenced and may be reclaimed by another worker.
+rollout. `WORKER_JOB_LEASE_SECONDS` defaults to 120 seconds and cannot be below 5 seconds. Active
+embedding jobs heartbeat before expiry; lease loss or shutdown aborts provider dispatch. Expired
+claims remain fenced and can be reclaimed without duplicate settlement.
 
 The app is published on `${PORT:-8000}`. Put it behind a TLS-terminating reverse proxy and forward
 the original scheme and host. Preserve streaming responses by disabling proxy buffering for `/v1/*`

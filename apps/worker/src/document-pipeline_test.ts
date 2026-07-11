@@ -175,6 +175,17 @@ Deno.test("absolute job deadline rejects stalled acquisition", async () => {
   );
 });
 
+Deno.test("process cancellation aborts stalled document work before its lease deadline", async () => {
+  const controller = new AbortController();
+  const pending = raceJobDeadline(
+    new Promise<never>(() => {}),
+    Date.now() + 60_000,
+    controller.signal,
+  );
+  controller.abort(new DOMException("shutdown", "AbortError"));
+  await assertRejects(() => pending, DOMException, "shutdown");
+});
+
 Deno.test("chunking refuses work after the absolute deadline", async () => {
   const bytes = encoder.encode("expired");
   await assertRejects(

@@ -52,6 +52,12 @@ export async function completeJob(sql: Sql, job: ClaimedJob): Promise<boolean> {
   return Boolean(rows[0]);
 }
 
+export async function heartbeatJob(sql: Sql, job: ClaimedJob): Promise<boolean> {
+  const rows = await sql<{ id: string }[]>`UPDATE jobs SET locked_at=now()
+    WHERE id=${job.id} AND status='running' AND locked_by=${job.claimToken} RETURNING id`;
+  return Boolean(rows[0]);
+}
+
 export async function deferJob(
   sql: Sql,
   job: ClaimedJob,

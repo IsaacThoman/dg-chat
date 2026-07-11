@@ -1,6 +1,6 @@
 import { assertEquals, assertNotEquals } from "jsr:@std/assert@1.0.14";
 import postgres from "npm:postgres@3.4.7";
-import { claimJob, completeJob, failOrRetryJob } from "./job-queue.ts";
+import { claimJob, completeJob, failOrRetryJob, heartbeatJob } from "./job-queue.ts";
 import { recordIngestionFailure } from "./attachment-ingestion.ts";
 
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
@@ -24,6 +24,7 @@ Deno.test({
       if (!first) throw new Error("first worker did not claim the job");
       assertEquals(first.id, id);
       assertEquals(first.attempts, 0);
+      assertEquals(await heartbeatJob(sql, first), true);
       assertEquals(await claimJob(sql, "worker-b", 60), undefined);
 
       await sql`UPDATE jobs SET locked_at = now() - interval '61 seconds' WHERE id = ${id}`;
@@ -32,6 +33,8 @@ Deno.test({
       assertEquals(reclaimed.id, id);
       assertEquals(reclaimed.attempts, 1);
       assertNotEquals(reclaimed.claimToken, first.claimToken);
+      assertEquals(await heartbeatJob(sql, first), false);
+      assertEquals(await heartbeatJob(sql, reclaimed), true);
 
       assertEquals(await completeJob(sql, first), false);
       assertEquals(await failOrRetryJob(sql, first, "stale failure"), false);

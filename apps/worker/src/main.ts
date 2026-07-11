@@ -1,17 +1,26 @@
 import postgres from "npm:postgres@3.4.7";
 import {
+  DomainError,
   INGESTIBLE_DOCUMENT_MIME_TYPES,
   type ObjectStore,
   objectStoreFromEnv,
   parseDocumentProcessingConfig,
+  PostgresRepository,
   validateDocumentChunkInputs,
 } from "@dg-chat/database";
+import {
+  estimateInputTokens,
+  MemoryCircuitBreaker,
+  ProviderExecutionEngine,
+  ProviderSecretKeyring,
+  RedisCircuitBreaker,
+} from "@dg-chat/provider-runtime";
 import {
   assertAttachmentInspectionTerminal,
   AttachmentInspectionPendingError,
   parseAttachmentInspectionPayload,
 } from "./attachment-inspection.ts";
-import { claimJob, completeJob, deferJob, failOrRetryJob } from "./job-queue.ts";
+import { claimJob, completeJob, deferJob, failOrRetryJob, heartbeatJob } from "./job-queue.ts";
 import {
   parseAttachmentIngestionPayload,
   recordIngestionFailure,
@@ -19,6 +28,13 @@ import {
 } from "./attachment-ingestion.ts";
 import { buildDocumentChunks, raceJobDeadline } from "./document-pipeline.ts";
 import type { DocumentExtractionLimits } from "./document-extraction.ts";
+import {
+  documentChunkSetSha256,
+  embeddingHeartbeatIntervalMs,
+  parseDocumentEmbeddingConfig,
+  validateWorkerJobLeaseSeconds,
+} from "./document-embedding.ts";
+import { runDocumentEmbeddingJob } from "./document-embedding-runner.ts";
 
 const databaseUrl = Deno.env.get("DATABASE_URL");
 const workerId = Deno.env.get("WORKER_ID") ?? `worker-${crypto.randomUUID().slice(0, 8)}`;
@@ -30,6 +46,7 @@ const documentProcessingConfig = parseDocumentProcessingConfig({
   DOCUMENT_EXTRACTOR_VERSION: Deno.env.get("DOCUMENT_EXTRACTOR_VERSION"),
   DOCUMENT_CHUNKER_VERSION: Deno.env.get("DOCUMENT_CHUNKER_VERSION"),
 });
+const documentEmbeddingConfig = parseDocumentEmbeddingConfig();
 function positiveInteger(name: string, fallback: number, minimum = 1): number {
   const raw = Deno.env.get(name);
   const value = raw === undefined ? fallback : Number(raw);
@@ -52,19 +69,24 @@ const documentExtractionLimits: DocumentExtractionLimits = {
   maxZipCompressionRatio: positiveInteger("DOCUMENT_EXTRACTION_MAX_ZIP_RATIO", 200),
 };
 const jobDeadlineMarginMs = positiveInteger("WORKER_JOB_DEADLINE_MARGIN_MS", 5_000);
+const embeddingRecoveryIntervalMs = positiveInteger(
+  "DOCUMENT_EMBEDDING_RECOVERY_INTERVAL_MS",
+  60_000,
+  1_000,
+);
 if (!Number.isSafeInteger(pollMs) || pollMs < 10) {
   throw new Error("WORKER_POLL_MS must be an integer of at least 10 milliseconds");
 }
-if (!Number.isSafeInteger(jobLeaseSeconds) || jobLeaseSeconds < 1) {
-  throw new Error("WORKER_JOB_LEASE_SECONDS must be a positive integer");
-}
+validateWorkerJobLeaseSeconds(jobLeaseSeconds);
 if (jobDeadlineMarginMs >= jobLeaseSeconds * 1000) {
   throw new Error("WORKER_JOB_DEADLINE_MARGIN_MS must be shorter than WORKER_JOB_LEASE_SECONDS");
 }
 let stopping = false;
+const processAbort = new AbortController();
 
 const abort = () => {
   stopping = true;
+  processAbort.abort(new DOMException("Worker is shutting down", "AbortError"));
 };
 Deno.addSignalListener("SIGINT", abort);
 if (Deno.build.os !== "windows") Deno.addSignalListener("SIGTERM", abort);
@@ -78,6 +100,33 @@ if (!databaseUrl) {
 }
 
 const sql = postgres(databaseUrl, { max: 4 });
+const repository = await PostgresRepository.connect(databaseUrl);
+const embeddingKeyring = documentEmbeddingConfig ? ProviderSecretKeyring.fromEnv() : undefined;
+if (documentEmbeddingConfig && !embeddingKeyring) {
+  throw new Error("Provider encryption keyring is required for document embeddings");
+}
+const embeddingCircuit = Deno.env.get("REDIS_URL")
+  ? new RedisCircuitBreaker(Deno.env.get("REDIS_URL")!)
+  : new MemoryCircuitBreaker();
+if (
+  documentEmbeddingConfig && Deno.env.get("DENO_ENV") === "production" &&
+  !Deno.env.get("REDIS_URL")
+) {
+  throw new Error("REDIS_URL is required for document embeddings in production");
+}
+const embeddingEngine = embeddingKeyring
+  ? new ProviderExecutionEngine({
+    repository,
+    keyring: embeddingKeyring,
+    circuitBreaker: embeddingCircuit,
+    breakerPolicy: {
+      failureThreshold: positiveInteger("PROVIDER_BREAKER_FAILURE_THRESHOLD", 3),
+      failureWindowSeconds: positiveInteger("PROVIDER_BREAKER_FAILURE_WINDOW_SECONDS", 60),
+      openSeconds: positiveInteger("PROVIDER_BREAKER_OPEN_SECONDS", 30),
+      halfOpenLeaseSeconds: positiveInteger("PROVIDER_BREAKER_HALF_OPEN_LEASE_SECONDS", 10),
+    },
+  })
+  : undefined;
 const discoveredObjectStore = objectStoreFromEnv();
 if (!discoveredObjectStore) {
   await sql.end({ timeout: 5 });
@@ -85,6 +134,107 @@ if (!discoveredObjectStore) {
 }
 const objectStore: ObjectStore = discoveredObjectStore;
 console.log(JSON.stringify({ level: "info", message: "Worker started", workerId }));
+console.log(JSON.stringify({
+  level: "info",
+  message: documentEmbeddingConfig ? "Document embeddings enabled" : "Document embeddings disabled",
+  modelId: documentEmbeddingConfig?.modelId,
+  configVersion: documentEmbeddingConfig?.configVersion,
+}));
+
+async function ensureDocumentEmbedding(
+  attachmentId: string,
+  ownerId: string,
+): Promise<void> {
+  if (!documentEmbeddingConfig || !embeddingEngine) return;
+  const chunks = await repository.listDocumentChunks(attachmentId, ownerId);
+  const chunkSetDigest = await documentChunkSetSha256(chunks);
+  const plan = await embeddingEngine.resolvePlan(documentEmbeddingConfig.modelId);
+  const inputTokens = estimateInputTokens({ input: chunks.map((chunk) => chunk.content) });
+  const reserveMicros = embeddingEngine.reservationMicros(plan, inputTokens, 0);
+  const identity = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(
+      `${chunkSetDigest}:${documentEmbeddingConfig.modelId}:${documentEmbeddingConfig.configVersion}`,
+    ),
+  );
+  const suffix = [...new Uint8Array(identity)].map((value) => value.toString(16).padStart(2, "0"))
+    .join("");
+  await repository.beginDocumentEmbedding({
+    ownerId,
+    attachmentId,
+    chunkSetDigest,
+    modelId: documentEmbeddingConfig.modelId,
+    configVersion: documentEmbeddingConfig.configVersion,
+    provider: plan.targets[0].providerSlug,
+    usageRunId: `document-embedding:${attachmentId}:${suffix}`,
+    reserveMicros,
+    pricingSnapshot: plan.targets[0].pricing,
+    planSnapshot: plan,
+  });
+}
+
+async function tryEnsureDocumentEmbedding(attachmentId: string, ownerId: string): Promise<void> {
+  try {
+    await ensureDocumentEmbedding(attachmentId, ownerId);
+  } catch (error) {
+    const terminal = error instanceof DomainError && error.code === "insufficient_credit";
+    console.log(JSON.stringify({
+      level: terminal ? "warn" : "error",
+      message: terminal
+        ? "Document embedding enqueue skipped"
+        : "Document embedding enqueue will be retried by reconciliation",
+      attachmentId,
+      ownerId,
+      code: error instanceof DomainError
+        ? error.code
+        : error instanceof Error
+        ? error.name
+        : "error",
+      error: error instanceof Error ? error.message : String(error),
+    }));
+    embeddingRecoveryBackoff.set(
+      attachmentId,
+      Date.now() + (terminal ? 15 * 60_000 : embeddingRecoveryIntervalMs),
+    );
+  }
+}
+
+let lastEmbeddingRecoveryAt = 0;
+let embeddingRecoveryCursor = "00000000-0000-0000-0000-000000000000";
+const embeddingRecoveryBackoff = new Map<string, number>();
+async function recoverPendingDocumentEmbeddings(): Promise<void> {
+  if (
+    !documentEmbeddingConfig || Date.now() - lastEmbeddingRecoveryAt < embeddingRecoveryIntervalMs
+  ) {
+    return;
+  }
+  lastEmbeddingRecoveryAt = Date.now();
+  const pending = await sql<{ id: string; owner_id: string }[]>`
+    SELECT DISTINCT a.id,a.owner_id FROM attachments a JOIN document_chunks d
+      ON d.attachment_id=a.id
+    WHERE a.deleted_at IS NULL AND a.state='ready' AND a.ingestion_status='ready'
+      AND d.embedding_status='pending'
+      AND a.id>${embeddingRecoveryCursor}
+      AND NOT EXISTS (SELECT 1 FROM document_embedding_executions e
+        WHERE e.attachment_id=a.id AND e.model_id=${documentEmbeddingConfig.modelId}
+          AND e.config_version=${documentEmbeddingConfig.configVersion})
+    ORDER BY a.id LIMIT 20`;
+  if (!pending.length) {
+    embeddingRecoveryCursor = "00000000-0000-0000-0000-000000000000";
+    return;
+  }
+  embeddingRecoveryCursor = pending.at(-1)!.id;
+  for (const item of pending) {
+    if ((embeddingRecoveryBackoff.get(item.id) ?? 0) > Date.now()) continue;
+    embeddingRecoveryBackoff.delete(item.id);
+    await tryEnsureDocumentEmbedding(item.id, item.owner_id);
+  }
+  if (embeddingRecoveryBackoff.size > 10_000) {
+    for (const [id, until] of embeddingRecoveryBackoff) {
+      if (until <= Date.now()) embeddingRecoveryBackoff.delete(id);
+    }
+  }
+}
 
 async function processJob(
   job: { id: string; type: string; payload: unknown; attempts: number; claimToken: string },
@@ -129,10 +279,17 @@ async function processJob(
           AND j.id=${job.id} AND j.status='running' AND j.locked_by=${job.claimToken}
         RETURNING a.object_key,a.mime_type,a.filename,a.sha256,a.size_bytes`;
       const source = rows[0];
-      if (!source) throw new Error("Attachment ingestion claim is stale or invalid");
+      if (!source) {
+        const ready = await sql`SELECT id FROM attachments WHERE id=${attachmentId}
+          AND owner_id=${ownerId} AND deleted_at IS NULL AND ingestion_status='ready'`;
+        if (!ready.length) throw new Error("Attachment ingestion claim is stale or invalid");
+        await tryEnsureDocumentEmbedding(attachmentId, ownerId);
+        return false;
+      }
       const object = await raceJobDeadline(
         requireIngestionObject(objectStore, source.object_key),
         deadlineAt,
+        processAbort.signal,
       );
       if (object.contentLength !== null && object.contentLength !== Number(source.size_bytes)) {
         throw new Error("Attachment object size does not match its record");
@@ -155,6 +312,7 @@ async function processJob(
           documentProcessingConfig,
           documentExtractionLimits,
           deadlineAt,
+          processAbort.signal,
         ),
         attachmentId,
       );
@@ -176,11 +334,29 @@ async function processJob(
         }
         await tx`UPDATE attachments SET ingestion_status='ready',ingestion_error=NULL,
           ingested_at=now(),updated_at=now() WHERE id=${attachmentId}`;
-        await tx`UPDATE jobs SET status='completed',completed_at=now(),locked_at=NULL,locked_by=NULL
-          WHERE id=${job.id}`;
         return true;
       });
       if (!committed) throw new Error("Attachment ingestion claim was reclaimed");
+      await tryEnsureDocumentEmbedding(attachmentId, ownerId);
+      return false;
+    }
+    case "document.embed": {
+      if (!embeddingEngine) throw new Error("Document embedding runtime is not configured");
+      const controller = new AbortController();
+      const signal = AbortSignal.any([processAbort.signal, controller.signal]);
+      const heartbeatMs = embeddingHeartbeatIntervalMs(jobLeaseSeconds);
+      const heartbeat = setInterval(() => {
+        void heartbeatJob(sql, job).then((alive) => {
+          if (!alive) {
+            controller.abort(new DOMException("Embedding job lease was lost", "AbortError"));
+          }
+        }).catch((error) => controller.abort(error));
+      }, heartbeatMs);
+      try {
+        await runDocumentEmbeddingJob({ job, repository, engine: embeddingEngine, signal });
+      } finally {
+        clearInterval(heartbeat);
+      }
       return true;
     }
     default:
@@ -189,6 +365,13 @@ async function processJob(
 }
 
 while (!stopping) {
+  await recoverPendingDocumentEmbeddings().catch((error) =>
+    console.log(JSON.stringify({
+      level: "error",
+      message: "Document embedding reconciliation failed",
+      error: error instanceof Error ? error.message : String(error),
+    }))
+  );
   const job = await claimJob(sql, workerId, jobLeaseSeconds);
   if (!job) {
     await new Promise((resolve) => setTimeout(resolve, pollMs));
@@ -216,5 +399,6 @@ while (!stopping) {
   }
 }
 await sql.end({ timeout: 5 });
+await Promise.all([repository.close(), embeddingCircuit.close()]);
 objectStore.close();
 console.log(JSON.stringify({ level: "info", message: "Worker stopped", workerId }));

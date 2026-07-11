@@ -21,7 +21,11 @@ export function remainingDeadline(deadlineAt: number): number {
   return remaining;
 }
 
-export function raceJobDeadline<T>(promise: Promise<T>, deadlineAt: number): Promise<T> {
+export function raceJobDeadline<T>(
+  promise: Promise<T>,
+  deadlineAt: number,
+  signal?: AbortSignal,
+): Promise<T> {
   const remaining = remainingDeadline(deadlineAt);
   let timer: ReturnType<typeof setTimeout> | undefined;
   return Promise.race([
@@ -29,6 +33,14 @@ export function raceJobDeadline<T>(promise: Promise<T>, deadlineAt: number): Pro
     new Promise<never>((_, reject) => {
       timer = setTimeout(() => reject(new DocumentPipelineTimeoutError()), remaining);
     }),
+    ...(signal
+      ? [
+        new Promise<never>((_, reject) => {
+          if (signal.aborted) reject(signal.reason);
+          else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        }),
+      ]
+      : []),
   ]).finally(() => clearTimeout(timer));
 }
 
@@ -44,6 +56,7 @@ export function extractDocumentIsolated(
       type: "module",
       deno: { permissions: "none" },
     }),
+  signal?: AbortSignal,
 ): Promise<ExtractionResult> {
   const remaining = remainingDeadline(deadlineAt);
   return new Promise((resolve, reject) => {
@@ -59,6 +72,11 @@ export function extractDocumentIsolated(
     const timer = setTimeout(
       () => finish(() => reject(new DocumentPipelineTimeoutError())),
       remaining,
+    );
+    signal?.addEventListener(
+      "abort",
+      () => finish(() => reject(signal.reason)),
+      { once: true },
     );
     worker.onmessage = (event: MessageEvent) => {
       const message = event.data as {
@@ -107,6 +125,7 @@ export async function buildDocumentChunks(
   config: DocumentProcessingConfig,
   extractionLimits: DocumentExtractionLimits = {},
   deadlineAt = Date.now() + (extractionLimits.timeoutMs ?? 30_000),
+  signal?: AbortSignal,
 ): Promise<DocumentChunkInput[]> {
   const remainingTimeout = () => remainingDeadline(deadlineAt);
   const common = {
@@ -129,6 +148,7 @@ export async function buildDocumentChunks(
         source.sha256,
       ),
       deadlineAt,
+      signal,
     );
     return await deterministicChunks({ ...common, text, deadlineAt });
   }
@@ -143,11 +163,19 @@ export async function buildDocumentChunks(
       source.sha256,
     ),
     deadlineAt,
+    signal,
   );
-  const extracted = await extractDocumentIsolated(bytes, source.mimeType, {
-    ...extractionLimits,
-    timeoutMs: remainingTimeout(),
-  }, deadlineAt);
+  const extracted = await extractDocumentIsolated(
+    bytes,
+    source.mimeType,
+    {
+      ...extractionLimits,
+      timeoutMs: remainingTimeout(),
+    },
+    deadlineAt,
+    undefined,
+    signal,
+  );
   remainingDeadline(deadlineAt);
   return await deterministicChunks({
     ...common,
