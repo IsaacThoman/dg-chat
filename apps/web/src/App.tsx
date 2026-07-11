@@ -1518,7 +1518,7 @@ function ChatView({
   balance,
   onConversationCreated,
   onUpdateConversation,
-  readOnly = false,
+  readOnly: readOnlyProp = false,
 }: {
   conversations: Conversation[];
   activeId: string;
@@ -1558,6 +1558,7 @@ function ChatView({
   const [renaming, setRenaming] = useState(false);
   const initialConversation = conversations.find((c) => c.id === activeId);
   const [conversation, setConversation] = useState(initialConversation);
+  const readOnly = readOnlyProp || Boolean(conversation?.archived || conversation?.deleted);
   useEffect(() => setLocalMessages(messages), [messages]);
   useEffect(() => setConversation(initialConversation), [initialConversation]);
   const activePath = useMemo(
@@ -1598,6 +1599,10 @@ function ChatView({
       queryClient.setQueryData(["messages", conversation.id], refreshed.messages);
       setConversation(refreshed.conversation);
       setLocalMessages(refreshed.messages);
+      if (error instanceof ApiError && error.code !== "version_conflict") {
+        setSendError(error.message);
+        return;
+      }
       if (error instanceof ApiError && error.code === "version_conflict") {
         const refreshedLeafId = preferredLeaf(refreshed.messages, messageId);
         if (refreshedLeafId === refreshed.conversation.activeLeafId) return;

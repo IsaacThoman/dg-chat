@@ -121,6 +121,7 @@ test("admin enables web search and a user explicitly reviews and cancels a tool 
   expect(concurrentRename.status).toBe(200);
   await page.getByRole("button", { name: "Previous branch" }).click();
   await expect(original).toBeVisible();
+  await expect(page.getByText("That branch changed in another tab.")).toHaveCount(0);
   await page.getByRole("button", { name: "Next branch" }).click();
   await expect(page.getByText("Edited summary that retains verified search provenance.", {
     exact: true,

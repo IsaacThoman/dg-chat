@@ -6,6 +6,7 @@
     "jsr:@std/internal@^1.0.10": "1.0.14",
     "npm:@aws-sdk/client-s3@3.1083.0": "3.1083.0",
     "npm:@fastify/busboy@3.2.0": "3.2.0",
+    "npm:@napi-rs/canvas@1.0.2": "1.0.2",
     "npm:@playwright/test@1.58.2": "1.58.2",
     "npm:@tanstack/react-query@^5.81.5": "5.101.2_react@19.2.7",
     "npm:@tanstack/react-router@^1.125.6": "1.170.17_react@19.2.7_react-dom@19.2.7__react@19.2.7",
@@ -4676,6 +4677,7 @@
       },
       "apps/worker": {
         "dependencies": [
+          "npm:@napi-rs/canvas@1.0.2",
           "npm:@xmldom/xmldom@0.9.10",
           "npm:fflate@0.8.3",
           "npm:pdfjs-dist@6.1.200",
