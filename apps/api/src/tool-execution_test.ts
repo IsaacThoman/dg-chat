@@ -418,3 +418,51 @@ Deno.test("approve does not refund when a concurrent recoverer advances its rese
   await waitFor(approver, "user", requested.id, "succeeded");
   assertEquals(refunds, 0);
 });
+
+Deno.test("approve finalizes a concurrent cancellation marker without dispatch", async () => {
+  const store = new MemoryToolExecutionStore();
+  let adapterCalls = 0;
+  let reserveStarted!: () => void;
+  let releaseReserve!: () => void;
+  let cancelRefundStarted!: () => void;
+  let releaseCancelRefund!: () => void;
+  let refundCalls = 0;
+  const reserveAtBarrier = new Promise<void>((resolve) => reserveStarted = resolve);
+  const reserveRelease = new Promise<void>((resolve) => releaseReserve = resolve);
+  const refundAtBarrier = new Promise<void>((resolve) => cancelRefundStarted = resolve);
+  const refundRelease = new Promise<void>((resolve) => releaseCancelRefund = resolve);
+  const service = new ToolExecutionService(store, [{
+    ...echoAdapter,
+    execute: () => {
+      adapterCalls++;
+      return Promise.resolve({ forbidden: true });
+    },
+  }], {
+    reserve: async () => {
+      reserveStarted();
+      await reserveRelease;
+    },
+    settle: () => Promise.resolve(),
+    refund: async () => {
+      refundCalls++;
+      if (refundCalls === 1) {
+        cancelRefundStarted();
+        await refundRelease;
+      }
+      return true;
+    },
+  });
+  await service.setPolicy({ toolId: "echo", allowed: true, actorId: "admin" });
+  const requested = await service.request("user", "echo", {});
+  const approval = service.approve("user", requested.id);
+  await reserveAtBarrier;
+  const cancellation = service.cancel("user", requested.id);
+  await refundAtBarrier;
+  releaseReserve();
+  await assertRejects(() => approval, ToolExecutionError, "cancelled");
+  releaseCancelRefund();
+  assertEquals((await cancellation).status, "cancelled");
+  await service.recover();
+  assertEquals((await service.get("user", requested.id)).status, "cancelled");
+  assertEquals(adapterCalls, 0);
+});

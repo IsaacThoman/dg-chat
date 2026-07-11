@@ -212,8 +212,9 @@ export class PostgresToolExecutionStore {
       const rows = await tx`
         WITH candidates AS (
           SELECT id FROM tool_executions
-          WHERE status='queued' OR (status='running' AND
+          WHERE cancellation_requested_at IS NULL AND (status='queued' OR (status='running' AND
             (claim_expires_at IS NULL OR claim_expires_at < now()))
+          )
           ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT ${limit}
         )
         UPDATE tool_executions e SET status='running',claim_token=${claimToken}::uuid,

@@ -174,7 +174,10 @@ export class MemoryToolExecutionStore implements ToolExecutionStore {
   claimRecoverable(limit: number) {
     const claimed: ToolExecution[] = [];
     for (const execution of this.#executions.values()) {
-      if (execution.status !== "queued" || claimed.length >= limit) continue;
+      if (
+        execution.status !== "queued" || execution.cancellationRequestedAt ||
+        claimed.length >= limit
+      ) continue;
       execution.status = "running";
       execution.updatedAt = new Date().toISOString();
       claimed.push(clone(execution));
@@ -451,6 +454,18 @@ export class ToolExecutionService {
         });
       }
       throw error;
+    }
+    if (queued?.cancellationRequestedAt) {
+      const refunded = await this.controls?.refund(
+        queued,
+        "tool execution cancelled during approval",
+      );
+      if (refunded === false) {
+        await this.controls?.reserve(queued);
+        await this.controls?.refund(queued, "tool execution cancelled during approval");
+      }
+      await this.store.transitionExecution(id, ["queued"], { status: "cancelled" });
+      throw new ToolExecutionError("execution_terminal", "Tool execution was cancelled", 409);
     }
     if (!queued) {
       const current = await this.store.getExecution(id, ownerId);
