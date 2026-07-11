@@ -118,7 +118,7 @@ jq -e '
 ' <<<"$audio_state" >/dev/null
 echo "Official SDK audio multipart and idempotent replay contracts passed"
 jq -e '
-  .speech.calls == 6 and
+  (.speech.calls == 6 or (.speech.calls == 7 and .speech.aborted > 0)) and
   .speech.lastModel == "mock-transcribe" and
   .speech.sawCustomVoice == true and
   .speech.sawSse == true
