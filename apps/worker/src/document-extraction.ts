@@ -440,6 +440,17 @@ function xmlText(value: string): string {
     .trim();
 }
 
+function decodeXmlEntities(value: string): string {
+  return value
+    .replace(/&#(\d+);/g, (_, number: string) => String.fromCodePoint(Number(number)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, number: string) => String.fromCodePoint(parseInt(number, 16)))
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&apos;", "'")
+    .replaceAll("&amp;", "&");
+}
+
 function assertSafeDocx(entries: ZipEntry[], files: Record<string, Uint8Array>): void {
   const names = new Set(entries.map((entry) => entry.name));
   const lowerNames = entries.map((entry) => entry.name.toLowerCase());
@@ -449,11 +460,23 @@ function assertSafeDocx(entries: ZipEntry[], files: Record<string, Uint8Array>):
       "DOCX required package parts must use canonical names",
     );
   }
+  for (const [name, bytes] of Object.entries(files)) {
+    if (
+      (name.toLowerCase().endsWith(".xml") || name.toLowerCase().endsWith(".rels")) &&
+      /<!DOCTYPE\b|<!ENTITY\b/i.test(decoder.decode(bytes))
+    ) {
+      throw new DocumentExtractionError(
+        "docx_active_content",
+        "DOCX document type and entity declarations are not allowed",
+      );
+    }
+  }
   if (lowerNames.some((name) => name.endsWith("vbaproject.bin") || name.includes("/macros/"))) {
     throw new DocumentExtractionError("docx_macro", "Macro-enabled DOCX files are not allowed");
   }
   const contentTypes = files["[Content_Types].xml"];
-  if (contentTypes && /macroEnabled|vbaProject/i.test(decoder.decode(contentTypes))) {
+  const decodedContentTypes = decodeXmlEntities(decoder.decode(contentTypes));
+  if (/macroEnabled|vbaProject/i.test(decodedContentTypes)) {
     throw new DocumentExtractionError("docx_macro", "Macro-enabled DOCX files are not allowed");
   }
   const activePart = lowerNames.some((name) =>
@@ -463,9 +486,9 @@ function assertSafeDocx(entries: ZipEntry[], files: Record<string, Uint8Array>):
     /(?:^|\/)(?:oleobject|package)(?:\.|\/|$)/i.test(name) ||
     /\.(?:exe|dll|com|bat|cmd|ps1|js|jse|vbs|vbe|wsf|wsh|scr|msi)$/i.test(name)
   );
-  const activeContentType = contentTypes &&
-    /(?:activeX|oleObject|customUI|vnd\.microsoft\.portable-executable)/i.test(
-      decoder.decode(contentTypes),
+  const activeContentType = /(?:activeX|oleObject|customUI|vnd\.microsoft\.portable-executable)/i
+    .test(
+      decodedContentTypes,
     );
   if (activePart || activeContentType) {
     throw new DocumentExtractionError(
@@ -474,11 +497,17 @@ function assertSafeDocx(entries: ZipEntry[], files: Record<string, Uint8Array>):
     );
   }
   const documentXml = decoder.decode(files["word/document.xml"]);
-  const fieldInstructions = [
-    ...documentXml.matchAll(/<w:instrText\b[^>]*>([\s\S]*?)<\/w:instrText\s*>/gi),
-    ...documentXml.matchAll(/<w:fldSimple\b[^>]*\bw:instr\s*=\s*["']([^"']*)["']/gi),
-  ];
-  if (fieldInstructions.some((match) => /\bDDE(?:AUTO)?\b/i.test(match[1]))) {
+  const complexInstruction = [...documentXml.matchAll(
+    /<w:instrText\b[^>]*>([\s\S]*?)<\/w:instrText\s*>/gi,
+  )].map((match) => decodeXmlEntities(match[1]).replace(/<[^>]*>/g, "")).join("");
+  const simpleInstructions = [...documentXml.matchAll(
+    /<w:fldSimple\b[^>]*\bw:instr\s*=\s*["']([^"']*)["']/gi,
+  )].map((match) => decodeXmlEntities(match[1]));
+  if (
+    [complexInstruction, ...simpleInstructions].some((instruction) =>
+      /\bDDE(?:AUTO)?\b/i.test(instruction)
+    ) || /<(?:\w+:)?(?:OLEObject|object)\b/i.test(documentXml)
+  ) {
     throw new DocumentExtractionError(
       "docx_active_content",
       "DDE-enabled DOCX fields are not allowed",
@@ -486,11 +515,25 @@ function assertSafeDocx(entries: ZipEntry[], files: Record<string, Uint8Array>):
   }
   for (const [name, bytes] of Object.entries(files)) {
     if (!name.toLowerCase().endsWith(".rels")) continue;
-    const relationships = decoder.decode(bytes);
+    const relationships = decodeXmlEntities(decoder.decode(bytes));
     if (/TargetMode\s*=\s*["']External["']/i.test(relationships)) {
       throw new DocumentExtractionError(
         "docx_external_reference",
         "External DOCX relationships are not allowed",
+      );
+    }
+    const relationshipTypes = [...relationships.matchAll(
+      /<(?:\w+:)?Relationship\b[^>]*\bType\s*=\s*["']([^"']+)["']/gi,
+    )].map((match) => match[1].toLowerCase());
+    if (
+      relationshipTypes.some((type) =>
+        /\/(?:oleobject|package|embeddedpackage|attachedtemplate|attachedtoolbars|control|activex|customui|vbaproject)$/i
+          .test(type)
+      )
+    ) {
+      throw new DocumentExtractionError(
+        "docx_active_content",
+        "Active DOCX relationships are not allowed",
       );
     }
   }

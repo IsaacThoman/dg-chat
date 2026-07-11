@@ -189,6 +189,30 @@ Deno.test("PE polyglot detection validates a DOS and PE header without mz false 
   await assertRejects(() => hostile.inspection, UploadSecurityError, "Conflicting");
 });
 
+Deno.test("PE polyglot detection follows large DOS offsets across stream boundaries", async () => {
+  const body = new Uint8Array(7_000);
+  body.set(bytes(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a));
+  new DataView(body.buffer).setUint32(16, 1);
+  new DataView(body.buffer).setUint32(20, 1);
+  const dosOffset = 100;
+  const peRelative = 5_000;
+  body.set(bytes(0x4d, 0x5a), dosOffset);
+  new DataView(body.buffer).setUint32(dosOffset + 0x3c, peRelative, true);
+  body.set(bytes(0x50, 0x45, 0, 0), dosOffset + peRelative);
+  const hostile = secureUploadStream(
+    stream(
+      body.slice(0, dosOffset + 1),
+      body.slice(dosOffset + 1, dosOffset + peRelative + 2),
+      body.slice(dosOffset + peRelative + 2),
+    ),
+    "large-stub.png",
+    "image/png",
+    { maxBytes: body.length },
+  );
+  await assertRejects(() => drain(hostile.stream), UploadSecurityError, "Conflicting");
+  await assertRejects(() => hostile.inspection, UploadSecurityError, "Conflicting");
+});
+
 Deno.test("validates the complete JSON document instead of only its prefix", async () => {
   const valid = secureUploadStream(
     stream(strToU8('{"safe":'), strToU8("true}")),
