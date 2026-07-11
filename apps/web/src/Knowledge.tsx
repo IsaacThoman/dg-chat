@@ -300,7 +300,13 @@ function AttachmentPicker(
 
 export function KnowledgeView({ onMenu }: { onMenu: () => void }) {
   const collections = useQuery({ queryKey: ["collections"], queryFn: api.collections });
-  const [selectedId, setSelectedId] = useState("");
+  const [selectedId, setSelectedId] = useState(() => {
+    try {
+      return sessionStorage.getItem("dg-chat.active-knowledge-collection") ?? "";
+    } catch {
+      return "";
+    }
+  });
   const [query, setQuery] = useState("");
   const [dialog, setDialog] = useState<"create" | "rename" | "delete" | "attach" | null>(null);
   const [actionError, setActionError] = useState("");
@@ -311,7 +317,18 @@ export function KnowledgeView({ onMenu }: { onMenu: () => void }) {
   const selected = collections.data?.find((item) => item.id === selectedId) ??
     collections.data?.[0];
   useEffect(() => {
-    if (!selectedId && collections.data?.[0]) setSelectedId(collections.data[0].id);
+    if (!collections.data) return;
+    if (!collections.data.some((collection) => collection.id === selectedId)) {
+      setSelectedId(collections.data[0]?.id ?? "");
+    }
+  }, [collections.data, selectedId]);
+  useEffect(() => {
+    try {
+      if (selectedId) sessionStorage.setItem("dg-chat.active-knowledge-collection", selectedId);
+      else if (collections.data) sessionStorage.removeItem("dg-chat.active-knowledge-collection");
+    } catch {
+      // In-memory selection remains available when browser storage is disabled.
+    }
   }, [collections.data, selectedId]);
   const detail = useQuery({
     queryKey: ["collections", selected?.id],
