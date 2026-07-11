@@ -159,6 +159,41 @@ export interface CreateAttachmentResult {
   deduplicated: boolean;
 }
 
+export type KnowledgeRetrievalMode = "retrieval" | "full_context";
+export interface KnowledgeCollection {
+  id: string;
+  ownerId: string;
+  name: string;
+  description: string;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+  deletedAt: string | null;
+}
+export interface CreateKnowledgeCollectionInput {
+  name: string;
+  description?: string;
+  idempotencyKey: string;
+}
+export interface KnowledgeCollectionPatch {
+  name?: string;
+  description?: string;
+  expectedVersion: number;
+}
+export interface KnowledgeConversationBinding {
+  conversationId: string;
+  collectionId: string;
+  ownerId: string;
+  mode: KnowledgeRetrievalMode;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+}
+export interface ReplaceConversationKnowledgeInput {
+  collectionIds: string[];
+  mode: KnowledgeRetrievalMode;
+}
+
 export interface AppendMessageInput {
   conversationId: string;
   ownerId: string;
@@ -305,7 +340,7 @@ export interface JobSummary {
   attempts: number;
   createdAt: string;
 }
-export type ApiIdempotencyEndpoint = "chat.completions" | "responses";
+export type ApiIdempotencyEndpoint = "chat.completions" | "responses" | "embeddings";
 export type ApiIdempotencyState = "in_progress" | "completed" | "failed";
 export interface ApiIdempotencyFrame {
   sequence: number;
@@ -808,6 +843,57 @@ export interface DomainRepository {
   ): MaybePromise<AttachmentRecord>;
   retryAttachmentIngestion(id: string, ownerId: string): MaybePromise<AttachmentRecord>;
   listDocumentChunks(id: string, ownerId: string): MaybePromise<DocumentChunk[]>;
+  createKnowledgeCollection(
+    ownerId: string,
+    input: CreateKnowledgeCollectionInput,
+  ): MaybePromise<KnowledgeCollection>;
+  listKnowledgeCollections(ownerId: string): MaybePromise<KnowledgeCollection[]>;
+  getKnowledgeCollection(id: string, ownerId: string): MaybePromise<KnowledgeCollection>;
+  updateKnowledgeCollection(
+    id: string,
+    ownerId: string,
+    patch: KnowledgeCollectionPatch,
+  ): MaybePromise<KnowledgeCollection>;
+  deleteKnowledgeCollection(
+    id: string,
+    ownerId: string,
+    expectedVersion: number,
+  ): MaybePromise<KnowledgeCollection>;
+  linkKnowledgeAttachment(
+    collectionId: string,
+    attachmentId: string,
+    ownerId: string,
+    expectedVersion: number,
+  ): MaybePromise<KnowledgeCollection>;
+  unlinkKnowledgeAttachment(
+    collectionId: string,
+    attachmentId: string,
+    ownerId: string,
+    expectedVersion: number,
+  ): MaybePromise<KnowledgeCollection>;
+  listKnowledgeAttachments(collectionId: string, ownerId: string): MaybePromise<AttachmentRecord[]>;
+  bindKnowledgeCollection(
+    conversationId: string,
+    collectionId: string,
+    ownerId: string,
+    mode: KnowledgeRetrievalMode,
+    expectedVersion?: number,
+  ): MaybePromise<KnowledgeConversationBinding>;
+  unbindKnowledgeCollection(
+    conversationId: string,
+    collectionId: string,
+    ownerId: string,
+    expectedVersion: number,
+  ): MaybePromise<void>;
+  listConversationKnowledge(
+    conversationId: string,
+    ownerId: string,
+  ): MaybePromise<KnowledgeConversationBinding[]>;
+  replaceConversationKnowledge(
+    conversationId: string,
+    ownerId: string,
+    input: ReplaceConversationKnowledgeInput,
+  ): MaybePromise<KnowledgeConversationBinding[]>;
   createApiToken(userId: string, input: CreateApiTokenInput): MaybePromise<StoredApiToken>;
   findApiTokenByHash(hash: string): MaybePromise<StoredApiToken | undefined>;
   listApiTokens(userId: string): MaybePromise<ApiTokenSummary[]>;

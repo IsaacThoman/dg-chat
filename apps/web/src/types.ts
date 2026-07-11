@@ -36,6 +36,7 @@ export interface Message {
   latency?: string;
   reasoning?: string;
   toolStatus?: string;
+  knowledgeSources?: Array<{ label: string; collectionName: string; filename: string }>;
   status?: "complete" | "stopped" | "error";
   branch?: Branch;
   attachments?: Attachment[];
@@ -122,6 +123,26 @@ export interface Attachment {
   ingestionError?: string | null;
   ingestedAt?: string | null;
   createdAt: string;
+}
+
+export interface KnowledgeCollection {
+  id: string;
+  name: string;
+  description?: string | null;
+  attachmentCount?: number;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type KnowledgeMode = "retrieval" | "full_context";
+
+export interface ConversationKnowledge {
+  bindings: Array<{
+    collectionId: string;
+    mode: KnowledgeMode;
+    version: number;
+  }>;
 }
 
 export interface AuditEvent {

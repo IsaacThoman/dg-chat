@@ -61,6 +61,27 @@ fi
 
 mock_request POST /__test/reset >/dev/null
 
+provider="$(curl --fail --silent --show-error --request POST \
+  "$api_url/api/admin/providers" --header 'content-type: application/json' \
+  --header "origin: $web_origin" --cookie "$CONTRACT_SESSION_COOKIE" \
+  --data '{"slug":"contracts","displayName":"Contract Mock Provider","baseUrl":"https://mock-provider:4010/v1","protocol":"chat_completions"}')"
+provider_id="$(jq --raw-output '.id' <<<"$provider")"
+provider_version="$(jq --raw-output '.version' <<<"$provider")"
+provider="$(curl --fail --silent --show-error --request PUT \
+  "$api_url/api/admin/providers/$provider_id/credential" --header 'content-type: application/json' \
+  --header "origin: $web_origin" --cookie "$CONTRACT_SESSION_COOKIE" \
+  --data "{\"expectedVersion\":$provider_version,\"credential\":\"ci-mock-provider-key\"}")"
+model="$(curl --fail --silent --show-error --request POST \
+  "$api_url/api/admin/models" --header 'content-type: application/json' \
+  --header "origin: $web_origin" --cookie "$CONTRACT_SESSION_COOKIE" \
+  --data "{\"providerId\":\"$provider_id\",\"publicModelId\":\"contracts/mock-embedding\",\"upstreamModelId\":\"mock-embedding\",\"displayName\":\"Contract Mock Embedding\",\"capabilities\":[\"embeddings\"],\"contextWindow\":8192}")"
+model_id="$(jq --raw-output '.id' <<<"$model")"
+model_version="$(jq --raw-output '.version' <<<"$model")"
+curl --fail --silent --show-error --request POST \
+  "$api_url/api/admin/models/$model_id/prices" --header 'content-type: application/json' \
+  --header "origin: $web_origin" --cookie "$CONTRACT_SESSION_COOKIE" \
+  --data "{\"providerModelId\":\"$model_id\",\"expectedModelVersion\":$model_version,\"effectiveAt\":\"2020-01-01T00:00:00.000Z\",\"inputMicrosPerMillion\":100000,\"cachedInputMicrosPerMillion\":100000,\"reasoningMicrosPerMillion\":0,\"outputMicrosPerMillion\":0,\"fixedCallMicros\":10,\"source\":\"contract\"}" >/dev/null
+
 echo "Explicitly unsupported contract TODOs:"
 jq --raw-output '.[] | "TODO  \(.endpoint): \(.reason)"' \
   tests/contracts/unsupported-contracts.json

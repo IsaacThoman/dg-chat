@@ -172,6 +172,177 @@ Deno.test("provider registry hides credentials, versions mutations, and preserve
   );
 });
 
+Deno.test("knowledge collections isolate owners and version membership and bindings", () => {
+  const repo = new MemoryRepository();
+  const owner = repo.createUser({
+    email: "knowledge@example.com",
+    name: "Knowledge",
+    passwordHash: "x",
+  });
+  const stranger = repo.createUser({
+    email: "knowledge-other@example.com",
+    name: "Other",
+    passwordHash: "x",
+  });
+  const collection = repo.createKnowledgeCollection(owner.id, {
+    name: " Docs ",
+    description: "Reference",
+    idempotencyKey: "docs-1",
+  });
+  assertEquals(
+    repo.createKnowledgeCollection(owner.id, {
+      name: "Docs",
+      description: "Reference",
+      idempotencyKey: "docs-1",
+    }).id,
+    collection.id,
+  );
+  assertThrows(
+    () => repo.createKnowledgeCollection(owner.id, { name: "drift", idempotencyKey: "docs-1" }),
+    DomainError,
+    "payload differs",
+  );
+  assertEquals(repo.listKnowledgeCollections(stranger.id), []);
+  assertThrows(
+    () => repo.getKnowledgeCollection(collection.id, stranger.id),
+    DomainError,
+    "not found",
+  );
+  const attachment = repo.createAttachment({
+    ownerId: owner.id,
+    objectKey: `users/${owner.id}/knowledge`,
+    filename: "doc.txt",
+    mimeType: "text/plain",
+    sizeBytes: 3,
+    sha256: "d".repeat(64),
+    state: "ready",
+  }).attachment;
+  const linked = repo.linkKnowledgeAttachment(collection.id, attachment.id, owner.id, 1);
+  assertEquals(linked.version, 2);
+  assertEquals(repo.linkKnowledgeAttachment(collection.id, attachment.id, owner.id, 1).version, 2);
+  assertEquals(repo.listKnowledgeAttachments(collection.id, owner.id)[0].id, attachment.id);
+  assertThrows(
+    () => repo.unlinkKnowledgeAttachment(collection.id, attachment.id, owner.id, 1),
+    DomainError,
+    "changed",
+  );
+  const conversation = repo.createConversation(owner.id, "RAG");
+  const binding = repo.bindKnowledgeCollection(
+    conversation.id,
+    collection.id,
+    owner.id,
+    "retrieval",
+  );
+  assertEquals(binding.version, 1);
+  assertEquals(
+    repo.bindKnowledgeCollection(conversation.id, collection.id, owner.id, "retrieval").version,
+    1,
+  );
+  assertThrows(
+    () => repo.bindKnowledgeCollection(conversation.id, collection.id, owner.id, "full_context"),
+    DomainError,
+    "changed",
+  );
+  const changed = repo.bindKnowledgeCollection(
+    conversation.id,
+    collection.id,
+    owner.id,
+    "full_context",
+    1,
+  );
+  assertEquals(changed.version, 2);
+  assertEquals(repo.listConversationKnowledge(conversation.id, owner.id)[0].mode, "full_context");
+  assertThrows(
+    () => repo.listConversationKnowledge(conversation.id, stranger.id),
+    DomainError,
+    "not found",
+  );
+  repo.unbindKnowledgeCollection(conversation.id, collection.id, owner.id, 2);
+  repo.unlinkKnowledgeAttachment(collection.id, attachment.id, owner.id, 2);
+  assertEquals(
+    repo.unlinkKnowledgeAttachment(collection.id, attachment.id, owner.id, 2).version,
+    3,
+  );
+  const disposable = repo.createAttachment({
+    ownerId: owner.id,
+    objectKey: `users/${owner.id}/knowledge-deleted`,
+    filename: "deleted.txt",
+    mimeType: "text/plain",
+    sizeBytes: 1,
+    sha256: "e".repeat(64),
+    state: "ready",
+  }).attachment;
+  const relinked = repo.linkKnowledgeAttachment(collection.id, disposable.id, owner.id, 3);
+  repo.deleteAttachment(disposable.id, owner.id);
+  assertEquals(repo.listKnowledgeAttachments(collection.id, owner.id), []);
+  assertThrows(
+    () => repo.unlinkKnowledgeAttachment(collection.id, disposable.id, owner.id, relinked.version),
+    DomainError,
+    "not found",
+  );
+  const hidden = repo.createKnowledgeCollection(owner.id, {
+    name: "Hidden",
+    idempotencyKey: "hidden-1",
+  });
+  repo.bindKnowledgeCollection(conversation.id, hidden.id, owner.id, "retrieval");
+  repo.deleteKnowledgeCollection(hidden.id, owner.id, 1);
+  assertEquals(repo.listConversationKnowledge(conversation.id, owner.id), []);
+  assertThrows(
+    () => repo.bindKnowledgeCollection(conversation.id, hidden.id, owner.id, "retrieval"),
+    DomainError,
+    "not found",
+  );
+  const replacementConversation = repo.createConversation(owner.id, "Replacement");
+  const secondCollection = repo.createKnowledgeCollection(owner.id, {
+    name: "Second",
+    idempotencyKey: "second-1",
+  });
+  const foreignCollection = repo.createKnowledgeCollection(stranger.id, {
+    name: "Foreign",
+    idempotencyKey: "foreign-1",
+  });
+  assertEquals(
+    repo.replaceConversationKnowledge(replacementConversation.id, owner.id, {
+      collectionIds: [collection.id, secondCollection.id],
+      mode: "retrieval",
+    }).length,
+    2,
+  );
+  assertThrows(
+    () =>
+      repo.replaceConversationKnowledge(replacementConversation.id, owner.id, {
+        collectionIds: [secondCollection.id, foreignCollection.id],
+        mode: "full_context",
+      }),
+    DomainError,
+    "not found",
+  );
+  assertEquals(repo.listConversationKnowledge(replacementConversation.id, owner.id).length, 2);
+  const replaced = repo.replaceConversationKnowledge(replacementConversation.id, owner.id, {
+    collectionIds: [secondCollection.id],
+    mode: "full_context",
+  });
+  assertEquals(replaced.map((value) => [value.collectionId, value.mode]), [[
+    secondCollection.id,
+    "full_context",
+  ]]);
+  const deleted = repo.deleteKnowledgeCollection(collection.id, owner.id, relinked.version);
+  assertEquals(deleted.deletedAt !== null, true);
+  assertThrows(
+    () =>
+      repo.createKnowledgeCollection(owner.id, {
+        name: "Docs",
+        description: "Reference",
+        idempotencyKey: "docs-1",
+      }),
+    DomainError,
+    "already used",
+  );
+  assertEquals(repo.listKnowledgeCollections(owner.id).map((value) => value.id), [
+    secondCollection.id,
+  ]);
+});
+
 Deno.test("provider resilience routes are acyclic and attempts are immutable and idempotent", () => {
   const repo = new MemoryRepository();
   const actor = repo.bootstrapAdmin({
@@ -1424,6 +1595,29 @@ Deno.test("generation atomically links only ready attachments and rejects attach
   });
   repo.credit(owner.id, "generation-files-grant", "grant", 1_000_000);
   const conversation = repo.createConversation(owner.id, "Generation files");
+  assertThrows(
+    () =>
+      repo.beginGeneration({
+        message: {
+          conversationId: conversation.id,
+          ownerId: owner.id,
+          parentId: null,
+          role: "user",
+          content: "   ",
+          model: "simulated/dg-chat",
+          expectedVersion: 0,
+          idempotencyKey: "generation-empty-message",
+        },
+        runId: "generation-empty-run",
+        provider: "simulated",
+        reserveMicros: 100,
+        attachmentIds: [],
+      }),
+    DomainError,
+    "content or at least one attachment",
+  );
+  assertEquals(repo.detail(conversation.id, owner.id).messages.length, 0);
+  assertEquals(repo.findUser(owner.id)?.balanceMicros, 1_000_000);
   const created = repo.createAttachment({
     ownerId: owner.id,
     objectKey: `users/${owner.id}/objects/generation-file`,
@@ -1751,7 +1945,13 @@ Deno.test("durable API idempotency lifecycle reserves once, replays frames, and 
     "payload differs",
   );
   repo.apiIdempotencyRequests.get(completed.id)!.expiresAt = new Date(0).toISOString();
-  assertEquals(repo.pruneExpiredApiRequests(), 1);
+  assertEquals(repo.getApiRequest(user.id, input.endpoint, input.idempotencyKey), undefined);
+  assertEquals(repo.apiIdempotencyRequests.has(completed.id), false);
+  assertEquals(
+    repo.apiIdempotencyKeys.has(`${user.id}:${input.endpoint}:${input.idempotencyKey}`),
+    false,
+  );
+  assertEquals(repo.pruneExpiredApiRequests(), 0);
   const reused = repo.beginApiRequest({ ...input, runId: "replay-run-1-reused" });
   assertEquals(reused.kind, "started");
   if (reused.kind !== "started") throw new Error("expected reused key to start");

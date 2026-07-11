@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { api, uploadAttachment } from "./api.ts";
-import type { Conversation } from "./types.ts";
+import type { Conversation, KnowledgeCollection } from "./types.ts";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -19,6 +19,72 @@ describe("setup discovery API", () => {
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/setup/status",
       expect.objectContaining({ credentials: "include" }),
+    );
+  });
+});
+
+describe("knowledge API", () => {
+  const collection: KnowledgeCollection = {
+    id: "collection/1",
+    name: "Docs",
+    attachmentCount: 1,
+    version: 4,
+    createdAt: "2026-07-10T00:00:00.000Z",
+    updatedAt: "2026-07-10T00:00:00.000Z",
+  };
+
+  it("includes optimistic versions when mutating collection membership", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json(collection))
+      .mockResolvedValueOnce(Response.json({ collection: { ...collection, version: 5 } }))
+      .mockResolvedValueOnce(Response.json({ collection: { ...collection, version: 5 } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.updateCollection(collection, "Product docs");
+    await api.addCollectionAttachment(collection, "attachment/1");
+    await api.removeCollectionAttachment(collection, "attachment/1");
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "/api/collections/collection%2F1",
+      expect.objectContaining({
+        method: "PATCH",
+        body: JSON.stringify({ name: "Product docs", expectedVersion: 4 }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/collections/collection%2F1/attachments/attachment%2F1",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ expectedVersion: 4 }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      "/api/collections/collection%2F1/attachments/attachment%2F1",
+      expect.objectContaining({
+        method: "DELETE",
+        body: JSON.stringify({ expectedVersion: 4 }),
+      }),
+    );
+  });
+
+  it("persists a conversation's selected collections and context mode", async () => {
+    const payload = { collectionIds: ["collection-1"], mode: "full_context" as const };
+    const response = {
+      bindings: [{ collectionId: "collection-1", mode: "full_context" as const, version: 1 }],
+    };
+    const fetchMock = vi.fn().mockResolvedValue(Response.json(response));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(api.setConversationKnowledge("chat/1", payload.collectionIds, payload.mode))
+      .resolves.toEqual(response);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/conversations/chat%2F1/knowledge",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify(payload),
+      }),
     );
   });
 });

@@ -1751,6 +1751,91 @@ Deno.test({
 });
 
 Deno.test({
+  name: "normalized knowledge collections serialize first bind and hide soft-deleted parents",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 1 });
+    await sql`TRUNCATE conversation_knowledge_bindings, knowledge_collection_attachments,
+      knowledge_collections, audit_events, document_chunks, message_attachments, attachments,
+      jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users
+      RESTART IDENTITY CASCADE`;
+    const first = await PostgresRepository.connect(databaseUrl!);
+    const second = await PostgresRepository.connect(databaseUrl!);
+    try {
+      const owner = await first.bootstrapAdmin({
+        email: "knowledge-pg@database.test",
+        name: "Knowledge",
+        passwordHash: "hash",
+      }, 100);
+      const conversation = await first.createConversation(owner.id, "Knowledge");
+      const collection = await first.createKnowledgeCollection(owner.id, {
+        name: "Docs",
+        idempotencyKey: "knowledge-pg-docs",
+      });
+      const bindings = await Promise.all([
+        first.bindKnowledgeCollection(conversation.id, collection.id, owner.id, "retrieval", 0),
+        second.bindKnowledgeCollection(conversation.id, collection.id, owner.id, "retrieval", 0),
+      ]);
+      assertEquals(bindings.map((value) => value.version), [1, 1]);
+      assertEquals((await first.listConversationKnowledge(conversation.id, owner.id)).length, 1);
+      const secondCollection = await first.createKnowledgeCollection(owner.id, {
+        name: "Second",
+        idempotencyKey: "knowledge-pg-second",
+      });
+      const replacements = await Promise.all([
+        first.replaceConversationKnowledge(conversation.id, owner.id, {
+          collectionIds: [collection.id, secondCollection.id],
+          mode: "full_context",
+        }),
+        second.replaceConversationKnowledge(conversation.id, owner.id, {
+          collectionIds: [collection.id, secondCollection.id],
+          mode: "full_context",
+        }),
+      ]);
+      assertEquals(replacements.map((value) => value.length), [2, 2]);
+      assertEquals(
+        (await first.listConversationKnowledge(conversation.id, owner.id)).map((
+          value,
+        ) => [value.collectionId, value.mode]).sort(),
+        [[collection.id, "full_context"], [secondCollection.id, "full_context"]].sort(),
+      );
+      await first.deleteKnowledgeCollection(collection.id, owner.id, 1);
+      assertEquals(
+        (await first.listConversationKnowledge(conversation.id, owner.id)).map((value) =>
+          value.collectionId
+        ),
+        [secondCollection.id],
+      );
+      await assertRejects(
+        () => second.bindKnowledgeCollection(conversation.id, collection.id, owner.id, "retrieval"),
+        DomainError,
+        "not found",
+      );
+      await assertRejects(
+        () => first.unbindKnowledgeCollection(conversation.id, collection.id, owner.id, 1),
+        DomainError,
+        "not found",
+      );
+      await assertRejects(
+        () =>
+          first.createKnowledgeCollection(owner.id, {
+            name: "Docs",
+            idempotencyKey: "knowledge-pg-docs",
+          }),
+        DomainError,
+        "already used",
+      );
+    } finally {
+      await first.close();
+      await second.close();
+      await sql.end();
+    }
+  },
+});
+
+Deno.test({
   name: "normalized attachments enforce ownership, dedupe, immutable links, and jobs",
   ignore: !databaseUrl,
   sanitizeOps: false,
@@ -1846,6 +1931,29 @@ Deno.test({
         passwordHash: "hash",
       }, 1_000_000);
       const conversation = await repo.createConversation(owner.id, "Generation attachments");
+      await assertRejects(
+        () =>
+          repo.beginGeneration({
+            message: {
+              conversationId: conversation.id,
+              ownerId: owner.id,
+              parentId: null,
+              role: "user",
+              content: "   ",
+              model: "simulated/dg-chat",
+              expectedVersion: 0,
+              idempotencyKey: "generation-empty-message",
+            },
+            runId: "generation-empty-run",
+            provider: "simulated",
+            reserveMicros: 100,
+            attachmentIds: [],
+          }),
+        DomainError,
+        "content or at least one attachment",
+      );
+      assertEquals((await repo.detail(conversation.id, owner.id)).messages.length, 0);
+      assertEquals((await repo.findUser(owner.id))?.balanceMicros, 1_000_000);
       const created = await repo.createAttachment({
         ownerId: owner.id,
         objectKey: `users/${owner.id}/objects/generation-attachment`,

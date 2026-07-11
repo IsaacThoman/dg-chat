@@ -6,10 +6,29 @@ if (!apiKey) throw new Error("OPENAI_API_KEY is required");
 
 const client = new OpenAI({ apiKey, baseURL, maxRetries: 0 });
 const model = "openai/mock-fast";
+const embeddingModel = "contracts/mock-embedding";
 
 const models = await client.models.list();
 if (!models.data.some((candidate) => candidate.id === "openai/default")) {
   throw new Error("Official JavaScript client did not receive the configured upstream model");
+}
+if (!models.data.some((candidate) => candidate.id === embeddingModel)) {
+  throw new Error("Official JavaScript client did not receive the embeddings model");
+}
+
+const embeddings = await client.embeddings.create({
+  model: embeddingModel,
+  input: ["JavaScript embeddings one", "JavaScript embeddings two"],
+  encoding_format: "float",
+});
+if (
+  embeddings.object !== "list" || embeddings.model !== embeddingModel ||
+  embeddings.data.length !== 2 || embeddings.data[0]?.index !== 0 ||
+  embeddings.data[1]?.index !== 1 ||
+  JSON.stringify(embeddings.data[0]?.embedding) !== JSON.stringify([0.1, 0.2, 0.3, 0.4]) ||
+  embeddings.usage.prompt_tokens !== 2 || embeddings.usage.total_tokens !== 2
+) {
+  throw new Error("JavaScript embeddings.create() returned an invalid response");
 }
 
 const completion = await client.chat.completions.create({
