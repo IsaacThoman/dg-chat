@@ -499,6 +499,16 @@ Deno.test({
         name: "Identity",
         passwordHash: "old-hash",
       });
+      const identitySql = postgres(databaseUrl!, { max: 1 });
+      await identitySql.begin(async (tx) => {
+        await tx`INSERT INTO auth_users
+          (id,name,email,email_verified,created_at,updated_at)
+          VALUES (${identityUser.id},${identityUser.name},${identityUser.email},false,now(),now())`;
+        await tx`INSERT INTO auth_accounts
+          (id,account_id,provider_id,user_id,password,created_at,updated_at)
+          VALUES (${crypto.randomUUID()},${identityUser.id},'credential',${identityUser.id},'old-hash',now(),now())`;
+      });
+      await identitySql.end();
       await assertRejects(
         () => repo.approveUser(identityUser.id, "approved", 10, true),
         DomainError,
@@ -551,6 +561,14 @@ Deno.test({
         ),
       ]);
       await repo.resetPassword("reset-db-hash", "new-hash");
+      const resetSql = postgres(databaseUrl!, { max: 1 });
+      const [resetCredential] = await resetSql<
+        { password: string; password_hash: string | null }[]
+      >`SELECT a.password,u.password_hash FROM auth_accounts a
+        JOIN users u ON u.id=a.user_id
+        WHERE a.provider_id='credential' AND a.user_id=${identityUser.id}`;
+      await resetSql.end();
+      assertEquals(resetCredential, { password: "new-hash", password_hash: null });
       assertEquals(await repo.getSession(identitySession.tokenHash), undefined);
       assertEquals((await repo.findApiTokenByHash("identity-api-hash"))?.revokedAt !== null, true);
       assertEquals(identityApiToken.userId, identityUser.id);

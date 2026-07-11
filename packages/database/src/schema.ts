@@ -42,6 +42,8 @@ export const users = pgTable("users", {
   email: text("email").notNull(),
   name: text("name").notNull(),
   passwordHash: text("password_hash"),
+  passwordResetPending: boolean("password_reset_pending").notNull().default(false),
+  passwordResetTokenIdentifier: text("password_reset_token_identifier"),
   role: userRole("role").notNull().default("user"),
   approvalStatus: approvalStatus("approval_status").notNull().default("pending"),
   state: accountState("state").notNull().default("active"),

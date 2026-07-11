@@ -13,10 +13,11 @@ services:
         condition: service_healthy
 
   mock-oidc:
-    image: denoland/deno:alpine
+    image: denoland/deno:2.9.2-alpine
     working_dir: /workspace/apps/mock-oidc
     command: ["task", "start"]
     environment:
+      DENO_DIR: /tmp/deno-dir
       MOCK_OIDC_PORT: "4020"
       MOCK_OIDC_PUBLIC_ISSUER: http://localhost:4020
       MOCK_OIDC_INTERNAL_BASE_URL: http://mock-oidc:4020

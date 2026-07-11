@@ -7,6 +7,42 @@ export const MOCK_OIDC_PERSONAS = {
     email_verified: true,
     name: "OIDC New Applicant",
   },
+  new_verified_desktop_0: {
+    sub: "mock-sub-new-verified-desktop-0",
+    email: "oidc-new-desktop-0@e2e.invalid",
+    email_verified: true,
+    name: "OIDC Desktop Applicant 0",
+  },
+  new_verified_desktop_1: {
+    sub: "mock-sub-new-verified-desktop-1",
+    email: "oidc-new-desktop-1@e2e.invalid",
+    email_verified: true,
+    name: "OIDC Desktop Applicant 1",
+  },
+  new_verified_desktop_2: {
+    sub: "mock-sub-new-verified-desktop-2",
+    email: "oidc-new-desktop-2@e2e.invalid",
+    email_verified: true,
+    name: "OIDC Desktop Applicant 2",
+  },
+  new_verified_mobile_0: {
+    sub: "mock-sub-new-verified-mobile-0",
+    email: "oidc-new-mobile-0@e2e.invalid",
+    email_verified: true,
+    name: "OIDC Mobile Applicant 0",
+  },
+  new_verified_mobile_1: {
+    sub: "mock-sub-new-verified-mobile-1",
+    email: "oidc-new-mobile-1@e2e.invalid",
+    email_verified: true,
+    name: "OIDC Mobile Applicant 1",
+  },
+  new_verified_mobile_2: {
+    sub: "mock-sub-new-verified-mobile-2",
+    email: "oidc-new-mobile-2@e2e.invalid",
+    email_verified: true,
+    name: "OIDC Mobile Applicant 2",
+  },
   new_unverified: {
     sub: "mock-sub-new-unverified",
     email: "oidc-unverified@e2e.invalid",
