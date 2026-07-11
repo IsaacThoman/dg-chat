@@ -690,24 +690,35 @@ function wordDocumentSections(document: Document): string[] {
     if (normalized) sections.push(normalized);
     text = "";
   };
-  const walk = (node: OfficeXmlNode): void => {
+  const walk = (node: OfficeXmlNode, deferSectionBreak = false): boolean => {
     const word = node.namespaceURI !== null && node.namespaceURI !== undefined &&
       WORDPROCESSING_NAMESPACES.has(node.namespaceURI);
     if (word && node.localName === "t") {
       append(node.textContent ?? "");
-      return;
+      return false;
     }
     if (word && node.localName === "tab") append("\t");
     else if (word && (node.localName === "br" || node.localName === "cr")) append("\n");
+    if (word && node.localName === "sectPr") {
+      if (deferSectionBreak) return true;
+      flush();
+      return false;
+    }
+    const paragraph = word && node.localName === "p";
+    let sectionBreak = false;
     for (
       let child = node.firstChild as OfficeXmlNode | null;
       child;
       child = child.nextSibling as OfficeXmlNode | null
     ) {
-      walk(child);
+      sectionBreak = walk(child, deferSectionBreak || paragraph) || sectionBreak;
     }
-    if (word && node.localName === "p") append("\n");
-    if (word && node.localName === "sectPr") flush();
+    if (paragraph) {
+      append("\n");
+      if (sectionBreak) flush();
+      return false;
+    }
+    return sectionBreak;
   };
   walk(document as unknown as OfficeXmlNode);
   flush();
