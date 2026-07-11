@@ -1,0 +1,344 @@
+export type ToolExecutionStatus =
+  | "pending_approval"
+  | "queued"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancelled";
+
+export interface ToolDefinition {
+  id: string;
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  /** A disabled tool fails closed even if an old policy record still allows it. */
+  enabled: boolean;
+}
+
+export interface ToolPolicy {
+  toolId: string;
+  allowed: boolean;
+  allowedDomains: string[];
+  allowPrivateNetwork: boolean;
+  version: number;
+  updatedAt: string;
+  updatedBy: string;
+}
+
+export interface ToolExecution {
+  id: string;
+  ownerId: string;
+  toolId: string;
+  input: unknown;
+  status: ToolExecutionStatus;
+  result: unknown | null;
+  error: { code: string; message: string } | null;
+  approvedAt: string | null;
+  approvedBy: string | null;
+  cancellationRequestedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Persistence boundary. PostgreSQL can implement this without changing execution semantics. */
+export interface ToolExecutionStore {
+  listPolicies(): Promise<ToolPolicy[]>;
+  getPolicy(toolId: string): Promise<ToolPolicy | undefined>;
+  putPolicy(
+    policy: Omit<ToolPolicy, "version" | "updatedAt">,
+    expectedVersion?: number,
+  ): Promise<ToolPolicy>;
+  createExecution(execution: ToolExecution): Promise<ToolExecution>;
+  getExecution(id: string): Promise<ToolExecution | undefined>;
+  /** Atomic compare-and-set; returns undefined if the current status no longer matches. */
+  transitionExecution(
+    id: string,
+    expected: readonly ToolExecutionStatus[],
+    patch: Partial<Omit<ToolExecution, "id" | "ownerId" | "toolId" | "input" | "createdAt">>,
+  ): Promise<ToolExecution | undefined>;
+}
+
+export interface ToolAdapterContext {
+  executionId: string;
+  ownerId: string;
+  signal: AbortSignal;
+  policy: ToolPolicy;
+}
+
+export interface ToolAdapter {
+  definition: ToolDefinition;
+  execute(input: unknown, context: ToolAdapterContext): Promise<unknown>;
+}
+
+export class ToolExecutionError extends Error {
+  constructor(
+    readonly code:
+      | "tool_not_found"
+      | "tool_not_allowed"
+      | "execution_not_found"
+      | "approval_required"
+      | "execution_terminal"
+      | "version_conflict"
+      | "invalid_input",
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+    this.name = "ToolExecutionError";
+  }
+}
+
+function clone<T>(value: T): T {
+  return structuredClone(value);
+}
+
+function validateJson(value: unknown, depth = 0): boolean {
+  if (depth > 12) return false;
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (Array.isArray(value)) {
+    return value.length <= 1_000 && value.every((v) => validateJson(v, depth + 1));
+  }
+  if (!value || typeof value !== "object" || Object.getPrototypeOf(value) !== Object.prototype) {
+    return false;
+  }
+  const entries = Object.entries(value as Record<string, unknown>);
+  return entries.length <= 1_000 &&
+    entries.every(([key, item]) => key.length <= 256 && validateJson(item, depth + 1));
+}
+
+export class MemoryToolExecutionStore implements ToolExecutionStore {
+  readonly #policies = new Map<string, ToolPolicy>();
+  readonly #executions = new Map<string, ToolExecution>();
+
+  listPolicies() {
+    return Promise.resolve([...this.#policies.values()].map(clone));
+  }
+  getPolicy(toolId: string) {
+    const value = this.#policies.get(toolId);
+    return Promise.resolve(value ? clone(value) : undefined);
+  }
+  putPolicy(
+    policy: Omit<ToolPolicy, "version" | "updatedAt">,
+    expectedVersion?: number,
+  ) {
+    const current = this.#policies.get(policy.toolId);
+    if ((current?.version ?? 0) !== (expectedVersion ?? current?.version ?? 0)) {
+      throw new ToolExecutionError(
+        "version_conflict",
+        "Tool policy changed in another session",
+        409,
+      );
+    }
+    const next = {
+      ...clone(policy),
+      version: (current?.version ?? 0) + 1,
+      updatedAt: new Date().toISOString(),
+    };
+    this.#policies.set(policy.toolId, next);
+    return Promise.resolve(clone(next));
+  }
+  createExecution(execution: ToolExecution) {
+    if (this.#executions.has(execution.id)) throw new Error("Duplicate tool execution");
+    this.#executions.set(execution.id, clone(execution));
+    return Promise.resolve(clone(execution));
+  }
+  getExecution(id: string) {
+    const value = this.#executions.get(id);
+    return Promise.resolve(value ? clone(value) : undefined);
+  }
+  transitionExecution(
+    id: string,
+    expected: readonly ToolExecutionStatus[],
+    patch: Partial<Omit<ToolExecution, "id" | "ownerId" | "toolId" | "input" | "createdAt">>,
+  ) {
+    const current = this.#executions.get(id);
+    if (!current || !expected.includes(current.status)) return Promise.resolve(undefined);
+    const next = { ...current, ...clone(patch), updatedAt: new Date().toISOString() };
+    this.#executions.set(id, next);
+    return Promise.resolve(clone(next));
+  }
+}
+
+const TERMINAL: readonly ToolExecutionStatus[] = ["succeeded", "failed", "cancelled"];
+
+export class ToolExecutionService {
+  readonly #adapters = new Map<string, ToolAdapter>();
+  readonly #active = new Map<string, AbortController>();
+
+  constructor(readonly store: ToolExecutionStore, adapters: readonly ToolAdapter[]) {
+    for (const adapter of adapters) {
+      if (this.#adapters.has(adapter.definition.id)) throw new Error("Duplicate tool adapter id");
+      this.#adapters.set(adapter.definition.id, adapter);
+    }
+  }
+
+  listDefinitions() {
+    return [...this.#adapters.values()].map((adapter) => clone(adapter.definition));
+  }
+
+  async listPolicies() {
+    const policies = new Map(
+      (await this.store.listPolicies()).map((policy) => [policy.toolId, policy]),
+    );
+    return this.listDefinitions().map((definition) => ({
+      definition,
+      policy: policies.get(definition.id) ?? null,
+    }));
+  }
+
+  async setPolicy(input: {
+    toolId: string;
+    allowed: boolean;
+    allowedDomains?: string[];
+    allowPrivateNetwork?: boolean;
+    expectedVersion?: number;
+    actorId: string;
+  }) {
+    if (!this.#adapters.has(input.toolId)) {
+      throw new ToolExecutionError("tool_not_found", "Tool is not registered", 404);
+    }
+    const domains = [
+      ...new Set(
+        (input.allowedDomains ?? []).map((value) =>
+          value.trim().toLowerCase().replace(/^\.+|\.+$/g, "")
+        ),
+      ),
+    ];
+    if (domains.some((domain) => !domain || domain.length > 253 || !/^[a-z0-9.-]+$/.test(domain))) {
+      throw new ToolExecutionError("invalid_input", "Tool domain allowlist is invalid", 422);
+    }
+    return await this.store.putPolicy({
+      toolId: input.toolId,
+      allowed: input.allowed,
+      allowedDomains: domains,
+      allowPrivateNetwork: input.allowPrivateNetwork === true,
+      updatedBy: input.actorId,
+    }, input.expectedVersion);
+  }
+
+  async request(ownerId: string, toolId: string, input: unknown): Promise<ToolExecution> {
+    const adapter = this.#adapters.get(toolId);
+    const policy = await this.store.getPolicy(toolId);
+    if (!adapter || !adapter.definition.enabled || !policy?.allowed) {
+      throw new ToolExecutionError(
+        "tool_not_allowed",
+        "Tool is unavailable or not allowlisted",
+        403,
+      );
+    }
+    if (!validateJson(input) || JSON.stringify(input).length > 256_000) {
+      throw new ToolExecutionError("invalid_input", "Tool input must be bounded JSON", 422);
+    }
+    const now = new Date().toISOString();
+    return await this.store.createExecution({
+      id: crypto.randomUUID(),
+      ownerId,
+      toolId,
+      input: clone(input),
+      status: "pending_approval",
+      result: null,
+      error: null,
+      approvedAt: null,
+      approvedBy: null,
+      cancellationRequestedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+  }
+
+  async get(ownerId: string, id: string): Promise<ToolExecution> {
+    const execution = await this.store.getExecution(id);
+    if (!execution || execution.ownerId !== ownerId) {
+      throw new ToolExecutionError("execution_not_found", "Tool execution was not found", 404);
+    }
+    return execution;
+  }
+
+  async approve(ownerId: string, id: string): Promise<ToolExecution> {
+    const execution = await this.get(ownerId, id);
+    if (execution.status !== "pending_approval") {
+      throw new ToolExecutionError(
+        TERMINAL.includes(execution.status) ? "execution_terminal" : "approval_required",
+        "Tool execution cannot be approved in its current state",
+        409,
+      );
+    }
+    const adapter = this.#adapters.get(execution.toolId);
+    const policy = await this.store.getPolicy(execution.toolId);
+    // Recheck policy at approval time so revocation between request and approval fails closed.
+    if (!adapter || !adapter.definition.enabled || !policy?.allowed) {
+      throw new ToolExecutionError("tool_not_allowed", "Tool is no longer allowlisted", 403);
+    }
+    const now = new Date().toISOString();
+    const queued = await this.store.transitionExecution(id, ["pending_approval"], {
+      status: "queued",
+      approvedAt: now,
+      approvedBy: ownerId,
+    });
+    if (!queued) throw new ToolExecutionError("execution_terminal", "Tool execution changed", 409);
+    void this.#dispatch(queued, adapter, policy);
+    return queued;
+  }
+
+  async cancel(ownerId: string, id: string): Promise<ToolExecution> {
+    const execution = await this.get(ownerId, id);
+    if (TERMINAL.includes(execution.status)) {
+      throw new ToolExecutionError("execution_terminal", "Tool execution is already complete", 409);
+    }
+    const now = new Date().toISOString();
+    const cancelled = await this.store.transitionExecution(
+      id,
+      ["pending_approval", "queued", "running"],
+      { status: "cancelled", cancellationRequestedAt: now },
+    );
+    if (!cancelled) {
+      throw new ToolExecutionError("execution_terminal", "Tool execution changed", 409);
+    }
+    this.#active.get(id)?.abort("user_cancelled");
+    return cancelled;
+  }
+
+  async #dispatch(execution: ToolExecution, adapter: ToolAdapter, policy: ToolPolicy) {
+    const controller = new AbortController();
+    this.#active.set(execution.id, controller);
+    try {
+      const running = await this.store.transitionExecution(execution.id, ["queued"], {
+        status: "running",
+      });
+      if (!running) return;
+      const result = await adapter.execute(execution.input, {
+        executionId: execution.id,
+        ownerId: execution.ownerId,
+        signal: controller.signal,
+        policy,
+      });
+      if (!validateJson(result) || JSON.stringify(result).length > 1_000_000) {
+        throw new Error("Tool returned an invalid or oversized result");
+      }
+      await this.store.transitionExecution(execution.id, ["running"], {
+        status: "succeeded",
+        result: clone(result),
+      });
+    } catch (error) {
+      if (controller.signal.aborted) {
+        await this.store.transitionExecution(execution.id, ["queued", "running"], {
+          status: "cancelled",
+          cancellationRequestedAt: new Date().toISOString(),
+        });
+      } else {
+        await this.store.transitionExecution(execution.id, ["running"], {
+          status: "failed",
+          error: {
+            code: "tool_execution_failed",
+            message: error instanceof Error
+              ? error.message.slice(0, 1_000)
+              : "Tool execution failed",
+          },
+        });
+      }
+    } finally {
+      this.#active.delete(execution.id);
+    }
+  }
+}
