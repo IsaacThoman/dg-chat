@@ -1,6 +1,6 @@
 import { assertEquals } from "jsr:@std/assert@1.0.14";
 import postgres from "npm:postgres@3.4.7";
-import { knowledgeEmbeddingIdentityVersion } from "@dg-chat/database";
+import { knowledgeEmbeddingIdentityVersion, PostgresRepository } from "@dg-chat/database";
 
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
 
@@ -133,6 +133,37 @@ Deno.test({
           { status: "failed", input_tokens: 0, cost_micros: 0 },
           { status: "completed", input_tokens: 3, cost_micros: 8 },
         ],
+      );
+      const successfulRunId = `${jobId}:embedding:2:0`;
+      // Reproduce the legacy split-finalization crash: usage/ledger committed, attempt finish lost.
+      await sql`UPDATE embedding_provider_attempts SET status='running',input_tokens=0,
+        cost_micros=0,token_source='none',cost_source='none',latency_ms=NULL,completed_at=NULL
+        WHERE usage_run_id=${successfulRunId}`;
+      const accountingRepo = await PostgresRepository.connect(databaseUrl!);
+      const terminal = {
+        usageRunId: successfulRunId,
+        status: "succeeded" as const,
+        inputTokens: 3,
+        costMicros: 8,
+        tokenSource: "provider" as const,
+        costSource: "calculated" as const,
+        latencyMs: 1,
+      };
+      await accountingRepo.finalizeEmbeddingProviderUsage(terminal);
+      await accountingRepo.finalizeEmbeddingProviderUsage(terminal);
+      await accountingRepo.close();
+      assertEquals(
+        [
+          ...await sql<{ status: string; input_tokens: number; cost_micros: number }[]>`
+          SELECT status,input_tokens,cost_micros::int FROM embedding_provider_attempts
+          WHERE usage_run_id=${successfulRunId}`,
+        ],
+        [{ status: "succeeded", input_tokens: 3, cost_micros: 8 }],
+      );
+      assertEquals(
+        (await sql<{ count: number }[]>`SELECT count(*)::int AS count FROM ledger_entries
+          WHERE usage_run_id=${successfulRunId}`)[0].count,
+        2,
       );
       assertEquals(
         [

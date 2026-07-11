@@ -47,6 +47,7 @@ import type {
   EnsureUsageReservationInput,
   FailApiRequestInput,
   FailGenerationInput,
+  FinalizeEmbeddingProviderUsageInput,
   FinalizeProviderUsageInput,
   FinishEmbeddingProviderAttemptInput,
   FinishProviderAttemptInput,
@@ -2098,6 +2099,81 @@ export class PostgresRepository implements DomainRepository {
     }
   }
 
+  async finalizeEmbeddingProviderUsage(
+    input: FinalizeEmbeddingProviderUsageInput,
+  ): Promise<UsageRun> {
+    if (
+      !["succeeded", "failed", "cancelled"].includes(input.status) ||
+      !Number.isSafeInteger(input.inputTokens) || input.inputTokens < 0 ||
+      !Number.isSafeInteger(input.costMicros) || input.costMicros < 0 ||
+      !Number.isSafeInteger(input.latencyMs) || input.latencyMs < 0
+    ) throw new DomainError("validation_error", "Embedding attempt result is invalid", 422);
+    return await this.#sql.begin(async (tx) => {
+      const [usage] = await tx<Row[]>`SELECT * FROM usage_runs
+        WHERE id=${input.usageRunId} FOR UPDATE`;
+      const [attempt] = await tx<Row[]>`SELECT * FROM embedding_provider_attempts
+        WHERE usage_run_id=${input.usageRunId} FOR UPDATE`;
+      if (!usage || !attempt) {
+        throw new DomainError("not_found", "Embedding accounting state was not found", 404);
+      }
+      const expectedRunStatus = input.status === "succeeded" ? "completed" : "failed";
+      const terminalMatches = String(usage.status) === expectedRunStatus &&
+        String(attempt.status) === input.status &&
+        number(usage.cost_micros) === input.costMicros &&
+        number(usage.input_tokens) === input.inputTokens &&
+        number(attempt.cost_micros) === input.costMicros &&
+        number(attempt.input_tokens) === input.inputTokens;
+      if (terminalMatches) return run(usage);
+      // Reconcile the pre-0019 split-finalization crash shape: usage committed, attempt running.
+      if (
+        usage.status === "completed" && attempt.status === "running" &&
+        input.status === "succeeded" && number(usage.cost_micros) === input.costMicros &&
+        number(usage.input_tokens) === input.inputTokens
+      ) {
+        await tx`UPDATE embedding_provider_attempts SET status='succeeded',
+          input_tokens=${input.inputTokens},cost_micros=${input.costMicros},
+          token_source=${input.tokenSource},cost_source=${input.costSource},
+          latency_ms=${input.latencyMs},error=NULL,completed_at=now()
+          WHERE usage_run_id=${input.usageRunId}`;
+        return run(usage);
+      }
+      if (usage.status !== "reserved" || attempt.status !== "running") {
+        throw new DomainError("idempotency_conflict", "Embedding terminal result differs", 409);
+      }
+      const reserved = number(usage.reserved_micros);
+      if (input.costMicros > reserved) {
+        throw new DomainError(
+          "invalid_usage_state",
+          "Embedding cost exceeded its reservation",
+          409,
+        );
+      }
+      const userId = String(usage.user_id);
+      const [account] = await tx<Row[]>`SELECT balance_micros FROM users
+        WHERE id=${userId} FOR UPDATE`;
+      const delta = reserved - input.costMicros;
+      const after = number(account.balance_micros) + delta;
+      await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${userId}`;
+      if (delta !== 0) {
+        await tx`INSERT INTO ledger_entries(
+          user_id,usage_run_id,kind,amount_micros,balance_after_micros)
+          VALUES(${userId},${input.usageRunId},'refund',${delta},${after})`;
+      }
+      const [updated] = await tx<Row[]>`UPDATE usage_runs SET
+        status=${expectedRunStatus},cost_micros=${input.costMicros},
+        input_tokens=${input.inputTokens},output_tokens=0,latency_ms=${input.latencyMs},
+        error=${input.error?.slice(0, 1000) ?? null},run_lease_token=NULL,
+        run_lease_expires_at=NULL,completed_at=now()
+        WHERE id=${input.usageRunId} RETURNING *`;
+      await tx`UPDATE embedding_provider_attempts SET status=${input.status},
+        input_tokens=${input.inputTokens},cost_micros=${input.costMicros},
+        token_source=${input.tokenSource},cost_source=${input.costSource},
+        latency_ms=${input.latencyMs},error=${input.error?.slice(0, 1000) ?? null},
+        completed_at=now() WHERE usage_run_id=${input.usageRunId}`;
+      return run(updated);
+    });
+  }
+
   async searchConversationKnowledge(
     input: SearchConversationKnowledgeInput,
   ): Promise<KnowledgeSearchHit[]> {
@@ -2118,7 +2194,9 @@ export class PostgresRepository implements DomainRepository {
 
     const vectorLiteral = vector ? JSON.stringify(vector) : null;
     const candidateLimit = Math.max(64, limit * 8);
-    const rows = await this.#sql<Row[]>`
+    const rows = await this.#sql.begin(async (tx) => {
+      if (vectorLiteral !== null) await tx`SET LOCAL hnsw.iterative_scan = 'strict_order'`;
+      return await tx<Row[]>`
       WITH scoped AS MATERIALIZED (
         SELECT dc.id,dc.attachment_id,dc.ordinal,dc.content,dc.metadata,
           k.id AS collection_id,k.name AS collection_name,a.filename,b.owner_id
@@ -2145,6 +2223,7 @@ export class PostgresRepository implements DomainRepository {
         FROM document_chunk_embeddings dce
         WHERE ${vectorLiteral}::text IS NOT NULL AND dce.owner_id=${input.ownerId}
           AND dce.embedding_version=${input.embeddingVersion ?? ""}
+          AND EXISTS (SELECT 1 FROM scoped s WHERE s.id=dce.chunk_id)
         ORDER BY dce.embedding <=> ${vectorLiteral}::vector
         LIMIT ${candidateLimit}
       ), vector_candidates AS (
@@ -2170,6 +2249,7 @@ export class PostgresRepository implements DomainRepository {
       WHERE lexical_score > 0 OR vector_score IS NOT NULL
       ORDER BY score DESC,collection_id,attachment_id,ordinal,id
       LIMIT ${limit}`;
+    });
     return rows.map((row) => ({
       ...documentChunk(row),
       collectionId: String(row.collection_id),

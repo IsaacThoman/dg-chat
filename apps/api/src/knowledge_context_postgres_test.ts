@@ -65,8 +65,11 @@ Deno.test({
       const context = await buildKnowledgeContext(repo, conversation.id, owner.id, "turbine");
       assertEquals(context.sources.length, 1);
       assertStringIncludes(String(context.message?.content), "Postgres turbine runbook");
+      const queryVector = Array(1536).fill(0);
+      queryVector[11] = 1;
       const vector = Array(1536).fill(0);
-      vector[11] = 1;
+      vector[11] = 0.8;
+      vector[12] = 0.6;
       await repo.upsertDocumentChunkEmbeddings([{
         chunkId,
         ownerId: owner.id,
@@ -75,8 +78,49 @@ Deno.test({
         contentSha256: "e".repeat(64),
         embedding: vector,
       }]);
+      // More than the production vector candidate floor are closer but deliberately outside this
+      // conversation's bound collection. They must never crowd the bound result out of top-k.
+      const distractorAttachment = (await repo.createAttachment({
+        ownerId: owner.id,
+        objectKey: `users/${owner.id}/distractors`,
+        filename: "distractors.txt",
+        mimeType: "text/plain",
+        sizeBytes: 70,
+        sha256: "f".repeat(64),
+        state: "ready",
+      })).attachment;
+      const distractorSql = postgres(databaseUrl!, { max: 1 });
+      await distractorSql`UPDATE attachments SET ingestion_status='processing'
+        WHERE id=${distractorAttachment.id}`;
+      await distractorSql.end();
+      const distractorChunks = Array.from({ length: 70 }, (_, ordinal) => ({
+        id: crypto.randomUUID(),
+        ordinal,
+        content: `irrelevant owner chunk ${ordinal}`,
+        metadata: {
+          sourceAttachmentId: distractorAttachment.id,
+          filename: distractorAttachment.filename,
+          mimeType: distractorAttachment.mimeType,
+          sha256: distractorAttachment.sha256,
+          extractorVersion: "builtin-document-v1",
+          chunkerVersion: "character-overlap-v1",
+        },
+      }));
+      await repo.completeAttachmentIngestion(
+        distractorAttachment.id,
+        owner.id,
+        distractorChunks,
+      );
+      await repo.upsertDocumentChunkEmbeddings(distractorChunks.map((chunk) => ({
+        chunkId: chunk.id,
+        ownerId: owner.id,
+        model: "embed-test",
+        version: "embed-v1",
+        contentSha256: "a".repeat(64),
+        embedding: queryVector,
+      })));
       const semantic = await buildKnowledgeContext(repo, conversation.id, owner.id, "spaceship", {
-        queryEmbedding: vector,
+        queryEmbedding: queryVector,
         embeddingVersion: "embed-v1",
       });
       assertEquals(semantic.sources.map((source) => source.chunkId), [chunkId]);

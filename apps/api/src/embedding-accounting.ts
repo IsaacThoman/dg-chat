@@ -2,6 +2,7 @@ import type { DomainRepository } from "@dg-chat/database";
 import {
   type EmbeddingBillingConfig,
   embeddingCostMicros,
+  embeddingTokenUpperBound,
   reserveEmbeddingMicros,
 } from "@dg-chat/database";
 
@@ -19,6 +20,7 @@ export async function runAccountedEmbeddingCall<T>(options: {
   call: () => Promise<{ value: T; inputTokens: number }>;
 }): Promise<T> {
   const reserved = reserveEmbeddingMicros(options.content, options.billing);
+  const maximumInputTokens = embeddingTokenUpperBound(options.content);
   await options.repository.reserve(
     options.userId,
     options.usageRunId,
@@ -36,12 +38,25 @@ export async function runAccountedEmbeddingCall<T>(options: {
     itemCount: options.content.length,
   });
   const started = performance.now();
+  const finalize = async (
+    input: Parameters<DomainRepository["finalizeEmbeddingProviderUsage"]>[0],
+  ) => {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        return await options.repository.finalizeEmbeddingProviderUsage(input);
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError;
+  };
   let result: { value: T; inputTokens: number };
   try {
     result = await options.call();
   } catch (error) {
     const latency = Math.max(0, Math.round(performance.now() - started));
-    await Promise.resolve(options.repository.finishEmbeddingProviderAttempt({
+    await finalize({
       usageRunId: options.usageRunId,
       status: error instanceof DOMException && error.name === "AbortError" ? "cancelled" : "failed",
       inputTokens: 0,
@@ -50,16 +65,25 @@ export async function runAccountedEmbeddingCall<T>(options: {
       costSource: "none",
       latencyMs: latency,
       error: error instanceof Error ? error.message : String(error),
-    })).catch(() => undefined);
-    await Promise.resolve(options.repository.refund(options.usageRunId)).catch(() => undefined);
+    });
     throw error;
   }
-  // Once the provider returned successfully, never enter the refund path. A terminal persistence
-  // error leaves the reservation intact so stale-run reconciliation charges conservatively.
-  const cost = Math.min(reserved, embeddingCostMicros(result.inputTokens, options.billing));
   const latency = Math.max(0, Math.round(performance.now() - started));
-  await options.repository.settle(options.usageRunId, cost, result.inputTokens, 0, latency);
-  await options.repository.finishEmbeddingProviderAttempt({
+  if (result.inputTokens > maximumInputTokens) {
+    await finalize({
+      usageRunId: options.usageRunId,
+      status: "failed",
+      inputTokens: maximumInputTokens,
+      costMicros: reserved,
+      tokenSource: "estimated",
+      costSource: "calculated",
+      latencyMs: latency,
+      error: "Provider reported impossible embedding token usage",
+    });
+    throw new Error("Provider reported impossible embedding token usage");
+  }
+  const cost = embeddingCostMicros(result.inputTokens, options.billing);
+  await finalize({
     usageRunId: options.usageRunId,
     status: "succeeded",
     inputTokens: result.inputTokens,

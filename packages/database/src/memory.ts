@@ -49,6 +49,7 @@ import type {
   EnsureUsageReservationInput,
   FailApiRequestInput,
   FailGenerationInput,
+  FinalizeEmbeddingProviderUsageInput,
   FinalizeProviderUsageInput,
   FinishEmbeddingProviderAttemptInput,
   FinishProviderAttemptInput,
@@ -1666,6 +1667,64 @@ export class MemoryRepository {
     attempt.status = input.status;
     attempt.inputTokens = input.inputTokens;
     attempt.costMicros = input.costMicros;
+  }
+
+  finalizeEmbeddingProviderUsage(input: FinalizeEmbeddingProviderUsageInput): UsageRun {
+    const usage = this.usageRuns.get(input.usageRunId);
+    const attempt = this.embeddingProviderAttempts.get(input.usageRunId);
+    if (!usage || !attempt) {
+      throw new DomainError("not_found", "Embedding accounting state was not found", 404);
+    }
+    const expectedRunStatus = input.status === "succeeded" ? "completed" : "failed";
+    if (usage.status === expectedRunStatus && attempt.status === input.status) {
+      if (
+        usage.costMicros !== input.costMicros || usage.inputTokens !== input.inputTokens ||
+        attempt.costMicros !== input.costMicros || attempt.inputTokens !== input.inputTokens
+      ) throw new DomainError("idempotency_conflict", "Embedding terminal result differs", 409);
+      return structuredClone(usage);
+    }
+    if (
+      usage.status === "completed" && attempt.status === "running" && input.status === "succeeded"
+    ) {
+      if (usage.costMicros !== input.costMicros || usage.inputTokens !== input.inputTokens) {
+        throw new DomainError("idempotency_conflict", "Embedding terminal result differs", 409);
+      }
+      this.finishEmbeddingProviderAttempt(input);
+      return structuredClone(usage);
+    }
+    if (usage.status !== "reserved" || attempt.status !== "running") {
+      throw new DomainError("invalid_usage_state", "Embedding accounting is not active", 409);
+    }
+    if (input.status === "succeeded") {
+      this.settle(
+        input.usageRunId,
+        input.costMicros,
+        input.inputTokens,
+        0,
+        input.latencyMs,
+      );
+    } else {
+      if (input.costMicros > usage.reservedMicros) {
+        throw new DomainError(
+          "invalid_usage_state",
+          "Embedding cost exceeded its reservation",
+          409,
+        );
+      }
+      const delta = usage.reservedMicros - input.costMicros;
+      if (delta !== 0) this.credit(usage.userId, usage.id, "refund", delta);
+      usage.status = "failed";
+      usage.costMicros = input.costMicros;
+      usage.inputTokens = input.inputTokens;
+      usage.outputTokens = 0;
+      usage.latencyMs = input.latencyMs;
+      usage.runLeaseToken = null;
+      usage.runLeaseExpiresAt = null;
+      this.finishEmbeddingProviderAttempt(input);
+      return structuredClone(usage);
+    }
+    this.finishEmbeddingProviderAttempt(input);
+    return structuredClone(this.usageRuns.get(input.usageRunId)!);
   }
 
   searchConversationKnowledge(input: SearchConversationKnowledgeInput): KnowledgeSearchHit[] {

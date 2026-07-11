@@ -199,6 +199,7 @@ export interface FinishEmbeddingProviderAttemptInput {
   latencyMs: number;
   error?: string;
 }
+export type FinalizeEmbeddingProviderUsageInput = FinishEmbeddingProviderAttemptInput;
 export interface SearchConversationKnowledgeInput {
   conversationId: string;
   ownerId: string;
@@ -1047,6 +1048,10 @@ export interface DomainRepository {
   ): MaybePromise<number>;
   startEmbeddingProviderAttempt(input: EmbeddingProviderAttemptInput): MaybePromise<void>;
   finishEmbeddingProviderAttempt(input: FinishEmbeddingProviderAttemptInput): MaybePromise<void>;
+  /** Atomically finalizes the attempt, usage run, ledger, and balance; safe to replay. */
+  finalizeEmbeddingProviderUsage(
+    input: FinalizeEmbeddingProviderUsageInput,
+  ): MaybePromise<UsageRun>;
   searchConversationKnowledge(
     input: SearchConversationKnowledgeInput,
   ): MaybePromise<KnowledgeSearchHit[]>;

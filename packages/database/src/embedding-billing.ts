@@ -26,13 +26,19 @@ export function parseEmbeddingBillingConfig(
   };
 }
 
-/** One token per Unicode code point is deliberately conservative for credit reservation. */
+/** Any text tokenizer token consumes at least one UTF-8 byte; this is a strict string upper bound. */
+export function embeddingTokenUpperBound(content: readonly string[]): number {
+  const encoder = new TextEncoder();
+  const bytes = content.reduce((sum, value) => sum + encoder.encode(value).byteLength, 0);
+  if (!Number.isSafeInteger(bytes)) throw new RangeError("Embedding input is too large");
+  return bytes;
+}
+
 export function reserveEmbeddingMicros(
   content: readonly string[],
   billing: EmbeddingBillingConfig,
 ): number {
-  const maximumTokens = content.reduce((sum, value) => sum + [...value].length, 0);
-  return embeddingCostMicros(maximumTokens, billing);
+  return embeddingCostMicros(embeddingTokenUpperBound(content), billing);
 }
 
 export function embeddingCostMicros(
