@@ -4,15 +4,16 @@
     "./apps/worker",
     "./apps/web",
     "./packages/contracts",
-    "./packages/database"
+    "./packages/database",
+    "./packages/provider-runtime"
   ],
   "nodeModulesDir": "manual",
   "tasks": {
     "dev": "deno task --filter @dg-chat/api dev",
     "dev:web": "deno task --filter @dg-chat/web dev",
     "dev:worker": "deno task --filter @dg-chat/worker dev",
-    "check": "deno fmt --check && deno lint && deno check apps/api/src/main.ts apps/worker/src/main.ts apps/web/src/main.tsx packages/contracts/mod.ts packages/database/mod.ts",
-    "test": "deno test --unstable-worker-options apps/api apps/worker packages/contracts packages/database --allow-env --allow-net --allow-read --allow-write",
+    "check": "deno fmt --check && deno lint && deno check apps/api/src/main.ts apps/worker/src/main.ts apps/web/src/main.tsx packages/contracts/mod.ts packages/database/mod.ts packages/provider-runtime/mod.ts",
+    "test": "deno test --unstable-worker-options apps/api apps/worker packages/contracts packages/database packages/provider-runtime --allow-env --allow-net --allow-read --allow-write",
     "test:web": "deno task --filter @dg-chat/web test",
     "build": "deno task --filter @dg-chat/web build",
     "db:generate": "deno task --filter @dg-chat/database generate",

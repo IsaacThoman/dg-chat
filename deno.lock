@@ -4691,6 +4691,11 @@
           "npm:drizzle-orm@0.45.2",
           "npm:postgres@3.4.7"
         ]
+      },
+      "packages/provider-runtime": {
+        "dependencies": [
+          "npm:ioredis@5.8.2"
+        ]
       }
     }
   }
