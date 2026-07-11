@@ -10,21 +10,25 @@ curl http://localhost:8000/v1/chat/completions \
 ```
 
 The implemented surface is models, chat completions, Responses, embeddings, audio transcription,
-audio translation, and the Files lifecycle. Simulated-model chat streams use SSE and terminate with
-`[DONE]`; configured upstream calls currently use non-streaming passthrough. Files support upload,
-list, retrieve, content, and delete through the official JavaScript and Python clients. Uploads
-currently accept only the `assistants` purpose, and list responses do not yet implement cursor
-pagination. Embeddings use admin-configured models with the `embeddings` capability, preserve input
-ordering and float/base64 formats, participate in provider fallback and circuit breaking, and are
-credit-metered and idempotent. Transcription and translation accept bounded, signature-validated
-multipart audio, support JSON, diarized JSON, verbose JSON, text, SRT, and VTT response formats, and
-use capable provider-registry models with the same retry, fallback, circuit-breaker, accounting,
-cancellation, and durable replay behavior. Transcriptions also preserve OpenAI-compatible
-`include[]=logprobs`, automatic or bounded server-VAD chunking, known-speaker references, and
-validated SSE delta/done streams. Streaming retries and fallback remain available until the first
-visible transcript event; provider usage is extracted from the terminal event. Image generation and
-speech synthesis still return explicit OpenAI-shaped `501 provider_not_configured` responses.
-Assistants, batches, fine-tuning, and realtime are not supported.
+audio translation, speech synthesis, and the Files lifecycle. Simulated-model chat streams use SSE
+and terminate with `[DONE]`; configured upstream calls currently use non-streaming passthrough.
+Files support upload, list, retrieve, content, and delete through the official JavaScript and Python
+clients. Uploads currently accept only the `assistants` purpose, and list responses do not yet
+implement cursor pagination. Embeddings use admin-configured models with the `embeddings`
+capability, preserve input ordering and float/base64 formats, participate in provider fallback and
+circuit breaking, and are credit-metered and idempotent. Transcription and translation accept
+bounded, signature-validated multipart audio, support JSON, diarized JSON, verbose JSON, text, SRT,
+and VTT response formats, and use capable provider-registry models with the same retry, fallback,
+circuit-breaker, accounting, cancellation, and durable replay behavior. Transcriptions also preserve
+OpenAI-compatible `include[]=logprobs`, automatic or bounded server-VAD chunking, known-speaker
+references, and validated SSE delta/done streams. Speech synthesis supports MP3, Opus, AAC, FLAC,
+WAV, and PCM, custom voice references, instructions, speed control, byte-exact binary replay, and
+canonical `speech.audio.delta`/`speech.audio.done` SSE. Speech models currently require
+fixed-call-only pricing because raw binary responses do not carry portable usage metadata. Streaming
+retries and fallback remain available until the first visible audio or transcript event; provider
+usage is extracted from terminal events. Image generation still returns an explicit OpenAI-shaped
+`501 provider_not_configured` response. Assistants, batches, fine-tuning, and realtime are not
+supported.
 
 Audio pricing supports token-reported usage and fixed per-call charges. Duration-only usage is
 accepted only for models configured with fixed-call-only pricing; mixing duration usage with token

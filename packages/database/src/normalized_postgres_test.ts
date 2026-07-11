@@ -3,8 +3,88 @@ import postgres from "npm:postgres@3.4.7";
 import { DomainError } from "./memory.ts";
 import { parseStoredModelCapabilities, PostgresRepository } from "./normalized-postgres.ts";
 import { backfillLegacyRuntimeSnapshot } from "./legacy-backfill.ts";
+import { decodeApiResponseBody, InvalidApiResponseBodyError } from "./repository.ts";
 
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
+
+Deno.test({
+  name:
+    "Postgres binary API replay round-trips decoded bytes and rejects malformed Base64 atomically",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 1 });
+    await sql`TRUNCATE api_idempotency_events, api_idempotency_requests, ledger_entries,
+      usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
+    const repo = await PostgresRepository.connect(databaseUrl!);
+    try {
+      const user = await repo.bootstrapAdmin({
+        email: "binary-replay-pg@example.com",
+        name: "Binary replay",
+        passwordHash: "hash",
+      }, 1_000);
+      const begin = async (suffix: string) =>
+        await repo.beginApiRequest({
+          userId: user.id,
+          endpoint: "audio.speech",
+          idempotencyKey: `postgres-binary-${suffix}`,
+          requestHash: suffix.repeat(64).slice(0, 64),
+          stream: false,
+          model: "test/binary",
+          runId: `postgres-binary-run-${suffix}`,
+          reserveMicros: 10,
+          provider: "test",
+          quota: { maxRequests: 5, maxEvents: 5, maxBytes: 3 },
+        });
+      const valid = await begin("a");
+      if (valid.kind !== "started") throw new Error("expected started request");
+      const completed = await repo.completeApiJson({
+        id: valid.request.id,
+        leaseToken: valid.leaseToken,
+        responseStatus: 200,
+        responseBody: "SUQz",
+        responseBodyEncoding: "base64",
+        costMicros: 1,
+        inputTokens: 1,
+        outputTokens: 1,
+        latencyMs: 1,
+        quota: { maxRequests: 5, maxEvents: 5, maxBytes: 3 },
+      });
+      assertEquals(completed.responseBodyEncoding, "base64");
+      assertEquals(
+        decodeApiResponseBody(completed.responseBody!, completed.responseBodyEncoding),
+        new Uint8Array([73, 68, 51]),
+      );
+
+      const malformed = await begin("b");
+      if (malformed.kind !== "started") throw new Error("expected started request");
+      await assertRejects(
+        () =>
+          repo.completeApiJson({
+            id: malformed.request.id,
+            leaseToken: malformed.leaseToken,
+            responseStatus: 200,
+            responseBody: "YR==",
+            responseBodyEncoding: "base64",
+            costMicros: 1,
+            inputTokens: 1,
+            outputTokens: 1,
+            latencyMs: 1,
+          }),
+        InvalidApiResponseBodyError,
+        "canonical Base64",
+      );
+      const state = await sql<{ request_state: string; usage_state: string }[]>`
+        SELECT r.state request_state,u.status usage_state FROM api_idempotency_requests r
+        JOIN usage_runs u ON u.id=r.usage_run_id WHERE r.id=${malformed.request.id}`;
+      assertEquals(state[0], { request_state: "in_progress", usage_state: "reserved" });
+    } finally {
+      await repo.close();
+      await sql.end();
+    }
+  },
+});
 
 Deno.test("persisted provider capabilities reject legacy or malformed values explicitly", () => {
   assertEquals(parseStoredModelCapabilities(["chat", "transcription"], "valid/model"), [
@@ -112,7 +192,7 @@ Deno.test({
 });
 
 Deno.test({
-  name: "Postgres provider accounting is authoritative for API failure and stale run leases",
+  name: "Postgres customer settlement is separate from provider costs and stale leases",
   ignore: !databaseUrl,
   sanitizeOps: false,
   sanitizeResources: false,
@@ -129,6 +209,87 @@ Deno.test({
         name: "Provider accounting",
         passwordHash: "hash",
       }, 1_000);
+      const completed = await repo.beginApiRequest({
+        userId: user.id,
+        endpoint: "chat.completions",
+        idempotencyKey: "postgres-source-target-complete",
+        requestHash: "a".repeat(64),
+        stream: false,
+        model: "public/source-model",
+        provider: "provider",
+        runId: "postgres-source-target-complete-run",
+        reserveMicros: 100,
+      });
+      if (completed.kind !== "started") throw new Error("request did not start");
+      // Simulate two fallback attempts whose aggregate target cost is much lower than the
+      // immutable public/source charge supplied by the route.
+      await sql`UPDATE usage_runs SET execution_epoch=1,actual_provider_cost_micros=7,
+        actual_provider_input_tokens=3,actual_provider_output_tokens=2
+        WHERE id=${completed.usageRun.id}`;
+      await repo.completeApiJson({
+        id: completed.request.id,
+        leaseToken: completed.leaseToken,
+        responseStatus: 200,
+        responseBody: "{}",
+        costMicros: 99,
+        inputTokens: 91,
+        outputTokens: 8,
+        latencyMs: 1,
+      });
+      const completedState = await sql<
+        Array<{
+          cost: string;
+          input_tokens: number;
+          actual_cost: string;
+          actual_input_tokens: string;
+        }>
+      >`SELECT cost_micros::text cost,input_tokens,
+          actual_provider_cost_micros::text actual_cost,
+          actual_provider_input_tokens actual_input_tokens
+        FROM usage_runs WHERE id=${completed.usageRun.id}`;
+      assertEquals(completedState[0], {
+        cost: "99",
+        input_tokens: 91,
+        actual_cost: "7",
+        actual_input_tokens: "3",
+      });
+
+      const fallback = await repo.beginApiRequest({
+        userId: user.id,
+        endpoint: "chat.completions",
+        idempotencyKey: "postgres-source-target-fallback",
+        requestHash: "f".repeat(64),
+        stream: false,
+        model: "public/low-price",
+        provider: "provider",
+        runId: "postgres-source-target-fallback-run",
+        reserveMicros: 800,
+      });
+      if (fallback.kind !== "started") throw new Error("fallback request did not start");
+      await sql`UPDATE usage_runs SET execution_epoch=1,actual_provider_cost_micros=700,
+        actual_provider_input_tokens=600,actual_provider_output_tokens=100
+        WHERE id=${fallback.usageRun.id}`;
+      await repo.completeApiJson({
+        id: fallback.request.id,
+        leaseToken: fallback.leaseToken,
+        responseStatus: 200,
+        responseBody: "{}",
+        costMicros: 2,
+        inputTokens: 8,
+        outputTokens: 1,
+        latencyMs: 2,
+      });
+      const fallbackState = await sql<
+        Array<{ customer_cost: string; customer_input: number; provider_cost: string }>
+      >`SELECT cost_micros::text customer_cost,input_tokens customer_input,
+          actual_provider_cost_micros::text provider_cost
+        FROM usage_runs WHERE id=${fallback.usageRun.id}`;
+      assertEquals(fallbackState[0], {
+        customer_cost: "2",
+        customer_input: 8,
+        provider_cost: "700",
+      });
+
       const begun = await repo.beginApiRequest({
         userId: user.id,
         endpoint: "chat.completions",
@@ -154,7 +315,12 @@ Deno.test({
       const failed = await sql<
         { status: string; cost: string; input_tokens: number }[]
       >`SELECT status,cost_micros::text cost,input_tokens FROM usage_runs WHERE id=${begun.usageRun.id}`;
-      assertEquals(failed[0], { status: "failed", cost: "7", input_tokens: 3 });
+      assertEquals(failed[0], { status: "failed", cost: "0", input_tokens: 0 });
+      const retainedProvider = await sql<
+        { cost: string; input_tokens: string }[]
+      >`SELECT actual_provider_cost_micros::text cost,actual_provider_input_tokens input_tokens
+        FROM usage_runs WHERE id=${begun.usageRun.id}`;
+      assertEquals(retainedProvider[0], { cost: "7", input_tokens: "3" });
 
       const stale = await repo.reserve(user.id, "postgres-provider-stale", "provider/model", 100);
       await sql`UPDATE usage_runs SET execution_epoch=1,actual_provider_cost_micros=5,
@@ -191,7 +357,7 @@ Deno.test({
       const reaped = await sql<
         { status: string; cost: string; run_lease_token: string | null }[]
       >`SELECT status,cost_micros::text cost,run_lease_token::text FROM usage_runs WHERE id=${stale.id}`;
-      assertEquals(reaped[0], { status: "failed", cost: "100", run_lease_token: null });
+      assertEquals(reaped[0], { status: "failed", cost: "0", run_lease_token: null });
       const attempts = await sql<
         { status: string; error_code: string | null }[]
       >`SELECT status,error_code FROM provider_attempts WHERE usage_run_id=${stale.id}`;
@@ -226,8 +392,8 @@ Deno.test({
       const apiAttempts = await sql<
         { status: string; error_code: string | null }[]
       >`SELECT status,error_code FROM provider_attempts WHERE usage_run_id=${api.usageRun.id}`;
-      assertEquals([...apiRun], [{ status: "failed", cost: "100" }]);
-      assertEquals([...apiBalanceAfter], [...apiBalanceBefore]);
+      assertEquals([...apiRun], [{ status: "failed", cost: "0" }]);
+      assertEquals(Number(apiBalanceAfter[0].balance), Number(apiBalanceBefore[0].balance) + 100);
       assertEquals([...apiAttempts], [{ status: "cancelled", error_code: "api_lease_expired" }]);
 
       const conversation = await repo.createConversation(user.id, "Uncertain generation");
@@ -264,8 +430,11 @@ Deno.test({
         { status: string; error_code: string | null }[]
       >`SELECT status,error_code FROM provider_attempts
         WHERE usage_run_id=${generation.usageRun.id}`;
-      assertEquals([...generationRun], [{ status: "failed", cost: "100" }]);
-      assertEquals([...generationBalanceAfter], [...generationBalanceBefore]);
+      assertEquals([...generationRun], [{ status: "failed", cost: "0" }]);
+      assertEquals(
+        Number(generationBalanceAfter[0].balance),
+        Number(generationBalanceBefore[0].balance) + 100,
+      );
       assertEquals([...generationAttempts], [{
         status: "cancelled",
         error_code: "generation_lease_expired",

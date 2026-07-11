@@ -675,6 +675,26 @@ kbd {
   gap: 4px;
   align-items: center;
 }
+.speech-preferences {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  min-width: 0;
+}
+.speech-preferences select {
+  max-width: 116px;
+  height: 30px;
+  padding: 0 22px 0 7px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+  background: var(--panel);
+  font-size: 9px;
+}
+.speech-preferences select:focus-visible {
+  outline: 2px solid #7465a8;
+  outline-offset: 1px;
+}
 .balance-pill {
   border: 1px solid #e6e2d8;
   background: #faf9f5;
@@ -786,6 +806,55 @@ kbd {
   width: 27px;
   height: 27px;
   border-radius: 7px;
+}
+.speech-playback-control,
+.speech-playback-progress {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.speech-playback-control > [role="status"],
+.speech-playback-control > [role="alert"] {
+  max-width: 210px;
+  padding: 3px 7px;
+  border-radius: 6px;
+  font-size: 9px;
+  color: var(--muted);
+  background: var(--hover);
+}
+.speech-playback-control > [role="alert"] {
+  color: #a84141;
+  background: #fbeded;
+}
+.speech-playback-progress {
+  min-width: 205px;
+  padding: 3px 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+.speech-playback-progress input[type="range"] {
+  min-width: 72px;
+  flex: 1;
+  accent-color: #7465a8;
+}
+.speech-playback-progress output {
+  white-space: nowrap;
+  font: 8px "DM Mono", monospace;
+  color: var(--muted);
+}
+.speech-stop {
+  min-height: 25px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 6px;
+  color: var(--muted);
+  background: var(--hover);
+  font-size: 9px;
+  cursor: pointer;
+}
+.speech-stop:hover {
+  color: var(--ink);
 }
 .assistant-label {
   display: flex;
@@ -3016,6 +3085,12 @@ kbd {
   .balance-pill {
     display: none;
   }
+  .speech-preferences select[aria-label="Speech model"] {
+    max-width: 82px;
+  }
+  .speech-preferences select[aria-label="Speech voice"] {
+    max-width: 70px;
+  }
   .model-popover {
     position: fixed;
     left: 10px;
@@ -3055,6 +3130,22 @@ kbd {
   .message-actions {
     flex-wrap: wrap;
     row-gap: 2px;
+  }
+  .speech-playback-control {
+    max-width: 100%;
+    flex-wrap: wrap;
+  }
+  .speech-playback-progress {
+    width: min(280px, calc(100vw - 48px));
+    min-width: 0;
+    min-height: 44px;
+  }
+  .speech-playback-progress input[type="range"] {
+    min-height: 44px;
+  }
+  .speech-stop {
+    min-width: 44px;
+    min-height: 44px;
   }
   .branch-control {
     height: 44px;

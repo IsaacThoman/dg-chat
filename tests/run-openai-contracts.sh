@@ -85,7 +85,7 @@ curl --fail --silent --show-error --request POST \
 audio_model="$(curl --fail --silent --show-error --request POST \
   "$api_url/api/admin/models" --header 'content-type: application/json' \
   --header "origin: $web_origin" --cookie "$CONTRACT_SESSION_COOKIE" \
-  --data "{\"providerId\":\"$provider_id\",\"publicModelId\":\"contracts/mock-transcribe\",\"upstreamModelId\":\"mock-transcribe\",\"displayName\":\"Contract Mock Audio\",\"capabilities\":[\"transcription\",\"translation\"],\"contextWindow\":8192}")"
+  --data "{\"providerId\":\"$provider_id\",\"publicModelId\":\"contracts/mock-transcribe\",\"upstreamModelId\":\"mock-transcribe\",\"displayName\":\"Contract Mock Audio\",\"capabilities\":[\"transcription\",\"translation\",\"speech\"],\"contextWindow\":8192}")"
 audio_model_id="$(jq --raw-output '.id' <<<"$audio_model")"
 audio_model_version="$(jq --raw-output '.version' <<<"$audio_model")"
 curl --fail --silent --show-error --request POST \
@@ -117,6 +117,13 @@ jq -e '
   .audio.lastBytes == 46
 ' <<<"$audio_state" >/dev/null
 echo "Official SDK audio multipart and idempotent replay contracts passed"
+jq -e '
+  .speech.calls == 6 and
+  .speech.lastModel == "mock-transcribe" and
+  .speech.sawCustomVoice == true and
+  .speech.sawSse == true
+' <<<"$audio_state" >/dev/null
+echo "Official SDK speech binary, SSE, replay, custom voice, and cancellation contracts passed"
 
 deno run --no-config --allow-env --allow-net \
   tests/contracts/upstream-stream.ts

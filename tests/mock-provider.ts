@@ -28,6 +28,16 @@ const audio: AudioState = {
   sawDiarization: false,
 };
 
+const speech = {
+  calls: 0,
+  aborted: 0,
+  lastModel: null as string | null,
+  lastVoice: null as unknown,
+  lastFormat: null as string | null,
+  sawCustomVoice: false,
+  sawSse: false,
+};
+
 interface ScenarioState {
   opened: number;
   completed: number;
@@ -346,6 +356,15 @@ Deno.serve({ port }, async (request) => {
       sawStream: false,
       sawDiarization: false,
     });
+    Object.assign(speech, {
+      calls: 0,
+      aborted: 0,
+      lastModel: null,
+      lastVoice: null,
+      lastFormat: null,
+      sawCustomVoice: false,
+      sawSse: false,
+    });
     return json({ reset: true });
   }
   if (url.pathname === "/__test/state" && request.method === "GET") {
@@ -354,6 +373,7 @@ Deno.serve({ port }, async (request) => {
       attempts: Object.fromEntries(attempts),
       scenarios: Object.fromEntries(scenarios),
       audio,
+      speech,
     });
   }
   if (url.pathname === "/v1/models" && request.method === "GET") {
@@ -411,9 +431,74 @@ Deno.serve({ port }, async (request) => {
       return error("Invalid mock provider key", 401, "unauthorized");
     }
     if (url.pathname.endsWith("/speech")) {
-      return new Response(new Uint8Array([73, 68, 51]), {
-        headers: { "content-type": "audio/mpeg" },
-      });
+      let body: Record<string, unknown>;
+      try {
+        body = await request.json() as Record<string, unknown>;
+      } catch {
+        return error("Invalid speech JSON", 400, "invalid_json");
+      }
+      if (
+        typeof body.model !== "string" || typeof body.input !== "string" || !body.input ||
+        !(typeof body.voice === "string" ||
+          (body.voice && typeof body.voice === "object" && !Array.isArray(body.voice) &&
+            typeof (body.voice as Record<string, unknown>).id === "string")) ||
+        (body.speed !== undefined &&
+          (typeof body.speed !== "number" || body.speed < 0.25 || body.speed > 4))
+      ) return error("Invalid speech request", 400, "invalid_request");
+      speech.calls++;
+      speech.lastModel = body.model;
+      speech.lastVoice = body.voice;
+      speech.lastFormat = typeof body.response_format === "string" ? body.response_format : "mp3";
+      speech.sawCustomVoice ||= typeof body.voice === "object";
+      if (body.input === "__slow_cancel__") {
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              const aborted = () => {
+                speech.aborted++;
+                controller.error(request.signal.reason);
+              };
+              request.signal.addEventListener("abort", aborted, { once: true });
+            },
+          }),
+          { headers: { "content-type": "audio/mpeg" } },
+        );
+      }
+      if (body.stream_format === "sse") {
+        speech.sawSse = true;
+        return new Response(
+          'event: speech.audio.delta\nid: mock-delta\nretry: 1000\ndata: {"type":"speech.audio.delta","audio":"YXVkaW8="}\n\n' +
+            'event: speech.audio.done\nid: mock-done\ndata: {"type":"speech.audio.done","usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}}\n\n',
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      if (body.response_format === "wav") {
+        const wav = new Uint8Array(12);
+        wav.set(encoder.encode("RIFF"));
+        wav.set(encoder.encode("WAVE"), 8);
+        return new Response(wav, { headers: { "content-type": "audio/wav" } });
+      }
+      return new Response(
+        new Uint8Array([
+          73,
+          68,
+          51,
+          4,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0xff,
+          0xfb,
+          0x90,
+          0x64,
+        ]),
+        {
+          headers: { "content-type": "audio/mpeg" },
+        },
+      );
     }
     const form = await request.formData();
     const file = form.get("file");

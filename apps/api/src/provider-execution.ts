@@ -59,6 +59,15 @@ import {
   createAudioTranscriptVisibility,
   observeAudioTranscriptFrame,
 } from "./audio-stream-accounting.ts";
+import {
+  assertSpeechFixedPricing,
+  createSpeech,
+  estimateSpeechInputTokens,
+  speechFrameDecodedBytes,
+  SpeechProviderError,
+  type SpeechProviderResponse,
+  type SpeechRequest,
+} from "./speech.ts";
 
 const OCR_MAX_OUTPUT_TOKENS = 4_096;
 
@@ -96,6 +105,7 @@ export interface ProviderExecutionOptions {
   stream?: typeof streamChatCompletion;
   embeddingsFetch?: ProviderFetch;
   audioFetch?: typeof fetch;
+  speechFetch?: typeof fetch;
   now?: () => number;
   ocrCache?: OcrCache;
   ocrFetch?: typeof fetch;
@@ -397,6 +407,7 @@ export class ProviderExecutionEngine {
   readonly #stream: typeof streamChatCompletion;
   readonly #embeddingsFetch?: ProviderFetch;
   readonly #audioFetch?: typeof fetch;
+  readonly #speechFetch?: typeof fetch;
   readonly #now: () => number;
   readonly #slowStream?: ProviderExecutionOptions["slowStream"];
   readonly #ocrCache: OcrCache;
@@ -412,6 +423,7 @@ export class ProviderExecutionEngine {
     this.#stream = options.stream ?? streamChatCompletion;
     this.#embeddingsFetch = options.embeddingsFetch;
     this.#audioFetch = options.audioFetch;
+    this.#speechFetch = options.speechFetch;
     this.#now = options.now ?? Date.now;
     this.#slowStream = options.slowStream;
     this.#ocrCache = options.ocrCache ?? new MemoryOcrCache(options.now);
@@ -587,7 +599,7 @@ export class ProviderExecutionEngine {
   async #prepare(
     sourceModelId: string,
     frozenPlan?: ProviderExecutionPlan,
-    capability: "chat" | "embeddings" | "transcription" | "translation" = "chat",
+    capability: "chat" | "embeddings" | "transcription" | "translation" | "speech" = "chat",
   ): Promise<{
     plan: ProviderExecutionPlan;
     candidates: Map<string, RuntimeCandidate>;
@@ -909,7 +921,10 @@ export class ProviderExecutionEngine {
   }
 
   #normalizeError(error: unknown, plan: ProviderExecutionPlan): never {
-    if (error instanceof AudioProviderError && error.providerStatus !== undefined) {
+    if (
+      (error instanceof AudioProviderError || error instanceof SpeechProviderError) &&
+      error.providerStatus !== undefined
+    ) {
       const retryable = plan.retryPolicy?.retryableStatuses ?? defaultRetryableStatuses;
       if (!retryable.includes(error.providerStatus)) throw error;
       error = new ProviderAttemptError(error.message, {
@@ -1264,6 +1279,183 @@ export class ProviderExecutionEngine {
               : providerUsage.source === "provider_tokens"
               ? "provider"
               : "none";
+            return result;
+          } catch (error) {
+            this.#normalizeError(error, plan);
+          }
+        },
+      });
+    } catch (error) {
+      this.#normalizeError(error, plan);
+    }
+  }
+
+  async speech(
+    sourceModelId: string,
+    usageRunId: string,
+    ownerLeaseToken: string,
+    request: SpeechRequest,
+    signal: AbortSignal,
+    frozenPlan?: ProviderExecutionPlan,
+  ): Promise<SpeechProviderResponse> {
+    const { plan, candidates } = await this.#prepare(sourceModelId, frozenPlan, "speech");
+    for (const target of plan.targets) assertSpeechFixedPricing(target.pricing);
+    const claim = await this.#repository.claimProviderExecution(usageRunId, ownerLeaseToken);
+    const remainingAttempts = policyFor(plan, undefined, this.#slowStream).maxAttempts -
+      claim.consumedAttempts;
+    const metrics = new Map<string, AttemptMetrics>();
+    const upstreams = new Map<string, UpstreamStreamOptions>();
+    const estimatedInput = estimateSpeechInputTokens(request);
+    const onAttempt = this.#telemetry(
+      usageRunId,
+      ownerLeaseToken,
+      claim,
+      plan,
+      metrics,
+      estimatedInput,
+    );
+    if (request.streamFormat === "sse") {
+      let resolveUsage!: (usage: Awaited<SpeechProviderResponse["usage"]>) => void;
+      let rejectUsage!: (error: unknown) => void;
+      let resolveTerminal!: (frame: Uint8Array) => void;
+      let rejectTerminal!: (error: unknown) => void;
+      const usage = new Promise<Awaited<SpeechProviderResponse["usage"]>>((resolve, reject) => {
+        resolveUsage = resolve;
+        rejectUsage = reject;
+      });
+      const terminalFrame = new Promise<Uint8Array>((resolve, reject) => {
+        resolveTerminal = resolve;
+        rejectTerminal = reject;
+      });
+      void usage.catch(() => undefined);
+      void terminalFrame.catch(() => undefined);
+      const stream = (async function* (engine: ProviderExecutionEngine) {
+        let finalUsage: Awaited<SpeechProviderResponse["usage"]> | undefined;
+        let finalTerminal: Uint8Array | undefined;
+        let settled = false;
+        try {
+          const orchestrated = streamProviderRequest<Uint8Array>({
+            initialCandidateId: plan.targets[0].providerModelId,
+            resolveCandidate: (id) => candidates.get(id),
+            policy: policyFor(plan, remainingAttempts, engine.#slowStream),
+            signal,
+            circuitStore: engine.#circuitStore(candidates),
+            onAttempt,
+            visibleUnits: speechFrameDecodedBytes,
+            beforeAttempt: async (candidate, _signal, context) => {
+              upstreams.set(
+                key(candidate.id, context),
+                await engine.#upstreamFor(candidates.get(candidate.id)!),
+              );
+            },
+            attempt: async function* (candidate, attemptSignal, context) {
+              try {
+                const upstream = upstreams.get(key(candidate.id, context));
+                upstreams.delete(key(candidate.id, context));
+                if (!upstream?.baseUrl || !upstream.apiKey || !upstream.upstreamModel) {
+                  throw new Error("Provider dispatch options are missing");
+                }
+                const observed = metrics.get(key(candidate.id, context)) ??
+                  emptyMetrics(estimatedInput);
+                observed.dispatched = true;
+                observed.inputTokens = estimatedInput;
+                observed.tokenSource = "estimated";
+                metrics.set(key(candidate.id, context), observed);
+                const result = await createSpeech(request, {
+                  baseUrl: upstream.baseUrl,
+                  apiKey: upstream.apiKey,
+                  upstreamModel: upstream.upstreamModel,
+                  signal: attemptSignal,
+                  fetch: engine.#speechFetch,
+                });
+                if (!result.stream || !result.terminalFrame) {
+                  throw new Error("Provider dispatch did not return a speech stream");
+                }
+                for await (const frame of result.stream) {
+                  const bytes = speechFrameDecodedBytes(frame);
+                  if (bytes > 0 && observed.firstVisibleAt === null) {
+                    observed.firstVisibleAt = engine.#now();
+                  }
+                  observed.visibleCharacters += bytes;
+                  yield frame;
+                }
+                const providerUsage = await result.usage;
+                observed.providerInputTokens = providerUsage.inputTokens;
+                observed.providerOutputTokens = providerUsage.outputTokens;
+                observed.inputTokens = providerUsage.inputTokens;
+                observed.outputTokens = providerUsage.outputTokens;
+                observed.tokenSource = providerUsage.source === "provider_tokens"
+                  ? "provider"
+                  : "estimated";
+                finalUsage = providerUsage;
+                finalTerminal = await result.terminalFrame;
+              } catch (error) {
+                engine.#normalizeError(error, plan);
+              }
+            },
+          });
+          for await (const frame of orchestrated) yield frame;
+          if (!finalUsage || !finalTerminal) {
+            throw new SpeechProviderError("Speech provider stream terminal state is missing");
+          }
+          resolveUsage(finalUsage);
+          resolveTerminal(finalTerminal);
+          settled = true;
+        } catch (error) {
+          rejectUsage(error);
+          rejectTerminal(error);
+          settled = true;
+          throw error;
+        } finally {
+          if (!settled) {
+            const error = new DOMException("Speech stream consumer disconnected", "AbortError");
+            rejectUsage(error);
+            rejectTerminal(error);
+          }
+        }
+      })(this);
+      return { contentType: "text/event-stream", stream, usage, terminalFrame };
+    }
+    try {
+      return await executeProviderRequest({
+        initialCandidateId: plan.targets[0].providerModelId,
+        resolveCandidate: (id) => candidates.get(id),
+        policy: policyFor(plan, remainingAttempts, this.#slowStream),
+        signal,
+        circuitStore: this.#circuitStore(candidates),
+        onAttempt,
+        beforeAttempt: async (candidate, _signal, context) => {
+          upstreams.set(
+            key(candidate.id, context),
+            await this.#upstreamFor(candidates.get(candidate.id)!),
+          );
+        },
+        attempt: async (candidate, attemptSignal, context) => {
+          try {
+            const upstream = upstreams.get(key(candidate.id, context));
+            upstreams.delete(key(candidate.id, context));
+            if (!upstream?.baseUrl || !upstream.apiKey || !upstream.upstreamModel) {
+              throw new Error("Provider dispatch options are missing");
+            }
+            const observed = metrics.get(key(candidate.id, context)) ??
+              emptyMetrics(estimatedInput);
+            observed.dispatched = true;
+            observed.inputTokens = estimatedInput;
+            observed.outputTokens = 0;
+            observed.tokenSource = "estimated";
+            metrics.set(key(candidate.id, context), observed);
+            const result = await createSpeech(request, {
+              baseUrl: upstream.baseUrl,
+              apiKey: upstream.apiKey,
+              upstreamModel: upstream.upstreamModel,
+              signal: attemptSignal,
+              fetch: this.#speechFetch,
+            });
+            if (!result.body || result.stream) {
+              throw new Error("Provider dispatch did not return buffered speech audio");
+            }
+            observed.firstVisibleAt = this.#now();
+            observed.visibleCharacters = result.body.byteLength;
             return result;
           } catch (error) {
             this.#normalizeError(error, plan);

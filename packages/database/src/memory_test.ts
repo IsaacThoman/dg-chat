@@ -1,5 +1,72 @@
 import { assertEquals, assertThrows } from "jsr:@std/assert@1.0.14";
 import { DomainError, MemoryRepository } from "./memory.ts";
+import { decodeApiResponseBody, InvalidApiResponseBodyError } from "./repository.ts";
+
+Deno.test("binary API replay validates Base64 and charges quota by decoded bytes", () => {
+  const repo = new MemoryRepository();
+  const user = repo.createUser({
+    email: "binary-replay@example.com",
+    name: "Binary",
+    passwordHash: "x",
+  });
+  repo.credit(user.id, "binary-grant", "grant", 1_000);
+  const begin = (suffix: string) =>
+    repo.beginApiRequest({
+      userId: user.id,
+      endpoint: "audio.speech",
+      idempotencyKey: `binary-replay-${suffix}`,
+      requestHash: suffix.repeat(64).slice(0, 64),
+      stream: false,
+      model: "test/binary",
+      runId: `binary-run-${suffix}`,
+      reserveMicros: 10,
+      provider: "test",
+      quota: { maxRequests: 5, maxEvents: 5, maxBytes: 3 },
+    });
+  const valid = begin("a");
+  if (valid.kind !== "started") throw new Error("expected started request");
+  const completed = repo.completeApiJson({
+    id: valid.request.id,
+    leaseToken: valid.leaseToken,
+    responseStatus: 200,
+    responseBody: "SUQz",
+    responseBodyEncoding: "base64",
+    costMicros: 1,
+    inputTokens: 1,
+    outputTokens: 1,
+    latencyMs: 1,
+    quota: { maxRequests: 5, maxEvents: 5, maxBytes: 3 },
+  });
+  assertEquals(completed.responseBodyEncoding, "base64");
+  assertEquals(
+    decodeApiResponseBody(completed.responseBody!, completed.responseBodyEncoding),
+    new Uint8Array([73, 68, 51]),
+  );
+
+  const malformed = begin("b");
+  if (malformed.kind !== "started") throw new Error("expected started request");
+  assertThrows(
+    () =>
+      repo.completeApiJson({
+        id: malformed.request.id,
+        leaseToken: malformed.leaseToken,
+        responseStatus: 200,
+        responseBody: "YR==",
+        responseBodyEncoding: "base64",
+        costMicros: 1,
+        inputTokens: 1,
+        outputTokens: 1,
+        latencyMs: 1,
+      }),
+    InvalidApiResponseBodyError,
+    "canonical Base64",
+  );
+  assertEquals(repo.usageRuns.get(`binary-run-b`)?.status, "reserved");
+  assertEquals(
+    repo.getApiRequest(user.id, "audio.speech", "binary-replay-b")?.state,
+    "in_progress",
+  );
+});
 
 Deno.test("provider registry hides credentials, versions mutations, and preserves price history", () => {
   const repo = new MemoryRepository();
@@ -654,7 +721,8 @@ Deno.test("provider resilience routes are acyclic and attempts are immutable and
     error: "all paths failed",
   });
   assertEquals(finalized.status, "failed");
-  assertEquals(finalized.costMicros, run.reservedMicros);
+  assertEquals(finalized.costMicros, 0);
+  assertEquals(finalized.actualProviderCostMicros, 2);
   assertEquals(
     repo.refundProviderUsage({
       usageRunId: run.id,
@@ -663,11 +731,11 @@ Deno.test("provider resilience routes are acyclic and attempts are immutable and
       latencyMs: 100,
       error: "all paths failed",
     }).costMicros,
-    run.reservedMicros,
+    0,
   );
 });
 
-Deno.test("provider aggregates authoritatively settle API failures and stale run leases", () => {
+Deno.test("customer settlement remains separate from provider costs and stale leases", () => {
   const repo = new MemoryRepository();
   const user = repo.createUser({
     email: "provider-accounting@example.com",
@@ -703,8 +771,47 @@ Deno.test("provider aggregates authoritatively settle API failures and stale run
     outputTokens: 99,
     latencyMs: 1,
   });
-  assertEquals(completedRun.costMicros, 7);
-  assertEquals(completedRun.inputTokens, 3);
+  assertEquals(completedRun.costMicros, 99);
+  assertEquals(completedRun.inputTokens, 99);
+  assertEquals(completedRun.outputTokens, 99);
+  assertEquals(completedRun.actualProviderCostMicros, 7);
+  assertEquals(completedRun.actualProviderInputTokens, 3);
+
+  const fallback = repo.beginApiRequest({
+    userId: user.id,
+    endpoint: "chat.completions",
+    idempotencyKey: "provider-accounting-fallback",
+    requestHash: "f".repeat(64),
+    stream: false,
+    model: "public/low-price",
+    provider: "provider",
+    runId: "provider-api-fallback",
+    reserveMicros: 800,
+  });
+  if (fallback.kind !== "started") throw new Error("fallback request did not start");
+  const fallbackRun = repo.usageRuns.get(fallback.usageRun.id)!;
+  fallbackRun.executionEpoch = 1;
+  // This is the aggregate of an expensive failed primary and successful fallback. It remains
+  // provider telemetry while the customer receives the low public/source charge.
+  fallbackRun.actualProviderCostMicros = 700;
+  fallbackRun.actualProviderInputTokens = 600;
+  fallbackRun.actualProviderOutputTokens = 100;
+  repo.completeApiJson({
+    id: fallback.request.id,
+    leaseToken: fallback.leaseToken,
+    responseStatus: 200,
+    responseBody: "{}",
+    costMicros: 2,
+    inputTokens: 8,
+    outputTokens: 1,
+    latencyMs: 2,
+  });
+  assertEquals({
+    customerCost: fallbackRun.costMicros,
+    customerInput: fallbackRun.inputTokens,
+    providerCost: fallbackRun.actualProviderCostMicros,
+    providerInput: fallbackRun.actualProviderInputTokens,
+  }, { customerCost: 2, customerInput: 8, providerCost: 700, providerInput: 600 });
 
   const failed = repo.beginApiRequest({
     userId: user.id,
@@ -730,8 +837,9 @@ Deno.test("provider aggregates authoritatively settle API failures and stale run
   });
   assertEquals({ status: failedRun.status, cost: failedRun.costMicros }, {
     status: "failed",
-    cost: 5,
+    cost: 0,
   });
+  assertEquals(failedRun.actualProviderCostMicros, 5);
 
   const stale = repo.reserve(user.id, "provider-run-stale", "provider/model", 100);
   stale.executionEpoch = 1;
@@ -740,9 +848,10 @@ Deno.test("provider aggregates authoritatively settle API failures and stale run
   assertEquals(repo.reapStaleProviderExecutionLeases(), 1);
   assertEquals({ status: stale.status, cost: stale.costMicros, lease: stale.runLeaseToken }, {
     status: "failed",
-    cost: 3,
+    cost: 0,
     lease: null,
   });
+  assertEquals(stale.actualProviderCostMicros, 3);
 });
 
 Deno.test("paid provider generation failure remains failed and replays durably", () => {
@@ -787,8 +896,9 @@ Deno.test("paid provider generation failure remains failed and replays durably",
   });
   assertEquals({ status: failed.usageRun.status, cost: failed.usageRun.costMicros }, {
     status: "failed",
-    cost: 4,
+    cost: 0,
   });
+  assertEquals(failed.usageRun.actualProviderCostMicros, 4);
   const replay = repo.beginGeneration(input);
   assertEquals(replay.kind, "completed");
   assertEquals(replay.usageRun.status, "failed");
