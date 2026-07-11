@@ -60,6 +60,26 @@ Deno.test({
         await store.transitionExecution(created.id, ["pending_approval"], { status: "cancelled" }),
         undefined,
       );
+      await store.transitionExecution(created.id, ["queued"], { status: "running" });
+      await store.transitionExecution(created.id, ["running"], {
+        status: "succeeded_pending_settlement",
+        result: { verified: true },
+      });
+      await store.transitionExecution(created.id, ["succeeded_pending_settlement"], {
+        status: "succeeded",
+      });
+      const conversations = await sql<{ id: string }[]>`INSERT INTO conversations(owner_id,title)
+        VALUES(${users[0].id},'Tool linkage') RETURNING id`;
+      const messages = await sql<{ id: string }[]>`INSERT INTO messages
+        (conversation_id,parent_id,sibling_index,role,content,idempotency_key)
+        VALUES(${conversations[0].id},NULL,0,'user','linked','tool-link') RETURNING id`;
+      await store.linkExecutions(users[0].id, messages[0].id, [created.id]);
+      await assertRejects(
+        () => store.linkExecutions(users[1].id, messages[0].id, [created.id]),
+        Error,
+        "invalid",
+      );
+      assertEquals((await sql`SELECT 1 FROM message_tool_executions`).length, 1);
       const audits = await sql<{ action: string }[]>`
         SELECT action FROM audit_events WHERE target_id IN ('web_search', ${created.id})
         ORDER BY created_at, id`;
@@ -67,6 +87,8 @@ Deno.test({
         "tool.policy.updated",
         "tool.policy.updated",
         "tool.execution.queued",
+        "tool.execution.succeeded_pending_settlement",
+        "tool.execution.succeeded",
       ]);
     } finally {
       await store.close();

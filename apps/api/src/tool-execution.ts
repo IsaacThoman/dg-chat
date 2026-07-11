@@ -2,6 +2,7 @@ export type ToolExecutionStatus =
   | "pending_approval"
   | "queued"
   | "running"
+  | "succeeded_pending_settlement"
   | "succeeded"
   | "failed"
   | "cancelled";
@@ -56,6 +57,12 @@ export interface ToolExecutionStore {
     expected: readonly ToolExecutionStatus[],
     patch: Partial<Omit<ToolExecution, "id" | "ownerId" | "toolId" | "input" | "createdAt">>,
   ): Promise<ToolExecution | undefined>;
+  linkExecutions?(
+    ownerId: string,
+    messageId: string,
+    executionIds: readonly string[],
+  ): Promise<void>;
+  claimRecoverable?(limit: number): Promise<ToolExecution[]>;
 }
 
 export interface ToolAdapterContext {
@@ -161,9 +168,24 @@ export class MemoryToolExecutionStore implements ToolExecutionStore {
     this.#executions.set(id, next);
     return Promise.resolve(clone(next));
   }
+  claimRecoverable(limit: number) {
+    const claimed: ToolExecution[] = [];
+    for (const execution of this.#executions.values()) {
+      if (execution.status !== "queued" || claimed.length >= limit) continue;
+      execution.status = "running";
+      execution.updatedAt = new Date().toISOString();
+      claimed.push(clone(execution));
+    }
+    return Promise.resolve(claimed);
+  }
 }
 
-const TERMINAL: readonly ToolExecutionStatus[] = ["succeeded", "failed", "cancelled"];
+const TERMINAL: readonly ToolExecutionStatus[] = [
+  "succeeded_pending_settlement",
+  "succeeded",
+  "failed",
+  "cancelled",
+];
 
 export class ToolExecutionService {
   readonly #adapters = new Map<string, ToolAdapter>();
@@ -274,7 +296,54 @@ export class ToolExecutionService {
     if (!execution) {
       throw new ToolExecutionError("execution_not_found", "Tool execution was not found", 404);
     }
+    if (execution.status === "succeeded_pending_settlement" && this.controls) {
+      try {
+        await this.controls.settle(execution, 0);
+        return await this.store.transitionExecution(id, ["succeeded_pending_settlement"], {
+          status: "succeeded",
+        }) ?? execution;
+      } catch {
+        return execution;
+      }
+    }
     return execution;
+  }
+
+  async resolveSucceeded(ownerId: string, ids: readonly string[]) {
+    if (ids.length > 8 || new Set(ids).size !== ids.length) {
+      throw new ToolExecutionError("invalid_input", "Tool execution identifiers are invalid", 422);
+    }
+    const values = await Promise.all(ids.map((id) => this.get(ownerId, id)));
+    if (values.some((value) => value.status !== "succeeded")) {
+      throw new ToolExecutionError(
+        "execution_terminal",
+        "Every linked tool execution must have succeeded",
+        409,
+      );
+    }
+    return values;
+  }
+
+  async linkToMessage(ownerId: string, messageId: string, ids: readonly string[]) {
+    if (ids.length) await this.store.linkExecutions?.(ownerId, messageId, ids);
+  }
+
+  async recover(limit = 25) {
+    const executions = await this.store.claimRecoverable?.(limit) ?? [];
+    for (const execution of executions) {
+      const adapter = this.#adapters.get(execution.toolId);
+      const policy = await this.store.getPolicy(execution.toolId);
+      if (adapter && policy?.allowed) {
+        void this.#dispatch(execution, adapter, policy, true);
+      } else {
+        await this.store.transitionExecution(execution.id, ["running"], {
+          status: "failed",
+          error: { code: "tool_not_allowed", message: "Tool policy changed before execution" },
+        });
+        await this.controls?.refund(execution, "tool policy changed before execution");
+      }
+    }
+    return executions.length;
   }
 
   async approve(ownerId: string, id: string): Promise<ToolExecution> {
@@ -294,16 +363,22 @@ export class ToolExecutionService {
     }
     const now = new Date().toISOString();
     await this.controls?.reserve(execution);
-    const queued = await this.store.transitionExecution(id, ["pending_approval"], {
-      status: "queued",
-      approvedAt: now,
-      approvedBy: ownerId,
-    });
+    let queued: ToolExecution | undefined;
+    try {
+      queued = await this.store.transitionExecution(id, ["pending_approval"], {
+        status: "queued",
+        approvedAt: now,
+        approvedBy: ownerId,
+      });
+    } catch (error) {
+      await this.controls?.refund(execution, "failed to persist tool approval");
+      throw error;
+    }
     if (!queued) {
       await this.controls?.refund(execution, "tool execution changed before approval");
       throw new ToolExecutionError("execution_terminal", "Tool execution changed", 409);
     }
-    void this.#dispatch(queued, adapter, policy);
+    void this.recover();
     return queued;
   }
 
@@ -325,10 +400,16 @@ export class ToolExecutionService {
     return cancelled;
   }
 
-  async #dispatch(execution: ToolExecution, adapter: ToolAdapter, policy: ToolPolicy) {
+  async #dispatch(
+    execution: ToolExecution,
+    adapter: ToolAdapter,
+    policy: ToolPolicy,
+    claimed = false,
+  ) {
     const controller = new AbortController();
     const startedAt = performance.now();
     this.#active.set(execution.id, controller);
+    let upstreamSucceeded = false;
     try {
       // Fence the exact policy revision immediately before execution. An administrator can revoke
       // or narrow a policy after user approval but before this microtask begins.
@@ -336,9 +417,11 @@ export class ToolExecutionService {
       if (!currentPolicy?.allowed || currentPolicy.version !== policy.version) {
         throw new Error("Tool policy changed before execution began");
       }
-      const running = await this.store.transitionExecution(execution.id, ["queued"], {
-        status: "running",
-      });
+      const running = claimed ? execution : await this.store.transitionExecution(
+        execution.id,
+        ["queued"],
+        { status: "running" },
+      );
       if (!running) return;
       const result = await adapter.execute(execution.input, {
         executionId: execution.id,
@@ -349,18 +432,21 @@ export class ToolExecutionService {
       if (!validateJson(result) || JSON.stringify(result).length > 1_000_000) {
         throw new Error("Tool returned an invalid or oversized result");
       }
+      upstreamSucceeded = true;
+      const recorded = await this.store.transitionExecution(execution.id, ["running"], {
+        status: "succeeded_pending_settlement",
+        result: clone(result),
+      });
+      if (!recorded) return;
       await this.controls?.settle(
         execution,
         Math.max(0, Math.round(performance.now() - startedAt)),
       );
-      const succeeded = await this.store.transitionExecution(execution.id, ["running"], {
+      await this.store.transitionExecution(execution.id, ["succeeded_pending_settlement"], {
         status: "succeeded",
-        result: clone(result),
       });
-      if (!succeeded) {
-        await this.controls?.refund(execution, "tool execution cancelled before completion");
-      }
     } catch (error) {
+      if (upstreamSucceeded) return;
       if (controller.signal.aborted) {
         await this.store.transitionExecution(execution.id, ["queued", "running"], {
           status: "cancelled",

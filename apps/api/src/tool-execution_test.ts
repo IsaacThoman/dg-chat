@@ -177,3 +177,30 @@ Deno.test("policy revision is fenced immediately before dispatch and reserved cr
   assertEquals(calls, 0);
   assertEquals(billing, ["reserve", "refund"]);
 });
+
+Deno.test("successful upstream result survives settlement failure and repairs without refund", async () => {
+  const store = new MemoryToolExecutionStore();
+  let settlementAttempts = 0;
+  let refunds = 0;
+  const service = new ToolExecutionService(store, [echoAdapter], {
+    reserve: () => Promise.resolve(),
+    settle: () => {
+      if (++settlementAttempts === 1) return Promise.reject(new Error("ledger unavailable"));
+      return Promise.resolve();
+    },
+    refund: () => {
+      refunds++;
+      return Promise.resolve();
+    },
+  });
+  await service.setPolicy({ toolId: "echo", allowed: true, actorId: "admin" });
+  const requested = await service.request("user", "echo", { durable: true });
+  await service.approve("user", requested.id);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const stored = await store.getExecution(requested.id, "user");
+  assertEquals(stored?.status, "succeeded_pending_settlement");
+  assertEquals(stored?.result, { input: { durable: true } });
+  assertEquals(refunds, 0);
+  assertEquals((await service.get("user", requested.id)).status, "succeeded");
+  assertEquals(settlementAttempts, 2);
+});

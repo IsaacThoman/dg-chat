@@ -127,6 +127,13 @@
       "when": 1783656017000,
       "tag": "0017_knowledge_vector_index",
       "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1783656018000,
+      "tag": "0018_tool_terminal_linkage",
+      "breakpoints": true
     }
   ]
 }

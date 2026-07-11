@@ -4,6 +4,7 @@ export type StoredToolExecutionStatus =
   | "pending_approval"
   | "queued"
   | "running"
+  | "succeeded_pending_settlement"
   | "succeeded"
   | "failed"
   | "cancelled";
@@ -188,5 +189,36 @@ export class PostgresToolExecutionStore {
     });
     if (!row) return undefined;
     return execution(row);
+  }
+
+  async linkExecutions(ownerId: string, messageId: string, executionIds: readonly string[]) {
+    await this.#sql.begin(async (tx) => {
+      const rows = await tx<{ id: string }[]>`
+        SELECT id FROM tool_executions
+        WHERE owner_id=${ownerId}::uuid AND status='succeeded'
+          AND id=ANY(${executionIds as string[]}::uuid[]) FOR UPDATE`;
+      if (rows.length !== executionIds.length) throw new Error("Tool execution linkage is invalid");
+      for (const executionId of executionIds) {
+        await tx`INSERT INTO message_tool_executions(message_id,execution_id)
+          VALUES(${messageId}::uuid,${executionId}::uuid) ON CONFLICT DO NOTHING`;
+      }
+    });
+  }
+
+  async claimRecoverable(limit: number): Promise<StoredToolExecution[]> {
+    return await this.#sql.begin(async (tx) => {
+      const claimToken = crypto.randomUUID();
+      const rows = await tx`
+        WITH candidates AS (
+          SELECT id FROM tool_executions
+          WHERE status='queued' OR (status='running' AND
+            (claim_expires_at IS NULL OR claim_expires_at < now()))
+          ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT ${limit}
+        )
+        UPDATE tool_executions e SET status='running',claim_token=${claimToken}::uuid,
+          claim_expires_at=now()+interval '2 minutes',updated_at=now()
+        FROM candidates c WHERE e.id=c.id RETURNING e.*`;
+      return rows.map(execution);
+    });
   }
 }
