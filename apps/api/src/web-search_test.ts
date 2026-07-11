@@ -39,7 +39,6 @@ Deno.test("SearXNG adapter bounds and normalizes results", async () => {
     url: "https://docs.example.com/a",
     snippet: "snippet",
     source: "x",
-    publishedAt: undefined,
   }]);
 });
 

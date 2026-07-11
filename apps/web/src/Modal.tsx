@@ -1,4 +1,5 @@
 import { type ReactNode, useEffect, useId, useRef } from "react";
+import { createPortal } from "react-dom";
 import { X } from "lucide-react";
 import { modalFocusableElements } from "./modalFocus.ts";
 
@@ -59,7 +60,7 @@ export function Modal(
       });
     };
   }, []);
-  return (
+  return createPortal(
     <div
       className="modal-overlay"
       onMouseDown={() => dismissibleRef.current && closeRef.current()}
@@ -87,6 +88,7 @@ export function Modal(
         </div>
         {children}
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

@@ -202,9 +202,17 @@ export class SearxngSearchAdapter implements WebSearchAdapter {
         let cursor = 0;
         dispatcher = new Agent({
           connect: {
-            lookup(_hostname, _options, callback) {
-              const address = addresses[cursor++ % addresses.length];
-              callback(null, address, address.includes(":") ? 6 : 4);
+            lookup(_hostname, options, callback) {
+              const records = addresses.map((address) => ({
+                address,
+                family: address.includes(":") ? 6 as const : 4 as const,
+              }));
+              if (options.all) {
+                callback(null, records);
+              } else {
+                const record = records[cursor++ % records.length];
+                callback(null, record.address, record.family);
+              }
             },
           },
         });
@@ -269,12 +277,14 @@ export class SearxngSearchAdapter implements WebSearchAdapter {
         continue;
       }
       if (!title) continue;
+      const source = boundedString(item.engine, 120);
+      const publishedAt = boundedString(item.publishedDate, 120);
       results.push({
         title,
         url: parsed.href,
         snippet: boundedString(item.content, 4_000),
-        source: boundedString(item.engine, 120) || undefined,
-        publishedAt: boundedString(item.publishedDate, 120) || undefined,
+        ...(source ? { source } : {}),
+        ...(publishedAt ? { publishedAt } : {}),
       });
       if (results.length >= count) break;
     }

@@ -1,5 +1,21 @@
-import { expect, test } from "@playwright/test";
-import { apiURL, bootstrap, login, uniqueUser } from "./helpers.ts";
+import { expect, type Page, test } from "@playwright/test";
+import { bootstrap, login, uniqueUser } from "./helpers.ts";
+
+async function authenticatedRequest(
+  page: Page,
+  path: string,
+  options: { method?: string; body?: unknown } = {},
+) {
+  return await page.evaluate(async ({ path, method, body }) => {
+    const response = await fetch(path, {
+      method,
+      credentials: "include",
+      headers: body === undefined ? undefined : { "content-type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    return { status: response.status, body: await response.json() };
+  }, { path, method: options.method ?? "GET", body: options.body });
+}
 
 test("admin enables web search and a user explicitly reviews and cancels a tool call", async ({
   page,
@@ -57,6 +73,10 @@ test("admin enables web search and a user explicitly reviews and cancels a tool 
   await page.getByRole("button", { name: "Send", exact: true }).click();
   await expect(page.getByText("Summarize the attached verified search result.", { exact: true }))
     .toBeVisible();
+  await expect.poll(
+    () => page.locator(".assistant-message .markdown").last().textContent(),
+    { timeout: 20_000, message: "the generation to commit before reloading" },
+  ).not.toBe("");
   await page.reload();
   await expect(page.getByText("Summarize the attached verified search result.", { exact: true }))
     .toBeVisible();
@@ -73,6 +93,23 @@ test("admin enables web search and a user explicitly reviews and cancels a tool 
   await expect(page.getByText("Edited summary that retains verified search provenance.", {
     exact: true,
   })).toBeVisible();
+  const conversationId = await page.locator(
+    ".conversation-row.active [data-conversation-actions]",
+  ).getAttribute("data-conversation-actions");
+  if (!conversationId) throw new Error("Active conversation ID was not available");
+  await expect.poll(
+    async () => {
+      const detail = await authenticatedRequest(page, `/api/conversations/${conversationId}`);
+      return detail.status === 200 && JSON.stringify(detail.body).includes(
+        "Edited summary that retains verified search provenance.",
+      );
+    },
+    { timeout: 20_000, message: "the edited branch generation to commit" },
+  ).toBe(true);
+  await page.reload();
+  await expect(page.getByText("Edited summary that retains verified search provenance.", {
+    exact: true,
+  })).toBeVisible();
   await page.getByRole("button", { name: "Previous branch" }).click();
   await expect(original).toBeVisible();
   await page.getByRole("button", { name: "Next branch" }).click();
@@ -84,26 +121,33 @@ test("admin enables web search and a user explicitly reviews and cancels a tool 
 test("a second approved user cannot inspect another user's tool execution", async ({ page, request }) => {
   await bootstrap(request);
   await login(page);
-  const adminHeaders = { origin: new URL(page.url()).origin };
-  const policies = await page.request.get(`${apiURL}/api/admin/tools`);
-  const webSearch = (await policies.json()).data.find((item: { definition: { id: string } }) =>
-    item.definition.id === "web_search"
-  );
-  await page.request.put(`${apiURL}/api/admin/tools/web_search/policy`, {
-    headers: adminHeaders,
-    data: {
+  const policies = await authenticatedRequest(page, "/api/admin/tools");
+  expect(policies.status).toBe(200);
+  const webSearch = (policies.body as {
+    data: Array<{
+      definition: { id: string };
+      policy?: {
+        version: number;
+      };
+    }>;
+  }).data.find((item) => item.definition.id === "web_search");
+  if (!webSearch) throw new Error("Web search policy was not returned");
+  const policy = await authenticatedRequest(page, "/api/admin/tools/web_search/policy", {
+    method: "PUT",
+    body: {
       allowed: true,
       allowedDomains: ["search-proxy"],
       allowPrivateNetwork: true,
       expectedVersion: webSearch.policy?.version ?? 0,
     },
   });
-  const executionResponse = await page.request.post(`${apiURL}/api/tools/executions`, {
-    headers: adminHeaders,
-    data: { toolId: "web_search", input: { query: "private owner result" } },
+  expect(policy.status).toBe(200);
+  const executionResponse = await authenticatedRequest(page, "/api/tools/executions", {
+    method: "POST",
+    body: { toolId: "web_search", input: { query: "private owner result" } },
   });
-  expect(executionResponse.status()).toBe(201);
-  const execution = await executionResponse.json() as { id: string };
+  expect(executionResponse.status).toBe(201);
+  const execution = executionResponse.body as { id: string };
 
   const applicant = uniqueUser("tool-owner-denial");
   await page.context().clearCookies();
@@ -113,20 +157,26 @@ test("a second approved user cannot inspect another user's tool execution", asyn
   await page.getByLabel(/email/i).fill(applicant.email);
   await page.getByLabel(/^password/i).fill(applicant.password);
   await page.getByRole("button", { name: "Request access" }).click();
+  await expect(page).toHaveURL(/\/pending$/);
   await page.context().clearCookies();
   await login(page);
-  const users = (await (await page.request.get(`${apiURL}/api/admin/users`)).json()).data as Array<{
-    id: string;
-    email: string;
-  }>;
+  const usersResponse = await authenticatedRequest(page, "/api/admin/users");
+  expect(usersResponse.status).toBe(200);
+  const users = (usersResponse.body as {
+    data: Array<{
+      id: string;
+      email: string;
+    }>;
+  }).data;
   const user = users.find((candidate) => candidate.email === applicant.email)!;
-  await page.request.patch(`${apiURL}/api/admin/users/${user.id}/approval`, {
-    headers: adminHeaders,
-    data: { status: "approved" },
+  const approval = await authenticatedRequest(page, `/api/admin/users/${user.id}/approval`, {
+    method: "PATCH",
+    body: { status: "approved" },
   });
+  expect(approval.status).toBe(200);
   await page.context().clearCookies();
   await login(page, applicant.email, applicant.password);
-  const denied = await page.request.get(`${apiURL}/api/tools/executions/${execution.id}`);
-  expect(denied.status()).toBe(404);
-  await expect(denied.json()).resolves.toMatchObject({ error: { code: "execution_not_found" } });
+  const denied = await authenticatedRequest(page, `/api/tools/executions/${execution.id}`);
+  expect(denied.status).toBe(404);
+  expect(denied.body).toMatchObject({ error: { code: "execution_not_found" } });
 });
