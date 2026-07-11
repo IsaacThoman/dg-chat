@@ -167,6 +167,26 @@ Deno.test("DOCX extraction preserves section boundaries and decodes OOXML text",
   assertEquals(result.units.map((unit) => unit.kind), ["section", "section"]);
 });
 
+Deno.test("DOCX extraction defers paragraph section breaks and preserves Word controls", async () => {
+  const result = await extractDocx(docx(
+    `<x:document xmlns:x="http://schemas.openxmlformats.org/wordprocessingml/2006/main">` +
+      `<x:body>` +
+      `<x:p><x:r><x:t>First</x:t></x:r></x:p>` +
+      `<x:p><x:pPr><x:sectPr/></x:pPr>` +
+      `<x:r><x:t>Last</x:t><x:t xml:space="preserve"> run</x:t><x:tab/>` +
+      `<x:t>tab</x:t><x:br/><x:t>after</x:t><x:cr/><x:t>end</x:t></x:r></x:p>` +
+      `<x:p><x:r><x:t>Second</x:t><x:t>A</x:t></x:r><x:r><x:t>B</x:t></x:r></x:p>` +
+      `<x:sectPr/>` +
+      `</x:body></x:document>`,
+  ));
+  assertEquals(result.text, "First\nLast run\ttab\nafter\nend\n\nSecondAB");
+  assertEquals(result.units.map((unit) => unit.text), [
+    "First\nLast run\ttab\nafter\nend",
+    "SecondAB",
+  ]);
+  assertEquals(result.units.map((unit) => unit.metadata.sectionNumber), [1, 2]);
+});
+
 Deno.test("DOCX rejects excessive raw bytes, output, entries, and elapsed deadline", async () => {
   const valid = docx();
   await rejectsCode(
