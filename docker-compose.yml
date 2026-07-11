@@ -33,8 +33,8 @@ x-app-environment: &app-environment
   KNOWLEDGE_EMBEDDING_VERSION: ${KNOWLEDGE_EMBEDDING_VERSION:-}
   KNOWLEDGE_EMBEDDING_BATCH_SIZE: ${KNOWLEDGE_EMBEDDING_BATCH_SIZE:-64}
   KNOWLEDGE_EMBEDDING_QUERY_TIMEOUT_MS: ${KNOWLEDGE_EMBEDDING_QUERY_TIMEOUT_MS:-10000}
-  SEARXNG_URL: ${SEARXNG_URL:-}
-  SEARXNG_ALLOW_PRIVATE_NETWORK: ${SEARXNG_ALLOW_PRIVATE_NETWORK:-false}
+  SEARXNG_URL: ${SEARXNG_URL:-http://searxng:8080}
+  SEARXNG_ALLOW_PRIVATE_NETWORK: ${SEARXNG_ALLOW_PRIVATE_NETWORK:-true}
   SEARXNG_TIMEOUT_MS: ${SEARXNG_TIMEOUT_MS:-8000}
   SEARXNG_MAX_RESPONSE_BYTES: ${SEARXNG_MAX_RESPONSE_BYTES:-2000000}
 
@@ -184,6 +184,33 @@ services:
       retries: 6
       start_period: 10s
     stop_grace_period: 30s
+
+  searxng:
+    image: searxng/searxng@sha256:1e9c9535cffd1d9d209985905091308257e23b2f4783fbd3b626c0a56285b80c
+    restart: unless-stopped
+    environment:
+      SEARXNG_BASE_URL: http://searxng:8080/
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?SEARXNG_SECRET is required}
+      UWSGI_WORKERS: ${SEARXNG_WORKERS:-2}
+      UWSGI_THREADS: ${SEARXNG_THREADS:-2}
+    volumes:
+      - ./deploy/searxng/settings.yml:/etc/searxng/settings.yml:ro
+    networks:
+      - backend
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      - /var/cache/searxng:size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
 
   postgres:
     image: pgvector/pgvector:pg17

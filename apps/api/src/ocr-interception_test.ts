@@ -216,10 +216,29 @@ Deno.test("provider execution applies model-level OCR config before the billed c
   const provider = repo.setProviderCredential(created.id, created.version, {
     envelope: await keyring.encrypt(created.id, created.version + 1, "secret"),
   }, mutation);
+  const ocrModel = repo.createProviderModel({
+    providerId: provider.id,
+    publicModelId: "ocr/vision",
+    upstreamModelId: "vision-upstream",
+    displayName: "OCR vision",
+    capabilities: ["chat", "vision"],
+    contextWindow: 8_192,
+  }, mutation);
+  const ocrPrice = repo.createModelPriceVersion({
+    providerModelId: ocrModel.id,
+    expectedModelVersion: ocrModel.version,
+    effectiveAt: "2026-01-01T00:00:00.000Z",
+    inputMicrosPerMillion: 1,
+    cachedInputMicrosPerMillion: 1,
+    reasoningMicrosPerMillion: 1,
+    outputMicrosPerMillion: 1_000_000,
+    fixedCallMicros: 10,
+    source: "test-ocr",
+  }, mutation);
   const model = repo.createProviderModel({
     providerId: provider.id,
     publicModelId: "ocr/chat",
-    upstreamModelId: "vision-upstream",
+    upstreamModelId: "chat-upstream",
     displayName: "OCR chat",
     capabilities: ["chat", "vision"],
     contextWindow: 8_192,
@@ -227,7 +246,7 @@ Deno.test("provider execution applies model-level OCR config before the billed c
       ocr: {
         enabled: true,
         providerId: provider.id,
-        model: "ocr/chat",
+        model: "ocr/vision",
         prompt: "Read it",
         maxBytes: 1_024,
         maxPixels: 100,
@@ -301,4 +320,67 @@ Deno.test("provider execution applies model-level OCR config before the billed c
     text: "[OCR image 1.2]\nreceipt total $42",
   });
   assertEquals(repo.listProviderAttempts(run.id).length, 1);
+  const childRuns = [...repo.usageRuns.values()].filter((candidate) => candidate.id !== run.id);
+  assertEquals(childRuns.length, 1);
+  assertEquals(childRuns[0].status, "completed");
+  assertEquals(childRuns[0].pricingSnapshot?.pricingVersionId, ocrPrice.id);
+  assertEquals(repo.listProviderAttempts(childRuns[0].id).length, 1);
+  assertEquals(
+    repo.ledger.filter((entry) => entry.usageRunId === childRuns[0].id).map((entry) => entry.kind),
+    ["reserve", "refund"],
+  );
+
+  const failedParent = repo.reserve(
+    user.id,
+    "ocr-failed-parent",
+    model.publicModelId,
+    1_000,
+    provider.slug,
+    undefined,
+    {
+      pricingVersionId: price.id,
+      inputMicrosPerMillion: 1,
+      cachedInputMicrosPerMillion: 1,
+      reasoningMicrosPerMillion: 1,
+      outputMicrosPerMillion: 1,
+      fixedCallMicros: 0,
+      source: "test",
+    },
+  );
+  const failingEngine = new ProviderExecutionEngine({
+    repository: repo,
+    keyring,
+    circuitBreaker: new MemoryCircuitBreaker(),
+    breakerPolicy: {
+      failureThreshold: 2,
+      failureWindowSeconds: 60,
+      openSeconds: 30,
+      halfOpenLeaseSeconds: 5,
+    },
+    complete: () => Promise.reject(new Error("OCR upstream failed")),
+  });
+  await assertRejects(
+    () =>
+      failingEngine.complete(
+        model.id,
+        failedParent.id,
+        failedParent.runLeaseToken!,
+        request(),
+        new AbortController().signal,
+      ),
+    OcrInterceptionError,
+    "OCR upstream failed",
+  );
+  const failedChild = [...repo.usageRuns.values()].find((candidate) =>
+    candidate.id !== run.id && candidate.id !== childRuns[0].id &&
+    candidate.id !== failedParent.id
+  )!;
+  assertEquals(failedChild.status, "failed");
+  assertEquals(repo.listProviderAttempts(failedChild.id).map((attempt) => attempt.status), [
+    "failed",
+  ]);
+  assertEquals(
+    repo.ledger.filter((entry) => entry.usageRunId === failedChild.id).map((entry) => entry.kind),
+    ["reserve", "refund"],
+  );
 });

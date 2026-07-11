@@ -8,6 +8,7 @@ import {
 import { MemoryRateLimiter, RedisRateLimiter } from "./rate-limit.ts";
 import { ProviderSecretKeyring } from "./provider-secrets.ts";
 import { MemoryCircuitBreaker, RedisCircuitBreaker } from "./provider-circuit.ts";
+import { ocrCacheFailureModeFromEnv, RedisOcrCache } from "./ocr-cache.ts";
 
 const port = Number(Deno.env.get("PORT") ?? 8000);
 const providerKeyring = ProviderSecretKeyring.fromEnv();
@@ -34,6 +35,11 @@ const rateLimiter = Deno.env.get("REDIS_URL")
 const circuitBreaker = Deno.env.get("REDIS_URL")
   ? new RedisCircuitBreaker(Deno.env.get("REDIS_URL")!)
   : new MemoryCircuitBreaker();
+const ocrCache = Deno.env.get("REDIS_URL")
+  ? new RedisOcrCache(Deno.env.get("REDIS_URL")!, {
+    failureMode: ocrCacheFailureModeFromEnv(Deno.env.get("OCR_CACHE_FAILURE_MODE")),
+  })
+  : undefined;
 const objectStore = objectStoreFromEnv();
 const { app } = createApp({
   repository,
@@ -41,6 +47,7 @@ const { app } = createApp({
   objectStore,
   providerKeyring,
   circuitBreaker,
+  ocrCache,
 });
 const replayMaintenance = setInterval(async () => {
   try {
@@ -79,6 +86,7 @@ const shutdown = async (signal: string) => {
     repository.close(),
     rateLimiter.close(),
     circuitBreaker.close(),
+    ocrCache?.close(),
     objectStore?.close(),
   ]);
 };

@@ -138,6 +138,7 @@ import {
 } from "./tool-execution.ts";
 import { SearxngSearchAdapter } from "./web-search.ts";
 import { WebSearchToolAdapter } from "./search-tool.ts";
+import type { OcrCache } from "./ocr-interception.ts";
 
 type Variables = {
   user: PublicUser;
@@ -180,6 +181,7 @@ export interface AppOptions {
     windowMs: number;
     minimumVisibleUnitsPerSecond: number;
   };
+  ocrCache?: OcrCache;
   toolExecutionService?: ToolExecutionService;
 }
 
@@ -875,6 +877,7 @@ export function createApp(options: AppOptions = {}) {
       stream: providerStream,
       embeddingsFetch: options.embeddingsFetch,
       slowStream: providerSlowStream,
+      ocrCache: options.ocrCache,
     })
     : undefined;
   const knowledgeQueryEmbedder = options.knowledgeQueryEmbedder ?? knowledgeQueryEmbedderFromEnv({

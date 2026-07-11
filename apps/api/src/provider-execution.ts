@@ -403,35 +403,74 @@ export class ProviderExecutionEngine {
           !provider?.enabled || !ocrModel?.enabled || ocrModel.providerId !== provider.id ||
           !ocrModel.capabilities.includes("vision")
         ) throw new Error("Configured OCR provider/model is unavailable or lacks vision support");
-        const credential = await this.#repository.getProviderCredential(provider.id);
-        if (!credential) throw new Error("Configured OCR provider credential is unavailable");
-        const apiKey = await this.#keyring.decrypt(
-          provider.id,
-          credential.envelope as unknown as ProviderSecretEnvelope,
-        );
         const encoded = Buffer.from(image.bytes).toString("base64");
-        const result = await this.#complete(
-          {
-            model: ocrModel.publicModelId,
-            messages: [{
-              role: "user",
-              content: [
-                { type: "text", text: prompt },
-                {
-                  type: "image_url",
-                  image_url: { url: `data:${image.mime};base64,${encoded}`, detail: "high" },
-                },
-              ],
-            }],
-          },
-          signal,
-          {
-            baseUrl: provider.baseUrl,
-            apiKey,
-            upstreamModel: ocrModel.upstreamModelId,
-          },
+        const ocrRequest: ChatCompletionRequest = {
+          model: ocrModel.publicModelId,
+          messages: [{
+            role: "user",
+            content: [
+              { type: "text", text: prompt },
+              {
+                type: "image_url",
+                image_url: { url: `data:${image.mime};base64,${encoded}`, detail: "high" },
+              },
+            ],
+          }],
+        };
+        if (parseOcrInterceptionConfig(ocrModel.customParams)) {
+          throw new Error("Configured OCR model cannot recursively enable OCR interception");
+        }
+        const plan = await this.resolvePlan(ocrModel.id);
+        const runId = crypto.randomUUID();
+        const reserveMicros = this.reservationMicros(
+          plan,
+          estimateInputTokens(ocrRequest),
+          8_192,
         );
-        return result.text;
+        const run = await this.#repository.reserveChildProviderUsage({
+          parentUsageRunId,
+          parentOwnerLeaseToken: ownerLeaseToken,
+          runId,
+          model: ocrModel.publicModelId,
+          provider: `ocr:${provider.slug}`,
+          reserveMicros,
+          pricingSnapshot: plan.targets[0].pricing,
+        });
+        const childLease = run.runLeaseToken;
+        if (!childLease) throw new Error("OCR usage reservation did not create an execution lease");
+        const startedAt = this.#now();
+        let claim: ProviderExecutionClaim | undefined;
+        try {
+          claim = await this.#repository.claimProviderExecution(runId, childLease);
+          const result = await this.complete(
+            ocrModel.id,
+            runId,
+            childLease,
+            ocrRequest,
+            signal,
+            plan,
+          );
+          await this.#repository.settleProviderUsage({
+            usageRunId: runId,
+            ownerLeaseToken: childLease,
+            executionEpoch: claim.executionEpoch,
+            latencyMs: Math.max(0, this.#now() - startedAt),
+          });
+          return result.text;
+        } catch (error) {
+          if (claim) {
+            await Promise.resolve(this.#repository.refundProviderUsage({
+              usageRunId: runId,
+              ownerLeaseToken: childLease,
+              executionEpoch: claim.executionEpoch,
+              latencyMs: Math.max(0, this.#now() - startedAt),
+              error: error instanceof Error ? error.message.slice(0, 1_000) : "OCR failed",
+            })).catch(() => undefined);
+          } else {
+            await this.#repository.refund(runId, "OCR failed before provider execution");
+          }
+          throw error;
+        }
       },
     }, signal);
   }

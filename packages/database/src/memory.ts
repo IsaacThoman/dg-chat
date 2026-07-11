@@ -69,6 +69,7 @@ import type {
   ProviderRetryPolicy,
   RegistryMutationContext,
   ReplaceConversationKnowledgeInput,
+  ReserveChildProviderUsageInput,
   SearchConversationKnowledgeInput,
   SessionSummary,
   SetProviderModelRouteInput,
@@ -2969,6 +2970,35 @@ export class MemoryRepository {
 
   refundProviderUsage(input: FinalizeProviderUsageInput): UsageRun {
     return this.finalizeProviderUsage(input, true);
+  }
+
+  reserveChildProviderUsage(input: ReserveChildProviderUsageInput): UsageRun {
+    const parent = this.usageRuns.get(input.parentUsageRunId);
+    const apiLeaseValid = [...this.apiIdempotencyRequests.values()].some((request) =>
+      request.usageRunId === input.parentUsageRunId && request.state === "in_progress" &&
+      request.leaseToken === input.parentOwnerLeaseToken && request.leaseExpiresAt !== null &&
+      Date.parse(request.leaseExpiresAt) > Date.now()
+    );
+    const leaseValid = parent?.status === "reserved" && (
+      (parent.runLeaseToken === input.parentOwnerLeaseToken && parent.runLeaseExpiresAt !== null &&
+        Date.parse(parent.runLeaseExpiresAt) > Date.now()) ||
+      (parent.generationLeaseToken === input.parentOwnerLeaseToken &&
+        parent.generationLeaseExpiresAt !== null &&
+        Date.parse(parent.generationLeaseExpiresAt) > Date.now()) ||
+      apiLeaseValid
+    );
+    if (!leaseValid || !parent) {
+      throw new DomainError("stale_lease", "Parent provider execution lease is stale", 409);
+    }
+    return this.reserve(
+      parent.userId,
+      input.runId,
+      input.model,
+      input.reserveMicros,
+      input.provider,
+      undefined,
+      input.pricingSnapshot,
+    );
   }
 
   createApiToken(

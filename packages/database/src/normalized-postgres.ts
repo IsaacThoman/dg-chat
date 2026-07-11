@@ -65,6 +65,7 @@ import type {
   ProviderRetryPolicy,
   RegistryMutationContext,
   ReplaceConversationKnowledgeInput,
+  ReserveChildProviderUsageInput,
   SearchConversationKnowledgeInput,
   SessionSummary,
   SetProviderModelRouteInput,
@@ -3364,6 +3365,59 @@ export class PostgresRepository implements DomainRepository {
 
   refundProviderUsage(input: FinalizeProviderUsageInput): Promise<UsageRun> {
     return this.#finalizeProviderUsage(input, true);
+  }
+
+  async reserveChildProviderUsage(input: ReserveChildProviderUsageInput): Promise<UsageRun> {
+    if (
+      !Number.isSafeInteger(input.reserveMicros) || input.reserveMicros < 0 ||
+      !isUsagePricingSnapshot(input.pricingSnapshot)
+    ) throw new DomainError("validation_error", "Child usage reservation is invalid", 422);
+    return await this.#sql.begin(async (tx) => {
+      const parents = await tx<Row[]>`SELECT *,(
+          (generation_lease_token=${input.parentOwnerLeaseToken} AND
+            generation_lease_expires_at>now()) OR
+          (run_lease_token=${input.parentOwnerLeaseToken} AND run_lease_expires_at>now()) OR
+          EXISTS(SELECT 1 FROM api_idempotency_requests a
+            WHERE a.usage_run_id=usage_runs.id AND a.state='in_progress'
+              AND a.lease_token=${input.parentOwnerLeaseToken} AND a.lease_expires_at>now())
+        ) AS lease_valid FROM usage_runs WHERE id=${input.parentUsageRunId} FOR UPDATE`;
+      const parent = parents[0];
+      if (!parent || parent.status !== "reserved" || parent.lease_valid !== true) {
+        throw new DomainError("stale_lease", "Parent provider execution lease is stale", 409);
+      }
+      const userId = String(parent.user_id);
+      const users = await tx<Row[]>`SELECT balance_micros FROM users WHERE id=${userId} FOR UPDATE`;
+      const balance = number(users[0].balance_micros);
+      if (balance < input.reserveMicros) {
+        throw new DomainError("insufficient_credit", "Insufficient credit for OCR", 402);
+      }
+      const p = input.pricingSnapshot;
+      const leaseToken = crypto.randomUUID();
+      let rows: Row[];
+      try {
+        rows = await tx<Row[]>`INSERT INTO usage_runs(
+          id,user_id,model,provider,status,reserved_micros,run_lease_token,run_lease_expires_at,
+          pricing_version_id,pricing_input_micros_per_million,
+          pricing_cached_input_micros_per_million,pricing_reasoning_micros_per_million,
+          pricing_output_micros_per_million,pricing_fixed_call_micros,pricing_source)
+          VALUES(${input.runId},${userId},${input.model},${input.provider},'reserved',
+          ${input.reserveMicros},${leaseToken},now()+120*interval '1 second',
+          ${p.pricingVersionId},${p.inputMicrosPerMillion},${p.cachedInputMicrosPerMillion},
+          ${p.reasoningMicrosPerMillion},${p.outputMicrosPerMillion},${p.fixedCallMicros},${p.source})
+          RETURNING *`;
+      } catch (error) {
+        if ((error as { code?: string }).code === "23505") {
+          throw new DomainError("idempotency_conflict", "Child usage run already exists", 409);
+        }
+        throw error;
+      }
+      const after = balance - input.reserveMicros;
+      await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${userId}`;
+      await tx`INSERT INTO ledger_entries(
+        user_id,usage_run_id,kind,amount_micros,balance_after_micros)
+        VALUES(${userId},${input.runId},'reserve',${-input.reserveMicros},${after})`;
+      return run(rows[0]);
+    });
   }
 
   async reapStaleProviderExecutionLeases(limit = 100): Promise<number> {

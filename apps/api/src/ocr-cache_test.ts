@@ -1,4 +1,4 @@
-import { assertEquals, assertRejects, assertThrows } from "@std/assert";
+import { assertEquals, assertRejects, assertThrows } from "jsr:@std/assert@1.0.14";
 import { ocrCacheFailureModeFromEnv, RedisOcrCache } from "./ocr-cache.ts";
 
 const key = `ocr:v1:${"a".repeat(64)}`;
