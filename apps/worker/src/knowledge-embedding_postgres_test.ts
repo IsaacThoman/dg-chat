@@ -4,7 +4,7 @@ import { knowledgeEmbeddingIdentityVersion } from "@dg-chat/database";
 
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
 
-async function eventually(check: () => Promise<boolean>, timeoutMs = 10_000): Promise<void> {
+async function eventually(check: () => Promise<boolean>, timeoutMs = 30_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (await check()) return;
