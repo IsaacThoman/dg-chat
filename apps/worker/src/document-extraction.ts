@@ -497,7 +497,7 @@ function assertSafeDocx(entries: ZipEntry[], files: Record<string, Uint8Array>):
     );
   }
   for (const [name, bytes] of Object.entries(files)) {
-    if (!name.startsWith("word/") || !name.toLowerCase().endsWith(".xml")) continue;
+    if (!name.toLowerCase().endsWith(".xml")) continue;
     const wordXml = decoder.decode(bytes);
     const complexInstruction = [...wordXml.matchAll(
       /<(?:[A-Za-z_][\w.-]*:)?instrText\b[^>]*>([\s\S]*?)<\/(?:[A-Za-z_][\w.-]*:)?instrText\s*>/gi,
@@ -508,7 +508,7 @@ function assertSafeDocx(entries: ZipEntry[], files: Record<string, Uint8Array>):
     if (
       [complexInstruction, ...simpleInstructions].some((instruction) =>
         /\bDDE(?:AUTO)?\b/i.test(instruction)
-      ) || /<(?:\w+:)?(?:OLEObject|object)\b/i.test(wordXml)
+      ) || /<(?:[A-Za-z_][\w.-]*:)?(?:OLEObject|object)\b/i.test(wordXml)
     ) {
       throw new DocumentExtractionError(
         "docx_active_content",

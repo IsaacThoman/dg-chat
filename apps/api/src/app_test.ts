@@ -1276,6 +1276,25 @@ Deno.test("attachment and OpenAI Files routes enforce security, ownership, scope
   const imageUpload = (await json(imageUploadResponse)).attachment;
   assertEquals(imageUpload.state, "ready");
 
+  const scanFlood = new Uint8Array(200_000);
+  scanFlood.set(pngBytes.slice(0, 24));
+  for (let index = 0; index < 1_025; index++) {
+    const offset = 64 + index * 64;
+    scanFlood.set([0x4d, 0x5a], offset);
+    new DataView(scanFlood.buffer).setUint32(offset + 0x3c, scanFlood.length - offset - 4, true);
+  }
+  const scanFloodForm = new FormData();
+  scanFloodForm.set("file", new File([scanFlood], "scan-flood.png", { type: "image/png" }));
+  const scanFloodResponse = await app.request("/api/attachments", {
+    method: "POST",
+    headers: adminSession,
+    body: scanFloodForm,
+  });
+  assertEquals(scanFloodResponse.status, 201);
+  const scanFloodAttachment = (await json(scanFloodResponse)).attachment;
+  assertEquals(scanFloodAttachment.state, "quarantined");
+  assertEquals(scanFloodAttachment.inspectionError, "security_scan_inconclusive");
+
   const webContent = await app.request(`/api/attachments/${webUpload.id}/content`, {
     headers: adminSession,
   });
@@ -1672,6 +1691,6 @@ Deno.test("attachment and OpenAI Files routes enforce security, ownership, scope
   });
   assertEquals(afterDelete.status, 404);
   assertEquals((await json(afterDelete)).error.code, "not_found");
-  assertEquals(objectStore.objects.size, 3);
+  assertEquals(objectStore.objects.size, 4);
   assertExists(admin.id);
 });

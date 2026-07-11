@@ -215,7 +215,7 @@ Deno.test("PE polyglot detection follows large DOS offsets across stream boundar
   await assertRejects(() => hostile.inspection, UploadSecurityError, "Conflicting");
 });
 
-Deno.test("PE candidate saturation short-circuits without scanning the remaining upload", async () => {
+Deno.test("PE live-candidate saturation quarantines without claiming a polyglot", async () => {
   const body = new Uint8Array(200_000);
   body.set(bytes(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a));
   new DataView(body.buffer).setUint32(16, 1);
@@ -231,20 +231,50 @@ Deno.test("PE candidate saturation short-circuits without scanning the remaining
   let previous = scanEmbeddedPe(first, 0, state, undefined, body.length).previousByte;
   previous = scanEmbeddedPe(second, first.length, state, previous, body.length).previousByte;
   assertEquals(state.terminal, true);
+  assertEquals(state.inconclusive, true);
   assertEquals(state.headers.length, 0);
   assertEquals(state.signatures.size, 0);
   if (state.work > body.length + 1_024 * 70) {
     throw new Error(`PE scan exceeded its deterministic work budget: ${state.work}`);
   }
   assertEquals(previous, second.at(-1));
-  const hostile = secureUploadStream(
+  const inconclusive = secureUploadStream(
     stream(body.slice(0, 70_000), body.slice(70_000)),
     "candidate-flood.png",
     "image/png",
     { maxBytes: body.length },
   );
-  await assertRejects(() => drain(hostile.stream), UploadSecurityError, "Conflicting");
-  await assertRejects(() => hostile.inspection, UploadSecurityError, "Conflicting");
+  await drain(inconclusive.stream);
+  assertEquals((await inconclusive.inspection).decision, {
+    state: "quarantine",
+    reason: "security_scan_inconclusive",
+  });
+});
+
+Deno.test("more than 1024 expired MZ candidates do not cause a false positive", async () => {
+  const body = new Uint8Array(200_000);
+  body.set(bytes(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a));
+  new DataView(body.buffer).setUint32(16, 1);
+  new DataView(body.buffer).setUint32(20, 1);
+  for (let index = 0; index < 1_100; index++) {
+    const offset = 64 + index * 128;
+    body.set(bytes(0x4d, 0x5a), offset);
+    new DataView(body.buffer).setUint32(offset + 0x3c, 0, true);
+  }
+  const state = createPeScanState();
+  const scan = scanEmbeddedPe(body, 0, state, undefined, body.length);
+  assertEquals(scan.detected, false);
+  assertEquals(state.inconclusive, false);
+  assertEquals(state.candidates, 0);
+  if (state.work > body.length * 2) {
+    throw new Error(`Expired candidates used excess work: ${state.work}`);
+  }
+
+  const valid = secureUploadStream(stream(body), "many-mz.png", "image/png", {
+    maxBytes: body.length,
+  });
+  await drain(valid.stream);
+  assertEquals((await valid.inspection).mime, "image/png");
 });
 
 Deno.test("validates the complete JSON document instead of only its prefix", async () => {
