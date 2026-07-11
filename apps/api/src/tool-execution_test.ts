@@ -308,9 +308,42 @@ Deno.test("recovery refunds when cancellation wins after reservation", async () 
   });
   const recovery = service.recover();
   await reservationStarted;
-  await service.cancel("user", requested.id);
+  const cancellation = service.cancel("user", requested.id);
   release();
+  await cancellation;
   await recovery;
   assertEquals((await service.get("user", requested.id)).status, "cancelled");
   assertEquals(refunds, 2);
+});
+
+Deno.test("concurrent recoverers do not refund the winning shared reservation", async () => {
+  const store = new MemoryToolExecutionStore();
+  let arrivals = 0;
+  let release!: () => void;
+  let refunds = 0;
+  const barrier = new Promise<void>((resolve) => release = resolve);
+  const controls = {
+    reserve: async () => {
+      arrivals++;
+      if (arrivals === 2) release();
+      await barrier;
+    },
+    settle: () => Promise.resolve(),
+    refund: () => {
+      refunds++;
+      return Promise.resolve();
+    },
+  };
+  const first = new ToolExecutionService(store, [echoAdapter], controls);
+  const second = new ToolExecutionService(store, [echoAdapter], controls);
+  await first.setPolicy({ toolId: "echo", allowed: true, actorId: "admin" });
+  const requested = await first.request("user", "echo", {});
+  await store.transitionExecution(requested.id, ["pending_approval"], {
+    status: "queued_pending_reservation",
+    approvedAt: new Date().toISOString(),
+    approvedBy: "user",
+  });
+  await Promise.all([first.recover(), second.recover()]);
+  await waitFor(first, "user", requested.id, "succeeded");
+  assertEquals(refunds, 0);
 });

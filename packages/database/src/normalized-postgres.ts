@@ -199,6 +199,7 @@ function run(row: Row): UsageRun {
     id: String(row.id),
     userId: String(row.user_id),
     model: String(row.model),
+    provider: String(row.provider),
     status: row.status as UsageRun["status"],
     reservedMicros: number(row.reserved_micros),
     costMicros: number(row.cost_micros),

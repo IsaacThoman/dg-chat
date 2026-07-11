@@ -116,6 +116,7 @@ export interface UsageRun {
   id: string;
   userId: string;
   model: string;
+  provider: string;
   status: "reserved" | "completed" | "failed";
   reservedMicros: number;
   costMicros: number;
@@ -3152,6 +3153,7 @@ export class MemoryRepository {
     }
     if (
       existing.userId !== input.userId || existing.model !== input.model ||
+      existing.provider !== input.provider ||
       existing.reservedMicros !== input.reservedMicros || existing.status !== "reserved"
     ) {
       throw new DomainError("idempotency_conflict", "Existing reservation does not match", 409);
@@ -3229,7 +3231,7 @@ export class MemoryRepository {
     runId: string,
     model: string,
     amountMicros: number,
-    _provider = "unknown",
+    provider = "unknown",
     _tokenId?: string,
     pricingSnapshot?: UsagePricingSnapshot,
   ) {
@@ -3249,6 +3251,7 @@ export class MemoryRepository {
       id: runId,
       userId,
       model,
+      provider,
       status: "reserved",
       reservedMicros: amountMicros,
       costMicros: 0,

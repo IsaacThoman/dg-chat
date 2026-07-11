@@ -350,6 +350,9 @@ export class ToolExecutionService {
     for (const execution of pendingReservation) {
       try {
         if (execution.cancellationRequestedAt) {
+          // Establish (or observe) the idempotent reservation before refunding. This closes the
+          // commit-after-refund window when a prior reservation acknowledgement was lost.
+          await this.controls?.reserve(execution);
           await this.controls?.refund(execution, "tool execution cancelled before dispatch");
           await this.store.transitionExecution(execution.id, ["queued_pending_reservation"], {
             status: "cancelled",
@@ -363,7 +366,12 @@ export class ToolExecutionService {
           status: "queued",
         });
         if (!queued) {
-          await this.controls?.refund(execution, "reservation lost execution race");
+          const current = await this.store.getExecution(execution.id, execution.ownerId);
+          // Another replica may have advanced the same idempotent reservation. It owns settlement;
+          // only a cancellation means the shared reservation must be refunded here.
+          if (current?.status === "cancelled" || current?.cancellationRequestedAt) {
+            await this.controls?.refund(execution, "reservation lost cancellation race");
+          }
         } else if (queued.cancellationRequestedAt) {
           await this.controls?.refund(execution, "tool execution cancelled before dispatch");
           await this.store.transitionExecution(execution.id, ["queued"], {
@@ -459,6 +467,7 @@ export class ToolExecutionService {
       if (!refundPending) {
         throw new ToolExecutionError("execution_terminal", "Tool execution changed", 409);
       }
+      await this.controls?.reserve(refundPending);
       await this.controls?.refund(refundPending, "tool execution cancelled before dispatch");
       const cancelled = await this.store.transitionExecution(id, ["queued_pending_reservation"], {
         status: "cancelled",
