@@ -36,6 +36,12 @@ export function ToolLauncher({ open, close, insert }: {
     return () => clearInterval(timer);
   }, [execution?.id, execution?.status]);
   if (!open) return null;
+  const dismiss = () => {
+    setExecution(undefined);
+    setError("");
+    setQuery("");
+    close();
+  };
   const webSearch = tools.data?.find((tool) => tool.id === "web_search");
   const run = async () => {
     setBusy(true);
@@ -72,7 +78,7 @@ export function ToolLauncher({ open, close, insert }: {
     }
   };
   return (
-    <Modal title="Web search" close={close}>
+    <Modal title="Web search" close={dismiss}>
       <p className="modal-description">
         Search runs only after your explicit approval. Its result can be attached to your next
         immutable chat branch.
@@ -123,7 +129,7 @@ export function ToolLauncher({ open, close, insert }: {
                 className="primary"
                 onClick={() => {
                   insert(execution);
-                  close();
+                  dismiss();
                 }}
               >
                 <Check size={16} /> Add to next message

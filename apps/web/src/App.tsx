@@ -967,7 +967,10 @@ function Composer(
   }, []);
   useEffect(() => {
     setExcludedEditAttachments(new Set());
-    if (edit) setValue(edit.content);
+    if (edit) {
+      setValue(edit.content);
+      setToolContexts((edit.toolExecutionIds ?? []).map((id) => ({ id })));
+    }
   }, [edit]);
   const retainedAttachments = (edit?.attachments ?? []).filter((attachment) =>
     !excludedEditAttachments.has(attachment.id)

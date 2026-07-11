@@ -211,9 +211,9 @@ Deno.test("startup recovery completes a persisted approval reservation before di
   let calls = 0;
   const service = new ToolExecutionService(store, [{
     ...echoAdapter,
-    execute: async () => {
+    execute: () => {
       calls++;
-      return { recovered: true };
+      return Promise.resolve({ recovered: true });
     },
   }], {
     reserve: () => {

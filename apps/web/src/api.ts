@@ -119,6 +119,9 @@ export function mapConversation(value: RawConversation): Conversation {
   };
 }
 export function mapMessage(value: RawMessage): Message {
+  const toolExecutionIds = Array.isArray(value.metadata?.toolExecutionIds)
+    ? value.metadata.toolExecutionIds.filter((id): id is string => typeof id === "string")
+    : [];
   const duration = typeof value.metadata?.durationMs === "number"
     ? `${value.metadata.durationMs}ms`
     : undefined;
@@ -147,7 +150,9 @@ export function mapMessage(value: RawMessage): Message {
     supersedesId: value.supersedesId,
     siblingIndex: value.siblingIndex,
     role: value.role === "assistant" ? "assistant" : "user",
-    content: value.content,
+    content: value.role === "user" && typeof value.metadata?.authoredContent === "string"
+      ? value.metadata.authoredContent
+      : value.content,
     createdAtIso: value.createdAt,
     createdAt: new Date(value.createdAt).toLocaleTimeString([], {
       hour: "2-digit",
@@ -157,6 +162,7 @@ export function mapMessage(value: RawMessage): Message {
     latency: [duration, tokens].filter(Boolean).join(" · ") || undefined,
     reasoning,
     toolStatus: toolCalls ? `${toolCalls} tool call${toolCalls === 1 ? "" : "s"}` : undefined,
+    toolExecutionIds,
     knowledgeSources,
     status: value.status ?? "complete",
     attachments: value.attachments,

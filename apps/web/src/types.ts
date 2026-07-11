@@ -36,6 +36,7 @@ export interface Message {
   latency?: string;
   reasoning?: string;
   toolStatus?: string;
+  toolExecutionIds?: string[];
   knowledgeSources?: Array<{ label: string; collectionName: string; filename: string }>;
   status?: "complete" | "stopped" | "error";
   branch?: Branch;
