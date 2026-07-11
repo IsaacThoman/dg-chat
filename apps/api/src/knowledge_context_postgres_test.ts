@@ -50,7 +50,14 @@ Deno.test({
         id: crypto.randomUUID(),
         ordinal: 0,
         content: "Postgres turbine runbook",
-        metadata: {},
+        metadata: {
+          sourceAttachmentId: attachment.id,
+          filename: attachment.filename,
+          mimeType: attachment.mimeType,
+          sha256: attachment.sha256,
+          extractorVersion: "builtin-document-v1",
+          chunkerVersion: "character-overlap-v1",
+        },
       }]);
       await repo.linkKnowledgeAttachment(collection.id, attachment.id, owner.id, 1);
       await repo.bindKnowledgeCollection(conversation.id, collection.id, owner.id, "full_context");

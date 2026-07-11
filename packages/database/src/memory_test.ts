@@ -1705,12 +1705,27 @@ Deno.test("text ingestion is separate, idempotent, replaceable, retryable, and o
     id: "00000000-0000-8000-8000-000000000001",
     ordinal: 0,
     content: "hello",
-    metadata: { sourceAttachmentId: created.attachment.id, startLine: 1, endLine: 1 },
+    metadata: {
+      sourceAttachmentId: created.attachment.id,
+      extractorVersion: "plain-text-v2",
+      chunkerVersion: "character-window-v1",
+      pageNumber: 2,
+      pageLabel: "ii",
+      section: "Introduction",
+      sectionPath: ["Guide", "Introduction"],
+      startLine: 1,
+      endLine: 1,
+    },
   }];
   repo.completeAttachmentIngestion(created.attachment.id, owner.id, first);
   assertEquals(repo.listDocumentChunks(created.attachment.id, owner.id), [
     { ...first[0], attachmentId: created.attachment.id },
   ]);
+  first[0].metadata.section = "mutated by caller";
+  assertEquals(
+    repo.listDocumentChunks(created.attachment.id, owner.id)[0].metadata.section,
+    "Introduction",
+  );
   assertThrows(
     () => repo.listDocumentChunks(created.attachment.id, stranger.id),
     DomainError,
@@ -1722,6 +1737,16 @@ Deno.test("text ingestion is separate, idempotent, replaceable, retryable, and o
       repo.completeAttachmentIngestion(created.attachment.id, owner.id, [{
         ...first[0],
         ordinal: 1,
+      }]),
+    DomainError,
+    "invalid",
+  );
+  assertThrows(
+    () =>
+      repo.completeAttachmentIngestion(created.attachment.id, owner.id, [{
+        ...first[0],
+        ordinal: 0,
+        metadata: { ...first[0].metadata, pageNumber: 0 },
       }]),
     DomainError,
     "invalid",
@@ -1746,6 +1771,90 @@ Deno.test("text ingestion is separate, idempotent, replaceable, retryable, and o
     DomainError,
     "not found",
   );
+});
+
+Deno.test("PDF and DOCX ingestion eligibility queues and retries while unsupported Office fails closed", () => {
+  const repo = new MemoryRepository();
+  const owner = repo.createUser({
+    email: "formats@example.com",
+    name: "Formats",
+    passwordHash: "x",
+  });
+  const stranger = repo.createUser({
+    email: "formats-stranger@example.com",
+    name: "Stranger",
+    passwordHash: "x",
+  });
+  const eligible = [
+    ["application/pdf", "document.pdf"],
+    ["application/vnd.openxmlformats-officedocument.wordprocessingml.document", "document.docx"],
+  ] as const;
+  for (const [index, [mimeType, filename]] of eligible.entries()) {
+    let attachment = repo.createAttachment({
+      ownerId: owner.id,
+      objectKey: `uploads/${owner.id}/${filename}`,
+      filename,
+      mimeType,
+      sizeBytes: 10,
+      sha256: crypto.randomUUID().replaceAll("-", "").padEnd(64, "0"),
+      state: index === 0 ? "ready" : "pending",
+    }).attachment;
+    if (index === 1) {
+      repo.transitionAttachment(attachment.id, owner.id, "pending", "inspecting");
+      attachment = repo.transitionAttachment(
+        attachment.id,
+        owner.id,
+        "inspecting",
+        "ready",
+      );
+    }
+    assertEquals(attachment.ingestionStatus, "queued");
+    assertThrows(
+      () => repo.beginAttachmentIngestion(attachment.id, stranger.id),
+      DomainError,
+      "not found",
+    );
+    assertEquals(
+      repo.beginAttachmentIngestion(attachment.id, owner.id).ingestionStatus,
+      "processing",
+    );
+    assertEquals(
+      repo.failAttachmentIngestion(attachment.id, owner.id, "extract failed").ingestionStatus,
+      "failed",
+    );
+    assertThrows(
+      () => repo.retryAttachmentIngestion(attachment.id, stranger.id),
+      DomainError,
+      "not found",
+    );
+    assertEquals(repo.retryAttachmentIngestion(attachment.id, owner.id).ingestionStatus, "queued");
+  }
+  assertEquals(repo.listJobs().filter((job) => job.type === "attachment.ingest").length, 2);
+
+  for (
+    const mimeType of [
+      "application/vnd.ms-word.document.macroEnabled.12",
+      "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ]
+  ) {
+    const attachment = repo.createAttachment({
+      ownerId: owner.id,
+      objectKey: `uploads/${owner.id}/${crypto.randomUUID()}`,
+      filename: "unsupported.office",
+      mimeType,
+      sizeBytes: 10,
+      sha256: crypto.randomUUID().replaceAll("-", "").padEnd(64, "0"),
+      state: "ready",
+    }).attachment;
+    assertEquals(attachment.ingestionStatus, "not_applicable");
+    assertThrows(
+      () => repo.beginAttachmentIngestion(attachment.id, owner.id),
+      DomainError,
+      "cannot be ingested",
+    );
+  }
+  assertEquals(repo.listJobs().filter((job) => job.type === "attachment.ingest").length, 2);
 });
 
 Deno.test("ledger reserve settle and refund are idempotent", () => {
