@@ -1,4 +1,9 @@
-import { assertEquals, assertRejects, assertStringIncludes } from "jsr:@std/assert@1.0.14";
+import {
+  assertEquals,
+  assertRejects,
+  assertStringIncludes,
+  assertThrows,
+} from "jsr:@std/assert@1.0.14";
 import { DomainError, MemoryRepository } from "@dg-chat/database";
 import { buildKnowledgeContext } from "./knowledge-context.ts";
 
@@ -90,5 +95,39 @@ Deno.test("knowledge context is strictly owner scoped", async () => {
     () => buildKnowledgeContext(repo, conversation.id, other.id, "anything"),
     DomainError,
     "not found",
+  );
+});
+
+Deno.test("knowledge context uses a versioned vector match when lexical search misses", async () => {
+  const { repo, owner, other, conversation } = fixture("retrieval");
+  const chunks = [...repo.documentChunks.values()].flat();
+  const target = chunks[1];
+  const vector = Array(1536).fill(0);
+  vector[7] = 1;
+  repo.upsertDocumentChunkEmbeddings([{
+    chunkId: target.id,
+    ownerId: owner.id,
+    model: "embed-test",
+    version: "embed-v1",
+    contentSha256: "b".repeat(64),
+    embedding: vector,
+  }]);
+  const result = await buildKnowledgeContext(repo, conversation.id, owner.id, "spaceship", {
+    queryEmbedding: vector,
+    embeddingVersion: "embed-v1",
+  });
+  assertEquals(result.sources.map((source) => source.chunkId), [target.id]);
+  assertEquals(result.sources[0].score! > 0.5, true);
+  assertThrows(
+    () =>
+      repo.upsertDocumentChunkEmbeddings([{
+        chunkId: target.id,
+        ownerId: other.id,
+        model: "embed-test",
+        version: "embed-v1",
+        contentSha256: "b".repeat(64),
+        embedding: vector,
+      }]),
+    DomainError,
   );
 });

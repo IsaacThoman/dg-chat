@@ -19,34 +19,28 @@ export interface KnowledgeContext {
   includedCharacters: number;
 }
 
-const words = (value: string) =>
-  new Set(value.toLocaleLowerCase().match(/[\p{L}\p{N}]{2,}/gu) ?? []);
-
-function lexicalScore(query: Set<string>, content: string) {
-  if (!query.size) return 0;
-  const terms = words(content);
-  let matches = 0;
-  for (const term of query) if (terms.has(term)) matches++;
-  return matches / Math.sqrt(Math.max(1, terms.size));
-}
-
 /** Builds owner-scoped, deterministic local document context for web generation. */
 export async function buildKnowledgeContext(
   repo: DomainRepository,
   conversationId: string,
   ownerId: string,
   query: string,
-  options: { maxCharacters?: number; retrievalTopK?: number } = {},
+  options: {
+    maxCharacters?: number;
+    retrievalTopK?: number;
+    queryEmbedding?: number[];
+    embeddingVersion?: string;
+  } = {},
 ): Promise<KnowledgeContext> {
   const maxCharacters = Math.max(0, Math.min(options.maxCharacters ?? 32_000, 128_000));
   const retrievalTopK = Math.max(1, Math.min(options.retrievalTopK ?? 12, 50));
   if (!maxCharacters) return { sources: [], includedCharacters: 0 };
 
-  const queryTerms = words(query);
   const candidates: Array<LocalKnowledgeSource & { content: string; score: number }> = [];
   const bindings = (await repo.listConversationKnowledge(conversationId, ownerId))
     .slice().sort((a, b) => a.collectionId.localeCompare(b.collectionId));
   for (const binding of bindings) {
+    if (binding.mode === "retrieval") continue;
     // Every lookup carries ownerId. Repositories reject cross-owner and deleted records.
     const collection = await repo.getKnowledgeCollection(binding.collectionId, ownerId);
     const attachments = (await repo.listKnowledgeAttachments(collection.id, ownerId))
@@ -67,16 +61,37 @@ export async function buildKnowledgeContext(
           chunkId: chunk.id,
           ordinal: chunk.ordinal,
           content,
-          score: binding.mode === "retrieval" ? lexicalScore(queryTerms, content) : 0,
+          score: 0,
         });
       }
     }
   }
 
+  const retrievalHits = await repo.searchConversationKnowledge({
+    conversationId,
+    ownerId,
+    query,
+    queryEmbedding: options.queryEmbedding,
+    embeddingVersion: options.embeddingVersion,
+    limit: retrievalTopK,
+  });
+  for (const hit of retrievalHits) {
+    candidates.push({
+      label: "",
+      mode: "retrieval",
+      collectionId: hit.collectionId,
+      collectionName: hit.collectionName,
+      attachmentId: hit.attachmentId,
+      filename: hit.filename,
+      chunkId: hit.id,
+      ordinal: hit.ordinal,
+      content: hit.content.trim(),
+      score: hit.score,
+    });
+  }
+
   const full = candidates.filter((item) => item.mode === "full_context");
-  const retrieval = candidates.filter((item) =>
-    item.mode === "retrieval" && (!queryTerms.size || item.score > 0)
-  )
+  const retrieval = candidates.filter((item) => item.mode === "retrieval" && item.score > 0)
     .sort((a, b) =>
       b.score - a.score || a.collectionId.localeCompare(b.collectionId) ||
       a.attachmentId.localeCompare(b.attachmentId) || a.ordinal - b.ordinal ||

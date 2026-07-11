@@ -11,7 +11,11 @@ import type {
   UserRole,
 } from "@dg-chat/contracts";
 import { isIngestibleDocumentMime } from "./attachment-policy.ts";
-import { validateDocumentChunkInputs } from "./repository.ts";
+import {
+  normalizeKnowledgeSearchLimit,
+  validateChunkEmbeddings,
+  validateDocumentChunkInputs,
+} from "./repository.ts";
 import type {
   ApiIdempotencyEndpoint,
   ApiIdempotencyRequest,
@@ -39,10 +43,16 @@ import type {
   CreateProviderRetryPolicyInput,
   CreateUserInput,
   DocumentChunk,
+  DocumentChunkEmbeddingInput,
   DocumentChunkInput,
+  EmbeddingProviderAttemptInput,
+  EnsureIdempotentReservationInput,
+  EnsureUsageReservationInput,
   FailApiRequestInput,
   FailGenerationInput,
+  FinalizeEmbeddingProviderUsageInput,
   FinalizeProviderUsageInput,
+  FinishEmbeddingProviderAttemptInput,
   FinishProviderAttemptInput,
   GenerationControl,
   GenerationResult,
@@ -51,6 +61,7 @@ import type {
   KnowledgeCollectionPatch,
   KnowledgeConversationBinding,
   KnowledgeRetrievalMode,
+  KnowledgeSearchHit,
   ModelPriceVersion,
   ProviderAttempt,
   ProviderCredentialEnvelope,
@@ -63,6 +74,8 @@ import type {
   ProviderRetryPolicy,
   RegistryMutationContext,
   ReplaceConversationKnowledgeInput,
+  ReserveChildProviderUsageInput,
+  SearchConversationKnowledgeInput,
   SessionSummary,
   SetProviderModelRouteInput,
   StartProviderAttemptInput,
@@ -103,6 +116,7 @@ export interface UsageRun {
   id: string;
   userId: string;
   model: string;
+  provider: string;
   status: "reserved" | "completed" | "failed";
   reservedMicros: number;
   costMicros: number;
@@ -139,6 +153,34 @@ function validateDocumentChunks(
   } catch {
     throw new DomainError("invalid_document_chunks", "Document chunks are invalid", 422);
   }
+}
+
+const knowledgeTerms = (value: string) =>
+  new Set(value.toLocaleLowerCase().match(/[\p{L}\p{N}]{2,}/gu) ?? []);
+
+function memoryLexicalScore(query: Set<string>, content: string): number {
+  if (!query.size) return 1;
+  const contentTerms = knowledgeTerms(content);
+  let matches = 0;
+  for (const term of query) if (contentTerms.has(term)) matches++;
+  return matches / Math.sqrt(Math.max(1, contentTerms.size));
+}
+
+function cosineSimilarity(left: number[], right: number[]): number | null {
+  if (left.length !== right.length || !left.length) return null;
+  let dot = 0;
+  let leftNorm = 0;
+  let rightNorm = 0;
+  for (let index = 0; index < left.length; index++) {
+    dot += left[index] * right[index];
+    leftNorm += left[index] ** 2;
+    rightNorm += right[index] ** 2;
+  }
+  return leftNorm && rightNorm ? dot / Math.sqrt(leftNorm * rightNorm) : null;
+}
+
+function hybridScore(lexical: number, vector: number | null): number {
+  return lexical * 0.45 + (vector === null ? 0 : Math.max(0, vector) * 0.55);
 }
 
 interface StoredProvider extends ProviderRecord {
@@ -351,6 +393,15 @@ export class MemoryRepository {
   readonly attachments = new Map<string, AttachmentRecord>();
   readonly messageAttachments = new Map<string, Set<string>>();
   readonly documentChunks = new Map<string, DocumentChunk[]>();
+  readonly documentChunkEmbeddings = new Map<string, DocumentChunkEmbeddingInput>();
+  readonly embeddingProviderAttempts = new Map<
+    string,
+    EmbeddingProviderAttemptInput & {
+      status: "running" | "succeeded" | "failed" | "cancelled";
+      inputTokens: number;
+      costMicros: number;
+    }
+  >();
   readonly knowledgeCollections = new Map<string, KnowledgeCollection>();
   readonly knowledgeAttachments = new Map<string, Set<string>>();
   readonly knowledgeBindings = new Map<string, KnowledgeConversationBinding>();
@@ -1573,6 +1624,145 @@ export class MemoryRepository {
   listDocumentChunks(id: string, ownerId: string) {
     this.getAttachment(id, ownerId);
     return [...(this.documentChunks.get(id) ?? [])].sort((a, b) => a.ordinal - b.ordinal);
+  }
+
+  upsertDocumentChunkEmbeddings(values: DocumentChunkEmbeddingInput[]) {
+    const validated = validateChunkEmbeddings(values);
+    for (const value of validated) {
+      const chunk = [...this.documentChunks.values()].flat().find((item) =>
+        item.id === value.chunkId
+      );
+      if (!chunk) throw new DomainError("not_found", "Document chunk not found", 404);
+      const attachment = this.getAttachment(chunk.attachmentId, value.ownerId);
+      if (attachment.ownerId !== value.ownerId) {
+        throw new DomainError("not_found", "Document chunk not found", 404);
+      }
+      this.documentChunkEmbeddings.set(`${value.chunkId}:${value.version}`, {
+        ...value,
+        embedding: [...value.embedding],
+      });
+    }
+    return validated.length;
+  }
+
+  startEmbeddingProviderAttempt(input: EmbeddingProviderAttemptInput): void {
+    if (this.embeddingProviderAttempts.has(input.usageRunId)) {
+      throw new DomainError("idempotency_conflict", "Embedding attempt already exists", 409);
+    }
+    this.embeddingProviderAttempts.set(input.usageRunId, {
+      ...structuredClone(input),
+      status: "running",
+      inputTokens: 0,
+      costMicros: 0,
+    });
+  }
+
+  finishEmbeddingProviderAttempt(input: FinishEmbeddingProviderAttemptInput): void {
+    const attempt = this.embeddingProviderAttempts.get(input.usageRunId);
+    if (
+      attempt?.status === input.status && attempt.inputTokens === input.inputTokens &&
+      attempt.costMicros === input.costMicros
+    ) return;
+    if (!attempt || attempt.status !== "running") {
+      throw new DomainError("invalid_usage_state", "Embedding attempt is not running", 409);
+    }
+    attempt.status = input.status;
+    attempt.inputTokens = input.inputTokens;
+    attempt.costMicros = input.costMicros;
+  }
+
+  finalizeEmbeddingProviderUsage(input: FinalizeEmbeddingProviderUsageInput): UsageRun {
+    const usage = this.usageRuns.get(input.usageRunId);
+    const attempt = this.embeddingProviderAttempts.get(input.usageRunId);
+    if (!usage || !attempt) {
+      throw new DomainError("not_found", "Embedding accounting state was not found", 404);
+    }
+    const expectedRunStatus = input.status === "succeeded" ? "completed" : "failed";
+    if (usage.status === expectedRunStatus && attempt.status === input.status) {
+      if (
+        usage.costMicros !== input.costMicros || usage.inputTokens !== input.inputTokens ||
+        attempt.costMicros !== input.costMicros || attempt.inputTokens !== input.inputTokens
+      ) throw new DomainError("idempotency_conflict", "Embedding terminal result differs", 409);
+      return structuredClone(usage);
+    }
+    if (
+      usage.status === "completed" && attempt.status === "running" && input.status === "succeeded"
+    ) {
+      if (usage.costMicros !== input.costMicros || usage.inputTokens !== input.inputTokens) {
+        throw new DomainError("idempotency_conflict", "Embedding terminal result differs", 409);
+      }
+      this.finishEmbeddingProviderAttempt(input);
+      return structuredClone(usage);
+    }
+    if (usage.status !== "reserved" || attempt.status !== "running") {
+      throw new DomainError("invalid_usage_state", "Embedding accounting is not active", 409);
+    }
+    if (input.status === "succeeded") {
+      this.settle(
+        input.usageRunId,
+        input.costMicros,
+        input.inputTokens,
+        0,
+        input.latencyMs,
+      );
+    } else {
+      if (input.costMicros > usage.reservedMicros) {
+        throw new DomainError(
+          "invalid_usage_state",
+          "Embedding cost exceeded its reservation",
+          409,
+        );
+      }
+      const delta = usage.reservedMicros - input.costMicros;
+      if (delta !== 0) this.credit(usage.userId, usage.id, "refund", delta);
+      usage.status = "failed";
+      usage.costMicros = input.costMicros;
+      usage.inputTokens = input.inputTokens;
+      usage.outputTokens = 0;
+      usage.latencyMs = input.latencyMs;
+      usage.runLeaseToken = null;
+      usage.runLeaseExpiresAt = null;
+      this.finishEmbeddingProviderAttempt(input);
+      return structuredClone(usage);
+    }
+    this.finishEmbeddingProviderAttempt(input);
+    return structuredClone(this.usageRuns.get(input.usageRunId)!);
+  }
+
+  searchConversationKnowledge(input: SearchConversationKnowledgeInput): KnowledgeSearchHit[] {
+    const limit = normalizeKnowledgeSearchLimit(input.limit);
+    const terms = knowledgeTerms(input.query);
+    const hits: KnowledgeSearchHit[] = [];
+    for (const binding of this.listConversationKnowledge(input.conversationId, input.ownerId)) {
+      if (binding.mode !== "retrieval") continue;
+      const collection = this.getKnowledgeCollection(binding.collectionId, input.ownerId);
+      for (const attachment of this.listKnowledgeAttachments(collection.id, input.ownerId)) {
+        for (const chunk of this.listDocumentChunks(attachment.id, input.ownerId)) {
+          const lexicalScore = memoryLexicalScore(terms, chunk.content);
+          const stored = input.embeddingVersion
+            ? this.documentChunkEmbeddings.get(`${chunk.id}:${input.embeddingVersion}`)
+            : undefined;
+          const vectorScore = stored && input.queryEmbedding
+            ? cosineSimilarity(input.queryEmbedding, stored.embedding)
+            : null;
+          if (lexicalScore <= 0 && vectorScore === null) continue;
+          hits.push({
+            ...chunk,
+            collectionId: collection.id,
+            collectionName: collection.name,
+            filename: attachment.filename,
+            lexicalScore,
+            vectorScore,
+            score: hybridScore(lexicalScore, vectorScore),
+          });
+        }
+      }
+    }
+    return hits.sort((a, b) =>
+      b.score - a.score || a.collectionId.localeCompare(b.collectionId) ||
+      a.attachmentId.localeCompare(b.attachmentId) || a.ordinal - b.ordinal ||
+      a.id.localeCompare(b.id)
+    ).slice(0, limit);
   }
 
   createKnowledgeCollection(ownerId: string, input: CreateKnowledgeCollectionInput) {
@@ -2880,6 +3070,97 @@ export class MemoryRepository {
     return this.finalizeProviderUsage(input, true);
   }
 
+  reserveChildProviderUsage(input: ReserveChildProviderUsageInput): UsageRun {
+    const parent = this.usageRuns.get(input.parentUsageRunId);
+    const apiLeaseValid = [...this.apiIdempotencyRequests.values()].some((request) =>
+      request.usageRunId === input.parentUsageRunId && request.state === "in_progress" &&
+      request.leaseToken === input.parentOwnerLeaseToken && request.leaseExpiresAt !== null &&
+      Date.parse(request.leaseExpiresAt) > Date.now()
+    );
+    const leaseValid = parent?.status === "reserved" && (
+      (parent.runLeaseToken === input.parentOwnerLeaseToken && parent.runLeaseExpiresAt !== null &&
+        Date.parse(parent.runLeaseExpiresAt) > Date.now()) ||
+      (parent.generationLeaseToken === input.parentOwnerLeaseToken &&
+        parent.generationLeaseExpiresAt !== null &&
+        Date.parse(parent.generationLeaseExpiresAt) > Date.now()) ||
+      apiLeaseValid
+    );
+    if (!leaseValid || !parent) {
+      throw new DomainError("stale_lease", "Parent provider execution lease is stale", 409);
+    }
+    return this.reserve(
+      parent.userId,
+      input.runId,
+      input.model,
+      input.reserveMicros,
+      input.provider,
+      undefined,
+      input.pricingSnapshot,
+    );
+  }
+
+  ensureUsageReservation(input: EnsureUsageReservationInput): UsageRun {
+    if (!Number.isSafeInteger(input.requiredMicros) || input.requiredMicros < 0) {
+      throw new DomainError("validation_error", "Usage reservation requirement is invalid", 422);
+    }
+    const run = this.usageRuns.get(input.usageRunId);
+    const apiLeaseValid = [...this.apiIdempotencyRequests.values()].some((request) =>
+      request.usageRunId === input.usageRunId && request.state === "in_progress" &&
+      request.leaseToken === input.ownerLeaseToken && request.leaseExpiresAt !== null &&
+      Date.parse(request.leaseExpiresAt) > Date.now()
+    );
+    const leaseValid = run?.status === "reserved" && (
+      (run.runLeaseToken === input.ownerLeaseToken && run.runLeaseExpiresAt !== null &&
+        Date.parse(run.runLeaseExpiresAt) > Date.now()) ||
+      (run.generationLeaseToken === input.ownerLeaseToken &&
+        run.generationLeaseExpiresAt !== null &&
+        Date.parse(run.generationLeaseExpiresAt) > Date.now()) ||
+      apiLeaseValid
+    );
+    if (!run || !leaseValid) {
+      throw new DomainError("stale_lease", "Usage reservation lease is stale", 409);
+    }
+    if (run.reservedMicros >= input.requiredMicros) return structuredClone(run);
+    const delta = input.requiredMicros - run.reservedMicros;
+    const user = this.users.get(run.userId)!;
+    if (user.balanceMicros < delta) {
+      throw new DomainError("insufficient_credit", "Insufficient credit for expanded input", 402);
+    }
+    user.balanceMicros -= delta;
+    run.reservedMicros = input.requiredMicros;
+    this.ledger.push({
+      id: crypto.randomUUID(),
+      userId: run.userId,
+      usageRunId: run.id,
+      kind: "reserve",
+      amountMicros: -delta,
+      balanceAfterMicros: user.balanceMicros,
+      createdAt: new Date().toISOString(),
+    });
+    return structuredClone(run);
+  }
+
+  ensureIdempotentReservation(input: EnsureIdempotentReservationInput): UsageRun {
+    const existing = this.usageRuns.get(input.usageRunId);
+    if (!existing) {
+      return this.reserve(
+        input.userId,
+        input.usageRunId,
+        input.model,
+        input.reservedMicros,
+        input.provider,
+      );
+    }
+    if (
+      existing.userId !== input.userId || existing.model !== input.model ||
+      existing.provider !== input.provider ||
+      existing.reservedMicros !== input.reservedMicros || existing.status !== "reserved"
+    ) {
+      throw new DomainError("idempotency_conflict", "Existing reservation does not match", 409);
+    }
+    return structuredClone(existing);
+  }
+
   createApiToken(
     userId: string,
     input: {
@@ -2950,7 +3231,7 @@ export class MemoryRepository {
     runId: string,
     model: string,
     amountMicros: number,
-    _provider = "unknown",
+    provider = "unknown",
     _tokenId?: string,
     pricingSnapshot?: UsagePricingSnapshot,
   ) {
@@ -2970,6 +3251,7 @@ export class MemoryRepository {
       id: runId,
       userId,
       model,
+      provider,
       status: "reserved",
       reservedMicros: amountMicros,
       costMicros: 0,
@@ -3030,6 +3312,16 @@ export class MemoryRepository {
   refund(runId: string) {
     const run = this.usageRuns.get(runId);
     if (!run || run.status !== "reserved") return run;
+    const embeddingAttempt = this.embeddingProviderAttempts.get(runId);
+    if (embeddingAttempt?.status === "running") {
+      embeddingAttempt.status = "cancelled";
+      embeddingAttempt.costMicros = run.reservedMicros;
+      run.status = "failed";
+      run.costMicros = run.reservedMicros;
+      run.runLeaseToken = null;
+      run.runLeaseExpiresAt = null;
+      return run;
+    }
     if (run.executionEpoch > 0) {
       const cost = this.authoritativeProviderCost(run);
       this.finalizeAccountingUnknownAttempts(run.id);

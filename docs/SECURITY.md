@@ -74,3 +74,28 @@ revocation.
 Do not open a public issue containing an exploit, secret, user data, or provider payload. Contact
 the maintainer privately with affected versions, reproduction steps, impact, and suggested
 mitigation. Rotate exposed credentials immediately and preserve sanitized audit evidence.
+
+## Web search and tool execution
+
+Tool adapters fail closed: registering an adapter does not make it available. An administrator must
+explicitly allowlist it, and every user invocation is persisted through the `ToolExecutionStore`
+boundary in `pending_approval` until that same user approves it. Revocation is checked again at
+approval time. Running adapters receive an `AbortSignal`; cancellation is a terminal compare-and-set
+transition so late results cannot replace it.
+
+The built-in SearXNG adapter rejects URL credentials, unexpected ports, redirects, non-HTTP schemes,
+mixed public/private DNS answers, private/link-local/loopback/documentation addresses, wrong
+response MIME types, oversized responses, and malformed JSON. Private-network access requires the
+deployment setting and still requires the admin tool policy to allow private networking and the
+exact endpoint domain. Returned result links are never fetched by the adapter.
+
+The default Compose deployment pins SearXNG by multi-platform image digest, exposes it only on the
+private backend network, mounts a read-only JSON-enabled configuration, drops all capabilities, and
+runs with a read-only root filesystem. It is registered as an adapter, not automatically
+allowlisted: an administrator must allow the `searxng` domain and private-network access before
+users can request searches.
+
+`MemoryToolExecutionStore` is intended for development and tests. Production deployments must inject
+a durable `ToolExecutionStore` implementation before tool execution is considered production-ready;
+the interface includes atomic state transitions and optimistic policy versions so PostgreSQL can be
+added without changing API or execution semantics.

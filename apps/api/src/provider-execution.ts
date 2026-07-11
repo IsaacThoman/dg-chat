@@ -11,6 +11,7 @@ import type {
 } from "@dg-chat/database";
 import { DomainError } from "@dg-chat/database";
 import type { ChatCompletionRequest } from "@dg-chat/contracts";
+import { Buffer } from "node:buffer";
 import { type ProviderSecretEnvelope, ProviderSecretKeyring } from "./provider-secrets.ts";
 import { complete, streamChatCompletion, type UpstreamStreamOptions } from "./models.ts";
 import {
@@ -37,6 +38,15 @@ import {
   type EmbeddingsResponse,
   type ProviderFetch,
 } from "./embeddings.ts";
+import {
+  interceptOcrImages,
+  MemoryOcrCache,
+  type OcrCache,
+  type OcrRecognize,
+  parseOcrInterceptionConfig,
+} from "./ocr-interception.ts";
+
+const OCR_MAX_OUTPUT_TOKENS = 4_096;
 
 type Completion = Awaited<ReturnType<typeof complete>>;
 
@@ -71,6 +81,16 @@ export interface ProviderExecutionOptions {
   stream?: typeof streamChatCompletion;
   embeddingsFetch?: ProviderFetch;
   now?: () => number;
+  ocrCache?: OcrCache;
+  ocrFetch?: typeof fetch;
+  /** Accounting-aware installations can replace the direct OCR provider call with a child run. */
+  ocrRecognize?: (
+    input: Parameters<OcrRecognize>[0] & {
+      sourceModelId: string;
+      parentUsageRunId: string;
+      ownerLeaseToken: string;
+    },
+  ) => ReturnType<OcrRecognize>;
   slowStream?: {
     windowMs: number;
     minimumVisibleUnitsPerSecond: number;
@@ -324,6 +344,9 @@ export class ProviderExecutionEngine {
   readonly #embeddingsFetch?: ProviderFetch;
   readonly #now: () => number;
   readonly #slowStream?: ProviderExecutionOptions["slowStream"];
+  readonly #ocrCache: OcrCache;
+  readonly #ocrFetch?: typeof fetch;
+  readonly #ocrRecognize?: ProviderExecutionOptions["ocrRecognize"];
 
   constructor(options: ProviderExecutionOptions) {
     this.#repository = options.repository;
@@ -335,6 +358,9 @@ export class ProviderExecutionEngine {
     this.#embeddingsFetch = options.embeddingsFetch;
     this.#now = options.now ?? Date.now;
     this.#slowStream = options.slowStream;
+    this.#ocrCache = options.ocrCache ?? new MemoryOcrCache(options.now);
+    this.#ocrFetch = options.ocrFetch;
+    this.#ocrRecognize = options.ocrRecognize;
     if (this.#slowStream) {
       if (
         !Number.isSafeInteger(this.#slowStream.windowMs) || this.#slowStream.windowMs < 250 ||
@@ -348,6 +374,121 @@ export class ProviderExecutionEngine {
 
   async resolvePlan(sourceModelId: string): Promise<ProviderExecutionPlan> {
     return await this.#repository.resolveProviderExecutionPlan(sourceModelId);
+  }
+
+  async #interceptOcr(
+    sourceModelId: string,
+    parentUsageRunId: string,
+    ownerLeaseToken: string,
+    request: ChatCompletionRequest,
+    signal: AbortSignal,
+    plan: ProviderExecutionPlan,
+  ): Promise<ChatCompletionRequest> {
+    const source = await this.#repository.findProviderModel(sourceModelId);
+    const config = parseOcrInterceptionConfig(source?.customParams);
+    if (!config) return request;
+    const rewritten = await interceptOcrImages(request, config, {
+      cache: this.#ocrCache,
+      ...(this.#ocrFetch ? { fetch: this.#ocrFetch } : {}),
+      recognize: async (input) => {
+        if (this.#ocrRecognize) {
+          return await this.#ocrRecognize({
+            ...input,
+            sourceModelId,
+            parentUsageRunId,
+            ownerLeaseToken,
+          });
+        }
+        const { providerId, model, prompt, image, signal } = input;
+        const provider = await this.#repository.findProvider(providerId);
+        const ocrModel = await this.#repository.findProviderModel(model);
+        if (
+          !provider?.enabled || !ocrModel?.enabled || ocrModel.providerId !== provider.id ||
+          !ocrModel.capabilities.includes("vision")
+        ) throw new Error("Configured OCR provider/model is unavailable or lacks vision support");
+        const encoded = Buffer.from(image.bytes).toString("base64");
+        const ocrRequest: ChatCompletionRequest = {
+          model: ocrModel.publicModelId,
+          max_tokens: OCR_MAX_OUTPUT_TOKENS,
+          messages: [{
+            role: "user",
+            content: [
+              { type: "text", text: prompt },
+              {
+                type: "image_url",
+                image_url: { url: `data:${image.mime};base64,${encoded}`, detail: "high" },
+              },
+            ],
+          }],
+        };
+        if (parseOcrInterceptionConfig(ocrModel.customParams)) {
+          throw new Error("Configured OCR model cannot recursively enable OCR interception");
+        }
+        const plan = await this.resolvePlan(ocrModel.id);
+        const runId = crypto.randomUUID();
+        const reserveMicros = this.reservationMicros(
+          plan,
+          estimateInputTokens(ocrRequest),
+          OCR_MAX_OUTPUT_TOKENS,
+        );
+        const run = await this.#repository.reserveChildProviderUsage({
+          parentUsageRunId,
+          parentOwnerLeaseToken: ownerLeaseToken,
+          runId,
+          model: ocrModel.publicModelId,
+          provider: `ocr:${provider.slug}`,
+          reserveMicros,
+          pricingSnapshot: plan.targets[0].pricing,
+        });
+        const childLease = run.runLeaseToken;
+        if (!childLease) throw new Error("OCR usage reservation did not create an execution lease");
+        const startedAt = this.#now();
+        let claim: ProviderExecutionClaim | undefined;
+        try {
+          claim = await this.#repository.claimProviderExecution(runId, childLease);
+          const result = await this.complete(
+            ocrModel.id,
+            runId,
+            childLease,
+            ocrRequest,
+            signal,
+            plan,
+          );
+          await this.#repository.settleProviderUsage({
+            usageRunId: runId,
+            ownerLeaseToken: childLease,
+            executionEpoch: claim.executionEpoch,
+            latencyMs: Math.max(0, this.#now() - startedAt),
+          });
+          return result.text;
+        } catch (error) {
+          if (claim) {
+            await Promise.resolve(this.#repository.refundProviderUsage({
+              usageRunId: runId,
+              ownerLeaseToken: childLease,
+              executionEpoch: claim.executionEpoch,
+              latencyMs: Math.max(0, this.#now() - startedAt),
+              error: error instanceof Error ? error.message.slice(0, 1_000) : "OCR failed",
+            })).catch(() => undefined);
+          } else {
+            await this.#repository.refund(runId, "OCR failed before provider execution");
+          }
+          throw error;
+        }
+      },
+    }, signal);
+    const inputTokens = estimateInputTokens(rewritten);
+    const contextRemaining = Math.max(0, source!.contextWindow - inputTokens);
+    const requestedOutput = rewritten.max_completion_tokens ?? rewritten.max_tokens;
+    const boundedOutput = requestedOutput === undefined
+      ? contextRemaining
+      : Math.min(requestedOutput, contextRemaining);
+    await this.#repository.ensureUsageReservation({
+      usageRunId: parentUsageRunId,
+      ownerLeaseToken,
+      requiredMicros: this.reservationMicros(plan, inputTokens, boundedOutput),
+    });
+    return rewritten;
   }
 
   reservationMicros(
@@ -733,6 +874,14 @@ export class ProviderExecutionEngine {
     frozenPlan?: ProviderExecutionPlan,
   ): Promise<Completion> {
     const { plan, candidates } = await this.#prepare(sourceModelId, frozenPlan);
+    request = await this.#interceptOcr(
+      sourceModelId,
+      usageRunId,
+      ownerLeaseToken,
+      request,
+      signal,
+      plan,
+    );
     const claim = await this.#repository.claimProviderExecution(usageRunId, ownerLeaseToken);
     const remainingAttempts = policyFor(plan, undefined, this.#slowStream).maxAttempts -
       claim.consumedAttempts;
@@ -876,6 +1025,14 @@ export class ProviderExecutionEngine {
     frozenPlan?: ProviderExecutionPlan,
   ): AsyncGenerator<string> {
     const { plan, candidates } = await this.#prepare(sourceModelId, frozenPlan);
+    request = await this.#interceptOcr(
+      sourceModelId,
+      usageRunId,
+      ownerLeaseToken,
+      request,
+      signal,
+      plan,
+    );
     const claim = await this.#repository.claimProviderExecution(usageRunId, ownerLeaseToken);
     const remainingAttempts = policyFor(plan, undefined, this.#slowStream).maxAttempts -
       claim.consumedAttempts;

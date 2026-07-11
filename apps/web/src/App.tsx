@@ -69,7 +69,7 @@ import {
   Volume2,
   X,
 } from "lucide-react";
-import { api } from "./api.ts";
+import { api, ApiError } from "./api.ts";
 import {
   conversationForFirstSend,
   mergeAttachmentIds,
@@ -102,6 +102,8 @@ import {
 import { Modal } from "./Modal.tsx";
 import { AdminModels, AdminProviders } from "./AdminRegistry.tsx";
 import { AdminResilience } from "./AdminResilience.tsx";
+import { AdminTools } from "./AdminTools.tsx";
+import { ToolLauncher } from "./ToolLauncher.tsx";
 import { ConversationKnowledgePicker, KnowledgeView } from "./Knowledge.tsx";
 import type {
   Attachment,
@@ -121,6 +123,7 @@ type AdminSection =
   | "providers"
   | "models"
   | "resilience"
+  | "tools"
   | "usage"
   | "jobs"
   | "audit"
@@ -919,7 +922,11 @@ function AttachmentIngestionBadge({ attachment }: { attachment: Attachment }) {
 
 function Composer(
   { onSend, edit, cancelEdit, disabled, streaming, stopping, queuedCount, onStop }: {
-    onSend: (value: string, attachmentIds: string[]) => Promise<boolean>;
+    onSend: (
+      value: string,
+      attachmentIds: string[],
+      toolExecutionIds: string[],
+    ) => Promise<boolean>;
     edit?: Message;
     cancelEdit: () => void;
     disabled: boolean;
@@ -930,6 +937,8 @@ function Composer(
   },
 ) {
   const [value, setValue] = useState("");
+  const [toolsOpen, setToolsOpen] = useState(false);
+  const [toolContexts, setToolContexts] = useState<Array<{ id: string }>>([]);
   const [dragging, setDragging] = useState(false);
   const [selectionError, setSelectionError] = useState("");
   type UploadState =
@@ -958,7 +967,10 @@ function Composer(
   }, []);
   useEffect(() => {
     setExcludedEditAttachments(new Set());
-    if (edit) setValue(edit.content);
+    if (edit) {
+      setValue(edit.content);
+      setToolContexts((edit.toolExecutionIds ?? []).map((id) => ({ id })));
+    }
   }, [edit]);
   const retainedAttachments = (edit?.attachments ?? []).filter((attachment) =>
     !excludedEditAttachments.has(attachment.id)
@@ -1073,14 +1085,16 @@ function Composer(
       item.status === "ready" && item.attachment ? [item.attachment.id] : []
     ),
   );
-  const canSubmit = (value.trim().length > 0 || readyAttachmentIds.length > 0) &&
+  const canSubmit =
+    (value.trim().length > 0 || readyAttachmentIds.length > 0 || toolContexts.length > 0) &&
     !disabled && !blockedByUpload;
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     if (!canSubmit) return;
-    if (await onSend(value.trim(), readyAttachmentIds)) {
+    if (await onSend(value.trim(), readyAttachmentIds, toolContexts.map((context) => context.id))) {
       setValue("");
       setUploads([]);
+      setToolContexts([]);
     }
   };
   return (
@@ -1184,6 +1198,28 @@ function Composer(
           ))}
         </div>
       )}
+      {toolContexts.length > 0 && (
+        <div className="upload-list" aria-label="Approved tool results" aria-live="polite">
+          {toolContexts.map((context) => (
+            <div className="upload-chip upload-ready" key={context.id}>
+              <Globe2 size={18} aria-hidden="true" />
+              <span>
+                <strong>Approved web search</strong>
+                <small>Will be added to this new branch</small>
+              </span>
+              <IconButton
+                label="Remove approved web search result"
+                onClick={() =>
+                  setToolContexts((current) =>
+                    current.filter((item) => item.id !== context.id)
+                  )}
+              >
+                <X size={15} />
+              </IconButton>
+            </div>
+          ))}
+        </div>
+      )}
       {selectionError && <p className="form-error" role="alert">{selectionError}</p>}
       <form className="composer" onSubmit={submit}>
         <textarea
@@ -1225,9 +1261,9 @@ function Composer(
           <button
             type="button"
             className="tool-pill"
-            disabled
-            aria-label="Web search (not available yet)"
-            title="Web search (not available yet)"
+            disabled={disabled}
+            aria-label="Open web search"
+            onClick={() => setToolsOpen(true)}
           >
             <Globe2 size={16} /> Search
           </button>
@@ -1267,6 +1303,11 @@ function Composer(
           </button>
         </div>
       </form>
+      <ToolLauncher
+        open={toolsOpen}
+        close={() => setToolsOpen(false)}
+        insert={(execution) => setToolContexts((current) => [...current, { id: execution.id }])}
+      />
       <p className="composer-note">
         AI can make mistakes. Check important information.{" "}
         <span>
@@ -1477,7 +1518,7 @@ function ChatView({
   balance,
   onConversationCreated,
   onUpdateConversation,
-  readOnly = false,
+  readOnly: readOnlyProp = false,
 }: {
   conversations: Conversation[];
   activeId: string;
@@ -1511,11 +1552,13 @@ function ChatView({
   const [failedPrompt, setFailedPrompt] = useState<QueuedPrompt>();
   const streamAbortRef = useRef<AbortController | null>(null);
   const runPromptRef = useRef<(item: QueuedPrompt) => Promise<void>>(() => Promise.resolve());
+  const branchInFlightRef = useRef(false);
   const [branchBusy, setBranchBusy] = useState(false);
   const [sendError, setSendError] = useState("");
   const [renaming, setRenaming] = useState(false);
   const initialConversation = conversations.find((c) => c.id === activeId);
   const [conversation, setConversation] = useState(initialConversation);
+  const readOnly = readOnlyProp || Boolean(conversation?.archived || conversation?.deleted);
   useEffect(() => setLocalMessages(messages), [messages]);
   useEffect(() => setConversation(initialConversation), [initialConversation]);
   const activePath = useMemo(
@@ -1531,22 +1574,51 @@ function ChatView({
     });
   }, [activeStream?.assistant.content]);
   const selectBranch = async (messageId: string) => {
-    if (!conversation || branchBusy || readOnly) return;
+    if (!conversation || branchInFlightRef.current || readOnly) return;
     const leafId = preferredLeaf(localMessages, messageId);
     if (leafId === conversation.activeLeafId) return;
+    branchInFlightRef.current = true;
     setBranchBusy(true);
     setSendError("");
     try {
       setConversation(await api.setActiveLeaf(conversation, leafId));
-    } catch {
-      const refreshed = await refreshConversationGraph(conversation.id, {
-        load: api.conversationGraph,
-      });
+    } catch (error) {
+      let refreshed: Awaited<ReturnType<typeof api.conversationGraph>>;
+      try {
+        refreshed = await refreshConversationGraph(conversation.id, {
+          load: api.conversationGraph,
+        });
+      } catch (refreshError) {
+        setSendError(
+          refreshError instanceof Error
+            ? refreshError.message
+            : "The latest conversation could not be loaded. Try again.",
+        );
+        return;
+      }
       queryClient.setQueryData(["messages", conversation.id], refreshed.messages);
       setConversation(refreshed.conversation);
       setLocalMessages(refreshed.messages);
+      if (error instanceof ApiError && error.code !== "version_conflict") {
+        setSendError(error.message);
+        return;
+      }
+      if (error instanceof ApiError && error.code === "version_conflict") {
+        const refreshedLeafId = preferredLeaf(refreshed.messages, messageId);
+        if (refreshedLeafId === refreshed.conversation.activeLeafId) return;
+        try {
+          setConversation(await api.setActiveLeaf(refreshed.conversation, refreshedLeafId));
+          return;
+        } catch (retryError) {
+          if (retryError instanceof ApiError && retryError.code !== "version_conflict") {
+            setSendError(retryError.message);
+            return;
+          }
+        }
+      }
       setSendError("That branch changed in another tab. The latest conversation has been loaded.");
     } finally {
+      branchInFlightRef.current = false;
       setBranchBusy(false);
     }
   };
@@ -1598,6 +1670,7 @@ function ChatView({
           sourceMessageId: item.sourceMessageId,
           operationId: item.operationId,
           attachmentIds: item.attachmentIds,
+          toolExecutionIds: item.toolExecutionIds ?? [],
           mode: item.mode,
         }, controller.signal)
       ) {
@@ -1681,7 +1754,7 @@ function ChatView({
           if (resolved.created) await onConversationCreated(event.conversation.id);
         }
       }
-    } catch {
+    } catch (error) {
       if (controller.signal.aborted) {
         setSendError(
           "Generation stopped. Your saved conversation and previous branches are intact.",
@@ -1693,15 +1766,18 @@ function ChatView({
             edit: undefined,
             sourceMessageId: terminalAssistant.id,
             attachmentIds: [],
+            toolExecutionIds: [],
             mode: "regenerate" as const,
             reuseOperationOnRetry: false,
           }
           : acceptedUserId
           ? undefined
           : { ...item, reuseOperationOnRetry: true };
+        let refreshedAfterFailure = false;
         if (targetConversationId) {
           try {
             const refreshed = await api.conversationGraph(targetConversationId);
+            refreshedAfterFailure = true;
             queryClient.setQueryData(["messages", targetConversationId], refreshed.messages);
             setLocalMessages(refreshed.messages);
             setConversation(refreshed.conversation);
@@ -1717,6 +1793,7 @@ function ChatView({
                 edit: undefined,
                 sourceMessageId: recovered.id,
                 attachmentIds: [],
+                toolExecutionIds: [],
                 mode: "regenerate",
                 reuseOperationOnRetry: false,
               };
@@ -1724,6 +1801,18 @@ function ChatView({
           } catch {
             // Keep the local immutable path visible when recovery is temporarily unavailable.
           }
+        }
+        if (
+          error instanceof ApiError && error.code === "version_conflict" && !acceptedUserId &&
+          refreshedAfterFailure && (item.versionRetryCount ?? 0) < 1
+        ) {
+          setQueue((current) => [{
+            ...item,
+            id: crypto.randomUUID(),
+            reuseOperationOnRetry: true,
+            versionRetryCount: (item.versionRetryCount ?? 0) + 1,
+          }, ...current]);
+          return;
         }
         setFailedPrompt(retryPrompt);
         setSendError(
@@ -1756,13 +1845,18 @@ function ChatView({
   }, [activeStream, queue, readOnly]);
   useEffect(() => () => streamAbortRef.current?.abort(), []);
 
-  const send = (content: string, attachmentIds: string[]): Promise<boolean> => {
+  const send = (
+    content: string,
+    attachmentIds: string[],
+    toolExecutionIds: string[],
+  ): Promise<boolean> => {
     const item: QueuedPrompt = {
       id: crypto.randomUUID(),
       content,
       model: selectedModel,
       edit,
       attachmentIds,
+      toolExecutionIds,
       mode: "send",
       operationId: crypto.randomUUID(),
     };
@@ -1783,6 +1877,7 @@ function ChatView({
         model: selectedModel,
         sourceMessageId,
         attachmentIds: [],
+        toolExecutionIds: [],
         mode,
         operationId,
       })
@@ -2433,6 +2528,7 @@ const adminNav: { id: AdminSection; label: string; icon: typeof Gauge }[] = [
   { id: "providers", label: "Providers", icon: Cloud },
   { id: "models", label: "Models & pricing", icon: Bot },
   { id: "resilience", label: "Routing resilience", icon: GitBranch },
+  { id: "tools", label: "Tools & search", icon: Globe2 },
   { id: "usage", label: "Usage analytics", icon: BarChart3 },
   { id: "jobs", label: "Background jobs", icon: Boxes },
   { id: "audit", label: "Audit log", icon: Shield },
@@ -2509,6 +2605,9 @@ function AdminSectionContent(
   }
   if (section === "resilience") {
     return <AdminResilience />;
+  }
+  if (section === "tools") {
+    return <AdminTools />;
   }
   if (section === "users") {
     return <UserManagement />;

@@ -11,6 +11,7 @@ export interface ChatStreamRequest {
   sourceMessageId?: string;
   operationId: string;
   attachmentIds: string[];
+  toolExecutionIds?: string[];
   mode: ChatStreamMode;
 }
 
@@ -44,9 +45,11 @@ export interface QueuedPrompt {
   edit?: Message;
   sourceMessageId?: string;
   attachmentIds: string[];
+  toolExecutionIds?: string[];
   mode: ChatStreamMode;
   operationId: string;
   reuseOperationOnRetry?: boolean;
+  versionRetryCount?: number;
 }
 
 export function enqueuePrompt(queue: QueuedPrompt[], item: QueuedPrompt): QueuedPrompt[] {
@@ -145,6 +148,7 @@ export const chatStreamAdapter: ChatStreamAdapter = {
         expectedVersion: input.conversation.version ?? 0,
         idempotencyKey: input.operationId,
         attachmentIds: input.attachmentIds,
+        toolExecutionIds: input.toolExecutionIds ?? [],
       }
       : {
         mode: input.mode,

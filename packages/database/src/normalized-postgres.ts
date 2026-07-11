@@ -2,7 +2,12 @@ import postgres from "npm:postgres@3.4.7";
 import type { AccountState, Conversation, MessageNode, PublicUser } from "@dg-chat/contracts";
 import { DomainError } from "./memory.ts";
 import { INGESTIBLE_DOCUMENT_MIME_TYPES, isIngestibleDocumentMime } from "./attachment-policy.ts";
-import { validateDocumentChunkInputs } from "./repository.ts";
+import {
+  KNOWLEDGE_EMBEDDING_DIMENSIONS,
+  normalizeKnowledgeSearchLimit,
+  validateChunkEmbeddings,
+  validateDocumentChunkInputs,
+} from "./repository.ts";
 import type { LedgerEntry, StoredApiToken, StoredSession, StoredUser, UsageRun } from "./memory.ts";
 import type {
   ApiIdempotencyEndpoint,
@@ -35,17 +40,24 @@ import type {
   CreateProviderRetryPolicyInput,
   CreateUserInput,
   DocumentChunk,
+  DocumentChunkEmbeddingInput,
   DocumentChunkInput,
   DomainRepository,
+  EmbeddingProviderAttemptInput,
+  EnsureIdempotentReservationInput,
+  EnsureUsageReservationInput,
   FailApiRequestInput,
   FailGenerationInput,
+  FinalizeEmbeddingProviderUsageInput,
   FinalizeProviderUsageInput,
+  FinishEmbeddingProviderAttemptInput,
   FinishProviderAttemptInput,
   IdentityTokenPurpose,
   KnowledgeCollection,
   KnowledgeCollectionPatch,
   KnowledgeConversationBinding,
   KnowledgeRetrievalMode,
+  KnowledgeSearchHit,
   ModelPriceVersion,
   ProviderAttempt,
   ProviderCredentialEnvelope,
@@ -58,6 +70,8 @@ import type {
   ProviderRetryPolicy,
   RegistryMutationContext,
   ReplaceConversationKnowledgeInput,
+  ReserveChildProviderUsageInput,
+  SearchConversationKnowledgeInput,
   SessionSummary,
   SetProviderModelRouteInput,
   StartProviderAttemptInput,
@@ -185,6 +199,7 @@ function run(row: Row): UsageRun {
     id: String(row.id),
     userId: String(row.user_id),
     model: String(row.model),
+    provider: String(row.provider),
     status: row.status as UsageRun["status"],
     reservedMicros: number(row.reserved_micros),
     costMicros: number(row.cost_micros),
@@ -2020,6 +2035,234 @@ export class PostgresRepository implements DomainRepository {
       .map(documentChunk);
   }
 
+  async upsertDocumentChunkEmbeddings(values: DocumentChunkEmbeddingInput[]) {
+    let validated: DocumentChunkEmbeddingInput[];
+    try {
+      validated = validateChunkEmbeddings(values);
+    } catch {
+      throw new DomainError("validation_error", "Document chunk embeddings are invalid", 422);
+    }
+    return await this.#sql.begin(async (tx) => {
+      for (const value of validated) {
+        const owned = await tx`SELECT 1 FROM document_chunks dc
+          JOIN attachments a ON a.id=dc.attachment_id
+          WHERE dc.id=${value.chunkId} AND a.owner_id=${value.ownerId}
+            AND a.deleted_at IS NULL FOR UPDATE OF dc`;
+        if (!owned.length) throw new DomainError("not_found", "Document chunk not found", 404);
+        await tx`INSERT INTO document_chunk_embeddings(
+          chunk_id,owner_id,model,embedding_version,content_sha256,embedding
+        ) VALUES(
+          ${value.chunkId},${value.ownerId},${value.model},${value.version},
+          ${value.contentSha256},${JSON.stringify(value.embedding)}::vector
+        ) ON CONFLICT(chunk_id,embedding_version) DO UPDATE SET
+          owner_id=EXCLUDED.owner_id,model=EXCLUDED.model,
+          content_sha256=EXCLUDED.content_sha256,embedding=EXCLUDED.embedding,updated_at=now()`;
+      }
+      return validated.length;
+    });
+  }
+
+  async startEmbeddingProviderAttempt(input: EmbeddingProviderAttemptInput): Promise<void> {
+    if (
+      !["document", "query"].includes(input.purpose) ||
+      !Number.isSafeInteger(input.itemCount) || input.itemCount < 1 || input.itemCount > 256
+    ) throw new DomainError("validation_error", "Embedding attempt is invalid", 422);
+    try {
+      await this.#sql`INSERT INTO embedding_provider_attempts(
+        usage_run_id,parent_usage_run_id,purpose,provider,model,upstream_model,item_count)
+        VALUES(${input.usageRunId},${input.parentUsageRunId ?? null},${input.purpose},
+          ${input.provider},${input.model},${input.upstreamModel},${input.itemCount})`;
+    } catch (error) {
+      if ((error as { code?: string }).code === "23505") {
+        throw new DomainError("idempotency_conflict", "Embedding attempt already exists", 409);
+      }
+      throw error;
+    }
+  }
+
+  async finishEmbeddingProviderAttempt(input: FinishEmbeddingProviderAttemptInput): Promise<void> {
+    if (
+      !["succeeded", "failed", "cancelled"].includes(input.status) ||
+      !Number.isSafeInteger(input.inputTokens) || input.inputTokens < 0 ||
+      !Number.isSafeInteger(input.costMicros) || input.costMicros < 0 ||
+      !Number.isSafeInteger(input.latencyMs) || input.latencyMs < 0
+    ) throw new DomainError("validation_error", "Embedding attempt result is invalid", 422);
+    const rows = await this.#sql`UPDATE embedding_provider_attempts SET status=${input.status},
+      input_tokens=${input.inputTokens},cost_micros=${input.costMicros},
+      token_source=${input.tokenSource},cost_source=${input.costSource},
+      latency_ms=${input.latencyMs},error=${input.error?.slice(0, 1000) ?? null},completed_at=now()
+      WHERE usage_run_id=${input.usageRunId} AND status='running' RETURNING id`;
+    if (!rows.length) {
+      const terminal = await this.#sql`SELECT 1 FROM embedding_provider_attempts
+        WHERE usage_run_id=${input.usageRunId} AND status=${input.status}
+          AND input_tokens=${input.inputTokens} AND cost_micros=${input.costMicros}`;
+      if (terminal.length) return;
+      throw new DomainError("invalid_usage_state", "Embedding attempt is not running", 409);
+    }
+  }
+
+  async finalizeEmbeddingProviderUsage(
+    input: FinalizeEmbeddingProviderUsageInput,
+  ): Promise<UsageRun> {
+    if (
+      !["succeeded", "failed", "cancelled"].includes(input.status) ||
+      !Number.isSafeInteger(input.inputTokens) || input.inputTokens < 0 ||
+      !Number.isSafeInteger(input.costMicros) || input.costMicros < 0 ||
+      !Number.isSafeInteger(input.latencyMs) || input.latencyMs < 0
+    ) throw new DomainError("validation_error", "Embedding attempt result is invalid", 422);
+    return await this.#sql.begin(async (tx) => {
+      const [usage] = await tx<Row[]>`SELECT * FROM usage_runs
+        WHERE id=${input.usageRunId} FOR UPDATE`;
+      const [attempt] = await tx<Row[]>`SELECT * FROM embedding_provider_attempts
+        WHERE usage_run_id=${input.usageRunId} FOR UPDATE`;
+      if (!usage || !attempt) {
+        throw new DomainError("not_found", "Embedding accounting state was not found", 404);
+      }
+      const expectedRunStatus = input.status === "succeeded" ? "completed" : "failed";
+      const terminalMatches = String(usage.status) === expectedRunStatus &&
+        String(attempt.status) === input.status &&
+        number(usage.cost_micros) === input.costMicros &&
+        number(usage.input_tokens) === input.inputTokens &&
+        number(attempt.cost_micros) === input.costMicros &&
+        number(attempt.input_tokens) === input.inputTokens;
+      if (terminalMatches) return run(usage);
+      // Reconcile the pre-0019 split-finalization crash shape: usage committed, attempt running.
+      if (
+        usage.status === "completed" && attempt.status === "running" &&
+        input.status === "succeeded" && number(usage.cost_micros) === input.costMicros &&
+        number(usage.input_tokens) === input.inputTokens
+      ) {
+        await tx`UPDATE embedding_provider_attempts SET status='succeeded',
+          input_tokens=${input.inputTokens},cost_micros=${input.costMicros},
+          token_source=${input.tokenSource},cost_source=${input.costSource},
+          latency_ms=${input.latencyMs},error=NULL,completed_at=now()
+          WHERE usage_run_id=${input.usageRunId}`;
+        return run(usage);
+      }
+      if (usage.status !== "reserved" || attempt.status !== "running") {
+        throw new DomainError("idempotency_conflict", "Embedding terminal result differs", 409);
+      }
+      const reserved = number(usage.reserved_micros);
+      if (input.costMicros > reserved) {
+        throw new DomainError(
+          "invalid_usage_state",
+          "Embedding cost exceeded its reservation",
+          409,
+        );
+      }
+      const userId = String(usage.user_id);
+      const [account] = await tx<Row[]>`SELECT balance_micros FROM users
+        WHERE id=${userId} FOR UPDATE`;
+      const delta = reserved - input.costMicros;
+      const after = number(account.balance_micros) + delta;
+      await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${userId}`;
+      if (delta !== 0) {
+        await tx`INSERT INTO ledger_entries(
+          user_id,usage_run_id,kind,amount_micros,balance_after_micros)
+          VALUES(${userId},${input.usageRunId},'refund',${delta},${after})`;
+      }
+      const [updated] = await tx<Row[]>`UPDATE usage_runs SET
+        status=${expectedRunStatus},cost_micros=${input.costMicros},
+        input_tokens=${input.inputTokens},output_tokens=0,latency_ms=${input.latencyMs},
+        error=${input.error?.slice(0, 1000) ?? null},run_lease_token=NULL,
+        run_lease_expires_at=NULL,completed_at=now()
+        WHERE id=${input.usageRunId} RETURNING *`;
+      await tx`UPDATE embedding_provider_attempts SET status=${input.status},
+        input_tokens=${input.inputTokens},cost_micros=${input.costMicros},
+        token_source=${input.tokenSource},cost_source=${input.costSource},
+        latency_ms=${input.latencyMs},error=${input.error?.slice(0, 1000) ?? null},
+        completed_at=now() WHERE usage_run_id=${input.usageRunId}`;
+      return run(updated);
+    });
+  }
+
+  async searchConversationKnowledge(
+    input: SearchConversationKnowledgeInput,
+  ): Promise<KnowledgeSearchHit[]> {
+    let limit: number;
+    try {
+      limit = normalizeKnowledgeSearchLimit(input.limit);
+    } catch {
+      throw new DomainError("validation_error", "Knowledge search input is invalid", 422);
+    }
+    const query = input.query.trim().slice(0, 8_000);
+    const vector = input.queryEmbedding;
+    if (
+      (vector !== undefined &&
+        (vector.length !== KNOWLEDGE_EMBEDDING_DIMENSIONS ||
+          vector.some((part) => typeof part !== "number" || !Number.isFinite(part)))) ||
+      (vector !== undefined && !input.embeddingVersion)
+    ) throw new DomainError("validation_error", "Knowledge search input is invalid", 422);
+
+    const vectorLiteral = vector ? JSON.stringify(vector) : null;
+    const candidateLimit = Math.max(64, limit * 8);
+    const rows = await this.#sql.begin(async (tx) => {
+      if (vectorLiteral !== null) await tx`SET LOCAL hnsw.iterative_scan = 'strict_order'`;
+      return await tx<Row[]>`
+      WITH scoped AS MATERIALIZED (
+        SELECT dc.id,dc.attachment_id,dc.ordinal,dc.content,dc.metadata,
+          k.id AS collection_id,k.name AS collection_name,a.filename,b.owner_id
+        FROM conversation_knowledge_bindings b
+        JOIN conversations c ON c.id=b.conversation_id AND c.owner_id=b.owner_id
+          AND c.deleted_at IS NULL
+        JOIN knowledge_collections k ON k.id=b.collection_id AND k.owner_id=b.owner_id
+          AND k.deleted_at IS NULL
+        JOIN knowledge_collection_attachments ka ON ka.collection_id=k.id
+        JOIN attachments a ON a.id=ka.attachment_id AND a.owner_id=b.owner_id
+          AND a.deleted_at IS NULL AND a.state='ready' AND a.ingestion_status='ready'
+        JOIN document_chunks dc ON dc.attachment_id=a.id
+        WHERE b.conversation_id=${input.conversationId} AND b.owner_id=${input.ownerId}
+          AND b.mode='retrieval'
+      ), lexical_candidates AS (
+        SELECT collection_id,id FROM scoped
+        WHERE ${query}='' OR to_tsvector('simple',content) @@ plainto_tsquery('simple',${query})
+        ORDER BY CASE WHEN ${query}='' THEN 1::double precision ELSE ts_rank_cd(
+          to_tsvector('simple',content),plainto_tsquery('simple',${query}),32
+        )::double precision END DESC,collection_id,id
+        LIMIT ${candidateLimit}
+      ), vector_nearest AS MATERIALIZED (
+        SELECT dce.chunk_id
+        FROM document_chunk_embeddings dce
+        WHERE ${vectorLiteral}::text IS NOT NULL AND dce.owner_id=${input.ownerId}
+          AND dce.embedding_version=${input.embeddingVersion ?? ""}
+          AND EXISTS (SELECT 1 FROM scoped s WHERE s.id=dce.chunk_id)
+        ORDER BY dce.embedding <=> ${vectorLiteral}::vector
+        LIMIT ${candidateLimit}
+      ), vector_candidates AS (
+        SELECT s.collection_id,s.id FROM vector_nearest vn
+        JOIN scoped s ON s.id=vn.chunk_id
+      ), candidate_ids AS (
+        SELECT collection_id,id FROM lexical_candidates
+        UNION SELECT collection_id,id FROM vector_candidates
+      ), candidates AS (
+        SELECT s.*,
+          CASE WHEN ${query}='' THEN 1::double precision ELSE ts_rank_cd(
+            to_tsvector('simple',s.content),plainto_tsquery('simple',${query}),32
+          )::double precision END AS lexical_score,
+          CASE WHEN ${vectorLiteral}::text IS NULL THEN NULL ELSE
+            (1-(dce.embedding <=> ${vectorLiteral}::vector))::double precision END AS vector_score
+        FROM candidate_ids ci JOIN scoped s USING(collection_id,id)
+        LEFT JOIN document_chunk_embeddings dce ON dce.chunk_id=s.id
+          AND dce.owner_id=s.owner_id AND dce.embedding_version=${input.embeddingVersion ?? ""}
+      )
+      SELECT *, lexical_score * 0.45 +
+        CASE WHEN vector_score IS NULL THEN 0 ELSE GREATEST(0,vector_score) * 0.55 END AS score
+      FROM candidates
+      WHERE lexical_score > 0 OR vector_score IS NOT NULL
+      ORDER BY score DESC,collection_id,attachment_id,ordinal,id
+      LIMIT ${limit}`;
+    });
+    return rows.map((row) => ({
+      ...documentChunk(row),
+      collectionId: String(row.collection_id),
+      collectionName: String(row.collection_name),
+      filename: String(row.filename),
+      lexicalScore: number(row.lexical_score),
+      vectorScore: row.vector_score == null ? null : number(row.vector_score),
+      score: number(row.score),
+    }));
+  }
+
   async createKnowledgeCollection(ownerId: string, input: CreateKnowledgeCollectionInput) {
     const name = input.name.trim();
     if (
@@ -3272,6 +3515,120 @@ export class PostgresRepository implements DomainRepository {
     return this.#finalizeProviderUsage(input, true);
   }
 
+  async reserveChildProviderUsage(input: ReserveChildProviderUsageInput): Promise<UsageRun> {
+    if (
+      !Number.isSafeInteger(input.reserveMicros) || input.reserveMicros < 0 ||
+      !isUsagePricingSnapshot(input.pricingSnapshot)
+    ) throw new DomainError("validation_error", "Child usage reservation is invalid", 422);
+    return await this.#sql.begin(async (tx) => {
+      const parents = await tx<Row[]>`SELECT *,(
+          (generation_lease_token=${input.parentOwnerLeaseToken} AND
+            generation_lease_expires_at>now()) OR
+          (run_lease_token=${input.parentOwnerLeaseToken} AND run_lease_expires_at>now()) OR
+          EXISTS(SELECT 1 FROM api_idempotency_requests a
+            WHERE a.usage_run_id=usage_runs.id AND a.state='in_progress'
+              AND a.lease_token=${input.parentOwnerLeaseToken} AND a.lease_expires_at>now())
+        ) AS lease_valid FROM usage_runs WHERE id=${input.parentUsageRunId} FOR UPDATE`;
+      const parent = parents[0];
+      if (!parent || parent.status !== "reserved" || parent.lease_valid !== true) {
+        throw new DomainError("stale_lease", "Parent provider execution lease is stale", 409);
+      }
+      const userId = String(parent.user_id);
+      const users = await tx<Row[]>`SELECT balance_micros FROM users WHERE id=${userId} FOR UPDATE`;
+      const balance = number(users[0].balance_micros);
+      if (balance < input.reserveMicros) {
+        throw new DomainError("insufficient_credit", "Insufficient credit for OCR", 402);
+      }
+      const p = input.pricingSnapshot;
+      const leaseToken = crypto.randomUUID();
+      let rows: Row[];
+      try {
+        rows = await tx<Row[]>`INSERT INTO usage_runs(
+          id,user_id,model,provider,status,reserved_micros,run_lease_token,run_lease_expires_at,
+          pricing_version_id,pricing_input_micros_per_million,
+          pricing_cached_input_micros_per_million,pricing_reasoning_micros_per_million,
+          pricing_output_micros_per_million,pricing_fixed_call_micros,pricing_source)
+          VALUES(${input.runId},${userId},${input.model},${input.provider},'reserved',
+          ${input.reserveMicros},${leaseToken},now()+120*interval '1 second',
+          ${p.pricingVersionId},${p.inputMicrosPerMillion},${p.cachedInputMicrosPerMillion},
+          ${p.reasoningMicrosPerMillion},${p.outputMicrosPerMillion},${p.fixedCallMicros},${p.source})
+          RETURNING *`;
+      } catch (error) {
+        if ((error as { code?: string }).code === "23505") {
+          throw new DomainError("idempotency_conflict", "Child usage run already exists", 409);
+        }
+        throw error;
+      }
+      const after = balance - input.reserveMicros;
+      await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${userId}`;
+      await tx`INSERT INTO ledger_entries(
+        user_id,usage_run_id,kind,amount_micros,balance_after_micros)
+        VALUES(${userId},${input.runId},'reserve',${-input.reserveMicros},${after})`;
+      return run(rows[0]);
+    });
+  }
+
+  async ensureUsageReservation(input: EnsureUsageReservationInput): Promise<UsageRun> {
+    if (!Number.isSafeInteger(input.requiredMicros) || input.requiredMicros < 0) {
+      throw new DomainError("validation_error", "Usage reservation requirement is invalid", 422);
+    }
+    return await this.#sql.begin(async (tx) => {
+      const rows = await tx<Row[]>`SELECT *,(
+          (generation_lease_token=${input.ownerLeaseToken} AND generation_lease_expires_at>now()) OR
+          (run_lease_token=${input.ownerLeaseToken} AND run_lease_expires_at>now()) OR
+          EXISTS(SELECT 1 FROM api_idempotency_requests a WHERE a.usage_run_id=usage_runs.id
+            AND a.state='in_progress' AND a.lease_token=${input.ownerLeaseToken}
+            AND a.lease_expires_at>now())
+        ) AS lease_valid FROM usage_runs WHERE id=${input.usageRunId} FOR UPDATE`;
+      const current = rows[0];
+      if (!current || current.status !== "reserved" || current.lease_valid !== true) {
+        throw new DomainError("stale_lease", "Usage reservation lease is stale", 409);
+      }
+      const reserved = number(current.reserved_micros);
+      if (reserved >= input.requiredMicros) return run(current);
+      const delta = input.requiredMicros - reserved;
+      const userId = String(current.user_id);
+      const users = await tx<Row[]>`SELECT balance_micros FROM users WHERE id=${userId} FOR UPDATE`;
+      const balance = number(users[0].balance_micros);
+      if (balance < delta) {
+        throw new DomainError("insufficient_credit", "Insufficient credit for expanded input", 402);
+      }
+      const after = balance - delta;
+      await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${userId}`;
+      const updated = await tx<Row[]>`UPDATE usage_runs SET reserved_micros=${input.requiredMicros}
+        WHERE id=${input.usageRunId} RETURNING *`;
+      await tx`INSERT INTO ledger_entries(
+        user_id,usage_run_id,kind,amount_micros,balance_after_micros)
+        VALUES(${userId},${input.usageRunId},'reserve',${-delta},${after})`;
+      return run(updated[0]);
+    });
+  }
+
+  async ensureIdempotentReservation(input: EnsureIdempotentReservationInput): Promise<UsageRun> {
+    try {
+      return await this.reserve(
+        input.userId,
+        input.usageRunId,
+        input.model,
+        input.reservedMicros,
+        input.provider,
+      );
+    } catch (error) {
+      if (!(error instanceof DomainError) || error.code !== "idempotency_conflict") throw error;
+      const rows = await this.#sql<Row[]>`SELECT * FROM usage_runs WHERE id=${input.usageRunId}`;
+      const existing = rows[0];
+      if (
+        !existing || String(existing.user_id) !== input.userId ||
+        String(existing.model) !== input.model || String(existing.provider) !== input.provider ||
+        number(existing.reserved_micros) !== input.reservedMicros ||
+        String(existing.status) !== "reserved" || existing.token_id !== null
+      ) {
+        throw new DomainError("idempotency_conflict", "Existing reservation does not match", 409);
+      }
+      return run(existing);
+    }
+  }
+
   async reapStaleProviderExecutionLeases(limit = 100): Promise<number> {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) {
       throw new DomainError("validation_error", "Provider lease reaper limit is invalid", 422);
@@ -3284,10 +3641,18 @@ export class PostgresRepository implements DomainRepository {
         ORDER BY r.run_lease_expires_at FOR UPDATE SKIP LOCKED LIMIT ${limit}`;
       for (const row of rows) {
         const runId = String(row.id);
-        const uncertainty = await tx<{ uncertain: boolean }[]>`SELECT EXISTS(SELECT 1
-          FROM provider_attempts WHERE usage_run_id=${runId} AND status='running') AS uncertain`;
+        const uncertainty = await tx<{ uncertain: boolean; embedding_uncertain: boolean }[]>`
+          SELECT EXISTS(SELECT 1 FROM provider_attempts
+            WHERE usage_run_id=${runId} AND status='running') AS uncertain,
+          EXISTS(SELECT 1 FROM embedding_provider_attempts
+            WHERE usage_run_id=${runId} AND status='running') AS embedding_uncertain`;
         await tx`UPDATE provider_attempts SET status='cancelled',phase='planning',
           error_code='execution_lease_expired',breaker_after='unavailable',retryable=true,
+          latency_ms=GREATEST(0,floor(extract(epoch FROM (now()-started_at))*1000)::int),
+          completed_at=now() WHERE usage_run_id=${runId} AND status='running'`;
+        await tx`UPDATE embedding_provider_attempts SET status='cancelled',
+          cost_micros=${number(row.reserved_micros)},cost_source='calculated',
+          token_source='estimated',error='execution lease expired',
           latency_ms=GREATEST(0,floor(extract(epoch FROM (now()-started_at))*1000)::int),
           completed_at=now() WHERE usage_run_id=${runId} AND status='running'`;
         const userId = String(row.user_id);
@@ -3295,7 +3660,9 @@ export class PostgresRepository implements DomainRepository {
           Row[]
         >`SELECT balance_micros FROM users WHERE id=${userId} FOR UPDATE`;
         const providerExecution = number(row.execution_epoch) > 0;
-        const cost = providerExecution
+        const cost = uncertainty[0].embedding_uncertain
+          ? number(row.reserved_micros)
+          : providerExecution
           ? uncertainty[0].uncertain
             ? number(row.reserved_micros)
             : number(row.actual_provider_cost_micros)
@@ -3405,7 +3772,9 @@ export class PostgresRepository implements DomainRepository {
   ) {
     return await this.#sql.begin(async (tx) => {
       const runs = await tx<Row[]>`SELECT *,EXISTS(SELECT 1 FROM provider_attempts
-        WHERE usage_run_id=usage_runs.id AND status='running') AS provider_accounting_uncertain
+        WHERE usage_run_id=usage_runs.id AND status='running') AS provider_accounting_uncertain,
+        EXISTS(SELECT 1 FROM embedding_provider_attempts
+          WHERE usage_run_id=usage_runs.id AND status='running') AS embedding_accounting_uncertain
         FROM usage_runs WHERE id=${runId} FOR UPDATE`;
       if (!runs[0]) throw new DomainError("not_found", "Usage reservation not found", 404);
       if (runs[0].status === "completed") return run(runs[0]);
@@ -3448,14 +3817,19 @@ export class PostgresRepository implements DomainRepository {
   async refund(runId: string, error?: string) {
     return await this.#sql.begin(async (tx) => {
       const runs = await tx<Row[]>`SELECT *,EXISTS(SELECT 1 FROM provider_attempts
-        WHERE usage_run_id=usage_runs.id AND status='running') AS provider_accounting_uncertain
+        WHERE usage_run_id=usage_runs.id AND status='running') AS provider_accounting_uncertain,
+        EXISTS(SELECT 1 FROM embedding_provider_attempts
+          WHERE usage_run_id=usage_runs.id AND status='running') AS embedding_accounting_uncertain
         FROM usage_runs WHERE id=${runId} FOR UPDATE`;
       if (!runs[0]) return undefined;
       if (runs[0].status !== "reserved") return run(runs[0]);
       const userId = String(runs[0].user_id);
       const users = await tx<Row[]>`SELECT balance_micros FROM users WHERE id=${userId} FOR UPDATE`;
       const providerExecution = number(runs[0].execution_epoch) > 0;
-      const actualCost = providerExecution
+      const embeddingExecution = runs[0].embedding_accounting_uncertain === true;
+      const actualCost = embeddingExecution
+        ? number(runs[0].reserved_micros)
+        : providerExecution
         ? runs[0].provider_accounting_uncertain === true
           ? number(runs[0].reserved_micros)
           : number(runs[0].actual_provider_cost_micros)
@@ -3463,6 +3837,13 @@ export class PostgresRepository implements DomainRepository {
       if (providerExecution && runs[0].provider_accounting_uncertain === true) {
         await tx`UPDATE provider_attempts SET status='cancelled',phase='planning',
           error_code='accounting_unknown',breaker_after='unavailable',retryable=false,
+          latency_ms=GREATEST(0,floor(extract(epoch FROM (now()-started_at))*1000)::int),
+          completed_at=now() WHERE usage_run_id=${runId} AND status='running'`;
+      }
+      if (embeddingExecution) {
+        await tx`UPDATE embedding_provider_attempts SET status='cancelled',
+          cost_micros=${actualCost},cost_source='calculated',token_source='estimated',
+          error='accounting state unknown',
           latency_ms=GREATEST(0,floor(extract(epoch FROM (now()-started_at))*1000)::int),
           completed_at=now() WHERE usage_run_id=${runId} AND status='running'`;
       }

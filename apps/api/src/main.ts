@@ -4,10 +4,12 @@ import {
   MemoryRepository,
   objectStoreFromEnv,
   PostgresRepository,
+  PostgresToolExecutionStore,
 } from "@dg-chat/database";
 import { MemoryRateLimiter, RedisRateLimiter } from "./rate-limit.ts";
 import { ProviderSecretKeyring } from "./provider-secrets.ts";
 import { MemoryCircuitBreaker, RedisCircuitBreaker } from "./provider-circuit.ts";
+import { ocrCacheFailureModeFromEnv, RedisOcrCache } from "./ocr-cache.ts";
 
 const port = Number(Deno.env.get("PORT") ?? 8000);
 const providerKeyring = ProviderSecretKeyring.fromEnv();
@@ -28,27 +30,39 @@ if (databaseUrl) {
 const repository = databaseUrl
   ? await PostgresRepository.connect(databaseUrl)
   : new MemoryRepository();
+const toolExecutionStore = databaseUrl
+  ? PostgresToolExecutionStore.connect(databaseUrl)
+  : undefined;
 const rateLimiter = Deno.env.get("REDIS_URL")
   ? new RedisRateLimiter(Deno.env.get("REDIS_URL")!)
   : new MemoryRateLimiter();
 const circuitBreaker = Deno.env.get("REDIS_URL")
   ? new RedisCircuitBreaker(Deno.env.get("REDIS_URL")!)
   : new MemoryCircuitBreaker();
+const ocrCache = Deno.env.get("REDIS_URL")
+  ? new RedisOcrCache(Deno.env.get("REDIS_URL")!, {
+    failureMode: ocrCacheFailureModeFromEnv(Deno.env.get("OCR_CACHE_FAILURE_MODE")),
+  })
+  : undefined;
 const objectStore = objectStoreFromEnv();
-const { app } = createApp({
+const { app, toolExecutionService } = createApp({
   repository,
   rateLimiter,
   objectStore,
   providerKeyring,
   circuitBreaker,
+  ocrCache,
+  toolExecutionStore,
 });
+await toolExecutionService.recover();
 const replayMaintenance = setInterval(async () => {
   try {
     const reaped = await repository.reapStaleApiRequests(100);
     const reapedGenerations = await repository.reapStaleGenerations(100);
     const reapedProviderRuns = await repository.reapStaleProviderExecutionLeases(100);
     const pruned = await repository.pruneExpiredApiRequests(100);
-    if (reaped || reapedGenerations || reapedProviderRuns || pruned) {
+    const recoveredTools = await toolExecutionService.recover();
+    if (reaped || reapedGenerations || reapedProviderRuns || pruned || recoveredTools) {
       console.log(JSON.stringify({
         level: "info",
         message: "Replay maintenance",
@@ -56,6 +70,7 @@ const replayMaintenance = setInterval(async () => {
         reapedGenerations,
         reapedProviderRuns,
         pruned,
+        recoveredTools,
       }));
     }
   } catch (error) {
@@ -77,8 +92,10 @@ const shutdown = async (signal: string) => {
   await server.shutdown();
   await Promise.all([
     repository.close(),
+    toolExecutionStore?.close(),
     rateLimiter.close(),
     circuitBreaker.close(),
+    ocrCache?.close(),
     objectStore?.close(),
   ]);
 };

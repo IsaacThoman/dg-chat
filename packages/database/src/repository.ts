@@ -164,6 +164,80 @@ export interface DocumentChunkInput {
 export interface DocumentChunk extends DocumentChunkInput {
   attachmentId: string;
 }
+export interface DocumentChunkEmbeddingInput {
+  chunkId: string;
+  ownerId: string;
+  model: string;
+  version: string;
+  contentSha256: string;
+  embedding: number[];
+}
+export interface KnowledgeSearchHit extends DocumentChunk {
+  collectionId: string;
+  collectionName: string;
+  filename: string;
+  lexicalScore: number;
+  vectorScore: number | null;
+  score: number;
+}
+export interface EmbeddingProviderAttemptInput {
+  usageRunId: string;
+  parentUsageRunId?: string;
+  purpose: "document" | "query";
+  provider: string;
+  model: string;
+  upstreamModel: string;
+  itemCount: number;
+}
+export interface FinishEmbeddingProviderAttemptInput {
+  usageRunId: string;
+  status: "succeeded" | "failed" | "cancelled";
+  inputTokens: number;
+  costMicros: number;
+  tokenSource: "provider" | "estimated" | "none";
+  costSource: "calculated" | "none";
+  latencyMs: number;
+  error?: string;
+}
+export type FinalizeEmbeddingProviderUsageInput = FinishEmbeddingProviderAttemptInput;
+export interface SearchConversationKnowledgeInput {
+  conversationId: string;
+  ownerId: string;
+  query: string;
+  queryEmbedding?: number[];
+  embeddingVersion?: string;
+  limit?: number;
+}
+export const KNOWLEDGE_EMBEDDING_DIMENSIONS = 1536;
+
+export function normalizeKnowledgeSearchLimit(limit = 12): number {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50) {
+    throw new TypeError("Knowledge search limit must be between 1 and 50");
+  }
+  return limit;
+}
+
+export function validateChunkEmbeddings(
+  values: readonly DocumentChunkEmbeddingInput[],
+): DocumentChunkEmbeddingInput[] {
+  if (values.length < 1 || values.length > 256) {
+    throw new TypeError("Document chunk embedding batch is invalid");
+  }
+  const keys = new Set<string>();
+  return values.map((value) => {
+    const key = `${value.chunkId}:${value.version}`;
+    if (
+      !DOCUMENT_UUID_PATTERN.test(value.chunkId) || !DOCUMENT_UUID_PATTERN.test(value.ownerId) ||
+      !value.model || value.model.length > 200 ||
+      !DOCUMENT_VERSION_PATTERN.test(value.version) ||
+      !/^[0-9a-f]{64}$/.test(value.contentSha256) || keys.has(key) ||
+      value.embedding.length !== KNOWLEDGE_EMBEDDING_DIMENSIONS ||
+      value.embedding.some((part) => typeof part !== "number" || !Number.isFinite(part))
+    ) throw new TypeError("Document chunk embedding batch is invalid");
+    keys.add(key);
+    return { ...value, embedding: [...value.embedding] };
+  });
+}
 
 const DOCUMENT_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const DOCUMENT_UUID_PATTERN =
@@ -844,6 +918,30 @@ export interface FinalizeProviderUsageInput {
   error?: string | null;
 }
 
+export interface ReserveChildProviderUsageInput {
+  parentUsageRunId: string;
+  parentOwnerLeaseToken: string;
+  runId: string;
+  model: string;
+  provider: string;
+  reserveMicros: number;
+  pricingSnapshot: UsagePricingSnapshot;
+}
+
+export interface EnsureUsageReservationInput {
+  usageRunId: string;
+  ownerLeaseToken: string;
+  requiredMicros: number;
+}
+
+export interface EnsureIdempotentReservationInput {
+  userId: string;
+  usageRunId: string;
+  model: string;
+  provider: string;
+  reservedMicros: number;
+}
+
 /** Persistence boundary shared by synchronous test stores and async production stores. */
 export interface DomainRepository {
   readonly storageKind: "postgres" | "memory";
@@ -953,6 +1051,18 @@ export interface DomainRepository {
   ): MaybePromise<AttachmentRecord>;
   retryAttachmentIngestion(id: string, ownerId: string): MaybePromise<AttachmentRecord>;
   listDocumentChunks(id: string, ownerId: string): MaybePromise<DocumentChunk[]>;
+  upsertDocumentChunkEmbeddings(
+    values: DocumentChunkEmbeddingInput[],
+  ): MaybePromise<number>;
+  startEmbeddingProviderAttempt(input: EmbeddingProviderAttemptInput): MaybePromise<void>;
+  finishEmbeddingProviderAttempt(input: FinishEmbeddingProviderAttemptInput): MaybePromise<void>;
+  /** Atomically finalizes the attempt, usage run, ledger, and balance; safe to replay. */
+  finalizeEmbeddingProviderUsage(
+    input: FinalizeEmbeddingProviderUsageInput,
+  ): MaybePromise<UsageRun>;
+  searchConversationKnowledge(
+    input: SearchConversationKnowledgeInput,
+  ): MaybePromise<KnowledgeSearchHit[]>;
   createKnowledgeCollection(
     ownerId: string,
     input: CreateKnowledgeCollectionInput,
@@ -1090,6 +1200,12 @@ export interface DomainRepository {
   listProviderAttempts(usageRunId: string): MaybePromise<ProviderAttempt[]>;
   settleProviderUsage(input: FinalizeProviderUsageInput): MaybePromise<UsageRun>;
   refundProviderUsage(input: FinalizeProviderUsageInput): MaybePromise<UsageRun>;
+  /** Atomically validates the active parent lease and reserves credit for a billed child call. */
+  reserveChildProviderUsage(input: ReserveChildProviderUsageInput): MaybePromise<UsageRun>;
+  /** Atomically raises an active run's reservation; never lowers or duplicates an extension. */
+  ensureUsageReservation(input: EnsureUsageReservationInput): MaybePromise<UsageRun>;
+  /** Creates a reservation once, or returns the existing active reservation when every billing field matches. */
+  ensureIdempotentReservation(input: EnsureIdempotentReservationInput): MaybePromise<UsageRun>;
   reapStaleProviderExecutionLeases(limit?: number): MaybePromise<number>;
   reserve(
     userId: string,
