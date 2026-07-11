@@ -19,8 +19,8 @@ CREATE TABLE document_embedding_executions (
     AND result_input_tokens IS NOT NULL AND result_latency_ms IS NOT NULL)
     OR (status NOT IN ('result_ready','completed') AND result_cost_micros IS NULL
       AND result_input_tokens IS NULL AND result_latency_ms IS NULL)),
-  CHECK ((status='completed' AND completed_at IS NOT NULL) OR
-    (status<>'completed' AND completed_at IS NULL))
+  CHECK ((status IN ('completed','failed') AND completed_at IS NOT NULL) OR
+    (status NOT IN ('completed','failed') AND completed_at IS NULL))
 );
 CREATE INDEX document_embedding_execution_owner_idx
   ON document_embedding_executions(owner_id,created_at);

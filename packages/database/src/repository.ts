@@ -242,6 +242,15 @@ export interface PersistDocumentEmbeddingResultInput {
   latencyMs: number;
 }
 
+export interface FailDocumentEmbeddingInput {
+  jobId: string;
+  jobClaimToken: string;
+  error: string;
+  billing:
+    | { mode: "refund" }
+    | { mode: "settle"; costMicros: number; inputTokens: number; latencyMs: number };
+}
+
 const DOCUMENT_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const DOCUMENT_UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -1054,6 +1063,9 @@ export interface DomainRepository {
   finalizeDocumentEmbedding(
     jobId: string,
     jobClaimToken: string,
+  ): MaybePromise<DocumentEmbeddingExecution>;
+  failDocumentEmbedding(
+    input: FailDocumentEmbeddingInput,
   ): MaybePromise<DocumentEmbeddingExecution>;
   createKnowledgeCollection(
     ownerId: string,

@@ -2392,6 +2392,9 @@ Deno.test({
         0,
       );
       assertEquals((await sql`SELECT id FROM jobs WHERE type='document.embed'`).length, 0);
+      const deniedChunk = (await repo.listDocumentChunks(attachment.id, owner.id))[0];
+      assertEquals(deniedChunk.embeddingStatus, "failed");
+      assertEquals(deniedChunk.embeddingError, "Insufficient credit for document embeddings");
 
       const begun = await repo.beginDocumentEmbedding({
         ownerId: owner.id,
@@ -2450,6 +2453,64 @@ Deno.test({
       assertEquals(
         (await sql`SELECT id FROM ledger_entries
         WHERE usage_run_id='embedding-durable-run'`).length,
+        2,
+      );
+
+      const failing = await repo.beginDocumentEmbedding({
+        ownerId: owner.id,
+        attachmentId: attachment.id,
+        chunkSetDigest: "d".repeat(64),
+        modelId: "provider/embed-1536",
+        configVersion: "knowledge-v2",
+        provider: "provider",
+        usageRunId: "embedding-failed-run",
+        reserveMicros: 100,
+      });
+      await sql`UPDATE jobs SET status='running',locked_by='claim-c',locked_at=now()
+        WHERE id=${failing.jobId}`;
+      await repo.claimDocumentEmbeddingExecution(failing.jobId, "claim-c");
+      await sql`UPDATE jobs SET locked_by='claim-d',locked_at=now() WHERE id=${failing.jobId}`;
+      await assertRejects(
+        () =>
+          repo.failDocumentEmbedding({
+            jobId: failing.jobId,
+            jobClaimToken: "claim-c",
+            error: "provider unavailable",
+            billing: { mode: "refund" },
+          }),
+        DomainError,
+        "stale",
+      );
+      await repo.claimDocumentEmbeddingExecution(failing.jobId, "claim-d");
+      assertEquals(
+        (await repo.failDocumentEmbedding({
+          jobId: failing.jobId,
+          jobClaimToken: "claim-d",
+          error: "provider unavailable",
+          billing: { mode: "refund" },
+        })).status,
+        "failed",
+      );
+      assertEquals(
+        (await repo.failDocumentEmbedding({
+          jobId: failing.jobId,
+          jobClaimToken: "obsolete",
+          error: "provider unavailable",
+          billing: { mode: "refund" },
+        })).status,
+        "failed",
+      );
+      const failedChunk = (await repo.listDocumentChunks(attachment.id, owner.id))[0];
+      assertEquals(failedChunk.embeddingStatus, "failed");
+      assertEquals(failedChunk.embeddingError, "provider unavailable");
+      const failureState = await sql<{ balance: number; status: string; job_status: string }[]>`
+        SELECT u.balance_micros::int AS balance,r.status,j.status AS job_status FROM users u
+        JOIN usage_runs r ON r.user_id=u.id JOIN document_embedding_executions e
+          ON e.usage_run_id=r.id JOIN jobs j ON j.id=e.job_id WHERE r.id='embedding-failed-run'`;
+      assertEquals(failureState[0], { balance: 960, status: "failed", job_status: "failed" });
+      assertEquals(
+        (await sql`SELECT id FROM ledger_entries
+        WHERE usage_run_id='embedding-failed-run'`).length,
         2,
       );
     } finally {

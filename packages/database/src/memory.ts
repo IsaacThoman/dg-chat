@@ -44,6 +44,7 @@ import type {
   DocumentChunkInput,
   DocumentEmbeddingExecution,
   FailApiRequestInput,
+  FailDocumentEmbeddingInput,
   FailGenerationInput,
   FinalizeProviderUsageInput,
   FinishProviderAttemptInput,
@@ -149,6 +150,8 @@ function validateDocumentChunks(
 
 const EMBEDDING_CONFIG_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const EMBEDDING_DIMENSIONS = 1536;
+const MAX_DOCUMENT_EMBEDDING_CHUNKS = 2_048;
+const MAX_DOCUMENT_EMBEDDING_CHARACTERS = 2_000_000;
 
 function validateEmbeddingReplacement(
   chunks: readonly DocumentChunk[],
@@ -1760,6 +1763,47 @@ export class MemoryRepository {
     if (!chunks.length) {
       throw new DomainError("embedding_chunks_missing", "Attachment has no chunks", 409);
     }
+    if (
+      chunks.length > MAX_DOCUMENT_EMBEDDING_CHUNKS ||
+      chunks.reduce((total, chunk) => total + chunk.content.length, 0) >
+        MAX_DOCUMENT_EMBEDDING_CHARACTERS
+    ) {
+      for (const chunk of chunks) {
+        Object.assign(chunk, {
+          embeddingStatus: "failed" as const,
+          embeddingModelId: input.modelId,
+          embeddingConfigVersion: input.configVersion,
+          embeddedAt: null,
+          embeddingError: "Embedding input exceeds the single-request limit",
+        });
+      }
+      throw new DomainError(
+        "embedding_input_too_large",
+        "Embedding input exceeds the single-request limit",
+        422,
+      );
+    }
+    if ((this.users.get(input.ownerId)?.balanceMicros ?? -1) < input.reserveMicros) {
+      for (const chunk of chunks) {
+        Object.assign(chunk, {
+          embeddingStatus: "failed" as const,
+          embeddingModelId: input.modelId,
+          embeddingConfigVersion: input.configVersion,
+          embeddedAt: null,
+          embeddingError: "Insufficient credit for document embeddings",
+        });
+      }
+      throw new DomainError("insufficient_credit", "Insufficient credit", 402);
+    }
+    for (const chunk of chunks) {
+      Object.assign(chunk, {
+        embeddingStatus: "pending" as const,
+        embeddingModelId: input.modelId,
+        embeddingConfigVersion: input.configVersion,
+        embeddedAt: null,
+        embeddingError: null,
+      });
+    }
     this.reserve(
       input.ownerId,
       input.usageRunId,
@@ -1931,6 +1975,51 @@ export class MemoryRepository {
     job.status = "completed";
     job.lockedBy = null;
     execution.status = "completed";
+    execution.completedAt = new Date().toISOString();
+    execution.runLeaseToken = null;
+    return embeddingExecutionProjection(execution);
+  }
+
+  failDocumentEmbedding(input: FailDocumentEmbeddingInput) {
+    const execution = this.documentEmbeddingExecutions.get(input.jobId);
+    if (!execution) throw new DomainError("not_found", "Embedding execution not found", 404);
+    if (execution.status === "failed") return embeddingExecutionProjection(execution);
+    if (execution.status === "completed" || execution.status === "result_ready") {
+      throw new DomainError("invalid_embedding_state", "Durable embedding result cannot fail", 409);
+    }
+    const job = this.jobs.find((value) => value.id === input.jobId);
+    if (!job || job.status !== "running" || job.lockedBy !== input.jobClaimToken) {
+      throw new DomainError("stale_lease", "Embedding job claim is stale", 409);
+    }
+    const run = this.usageRuns.get(execution.usageRunId);
+    if (!run) throw new DomainError("not_found", "Embedding usage is missing", 404);
+    if (run.status === "reserved") {
+      if (input.billing.mode === "refund") this.refund(run.id);
+      else {
+        this.settle(
+          run.id,
+          input.billing.costMicros,
+          input.billing.inputTokens,
+          0,
+          input.billing.latencyMs,
+        );
+        run.status = "failed";
+      }
+    }
+    for (const chunk of this.documentChunks.get(execution.attachmentId) ?? []) {
+      if (!execution.chunkIds.includes(chunk.id)) continue;
+      this.documentChunkEmbeddings.delete(chunk.id);
+      Object.assign(chunk, {
+        embeddingStatus: "failed" as const,
+        embeddingModelId: execution.modelId,
+        embeddingConfigVersion: execution.configVersion,
+        embeddedAt: null,
+        embeddingError: input.error,
+      });
+    }
+    job.status = "failed";
+    job.lockedBy = null;
+    execution.status = "failed";
     execution.completedAt = new Date().toISOString();
     execution.runLeaseToken = null;
     return embeddingExecutionProjection(execution);

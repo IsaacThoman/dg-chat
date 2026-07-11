@@ -41,6 +41,7 @@ import type {
   DocumentEmbeddingExecution,
   DomainRepository,
   FailApiRequestInput,
+  FailDocumentEmbeddingInput,
   FailGenerationInput,
   FinalizeProviderUsageInput,
   FinishProviderAttemptInput,
@@ -269,6 +270,8 @@ function documentEmbeddingExecution(row: Row): DocumentEmbeddingExecution {
 }
 
 const EMBEDDING_DIMENSIONS = 1536;
+const MAX_DOCUMENT_EMBEDDING_CHUNKS = 2_048;
+const MAX_DOCUMENT_EMBEDDING_CHARACTERS = 2_000_000;
 const EMBEDDING_CONFIG_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
 function validateEmbeddingReplacement(
@@ -2126,7 +2129,7 @@ export class PostgresRepository implements DomainRepository {
       input.reserveMicros < 0 ||
       (input.pricingSnapshot !== undefined && !isUsagePricingSnapshot(input.pricingSnapshot))
     ) throw new DomainError("validation_error", "Document embedding request is invalid", 422);
-    return await this.#sql.begin(async (tx) => {
+    const outcome = await this.#sql.begin(async (tx) => {
       const replay = await tx<Row[]>`SELECT * FROM document_embedding_executions
         WHERE attachment_id=${input.attachmentId} AND chunk_set_digest=${input.chunkSetDigest}
           AND model_id=${input.modelId} AND config_version=${input.configVersion}`;
@@ -2140,14 +2143,42 @@ export class PostgresRepository implements DomainRepository {
       if (!chunks.length) {
         throw new DomainError("embedding_chunks_missing", "Attachment has no chunks", 409);
       }
+      const sizes = await tx<{ characters: number }[]>`SELECT
+        COALESCE(sum(char_length(content)),0)::int AS characters FROM document_chunks
+        WHERE attachment_id=${input.attachmentId}`;
+      if (
+        chunks.length > MAX_DOCUMENT_EMBEDDING_CHUNKS ||
+        number(sizes[0].characters) > MAX_DOCUMENT_EMBEDDING_CHARACTERS
+      ) {
+        await tx`UPDATE document_chunks SET embedding=NULL,embedding_status='failed',
+          embedding_model_id=${input.modelId},embedding_config_version=${input.configVersion},
+          embedded_at=NULL,embedding_error='Embedding input exceeds the single-request limit'
+          WHERE attachment_id=${input.attachmentId}`;
+        return {
+          failure: new DomainError(
+            "embedding_input_too_large",
+            "Embedding input exceeds the single-request limit",
+            422,
+          ),
+        } as const;
+      }
       const users = await tx<
         Row[]
       >`SELECT balance_micros FROM users WHERE id=${input.ownerId} FOR UPDATE`;
       if (!users[0]) throw new DomainError("not_found", "User not found", 404);
       const balance = number(users[0].balance_micros);
       if (balance < input.reserveMicros) {
-        throw new DomainError("insufficient_credit", "Insufficient credit", 402);
+        await tx`UPDATE document_chunks SET embedding=NULL,embedding_status='failed',
+          embedding_model_id=${input.modelId},embedding_config_version=${input.configVersion},
+          embedded_at=NULL,embedding_error='Insufficient credit for document embeddings'
+          WHERE attachment_id=${input.attachmentId}`;
+        return {
+          failure: new DomainError("insufficient_credit", "Insufficient credit", 402),
+        } as const;
       }
+      await tx`UPDATE document_chunks SET embedding=NULL,embedding_status='pending',
+        embedding_model_id=${input.modelId},embedding_config_version=${input.configVersion},
+        embedded_at=NULL,embedding_error=NULL WHERE attachment_id=${input.attachmentId}`;
       const runLeaseToken = crypto.randomUUID();
       await tx`INSERT INTO usage_runs(id,user_id,model,provider,status,reserved_micros,
         run_lease_token,run_lease_expires_at,pricing_version_id,
@@ -2190,6 +2221,8 @@ export class PostgresRepository implements DomainRepository {
       }
       return documentEmbeddingExecution(executions[0]);
     });
+    if ("failure" in outcome) throw outcome.failure;
+    return outcome;
   }
 
   async claimDocumentEmbeddingExecution(jobId: string, jobClaimToken: string, leaseSeconds = 120) {
@@ -2369,6 +2402,85 @@ export class PostgresRepository implements DomainRepository {
       await tx`UPDATE jobs SET status='completed',completed_at=now(),locked_at=NULL,locked_by=NULL
         WHERE id=${jobId}`;
       const updated = await tx<Row[]>`UPDATE document_embedding_executions SET status='completed',
+        completed_at=now(),run_lease_token=NULL WHERE id=${executionId} RETURNING *`;
+      return documentEmbeddingExecution(updated[0]);
+    });
+  }
+
+  async failDocumentEmbedding(input: FailDocumentEmbeddingInput) {
+    if (
+      !input.error.trim() || input.error.length > 1_000 ||
+      (input.billing.mode === "settle" &&
+        (!Number.isSafeInteger(input.billing.costMicros) || input.billing.costMicros < 0 ||
+          !Number.isSafeInteger(input.billing.inputTokens) || input.billing.inputTokens < 0 ||
+          !Number.isSafeInteger(input.billing.latencyMs) || input.billing.latencyMs < 0))
+    ) throw new DomainError("validation_error", "Embedding failure is invalid", 422);
+    return await this.#sql.begin(async (tx) => {
+      const rows = await tx<Row[]>`SELECT * FROM document_embedding_executions
+        WHERE job_id=${input.jobId} FOR UPDATE`;
+      if (!rows[0]) throw new DomainError("not_found", "Embedding execution not found", 404);
+      if (rows[0].status === "failed") return documentEmbeddingExecution(rows[0]);
+      if (rows[0].status === "completed" || rows[0].status === "result_ready") {
+        throw new DomainError(
+          "invalid_embedding_state",
+          "Durable embedding result cannot fail",
+          409,
+        );
+      }
+      const job = await tx`SELECT id FROM jobs WHERE id=${input.jobId} AND status='running'
+        AND locked_by=${input.jobClaimToken} FOR UPDATE`;
+      if (!job.length) throw new DomainError("stale_lease", "Embedding job claim is stale", 409);
+      const executionId = String(rows[0].id);
+      const usageRunId = String(rows[0].usage_run_id);
+      const ownerId = String(rows[0].owner_id);
+      const attachmentId = String(rows[0].attachment_id);
+      const modelId = String(rows[0].model_id);
+      const configVersion = String(rows[0].config_version);
+      const runRows = await tx<Row[]>`SELECT * FROM usage_runs WHERE id=${usageRunId} FOR UPDATE`;
+      if (!runRows[0]) throw new DomainError("not_found", "Embedding usage is missing", 404);
+      if (runRows[0].status === "reserved") {
+        if (input.billing.mode === "refund") {
+          const dispatched = await tx`SELECT id FROM provider_attempts
+            WHERE usage_run_id=${usageRunId} AND status<>'skipped' LIMIT 1`;
+          if (dispatched.length) {
+            throw new DomainError(
+              "provider_accounting_uncertain",
+              "Dispatched embedding work requires settled billing",
+              409,
+            );
+          }
+        }
+        const cost = input.billing.mode === "refund" ? 0 : input.billing.costMicros;
+        const inputTokens = input.billing.mode === "refund" ? 0 : input.billing.inputTokens;
+        const latencyMs = input.billing.mode === "refund" ? 0 : input.billing.latencyMs;
+        const reserved = number(runRows[0].reserved_micros);
+        const delta = reserved - cost;
+        const users = await tx<
+          Row[]
+        >`SELECT balance_micros FROM users WHERE id=${ownerId} FOR UPDATE`;
+        const after = number(users[0].balance_micros) + delta;
+        if (after < 0) {
+          throw new DomainError("insufficient_credit", "Actual cost exceeds credit", 402);
+        }
+        await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${ownerId}`;
+        if (delta !== 0) {
+          await tx`INSERT INTO ledger_entries(user_id,usage_run_id,kind,amount_micros,balance_after_micros)
+            VALUES(${ownerId},${usageRunId},${delta > 0 ? "refund" : "settle"},${delta},${after})`;
+        }
+        await tx`UPDATE usage_runs SET status='failed',cost_micros=${cost},
+          input_tokens=${inputTokens},output_tokens=0,latency_ms=${latencyMs},error=${input.error},
+          run_lease_token=NULL,run_lease_expires_at=NULL,completed_at=now() WHERE id=${usageRunId}`;
+      } else if (runRows[0].status !== "failed") {
+        throw new DomainError("invalid_usage_state", "Embedding usage is already terminal", 409);
+      }
+      await tx`UPDATE document_chunks d SET embedding=NULL,embedding_status='failed',
+        embedding_model_id=${modelId},embedding_config_version=${configVersion},
+        embedded_at=NULL,embedding_error=${input.error}
+        FROM document_embedding_execution_chunks ec WHERE ec.execution_id=${executionId}
+          AND ec.chunk_id=d.id AND d.attachment_id=${attachmentId}`;
+      await tx`UPDATE jobs SET status='failed',last_error=${input.error},completed_at=now(),
+        locked_at=NULL,locked_by=NULL WHERE id=${input.jobId}`;
+      const updated = await tx<Row[]>`UPDATE document_embedding_executions SET status='failed',
         completed_at=now(),run_lease_token=NULL WHERE id=${executionId} RETURNING *`;
       return documentEmbeddingExecution(updated[0]);
     });
