@@ -150,6 +150,18 @@ Deno.test({
         requireEmailVerification: true,
       });
 
+      const noUserInfoMode = await mockOidc.fetch(
+        new Request("http://mock-oidc:4020/control/mode", {
+          method: "POST",
+          headers: {
+            authorization: "Bearer test-control-token",
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ mode: "no_userinfo" }),
+        }),
+      );
+      assertEquals(noUserInfoMode.status, 200);
+
       const oidcStart = await service.handler(
         new Request("http://localhost:8000/api/auth/sign-in/oidc", {
           method: "POST",
@@ -197,6 +209,15 @@ Deno.test({
       assertEquals(oidcIdentity.user.email, "oidc-new@e2e.invalid");
       assertEquals(oidcIdentity.user.approvalStatus, "pending");
       assertEquals(oidcIdentity.limited, true);
+      const oidcState = await mockOidc.fetch(
+        new Request("http://mock-oidc:4020/control/state", {
+          headers: { authorization: "Bearer test-control-token" },
+        }),
+      );
+      assertEquals(
+        (await oidcState.json() as { counters: { userinfo: number } }).counters.userinfo,
+        0,
+      );
       const firstOidcApproval = await repository.approveUser(
         oidcIdentity.user.id,
         "approved",

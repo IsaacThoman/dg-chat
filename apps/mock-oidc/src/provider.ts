@@ -87,6 +87,7 @@ export const MOCK_OIDC_PERSONAS = {
 export type MockOidcPersona = keyof typeof MOCK_OIDC_PERSONAS;
 export type MockOidcMode =
   | "normal"
+  | "no_userinfo"
   | "authorization_error"
   | "token_http_500"
   | "userinfo_http_500"
@@ -143,6 +144,7 @@ interface Counters {
 
 const modes = new Set<MockOidcMode>([
   "normal",
+  "no_userinfo",
   "authorization_error",
   "token_http_500",
   "userinfo_http_500",
@@ -305,7 +307,9 @@ export async function createMockOidcProvider(options: MockOidcProviderOptions) {
           issuer: options.publicIssuer,
           authorization_endpoint: `${options.publicIssuer}/authorize`,
           token_endpoint: `${options.internalBaseUrl}/token`,
-          userinfo_endpoint: `${options.internalBaseUrl}/userinfo`,
+          ...(mode === "no_userinfo"
+            ? {}
+            : { userinfo_endpoint: `${options.internalBaseUrl}/userinfo` }),
           jwks_uri: `${options.internalBaseUrl}/jwks`,
           response_types_supported: ["code"],
           response_modes_supported: ["query"],

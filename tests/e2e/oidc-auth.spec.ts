@@ -51,6 +51,7 @@ test("OIDC creates a pending applicant and approval enables a fresh SSO session"
   await signInWithOidc(page, personaName);
 
   await expect(page).toHaveURL(/\/$/u);
+  await page.getByRole("main").getByRole("button", { name: /^new chat$/i }).click();
   await expect(page.getByRole("textbox", { name: /message/i })).toBeVisible();
   const stateResponse = await request.get(`${mockControlUrl}/control/state`, {
     headers: mockControlHeaders,

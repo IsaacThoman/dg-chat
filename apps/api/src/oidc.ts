@@ -38,7 +38,7 @@ const discoverySchema = z.object({
   issuer: z.string().url(),
   authorization_endpoint: z.string().url(),
   token_endpoint: z.string().url(),
-  userinfo_endpoint: z.string().url(),
+  userinfo_endpoint: z.string().url().optional(),
   jwks_uri: z.string().url(),
   response_types_supported: z.array(z.string()).optional(),
   code_challenge_methods_supported: z.array(z.string()).optional(),
@@ -152,6 +152,18 @@ const exactOriginUrl = (value: string, allowHttp: boolean): URL => {
   return url;
 };
 
+const configuredEndpointOrigin = (value: string, allowHttp: boolean): URL => {
+  const url = exactOriginUrl(value, allowHttp);
+  if (url.pathname !== "/" || url.search) {
+    throw new Error("OIDC allowed endpoint origins must be origins without a path or query");
+  }
+  return url;
+};
+
+export function parseOidcProfile(value: unknown) {
+  return userInfoSchema.parse(value);
+}
+
 const timingSafeEqual = (left: string, right: string): boolean => {
   const a = new TextEncoder().encode(left);
   const b = new TextEncoder().encode(right);
@@ -199,6 +211,9 @@ export function validateOidcConfig(config: OidcConfig): OidcConfig {
   ) throw new Error("OIDC client credentials must be bounded ASCII values");
   exactOriginUrl(config.discoveryUrl, config.allowInsecureHttp === true);
   exactOriginUrl(config.expectedIssuer, config.allowInsecureHttp === true);
+  for (const origin of config.allowedEndpointOrigins ?? []) {
+    configuredEndpointOrigin(origin, config.allowInsecureHttp === true);
+  }
   if (
     !config.allowedAlgorithms.length ||
     config.allowedAlgorithms.some((value) =>
@@ -217,7 +232,7 @@ export function oidcPlugin(rawConfig: OidcConfig): BetterAuthPlugin {
   const allowedEndpointOrigins = new Set([
     new URL(config.discoveryUrl).origin,
     ...(config.allowedEndpointOrigins ?? []).map((value) =>
-      exactOriginUrl(value, config.allowInsecureHttp === true).origin
+      configuredEndpointOrigin(value, config.allowInsecureHttp === true).origin
     ),
   ]);
   const allowedEndpointUrls = [...allowedEndpointOrigins].map((origin) => new URL(origin));
@@ -255,11 +270,15 @@ export function oidcPlugin(rawConfig: OidcConfig): BetterAuthPlugin {
         value.token_endpoint,
         value.userinfo_endpoint,
         value.jwks_uri,
-      ]
+      ].filter((endpoint): endpoint is string => Boolean(endpoint))
     ) {
       exactOriginUrl(endpoint, config.allowInsecureHttp === true);
     }
-    for (const endpoint of [value.token_endpoint, value.userinfo_endpoint, value.jwks_uri]) {
+    for (
+      const endpoint of [value.token_endpoint, value.userinfo_endpoint, value.jwks_uri].filter(
+        (candidate): candidate is string => Boolean(candidate),
+      )
+    ) {
       if (!allowedEndpointOrigins.has(new URL(endpoint).origin)) {
         throw new Error("OIDC server endpoint origin is not allowlisted");
       }
@@ -394,11 +413,13 @@ export function oidcPlugin(rawConfig: OidcConfig): BetterAuthPlugin {
           if (typeof claims.nonce !== "string" || !timingSafeEqual(claims.nonce, state.nonce)) {
             return stableError(config.webOrigin, "oidc_nonce_invalid");
           }
-          const profile = userInfoSchema.parse(
-            await secureFetchJson(discovery.userinfo_endpoint, {
-              headers: { authorization: `Bearer ${tokens.access_token}` },
-            }),
-          );
+          const profile = discovery.userinfo_endpoint
+            ? parseOidcProfile(
+              await secureFetchJson(discovery.userinfo_endpoint, {
+                headers: { authorization: `Bearer ${tokens.access_token}` },
+              }),
+            )
+            : parseOidcProfile(claims);
           if (profile.sub !== claims.sub) {
             return stableError(config.webOrigin, "oidc_profile_invalid");
           }

@@ -3890,9 +3890,19 @@ export function App() {
           </h2>
           <p>
             {view === "chat"
-              ? "Choose New chat to begin."
+              ? "Create a chat to start a conversation."
               : "Conversations moved here will appear in this view."}
           </p>
+          {view === "chat" && (
+            <button
+              className="primary"
+              type="button"
+              onClick={() => void open("new")}
+            >
+              <Plus size={16} aria-hidden="true" />
+              New chat
+            </button>
+          )}
         </main>
       )}
       {view === "settings" && <SettingsView user={user} onMenu={() => setMobile(true)} />}

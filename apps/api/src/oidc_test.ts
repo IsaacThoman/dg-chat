@@ -3,6 +3,7 @@ import {
   authorizedPartyIsValid,
   fetchOidcJson,
   oauthFormEncode,
+  parseOidcProfile,
   selectTokenClientAuthentication,
   validateOidcConfig,
 } from "./oidc.ts";
@@ -25,6 +26,41 @@ Deno.test("OIDC configuration pins safe endpoints and an asymmetric algorithm", 
   assertThrows(() => validateOidcConfig({ ...valid, providerId: "Organization SSO" }));
   assertThrows(() => validateOidcConfig({ ...valid, allowedAlgorithms: ["none"] }));
   assertThrows(() => validateOidcConfig({ ...valid, allowedAlgorithms: ["HS256"] }));
+  assertThrows(() =>
+    validateOidcConfig({
+      ...valid,
+      allowedEndpointOrigins: ["https://idp.example/tenant-a"],
+    })
+  );
+  assertThrows(() =>
+    validateOidcConfig({
+      ...valid,
+      allowedEndpointOrigins: ["https://idp.example/?tenant=a"],
+    })
+  );
+  assertEquals(
+    validateOidcConfig({ ...valid, allowedEndpointOrigins: ["https://tokens.example"] })
+      .allowedEndpointOrigins,
+    ["https://tokens.example"],
+  );
+});
+
+Deno.test("OIDC profile parsing supports verified ID-token claims when UserInfo is absent", () => {
+  assertEquals(
+    parseOidcProfile({
+      sub: "subject-1",
+      email: "person@example.com",
+      email_verified: true,
+      name: "Example Person",
+    }),
+    {
+      sub: "subject-1",
+      email: "person@example.com",
+      email_verified: true,
+      name: "Example Person",
+    },
+  );
+  assertThrows(() => parseOidcProfile({ sub: "subject-1", name: "Missing email" }));
 });
 
 Deno.test("insecure HTTP OIDC is an explicit test/private deployment opt-in", () => {
