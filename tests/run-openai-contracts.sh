@@ -93,6 +93,17 @@ curl --fail --silent --show-error --request POST \
   --header "origin: $web_origin" --cookie "$CONTRACT_SESSION_COOKIE" \
   --data "{\"providerModelId\":\"$audio_model_id\",\"expectedModelVersion\":$audio_model_version,\"effectiveAt\":\"2020-01-01T00:00:00.000Z\",\"inputMicrosPerMillion\":0,\"cachedInputMicrosPerMillion\":0,\"reasoningMicrosPerMillion\":0,\"outputMicrosPerMillion\":0,\"fixedCallMicros\":10,\"source\":\"contract\"}" >/dev/null
 
+image_model="$(curl --fail --silent --show-error --request POST \
+  "$api_url/api/admin/models" --header 'content-type: application/json' \
+  --header "origin: $web_origin" --cookie "$CONTRACT_SESSION_COOKIE" \
+  --data "{\"providerId\":\"$provider_id\",\"publicModelId\":\"contracts/mock-image\",\"upstreamModelId\":\"mock-image\",\"displayName\":\"Contract Mock Image\",\"capabilities\":[\"image_generation\"],\"contextWindow\":8192}")"
+image_model_id="$(jq --raw-output '.id' <<<"$image_model")"
+image_model_version="$(jq --raw-output '.version' <<<"$image_model")"
+curl --fail --silent --show-error --request POST \
+  "$api_url/api/admin/models/$image_model_id/prices" --header 'content-type: application/json' \
+  --header "origin: $web_origin" --cookie "$CONTRACT_SESSION_COOKIE" \
+  --data "{\"providerModelId\":\"$image_model_id\",\"expectedModelVersion\":$image_model_version,\"effectiveAt\":\"2020-01-01T00:00:00.000Z\",\"inputMicrosPerMillion\":0,\"cachedInputMicrosPerMillion\":0,\"reasoningMicrosPerMillion\":0,\"outputMicrosPerMillion\":0,\"fixedCallMicros\":1000,\"source\":\"contract\"}" >/dev/null
+
 echo "Explicitly unsupported contract TODOs:"
 jq --raw-output '.[] | "TODO  \(.endpoint): \(.reason)"' \
   tests/contracts/unsupported-contracts.json
@@ -124,6 +135,15 @@ jq -e '
   .speech.sawSse == true
 ' <<<"$audio_state" >/dev/null
 echo "Official SDK speech binary, SSE, replay, custom voice, and cancellation contracts passed"
+jq -e '
+  .images.calls == 3 and
+  .images.lastAuthorized == true and
+  .images.lastModel == "mock-image" and
+  .images.lastResponseFormat == "b64_json" and
+  .images.lastCount == 1 and
+  .images.lastPrompt == "Python image contract"
+' <<<"$audio_state" >/dev/null
+echo "Official SDK image generation, PNG validation, and exact replay contracts passed"
 
 deno run --no-config --allow-env --allow-net \
   tests/contracts/upstream-stream.ts

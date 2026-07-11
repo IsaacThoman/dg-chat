@@ -38,6 +38,19 @@ const speech = {
   sawSse: false,
 };
 
+const images = {
+  calls: 0,
+  lastAuthorized: false,
+  lastModel: null as string | null,
+  lastResponseFormat: null as string | null,
+  lastCount: 0,
+  lastPrompt: null as string | null,
+};
+
+// Valid 1x1 PNG. The API decodes and validates dimensions before persistence.
+const imagePngBase64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZQmcAAAAASUVORK5CYII=";
+
 interface ScenarioState {
   opened: number;
   completed: number;
@@ -365,6 +378,14 @@ Deno.serve({ port }, async (request) => {
       sawCustomVoice: false,
       sawSse: false,
     });
+    Object.assign(images, {
+      calls: 0,
+      lastAuthorized: false,
+      lastModel: null,
+      lastResponseFormat: null,
+      lastCount: 0,
+      lastPrompt: null,
+    });
     return json({ reset: true });
   }
   if (url.pathname === "/__test/state" && request.method === "GET") {
@@ -374,6 +395,7 @@ Deno.serve({ port }, async (request) => {
       scenarios: Object.fromEntries(scenarios),
       audio,
       speech,
+      images,
     });
   }
   if (url.pathname === "/v1/models" && request.method === "GET") {
@@ -421,9 +443,41 @@ Deno.serve({ port }, async (request) => {
     if (!authorized(request, apiKey)) {
       return error("Invalid mock provider key", 401, "unauthorized");
     }
+    const body = await request.json() as Record<string, unknown>;
+    images.calls++;
+    images.lastAuthorized = true;
+    images.lastModel = typeof body.model === "string" ? body.model : null;
+    images.lastResponseFormat = typeof body.response_format === "string"
+      ? body.response_format
+      : null;
+    images.lastCount = typeof body.n === "number" ? body.n : 1;
+    images.lastPrompt = typeof body.prompt === "string" ? body.prompt : null;
+    if (body.stream === true) {
+      const partial = {
+        type: "image_generation.partial_image",
+        b64_json: imagePngBase64,
+        created_at: 1_700_000_000,
+        partial_image_index: 0,
+      };
+      const completed = {
+        type: "image_generation.completed",
+        b64_json: imagePngBase64,
+        created_at: 1_700_000_001,
+      };
+      return new Response(
+        (Number(body.partial_images ?? 0) > 0
+          ? `event: ${partial.type}\ndata: ${JSON.stringify(partial)}\n\n`
+          : "") +
+          `event: ${completed.type}\ndata: ${JSON.stringify(completed)}\n\n`,
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    }
     return json({
       created: 1_700_000_000,
-      data: [{ b64_json: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB" }],
+      data: Array.from({ length: images.lastCount }, () => ({
+        b64_json: imagePngBase64,
+        revised_prompt: images.lastPrompt,
+      })),
     });
   }
   if (url.pathname.startsWith("/v1/audio/") && request.method === "POST") {

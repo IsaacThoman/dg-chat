@@ -1,6 +1,7 @@
 import os
 import io
 import uuid
+import base64
 
 from openai import OpenAI
 
@@ -14,6 +15,7 @@ client = OpenAI(api_key=api_key, base_url=base_url, max_retries=0)
 model = "openai/mock-fast"
 embedding_model = "contracts/mock-embedding"
 audio_model = "contracts/mock-transcribe"
+image_model = "contracts/mock-image"
 speech_bytes = bytes([73, 68, 51, 4, 0, 0, 0, 0, 0, 0, 0xFF, 0xFB, 0x90, 0x64])
 
 
@@ -35,6 +37,39 @@ if not any(candidate.id == embedding_model for candidate in models.data):
     raise RuntimeError("Official Python client did not receive the embeddings model")
 if not any(candidate.id == audio_model for candidate in models.data):
     raise RuntimeError("Official Python client did not receive the transcription model")
+if not any(candidate.id == image_model for candidate in models.data):
+    raise RuntimeError("Official Python client did not receive the image generation model")
+
+image_replay_key = f"python-image-{uuid.uuid4()}"
+def create_image():
+    return client.images.generate(
+        model=image_model,
+        prompt="Python image contract",
+        n=1,
+        response_format="b64_json",
+        size="1024x1024",
+        extra_headers={"Idempotency-Key": image_replay_key},
+    )
+
+first_image = create_image()
+replayed_image = create_image()
+image_base64 = first_image.data[0].b64_json
+if not image_base64 or replayed_image.data[0].b64_json != image_base64:
+    raise RuntimeError("Python images.generate() or its exact replay was invalid")
+if base64.b64decode(image_base64)[1:4] != b"PNG":
+    raise RuntimeError("Python images.generate() did not return a valid PNG signature")
+try:
+    client.images.generate(
+        model=image_model,
+        prompt="Invalid image count",
+        n=0,
+        response_format="b64_json",
+    )
+except Exception as error:
+    if getattr(error, "status_code", None) != 422:
+        raise RuntimeError("Python malformed image request did not return compatible 422") from error
+else:
+    raise RuntimeError("Python malformed image request was accepted")
 
 speech = client.audio.speech.create(
     model=audio_model,

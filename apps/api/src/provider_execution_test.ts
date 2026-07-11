@@ -1410,6 +1410,217 @@ Deno.test("engine slow-stream policy cuts off visible streams without retry", as
   assertEquals(attempt.breakerAfter, "open");
 });
 
+Deno.test("image generation execution enforces capability and persists provider usage telemetry", async () => {
+  const fixture = await singleProviderFixture("chat_completions", ["image_generation"], true);
+  const png =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZQmcAAAAASUVORK5CYII=";
+  let sentModel = "";
+  const engine = new ProviderExecutionEngine({
+    repository: fixture.repo,
+    keyring: fixture.keyring,
+    circuitBreaker: new MemoryCircuitBreaker(),
+    breakerPolicy: {
+      failureThreshold: 2,
+      failureWindowSeconds: 60,
+      openSeconds: 30,
+      halfOpenLeaseSeconds: 5,
+    },
+    imageFetch: (_input, init) => {
+      sentModel = (JSON.parse(String(init?.body)) as { model: string }).model;
+      return Promise.resolve(Response.json({
+        created: 1_700_000_000,
+        data: [{ b64_json: png }],
+        usage: { input_tokens: 7, output_tokens: 13, total_tokens: 20 },
+      }));
+    },
+  });
+  const response = await engine.imageGenerate(
+    fixture.model.id,
+    fixture.runId,
+    fixture.run.runLeaseToken!,
+    {
+      model: fixture.model.publicModelId,
+      prompt: "a safe robot",
+      n: 1,
+      background: "auto",
+      moderation: "auto",
+      outputCompression: 100,
+      outputFormat: "png",
+      partialImages: 0,
+      quality: "auto",
+      responseFormat: "b64_json",
+      size: "auto",
+      stream: false,
+      style: "vivid",
+    },
+    new AbortController().signal,
+  );
+  assertEquals(sentModel, "single-upstream");
+  assertEquals(response.data?.[0].width, 1);
+  assertEquals(await response.executionTarget, {
+    providerModelId: fixture.model.id,
+    publicModelId: fixture.model.publicModelId,
+    upstreamModelId: fixture.model.upstreamModelId,
+    providerSlug: fixture.provider.slug,
+  });
+  const attempt = fixture.repo.listProviderAttempts(fixture.runId)[0];
+  assertEquals(attempt.status, "succeeded");
+  assertEquals(attempt.inputTokens, 7);
+  assertEquals(attempt.outputTokens, 13);
+  assertEquals(attempt.tokenSource, "provider");
+
+  const wrongCapability = await singleProviderFixture("chat_completions", ["chat"]);
+  const wrongEngine = new ProviderExecutionEngine({
+    repository: wrongCapability.repo,
+    keyring: wrongCapability.keyring,
+    circuitBreaker: new MemoryCircuitBreaker(),
+    breakerPolicy: {
+      failureThreshold: 1,
+      failureWindowSeconds: 60,
+      openSeconds: 30,
+      halfOpenLeaseSeconds: 5,
+    },
+  });
+  await assertRejects(
+    () =>
+      wrongEngine.imageGenerate(
+        wrongCapability.model.id,
+        wrongCapability.runId,
+        wrongCapability.run.runLeaseToken!,
+        {
+          model: wrongCapability.model.publicModelId,
+          prompt: "robot",
+          n: 1,
+          background: "auto",
+          moderation: "auto",
+          outputCompression: 100,
+          outputFormat: "png",
+          partialImages: 0,
+          quality: "auto",
+          responseFormat: "b64_json",
+          size: "auto",
+          stream: false,
+          style: "vivid",
+        },
+        new AbortController().signal,
+      ),
+    Error,
+    "changed before dispatch",
+  );
+});
+
+Deno.test("image generation reports the actual winning fallback target", async () => {
+  const fixture = await singleProviderFixture("chat_completions", ["image_generation"], true);
+  const mutation = { actorId: fixture.user.id, action: "test.image-fallback" };
+  const createdProvider = fixture.repo.createProvider({
+    slug: "image-fallback",
+    displayName: "Image fallback",
+    baseUrl: "https://image-fallback.example/v1",
+    protocol: "chat_completions",
+  }, mutation);
+  const fallbackProvider = fixture.repo.setProviderCredential(
+    createdProvider.id,
+    createdProvider.version,
+    {
+      envelope: await fixture.keyring.encrypt(
+        createdProvider.id,
+        createdProvider.version + 1,
+        "fallback-secret",
+      ),
+    },
+    mutation,
+  );
+  const fallbackModel = fixture.repo.createProviderModel({
+    providerId: fallbackProvider.id,
+    publicModelId: "image-fallback/artist",
+    upstreamModelId: "fallback-artist-v2",
+    displayName: "Fallback artist",
+    capabilities: ["image_generation"],
+    contextWindow: 8_192,
+  }, mutation);
+  fixture.repo.createModelPriceVersion({
+    providerModelId: fallbackModel.id,
+    expectedModelVersion: fallbackModel.version,
+    effectiveAt: "2026-01-01T00:00:00.000Z",
+    inputMicrosPerMillion: 0,
+    cachedInputMicrosPerMillion: 0,
+    reasoningMicrosPerMillion: 0,
+    outputMicrosPerMillion: 0,
+    fixedCallMicros: 20,
+    source: "fallback-test",
+  }, mutation);
+  const policy = fixture.repo.createProviderRetryPolicy({
+    name: "Image fallback policy",
+    maxAttempts: 2,
+    maxRetries: 0,
+    baseDelayMs: 0,
+    maxDelayMs: 0,
+    backoffMultiplierBps: 10_000,
+    jitterBps: 0,
+    firstTokenTimeoutMs: 1_000,
+    idleTimeoutMs: 1_000,
+    totalTimeoutMs: 10_000,
+    retryableStatuses: [500],
+  }, mutation);
+  fixture.repo.setProviderModelRoute({
+    sourceModelId: fixture.model.id,
+    expectedVersion: 0,
+    retryPolicyId: policy.id,
+    fallbackModelIds: [fallbackModel.id],
+  }, mutation);
+  const png =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZQmcAAAAASUVORK5CYII=";
+  const calls: string[] = [];
+  const engine = new ProviderExecutionEngine({
+    repository: fixture.repo,
+    keyring: fixture.keyring,
+    circuitBreaker: new MemoryCircuitBreaker(),
+    breakerPolicy: {
+      failureThreshold: 2,
+      failureWindowSeconds: 60,
+      openSeconds: 30,
+      halfOpenLeaseSeconds: 5,
+    },
+    imageFetch: (_input, init) => {
+      const model = (JSON.parse(String(init?.body)) as { model: string }).model;
+      calls.push(model);
+      return Promise.resolve(
+        model === fixture.model.upstreamModelId
+          ? new Response("failed", { status: 500 })
+          : Response.json({ created: 123, data: [{ b64_json: png }] }),
+      );
+    },
+  });
+  const result = await engine.imageGenerate(
+    fixture.model.id,
+    fixture.runId,
+    fixture.run.runLeaseToken!,
+    {
+      model: fixture.model.publicModelId,
+      prompt: "fallback",
+      n: 1,
+      background: "auto",
+      moderation: "auto",
+      outputCompression: 100,
+      outputFormat: "png",
+      partialImages: 0,
+      quality: "auto",
+      responseFormat: "b64_json",
+      size: "auto",
+      stream: false,
+      style: "vivid",
+    },
+    new AbortController().signal,
+  );
+  assertEquals(calls, [fixture.model.upstreamModelId, fallbackModel.upstreamModelId]);
+  assertEquals(await result.executionTarget, {
+    providerModelId: fallbackModel.id,
+    publicModelId: fallbackModel.publicModelId,
+    upstreamModelId: fallbackModel.upstreamModelId,
+    providerSlug: fallbackProvider.slug,
+  });
+});
+
 Deno.test("engine persists a truthful half-open transition after a successful probe", async () => {
   const fixture = await singleProviderFixture("chat_completions");
   let now = 0;

@@ -9,6 +9,8 @@ regexes = [
   '''env\.S3_SECRET_KEY''',
   # Historical test idempotency fixture; it is not a credential.
   '''knowledge-api-docs-1''',
+  # Historical `.env.example` placeholder from the image-generation branch; never a credential.
+  '''replace-with-an-independent-32-byte-secret''',
 ]
 paths = [
   '''\.github/workflows/ci\.yml''',

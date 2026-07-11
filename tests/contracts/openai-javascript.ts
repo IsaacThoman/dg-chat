@@ -8,6 +8,7 @@ const client = new OpenAI({ apiKey, baseURL, maxRetries: 0 });
 const model = "openai/mock-fast";
 const embeddingModel = "contracts/mock-embedding";
 const audioModel = "contracts/mock-transcribe";
+const imageModel = "contracts/mock-image";
 const speechBytes = new Uint8Array([
   73,
   68,
@@ -52,6 +53,77 @@ if (!models.data.some((candidate) => candidate.id === embeddingModel)) {
 }
 if (!models.data.some((candidate) => candidate.id === audioModel)) {
   throw new Error("Official JavaScript client did not receive the transcription model");
+}
+if (!models.data.some((candidate) => candidate.id === imageModel)) {
+  throw new Error("Official JavaScript client did not receive the image generation model");
+}
+
+const imageReplayKey = `javascript-image-${crypto.randomUUID()}`;
+const createImage = () =>
+  client.images.generate({
+    model: imageModel,
+    prompt: "JavaScript image contract",
+    n: 1,
+    response_format: "b64_json",
+    size: "1024x1024",
+  }, { headers: { "Idempotency-Key": imageReplayKey } });
+const firstImage = await createImage();
+const replayedImage = await createImage();
+const imageBase64 = firstImage.data?.[0]?.b64_json;
+if (!imageBase64 || replayedImage.data?.[0]?.b64_json !== imageBase64) {
+  throw new Error("JavaScript images.generate() or its exact replay was invalid");
+}
+const imageBytes = Uint8Array.from(atob(imageBase64), (character) => character.charCodeAt(0));
+if (new TextDecoder().decode(imageBytes.subarray(1, 4)) !== "PNG") {
+  throw new Error("JavaScript images.generate() did not return a valid PNG signature");
+}
+const imageStreamKey = `javascript-image-stream-${crypto.randomUUID()}`;
+const streamImage = () =>
+  fetch(`${baseURL}/images/generations`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${apiKey}`,
+      "content-type": "application/json",
+      "idempotency-key": imageStreamKey,
+    },
+    body: JSON.stringify({
+      model: imageModel,
+      prompt: "JavaScript streaming image contract",
+      stream: true,
+      partial_images: 0,
+      response_format: "b64_json",
+    }),
+  });
+const streamedImage = await streamImage();
+const streamedImageBody = await streamedImage.text();
+if (
+  !streamedImage.ok || !streamedImage.headers.get("content-type")?.includes("text/event-stream") ||
+  streamedImageBody.indexOf("image_generation.completed") < 0
+) throw new Error("Raw JavaScript streaming image contract was invalid");
+const replayedImageStream = await streamImage();
+if (
+  replayedImageStream.headers.get("x-idempotent-replay") !== "true" ||
+  await replayedImageStream.text() !== streamedImageBody
+) throw new Error("Raw JavaScript streaming image replay was not exact");
+try {
+  await client.images.generate({
+    model: imageModel,
+    prompt: "Invalid image count",
+    n: 0,
+    response_format: "b64_json",
+  });
+  throw new Error("JavaScript malformed image request was accepted");
+} catch (error) {
+  if (
+    error instanceof Error && error.message === "JavaScript malformed image request was accepted"
+  ) {
+    throw error;
+  }
+  if (!(error instanceof OpenAI.APIError) || error.status !== 422) {
+    throw new Error("JavaScript malformed image request did not return compatible 422", {
+      cause: error,
+    });
+  }
 }
 
 const speech = await client.audio.speech.create({

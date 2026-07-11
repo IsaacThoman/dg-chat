@@ -155,6 +155,13 @@
       "when": 1783656021000,
       "tag": "0021_binary_api_replay",
       "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1783656022000,
+      "tag": "0022_generated_assets",
+      "breakpoints": true
     }
   ]
 }

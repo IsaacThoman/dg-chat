@@ -57,9 +57,12 @@ import type {
   FailApiRequestInput,
   FailGenerationInput,
   FinalizeEmbeddingProviderUsageInput,
+  FinalizeGeneratedAssetsInput,
   FinalizeProviderUsageInput,
   FinishEmbeddingProviderAttemptInput,
   FinishProviderAttemptInput,
+  GeneratedAssetRecord,
+  GeneratedObjectStage,
   IdentityTokenPurpose,
   KnowledgeCollection,
   KnowledgeCollectionPatch,
@@ -82,6 +85,7 @@ import type {
   SearchConversationKnowledgeInput,
   SessionSummary,
   SetProviderModelRouteInput,
+  StageGeneratedObjectInput,
   StartProviderAttemptInput,
   StoredProviderCredential,
   UpdateProviderInput,
@@ -93,6 +97,9 @@ import {
   decodeAuditCursor,
   encodeAuditPostgresCursor,
   isUsagePricingSnapshot,
+  sameGeneratedAssetFinalization,
+  usagePricingSnapshotsEqual,
+  validateGeneratedAssetFinalization,
 } from "./repository.ts";
 
 type Row = Record<string, unknown>;
@@ -250,6 +257,62 @@ function attachment(row: Row): AttachmentRecord {
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at ?? row.created_at),
     deletedAt: nullableIso(row.deleted_at),
+  };
+}
+function generatedAsset(row: Row): GeneratedAssetRecord {
+  const rawInputs = Array.isArray(row.inputs) ? row.inputs as Row[] : [];
+  return {
+    id: String(row.id),
+    ownerId: String(row.owner_id),
+    usageRunId: String(row.usage_run_id),
+    providerModelId: String(row.provider_model_id),
+    publicModelId: String(row.public_model_id),
+    upstreamModelId: String(row.upstream_model_id),
+    providerSlug: String(row.provider_slug),
+    pricingSnapshot: {
+      pricingVersionId: String(row.pricing_version_id),
+      inputMicrosPerMillion: number(row.pricing_input_micros_per_million),
+      cachedInputMicrosPerMillion: number(row.pricing_cached_input_micros_per_million),
+      reasoningMicrosPerMillion: number(row.pricing_reasoning_micros_per_million),
+      outputMicrosPerMillion: number(row.pricing_output_micros_per_million),
+      fixedCallMicros: number(row.pricing_fixed_call_micros),
+      source: String(row.pricing_source),
+    },
+    attachmentId: String(row.attachment_id),
+    idempotencyKey: String(row.idempotency_key),
+    requestHash: String(row.request_hash),
+    operation: row.operation as GeneratedAssetRecord["operation"],
+    prompt: String(row.prompt),
+    providerCreatedAt: number(row.provider_created_at),
+    ordinal: number(row.ordinal),
+    width: number(row.width),
+    height: number(row.height),
+    revisedPrompt: row.revised_prompt == null ? null : String(row.revised_prompt),
+    inputs: rawInputs.map((value) => ({
+      attachmentId: String(value.attachmentId ?? value.attachment_id),
+      role: String(value.role) as GeneratedAssetRecord["inputs"][number]["role"],
+      ordinal: number(value.ordinal),
+    })),
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+    deletedAt: nullableIso(row.deleted_at),
+  };
+}
+function generatedObjectStage(row: Row): GeneratedObjectStage {
+  return {
+    id: String(row.id),
+    ownerId: String(row.owner_id),
+    usageRunId: String(row.usage_run_id),
+    ordinal: number(row.ordinal),
+    objectKey: String(row.object_key),
+    mimeType: String(row.mime_type),
+    sizeBytes: number(row.size_bytes),
+    sha256: String(row.sha256),
+    attachmentId: row.attachment_id == null ? null : String(row.attachment_id),
+    state: String(row.state) as GeneratedObjectStage["state"],
+    cleanupError: row.cleanup_error == null ? null : String(row.cleanup_error),
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
   };
 }
 function documentChunk(row: Row): DocumentChunk {
@@ -629,6 +692,19 @@ function validateAttachmentInput(input: CreateAttachmentInput) {
     !input.objectKey || input.objectKey.length > 1024 || input.objectKey.startsWith("/") ||
     input.objectKey.split("/").some((part) => part === ".." || part === "")
   ) throw new DomainError("validation_error", "Attachment metadata is invalid", 422);
+}
+
+function validateGeneratedObjectStageInput(input: StageGeneratedObjectInput) {
+  if (
+    !/^[0-9a-f-]{36}$/i.test(input.ownerId) || !input.usageRunId ||
+    input.usageRunId.length > 200 || !Number.isSafeInteger(input.ordinal) || input.ordinal < 0 ||
+    input.ordinal > 9 || !input.objectKey || input.objectKey.length > 1024 ||
+    input.objectKey.startsWith("/") ||
+    input.objectKey.split("/").some((part) => !part || part === "..") ||
+    !/^[\w.+-]+\/[\w.+-]+$/.test(input.mimeType) || input.mimeType.length > 255 ||
+    !Number.isSafeInteger(input.sizeBytes) || input.sizeBytes < 1 ||
+    input.sizeBytes > 25 * 1024 * 1024 || !/^[0-9a-f]{64}$/.test(input.sha256)
+  ) throw new DomainError("validation_error", "Generated object stage is invalid", 422);
 }
 function apiRequest(row: Row, frames: ApiIdempotencyFrame[] = []): ApiIdempotencyRequest {
   return {
@@ -1844,7 +1920,7 @@ export class PostgresRepository implements DomainRepository {
       }
       const attachmentId = String(record.id);
       const idempotencyKey = `attachment.inspect:${attachmentId}`;
-      const jobs = await tx<
+      const jobs = input.inspectionComplete ? [] : await tx<
         Row[]
       >`INSERT INTO jobs(type,payload,idempotency_key) VALUES('attachment.inspect',${
         tx.json({ attachmentId, ownerId: input.ownerId })
@@ -1856,7 +1932,7 @@ export class PostgresRepository implements DomainRepository {
       }
       return {
         attachment: attachment(record),
-        inspectionJobId: String(jobs[0].id),
+        inspectionJobId: jobs[0] ? String(jobs[0].id) : null,
         deduplicated,
       };
     });
@@ -1936,13 +2012,17 @@ export class PostgresRepository implements DomainRepository {
   }
 
   async linkAttachmentToMessage(messageId: string, attachmentId: string, ownerId: string) {
-    const authorized = await this
-      .#sql`SELECT m.id FROM messages m JOIN conversations c ON c.id=m.conversation_id JOIN attachments a ON a.id=${attachmentId} AND a.owner_id=${ownerId} AND a.state='ready' AND a.deleted_at IS NULL WHERE m.id=${messageId} AND c.owner_id=${ownerId}`;
-    if (!authorized.length) {
-      throw new DomainError("attachment_not_ready", "Message or ready attachment not found", 409);
-    }
-    await this
-      .#sql`INSERT INTO message_attachments(message_id,attachment_id) VALUES(${messageId},${attachmentId}) ON CONFLICT DO NOTHING`;
+    await this.#sql.begin(async (tx) => {
+      const ready = await tx`SELECT id FROM attachments WHERE id=${attachmentId}
+        AND owner_id=${ownerId} AND state='ready' AND deleted_at IS NULL FOR UPDATE`;
+      const message = await tx`SELECT m.id FROM messages m JOIN conversations c
+        ON c.id=m.conversation_id WHERE m.id=${messageId} AND c.owner_id=${ownerId}`;
+      if (!ready.length || !message.length) {
+        throw new DomainError("attachment_not_ready", "Message or ready attachment not found", 409);
+      }
+      await tx`INSERT INTO message_attachments(message_id,attachment_id)
+        VALUES(${messageId},${attachmentId}) ON CONFLICT DO NOTHING`;
+    });
   }
 
   async listMessageAttachments(messageId: string, ownerId: string) {
@@ -1953,6 +2033,261 @@ export class PostgresRepository implements DomainRepository {
       Row[]
     >`SELECT a.* FROM attachments a JOIN message_attachments ma ON ma.attachment_id=a.id WHERE ma.message_id=${messageId} ORDER BY a.created_at,a.id`)
       .map(attachment);
+  }
+
+  async finalizeGeneratedAssets(input: FinalizeGeneratedAssetsInput) {
+    validateGeneratedAssetFinalization(input);
+    return await this.#sql.begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtextextended(${`${input.ownerId}:${input.idempotencyKey}`},0))`;
+      const priorRows = await tx<Row[]>`
+        SELECT ga.*,COALESCE((SELECT jsonb_agg(jsonb_build_object(
+          'attachmentId',gai.attachment_id,'role',gai.role,'ordinal',gai.ordinal)
+          ORDER BY gai.role,gai.ordinal,gai.attachment_id)
+          FROM generated_asset_inputs gai WHERE gai.generated_asset_id=ga.id),'[]'::jsonb) AS inputs
+        FROM generated_assets ga
+        WHERE ga.owner_id=${input.ownerId} AND ga.idempotency_key=${input.idempotencyKey}
+        ORDER BY ga.ordinal FOR UPDATE`;
+      if (priorRows.length) {
+        const prior = priorRows.map(generatedAsset);
+        if (!sameGeneratedAssetFinalization(prior, input)) {
+          throw new DomainError(
+            "idempotency_conflict",
+            "Generated asset replay payload differs",
+            409,
+          );
+        }
+        return prior;
+      }
+      const runRows = await tx<Row[]>`SELECT * FROM usage_runs WHERE id=${input.usageRunId}
+        AND user_id=${input.ownerId} FOR UPDATE`;
+      if (!runRows.length) throw new DomainError("not_found", "Usage run not found", 404);
+      const used = await tx`SELECT id FROM generated_assets WHERE usage_run_id=${input.usageRunId}
+        LIMIT 1`;
+      if (used.length) {
+        throw new DomainError(
+          "idempotency_conflict",
+          "Usage run already has generated assets",
+          409,
+        );
+      }
+      const models = await tx<Row[]>`SELECT pm.*,p.slug provider_slug FROM provider_models pm
+        JOIN providers p ON p.id=pm.provider_id WHERE pm.id=${input.providerModelId}`;
+      if (!models.length) throw new DomainError("not_found", "Provider model not found", 404);
+      const prices = await tx<Row[]>`SELECT * FROM model_price_versions
+        WHERE id=${input.pricingSnapshot.pricingVersionId}`;
+      const usage = run(runRows[0]);
+      const persistedPrice = prices[0]
+        ? {
+          pricingVersionId: String(prices[0].id),
+          inputMicrosPerMillion: number(prices[0].input_micros_per_million),
+          cachedInputMicrosPerMillion: number(prices[0].cached_input_micros_per_million),
+          reasoningMicrosPerMillion: number(prices[0].reasoning_micros_per_million),
+          outputMicrosPerMillion: number(prices[0].output_micros_per_million),
+          fixedCallMicros: number(prices[0].fixed_call_micros),
+          source: String(prices[0].source),
+        }
+        : undefined;
+      if (
+        usage.model !== input.publicModelId ||
+        String(models[0].upstream_model_id) !== input.upstreamModelId ||
+        String(models[0].provider_slug) !== input.providerSlug ||
+        !usagePricingSnapshotsEqual(persistedPrice, input.pricingSnapshot) ||
+        !usagePricingSnapshotsEqual(usage.pricingSnapshot ?? undefined, input.pricingSnapshot)
+      ) {
+        throw new DomainError(
+          "snapshot_conflict",
+          "Generated asset registry snapshot does not match the usage run",
+          409,
+        );
+      }
+      const attachmentIds = [
+        ...new Set(input.assets.flatMap((asset) => [
+          asset.attachmentId,
+          ...(asset.inputs ?? []).map((source) => source.attachmentId),
+        ])),
+      ];
+      const ready = await tx<{ id: string }[]>`
+        SELECT id FROM attachments WHERE owner_id=${input.ownerId} AND id=ANY(${attachmentIds})
+          AND state='ready' AND deleted_at IS NULL FOR UPDATE`;
+      if (ready.length !== attachmentIds.length) {
+        throw new DomainError(
+          "attachment_not_ready",
+          "Generated asset attachment is not ready",
+          409,
+        );
+      }
+      const stages = await tx<Row[]>`SELECT * FROM generated_object_staging
+        WHERE usage_run_id=${input.usageRunId} ORDER BY ordinal FOR UPDATE`;
+      if (
+        stages.length > 0 &&
+        (stages.length !== input.assets.length ||
+          stages.some((stage, index) =>
+            number(stage.ordinal) !== index || String(stage.state) !== "attached" ||
+            String(stage.attachment_id) !== input.assets[index].attachmentId
+          ))
+      ) {
+        throw new DomainError(
+          "generated_stage_conflict",
+          "Generated object stages are not ready",
+          409,
+        );
+      }
+      for (const candidate of input.assets) {
+        const inserted = await tx<Row[]>`
+          INSERT INTO generated_assets(owner_id,usage_run_id,provider_model_id,public_model_id,
+            upstream_model_id,provider_slug,pricing_version_id,
+            pricing_input_micros_per_million,pricing_cached_input_micros_per_million,
+            pricing_reasoning_micros_per_million,pricing_output_micros_per_million,
+            pricing_fixed_call_micros,pricing_source,attachment_id,idempotency_key,request_hash,
+            operation,prompt,provider_created_at,ordinal,width,height,revised_prompt)
+          VALUES(${input.ownerId},${input.usageRunId},${input.providerModelId},
+            ${input.publicModelId},${input.upstreamModelId},${input.providerSlug},
+            ${input.pricingSnapshot.pricingVersionId},
+            ${input.pricingSnapshot.inputMicrosPerMillion},
+            ${input.pricingSnapshot.cachedInputMicrosPerMillion},
+            ${input.pricingSnapshot.reasoningMicrosPerMillion},
+            ${input.pricingSnapshot.outputMicrosPerMillion},
+            ${input.pricingSnapshot.fixedCallMicros},${input.pricingSnapshot.source},
+            ${candidate.attachmentId},${input.idempotencyKey},${input.requestHash},
+            ${input.operation},${input.prompt},${input.providerCreatedAt},
+            ${candidate.ordinal},${candidate.width},${candidate.height},
+            ${candidate.revisedPrompt ?? null}) RETURNING id`;
+        const assetId = String(inserted[0].id);
+        for (const source of candidate.inputs ?? []) {
+          await tx`INSERT INTO generated_asset_inputs(generated_asset_id,owner_id,attachment_id,role,ordinal)
+            VALUES(${assetId},${input.ownerId},${source.attachmentId},${source.role},${source.ordinal})`;
+        }
+      }
+      if (stages.length) {
+        await tx`UPDATE generated_object_staging SET state='finalized',cleanup_error=NULL,
+          updated_at=now() WHERE usage_run_id=${input.usageRunId}`;
+      }
+      const rows = await tx<Row[]>`
+        SELECT ga.*,COALESCE((SELECT jsonb_agg(jsonb_build_object(
+          'attachmentId',gai.attachment_id,'role',gai.role,'ordinal',gai.ordinal)
+          ORDER BY gai.role,gai.ordinal,gai.attachment_id)
+          FROM generated_asset_inputs gai WHERE gai.generated_asset_id=ga.id),'[]'::jsonb) AS inputs
+        FROM generated_assets ga WHERE ga.owner_id=${input.ownerId}
+          AND ga.idempotency_key=${input.idempotencyKey} ORDER BY ga.ordinal`;
+      return rows.map(generatedAsset);
+    });
+  }
+
+  async listGeneratedAssets(ownerId: string, includeDeleted = false) {
+    const rows = await this.#sql<Row[]>`
+      SELECT ga.*,COALESCE((SELECT jsonb_agg(jsonb_build_object(
+        'attachmentId',gai.attachment_id,'role',gai.role,'ordinal',gai.ordinal)
+        ORDER BY gai.role,gai.ordinal,gai.attachment_id)
+        FROM generated_asset_inputs gai WHERE gai.generated_asset_id=ga.id),'[]'::jsonb) AS inputs
+      FROM generated_assets ga WHERE ga.owner_id=${ownerId}
+        AND (${includeDeleted} OR ga.deleted_at IS NULL)
+      ORDER BY ga.created_at DESC,ga.id DESC`;
+    return rows.map(generatedAsset);
+  }
+
+  async findGeneratedAssetsByIdempotency(ownerId: string, idempotencyKey: string) {
+    const rows = await this.#sql<Row[]>`
+      SELECT ga.*,COALESCE((SELECT jsonb_agg(jsonb_build_object(
+        'attachmentId',gai.attachment_id,'role',gai.role,'ordinal',gai.ordinal)
+        ORDER BY gai.role,gai.ordinal,gai.attachment_id)
+        FROM generated_asset_inputs gai WHERE gai.generated_asset_id=ga.id),'[]'::jsonb) AS inputs
+      FROM generated_assets ga WHERE ga.owner_id=${ownerId}
+        AND ga.idempotency_key=${idempotencyKey} ORDER BY ga.ordinal`;
+    return rows.map(generatedAsset);
+  }
+
+  async getGeneratedAsset(id: string, ownerId: string, includeDeleted = false) {
+    const rows = await this.#sql<Row[]>`
+      SELECT ga.*,COALESCE((SELECT jsonb_agg(jsonb_build_object(
+        'attachmentId',gai.attachment_id,'role',gai.role,'ordinal',gai.ordinal)
+        ORDER BY gai.role,gai.ordinal,gai.attachment_id)
+        FROM generated_asset_inputs gai WHERE gai.generated_asset_id=ga.id),'[]'::jsonb) AS inputs
+      FROM generated_assets ga WHERE ga.id=${id} AND ga.owner_id=${ownerId}
+        AND (${includeDeleted} OR ga.deleted_at IS NULL)`;
+    if (!rows[0]) throw new DomainError("not_found", "Generated asset not found", 404);
+    return generatedAsset(rows[0]);
+  }
+
+  async deleteGeneratedAsset(id: string, ownerId: string) {
+    const rows = await this.#sql<Row[]>`
+      UPDATE generated_assets SET deleted_at=COALESCE(deleted_at,now()),updated_at=now()
+      WHERE id=${id} AND owner_id=${ownerId} RETURNING id`;
+    if (!rows[0]) throw new DomainError("not_found", "Generated asset not found", 404);
+    return await this.getGeneratedAsset(id, ownerId, true);
+  }
+
+  async restoreGeneratedAsset(id: string, ownerId: string) {
+    const rows = await this.#sql<Row[]>`
+      UPDATE generated_assets SET deleted_at=NULL,updated_at=now()
+      WHERE id=${id} AND owner_id=${ownerId} RETURNING id`;
+    if (!rows[0]) throw new DomainError("not_found", "Generated asset not found", 404);
+    return await this.getGeneratedAsset(id, ownerId, true);
+  }
+
+  async stageGeneratedObject(input: StageGeneratedObjectInput) {
+    validateGeneratedObjectStageInput(input);
+    return await this.#sql.begin(async (tx) => {
+      const run = await tx`SELECT id FROM usage_runs WHERE id=${input.usageRunId}
+        AND user_id=${input.ownerId} FOR UPDATE`;
+      if (!run.length) throw new DomainError("not_found", "Usage run not found", 404);
+      const inserted = await tx<Row[]>`INSERT INTO generated_object_staging(
+        owner_id,usage_run_id,ordinal,object_key,mime_type,size_bytes,sha256)
+        VALUES(${input.ownerId},${input.usageRunId},${input.ordinal},${input.objectKey},
+          ${input.mimeType},${input.sizeBytes},${input.sha256})
+        ON CONFLICT DO NOTHING RETURNING *`;
+      const row = inserted[0] ?? (await tx<Row[]>`SELECT * FROM generated_object_staging
+        WHERE usage_run_id=${input.usageRunId} AND ordinal=${input.ordinal} FOR UPDATE`)[0];
+      if (!row) throw new DomainError("object_key_taken", "Generated object key exists", 409);
+      if (
+        String(row.owner_id) !== input.ownerId || String(row.object_key) !== input.objectKey ||
+        String(row.mime_type) !== input.mimeType || number(row.size_bytes) !== input.sizeBytes ||
+        String(row.sha256) !== input.sha256
+      ) throw new DomainError("idempotency_conflict", "Generated object stage differs", 409);
+      return generatedObjectStage(row);
+    });
+  }
+
+  async markGeneratedObjectStored(id: string, ownerId: string) {
+    const rows = await this.#sql<Row[]>`UPDATE generated_object_staging SET state='stored',
+      updated_at=now() WHERE id=${id} AND owner_id=${ownerId} AND state IN ('pending','stored')
+      RETURNING *`;
+    if (rows[0]) return generatedObjectStage(rows[0]);
+    const exists = await this.#sql`SELECT id FROM generated_object_staging
+      WHERE id=${id} AND owner_id=${ownerId}`;
+    if (!exists.length) throw new DomainError("not_found", "Generated object stage not found", 404);
+    throw new DomainError("generated_stage_conflict", "Generated object stage changed", 409);
+  }
+
+  async attachGeneratedObject(id: string, ownerId: string, attachmentId: string) {
+    const rows = await this.#sql<Row[]>`UPDATE generated_object_staging s SET state='attached',
+      attachment_id=${attachmentId},updated_at=now() FROM attachments a
+      WHERE s.id=${id} AND s.owner_id=${ownerId} AND s.state IN ('stored','attached')
+        AND (s.attachment_id IS NULL OR s.attachment_id=${attachmentId})
+        AND a.id=${attachmentId} AND a.owner_id=${ownerId} AND a.state='ready'
+        AND a.deleted_at IS NULL RETURNING s.*`;
+    if (rows[0]) return generatedObjectStage(rows[0]);
+    const exists = await this.#sql`SELECT id FROM generated_object_staging
+      WHERE id=${id} AND owner_id=${ownerId}`;
+    if (!exists.length) throw new DomainError("not_found", "Generated object stage not found", 404);
+    throw new DomainError("generated_stage_conflict", "Generated object stage changed", 409);
+  }
+
+  async requestGeneratedObjectCleanup(ownerId: string, usageRunId: string, reason: string) {
+    const message = reason.slice(0, 1000);
+    return await this.#sql.begin(async (tx) => {
+      const rows = await tx<Row[]>`UPDATE generated_object_staging SET state='cleanup_pending',
+        cleanup_error=${message},updated_at=now() WHERE owner_id=${ownerId}
+        AND usage_run_id=${usageRunId} AND state NOT IN ('finalized','cleaned') RETURNING id`;
+      for (const row of rows) {
+        await tx`INSERT INTO jobs(type,payload,idempotency_key,status,attempts,available_at)
+          VALUES('generated_object.cleanup',${tx.json({ stageId: String(row.id), ownerId })},
+            ${`generated_object.cleanup:${String(row.id)}`},'queued',0,now())
+          ON CONFLICT(idempotency_key) DO UPDATE SET status='queued',available_at=now(),
+            last_error=NULL,locked_at=NULL,locked_by=NULL,completed_at=NULL
+            WHERE jobs.status IN ('completed','failed')`;
+      }
+      return rows.length;
+    });
   }
 
   async beginAttachmentIngestion(id: string, ownerId: string) {
@@ -4104,6 +4439,23 @@ export class PostgresRepository implements DomainRepository {
       throw new DomainError("stale_lease", "Idempotent request lease is no longer active", 409);
     }
   }
+  async reclaimApiRequest(id: string, expiredLeaseToken: string, leaseSeconds = 120) {
+    if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1) {
+      throw new DomainError("validation_error", "Lease duration is invalid", 422);
+    }
+    const leaseToken = crypto.randomUUID();
+    const rows = await this.#sql<Row[]>`
+      UPDATE api_idempotency_requests SET lease_token=${leaseToken},
+        lease_expires_at=now()+${leaseSeconds}*interval '1 second',updated_at=now()
+      WHERE id=${id} AND state='in_progress' AND lease_token=${expiredLeaseToken}
+        AND lease_expires_at<=now() RETURNING *`;
+    if (!rows[0]) {
+      throw new DomainError("stale_lease", "Idempotent request cannot be reclaimed", 409);
+    }
+    const events = await this.#sql<Row[]>`
+      SELECT * FROM api_idempotency_events WHERE request_id=${id} ORDER BY sequence`;
+    return { request: apiRequest(rows[0], events.map(apiFrame)), leaseToken };
+  }
   async #completeApi(input: CompleteApiRequestInput, stream: boolean) {
     const responseBodyEncoding = input.responseBodyEncoding ?? "utf8";
     const decodedResponseBytes = input.responseBody
@@ -4395,7 +4747,11 @@ export class PostgresRepository implements DomainRepository {
     return await this.#sql.begin(async (tx) => {
       const rows = await tx<
         Row[]
-      >`SELECT * FROM api_idempotency_requests WHERE state='in_progress' AND lease_expires_at<=now() ORDER BY lease_expires_at FOR UPDATE SKIP LOCKED LIMIT ${limit}`;
+      >`SELECT r.* FROM api_idempotency_requests r
+        WHERE r.state='in_progress' AND r.lease_expires_at<=now()
+          AND NOT (r.endpoint='images.generations' AND EXISTS(
+            SELECT 1 FROM generated_assets ga WHERE ga.usage_run_id=r.usage_run_id))
+        ORDER BY r.lease_expires_at FOR UPDATE OF r SKIP LOCKED LIMIT ${limit}`;
       for (const row of rows) {
         const id = String(row.id);
         const runs = await tx<Row[]>`SELECT *,EXISTS(SELECT 1 FROM provider_attempts

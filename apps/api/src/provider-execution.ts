@@ -68,6 +68,16 @@ import {
   type SpeechProviderResponse,
   type SpeechRequest,
 } from "./speech.ts";
+import {
+  assertImageUsagePricing,
+  createImageGeneration,
+  estimateImageInputTokens,
+  type ImageExecutionTarget,
+  imageFrameDecodedBytes,
+  type ImageGenerationRequest,
+  ImageProviderError,
+  type ImageProviderResponse,
+} from "./images.ts";
 
 const OCR_MAX_OUTPUT_TOKENS = 4_096;
 
@@ -106,6 +116,7 @@ export interface ProviderExecutionOptions {
   embeddingsFetch?: ProviderFetch;
   audioFetch?: typeof fetch;
   speechFetch?: typeof fetch;
+  imageFetch?: typeof fetch;
   now?: () => number;
   ocrCache?: OcrCache;
   ocrFetch?: typeof fetch;
@@ -408,6 +419,7 @@ export class ProviderExecutionEngine {
   readonly #embeddingsFetch?: ProviderFetch;
   readonly #audioFetch?: typeof fetch;
   readonly #speechFetch?: typeof fetch;
+  readonly #imageFetch?: typeof fetch;
   readonly #now: () => number;
   readonly #slowStream?: ProviderExecutionOptions["slowStream"];
   readonly #ocrCache: OcrCache;
@@ -424,6 +436,7 @@ export class ProviderExecutionEngine {
     this.#embeddingsFetch = options.embeddingsFetch;
     this.#audioFetch = options.audioFetch;
     this.#speechFetch = options.speechFetch;
+    this.#imageFetch = options.imageFetch;
     this.#now = options.now ?? Date.now;
     this.#slowStream = options.slowStream;
     this.#ocrCache = options.ocrCache ?? new MemoryOcrCache(options.now);
@@ -599,7 +612,13 @@ export class ProviderExecutionEngine {
   async #prepare(
     sourceModelId: string,
     frozenPlan?: ProviderExecutionPlan,
-    capability: "chat" | "embeddings" | "transcription" | "translation" | "speech" = "chat",
+    capability:
+      | "chat"
+      | "embeddings"
+      | "transcription"
+      | "translation"
+      | "speech"
+      | "image_generation" = "chat",
   ): Promise<{
     plan: ProviderExecutionPlan;
     candidates: Map<string, RuntimeCandidate>;
@@ -922,7 +941,8 @@ export class ProviderExecutionEngine {
 
   #normalizeError(error: unknown, plan: ProviderExecutionPlan): never {
     if (
-      (error instanceof AudioProviderError || error instanceof SpeechProviderError) &&
+      (error instanceof AudioProviderError || error instanceof SpeechProviderError ||
+        error instanceof ImageProviderError) &&
       error.providerStatus !== undefined
     ) {
       const retryable = plan.retryPolicy?.retryableStatuses ?? defaultRetryableStatuses;
@@ -1389,6 +1409,11 @@ export class ProviderExecutionEngine {
                   : "estimated";
                 finalUsage = providerUsage;
                 finalTerminal = await result.terminalFrame;
+                const finalBytes = imageFrameDecodedBytes(finalTerminal);
+                if (finalBytes > 0 && observed.firstVisibleAt === null) {
+                  observed.firstVisibleAt = engine.#now();
+                }
+                observed.visibleCharacters += finalBytes;
               } catch (error) {
                 engine.#normalizeError(error, plan);
               }
@@ -1457,6 +1482,236 @@ export class ProviderExecutionEngine {
             observed.firstVisibleAt = this.#now();
             observed.visibleCharacters = result.body.byteLength;
             return result;
+          } catch (error) {
+            this.#normalizeError(error, plan);
+          }
+        },
+      });
+    } catch (error) {
+      this.#normalizeError(error, plan);
+    }
+  }
+
+  async imageGenerate(
+    sourceModelId: string,
+    usageRunId: string,
+    ownerLeaseToken: string,
+    request: ImageGenerationRequest,
+    signal: AbortSignal,
+    frozenPlan?: ProviderExecutionPlan,
+  ): Promise<ImageProviderResponse> {
+    const { plan, candidates } = await this.#prepare(
+      sourceModelId,
+      frozenPlan,
+      "image_generation",
+    );
+    const claim = await this.#repository.claimProviderExecution(usageRunId, ownerLeaseToken);
+    const remainingAttempts = policyFor(plan, undefined, this.#slowStream).maxAttempts -
+      claim.consumedAttempts;
+    const metrics = new Map<string, AttemptMetrics>();
+    const upstreams = new Map<string, UpstreamStreamOptions>();
+    const estimatedInput = estimateImageInputTokens(request);
+    const onAttempt = this.#telemetry(
+      usageRunId,
+      ownerLeaseToken,
+      claim,
+      plan,
+      metrics,
+      estimatedInput,
+    );
+    if (request.stream) {
+      let resolveUsage!: (usage: Awaited<ImageProviderResponse["usage"]>) => void;
+      let rejectUsage!: (error: unknown) => void;
+      let resolveTerminal!: (frame: Uint8Array) => void;
+      let rejectTerminal!: (error: unknown) => void;
+      let resolveExecutionTarget!: (target: ImageExecutionTarget) => void;
+      let rejectExecutionTarget!: (error: unknown) => void;
+      const usage = new Promise<Awaited<ImageProviderResponse["usage"]>>((resolve, reject) => {
+        resolveUsage = resolve;
+        rejectUsage = reject;
+      });
+      const terminalFrame = new Promise<Uint8Array>((resolve, reject) => {
+        resolveTerminal = resolve;
+        rejectTerminal = reject;
+      });
+      const executionTarget = new Promise<ImageExecutionTarget>((resolve, reject) => {
+        resolveExecutionTarget = resolve;
+        rejectExecutionTarget = reject;
+      });
+      void usage.catch(() => undefined);
+      void terminalFrame.catch(() => undefined);
+      void executionTarget.catch(() => undefined);
+      const stream = (async function* (engine: ProviderExecutionEngine) {
+        let finalUsage: Awaited<ImageProviderResponse["usage"]> | undefined;
+        let finalTerminal: Uint8Array | undefined;
+        let settled = false;
+        try {
+          const orchestrated = streamProviderRequest<Uint8Array>({
+            initialCandidateId: plan.targets[0].providerModelId,
+            resolveCandidate: (id) => candidates.get(id),
+            policy: policyFor(plan, remainingAttempts, engine.#slowStream),
+            signal,
+            circuitStore: engine.#circuitStore(candidates),
+            onAttempt,
+            visibleUnits: imageFrameDecodedBytes,
+            allowNoVisibleOutput: true,
+            beforeAttempt: async (candidate, _signal, context) => {
+              upstreams.set(
+                key(candidate.id, context),
+                await engine.#upstreamFor(candidates.get(candidate.id)!),
+              );
+            },
+            attempt: async function* (candidate, attemptSignal, context) {
+              try {
+                const upstream = upstreams.get(key(candidate.id, context));
+                upstreams.delete(key(candidate.id, context));
+                if (!upstream?.baseUrl || !upstream.apiKey || !upstream.upstreamModel) {
+                  throw new Error("Provider dispatch options are missing");
+                }
+                const observed = metrics.get(key(candidate.id, context)) ??
+                  emptyMetrics(estimatedInput);
+                observed.dispatched = true;
+                observed.inputTokens = estimatedInput;
+                observed.tokenSource = "estimated";
+                metrics.set(key(candidate.id, context), observed);
+                const result = await createImageGeneration(request, {
+                  baseUrl: upstream.baseUrl,
+                  apiKey: upstream.apiKey,
+                  upstreamModel: upstream.upstreamModel,
+                  signal: attemptSignal,
+                  fetch: engine.#imageFetch,
+                });
+                if (!result.stream || !result.terminalFrame) {
+                  throw new Error("Provider dispatch did not return an image stream");
+                }
+                for await (const frame of result.stream) {
+                  const bytes = imageFrameDecodedBytes(frame);
+                  if (bytes > 0 && observed.firstVisibleAt === null) {
+                    observed.firstVisibleAt = engine.#now();
+                  }
+                  observed.visibleCharacters += bytes;
+                  yield frame;
+                }
+                const providerUsage = await result.usage;
+                assertImageUsagePricing(
+                  providerUsage,
+                  candidates.get(candidate.id)!.target.pricing,
+                );
+                observed.providerInputTokens = providerUsage.source === "provider_tokens"
+                  ? providerUsage.inputTokens
+                  : null;
+                observed.providerOutputTokens = providerUsage.source === "provider_tokens"
+                  ? providerUsage.outputTokens
+                  : null;
+                observed.inputTokens = providerUsage.inputTokens;
+                observed.outputTokens = providerUsage.outputTokens;
+                observed.tokenSource = providerUsage.source === "provider_tokens"
+                  ? "provider"
+                  : "estimated";
+                finalUsage = providerUsage;
+                finalTerminal = await result.terminalFrame;
+                resolveExecutionTarget({
+                  providerModelId: candidates.get(candidate.id)!.target.providerModelId,
+                  publicModelId: candidates.get(candidate.id)!.target.publicModelId,
+                  upstreamModelId: candidates.get(candidate.id)!.target.upstreamModelId,
+                  providerSlug: candidates.get(candidate.id)!.target.providerSlug,
+                });
+              } catch (error) {
+                engine.#normalizeError(error, plan);
+              }
+            },
+          });
+          for await (const frame of orchestrated) yield frame;
+          if (!finalUsage || !finalTerminal) {
+            throw new ImageProviderError("Image provider stream terminal state is missing");
+          }
+          resolveUsage(finalUsage);
+          resolveTerminal(finalTerminal);
+          settled = true;
+        } catch (error) {
+          rejectUsage(error);
+          rejectTerminal(error);
+          rejectExecutionTarget(error);
+          settled = true;
+          throw error;
+        } finally {
+          if (!settled) {
+            const error = new DOMException("Image stream consumer disconnected", "AbortError");
+            rejectUsage(error);
+            rejectTerminal(error);
+            rejectExecutionTarget(error);
+          }
+        }
+      })(this);
+      return { created: 0, stream, usage, terminalFrame, executionTarget };
+    }
+    try {
+      return await executeProviderRequest({
+        initialCandidateId: plan.targets[0].providerModelId,
+        resolveCandidate: (id) => candidates.get(id),
+        policy: policyFor(plan, remainingAttempts, this.#slowStream),
+        signal,
+        circuitStore: this.#circuitStore(candidates),
+        onAttempt,
+        beforeAttempt: async (candidate, _signal, context) => {
+          upstreams.set(
+            key(candidate.id, context),
+            await this.#upstreamFor(candidates.get(candidate.id)!),
+          );
+        },
+        attempt: async (candidate, attemptSignal, context) => {
+          try {
+            const upstream = upstreams.get(key(candidate.id, context));
+            upstreams.delete(key(candidate.id, context));
+            if (!upstream?.baseUrl || !upstream.apiKey || !upstream.upstreamModel) {
+              throw new Error("Provider dispatch options are missing");
+            }
+            const observed = metrics.get(key(candidate.id, context)) ??
+              emptyMetrics(estimatedInput);
+            observed.dispatched = true;
+            observed.inputTokens = estimatedInput;
+            observed.tokenSource = "estimated";
+            metrics.set(key(candidate.id, context), observed);
+            const result = await createImageGeneration(request, {
+              baseUrl: upstream.baseUrl,
+              apiKey: upstream.apiKey,
+              upstreamModel: upstream.upstreamModel,
+              signal: attemptSignal,
+              fetch: this.#imageFetch,
+            });
+            if (!result.data || result.stream) {
+              throw new Error("Provider dispatch did not return buffered image data");
+            }
+            const providerUsage = await result.usage;
+            assertImageUsagePricing(
+              providerUsage,
+              candidates.get(candidate.id)!.target.pricing,
+            );
+            observed.providerInputTokens = providerUsage.source === "provider_tokens"
+              ? providerUsage.inputTokens
+              : null;
+            observed.providerOutputTokens = providerUsage.source === "provider_tokens"
+              ? providerUsage.outputTokens
+              : null;
+            observed.inputTokens = providerUsage.inputTokens;
+            observed.outputTokens = providerUsage.outputTokens;
+            observed.tokenSource = providerUsage.source === "provider_tokens"
+              ? "provider"
+              : "estimated";
+            observed.firstVisibleAt = this.#now();
+            observed.visibleCharacters = result.data.reduce(
+              (sum, image) => sum + image.bytes.byteLength,
+              0,
+            );
+            return {
+              ...result,
+              executionTarget: {
+                providerModelId: candidates.get(candidate.id)!.target.providerModelId,
+                publicModelId: candidates.get(candidate.id)!.target.publicModelId,
+                upstreamModelId: candidates.get(candidate.id)!.target.upstreamModelId,
+                providerSlug: candidates.get(candidate.id)!.target.providerSlug,
+              },
+            };
           } catch (error) {
             this.#normalizeError(error, plan);
           }

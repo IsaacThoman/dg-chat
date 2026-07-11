@@ -337,11 +337,187 @@ export interface CreateAttachmentInput {
   sha256: string;
   state?: "pending" | "ready" | "quarantined";
   inspectionError?: string | null;
+  /** Set only when trusted server-side validation has already completed. */
+  inspectionComplete?: boolean;
 }
 export interface CreateAttachmentResult {
   attachment: AttachmentRecord;
-  inspectionJobId: string;
+  inspectionJobId: string | null;
   deduplicated: boolean;
+}
+
+export type GeneratedAssetInputRole = "source" | "mask" | "reference";
+export interface GeneratedAssetInput {
+  attachmentId: string;
+  role: GeneratedAssetInputRole;
+  ordinal: number;
+}
+export interface GeneratedAssetRecord {
+  id: string;
+  ownerId: string;
+  usageRunId: string;
+  providerModelId: string;
+  publicModelId: string;
+  upstreamModelId: string;
+  providerSlug: string;
+  pricingSnapshot: UsagePricingSnapshot;
+  attachmentId: string;
+  idempotencyKey: string;
+  requestHash: string;
+  operation: "generation" | "edit";
+  prompt: string;
+  providerCreatedAt: number;
+  ordinal: number;
+  width: number;
+  height: number;
+  revisedPrompt: string | null;
+  inputs: GeneratedAssetInput[];
+  createdAt: string;
+  updatedAt: string;
+  deletedAt: string | null;
+}
+export interface FinalizeGeneratedAssetsInput {
+  ownerId: string;
+  usageRunId: string;
+  providerModelId: string;
+  publicModelId: string;
+  upstreamModelId: string;
+  providerSlug: string;
+  pricingSnapshot: UsagePricingSnapshot;
+  idempotencyKey: string;
+  requestHash: string;
+  operation: "generation" | "edit";
+  prompt: string;
+  providerCreatedAt: number;
+  assets: Array<{
+    attachmentId: string;
+    ordinal: number;
+    width: number;
+    height: number;
+    revisedPrompt?: string | null;
+    inputs?: GeneratedAssetInput[];
+  }>;
+}
+
+export type GeneratedObjectStageState =
+  | "pending"
+  | "stored"
+  | "attached"
+  | "finalized"
+  | "cleanup_pending"
+  | "cleaning"
+  | "cleaned";
+export interface GeneratedObjectStage {
+  id: string;
+  ownerId: string;
+  usageRunId: string;
+  ordinal: number;
+  objectKey: string;
+  mimeType: string;
+  sizeBytes: number;
+  sha256: string;
+  attachmentId: string | null;
+  state: GeneratedObjectStageState;
+  cleanupError: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+export interface StageGeneratedObjectInput {
+  ownerId: string;
+  usageRunId: string;
+  ordinal: number;
+  objectKey: string;
+  mimeType: string;
+  sizeBytes: number;
+  sha256: string;
+}
+
+const unicodeScalarLength = (value: string): number => [...value].length;
+
+export function validateGeneratedAssetFinalization(input: FinalizeGeneratedAssetsInput): void {
+  if (
+    !DOCUMENT_UUID_PATTERN.test(input.ownerId) || !input.usageRunId ||
+    input.usageRunId.length > 200 || !DOCUMENT_UUID_PATTERN.test(input.providerModelId) ||
+    input.publicModelId.length < 3 || input.publicModelId.length > 255 ||
+    !input.publicModelId.includes("/") || !input.upstreamModelId.trim() ||
+    input.upstreamModelId.length > 255 ||
+    !/^[a-z0-9][a-z0-9-]{0,62}$/.test(input.providerSlug) ||
+    !isUsagePricingSnapshot(input.pricingSnapshot) ||
+    input.idempotencyKey.length < 8 || input.idempotencyKey.length > 200 ||
+    !/^[0-9a-f]{64}$/.test(input.requestHash) ||
+    !["generation", "edit"].includes(input.operation) || !input.prompt ||
+    !Number.isSafeInteger(input.providerCreatedAt) || input.providerCreatedAt < 0 ||
+    unicodeScalarLength(input.prompt) > 32_000 || input.assets.length < 1 ||
+    input.assets.length > 10
+  ) throw new TypeError("Generated asset finalization is invalid");
+  for (let index = 0; index < input.assets.length; index++) {
+    const asset = input.assets[index];
+    if (
+      asset.ordinal !== index || !DOCUMENT_UUID_PATTERN.test(asset.attachmentId) ||
+      !Number.isSafeInteger(asset.width) ||
+      asset.width < 1 || asset.width > 65_535 || !Number.isSafeInteger(asset.height) ||
+      asset.height < 1 || asset.height > 65_535 ||
+      (asset.revisedPrompt != null &&
+        (typeof asset.revisedPrompt !== "string" ||
+          unicodeScalarLength(asset.revisedPrompt) > 32_000))
+    ) throw new TypeError("Generated asset finalization is invalid");
+    const inputKeys = new Set<string>();
+    for (const source of asset.inputs ?? []) {
+      const key = `${source.role}:${source.ordinal}`;
+      if (
+        !DOCUMENT_UUID_PATTERN.test(source.attachmentId) ||
+        !["source", "mask", "reference"].includes(source.role) ||
+        !Number.isSafeInteger(source.ordinal) || source.ordinal < 0 || source.ordinal > 9 ||
+        inputKeys.has(key)
+      ) throw new TypeError("Generated asset finalization is invalid");
+      inputKeys.add(key);
+    }
+  }
+}
+
+export function sameGeneratedAssetFinalization(
+  records: GeneratedAssetRecord[],
+  input: FinalizeGeneratedAssetsInput,
+): boolean {
+  return records.length === input.assets.length && records.every((record, index) => {
+    const candidate = input.assets[index];
+    const sources = candidate.inputs ?? [];
+    return record.ownerId === input.ownerId && record.usageRunId === input.usageRunId &&
+      record.providerModelId === input.providerModelId &&
+      record.publicModelId === input.publicModelId &&
+      record.upstreamModelId === input.upstreamModelId &&
+      record.providerSlug === input.providerSlug &&
+      usagePricingSnapshotsEqual(record.pricingSnapshot, input.pricingSnapshot) &&
+      record.idempotencyKey === input.idempotencyKey && record.requestHash === input.requestHash &&
+      record.operation === input.operation && record.prompt === input.prompt &&
+      record.providerCreatedAt === input.providerCreatedAt &&
+      record.attachmentId === candidate.attachmentId && record.ordinal === candidate.ordinal &&
+      record.width === candidate.width && record.height === candidate.height &&
+      record.revisedPrompt === (candidate.revisedPrompt ?? null) &&
+      record.inputs.length === sources.length && [...record.inputs].sort(generatedInputOrder)
+      .every((source, sourceIndex) => {
+        const expected = [...sources].sort(generatedInputOrder)[sourceIndex];
+        return source.attachmentId === expected.attachmentId && source.role === expected.role &&
+          source.ordinal === expected.ordinal;
+      });
+  });
+}
+
+export function usagePricingSnapshotsEqual(
+  left: UsagePricingSnapshot | undefined,
+  right: UsagePricingSnapshot | undefined,
+): boolean {
+  return Boolean(left && right) && left!.pricingVersionId === right!.pricingVersionId &&
+    left!.inputMicrosPerMillion === right!.inputMicrosPerMillion &&
+    left!.cachedInputMicrosPerMillion === right!.cachedInputMicrosPerMillion &&
+    left!.reasoningMicrosPerMillion === right!.reasoningMicrosPerMillion &&
+    left!.outputMicrosPerMillion === right!.outputMicrosPerMillion &&
+    left!.fixedCallMicros === right!.fixedCallMicros && left!.source === right!.source;
+}
+
+function generatedInputOrder(a: GeneratedAssetInput, b: GeneratedAssetInput): number {
+  return a.role.localeCompare(b.role) || a.ordinal - b.ordinal ||
+    a.attachmentId.localeCompare(b.attachmentId);
 }
 
 export type KnowledgeRetrievalMode = "retrieval" | "full_context";
@@ -529,6 +705,7 @@ export type ApiIdempotencyEndpoint =
   | "chat.completions"
   | "responses"
   | "embeddings"
+  | "images.generations"
   | "audio.transcriptions"
   | "audio.translations"
   | "audio.speech";
@@ -1091,6 +1268,36 @@ export interface DomainRepository {
     ownerId: string,
   ): MaybePromise<void>;
   listMessageAttachments(messageId: string, ownerId: string): MaybePromise<AttachmentRecord[]>;
+  finalizeGeneratedAssets(
+    input: FinalizeGeneratedAssetsInput,
+  ): MaybePromise<GeneratedAssetRecord[]>;
+  listGeneratedAssets(
+    ownerId: string,
+    includeDeleted?: boolean,
+  ): MaybePromise<GeneratedAssetRecord[]>;
+  findGeneratedAssetsByIdempotency(
+    ownerId: string,
+    idempotencyKey: string,
+  ): MaybePromise<GeneratedAssetRecord[]>;
+  getGeneratedAsset(
+    id: string,
+    ownerId: string,
+    includeDeleted?: boolean,
+  ): MaybePromise<GeneratedAssetRecord>;
+  deleteGeneratedAsset(id: string, ownerId: string): MaybePromise<GeneratedAssetRecord>;
+  restoreGeneratedAsset(id: string, ownerId: string): MaybePromise<GeneratedAssetRecord>;
+  stageGeneratedObject(input: StageGeneratedObjectInput): MaybePromise<GeneratedObjectStage>;
+  markGeneratedObjectStored(id: string, ownerId: string): MaybePromise<GeneratedObjectStage>;
+  attachGeneratedObject(
+    id: string,
+    ownerId: string,
+    attachmentId: string,
+  ): MaybePromise<GeneratedObjectStage>;
+  requestGeneratedObjectCleanup(
+    ownerId: string,
+    usageRunId: string,
+    reason: string,
+  ): MaybePromise<number>;
   beginAttachmentIngestion(id: string, ownerId: string): MaybePromise<AttachmentRecord>;
   completeAttachmentIngestion(
     id: string,
@@ -1306,6 +1513,11 @@ export interface DomainRepository {
     leaseSeconds?: number,
     observation?: ApiUsageObservation,
   ): MaybePromise<void>;
+  reclaimApiRequest(
+    id: string,
+    expiredLeaseToken: string,
+    leaseSeconds?: number,
+  ): MaybePromise<{ request: ApiIdempotencyRequest; leaseToken: string }>;
   completeApiJson(input: CompleteApiRequestInput): MaybePromise<ApiIdempotencyRequest>;
   completeApiStream(input: CompleteApiRequestInput): MaybePromise<ApiIdempotencyRequest>;
   failApiRequest(input: FailApiRequestInput): MaybePromise<ApiIdempotencyRequest>;

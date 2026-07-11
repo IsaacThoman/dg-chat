@@ -66,6 +66,7 @@ const { app, toolExecutionService } = createApp({
   ocrCache,
   toolExecutionStore,
   audioConcurrencyLimiter,
+  imageConcurrencyLimiter: audioConcurrencyLimiter,
 });
 await toolExecutionService.recover();
 const replayMaintenance = setInterval(async () => {
