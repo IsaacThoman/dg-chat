@@ -23,7 +23,15 @@ test("admin enables web search and a user explicitly reviews and cancels a tool 
   const privateNetwork = card.getByRole("checkbox", { name: /private network targets/i });
   if (!(await privateNetwork.isChecked())) await privateNetwork.check();
   await card.getByRole("button", { name: "Save policy" }).click();
-  await expect(card.getByText(/Policy version \d+/)).toBeVisible();
+  const policyVersion = card.getByText(/Policy version \d+/);
+  const concurrentUpdate = card.getByText("Tool policy changed in another session");
+  await expect(policyVersion.or(concurrentUpdate)).toBeVisible();
+  if (await concurrentUpdate.isVisible()) {
+    // Desktop and mobile projects intentionally run together. The policy uses optimistic CAS, so
+    // the loser must refresh and observe the winner's equivalent configuration.
+    await page.getByRole("button", { name: "Refresh" }).click();
+  }
+  await expect(policyVersion).toBeVisible();
 
   if (mobile) await page.getByRole("button", { name: "Open menu", exact: true }).click();
   await page.getByRole("button", { name: "New chat ⌘ K", exact: true }).click();
