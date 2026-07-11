@@ -1,5 +1,9 @@
 import { createEmbeddings } from "../../api/src/embeddings.ts";
-import { KNOWLEDGE_EMBEDDING_DIMENSIONS } from "@dg-chat/database";
+import {
+  type EmbeddingBillingConfig,
+  KNOWLEDGE_EMBEDDING_DIMENSIONS,
+  parseEmbeddingBillingConfig,
+} from "@dg-chat/database";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const VERSION = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
@@ -11,6 +15,7 @@ export interface KnowledgeEmbeddingConfig {
   upstreamModel: string;
   version: string;
   batchSize: number;
+  billing: EmbeddingBillingConfig;
 }
 
 export interface DocumentEmbeddingPayload {
@@ -38,7 +43,15 @@ export function parseKnowledgeEmbeddingConfig(
   if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) {
     throw new Error("KNOWLEDGE_EMBEDDING_BASE_URL must be a credential-free HTTPS URL");
   }
-  return { baseUrl, apiKey, model, upstreamModel, version, batchSize };
+  return {
+    baseUrl,
+    apiKey,
+    model,
+    upstreamModel,
+    version,
+    batchSize,
+    billing: parseEmbeddingBillingConfig(env),
+  };
 }
 
 export function parseDocumentEmbeddingPayload(value: unknown): DocumentEmbeddingPayload {
@@ -68,7 +81,7 @@ export async function embedKnowledgeChunks(
   content: string[],
   config: KnowledgeEmbeddingConfig,
   signal: AbortSignal,
-): Promise<number[][]> {
+): Promise<{ embeddings: number[][]; inputTokens: number }> {
   if (!content.length || content.length > config.batchSize) {
     throw new Error("Knowledge embedding batch is invalid");
   }
@@ -87,8 +100,9 @@ export async function embedKnowledgeChunks(
       signal,
     },
   );
-  return response.data.map((item) => {
+  const embeddings = response.data.map((item) => {
     if (!Array.isArray(item.embedding)) throw new Error("Embedding provider returned base64 data");
     return item.embedding;
   });
+  return { embeddings, inputTokens: response.usage.prompt_tokens };
 }

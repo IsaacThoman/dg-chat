@@ -7,3 +7,5 @@ export * from "./src/legacy-backfill.ts";
 export * from "./src/object-store.ts";
 export * from "./src/document-processing-config.ts";
 export * from "./src/attachment-policy.ts";
+export * from "./src/tool-store.ts";
+export * from "./src/embedding-billing.ts";

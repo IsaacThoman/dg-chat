@@ -28,6 +28,8 @@ Deno.test("query embedder sends bounded version-compatible requests", async () =
     encoding_format: "float",
   });
   assertEquals(result.version, "embed-v3");
+  assertEquals(result.inputTokens, 2);
+  assertEquals(result.billing, { inputMicrosPerMillion: 0, fixedCallMicros: 0 });
   assertEquals(result.embedding.length, 1536);
 });
 

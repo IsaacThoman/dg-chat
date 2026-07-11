@@ -1,15 +1,31 @@
-import { KNOWLEDGE_EMBEDDING_DIMENSIONS } from "@dg-chat/database";
+import {
+  type EmbeddingBillingConfig,
+  KNOWLEDGE_EMBEDDING_DIMENSIONS,
+  parseEmbeddingBillingConfig,
+} from "@dg-chat/database";
 import { createEmbeddings, type ProviderFetch } from "./embeddings.ts";
 
 export interface KnowledgeQueryEmbedding {
   embedding: number[];
   version: string;
+  inputTokens: number;
+  provider: string;
+  model: string;
+  upstreamModel: string;
+  billing: EmbeddingBillingConfig;
 }
 
-export type KnowledgeQueryEmbedder = (
-  query: string,
-  signal?: AbortSignal,
-) => Promise<KnowledgeQueryEmbedding>;
+export type KnowledgeQueryEmbedder =
+  & ((
+    query: string,
+    signal?: AbortSignal,
+  ) => Promise<KnowledgeQueryEmbedding>)
+  & {
+    readonly provider: string;
+    readonly model: string;
+    readonly upstreamModel: string;
+    readonly billing: EmbeddingBillingConfig;
+  };
 
 /** Creates the query side of the same versioned embedding pipeline used by the worker. */
 export function knowledgeQueryEmbedderFromEnv(
@@ -29,7 +45,9 @@ export function knowledgeQueryEmbedderFromEnv(
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 60_000) {
     throw new Error("KNOWLEDGE_EMBEDDING_QUERY_TIMEOUT_MS must be between 100 and 60000");
   }
-  return async (query, signal) => {
+  const billing = parseEmbeddingBillingConfig(env);
+  const provider = new URL(baseUrl).host;
+  const embed = async (query: string, signal?: AbortSignal) => {
     const normalized = query.trim().slice(0, 8_000);
     if (!normalized) throw new Error("Knowledge embedding query is empty");
     const timeoutSignal = AbortSignal.timeout(timeoutMs);
@@ -52,6 +70,15 @@ export function knowledgeQueryEmbedderFromEnv(
     );
     const embedding = response.data[0]?.embedding;
     if (!Array.isArray(embedding)) throw new Error("Embedding provider returned base64 data");
-    return { embedding, version };
+    return {
+      embedding,
+      version,
+      inputTokens: response.usage.prompt_tokens,
+      provider,
+      model,
+      upstreamModel,
+      billing,
+    };
   };
+  return Object.assign(embed, { provider, model, upstreamModel, billing });
 }

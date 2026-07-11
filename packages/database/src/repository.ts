@@ -180,6 +180,25 @@ export interface KnowledgeSearchHit extends DocumentChunk {
   vectorScore: number | null;
   score: number;
 }
+export interface EmbeddingProviderAttemptInput {
+  usageRunId: string;
+  parentUsageRunId?: string;
+  purpose: "document" | "query";
+  provider: string;
+  model: string;
+  upstreamModel: string;
+  itemCount: number;
+}
+export interface FinishEmbeddingProviderAttemptInput {
+  usageRunId: string;
+  status: "succeeded" | "failed" | "cancelled";
+  inputTokens: number;
+  costMicros: number;
+  tokenSource: "provider" | "estimated" | "none";
+  costSource: "calculated" | "none";
+  latencyMs: number;
+  error?: string;
+}
 export interface SearchConversationKnowledgeInput {
   conversationId: string;
   ownerId: string;
@@ -1020,6 +1039,8 @@ export interface DomainRepository {
   upsertDocumentChunkEmbeddings(
     values: DocumentChunkEmbeddingInput[],
   ): MaybePromise<number>;
+  startEmbeddingProviderAttempt(input: EmbeddingProviderAttemptInput): MaybePromise<void>;
+  finishEmbeddingProviderAttempt(input: FinishEmbeddingProviderAttemptInput): MaybePromise<void>;
   searchConversationKnowledge(
     input: SearchConversationKnowledgeInput,
   ): MaybePromise<KnowledgeSearchHit[]>;

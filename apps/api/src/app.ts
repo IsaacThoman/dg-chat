@@ -56,6 +56,7 @@ import {
   type ModelPriceVersion,
   ObjectAlreadyExistsError,
   type ObjectStore,
+  parseEmbeddingBillingConfig,
   type ProviderModelRecord,
   type ProviderRecord,
   type UsagePricingSnapshot,
@@ -131,6 +132,7 @@ import {
   type KnowledgeQueryEmbedder,
   knowledgeQueryEmbedderFromEnv,
 } from "./knowledge-query-embedding.ts";
+import { runAccountedEmbeddingCall } from "./embedding-accounting.ts";
 import {
   MemoryToolExecutionStore,
   ToolExecutionError,
@@ -887,12 +889,51 @@ export function createApp(options: AppOptions = {}) {
     KNOWLEDGE_EMBEDDING_UPSTREAM_MODEL: Deno.env.get("KNOWLEDGE_EMBEDDING_UPSTREAM_MODEL"),
     KNOWLEDGE_EMBEDDING_VERSION: Deno.env.get("KNOWLEDGE_EMBEDDING_VERSION"),
     KNOWLEDGE_EMBEDDING_QUERY_TIMEOUT_MS: Deno.env.get("KNOWLEDGE_EMBEDDING_QUERY_TIMEOUT_MS"),
+    KNOWLEDGE_EMBEDDING_INPUT_MICROS_PER_MILLION: Deno.env.get(
+      "KNOWLEDGE_EMBEDDING_INPUT_MICROS_PER_MILLION",
+    ),
+    KNOWLEDGE_EMBEDDING_FIXED_CALL_MICROS: Deno.env.get(
+      "KNOWLEDGE_EMBEDDING_FIXED_CALL_MICROS",
+    ),
   }, options.embeddingsFetch);
-  const embedKnowledgeQuery = async (query: string, signal?: AbortSignal) => {
+  const knowledgeEmbeddingBilling = parseEmbeddingBillingConfig({
+    KNOWLEDGE_EMBEDDING_INPUT_MICROS_PER_MILLION: Deno.env.get(
+      "KNOWLEDGE_EMBEDDING_INPUT_MICROS_PER_MILLION",
+    ),
+    KNOWLEDGE_EMBEDDING_FIXED_CALL_MICROS: Deno.env.get(
+      "KNOWLEDGE_EMBEDDING_FIXED_CALL_MICROS",
+    ),
+  });
+  const embedKnowledgeQuery = async (
+    query: string,
+    userId: string,
+    parentUsageRunId: string,
+    signal?: AbortSignal,
+  ) => {
     if (!knowledgeQueryEmbedder || !query.trim()) return undefined;
     try {
-      return await knowledgeQueryEmbedder(query, signal);
+      const normalized = query.trim().slice(0, 8_000);
+      const value = await runAccountedEmbeddingCall({
+        repository: repo,
+        userId,
+        usageRunId: `${parentUsageRunId}:knowledge-query`,
+        parentUsageRunId,
+        purpose: "query",
+        provider: knowledgeQueryEmbedder.provider,
+        model: knowledgeQueryEmbedder.model,
+        upstreamModel: knowledgeQueryEmbedder.upstreamModel,
+        content: [normalized],
+        billing: options.knowledgeQueryEmbedder
+          ? knowledgeQueryEmbedder.billing
+          : knowledgeEmbeddingBilling,
+        call: async () => {
+          const result = await knowledgeQueryEmbedder(normalized, signal);
+          return { value: result, inputTokens: result.inputTokens };
+        },
+      });
+      return value;
     } catch (error) {
+      if (error instanceof DomainError && error.code === "insufficient_credit") throw error;
       console.warn(JSON.stringify({
         level: "warn",
         message: "Knowledge query embedding failed; using lexical retrieval",
@@ -2242,7 +2283,7 @@ export function createApp(options: AppOptions = {}) {
           ]
           : body.content,
       });
-      const queryEmbedding = await embedKnowledgeQuery(body.content);
+      const queryEmbedding = await embedKnowledgeQuery(body.content, ownerId, runId);
       knowledgeContext = await buildKnowledgeContext(repo, conversationId, ownerId, body.content, {
         maxCharacters: knowledgeContextMaxCharacters,
         retrievalTopK: knowledgeRetrievalTopK,
@@ -2615,7 +2656,12 @@ export function createApp(options: AppOptions = {}) {
         const knowledgeQuery = body.mode === "send"
           ? body.content
           : [...activePath].reverse().find((message) => message.role === "user")?.content ?? "";
-        const queryEmbedding = await embedKnowledgeQuery(knowledgeQuery, controller.signal);
+        const queryEmbedding = await embedKnowledgeQuery(
+          knowledgeQuery,
+          ownerId,
+          runId,
+          controller.signal,
+        );
         knowledgeContext = await buildKnowledgeContext(
           repo,
           conversationId,

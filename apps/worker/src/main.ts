@@ -4,6 +4,7 @@ import {
   type ObjectStore,
   objectStoreFromEnv,
   parseDocumentProcessingConfig,
+  PostgresRepository,
   validateDocumentChunkInputs,
 } from "@dg-chat/database";
 import {
@@ -25,6 +26,7 @@ import {
   parseKnowledgeEmbeddingConfig,
   sha256,
 } from "./knowledge-embedding.ts";
+import { runAccountedEmbeddingCall } from "../../api/src/embedding-accounting.ts";
 
 const databaseUrl = Deno.env.get("DATABASE_URL");
 const workerId = Deno.env.get("WORKER_ID") ?? `worker-${crypto.randomUUID().slice(0, 8)}`;
@@ -43,6 +45,12 @@ const knowledgeEmbeddingConfig = parseKnowledgeEmbeddingConfig({
   KNOWLEDGE_EMBEDDING_UPSTREAM_MODEL: Deno.env.get("KNOWLEDGE_EMBEDDING_UPSTREAM_MODEL"),
   KNOWLEDGE_EMBEDDING_VERSION: Deno.env.get("KNOWLEDGE_EMBEDDING_VERSION"),
   KNOWLEDGE_EMBEDDING_BATCH_SIZE: Deno.env.get("KNOWLEDGE_EMBEDDING_BATCH_SIZE"),
+  KNOWLEDGE_EMBEDDING_INPUT_MICROS_PER_MILLION: Deno.env.get(
+    "KNOWLEDGE_EMBEDDING_INPUT_MICROS_PER_MILLION",
+  ),
+  KNOWLEDGE_EMBEDDING_FIXED_CALL_MICROS: Deno.env.get(
+    "KNOWLEDGE_EMBEDDING_FIXED_CALL_MICROS",
+  ),
 });
 function positiveInteger(name: string, fallback: number, minimum = 1): number {
   const raw = Deno.env.get(name);
@@ -92,6 +100,7 @@ if (!databaseUrl) {
 }
 
 const sql = postgres(databaseUrl, { max: 4 });
+const repository = await PostgresRepository.connect(databaseUrl);
 const discoveredObjectStore = objectStoreFromEnv();
 if (!discoveredObjectStore) {
   await sql.end({ timeout: 5 });
@@ -252,11 +261,26 @@ async function processJob(
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), remaining);
         try {
-          const embeddings = await embedKnowledgeChunks(
-            batch.map((row) => row.content),
-            knowledgeEmbeddingConfig,
-            controller.signal,
-          );
+          const content = batch.map((row) => row.content);
+          const embeddings = await runAccountedEmbeddingCall({
+            repository,
+            userId: payload.ownerId,
+            usageRunId: `${job.id}:embedding:${job.attempts + 1}:${offset}`,
+            purpose: "document",
+            provider: new URL(knowledgeEmbeddingConfig.baseUrl).host,
+            model: knowledgeEmbeddingConfig.model,
+            upstreamModel: knowledgeEmbeddingConfig.upstreamModel,
+            content,
+            billing: knowledgeEmbeddingConfig.billing,
+            call: async () => {
+              const result = await embedKnowledgeChunks(
+                content,
+                knowledgeEmbeddingConfig,
+                controller.signal,
+              );
+              return { value: result.embeddings, inputTokens: result.inputTokens };
+            },
+          });
           const hashes = await Promise.all(batch.map((row) => sha256(row.content)));
           batch.forEach((row, index) =>
             values.push({ id: row.id, contentSha256: hashes[index], embedding: embeddings[index] })
@@ -333,5 +357,6 @@ while (!stopping) {
   }
 }
 await sql.end({ timeout: 5 });
+await repository.close();
 objectStore.close();
 console.log(JSON.stringify({ level: "info", message: "Worker stopped", workerId }));

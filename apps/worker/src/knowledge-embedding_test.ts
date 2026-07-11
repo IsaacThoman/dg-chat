@@ -31,6 +31,7 @@ Deno.test("knowledge embedding configuration is disabled cleanly and validates c
       upstreamModel: "upstream-embed",
       version: "embed-v2",
       batchSize: 32,
+      billing: { inputMicrosPerMillion: 0, fixedCallMicros: 0 },
     },
   );
 });

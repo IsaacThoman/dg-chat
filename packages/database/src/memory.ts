@@ -45,9 +45,11 @@ import type {
   DocumentChunk,
   DocumentChunkEmbeddingInput,
   DocumentChunkInput,
+  EmbeddingProviderAttemptInput,
   FailApiRequestInput,
   FailGenerationInput,
   FinalizeProviderUsageInput,
+  FinishEmbeddingProviderAttemptInput,
   FinishProviderAttemptInput,
   GenerationControl,
   GenerationResult,
@@ -388,6 +390,14 @@ export class MemoryRepository {
   readonly messageAttachments = new Map<string, Set<string>>();
   readonly documentChunks = new Map<string, DocumentChunk[]>();
   readonly documentChunkEmbeddings = new Map<string, DocumentChunkEmbeddingInput>();
+  readonly embeddingProviderAttempts = new Map<
+    string,
+    EmbeddingProviderAttemptInput & {
+      status: "running" | "succeeded" | "failed" | "cancelled";
+      inputTokens: number;
+      costMicros: number;
+    }
+  >();
   readonly knowledgeCollections = new Map<string, KnowledgeCollection>();
   readonly knowledgeAttachments = new Map<string, Set<string>>();
   readonly knowledgeBindings = new Map<string, KnowledgeConversationBinding>();
@@ -1629,6 +1639,28 @@ export class MemoryRepository {
       });
     }
     return validated.length;
+  }
+
+  startEmbeddingProviderAttempt(input: EmbeddingProviderAttemptInput): void {
+    if (this.embeddingProviderAttempts.has(input.usageRunId)) {
+      throw new DomainError("idempotency_conflict", "Embedding attempt already exists", 409);
+    }
+    this.embeddingProviderAttempts.set(input.usageRunId, {
+      ...structuredClone(input),
+      status: "running",
+      inputTokens: 0,
+      costMicros: 0,
+    });
+  }
+
+  finishEmbeddingProviderAttempt(input: FinishEmbeddingProviderAttemptInput): void {
+    const attempt = this.embeddingProviderAttempts.get(input.usageRunId);
+    if (!attempt || attempt.status !== "running") {
+      throw new DomainError("invalid_usage_state", "Embedding attempt is not running", 409);
+    }
+    attempt.status = input.status;
+    attempt.inputTokens = input.inputTokens;
+    attempt.costMicros = input.costMicros;
   }
 
   searchConversationKnowledge(input: SearchConversationKnowledgeInput): KnowledgeSearchHit[] {

@@ -43,9 +43,11 @@ import type {
   DocumentChunkEmbeddingInput,
   DocumentChunkInput,
   DomainRepository,
+  EmbeddingProviderAttemptInput,
   FailApiRequestInput,
   FailGenerationInput,
   FinalizeProviderUsageInput,
+  FinishEmbeddingProviderAttemptInput,
   FinishProviderAttemptInput,
   IdentityTokenPurpose,
   KnowledgeCollection,
@@ -2056,6 +2058,41 @@ export class PostgresRepository implements DomainRepository {
     });
   }
 
+  async startEmbeddingProviderAttempt(input: EmbeddingProviderAttemptInput): Promise<void> {
+    if (
+      !["document", "query"].includes(input.purpose) ||
+      !Number.isSafeInteger(input.itemCount) || input.itemCount < 1 || input.itemCount > 256
+    ) throw new DomainError("validation_error", "Embedding attempt is invalid", 422);
+    try {
+      await this.#sql`INSERT INTO embedding_provider_attempts(
+        usage_run_id,parent_usage_run_id,purpose,provider,model,upstream_model,item_count)
+        VALUES(${input.usageRunId},${input.parentUsageRunId ?? null},${input.purpose},
+          ${input.provider},${input.model},${input.upstreamModel},${input.itemCount})`;
+    } catch (error) {
+      if ((error as { code?: string }).code === "23505") {
+        throw new DomainError("idempotency_conflict", "Embedding attempt already exists", 409);
+      }
+      throw error;
+    }
+  }
+
+  async finishEmbeddingProviderAttempt(input: FinishEmbeddingProviderAttemptInput): Promise<void> {
+    if (
+      !["succeeded", "failed", "cancelled"].includes(input.status) ||
+      !Number.isSafeInteger(input.inputTokens) || input.inputTokens < 0 ||
+      !Number.isSafeInteger(input.costMicros) || input.costMicros < 0 ||
+      !Number.isSafeInteger(input.latencyMs) || input.latencyMs < 0
+    ) throw new DomainError("validation_error", "Embedding attempt result is invalid", 422);
+    const rows = await this.#sql`UPDATE embedding_provider_attempts SET status=${input.status},
+      input_tokens=${input.inputTokens},cost_micros=${input.costMicros},
+      token_source=${input.tokenSource},cost_source=${input.costSource},
+      latency_ms=${input.latencyMs},error=${input.error?.slice(0, 1000) ?? null},completed_at=now()
+      WHERE usage_run_id=${input.usageRunId} AND status='running' RETURNING id`;
+    if (!rows.length) {
+      throw new DomainError("invalid_usage_state", "Embedding attempt is not running", 409);
+    }
+  }
+
   async searchConversationKnowledge(
     input: SearchConversationKnowledgeInput,
   ): Promise<KnowledgeSearchHit[]> {
@@ -2075,15 +2112,11 @@ export class PostgresRepository implements DomainRepository {
     ) throw new DomainError("validation_error", "Knowledge search input is invalid", 422);
 
     const vectorLiteral = vector ? JSON.stringify(vector) : null;
+    const candidateLimit = Math.max(64, limit * 8);
     const rows = await this.#sql<Row[]>`
-      WITH candidates AS (
-        SELECT dc.*, k.id AS collection_id, k.name AS collection_name, a.filename,
-          CASE WHEN ${query} = '' THEN 1::double precision ELSE ts_rank_cd(
-            to_tsvector('simple', dc.content), plainto_tsquery('simple', ${query}), 32
-          )::double precision END AS lexical_score,
-          CASE WHEN ${vectorLiteral}::text IS NULL THEN NULL
-            ELSE (1 - (dce.embedding <=> ${vectorLiteral}::vector))::double precision
-          END AS vector_score
+      WITH scoped AS MATERIALIZED (
+        SELECT dc.id,dc.attachment_id,dc.ordinal,dc.content,dc.metadata,
+          k.id AS collection_id,k.name AS collection_name,a.filename,b.owner_id
         FROM conversation_knowledge_bindings b
         JOIN conversations c ON c.id=b.conversation_id AND c.owner_id=b.owner_id
           AND c.deleted_at IS NULL
@@ -2093,10 +2126,35 @@ export class PostgresRepository implements DomainRepository {
         JOIN attachments a ON a.id=ka.attachment_id AND a.owner_id=b.owner_id
           AND a.deleted_at IS NULL AND a.state='ready' AND a.ingestion_status='ready'
         JOIN document_chunks dc ON dc.attachment_id=a.id
-        LEFT JOIN document_chunk_embeddings dce ON dce.chunk_id=dc.id
-          AND dce.owner_id=b.owner_id AND dce.embedding_version=${input.embeddingVersion ?? ""}
         WHERE b.conversation_id=${input.conversationId} AND b.owner_id=${input.ownerId}
           AND b.mode='retrieval'
+      ), lexical_candidates AS (
+        SELECT collection_id,id FROM scoped
+        WHERE ${query}='' OR to_tsvector('simple',content) @@ plainto_tsquery('simple',${query})
+        ORDER BY CASE WHEN ${query}='' THEN 1::double precision ELSE ts_rank_cd(
+          to_tsvector('simple',content),plainto_tsquery('simple',${query}),32
+        )::double precision END DESC,collection_id,id
+        LIMIT ${candidateLimit}
+      ), vector_candidates AS (
+        SELECT s.collection_id,s.id
+        FROM document_chunk_embeddings dce JOIN scoped s ON s.id=dce.chunk_id
+        WHERE ${vectorLiteral}::text IS NOT NULL AND dce.owner_id=${input.ownerId}
+          AND dce.embedding_version=${input.embeddingVersion ?? ""}
+        ORDER BY dce.embedding <=> ${vectorLiteral}::vector,s.collection_id,s.id
+        LIMIT ${candidateLimit}
+      ), candidate_ids AS (
+        SELECT collection_id,id FROM lexical_candidates
+        UNION SELECT collection_id,id FROM vector_candidates
+      ), candidates AS (
+        SELECT s.*,
+          CASE WHEN ${query}='' THEN 1::double precision ELSE ts_rank_cd(
+            to_tsvector('simple',s.content),plainto_tsquery('simple',${query}),32
+          )::double precision END AS lexical_score,
+          CASE WHEN ${vectorLiteral}::text IS NULL THEN NULL ELSE
+            (1-(dce.embedding <=> ${vectorLiteral}::vector))::double precision END AS vector_score
+        FROM candidate_ids ci JOIN scoped s USING(collection_id,id)
+        LEFT JOIN document_chunk_embeddings dce ON dce.chunk_id=s.id
+          AND dce.owner_id=s.owner_id AND dce.embedding_version=${input.embeddingVersion ?? ""}
       )
       SELECT *, lexical_score * 0.45 +
         CASE WHEN vector_score IS NULL THEN 0 ELSE GREATEST(0,vector_score) * 0.55 END AS score
