@@ -183,6 +183,7 @@ import {
 import { SearxngSearchAdapter } from "./web-search.ts";
 import { WebSearchToolAdapter } from "./search-tool.ts";
 import type { OcrCache } from "./ocr-interception.ts";
+import type { BetterAuthService } from "./better-auth.ts";
 
 type Variables = {
   user: PublicUser;
@@ -250,6 +251,7 @@ export interface AppOptions {
   toolAdapters?: readonly ToolAdapter[];
   toolRateLimitPerMinute?: number;
   toolReserveMicros?: number;
+  browserAuth?: BetterAuthService;
 }
 
 interface StagedUpload {
@@ -678,7 +680,11 @@ const sameOrigin = (candidate: string, allowed: string): boolean => {
 };
 const publicUser = (user: Awaited<ReturnType<DomainRepository["findUser"]>>) => {
   if (!user) return undefined;
-  const { passwordHash: _passwordHash, ...safe } = user;
+  const {
+    passwordHash: _passwordHash,
+    passwordResetPending: _passwordResetPending,
+    ...safe
+  } = user;
   return safe;
 };
 const parseJson = async <T>(
@@ -875,6 +881,7 @@ async function stageMultipartUpload(
 
 export function createApp(options: AppOptions = {}) {
   const repo = options.repository ?? new MemoryRepository();
+  const browserAuth = options.browserAuth;
   const objectStore = options.objectStore;
   const rateLimiter = options.rateLimiter ?? new MemoryRateLimiter();
   const audioConcurrencyLimiter = options.audioConcurrencyLimiter ??
@@ -1390,7 +1397,11 @@ export function createApp(options: AppOptions = {}) {
   const speechBodyLimit = bodyLimit({ maxSize: 64 * 1024 });
   app.use(
     "/api/*",
-    (c, next) => c.req.path.startsWith("/api/attachments") ? next() : apiBodyLimit(c, next),
+    (c, next) =>
+      c.req.path.startsWith("/api/attachments") ||
+        c.req.path === "/api/audio/transcriptions"
+        ? next()
+        : apiBodyLimit(c, next),
   );
   app.use(
     "/v1/*",
@@ -1427,6 +1438,7 @@ export function createApp(options: AppOptions = {}) {
         path === "/v1/responses" || path === "/v1/images/generations" ||
         path === "/v1/images/edits" || path === "/api/images/generations" ||
         path === "/api/images/edits" || path.startsWith("/v1/audio/") ||
+        path.startsWith("/api/audio/") ||
         path.endsWith("/active-leaf"));
     const providerAdminRoute = c.req.method !== "GET" && (
       path.startsWith("/api/admin/providers") || path.startsWith("/api/admin/models") ||
@@ -1490,10 +1502,11 @@ export function createApp(options: AppOptions = {}) {
         }
         result = results.find((candidate) => !candidate.allowed) ?? results[0];
       } else {
-        const authorizationIdentity = authorizationCredentialIdentity(
-          c.req.header("authorization"),
-        );
-        const sessionIdentity = getCookie(c, sessionCookie) ??
+        const authorizationIdentity = path.startsWith("/api/")
+          ? undefined
+          : authorizationCredentialIdentity(c.req.header("authorization"));
+        const sessionIdentity = browserAuth?.presentedSessionToken(c.req.raw.headers) ??
+          getCookie(c, sessionCookie) ??
           (production ? getCookie(c, "dg_session") : undefined);
         const credentialIdentity = authorizationIdentity ??
           (sessionIdentity ? `session:${sessionIdentity}` : undefined);
@@ -1528,11 +1541,16 @@ export function createApp(options: AppOptions = {}) {
     await next();
   });
   app.use("/api/*", async (c, next) => {
+    if (browserAuth && c.req.path.startsWith("/api/auth/")) return next();
     if (!["GET", "HEAD", "OPTIONS"].includes(c.req.method)) {
       const origin = c.req.header("origin");
+      const setupBootstrap = c.req.path === "/api/setup/bootstrap";
       const cookieAuthenticated = getCookie(c, sessionCookie) !== undefined ||
         (production && getCookie(c, "dg_session") !== undefined);
-      if ((cookieAuthenticated && !origin) || (origin && !sameOrigin(origin, webOrigin))) {
+      if (
+        (((browserAuth && !setupBootstrap) || cookieAuthenticated) && !origin) ||
+        (origin && !sameOrigin(origin, webOrigin))
+      ) {
         return c.json({
           error: { code: "invalid_origin", message: "Request origin is not allowed" },
         }, 403);
@@ -1542,6 +1560,41 @@ export function createApp(options: AppOptions = {}) {
   });
 
   const authenticate: MiddlewareHandler<{ Variables: Variables }> = async (c, next) => {
+    if (browserAuth) {
+      const presentedBetterAuth = browserAuth.presentedSessionToken(c.req.raw.headers);
+      const session = await browserAuth.getSession(c.req.raw.headers);
+      if (!session) {
+        if (presentedBetterAuth) {
+          return c.json(openAIError("Invalid or expired session", "unauthorized"), 401);
+        }
+        // Read-only compatibility for sessions minted before the Better Auth cutover. They are
+        // never refreshed or copied and naturally disappear at their existing 30-day expiry.
+        const legacyToken = getCookie(c, sessionCookie) ??
+          (production ? getCookie(c, "dg_session") : undefined);
+        const legacySession = legacyToken
+          ? await repo.getSession(await sha256(legacyToken))
+          : undefined;
+        const legacyUser = legacySession ? await repo.findUser(legacySession.userId) : undefined;
+        if (
+          !legacySession || !legacyUser || legacyUser.state !== "active" ||
+          legacyUser.passwordResetPending === true
+        ) {
+          return c.json(openAIError("Invalid or expired session", "unauthorized"), 401);
+        }
+        c.set("user", publicUser(legacyUser)!);
+        c.set("authType", "session");
+        c.set("sessionLimited", legacySession.limited);
+        return next();
+      }
+      const user = await repo.findUser(session.userId);
+      if (!user || user.state !== "active" || user.passwordResetPending === true) {
+        return c.json(openAIError("Invalid or expired session", "unauthorized"), 401);
+      }
+      c.set("user", publicUser(user)!);
+      c.set("authType", "session");
+      c.set("sessionLimited", session.limited);
+      return next();
+    }
     const legacySession = production ? getCookie(c, "dg_session") : undefined;
     const raw = c.req.header("authorization")?.replace(/^Bearer\s+/i, "") ??
       getCookie(c, sessionCookie) ?? legacySession;
@@ -1551,7 +1604,8 @@ export function createApp(options: AppOptions = {}) {
     if (apiToken) {
       const user = await repo.findUser(apiToken.userId);
       if (
-        !user || user.state !== "active" || user.approvalStatus !== "approved" ||
+        !user || user.state !== "active" || user.passwordResetPending === true ||
+        user.approvalStatus !== "approved" ||
         (requireEmailVerification && !user.emailVerifiedAt) ||
         apiToken.revokedAt || (apiToken.expiresAt && Date.parse(apiToken.expiresAt) <= Date.now())
       ) return c.json(openAIError("Invalid or expired token", "unauthorized"), 401);
@@ -1563,7 +1617,7 @@ export function createApp(options: AppOptions = {}) {
     }
     const session = await repo.getSession(hash);
     const user = session ? await repo.findUser(session.userId) : undefined;
-    if (!session || !user || user.state !== "active") {
+    if (!session || !user || user.state !== "active" || user.passwordResetPending === true) {
       return c.json(openAIError("Invalid or expired session", "unauthorized"), 401);
     }
     c.set("user", publicUser(user)!);
@@ -1579,6 +1633,23 @@ export function createApp(options: AppOptions = {}) {
       });
       deleteCookie(c, "dg_session", { path: "/" });
     }
+    return next();
+  };
+  const authenticateApiToken: MiddlewareHandler<{ Variables: Variables }> = async (c, next) => {
+    const raw = c.req.header("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
+    if (!raw) return c.json(openAIError("Authentication required", "unauthorized"), 401);
+    const apiToken = await repo.findApiTokenByHash(await sha256(raw));
+    const user = apiToken ? await repo.findUser(apiToken.userId) : undefined;
+    if (
+      !apiToken || !user || user.state !== "active" || user.passwordResetPending === true ||
+      user.approvalStatus !== "approved" ||
+      (requireEmailVerification && !user.emailVerifiedAt) || apiToken.revokedAt ||
+      (apiToken.expiresAt && Date.parse(apiToken.expiresAt) <= Date.now())
+    ) return c.json(openAIError("Invalid or expired token", "unauthorized"), 401);
+    c.set("user", publicUser(user)!);
+    c.set("authType", "token");
+    c.set("tokenId", apiToken.id);
+    c.set("tokenScopes", apiToken.scopes);
     return next();
   };
   const approved: MiddlewareHandler<{ Variables: Variables }> = async (c, next) => {
@@ -2166,10 +2237,55 @@ export function createApp(options: AppOptions = {}) {
     });
     return c.json({ user: publicUser(user), limited: true }, 201);
   };
-  app.post("/api/auth/sign-up/email", signUp);
-  app.post("/api/auth/register", signUp);
+  const forwardBetterAuth = (c: Context, pathname: string) => {
+    if (!browserAuth) throw new Error("Better Auth is not configured");
+    const url = new URL(c.req.url);
+    url.pathname = pathname;
+    return browserAuth.handler(new Request(url, c.req.raw));
+  };
+  const forwardBetterAuthJson = (c: Context, pathname: string, body: unknown) => {
+    if (!browserAuth) throw new Error("Better Auth is not configured");
+    const url = new URL(c.req.url);
+    url.pathname = pathname;
+    const headers = new Headers(c.req.raw.headers);
+    headers.set("content-type", "application/json");
+    return browserAuth.handler(
+      new Request(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+      }),
+    );
+  };
+  if (browserAuth) {
+    app.post(
+      "/api/auth/sign-up/email",
+      async (c) =>
+        forwardBetterAuthJson(c, "/api/auth/sign-up/email", {
+          ...await parseJson(c, registerSchema),
+          callbackURL: `${webOrigin}/pending`,
+        }),
+    );
+    app.post(
+      "/api/auth/register",
+      async (c) =>
+        forwardBetterAuthJson(c, "/api/auth/sign-up/email", {
+          ...await parseJson(c, registerSchema),
+          callbackURL: `${webOrigin}/pending`,
+        }),
+    );
+  } else {
+    app.post("/api/auth/sign-up/email", signUp);
+    app.post("/api/auth/register", signUp);
+  }
   app.post("/api/auth/verify-email", async (c) => {
     const body = await parseJson(c, identityTokenSchema);
+    if (browserAuth && !body.token.startsWith("verify_")) {
+      const url = new URL(c.req.url);
+      url.pathname = "/api/auth/verify-email";
+      url.search = new URLSearchParams({ token: body.token, callbackURL: "/pending" }).toString();
+      return browserAuth.handler(new Request(url, { method: "GET", headers: c.req.raw.headers }));
+    }
     const user = await repo.verifyEmail(await sha256(body.token));
     await repo.recordAudit({
       actorId: user.id,
@@ -2180,6 +2296,17 @@ export function createApp(options: AppOptions = {}) {
     return c.json({ user: publicUser(user) });
   });
   app.post("/api/auth/verify-email/request", authenticate, async (c) => {
+    if (browserAuth) {
+      const url = new URL(c.req.url);
+      url.pathname = "/api/auth/send-verification-email";
+      return browserAuth.handler(
+        new Request(url, {
+          method: "POST",
+          headers: c.req.raw.headers,
+          body: JSON.stringify({ email: c.get("user").email, callbackURL: "/pending" }),
+        }),
+      );
+    }
     if (!mailer) {
       throw new DomainError("smtp_not_configured", "Email delivery is not configured", 503);
     }
@@ -2207,6 +2334,13 @@ export function createApp(options: AppOptions = {}) {
     return c.body(null, 202);
   });
   app.post("/api/auth/password-reset/request", async (c) => {
+    if (browserAuth) {
+      const body = await parseJson(c, passwordResetRequestSchema);
+      return forwardBetterAuthJson(c, "/api/auth/request-password-reset", {
+        email: body.email,
+        redirectTo: `${webOrigin}/reset-password`,
+      });
+    }
     const body = await parseJson(c, passwordResetRequestSchema);
     const user = await repo.findUserByEmail(body.email);
     if (user && mailer) {
@@ -2241,6 +2375,20 @@ export function createApp(options: AppOptions = {}) {
   });
   app.post("/api/auth/password-reset", async (c) => {
     const body = await parseJson(c, passwordResetSchema);
+    if (browserAuth && !body.token.startsWith("reset_")) {
+      await repo.prepareBetterAuthPasswordReset(body.token);
+      const url = new URL(c.req.url);
+      url.pathname = "/api/auth/reset-password";
+      const headers = new Headers(c.req.raw.headers);
+      headers.set("x-dg-password-reset-token", body.token);
+      return browserAuth.handler(
+        new Request(url, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ token: body.token, newPassword: body.password }),
+        }),
+      );
+    }
     const user = await repo.resetPassword(
       await sha256(body.token),
       await hashPassword(body.password),
@@ -2293,9 +2441,38 @@ export function createApp(options: AppOptions = {}) {
     });
     return c.json({ user: publicUser(user), limited });
   };
-  app.post("/api/auth/sign-in/email", signIn);
-  app.post("/api/auth/login", signIn);
+  if (browserAuth) {
+    app.post(
+      "/api/auth/sign-in/email",
+      (c) => forwardBetterAuth(c, "/api/auth/sign-in/email"),
+    );
+    app.post(
+      "/api/auth/login",
+      (c) => forwardBetterAuth(c, "/api/auth/sign-in/email"),
+    );
+  } else {
+    app.post("/api/auth/sign-in/email", signIn);
+    app.post("/api/auth/login", signIn);
+  }
   app.post("/api/auth/sign-out", async (c) => {
+    if (browserAuth) {
+      const legacyTokens = [
+        getCookie(c, sessionCookie),
+        production ? getCookie(c, "dg_session") : undefined,
+      ].filter((value): value is string => Boolean(value));
+      await Promise.all(
+        legacyTokens.map(async (token) => await repo.deleteSession(await sha256(token))),
+      );
+      const response = await forwardBetterAuth(c, "/api/auth/sign-out");
+      const headers = new Headers(response.headers);
+      headers.append(
+        "set-cookie",
+        `${sessionCookie}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax${
+          production ? "; Secure" : ""
+        }`,
+      );
+      return new Response(response.body, { status: response.status, headers });
+    }
     const currentToken = getCookie(c, sessionCookie);
     const legacyToken = production ? getCookie(c, "dg_session") : undefined;
     if (currentToken) {
@@ -2338,10 +2515,37 @@ export function createApp(options: AppOptions = {}) {
     "/api/sessions",
     authenticate,
     sessionOnly,
-    async (c) => c.json({ data: await repo.listSessions(c.get("user").id) }),
+    async (c) =>
+      c.json({
+        data: browserAuth
+          ? [
+            ...(await browserAuth.listUserSessions(c.get("user").id)).map((session) => ({
+              ...session,
+              id: `better_auth:${session.id}`,
+              source: "better_auth" as const,
+            })),
+            ...(await repo.listSessions(c.get("user").id)).map((session) => ({
+              ...session,
+              id: `legacy:${session.id}`,
+              source: "legacy" as const,
+            })),
+          ]
+          : await repo.listSessions(c.get("user").id),
+      }),
   );
   app.delete("/api/sessions/:id", authenticate, sessionOnly, async (c) => {
-    await repo.revokeSession(c.req.param("id"), c.get("user").id);
+    const requestedId = c.req.param("id");
+    if (browserAuth && requestedId.startsWith("better_auth:")) {
+      await browserAuth.revokeUserSession(
+        c.get("user").id,
+        requestedId.slice("better_auth:".length),
+      );
+    } else {
+      const legacyId = requestedId.startsWith("legacy:")
+        ? requestedId.slice("legacy:".length)
+        : requestedId;
+      await repo.revokeSession(legacyId, c.get("user").id);
+    }
     await repo.recordAudit({
       actorId: c.get("user").id,
       action: "session.revoked",
@@ -2350,6 +2554,27 @@ export function createApp(options: AppOptions = {}) {
     });
     return c.body(null, 204);
   });
+
+  if (browserAuth) {
+    const credentialChangeUnavailable = (c: Context) =>
+      c.json({
+        code: "CREDENTIAL_CHANGE_REQUIRES_RESET",
+        message: "Use the password reset flow during the authentication upgrade window",
+      }, 409);
+    app.post("/api/auth/change-password", credentialChangeUnavailable);
+    app.post("/api/auth/set-password", credentialChangeUnavailable);
+    // The product wrapper performs fail-closed authority revocation before
+    // Better Auth changes the credential. Do not expose the raw route.
+    app.post("/api/auth/reset-password", credentialChangeUnavailable);
+  }
+
+  if (browserAuth) {
+    app.on(
+      ["GET", "POST"],
+      "/api/auth/*",
+      (c) => browserAuth.handler(c.req.raw),
+    );
+  }
 
   app.use("/api/attachments/*", authenticate, approved, sessionOnly);
   app.use("/api/attachments", authenticate, approved, sessionOnly);
@@ -3765,7 +3990,14 @@ export function createApp(options: AppOptions = {}) {
     return c.json(publicUser(updated));
   });
   app.delete("/api/admin/sessions/:id", async (c) => {
-    await repo.revokeSession(c.req.param("id"));
+    const requestedId = c.req.param("id");
+    if (browserAuth && requestedId.startsWith("better_auth:")) {
+      await browserAuth.revokeSessionAsAdmin(requestedId.slice("better_auth:".length));
+    } else {
+      await repo.revokeSession(
+        requestedId.startsWith("legacy:") ? requestedId.slice("legacy:".length) : requestedId,
+      );
+    }
     await repo.recordAudit({
       actorId: c.get("user").id,
       action: "session.admin_revoked",
@@ -4143,7 +4375,10 @@ export function createApp(options: AppOptions = {}) {
     }
   });
 
-  app.use("/v1/*", authenticate, approved);
+  // Production always supplies Better Auth and keeps the OpenAI surface
+  // bearer-only. The in-memory adapter remains a test/development harness for
+  // legacy route-level suites that authenticate through its local session.
+  app.use("/v1/*", browserAuth ? authenticateApiToken : authenticate, approved);
   const replayResponse = (request: ApiIdempotencyRequest) => {
     // A streaming request can fail before the first event is exposed. In that case the
     // original response is the stored JSON error, not an empty event stream.
@@ -6826,226 +7061,276 @@ export function createApp(options: AppOptions = {}) {
     requireScope("chat:write"),
     audioHandler("translations"),
   );
-  app.post(
-    "/v1/audio/speech",
-    requireScope("chat:write"),
-    async (c) => {
-      const contentType = c.req.header("content-type")?.split(";", 1)[0].trim().toLowerCase();
-      if (contentType !== "application/json") {
-        return c.json(
-          openAIError("Content-Type must be application/json", "invalid_content_type"),
-          415,
-        );
-      }
-      let request: SpeechRequest;
-      try {
-        let value: unknown;
-        try {
-          value = await c.req.json();
-        } catch {
-          throw new SpeechProviderError(
-            "Request body must be valid JSON",
-            400,
-            "invalid_json",
-          );
-        }
-        request = parseSpeechRequest(value);
-      } catch (error) {
-        if (!(error instanceof SpeechProviderError)) throw error;
-        return c.json(openAIError(error.message, error.code), error.status as 400);
-      }
-
-      const endpointKey = "audio.speech" as const;
-      const idempotencyKey = c.req.header("idempotency-key");
-      if (idempotencyKey) {
-        if (idempotencyKey.length < 8 || idempotencyKey.length > 200) {
-          throw new DomainError(
-            "invalid_idempotency_key",
-            "Idempotency-Key must contain between 8 and 200 characters",
-            400,
-          );
-        }
-        const existing = await repo.getApiRequest(c.get("user").id, endpointKey, idempotencyKey);
-        if (existing) {
-          const requestHash = await sha256Hex(canonicalJson({ endpoint: endpointKey, request }));
-          if (
-            existing.requestHash !== requestHash ||
-            existing.stream !== (request.streamFormat === "sse")
-          ) {
-            throw new DomainError("idempotency_conflict", "Idempotency key payload differs", 409);
-          }
-          if (existing.state !== "in_progress") return replayResponse(existing);
-          return new Response(
-            JSON.stringify(
-              openAIError("An identical request is still in progress", "idempotency_in_progress"),
-            ),
-            {
-              status: 409,
-              headers: {
-                "content-type": "application/json",
-                "retry-after": String(Math.max(
-                  1,
-                  Math.ceil((Date.parse(existing.leaseExpiresAt ?? "") - Date.now()) / 1_000) || 1,
-                )),
-              },
-            },
-          );
-        }
-      }
-
-      const resolved = await resolveAudioRuntimeModel(request.model, "speech");
-      const model = resolved?.info;
-      const sourcePricing = pricingSnapshot(resolved?.price);
-      if (!model || !resolved?.registryModel || !providerExecution || !sourcePricing) {
-        return c.json(
-          openAIError(`Model '${request.model}' does not exist`, "model_not_found"),
-          404,
-        );
-      }
-      try {
-        assertSpeechFixedPricing(sourcePricing);
-      } catch (error) {
-        if (!(error instanceof SpeechProviderError)) throw error;
-        return c.json(openAIError(error.message, error.code), error.status as 500);
-      }
-      const providerPlan = await providerExecution.resolvePlan(resolved.registryModel.id);
-      const estimatedInputTokens = estimateSpeechInputTokens(request);
-      const reserveMicros = priceUsage(model, estimatedInputTokens, 0).costMicros;
-      const usage = await beginOpenAIUsage(
-        c,
-        endpointKey,
-        request,
-        model,
-        reserveMicros,
-        resolved.price,
+  const speechHandler = async (c: Context<{ Variables: Variables }>) => {
+    const contentType = c.req.header("content-type")?.split(";", 1)[0].trim().toLowerCase();
+    if (contentType !== "application/json") {
+      return c.json(
+        openAIError("Content-Type must be application/json", "invalid_content_type"),
+        415,
       );
-      if (usage.kind === "replay") return usage.response;
-      const { runId, idempotency, executionLeaseToken, runLease } = usage;
-      let speechSlot: Awaited<ReturnType<typeof claimAudioSlot>> | undefined;
-      let speechSlotDeferred = false;
+    }
+    let request: SpeechRequest;
+    try {
+      let value: unknown;
       try {
-        try {
-          speechSlot = await claimAudioSlot(c.get("user").id);
-        } catch (error) {
-          const domain = error instanceof DomainError ? error : undefined;
-          const status = domain?.status === 429 ? 429 : 503;
-          const code = status === 429
-            ? domain?.code ?? "audio_capacity_exceeded"
-            : "service_unavailable";
-          const message = status === 429
-            ? domain?.message ?? "Too many audio requests are in progress"
-            : "Audio admission is temporarily unavailable";
-          const responseBody = JSON.stringify(openAIError(message, code));
-          if (idempotency) {
-            await repo.failApiRequest({
-              id: idempotency.id,
-              leaseToken: idempotency.leaseToken,
-              responseStatus: status,
-              responseHeaders: { "content-type": "application/json", "retry-after": "5" },
-              responseBody,
-              billing: { mode: "refund" },
-            });
-          } else await repo.refund(runId);
-          return new Response(responseBody, {
-            status,
-            headers: { "content-type": "application/json", "retry-after": "5" },
-          });
-        }
-        const activeSpeechSlot = speechSlot;
-        const downstreamSpeechAbort = new AbortController();
-        const speechSignal = AbortSignal.any([
-          c.req.raw.signal,
-          activeSpeechSlot.signal,
-          downstreamSpeechAbort.signal,
-        ]);
-        if (activeSpeechSlot.signal.aborted) {
-          const responseBody = JSON.stringify(openAIError(
-            "Audio admission lease expired before provider dispatch",
-            "service_unavailable",
-          ));
-          if (idempotency) {
-            await repo.failApiRequest({
-              id: idempotency.id,
-              leaseToken: idempotency.leaseToken,
-              responseStatus: 503,
-              responseHeaders: { "content-type": "application/json", "retry-after": "5" },
-              responseBody,
-              billing: { mode: "refund" },
-            });
-          } else await repo.refund(runId);
-          return new Response(responseBody, {
-            status: 503,
-            headers: { "content-type": "application/json", "retry-after": "5" },
-          });
-        }
-
-        const lease = keepApiLeaseAlive(
-          idempotency,
-          runLease ? { runId, leaseToken: executionLeaseToken } : undefined,
+        value = await c.req.json();
+      } catch {
+        throw new SpeechProviderError(
+          "Request body must be valid JSON",
+          400,
+          "invalid_json",
         );
-        let leaseDeferred = false;
-        const started = performance.now();
-        let terminalAccounting = false;
-        let providerCompleted = false;
-        let observed = { inputTokens: estimatedInputTokens, outputTokens: 0 };
-        let customerCostMicros = reserveMicros;
-        try {
-          const result = await providerExecution.speech(
-            resolved.registryModel.id,
-            runId,
-            executionLeaseToken,
-            request,
-            speechSignal,
-            providerPlan,
-          );
-          if (request.streamFormat === "sse") {
-            if (!result.stream || !result.terminalFrame) {
-              throw new SpeechProviderError("Speech provider did not return a stream");
-            }
-            leaseDeferred = true;
-            speechSlotDeferred = true;
-            return streamSSE(c, async (stream) => {
-              stream.onAbort(() =>
-                downstreamSpeechAbort.abort(
-                  new DOMException("Downstream speech stream disconnected", "AbortError"),
-                )
-              );
-              let sequence = 0;
-              let visibleAudioBytes = 0;
-              let settled = false;
-              try {
-                for await (const frameBytes of result.stream!) {
-                  if (stream.aborted || speechSignal.aborted) {
-                    throw new DOMException("Client disconnected", "AbortError");
-                  }
-                  visibleAudioBytes += speechFrameDecodedBytes(frameBytes);
-                  const frame = new TextDecoder("utf-8", { fatal: true }).decode(frameBytes);
-                  if (idempotency) {
-                    await repo.appendApiSseFrame(
-                      idempotency.id,
-                      idempotency.leaseToken,
-                      sequence++,
-                      frame,
-                      undefined,
-                      undefined,
-                      replayQuota,
-                    );
-                  }
-                  await stream.write(frame);
+      }
+      request = parseSpeechRequest(value);
+    } catch (error) {
+      if (!(error instanceof SpeechProviderError)) throw error;
+      return c.json(openAIError(error.message, error.code), error.status as 400);
+    }
+
+    const endpointKey = "audio.speech" as const;
+    const idempotencyKey = c.req.header("idempotency-key");
+    if (idempotencyKey) {
+      if (idempotencyKey.length < 8 || idempotencyKey.length > 200) {
+        throw new DomainError(
+          "invalid_idempotency_key",
+          "Idempotency-Key must contain between 8 and 200 characters",
+          400,
+        );
+      }
+      const existing = await repo.getApiRequest(c.get("user").id, endpointKey, idempotencyKey);
+      if (existing) {
+        const requestHash = await sha256Hex(canonicalJson({ endpoint: endpointKey, request }));
+        if (
+          existing.requestHash !== requestHash ||
+          existing.stream !== (request.streamFormat === "sse")
+        ) {
+          throw new DomainError("idempotency_conflict", "Idempotency key payload differs", 409);
+        }
+        if (existing.state !== "in_progress") return replayResponse(existing);
+        return new Response(
+          JSON.stringify(
+            openAIError("An identical request is still in progress", "idempotency_in_progress"),
+          ),
+          {
+            status: 409,
+            headers: {
+              "content-type": "application/json",
+              "retry-after": String(Math.max(
+                1,
+                Math.ceil((Date.parse(existing.leaseExpiresAt ?? "") - Date.now()) / 1_000) || 1,
+              )),
+            },
+          },
+        );
+      }
+    }
+
+    const resolved = await resolveAudioRuntimeModel(request.model, "speech");
+    const model = resolved?.info;
+    const sourcePricing = pricingSnapshot(resolved?.price);
+    if (!model || !resolved?.registryModel || !providerExecution || !sourcePricing) {
+      return c.json(
+        openAIError(`Model '${request.model}' does not exist`, "model_not_found"),
+        404,
+      );
+    }
+    try {
+      assertSpeechFixedPricing(sourcePricing);
+    } catch (error) {
+      if (!(error instanceof SpeechProviderError)) throw error;
+      return c.json(openAIError(error.message, error.code), error.status as 500);
+    }
+    const providerPlan = await providerExecution.resolvePlan(resolved.registryModel.id);
+    const estimatedInputTokens = estimateSpeechInputTokens(request);
+    const reserveMicros = priceUsage(model, estimatedInputTokens, 0).costMicros;
+    const usage = await beginOpenAIUsage(
+      c,
+      endpointKey,
+      request,
+      model,
+      reserveMicros,
+      resolved.price,
+    );
+    if (usage.kind === "replay") return usage.response;
+    const { runId, idempotency, executionLeaseToken, runLease } = usage;
+    let speechSlot: Awaited<ReturnType<typeof claimAudioSlot>> | undefined;
+    let speechSlotDeferred = false;
+    try {
+      try {
+        speechSlot = await claimAudioSlot(c.get("user").id);
+      } catch (error) {
+        const domain = error instanceof DomainError ? error : undefined;
+        const status = domain?.status === 429 ? 429 : 503;
+        const code = status === 429
+          ? domain?.code ?? "audio_capacity_exceeded"
+          : "service_unavailable";
+        const message = status === 429
+          ? domain?.message ?? "Too many audio requests are in progress"
+          : "Audio admission is temporarily unavailable";
+        const responseBody = JSON.stringify(openAIError(message, code));
+        if (idempotency) {
+          await repo.failApiRequest({
+            id: idempotency.id,
+            leaseToken: idempotency.leaseToken,
+            responseStatus: status,
+            responseHeaders: { "content-type": "application/json", "retry-after": "5" },
+            responseBody,
+            billing: { mode: "refund" },
+          });
+        } else await repo.refund(runId);
+        return new Response(responseBody, {
+          status,
+          headers: { "content-type": "application/json", "retry-after": "5" },
+        });
+      }
+      const activeSpeechSlot = speechSlot;
+      const downstreamSpeechAbort = new AbortController();
+      const speechSignal = AbortSignal.any([
+        c.req.raw.signal,
+        activeSpeechSlot.signal,
+        downstreamSpeechAbort.signal,
+      ]);
+      if (activeSpeechSlot.signal.aborted) {
+        const responseBody = JSON.stringify(openAIError(
+          "Audio admission lease expired before provider dispatch",
+          "service_unavailable",
+        ));
+        if (idempotency) {
+          await repo.failApiRequest({
+            id: idempotency.id,
+            leaseToken: idempotency.leaseToken,
+            responseStatus: 503,
+            responseHeaders: { "content-type": "application/json", "retry-after": "5" },
+            responseBody,
+            billing: { mode: "refund" },
+          });
+        } else await repo.refund(runId);
+        return new Response(responseBody, {
+          status: 503,
+          headers: { "content-type": "application/json", "retry-after": "5" },
+        });
+      }
+
+      const lease = keepApiLeaseAlive(
+        idempotency,
+        runLease ? { runId, leaseToken: executionLeaseToken } : undefined,
+      );
+      let leaseDeferred = false;
+      const started = performance.now();
+      let terminalAccounting = false;
+      let providerCompleted = false;
+      let observed = { inputTokens: estimatedInputTokens, outputTokens: 0 };
+      let customerCostMicros = reserveMicros;
+      try {
+        const result = await providerExecution.speech(
+          resolved.registryModel.id,
+          runId,
+          executionLeaseToken,
+          request,
+          speechSignal,
+          providerPlan,
+        );
+        if (request.streamFormat === "sse") {
+          if (!result.stream || !result.terminalFrame) {
+            throw new SpeechProviderError("Speech provider did not return a stream");
+          }
+          leaseDeferred = true;
+          speechSlotDeferred = true;
+          return streamSSE(c, async (stream) => {
+            stream.onAbort(() =>
+              downstreamSpeechAbort.abort(
+                new DOMException("Downstream speech stream disconnected", "AbortError"),
+              )
+            );
+            let sequence = 0;
+            let visibleAudioBytes = 0;
+            let settled = false;
+            try {
+              for await (const frameBytes of result.stream!) {
+                if (stream.aborted || speechSignal.aborted) {
+                  throw new DOMException("Client disconnected", "AbortError");
                 }
-                const streamUsage = await result.usage;
-                const terminal = new TextDecoder("utf-8", { fatal: true }).decode(
-                  await result.terminalFrame!,
-                );
-                const latencyMs = Math.round(performance.now() - started);
-                const costMicros = priceUsage(
-                  model,
+                visibleAudioBytes += speechFrameDecodedBytes(frameBytes);
+                const frame = new TextDecoder("utf-8", { fatal: true }).decode(frameBytes);
+                if (idempotency) {
+                  await repo.appendApiSseFrame(
+                    idempotency.id,
+                    idempotency.leaseToken,
+                    sequence++,
+                    frame,
+                    undefined,
+                    undefined,
+                    replayQuota,
+                  );
+                }
+                await stream.write(frame);
+              }
+              const streamUsage = await result.usage;
+              const terminal = new TextDecoder("utf-8", { fatal: true }).decode(
+                await result.terminalFrame!,
+              );
+              const latencyMs = Math.round(performance.now() - started);
+              const costMicros = priceUsage(
+                model,
+                streamUsage.inputTokens,
+                streamUsage.outputTokens,
+              ).costMicros;
+              await lease.checkpoint({ ...streamUsage, costMicros, latencyMs });
+              if (idempotency) {
+                await repo.completeApiStream({
+                  id: idempotency.id,
+                  leaseToken: idempotency.leaseToken,
+                  responseStatus: 200,
+                  responseHeaders: {
+                    "content-type": "text/event-stream",
+                    "cache-control": "no-cache",
+                  },
+                  terminalFrame: terminal,
+                  costMicros,
+                  inputTokens: streamUsage.inputTokens,
+                  outputTokens: streamUsage.outputTokens,
+                  latencyMs,
+                  quota: replayQuota,
+                });
+              } else {
+                await repo.settle(
+                  runId,
+                  costMicros,
                   streamUsage.inputTokens,
                   streamUsage.outputTokens,
+                  latencyMs,
+                );
+              }
+              settled = true;
+              if (!stream.aborted && !c.req.raw.signal.aborted) await stream.write(terminal);
+            } catch {
+              if (!settled) {
+                const cancelled = c.req.raw.signal.aborted || stream.aborted;
+                const leaseLost = activeSpeechSlot.signal.aborted && !c.req.raw.signal.aborted;
+                // Decoded audio bytes prove visible work but are not speech tokens. Fixed-call
+                // pricing lets partial output settle without inventing token usage.
+                const partialOutputTokens = 0;
+                const partialCostMicros = priceUsage(
+                  model,
+                  estimatedInputTokens,
+                  partialOutputTokens,
                 ).costMicros;
-                await lease.checkpoint({ ...streamUsage, costMicros, latencyMs });
+                const latencyMs = Math.round(performance.now() - started);
+                const errorBody = openAIError(
+                  cancelled
+                    ? "Request cancelled"
+                    : leaseLost
+                    ? "Audio admission lease was lost"
+                    : "Speech provider stream failed",
+                  cancelled
+                    ? "request_cancelled"
+                    : leaseLost
+                    ? "service_unavailable"
+                    : "provider_error",
+                );
+                const errorFrame = `data: ${JSON.stringify(errorBody)}\n\n`;
                 if (idempotency) {
-                  await repo.completeApiStream({
+                  await repo.failApiRequest({
                     id: idempotency.id,
                     leaseToken: idempotency.leaseToken,
                     responseStatus: 200,
@@ -7053,245 +7338,208 @@ export function createApp(options: AppOptions = {}) {
                       "content-type": "text/event-stream",
                       "cache-control": "no-cache",
                     },
-                    terminalFrame: terminal,
-                    costMicros,
-                    inputTokens: streamUsage.inputTokens,
-                    outputTokens: streamUsage.outputTokens,
-                    latencyMs,
-                    quota: replayQuota,
+                    responseBody: JSON.stringify(errorBody),
+                    terminalFrame: errorFrame,
+                    billing: visibleAudioBytes > 0
+                      ? {
+                        mode: "settle",
+                        costMicros: partialCostMicros,
+                        inputTokens: estimatedInputTokens,
+                        outputTokens: partialOutputTokens,
+                        latencyMs,
+                      }
+                      : { mode: "refund" },
                   });
-                } else {
+                } else if (visibleAudioBytes > 0) {
                   await repo.settle(
                     runId,
-                    costMicros,
-                    streamUsage.inputTokens,
-                    streamUsage.outputTokens,
-                    latencyMs,
-                  );
-                }
-                settled = true;
-                if (!stream.aborted && !c.req.raw.signal.aborted) await stream.write(terminal);
-              } catch {
-                if (!settled) {
-                  const cancelled = c.req.raw.signal.aborted || stream.aborted;
-                  const leaseLost = activeSpeechSlot.signal.aborted && !c.req.raw.signal.aborted;
-                  // Decoded audio bytes prove visible work but are not speech tokens. Fixed-call
-                  // pricing lets partial output settle without inventing token usage.
-                  const partialOutputTokens = 0;
-                  const partialCostMicros = priceUsage(
-                    model,
+                    partialCostMicros,
                     estimatedInputTokens,
                     partialOutputTokens,
-                  ).costMicros;
-                  const latencyMs = Math.round(performance.now() - started);
-                  const errorBody = openAIError(
-                    cancelled
-                      ? "Request cancelled"
-                      : leaseLost
-                      ? "Audio admission lease was lost"
-                      : "Speech provider stream failed",
-                    cancelled
-                      ? "request_cancelled"
-                      : leaseLost
-                      ? "service_unavailable"
-                      : "provider_error",
+                    latencyMs,
                   );
-                  const errorFrame = `data: ${JSON.stringify(errorBody)}\n\n`;
-                  if (idempotency) {
-                    await repo.failApiRequest({
-                      id: idempotency.id,
-                      leaseToken: idempotency.leaseToken,
-                      responseStatus: 200,
-                      responseHeaders: {
-                        "content-type": "text/event-stream",
-                        "cache-control": "no-cache",
-                      },
-                      responseBody: JSON.stringify(errorBody),
-                      terminalFrame: errorFrame,
-                      billing: visibleAudioBytes > 0
-                        ? {
-                          mode: "settle",
-                          costMicros: partialCostMicros,
-                          inputTokens: estimatedInputTokens,
-                          outputTokens: partialOutputTokens,
-                          latencyMs,
-                        }
-                        : { mode: "refund" },
-                    });
-                  } else if (visibleAudioBytes > 0) {
-                    await repo.settle(
-                      runId,
-                      partialCostMicros,
-                      estimatedInputTokens,
-                      partialOutputTokens,
-                      latencyMs,
-                    );
-                  } else await repo.refund(runId);
-                  settled = true;
-                  if (!cancelled) await stream.write(errorFrame);
-                }
-              } finally {
-                await lease.stop();
-                await activeSpeechSlot.release().catch(() => undefined);
+                } else await repo.refund(runId);
+                settled = true;
+                if (!cancelled) await stream.write(errorFrame);
               }
-            });
-          }
-          providerCompleted = true;
-          observed = await result.usage;
-          if (!result.body) throw new SpeechProviderError("Speech provider returned no audio");
-          customerCostMicros = priceUsage(
-            model,
-            observed.inputTokens,
-            observed.outputTokens,
-          ).costMicros;
-          const latencyMs = Math.round(performance.now() - started);
-          await lease.checkpoint({ ...observed, costMicros: customerCostMicros, latencyMs });
-          if (idempotency) {
-            const responseBody = Buffer.from(result.body).toString("base64");
-            try {
-              await repo.completeApiJson({
-                id: idempotency.id,
-                leaseToken: idempotency.leaseToken,
-                responseStatus: 200,
-                responseHeaders: { "content-type": result.contentType },
-                responseBody,
-                responseBodyEncoding: "base64",
-                costMicros: customerCostMicros,
-                inputTokens: observed.inputTokens,
-                outputTokens: observed.outputTokens,
-                latencyMs,
-                quota: replayQuota,
-              });
-              terminalAccounting = true;
-            } catch (persistenceError) {
-              const status = persistenceError instanceof DomainError
-                ? persistenceError.status
-                : 500;
-              const failureBody = JSON.stringify(
-                openAIError("Response replay persistence failed", "replay_persistence_error"),
-              );
-              await repo.failApiRequest({
-                id: idempotency.id,
-                leaseToken: idempotency.leaseToken,
-                responseStatus: status,
-                responseHeaders: { "content-type": "application/json" },
-                responseBody: failureBody,
-                billing: {
-                  mode: "settle",
-                  costMicros: customerCostMicros,
-                  inputTokens: observed.inputTokens,
-                  outputTokens: observed.outputTokens,
-                  latencyMs,
-                },
-              });
-              terminalAccounting = true;
-              return new Response(failureBody, {
-                status,
-                headers: { "content-type": "application/json" },
-              });
+            } finally {
+              await lease.stop();
+              await activeSpeechSlot.release().catch(() => undefined);
             }
-          } else {
-            try {
-              await repo.settle(
-                runId,
-                customerCostMicros,
-                observed.inputTokens,
-                observed.outputTokens,
-                latencyMs,
-              );
-              terminalAccounting = true;
-            } catch (error) {
-              throw new TerminalAccountingPersistenceError(error);
-            }
-          }
-          return new Response(result.body.slice().buffer as ArrayBuffer, {
-            headers: { "content-type": result.contentType },
           });
-        } catch (error) {
-          if (terminalAccounting || error instanceof TerminalAccountingPersistenceError) {
-            throw error;
-          }
-          const cancelled = c.req.raw.signal.aborted;
-          const leaseLost = activeSpeechSlot.signal.aborted && !cancelled;
-          const latencyMs = Math.round(performance.now() - started);
-          const status = cancelled
-            ? 499
-            : leaseLost
-            ? 503
-            : error instanceof SpeechProviderError
-            ? error.status
-            : 502;
-          const code = cancelled
-            ? "request_cancelled"
-            : leaseLost
-            ? "service_unavailable"
-            : error instanceof SpeechProviderError
-            ? error.code
-            : "provider_error";
-          const responseBody = JSON.stringify(openAIError(
-            cancelled
-              ? "Request cancelled"
-              : leaseLost
-              ? "Audio admission lease was lost"
-              : providerCompleted
-              ? "Speech response could not be finalized"
-              : "Speech provider request failed",
-            code,
-          ));
-          const billing = providerCompleted
-            ? {
-              mode: "settle" as const,
+        }
+        providerCompleted = true;
+        observed = await result.usage;
+        if (!result.body) throw new SpeechProviderError("Speech provider returned no audio");
+        customerCostMicros = priceUsage(
+          model,
+          observed.inputTokens,
+          observed.outputTokens,
+        ).costMicros;
+        const latencyMs = Math.round(performance.now() - started);
+        await lease.checkpoint({ ...observed, costMicros: customerCostMicros, latencyMs });
+        if (idempotency) {
+          const responseBody = Buffer.from(result.body).toString("base64");
+          try {
+            await repo.completeApiJson({
+              id: idempotency.id,
+              leaseToken: idempotency.leaseToken,
+              responseStatus: 200,
+              responseHeaders: { "content-type": result.contentType },
+              responseBody,
+              responseBodyEncoding: "base64",
               costMicros: customerCostMicros,
               inputTokens: observed.inputTokens,
               outputTokens: observed.outputTokens,
               latencyMs,
-            }
-            : { mode: "refund" as const };
-          if (idempotency) {
+              quota: replayQuota,
+            });
+            terminalAccounting = true;
+          } catch (persistenceError) {
+            const status = persistenceError instanceof DomainError ? persistenceError.status : 500;
+            const failureBody = JSON.stringify(
+              openAIError("Response replay persistence failed", "replay_persistence_error"),
+            );
             await repo.failApiRequest({
               id: idempotency.id,
               leaseToken: idempotency.leaseToken,
               responseStatus: status,
-              responseHeaders: {
-                "content-type": "application/json",
-                ...(leaseLost ? { "retry-after": "5" } : {}),
-              },
-              responseBody,
-              billing,
-            });
-          } else if (providerCompleted) {
-            try {
-              await repo.settle(
-                runId,
-                customerCostMicros,
-                observed.inputTokens,
-                observed.outputTokens,
+              responseHeaders: { "content-type": "application/json" },
+              responseBody: failureBody,
+              billing: {
+                mode: "settle",
+                costMicros: customerCostMicros,
+                inputTokens: observed.inputTokens,
+                outputTokens: observed.outputTokens,
                 latencyMs,
-              );
-            } catch (accountingError) {
-              throw new TerminalAccountingPersistenceError(accountingError);
-            }
-          } else await repo.refund(runId);
-          terminalAccounting = true;
-          const retryAfter = leaseLost
-            ? "5"
-            : error instanceof SpeechProviderError && error.retryAfterMs !== undefined
-            ? String(Math.max(1, Math.ceil(error.retryAfterMs / 1_000)))
-            : undefined;
-          return new Response(responseBody, {
-            status,
-            headers: {
-              "content-type": "application/json",
-              ...(retryAfter ? { "retry-after": retryAfter } : {}),
-            },
-          });
-        } finally {
-          if (!leaseDeferred) await lease.stop();
+              },
+            });
+            terminalAccounting = true;
+            return new Response(failureBody, {
+              status,
+              headers: { "content-type": "application/json" },
+            });
+          }
+        } else {
+          try {
+            await repo.settle(
+              runId,
+              customerCostMicros,
+              observed.inputTokens,
+              observed.outputTokens,
+              latencyMs,
+            );
+            terminalAccounting = true;
+          } catch (error) {
+            throw new TerminalAccountingPersistenceError(error);
+          }
         }
+        return new Response(result.body.slice().buffer as ArrayBuffer, {
+          headers: { "content-type": result.contentType },
+        });
+      } catch (error) {
+        if (terminalAccounting || error instanceof TerminalAccountingPersistenceError) {
+          throw error;
+        }
+        const cancelled = c.req.raw.signal.aborted;
+        const leaseLost = activeSpeechSlot.signal.aborted && !cancelled;
+        const latencyMs = Math.round(performance.now() - started);
+        const status = cancelled
+          ? 499
+          : leaseLost
+          ? 503
+          : error instanceof SpeechProviderError
+          ? error.status
+          : 502;
+        const code = cancelled
+          ? "request_cancelled"
+          : leaseLost
+          ? "service_unavailable"
+          : error instanceof SpeechProviderError
+          ? error.code
+          : "provider_error";
+        const responseBody = JSON.stringify(openAIError(
+          cancelled
+            ? "Request cancelled"
+            : leaseLost
+            ? "Audio admission lease was lost"
+            : providerCompleted
+            ? "Speech response could not be finalized"
+            : "Speech provider request failed",
+          code,
+        ));
+        const billing = providerCompleted
+          ? {
+            mode: "settle" as const,
+            costMicros: customerCostMicros,
+            inputTokens: observed.inputTokens,
+            outputTokens: observed.outputTokens,
+            latencyMs,
+          }
+          : { mode: "refund" as const };
+        if (idempotency) {
+          await repo.failApiRequest({
+            id: idempotency.id,
+            leaseToken: idempotency.leaseToken,
+            responseStatus: status,
+            responseHeaders: {
+              "content-type": "application/json",
+              ...(leaseLost ? { "retry-after": "5" } : {}),
+            },
+            responseBody,
+            billing,
+          });
+        } else if (providerCompleted) {
+          try {
+            await repo.settle(
+              runId,
+              customerCostMicros,
+              observed.inputTokens,
+              observed.outputTokens,
+              latencyMs,
+            );
+          } catch (accountingError) {
+            throw new TerminalAccountingPersistenceError(accountingError);
+          }
+        } else await repo.refund(runId);
+        terminalAccounting = true;
+        const retryAfter = leaseLost
+          ? "5"
+          : error instanceof SpeechProviderError && error.retryAfterMs !== undefined
+          ? String(Math.max(1, Math.ceil(error.retryAfterMs / 1_000)))
+          : undefined;
+        return new Response(responseBody, {
+          status,
+          headers: {
+            "content-type": "application/json",
+            ...(retryAfter ? { "retry-after": retryAfter } : {}),
+          },
+        });
       } finally {
-        if (!speechSlotDeferred) await speechSlot?.release().catch(() => undefined);
+        if (!leaseDeferred) await lease.stop();
       }
-    },
+    } finally {
+      if (!speechSlotDeferred) await speechSlot?.release().catch(() => undefined);
+    }
+  };
+  app.post(
+    "/v1/audio/speech",
+    requireScope("chat:write"),
+    speechHandler,
+  );
+  app.post(
+    "/api/audio/transcriptions",
+    authenticate,
+    approved,
+    sessionOnly,
+    audioHandler("transcriptions"),
+  );
+  app.post(
+    "/api/audio/speech",
+    authenticate,
+    approved,
+    sessionOnly,
+    speechHandler,
   );
   app.get(
     "/v1/files",

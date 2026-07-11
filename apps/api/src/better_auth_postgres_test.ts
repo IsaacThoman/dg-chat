@@ -3,6 +3,7 @@ import postgres from "npm:postgres@3.4.7";
 import { PostgresRepository } from "@dg-chat/database";
 import { createBetterAuthService } from "./better-auth.ts";
 import { hashPassword } from "./crypto.ts";
+import { createApp } from "./app.ts";
 
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
 
@@ -23,6 +24,7 @@ Deno.test({
     let service: ReturnType<typeof createBetterAuthService> | undefined;
     let repository: PostgresRepository | undefined;
     const verificationDeliveries: Array<{ email: string; url: string; token: string }> = [];
+    const passwordResetDeliveries: Array<{ email: string; url: string; token: string }> = [];
     try {
       await adminSql.unsafe(`CREATE SCHEMA ${schema}`);
       await adminSql.unsafe(`SET search_path TO ${schema},public`);
@@ -57,6 +59,13 @@ Deno.test({
         CREATE TABLE api_tokens (
           id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
           user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          name text NOT NULL,
+          token_hash text NOT NULL UNIQUE,
+          preview text NOT NULL,
+          scopes jsonb NOT NULL,
+          expires_at timestamptz,
+          last_used_at timestamptz,
+          created_at timestamptz NOT NULL DEFAULT now(),
           revoked_at timestamptz
         );
         CREATE TABLE ledger_entries (
@@ -68,6 +77,15 @@ Deno.test({
           balance_after_micros bigint NOT NULL,
           created_at timestamptz NOT NULL DEFAULT now(),
           UNIQUE(usage_run_id,kind)
+        );
+        CREATE TABLE audit_events (
+          id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+          actor_id uuid REFERENCES users(id),
+          action text NOT NULL,
+          target_type text NOT NULL,
+          target_id text,
+          metadata jsonb NOT NULL DEFAULT '{}',
+          created_at timestamptz NOT NULL DEFAULT now()
         );
       `);
       const legacyId = crypto.randomUUID();
@@ -100,6 +118,15 @@ Deno.test({
           verificationDeliveries.push(delivery);
           return Promise.resolve();
         },
+        sendPasswordResetEmail: (delivery) => {
+          passwordResetDeliveries.push(delivery);
+          return Promise.resolve();
+        },
+      });
+      const { app } = createApp({
+        repository,
+        browserAuth: service,
+        requireEmailVerification: true,
       });
 
       const legacySignin = await service.handler(
@@ -122,24 +149,213 @@ Deno.test({
         await service.getSession(new Headers({ cookie: legacyCookie })),
         { userId: legacyId, limited: false },
       );
-
-      const signup = await service.handler(
-        new Request(
-          "http://localhost:8000/api/auth/sign-up/email",
-          {
-            method: "POST",
-            headers: {
-              "content-type": "application/json",
-              origin: "http://localhost:5173",
-            },
-            body: JSON.stringify({
-              name: "OIDC Bridge",
-              email: "bridge@example.com",
-              password: "correct horse battery staple",
-            }),
+      const bootstrap = await repository.bootstrapAdmin({
+        email: "admin@example.com",
+        name: "Bootstrap Admin",
+        passwordHash: await hashPassword("bootstrap password remains valid"),
+      }, 5_000_000);
+      assertEquals(bootstrap.passwordHash, null);
+      assertEquals(bootstrap.balanceMicros, 5_000_000);
+      const bootstrapSignin = await service.handler(
+        new Request("http://localhost:8000/api/auth/sign-in/email", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            origin: "http://localhost:5173",
           },
-        ),
+          body: JSON.stringify({
+            email: "admin@example.com",
+            password: "bootstrap password remains valid",
+          }),
+        }),
       );
+      assertEquals(bootstrapSignin.status, 200, await bootstrapSignin.clone().text());
+      const bootstrapCookie = bootstrapSignin.headers.get("set-cookie")?.split(";", 1)[0];
+      assert(bootstrapCookie);
+      const tokenResponse = await app.request("/api/tokens", {
+        method: "POST",
+        headers: {
+          cookie: bootstrapCookie,
+          origin: "http://localhost:5173",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ name: "Before reset", scopes: ["models:read"] }),
+      });
+      assertEquals(tokenResponse.status, 201, await tokenResponse.clone().text());
+      const apiToken = (await tokenResponse.json() as { token: string }).token;
+      assertEquals(
+        (await app.request("/v1/models", {
+          headers: { authorization: `Bearer ${apiToken}` },
+        })).status,
+        200,
+      );
+      const resetRequest = await app.request("/api/auth/password-reset/request", {
+        method: "POST",
+        headers: {
+          origin: "http://localhost:5173",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ email: "admin@example.com" }),
+      });
+      assertEquals(resetRequest.status, 200, await resetRequest.clone().text());
+      assertEquals(passwordResetDeliveries.length, 1);
+      const resetCallback = await service.handler(
+        new Request(passwordResetDeliveries[0].url, {
+          redirect: "manual",
+        }),
+      );
+      assertEquals(resetCallback.status, 302);
+      const resetLocation = new URL(resetCallback.headers.get("location")!);
+      assertEquals(
+        resetLocation.origin + resetLocation.pathname,
+        "http://localhost:5173/reset-password",
+      );
+      const resetToken = resetLocation.searchParams.get("token");
+      assert(resetToken);
+      const originalHandler = service.handler;
+      let failResetOnce = true;
+      service.handler = (request) => {
+        const url = new URL(request.url);
+        if (
+          failResetOnce && request.method === "POST" && url.pathname.endsWith("/reset-password")
+        ) {
+          failResetOnce = false;
+          return Promise.resolve(new Response("temporary auth storage failure", { status: 503 }));
+        }
+        return originalHandler(request);
+      };
+      const failedReset = await app.request("/api/auth/password-reset", {
+        method: "POST",
+        headers: {
+          origin: "http://localhost:5173",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ token: resetToken, password: "new bootstrap password valid" }),
+      });
+      assertEquals(failedReset.status, 503, await failedReset.clone().text());
+      const guarded = await adminSql<
+        { state: string; password_reset_pending: boolean }[]
+      >`SELECT state,password_reset_pending FROM users WHERE email='admin@example.com'`;
+      assertEquals(guarded[0], { state: "active", password_reset_pending: true });
+      assertEquals(
+        (await app.request("/v1/models", {
+          headers: { authorization: `Bearer ${apiToken}` },
+        })).status,
+        401,
+      );
+      const originalSecureAfterReset = repository.secureAfterPasswordReset.bind(repository);
+      let failCompletionOnce = true;
+      repository.secureAfterPasswordReset = (userId, token) => {
+        if (failCompletionOnce) {
+          failCompletionOnce = false;
+          return Promise.reject(new Error("injected reset completion failure"));
+        }
+        return originalSecureAfterReset(userId, token);
+      };
+      const completionFailed = await app.request("/api/auth/password-reset", {
+        method: "POST",
+        headers: {
+          origin: "http://localhost:5173",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ token: resetToken, password: "new bootstrap password valid" }),
+      });
+      assertEquals(completionFailed.status, 500, await completionFailed.clone().text());
+      const replacementRequest = await app.request("/api/auth/password-reset/request", {
+        method: "POST",
+        headers: {
+          origin: "http://localhost:5173",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ email: "admin@example.com" }),
+      });
+      assertEquals(replacementRequest.status, 200, await replacementRequest.clone().text());
+      assertEquals(passwordResetDeliveries.length, 2);
+      const replacementCallback = await service.handler(
+        new Request(passwordResetDeliveries[1].url, { redirect: "manual" }),
+      );
+      const replacementLocation = new URL(replacementCallback.headers.get("location")!);
+      const replacementToken = replacementLocation.searchParams.get("token");
+      assert(replacementToken);
+      const reset = await app.request("/api/auth/password-reset", {
+        method: "POST",
+        headers: {
+          origin: "http://localhost:5173",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          token: replacementToken,
+          password: "final bootstrap password valid",
+        }),
+      });
+      assertEquals(reset.status, 200, await reset.clone().text());
+      assertEquals(
+        (await app.request("/v1/models", {
+          headers: { authorization: `Bearer ${apiToken}` },
+        })).status,
+        401,
+      );
+      assertEquals(
+        (await app.request("/api/auth/sign-in/email", {
+          method: "POST",
+          headers: {
+            origin: "http://localhost:5173",
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            email: "admin@example.com",
+            password: "bootstrap password remains valid",
+          }),
+        })).status,
+        401,
+      );
+      const resetSignin = await app.request("/api/auth/sign-in/email", {
+        method: "POST",
+        headers: {
+          origin: "http://localhost:5173",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          email: "admin@example.com",
+          password: "final bootstrap password valid",
+        }),
+      });
+      assertEquals(resetSignin.status, 200, await resetSignin.clone().text());
+      const resetCookie = resetSignin.headers.get("set-cookie")?.split(";", 1)[0];
+      assert(resetCookie);
+      assertEquals(
+        (await app.request("/api/audio/speech", {
+          method: "POST",
+          headers: {
+            cookie: resetCookie,
+            origin: "http://localhost:5173",
+            "content-type": "application/json",
+          },
+          body: "{}",
+        })).status,
+        422,
+      );
+      assertEquals(
+        (await app.request("/v1/audio/speech", {
+          method: "POST",
+          headers: { cookie: resetCookie, "content-type": "application/json" },
+          body: "{}",
+        })).status,
+        401,
+      );
+
+      const signup = await app.request("/api/auth/sign-up/email", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          origin: "http://localhost:5173",
+        },
+        body: JSON.stringify({
+          name: "OIDC Bridge",
+          email: "bridge@example.com",
+          password: "correct horse battery staple",
+        }),
+      });
       assertEquals(signup.status, 200, await signup.clone().text());
       const body = await signup.json() as { user: { id: string; email: string } };
       assertMatch(
@@ -156,6 +372,14 @@ Deno.test({
       assert(!cookie.includes("correct horse battery staple"));
       const session = await service.getSession(new Headers({ cookie }));
       assertEquals(session, { userId: body.user.id, limited: true });
+      assertEquals((await app.request("/api/auth/me", { headers: { cookie } })).status, 200);
+      assertEquals((await app.request("/v1/models", { headers: { cookie } })).status, 401);
+      assertEquals(
+        (await app.request("/api/auth/me", {
+          headers: { authorization: "Bearer copied-api-credential" },
+        })).status,
+        401,
+      );
       assertEquals(verificationDeliveries.length, 1);
       assertEquals(verificationDeliveries[0].email, "bridge@example.com");
       const verification = await service.handler(
@@ -164,6 +388,7 @@ Deno.test({
         }),
       );
       assertEquals(verification.status, 302);
+      assertEquals(verification.headers.get("location"), "http://localhost:5173/pending");
       assert((await repository.findUser(body.user.id))?.emailVerifiedAt);
 
       await repository.approveUser(body.user.id, "approved", 5_000_000, true);
@@ -206,7 +431,7 @@ Deno.test({
           SELECT limited FROM auth_sessions WHERE user_id=${body.user.id}
         `,
         ],
-        [{ limited: false }],
+        [],
       );
       assertEquals(
         [

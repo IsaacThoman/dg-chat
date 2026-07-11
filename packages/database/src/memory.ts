@@ -102,6 +102,7 @@ import {
 
 export interface StoredUser extends PublicUser {
   passwordHash: string | null;
+  passwordResetPending?: boolean;
 }
 export interface StoredSession {
   id: string;
@@ -646,6 +647,27 @@ export class MemoryRepository {
       }
     }
     return user;
+  }
+  prepareBetterAuthPasswordReset(_token: string) {
+    throw new DomainError(
+      "better_auth_storage_required",
+      "Better Auth password reset requires durable authentication storage",
+      503,
+    );
+  }
+  secureAfterPasswordReset(userId: string, _token: string) {
+    const user = this.users.get(userId);
+    if (!user) throw new DomainError("not_found", "User not found", 404);
+    user.passwordHash = null;
+    this.invalidateUserSessions(userId);
+    for (const token of this.tokens.values()) {
+      if (token.userId === userId && !token.revokedAt) token.revokedAt = new Date().toISOString();
+    }
+    for (const identityToken of this.identityTokens.values()) {
+      if (identityToken.userId === userId && !identityToken.consumedAt) {
+        identityToken.consumedAt = new Date().toISOString();
+      }
+    }
   }
   recordAudit(input: AuditEventInput): AuditEvent {
     const event = {

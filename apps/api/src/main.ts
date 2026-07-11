@@ -5,6 +5,7 @@ import {
   objectStoreFromEnv,
   PostgresRepository,
   PostgresToolExecutionStore,
+  reconcileBetterAuthIdentities,
 } from "@dg-chat/database";
 import { MemoryRateLimiter, RedisRateLimiter } from "./rate-limit.ts";
 import { ProviderSecretKeyring } from "./provider-secrets.ts";
@@ -14,6 +15,8 @@ import {
   MemoryAudioConcurrencyLimiter,
   RedisAudioConcurrencyLimiter,
 } from "./audio-concurrency.ts";
+import { createBetterAuthService } from "./better-auth.ts";
+import { smtpIdentityMailer } from "./mail.ts";
 
 const port = Number(Deno.env.get("PORT") ?? 8000);
 const providerKeyring = ProviderSecretKeyring.fromEnv();
@@ -23,12 +26,24 @@ if (Deno.env.get("DENO_ENV") === "production" && !providerKeyring) {
   );
 }
 const databaseUrl = Deno.env.get("DATABASE_URL");
+const production = Deno.env.get("DENO_ENV") === "production";
+if (production && !databaseUrl) throw new Error("Production requires DATABASE_URL");
 if (databaseUrl) {
   const backfill = await backfillLegacyRuntimeSnapshot(databaseUrl);
   if (backfill.status === "imported") {
     console.log(
       JSON.stringify({ level: "info", message: "Legacy repository imported", ...backfill }),
     );
+  }
+  const reconciliation = await reconcileBetterAuthIdentities(databaseUrl);
+  if (
+    reconciliation.usersInserted || reconciliation.credentialsInserted
+  ) {
+    console.log(JSON.stringify({
+      level: "info",
+      message: "Better Auth identities reconciled",
+      ...reconciliation,
+    }));
   }
 }
 const repository = databaseUrl
@@ -57,6 +72,42 @@ const audioConcurrencyLimiter = Deno.env.get("REDIS_URL")
   })
   : new MemoryAudioConcurrencyLimiter({ leaseMs: audioConcurrencyLeaseMs });
 const objectStore = objectStoreFromEnv();
+const requireEmailVerification = Deno.env.get("REQUIRE_EMAIL_VERIFICATION") === "true";
+const mailer = Deno.env.get("SMTP_URL")
+  ? smtpIdentityMailer(
+    Deno.env.get("SMTP_URL")!,
+    Deno.env.get("SMTP_FROM") ?? "DG Chat <no-reply@localhost>",
+  )
+  : undefined;
+const appSecret = Deno.env.get("APP_SECRET");
+if (databaseUrl && (!appSecret || new TextEncoder().encode(appSecret).byteLength < 32)) {
+  throw new Error("PostgreSQL authentication requires APP_SECRET with at least 32 bytes");
+}
+const webOrigin = new URL(
+  Deno.env.get("WEB_ORIGIN") ?? Deno.env.get("WEB_URL") ??
+    "http://localhost:5173",
+).origin;
+const appUrl = new URL(
+  Deno.env.get("PUBLIC_API_ORIGIN") ?? Deno.env.get("APP_URL") ??
+    "http://localhost:8000",
+).origin;
+const browserAuth = databaseUrl
+  ? createBetterAuthService({
+    databaseUrl,
+    repository,
+    secret: appSecret!,
+    appUrl,
+    webOrigin,
+    requireEmailVerification,
+    sendVerificationEmail: mailer
+      ? ({ email, url, token }) =>
+        mailer.send({ to: email, kind: "email_verification", url, token })
+      : undefined,
+    sendPasswordResetEmail: mailer
+      ? ({ email, url, token }) => mailer.send({ to: email, kind: "password_reset", url, token })
+      : undefined,
+  })
+  : undefined;
 const { app, toolExecutionService } = createApp({
   repository,
   rateLimiter,
@@ -67,6 +118,9 @@ const { app, toolExecutionService } = createApp({
   toolExecutionStore,
   audioConcurrencyLimiter,
   imageConcurrencyLimiter: audioConcurrencyLimiter,
+  browserAuth,
+  mailer,
+  requireEmailVerification,
 });
 await toolExecutionService.recover();
 const replayMaintenance = setInterval(async () => {
@@ -112,6 +166,7 @@ const shutdown = async (signal: string) => {
     ocrCache?.close(),
     audioConcurrencyLimiter.close(),
     objectStore?.close(),
+    browserAuth?.close(),
   ]);
 };
 for (const signal of ["SIGTERM", "SIGINT"] as const) {

@@ -1,7 +1,14 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.14";
 import postgres from "npm:postgres@3.4.7";
+import { reconcileBetterAuthIdentities } from "./better-auth-reconciliation.ts";
 
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
+
+function schemaDatabaseUrl(source: string, schema: string): string {
+  const url = new URL(source);
+  url.searchParams.set("options", `-c search_path=${schema},public`);
+  return url.toString();
+}
 
 Deno.test({
   name: "0024 creates isolated Better Auth storage and backfills legacy credentials",
@@ -51,6 +58,10 @@ Deno.test({
         ],
       );
       assertEquals(
+        [...await sql`SELECT count(*)::int AS count FROM users WHERE password_hash IS NOT NULL`],
+        [{ count: 2 }],
+      );
+      assertEquals(
         [
           ...await sql`
           SELECT account_id,provider_id,user_id::text,password
@@ -78,6 +89,58 @@ Deno.test({
         INSERT INTO users(id,email,name,password_hash)
         VALUES(${oidcOnlyId},'oidc@example.com','OIDC only',null)
       `;
+      const lateImportId = crypto.randomUUID();
+      await sql`
+        INSERT INTO users(id,email,name,password_hash,email_verified_at)
+        VALUES(${lateImportId},'late@example.com','Late import','pbkdf2$late',now())
+      `;
+      const changedPasswordId = crypto.randomUUID();
+      await sql`
+        INSERT INTO users(id,email,name,password_hash,email_verified_at)
+        VALUES(
+          ${changedPasswordId},'changed@example.com','Changed password','pbkdf2$new',now()
+        )
+      `;
+      await sql`
+        INSERT INTO auth_users(id,email,name,email_verified)
+        VALUES(${changedPasswordId},'changed@example.com','Changed password',true)
+      `;
+      await sql`
+        INSERT INTO auth_accounts(account_id,provider_id,user_id,password,updated_at)
+        VALUES(${changedPasswordId},'credential',${changedPasswordId},'pbkdf2$old',now())
+      `;
+      assertEquals(
+        await reconcileBetterAuthIdentities(schemaDatabaseUrl(databaseUrl!, schema)),
+        {
+          usersInserted: 2,
+          credentialsInserted: 1,
+        },
+      );
+      assertEquals(
+        await reconcileBetterAuthIdentities(schemaDatabaseUrl(databaseUrl!, schema)),
+        {
+          usersInserted: 0,
+          credentialsInserted: 0,
+        },
+      );
+      assertEquals(
+        [
+          ...await sql`
+          SELECT password FROM auth_accounts
+          WHERE provider_id='credential' AND account_id=${lateImportId}
+        `,
+        ],
+        [{ password: "pbkdf2$late" }],
+      );
+      assertEquals(
+        [
+          ...await sql`
+          SELECT password FROM auth_accounts
+          WHERE provider_id='credential' AND account_id=${changedPasswordId}
+        `,
+        ],
+        [{ password: "pbkdf2$old" }],
+      );
       const authUserId = crypto.randomUUID();
       await sql`
         INSERT INTO auth_users(id,email,name) VALUES(${authUserId},'new@example.com','New user')

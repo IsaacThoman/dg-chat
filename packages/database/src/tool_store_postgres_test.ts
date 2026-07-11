@@ -12,7 +12,7 @@ Deno.test({
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
     const store = PostgresToolExecutionStore.connect(databaseUrl!);
-    await sql`TRUNCATE tool_executions, tool_policies, audit_events, users RESTART IDENTITY CASCADE`;
+    await sql`TRUNCATE auth_verifications, auth_sessions, auth_accounts, auth_users, tool_executions, tool_policies, audit_events, users RESTART IDENTITY CASCADE`;
     const users = await sql<{ id: string }[]>`
       INSERT INTO users(email,name,password_hash,approval_status)
       VALUES ('tool-owner@example.com','Owner','x','approved'),

@@ -7,6 +7,7 @@ import {
   authSessions,
   authUsers,
   authVerifications,
+  DomainError,
   type DomainRepository,
 } from "@dg-chat/database";
 import { hashPassword, verifyPassword } from "./crypto.ts";
@@ -19,6 +20,11 @@ export interface BetterAuthServiceOptions {
   webOrigin: string;
   requireEmailVerification?: boolean;
   sendVerificationEmail?: (input: {
+    email: string;
+    url: string;
+    token: string;
+  }) => Promise<void>;
+  sendPasswordResetEmail?: (input: {
     email: string;
     url: string;
     token: string;
@@ -139,6 +145,28 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
         hash: hashPassword,
         verify: ({ hash, password }) => verifyPassword(password, hash),
       },
+      sendResetPassword: options.sendPasswordResetEmail
+        ? ({ user, url, token }) =>
+          options.sendPasswordResetEmail!({ email: user.email, url, token })
+        : undefined,
+      onPasswordReset: async ({ user }, request) => {
+        const token = request?.headers.get("x-dg-password-reset-token");
+        if (!token) throw new Error("Password reset guard token is missing");
+        await options.repository.secureAfterPasswordReset(user.id, token);
+        await Promise.resolve(options.repository.recordAudit({
+          actorId: user.id,
+          action: "identity.password_reset_completed",
+          targetType: "user",
+          targetId: user.id,
+        })).catch((error) => {
+          console.error(JSON.stringify({
+            level: "error",
+            message: "Password reset audit persistence failed",
+            userId: user.id,
+            error: error instanceof Error ? error.message : String(error),
+          }));
+        });
+      },
     },
     emailVerification: options.sendVerificationEmail
       ? {
@@ -176,7 +204,9 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
             const authUser = await loadAuthUser(session.userId);
             if (authUser) domainUser = await provisionDomainUser(authUser);
             if (!domainUser) return { data: { ...session, limited: true } };
-            if (domainUser.state !== "active") return false;
+            if (domainUser.state !== "active" || domainUser.passwordResetPending === true) {
+              return false;
+            }
             const limited = domainUser.approvalStatus !== "approved" ||
               ((options.requireEmailVerification ?? false) && !domainUser.emailVerifiedAt);
             return { data: { ...session, limited } };
@@ -189,6 +219,19 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
   return {
     auth,
     handler: (request: Request) => auth.handler(request),
+    presentedSessionToken(headers: Headers): string | undefined {
+      const cookie = headers.get("cookie");
+      if (!cookie) return undefined;
+      for (const segment of cookie.split(";")) {
+        const separator = segment.indexOf("=");
+        if (separator < 1) continue;
+        const name = segment.slice(0, separator).trim();
+        if (name !== "dg_chat.session_token" && name !== "__Secure-dg_chat.session_token") continue;
+        const value = segment.slice(separator + 1).trim();
+        if (value) return value;
+      }
+      return undefined;
+    },
     async getSession(headers: Headers): Promise<BetterAuthBrowserSession | null> {
       const result = await auth.api.getSession({ headers });
       if (!result) return null;
@@ -199,7 +242,7 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
         emailVerified: result.user.emailVerified,
       });
       if (
-        !domainUser || domainUser.state !== "active" ||
+        !domainUser || domainUser.state !== "active" || domainUser.passwordResetPending === true ||
         domainUser.approvalStatus === "rejected" ||
         normalizeEmail(domainUser.email) !== normalizeEmail(result.user.email)
       ) return null;
@@ -213,6 +256,39 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
     },
     invalidateUserSessions: async (userId: string) => {
       await sql`DELETE FROM auth_sessions WHERE user_id=${userId}`;
+    },
+    listUserSessions: async (userId: string) => {
+      const rows = await sql<
+        Array<{
+          id: string;
+          user_id: string;
+          limited: boolean;
+          expires_at: Date;
+          created_at: Date;
+        }>
+      >`
+        SELECT id,user_id,limited,expires_at,created_at
+        FROM auth_sessions WHERE user_id=${userId}
+        ORDER BY created_at DESC,id DESC
+      `;
+      return rows.map((row) => ({
+        id: String(row.id),
+        userId: String(row.user_id),
+        limited: Boolean(row.limited),
+        expiresAt: row.expires_at.toISOString(),
+        createdAt: row.created_at.toISOString(),
+        invalidatedAt: null,
+      }));
+    },
+    revokeUserSession: async (userId: string, sessionId: string) => {
+      const deleted = await sql`
+        DELETE FROM auth_sessions WHERE id=${sessionId} AND user_id=${userId} RETURNING id
+      `;
+      if (!deleted.length) throw new DomainError("not_found", "Session not found", 404);
+    },
+    revokeSessionAsAdmin: async (sessionId: string) => {
+      const deleted = await sql`DELETE FROM auth_sessions WHERE id=${sessionId} RETURNING id`;
+      if (!deleted.length) throw new DomainError("not_found", "Session not found", 404);
     },
     close: () => sql.end({ timeout: 5 }),
   };

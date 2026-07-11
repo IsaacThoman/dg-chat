@@ -13,7 +13,10 @@ export const loginSchema = z.object({ email: emailSchema, password: z.string().m
 export const identityTokenSchema = z.object({ token: z.string().min(32).max(512) }).strict();
 export const passwordResetRequestSchema = z.object({ email: emailSchema }).strict();
 export const passwordResetSchema = z.object({
-  token: z.string().min(32).max(512),
+  // Better Auth generates 24-character, high-entropy reset tokens. The legacy
+  // reset flow still emits longer `reset_` tokens, so the shared web contract
+  // must accept both during the coordinated migration window.
+  token: z.string().min(16).max(512),
   password: passwordSchema,
 }).strict();
 

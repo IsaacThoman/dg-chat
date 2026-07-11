@@ -95,7 +95,7 @@ export async function createSpeech(input: SpeechInput): Promise<Blob> {
   ) {
     throw new SpeechApiError(400, "invalid_request", "Speech speed must be between 0.25 and 4.");
   }
-  const response = await fetch("/v1/audio/speech", {
+  const response = await fetch("/api/audio/speech", {
     method: "POST",
     credentials: "include",
     headers: { "Content-Type": "application/json" },

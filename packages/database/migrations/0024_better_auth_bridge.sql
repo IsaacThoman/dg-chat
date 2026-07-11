@@ -1,6 +1,8 @@
 -- Better Auth owns credentials and browser sessions while the existing users table remains the
 -- authority for approval, role, account state, credits, and API-token eligibility.
 ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL;
+ALTER TABLE users ADD COLUMN password_reset_pending boolean NOT NULL DEFAULT false;
+ALTER TABLE users ADD COLUMN password_reset_token_identifier text;
 
 CREATE TABLE auth_users (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -67,3 +69,7 @@ INSERT INTO auth_accounts (
 SELECT gen_random_uuid(), id::text, 'credential', id, password_hash, created_at, updated_at
 FROM users
 WHERE password_hash IS NOT NULL;
+
+-- Keep the legacy hash during the bounded compatibility window for existing credential imports.
+-- The application cutover is coordinated (old replicas must be stopped); a later contract
+-- migration removes the column after compatibility sessions and tokens have expired.
