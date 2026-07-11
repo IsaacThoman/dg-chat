@@ -46,6 +46,8 @@ import {
   parseOcrInterceptionConfig,
 } from "./ocr-interception.ts";
 
+const OCR_MAX_OUTPUT_TOKENS = 4_096;
+
 type Completion = Awaited<ReturnType<typeof complete>>;
 
 interface RuntimeCandidate extends ProviderCandidate {
@@ -380,11 +382,12 @@ export class ProviderExecutionEngine {
     ownerLeaseToken: string,
     request: ChatCompletionRequest,
     signal: AbortSignal,
+    plan: ProviderExecutionPlan,
   ): Promise<ChatCompletionRequest> {
     const source = await this.#repository.findProviderModel(sourceModelId);
     const config = parseOcrInterceptionConfig(source?.customParams);
     if (!config) return request;
-    return await interceptOcrImages(request, config, {
+    const rewritten = await interceptOcrImages(request, config, {
       cache: this.#ocrCache,
       ...(this.#ocrFetch ? { fetch: this.#ocrFetch } : {}),
       recognize: async (input) => {
@@ -406,6 +409,7 @@ export class ProviderExecutionEngine {
         const encoded = Buffer.from(image.bytes).toString("base64");
         const ocrRequest: ChatCompletionRequest = {
           model: ocrModel.publicModelId,
+          max_tokens: OCR_MAX_OUTPUT_TOKENS,
           messages: [{
             role: "user",
             content: [
@@ -425,7 +429,7 @@ export class ProviderExecutionEngine {
         const reserveMicros = this.reservationMicros(
           plan,
           estimateInputTokens(ocrRequest),
-          8_192,
+          OCR_MAX_OUTPUT_TOKENS,
         );
         const run = await this.#repository.reserveChildProviderUsage({
           parentUsageRunId,
@@ -473,6 +477,18 @@ export class ProviderExecutionEngine {
         }
       },
     }, signal);
+    const inputTokens = estimateInputTokens(rewritten);
+    const contextRemaining = Math.max(0, source!.contextWindow - inputTokens);
+    const requestedOutput = rewritten.max_completion_tokens ?? rewritten.max_tokens;
+    const boundedOutput = requestedOutput === undefined
+      ? contextRemaining
+      : Math.min(requestedOutput, contextRemaining);
+    await this.#repository.ensureUsageReservation({
+      usageRunId: parentUsageRunId,
+      ownerLeaseToken,
+      requiredMicros: this.reservationMicros(plan, inputTokens, boundedOutput),
+    });
+    return rewritten;
   }
 
   reservationMicros(
@@ -864,6 +880,7 @@ export class ProviderExecutionEngine {
       ownerLeaseToken,
       request,
       signal,
+      plan,
     );
     const claim = await this.#repository.claimProviderExecution(usageRunId, ownerLeaseToken);
     const remainingAttempts = policyFor(plan, undefined, this.#slowStream).maxAttempts -
@@ -1014,6 +1031,7 @@ export class ProviderExecutionEngine {
       ownerLeaseToken,
       request,
       signal,
+      plan,
     );
     const claim = await this.#repository.claimProviderExecution(usageRunId, ownerLeaseToken);
     const remainingAttempts = policyFor(plan, undefined, this.#slowStream).maxAttempts -

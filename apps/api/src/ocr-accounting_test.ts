@@ -53,3 +53,35 @@ Deno.test("OCR child reservation atomically validates the parent lease and preve
     "stale",
   );
 });
+
+Deno.test("expanded OCR input raises the parent reservation once under concurrency", async () => {
+  const repo = new MemoryRepository();
+  const user = repo.bootstrapAdmin({
+    email: "ocr-expand@example.com",
+    name: "OCR expansion",
+    passwordHash: "unused",
+  }, 500);
+  const parent = repo.reserve(user.id, "ocr-expand-parent", "chat/model", 50);
+  const ensure = (requiredMicros: number) =>
+    Promise.resolve().then(() =>
+      repo.ensureUsageReservation({
+        usageRunId: parent.id,
+        ownerLeaseToken: parent.runLeaseToken!,
+        requiredMicros,
+      })
+    );
+  const [smaller, larger] = await Promise.all([ensure(150), ensure(200)]);
+  assertEquals(smaller.reservedMicros >= 150, true);
+  assertEquals(larger.reservedMicros, 200);
+  assertEquals(repo.usageRuns.get(parent.id)?.reservedMicros, 200);
+  assertEquals(
+    repo.ledger.filter((entry) => entry.usageRunId === parent.id && entry.kind === "reserve")
+      .reduce((total, entry) => total + entry.amountMicros, 0),
+    -200,
+  );
+  assertEquals(repo.ledger.at(-1)?.balanceAfterMicros, 300);
+
+  repo.refund(parent.id);
+  assertEquals(repo.ledger.at(-1)?.balanceAfterMicros, 500);
+  await assertRejects(() => ensure(250), DomainError, "stale");
+});

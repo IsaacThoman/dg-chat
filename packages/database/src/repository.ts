@@ -927,6 +927,12 @@ export interface ReserveChildProviderUsageInput {
   pricingSnapshot: UsagePricingSnapshot;
 }
 
+export interface EnsureUsageReservationInput {
+  usageRunId: string;
+  ownerLeaseToken: string;
+  requiredMicros: number;
+}
+
 /** Persistence boundary shared by synchronous test stores and async production stores. */
 export interface DomainRepository {
   readonly storageKind: "postgres" | "memory";
@@ -1183,6 +1189,8 @@ export interface DomainRepository {
   refundProviderUsage(input: FinalizeProviderUsageInput): MaybePromise<UsageRun>;
   /** Atomically validates the active parent lease and reserves credit for a billed child call. */
   reserveChildProviderUsage(input: ReserveChildProviderUsageInput): MaybePromise<UsageRun>;
+  /** Atomically raises an active run's reservation; never lowers or duplicates an extension. */
+  ensureUsageReservation(input: EnsureUsageReservationInput): MaybePromise<UsageRun>;
   reapStaleProviderExecutionLeases(limit?: number): MaybePromise<number>;
   reserve(
     userId: string,

@@ -44,6 +44,7 @@ import type {
   DocumentChunkInput,
   DomainRepository,
   EmbeddingProviderAttemptInput,
+  EnsureUsageReservationInput,
   FailApiRequestInput,
   FailGenerationInput,
   FinalizeProviderUsageInput,
@@ -2089,6 +2090,10 @@ export class PostgresRepository implements DomainRepository {
       latency_ms=${input.latencyMs},error=${input.error?.slice(0, 1000) ?? null},completed_at=now()
       WHERE usage_run_id=${input.usageRunId} AND status='running' RETURNING id`;
     if (!rows.length) {
+      const terminal = await this.#sql`SELECT 1 FROM embedding_provider_attempts
+        WHERE usage_run_id=${input.usageRunId} AND status=${input.status}
+          AND input_tokens=${input.inputTokens} AND cost_micros=${input.costMicros}`;
+      if (terminal.length) return;
       throw new DomainError("invalid_usage_state", "Embedding attempt is not running", 409);
     }
   }
@@ -3478,6 +3483,42 @@ export class PostgresRepository implements DomainRepository {
     });
   }
 
+  async ensureUsageReservation(input: EnsureUsageReservationInput): Promise<UsageRun> {
+    if (!Number.isSafeInteger(input.requiredMicros) || input.requiredMicros < 0) {
+      throw new DomainError("validation_error", "Usage reservation requirement is invalid", 422);
+    }
+    return await this.#sql.begin(async (tx) => {
+      const rows = await tx<Row[]>`SELECT *,(
+          (generation_lease_token=${input.ownerLeaseToken} AND generation_lease_expires_at>now()) OR
+          (run_lease_token=${input.ownerLeaseToken} AND run_lease_expires_at>now()) OR
+          EXISTS(SELECT 1 FROM api_idempotency_requests a WHERE a.usage_run_id=usage_runs.id
+            AND a.state='in_progress' AND a.lease_token=${input.ownerLeaseToken}
+            AND a.lease_expires_at>now())
+        ) AS lease_valid FROM usage_runs WHERE id=${input.usageRunId} FOR UPDATE`;
+      const current = rows[0];
+      if (!current || current.status !== "reserved" || current.lease_valid !== true) {
+        throw new DomainError("stale_lease", "Usage reservation lease is stale", 409);
+      }
+      const reserved = number(current.reserved_micros);
+      if (reserved >= input.requiredMicros) return run(current);
+      const delta = input.requiredMicros - reserved;
+      const userId = String(current.user_id);
+      const users = await tx<Row[]>`SELECT balance_micros FROM users WHERE id=${userId} FOR UPDATE`;
+      const balance = number(users[0].balance_micros);
+      if (balance < delta) {
+        throw new DomainError("insufficient_credit", "Insufficient credit for expanded input", 402);
+      }
+      const after = balance - delta;
+      await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${userId}`;
+      const updated = await tx<Row[]>`UPDATE usage_runs SET reserved_micros=${input.requiredMicros}
+        WHERE id=${input.usageRunId} RETURNING *`;
+      await tx`INSERT INTO ledger_entries(
+        user_id,usage_run_id,kind,amount_micros,balance_after_micros)
+        VALUES(${userId},${input.usageRunId},'reserve',${-delta},${after})`;
+      return run(updated[0]);
+    });
+  }
+
   async reapStaleProviderExecutionLeases(limit = 100): Promise<number> {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) {
       throw new DomainError("validation_error", "Provider lease reaper limit is invalid", 422);
@@ -3490,10 +3531,18 @@ export class PostgresRepository implements DomainRepository {
         ORDER BY r.run_lease_expires_at FOR UPDATE SKIP LOCKED LIMIT ${limit}`;
       for (const row of rows) {
         const runId = String(row.id);
-        const uncertainty = await tx<{ uncertain: boolean }[]>`SELECT EXISTS(SELECT 1
-          FROM provider_attempts WHERE usage_run_id=${runId} AND status='running') AS uncertain`;
+        const uncertainty = await tx<{ uncertain: boolean; embedding_uncertain: boolean }[]>`
+          SELECT EXISTS(SELECT 1 FROM provider_attempts
+            WHERE usage_run_id=${runId} AND status='running') AS uncertain,
+          EXISTS(SELECT 1 FROM embedding_provider_attempts
+            WHERE usage_run_id=${runId} AND status='running') AS embedding_uncertain`;
         await tx`UPDATE provider_attempts SET status='cancelled',phase='planning',
           error_code='execution_lease_expired',breaker_after='unavailable',retryable=true,
+          latency_ms=GREATEST(0,floor(extract(epoch FROM (now()-started_at))*1000)::int),
+          completed_at=now() WHERE usage_run_id=${runId} AND status='running'`;
+        await tx`UPDATE embedding_provider_attempts SET status='cancelled',
+          cost_micros=${number(row.reserved_micros)},cost_source='calculated',
+          token_source='estimated',error='execution lease expired',
           latency_ms=GREATEST(0,floor(extract(epoch FROM (now()-started_at))*1000)::int),
           completed_at=now() WHERE usage_run_id=${runId} AND status='running'`;
         const userId = String(row.user_id);
@@ -3501,7 +3550,9 @@ export class PostgresRepository implements DomainRepository {
           Row[]
         >`SELECT balance_micros FROM users WHERE id=${userId} FOR UPDATE`;
         const providerExecution = number(row.execution_epoch) > 0;
-        const cost = providerExecution
+        const cost = uncertainty[0].embedding_uncertain
+          ? number(row.reserved_micros)
+          : providerExecution
           ? uncertainty[0].uncertain
             ? number(row.reserved_micros)
             : number(row.actual_provider_cost_micros)
@@ -3611,7 +3662,9 @@ export class PostgresRepository implements DomainRepository {
   ) {
     return await this.#sql.begin(async (tx) => {
       const runs = await tx<Row[]>`SELECT *,EXISTS(SELECT 1 FROM provider_attempts
-        WHERE usage_run_id=usage_runs.id AND status='running') AS provider_accounting_uncertain
+        WHERE usage_run_id=usage_runs.id AND status='running') AS provider_accounting_uncertain,
+        EXISTS(SELECT 1 FROM embedding_provider_attempts
+          WHERE usage_run_id=usage_runs.id AND status='running') AS embedding_accounting_uncertain
         FROM usage_runs WHERE id=${runId} FOR UPDATE`;
       if (!runs[0]) throw new DomainError("not_found", "Usage reservation not found", 404);
       if (runs[0].status === "completed") return run(runs[0]);
@@ -3654,14 +3707,19 @@ export class PostgresRepository implements DomainRepository {
   async refund(runId: string, error?: string) {
     return await this.#sql.begin(async (tx) => {
       const runs = await tx<Row[]>`SELECT *,EXISTS(SELECT 1 FROM provider_attempts
-        WHERE usage_run_id=usage_runs.id AND status='running') AS provider_accounting_uncertain
+        WHERE usage_run_id=usage_runs.id AND status='running') AS provider_accounting_uncertain,
+        EXISTS(SELECT 1 FROM embedding_provider_attempts
+          WHERE usage_run_id=usage_runs.id AND status='running') AS embedding_accounting_uncertain
         FROM usage_runs WHERE id=${runId} FOR UPDATE`;
       if (!runs[0]) return undefined;
       if (runs[0].status !== "reserved") return run(runs[0]);
       const userId = String(runs[0].user_id);
       const users = await tx<Row[]>`SELECT balance_micros FROM users WHERE id=${userId} FOR UPDATE`;
       const providerExecution = number(runs[0].execution_epoch) > 0;
-      const actualCost = providerExecution
+      const embeddingExecution = runs[0].embedding_accounting_uncertain === true;
+      const actualCost = embeddingExecution
+        ? number(runs[0].reserved_micros)
+        : providerExecution
         ? runs[0].provider_accounting_uncertain === true
           ? number(runs[0].reserved_micros)
           : number(runs[0].actual_provider_cost_micros)
@@ -3669,6 +3727,13 @@ export class PostgresRepository implements DomainRepository {
       if (providerExecution && runs[0].provider_accounting_uncertain === true) {
         await tx`UPDATE provider_attempts SET status='cancelled',phase='planning',
           error_code='accounting_unknown',breaker_after='unavailable',retryable=false,
+          latency_ms=GREATEST(0,floor(extract(epoch FROM (now()-started_at))*1000)::int),
+          completed_at=now() WHERE usage_run_id=${runId} AND status='running'`;
+      }
+      if (embeddingExecution) {
+        await tx`UPDATE embedding_provider_attempts SET status='cancelled',
+          cost_micros=${actualCost},cost_source='calculated',token_source='estimated',
+          error='accounting state unknown',
           latency_ms=GREATEST(0,floor(extract(epoch FROM (now()-started_at))*1000)::int),
           completed_at=now() WHERE usage_run_id=${runId} AND status='running'`;
       }

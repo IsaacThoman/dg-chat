@@ -58,6 +58,8 @@ export class OcrInterceptionError extends Error {
 }
 
 const ALLOWED_MIMES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+/** Matches the maximum text volume possible from the bounded OCR provider request. */
+export const OCR_MAX_TEXT_BYTES = 65_536;
 const decoder = new TextDecoder();
 
 function boundedInteger(value: unknown, fallback: number, min: number, max: number): number {
@@ -328,7 +330,7 @@ export async function interceptOcrImages(
             image,
             signal: combined,
           })).trim();
-          if (!text || new TextEncoder().encode(text).length > 2_000_000) {
+          if (!text || new TextEncoder().encode(text).length > OCR_MAX_TEXT_BYTES) {
             throw new Error("OCR provider returned invalid text");
           }
           await dependencies.cache.set(key, text, config.cacheTtlSeconds);

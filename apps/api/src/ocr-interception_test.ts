@@ -1,6 +1,6 @@
 import { assertEquals, assertRejects, assertThrows } from "jsr:@std/assert@1.0.14";
 import type { ChatCompletionRequest } from "@dg-chat/contracts";
-import { MemoryRepository } from "@dg-chat/database";
+import { DomainError, MemoryRepository } from "@dg-chat/database";
 import { MemoryCircuitBreaker } from "./provider-circuit.ts";
 import { ProviderExecutionEngine } from "./provider-execution.ts";
 import { ProviderSecretKeyring } from "./provider-secrets.ts";
@@ -102,6 +102,18 @@ Deno.test("OCR replaces images without mutating the caller and caches by image a
   assertEquals(
     (original.messages[0].content as unknown[])[1] !== first.messages[0].content?.[1],
     true,
+  );
+});
+
+Deno.test("OCR rejects provider text beyond the bounded parent-prompt volume", async () => {
+  await assertRejects(
+    () =>
+      interceptOcrImages(request(), config, {
+        cache: new MemoryOcrCache(),
+        recognize: () => Promise.resolve("x".repeat(65_537)),
+      }, new AbortController().signal),
+    OcrInterceptionError,
+    "invalid text",
   );
 });
 
@@ -259,7 +271,7 @@ Deno.test("provider execution applies model-level OCR config before the billed c
     providerModelId: model.id,
     expectedModelVersion: model.version,
     effectiveAt: "2026-01-01T00:00:00.000Z",
-    inputMicrosPerMillion: 1,
+    inputMicrosPerMillion: 1_000_000,
     cachedInputMicrosPerMillion: 1,
     reasoningMicrosPerMillion: 1,
     outputMicrosPerMillion: 1,
@@ -270,12 +282,12 @@ Deno.test("provider execution applies model-level OCR config before the billed c
     user.id,
     "ocr-run",
     model.publicModelId,
-    1_000,
+    1,
     provider.slug,
     undefined,
     {
       pricingVersionId: price.id,
-      inputMicrosPerMillion: 1,
+      inputMicrosPerMillion: 1_000_000,
       cachedInputMicrosPerMillion: 1,
       reasoningMicrosPerMillion: 1,
       outputMicrosPerMillion: 1,
@@ -315,11 +327,17 @@ Deno.test("provider execution applies model-level OCR config before the billed c
   );
   assertEquals(result.text, "understood");
   assertEquals(seen.length, 2);
+  assertEquals(seen[0].max_tokens, 4_096);
   assertEquals(seen[1].messages[0].content?.[1], {
     type: "text",
     text: "[OCR image 1.2]\nreceipt total $42",
   });
   assertEquals(repo.listProviderAttempts(run.id).length, 1);
+  assertEquals(repo.usageRuns.get(run.id)!.reservedMicros > 1, true);
+  assertEquals(
+    repo.ledger.filter((entry) => entry.usageRunId === run.id && entry.kind === "reserve").length,
+    2,
+  );
   const childRuns = [...repo.usageRuns.values()].filter((candidate) => candidate.id !== run.id);
   assertEquals(childRuns.length, 1);
   assertEquals(childRuns[0].status, "completed");
@@ -339,7 +357,7 @@ Deno.test("provider execution applies model-level OCR config before the billed c
     undefined,
     {
       pricingVersionId: price.id,
-      inputMicrosPerMillion: 1,
+      inputMicrosPerMillion: 1_000_000,
       cachedInputMicrosPerMillion: 1,
       reasoningMicrosPerMillion: 1,
       outputMicrosPerMillion: 1,
@@ -383,4 +401,59 @@ Deno.test("provider execution applies model-level OCR config before the billed c
     repo.ledger.filter((entry) => entry.usageRunId === failedChild.id).map((entry) => entry.kind),
     ["reserve", "refund"],
   );
+
+  const balance = repo.ledger.at(-1)!.balanceAfterMicros;
+  repo.reserve(user.id, "ocr-credit-drain", model.publicModelId, balance - 1);
+  const underfunded = repo.reserve(
+    user.id,
+    "ocr-underfunded-parent",
+    model.publicModelId,
+    0,
+    provider.slug,
+    undefined,
+    {
+      pricingVersionId: price.id,
+      inputMicrosPerMillion: 1_000_000,
+      cachedInputMicrosPerMillion: 1,
+      reasoningMicrosPerMillion: 1,
+      outputMicrosPerMillion: 1,
+      fixedCallMicros: 0,
+      source: "test",
+    },
+  );
+  let primaryDispatches = 0;
+  const underfundedEngine = new ProviderExecutionEngine({
+    repository: repo,
+    keyring,
+    circuitBreaker: new MemoryCircuitBreaker(),
+    breakerPolicy: {
+      failureThreshold: 2,
+      failureWindowSeconds: 60,
+      openSeconds: 30,
+      halfOpenLeaseSeconds: 5,
+    },
+    ocrRecognize: () => Promise.resolve("expanded OCR text that must be reserved"),
+    complete: () => {
+      primaryDispatches++;
+      return Promise.resolve({
+        text: "must not dispatch",
+        inputTokens: 0,
+        outputTokens: 0,
+        upstream: {},
+      });
+    },
+  });
+  await assertRejects(
+    () =>
+      underfundedEngine.complete(
+        model.id,
+        underfunded.id,
+        underfunded.runLeaseToken!,
+        request(),
+        new AbortController().signal,
+      ),
+    DomainError,
+    "Insufficient credit for expanded input",
+  );
+  assertEquals(primaryDispatches, 0);
 });

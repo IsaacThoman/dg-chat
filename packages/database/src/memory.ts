@@ -46,6 +46,7 @@ import type {
   DocumentChunkEmbeddingInput,
   DocumentChunkInput,
   EmbeddingProviderAttemptInput,
+  EnsureUsageReservationInput,
   FailApiRequestInput,
   FailGenerationInput,
   FinalizeProviderUsageInput,
@@ -1655,6 +1656,10 @@ export class MemoryRepository {
 
   finishEmbeddingProviderAttempt(input: FinishEmbeddingProviderAttemptInput): void {
     const attempt = this.embeddingProviderAttempts.get(input.usageRunId);
+    if (
+      attempt?.status === input.status && attempt.inputTokens === input.inputTokens &&
+      attempt.costMicros === input.costMicros
+    ) return;
     if (!attempt || attempt.status !== "running") {
       throw new DomainError("invalid_usage_state", "Embedding attempt is not running", 409);
     }
@@ -3033,6 +3038,47 @@ export class MemoryRepository {
     );
   }
 
+  ensureUsageReservation(input: EnsureUsageReservationInput): UsageRun {
+    if (!Number.isSafeInteger(input.requiredMicros) || input.requiredMicros < 0) {
+      throw new DomainError("validation_error", "Usage reservation requirement is invalid", 422);
+    }
+    const run = this.usageRuns.get(input.usageRunId);
+    const apiLeaseValid = [...this.apiIdempotencyRequests.values()].some((request) =>
+      request.usageRunId === input.usageRunId && request.state === "in_progress" &&
+      request.leaseToken === input.ownerLeaseToken && request.leaseExpiresAt !== null &&
+      Date.parse(request.leaseExpiresAt) > Date.now()
+    );
+    const leaseValid = run?.status === "reserved" && (
+      (run.runLeaseToken === input.ownerLeaseToken && run.runLeaseExpiresAt !== null &&
+        Date.parse(run.runLeaseExpiresAt) > Date.now()) ||
+      (run.generationLeaseToken === input.ownerLeaseToken &&
+        run.generationLeaseExpiresAt !== null &&
+        Date.parse(run.generationLeaseExpiresAt) > Date.now()) ||
+      apiLeaseValid
+    );
+    if (!run || !leaseValid) {
+      throw new DomainError("stale_lease", "Usage reservation lease is stale", 409);
+    }
+    if (run.reservedMicros >= input.requiredMicros) return structuredClone(run);
+    const delta = input.requiredMicros - run.reservedMicros;
+    const user = this.users.get(run.userId)!;
+    if (user.balanceMicros < delta) {
+      throw new DomainError("insufficient_credit", "Insufficient credit for expanded input", 402);
+    }
+    user.balanceMicros -= delta;
+    run.reservedMicros = input.requiredMicros;
+    this.ledger.push({
+      id: crypto.randomUUID(),
+      userId: run.userId,
+      usageRunId: run.id,
+      kind: "reserve",
+      amountMicros: -delta,
+      balanceAfterMicros: user.balanceMicros,
+      createdAt: new Date().toISOString(),
+    });
+    return structuredClone(run);
+  }
+
   createApiToken(
     userId: string,
     input: {
@@ -3183,6 +3229,16 @@ export class MemoryRepository {
   refund(runId: string) {
     const run = this.usageRuns.get(runId);
     if (!run || run.status !== "reserved") return run;
+    const embeddingAttempt = this.embeddingProviderAttempts.get(runId);
+    if (embeddingAttempt?.status === "running") {
+      embeddingAttempt.status = "cancelled";
+      embeddingAttempt.costMicros = run.reservedMicros;
+      run.status = "failed";
+      run.costMicros = run.reservedMicros;
+      run.runLeaseToken = null;
+      run.runLeaseExpiresAt = null;
+      return run;
+    }
     if (run.executionEpoch > 0) {
       const cost = this.authoritativeProviderCost(run);
       this.finalizeAccountingUnknownAttempts(run.id);

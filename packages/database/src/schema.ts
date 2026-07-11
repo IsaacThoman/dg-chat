@@ -233,7 +233,7 @@ export const ledgerEntries = pgTable(
   (
     table,
   ) => [
-    uniqueIndex("ledger_run_kind_uq").on(table.usageRunId, table.kind),
+    index("ledger_run_kind_idx").on(table.usageRunId, table.kind),
     index("ledger_user_idx").on(table.userId),
   ],
 );

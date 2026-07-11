@@ -63,12 +63,33 @@ Deno.test({
         ledger.filter((entry) => entry.kind === "reserve").map((entry) => entry.amount).sort(),
         ["-150", "-50"],
       );
+      const child = results.find((result) => result.status === "fulfilled") as
+        | PromiseFulfilledResult<Awaited<ReturnType<typeof reserve>>>
+        | undefined;
+      await repo.refund(child!.value.id);
       await repo.refund(parent.id);
       await assertRejects(
         () => reserve("ocr-pg-stale"),
         DomainError,
         "stale",
       );
+
+      const expanded = await repo.reserve(user.id, "ocr-pg-expand", "chat/model", 50);
+      const ensure = (requiredMicros: number) =>
+        repo.ensureUsageReservation({
+          usageRunId: expanded.id,
+          ownerLeaseToken: expanded.runLeaseToken!,
+          requiredMicros,
+        });
+      await Promise.all([ensure(150), ensure(200)]);
+      const state = await sql<{ reserved: string; balance: string; total: string }[]>`
+        SELECT r.reserved_micros::text reserved,u.balance_micros::text balance,
+          (SELECT sum(amount_micros)::text FROM ledger_entries
+            WHERE usage_run_id=r.id AND kind='reserve') total
+        FROM usage_runs r JOIN users u ON u.id=r.user_id WHERE r.id=${expanded.id}`;
+      assertEquals(state[0], { reserved: "200", balance: "50", total: "-200" });
+      await repo.refund(expanded.id);
+      await assertRejects(() => ensure(250), DomainError, "stale");
     } finally {
       await repo.close();
       await sql.end();
