@@ -148,6 +148,13 @@
       "when": 1783656020000,
       "tag": "0020_provider_model_capabilities",
       "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1783656021000,
+      "tag": "0021_binary_api_replay",
+      "breakpoints": true
     }
   ]
 }

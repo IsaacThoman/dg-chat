@@ -14,6 +14,7 @@ client = OpenAI(api_key=api_key, base_url=base_url, max_retries=0)
 model = "openai/mock-fast"
 embedding_model = "contracts/mock-embedding"
 audio_model = "contracts/mock-transcribe"
+speech_bytes = bytes([73, 68, 51, 4, 0, 0, 0, 0, 0, 0, 0xFF, 0xFB, 0x90, 0x64])
 
 
 def wav_file() -> bytes:
@@ -34,6 +35,53 @@ if not any(candidate.id == embedding_model for candidate in models.data):
     raise RuntimeError("Official Python client did not receive the embeddings model")
 if not any(candidate.id == audio_model for candidate in models.data):
     raise RuntimeError("Official Python client did not receive the transcription model")
+
+speech = client.audio.speech.create(
+    model=audio_model,
+    input="Python speech contract",
+    voice="alloy",
+)
+if speech.read() != speech_bytes:
+    raise RuntimeError("Python audio.speech.create() returned invalid MP3 bytes")
+
+speech_replay_key = f"python-speech-{uuid.uuid4()}"
+def custom_speech():
+    return client.audio.speech.create(
+        model=audio_model,
+        input="Custom voice contract",
+        voice={"id": "voice_contract"},
+        instructions="Warmly",
+        response_format="wav",
+        speed=1.25,
+        extra_headers={"Idempotency-Key": speech_replay_key},
+    )
+
+first_speech = custom_speech().read()
+replayed_speech = custom_speech().read()
+if not first_speech.startswith(b"RIFF") or replayed_speech != first_speech:
+    raise RuntimeError("Python custom WAV speech or exact replay was invalid")
+
+speech_sse = client.audio.speech.create(
+    model=audio_model,
+    input="Stream speech",
+    voice="alloy",
+    stream_format="sse",
+).read().decode("utf-8")
+if "speech.audio.delta" not in speech_sse or speech_sse.count("speech.audio.done") != 1:
+    raise RuntimeError("Python speech SSE contract was invalid")
+
+try:
+    client.audio.speech.create(
+        model=audio_model,
+        input="Invalid speed",
+        voice="alloy",
+        speed=5,
+    )
+except Exception as error:
+    if getattr(error, "status_code", None) != 422:
+        raise RuntimeError("Python malformed speech did not return compatible 422") from error
+else:
+    raise RuntimeError("Python malformed speech request was accepted")
 
 transcription = client.audio.transcriptions.create(
     file=("python-contract.wav", io.BytesIO(wav_file()), "audio/wav"),

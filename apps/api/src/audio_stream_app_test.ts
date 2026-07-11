@@ -339,5 +339,10 @@ Deno.test("duration-only fallback cannot settle through a token-priced public so
   assertEquals((await response.json()).error.code, "unsupported_audio_usage");
   const usage = value.repository.usage(value.user.id);
   assertEquals(usage.calls, 0);
-  assertEquals(usage.balanceMicros < 5_000_000, true);
+  assertEquals(usage.balanceMicros, 5_000_000);
+  const run = [...value.repository.usageRuns.values()].find((entry) =>
+    entry.userId === value.user.id && entry.executionEpoch > 0
+  );
+  assertExists(run);
+  assertEquals(run.actualProviderCostMicros > 0, true);
 });

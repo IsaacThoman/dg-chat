@@ -675,6 +675,7 @@ Deno.test("provider execution retries through the breaker, falls back, and persi
 async function singleProviderFixture(
   protocol: "chat_completions" | "responses",
   capabilities: ModelCapability[] = ["chat"],
+  fixedCallOnly = false,
 ) {
   const repo = new MemoryRepository();
   const user = repo.bootstrapAdmin({
@@ -708,10 +709,10 @@ async function singleProviderFixture(
     providerModelId: model.id,
     expectedModelVersion: model.version,
     effectiveAt: "2026-01-01T00:00:00.000Z",
-    inputMicrosPerMillion: 100_000,
-    cachedInputMicrosPerMillion: 50_000,
-    reasoningMicrosPerMillion: 200_000,
-    outputMicrosPerMillion: 300_000,
+    inputMicrosPerMillion: fixedCallOnly ? 0 : 100_000,
+    cachedInputMicrosPerMillion: fixedCallOnly ? 0 : 50_000,
+    reasoningMicrosPerMillion: fixedCallOnly ? 0 : 200_000,
+    outputMicrosPerMillion: fixedCallOnly ? 0 : 300_000,
     fixedCallMicros: 10,
     source: "test",
   }, mutation);
@@ -720,6 +721,147 @@ async function singleProviderFixture(
   if (!run.runLeaseToken) throw new Error("execution lease missing");
   return { repo, user, keyring, provider, model, price, runId, run };
 }
+
+Deno.test("speech provider execution retries 429, preserves telemetry, and requires capability and fixed pricing", async () => {
+  const fixture = await singleProviderFixture("chat_completions", ["speech"], true);
+  const mutation = { actorId: fixture.user.id, action: "test.speech-execution" };
+  const retryPolicy = fixture.repo.createProviderRetryPolicy({
+    name: "Speech retry",
+    maxAttempts: 2,
+    maxRetries: 1,
+    baseDelayMs: 0,
+    maxDelayMs: 0,
+    backoffMultiplierBps: 10_000,
+    jitterBps: 0,
+    firstTokenTimeoutMs: 1_000,
+    idleTimeoutMs: 1_000,
+    totalTimeoutMs: 10_000,
+    retryableStatuses: [429],
+  }, mutation);
+  fixture.repo.setProviderModelRoute({
+    sourceModelId: fixture.model.id,
+    expectedVersion: 0,
+    retryPolicyId: retryPolicy.id,
+    fallbackModelIds: [],
+  }, mutation);
+  let calls = 0;
+  const engine = new ProviderExecutionEngine({
+    repository: fixture.repo,
+    keyring: fixture.keyring,
+    circuitBreaker: new MemoryCircuitBreaker(),
+    breakerPolicy: {
+      failureThreshold: 10,
+      failureWindowSeconds: 60,
+      openSeconds: 30,
+      halfOpenLeaseSeconds: 5,
+    },
+    speechFetch: ((_url: string | URL | Request, init?: RequestInit) => {
+      calls++;
+      assertEquals((JSON.parse(String(init?.body)) as { model: string }).model, "single-upstream");
+      if (calls === 1) {
+        return Promise.resolve(
+          new Response("busy", { status: 429, headers: { "retry-after": "0" } }),
+        );
+      }
+      return Promise.resolve(
+        new Response(
+          new Uint8Array([
+            73,
+            68,
+            51,
+            4,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0xff,
+            0xfb,
+            0x90,
+            0x64,
+          ]).buffer,
+          {
+            headers: { "content-type": "audio/mpeg" },
+          },
+        ),
+      );
+    }) as typeof fetch,
+  });
+  const result = await engine.speech(
+    fixture.model.id,
+    fixture.runId,
+    fixture.run.runLeaseToken!,
+    {
+      model: fixture.model.publicModelId,
+      input: "Retry safely",
+      voice: "alloy",
+      responseFormat: "mp3",
+      speed: 1,
+      streamFormat: "audio",
+    },
+    new AbortController().signal,
+  );
+  assertEquals(
+    result.body,
+    new Uint8Array([
+      73,
+      68,
+      51,
+      4,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0xff,
+      0xfb,
+      0x90,
+      0x64,
+    ]),
+  );
+  assertEquals(calls, 2);
+  const attempts = fixture.repo.listProviderAttempts(fixture.runId);
+  assertEquals(attempts.map(({ status }) => status), ["failed", "succeeded"]);
+  assertEquals(attempts[0].httpStatus, 429);
+  assertEquals(attempts[0].retryable, true);
+  assertEquals(attempts[1].tokenSource, "estimated");
+  assertEquals(attempts[1].costMicros, fixture.price.fixedCallMicros);
+  assertEquals(attempts[1].ttftMs !== null, true);
+
+  const variable = await singleProviderFixture("chat_completions", ["speech"]);
+  const variableEngine = new ProviderExecutionEngine({
+    repository: variable.repo,
+    keyring: variable.keyring,
+    circuitBreaker: new MemoryCircuitBreaker(),
+    breakerPolicy: {
+      failureThreshold: 1,
+      failureWindowSeconds: 60,
+      openSeconds: 30,
+      halfOpenLeaseSeconds: 5,
+    },
+  });
+  await assertRejects(
+    () =>
+      variableEngine.speech(
+        variable.model.id,
+        variable.runId,
+        variable.run.runLeaseToken!,
+        {
+          model: variable.model.publicModelId,
+          input: "Unsafe pricing",
+          voice: "alloy",
+          responseFormat: "mp3",
+          speed: 1,
+          streamFormat: "audio",
+        },
+        new AbortController().signal,
+      ),
+    Error,
+    "fixed-call-only",
+  );
+});
 
 Deno.test("audio streaming attempts remain active through final usage and persist truthful telemetry", async () => {
   const fixture = await singleProviderFixture("chat_completions", ["transcription"]);
@@ -1131,9 +1273,12 @@ Deno.test("exhausted terminal accounting persistence is distinct and never redis
   const reaped = fixture.repo.usageRuns.get(fixture.runId)!;
   assertEquals({ status: reaped.status, costMicros: reaped.costMicros }, {
     status: "failed",
-    costMicros: reaped.reservedMicros,
+    costMicros: 0,
   });
-  assertEquals(fixture.repo.users.get(fixture.user.id)!.balanceMicros, balanceBeforeReap);
+  assertEquals(
+    fixture.repo.users.get(fixture.user.id)!.balanceMicros,
+    balanceBeforeReap + reaped.reservedMicros,
+  );
   assertEquals(
     fixture.repo.listProviderAttempts(fixture.runId).map((attempt) => ({
       status: attempt.status,
@@ -1166,8 +1311,8 @@ Deno.test("exhausted terminal accounting persistence is distinct and never redis
   ).toISOString();
   const apiBalance = fixture.repo.users.get(fixture.user.id)!.balanceMicros;
   assertEquals(fixture.repo.reapStaleApiRequests(), 1);
-  assertEquals(fixture.repo.usageRuns.get(api.usageRun.id)?.costMicros, 100);
-  assertEquals(fixture.repo.users.get(fixture.user.id)!.balanceMicros, apiBalance);
+  assertEquals(fixture.repo.usageRuns.get(api.usageRun.id)?.costMicros, 0);
+  assertEquals(fixture.repo.users.get(fixture.user.id)!.balanceMicros, apiBalance + 100);
 
   const conversation = fixture.repo.createConversation(fixture.user.id, "Uncertain generation");
   const generation = fixture.repo.beginGeneration({
@@ -1196,8 +1341,8 @@ Deno.test("exhausted terminal accounting persistence is distinct and never redis
   generation.usageRun.generationLeaseExpiresAt = new Date(Date.now() - 1).toISOString();
   const generationBalance = fixture.repo.users.get(fixture.user.id)!.balanceMicros;
   assertEquals(fixture.repo.reapStaleGenerations(), 1);
-  assertEquals(fixture.repo.usageRuns.get(generation.usageRun.id)?.costMicros, 100);
-  assertEquals(fixture.repo.users.get(fixture.user.id)!.balanceMicros, generationBalance);
+  assertEquals(fixture.repo.usageRuns.get(generation.usageRun.id)?.costMicros, 0);
+  assertEquals(fixture.repo.users.get(fixture.user.id)!.balanceMicros, generationBalance + 100);
 });
 
 Deno.test("engine slow-stream policy cuts off visible streams without retry", async () => {

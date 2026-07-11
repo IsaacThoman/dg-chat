@@ -8,6 +8,22 @@ const client = new OpenAI({ apiKey, baseURL, maxRetries: 0 });
 const model = "openai/mock-fast";
 const embeddingModel = "contracts/mock-embedding";
 const audioModel = "contracts/mock-transcribe";
+const speechBytes = new Uint8Array([
+  73,
+  68,
+  51,
+  4,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0xff,
+  0xfb,
+  0x90,
+  0x64,
+]);
 
 function wavFile(): Uint8Array {
   const bytes = new Uint8Array(46);
@@ -36,6 +52,75 @@ if (!models.data.some((candidate) => candidate.id === embeddingModel)) {
 }
 if (!models.data.some((candidate) => candidate.id === audioModel)) {
   throw new Error("Official JavaScript client did not receive the transcription model");
+}
+
+const speech = await client.audio.speech.create({
+  model: audioModel,
+  input: "JavaScript speech contract",
+  voice: "alloy",
+});
+if (JSON.stringify(new Uint8Array(await speech.arrayBuffer())) !== JSON.stringify(speechBytes)) {
+  throw new Error("JavaScript audio.speech.create() returned invalid MP3 bytes");
+}
+const speechReplayKey = `javascript-speech-${crypto.randomUUID()}`;
+const customSpeech = () =>
+  client.audio.speech.create({
+    model: audioModel,
+    input: "Custom voice contract",
+    // The service supports the current OpenAI custom-voice object even though SDK 6.16's
+    // generated TypeScript union still only lists built-in string voices.
+    voice: { id: "voice_contract" } as unknown as "alloy",
+    instructions: "Warmly",
+    response_format: "wav",
+    speed: 1.25,
+  }, { headers: { "Idempotency-Key": speechReplayKey } });
+const firstSpeech = new Uint8Array(await (await customSpeech()).arrayBuffer());
+const replayedSpeech = new Uint8Array(await (await customSpeech()).arrayBuffer());
+if (
+  new TextDecoder().decode(firstSpeech.subarray(0, 4)) !== "RIFF" ||
+  JSON.stringify(firstSpeech) !== JSON.stringify(replayedSpeech)
+) throw new Error("JavaScript custom WAV speech or exact replay was invalid");
+const speechSse = await client.audio.speech.create({
+  model: audioModel,
+  input: "Stream speech",
+  voice: "alloy",
+  stream_format: "sse",
+});
+const speechSseText = await speechSse.text();
+if (
+  !speechSseText.includes("speech.audio.delta") ||
+  (speechSseText.match(/speech\.audio\.done/g)?.length ?? 0) !== 1
+) throw new Error("JavaScript speech SSE contract was invalid");
+try {
+  await client.audio.speech.create({
+    model: audioModel,
+    input: "Invalid speed",
+    voice: "alloy",
+    speed: 5,
+  });
+  throw new Error("JavaScript malformed speech request was accepted");
+} catch (error) {
+  if (
+    error instanceof Error && error.message === "JavaScript malformed speech request was accepted"
+  ) throw error;
+  if (!(error instanceof OpenAI.APIError) || error.status !== 422) {
+    throw new Error("JavaScript malformed speech did not return compatible 422", { cause: error });
+  }
+}
+const speechAbort = new AbortController();
+const cancelledSpeech = client.audio.speech.create({
+  model: audioModel,
+  input: "__slow_cancel__",
+  voice: "alloy",
+}, { signal: speechAbort.signal });
+setTimeout(() => speechAbort.abort(), 20);
+try {
+  await cancelledSpeech;
+  throw new Error("JavaScript cancelled speech request completed");
+} catch (error) {
+  if (error instanceof Error && error.message === "JavaScript cancelled speech request completed") {
+    throw error;
+  }
 }
 
 const transcription = await client.audio.transcriptions.create({

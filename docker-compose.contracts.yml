@@ -7,6 +7,9 @@ services:
       OPENAI_ALLOWED_MODELS: mock-fast,mock-split,mock-error,mock-role-stall
       # This exact-name exception is honored only in DENO_ENV=test.
       OPENAI_TEST_ALLOW_HTTP_HOST: mock-provider
+      # The contract job intentionally runs both official SDK suites back-to-back.
+      OPENAI_RATE_LIMIT: 1000
+      GENERATION_RATE_LIMIT: 1000
     depends_on:
       mock-provider:
         condition: service_healthy

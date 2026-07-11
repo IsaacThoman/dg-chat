@@ -106,6 +106,10 @@ import { ToolLauncher } from "./ToolLauncher.tsx";
 import { ConversationKnowledgePicker, KnowledgeView } from "./Knowledge.tsx";
 import { VoiceRecorder } from "./voice/VoiceRecorder.tsx";
 import { insertTranscript } from "./voice/voiceState.ts";
+import { SpeechPlaybackControl } from "./speech/SpeechPlaybackControl.tsx";
+import { speechTextForMarkdown } from "./speech/speechText.ts";
+import { useSpeechPlayback } from "./speech/useSpeechPlayback.ts";
+import type { SpeechPlaybackController, SpeechPlaybackState } from "./speech/playback.ts";
 import type {
   Attachment,
   AuditFilters,
@@ -738,6 +742,7 @@ function MessageItem(
     onContinue,
     branchBusy,
     generationBusy,
+    speech,
     readOnly = false,
   }: {
     message: Message;
@@ -749,6 +754,13 @@ function MessageItem(
     onContinue: (message: Message) => void;
     branchBusy: boolean;
     generationBusy: boolean;
+    speech?: {
+      model: string;
+      voice: string;
+      controller: SpeechPlaybackController;
+      state: SpeechPlaybackState;
+      disabledReason?: string;
+    };
     readOnly?: boolean;
   },
 ) {
@@ -850,9 +862,29 @@ function MessageItem(
           <IconButton label="Copy response" onClick={copy}>
             {copied ? <Check size={15} /> : <Copy size={15} />}
           </IconButton>
-          <IconButton label="Read aloud (not available yet)" disabled>
-            <Volume2 size={15} />
-          </IconButton>
+          {speech
+            ? (
+              <SpeechPlaybackControl
+                messageId={message.id}
+                input={{
+                  model: speech.model,
+                  input: speechTextForMarkdown(message.content),
+                  voice: speech.voice,
+                  responseFormat: "mp3",
+                }}
+                controller={speech.controller}
+                state={speech.state}
+                disabledReason={speech.disabledReason}
+                icon={speech.state.messageId === message.id && speech.state.phase === "loading"
+                  ? <X size={15} />
+                  : <Volume2 size={15} />}
+              />
+            )
+            : (
+              <IconButton label="Read aloud unavailable: no speech model" disabled>
+                <Volume2 size={15} />
+              </IconButton>
+            )}
           {!readOnly && (
             <IconButton
               label="Regenerate response in a new branch"
@@ -1602,6 +1634,61 @@ function ChatView({
     () => models.filter((model) => model.capabilities.includes("transcription")),
     [models],
   );
+  const speechModels = useMemo(
+    () => models.filter((model) => model.capabilities.includes("speech")),
+    [models],
+  );
+  const speechVoices = [
+    "alloy",
+    "ash",
+    "ballad",
+    "coral",
+    "echo",
+    "fable",
+    "nova",
+    "onyx",
+    "sage",
+    "shimmer",
+    "verse",
+  ] as const;
+  const [speechModel, setSpeechModel] = useState(() => {
+    try {
+      return localStorage.getItem("dg-chat.speech-model") ?? "";
+    } catch {
+      return "";
+    }
+  });
+  useEffect(() => {
+    if (models.length === 0) return;
+    const selected = speechModels.some((model) => model.id === speechModel)
+      ? speechModel
+      : speechModels[0]?.id ?? "";
+    if (selected !== speechModel) setSpeechModel(selected);
+    try {
+      if (selected) localStorage.setItem("dg-chat.speech-model", selected);
+      else localStorage.removeItem("dg-chat.speech-model");
+    } catch {
+      // Private browser contexts retain the valid in-memory fallback.
+    }
+  }, [models.length, speechModel, speechModels]);
+  const [speechVoice, setSpeechVoice] = useState(() => {
+    try {
+      const stored = localStorage.getItem("dg-chat.speech-voice");
+      return speechVoices.includes(stored as (typeof speechVoices)[number]) ? stored! : "alloy";
+    } catch {
+      return "alloy";
+    }
+  });
+  const chooseSpeechVoice = (voice: string) => {
+    if (!speechVoices.includes(voice as (typeof speechVoices)[number])) return;
+    setSpeechVoice(voice);
+    try {
+      localStorage.setItem("dg-chat.speech-voice", voice);
+    } catch {
+      // The validated in-memory preference remains available in private contexts.
+    }
+  };
+  const speechPlayback = useSpeechPlayback();
   const [transcriptionModel, setTranscriptionModelState] = useState(() => {
     try {
       return localStorage.getItem("dg-chat.transcription-model") ?? "";
@@ -1656,6 +1743,18 @@ function ChatView({
     [localMessages, conversation?.activeLeafId],
   );
   const streaming = Boolean(activeStream);
+  const speechContentFingerprint = useMemo(
+    () => localMessages.map((message) => `${message.id}:${message.content}`).join("\u0000"),
+    [localMessages],
+  );
+  useEffect(() => speechPlayback.controller.cancel(), [
+    activeId,
+    conversation?.activeLeafId,
+    speechContentFingerprint,
+    speechModel,
+    speechVoice,
+    speechPlayback.controller,
+  ]);
   useEffect(() => {
     if (!activeStream || !followStreamRef.current) return;
     chatScrollRef.current?.scrollTo({
@@ -1982,6 +2081,34 @@ function ChatView({
         </IconButton>
         <ModelPicker models={chatModels} selected={selectedModel} setSelected={setSelectedModel} />
         <div className="header-actions">
+          {speechModels.length > 0 && (
+            <div className="speech-preferences" aria-label="Read aloud settings">
+              <label>
+                <span className="sr-only">Speech model</span>
+                <select
+                  aria-label="Speech model"
+                  value={speechModel}
+                  onChange={(event) =>
+                    setSpeechModel(event.currentTarget.value)}
+                >
+                  {speechModels.map((model) => (
+                    <option key={model.id} value={model.id}>{model.name}</option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span className="sr-only">Speech voice</span>
+                <select
+                  aria-label="Speech voice"
+                  value={speechVoice}
+                  onChange={(event) =>
+                    chooseSpeechVoice(event.currentTarget.value)}
+                >
+                  {speechVoices.map((voice) => <option key={voice} value={voice}>{voice}</option>)}
+                </select>
+              </label>
+            </div>
+          )}
           {conversation && (
             <ConversationKnowledgePicker
               conversationId={conversation.id}
@@ -2040,6 +2167,21 @@ function ChatView({
               )}
             branchBusy={branchBusy}
             generationBusy={streaming || queue.length > 0}
+            speech={speechModel
+              ? {
+                model: speechModel,
+                voice: speechVoice,
+                controller: speechPlayback.controller,
+                state: speechPlayback.state,
+                disabledReason: streaming || queue.length > 0
+                  ? "a response is being generated"
+                  : m.status === "error" || m.status === "stopped"
+                  ? "the response is incomplete"
+                  : !speechTextForMarkdown(m.content)
+                  ? "the response has no readable text"
+                  : undefined,
+              }
+              : undefined}
             readOnly={readOnly}
           />
         ))}
@@ -2063,6 +2205,7 @@ function ChatView({
                 onContinue={() => undefined}
                 branchBusy
                 generationBusy
+                speech={undefined}
               />
             )}
             <MessageItem
@@ -2075,6 +2218,15 @@ function ChatView({
               onContinue={() => undefined}
               branchBusy
               generationBusy
+              speech={speechModel
+                ? {
+                  model: speechModel,
+                  voice: speechVoice,
+                  controller: speechPlayback.controller,
+                  state: speechPlayback.state,
+                  disabledReason: "the response is still streaming",
+                }
+                : undefined}
             />
             {!activeStream.assistant.content && (
               <div className="typing" role="status" aria-label="Assistant is thinking">

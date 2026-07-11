@@ -530,8 +530,53 @@ export type ApiIdempotencyEndpoint =
   | "responses"
   | "embeddings"
   | "audio.transcriptions"
-  | "audio.translations";
+  | "audio.translations"
+  | "audio.speech";
 export type ApiIdempotencyState = "in_progress" | "completed" | "failed";
+export type ApiResponseBodyEncoding = "utf8" | "base64";
+export class InvalidApiResponseBodyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidApiResponseBodyError";
+  }
+}
+
+/**
+ * Returns the public response body's decoded byte length and rejects non-canonical Base64.
+ * Keeping this validation in the repository makes replay quotas independent of storage encoding.
+ */
+export function apiResponseBodyByteLength(
+  body: string,
+  encoding: ApiResponseBodyEncoding = "utf8",
+): number {
+  if (encoding === "utf8") return new TextEncoder().encode(body).byteLength;
+  if (
+    body.length % 4 !== 0 ||
+    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(body)
+  ) throw new InvalidApiResponseBodyError("Binary replay body is not valid Base64");
+  let decoded: string;
+  try {
+    decoded = atob(body);
+  } catch {
+    throw new InvalidApiResponseBodyError("Binary replay body is not valid Base64");
+  }
+  if (btoa(decoded) !== body) {
+    throw new InvalidApiResponseBodyError("Binary replay body is not canonical Base64");
+  }
+  return decoded.length;
+}
+
+export function decodeApiResponseBody(
+  body: string,
+  encoding: ApiResponseBodyEncoding = "utf8",
+): Uint8Array {
+  if (encoding === "utf8") return new TextEncoder().encode(body);
+  apiResponseBodyByteLength(body, encoding);
+  const decoded = atob(body);
+  const bytes = new Uint8Array(decoded.length);
+  for (let index = 0; index < decoded.length; index++) bytes[index] = decoded.charCodeAt(index);
+  return bytes;
+}
 export interface ApiIdempotencyFrame {
   sequence: number;
   frame: string;
@@ -567,6 +612,7 @@ export interface ApiIdempotencyRequest {
   responseStatus: number | null;
   responseHeaders: Record<string, string>;
   responseBody: string | null;
+  responseBodyEncoding: ApiResponseBodyEncoding;
   failureStartedStream: boolean;
   observedInputTokens: number;
   observedOutputTokens: number;
@@ -604,6 +650,7 @@ export interface CompleteApiRequestInput {
   responseStatus: number;
   responseHeaders?: Record<string, string>;
   responseBody?: string;
+  responseBodyEncoding?: ApiResponseBodyEncoding;
   frames?: ApiSseFrameInput[];
   terminalFrame?: string;
   costMicros: number;

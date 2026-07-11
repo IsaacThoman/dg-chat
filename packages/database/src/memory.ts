@@ -13,6 +13,7 @@ import type {
 } from "@dg-chat/contracts";
 import { isIngestibleDocumentMime } from "./attachment-policy.ts";
 import {
+  apiResponseBodyByteLength,
   normalizeKnowledgeSearchLimit,
   validateChunkEmbeddings,
   validateDocumentChunkInputs,
@@ -3006,18 +3007,6 @@ export class MemoryRepository {
       .sort((a, b) => a.attemptNumber - b.attemptNumber).map((attempt) => structuredClone(attempt));
   }
 
-  private providerAccountingUncertain(usageRunId: string): boolean {
-    return [...this.providerAttempts.values()].some((attempt) =>
-      attempt.usageRunId === usageRunId && attempt.status === "running"
-    );
-  }
-
-  private authoritativeProviderCost(run: UsageRun): number {
-    return this.providerAccountingUncertain(run.id)
-      ? run.reservedMicros
-      : run.actualProviderCostMicros;
-  }
-
   private finalizeAccountingUnknownAttempts(usageRunId: string): void {
     for (const attempt of this.providerAttempts.values()) {
       if (attempt.usageRunId !== usageRunId || attempt.status !== "running") continue;
@@ -3288,9 +3277,8 @@ export class MemoryRepository {
     if (!run) throw new DomainError("not_found", "Usage reservation not found", 404);
     if (run.status === "completed") return run;
     if (run.executionEpoch > 0) {
-      costMicros = this.authoritativeProviderCost(run);
-      inputTokens = run.actualProviderInputTokens;
-      outputTokens = run.actualProviderOutputTokens;
+      // The route supplies customer usage and cost from the immutable public/source pricing
+      // snapshot. Target-attempt aggregates remain separate provider-cost telemetry.
       this.finalizeAccountingUnknownAttempts(run.id);
     }
     if (costMicros > run.reservedMicros) {
@@ -3324,14 +3312,12 @@ export class MemoryRepository {
       return run;
     }
     if (run.executionEpoch > 0) {
-      const cost = this.authoritativeProviderCost(run);
       this.finalizeAccountingUnknownAttempts(run.id);
-      const delta = run.reservedMicros - cost;
-      if (delta !== 0) this.credit(run.userId, runId, delta > 0 ? "refund" : "settle", delta);
+      this.credit(run.userId, runId, "refund", run.reservedMicros);
       run.status = "failed";
-      run.costMicros = cost;
-      run.inputTokens = run.actualProviderInputTokens;
-      run.outputTokens = run.actualProviderOutputTokens;
+      run.costMicros = 0;
+      run.inputTokens = 0;
+      run.outputTokens = 0;
       run.runLeaseToken = null;
       run.runLeaseExpiresAt = null;
       return run;
@@ -3368,7 +3354,9 @@ export class MemoryRepository {
       requests++;
       events += request.frames.length;
       bytes += request.frames.reduce((sum, item) => sum + encoder.encode(item.frame).length, 0);
-      if (request.responseBody) bytes += encoder.encode(request.responseBody).length;
+      if (request.responseBody) {
+        bytes += apiResponseBodyByteLength(request.responseBody, request.responseBodyEncoding);
+      }
     }
     return { requests, events, bytes };
   }
@@ -3446,6 +3434,7 @@ export class MemoryRepository {
       responseStatus: null,
       responseHeaders: {},
       responseBody: null,
+      responseBodyEncoding: "utf8",
       failureStartedStream: false,
       observedInputTokens: 0,
       observedOutputTokens: 0,
@@ -3576,7 +3565,15 @@ export class MemoryRepository {
   }
   #completeApi(input: CompleteApiRequestInput, stream: boolean) {
     const request = this.#apiRequest(input.id);
-    if (request.state === "completed") return structuredClone(request);
+    const responseBodyEncoding = input.responseBodyEncoding ?? "utf8";
+    if (request.state === "completed") {
+      if (
+        request.responseStatus !== input.responseStatus ||
+        (request.responseBody ?? "") !== (input.responseBody ?? "") ||
+        request.responseBodyEncoding !== responseBodyEncoding
+      ) throw new DomainError("idempotency_conflict", "Completion replay payload differs", 409);
+      return structuredClone(request);
+    }
     this.#assertLease(request, input.leaseToken);
     const encoder = new TextEncoder();
     const quota = this.#replayQuota(input.quota);
@@ -3606,7 +3603,12 @@ export class MemoryRepository {
       (sum, item) => sum + encoder.encode(item.frame).length,
       0,
     );
-    const responseBytes = input.responseBody ? encoder.encode(input.responseBody).length : 0;
+    const responseBytes = input.responseBody
+      ? apiResponseBodyByteLength(input.responseBody, responseBodyEncoding)
+      : 0;
+    if (responseBytes > 16_777_216) {
+      throw new DomainError("response_too_large", "Replay response exceeds storage limit", 413);
+    }
     const terminalBytes = input.terminalFrame ? encoder.encode(input.terminalFrame).length : 0;
     const existingBytes = request.frames.reduce(
       (sum, item) => sum + encoder.encode(item.frame).length,
@@ -3651,6 +3653,7 @@ export class MemoryRepository {
     request.responseStatus = input.responseStatus;
     request.responseHeaders = input.responseHeaders ?? {};
     request.responseBody = input.responseBody ?? null;
+    request.responseBodyEncoding = responseBodyEncoding;
     request.completedAt = new Date().toISOString();
     request.expiresAt = new Date(Date.now() + request.retentionSeconds * 1000).toISOString();
     return structuredClone(request);
@@ -3701,6 +3704,7 @@ export class MemoryRepository {
     request.responseStatus = input.responseStatus;
     request.responseHeaders = input.responseHeaders ?? {};
     request.responseBody = input.responseBody;
+    request.responseBodyEncoding = "utf8";
     request.completedAt = new Date().toISOString();
     request.expiresAt = new Date(Date.now() + request.retentionSeconds * 1000).toISOString();
     return structuredClone(request);
@@ -3713,10 +3717,7 @@ export class MemoryRepository {
         request.state !== "in_progress" || !request.leaseExpiresAt ||
         Date.parse(request.leaseExpiresAt) > Date.now()
       ) continue;
-      const usageRun = this.usageRuns.get(request.usageRunId);
-      if ((usageRun?.executionEpoch ?? 0) > 0) {
-        this.refund(request.usageRunId);
-      } else if (request.observedCostMicros > 0) {
+      if (request.observedCostMicros > 0) {
         this.settle(
           request.usageRunId,
           request.observedCostMicros,
@@ -3744,6 +3745,7 @@ export class MemoryRepository {
           code: "request_abandoned",
         },
       });
+      request.responseBodyEncoding = "utf8";
       request.failureStartedStream = request.frames.length > 0;
       if (request.failureStartedStream) {
         const frame = request.endpoint === "responses"

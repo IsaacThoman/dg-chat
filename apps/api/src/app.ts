@@ -4,6 +4,7 @@ import { cors } from "npm:hono@4.12.28/cors";
 import { bodyLimit } from "npm:hono@4.12.28/body-limit";
 import { deleteCookie, getCookie, setCookie } from "npm:hono@4.12.28/cookie";
 import { logger } from "npm:hono@4.12.28/logger";
+import { HTTPException } from "npm:hono@4.12.28/http-exception";
 import { secureHeaders } from "npm:hono@4.12.28/secure-headers";
 import { streamSSE } from "npm:hono@4.12.28/streaming";
 import type { Context, MiddlewareHandler } from "npm:hono@4.12.28";
@@ -48,6 +49,7 @@ import {
   type AttachmentRecord,
   type AuditEvent,
   type AuditQuery,
+  decodeApiResponseBody,
   DomainError,
   type DomainRepository,
   type KnowledgeCollection,
@@ -64,6 +66,14 @@ import {
 import { hashPassword, randomToken, sha256, sha256Hex, verifyPassword } from "./crypto.ts";
 import { createEmbeddings, EmbeddingsProviderError, type ProviderFetch } from "./embeddings.ts";
 import { AudioProviderError, type AudioRequest, estimateAudioInputTokens } from "./audio.ts";
+import {
+  assertSpeechFixedPricing,
+  estimateSpeechInputTokens,
+  parseSpeechRequest,
+  speechFrameDecodedBytes,
+  SpeechProviderError,
+  type SpeechRequest,
+} from "./speech.ts";
 import {
   createAudioTranscriptVisibility,
   observeAudioTranscriptFrame,
@@ -190,6 +200,7 @@ export interface AppOptions {
   providerDiscoveryFetch?: typeof fetch;
   embeddingsFetch?: ProviderFetch;
   audioFetch?: typeof fetch;
+  speechFetch?: typeof fetch;
   audioConcurrencyLimiter?: AudioConcurrencyLimiter;
   circuitBreaker?: CircuitBreaker;
   breakerPolicy?: BreakerPolicy;
@@ -936,6 +947,7 @@ export function createApp(options: AppOptions = {}) {
       stream: providerStream,
       embeddingsFetch: options.embeddingsFetch,
       audioFetch: options.audioFetch,
+      speechFetch: options.speechFetch,
       slowStream: providerSlowStream,
       ocrCache: options.ocrCache,
     })
@@ -1115,7 +1127,8 @@ export function createApp(options: AppOptions = {}) {
         const resolved = await resolveRuntimeModel(model.publicModelId) ??
           await resolveEmbeddingsRuntimeModel(model.publicModelId) ??
           await resolveAudioRuntimeModel(model.publicModelId, "transcription") ??
-          await resolveAudioRuntimeModel(model.publicModelId, "translation");
+          await resolveAudioRuntimeModel(model.publicModelId, "translation") ??
+          await resolveAudioRuntimeModel(model.publicModelId, "speech");
         return resolved?.registryModel ? resolved.info : undefined;
       }),
     );
@@ -1185,7 +1198,7 @@ export function createApp(options: AppOptions = {}) {
   };
   const resolveAudioRuntimeModel = async (
     id: string,
-    capability: "transcription" | "translation",
+    capability: "transcription" | "translation" | "speech",
   ): Promise<RuntimeModel | undefined> => {
     const model = await repo.findProviderModel(id);
     if (!model?.enabled || !model.capabilities.includes(capability)) return undefined;
@@ -1223,6 +1236,7 @@ export function createApp(options: AppOptions = {}) {
   );
   const apiBodyLimit = bodyLimit({ maxSize: 2 * 1024 * 1024 });
   const openAIBodyLimit = bodyLimit({ maxSize: 4 * 1024 * 1024 });
+  const speechBodyLimit = bodyLimit({ maxSize: 64 * 1024 });
   app.use(
     "/api/*",
     (c, next) => c.req.path.startsWith("/api/attachments") ? next() : apiBodyLimit(c, next),
@@ -1230,11 +1244,13 @@ export function createApp(options: AppOptions = {}) {
   app.use(
     "/v1/*",
     (c, next) =>
-      c.req.method === "POST" && [
-          "/v1/files",
-          "/v1/audio/transcriptions",
-          "/v1/audio/translations",
-        ].includes(c.req.path)
+      c.req.method === "POST" && c.req.path === "/v1/audio/speech"
+        ? speechBodyLimit(c, next)
+        : c.req.method === "POST" && [
+            "/v1/files",
+            "/v1/audio/transcriptions",
+            "/v1/audio/translations",
+          ].includes(c.req.path)
         ? next()
         : openAIBodyLimit(c, next),
   );
@@ -3712,8 +3728,13 @@ export function createApp(options: AppOptions = {}) {
     if (replayAsStream && !headers.has("Content-Type")) {
       headers.set("Content-Type", "text/event-stream");
     } else if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+    const body = replayAsStream
+      ? request.frames.map((frame) => frame.frame).join("")
+      : request.responseBody === null
+      ? null
+      : decodeApiResponseBody(request.responseBody, request.responseBodyEncoding);
     return new Response(
-      replayAsStream ? request.frames.map((frame) => frame.frame).join("") : request.responseBody,
+      body instanceof Uint8Array ? body.slice().buffer as ArrayBuffer : body,
       { status: request.responseStatus ?? 500, headers },
     );
   };
@@ -3821,7 +3842,10 @@ export function createApp(options: AppOptions = {}) {
       endpoint,
       idempotencyKey,
       requestHash,
-      stream: Boolean((request as { stream?: boolean }).stream),
+      stream: Boolean(
+        (request as { stream?: boolean }).stream ||
+          (request as { streamFormat?: string }).streamFormat === "sse",
+      ),
       model: model.id,
       runId,
       reserveMicros,
@@ -5261,7 +5285,469 @@ export function createApp(options: AppOptions = {}) {
   app.post(
     "/v1/audio/speech",
     requireScope("chat:write"),
-    (c) => c.json(openAIError("Speech provider is not configured", "provider_not_configured"), 501),
+    async (c) => {
+      const contentType = c.req.header("content-type")?.split(";", 1)[0].trim().toLowerCase();
+      if (contentType !== "application/json") {
+        return c.json(
+          openAIError("Content-Type must be application/json", "invalid_content_type"),
+          415,
+        );
+      }
+      let request: SpeechRequest;
+      try {
+        let value: unknown;
+        try {
+          value = await c.req.json();
+        } catch {
+          throw new SpeechProviderError(
+            "Request body must be valid JSON",
+            400,
+            "invalid_json",
+          );
+        }
+        request = parseSpeechRequest(value);
+      } catch (error) {
+        if (!(error instanceof SpeechProviderError)) throw error;
+        return c.json(openAIError(error.message, error.code), error.status as 400);
+      }
+
+      const endpointKey = "audio.speech" as const;
+      const idempotencyKey = c.req.header("idempotency-key");
+      if (idempotencyKey) {
+        if (idempotencyKey.length < 8 || idempotencyKey.length > 200) {
+          throw new DomainError(
+            "invalid_idempotency_key",
+            "Idempotency-Key must contain between 8 and 200 characters",
+            400,
+          );
+        }
+        const existing = await repo.getApiRequest(c.get("user").id, endpointKey, idempotencyKey);
+        if (existing) {
+          const requestHash = await sha256Hex(canonicalJson({ endpoint: endpointKey, request }));
+          if (
+            existing.requestHash !== requestHash ||
+            existing.stream !== (request.streamFormat === "sse")
+          ) {
+            throw new DomainError("idempotency_conflict", "Idempotency key payload differs", 409);
+          }
+          if (existing.state !== "in_progress") return replayResponse(existing);
+          return new Response(
+            JSON.stringify(
+              openAIError("An identical request is still in progress", "idempotency_in_progress"),
+            ),
+            {
+              status: 409,
+              headers: {
+                "content-type": "application/json",
+                "retry-after": String(Math.max(
+                  1,
+                  Math.ceil((Date.parse(existing.leaseExpiresAt ?? "") - Date.now()) / 1_000) || 1,
+                )),
+              },
+            },
+          );
+        }
+      }
+
+      const resolved = await resolveAudioRuntimeModel(request.model, "speech");
+      const model = resolved?.info;
+      const sourcePricing = pricingSnapshot(resolved?.price);
+      if (!model || !resolved?.registryModel || !providerExecution || !sourcePricing) {
+        return c.json(
+          openAIError(`Model '${request.model}' does not exist`, "model_not_found"),
+          404,
+        );
+      }
+      try {
+        assertSpeechFixedPricing(sourcePricing);
+      } catch (error) {
+        if (!(error instanceof SpeechProviderError)) throw error;
+        return c.json(openAIError(error.message, error.code), error.status as 500);
+      }
+      const providerPlan = await providerExecution.resolvePlan(resolved.registryModel.id);
+      const estimatedInputTokens = estimateSpeechInputTokens(request);
+      const reserveMicros = priceUsage(model, estimatedInputTokens, 0).costMicros;
+      const usage = await beginOpenAIUsage(
+        c,
+        endpointKey,
+        request,
+        model,
+        reserveMicros,
+        resolved.price,
+      );
+      if (usage.kind === "replay") return usage.response;
+      const { runId, idempotency, executionLeaseToken, runLease } = usage;
+      let speechSlot: Awaited<ReturnType<typeof claimAudioSlot>> | undefined;
+      let speechSlotDeferred = false;
+      try {
+        try {
+          speechSlot = await claimAudioSlot(c.get("user").id);
+        } catch (error) {
+          const domain = error instanceof DomainError ? error : undefined;
+          const status = domain?.status === 429 ? 429 : 503;
+          const code = status === 429
+            ? domain?.code ?? "audio_capacity_exceeded"
+            : "service_unavailable";
+          const message = status === 429
+            ? domain?.message ?? "Too many audio requests are in progress"
+            : "Audio admission is temporarily unavailable";
+          const responseBody = JSON.stringify(openAIError(message, code));
+          if (idempotency) {
+            await repo.failApiRequest({
+              id: idempotency.id,
+              leaseToken: idempotency.leaseToken,
+              responseStatus: status,
+              responseHeaders: { "content-type": "application/json", "retry-after": "5" },
+              responseBody,
+              billing: { mode: "refund" },
+            });
+          } else await repo.refund(runId);
+          return new Response(responseBody, {
+            status,
+            headers: { "content-type": "application/json", "retry-after": "5" },
+          });
+        }
+        const activeSpeechSlot = speechSlot;
+        const downstreamSpeechAbort = new AbortController();
+        const speechSignal = AbortSignal.any([
+          c.req.raw.signal,
+          activeSpeechSlot.signal,
+          downstreamSpeechAbort.signal,
+        ]);
+        if (activeSpeechSlot.signal.aborted) {
+          const responseBody = JSON.stringify(openAIError(
+            "Audio admission lease expired before provider dispatch",
+            "service_unavailable",
+          ));
+          if (idempotency) {
+            await repo.failApiRequest({
+              id: idempotency.id,
+              leaseToken: idempotency.leaseToken,
+              responseStatus: 503,
+              responseHeaders: { "content-type": "application/json", "retry-after": "5" },
+              responseBody,
+              billing: { mode: "refund" },
+            });
+          } else await repo.refund(runId);
+          return new Response(responseBody, {
+            status: 503,
+            headers: { "content-type": "application/json", "retry-after": "5" },
+          });
+        }
+
+        const lease = keepApiLeaseAlive(
+          idempotency,
+          runLease ? { runId, leaseToken: executionLeaseToken } : undefined,
+        );
+        let leaseDeferred = false;
+        const started = performance.now();
+        let terminalAccounting = false;
+        let providerCompleted = false;
+        let observed = { inputTokens: estimatedInputTokens, outputTokens: 0 };
+        let customerCostMicros = reserveMicros;
+        try {
+          const result = await providerExecution.speech(
+            resolved.registryModel.id,
+            runId,
+            executionLeaseToken,
+            request,
+            speechSignal,
+            providerPlan,
+          );
+          if (request.streamFormat === "sse") {
+            if (!result.stream || !result.terminalFrame) {
+              throw new SpeechProviderError("Speech provider did not return a stream");
+            }
+            leaseDeferred = true;
+            speechSlotDeferred = true;
+            return streamSSE(c, async (stream) => {
+              stream.onAbort(() =>
+                downstreamSpeechAbort.abort(
+                  new DOMException("Downstream speech stream disconnected", "AbortError"),
+                )
+              );
+              let sequence = 0;
+              let visibleAudioBytes = 0;
+              let settled = false;
+              try {
+                for await (const frameBytes of result.stream!) {
+                  if (stream.aborted || speechSignal.aborted) {
+                    throw new DOMException("Client disconnected", "AbortError");
+                  }
+                  visibleAudioBytes += speechFrameDecodedBytes(frameBytes);
+                  const frame = new TextDecoder("utf-8", { fatal: true }).decode(frameBytes);
+                  if (idempotency) {
+                    await repo.appendApiSseFrame(
+                      idempotency.id,
+                      idempotency.leaseToken,
+                      sequence++,
+                      frame,
+                      undefined,
+                      undefined,
+                      replayQuota,
+                    );
+                  }
+                  await stream.write(frame);
+                }
+                const streamUsage = await result.usage;
+                const terminal = new TextDecoder("utf-8", { fatal: true }).decode(
+                  await result.terminalFrame!,
+                );
+                const latencyMs = Math.round(performance.now() - started);
+                const costMicros = priceUsage(
+                  model,
+                  streamUsage.inputTokens,
+                  streamUsage.outputTokens,
+                ).costMicros;
+                await lease.checkpoint({ ...streamUsage, costMicros, latencyMs });
+                if (idempotency) {
+                  await repo.completeApiStream({
+                    id: idempotency.id,
+                    leaseToken: idempotency.leaseToken,
+                    responseStatus: 200,
+                    responseHeaders: {
+                      "content-type": "text/event-stream",
+                      "cache-control": "no-cache",
+                    },
+                    terminalFrame: terminal,
+                    costMicros,
+                    inputTokens: streamUsage.inputTokens,
+                    outputTokens: streamUsage.outputTokens,
+                    latencyMs,
+                    quota: replayQuota,
+                  });
+                } else {
+                  await repo.settle(
+                    runId,
+                    costMicros,
+                    streamUsage.inputTokens,
+                    streamUsage.outputTokens,
+                    latencyMs,
+                  );
+                }
+                settled = true;
+                if (!stream.aborted && !c.req.raw.signal.aborted) await stream.write(terminal);
+              } catch {
+                if (!settled) {
+                  const cancelled = c.req.raw.signal.aborted || stream.aborted;
+                  const leaseLost = activeSpeechSlot.signal.aborted && !c.req.raw.signal.aborted;
+                  // Decoded audio bytes prove visible work but are not speech tokens. Fixed-call
+                  // pricing lets partial output settle without inventing token usage.
+                  const partialOutputTokens = 0;
+                  const partialCostMicros = priceUsage(
+                    model,
+                    estimatedInputTokens,
+                    partialOutputTokens,
+                  ).costMicros;
+                  const latencyMs = Math.round(performance.now() - started);
+                  const errorBody = openAIError(
+                    cancelled
+                      ? "Request cancelled"
+                      : leaseLost
+                      ? "Audio admission lease was lost"
+                      : "Speech provider stream failed",
+                    cancelled
+                      ? "request_cancelled"
+                      : leaseLost
+                      ? "service_unavailable"
+                      : "provider_error",
+                  );
+                  const errorFrame = `data: ${JSON.stringify(errorBody)}\n\n`;
+                  if (idempotency) {
+                    await repo.failApiRequest({
+                      id: idempotency.id,
+                      leaseToken: idempotency.leaseToken,
+                      responseStatus: 200,
+                      responseHeaders: {
+                        "content-type": "text/event-stream",
+                        "cache-control": "no-cache",
+                      },
+                      responseBody: JSON.stringify(errorBody),
+                      terminalFrame: errorFrame,
+                      billing: visibleAudioBytes > 0
+                        ? {
+                          mode: "settle",
+                          costMicros: partialCostMicros,
+                          inputTokens: estimatedInputTokens,
+                          outputTokens: partialOutputTokens,
+                          latencyMs,
+                        }
+                        : { mode: "refund" },
+                    });
+                  } else if (visibleAudioBytes > 0) {
+                    await repo.settle(
+                      runId,
+                      partialCostMicros,
+                      estimatedInputTokens,
+                      partialOutputTokens,
+                      latencyMs,
+                    );
+                  } else await repo.refund(runId);
+                  settled = true;
+                  if (!cancelled) await stream.write(errorFrame);
+                }
+              } finally {
+                await lease.stop();
+                await activeSpeechSlot.release().catch(() => undefined);
+              }
+            });
+          }
+          providerCompleted = true;
+          observed = await result.usage;
+          if (!result.body) throw new SpeechProviderError("Speech provider returned no audio");
+          customerCostMicros = priceUsage(
+            model,
+            observed.inputTokens,
+            observed.outputTokens,
+          ).costMicros;
+          const latencyMs = Math.round(performance.now() - started);
+          await lease.checkpoint({ ...observed, costMicros: customerCostMicros, latencyMs });
+          if (idempotency) {
+            const responseBody = Buffer.from(result.body).toString("base64");
+            try {
+              await repo.completeApiJson({
+                id: idempotency.id,
+                leaseToken: idempotency.leaseToken,
+                responseStatus: 200,
+                responseHeaders: { "content-type": result.contentType },
+                responseBody,
+                responseBodyEncoding: "base64",
+                costMicros: customerCostMicros,
+                inputTokens: observed.inputTokens,
+                outputTokens: observed.outputTokens,
+                latencyMs,
+                quota: replayQuota,
+              });
+              terminalAccounting = true;
+            } catch (persistenceError) {
+              const status = persistenceError instanceof DomainError
+                ? persistenceError.status
+                : 500;
+              const failureBody = JSON.stringify(
+                openAIError("Response replay persistence failed", "replay_persistence_error"),
+              );
+              await repo.failApiRequest({
+                id: idempotency.id,
+                leaseToken: idempotency.leaseToken,
+                responseStatus: status,
+                responseHeaders: { "content-type": "application/json" },
+                responseBody: failureBody,
+                billing: {
+                  mode: "settle",
+                  costMicros: customerCostMicros,
+                  inputTokens: observed.inputTokens,
+                  outputTokens: observed.outputTokens,
+                  latencyMs,
+                },
+              });
+              terminalAccounting = true;
+              return new Response(failureBody, {
+                status,
+                headers: { "content-type": "application/json" },
+              });
+            }
+          } else {
+            try {
+              await repo.settle(
+                runId,
+                customerCostMicros,
+                observed.inputTokens,
+                observed.outputTokens,
+                latencyMs,
+              );
+              terminalAccounting = true;
+            } catch (error) {
+              throw new TerminalAccountingPersistenceError(error);
+            }
+          }
+          return new Response(result.body.slice().buffer as ArrayBuffer, {
+            headers: { "content-type": result.contentType },
+          });
+        } catch (error) {
+          if (terminalAccounting || error instanceof TerminalAccountingPersistenceError) {
+            throw error;
+          }
+          const cancelled = c.req.raw.signal.aborted;
+          const leaseLost = activeSpeechSlot.signal.aborted && !cancelled;
+          const latencyMs = Math.round(performance.now() - started);
+          const status = cancelled
+            ? 499
+            : leaseLost
+            ? 503
+            : error instanceof SpeechProviderError
+            ? error.status
+            : 502;
+          const code = cancelled
+            ? "request_cancelled"
+            : leaseLost
+            ? "service_unavailable"
+            : error instanceof SpeechProviderError
+            ? error.code
+            : "provider_error";
+          const responseBody = JSON.stringify(openAIError(
+            cancelled
+              ? "Request cancelled"
+              : leaseLost
+              ? "Audio admission lease was lost"
+              : providerCompleted
+              ? "Speech response could not be finalized"
+              : "Speech provider request failed",
+            code,
+          ));
+          const billing = providerCompleted
+            ? {
+              mode: "settle" as const,
+              costMicros: customerCostMicros,
+              inputTokens: observed.inputTokens,
+              outputTokens: observed.outputTokens,
+              latencyMs,
+            }
+            : { mode: "refund" as const };
+          if (idempotency) {
+            await repo.failApiRequest({
+              id: idempotency.id,
+              leaseToken: idempotency.leaseToken,
+              responseStatus: status,
+              responseHeaders: {
+                "content-type": "application/json",
+                ...(leaseLost ? { "retry-after": "5" } : {}),
+              },
+              responseBody,
+              billing,
+            });
+          } else if (providerCompleted) {
+            try {
+              await repo.settle(
+                runId,
+                customerCostMicros,
+                observed.inputTokens,
+                observed.outputTokens,
+                latencyMs,
+              );
+            } catch (accountingError) {
+              throw new TerminalAccountingPersistenceError(accountingError);
+            }
+          } else await repo.refund(runId);
+          terminalAccounting = true;
+          const retryAfter = leaseLost
+            ? "5"
+            : error instanceof SpeechProviderError && error.retryAfterMs !== undefined
+            ? String(Math.max(1, Math.ceil(error.retryAfterMs / 1_000)))
+            : undefined;
+          return new Response(responseBody, {
+            status,
+            headers: {
+              "content-type": "application/json",
+              ...(retryAfter ? { "retry-after": retryAfter } : {}),
+            },
+          });
+        } finally {
+          if (!leaseDeferred) await lease.stop();
+        }
+      } finally {
+        if (!speechSlotDeferred) await speechSlot?.release().catch(() => undefined);
+      }
+    },
   );
   app.get(
     "/v1/files",
@@ -5309,6 +5795,13 @@ export function createApp(options: AppOptions = {}) {
   );
 
   app.onError((error, c) => {
+    if (error instanceof HTTPException) {
+      if (c.req.path.startsWith("/v1/")) {
+        const code = error.status === 413 ? "request_too_large" : "request_error";
+        return c.json(openAIError(error.message, code), error.status as 400);
+      }
+      return error.getResponse();
+    }
     if (error instanceof ToolExecutionError) {
       return c.json(
         { error: { code: error.code, message: error.message } },
