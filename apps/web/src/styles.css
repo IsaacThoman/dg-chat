@@ -3466,8 +3466,100 @@ kbd {
   color: inherit;
   background: transparent;
 }
+.tool-policy-grid {
+  display: grid;
+  gap: 16px;
+}
+.tool-policy-card {
+  display: grid;
+  gap: 18px;
+  padding: 20px;
+}
+.tool-policy-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.tool-policy-head div:nth-child(2) {
+  flex: 1;
+}
+.tool-policy-head h3,
+.tool-policy-head p {
+  margin: 0;
+}
+.tool-policy-head p,
+.tool-policy-card small,
+.tool-policy-card footer {
+  color: var(--muted);
+}
+.tool-launch-form,
+.tool-launch-form label,
+.tool-execution-status {
+  display: grid;
+  gap: 12px;
+}
+.tool-launch-form input {
+  width: 100%;
+}
+.tool-execution-status pre {
+  max-height: 280px;
+  overflow: auto;
+  padding: 12px;
+  border-radius: 9px;
+  background: var(--surface-subtle);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.tool-execution-status > p {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.tool-policy-toggle,
+.tool-private-warning {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.tool-policy-toggle {
+  min-height: 44px;
+  font-weight: 650;
+}
+.tool-policy-card .form-field {
+  display: grid;
+  gap: 7px;
+}
+.tool-policy-card textarea {
+  width: 100%;
+  resize: vertical;
+}
+.tool-private-warning {
+  padding: 12px;
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--warning) 9%, transparent);
+}
+.tool-private-warning span {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.tool-policy-card footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
 
 @media (max-width: 760px) {
+  .tool-policy-head,
+  .tool-policy-card footer {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .tool-policy-card footer .primary {
+    min-height: 44px;
+    justify-content: center;
+  }
   .knowledge-main {
     overflow-y: auto;
   }

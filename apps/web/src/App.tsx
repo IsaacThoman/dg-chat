@@ -102,6 +102,8 @@ import {
 import { Modal } from "./Modal.tsx";
 import { AdminModels, AdminProviders } from "./AdminRegistry.tsx";
 import { AdminResilience } from "./AdminResilience.tsx";
+import { AdminTools } from "./AdminTools.tsx";
+import { ToolLauncher } from "./ToolLauncher.tsx";
 import { ConversationKnowledgePicker, KnowledgeView } from "./Knowledge.tsx";
 import type {
   Attachment,
@@ -121,6 +123,7 @@ type AdminSection =
   | "providers"
   | "models"
   | "resilience"
+  | "tools"
   | "usage"
   | "jobs"
   | "audit"
@@ -930,6 +933,7 @@ function Composer(
   },
 ) {
   const [value, setValue] = useState("");
+  const [toolsOpen, setToolsOpen] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [selectionError, setSelectionError] = useState("");
   type UploadState =
@@ -1225,9 +1229,9 @@ function Composer(
           <button
             type="button"
             className="tool-pill"
-            disabled
-            aria-label="Web search (not available yet)"
-            title="Web search (not available yet)"
+            disabled={disabled}
+            aria-label="Open web search"
+            onClick={() => setToolsOpen(true)}
           >
             <Globe2 size={16} /> Search
           </button>
@@ -1267,6 +1271,11 @@ function Composer(
           </button>
         </div>
       </form>
+      <ToolLauncher
+        open={toolsOpen}
+        close={() => setToolsOpen(false)}
+        insert={(text) => setValue((current) => `${current}${text}`)}
+      />
       <p className="composer-note">
         AI can make mistakes. Check important information.{" "}
         <span>
@@ -2433,6 +2442,7 @@ const adminNav: { id: AdminSection; label: string; icon: typeof Gauge }[] = [
   { id: "providers", label: "Providers", icon: Cloud },
   { id: "models", label: "Models & pricing", icon: Bot },
   { id: "resilience", label: "Routing resilience", icon: GitBranch },
+  { id: "tools", label: "Tools & search", icon: Globe2 },
   { id: "usage", label: "Usage analytics", icon: BarChart3 },
   { id: "jobs", label: "Background jobs", icon: Boxes },
   { id: "audit", label: "Audit log", icon: Shield },
@@ -2509,6 +2519,9 @@ function AdminSectionContent(
   }
   if (section === "resilience") {
     return <AdminResilience />;
+  }
+  if (section === "tools") {
+    return <AdminTools />;
   }
   if (section === "users") {
     return <UserManagement />;

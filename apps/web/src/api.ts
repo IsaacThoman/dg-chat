@@ -62,6 +62,34 @@ type RawModel = {
   capabilities: string[];
   contextWindow: number;
 };
+export type ToolDefinition = {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  inputSchema: Record<string, unknown>;
+};
+export type ToolPolicy = {
+  toolId: string;
+  allowed: boolean;
+  allowedDomains: string[];
+  allowPrivateNetwork: boolean;
+  version: number;
+  updatedAt: string;
+  updatedBy: string;
+};
+export type AdminTool = { definition: ToolDefinition; policy: ToolPolicy | null };
+export type ToolExecution = {
+  id: string;
+  ownerId: string;
+  toolId: string;
+  input: unknown;
+  status: "pending_approval" | "queued" | "running" | "succeeded" | "failed" | "cancelled";
+  result: unknown | null;
+  error: { code: string; message: string } | null;
+  createdAt: string;
+  updatedAt: string;
+};
 
 function mapUser(user: RawUser): User {
   const status = user.state === "suspended" || user.state === "deleted"
@@ -498,6 +526,31 @@ export const api = {
       { method: "POST", body: JSON.stringify({ expectedVersion: provider.version }) },
     ),
   adminModels: async () => (await request<{ data: AdminModel[] }>("/admin/models")).data,
+  adminTools: async () => (await request<{ data: AdminTool[] }>("/admin/tools")).data,
+  updateAdminTool: (
+    tool: AdminTool,
+    input: Pick<ToolPolicy, "allowed" | "allowedDomains" | "allowPrivateNetwork">,
+  ) =>
+    request<ToolPolicy>(`/admin/tools/${encodeURIComponent(tool.definition.id)}/policy`, {
+      method: "PUT",
+      body: JSON.stringify({ ...input, expectedVersion: tool.policy?.version ?? 0 }),
+    }),
+  tools: async () => (await request<{ data: ToolDefinition[] }>("/tools")).data,
+  requestToolExecution: (toolId: string, input: unknown) =>
+    request<ToolExecution>("/tools/executions", {
+      method: "POST",
+      body: JSON.stringify({ toolId, input }),
+    }),
+  toolExecution: (id: string) =>
+    request<ToolExecution>(`/tools/executions/${encodeURIComponent(id)}`),
+  approveToolExecution: (id: string) =>
+    request<ToolExecution>(`/tools/executions/${encodeURIComponent(id)}/approve`, {
+      method: "POST",
+    }),
+  cancelToolExecution: (id: string) =>
+    request<ToolExecution>(`/tools/executions/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }),
   createAdminModel: (input: {
     providerId: string;
     publicModelId: string;
