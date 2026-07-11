@@ -671,7 +671,10 @@ Deno.test("provider execution retries through the breaker, falls back, and persi
   }
 });
 
-async function singleProviderFixture(protocol: "chat_completions" | "responses") {
+async function singleProviderFixture(
+  protocol: "chat_completions" | "responses",
+  capabilities: Array<"chat" | "embeddings"> = ["chat"],
+) {
   const repo = new MemoryRepository();
   const user = repo.bootstrapAdmin({
     email: `${protocol}@example.com`,
@@ -697,7 +700,7 @@ async function singleProviderFixture(protocol: "chat_completions" | "responses")
     publicModelId: `single/${protocol}`,
     upstreamModelId: "single-upstream",
     displayName: "Single",
-    capabilities: ["chat"],
+    capabilities,
     contextWindow: 8_192,
   }, mutation);
   const price = repo.createModelPriceVersion({
@@ -716,6 +719,93 @@ async function singleProviderFixture(protocol: "chat_completions" | "responses")
   if (!run.runLeaseToken) throw new Error("execution lease missing");
   return { repo, user, keyring, provider, model, price, runId, run };
 }
+
+Deno.test("embedding success persistence follows telemetry and preserves accounting certainty", async () => {
+  const fixture = await singleProviderFixture("chat_completions", ["embeddings"]);
+  const engine = new ProviderExecutionEngine({
+    repository: fixture.repo,
+    keyring: fixture.keyring,
+    circuitBreaker: new MemoryCircuitBreaker(),
+    breakerPolicy: {
+      failureThreshold: 1,
+      failureWindowSeconds: 60,
+      openSeconds: 30,
+      halfOpenLeaseSeconds: 5,
+    },
+    embeddingsFetch: () =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            object: "list",
+            data: [{ object: "embedding", embedding: [0.25, 0.75], index: 0 }],
+            usage: { prompt_tokens: 3, total_tokens: 3 },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      ),
+  });
+  const order: string[] = [];
+  const response = await engine.embeddings(
+    fixture.model.id,
+    fixture.runId,
+    fixture.run.runLeaseToken!,
+    { model: fixture.model.publicModelId, input: "hello", dimensions: 2 },
+    new AbortController().signal,
+    undefined,
+    (input) => {
+      order.push("persist");
+      assertEquals(fixture.repo.listProviderAttempts(fixture.runId)[0].status, "succeeded");
+      assertEquals(fixture.repo.usageRuns.get(fixture.runId)?.status, "reserved");
+      assertEquals(input.response.usage.prompt_tokens, 3);
+      assertEquals(input.usageRunId, fixture.runId);
+    },
+  );
+  order.push("returned");
+  assertEquals(order, ["persist", "returned"]);
+  assertEquals(response.data[0].embedding, [0.25, 0.75]);
+
+  const failed = await singleProviderFixture("chat_completions", ["embeddings"]);
+  const failingEngine = new ProviderExecutionEngine({
+    repository: failed.repo,
+    keyring: failed.keyring,
+    circuitBreaker: new MemoryCircuitBreaker(),
+    breakerPolicy: {
+      failureThreshold: 1,
+      failureWindowSeconds: 60,
+      openSeconds: 30,
+      halfOpenLeaseSeconds: 5,
+    },
+    embeddingsFetch: () =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            object: "list",
+            data: [{ object: "embedding", embedding: [1, 0], index: 0 }],
+            usage: { prompt_tokens: 2, total_tokens: 2 },
+          }),
+          { status: 200 },
+        ),
+      ),
+  });
+  await assertRejects(
+    () =>
+      failingEngine.embeddings(
+        failed.model.id,
+        failed.runId,
+        failed.run.runLeaseToken!,
+        { model: failed.model.publicModelId, input: "hello", dimensions: 2 },
+        new AbortController().signal,
+        undefined,
+        () => {
+          throw new Error("embedding fence was reclaimed");
+        },
+      ),
+    Error,
+    "embedding fence was reclaimed",
+  );
+  assertEquals(failed.repo.listProviderAttempts(failed.runId)[0].status, "succeeded");
+  assertEquals(failed.repo.usageRuns.get(failed.runId)?.status, "reserved");
+});
 
 Deno.test("provider execution rejects native Responses targets before dispatch", async () => {
   const fixture = await singleProviderFixture("responses");

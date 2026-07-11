@@ -77,6 +77,18 @@ export interface ProviderExecutionOptions {
   };
 }
 
+export interface EmbeddingSuccessPersistenceInput {
+  sourceModelId: string;
+  usageRunId: string;
+  ownerLeaseToken: string;
+  plan: ProviderExecutionPlan;
+  response: EmbeddingsResponse;
+}
+
+export type PersistEmbeddingSuccess = (
+  input: EmbeddingSuccessPersistenceInput,
+) => void | Promise<void>;
+
 const defaultRetryableStatuses = [408, 425, 429, 500, 502, 503, 504];
 const terminalPersistenceDelaysMs = [0, 10, 50, 200] as const;
 
@@ -787,6 +799,7 @@ export class ProviderExecutionEngine {
     request: EmbeddingsRequest,
     signal: AbortSignal,
     frozenPlan?: ProviderExecutionPlan,
+    persistSuccess?: PersistEmbeddingSuccess,
   ): Promise<EmbeddingsResponse> {
     const { plan, candidates } = await this.#prepare(sourceModelId, frozenPlan, "embeddings");
     const claim = await this.#repository.claimProviderExecution(usageRunId, ownerLeaseToken);
@@ -804,7 +817,7 @@ export class ProviderExecutionEngine {
       estimatedInput,
     );
     try {
-      return await executeProviderRequest({
+      const response = await executeProviderRequest({
         initialCandidateId: plan.targets[0].providerModelId,
         resolveCandidate: (id) => candidates.get(id),
         policy: policyFor(plan, remainingAttempts, this.#slowStream),
@@ -847,6 +860,17 @@ export class ProviderExecutionEngine {
           }
         },
       });
+      // executeProviderRequest does not resolve until the successful attempt's terminal telemetry
+      // is durable. Persistence therefore runs after exact provider usage/cost is known, while the
+      // owning usage run remains reserved for its caller to settle or refund.
+      await persistSuccess?.({
+        sourceModelId,
+        usageRunId,
+        ownerLeaseToken,
+        plan: structuredClone(plan),
+        response: structuredClone(response),
+      });
+      return response;
     } catch (error) {
       this.#normalizeError(error, plan);
     }
