@@ -222,6 +222,69 @@ test("recovers failed extraction from the file picker and polls until selectable
   await expect(picker.getByRole("button", { name: "Add file" })).toBeEnabled();
 });
 
+test("persists library selection and repairs it after the selected collection is deleted", async ({
+  page,
+}, testInfo) => {
+  const suffix = `${Date.now()}-${testInfo.project.name}`;
+  const firstName = `Selection first ${suffix}`;
+  const secondName = `Selection second ${suffix}`;
+  const storageKey = "dg-chat.active-knowledge-collection";
+
+  await openSidebar(page);
+  await page.getByRole("complementary").getByRole("button", { name: "Knowledge", exact: true })
+    .click();
+  const createCollection = async (name: string) => {
+    await page.getByRole("button", { name: "Create collection" }).click();
+    const dialog = page.getByRole("dialog", { name: "New collection" });
+    await dialog.getByLabel("Name").fill(name);
+    await dialog.getByRole("button", { name: "Save" }).click();
+    await expect(page.getByRole("heading", { name, exact: true })).toBeVisible();
+  };
+  await createCollection(firstName);
+  await createCollection(secondName);
+
+  type Collection = { id: string; name: string };
+  const collections = async (): Promise<Collection[]> => {
+    const response = await page.request.get(`${apiURL}/api/collections`);
+    expect(response.ok()).toBe(true);
+    return ((await response.json()) as { data: Collection[] }).data;
+  };
+  const created = await collections();
+  const first = created.find((collection) => collection.name === firstName);
+  expect(first).toBeTruthy();
+
+  await page.getByRole("button", { name: new RegExp(firstName) }).click();
+  await expect(page.getByRole("heading", { name: firstName, exact: true })).toBeVisible();
+  await expect.poll(() => page.evaluate((key) => sessionStorage.getItem(key), storageKey)).toBe(
+    first!.id,
+  );
+
+  await openSidebar(page);
+  await page.getByRole("complementary").getByRole("button", { name: "Chats", exact: true })
+    .click();
+  await page.reload();
+  await openSidebar(page);
+  await page.getByRole("complementary").getByRole("button", { name: "Knowledge", exact: true })
+    .click();
+  await expect(page.getByRole("heading", { name: firstName, exact: true })).toBeVisible();
+  expect(await page.evaluate((key) => sessionStorage.getItem(key), storageKey)).toBe(first!.id);
+
+  await page.getByRole("button", { name: `Delete ${firstName}` }).click();
+  await page.getByRole("dialog", { name: "Delete collection?" })
+    .getByRole("button", { name: "Delete collection" }).click();
+  await expect.poll(async () => {
+    const data = await collections();
+    return data.some((collection) => collection.id === first!.id) ? null : data[0] ?? null;
+  }).not.toBeNull();
+  // Read the current server order after the deletion; the UI intentionally falls back to item zero.
+  const fallback = (await collections())[0];
+  expect(fallback).toBeTruthy();
+  await expect(page.getByRole("heading", { name: fallback.name, exact: true })).toBeVisible();
+  await expect.poll(() => page.evaluate((key) => sessionStorage.getItem(key), storageKey)).toBe(
+    fallback.id,
+  );
+});
+
 test("extracts uploaded PDF pages and DOCX sections with persisted provenance", async ({
   page,
 }, testInfo) => {
