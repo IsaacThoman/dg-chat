@@ -993,7 +993,7 @@ export function createApp(options: AppOptions = {}) {
         await repo.settle(`tool:${execution.id}`, toolReserveMicros, 0, 0, latencyMs);
       },
       async refund(execution, error) {
-        await repo.refund(`tool:${execution.id}`, error);
+        return (await repo.refund(`tool:${execution.id}`, error)) !== undefined;
       },
     },
   );

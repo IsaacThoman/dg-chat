@@ -45,7 +45,7 @@ Deno.test({
         settle: (execution) =>
           repo.settle(`tool:${execution.id}`, reserveMicros, 0, 0, 0).then(() => undefined),
         refund: (execution, error) =>
-          repo.refund(`tool:${execution.id}`, error).then(() => undefined),
+          repo.refund(`tool:${execution.id}`, error).then((run) => run !== undefined),
       });
       await service.setPolicy({ toolId: "echo", allowed: true, actorId: user.id });
       const requested = await service.request(user.id, "echo", {});

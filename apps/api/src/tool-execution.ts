@@ -214,7 +214,8 @@ export class ToolExecutionService {
     readonly controls?: {
       reserve(execution: ToolExecution): Promise<void>;
       settle(execution: ToolExecution, latencyMs: number): Promise<void>;
-      refund(execution: ToolExecution, error?: string): Promise<void>;
+      /** Returns false only when no matching reservation existed yet. */
+      refund(execution: ToolExecution, error?: string): Promise<boolean | void>;
     },
   ) {
     for (const adapter of adapters) {
@@ -350,10 +351,16 @@ export class ToolExecutionService {
     for (const execution of pendingReservation) {
       try {
         if (execution.cancellationRequestedAt) {
-          // Establish (or observe) the idempotent reservation before refunding. This closes the
-          // commit-after-refund window when a prior reservation acknowledgement was lost.
-          await this.controls?.reserve(execution);
-          await this.controls?.refund(execution, "tool execution cancelled before dispatch");
+          const refunded = await this.controls?.refund(
+            execution,
+            "tool execution cancelled before dispatch",
+          );
+          if (refunded === false) {
+            // A reservation may still be committing with a lost acknowledgement. Establish or
+            // observe it, then refund it. On a later retry, refund returns true for terminal runs.
+            await this.controls?.reserve(execution);
+            await this.controls?.refund(execution, "tool execution cancelled before dispatch");
+          }
           await this.store.transitionExecution(execution.id, ["queued_pending_reservation"], {
             status: "cancelled",
           });
@@ -467,8 +474,14 @@ export class ToolExecutionService {
       if (!refundPending) {
         throw new ToolExecutionError("execution_terminal", "Tool execution changed", 409);
       }
-      await this.controls?.reserve(refundPending);
-      await this.controls?.refund(refundPending, "tool execution cancelled before dispatch");
+      const refunded = await this.controls?.refund(
+        refundPending,
+        "tool execution cancelled before dispatch",
+      );
+      if (refunded === false) {
+        await this.controls?.reserve(refundPending);
+        await this.controls?.refund(refundPending, "tool execution cancelled before dispatch");
+      }
       const cancelled = await this.store.transitionExecution(id, ["queued_pending_reservation"], {
         status: "cancelled",
       });

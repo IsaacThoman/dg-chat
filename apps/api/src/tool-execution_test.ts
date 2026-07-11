@@ -347,3 +347,32 @@ Deno.test("concurrent recoverers do not refund the winning shared reservation", 
   await waitFor(first, "user", requested.id, "succeeded");
   assertEquals(refunds, 0);
 });
+
+Deno.test("recovery finalizes cancellation after refund committed before tool transition", async () => {
+  const store = new MemoryToolExecutionStore();
+  let reserves = 0;
+  let refunds = 0;
+  const service = new ToolExecutionService(store, [echoAdapter], {
+    reserve: () => {
+      reserves++;
+      return Promise.resolve();
+    },
+    settle: () => Promise.resolve(),
+    refund: () => {
+      refunds++;
+      return Promise.resolve(true);
+    },
+  });
+  await service.setPolicy({ toolId: "echo", allowed: true, actorId: "admin" });
+  const requested = await service.request("user", "echo", {});
+  await store.transitionExecution(requested.id, ["pending_approval"], {
+    status: "queued_pending_reservation",
+    approvedAt: new Date().toISOString(),
+    approvedBy: "user",
+    cancellationRequestedAt: new Date().toISOString(),
+  });
+  await service.recover();
+  assertEquals((await service.get("user", requested.id)).status, "cancelled");
+  assertEquals(refunds, 1);
+  assertEquals(reserves, 0);
+});
