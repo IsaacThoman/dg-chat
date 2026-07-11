@@ -209,15 +209,27 @@ interface PeCandidate {
   header: number[];
 }
 
-interface PeScanState {
+export interface PeScanState {
   headers: PeCandidate[];
   signatures: Map<number, number[]>;
   candidates: number;
   seen: number;
   terminal: boolean;
+  work: number;
 }
 
-function scanEmbeddedPe(
+export function createPeScanState(): PeScanState {
+  return {
+    headers: [],
+    signatures: new Map(),
+    candidates: 0,
+    seen: 0,
+    terminal: false,
+    work: 0,
+  };
+}
+
+export function scanEmbeddedPe(
   bytes: Uint8Array,
   absoluteStart: number,
   state: PeScanState,
@@ -227,12 +239,14 @@ function scanEmbeddedPe(
   if (state.terminal) return { detected: true, previousByte: bytes.at(-1) ?? previousByte! };
   let detected = false;
   for (let index = 0; index < bytes.length; index++) {
+    state.work++;
     const absolute = absoluteStart + index;
     const byte = bytes[index];
     const signatures = state.signatures.get(absolute);
     if (signatures) {
       state.signatures.delete(absolute);
       for (const progress of signatures) {
+        state.work++;
         const expected = [0x50, 0x45, 0, 0];
         if (byte !== expected[progress]) state.candidates--;
         else if (progress + 1 === expected.length) {
@@ -246,6 +260,7 @@ function scanEmbeddedPe(
       }
     }
     for (let candidateIndex = state.headers.length - 1; candidateIndex >= 0; candidateIndex--) {
+      state.work++;
       const candidate = state.headers[candidateIndex];
       if (candidate.header.length < 64 && absolute === candidate.offset + candidate.header.length) {
         candidate.header.push(byte);
@@ -439,13 +454,7 @@ export function secureUploadStream(
     executable: false,
   };
   let markerCarry = new Uint8Array();
-  const peState: PeScanState = {
-    headers: [],
-    signatures: new Map(),
-    candidates: 0,
-    seen: 0,
-    terminal: false,
-  };
+  const peState = createPeScanState();
   let previousByte: number | undefined;
   let resolveInspection!: (value: UploadInspection) => void;
   let rejectInspection!: (reason: unknown) => void;
