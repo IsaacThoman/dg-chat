@@ -151,6 +151,77 @@ test("manages a collection and persists conversation knowledge", async ({ page }
   await expect(page.getByRole("heading", { name: renamedName })).toBeHidden();
 });
 
+test("recovers failed extraction from the file picker and polls until selectable", async ({
+  page,
+}, testInfo) => {
+  const suffix = `${Date.now()}-${testInfo.project.name}`;
+  const collectionName = `Recovery ${suffix}`;
+  const filename = `broken-${suffix}.pdf`;
+  const id = "00000000-0000-4000-8000-000000000099";
+  let state: "failed" | "queued" | "ready" = "failed";
+  let queuedReads = 0;
+  const attachment = () => ({
+    id,
+    filename,
+    mimeType: "application/pdf",
+    sizeBytes: 2048,
+    state: "ready",
+    ingestionStatus: state,
+    ingestionError: state === "failed"
+      ? "The document parser could not read this unusually detailed test fixture."
+      : null,
+    ingestedAt: state === "ready" ? new Date().toISOString() : null,
+    createdAt: new Date().toISOString(),
+  });
+
+  await page.route(/\/api\/attachments$/, async (route) => {
+    if (state === "queued" && queuedReads++ > 0) state = "ready";
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        data: [attachment()],
+      }),
+    });
+  });
+  await page.route(/\/api\/attachments\/[^/]+\/ingestion\/retry$/, async (route) => {
+    state = "queued";
+    queuedReads = 0;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        attachment: attachment(),
+      }),
+    });
+  });
+
+  await openSidebar(page);
+  await page.getByRole("complementary").getByRole("button", { name: "Knowledge", exact: true })
+    .click();
+  await page.getByRole("button", { name: "Create collection" }).click();
+  const createDialog = page.getByRole("dialog", { name: "New collection" });
+  await createDialog.getByLabel("Name").fill(collectionName);
+  await createDialog.getByRole("button", { name: "Save" }).click();
+  await page.getByRole("button", { name: "Add uploaded file" }).click();
+
+  const picker = page.getByRole("dialog", { name: "Add an uploaded file" });
+  const retry = picker.getByRole("button", { name: `Retry extraction for ${filename}` });
+  await expect(picker.getByText(/Extraction failed: The document parser/)).toBeVisible();
+  await expect(picker.getByRole("radio", { name: new RegExp(filename) })).toBeDisabled();
+  if (testInfo.project.name.includes("mobile")) {
+    expect((await retry.boundingBox())?.height ?? 0).toBeGreaterThanOrEqual(44);
+  }
+
+  await retry.click();
+  await expect(picker.getByText("Extraction queued — waiting for a worker")).toBeVisible();
+  const recovered = picker.getByRole("radio", { name: new RegExp(filename) });
+  await expect(recovered).toBeEnabled({ timeout: 7_000 });
+  await expect(picker.getByText(/Extraction ready/)).toBeVisible();
+  await recovered.check();
+  await expect(picker.getByRole("button", { name: "Add file" })).toBeEnabled();
+});
+
 test("extracts uploaded PDF pages and DOCX sections with persisted provenance", async ({
   page,
 }, testInfo) => {
