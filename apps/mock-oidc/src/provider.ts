@@ -339,6 +339,7 @@ export async function createMockOidcProvider(options: MockOidcProviderOptions) {
         createdAt: now(),
       });
       observe({ type: "authorize", noncePresent: true, pkce: "S256" });
+      const callbackOrigin = new URL(options.redirectUri).origin;
       const buttons = Object.entries(MOCK_OIDC_PERSONAS).map(([id, persona]) =>
         `<button name="persona" value="${escapeHtml(id)}" type="submit">${
           escapeHtml("name" in persona ? persona.name : id.replaceAll("_", " "))
@@ -358,7 +359,7 @@ main{background:#1b1d22;border:1px solid #343741;border-radius:16px;padding:24px
             "content-type": "text/html; charset=utf-8",
             "cache-control": "no-store",
             "content-security-policy":
-              "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
+              `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${callbackOrigin}; frame-ancestors 'none'`,
             "x-frame-options": "DENY",
           },
         },

@@ -42,6 +42,7 @@ async function authorize(
   ) url.searchParams.set(key, value);
   const page = await provider.fetch(new Request(url));
   assertEquals(page.status, 200);
+  const contentSecurityPolicy = page.headers.get("content-security-policy");
   const requestId = (await page.text()).match(/name="request_id" value="([^"]+)"/u)?.[1];
   assert(requestId);
   const form = new URLSearchParams({ request_id: requestId, persona });
@@ -54,7 +55,7 @@ async function authorize(
   );
   assertEquals(decision.status, 302);
   const callback = new URL(decision.headers.get("location")!);
-  return { code: callback.searchParams.get("code")!, callback, challenge };
+  return { code: callback.searchParams.get("code")!, callback, challenge, contentSecurityPolicy };
 }
 
 async function setMode(
@@ -129,6 +130,11 @@ Deno.test("authorization requires state, nonce, exact redirect, scopes, and S256
   );
   assertEquals(response.status, 400);
   assertEquals((await response.json()).error, "invalid_request");
+  const valid = await authorize(provider, "v".repeat(64));
+  assertEquals(
+    valid.contentSecurityPolicy,
+    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' http://localhost:8000; frame-ancestors 'none'",
+  );
 });
 
 Deno.test("token exchange enforces PKCE, consumes codes, signs ID token, and serves UserInfo", async () => {

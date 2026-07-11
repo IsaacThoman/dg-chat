@@ -69,7 +69,7 @@ test("assistant speech is capability-aware, exclusive, controllable, and cleaned
     });
   });
   let speechBody: Record<string, unknown> | undefined;
-  await page.route("**/v1/audio/speech", async (route) => {
+  await page.route("**/api/audio/speech", async (route) => {
     speechBody = route.request().postDataJSON() as Record<string, unknown>;
     await new Promise((resolve) => setTimeout(resolve, 80));
     await route.fulfill({ status: 200, contentType: "audio/mpeg", body: "mock-mp3" });
