@@ -47,6 +47,7 @@ type RawMessage = {
   role: "system" | "user" | "assistant" | "tool";
   content: string;
   model: string | null;
+  status?: "complete" | "stopped" | "error";
   metadata: Record<string, unknown>;
   createdAt: string;
   attachments?: Attachment[];
@@ -65,7 +66,7 @@ function mapUser(user: RawUser): User {
     : user.approvalStatus;
   return { ...user, status, balance: user.balanceMicros / 1_000_000 };
 }
-function mapConversation(value: RawConversation): Conversation {
+export function mapConversation(value: RawConversation): Conversation {
   return {
     id: value.id,
     title: value.title,
@@ -78,13 +79,17 @@ function mapConversation(value: RawConversation): Conversation {
     version: value.version,
   };
 }
-function mapMessage(value: RawMessage): Message {
+export function mapMessage(value: RawMessage): Message {
   const duration = typeof value.metadata?.durationMs === "number"
     ? `${value.metadata.durationMs}ms`
     : undefined;
   const tokens = typeof value.metadata?.outputTokens === "number"
     ? `${value.metadata.outputTokens} tokens`
     : undefined;
+  const reasoning = typeof value.metadata?.reasoning === "string" && value.metadata.reasoning
+    ? value.metadata.reasoning
+    : undefined;
+  const toolCalls = Array.isArray(value.metadata?.toolCalls) ? value.metadata.toolCalls.length : 0;
   return {
     id: value.id,
     parentId: value.parentId,
@@ -99,6 +104,9 @@ function mapMessage(value: RawMessage): Message {
     }),
     model: value.model ?? undefined,
     latency: [duration, tokens].filter(Boolean).join(" · ") || undefined,
+    reasoning,
+    toolStatus: toolCalls ? `${toolCalls} tool call${toolCalls === 1 ? "" : "s"}` : undefined,
+    status: value.status ?? "complete",
     attachments: value.attachments,
   };
 }
@@ -122,7 +130,7 @@ export class ApiError extends Error {
   }
 }
 
-async function responseError(response: Response): Promise<ApiError> {
+export async function responseError(response: Response): Promise<ApiError> {
   const fallback = `Request failed (${response.status})`;
   const contentType = response.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
   if (contentType !== "application/json") {
@@ -355,11 +363,13 @@ export const api = {
     edit?: Message,
     idempotencyKey: string = crypto.randomUUID(),
     attachmentIds: string[] = [],
+    signal?: AbortSignal,
   ) => {
     const result = await request<
       { user: RawMessage; assistant: RawMessage; conversation: RawConversation }
     >(`/conversations/${conversation.id}/generate`, {
       method: "POST",
+      signal,
       body: JSON.stringify({
         content,
         model,

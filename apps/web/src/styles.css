@@ -33,6 +33,40 @@
   border: 0;
 }
 
+.reasoning-panel,
+.tool-status {
+  margin: .65rem 0;
+  color: var(--muted);
+  font-size: .875rem;
+}
+.reasoning-panel {
+  padding: .7rem .8rem;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--card) 94%, var(--purple) 6%);
+}
+.reasoning-panel summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.reasoning-panel > :last-child {
+  margin-bottom: 0;
+}
+.terminal-badge {
+  padding: .15rem .4rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--muted) 12%, transparent);
+  color: var(--muted);
+  font-size: .7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+.terminal-badge.error {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+}
+
 .resilience-playground {
   margin: 1rem 0 1.75rem;
   padding: 1rem;
@@ -976,6 +1010,118 @@ kbd {
   color: #aaa69e;
   background: #e9e7e2;
   cursor: default;
+}
+.stop-button {
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid #d8d4cc;
+  border-radius: 9px;
+  padding: 0 10px;
+  color: #4f4b45;
+  background: #f7f6f2;
+  font-size: 9px;
+  font-weight: 650;
+  cursor: pointer;
+}
+.stop-button:hover {
+  background: #eeece6;
+}
+.prompt-queue {
+  position: absolute;
+  z-index: 9;
+  left: max(20px, calc((100% - 780px) / 2));
+  right: max(20px, calc((100% - 780px) / 2));
+  bottom: 142px;
+  max-height: min(220px, 35vh);
+  overflow: auto;
+  padding: 10px;
+  border: 1px solid #dcd7ea;
+  border-radius: 13px;
+  background: #fbfafff2;
+  box-shadow: 0 12px 35px #30254b1c;
+  backdrop-filter: blur(12px);
+}
+.prompt-queue > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 4px 7px;
+}
+.prompt-queue strong {
+  font-size: 10px;
+}
+.prompt-queue small {
+  color: var(--muted);
+  font-size: 8px;
+}
+.prompt-queue ol {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.prompt-queue li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 36px;
+  padding: 5px 6px 5px 9px;
+  border-radius: 9px;
+  background: #f0edf8;
+}
+.prompt-queue li > span {
+  color: #7b69ad;
+  font: 8px 'DM Mono',monospace;
+}
+.prompt-queue p {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: #4c4758;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.streaming-turn .assistant-message .markdown::after {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 14px;
+  margin-left: 2px;
+  vertical-align: -2px;
+  border-radius: 2px;
+  background: #8872c7;
+  animation: pulse 1s infinite;
+}
+.stream-error {
+  width: min(760px, calc(100% - 40px));
+  margin: 18px auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid #e8c4c4;
+  border-radius: 10px;
+  color: #8a3f3f;
+  background: #fff8f8;
+  font-size: 10px;
+}
+.stream-error button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
 }
 .composer-note {
   margin: 6px 0 0;
@@ -2800,9 +2946,42 @@ kbd {
   .response-meta {
     display: none;
   }
+  .message-actions .icon-button,
+  .composer-tools .icon-button,
+  .composer-tools .tool-pill,
+  .composer-tools .send-button,
+  .composer-tools .stop-button {
+    min-width: 44px;
+    width: 44px;
+    height: 44px;
+  }
+  .message-actions {
+    flex-wrap: wrap;
+    row-gap: 2px;
+  }
+  .branch-control {
+    height: 44px;
+    margin-left: 0;
+    padding-left: 0;
+    border-left: 0;
+  }
   .composer-wrap {
     padding-left: 8px;
     padding-right: 8px;
+  }
+  .prompt-queue {
+    left: 8px;
+    right: 8px;
+    bottom: 138px;
+  }
+  .prompt-queue > div small {
+    display: none;
+  }
+  .stop-button {
+    width: 32px;
+    padding: 0;
+    justify-content: center;
+    font-size: 0;
   }
   .upload-list {
     width: 100%;

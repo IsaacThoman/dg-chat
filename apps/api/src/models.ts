@@ -13,6 +13,15 @@ export const models: ModelInfo[] = [
     outputMicrosPerMillion: 300_000,
   },
   {
+    id: "simulated/slow",
+    displayName: "DG Chat Slow Stream",
+    provider: "simulated",
+    capabilities: ["chat", "streaming", "tools", "vision"],
+    contextWindow: 128000,
+    inputMicrosPerMillion: 100_000,
+    outputMicrosPerMillion: 300_000,
+  },
+  {
     id: "openai/default",
     displayName: "Configured OpenAI model",
     provider: "openai-compatible",

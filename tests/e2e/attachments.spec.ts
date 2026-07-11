@@ -33,49 +33,69 @@ test("uploads, retains attachments on edit branches, and removes unsent uploads"
     deleted = true;
     await route.fulfill({ status: 204, body: "" });
   });
-  await page.route("**/api/conversations/*/generate", async (route) => {
+  await page.route("**/api/conversations/*/generate/stream", async (route) => {
     generationCount += 1;
     generationBody = route.request().postDataJSON() as Record<string, unknown>;
-    const conversationId = new URL(route.request().url()).pathname.split("/").at(-2)!;
+    const conversationId = new URL(route.request().url()).pathname.split("/").at(-3)!;
     const now = "2026-07-10T00:00:00.000Z";
+    const generationId = `attachment-generation-${generationCount}`;
+    const user = {
+      id: `attachment-user-message-${generationCount}`,
+      parentId: generationBody.parentId ?? null,
+      supersedesId: generationBody.supersedesId ?? null,
+      siblingIndex: generationCount - 1,
+      role: "user",
+      content: generationBody.content,
+      model: generationBody.model,
+      metadata: {},
+      createdAt: now,
+      attachments: generationBody.attachmentIds ? [attachment] : [],
+    };
+    const assistant = {
+      id: `attachment-assistant-message-${generationCount}`,
+      parentId: user.id,
+      supersedesId: null,
+      siblingIndex: 0,
+      role: "assistant",
+      content: "Attachment request received",
+      model: generationBody.model,
+      metadata: {},
+      createdAt: now,
+    };
+    const conversation = {
+      id: conversationId,
+      title: "New chat",
+      activeLeafId: assistant.id,
+      version: Number(generationBody.expectedVersion ?? 0) + 2,
+      pinned: false,
+      archivedAt: null,
+      deletedAt: null,
+      updatedAt: now,
+    };
+    const events = [
+      {
+        type: "generation.started",
+        generationId,
+        sequence: 0,
+        user,
+        conversation: {
+          ...conversation,
+          activeLeafId: user.id,
+          version: conversation.version - 1,
+        },
+      },
+      {
+        type: "generation.completed",
+        generationId,
+        sequence: 1,
+        assistant,
+        conversation,
+      },
+    ];
     await route.fulfill({
       status: 200,
-      contentType: "application/json",
-      body: JSON.stringify({
-        user: {
-          id: `attachment-user-message-${generationCount}`,
-          parentId: generationBody.parentId ?? null,
-          supersedesId: generationBody.supersedesId ?? null,
-          siblingIndex: generationCount - 1,
-          role: "user",
-          content: generationBody.content,
-          model: generationBody.model,
-          metadata: {},
-          createdAt: now,
-          attachments: generationBody.attachmentIds ? [attachment] : [],
-        },
-        assistant: {
-          id: `attachment-assistant-message-${generationCount}`,
-          parentId: `attachment-user-message-${generationCount}`,
-          supersedesId: null,
-          siblingIndex: 0,
-          role: "assistant",
-          content: "Attachment request received",
-          model: generationBody.model,
-          metadata: {},
-          createdAt: now,
-        },
-        conversation: {
-          id: conversationId,
-          title: "New chat",
-          activeLeafId: `attachment-assistant-message-${generationCount}`,
-          version: Number(generationBody.expectedVersion ?? 0) + 1,
-          pinned: false,
-          archivedAt: null,
-          deletedAt: null,
-          updatedAt: now,
-        },
-      }),
+      contentType: "text/event-stream",
+      body: events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
     });
   });
 

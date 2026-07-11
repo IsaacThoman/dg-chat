@@ -34,6 +34,9 @@ export interface Message {
   createdAtIso?: string;
   model?: string;
   latency?: string;
+  reasoning?: string;
+  toolStatus?: string;
+  status?: "complete" | "stopped" | "error";
   branch?: Branch;
   attachments?: Attachment[];
   parentId?: string | null;

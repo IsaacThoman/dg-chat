@@ -59,6 +59,7 @@ import {
   ShieldCheck,
   SlidersHorizontal,
   Sparkles,
+  Square,
   Sun,
   Terminal,
   Trash2,
@@ -70,15 +71,19 @@ import {
 } from "lucide-react";
 import { api } from "./api.ts";
 import {
-  beginInFlight,
   conversationForFirstSend,
-  endInFlight,
   mergeAttachmentIds,
-  operationForMessage,
   refreshConversationGraph,
-  type SendOperation,
   tokenScopesFromSelection,
 } from "./chatWorkflow.ts";
+import {
+  chatStreamAdapter,
+  enqueuePrompt,
+  nextQueuedPrompt,
+  type QueuedPrompt,
+  removeQueuedPrompt,
+  retryQueuedPrompt,
+} from "./chatStreaming.ts";
 import {
   activeMessagePath,
   conversationTree,
@@ -703,13 +708,27 @@ function BranchControl(
 }
 
 function MessageItem(
-  { message, branch, onTree, onEdit, onSelectBranch, branchBusy, readOnly = false }: {
+  {
+    message,
+    branch,
+    onTree,
+    onEdit,
+    onSelectBranch,
+    onRegenerate,
+    onContinue,
+    branchBusy,
+    generationBusy,
+    readOnly = false,
+  }: {
     message: Message;
     branch: MessageBranch | null;
     onTree: () => void;
     onEdit: (m: Message) => void;
     onSelectBranch: (messageId: string) => void;
+    onRegenerate: (message: Message) => void;
+    onContinue: (message: Message) => void;
     branchBusy: boolean;
+    generationBusy: boolean;
     readOnly?: boolean;
   },
 ) {
@@ -761,7 +780,7 @@ function MessageItem(
                 branch={branch}
                 onTree={onTree}
                 onSelect={onSelectBranch}
-                busy={branchBusy}
+                busy={branchBusy || generationBusy}
                 readOnly={readOnly}
               />
             )}
@@ -778,7 +797,16 @@ function MessageItem(
             <Sparkles size={16} />
           </span>
           <strong>{message.model ?? "Assistant"}</strong>
+          {message.status === "stopped" && <span className="terminal-badge">Stopped</span>}
+          {message.status === "error" && <span className="terminal-badge error">Error</span>}
         </div>
+        {message.reasoning && (
+          <details className="reasoning-panel">
+            <summary>Reasoning</summary>
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.reasoning}</ReactMarkdown>
+          </details>
+        )}
+        {message.toolStatus && <p className="tool-status">{message.toolStatus}</p>}
         <div className="markdown">
           <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
             {message.content}
@@ -792,8 +820,21 @@ function MessageItem(
             <Volume2 size={15} />
           </IconButton>
           {!readOnly && (
-            <IconButton label="Regenerate response (not available yet)" disabled>
+            <IconButton
+              label="Regenerate response in a new branch"
+              disabled={generationBusy}
+              onClick={() => onRegenerate(message)}
+            >
               <RefreshCw size={15} />
+            </IconButton>
+          )}
+          {!readOnly && (
+            <IconButton
+              label="Continue response"
+              disabled={generationBusy}
+              onClick={() => onContinue(message)}
+            >
+              <ArrowRight size={15} />
             </IconButton>
           )}
           <IconButton label="More response actions (not available yet)" disabled>
@@ -804,7 +845,7 @@ function MessageItem(
               branch={branch}
               onTree={onTree}
               onSelect={onSelectBranch}
-              busy={branchBusy}
+              busy={branchBusy || generationBusy}
               readOnly={readOnly}
             />
           )}
@@ -854,11 +895,15 @@ function AttachmentIngestionBadge({ attachment }: { attachment: Attachment }) {
 }
 
 function Composer(
-  { onSend, edit, cancelEdit, disabled }: {
+  { onSend, edit, cancelEdit, disabled, streaming, stopping, queuedCount, onStop }: {
     onSend: (value: string, attachmentIds: string[]) => Promise<boolean>;
     edit?: Message;
     cancelEdit: () => void;
     disabled: boolean;
+    streaming: boolean;
+    stopping: boolean;
+    queuedCount: number;
+    onStop: () => void;
   },
 ) {
   const [value, setValue] = useState("");
@@ -1175,9 +1220,20 @@ function Composer(
           >
             <Mic size={19} />
           </IconButton>
+          {streaming && (
+            <button
+              type="button"
+              className="stop-button"
+              aria-label={stopping ? "Stopping generation" : "Stop generating"}
+              disabled={stopping}
+              onClick={onStop}
+            >
+              <Square size={14} fill="currentColor" /> {stopping ? "Stopping…" : "Stop"}
+            </button>
+          )}
           <button
             className="send-button"
-            aria-label="Send"
+            aria-label={streaming ? "Queue message" : "Send"}
             disabled={!value.trim() || disabled || blockedByUpload}
           >
             <ArrowDown size={19} />
@@ -1185,7 +1241,10 @@ function Composer(
         </div>
       </form>
       <p className="composer-note">
-        AI can make mistakes. Check important information. <span>Shift + Enter for new line</span>
+        AI can make mistakes. Check important information.{" "}
+        <span>
+          {queuedCount > 0 ? `${queuedCount} queued · ` : ""}Shift + Enter for new line
+        </span>
       </p>
     </div>
   );
@@ -1409,13 +1468,22 @@ function ChatView({
   readOnly?: boolean;
 }) {
   const queryClient = useQueryClient();
+  const chatScrollRef = useRef<HTMLDivElement>(null);
+  const followStreamRef = useRef(true);
   const [localMessages, setLocalMessages] = useState(messages);
   const [tree, setTree] = useState(false);
   const treeReturnFocusRef = useRef<HTMLElement | null>(null);
   const [edit, setEdit] = useState<Message>();
-  const [streaming, setStreaming] = useState(false);
-  const sendInFlightRef = useRef(false);
-  const pendingOperationRef = useRef<SendOperation | null>(null);
+  const [queue, setQueue] = useState<QueuedPrompt[]>([]);
+  const [activeStream, setActiveStream] = useState<{
+    item: QueuedPrompt;
+    user: Message;
+    assistant: Message;
+    phase: "connecting" | "streaming" | "stopping";
+  }>();
+  const [failedPrompt, setFailedPrompt] = useState<QueuedPrompt>();
+  const streamAbortRef = useRef<AbortController | null>(null);
+  const runPromptRef = useRef<(item: QueuedPrompt) => Promise<void>>(() => Promise.resolve());
   const [branchBusy, setBranchBusy] = useState(false);
   const [sendError, setSendError] = useState("");
   const [renaming, setRenaming] = useState(false);
@@ -1427,6 +1495,14 @@ function ChatView({
     () => activeMessagePath(localMessages, conversation?.activeLeafId),
     [localMessages, conversation?.activeLeafId],
   );
+  const streaming = Boolean(activeStream);
+  useEffect(() => {
+    if (!activeStream || !followStreamRef.current) return;
+    chatScrollRef.current?.scrollTo({
+      top: chatScrollRef.current.scrollHeight,
+      behavior: "smooth",
+    });
+  }, [activeStream?.assistant.content]);
   const selectBranch = async (messageId: string) => {
     if (!conversation || branchBusy || readOnly) return;
     const leafId = preferredLeaf(localMessages, messageId);
@@ -1447,61 +1523,244 @@ function ChatView({
       setBranchBusy(false);
     }
   };
-  const send = async (content: string, attachmentIds: string[]): Promise<boolean> => {
-    if (!beginInFlight(sendInFlightRef)) return false;
-    const fingerprint = JSON.stringify({
-      content,
-      attachmentIds,
-      model: selectedModel,
-      parentId: edit ? edit.parentId : conversation?.activeLeafId ?? null,
-      supersedesId: edit?.id ?? null,
+  runPromptRef.current = async (item: QueuedPrompt) => {
+    const controller = new AbortController();
+    streamAbortRef.current = controller;
+    const optimisticUser: Message = {
+      id: `pending-user-${item.id}`,
+      parentId: item.edit ? item.edit.parentId : conversation?.activeLeafId ?? null,
+      supersedesId: item.edit?.id ?? null,
+      role: "user",
+      content: item.content,
+      model: item.model,
+      createdAt: "Sending…",
+    };
+    const optimisticAssistant: Message = {
+      id: `pending-assistant-${item.id}`,
+      parentId: optimisticUser.id,
+      role: "assistant",
+      content: "",
+      model: item.model,
+      createdAt: "",
+    };
+    setActiveStream({
+      item,
+      user: optimisticUser,
+      assistant: optimisticAssistant,
+      phase: "connecting",
     });
-    const operation = operationForMessage(pendingOperationRef.current, fingerprint);
-    pendingOperationRef.current = operation;
-    const edited = edit;
-    setStreaming(true);
     setSendError("");
+    setFailedPrompt(undefined);
+    let acceptedUserId: string | undefined;
+    let terminalAssistant: Message | undefined;
+    let targetConversationId = conversation?.id ?? activeId;
     try {
       const resolved = await conversationForFirstSend(activeId, conversation, {
         load: api.conversation,
-        create: () => api.createConversation("New chat", operation.id),
+        create: () => api.createConversation("New chat", item.operationId),
       });
       const target = resolved.conversation;
+      targetConversationId = target.id;
       if (resolved.created) setConversation(target);
-      const result = await api.generate(
-        target,
-        content,
-        selectedModel,
-        edited,
-        operation.id,
-        attachmentIds,
-      );
-      setLocalMessages((current) => {
-        const next = [...current, result.user, result.assistant];
-        queryClient.setQueryData(["messages", result.conversation.id], next);
-        return next;
-      });
-      setConversation(result.conversation);
-      setEdit(undefined);
-      if (resolved.created) await onConversationCreated(result.conversation.id);
-      pendingOperationRef.current = null;
-      return true;
-    } catch {
-      if (activeId) {
-        const [refreshedMessages, refreshedConversation] = await Promise.all([
-          api.messages(activeId),
-          api.conversation(activeId),
-        ]);
-        queryClient.setQueryData(["messages", activeId], refreshedMessages);
-        setLocalMessages(refreshedMessages);
-        setConversation(refreshedConversation);
+      for await (
+        const event of chatStreamAdapter.stream({
+          conversation: target,
+          content: item.content,
+          model: item.model,
+          edit: item.edit,
+          sourceMessageId: item.sourceMessageId,
+          operationId: item.operationId,
+          attachmentIds: item.attachmentIds,
+          mode: item.mode,
+        }, controller.signal)
+      ) {
+        if (event.type === "accepted") {
+          acceptedUserId = event.user.id;
+          setActiveStream((current) =>
+            current && current.item.id === item.id
+              ? {
+                ...current,
+                user: event.user,
+                assistant: { ...event.assistant, content: "" },
+                phase: "streaming",
+              }
+              : current
+          );
+        } else if (event.type === "delta") {
+          setActiveStream((current) =>
+            current && current.item.id === item.id
+              ? {
+                ...current,
+                assistant: {
+                  ...current.assistant,
+                  content: current.assistant.content + event.text,
+                },
+                phase: "streaming",
+              }
+              : current
+          );
+        } else if (event.type === "reasoning") {
+          setActiveStream((current) =>
+            current && current.item.id === item.id
+              ? {
+                ...current,
+                assistant: {
+                  ...current.assistant,
+                  reasoning: (current.assistant.reasoning ?? "") + event.text,
+                },
+                phase: "streaming",
+              }
+              : current
+          );
+        } else if (event.type === "tool") {
+          setActiveStream((current) =>
+            current && current.item.id === item.id
+              ? {
+                ...current,
+                assistant: {
+                  ...current.assistant,
+                  toolStatus: event.name
+                    ? `Calling ${event.name}…`
+                    : `Receiving tool call ${event.index + 1}…`,
+                },
+                phase: "streaming",
+              }
+              : current
+          );
+        } else if (event.type === "usage") {
+          setActiveStream((current) =>
+            current && current.item.id === item.id
+              ? {
+                ...current,
+                assistant: {
+                  ...current.assistant,
+                  latency: `${event.outputTokens} output tokens`,
+                },
+              }
+              : current
+          );
+        } else {
+          terminalAssistant = event.assistant;
+          setLocalMessages((current) => {
+            const nextById = new Map(current.map((message) => [message.id, message]));
+            nextById.set(event.user.id, event.user);
+            nextById.set(event.assistant.id, event.assistant);
+            const next = [...nextById.values()];
+            queryClient.setQueryData(["messages", event.conversation.id], next);
+            return next;
+          });
+          setConversation(event.conversation);
+          setEdit(undefined);
+          if (resolved.created) await onConversationCreated(event.conversation.id);
+        }
       }
-      setSendError("The message could not be sent. Refresh the conversation and try again.");
-      return false;
+    } catch {
+      if (controller.signal.aborted) {
+        setSendError(
+          "Generation stopped. Your saved conversation and previous branches are intact.",
+        );
+      } else {
+        let retryPrompt = terminalAssistant
+          ? {
+            ...item,
+            edit: undefined,
+            sourceMessageId: terminalAssistant.id,
+            attachmentIds: [],
+            mode: "regenerate" as const,
+            reuseOperationOnRetry: false,
+          }
+          : acceptedUserId
+          ? undefined
+          : { ...item, reuseOperationOnRetry: true };
+        if (targetConversationId) {
+          try {
+            const refreshed = await api.conversationGraph(targetConversationId);
+            queryClient.setQueryData(["messages", targetConversationId], refreshed.messages);
+            setLocalMessages(refreshed.messages);
+            setConversation(refreshed.conversation);
+            const recovered = acceptedUserId
+              ? refreshed.messages.find((message) =>
+                message.id === refreshed.conversation.activeLeafId &&
+                message.role === "assistant" && message.parentId === acceptedUserId
+              )
+              : undefined;
+            if (recovered) {
+              retryPrompt = {
+                ...item,
+                edit: undefined,
+                sourceMessageId: recovered.id,
+                attachmentIds: [],
+                mode: "regenerate",
+                reuseOperationOnRetry: false,
+              };
+            }
+          } catch {
+            // Keep the local immutable path visible when recovery is temporarily unavailable.
+          }
+        }
+        setFailedPrompt(retryPrompt);
+        setSendError(
+          retryPrompt
+            ? "Generation was interrupted before it finished. Retry to create a new branch."
+            : "Generation was interrupted. Reload the conversation to recover its saved terminal branch.",
+        );
+        return;
+      }
+      if (targetConversationId) {
+        try {
+          const refreshed = await api.conversationGraph(targetConversationId);
+          queryClient.setQueryData(["messages", targetConversationId], refreshed.messages);
+          setLocalMessages(refreshed.messages);
+          setConversation(refreshed.conversation);
+        } catch {
+          // Keep the local immutable path visible when recovery is temporarily unavailable.
+        }
+      }
     } finally {
-      endInFlight(sendInFlightRef);
-      setStreaming(false);
+      if (streamAbortRef.current === controller) streamAbortRef.current = null;
+      setActiveStream((current) => current?.item.id === item.id ? undefined : current);
     }
+  };
+  useEffect(() => {
+    if (activeStream || queue.length === 0 || readOnly) return;
+    const { next, remaining } = nextQueuedPrompt(queue);
+    setQueue(remaining);
+    if (next) void runPromptRef.current(next);
+  }, [activeStream, queue, readOnly]);
+  useEffect(() => () => streamAbortRef.current?.abort(), []);
+
+  const send = (content: string, attachmentIds: string[]): Promise<boolean> => {
+    const item: QueuedPrompt = {
+      id: crypto.randomUUID(),
+      content,
+      model: selectedModel,
+      edit,
+      attachmentIds,
+      mode: "send",
+      operationId: crypto.randomUUID(),
+    };
+    setQueue((current) => enqueuePrompt(current, item));
+    setEdit(undefined);
+    return Promise.resolve(true);
+  };
+  const queueSpecialPrompt = (
+    content: string,
+    mode: "regenerate" | "continue",
+    sourceMessageId: string,
+  ) => {
+    const operationId = crypto.randomUUID();
+    setQueue((current) =>
+      enqueuePrompt(current, {
+        id: crypto.randomUUID(),
+        content,
+        model: selectedModel,
+        sourceMessageId,
+        attachmentIds: [],
+        mode,
+        operationId,
+      })
+    );
+    setSendError("");
   };
   return (
     <main className="chat-main">
@@ -1522,7 +1781,16 @@ function ChatView({
           </IconButton>
         </div>
       </header>
-      <div className="chat-scroll">
+      <div
+        className="chat-scroll"
+        ref={chatScrollRef}
+        onScroll={(event) => {
+          const element = event.currentTarget;
+          followStreamRef.current =
+            element.scrollHeight - element.scrollTop - element.clientHeight <
+              120;
+        }}
+      >
         <div className="chat-title">
           <h1>{conversation?.title ?? "New conversation"}</h1>
           <button onClick={() => setRenaming(true)} disabled={!conversation || readOnly}>
@@ -1540,18 +1808,82 @@ function ChatView({
             }}
             onEdit={setEdit}
             onSelectBranch={selectBranch}
+            onRegenerate={(assistant) => {
+              const source = localMessages.find((message) => message.id === assistant.parentId);
+              if (source?.role === "user") {
+                queueSpecialPrompt(source.content, "regenerate", assistant.id);
+              }
+            }}
+            onContinue={(assistant) =>
+              queueSpecialPrompt(
+                "Continue from where you left off without repeating the previous response.",
+                "continue",
+                assistant.id,
+              )}
             branchBusy={branchBusy}
+            generationBusy={streaming || queue.length > 0}
             readOnly={readOnly}
           />
         ))}
-        {streaming && (
-          <div className="typing">
-            <span />
-            <span />
-            <span />
+        {activeStream && (
+          <div className="streaming-turn" aria-busy="true">
+            <span className="sr-only" role="status" aria-live="polite">
+              {activeStream.phase === "stopping"
+                ? "Stopping generation"
+                : activeStream.phase === "connecting"
+                ? "Connecting to the model"
+                : "Assistant response is streaming"}
+            </span>
+            {activeStream.item.mode === "send" && (
+              <MessageItem
+                message={activeStream.user}
+                branch={null}
+                onTree={() => setTree(true)}
+                onEdit={() => undefined}
+                onSelectBranch={() => undefined}
+                onRegenerate={() => undefined}
+                onContinue={() => undefined}
+                branchBusy
+                generationBusy
+              />
+            )}
+            <MessageItem
+              message={activeStream.assistant}
+              branch={null}
+              onTree={() => setTree(true)}
+              onEdit={() => undefined}
+              onSelectBranch={() => undefined}
+              onRegenerate={() => undefined}
+              onContinue={() => undefined}
+              branchBusy
+              generationBusy
+            />
+            {!activeStream.assistant.content && (
+              <div className="typing" role="status" aria-label="Assistant is thinking">
+                <span />
+                <span />
+                <span />
+              </div>
+            )}
           </div>
         )}
-        {sendError && <p className="form-error">{sendError}</p>}
+        {sendError && (
+          <div className="stream-error" role="alert">
+            <span>{sendError}</span>
+            {failedPrompt && (
+              <button
+                type="button"
+                onClick={() => {
+                  setQueue((current) => enqueuePrompt(current, retryQueuedPrompt(failedPrompt)));
+                  setFailedPrompt(undefined);
+                  setSendError("");
+                }}
+              >
+                <RefreshCw size={14} /> Retry
+              </button>
+            )}
+          </div>
+        )}
       </div>
       {readOnly
         ? (
@@ -1560,12 +1892,62 @@ function ChatView({
           </div>
         )
         : (
-          <Composer
-            onSend={send}
-            edit={edit}
-            cancelEdit={() => setEdit(undefined)}
-            disabled={streaming}
-          />
+          <>
+            {queue.length > 0 && (
+              <div className="prompt-queue" aria-label="Queued messages" aria-live="polite">
+                <div>
+                  <strong>{queue.length} queued</strong>
+                  <small>Messages run in order on the latest saved branch.</small>
+                </div>
+                <ol>
+                  {queue.map((item, index) => (
+                    <li key={item.id}>
+                      <span>{index + 1}</span>
+                      <p>{item.content}</p>
+                      <IconButton
+                        label={`Cancel queued message ${index + 1}`}
+                        onClick={() =>
+                          setQueue((current) => removeQueuedPrompt(current, item.id))}
+                      >
+                        <X size={15} />
+                      </IconButton>
+                    </li>
+                  ))}
+                </ol>
+              </div>
+            )}
+            <Composer
+              onSend={send}
+              edit={edit}
+              cancelEdit={() => setEdit(undefined)}
+              disabled={false}
+              streaming={streaming}
+              stopping={activeStream?.phase === "stopping"}
+              queuedCount={queue.length}
+              onStop={() => {
+                if (activeStream?.phase === "stopping") return;
+                setActiveStream((current) => current ? { ...current, phase: "stopping" } : current);
+                const stop = activeStream && !activeStream.user.id.startsWith("pending-user-")
+                  ? chatStreamAdapter.stop?.({
+                    conversationId: conversation?.id ?? activeId,
+                    userMessageId: activeStream.user.id,
+                    operationId: activeStream.item.operationId,
+                  })
+                  : undefined;
+                if (stop) {
+                  void stop.catch(() =>
+                    streamAbortRef.current?.abort(
+                      new DOMException("Stopped by user", "AbortError"),
+                    )
+                  );
+                } else {
+                  streamAbortRef.current?.abort(
+                    new DOMException("Stopped by user", "AbortError"),
+                  );
+                }
+              }}
+            />
+          </>
         )}
       {tree && (
         <TreePanel
@@ -1573,7 +1955,7 @@ function ChatView({
           activeLeafId={conversation?.activeLeafId}
           close={() => setTree(false)}
           onSelect={selectBranch}
-          busy={branchBusy}
+          busy={branchBusy || streaming || queue.length > 0}
           readOnly={readOnly}
           returnFocus={treeReturnFocusRef.current}
         />
