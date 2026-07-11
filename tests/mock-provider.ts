@@ -480,6 +480,42 @@ Deno.serve({ port }, async (request) => {
       })),
     });
   }
+  if (url.pathname === "/v1/images/edits" && request.method === "POST") {
+    if (!authorized(request, apiKey)) {
+      return error("Invalid mock provider key", 401, "unauthorized");
+    }
+    const form = await request.formData();
+    const model = String(form.get("model") ?? "");
+    const prompt = String(form.get("prompt") ?? "");
+    const inputs = [...form.getAll("image"), ...form.getAll("image[]")];
+    const mixedImageFields = form.has("image") && form.has("image[]");
+    if (
+      !model || !prompt || !inputs.length || mixedImageFields ||
+      (inputs.length > 1 && !form.has("image[]")) ||
+      inputs.some((input) => !(input instanceof File))
+    ) {
+      return error("Invalid image edit multipart", 400, "invalid_request");
+    }
+    images.calls++;
+    images.lastAuthorized = true;
+    images.lastModel = model;
+    images.lastPrompt = prompt;
+    images.lastResponseFormat = String(form.get("response_format") ?? "");
+    if (form.get("stream") === "true") {
+      const completed = {
+        type: "image_edit.completed",
+        b64_json: imagePngBase64,
+        created_at: 1_700_000_002,
+      };
+      return new Response(`event: ${completed.type}\ndata: ${JSON.stringify(completed)}\n\n`, {
+        headers: { "content-type": "text/event-stream" },
+      });
+    }
+    return json({
+      created: 1_700_000_002,
+      data: [{ b64_json: imagePngBase64, revised_prompt: prompt }],
+    });
+  }
   if (url.pathname.startsWith("/v1/audio/") && request.method === "POST") {
     if (!authorized(request, apiKey)) {
       return error("Invalid mock provider key", 401, "unauthorized");

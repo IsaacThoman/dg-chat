@@ -2,6 +2,7 @@ export * from "./types.ts";
 export * from "./imageApi.ts";
 export * from "./imageGenerationState.ts";
 export * from "./imageHistory.ts";
+export * from "./imageEditState.ts";
 export * from "./useImageGeneration.ts";
 export * from "./ImageCard.tsx";
 export * from "./ImageLightbox.tsx";

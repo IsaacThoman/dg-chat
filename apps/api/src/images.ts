@@ -65,6 +65,26 @@ export interface ImageProviderResponse {
   /** Winning provider target. Added by the execution engine, never trusted from upstream. */
   executionTarget?: ImageExecutionTarget | Promise<ImageExecutionTarget>;
 }
+export interface ImageEditInput {
+  bytes: Uint8Array;
+  filename: string;
+  mimeType: "image/png" | "image/jpeg" | "image/webp";
+  sha256: string;
+  image: ImageOutput;
+}
+export interface ImageEditRequest extends ImageGenerationRequest {
+  images: ImageEditInput[];
+  mask?: ImageEditInput;
+  inputFidelity?: "high" | "low";
+}
+export interface ImageEditFileReference {
+  fileId: string;
+}
+export interface ParsedImageEditJson {
+  request: ImageGenerationRequest & { inputFidelity?: "high" | "low" };
+  images: ImageEditFileReference[];
+  mask?: ImageEditFileReference;
+}
 export interface ImageExecutionTarget {
   providerModelId: string;
   publicModelId: string;
@@ -220,6 +240,84 @@ export function parseImageGenerationRequest(value: unknown): ImageGenerationRequ
     stream,
     style: choice(body.style, "style", ["vivid", "natural"], "vivid"),
     ...(body.user === undefined ? {} : { user: text(body.user, "user", 256) }),
+  };
+}
+
+/** Parse the current OpenAI JSON edit shape; owned file IDs are resolved by the authenticated route. */
+export function parseImageEditJson(value: unknown): ParsedImageEditJson {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ImageProviderError(
+      "Image edit request must be a JSON object",
+      422,
+      "validation_error",
+    );
+  }
+  const body = { ...(value as Record<string, unknown>) };
+  const rawImages = body.images;
+  const rawMask = body.mask;
+  const inputFidelity = body.input_fidelity;
+  delete body.images;
+  delete body.mask;
+  delete body.input_fidelity;
+  if (body.model === undefined) {
+    throw new ImageProviderError(
+      "model is required because this installation has no global image-edit default",
+      422,
+      "model_required",
+    );
+  }
+  if (!Array.isArray(rawImages) || rawImages.length < 1 || rawImages.length > 16) {
+    throw new ImageProviderError(
+      "images must contain between 1 and 16 references",
+      422,
+      "validation_error",
+    );
+  }
+  const reference = (raw: unknown, name: string): ImageEditFileReference => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new ImageProviderError(`${name} is invalid`, 422, "validation_error");
+    }
+    const item = raw as Record<string, unknown>;
+    if (typeof item.image_url === "string") {
+      throw new ImageProviderError(
+        "Remote image_url edit inputs are not supported; upload the image and use file_id",
+        422,
+        "remote_image_url_unsupported",
+      );
+    }
+    if (
+      Object.keys(item).length !== 1 || typeof item.file_id !== "string" ||
+      item.file_id.length < 1 || item.file_id.length > 200 ||
+      [...item.file_id].some((character) => character.charCodeAt(0) < 33)
+    ) throw new ImageProviderError(`${name}.file_id is invalid`, 422, "validation_error");
+    return { fileId: item.file_id };
+  };
+  const images = rawImages.map((item, index) => reference(item, `images[${index}]`));
+  if (new Set(images.map((item) => item.fileId)).size !== images.length) {
+    throw new ImageProviderError("Each source image must be distinct", 422, "duplicate_image");
+  }
+  const mask = rawMask === undefined ? undefined : reference(rawMask, "mask");
+  if (mask && images.some((item) => item.fileId === mask.fileId)) {
+    throw new ImageProviderError(
+      "The mask must be distinct from every source image",
+      422,
+      "duplicate_image",
+    );
+  }
+  return {
+    request: {
+      ...parseImageGenerationRequest(body),
+      ...(inputFidelity === undefined ? {} : {
+        inputFidelity: choice(
+          inputFidelity,
+          "input_fidelity",
+          ["high", "low"] as const,
+          "low",
+        ),
+      }),
+    },
+    images,
+    ...(mask ? { mask } : {}),
   };
 }
 
@@ -399,6 +497,15 @@ export function decodeImage(value: unknown): ImageOutput {
   return { b64Json: value, bytes, ...dimensions(bytes) };
 }
 
+export function imageHasAlpha(image: Pick<ImageOutput, "bytes" | "format">): boolean {
+  if (image.format === "png") return image.bytes[25] === 4 || image.bytes[25] === 6;
+  if (image.format === "webp") {
+    return new TextDecoder().decode(image.bytes.subarray(12, 16)) === "VP8X" &&
+      (image.bytes[20] & 0x10) !== 0;
+  }
+  return false;
+}
+
 export function assertImageAggregateBytes(
   outputs: readonly Pick<ImageOutput, "bytes">[],
 ): void {
@@ -442,7 +549,7 @@ function usage(value: unknown, request: ImageGenerationRequest): ImageProviderUs
   };
 }
 
-function endpoint(baseUrl: string): URL {
+function endpoint(baseUrl: string, operation: "generations" | "edits" = "generations"): URL {
   const url = new URL(baseUrl);
   const test = Deno.env.get("DENO_ENV") === "test" &&
     Deno.env.get("OPENAI_TEST_ALLOW_HTTP_HOST")?.toLowerCase() === url.hostname.toLowerCase();
@@ -450,7 +557,7 @@ function endpoint(baseUrl: string): URL {
     throw new ImageProviderError("Provider base URL is invalid", 500, "provider_config_error");
   }
   if (test) url.protocol = "http:";
-  url.pathname = `${url.pathname.replace(/\/$/, "")}/images/generations`;
+  url.pathname = `${url.pathname.replace(/\/$/, "")}/images/${operation}`;
   return url;
 }
 function retryAfter(response: Response): number | undefined {
@@ -496,6 +603,7 @@ function imageSse(
   body: ReadableStream<Uint8Array>,
   request: ImageGenerationRequest,
   signal: AbortSignal,
+  eventPrefix = "image_generation",
 ) {
   let resolveUsage!: (value: ImageProviderUsage) => void;
   let rejectUsage!: (reason: unknown) => void;
@@ -558,7 +666,7 @@ function imageSse(
       if (eventNames.length > 1 || (eventNames[0] && eventNames[0] !== item.type)) {
         throw new ImageProviderError("Image provider SSE event name does not match its type");
       }
-      if (item.type === "image_generation.partial_image") {
+      if (item.type === `${eventPrefix}.partial_image`) {
         if (
           terminal || !Number.isSafeInteger(item.partial_image_index) ||
           item.partial_image_index !== expectedPartial++ || expectedPartial > request.partialImages
@@ -581,7 +689,7 @@ function imageSse(
           ),
         };
       }
-      if (item.type === "image_generation.completed") {
+      if (item.type === `${eventPrefix}.completed`) {
         if (terminal) {
           throw new ImageProviderError("Image provider returned duplicate terminal image event");
         }
@@ -686,7 +794,9 @@ export function imageTerminalOutput(frame: Uint8Array): {
     const raw = new TextDecoder("utf-8", { fatal: true }).decode(frame);
     const line = raw.split(/\r?\n/).find((part) => part.startsWith("data:"));
     const item = JSON.parse(line!.slice(5)) as Record<string, unknown>;
-    if (item.type !== "image_generation.completed") throw new Error("not terminal");
+    if (!["image_generation.completed", "image_edit.completed"].includes(String(item.type))) {
+      throw new Error("not terminal");
+    }
     return {
       created: safeTimestamp(item.created_at),
       output: decodeImage(item.b64_json),
@@ -774,6 +884,127 @@ export async function createImageGeneration(
     const item = entry as Record<string, unknown>;
     if (item.url !== undefined) {
       throw new ImageProviderError("Image provider returned an unsafe URL instead of image data");
+    }
+    const decoded = assertRequestedFormat(decodeImage(item.b64_json), request);
+    if (item.revised_prompt !== undefined) {
+      decoded.revisedPrompt = text(item.revised_prompt, "revised_prompt", 32_000);
+    }
+    return decoded;
+  });
+  assertImageAggregateBytes(data);
+  return { created, data, usage: usage(value.usage, request) };
+}
+
+/** OpenAI-compatible image edit dispatch. Inputs are already sniffed and structurally validated. */
+export async function createImageEdit(
+  request: ImageEditRequest,
+  options: {
+    baseUrl: string;
+    apiKey: string;
+    upstreamModel: string;
+    signal: AbortSignal;
+    fetch?: typeof fetch;
+  },
+): Promise<ImageProviderResponse> {
+  options.signal.throwIfAborted();
+  const form = new FormData();
+  const upstreamImageField = request.images.length === 1 ? "image" : "image[]";
+  for (const input of request.images) {
+    form.append(
+      upstreamImageField,
+      new Blob([input.bytes.slice().buffer], { type: input.mimeType }),
+      input.filename,
+    );
+  }
+  if (request.mask) {
+    form.append(
+      "mask",
+      new Blob([request.mask.bytes.slice().buffer], { type: request.mask.mimeType }),
+      request.mask.filename,
+    );
+  }
+  const fields: Record<string, string | number | boolean> = {
+    model: options.upstreamModel,
+    prompt: request.prompt,
+    n: request.n,
+    background: request.background,
+    output_compression: request.outputCompression,
+    output_format: request.outputFormat,
+    partial_images: request.partialImages,
+    quality: request.quality,
+    response_format: "b64_json",
+    size: request.size,
+    stream: request.stream,
+    ...(request.inputFidelity ? { input_fidelity: request.inputFidelity } : {}),
+    ...(request.user ? { user: request.user } : {}),
+  };
+  for (const [name, value] of Object.entries(fields)) form.append(name, String(value));
+  // The pinned production transport intentionally accepts only materialized bytes so it can
+  // send the exact validated body through its DNS-pinned TLS connection. Let the platform's
+  // standards-compliant FormData encoder choose the boundary, then preserve that content type
+  // while materializing the already-bounded edit inputs.
+  const encodedForm = new Response(form);
+  const multipartContentType = encodedForm.headers.get("content-type");
+  if (!multipartContentType?.toLowerCase().startsWith("multipart/form-data; boundary=")) {
+    throw new ImageProviderError("Could not encode image edit multipart request");
+  }
+  const multipartBody = new Uint8Array(await encodedForm.arrayBuffer());
+  const url = endpoint(options.baseUrl, "edits");
+  const test = Deno.env.get("DENO_ENV") === "test" && url.protocol === "http:";
+  const response = await (options.fetch ?? (test ? fetch : pinnedProviderFetch))(
+    url,
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${options.apiKey}`,
+        accept: request.stream ? "text/event-stream" : "application/json",
+        "content-type": multipartContentType,
+      },
+      redirect: "error",
+      signal: options.signal,
+      body: multipartBody,
+    },
+  );
+  if (!response.ok) {
+    await response.body?.cancel();
+    throw new ImageProviderError(
+      "Image edit provider request failed",
+      response.status >= 500 || response.status === 429 ? 502 : 400,
+      "provider_error",
+      response.status,
+      retryAfter(response),
+    );
+  }
+  const contentType = response.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
+  if (request.stream) {
+    if (contentType !== "text/event-stream" || !response.body) {
+      await response.body?.cancel();
+      throw new ImageProviderError("Image edit provider did not return an SSE stream");
+    }
+    return { created: 0, ...imageSse(response.body, request, options.signal, "image_edit") };
+  }
+  if (contentType !== "application/json") {
+    await response.body?.cancel();
+    throw new ImageProviderError("Image edit provider returned an unexpected content type");
+  }
+  const raw = await boundedJson(response);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new ImageProviderError("Image edit provider returned malformed response");
+  }
+  const value = raw as Record<string, unknown>;
+  const created = safeTimestamp(value.created);
+  if (!Array.isArray(value.data) || value.data.length !== request.n) {
+    throw new ImageProviderError("Image edit provider returned an unexpected image count");
+  }
+  const data = value.data.map((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new ImageProviderError("Image edit provider returned malformed image data");
+    }
+    const item = entry as Record<string, unknown>;
+    if (item.url !== undefined) {
+      throw new ImageProviderError(
+        "Image edit provider returned an unsafe URL instead of image data",
+      );
     }
     const decoded = assertRequestedFormat(decodeImage(item.b64_json), request);
     if (item.revised_prompt !== undefined) {

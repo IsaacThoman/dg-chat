@@ -74,9 +74,42 @@ if (!imageBase64 || replayedImage.data?.[0]?.b64_json !== imageBase64) {
   throw new Error("JavaScript images.generate() or its exact replay was invalid");
 }
 const imageBytes = Uint8Array.from(atob(imageBase64), (character) => character.charCodeAt(0));
+const alternateImageBytes = Uint8Array.from(
+  atob(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+  ),
+  (character) => character.charCodeAt(0),
+);
 if (new TextDecoder().decode(imageBytes.subarray(1, 4)) !== "PNG") {
   throw new Error("JavaScript images.generate() did not return a valid PNG signature");
 }
+const editedImage = await client.images.edit({
+  model: imageModel,
+  prompt: "JavaScript image edit contract",
+  image: [
+    await toFile(imageBytes, "edit-source-one.png", { type: "image/png" }),
+    await toFile(alternateImageBytes, "edit-source-two.png", { type: "image/png" }),
+  ],
+  response_format: "b64_json",
+});
+if (editedImage.data?.[0]?.b64_json !== imageBase64) {
+  throw new Error("JavaScript images.edit() did not return a valid edited image");
+}
+const editStream = await client.images.edit({
+  model: imageModel,
+  prompt: "JavaScript streaming image edit contract",
+  image: await toFile(imageBytes, "edit-stream-source.png", { type: "image/png" }),
+  stream: true,
+  partial_images: 0,
+  response_format: "b64_json",
+});
+let completedEdit = false;
+for await (const event of editStream) {
+  if (event.type === "image_edit.completed" && event.b64_json === imageBase64) {
+    completedEdit = true;
+  }
+}
+if (!completedEdit) throw new Error("JavaScript images.edit() stream was invalid");
 const imageStreamKey = `javascript-image-stream-${crypto.randomUUID()}`;
 const streamImage = () =>
   fetch(`${baseURL}/images/generations`, {

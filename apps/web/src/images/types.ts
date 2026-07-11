@@ -31,6 +31,8 @@ export interface ImageGenerationInput {
 
 export interface ImageEditInput extends ImageGenerationInput {
   sourceAssetId: string;
+  sourceAttachmentId: string;
+  maskAttachmentId?: string;
 }
 
 export interface GeneratedAssetPage {

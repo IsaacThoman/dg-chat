@@ -292,6 +292,11 @@ function generatedAsset(row: Row): GeneratedAssetRecord {
       attachmentId: String(value.attachmentId ?? value.attachment_id),
       role: String(value.role) as GeneratedAssetRecord["inputs"][number]["role"],
       ordinal: number(value.ordinal),
+      width: number(value.width),
+      height: number(value.height),
+      hasAlpha: value.hasAlpha == null && value.has_alpha == null
+        ? null
+        : Boolean(value.hasAlpha ?? value.has_alpha),
     })),
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at),
@@ -304,11 +309,13 @@ function generatedObjectStage(row: Row): GeneratedObjectStage {
     ownerId: String(row.owner_id),
     usageRunId: String(row.usage_run_id),
     ordinal: number(row.ordinal),
+    purpose: String(row.purpose ?? "output") as GeneratedObjectStage["purpose"],
     objectKey: String(row.object_key),
     mimeType: String(row.mime_type),
     sizeBytes: number(row.size_bytes),
     sha256: String(row.sha256),
     attachmentId: row.attachment_id == null ? null : String(row.attachment_id),
+    cleanupAttachment: row.cleanup_attachment == null ? true : Boolean(row.cleanup_attachment),
     state: String(row.state) as GeneratedObjectStage["state"],
     cleanupError: row.cleanup_error == null ? null : String(row.cleanup_error),
     createdAt: iso(row.created_at),
@@ -698,7 +705,8 @@ function validateGeneratedObjectStageInput(input: StageGeneratedObjectInput) {
   if (
     !/^[0-9a-f-]{36}$/i.test(input.ownerId) || !input.usageRunId ||
     input.usageRunId.length > 200 || !Number.isSafeInteger(input.ordinal) || input.ordinal < 0 ||
-    input.ordinal > 9 || !input.objectKey || input.objectKey.length > 1024 ||
+    input.ordinal > 16 || !input.objectKey || input.objectKey.length > 1024 ||
+    (input.purpose !== undefined && !["output", "edit_input"].includes(input.purpose)) ||
     input.objectKey.startsWith("/") ||
     input.objectKey.split("/").some((part) => !part || part === "..") ||
     !/^[\w.+-]+\/[\w.+-]+$/.test(input.mimeType) || input.mimeType.length > 255 ||
@@ -2041,7 +2049,8 @@ export class PostgresRepository implements DomainRepository {
       await tx`SELECT pg_advisory_xact_lock(hashtextextended(${`${input.ownerId}:${input.idempotencyKey}`},0))`;
       const priorRows = await tx<Row[]>`
         SELECT ga.*,COALESCE((SELECT jsonb_agg(jsonb_build_object(
-          'attachmentId',gai.attachment_id,'role',gai.role,'ordinal',gai.ordinal)
+          'attachmentId',gai.attachment_id,'role',gai.role,'ordinal',gai.ordinal,
+          'width',gai.width,'height',gai.height,'hasAlpha',gai.has_alpha)
           ORDER BY gai.role,gai.ordinal,gai.attachment_id)
           FROM generated_asset_inputs gai WHERE gai.generated_asset_id=ga.id),'[]'::jsonb) AS inputs
         FROM generated_assets ga
@@ -2106,8 +2115,8 @@ export class PostgresRepository implements DomainRepository {
           ...(asset.inputs ?? []).map((source) => source.attachmentId),
         ])),
       ];
-      const ready = await tx<{ id: string }[]>`
-        SELECT id FROM attachments WHERE owner_id=${input.ownerId} AND id=ANY(${attachmentIds})
+      const ready = await tx<{ id: string; mime_type: string }[]>`
+        SELECT id,mime_type FROM attachments WHERE owner_id=${input.ownerId} AND id=ANY(${attachmentIds})
           AND state='ready' AND deleted_at IS NULL FOR UPDATE`;
       if (ready.length !== attachmentIds.length) {
         throw new DomainError(
@@ -2116,10 +2125,27 @@ export class PostgresRepository implements DomainRepository {
           409,
         );
       }
+      const mimeById = new Map(ready.map((attachment) => [
+        String(attachment.id),
+        String(attachment.mime_type).toLowerCase(),
+      ]));
+      for (const asset of input.assets) {
+        for (const source of asset.inputs ?? []) {
+          const mime = mimeById.get(source.attachmentId) ?? "";
+          if (!mime.startsWith("image/") || (source.role === "mask" && mime !== "image/png")) {
+            throw new DomainError(
+              "attachment_not_ready",
+              "Generated asset input is not a supported image",
+              409,
+            );
+          }
+        }
+      }
       const stages = await tx<Row[]>`SELECT * FROM generated_object_staging
-        WHERE usage_run_id=${input.usageRunId} ORDER BY ordinal FOR UPDATE`;
+        WHERE usage_run_id=${input.usageRunId} AND purpose='output'
+        ORDER BY ordinal FOR UPDATE`;
       if (
-        stages.length > 0 &&
+        (input.operation === "edit" || stages.length > 0) &&
         (stages.length !== input.assets.length ||
           stages.some((stage, index) =>
             number(stage.ordinal) !== index || String(stage.state) !== "attached" ||
@@ -2129,6 +2155,26 @@ export class PostgresRepository implements DomainRepository {
         throw new DomainError(
           "generated_stage_conflict",
           "Generated object stages are not ready",
+          409,
+        );
+      }
+      const editStages = await tx<Row[]>`SELECT * FROM generated_object_staging
+        WHERE usage_run_id=${input.usageRunId} AND purpose='edit_input'
+        ORDER BY ordinal FOR UPDATE`;
+      const editInputIds = new Set(
+        input.assets[0]?.inputs?.map((source) => source.attachmentId) ?? [],
+      );
+      if (
+        editStages.length > 0 &&
+        (editStages.length !== editInputIds.size ||
+          editStages.some((stage) =>
+            String(stage.state) !== "attached" || !stage.attachment_id ||
+            !editInputIds.has(String(stage.attachment_id))
+          ))
+      ) {
+        throw new DomainError(
+          "generated_stage_conflict",
+          "Edit input stages do not match immutable lineage",
           409,
         );
       }
@@ -2154,17 +2200,33 @@ export class PostgresRepository implements DomainRepository {
             ${candidate.revisedPrompt ?? null}) RETURNING id`;
         const assetId = String(inserted[0].id);
         for (const source of candidate.inputs ?? []) {
-          await tx`INSERT INTO generated_asset_inputs(generated_asset_id,owner_id,attachment_id,role,ordinal)
-            VALUES(${assetId},${input.ownerId},${source.attachmentId},${source.role},${source.ordinal})`;
+          await tx`INSERT INTO generated_asset_inputs(generated_asset_id,owner_id,attachment_id,role,
+            ordinal,width,height,has_alpha) VALUES(${assetId},${input.ownerId},
+            ${source.attachmentId},${source.role},${source.ordinal},${source.width},${source.height},
+            ${source.hasAlpha ?? null})`;
         }
       }
       if (stages.length) {
-        await tx`UPDATE generated_object_staging SET state='finalized',cleanup_error=NULL,
+        await tx`UPDATE generated_object_staging SET
+          state=CASE WHEN cleanup_attachment THEN 'finalized' ELSE 'cleanup_pending' END,
+          cleanup_error=CASE WHEN cleanup_attachment THEN NULL ELSE 'deduplicated object cleanup' END,
           updated_at=now() WHERE usage_run_id=${input.usageRunId}`;
+        const cleanupStages = await tx<{ id: string }[]>`SELECT id FROM generated_object_staging
+          WHERE usage_run_id=${input.usageRunId} AND NOT cleanup_attachment FOR UPDATE`;
+        for (const stage of cleanupStages) {
+          await tx`INSERT INTO jobs(type,payload,idempotency_key,status,attempts,available_at)
+            VALUES('generated_object.cleanup',${
+            tx.json({ stageId: String(stage.id), ownerId: input.ownerId })
+          },${`generated_object.cleanup:${String(stage.id)}`},'queued',0,now())
+            ON CONFLICT(idempotency_key) DO UPDATE SET status='queued',attempts=0,
+              available_at=now(),last_error=NULL,locked_at=NULL,locked_by=NULL,completed_at=NULL
+              WHERE jobs.status IN ('completed','failed')`;
+        }
       }
       const rows = await tx<Row[]>`
         SELECT ga.*,COALESCE((SELECT jsonb_agg(jsonb_build_object(
-          'attachmentId',gai.attachment_id,'role',gai.role,'ordinal',gai.ordinal)
+          'attachmentId',gai.attachment_id,'role',gai.role,'ordinal',gai.ordinal,
+          'width',gai.width,'height',gai.height,'hasAlpha',gai.has_alpha)
           ORDER BY gai.role,gai.ordinal,gai.attachment_id)
           FROM generated_asset_inputs gai WHERE gai.generated_asset_id=ga.id),'[]'::jsonb) AS inputs
         FROM generated_assets ga WHERE ga.owner_id=${input.ownerId}
@@ -2176,7 +2238,8 @@ export class PostgresRepository implements DomainRepository {
   async listGeneratedAssets(ownerId: string, includeDeleted = false) {
     const rows = await this.#sql<Row[]>`
       SELECT ga.*,COALESCE((SELECT jsonb_agg(jsonb_build_object(
-        'attachmentId',gai.attachment_id,'role',gai.role,'ordinal',gai.ordinal)
+        'attachmentId',gai.attachment_id,'role',gai.role,'ordinal',gai.ordinal,
+        'width',gai.width,'height',gai.height,'hasAlpha',gai.has_alpha)
         ORDER BY gai.role,gai.ordinal,gai.attachment_id)
         FROM generated_asset_inputs gai WHERE gai.generated_asset_id=ga.id),'[]'::jsonb) AS inputs
       FROM generated_assets ga WHERE ga.owner_id=${ownerId}
@@ -2185,10 +2248,33 @@ export class PostgresRepository implements DomainRepository {
     return rows.map(generatedAsset);
   }
 
+  async findGeneratedAssetByAttachment(
+    ownerId: string,
+    attachmentId: string,
+    before?: string,
+    excludeId?: string,
+  ) {
+    const rows = await this.#sql<Row[]>`
+      SELECT ga.*,COALESCE((SELECT jsonb_agg(jsonb_build_object(
+        'attachmentId',gai.attachment_id,'role',gai.role,'ordinal',gai.ordinal,
+        'width',gai.width,'height',gai.height,'hasAlpha',gai.has_alpha)
+        ORDER BY gai.role,gai.ordinal,gai.attachment_id)
+        FROM generated_asset_inputs gai WHERE gai.generated_asset_id=ga.id),'[]'::jsonb) AS inputs
+      FROM generated_assets ga
+      WHERE ga.owner_id=${ownerId} AND ga.attachment_id=${attachmentId}
+        AND (${before ?? null}::timestamptz IS NULL OR ga.created_at <= ${
+      before ?? null
+    }::timestamptz)
+        AND (${excludeId ?? null}::uuid IS NULL OR ga.id <> ${excludeId ?? null}::uuid)
+      ORDER BY ga.created_at DESC,ga.id DESC LIMIT 1`;
+    return rows[0] ? generatedAsset(rows[0]) : undefined;
+  }
+
   async findGeneratedAssetsByIdempotency(ownerId: string, idempotencyKey: string) {
     const rows = await this.#sql<Row[]>`
       SELECT ga.*,COALESCE((SELECT jsonb_agg(jsonb_build_object(
-        'attachmentId',gai.attachment_id,'role',gai.role,'ordinal',gai.ordinal)
+        'attachmentId',gai.attachment_id,'role',gai.role,'ordinal',gai.ordinal,
+        'width',gai.width,'height',gai.height,'hasAlpha',gai.has_alpha)
         ORDER BY gai.role,gai.ordinal,gai.attachment_id)
         FROM generated_asset_inputs gai WHERE gai.generated_asset_id=ga.id),'[]'::jsonb) AS inputs
       FROM generated_assets ga WHERE ga.owner_id=${ownerId}
@@ -2199,7 +2285,8 @@ export class PostgresRepository implements DomainRepository {
   async getGeneratedAsset(id: string, ownerId: string, includeDeleted = false) {
     const rows = await this.#sql<Row[]>`
       SELECT ga.*,COALESCE((SELECT jsonb_agg(jsonb_build_object(
-        'attachmentId',gai.attachment_id,'role',gai.role,'ordinal',gai.ordinal)
+        'attachmentId',gai.attachment_id,'role',gai.role,'ordinal',gai.ordinal,
+        'width',gai.width,'height',gai.height,'hasAlpha',gai.has_alpha)
         ORDER BY gai.role,gai.ordinal,gai.attachment_id)
         FROM generated_asset_inputs gai WHERE gai.generated_asset_id=ga.id),'[]'::jsonb) AS inputs
       FROM generated_assets ga WHERE ga.id=${id} AND ga.owner_id=${ownerId}
@@ -2231,15 +2318,19 @@ export class PostgresRepository implements DomainRepository {
         AND user_id=${input.ownerId} FOR UPDATE`;
       if (!run.length) throw new DomainError("not_found", "Usage run not found", 404);
       const inserted = await tx<Row[]>`INSERT INTO generated_object_staging(
-        owner_id,usage_run_id,ordinal,object_key,mime_type,size_bytes,sha256)
-        VALUES(${input.ownerId},${input.usageRunId},${input.ordinal},${input.objectKey},
+        owner_id,usage_run_id,purpose,ordinal,object_key,mime_type,size_bytes,sha256)
+        VALUES(${input.ownerId},${input.usageRunId},${
+        input.purpose ?? "output"
+      },${input.ordinal},${input.objectKey},
           ${input.mimeType},${input.sizeBytes},${input.sha256})
         ON CONFLICT DO NOTHING RETURNING *`;
       const row = inserted[0] ?? (await tx<Row[]>`SELECT * FROM generated_object_staging
-        WHERE usage_run_id=${input.usageRunId} AND ordinal=${input.ordinal} FOR UPDATE`)[0];
+        WHERE usage_run_id=${input.usageRunId} AND purpose=${input.purpose ?? "output"}
+          AND ordinal=${input.ordinal} FOR UPDATE`)[0];
       if (!row) throw new DomainError("object_key_taken", "Generated object key exists", 409);
       if (
         String(row.owner_id) !== input.ownerId || String(row.object_key) !== input.objectKey ||
+        String(row.purpose) !== (input.purpose ?? "output") ||
         String(row.mime_type) !== input.mimeType || number(row.size_bytes) !== input.sizeBytes ||
         String(row.sha256) !== input.sha256
       ) throw new DomainError("idempotency_conflict", "Generated object stage differs", 409);
@@ -2258,11 +2349,18 @@ export class PostgresRepository implements DomainRepository {
     throw new DomainError("generated_stage_conflict", "Generated object stage changed", 409);
   }
 
-  async attachGeneratedObject(id: string, ownerId: string, attachmentId: string) {
+  async attachGeneratedObject(
+    id: string,
+    ownerId: string,
+    attachmentId: string,
+    cleanupAttachment = true,
+  ) {
     const rows = await this.#sql<Row[]>`UPDATE generated_object_staging s SET state='attached',
-      attachment_id=${attachmentId},updated_at=now() FROM attachments a
+      attachment_id=${attachmentId},cleanup_attachment=${cleanupAttachment},updated_at=now()
+      FROM attachments a
       WHERE s.id=${id} AND s.owner_id=${ownerId} AND s.state IN ('stored','attached')
         AND (s.attachment_id IS NULL OR s.attachment_id=${attachmentId})
+        AND (s.state='stored' OR s.cleanup_attachment=${cleanupAttachment})
         AND a.id=${attachmentId} AND a.owner_id=${ownerId} AND a.state='ready'
         AND a.deleted_at IS NULL RETURNING s.*`;
     if (rows[0]) return generatedObjectStage(rows[0]);

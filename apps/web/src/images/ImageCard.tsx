@@ -67,7 +67,8 @@ export function ImageCard({
             {selected ? <Check size={15} /> : <Plus size={15} />} {selected ? "Added" : "Add"}
           </button>
         )}
-        {onEdit && asset.status === "ready" && (
+        {onEdit && asset.status === "ready" && asset.attachmentId &&
+          asset.mimeType?.startsWith("image/") && (
           <button
             type="button"
             onClick={() => onEdit(asset)}

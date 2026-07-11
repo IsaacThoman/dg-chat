@@ -30,22 +30,27 @@ Deno.test({
     const cleanupAttachmentId = crypto.randomUUID();
     const messageAttachmentId = crypto.randomUUID();
     const generatedAttachmentId = crypto.randomUUID();
+    const lineageAttachmentId = crypto.randomUUID();
     const cleanupStageId = crypto.randomUUID();
     const messageStageId = crypto.randomUUID();
     const generatedStageId = crypto.randomUUID();
+    const lineageStageId = crypto.randomUUID();
     const generatedAssetId = crypto.randomUUID();
     const generatedJobId = crypto.randomUUID();
     const runIds = {
       cleanup: `cleanup-run-${suffix}`,
       message: `message-run-${suffix}`,
       generated: `generated-run-${suffix}`,
+      lineage: `lineage-run-${suffix}`,
     };
     const objectKeys = {
       cleanup: `generated/${ownerId}/cleanup-${suffix}.png`,
       message: `generated/${ownerId}/message-${suffix}.png`,
       generated: `generated/${ownerId}/asset-${suffix}.png`,
+      lineage: `generated/${ownerId}/lineage-${suffix}.png`,
     };
     const deletes: string[] = [];
+    let transientCleanupFailures = 0;
     let signalDeleteStarted!: () => void;
     let releaseDelete!: () => void;
     const deleteStarted = new Promise<void>((resolve) => signalDeleteStarted = resolve);
@@ -56,6 +61,9 @@ Deno.test({
         if (decodeURIComponent(new URL(request.url).pathname).endsWith(objectKeys.cleanup)) {
           signalDeleteStarted();
           await deleteRelease;
+          if (transientCleanupFailures++ === 0) {
+            return new Response("retry", { status: 503 });
+          }
         }
       }
       return new Response(null, { status: request.method === "DELETE" ? 204 : 200 });
@@ -104,6 +112,7 @@ Deno.test({
         [cleanupAttachmentId, objectKeys.cleanup, "a"],
         [messageAttachmentId, objectKeys.message, "b"],
         [generatedAttachmentId, objectKeys.generated, "c"],
+        [lineageAttachmentId, objectKeys.lineage, "f"],
       ] as const;
       for (const [id, key, sha] of attachments) {
         await sql`INSERT INTO attachments(id,owner_id,object_key,filename,mime_type,size_bytes,
@@ -126,6 +135,7 @@ Deno.test({
           "c",
           "cleanup_pending",
         ],
+        [lineageStageId, runIds.lineage, lineageAttachmentId, objectKeys.lineage, "f", "attached"],
       ] as const;
       for (const [id, runId, attachmentId, key, sha, state] of stages) {
         await sql`INSERT INTO generated_object_staging(id,owner_id,usage_run_id,ordinal,object_key,
@@ -133,6 +143,8 @@ Deno.test({
           VALUES(${id},${ownerId},${runId},0,${key},'image/png',68,${sha.repeat(64)},
             ${attachmentId},${state},now() - interval '5 seconds')`;
       }
+      await sql`UPDATE generated_object_staging SET purpose='edit_input'
+        WHERE id=${cleanupStageId}`;
       await sql`INSERT INTO generated_assets(id,owner_id,usage_run_id,provider_model_id,
         public_model_id,upstream_model_id,provider_slug,pricing_version_id,
         pricing_input_micros_per_million,pricing_cached_input_micros_per_million,
@@ -145,6 +157,9 @@ Deno.test({
         "d".repeat(64)
       },
           'generation','keep generated',1700000000,0,1,1)`;
+      await sql`INSERT INTO generated_asset_inputs(generated_asset_id,owner_id,attachment_id,role,
+        ordinal,width,height,has_alpha) VALUES(${generatedAssetId},${ownerId},
+        ${lineageAttachmentId},'source',0,1,1,NULL)`;
       await sql`INSERT INTO jobs(id,type,payload,idempotency_key)
         VALUES(${generatedJobId},'generated_object.cleanup',${
         sql.json({ stageId: generatedStageId, ownerId })
@@ -193,12 +208,16 @@ Deno.test({
       await eventually(async () => {
         const rows = await sql<{ count: number }[]>`SELECT count(*)::int AS count FROM jobs
           WHERE idempotency_key IN (${`generated_object.cleanup:${messageStageId}`},
-            ${`generated_object.cleanup:${generatedStageId}`})
+            ${`generated_object.cleanup:${generatedStageId}`},
+            ${`generated_object.cleanup:${lineageStageId}`})
             AND last_error LIKE '%durable reference%'`;
-        return rows[0]?.count === 2;
+        return rows[0]?.count === 3;
       });
 
-      assertEquals(deletes, [`/cleanup-test/${objectKeys.cleanup}`]);
+      assertEquals(deletes, [
+        `/cleanup-test/${objectKeys.cleanup}`,
+        `/cleanup-test/${objectKeys.cleanup}`,
+      ]);
       assertEquals(
         [
           ...await sql`SELECT state,deleted_at IS NOT NULL AS deleted FROM attachments
@@ -229,7 +248,8 @@ Deno.test({
       );
       const fenced = await sql<{ last_error: string }[]>`SELECT last_error FROM jobs WHERE
         idempotency_key IN (${`generated_object.cleanup:${messageStageId}`},
-          ${`generated_object.cleanup:${generatedStageId}`})`;
+          ${`generated_object.cleanup:${generatedStageId}`},
+          ${`generated_object.cleanup:${lineageStageId}`})`;
       for (const row of fenced) assertStringIncludes(row.last_error, "durable reference");
     } finally {
       worker.kill("SIGTERM");

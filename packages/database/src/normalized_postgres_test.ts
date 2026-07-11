@@ -2266,6 +2266,7 @@ Deno.test({
           state: "ready",
         })).attachment;
       const source = await createAttachment("source", "a");
+      const mask = await createAttachment("mask", "c");
       const output = await createAttachment("output", "b");
       const input = {
         ownerId: owner.id,
@@ -2285,7 +2286,23 @@ Deno.test({
           ordinal: 0,
           width: 1024,
           height: 1024,
-          inputs: [{ attachmentId: source.id, role: "source" as const, ordinal: 0 }],
+          inputs: [
+            {
+              attachmentId: source.id,
+              role: "source" as const,
+              ordinal: 0,
+              width: 1024,
+              height: 1024,
+            },
+            {
+              attachmentId: mask.id,
+              role: "mask" as const,
+              ordinal: 0,
+              width: 1024,
+              height: 1024,
+              hasAlpha: true,
+            },
+          ],
         }],
       };
       const stage = await first.stageGeneratedObject({
@@ -2299,12 +2316,37 @@ Deno.test({
       });
       await first.markGeneratedObjectStored(stage.id, owner.id);
       await first.attachGeneratedObject(stage.id, owner.id, output.id);
+      for (const [ordinal, attachment] of [source, mask].entries()) {
+        const inputStage = await first.stageGeneratedObject({
+          ownerId: owner.id,
+          usageRunId: input.usageRunId,
+          purpose: "edit_input",
+          ordinal,
+          objectKey: attachment.objectKey,
+          mimeType: attachment.mimeType,
+          sizeBytes: attachment.sizeBytes,
+          sha256: attachment.sha256,
+        });
+        await first.markGeneratedObjectStored(inputStage.id, owner.id);
+        await first.attachGeneratedObject(inputStage.id, owner.id, attachment.id);
+      }
       const concurrent = await Promise.all([
         first.finalizeGeneratedAssets(input),
         second.finalizeGeneratedAssets(input),
       ]);
       assertEquals(concurrent[0][0].id, concurrent[1][0].id);
-      assertEquals(concurrent[0][0].inputs[0].attachmentId, source.id);
+      assertEquals(
+        concurrent[0][0].inputs.find((lineage) => lineage.role === "source")?.attachmentId,
+        source.id,
+      );
+      assertEquals(concurrent[0][0].inputs.find((lineage) => lineage.role === "mask"), {
+        attachmentId: mask.id,
+        role: "mask",
+        ordinal: 0,
+        width: 1024,
+        height: 1024,
+        hasAlpha: true,
+      });
       assertEquals(
         (await sql<{ state: string }[]>`SELECT state FROM generated_object_staging
           WHERE id=${stage.id}`)[0].state,
@@ -2333,6 +2375,22 @@ Deno.test({
         pricingSnapshot,
       });
       assertEquals((await first.finalizeGeneratedAssets(input))[0].id, concurrent[0][0].id);
+      await assertRejects(
+        () =>
+          first.finalizeGeneratedAssets({
+            ...input,
+            assets: [{
+              ...input.assets[0],
+              inputs: input.assets[0].inputs.map((lineage) => ({
+                ...lineage,
+                width: 512,
+                height: 512,
+              })),
+            }],
+          }),
+        DomainError,
+        "differs",
+      );
       await assertRejects(
         () => first.getGeneratedAsset(concurrent[0][0].id, stranger.id),
         DomainError,

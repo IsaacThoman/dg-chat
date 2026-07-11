@@ -68,18 +68,24 @@ import { hashPassword, randomToken, sha256, sha256Hex, verifyPassword } from "./
 import { createEmbeddings, EmbeddingsProviderError, type ProviderFetch } from "./embeddings.ts";
 import { AudioProviderError, type AudioRequest, estimateAudioInputTokens } from "./audio.ts";
 import {
+  assertImageAggregateBytes,
   assertImageUsagePricing,
   decodeImage,
   estimateImageInputTokens,
   IMAGE_MAX_BYTES,
   IMAGE_MAX_TOTAL_BYTES,
+  type ImageEditInput,
+  type ImageEditRequest,
   type ImageGenerationRequest,
+  imageHasAlpha,
   type ImageOutput,
   ImageProviderError,
   imageTerminalOutput,
   maximumImageStreamReplayBytes,
+  parseImageEditJson,
   parseImageGenerationRequest,
 } from "./images.ts";
+import { parseImageEditMultipart } from "./image-edit-multipart.ts";
 import {
   assertSpeechFixedPricing,
   estimateSpeechInputTokens,
@@ -305,7 +311,10 @@ const publicGeneratedAsset = (
   attachmentId: asset.attachmentId,
   contentUrl: asset.deletedAt ? null : `/api/images/${asset.id}/content`,
   thumbnailUrl: null,
-  sourceAttachmentIds: asset.inputs.map((input) => input.attachmentId),
+  sourceAttachmentIds: asset.inputs
+    .filter((input) => input.role === "source")
+    .sort((left, right) => left.ordinal - right.ordinal)
+    .map((input) => input.attachmentId),
   operation: asset.operation,
   prompt: asset.prompt,
   model: asset.publicModelId,
@@ -1334,9 +1343,12 @@ export function createApp(options: AppOptions = {}) {
     if (!resolved.price) return undefined;
     return resolved;
   };
-  const resolveImageRuntimeModel = async (id: string): Promise<RuntimeModel | undefined> => {
+  const resolveImageRuntimeModel = async (
+    id: string,
+    capability: "image_generation" | "image_editing" = "image_generation",
+  ): Promise<RuntimeModel | undefined> => {
     const model = await repo.findProviderModel(id);
-    if (!model?.enabled || !model.capabilities.includes("image_generation")) return undefined;
+    if (!model?.enabled || !model.capabilities.includes(capability)) return undefined;
     const provider = await repo.findProvider(model.providerId);
     if (!provider?.enabled || !provider.hasCredential || !providerKeyring) return undefined;
     const credential = await repo.getProviderCredential(provider.id);
@@ -1412,7 +1424,8 @@ export function createApp(options: AppOptions = {}) {
     const generationRoute = c.req.method === "POST" &&
       (path.endsWith("/generate") || path === "/v1/chat/completions" ||
         path === "/v1/responses" || path === "/v1/images/generations" ||
-        path === "/api/images/generations" || path.startsWith("/v1/audio/") ||
+        path === "/v1/images/edits" || path === "/api/images/generations" ||
+        path === "/api/images/edits" || path.startsWith("/v1/audio/") ||
         path.endsWith("/active-leaf"));
     const providerAdminRoute = c.req.method !== "GET" && (
       path.startsWith("/api/admin/providers") || path.startsWith("/api/admin/models") ||
@@ -2407,6 +2420,25 @@ export function createApp(options: AppOptions = {}) {
         ? encodeGeneratedAssetCursor(page[page.length - 1])
         : null,
     });
+  });
+  app.get("/api/images/by-attachment/:attachmentId", async (c) => {
+    const before = c.req.query("before");
+    const excludeQuery = c.req.query("exclude");
+    const exclude = excludeQuery === undefined ? undefined : requireUuid(excludeQuery, "exclude");
+    const attachmentId = requireUuid(c.req.param("attachmentId"), "attachmentId");
+    if (before !== undefined && !Number.isFinite(Date.parse(before))) {
+      throw new DomainError("validation_error", "before must be an ISO timestamp", 422);
+    }
+    const match = await repo.findGeneratedAssetByAttachment(
+      c.get("user").id,
+      attachmentId,
+      before,
+      exclude,
+    );
+    if (!match) {
+      throw new DomainError("generated_asset_not_found", "Generated asset not found", 404);
+    }
+    return c.json(await generatedAssetView(match));
   });
   app.get("/api/images/:id", async (c) =>
     c.json(
@@ -4329,10 +4361,126 @@ export function createApp(options: AppOptions = {}) {
         inspectionError: null,
         inspectionComplete: true,
       });
-      if (created.deduplicated && stored) {
-        await objectStore.delete(objectKey).catch(() => undefined);
+      await repo.attachGeneratedObject(
+        stage.id,
+        ownerId,
+        created.attachment.id,
+        !created.deduplicated,
+      );
+      return created.attachment;
+    } catch (error) {
+      if (stored) await objectStore.delete(objectKey).catch(() => undefined);
+      throw error;
+    }
+  };
+  const loadEditInputAttachment = async (attachmentId: string, ownerId: string) => {
+    if (!objectStore) {
+      throw new DomainError("storage_not_configured", "Object storage is not configured", 503);
+    }
+    const attachment = await repo.getAttachment(attachmentId, ownerId);
+    if (!attachment.mimeType.startsWith("image/") || attachment.sizeBytes > IMAGE_MAX_BYTES) {
+      throw new DomainError("invalid_image_edit", "Edit input is not a supported image", 422);
+    }
+    const object = await objectStore.get(attachment.objectKey);
+    if (!object || object.contentLength !== attachment.sizeBytes) {
+      throw new DomainError("object_missing", "Edit input is unavailable", 503);
+    }
+    const bytes = new Uint8Array(await new Response(object.body).arrayBuffer());
+    if (
+      bytes.byteLength !== attachment.sizeBytes ||
+      await imageBytesSha256(bytes) !== attachment.sha256
+    ) {
+      throw new DomainError(
+        "generated_asset_corrupt",
+        "Edit input failed integrity validation",
+        503,
+      );
+    }
+    let image: ImageOutput;
+    try {
+      image = decodeImage(Buffer.from(bytes).toString("base64"));
+    } catch {
+      throw new DomainError("invalid_image_edit", "Edit input is not a supported image", 422);
+    }
+    return {
+      attachment,
+      input: {
+        bytes,
+        filename: attachment.filename,
+        mimeType: attachment.mimeType as ImageEditInput["mimeType"],
+        sha256: attachment.sha256,
+        image,
+      } satisfies ImageEditInput,
+    };
+  };
+  const persistEditInput = async (
+    ownerId: string,
+    runId: string,
+    ordinal: number,
+    input: ImageEditInput,
+  ) => {
+    if (!objectStore) {
+      throw new DomainError("storage_not_configured", "Object storage is not configured", 503);
+    }
+    const extension = input.image.format === "jpeg" ? "jpg" : input.image.format;
+    const objectKey = `users/${ownerId}/edit-inputs/${await sha256Hex(
+      runId,
+    )}/${ordinal}.${extension}`;
+    const stage = await repo.stageGeneratedObject({
+      ownerId,
+      usageRunId: runId,
+      purpose: "edit_input",
+      ordinal,
+      objectKey,
+      mimeType: input.mimeType,
+      sizeBytes: input.bytes.byteLength,
+      sha256: input.sha256,
+    });
+    let stored = false;
+    try {
+      await objectStore.put({
+        key: objectKey,
+        body: new Blob([input.bytes.slice().buffer]).stream(),
+        contentLength: input.bytes.byteLength,
+        contentType: input.mimeType,
+        metadata: { sha256: input.sha256, owner: ownerId },
+      });
+      stored = true;
+    } catch (error) {
+      if (!(error instanceof ObjectAlreadyExistsError)) throw error;
+      const prior = await objectStore.get(objectKey);
+      if (
+        !prior || prior.contentLength !== input.bytes.byteLength ||
+        prior.contentType !== input.mimeType || prior.metadata.sha256 !== input.sha256 ||
+        prior.metadata.owner !== ownerId
+      ) {
+        throw new DomainError("object_key_conflict", "Edit input object collision", 409);
       }
-      await repo.attachGeneratedObject(stage.id, ownerId, created.attachment.id);
+      const priorBytes = new Uint8Array(await new Response(prior.body).arrayBuffer());
+      if (
+        priorBytes.byteLength !== input.bytes.byteLength ||
+        await imageBytesSha256(priorBytes) !== input.sha256
+      ) throw new DomainError("object_key_conflict", "Edit input object collision", 409);
+    }
+    await repo.markGeneratedObjectStored(stage.id, ownerId);
+    try {
+      const created = await repo.createAttachment({
+        ownerId,
+        objectKey,
+        filename: input.filename,
+        mimeType: input.mimeType,
+        sizeBytes: input.bytes.byteLength,
+        sha256: input.sha256,
+        state: "ready",
+        inspectionError: null,
+        inspectionComplete: true,
+      });
+      await repo.attachGeneratedObject(
+        stage.id,
+        ownerId,
+        created.attachment.id,
+        !created.deduplicated,
+      );
       return created.attachment;
     } catch (error) {
       if (stored) await objectStore.delete(objectKey).catch(() => undefined);
@@ -4342,16 +4490,46 @@ export function createApp(options: AppOptions = {}) {
   const imageGenerationHandler = async (
     c: Context<{ Variables: Variables }>,
     richApi: boolean,
+    operation: "generation" | "edit" = "generation",
   ): Promise<Response> => {
-    let request: ImageGenerationRequest;
+    let request!: ImageGenerationRequest;
+    let editRequest: ImageEditRequest | undefined;
+    let editAttachments: AttachmentRecord[] = [];
+    let pendingEditJson: ReturnType<typeof parseImageEditJson> | undefined;
     try {
       let value: unknown;
-      try {
-        value = await c.req.json();
-      } catch {
-        throw new ImageProviderError("Request body must be valid JSON", 400, "invalid_json");
+      if (
+        operation === "edit" &&
+        c.req.header("content-type")?.toLowerCase().startsWith("multipart/form-data;")
+      ) {
+        editRequest = await parseImageEditMultipart(c.req.raw);
+        request = editRequest;
+        value = undefined;
+      } else {
+        try {
+          value = await c.req.json();
+        } catch {
+          throw new ImageProviderError("Request body must be valid JSON", 400, "invalid_json");
+        }
+        if (operation === "edit") {
+          const parsed = parseImageEditJson(value);
+          pendingEditJson = parsed;
+          editAttachments = await Promise.all([
+            ...parsed.images.map((source) =>
+              repo.getAttachment(source.fileId, c.get("user").id, true)
+            ),
+            ...(parsed.mask
+              ? [repo.getAttachment(parsed.mask.fileId, c.get("user").id, true)]
+              : []),
+          ]);
+          request = parsed.request;
+          value = undefined;
+        }
       }
-      if (richApi && value && typeof value === "object" && !Array.isArray(value)) {
+      if (
+        operation === "generation" && richApi && value && typeof value === "object" &&
+        !Array.isArray(value)
+      ) {
         const rich = { ...(value as Record<string, unknown>) };
         if (rich.count !== undefined && rich.n !== undefined) {
           throw new ImageProviderError(
@@ -4366,7 +4544,40 @@ export function createApp(options: AppOptions = {}) {
         }
         value = rich;
       }
-      request = parseImageGenerationRequest(value);
+      if (operation === "generation") request = parseImageGenerationRequest(value);
+      if (editRequest) {
+        assertImageAggregateBytes([
+          ...editRequest.images.map((input) => input.image),
+          ...(editRequest.mask ? [editRequest.mask.image] : []),
+        ]);
+        const first = editRequest.images[0]?.image;
+        if (
+          !first ||
+          editRequest.images.some((input) =>
+            input.image.width !== first.width || input.image.height !== first.height
+          )
+        ) {
+          throw new ImageProviderError(
+            "Edit source dimensions must match",
+            422,
+            "invalid_image_edit",
+          );
+        }
+        if (
+          editRequest.mask && (
+            editRequest.mask.image.format !== "png" ||
+            editRequest.mask.image.width !== first.width ||
+            editRequest.mask.image.height !== first.height ||
+            !imageHasAlpha(editRequest.mask.image)
+          )
+        ) {
+          throw new ImageProviderError(
+            "Mask must match source dimensions and contain alpha",
+            422,
+            "invalid_mask",
+          );
+        }
+      }
       if (!richApi && request.responseFormat === "url" && !imageSigningKey) {
         throw new ImageProviderError(
           "URL image responses require IMAGE_URL_SIGNING_SECRET",
@@ -4385,15 +4596,35 @@ export function createApp(options: AppOptions = {}) {
       if (!(error instanceof ImageProviderError)) throw error;
       return c.json(openAIError(error.message, error.code), error.status as 400);
     }
-    const requestHash = await sha256Hex(canonicalJson({
-      endpoint: "images.generations",
-      request,
-    }));
+    const imageEndpoint = operation === "edit" ? "images.edits" : "images.generations";
+    const requestIdentity = editRequest
+      ? (() => {
+        const { images, mask, ...fields } = editRequest;
+        return {
+          ...fields,
+          images: images.map((input) => ({ sha256: input.sha256 })),
+          ...(mask ? { mask: { sha256: mask.sha256 } } : {}),
+        };
+      })()
+      : pendingEditJson
+      ? {
+        ...pendingEditJson.request,
+        images: editAttachments.slice(0, pendingEditJson.images.length).map((attachment) => ({
+          sha256: attachment.sha256,
+        })),
+        ...(pendingEditJson.mask
+          ? { mask: { sha256: editAttachments[pendingEditJson.images.length].sha256 } }
+          : {}),
+      }
+      : request;
+    const requestHash = await sha256Hex(
+      canonicalJson({ endpoint: imageEndpoint, request: requestIdentity }),
+    );
     const suppliedIdempotencyKey = c.req.header("idempotency-key");
     const existing = suppliedIdempotencyKey
       ? await repo.getApiRequest(
         c.get("user").id,
-        "images.generations",
+        imageEndpoint,
         suppliedIdempotencyKey,
       )
       : undefined;
@@ -4404,6 +4635,55 @@ export function createApp(options: AppOptions = {}) {
       );
     }
     if (existing && existing.state !== "in_progress") return replayResponse(existing);
+    if (pendingEditJson) {
+      try {
+        const sources = await Promise.all(
+          pendingEditJson.images.map((source) =>
+            loadEditInputAttachment(source.fileId, c.get("user").id)
+          ),
+        );
+        const mask = pendingEditJson.mask
+          ? await loadEditInputAttachment(pendingEditJson.mask.fileId, c.get("user").id)
+          : undefined;
+        editRequest = {
+          ...pendingEditJson.request,
+          images: sources.map((source) => source.input),
+          ...(mask ? { mask: mask.input } : {}),
+        };
+        assertImageAggregateBytes([
+          ...editRequest.images.map((input) => input.image),
+          ...(editRequest.mask ? [editRequest.mask.image] : []),
+        ]);
+        const first = editRequest.images[0].image;
+        if (
+          editRequest.images.some((input) =>
+            input.image.width !== first.width || input.image.height !== first.height
+          )
+        ) {
+          throw new ImageProviderError(
+            "Edit source dimensions must match",
+            422,
+            "invalid_image_edit",
+          );
+        }
+        if (
+          editRequest.mask && (
+            editRequest.mask.image.format !== "png" ||
+            editRequest.mask.image.width !== first.width ||
+            editRequest.mask.image.height !== first.height || !imageHasAlpha(editRequest.mask.image)
+          )
+        ) {
+          throw new ImageProviderError(
+            "Mask must match source dimensions and contain alpha",
+            422,
+            "invalid_mask",
+          );
+        }
+      } catch (error) {
+        if (!(error instanceof ImageProviderError)) throw error;
+        return c.json(openAIError(error.message, error.code), error.status as 400);
+      }
+    }
     if (
       request.stream && suppliedIdempotencyKey &&
       maximumImageStreamReplayBytes(request) > replayQuota.maxBytes
@@ -4423,14 +4703,19 @@ export function createApp(options: AppOptions = {}) {
       existing?.state === "in_progress" && existing.leaseToken && existing.leaseExpiresAt &&
         Date.parse(existing.leaseExpiresAt) <= Date.now() && finalized.length,
     );
-    const resolved = await resolveImageRuntimeModel(request.model);
+    const resolved = await resolveImageRuntimeModel(
+      request.model,
+      operation === "edit" ? "image_editing" : "image_generation",
+    );
     const recoveryPricing = finalized[0]?.pricingSnapshot;
     const model = resolved?.info ?? (recoveryPricing && finalized[0]
       ? {
         id: finalized[0].publicModelId,
         displayName: finalized[0].publicModelId,
         provider: finalized[0].providerSlug,
-        capabilities: ["image_generation" as const],
+        capabilities: [
+          operation === "edit" ? "image_editing" as const : "image_generation" as const,
+        ],
         contextWindow: 1,
         inputMicrosPerMillion: recoveryPricing.inputMicrosPerMillion,
         cachedInputMicrosPerMillion: recoveryPricing.cachedInputMicrosPerMillion,
@@ -4483,8 +4768,8 @@ export function createApp(options: AppOptions = {}) {
     } else {
       usage = await beginOpenAIUsage(
         c,
-        "images.generations",
-        request,
+        imageEndpoint,
+        requestIdentity,
         model,
         reserveMicros,
         resolved!.price,
@@ -4492,6 +4777,16 @@ export function createApp(options: AppOptions = {}) {
     }
     if (usage.kind === "replay") return usage.response;
     const { runId, idempotency, executionLeaseToken, runLease } = usage;
+    let editLineage:
+      | Array<{
+        attachmentId: string;
+        role: "source" | "mask";
+        ordinal: number;
+        width: number;
+        height: number;
+        hasAlpha: boolean | null;
+      }>
+      | undefined;
     const assetIdempotencyKey = suppliedIdempotencyKey ?? `run:${runId}`;
     const lease = keepApiLeaseAlive(
       idempotency,
@@ -4506,6 +4801,50 @@ export function createApp(options: AppOptions = {}) {
     let observedOutputTokens = 0;
     let observedCostMicros = reserveMicros;
     try {
+      if (editRequest) {
+        if (!editAttachments.length) {
+          const persisted = await Promise.allSettled([
+            ...editRequest.images.map((input, ordinal) =>
+              persistEditInput(c.get("user").id, runId, ordinal, input)
+            ),
+            ...(editRequest.mask
+              ? [persistEditInput(
+                c.get("user").id,
+                runId,
+                editRequest.images.length,
+                editRequest.mask,
+              )]
+              : []),
+          ]);
+          const failed = persisted.find(
+            (result): result is PromiseRejectedResult => result.status === "rejected",
+          );
+          if (failed) throw failed.reason;
+          editAttachments = persisted.map((result) =>
+            (result as PromiseFulfilledResult<AttachmentRecord>).value
+          );
+        }
+        editLineage = [
+          ...editRequest.images.map((input, ordinal) => ({
+            attachmentId: editAttachments[ordinal].id,
+            role: "source" as const,
+            ordinal,
+            width: input.image.width,
+            height: input.image.height,
+            hasAlpha: null,
+          })),
+          ...(editRequest.mask
+            ? [{
+              attachmentId: editAttachments[editRequest.images.length].id,
+              role: "mask" as const,
+              ordinal: 0,
+              width: editRequest.mask.image.width,
+              height: editRequest.mask.image.height,
+              hasAlpha: true,
+            }]
+            : []),
+        ];
+      }
       // Object storage and generated-assets finalization can succeed immediately before the
       // idempotency/accounting transaction is interrupted. A reclaimed lease must finish that
       // durable result instead of paying for and colliding with a second stochastic generation.
@@ -4617,9 +4956,10 @@ export function createApp(options: AppOptions = {}) {
                 : {}),
             });
           if (request.stream) {
-            const terminalFrame = `event: image_generation.completed\ndata: ${
+            const eventPrefix = operation === "edit" ? "image_edit" : "image_generation";
+            const terminalFrame = `event: ${eventPrefix}.completed\ndata: ${
               JSON.stringify({
-                type: "image_generation.completed",
+                type: `${eventPrefix}.completed`,
                 b64_json: recovered[0].b64Json,
                 created_at: created,
                 size: request.size,
@@ -4681,14 +5021,23 @@ export function createApp(options: AppOptions = {}) {
         imageSlot.signal,
         downstreamImageAbort.signal,
       ]);
-      const result = await providerExecution.imageGenerate(
-        resolved!.registryModel!.id,
-        runId,
-        executionLeaseToken,
-        request,
-        imageSignal,
-        providerPlan!,
-      );
+      const result = await (operation === "edit"
+        ? providerExecution.imageEdit(
+          resolved!.registryModel!.id,
+          runId,
+          executionLeaseToken,
+          editRequest!,
+          imageSignal,
+          providerPlan!,
+        )
+        : providerExecution.imageGenerate(
+          resolved!.registryModel!.id,
+          runId,
+          executionLeaseToken,
+          request,
+          imageSignal,
+          providerPlan!,
+        ));
       if (request.stream) {
         if (!result.stream || !result.usage || !result.terminalFrame || result.data) {
           throw new ImageProviderError("Image provider did not return an image stream");
@@ -4763,7 +5112,7 @@ export function createApp(options: AppOptions = {}) {
               pricingSnapshot: sourcePricing,
               idempotencyKey: assetIdempotencyKey,
               requestHash,
-              operation: "generation",
+              operation,
               prompt: request.prompt,
               providerCreatedAt,
               assets: [{
@@ -4772,6 +5121,7 @@ export function createApp(options: AppOptions = {}) {
                 width: output.width,
                 height: output.height,
                 revisedPrompt: output.revisedPrompt,
+                ...(editLineage ? { inputs: editLineage } : {}),
               }],
             });
             const latencyMs = Math.round(performance.now() - started);
@@ -4924,7 +5274,7 @@ export function createApp(options: AppOptions = {}) {
         pricingSnapshot: sourcePricing,
         idempotencyKey: assetIdempotencyKey,
         requestHash,
-        operation: "generation",
+        operation,
         prompt: request.prompt,
         providerCreatedAt: result.created,
         assets: result.data.map((output, ordinal) => ({
@@ -4933,6 +5283,7 @@ export function createApp(options: AppOptions = {}) {
           width: output.width,
           height: output.height,
           revisedPrompt: output.revisedPrompt,
+          ...(editLineage ? { inputs: editLineage } : {}),
         })),
       });
       const latencyMs = Math.round(performance.now() - started);
@@ -6007,6 +6358,12 @@ export function createApp(options: AppOptions = {}) {
     async (c) => await imageGenerationHandler(c, false),
   );
   app.post("/api/images/generations", async (c) => await imageGenerationHandler(c, true));
+  app.post(
+    "/v1/images/edits",
+    requireScope("chat:write"),
+    async (c) => await imageGenerationHandler(c, false, "edit"),
+  );
+  app.post("/api/images/edits", async (c) => await imageGenerationHandler(c, true, "edit"));
   const audioHandler = (endpoint: "transcriptions" | "translations") =>
   async (
     c: Context<{ Variables: Variables }>,

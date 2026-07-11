@@ -8,6 +8,62 @@ import { maximumImageStreamReplayBytes } from "./images.ts";
 
 const png =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZQmcAAAAASUVORK5CYII=";
+const alternatePng =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+function pngCrc32(value: Uint8Array): number {
+  let crc = 0xffffffff;
+  for (const byte of value) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(type: string, data: Uint8Array): Uint8Array {
+  const typeBytes = new TextEncoder().encode(type);
+  const result = new Uint8Array(12 + data.byteLength);
+  const view = new DataView(result.buffer);
+  view.setUint32(0, data.byteLength);
+  result.set(typeBytes, 4);
+  result.set(data, 8);
+  view.setUint32(8 + data.byteLength, pngCrc32(result.subarray(4, 8 + data.byteLength)));
+  return result;
+}
+
+async function rgbaPng(width: number, red: number): Promise<Uint8Array> {
+  const header = new Uint8Array(13);
+  const view = new DataView(header.buffer);
+  view.setUint32(0, width);
+  view.setUint32(4, 1);
+  header.set([8, 6, 0, 0, 0], 8);
+  const pixels = new Uint8Array(1 + width * 4);
+  for (let offset = 1; offset < pixels.length; offset += 4) {
+    pixels.set([red, 17, 29, 255], offset);
+  }
+  const compressed = new Uint8Array(
+    await new Response(
+      new Blob([pixels]).stream().pipeThrough(
+        new CompressionStream("deflate"),
+      ),
+    ).arrayBuffer(),
+  );
+  const parts = [
+    new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]),
+    pngChunk("IHDR", header),
+    pngChunk("IDAT", compressed),
+    pngChunk("IEND", new Uint8Array()),
+  ];
+  const result = new Uint8Array(parts.reduce((total, part) => total + part.byteLength, 0));
+  let offset = 0;
+  for (const part of parts) {
+    result.set(part, offset);
+    offset += part.byteLength;
+  }
+  return result;
+}
+
+const onePixelPng = (red: number) => rgbaPng(1, red);
 
 Deno.test("signed image capability queries are always redacted from request logs", () => {
   for (const query of ["token=secret", "%74oken=secret", "x=1&to%6ben=secret"]) {
@@ -25,6 +81,7 @@ async function fixture(options: {
   streaming?: "success" | "before_partial_failure" | "after_partial_failure" | "disconnect";
   replayMaxBytes?: number;
   fallback?: boolean;
+  editing?: boolean;
 } = {}) {
   const repository = new MemoryRepository();
   const objectStore = new TestObjectStore();
@@ -44,8 +101,30 @@ async function fixture(options: {
       ? { replayQuota: { maxBytes: options.replayMaxBytes, maxEvents: 10_000, maxRequests: 1_000 } }
       : {}),
     rateLimiter: options.rateLimiter,
-    imageFetch: (_input, init) => {
+    imageFetch: async (input, init) => {
       calls++;
+      const contentType = new Headers(init?.headers).get("content-type") ?? "";
+      if (contentType.startsWith("multipart/form-data;")) {
+        const form = await new Request(input, init).formData();
+        assertEquals(form.get("model"), "upstream-image");
+        assertEquals(form.get("response_format"), "b64_json");
+        if (form.get("stream") === "true") {
+          return new Response(
+            `event: image_edit.completed\ndata: ${
+              JSON.stringify({
+                type: "image_edit.completed",
+                b64_json: png,
+                created_at: 125,
+              })
+            }\n\n`,
+            { headers: { "content-type": "text/event-stream" } },
+          );
+        }
+        return Response.json({
+          created: 125,
+          data: [{ b64_json: png, revised_prompt: "Edited robot" }],
+        });
+      }
       const request = JSON.parse(String(init?.body));
       calledModels.push(request.model);
       assertEquals(request.response_format, "b64_json");
@@ -139,7 +218,7 @@ async function fixture(options: {
     publicModelId: "images/public",
     upstreamModelId: "upstream-image",
     displayName: "Image public",
-    capabilities: ["image_generation"],
+    capabilities: ["image_generation", ...(options.editing ? ["image_editing" as const] : [])],
     contextWindow: 32_000,
   }, mutation);
   repository.createModelPriceVersion({
@@ -369,7 +448,7 @@ Deno.test("completed image stream replay survives a lower quota after restart", 
     body,
   });
   const firstBody = await first.text();
-  assertEquals(first.status, 200);
+  assertEquals(first.status, 200, firstBody);
   const restarted = createApp({
     repository: original.repository,
     replayQuota: { maxBytes: required - 1, maxEvents: 10_000, maxRequests: 1_000 },
@@ -602,6 +681,429 @@ Deno.test("image generation persists immutable assets, accounts usage, and repla
     (await app.request("/api/images?cursor=not-a-cursor", { headers })).status,
     422,
   );
+});
+
+Deno.test("image edits support multipart, immutable lineage, JSON file IDs, and exact replay", async () => {
+  const fx = await fixture({ editing: true });
+  const editForm = () => {
+    const form = new FormData();
+    form.append("model", "images/public");
+    form.append("prompt", "Polish this robot");
+    form.append(
+      "image",
+      new Blob([
+        Uint8Array.from(atob(png), (part) => part.charCodeAt(0)),
+      ], { type: "image/png" }),
+      "source.png",
+    );
+    form.append(
+      "mask",
+      new Blob([Uint8Array.from(atob(alternatePng), (part) => part.charCodeAt(0))], {
+        type: "image/png",
+      }),
+      "mask.png",
+    );
+    return form;
+  };
+  const headers = { cookie: fx.cookie, "idempotency-key": "image-edit-multipart-key" };
+  const first = await fx.app.request("/v1/images/edits", {
+    method: "POST",
+    headers,
+    body: editForm(),
+  });
+  const firstBody = await first.text();
+  assertEquals(first.status, 200, firstBody);
+  const asset = fx.repository.listGeneratedAssets((await fx.repository.listUsers())[0].id)[0];
+  assertEquals(asset.operation, "edit");
+  assertEquals(asset.inputs.map((input) => [input.role, input.ordinal]), [
+    ["source", 0],
+    ["mask", 0],
+  ]);
+  const gallery = await fx.app.request("/api/images", { headers: { cookie: fx.cookie } });
+  const galleryBody = await gallery.json();
+  assertEquals(galleryBody.data[0].sourceAttachmentIds, [asset.inputs[0].attachmentId]);
+  const replay = await fx.app.request("/v1/images/edits", {
+    method: "POST",
+    headers,
+    body: editForm(),
+  });
+  assertEquals(await replay.text(), firstBody);
+  assertEquals(replay.headers.get("x-idempotent-replay"), "true");
+
+  const rich = await fx.app.request("/api/images/edits", {
+    method: "POST",
+    headers: {
+      cookie: fx.cookie,
+      origin: "http://localhost:5173",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "images/public",
+      prompt: "Edit by owned file ID",
+      images: [{ file_id: asset.attachmentId }],
+    }),
+  });
+  assertEquals(rich.status, 200);
+  const richBody = await rich.json();
+  assertEquals(richBody.assets[0].operation, "edit");
+  const sourceLookup = await fx.app.request(
+    `/api/images/by-attachment/${asset.attachmentId}?before=${
+      encodeURIComponent(richBody.assets[0].createdAt)
+    }&exclude=${richBody.assets[0].id}`,
+    { headers: { cookie: fx.cookie } },
+  );
+  assertEquals(sourceLookup.status, 200);
+  assertEquals((await sourceLookup.json()).id, asset.id);
+  const invalidLookup = await fx.app.request(
+    `/api/images/by-attachment/${asset.attachmentId}?exclude=not-a-uuid`,
+    { headers: { cookie: fx.cookie } },
+  );
+  assertEquals(invalidLookup.status, 422);
+  const missingSource = await fx.app.request(
+    `/api/images/by-attachment/${crypto.randomUUID()}`,
+    { headers: { cookie: fx.cookie } },
+  );
+  assertEquals(missingSource.status, 404);
+  assertEquals(fx.calls(), 2);
+
+  const remote = await fx.app.request("/v1/images/edits", {
+    method: "POST",
+    headers: { cookie: fx.cookie, "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "images/public",
+      prompt: "No remote fetch",
+      images: [{ image_url: "http://127.0.0.1/private" }],
+    }),
+  });
+  assertEquals(remote.status, 422);
+  assertEquals((await remote.json()).error.code, "remote_image_url_unsupported");
+});
+
+Deno.test("image edit SSE uses official event names and settles before completion", async () => {
+  const fx = await fixture({ editing: true });
+  const form = new FormData();
+  form.append("model", "images/public");
+  form.append("prompt", "Stream this edit");
+  form.append("stream", "true");
+  form.append(
+    "image",
+    new Blob([
+      Uint8Array.from(atob(png), (part) => part.charCodeAt(0)),
+    ], { type: "image/png" }),
+    "source.png",
+  );
+  const response = await fx.app.request("/v1/images/edits", {
+    method: "POST",
+    headers: { cookie: fx.cookie },
+    body: form,
+  });
+  assertEquals(response.status, 200);
+  const body = await response.text();
+  assertEquals(body.includes("image_edit.completed"), true, body);
+  assertEquals(body.includes("image_generation.completed"), false);
+  const run = [...fx.repository.usageRuns.values()].at(-1)!;
+  assertEquals([run.status, run.costMicros], ["completed", 25]);
+});
+
+Deno.test("image edit persists sixteen sources plus a mask before provider dispatch", async () => {
+  const fx = await fixture({ editing: true });
+  const form = new FormData();
+  form.append("model", "images/public");
+  form.append("prompt", "Composite every layer");
+  for (let index = 0; index < 16; index++) {
+    form.append(
+      "image[]",
+      new Blob([(await onePixelPng(index + 1)).buffer as ArrayBuffer], { type: "image/png" }),
+      `source-${index + 1}.png`,
+    );
+  }
+  form.append(
+    "mask",
+    new Blob([(await onePixelPng(200)).buffer as ArrayBuffer], { type: "image/png" }),
+    "mask.png",
+  );
+  const response = await fx.app.request("/v1/images/edits", {
+    method: "POST",
+    headers: { cookie: fx.cookie },
+    body: form,
+  });
+  assertEquals(response.status, 200, await response.text());
+  assertEquals(fx.calls(), 1);
+  const asset = fx.repository.listGeneratedAssets((await fx.repository.listUsers())[0].id)[0];
+  assertEquals(asset.inputs.filter((input) => input.role === "source").length, 16);
+  assertEquals(asset.inputs.filter((input) => input.role === "mask").length, 1);
+});
+
+Deno.test("image edit input persistence failure refunds and terminates idempotency before dispatch", async () => {
+  const fx = await fixture({ editing: true });
+  const originalPut = fx.objectStore.put.bind(fx.objectStore);
+  fx.objectStore.put = async (input) => {
+    if (input.key.includes("/edit-inputs/") && input.key.endsWith("/0.png")) {
+      throw new Error("injected edit input storage failure");
+    }
+    if (input.key.includes("/edit-inputs/") && input.key.endsWith("/1.png")) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    return await originalPut(input);
+  };
+  const form = new FormData();
+  form.append("model", "images/public");
+  form.append("prompt", "Fail before provider dispatch");
+  form.append(
+    "image[]",
+    new Blob([
+      Uint8Array.from(atob(png), (part) => part.charCodeAt(0)),
+    ], { type: "image/png" }),
+    "source.png",
+  );
+  form.append(
+    "image[]",
+    new Blob([Uint8Array.from(atob(alternatePng), (part) => part.charCodeAt(0))], {
+      type: "image/png",
+    }),
+    "delayed-source.png",
+  );
+  const response = await fx.app.request("/v1/images/edits", {
+    method: "POST",
+    headers: { cookie: fx.cookie, "idempotency-key": "image-edit-storage-failure-key" },
+    body: form,
+  });
+  assertEquals(response.status, 502);
+  assertEquals(fx.calls(), 0);
+  const run = [...fx.repository.usageRuns.values()].at(-1)!;
+  assertEquals([run.status, run.costMicros], ["failed", 0]);
+  const inputStages = [...fx.repository.generatedObjectStages.values()].filter((stage) =>
+    stage.purpose === "edit_input"
+  );
+  assertEquals(inputStages.length, 2);
+  assertEquals(inputStages.every((stage) => stage.state === "cleanup_pending"), true);
+  const apiRequest = [...fx.repository.apiIdempotencyRequests.values()].at(-1)!;
+  assertEquals(apiRequest.state, "failed");
+  const replayForm = new FormData();
+  replayForm.append("model", "images/public");
+  replayForm.append("prompt", "Fail before provider dispatch");
+  replayForm.append(
+    "image[]",
+    new Blob([
+      Uint8Array.from(atob(png), (part) => part.charCodeAt(0)),
+    ], { type: "image/png" }),
+    "source.png",
+  );
+  replayForm.append(
+    "image[]",
+    new Blob([Uint8Array.from(atob(alternatePng), (part) => part.charCodeAt(0))], {
+      type: "image/png",
+    }),
+    "delayed-source.png",
+  );
+  const replay = await fx.app.request("/v1/images/edits", {
+    method: "POST",
+    headers: { cookie: fx.cookie, "idempotency-key": "image-edit-storage-failure-key" },
+    body: replayForm,
+  });
+  assertEquals(replay.status, 502);
+  assertEquals(replay.headers.get("x-idempotent-replay"), "true");
+  assertEquals(fx.calls(), 0);
+});
+
+Deno.test("duplicate source and mask fail before reservation and provider dispatch", async () => {
+  const fx = await fixture({ editing: true });
+  const imageBytes = Uint8Array.from(atob(png), (part) => part.charCodeAt(0));
+  const multipart = new FormData();
+  multipart.append("model", "images/public");
+  multipart.append("prompt", "Reject duplicate mask bytes");
+  multipart.append("image", new Blob([imageBytes], { type: "image/png" }), "source.png");
+  multipart.append("mask", new Blob([imageBytes], { type: "image/png" }), "mask.png");
+  const multipartResponse = await fx.app.request("/v1/images/edits", {
+    method: "POST",
+    headers: { cookie: fx.cookie },
+    body: multipart,
+  });
+  assertEquals(multipartResponse.status, 422);
+
+  const jsonResponse = await fx.app.request("/v1/images/edits", {
+    method: "POST",
+    headers: { cookie: fx.cookie, "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "images/public",
+      prompt: "Reject duplicate mask ID",
+      images: [{ file_id: "same-attachment" }],
+      mask: { file_id: "same-attachment" },
+    }),
+  });
+  assertEquals(jsonResponse.status, 422);
+  assertEquals(fx.calls(), 0);
+  assertEquals(fx.repository.usageRuns.size, 0);
+});
+
+Deno.test("invalid stored JSON edit input returns a stable validation error", async () => {
+  const fx = await fixture({ editing: true });
+  const generated = await fx.app.request("/v1/images/generations", {
+    method: "POST",
+    headers: { cookie: fx.cookie, "content-type": "application/json" },
+    body: JSON.stringify({ model: "images/public", prompt: "source to corrupt" }),
+  });
+  assertEquals(generated.status, 200);
+  const owner = (await fx.repository.listUsers())[0].id;
+  const source = fx.repository.listGeneratedAssets(owner)[0];
+  const mismatch = await rgbaPng(2, 211);
+  const digest = [
+    ...new Uint8Array(
+      await crypto.subtle.digest("SHA-256", mismatch.buffer as ArrayBuffer),
+    ),
+  ]
+    .map((value) => value.toString(16).padStart(2, "0")).join("");
+  const objectKey = `users/${owner}/image-edit-tests/${digest}.png`;
+  await fx.objectStore.put({
+    key: objectKey,
+    body: new Blob([mismatch.buffer as ArrayBuffer]).stream(),
+    contentLength: mismatch.byteLength,
+    contentType: "image/png",
+    metadata: { sha256: digest },
+  });
+  const mismatchAttachment = fx.repository.createAttachment({
+    ownerId: owner,
+    objectKey,
+    filename: "two-pixels.png",
+    mimeType: "image/png",
+    sizeBytes: mismatch.byteLength,
+    sha256: digest,
+    state: "ready",
+    inspectionComplete: true,
+  }).attachment;
+  const response = await fx.app.request("/v1/images/edits", {
+    method: "POST",
+    headers: { cookie: fx.cookie, "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "images/public",
+      prompt: "must not become a 500",
+      images: [{ file_id: source.attachmentId }, { file_id: mismatchAttachment.id }],
+    }),
+  });
+  assertEquals(response.status, 422);
+  assertEquals((await response.json()).error.code, "invalid_image_edit");
+  assertEquals(fx.calls(), 1);
+});
+
+Deno.test("repeated multipart edits deduplicate safely across run-scoped stages", async () => {
+  const fx = await fixture({ editing: true });
+  const form = () => {
+    const value = new FormData();
+    value.append("model", "images/public");
+    value.append("prompt", "Repeat safely");
+    value.append(
+      "image[]",
+      new Blob([
+        Uint8Array.from(atob(png), (part) => part.charCodeAt(0)),
+      ], { type: "image/png" }),
+      "same.png",
+    );
+    return value;
+  };
+  for (let index = 0; index < 2; index++) {
+    const response = await fx.app.request("/v1/images/edits", {
+      method: "POST",
+      headers: { cookie: fx.cookie },
+      body: form(),
+    });
+    assertEquals(response.status, 200);
+  }
+  assertEquals(fx.calls(), 2);
+  assertEquals(fx.repository.generatedObjectStages.size, 4);
+  assertEquals(
+    [...fx.repository.generatedObjectStages.values()].every((stage) =>
+      ["finalized", "cleanup_pending"].includes(stage.state)
+    ),
+    true,
+  );
+  const cleanup = [...fx.repository.generatedObjectStages.values()].filter((stage) =>
+    stage.state === "cleanup_pending"
+  );
+  assertEquals(cleanup.length > 0, true);
+  assertEquals(
+    cleanup.every((stage) =>
+      fx.repository.jobs.some((job) =>
+        job.type === "generated_object.cleanup" &&
+        (job.payload as { stageId?: string }).stageId === stage.id
+      )
+    ),
+    true,
+  );
+});
+
+Deno.test("completed JSON edit replay needs metadata but not deleted source bytes", async () => {
+  const fx = await fixture({ editing: true });
+  const generated = await fx.app.request("/v1/images/generations", {
+    method: "POST",
+    headers: { cookie: fx.cookie, "content-type": "application/json" },
+    body: JSON.stringify({ model: "images/public", prompt: "source" }),
+  });
+  assertEquals(generated.status, 200);
+  const source = fx.repository.listGeneratedAssets((await fx.repository.listUsers())[0].id)[0];
+  const headers = {
+    cookie: fx.cookie,
+    "content-type": "application/json",
+    "idempotency-key": "image-edit-json-outage-key",
+  };
+  const body = JSON.stringify({
+    model: "images/public",
+    prompt: "replay without bytes",
+    images: [{ file_id: source.attachmentId }],
+  });
+  const first = await fx.app.request("/v1/images/edits", { method: "POST", headers, body });
+  const firstBody = await first.text();
+  assertEquals(first.status, 200);
+  fx.repository.deleteAttachment(source.attachmentId, source.ownerId);
+  const originalGet = fx.objectStore.get.bind(fx.objectStore);
+  fx.objectStore.get = () => Promise.reject(new Error("storage outage"));
+  const replay = await fx.app.request("/v1/images/edits", { method: "POST", headers, body });
+  fx.objectStore.get = originalGet;
+  assertEquals(replay.status, 200);
+  assertEquals(replay.headers.get("x-idempotent-replay"), "true");
+  assertEquals(await replay.text(), firstBody);
+  assertEquals(fx.calls(), 2);
+});
+
+Deno.test("crash-left objects plus attachment dedup schedule durable cleanup for edit inputs and outputs", async () => {
+  const fx = await fixture({ editing: true });
+  const form = () => {
+    const value = new FormData();
+    value.append("model", "images/public");
+    value.append("prompt", "Recover staged duplicates");
+    value.append(
+      "image[]",
+      new Blob([Uint8Array.from(atob(png), (part) => part.charCodeAt(0))], {
+        type: "image/png",
+      }),
+      "same.png",
+    );
+    return value;
+  };
+  assertEquals(
+    (await fx.app.request("/v1/images/edits", {
+      method: "POST",
+      headers: { cookie: fx.cookie },
+      body: form(),
+    })).status,
+    200,
+  );
+  const originalPut = fx.objectStore.put.bind(fx.objectStore);
+  fx.objectStore.put = async (input) => {
+    await originalPut(input);
+    return await originalPut(input);
+  };
+  const recovered = await fx.app.request("/v1/images/edits", {
+    method: "POST",
+    headers: { cookie: fx.cookie },
+    body: form(),
+  });
+  fx.objectStore.put = originalPut;
+  assertEquals(recovered.status, 200, await recovered.text());
+  const pending = [...fx.repository.generatedObjectStages.values()].filter((stage) =>
+    stage.state === "cleanup_pending"
+  );
+  assertEquals(new Set(pending.map((stage) => stage.purpose)), new Set(["output", "edit_input"]));
+  assertEquals(pending.every((stage) => stage.cleanupAttachment === false), true);
 });
 
 Deno.test("completed image replay remains exact after provider and model rename and disable", async () => {

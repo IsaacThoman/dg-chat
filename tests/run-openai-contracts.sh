@@ -96,7 +96,7 @@ curl --fail --silent --show-error --request POST \
 image_model="$(curl --fail --silent --show-error --request POST \
   "$api_url/api/admin/models" --header 'content-type: application/json' \
   --header "origin: $web_origin" --cookie "$CONTRACT_SESSION_COOKIE" \
-  --data "{\"providerId\":\"$provider_id\",\"publicModelId\":\"contracts/mock-image\",\"upstreamModelId\":\"mock-image\",\"displayName\":\"Contract Mock Image\",\"capabilities\":[\"image_generation\"],\"contextWindow\":8192}")"
+  --data "{\"providerId\":\"$provider_id\",\"publicModelId\":\"contracts/mock-image\",\"upstreamModelId\":\"mock-image\",\"displayName\":\"Contract Mock Image\",\"capabilities\":[\"image_generation\",\"image_editing\"],\"contextWindow\":8192}")"
 image_model_id="$(jq --raw-output '.id' <<<"$image_model")"
 image_model_version="$(jq --raw-output '.version' <<<"$image_model")"
 curl --fail --silent --show-error --request POST \
@@ -136,14 +136,14 @@ jq -e '
 ' <<<"$audio_state" >/dev/null
 echo "Official SDK speech binary, SSE, replay, custom voice, and cancellation contracts passed"
 jq -e '
-  .images.calls == 3 and
+  .images.calls == 6 and
   .images.lastAuthorized == true and
   .images.lastModel == "mock-image" and
   .images.lastResponseFormat == "b64_json" and
   .images.lastCount == 1 and
-  .images.lastPrompt == "Python image contract"
+  .images.lastPrompt == "Python image edit contract"
 ' <<<"$audio_state" >/dev/null
-echo "Official SDK image generation, PNG validation, and exact replay contracts passed"
+echo "Official SDK image generation/editing, streaming, PNG validation, and exact replay contracts passed"
 
 deno run --no-config --allow-env --allow-net \
   tests/contracts/upstream-stream.ts

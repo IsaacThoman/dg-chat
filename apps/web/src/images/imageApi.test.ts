@@ -7,7 +7,13 @@ describe("imageApi", () => {
     const api = createImageApi(request);
     const signal = new AbortController().signal;
     await api.generate({ prompt: "A lighthouse", model: "p/image", count: 2 }, "key-1", signal);
-    await api.edit({ prompt: "At dusk", model: "p/image", sourceAssetId: "asset/1" }, "key-2");
+    await api.edit({
+      prompt: "At dusk",
+      model: "p/image",
+      sourceAssetId: "asset/1",
+      sourceAttachmentId: "attachment-1",
+      maskAttachmentId: "mask-1",
+    }, "key-2");
     await api.list({
       operation: "edit",
       query: "dusk",
@@ -27,6 +33,12 @@ describe("imageApi", () => {
         headers: expect.objectContaining({ "Idempotency-Key": "key-1" }),
       }),
     );
+    expect(JSON.parse(request.mock.calls[1][1].body)).toEqual({
+      prompt: "At dusk",
+      model: "p/image",
+      images: [{ file_id: "attachment-1" }],
+      mask: { file_id: "mask-1" },
+    });
     expect(JSON.parse(request.mock.calls[0][1].body)).toEqual({
       prompt: "A lighthouse",
       model: "p/image",

@@ -1307,6 +1307,111 @@ kbd {
   object-fit: cover;
   border-radius: 8px;
 }
+.image-source span,
+.image-mask-row span {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+.image-source small,
+.image-mask-row small,
+.image-mask-field legend span {
+  color: var(--muted);
+  font-weight: 400;
+}
+.image-mask-field {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 13px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+}
+.image-mask-field legend {
+  padding: 0 5px;
+  font-size: 13px;
+  font-weight: 650;
+}
+.image-mask-picker,
+.image-mask-row {
+  flex-wrap: wrap;
+  display: flex;
+  min-height: 48px;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 11px;
+  border: 1px dashed var(--line);
+  border-radius: 9px;
+  background: var(--surface, #fff);
+}
+.image-mask-picker {
+  justify-content: center;
+  color: var(--muted);
+}
+.image-mask-row > span {
+  flex: 1;
+  flex-basis: 150px;
+}
+.image-mask-row strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.image-mask-row > img {
+  width: 52px;
+  height: 52px;
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  object-fit: contain;
+  background: repeating-conic-gradient(#eee 0 25%, #fff 0 50%) 50% / 12px 12px;
+}
+.image-mask-row button {
+  display: inline-flex;
+  min-width: 40px;
+  min-height: 40px;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+}
+.image-mask-row progress {
+  width: 100%;
+}
+.image-lineage {
+  padding: 12px;
+  border-radius: 10px;
+  background: var(--surface-subtle);
+}
+.image-lineage h3,
+.image-lineage p {
+  margin: 0 0 7px;
+}
+.image-lineage > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+.image-lineage button {
+  display: inline-flex;
+  min-height: 40px;
+  align-items: center;
+  gap: 5px;
+}
+.image-lineage-source-error {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--danger);
+}
+.image-edit-success {
+  padding: 10px 12px;
+  border-radius: 9px;
+  color: #27613b;
+  background: #eaf6ee;
+}
 .image-lightbox {
   display: grid;
   gap: 14px;
@@ -1417,6 +1522,12 @@ kbd {
   }
   .generated-asset-gallery > header label {
     width: 100%;
+  }
+  .image-mask-row > span {
+    flex-basis: calc(100% - 76px);
+  }
+  .image-mask-row button {
+    flex: 1 1 auto;
   }
 }
 @media (max-width: 390px) {

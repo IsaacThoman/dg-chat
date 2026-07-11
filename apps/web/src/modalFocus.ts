@@ -16,3 +16,7 @@ export function modalFocusableElements(dialog: HTMLElement): HTMLElement[] {
     !element.closest("[inert]")
   );
 }
+
+export function modalShouldRestoreFocus(value: boolean | (() => boolean)): boolean {
+  return typeof value === "function" ? value() : value;
+}

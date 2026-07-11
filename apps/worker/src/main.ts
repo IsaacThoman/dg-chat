@@ -368,27 +368,35 @@ async function processJob(
           state: string;
           object_key: string;
           attachment_id: string | null;
-        }[]>`SELECT state,object_key,attachment_id FROM generated_object_staging
+          cleanup_attachment: boolean;
+        }[]>`SELECT state,object_key,attachment_id,cleanup_attachment
+          FROM generated_object_staging
           WHERE id=${stageId} AND owner_id=${ownerId}`;
         const candidate = candidates[0];
-        if (candidate?.attachment_id) {
+        if (candidate?.attachment_id && candidate.cleanup_attachment) {
           // Reference writers take the same attachment row lock and require ready/not-deleted.
           // Fencing the attachment before the external delete closes the check/delete race.
           await tx`SELECT id FROM attachments WHERE id=${candidate.attachment_id}
             AND owner_id=${ownerId} FOR UPDATE`;
         }
-        const rows = await tx<{ object_key: string; attachment_id: string | null }[]>`
+        const rows = await tx<{
+          object_key: string;
+          attachment_id: string | null;
+          cleanup_attachment: boolean;
+        }[]>`
           UPDATE generated_object_staging s SET state='cleaning',updated_at=now()
           FROM jobs j WHERE s.id=${stageId} AND s.owner_id=${ownerId}
             AND s.state IN ('cleanup_pending','cleaning')
             AND j.id=${job.id} AND j.status='running' AND j.locked_by=${job.claimToken}
-            AND NOT EXISTS(SELECT 1 FROM generated_assets ga
-              WHERE ga.usage_run_id=s.usage_run_id OR ga.attachment_id=s.attachment_id)
-            AND NOT EXISTS(SELECT 1 FROM message_attachments ma
-              WHERE ma.attachment_id=s.attachment_id)
-          RETURNING s.object_key,s.attachment_id`;
+            AND (NOT s.cleanup_attachment OR NOT EXISTS(SELECT 1 FROM generated_assets ga
+              WHERE ga.usage_run_id=s.usage_run_id OR ga.attachment_id=s.attachment_id))
+            AND (NOT s.cleanup_attachment OR NOT EXISTS(SELECT 1 FROM message_attachments ma
+              WHERE ma.attachment_id=s.attachment_id))
+            AND (NOT s.cleanup_attachment OR NOT EXISTS(SELECT 1 FROM generated_asset_inputs gai
+              WHERE gai.attachment_id=s.attachment_id))
+          RETURNING s.object_key,s.attachment_id,s.cleanup_attachment`;
         if (rows[0]) {
-          if (rows[0].attachment_id) {
+          if (rows[0].attachment_id && rows[0].cleanup_attachment) {
             const fenced = await tx`UPDATE attachments SET state='deleted',
               deleted_at=COALESCE(deleted_at,now()),updated_at=now()
               WHERE id=${rows[0].attachment_id} AND owner_id=${ownerId}
