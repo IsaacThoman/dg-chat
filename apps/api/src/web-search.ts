@@ -2,8 +2,10 @@ import {
   type DnsResolver,
   type NetworkPolicy,
   NetworkPolicyError,
+  resolveNetworkTarget,
   validateNetworkTarget,
 } from "./network-policy.ts";
+import { Agent, fetch as pinnedFetch } from "undici";
 
 export interface WebSearchRequest {
   query: string;
@@ -164,23 +166,57 @@ export class SearxngSearchAdapter implements WebSearchAdapter {
     url.searchParams.set("safesearch", String(request.safeSearch ?? 1));
     if (request.language) url.searchParams.set("language", request.language.slice(0, 32));
     try {
-      await validateNetworkTarget(url, this.#policy, this.#resolveDns);
+      if (this.#fetch !== fetch) {
+        const validated = await validateNetworkTarget(url, this.#policy, this.#resolveDns);
+        return await this.#request(request, validated, [], count, query);
+      }
+      const resolved = await resolveNetworkTarget(url, this.#policy, this.#resolveDns);
+      return await this.#request(request, resolved.url, resolved.addresses, count, query);
     } catch (error) {
       if (error instanceof NetworkPolicyError) {
         throw new WebSearchError("request_failed", `Search endpoint blocked: ${error.code}`);
       }
       throw error;
     }
+  }
+
+  async #request(
+    request: WebSearchRequest,
+    url: URL,
+    addresses: string[],
+    count: number,
+    query: string,
+  ): Promise<WebSearchResponse> {
     const timeout = AbortSignal.timeout(this.#timeoutMs);
     const signal = request.signal ? AbortSignal.any([request.signal, timeout]) : timeout;
     let response: Response;
+    let dispatcher: Agent | undefined;
     try {
-      response = await this.#fetch(url, {
-        headers: { accept: "application/json" },
-        redirect: "error",
-        signal,
-      });
+      if (this.#fetch !== fetch) {
+        response = await this.#fetch(url, {
+          headers: { accept: "application/json" },
+          redirect: "error",
+          signal,
+        });
+      } else {
+        let cursor = 0;
+        dispatcher = new Agent({
+          connect: {
+            lookup(_hostname, _options, callback) {
+              const address = addresses[cursor++ % addresses.length];
+              callback(null, address, address.includes(":") ? 6 : 4);
+            },
+          },
+        });
+        response = await pinnedFetch(url, {
+          headers: { accept: "application/json" },
+          redirect: "error",
+          signal,
+          dispatcher,
+        }) as unknown as Response;
+      }
     } catch {
+      await dispatcher?.close();
       if (signal.aborted) {
         throw new WebSearchError(
           "request_timeout",
@@ -191,6 +227,8 @@ export class SearxngSearchAdapter implements WebSearchAdapter {
       throw new WebSearchError("request_failed", "Search service could not be reached", true);
     }
     if (!response.ok) {
+      await response.body?.cancel();
+      await dispatcher?.close();
       throw new WebSearchError(
         "request_failed",
         `Search service returned HTTP ${response.status}`,
@@ -199,9 +237,16 @@ export class SearxngSearchAdapter implements WebSearchAdapter {
     }
     const contentType = response.headers.get("content-type")?.split(";", 1)[0].trim();
     if (contentType !== "application/json") {
+      await response.body?.cancel();
+      await dispatcher?.close();
       throw new WebSearchError("invalid_response", "Search service did not return JSON");
     }
-    const data = await readBoundedJson(response, this.#maxResponseBytes);
+    let data: unknown;
+    try {
+      data = await readBoundedJson(response, this.#maxResponseBytes);
+    } finally {
+      await dispatcher?.close();
+    }
     if (
       !data || typeof data !== "object" || !Array.isArray((data as { results?: unknown }).results)
     ) {

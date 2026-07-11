@@ -49,7 +49,7 @@ export interface ToolExecutionStore {
     expectedVersion?: number,
   ): Promise<ToolPolicy>;
   createExecution(execution: ToolExecution): Promise<ToolExecution>;
-  getExecution(id: string): Promise<ToolExecution | undefined>;
+  getExecution(id: string, ownerId?: string): Promise<ToolExecution | undefined>;
   /** Atomic compare-and-set; returns undefined if the current status no longer matches. */
   transitionExecution(
     id: string,
@@ -79,6 +79,7 @@ export class ToolExecutionError extends Error {
       | "approval_required"
       | "execution_terminal"
       | "version_conflict"
+      | "rate_limited"
       | "invalid_input",
     message: string,
     readonly status: number,
@@ -143,9 +144,11 @@ export class MemoryToolExecutionStore implements ToolExecutionStore {
     this.#executions.set(execution.id, clone(execution));
     return Promise.resolve(clone(execution));
   }
-  getExecution(id: string) {
+  getExecution(id: string, ownerId?: string) {
     const value = this.#executions.get(id);
-    return Promise.resolve(value ? clone(value) : undefined);
+    return Promise.resolve(
+      value && (!ownerId || value.ownerId === ownerId) ? clone(value) : undefined,
+    );
   }
   transitionExecution(
     id: string,
@@ -166,7 +169,15 @@ export class ToolExecutionService {
   readonly #adapters = new Map<string, ToolAdapter>();
   readonly #active = new Map<string, AbortController>();
 
-  constructor(readonly store: ToolExecutionStore, adapters: readonly ToolAdapter[]) {
+  constructor(
+    readonly store: ToolExecutionStore,
+    adapters: readonly ToolAdapter[],
+    readonly controls?: {
+      reserve(execution: ToolExecution): Promise<void>;
+      settle(execution: ToolExecution, latencyMs: number): Promise<void>;
+      refund(execution: ToolExecution, error?: string): Promise<void>;
+    },
+  ) {
     for (const adapter of adapters) {
       if (this.#adapters.has(adapter.definition.id)) throw new Error("Duplicate tool adapter id");
       this.#adapters.set(adapter.definition.id, adapter);
@@ -208,13 +219,24 @@ export class ToolExecutionService {
     if (domains.some((domain) => !domain || domain.length > 253 || !/^[a-z0-9.-]+$/.test(domain))) {
       throw new ToolExecutionError("invalid_input", "Tool domain allowlist is invalid", 422);
     }
-    return await this.store.putPolicy({
-      toolId: input.toolId,
-      allowed: input.allowed,
-      allowedDomains: domains,
-      allowPrivateNetwork: input.allowPrivateNetwork === true,
-      updatedBy: input.actorId,
-    }, input.expectedVersion);
+    try {
+      return await this.store.putPolicy({
+        toolId: input.toolId,
+        allowed: input.allowed,
+        allowedDomains: domains,
+        allowPrivateNetwork: input.allowPrivateNetwork === true,
+        updatedBy: input.actorId,
+      }, input.expectedVersion);
+    } catch (error) {
+      if (error instanceof Error && error.name === "ToolPolicyVersionConflict") {
+        throw new ToolExecutionError(
+          "version_conflict",
+          "Tool policy changed in another session",
+          409,
+        );
+      }
+      throw error;
+    }
   }
 
   async request(ownerId: string, toolId: string, input: unknown): Promise<ToolExecution> {
@@ -248,8 +270,8 @@ export class ToolExecutionService {
   }
 
   async get(ownerId: string, id: string): Promise<ToolExecution> {
-    const execution = await this.store.getExecution(id);
-    if (!execution || execution.ownerId !== ownerId) {
+    const execution = await this.store.getExecution(id, ownerId);
+    if (!execution) {
       throw new ToolExecutionError("execution_not_found", "Tool execution was not found", 404);
     }
     return execution;
@@ -271,12 +293,16 @@ export class ToolExecutionService {
       throw new ToolExecutionError("tool_not_allowed", "Tool is no longer allowlisted", 403);
     }
     const now = new Date().toISOString();
+    await this.controls?.reserve(execution);
     const queued = await this.store.transitionExecution(id, ["pending_approval"], {
       status: "queued",
       approvedAt: now,
       approvedBy: ownerId,
     });
-    if (!queued) throw new ToolExecutionError("execution_terminal", "Tool execution changed", 409);
+    if (!queued) {
+      await this.controls?.refund(execution, "tool execution changed before approval");
+      throw new ToolExecutionError("execution_terminal", "Tool execution changed", 409);
+    }
     void this.#dispatch(queued, adapter, policy);
     return queued;
   }
@@ -301,8 +327,15 @@ export class ToolExecutionService {
 
   async #dispatch(execution: ToolExecution, adapter: ToolAdapter, policy: ToolPolicy) {
     const controller = new AbortController();
+    const startedAt = performance.now();
     this.#active.set(execution.id, controller);
     try {
+      // Fence the exact policy revision immediately before execution. An administrator can revoke
+      // or narrow a policy after user approval but before this microtask begins.
+      const currentPolicy = await this.store.getPolicy(execution.toolId);
+      if (!currentPolicy?.allowed || currentPolicy.version !== policy.version) {
+        throw new Error("Tool policy changed before execution began");
+      }
       const running = await this.store.transitionExecution(execution.id, ["queued"], {
         status: "running",
       });
@@ -311,15 +344,22 @@ export class ToolExecutionService {
         executionId: execution.id,
         ownerId: execution.ownerId,
         signal: controller.signal,
-        policy,
+        policy: currentPolicy,
       });
       if (!validateJson(result) || JSON.stringify(result).length > 1_000_000) {
         throw new Error("Tool returned an invalid or oversized result");
       }
-      await this.store.transitionExecution(execution.id, ["running"], {
+      await this.controls?.settle(
+        execution,
+        Math.max(0, Math.round(performance.now() - startedAt)),
+      );
+      const succeeded = await this.store.transitionExecution(execution.id, ["running"], {
         status: "succeeded",
         result: clone(result),
       });
+      if (!succeeded) {
+        await this.controls?.refund(execution, "tool execution cancelled before completion");
+      }
     } catch (error) {
       if (controller.signal.aborted) {
         await this.store.transitionExecution(execution.id, ["queued", "running"], {
@@ -327,7 +367,7 @@ export class ToolExecutionService {
           cancellationRequestedAt: new Date().toISOString(),
         });
       } else {
-        await this.store.transitionExecution(execution.id, ["running"], {
+        await this.store.transitionExecution(execution.id, ["queued", "running"], {
           status: "failed",
           error: {
             code: "tool_execution_failed",
@@ -337,6 +377,10 @@ export class ToolExecutionService {
           },
         });
       }
+      await this.controls?.refund(
+        execution,
+        error instanceof Error ? error.message.slice(0, 1_000) : "Tool execution failed",
+      );
     } finally {
       this.#active.delete(execution.id);
     }

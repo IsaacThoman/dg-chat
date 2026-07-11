@@ -68,6 +68,9 @@ services:
       context: .
       dockerfile: Dockerfile
       target: app
+    networks:
+      - backend
+      - search-egress
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8000/ready"]
       interval: 10s
@@ -170,6 +173,7 @@ services:
         condition: service_completed_successfully
     networks:
       - backend
+      - egress
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -196,7 +200,7 @@ services:
     volumes:
       - ./deploy/searxng/settings.yml:/etc/searxng/settings.yml:ro
     networks:
-      - backend
+      - search-egress
     read_only: true
     tmpfs:
       - /tmp:size=64m,mode=1777
@@ -317,6 +321,11 @@ services:
 
 networks:
   backend:
+    driver: bridge
+    internal: true
+  search-egress:
+    driver: bridge
+  egress:
     driver: bridge
 
 volumes:

@@ -129,3 +129,51 @@ Deno.test("tool executions are owner-isolated and policy writes use optimistic v
     "another session",
   );
 });
+
+Deno.test("policy revision is fenced immediately before dispatch and reserved credit is refunded", async () => {
+  class DispatchFenceStore extends MemoryToolExecutionStore {
+    reads = 0;
+    release!: () => void;
+    override async getPolicy(toolId: string) {
+      this.reads++;
+      if (this.reads === 3) await new Promise<void>((resolve) => this.release = resolve);
+      return await super.getPolicy(toolId);
+    }
+  }
+  const store = new DispatchFenceStore();
+  let calls = 0;
+  const billing: string[] = [];
+  const service = new ToolExecutionService(store, [{
+    ...echoAdapter,
+    execute: () => {
+      calls++;
+      return Promise.resolve({});
+    },
+  }], {
+    reserve: () => {
+      billing.push("reserve");
+      return Promise.resolve();
+    },
+    settle: () => {
+      billing.push("settle");
+      return Promise.resolve();
+    },
+    refund: () => {
+      billing.push("refund");
+      return Promise.resolve();
+    },
+  });
+  const initial = await service.setPolicy({ toolId: "echo", allowed: true, actorId: "admin" });
+  const execution = await service.request("user", "echo", {});
+  await service.approve("user", execution.id);
+  await service.setPolicy({
+    toolId: "echo",
+    allowed: false,
+    expectedVersion: initial.version,
+    actorId: "admin",
+  });
+  store.release();
+  await waitFor(service, "user", execution.id, "failed");
+  assertEquals(calls, 0);
+  assertEquals(billing, ["reserve", "refund"]);
+});

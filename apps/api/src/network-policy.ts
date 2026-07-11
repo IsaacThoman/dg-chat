@@ -100,7 +100,7 @@ export function isPublicNetworkAddress(address: string): boolean {
   );
 }
 
-const defaultResolver: DnsResolver = async (hostname, recordType) => {
+export const defaultDnsResolver: DnsResolver = async (hostname, recordType) => {
   try {
     return await Deno.resolveDns(hostname, recordType);
   } catch (error) {
@@ -112,7 +112,7 @@ const defaultResolver: DnsResolver = async (hostname, recordType) => {
 export async function validateNetworkTarget(
   input: string | URL,
   policy: NetworkPolicy = {},
-  resolve: DnsResolver = defaultResolver,
+  resolve: DnsResolver = defaultDnsResolver,
 ): Promise<URL> {
   let url: URL;
   try {
@@ -159,4 +159,26 @@ export async function validateNetworkTarget(
     throw new NetworkPolicyError("address_not_allowed", "Target resolves to a private address");
   }
   return url;
+}
+
+/** Validates and returns the exact addresses a transport must pin for this request. */
+export async function resolveNetworkTarget(
+  input: string | URL,
+  policy: NetworkPolicy = {},
+  resolve: DnsResolver = defaultDnsResolver,
+): Promise<{ url: URL; addresses: string[] }> {
+  const url = await validateNetworkTarget(input, policy, resolve);
+  const literal = parseIpv4(url.hostname) || parseIpv6(url.hostname);
+  const addresses = literal
+    ? [url.hostname.replace(/^\[|\]$/g, "")]
+    : [...await resolve(url.hostname, "A"), ...await resolve(url.hostname, "AAAA")];
+  if (!addresses.length) {
+    throw new NetworkPolicyError("dns_resolution_failed", "Target did not resolve to an address");
+  }
+  if (
+    !policy.allowPrivateNetwork && addresses.some((address) => !isPublicNetworkAddress(address))
+  ) {
+    throw new NetworkPolicyError("address_not_allowed", "Target resolves to a private address");
+  }
+  return { url, addresses: [...new Set(addresses)] };
 }

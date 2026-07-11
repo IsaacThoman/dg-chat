@@ -122,3 +122,81 @@ Deno.test("tool API enforces admin allowlisting, explicit approval, status, canc
     "tool.execution.requested",
   ]);
 });
+
+Deno.test("approved tools reserve and settle credit and enforce a per-user tool rate limit", async () => {
+  const adapter: ToolAdapter = {
+    definition: {
+      id: "metered_tool",
+      name: "Metered tool",
+      description: "Metered adapter",
+      inputSchema: { type: "object" },
+      enabled: true,
+    },
+    execute: () => Promise.resolve({ ok: true }),
+  };
+  const { app } = createApp({
+    setupToken: "metered-setup",
+    toolAdapters: [adapter],
+    toolReserveMicros: 1_000,
+    toolRateLimitPerMinute: 1,
+  });
+  await app.request("/api/setup/bootstrap", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-setup-token": "metered-setup" },
+    body: JSON.stringify({
+      email: "metered-admin@example.com",
+      name: "Metered Admin",
+      password: "correct horse battery staple",
+    }),
+  });
+  const login = await app.request("/api/auth/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email: "metered-admin@example.com",
+      password: "correct horse battery staple",
+    }),
+  });
+  const headers = {
+    cookie: cookie(login),
+    origin: "http://localhost:5173",
+    "content-type": "application/json",
+  };
+  await app.request("/api/admin/tools/metered_tool/policy", {
+    method: "PUT",
+    headers,
+    body: JSON.stringify({ allowed: true, expectedVersion: 0 }),
+  });
+  const create = async () =>
+    await json(
+      await app.request("/api/tools/executions", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ toolId: "metered_tool", input: {} }),
+      }),
+    );
+  const first = await create();
+  assertEquals(
+    (await app.request(`/api/tools/executions/${first.id}/approve`, { method: "POST", headers }))
+      .status,
+    202,
+  );
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const current = await json(await app.request(`/api/tools/executions/${first.id}`, { headers }));
+    if (current.status === "succeeded") break;
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  const usage = await json(await app.request("/api/usage", { headers }));
+  assertEquals(usage.spentMicros, 1_000);
+  const second = await create();
+  const limited = await app.request(`/api/tools/executions/${second.id}/approve`, {
+    method: "POST",
+    headers,
+  });
+  assertEquals(limited.status, 429);
+  assertEquals((await json(limited)).error.code, "rate_limited");
+  assertEquals(
+    (await json(await app.request(`/api/tools/executions/${second.id}`, { headers }))).status,
+    "pending_approval",
+  );
+});

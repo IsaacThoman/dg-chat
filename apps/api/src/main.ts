@@ -4,6 +4,7 @@ import {
   MemoryRepository,
   objectStoreFromEnv,
   PostgresRepository,
+  PostgresToolExecutionStore,
 } from "@dg-chat/database";
 import { MemoryRateLimiter, RedisRateLimiter } from "./rate-limit.ts";
 import { ProviderSecretKeyring } from "./provider-secrets.ts";
@@ -29,6 +30,9 @@ if (databaseUrl) {
 const repository = databaseUrl
   ? await PostgresRepository.connect(databaseUrl)
   : new MemoryRepository();
+const toolExecutionStore = databaseUrl
+  ? PostgresToolExecutionStore.connect(databaseUrl)
+  : undefined;
 const rateLimiter = Deno.env.get("REDIS_URL")
   ? new RedisRateLimiter(Deno.env.get("REDIS_URL")!)
   : new MemoryRateLimiter();
@@ -48,6 +52,7 @@ const { app } = createApp({
   providerKeyring,
   circuitBreaker,
   ocrCache,
+  toolExecutionStore,
 });
 const replayMaintenance = setInterval(async () => {
   try {
@@ -84,6 +89,7 @@ const shutdown = async (signal: string) => {
   await server.shutdown();
   await Promise.all([
     repository.close(),
+    toolExecutionStore?.close(),
     rateLimiter.close(),
     circuitBreaker.close(),
     ocrCache?.close(),

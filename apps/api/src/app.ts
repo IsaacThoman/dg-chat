@@ -135,8 +135,10 @@ import {
 import { runAccountedEmbeddingCall } from "./embedding-accounting.ts";
 import {
   MemoryToolExecutionStore,
+  type ToolAdapter,
   ToolExecutionError,
   ToolExecutionService,
+  type ToolExecutionStore,
 } from "./tool-execution.ts";
 import { SearxngSearchAdapter } from "./web-search.ts";
 import { WebSearchToolAdapter } from "./search-tool.ts";
@@ -185,6 +187,10 @@ export interface AppOptions {
   };
   ocrCache?: OcrCache;
   toolExecutionService?: ToolExecutionService;
+  toolExecutionStore?: ToolExecutionStore;
+  toolAdapters?: readonly ToolAdapter[];
+  toolRateLimitPerMinute?: number;
+  toolReserveMicros?: number;
 }
 
 interface StagedUpload {
@@ -943,9 +949,13 @@ export function createApp(options: AppOptions = {}) {
     }
   };
   const configuredSearxngUrl = Deno.env.get("SEARXNG_URL")?.trim();
+  const toolReserveMicros = options.toolReserveMicros ??
+    positiveInteger("TOOL_WEB_SEARCH_RESERVE_MICROS", 1_000);
+  const toolRateLimit = options.toolRateLimitPerMinute ??
+    positiveInteger("TOOL_WEB_SEARCH_RATE_LIMIT_PER_MINUTE", 10);
   const toolExecution = options.toolExecutionService ?? new ToolExecutionService(
-    new MemoryToolExecutionStore(),
-    configuredSearxngUrl
+    options.toolExecutionStore ?? new MemoryToolExecutionStore(),
+    options.toolAdapters ?? (configuredSearxngUrl
       ? [
         new WebSearchToolAdapter(
           new SearxngSearchAdapter({
@@ -956,7 +966,36 @@ export function createApp(options: AppOptions = {}) {
           }),
         ),
       ]
-      : [],
+      : []),
+    {
+      async reserve(execution) {
+        const rate = await rateLimiter.consume(
+          `tool:${execution.toolId}:user:${execution.ownerId}`,
+          toolRateLimit,
+          60,
+        );
+        if (!rate.allowed) {
+          throw new ToolExecutionError(
+            "rate_limited",
+            `Tool rate limit exceeded; retry in ${rate.retryAfterSeconds} seconds`,
+            429,
+          );
+        }
+        await repo.reserve(
+          execution.ownerId,
+          `tool:${execution.id}`,
+          `tool/${execution.toolId}`,
+          toolReserveMicros,
+          "tool",
+        );
+      },
+      async settle(execution, latencyMs) {
+        await repo.settle(`tool:${execution.id}`, toolReserveMicros, 0, 0, latencyMs);
+      },
+      async refund(execution, error) {
+        await repo.refund(`tool:${execution.id}`, error);
+      },
+    },
   );
   type RuntimeModel = {
     info: ModelInfo;

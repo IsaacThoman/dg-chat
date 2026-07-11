@@ -3,6 +3,7 @@ import {
   domainMatches,
   isPublicNetworkAddress,
   NetworkPolicyError,
+  resolveNetworkTarget,
   validateNetworkTarget,
 } from "./network-policy.ts";
 
@@ -26,6 +27,23 @@ Deno.test("network policy recognizes public and non-public IPv4 and IPv6 ranges"
   for (const address of ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111", "2001:4860:4860::8888"]) {
     assertEquals(isPublicNetworkAddress(address), true, address);
   }
+});
+
+Deno.test("resolved transport addresses are revalidated and pinned against DNS rebinding", async () => {
+  let aReads = 0;
+  const error = await assertRejects(
+    () =>
+      resolveNetworkTarget(
+        "https://search.example.com/path",
+        { allowedDomains: ["example.com"] },
+        (_host, type) => {
+          if (type === "AAAA") return Promise.resolve([]);
+          return Promise.resolve([++aReads === 1 ? "93.184.216.34" : "127.0.0.1"]);
+        },
+      ),
+    NetworkPolicyError,
+  );
+  assertEquals(error.code, "address_not_allowed");
 });
 
 Deno.test("domain allowlist matches exact host and subdomains without suffix confusion", () => {
