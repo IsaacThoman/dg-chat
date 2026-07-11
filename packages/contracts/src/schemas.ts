@@ -94,13 +94,20 @@ const generateMessageObjectSchema = z.object({
     (ids) => new Set(ids).size === ids.length,
     "Attachment identifiers must be unique",
   ).optional().default([]),
+  toolExecutionIds: z.array(z.string().uuid()).max(8).refine(
+    (ids) => new Set(ids).size === ids.length,
+    "Tool execution identifiers must be unique",
+  ).optional().default([]),
 });
 
 const requireMessageContent = (
-  value: { content: string; attachmentIds: string[] },
+  value: { content: string; attachmentIds: string[]; toolExecutionIds: string[] },
   context: z.RefinementCtx,
 ) => {
-  if (value.content.length === 0 && value.attachmentIds.length === 0) {
+  if (
+    value.content.length === 0 && value.attachmentIds.length === 0 &&
+    value.toolExecutionIds.length === 0
+  ) {
     context.addIssue({
       code: z.ZodIssueCode.custom,
       path: ["content"],

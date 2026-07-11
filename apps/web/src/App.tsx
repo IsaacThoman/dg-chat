@@ -922,7 +922,11 @@ function AttachmentIngestionBadge({ attachment }: { attachment: Attachment }) {
 
 function Composer(
   { onSend, edit, cancelEdit, disabled, streaming, stopping, queuedCount, onStop }: {
-    onSend: (value: string, attachmentIds: string[]) => Promise<boolean>;
+    onSend: (
+      value: string,
+      attachmentIds: string[],
+      toolExecutionIds: string[],
+    ) => Promise<boolean>;
     edit?: Message;
     cancelEdit: () => void;
     disabled: boolean;
@@ -934,7 +938,7 @@ function Composer(
 ) {
   const [value, setValue] = useState("");
   const [toolsOpen, setToolsOpen] = useState(false);
-  const [toolContexts, setToolContexts] = useState<Array<{ id: string; content: string }>>([]);
+  const [toolContexts, setToolContexts] = useState<Array<{ id: string }>>([]);
   const [dragging, setDragging] = useState(false);
   const [selectionError, setSelectionError] = useState("");
   type UploadState =
@@ -1084,9 +1088,7 @@ function Composer(
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     if (!canSubmit) return;
-    const content = [value.trim(), ...toolContexts.map((context) => context.content)]
-      .filter(Boolean).join("\n");
-    if (await onSend(content, readyAttachmentIds)) {
+    if (await onSend(value.trim(), readyAttachmentIds, toolContexts.map((context) => context.id))) {
       setValue("");
       setUploads([]);
       setToolContexts([]);
@@ -1301,8 +1303,7 @@ function Composer(
       <ToolLauncher
         open={toolsOpen}
         close={() => setToolsOpen(false)}
-        insert={(content) =>
-          setToolContexts((current) => [...current, { id: crypto.randomUUID(), content }])}
+        insert={(execution) => setToolContexts((current) => [...current, { id: execution.id }])}
       />
       <p className="composer-note">
         AI can make mistakes. Check important information.{" "}
@@ -1635,6 +1636,7 @@ function ChatView({
           sourceMessageId: item.sourceMessageId,
           operationId: item.operationId,
           attachmentIds: item.attachmentIds,
+          toolExecutionIds: item.toolExecutionIds,
           mode: item.mode,
         }, controller.signal)
       ) {
@@ -1730,6 +1732,7 @@ function ChatView({
             edit: undefined,
             sourceMessageId: terminalAssistant.id,
             attachmentIds: [],
+            toolExecutionIds: [],
             mode: "regenerate" as const,
             reuseOperationOnRetry: false,
           }
@@ -1754,6 +1757,7 @@ function ChatView({
                 edit: undefined,
                 sourceMessageId: recovered.id,
                 attachmentIds: [],
+                toolExecutionIds: [],
                 mode: "regenerate",
                 reuseOperationOnRetry: false,
               };
@@ -1793,13 +1797,18 @@ function ChatView({
   }, [activeStream, queue, readOnly]);
   useEffect(() => () => streamAbortRef.current?.abort(), []);
 
-  const send = (content: string, attachmentIds: string[]): Promise<boolean> => {
+  const send = (
+    content: string,
+    attachmentIds: string[],
+    toolExecutionIds: string[],
+  ): Promise<boolean> => {
     const item: QueuedPrompt = {
       id: crypto.randomUUID(),
       content,
       model: selectedModel,
       edit,
       attachmentIds,
+      toolExecutionIds,
       mode: "send",
       operationId: crypto.randomUUID(),
     };
@@ -1820,6 +1829,7 @@ function ChatView({
         model: selectedModel,
         sourceMessageId,
         attachmentIds: [],
+        toolExecutionIds: [],
         mode,
         operationId,
       })

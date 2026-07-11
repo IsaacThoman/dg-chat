@@ -997,6 +997,21 @@ export function createApp(options: AppOptions = {}) {
       },
     },
   );
+  const materializeToolContext = async (
+    ownerId: string,
+    content: string,
+    ids: readonly string[],
+  ) => {
+    const executions = await toolExecution.resolveSucceeded(ownerId, ids);
+    return [
+      content,
+      ...executions.map((execution) =>
+        `Tool result (server-verified execution ${execution.id}, ${execution.toolId}):\n${
+          JSON.stringify(execution.result)
+        }`
+      ),
+    ].filter(Boolean).join("\n\n");
+  };
   type RuntimeModel = {
     info: ModelInfo;
     provider?: ProviderRecord;
@@ -2162,6 +2177,11 @@ export function createApp(options: AppOptions = {}) {
     const body = await parseJson(c, generateMessageSchema);
     const conversationId = c.req.param("id");
     const ownerId = c.get("user").id;
+    const messageContent = await materializeToolContext(
+      ownerId,
+      body.content,
+      body.toolExecutionIds,
+    );
     const resolvedModel = await resolveRuntimeModel(body.model);
     const model = resolvedModel?.info;
     if (!model) {
@@ -2205,7 +2225,7 @@ export function createApp(options: AppOptions = {}) {
         parentId: body.parentId,
         supersedesId: body.supersedesId,
         role: "user",
-        content: body.content,
+        content: messageContent,
         model: body.model,
         expectedVersion: body.expectedVersion,
         idempotencyKey: `${body.idempotencyKey}:user`,
@@ -2217,6 +2237,7 @@ export function createApp(options: AppOptions = {}) {
       leaseSeconds: generationLeaseSeconds,
       attachmentIds: body.attachmentIds,
     });
+    await toolExecution.linkToMessage(ownerId, begun.message.id, body.toolExecutionIds);
     const completedPayload = async () => {
       const detail = await detailWithAttachments(conversationId, ownerId);
       const user = detail.messages.find((message) => message.id === begun.message.id);
@@ -2419,6 +2440,9 @@ export function createApp(options: AppOptions = {}) {
     const body = await parseJson(c, streamGenerationSchema);
     const conversationId = c.req.param("id");
     const ownerId = c.get("user").id;
+    const messageContent = body.mode === "send"
+      ? await materializeToolContext(ownerId, body.content, body.toolExecutionIds)
+      : undefined;
     const resolvedModel = await resolveRuntimeModel(body.model);
     const model = resolvedModel?.info;
     if (!model) {
@@ -2469,7 +2493,7 @@ export function createApp(options: AppOptions = {}) {
           parentId: body.parentId,
           supersedesId: body.supersedesId,
           role: "user",
-          content: body.content,
+          content: messageContent!,
           model: body.model,
           expectedVersion: body.expectedVersion,
           idempotencyKey: `${body.idempotencyKey}:user`,
@@ -2497,6 +2521,9 @@ export function createApp(options: AppOptions = {}) {
         leaseSeconds: generationLeaseSeconds,
         generationId,
       });
+    if (body.mode === "send") {
+      await toolExecution.linkToMessage(ownerId, begun.message.id, body.toolExecutionIds);
+    }
     const completedPayload = async () => {
       const detail = await detailWithAttachments(conversationId, ownerId);
       const user = detail.messages.find((message) => message.id === begun.message.id);

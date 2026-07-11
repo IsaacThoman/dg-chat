@@ -45,7 +45,7 @@ const ocrCache = Deno.env.get("REDIS_URL")
   })
   : undefined;
 const objectStore = objectStoreFromEnv();
-const { app } = createApp({
+const { app, toolExecutionService } = createApp({
   repository,
   rateLimiter,
   objectStore,
@@ -54,13 +54,15 @@ const { app } = createApp({
   ocrCache,
   toolExecutionStore,
 });
+await toolExecutionService.recover();
 const replayMaintenance = setInterval(async () => {
   try {
     const reaped = await repository.reapStaleApiRequests(100);
     const reapedGenerations = await repository.reapStaleGenerations(100);
     const reapedProviderRuns = await repository.reapStaleProviderExecutionLeases(100);
     const pruned = await repository.pruneExpiredApiRequests(100);
-    if (reaped || reapedGenerations || reapedProviderRuns || pruned) {
+    const recoveredTools = await toolExecutionService.recover();
+    if (reaped || reapedGenerations || reapedProviderRuns || pruned || recoveredTools) {
       console.log(JSON.stringify({
         level: "info",
         message: "Replay maintenance",
@@ -68,6 +70,7 @@ const replayMaintenance = setInterval(async () => {
         reapedGenerations,
         reapedProviderRuns,
         pruned,
+        recoveredTools,
       }));
     }
   } catch (error) {

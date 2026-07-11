@@ -84,7 +84,14 @@ export type ToolExecution = {
   ownerId: string;
   toolId: string;
   input: unknown;
-  status: "pending_approval" | "queued" | "running" | "succeeded" | "failed" | "cancelled";
+  status:
+    | "pending_approval"
+    | "queued"
+    | "running"
+    | "succeeded_pending_settlement"
+    | "succeeded"
+    | "failed"
+    | "cancelled";
   result: unknown | null;
   error: { code: string; message: string } | null;
   createdAt: string;
@@ -459,6 +466,7 @@ export const api = {
     idempotencyKey: string = crypto.randomUUID(),
     attachmentIds: string[] = [],
     signal?: AbortSignal,
+    toolExecutionIds: string[] = [],
   ) => {
     const result = await request<
       { user: RawMessage; assistant: RawMessage; conversation: RawConversation }
@@ -473,6 +481,7 @@ export const api = {
         expectedVersion: conversation.version,
         idempotencyKey,
         attachmentIds,
+        toolExecutionIds,
       }),
     });
     return {

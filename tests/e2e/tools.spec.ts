@@ -19,7 +19,7 @@ test("admin enables web search and a user explicitly reviews and cancels a tool 
   const card = page.locator("article", { hasText: "Web search" });
   const enabled = card.getByRole("checkbox", { name: "Enable" });
   if (!(await enabled.isChecked())) await enabled.check();
-  await card.getByLabel("Domain allowlist").fill("searxng");
+  await card.getByLabel("Domain allowlist").fill("search-proxy");
   const privateNetwork = card.getByRole("checkbox", { name: /private network targets/i });
   if (!(await privateNetwork.isChecked())) await privateNetwork.check();
   await card.getByRole("button", { name: "Save policy" }).click();

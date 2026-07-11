@@ -19,7 +19,7 @@ export function toolResultForMessage(execution: ToolExecution, maxCharacters = 5
 export function ToolLauncher({ open, close, insert }: {
   open: boolean;
   close: () => void;
-  insert: (text: string) => void;
+  insert: (execution: ToolExecution) => void;
 }) {
   const tools = useQuery({ queryKey: ["tools"], queryFn: api.tools, enabled: open });
   const [query, setQuery] = useState("");
@@ -122,7 +122,7 @@ export function ToolLauncher({ open, close, insert }: {
               <button
                 className="primary"
                 onClick={() => {
-                  insert(toolResultForMessage(execution));
+                  insert(execution);
                   close();
                 }}
               >

@@ -33,7 +33,7 @@ x-app-environment: &app-environment
   KNOWLEDGE_EMBEDDING_VERSION: ${KNOWLEDGE_EMBEDDING_VERSION:-}
   KNOWLEDGE_EMBEDDING_BATCH_SIZE: ${KNOWLEDGE_EMBEDDING_BATCH_SIZE:-64}
   KNOWLEDGE_EMBEDDING_QUERY_TIMEOUT_MS: ${KNOWLEDGE_EMBEDDING_QUERY_TIMEOUT_MS:-10000}
-  SEARXNG_URL: ${SEARXNG_URL:-http://searxng:8080}
+  SEARXNG_URL: ${SEARXNG_URL:-http://search-proxy:8080}
   SEARXNG_ALLOW_PRIVATE_NETWORK: ${SEARXNG_ALLOW_PRIVATE_NETWORK:-true}
   SEARXNG_TIMEOUT_MS: ${SEARXNG_TIMEOUT_MS:-8000}
   SEARXNG_MAX_RESPONSE_BYTES: ${SEARXNG_MAX_RESPONSE_BYTES:-2000000}
@@ -70,7 +70,8 @@ services:
       target: app
     networks:
       - backend
-      - search-egress
+      - app-search
+      - egress
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8000/ready"]
       interval: 10s
@@ -203,6 +204,7 @@ services:
     volumes:
       - ./deploy/searxng/settings.yml:/etc/searxng/settings.yml:ro
     networks:
+      - search-backend
       - search-egress
     read_only: true
     tmpfs:
@@ -218,6 +220,27 @@ services:
       timeout: 5s
       retries: 12
       start_period: 20s
+
+  search-proxy:
+    image: nginxinc/nginx-unprivileged:1.27-alpine
+    restart: unless-stopped
+    volumes:
+      - ./deploy/search-proxy.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - app-search
+      - search-backend
+    depends_on:
+      searxng:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+      - /var/cache/nginx:size=16m
+      - /var/run:size=4m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
 
   postgres:
     image: pgvector/pgvector:pg17
@@ -328,6 +351,12 @@ networks:
     internal: true
   search-egress:
     driver: bridge
+  app-search:
+    driver: bridge
+    internal: true
+  search-backend:
+    driver: bridge
+    internal: true
   egress:
     driver: bridge
 
