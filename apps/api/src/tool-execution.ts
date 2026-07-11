@@ -63,6 +63,7 @@ export interface ToolExecutionStore {
     executionIds: readonly string[],
   ): Promise<void>;
   claimRecoverable?(limit: number): Promise<ToolExecution[]>;
+  listPendingSettlement?(limit: number): Promise<ToolExecution[]>;
 }
 
 export interface ToolAdapterContext {
@@ -177,6 +178,13 @@ export class MemoryToolExecutionStore implements ToolExecutionStore {
       claimed.push(clone(execution));
     }
     return Promise.resolve(claimed);
+  }
+  listPendingSettlement(limit: number) {
+    return Promise.resolve(
+      [...this.#executions.values()]
+        .filter((execution) => execution.status === "succeeded_pending_settlement")
+        .slice(0, limit).map(clone),
+    );
   }
 }
 
@@ -329,6 +337,8 @@ export class ToolExecutionService {
   }
 
   async recover(limit = 25) {
+    const pendingSettlement = await this.store.listPendingSettlement?.(limit) ?? [];
+    for (const execution of pendingSettlement) await this.get(execution.ownerId, execution.id);
     const executions = await this.store.claimRecoverable?.(limit) ?? [];
     for (const execution of executions) {
       const adapter = this.#adapters.get(execution.toolId);
@@ -343,7 +353,7 @@ export class ToolExecutionService {
         await this.controls?.refund(execution, "tool policy changed before execution");
       }
     }
-    return executions.length;
+    return executions.length + pendingSettlement.length;
   }
 
   async approve(ownerId: string, id: string): Promise<ToolExecution> {

@@ -42,4 +42,20 @@ test("admin enables web search and a user explicitly reviews and cancels a tool 
   await expect(page.getByText("Status: pending approval")).toBeVisible();
   await page.getByRole("button", { name: "Cancel" }).click();
   await expect(page.getByText("Search cancelled.")).toBeVisible();
+  await page.getByRole("button", { name: "Close" }).click();
+
+  await page.getByRole("button", { name: "Open web search" }).click();
+  await page.getByLabel("Search query").fill("OpenAI compatible API");
+  await page.getByRole("button", { name: "Review search" }).click();
+  await page.getByRole("button", { name: "Approve this search" }).click();
+  await expect(page.getByText("Status: succeeded")).toBeVisible({ timeout: 20_000 });
+  await page.getByRole("button", { name: "Add to next message" }).click();
+  await expect(page.getByText("Approved web search", { exact: true })).toBeVisible();
+  await page.getByLabel("Message").fill("Summarize the attached verified search result.");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect(page.getByText("Summarize the attached verified search result.", { exact: true }))
+    .toBeVisible();
+  await page.reload();
+  await expect(page.getByText("Summarize the attached verified search result.", { exact: true }))
+    .toBeVisible();
 });

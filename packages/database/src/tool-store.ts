@@ -221,4 +221,10 @@ export class PostgresToolExecutionStore {
       return rows.map(execution);
     });
   }
+
+  async listPendingSettlement(limit: number): Promise<StoredToolExecution[]> {
+    return (await this.#sql`SELECT * FROM tool_executions
+      WHERE status='succeeded_pending_settlement' ORDER BY updated_at LIMIT ${limit}`)
+      .map(execution);
+  }
 }
