@@ -981,13 +981,13 @@ export function createApp(options: AppOptions = {}) {
             429,
           );
         }
-        await repo.reserve(
-          execution.ownerId,
-          `tool:${execution.id}`,
-          `tool/${execution.toolId}`,
-          toolReserveMicros,
-          "tool",
-        );
+        await repo.ensureIdempotentReservation({
+          userId: execution.ownerId,
+          usageRunId: `tool:${execution.id}`,
+          model: `tool/${execution.toolId}`,
+          provider: "tool",
+          reservedMicros: toolReserveMicros,
+        });
       },
       async settle(execution, latencyMs) {
         await repo.settle(`tool:${execution.id}`, toolReserveMicros, 0, 0, latencyMs);

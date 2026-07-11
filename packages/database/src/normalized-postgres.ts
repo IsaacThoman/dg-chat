@@ -44,6 +44,7 @@ import type {
   DocumentChunkInput,
   DomainRepository,
   EmbeddingProviderAttemptInput,
+  EnsureIdempotentReservationInput,
   EnsureUsageReservationInput,
   FailApiRequestInput,
   FailGenerationInput,
@@ -3600,6 +3601,31 @@ export class PostgresRepository implements DomainRepository {
         VALUES(${userId},${input.usageRunId},'reserve',${-delta},${after})`;
       return run(updated[0]);
     });
+  }
+
+  async ensureIdempotentReservation(input: EnsureIdempotentReservationInput): Promise<UsageRun> {
+    try {
+      return await this.reserve(
+        input.userId,
+        input.usageRunId,
+        input.model,
+        input.reservedMicros,
+        input.provider,
+      );
+    } catch (error) {
+      if (!(error instanceof DomainError) || error.code !== "idempotency_conflict") throw error;
+      const rows = await this.#sql<Row[]>`SELECT * FROM usage_runs WHERE id=${input.usageRunId}`;
+      const existing = rows[0];
+      if (
+        !existing || String(existing.user_id) !== input.userId ||
+        String(existing.model) !== input.model || String(existing.provider) !== input.provider ||
+        number(existing.reserved_micros) !== input.reservedMicros ||
+        String(existing.status) !== "reserved" || existing.token_id !== null
+      ) {
+        throw new DomainError("idempotency_conflict", "Existing reservation does not match", 409);
+      }
+      return run(existing);
+    }
   }
 
   async reapStaleProviderExecutionLeases(limit = 100): Promise<number> {

@@ -235,3 +235,82 @@ Deno.test("startup recovery completes a persisted approval reservation before di
   assertEquals(reserves, 1);
   assertEquals(calls, 1);
 });
+
+Deno.test("lost reservation acknowledgement preserves approval for recovery", async () => {
+  const store = new MemoryToolExecutionStore();
+  let attempts = 0;
+  const service = new ToolExecutionService(store, [echoAdapter], {
+    reserve: () => {
+      if (++attempts === 1) return Promise.reject(new Error("connection lost after commit"));
+      return Promise.resolve();
+    },
+    settle: () => Promise.resolve(),
+    refund: () => Promise.resolve(),
+  });
+  await service.setPolicy({ toolId: "echo", allowed: true, actorId: "admin" });
+  const requested = await service.request("user", "echo", {});
+  await assertRejects(() => service.approve("user", requested.id), Error, "connection lost");
+  assertEquals(
+    (await service.get("user", requested.id)).status,
+    "queued_pending_reservation",
+  );
+  await service.recover();
+  await waitFor(service, "user", requested.id, "succeeded");
+  assertEquals(attempts, 2);
+});
+
+Deno.test("queued cancellation refunds its reservation", async () => {
+  const store = new MemoryToolExecutionStore();
+  let refunds = 0;
+  const service = new ToolExecutionService(store, [echoAdapter], {
+    reserve: () => Promise.resolve(),
+    settle: () => Promise.resolve(),
+    refund: () => {
+      refunds++;
+      return Promise.resolve();
+    },
+  });
+  await service.setPolicy({ toolId: "echo", allowed: true, actorId: "admin" });
+  const requested = await service.request("user", "echo", {});
+  await store.transitionExecution(requested.id, ["pending_approval"], {
+    status: "queued",
+    approvedAt: new Date().toISOString(),
+    approvedBy: "user",
+  });
+  assertEquals((await service.cancel("user", requested.id)).status, "cancelled");
+  assertEquals(refunds, 1);
+});
+
+Deno.test("recovery refunds when cancellation wins after reservation", async () => {
+  const store = new MemoryToolExecutionStore();
+  let release!: () => void;
+  let reserved!: () => void;
+  let refunds = 0;
+  const reservationStarted = new Promise<void>((resolve) => reserved = resolve);
+  const reservationRelease = new Promise<void>((resolve) => release = resolve);
+  const service = new ToolExecutionService(store, [echoAdapter], {
+    reserve: async () => {
+      reserved();
+      await reservationRelease;
+    },
+    settle: () => Promise.resolve(),
+    refund: () => {
+      refunds++;
+      return Promise.resolve();
+    },
+  });
+  await service.setPolicy({ toolId: "echo", allowed: true, actorId: "admin" });
+  const requested = await service.request("user", "echo", {});
+  await store.transitionExecution(requested.id, ["pending_approval"], {
+    status: "queued_pending_reservation",
+    approvedAt: new Date().toISOString(),
+    approvedBy: "user",
+  });
+  const recovery = service.recover();
+  await reservationStarted;
+  await service.cancel("user", requested.id);
+  release();
+  await recovery;
+  assertEquals((await service.get("user", requested.id)).status, "cancelled");
+  assertEquals(refunds, 2);
+});

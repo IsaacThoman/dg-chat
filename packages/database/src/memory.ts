@@ -46,6 +46,7 @@ import type {
   DocumentChunkEmbeddingInput,
   DocumentChunkInput,
   EmbeddingProviderAttemptInput,
+  EnsureIdempotentReservationInput,
   EnsureUsageReservationInput,
   FailApiRequestInput,
   FailGenerationInput,
@@ -3136,6 +3137,26 @@ export class MemoryRepository {
       createdAt: new Date().toISOString(),
     });
     return structuredClone(run);
+  }
+
+  ensureIdempotentReservation(input: EnsureIdempotentReservationInput): UsageRun {
+    const existing = this.usageRuns.get(input.usageRunId);
+    if (!existing) {
+      return this.reserve(
+        input.userId,
+        input.usageRunId,
+        input.model,
+        input.reservedMicros,
+        input.provider,
+      );
+    }
+    if (
+      existing.userId !== input.userId || existing.model !== input.model ||
+      existing.reservedMicros !== input.reservedMicros || existing.status !== "reserved"
+    ) {
+      throw new DomainError("idempotency_conflict", "Existing reservation does not match", 409);
+    }
+    return structuredClone(existing);
   }
 
   createApiToken(

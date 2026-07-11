@@ -349,10 +349,27 @@ export class ToolExecutionService {
     const pendingReservation = await this.store.listPendingReservation?.(limit) ?? [];
     for (const execution of pendingReservation) {
       try {
+        if (execution.cancellationRequestedAt) {
+          await this.controls?.refund(execution, "tool execution cancelled before dispatch");
+          await this.store.transitionExecution(execution.id, ["queued_pending_reservation"], {
+            status: "cancelled",
+          });
+          continue;
+        }
         await this.controls?.reserve(execution);
-        await this.store.transitionExecution(execution.id, ["queued_pending_reservation"], {
+        const queued = await this.store.transitionExecution(execution.id, [
+          "queued_pending_reservation",
+        ], {
           status: "queued",
         });
+        if (!queued) {
+          await this.controls?.refund(execution, "reservation lost execution race");
+        } else if (queued.cancellationRequestedAt) {
+          await this.controls?.refund(execution, "tool execution cancelled before dispatch");
+          await this.store.transitionExecution(execution.id, ["queued"], {
+            status: "cancelled",
+          });
+        }
       } catch {
         // Retain the durable pending state. A later maintenance pass retries idempotently.
       }
@@ -405,12 +422,19 @@ export class ToolExecutionService {
         status: "queued",
       });
     } catch (error) {
-      await this.controls?.refund(execution, "failed to persist tool approval");
-      await this.store.transitionExecution(id, ["queued_pending_reservation"], {
-        status: "pending_approval",
-        approvedAt: null,
-        approvedBy: null,
-      });
+      const code = typeof error === "object" && error !== null && "code" in error
+        ? String((error as { code: unknown }).code)
+        : "";
+      // Unknown failures may be a committed reservation with a lost acknowledgement. Preserve the
+      // durable reconciliation state; only failures known to happen before a debit are retryable by
+      // the user as a fresh approval.
+      if (code === "insufficient_credit" || code === "rate_limited") {
+        await this.store.transitionExecution(id, ["queued_pending_reservation"], {
+          status: "pending_approval",
+          approvedAt: null,
+          approvedBy: null,
+        });
+      }
       throw error;
     }
     if (!queued) {
@@ -427,11 +451,24 @@ export class ToolExecutionService {
       throw new ToolExecutionError("execution_terminal", "Tool execution is already complete", 409);
     }
     const now = new Date().toISOString();
-    const cancelled = await this.store.transitionExecution(
-      id,
-      ["pending_approval", "queued_pending_reservation", "queued", "running"],
-      { status: "cancelled", cancellationRequestedAt: now },
-    );
+    if (execution.status === "queued_pending_reservation" || execution.status === "queued") {
+      const refundPending = await this.store.transitionExecution(id, [execution.status], {
+        status: "queued_pending_reservation",
+        cancellationRequestedAt: now,
+      });
+      if (!refundPending) {
+        throw new ToolExecutionError("execution_terminal", "Tool execution changed", 409);
+      }
+      await this.controls?.refund(refundPending, "tool execution cancelled before dispatch");
+      const cancelled = await this.store.transitionExecution(id, ["queued_pending_reservation"], {
+        status: "cancelled",
+      });
+      return cancelled ?? await this.get(ownerId, id);
+    }
+    const cancelled = await this.store.transitionExecution(id, ["pending_approval", "running"], {
+      status: "cancelled",
+      cancellationRequestedAt: now,
+    });
     if (!cancelled) {
       throw new ToolExecutionError("execution_terminal", "Tool execution changed", 409);
     }

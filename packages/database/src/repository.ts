@@ -934,6 +934,14 @@ export interface EnsureUsageReservationInput {
   requiredMicros: number;
 }
 
+export interface EnsureIdempotentReservationInput {
+  userId: string;
+  usageRunId: string;
+  model: string;
+  provider: string;
+  reservedMicros: number;
+}
+
 /** Persistence boundary shared by synchronous test stores and async production stores. */
 export interface DomainRepository {
   readonly storageKind: "postgres" | "memory";
@@ -1196,6 +1204,8 @@ export interface DomainRepository {
   reserveChildProviderUsage(input: ReserveChildProviderUsageInput): MaybePromise<UsageRun>;
   /** Atomically raises an active run's reservation; never lowers or duplicates an extension. */
   ensureUsageReservation(input: EnsureUsageReservationInput): MaybePromise<UsageRun>;
+  /** Creates a reservation once, or returns the existing active reservation when every billing field matches. */
+  ensureIdempotentReservation(input: EnsureIdempotentReservationInput): MaybePromise<UsageRun>;
   reapStaleProviderExecutionLeases(limit?: number): MaybePromise<number>;
   reserve(
     userId: string,
