@@ -1,8 +1,5 @@
-import { createRequire } from "node:module";
-
-// Nodemailer does not publish TypeScript declarations. Loading community Node typings globally
-// collides with Deno's web types, so keep this small runtime boundary intentionally untyped.
-const nodemailer = createRequire(import.meta.url)("nodemailer");
+// @ts-types="./nodemailer.d.ts"
+import nodemailer from "npm:nodemailer@9.0.3";
 
 export type IdentityMailKind = "email_verification" | "password_reset";
 export interface IdentityMailer {
