@@ -229,6 +229,23 @@ Deno.test({
       assertEquals(rolledBack, { credential_envelope: null, version: 2 });
       assertEquals((await store.get(rollbackValidated.id)).status, "validated");
 
+      const staleUploadRestoreId = await makeRestore("sidecar-store-stale-upload-epoch");
+      const staleUpload = await store.create({
+        ...create,
+        restoreOperationId: staleUploadRestoreId,
+        idempotencyKey: "sidecar-store-stale-upload-epoch",
+        sourceObjectKey:
+          `backups/restores/${staleUploadRestoreId}/stale-provider-secrets.dgsecrets`,
+        sidecarId: crypto.randomUUID(),
+      });
+      await sql`UPDATE installation_state SET restore_epoch=restore_epoch+1,version=version+1
+        WHERE singleton_id=1`;
+      await assertRejects(
+        () => store.markUploaded(staleUpload.id, staleUpload.version),
+        RestoreProviderSecretsStoreError,
+      );
+      assertEquals((await store.get(staleUpload.id)).status, "staging");
+
       const epochRestoreId = await makeRestore("sidecar-store-restore-epoch");
       let epochUpload = await store.create({
         ...create,

@@ -465,10 +465,22 @@ export class PostgresRestoreProviderSecretsStore {
       throw new RestoreProviderSecretsStoreError("invalid", "Sidecar ID is invalid");
     }
     return await this.#sql.begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-backup-restore'))`;
       const [current] = await tx<Row[]>`
-        SELECT * FROM backup_restore_secret_sidecars WHERE id=${id} FOR UPDATE`;
+        SELECT s.*,i.restore_epoch,i.maintenance_enabled,i.active_restore_id
+        FROM backup_restore_secret_sidecars s CROSS JOIN installation_state i
+        WHERE s.id=${id} AND i.singleton_id=1 FOR UPDATE OF s,i`;
       if (!current) {
         throw new RestoreProviderSecretsStoreError("not_found", "Restore sidecar was not found");
+      }
+      if (
+        current.maintenance_enabled !== false || current.active_restore_id != null ||
+        Number(current.restore_epoch) !== Number(current.base_restore_epoch)
+      ) {
+        throw new RestoreProviderSecretsStoreError(
+          "conflict",
+          "The base restore changed before the sidecar upload completed",
+        );
       }
       if (current.status === "uploaded" && Number(current.version) === expectedVersion) {
         return map(current);
