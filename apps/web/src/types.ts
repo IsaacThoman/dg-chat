@@ -370,6 +370,47 @@ export interface BackupExportPage {
   items: BackupExport[];
   restoreEnabled: boolean;
   privilegedSecretBackupsEnabled: boolean;
+  providerSecretRestoreEnabled: boolean;
+}
+export interface ProviderSecretRestoreUpload {
+  id: string;
+  restoreId: string;
+  status: "uploaded";
+  version: number;
+  filename: string;
+  bytes: number;
+  baseFingerprint: string;
+  sidecarFingerprint: string;
+  recoveryKeyId: string;
+  createdAt: string;
+}
+export interface ProviderSecretRestoreImpact {
+  providerId: string;
+  displayName: string;
+  action: "restore" | "skip" | "blocked";
+  reason: string | null;
+}
+export interface ProviderSecretRestorePreview {
+  id: string;
+  restoreId: string;
+  status: "validated";
+  version: number;
+  baseFingerprint: string;
+  sidecarFingerprint: string;
+  recoveryKeyId: string;
+  recordCount: number;
+  providers: ProviderSecretRestoreImpact[];
+  warnings: string[];
+  blockingErrors: string[];
+  providersRemainDisabled: true;
+}
+export interface ProviderSecretRestoreResult {
+  id: string;
+  restoreId: string;
+  status: "applied";
+  providerCount: number;
+  providersRemainDisabled: true;
+  appliedAt: string;
 }
 export interface BackupRestoreUpload {
   id: string;

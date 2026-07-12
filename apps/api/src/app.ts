@@ -1719,6 +1719,11 @@ export function createApp(options: AppOptions = {}) {
     (c, next) =>
       c.req.path.startsWith("/api/attachments") ||
         c.req.path === "/api/admin/backups/restore-uploads" ||
+        (c.req.method === "POST" &&
+          /^\/api\/admin\/backups\/restores\/[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/provider-secrets\/uploads$/i
+            .test(
+              c.req.path,
+            )) ||
         c.req.path === "/api/audio/transcriptions"
         ? next()
         : apiBodyLimit(c, next),
@@ -4353,6 +4358,40 @@ export function createApp(options: AppOptions = {}) {
       );
     }
   };
+  const requireProviderSecretRestoreAdmin = ():
+    & BackupAdminService
+    & Required<
+      Pick<
+        BackupAdminService,
+        | "uploadProviderSecretRestore"
+        | "previewProviderSecretRestore"
+        | "applyProviderSecretRestore"
+      >
+    > => {
+    const service = requireBackupAdmin();
+    if (
+      service.providerSecretRestoreEnabled !== true ||
+      typeof service.uploadProviderSecretRestore !== "function" ||
+      typeof service.previewProviderSecretRestore !== "function" ||
+      typeof service.applyProviderSecretRestore !== "function"
+    ) {
+      throw new DomainError(
+        "provider_secret_restore_unavailable",
+        "Provider-secret restore is not enabled for this installation",
+        503,
+      );
+    }
+    return service as
+      & BackupAdminService
+      & Required<
+        Pick<
+          BackupAdminService,
+          | "uploadProviderSecretRestore"
+          | "previewProviderSecretRestore"
+          | "applyProviderSecretRestore"
+        >
+      >;
+  };
   const backupIdempotencyKey = (c: Context<{ Variables: Variables }>): string => {
     const value = c.req.header("idempotency-key")?.trim();
     if (
@@ -4398,6 +4437,7 @@ export function createApp(options: AppOptions = {}) {
       items: await service.listExports(c.get("user").id),
       restoreEnabled: service.restoreEnabled,
       privilegedSecretBackupsEnabled: service.privilegedSecretBackupsEnabled === true,
+      providerSecretRestoreEnabled: service.providerSecretRestoreEnabled === true,
     });
   });
   app.post("/api/admin/backups/exports", async (c) => {
@@ -4511,6 +4551,91 @@ export function createApp(options: AppOptions = {}) {
     );
     return new Response(response.body, { status: response.status, headers });
   });
+  app.post("/api/admin/backups/restores/:restoreId/provider-secrets/uploads", async (c) => {
+    noStoreBackupResponse(c);
+    requireRecentBackupAuthentication(c, "uploading provider secrets");
+    const restoreId = requireUuid(c.req.param("restoreId"), "restoreId");
+    const upload = await requireProviderSecretRestoreAdmin().uploadProviderSecretRestore({
+      actorId: c.get("user").id,
+      restoreId,
+      request: c.req.raw,
+      idempotencyKey: backupIdempotencyKey(c),
+    });
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: "backup.provider_secrets_restore_uploaded",
+      targetType: "backup_operation",
+      targetId: restoreId,
+      metadata: { sidecarId: upload.id, bytes: upload.bytes, recoveryKeyId: upload.recoveryKeyId },
+    });
+    return c.json(upload, 201);
+  });
+  app.post(
+    "/api/admin/backups/restores/:restoreId/provider-secrets/:sidecarId/dry-run",
+    async (c) => {
+      noStoreBackupResponse(c);
+      requireRecentBackupAuthentication(c, "previewing provider-secret recovery");
+      const restoreId = requireUuid(c.req.param("restoreId"), "restoreId");
+      const preview = await requireProviderSecretRestoreAdmin().previewProviderSecretRestore(
+        c.get("user").id,
+        restoreId,
+        requireUuid(c.req.param("sidecarId"), "sidecarId"),
+      );
+      await repo.recordAudit({
+        actorId: c.get("user").id,
+        action: "backup.provider_secrets_restore_previewed",
+        targetType: "backup_operation",
+        targetId: restoreId,
+        metadata: {
+          sidecarId: preview.id,
+          providerCount: preview.recordCount,
+          blockingErrorCount: preview.blockingErrors.length,
+        },
+      });
+      return c.json(preview);
+    },
+  );
+  app.post(
+    "/api/admin/backups/restores/:restoreId/provider-secrets/:sidecarId/apply",
+    async (c) => {
+      noStoreBackupResponse(c);
+      requireRecentBackupAuthentication(c, "restoring provider secrets");
+      const service = requireProviderSecretRestoreAdmin();
+      let raw: unknown;
+      try {
+        raw = await c.req.json();
+      } catch {
+        throw new DomainError("invalid_json", "Request body must be valid JSON", 400);
+      }
+      if (
+        !raw || typeof raw !== "object" || Array.isArray(raw) ||
+        Object.keys(raw).length !== 4 ||
+        (raw as { confirmation?: unknown }).confirmation !== "RESTORE PROVIDER SECRETS" ||
+        !Number.isSafeInteger((raw as { expectedVersion?: unknown }).expectedVersion) ||
+        Number((raw as { expectedVersion?: unknown }).expectedVersion) < 1 ||
+        typeof (raw as { baseFingerprint?: unknown }).baseFingerprint !== "string" ||
+        !/^[0-9a-f]{64}$/u.test((raw as { baseFingerprint: string }).baseFingerprint) ||
+        typeof (raw as { sidecarFingerprint?: unknown }).sidecarFingerprint !== "string" ||
+        !/^[0-9a-f]{64}$/u.test((raw as { sidecarFingerprint: string }).sidecarFingerprint)
+      ) {
+        throw new DomainError(
+          "validation_error",
+          "Provider-secret restore confirmation is invalid",
+          422,
+        );
+      }
+      const restoreId = requireUuid(c.req.param("restoreId"), "restoreId");
+      const result = await service.applyProviderSecretRestore({
+        actorId: c.get("user").id,
+        restoreId,
+        sidecarId: requireUuid(c.req.param("sidecarId"), "sidecarId"),
+        expectedVersion: Number((raw as { expectedVersion: number }).expectedVersion),
+        baseFingerprint: (raw as { baseFingerprint: string }).baseFingerprint,
+        sidecarFingerprint: (raw as { sidecarFingerprint: string }).sidecarFingerprint,
+      });
+      return c.json(result);
+    },
+  );
   app.post("/api/admin/backups/restore-uploads", async (c) => {
     noStoreBackupResponse(c);
     const upload = await requireBackupAdmin().uploadRestore({

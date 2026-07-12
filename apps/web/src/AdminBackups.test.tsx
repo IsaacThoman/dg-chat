@@ -160,10 +160,12 @@ describe("AdminBackups", () => {
       items: [],
       restoreEnabled: true,
       privilegedSecretBackupsEnabled: true,
+      providerSecretRestoreEnabled: true,
     }, item);
     expect(updated.items).toEqual([item]);
     expect(updated.restoreEnabled).toBe(true);
     expect(updated.privilegedSecretBackupsEnabled).toBe(true);
+    expect(updated.providerSecretRestoreEnabled).toBe(true);
   });
 
   it("requires an exact fingerprint and a blocker-free fresh preview", () => {

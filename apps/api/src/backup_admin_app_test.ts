@@ -6,6 +6,7 @@ import type {
   BackupAdminService,
   BackupExportSummary,
   BackupRestorePreview,
+  ProviderSecretRestorePreview,
 } from "./backup-admin.ts";
 
 const cookie = (response: Response) => {
@@ -20,12 +21,15 @@ const fingerprint = "a".repeat(64);
 class FakeBackupAdmin implements BackupAdminService {
   restoreEnabled = true;
   privilegedSecretBackupsEnabled = true;
+  providerSecretRestoreEnabled = true;
   maintenance = false;
   maintenanceError = false;
   exportInput: unknown;
   privilegedExportInput: unknown;
   uploadInput: unknown;
   applyCalls = 0;
+  providerSecretUploadInput: unknown;
+  providerSecretApplyInput: unknown;
   readonly backup: BackupExportSummary = {
     id: "10000000-0000-4000-8000-000000000001",
     status: "completed",
@@ -83,6 +87,61 @@ class FakeBackupAdmin implements BackupAdminService {
         headers: { "content-type": "application/vnd.dg-chat.provider-secrets" },
       }),
     );
+  }
+  uploadProviderSecretRestore(input: { restoreId: string; idempotencyKey: string }) {
+    this.providerSecretUploadInput = {
+      restoreId: input.restoreId,
+      idempotencyKey: input.idempotencyKey,
+    };
+    return Promise.resolve({
+      id: "10000000-0000-4000-8000-000000000013",
+      restoreId: input.restoreId,
+      status: "uploaded" as const,
+      version: 1,
+      filename: "provider-secrets.dgsecrets",
+      bytes: 17,
+      baseFingerprint: "c".repeat(64),
+      sidecarFingerprint: "d".repeat(64),
+      recoveryKeyId: "recovery-2026",
+      createdAt: now,
+    });
+  }
+  previewProviderSecretRestore(_actorId: string, restoreId: string, sidecarId: string) {
+    return Promise.resolve(
+      {
+        id: sidecarId,
+        restoreId,
+        status: "validated" as const,
+        version: 2,
+        baseFingerprint: "c".repeat(64),
+        sidecarFingerprint: "d".repeat(64),
+        recoveryKeyId: "recovery-2026",
+        recordCount: 1,
+        providers: [{
+          providerId: "10000000-0000-4000-8000-000000000014",
+          displayName: "Recovered provider",
+          action: "restore" as const,
+          reason: null,
+        }],
+        warnings: ["Provider remains disabled"],
+        blockingErrors: [],
+        providersRemainDisabled: true as const,
+      } satisfies ProviderSecretRestorePreview,
+    );
+  }
+  applyProviderSecretRestore(input: {
+    restoreId: string;
+    sidecarId: string;
+  }) {
+    this.providerSecretApplyInput = input;
+    return Promise.resolve({
+      id: input.sidecarId,
+      restoreId: input.restoreId,
+      status: "applied" as const,
+      providerCount: 1,
+      providersRemainDisabled: true as const,
+      appliedAt: now,
+    });
   }
   uploadRestore(input: { idempotencyKey: string }) {
     this.uploadInput = { idempotencyKey: input.idempotencyKey };
@@ -395,6 +454,141 @@ Deno.test("privileged backup export and download reject stale authentication bef
     { headers },
   );
   assertEquals(content.status, 403);
+});
+
+Deno.test("provider-secret restore is recently authenticated, paired, previewed, and exactly confirmed", async () => {
+  const { app, backupAdmin, headers, repository } = await fixture();
+  const restoreId = "10000000-0000-4000-8000-000000000012";
+  const sidecarId = "10000000-0000-4000-8000-000000000013";
+  const upload = await app.request(
+    `/api/admin/backups/restores/${restoreId}/provider-secrets/uploads`,
+    {
+      method: "POST",
+      headers: {
+        ...headers,
+        "content-type": "application/octet-stream",
+        "idempotency-key": "provider-secret-upload-one",
+      },
+      body: "encrypted-sidecar",
+    },
+  );
+  assertEquals(upload.status, 201, await upload.clone().text());
+  assertEquals(backupAdmin.providerSecretUploadInput, {
+    restoreId,
+    idempotencyKey: "provider-secret-upload-one",
+  });
+
+  const preview = await app.request(
+    `/api/admin/backups/restores/${restoreId}/provider-secrets/${sidecarId}/dry-run`,
+    { method: "POST", headers },
+  );
+  assertEquals(preview.status, 200, await preview.clone().text());
+  const summary = await preview.json() as ProviderSecretRestorePreview;
+  assertEquals(summary.providersRemainDisabled, true);
+  assertEquals(summary.providers[0].action, "restore");
+
+  const applyUrl = `/api/admin/backups/restores/${restoreId}/provider-secrets/${sidecarId}/apply`;
+  assertEquals(
+    (await app.request(applyUrl, {
+      method: "POST",
+      headers: { ...headers, "content-type": "application/json" },
+      body: JSON.stringify({
+        confirmation: "restore provider secrets",
+        expectedVersion: summary.version,
+        baseFingerprint: summary.baseFingerprint,
+        sidecarFingerprint: summary.sidecarFingerprint,
+      }),
+    })).status,
+    422,
+  );
+  const applied = await app.request(applyUrl, {
+    method: "POST",
+    headers: { ...headers, "content-type": "application/json" },
+    body: JSON.stringify({
+      confirmation: "RESTORE PROVIDER SECRETS",
+      expectedVersion: summary.version,
+      baseFingerprint: summary.baseFingerprint,
+      sidecarFingerprint: summary.sidecarFingerprint,
+    }),
+  });
+  assertEquals(applied.status, 200, await applied.clone().text());
+  assertEquals(
+    (backupAdmin.providerSecretApplyInput as { baseFingerprint: string }).baseFingerprint,
+    summary.baseFingerprint,
+  );
+  assertEquals(
+    (backupAdmin.providerSecretApplyInput as { sidecarFingerprint: string }).sidecarFingerprint,
+    summary.sidecarFingerprint,
+  );
+  const actions = (await repository.listAudit()).data.map((event) => event.action);
+  assertEquals(actions.includes("backup.provider_secrets_restore_uploaded"), true);
+  assertEquals(actions.includes("backup.provider_secrets_restore_previewed"), true);
+});
+
+Deno.test("provider-secret restore fails closed and rejects stale authentication before upload", async () => {
+  const stale = await fixture({ now: () => Date.now() + 11 * 60 * 1_000 });
+  const restoreId = "10000000-0000-4000-8000-000000000012";
+  const response = await stale.app.request(
+    `/api/admin/backups/restores/${restoreId}/provider-secrets/uploads`,
+    {
+      method: "POST",
+      headers: {
+        ...stale.headers,
+        "content-type": "application/octet-stream",
+        "idempotency-key": "provider-secret-upload-stale",
+      },
+      body: "encrypted-sidecar",
+    },
+  );
+  assertEquals(response.status, 403);
+  assertEquals(stale.backupAdmin.providerSecretUploadInput, undefined);
+
+  const disabled = await fixture();
+  disabled.backupAdmin.providerSecretRestoreEnabled = false;
+  const unavailable = await disabled.app.request(
+    `/api/admin/backups/restores/${restoreId}/provider-secrets/uploads`,
+    {
+      method: "POST",
+      headers: {
+        ...disabled.headers,
+        "content-type": "application/octet-stream",
+        "idempotency-key": "provider-secret-upload-disabled",
+      },
+      body: "encrypted-sidecar",
+    },
+  );
+  assertEquals(unavailable.status, 503);
+});
+
+Deno.test("provider-secret multipart body-limit bypass is restricted to the canonical upload route", async () => {
+  const { app, headers } = await fixture();
+  const oversized = new Uint8Array(2 * 1024 * 1024 + 1);
+  const canonical = await app.request(
+    "/api/admin/backups/restores/10000000-0000-4000-8000-000000000012/provider-secrets/uploads",
+    {
+      method: "POST",
+      headers: {
+        ...headers,
+        "content-type": "application/octet-stream",
+        "idempotency-key": "provider-secret-large-canonical",
+      },
+      body: oversized,
+    },
+  );
+  assertEquals(canonical.status, 201, await canonical.clone().text());
+  const malformed = await app.request(
+    "/api/admin/backups/restores/00000000-0000-0000-0000-000000000000/provider-secrets/uploads",
+    {
+      method: "POST",
+      headers: {
+        ...headers,
+        "content-type": "application/octet-stream",
+        "idempotency-key": "provider-secret-large-malformed",
+      },
+      body: oversized,
+    },
+  );
+  assertEquals(malformed.status, 413);
 });
 
 Deno.test("restore apply fails closed when browser authentication is older than ten minutes", async () => {

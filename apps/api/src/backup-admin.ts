@@ -73,6 +73,48 @@ export interface BackupRestoreStatus {
   error: string | null;
 }
 
+export type ProviderSecretRestoreImpactAction = "restore" | "skip" | "blocked";
+export interface ProviderSecretRestoreImpact {
+  providerId: string;
+  displayName: string;
+  action: ProviderSecretRestoreImpactAction;
+  reason: string | null;
+}
+export interface ProviderSecretRestoreUploadSummary {
+  id: string;
+  restoreId: string;
+  status: "uploaded";
+  version: number;
+  filename: string;
+  bytes: number;
+  baseFingerprint: string;
+  sidecarFingerprint: string;
+  recoveryKeyId: string;
+  createdAt: string;
+}
+export interface ProviderSecretRestorePreview {
+  id: string;
+  restoreId: string;
+  status: "validated";
+  version: number;
+  baseFingerprint: string;
+  sidecarFingerprint: string;
+  recoveryKeyId: string;
+  recordCount: number;
+  providers: ProviderSecretRestoreImpact[];
+  warnings: string[];
+  blockingErrors: string[];
+  providersRemainDisabled: true;
+}
+export interface ProviderSecretRestoreResult {
+  id: string;
+  restoreId: string;
+  status: "applied";
+  providerCount: number;
+  providersRemainDisabled: true;
+  appliedAt: string;
+}
+
 /**
  * Privileged installation-portability boundary. Implementations own durable operation state,
  * archive validation, object staging, and the database maintenance fence. Hono only authenticates
@@ -82,6 +124,8 @@ export interface BackupAdminService {
   readonly restoreEnabled: boolean;
   /** Fail-closed feature capability; omitted by services that only support redacted backups. */
   readonly privilegedSecretBackupsEnabled?: boolean;
+  /** Fail-closed destination recovery capability; independent from privileged export support. */
+  readonly providerSecretRestoreEnabled?: boolean;
   listExports(actorId: string): Promise<BackupExportSummary[]>;
   requestExport(input: {
     actorId: string;
@@ -95,6 +139,25 @@ export interface BackupAdminService {
     idempotencyKey: string;
   }): Promise<PrivilegedBackupExportSummary>;
   providerSecretExportContent?(actorId: string, exportId: string): Promise<Response>;
+  uploadProviderSecretRestore?(input: {
+    actorId: string;
+    restoreId: string;
+    request: Request;
+    idempotencyKey: string;
+  }): Promise<ProviderSecretRestoreUploadSummary>;
+  previewProviderSecretRestore?(
+    actorId: string,
+    restoreId: string,
+    sidecarId: string,
+  ): Promise<ProviderSecretRestorePreview>;
+  applyProviderSecretRestore?(input: {
+    actorId: string;
+    restoreId: string;
+    sidecarId: string;
+    expectedVersion: number;
+    baseFingerprint: string;
+    sidecarFingerprint: string;
+  }): Promise<ProviderSecretRestoreResult>;
   uploadRestore(input: {
     actorId: string;
     request: Request;

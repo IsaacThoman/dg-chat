@@ -28,6 +28,9 @@ import type {
   ModelAlias,
   ModelPriceVersion,
   ProviderProtocol,
+  ProviderSecretRestorePreview,
+  ProviderSecretRestoreResult,
+  ProviderSecretRestoreUpload,
   RetentionPolicy,
   RetentionPreview,
   RetentionScrubRun,
@@ -929,6 +932,90 @@ export const api = {
       throw error;
     }
   },
+  uploadAdminProviderSecretRestore: (
+    restoreId: string,
+    file: File,
+    idempotencyKey: string,
+    onProgress?: (percent: number) => void,
+    signal?: AbortSignal,
+  ): Promise<ProviderSecretRestoreUpload> =>
+    new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      const form = new FormData();
+      form.append("file", file);
+      xhr.open(
+        "POST",
+        `/api/admin/backups/restores/${encodeURIComponent(restoreId)}/provider-secrets/uploads`,
+      );
+      xhr.withCredentials = true;
+      xhr.setRequestHeader("Idempotency-Key", idempotencyKey);
+      const abort = () => xhr.abort();
+      const cleanup = () => signal?.removeEventListener("abort", abort);
+      if (signal?.aborted) {
+        reject(signal.reason ?? new DOMException("Upload cancelled", "AbortError"));
+        return;
+      }
+      signal?.addEventListener("abort", abort, { once: true });
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) onProgress?.(Math.round(event.loaded / event.total * 100));
+      };
+      xhr.onerror = () => {
+        cleanup();
+        reject(new Error("Provider-secret upload failed. Check your connection and retry."));
+      };
+      xhr.onabort = () => {
+        cleanup();
+        reject(new DOMException("Upload cancelled", "AbortError"));
+      };
+      xhr.onload = () => {
+        cleanup();
+        let body: unknown;
+        try {
+          body = JSON.parse(xhr.responseText);
+        } catch {
+          reject(new Error(`Upload failed (${xhr.status})`));
+          return;
+        }
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve(body as ProviderSecretRestoreUpload);
+          return;
+        }
+        const failure = body as { error?: { code?: string; message?: string } };
+        reject(
+          new ApiError(
+            xhr.status,
+            failure.error?.code ?? "upload_failed",
+            failure.error?.message ?? `Upload failed (${xhr.status})`,
+          ),
+        );
+      };
+      xhr.send(form);
+    }),
+  previewAdminProviderSecretRestore: (restoreId: string, sidecarId: string) =>
+    request<ProviderSecretRestorePreview>(
+      `/admin/backups/restores/${encodeURIComponent(restoreId)}/provider-secrets/${
+        encodeURIComponent(sidecarId)
+      }/dry-run`,
+      { method: "POST" },
+    ),
+  applyAdminProviderSecretRestore: (
+    preview: ProviderSecretRestorePreview,
+    confirmation: string,
+  ) =>
+    request<ProviderSecretRestoreResult>(
+      `/admin/backups/restores/${encodeURIComponent(preview.restoreId)}/provider-secrets/${
+        encodeURIComponent(preview.id)
+      }/apply`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          confirmation,
+          expectedVersion: preview.version,
+          baseFingerprint: preview.baseFingerprint,
+          sidecarFingerprint: preview.sidecarFingerprint,
+        }),
+      },
+    ),
   uploadAdminBackupRestore: (
     file: File,
     idempotencyKey: string,

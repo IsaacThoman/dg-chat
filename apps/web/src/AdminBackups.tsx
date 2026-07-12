@@ -12,6 +12,7 @@ import {
   Upload,
 } from "lucide-react";
 import { api, ApiError } from "./api.ts";
+import { ProviderSecretRestore } from "./ProviderSecretRestore.tsx";
 import type {
   BackupExport,
   BackupExportPage,
@@ -36,6 +37,7 @@ export const mergeBackupExport = (
   items: [item, ...(current?.items ?? []).filter((existing) => existing.id !== item.id)],
   restoreEnabled: current?.restoreEnabled ?? false,
   privilegedSecretBackupsEnabled: current?.privilegedSecretBackupsEnabled ?? false,
+  providerSecretRestoreEnabled: current?.providerSecretRestoreEnabled ?? false,
 });
 export const isRecentAuthenticationRequired = (error: unknown) =>
   error instanceof ApiError && error.status === 403 &&
@@ -228,6 +230,9 @@ export async function monitorBackupRestore(
 export function AdminBackupsView() {
   const client = useQueryClient();
   const exportKey = useRef(crypto.randomUUID());
+  const [recentRestoreId, setRecentRestoreId] = useState(() =>
+    globalThis.sessionStorage?.getItem("dg.provider-secret-restore-id") ?? undefined
+  );
   const backups = useQuery({
     queryKey: ["admin-backups"],
     queryFn: api.adminBackups,
@@ -296,6 +301,8 @@ export function AdminBackupsView() {
       exports={backups.data?.items ?? []}
       restoreEnabled={backups.data?.restoreEnabled}
       privilegedSecretBackupsEnabled={backups.data?.privilegedSecretBackupsEnabled}
+      providerSecretRestoreEnabled={backups.data?.providerSecretRestoreEnabled}
+      recentRestoreId={recentRestoreId}
       loading={backups.isLoading}
       stale={backups.isError && backups.data !== undefined}
       loadError={backups.isError ? message(backups.error) : undefined}
@@ -308,6 +315,14 @@ export function AdminBackupsView() {
       onCreatePrivileged={(confirmation) =>
         privilegedCreate.mutateAsync(confirmation).then(() => undefined)}
       onDownloadSecrets={downloadSecrets}
+      onBaseRestoreCompleted={(restoreId) => {
+        globalThis.sessionStorage?.setItem("dg.provider-secret-restore-id", restoreId);
+        setRecentRestoreId(restoreId);
+      }}
+      onProviderSecretsApplied={() => {
+        globalThis.sessionStorage?.removeItem("dg.provider-secret-restore-id");
+        setRecentRestoreId(undefined);
+      }}
       onReauthenticate={() => globalThis.location.assign("/login")}
     />
   );
@@ -317,6 +332,8 @@ export interface AdminBackupsProps {
   exports: BackupExport[];
   restoreEnabled?: boolean;
   privilegedSecretBackupsEnabled?: boolean;
+  providerSecretRestoreEnabled?: boolean;
+  recentRestoreId?: string;
   loading?: boolean;
   stale?: boolean;
   loadError?: string;
@@ -328,6 +345,8 @@ export interface AdminBackupsProps {
   onCreate(): Promise<void>;
   onCreatePrivileged?(confirmation: string): Promise<void>;
   onDownloadSecrets?(item: BackupExport): Promise<void>;
+  onBaseRestoreCompleted?(restoreId: string): void;
+  onProviderSecretsApplied?(): void;
   onReauthenticate?(): void;
 }
 
@@ -526,6 +545,7 @@ export function AdminBackups(props: AdminBackupsProps) {
         throw new Error("The restore failed. Check server logs before retrying.");
       }
       setCompleted(true);
+      props.onBaseRestoreCompleted?.(preview.restoreId);
       setAnnouncement("Restore completed. All sessions were invalidated; redirecting to sign in.");
       globalThis.setTimeout(() => props.onReauthenticate?.(), 900);
     } catch (error) {
@@ -958,6 +978,12 @@ export function AdminBackups(props: AdminBackupsProps) {
           </form>
         )}
       </section>
+      <ProviderSecretRestore
+        enabled={props.providerSecretRestoreEnabled}
+        initialRestoreId={props.recentRestoreId}
+        onReauthenticate={props.onReauthenticate}
+        onApplied={props.onProviderSecretsApplied}
+      />
     </section>
   );
 }

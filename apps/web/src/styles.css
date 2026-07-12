@@ -4595,6 +4595,64 @@ kbd {
   align-items: center;
   gap: 7px;
 }
+.backup-secret-restore {
+  border-color: color-mix(in srgb, #7258aa 32%, var(--line));
+}
+.backup-secret-restore h2 {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.backup-secret-restore .backup-warning p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.backup-restore-target {
+  display: grid;
+  gap: 6px;
+  font-size: 13px;
+}
+.backup-restore-target input {
+  min-height: 42px;
+  padding: 0 11px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--ink);
+  background: var(--panel);
+  font: 13px ui-monospace, monospace;
+}
+.backup-restore-target small {
+  color: color-mix(in srgb, #d45d5d 75%, var(--ink));
+}
+.backup-secret-picker {
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  min-height: 120px;
+  padding: 20px;
+  border: 1px dashed #a99bbb;
+  border-radius: 11px;
+  background: color-mix(in srgb, var(--panel) 90%, #8b6fc4 10%);
+  cursor: pointer;
+}
+.backup-secret-picker:hover:not(.disabled) {
+  border-color: #7258aa;
+  background: color-mix(in srgb, var(--panel) 82%, #8b6fc4 18%);
+}
+.backup-secret-picker.disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+.backup-secret-picker span {
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+.backup-secret-restore .backup-alert {
+  justify-content: space-between;
+}
 .backup-privileged-form {
   display: grid;
   gap: 12px;

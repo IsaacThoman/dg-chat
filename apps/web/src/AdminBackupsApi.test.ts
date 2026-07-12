@@ -150,6 +150,86 @@ describe("backup administration API", () => {
     expect(cancel).toHaveBeenCalledOnce();
   });
 
+  it("uploads a sidecar with stable identity and binds preview/apply to both fingerprints", async () => {
+    let xhr: RestoreSidecarXhr | undefined;
+    class RestoreSidecarXhr {
+      status = 201;
+      responseText = JSON.stringify({ id: "sidecar", restoreId: "restore" });
+      withCredentials = false;
+      upload: { onprogress?: (event: ProgressEvent) => void } = {};
+      onerror?: () => void;
+      onabort?: () => void;
+      onload?: () => void;
+      headers = new Map<string, string>();
+      url = "";
+      constructor() {
+        xhr = this;
+      }
+      open(_method: string, url: string) {
+        this.url = url;
+      }
+      setRequestHeader(name: string, value: string) {
+        this.headers.set(name, value);
+      }
+      send() {
+        this.onload?.();
+      }
+      abort() {
+        this.onabort?.();
+      }
+    }
+    vi.stubGlobal("XMLHttpRequest", RestoreSidecarXhr);
+    await api.uploadAdminProviderSecretRestore(
+      "restore/one",
+      new File(["encrypted"], "paired.dgsecrets"),
+      "stable-sidecar-upload",
+    );
+    expect(xhr?.url).toBe(
+      "/api/admin/backups/restores/restore%2Fone/provider-secrets/uploads",
+    );
+    expect(xhr?.withCredentials).toBe(true);
+    expect(xhr?.headers.get("Idempotency-Key")).toBe("stable-sidecar-upload");
+
+    const preview = {
+      id: "sidecar/one",
+      restoreId: "restore/one",
+      status: "validated" as const,
+      version: 2,
+      baseFingerprint: "a".repeat(64),
+      sidecarFingerprint: "b".repeat(64),
+      recoveryKeyId: "recovery-2026",
+      recordCount: 1,
+      providers: [],
+      warnings: [],
+      blockingErrors: [],
+      providersRemainDisabled: true as const,
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json(preview))
+      .mockResolvedValueOnce(Response.json({ status: "applied" }));
+    vi.stubGlobal("fetch", fetchMock);
+    await api.previewAdminProviderSecretRestore(preview.restoreId, preview.id);
+    await api.applyAdminProviderSecretRestore(preview, "RESTORE PROVIDER SECRETS");
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "/api/admin/backups/restores/restore%2Fone/provider-secrets/sidecar%2Fone/dry-run",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/admin/backups/restores/restore%2Fone/provider-secrets/sidecar%2Fone/apply",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          confirmation: "RESTORE PROVIDER SECRETS",
+          expectedVersion: 2,
+          baseFingerprint: "a".repeat(64),
+          sidecarFingerprint: "b".repeat(64),
+        }),
+      }),
+    );
+  });
+
   it("wires cancellation to the active XHR while retaining its idempotency header", async () => {
     let xhr: FakeXhr | undefined;
     class FakeXhr {
