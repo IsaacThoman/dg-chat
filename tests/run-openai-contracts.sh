@@ -42,7 +42,7 @@ if [[ -z "${OPENAI_API_KEY:-}" ]]; then
   export OPENAI_API_KEY="$(curl --fail --silent --show-error --request POST \
     "$api_url/api/tokens" --header 'content-type: application/json' --header "origin: $web_origin" \
     --cookie "$cookie_jar" \
-    --data '{"name":"Official SDK contracts","scopes":["models:read","chat:write","files:read","files:write"]}' | jq --raw-output '.token')"
+    --data '{"name":"Official SDK contracts","scopes":["models:read","chat:write","files:read","files:write"],"rpmLimit":60000,"burstLimit":1000}' | jq --raw-output '.token')"
   export CONTRACT_SESSION_COOKIE="$(
     awk 'NF >= 7 && ($0 !~ /^#/ || $0 ~ /^#HttpOnly_/) { value=$6 "=" $7 } END { print value }' \
       "$cookie_jar"
