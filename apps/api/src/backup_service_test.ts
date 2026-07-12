@@ -650,7 +650,9 @@ class MemoryProviderSecretRestoreStore {
     baseContentRootSha256: string;
     sourceInstallationId: string;
   }) {
-    if (this.attachment) return Promise.resolve(structuredClone(this.attachment));
+    if (
+      this.attachment && ["staging", "uploaded", "validated"].includes(this.attachment.status)
+    ) return Promise.resolve(structuredClone(this.attachment));
     const now = new Date().toISOString();
     this.attachment = {
       id: crypto.randomUUID(),
@@ -706,6 +708,12 @@ class MemoryProviderSecretRestoreStore {
         item.baseArchiveSha256 === baseSha && item.archiveSha256 === sidecarSha
         ? structuredClone(item)
         : undefined,
+    );
+  }
+  getActiveByRestoreOperation(restoreId: string) {
+    const item = this.attachment;
+    return Promise.resolve(
+      item?.restoreOperationId === restoreId ? structuredClone(item) : undefined,
     );
   }
   get(id: string) {
@@ -787,6 +795,17 @@ class MemoryProviderSecretRestoreStore {
       throw new Error("stale");
     }
     Object.assign(this.attachment, { status: "failed", version: version + 1, error });
+    return Promise.resolve(structuredClone(this.attachment));
+  }
+  cancel(id: string, version: number) {
+    if (!this.attachment || this.attachment.id !== id || this.attachment.version !== version) {
+      throw new Error("stale");
+    }
+    Object.assign(this.attachment, {
+      status: "cancelled",
+      version: version + 1,
+      completedAt: new Date().toISOString(),
+    });
     return Promise.resolve(structuredClone(this.attachment));
   }
   claimCleanup() {
@@ -1153,6 +1172,7 @@ Deno.test("provider-secret restore keeps transient previews retriable, reports b
     idempotencyKey: "restore-provider-secret-upload-1",
   });
   assertEquals(uploaded.status, "uploaded");
+  assertEquals((await service.getProviderSecretRestore(ACTOR, base.id))?.id, uploaded.id);
   const originalGet = fx.objects.get.bind(fx.objects);
   let transientReadFailure = true;
   fx.objects.get = (key: string) => {
@@ -1206,6 +1226,7 @@ Deno.test("provider-secret restore keeps transient previews retriable, reports b
   assertEquals(applied.providerCount, 1);
   assertEquals(applied.providersRemainDisabled, true);
   assertEquals((await service.applyProviderSecretRestore(applyInput)).appliedAt, applied.appliedAt);
+  assertEquals((await service.getProviderSecretRestore(ACTOR, base.id))?.status, "applied");
   const restored = await destinationKeyring.decrypt(
     providerId,
     restoreStore.appliedCredentials[0].envelope as ProviderSecretEnvelope,
@@ -1327,17 +1348,36 @@ Deno.test("provider-secret staging survives missing or lost PUT responses and fo
     privilegedProviderSecrets: { recoveryKeyring, providerKeyring: destinationKeyring },
     providerSecretRestoreStore: retryStore,
   });
-  const retryInput = () => ({
+  const retryInput = (idempotencyKey: string) => ({
     actorId: ACTOR,
     restoreId: base.id,
     request: providerSecretUploadRequest(sidecar),
-    idempotencyKey: "missing-provider-secret-put-retry",
+    idempotencyKey,
   });
-  await assertRejects(() => retryService.uploadProviderSecretRestore(retryInput()));
+  await assertRejects(() =>
+    retryService.uploadProviderSecretRestore(retryInput("missing-provider-secret-put-first"))
+  );
   assertEquals(retryStore.attachment?.status, "staging");
   assertEquals(retryObjects.values.size, 0);
-  assertEquals((await retryService.uploadProviderSecretRestore(retryInput())).status, "uploaded");
+  assertEquals(
+    (await retryService.uploadProviderSecretRestore(
+      retryInput("fresh-browser-provider-secret-put-retry"),
+    )).status,
+    "uploaded",
+  );
   assertEquals(retryStore.attachment?.status, "uploaded");
+  const cancelled = await retryService.cancelProviderSecretRestore({
+    actorId: ACTOR,
+    restoreId: base.id,
+    sidecarId: retryStore.attachment!.id,
+    expectedVersion: retryStore.attachment!.version,
+  });
+  assertEquals(cancelled.status, "cancelled");
+  const replacement = await retryService.uploadProviderSecretRestore({
+    ...retryInput("replacement-provider-secret-after-cancel"),
+  });
+  assertEquals(replacement.status, "uploaded");
+  assertEquals(replacement.id === cancelled.id, false);
   await retryService.close();
 
   const gatedObjects = new DelayedPutObjects();

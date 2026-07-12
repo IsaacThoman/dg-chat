@@ -82,6 +82,14 @@ Deno.test({
       let uploaded = concurrent[0];
       assertEquals(concurrent[1].id, uploaded.id);
       assertEquals(uploaded.status, "staging");
+      assertEquals((await store.getActiveByRestoreOperation(restoreId))?.id, uploaded.id);
+      const resumed = await store.create({
+        ...create,
+        idempotencyKey: "fresh-browser-upload-key",
+        sourceObjectKey: `backups/restores/${restoreId}/fresh-browser-object.dgsecrets`,
+      });
+      assertEquals(resumed.id, uploaded.id);
+      assertEquals(resumed.sourceObjectKey, uploaded.sourceObjectKey);
       uploaded = await store.markUploaded(uploaded.id, uploaded.version);
       assertEquals(uploaded.status, "uploaded");
       assertEquals((await store.markUploaded(uploaded.id, uploaded.version)).id, uploaded.id);
@@ -121,6 +129,7 @@ Deno.test({
         })(),
       );
       assertEquals(applied.status, "applied");
+      assertEquals((await store.getActiveByRestoreOperation(restoreId))?.id, applied.id);
       assertEquals(
         (await store.getAppliedResult(
           applied.id,

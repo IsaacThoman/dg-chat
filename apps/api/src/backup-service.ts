@@ -35,6 +35,7 @@ import type {
   PrivilegedBackupExportSummary,
   ProviderSecretRestorePreview,
   ProviderSecretRestoreResult,
+  ProviderSecretRestoreState,
   ProviderSecretRestoreUploadSummary,
 } from "./backup-admin.ts";
 import type { PrivilegedBackupSecretKeyring } from "./backup-secret-keyring.ts";
@@ -89,6 +90,7 @@ type ProviderSecretRestoreStorePort = Pick<
   | "create"
   | "markUploaded"
   | "getAppliedResult"
+  | "getActiveByRestoreOperation"
   | "invalidateStaleEpochAttachments"
   | "expireAbandonedStaging"
   | "expireAbandonedAttachments"
@@ -96,6 +98,7 @@ type ProviderSecretRestoreStorePort = Pick<
   | "validate"
   | "apply"
   | "fail"
+  | "cancel"
   | "claimCleanup"
   | "recordCleanup"
   | "releaseCleanup"
@@ -1141,7 +1144,7 @@ export class DefaultBackupAdminService implements BackupAdminService {
           `${input.actorId}\n${input.restoreId}\n${input.idempotencyKey}\n${staged.digest}`,
         ),
       );
-      const objectKey =
+      let objectKey =
         `backups/restores/${input.restoreId}/provider-secrets/${identity}-${staged.digest}.dgsecrets`;
       let attachment: Awaited<ReturnType<ProviderSecretRestoreStorePort["create"]>>;
       try {
@@ -1173,6 +1176,9 @@ export class DefaultBackupAdminService implements BackupAdminService {
       if (attachment.status !== "staging" && attachment.status !== "uploaded") {
         throw new BackupServiceError("conflict", "The provider-secret upload is already terminal");
       }
+      // A fresh browser idempotency key may resume an exact durable staging intent after reload.
+      // Its original immutable object identity remains authoritative.
+      objectKey = attachment.sourceObjectKey;
       const existing = await this.#objects.get(objectKey);
       if (existing) {
         if (
@@ -1350,6 +1356,85 @@ export class DefaultBackupAdminService implements BackupAdminService {
       providersRemainDisabled: true,
       appliedAt: attachment.appliedAt,
     };
+  }
+  #providerSecretRestoreState(
+    attachment: Awaited<
+      ReturnType<ProviderSecretRestoreStorePort["get"]>
+    >,
+  ): ProviderSecretRestoreState {
+    const impact = attachment.impact as unknown as {
+      providers?: ProviderSecretRestorePreview["providers"];
+      warnings?: string[];
+      blockingErrors?: string[];
+    } | null;
+    const expiryBase = attachment.status === "validated"
+      ? attachment.validatedAt
+      : attachment.updatedAt;
+    const expiryMs = attachment.status === "staging"
+      ? ABANDONED_PROVIDER_SECRET_STAGING_MS
+      : attachment.status === "uploaded"
+      ? ABANDONED_PROVIDER_SECRET_UPLOAD_MS
+      : attachment.status === "validated"
+      ? ABANDONED_PROVIDER_SECRET_VALIDATION_MS
+      : null;
+    return {
+      id: attachment.id,
+      restoreId: attachment.restoreOperationId,
+      status: attachment.status,
+      version: attachment.version,
+      filename: "provider-secrets.dgsecrets",
+      bytes: attachment.archiveBytes,
+      baseFingerprint: attachment.baseArchiveSha256,
+      sidecarFingerprint: attachment.archiveSha256,
+      recoveryKeyId: attachment.recoveryKeyId,
+      recordCount: attachment.recordCount,
+      providers: impact?.providers ?? [],
+      warnings: impact?.warnings ?? [],
+      blockingErrors: impact?.blockingErrors ?? [],
+      providersRemainDisabled: true as const,
+      error: attachment.error,
+      createdAt: attachment.createdAt,
+      updatedAt: attachment.updatedAt,
+      appliedAt: attachment.appliedAt,
+      expiresAt: expiryBase && expiryMs != null
+        ? new Date(Date.parse(expiryBase) + expiryMs).toISOString()
+        : null,
+      canCancel: ["staging", "uploaded", "validated"].includes(attachment.status),
+    };
+  }
+  getProviderSecretRestore(_actorId: string, restoreId: string) {
+    return this.#trackProviderSecretForeground(async () => {
+      const { store } = this.#providerSecretRestoreDependencies();
+      const attachment = await providerSecretStoreCall(() =>
+        store.getActiveByRestoreOperation(restoreId)
+      );
+      return attachment ? this.#providerSecretRestoreState(attachment) : null;
+    });
+  }
+  cancelProviderSecretRestore(input: {
+    actorId: string;
+    restoreId: string;
+    sidecarId: string;
+    expectedVersion: number;
+  }) {
+    return this.#trackProviderSecretForeground(async () => {
+      const { store } = this.#providerSecretRestoreDependencies();
+      const current = await providerSecretStoreCall(() => store.get(input.sidecarId));
+      if (
+        current.restoreOperationId !== input.restoreId ||
+        current.version !== input.expectedVersion ||
+        !["staging", "uploaded", "validated"].includes(current.status)
+      ) throw new BackupServiceError("conflict", "The provider-secret restore is stale");
+      const cancelled = await providerSecretStoreCall(() =>
+        store.cancel(current.id, current.version)
+      );
+      if (this.#artifactSweep !== undefined) {
+        clearTimeout(this.#artifactSweep);
+        this.#artifactSweep = undefined;
+      }
+      this.#scheduleArtifactSweep(10);
+      return this.#providerSecretRestoreState(cancelled);
+    });
   }
   previewProviderSecretRestore(
     actorId: string,

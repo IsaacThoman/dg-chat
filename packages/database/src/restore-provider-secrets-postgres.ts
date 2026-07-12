@@ -224,6 +224,21 @@ function exactCreateMatch(
     item.sourceInstallationId === input.sourceInstallationId.toLowerCase();
 }
 
+function resumableStagingMatch(
+  item: RestoreProviderSecretsAttachment,
+  input: CreateRestoreProviderSecretsAttachment,
+  restoreEpoch: number,
+): boolean {
+  return item.status === "staging" && item.archiveSha256 === input.archiveSha256 &&
+    item.archiveBytes === input.archiveBytes && item.sidecarId === input.sidecarId.toLowerCase() &&
+    item.recoveryKeyId === input.recoveryKeyId &&
+    item.baseBackupId === input.baseBackupId.toLowerCase() &&
+    item.baseArchiveSha256 === input.baseArchiveSha256 &&
+    item.baseContentRootSha256 === input.baseContentRootSha256 &&
+    item.sourceInstallationId === input.sourceInstallationId.toLowerCase() &&
+    item.baseRestoreEpoch === restoreEpoch;
+}
+
 function validateCreate(input: CreateRestoreProviderSecretsAttachment): void {
   if (
     !UUID.test(input.restoreOperationId) || !UUID.test(input.requestedBy) ||
@@ -306,6 +321,18 @@ export class PostgresRestoreProviderSecretsStore {
     const [row] = await this.#sql<Row[]>`
       SELECT * FROM backup_restore_secret_sidecars
       WHERE restore_operation_id=${restoreOperationId} AND idempotency_key=${idempotencyKey}`;
+    return row ? map(row) : undefined;
+  }
+
+  /** Active attachment when present, otherwise the newest terminal result for reload recovery. */
+  async getActiveByRestoreOperation(restoreOperationId: string) {
+    if (!UUID.test(restoreOperationId)) {
+      throw new RestoreProviderSecretsStoreError("invalid", "Base restore ID is invalid");
+    }
+    const [row] = await this.#sql<Row[]>`
+      SELECT * FROM backup_restore_secret_sidecars
+      WHERE restore_operation_id=${restoreOperationId}
+      ORDER BY (status IN ('staging','uploaded','validated')) DESC,created_at DESC,id DESC LIMIT 1`;
     return row ? map(row) : undefined;
   }
 
@@ -407,6 +434,8 @@ export class PostgresRestoreProviderSecretsStore {
           WHERE restore_operation_id=${input.restoreOperationId}
             AND status IN ('staging','uploaded','validated','applied') FOR UPDATE`;
         if (active[0]) {
+          const item = map(active[0]);
+          if (resumableStagingMatch(item, input, restoreEpoch)) return item;
           throw new RestoreProviderSecretsStoreError(
             "conflict",
             "A sidecar is already paired with this restore",
@@ -430,7 +459,11 @@ export class PostgresRestoreProviderSecretsStore {
           WHERE restore_operation_id=${input.restoreOperationId}
             AND status IN ('staging','uploaded','validated','applied') FOR UPDATE`;
         const item = winner && map(winner);
-        if (item && exactCreateMatch(item, input) && item.baseRestoreEpoch === restoreEpoch) {
+        if (
+          item &&
+          (exactCreateMatch(item, input) || resumableStagingMatch(item, input, restoreEpoch)) &&
+          item.baseRestoreEpoch === restoreEpoch
+        ) {
           return item;
         }
         throw new RestoreProviderSecretsStoreError(
