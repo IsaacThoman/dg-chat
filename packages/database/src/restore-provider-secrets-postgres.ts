@@ -7,6 +7,7 @@ type JsonObject = Record<string, unknown>;
 type Row = Record<string, unknown>;
 
 export type RestoreProviderSecretsStatus =
+  | "staging"
   | "uploaded"
   | "validated"
   | "applied"
@@ -279,6 +280,23 @@ export class PostgresRestoreProviderSecretsStore {
     return map(row);
   }
 
+  async getAppliedResult(
+    id: string,
+    restoreOperationId: string,
+    baseArchiveSha256: string,
+    archiveSha256: string,
+  ): Promise<RestoreProviderSecretsAttachment | undefined> {
+    if (
+      !UUID.test(id) || !UUID.test(restoreOperationId) || !SHA256.test(baseArchiveSha256) ||
+      !SHA256.test(archiveSha256)
+    ) throw new RestoreProviderSecretsStoreError("invalid", "Applied sidecar lookup is invalid");
+    const [row] = await this.#sql<Row[]>`
+      SELECT * FROM backup_restore_secret_sidecars
+      WHERE id=${id} AND restore_operation_id=${restoreOperationId} AND status='applied'
+        AND base_archive_sha256=${baseArchiveSha256} AND archive_sha256=${archiveSha256}`;
+    return row ? map(row) : undefined;
+  }
+
   async findByIdempotency(restoreOperationId: string, idempotencyKey: string) {
     if (
       !UUID.test(restoreOperationId) || idempotencyKey.length < 8 || idempotencyKey.length > 200
@@ -369,12 +387,26 @@ export class PostgresRestoreProviderSecretsStore {
             "Provider-secret sidecar does not match the current completed restore",
           );
         }
-        const existing = await tx<Row[]>`
+        const replay = await tx<Row[]>`
           SELECT * FROM backup_restore_secret_sidecars
-          WHERE restore_operation_id=${input.restoreOperationId} FOR UPDATE`;
-        if (existing[0]) {
-          const item = map(existing[0]);
-          if (exactCreateMatch(item, input) && item.baseRestoreEpoch === restoreEpoch) return item;
+          WHERE restore_operation_id=${input.restoreOperationId}
+            AND idempotency_key=${input.idempotencyKey} FOR UPDATE`;
+        if (replay[0]) {
+          const item = map(replay[0]);
+          if (
+            ["staging", "uploaded"].includes(item.status) && exactCreateMatch(item, input) &&
+            item.baseRestoreEpoch === restoreEpoch
+          ) return item;
+          throw new RestoreProviderSecretsStoreError(
+            "conflict",
+            "The sidecar idempotency key is already terminal or has different metadata",
+          );
+        }
+        const active = await tx<Row[]>`
+          SELECT * FROM backup_restore_secret_sidecars
+          WHERE restore_operation_id=${input.restoreOperationId}
+            AND status IN ('staging','uploaded','validated','applied') FOR UPDATE`;
+        if (active[0]) {
           throw new RestoreProviderSecretsStoreError(
             "conflict",
             "A sidecar is already paired with this restore",
@@ -389,11 +421,14 @@ export class PostgresRestoreProviderSecretsStore {
             ${input.sourceObjectKey},${input.archiveSha256},${input.archiveBytes},${input.sidecarId},
             ${input.recoveryKeyId},${input.baseBackupId},${input.baseArchiveSha256},
             ${input.baseContentRootSha256},${input.sourceInstallationId},${restoreEpoch}
-          ) ON CONFLICT(restore_operation_id) DO NOTHING RETURNING *`;
+          ) ON CONFLICT(restore_operation_id)
+            WHERE status IN ('staging','uploaded','validated','applied')
+            DO NOTHING RETURNING *`;
         if (row) return map(row);
         const [winner] = await tx<Row[]>`
           SELECT * FROM backup_restore_secret_sidecars
-          WHERE restore_operation_id=${input.restoreOperationId} FOR UPDATE`;
+          WHERE restore_operation_id=${input.restoreOperationId}
+            AND status IN ('staging','uploaded','validated','applied') FOR UPDATE`;
         const item = winner && map(winner);
         if (item && exactCreateMatch(item, input) && item.baseRestoreEpoch === restoreEpoch) {
           return item;
@@ -411,7 +446,10 @@ export class PostgresRestoreProviderSecretsStore {
           input.restoreOperationId,
           input.idempotencyKey,
         );
-        if (existing && exactCreateMatch(existing, input)) return existing;
+        if (
+          existing && ["staging", "uploaded"].includes(existing.status) &&
+          exactCreateMatch(existing, input)
+        ) return existing;
         throw new RestoreProviderSecretsStoreError(
           "conflict",
           "A sidecar is already paired with this restore",
@@ -419,6 +457,110 @@ export class PostgresRestoreProviderSecretsStore {
       }
       throw error;
     }
+  }
+
+  async markUploaded(id: string, expectedVersion: number) {
+    positiveVersion(expectedVersion);
+    if (!UUID.test(id)) {
+      throw new RestoreProviderSecretsStoreError("invalid", "Sidecar ID is invalid");
+    }
+    return await this.#sql.begin(async (tx) => {
+      const [current] = await tx<Row[]>`
+        SELECT * FROM backup_restore_secret_sidecars WHERE id=${id} FOR UPDATE`;
+      if (!current) {
+        throw new RestoreProviderSecretsStoreError("not_found", "Restore sidecar was not found");
+      }
+      if (current.status === "uploaded" && Number(current.version) === expectedVersion) {
+        return map(current);
+      }
+      if (current.status !== "staging" || Number(current.version) !== expectedVersion) {
+        throw new RestoreProviderSecretsStoreError(
+          "conflict",
+          "Sidecar upload completion is stale",
+        );
+      }
+      const [row] = await tx<Row[]>`UPDATE backup_restore_secret_sidecars SET
+          status='uploaded',updated_at=now(),version=version+1
+        WHERE id=${id} AND status='staging' AND version=${expectedVersion} RETURNING *`;
+      if (!row) {
+        throw new RestoreProviderSecretsStoreError(
+          "conflict",
+          "Sidecar upload completion is stale",
+        );
+      }
+      return map(row);
+    });
+  }
+
+  async invalidateStaleEpochAttachments(limit = 100) {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+      throw new RestoreProviderSecretsStoreError("invalid", "Stale sidecar limit is invalid");
+    }
+    return await this.#sql.begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-backup-restore'))`;
+      const [state] = await tx<Row[]>`SELECT restore_epoch,maintenance_enabled,active_restore_id
+        FROM installation_state WHERE singleton_id=1 FOR SHARE`;
+      if (!state) {
+        throw new RestoreProviderSecretsStoreError("not_found", "Installation state is missing");
+      }
+      if (state.maintenance_enabled !== false || state.active_restore_id != null) return [];
+      const rows = await tx<Row[]>`UPDATE backup_restore_secret_sidecars SET
+          status='failed',error='The base restore was superseded by a later restore',
+          completed_at=now(),updated_at=now(),version=version+1
+        WHERE id IN (
+          SELECT id FROM backup_restore_secret_sidecars
+          WHERE status IN ('staging','uploaded','validated')
+            AND base_restore_epoch<>${Number(state.restore_epoch)}
+          ORDER BY created_at,id FOR UPDATE SKIP LOCKED LIMIT ${limit}
+        ) RETURNING *`;
+      return rows.map(map);
+    });
+  }
+
+  async expireAbandonedStaging(minimumAgeMilliseconds: number, limit = 100) {
+    if (
+      !Number.isSafeInteger(minimumAgeMilliseconds) || minimumAgeMilliseconds < 60_000 ||
+      minimumAgeMilliseconds > 30 * 24 * 60 * 60_000 ||
+      !Number.isSafeInteger(limit) || limit < 1 || limit > 1000
+    ) throw new RestoreProviderSecretsStoreError("invalid", "Staging expiry is invalid");
+    return await this.#sql.begin(async (tx) => {
+      const rows = await tx<Row[]>`UPDATE backup_restore_secret_sidecars SET
+          status='cancelled',completed_at=now(),updated_at=now(),version=version+1
+        WHERE id IN (
+          SELECT id FROM backup_restore_secret_sidecars
+          WHERE status='staging' AND updated_at < now()-
+            (${minimumAgeMilliseconds}::text || ' milliseconds')::interval
+          ORDER BY updated_at,id FOR UPDATE SKIP LOCKED LIMIT ${limit}
+        ) RETURNING *`;
+      return rows.map(map);
+    });
+  }
+
+  async expireAbandonedAttachments(
+    uploadedAgeMilliseconds: number,
+    validatedAgeMilliseconds: number,
+    limit = 100,
+  ) {
+    if (
+      !Number.isSafeInteger(uploadedAgeMilliseconds) || uploadedAgeMilliseconds < 60_000 ||
+      uploadedAgeMilliseconds > 365 * 24 * 60 * 60_000 ||
+      !Number.isSafeInteger(validatedAgeMilliseconds) || validatedAgeMilliseconds < 60_000 ||
+      validatedAgeMilliseconds > 365 * 24 * 60 * 60_000 ||
+      !Number.isSafeInteger(limit) || limit < 1 || limit > 1000
+    ) throw new RestoreProviderSecretsStoreError("invalid", "Sidecar expiry is invalid");
+    return await this.#sql.begin(async (tx) => {
+      const rows = await tx<Row[]>`UPDATE backup_restore_secret_sidecars SET
+          status='cancelled',completed_at=now(),updated_at=now(),version=version+1
+        WHERE id IN (
+          SELECT id FROM backup_restore_secret_sidecars
+          WHERE (status='uploaded' AND updated_at < now()-
+              (${uploadedAgeMilliseconds}::text || ' milliseconds')::interval)
+            OR (status='validated' AND validated_at < now()-
+              (${validatedAgeMilliseconds}::text || ' milliseconds')::interval)
+          ORDER BY updated_at,id FOR UPDATE SKIP LOCKED LIMIT ${limit}
+        ) RETURNING *`;
+      return rows.map(map);
+    });
   }
 
   async validate(
@@ -587,7 +729,7 @@ export class PostgresRestoreProviderSecretsStore {
     }
     const [row] = await this.#sql<Row[]>`UPDATE backup_restore_secret_sidecars SET
         status='failed',error=${error},completed_at=now(),updated_at=now(),version=version+1
-      WHERE id=${id} AND status IN ('uploaded','validated') AND version=${expectedVersion}
+      WHERE id=${id} AND status IN ('staging','uploaded','validated') AND version=${expectedVersion}
       RETURNING *`;
     if (!row) throw new RestoreProviderSecretsStoreError("conflict", "Sidecar failure is stale");
     return map(row);
@@ -600,7 +742,7 @@ export class PostgresRestoreProviderSecretsStore {
     }
     const [row] = await this.#sql<Row[]>`UPDATE backup_restore_secret_sidecars SET
         status='cancelled',completed_at=now(),updated_at=now(),version=version+1
-      WHERE id=${id} AND status IN ('uploaded','validated') AND version=${expectedVersion}
+      WHERE id=${id} AND status IN ('staging','uploaded','validated') AND version=${expectedVersion}
       RETURNING *`;
     if (!row) {
       throw new RestoreProviderSecretsStoreError("conflict", "Sidecar cancellation is stale");

@@ -47,6 +47,11 @@ Deno.test({
         ) VALUES(${values.restoreId},'sidecar-upload-key',${actor},${values.objectKey},
           ${"b".repeat(64)},128,${values.sidecarId},'recovery-v1',${values.backupId},
           ${"a".repeat(64)},${"c".repeat(64)},${values.installationId},1) RETURNING id`;
+      assertEquals(
+        (await sql`SELECT status FROM backup_restore_secret_sidecars WHERE id=${sidecar.id}`)[0]
+          .status,
+        "staging",
+      );
       await assertRejects(() =>
         sql`UPDATE backup_restore_secret_sidecars SET status='validated' WHERE id=${sidecar.id}`
       );

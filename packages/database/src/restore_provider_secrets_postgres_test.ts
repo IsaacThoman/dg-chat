@@ -79,8 +79,12 @@ Deno.test({
         sourceInstallationId: base.sourceInstallationId,
       };
       const concurrent = await Promise.all([store.create(create), store.create(create)]);
-      const uploaded = concurrent[0];
+      let uploaded = concurrent[0];
       assertEquals(concurrent[1].id, uploaded.id);
+      assertEquals(uploaded.status, "staging");
+      uploaded = await store.markUploaded(uploaded.id, uploaded.version);
+      assertEquals(uploaded.status, "uploaded");
+      assertEquals((await store.markUploaded(uploaded.id, uploaded.version)).id, uploaded.id);
       await assertRejects(
         () => store.create({ ...create, idempotencyKey: "different-upload-key" }),
         RestoreProviderSecretsStoreError,
@@ -117,6 +121,19 @@ Deno.test({
         })(),
       );
       assertEquals(applied.status, "applied");
+      assertEquals(
+        (await store.getAppliedResult(
+          applied.id,
+          restoreId,
+          create.baseArchiveSha256,
+          create.archiveSha256,
+        ))?.id,
+        applied.id,
+      );
+      assertEquals(
+        await store.getAppliedResult(applied.id, restoreId, create.baseArchiveSha256, digest("9")),
+        undefined,
+      );
       const [provider] = await sql<{
         enabled: boolean;
         version: number;
@@ -144,13 +161,14 @@ Deno.test({
       assertEquals((await store.get(applied.id)).cleanupCheckedAt !== null, true);
 
       const rollbackRestoreId = await makeRestore("sidecar-store-restore-two");
-      const rollbackUpload = await store.create({
+      let rollbackUpload = await store.create({
         ...create,
         restoreOperationId: rollbackRestoreId,
         idempotencyKey: "sidecar-store-upload-two",
         sourceObjectKey: `backups/restores/${rollbackRestoreId}/provider-secrets.dgsecrets`,
         sidecarId: crypto.randomUUID(),
       });
+      rollbackUpload = await store.markUploaded(rollbackUpload.id, rollbackUpload.version);
       const first = crypto.randomUUID();
       const second = crypto.randomUUID();
       await sql`INSERT INTO providers(
@@ -212,13 +230,14 @@ Deno.test({
       assertEquals((await store.get(rollbackValidated.id)).status, "validated");
 
       const epochRestoreId = await makeRestore("sidecar-store-restore-epoch");
-      const epochUpload = await store.create({
+      let epochUpload = await store.create({
         ...create,
         restoreOperationId: epochRestoreId,
         idempotencyKey: "sidecar-store-upload-epoch",
         sourceObjectKey: `backups/restores/${epochRestoreId}/provider-secrets.dgsecrets`,
         sidecarId: crypto.randomUUID(),
       });
+      epochUpload = await store.markUploaded(epochUpload.id, epochUpload.version);
       const epochProvider = crypto.randomUUID();
       await sql`INSERT INTO providers(
           id,slug,display_name,base_url,protocol,enabled,version,health_status
@@ -248,6 +267,77 @@ Deno.test({
           SELECT credential_envelope FROM providers WHERE id=${epochProvider}`)[0]
           .credential_envelope,
         null,
+      );
+      const invalidated = await store.invalidateStaleEpochAttachments();
+      assertEquals(invalidated.some((item) => item.id === epochValidated.id), true);
+      assertEquals((await store.get(epochValidated.id)).status, "failed");
+
+      const expiryRestoreId = await makeRestore("sidecar-store-restore-expiry");
+      const expiryUpload = await store.create({
+        ...create,
+        restoreOperationId: expiryRestoreId,
+        idempotencyKey: "sidecar-store-upload-expiry",
+        sourceObjectKey: `backups/restores/${expiryRestoreId}/provider-secrets.dgsecrets`,
+        sidecarId: crypto.randomUUID(),
+      });
+      await sql`UPDATE backup_restore_secret_sidecars SET created_at=now()-interval '2 hours',
+        updated_at=now()-interval '2 hours'
+        WHERE id=${expiryUpload.id}`;
+      assertEquals(
+        (await store.expireAbandonedStaging(60 * 60_000)).some((item) =>
+          item.id === expiryUpload.id && item.status === "cancelled"
+        ),
+        true,
+      );
+      await assertRejects(
+        () =>
+          store.create({
+            ...create,
+            restoreOperationId: expiryRestoreId,
+            idempotencyKey: "sidecar-store-upload-expiry",
+            sourceObjectKey: `backups/restores/${expiryRestoreId}/provider-secrets.dgsecrets`,
+            sidecarId: expiryUpload.sidecarId,
+          }),
+        RestoreProviderSecretsStoreError,
+      );
+      const replacement = await store.create({
+        ...create,
+        restoreOperationId: expiryRestoreId,
+        idempotencyKey: "sidecar-store-upload-replacement",
+        sourceObjectKey: `backups/restores/${expiryRestoreId}/replacement.dgsecrets`,
+        sidecarId: crypto.randomUUID(),
+      });
+      assertEquals(replacement.status, "staging");
+      assertEquals(replacement.id === expiryUpload.id, false);
+      const replacementUploaded = await store.markUploaded(replacement.id, replacement.version);
+      await sql`UPDATE backup_restore_secret_sidecars SET created_at=now()-interval '8 days',
+        updated_at=now()-interval '8 days' WHERE id=${replacementUploaded.id}`;
+      assertEquals(
+        (await store.expireAbandonedAttachments(7 * 24 * 60 * 60_000, 30 * 24 * 60 * 60_000))
+          .some((item) => item.id === replacementUploaded.id && item.status === "cancelled"),
+        true,
+      );
+      let validatedExpiry = await store.create({
+        ...create,
+        restoreOperationId: expiryRestoreId,
+        idempotencyKey: "sidecar-store-upload-validated-expiry",
+        sourceObjectKey: `backups/restores/${expiryRestoreId}/validated-expiry.dgsecrets`,
+        sidecarId: crypto.randomUUID(),
+      });
+      validatedExpiry = await store.markUploaded(validatedExpiry.id, validatedExpiry.version);
+      validatedExpiry = await store.validate(validatedExpiry.id, validatedExpiry.version, {
+        recordCount: 1,
+        recordsSha256: digest("4"),
+        providerPlan: [{ providerId: epochProvider, expectedVersion: 6 }],
+        impact: { ready: 1 },
+      });
+      await sql`UPDATE backup_restore_secret_sidecars SET created_at=now()-interval '31 days',
+        validated_at=now()-interval '31 days',updated_at=now()-interval '31 days'
+        WHERE id=${validatedExpiry.id}`;
+      assertEquals(
+        (await store.expireAbandonedAttachments(7 * 24 * 60 * 60_000, 30 * 24 * 60 * 60_000))
+          .some((item) => item.id === validatedExpiry.id && item.status === "cancelled"),
+        true,
       );
     } finally {
       await store.close();

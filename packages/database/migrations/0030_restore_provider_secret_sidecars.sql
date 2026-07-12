@@ -3,7 +3,7 @@
 CREATE TABLE backup_restore_secret_sidecars (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   restore_operation_id uuid NOT NULL REFERENCES backup_operations(id) ON DELETE RESTRICT,
-  status text NOT NULL DEFAULT 'uploaded',
+  status text NOT NULL DEFAULT 'staging',
   version integer NOT NULL DEFAULT 1,
   idempotency_key text NOT NULL,
   -- Deliberately not foreign keys: this control-plane evidence must survive the next whole-
@@ -34,11 +34,10 @@ CREATE TABLE backup_restore_secret_sidecars (
   applied_at timestamptz,
   completed_at timestamptz,
   updated_at timestamptz NOT NULL DEFAULT now(),
-  CONSTRAINT backup_restore_secret_sidecars_restore_uq UNIQUE(restore_operation_id),
   CONSTRAINT backup_restore_secret_sidecars_idempotency_uq
     UNIQUE(restore_operation_id,idempotency_key),
   CONSTRAINT backup_restore_secret_sidecars_status_check
-    CHECK(status IN ('uploaded','validated','applied','failed','cancelled')),
+    CHECK(status IN ('staging','uploaded','validated','applied','failed','cancelled')),
   CONSTRAINT backup_restore_secret_sidecars_version_check CHECK(version >= 1),
   CONSTRAINT backup_restore_secret_sidecars_idempotency_check
     CHECK(char_length(idempotency_key) BETWEEN 8 AND 200),
@@ -74,7 +73,7 @@ CREATE TABLE backup_restore_secret_sidecars (
     (applied_at IS NULL OR applied_at >= created_at) AND
     (completed_at IS NULL OR completed_at >= created_at)),
   CONSTRAINT backup_restore_secret_sidecars_lifecycle_check CHECK(
-    (status='uploaded' AND validated_at IS NULL AND applied_at IS NULL AND completed_at IS NULL AND
+    (status IN ('staging','uploaded') AND validated_at IS NULL AND applied_at IS NULL AND completed_at IS NULL AND
       error IS NULL) OR
     (status='validated' AND validated_at IS NOT NULL AND applied_at IS NULL AND
       completed_at IS NULL AND error IS NULL) OR
@@ -83,6 +82,10 @@ CREATE TABLE backup_restore_secret_sidecars (
     (status='failed' AND applied_at IS NULL AND completed_at IS NOT NULL AND error IS NOT NULL) OR
     (status='cancelled' AND applied_at IS NULL AND completed_at IS NOT NULL AND error IS NULL))
 );
+
+CREATE UNIQUE INDEX backup_restore_secret_sidecars_active_restore_uq
+  ON backup_restore_secret_sidecars(restore_operation_id)
+  WHERE status IN ('staging','uploaded','validated','applied');
 
 CREATE INDEX backup_restore_secret_sidecars_cleanup_idx
   ON backup_restore_secret_sidecars(cleanup_checked_at,completed_at,id)

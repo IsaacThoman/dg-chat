@@ -1219,8 +1219,9 @@ export const backupRestoreSecretSidecars = pgTable("backup_restore_secret_sideca
   restoreOperationId: uuid("restore_operation_id").notNull().references(() => backupOperations.id, {
     onDelete: "restrict",
   }),
-  status: text("status").$type<"uploaded" | "validated" | "applied" | "failed" | "cancelled">()
-    .notNull().default("uploaded"),
+  status: text("status").$type<
+    "staging" | "uploaded" | "validated" | "applied" | "failed" | "cancelled"
+  >().notNull().default("staging"),
   version: integer("version").notNull().default(1),
   idempotencyKey: text("idempotency_key").notNull(),
   // Control-plane actor evidence intentionally has no users FK so a later full restore cannot
@@ -1252,7 +1253,8 @@ export const backupRestoreSecretSidecars = pgTable("backup_restore_secret_sideca
   completedAt: timestamp("completed_at", { withTimezone: true }),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [
-  uniqueIndex("backup_restore_secret_sidecars_restore_uq").on(table.restoreOperationId),
+  uniqueIndex("backup_restore_secret_sidecars_active_restore_uq").on(table.restoreOperationId)
+    .where(sql`${table.status} IN ('staging','uploaded','validated','applied')`),
   uniqueIndex("backup_restore_secret_sidecars_idempotency_uq").on(
     table.restoreOperationId,
     table.idempotencyKey,
@@ -1264,7 +1266,7 @@ export const backupRestoreSecretSidecars = pgTable("backup_restore_secret_sideca
   ).where(sql`${table.status} IN ('applied','failed','cancelled')`),
   check(
     "backup_restore_secret_sidecars_status_check",
-    sql`${table.status} IN ('uploaded','validated','applied','failed','cancelled')`,
+    sql`${table.status} IN ('staging','uploaded','validated','applied','failed','cancelled')`,
   ),
   check("backup_restore_secret_sidecars_version_check", sql`${table.version} >= 1`),
   check(
@@ -1306,7 +1308,7 @@ export const backupRestoreSecretSidecars = pgTable("backup_restore_secret_sideca
   ),
   check(
     "backup_restore_secret_sidecars_lifecycle_check",
-    sql`(${table.status}='uploaded' AND ${table.validatedAt} IS NULL AND ${table.appliedAt} IS NULL AND ${table.completedAt} IS NULL AND ${table.error} IS NULL) OR (${table.status}='validated' AND ${table.validatedAt} IS NOT NULL AND ${table.appliedAt} IS NULL AND ${table.completedAt} IS NULL AND ${table.error} IS NULL) OR (${table.status}='applied' AND ${table.validatedAt} IS NOT NULL AND ${table.appliedAt} IS NOT NULL AND ${table.completedAt} IS NOT NULL AND ${table.error} IS NULL AND ${table.appliedBy} IS NOT NULL) OR (${table.status}='failed' AND ${table.appliedAt} IS NULL AND ${table.completedAt} IS NOT NULL AND ${table.error} IS NOT NULL) OR (${table.status}='cancelled' AND ${table.appliedAt} IS NULL AND ${table.completedAt} IS NOT NULL AND ${table.error} IS NULL)`,
+    sql`(${table.status} IN ('staging','uploaded') AND ${table.validatedAt} IS NULL AND ${table.appliedAt} IS NULL AND ${table.completedAt} IS NULL AND ${table.error} IS NULL) OR (${table.status}='validated' AND ${table.validatedAt} IS NOT NULL AND ${table.appliedAt} IS NULL AND ${table.completedAt} IS NULL AND ${table.error} IS NULL) OR (${table.status}='applied' AND ${table.validatedAt} IS NOT NULL AND ${table.appliedAt} IS NOT NULL AND ${table.completedAt} IS NOT NULL AND ${table.error} IS NULL AND ${table.appliedBy} IS NOT NULL) OR (${table.status}='failed' AND ${table.appliedAt} IS NULL AND ${table.completedAt} IS NOT NULL AND ${table.error} IS NOT NULL) OR (${table.status}='cancelled' AND ${table.appliedAt} IS NULL AND ${table.completedAt} IS NOT NULL AND ${table.error} IS NULL)`,
   ),
 ]);
 
