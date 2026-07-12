@@ -4312,6 +4312,47 @@ export function createApp(options: AppOptions = {}) {
     }
     return options.backupAdmin;
   };
+  const requirePrivilegedBackupAdmin = ():
+    & BackupAdminService
+    & Required<
+      Pick<
+        BackupAdminService,
+        "requestPrivilegedExport" | "providerSecretExportContent"
+      >
+    > => {
+    const service = requireBackupAdmin();
+    if (
+      service.privilegedSecretBackupsEnabled !== true ||
+      typeof service.requestPrivilegedExport !== "function" ||
+      typeof service.providerSecretExportContent !== "function"
+    ) {
+      throw new DomainError(
+        "privileged_backup_unavailable",
+        "Encrypted provider-secret backups are not enabled for this installation",
+        503,
+      );
+    }
+    return service as
+      & BackupAdminService
+      & Required<
+        Pick<
+          BackupAdminService,
+          "requestPrivilegedExport" | "providerSecretExportContent"
+        >
+      >;
+  };
+  const requireRecentBackupAuthentication = (
+    c: Context<{ Variables: Variables }>,
+    action: string,
+  ) => {
+    if (!hasRecentAuthentication(c.get("sessionAuthenticatedAt"), (options.now ?? Date.now)())) {
+      throw new DomainError(
+        "recent_authentication_required",
+        `Sign in again before ${action}`,
+        403,
+      );
+    }
+  };
   const backupIdempotencyKey = (c: Context<{ Variables: Variables }>): string => {
     const value = c.req.header("idempotency-key")?.trim();
     if (
@@ -4385,6 +4426,46 @@ export function createApp(options: AppOptions = {}) {
     });
     return c.json(backup, 202);
   });
+  app.post("/api/admin/backups/privileged-exports", async (c) => {
+    noStoreBackupResponse(c);
+    requireRecentBackupAuthentication(c, "exporting provider secrets");
+    const service = requirePrivilegedBackupAdmin();
+    let raw: unknown;
+    try {
+      raw = await c.req.json();
+    } catch {
+      throw new DomainError("invalid_json", "Request body must be valid JSON", 400);
+    }
+    if (
+      !raw || typeof raw !== "object" || Array.isArray(raw) ||
+      Object.keys(raw).length !== 2 ||
+      typeof (raw as { includeDiagnostics?: unknown }).includeDiagnostics !== "boolean" ||
+      (raw as { confirmation?: unknown }).confirmation !== "EXPORT PROVIDER SECRETS"
+    ) {
+      throw new DomainError(
+        "validation_error",
+        "Privileged backup confirmation and options are invalid",
+        422,
+      );
+    }
+    const backup = await service.requestPrivilegedExport({
+      actorId: c.get("user").id,
+      includeDiagnostics: (raw as { includeDiagnostics: boolean }).includeDiagnostics,
+      idempotencyKey: backupIdempotencyKey(c),
+    });
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: "backup.provider_secrets_export_requested",
+      targetType: "backup_operation",
+      targetId: backup.id,
+      metadata: {
+        includeDiagnostics: backup.includesDiagnostics,
+        secretsEncrypted: true,
+        recoveryKeyId: backup.providerSecrets.recoveryKeyId,
+      },
+    });
+    return c.json(backup, 202);
+  });
   app.get("/api/admin/backups/:id/content", async (c) => {
     noStoreBackupResponse(c);
     const id = requireUuid(c.req.param("id"), "backupId");
@@ -4400,6 +4481,33 @@ export function createApp(options: AppOptions = {}) {
     headers.set("Pragma", "no-cache");
     headers.set("X-Content-Type-Options", "nosniff");
     headers.set("Content-Disposition", `attachment; filename="dg-chat-backup-${id}.dgbackup"`);
+    return new Response(response.body, { status: response.status, headers });
+  });
+  app.get("/api/admin/backups/:id/provider-secrets/content", async (c) => {
+    noStoreBackupResponse(c);
+    c.header("Referrer-Policy", "no-referrer");
+    requireRecentBackupAuthentication(c, "downloading provider secrets");
+    const id = requireUuid(c.req.param("id"), "backupId");
+    const response = await requirePrivilegedBackupAdmin().providerSecretExportContent(
+      c.get("user").id,
+      id,
+    );
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: "backup.provider_secrets_download_requested",
+      targetType: "backup_operation",
+      targetId: id,
+      metadata: { secretsEncrypted: true },
+    });
+    const headers = new Headers(response.headers);
+    headers.set("Cache-Control", "private, no-store");
+    headers.set("Pragma", "no-cache");
+    headers.set("X-Content-Type-Options", "nosniff");
+    headers.set("Referrer-Policy", "no-referrer");
+    headers.set(
+      "Content-Disposition",
+      `attachment; filename="dg-chat-provider-secrets-${id}.dgsecrets"`,
+    );
     return new Response(response.body, { status: response.status, headers });
   });
   app.post("/api/admin/backups/restore-uploads", async (c) => {

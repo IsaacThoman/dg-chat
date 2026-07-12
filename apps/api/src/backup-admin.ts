@@ -13,6 +13,19 @@ export interface BackupExportSummary {
   error: string | null;
 }
 
+export interface ProviderSecretExportSummary {
+  status: BackupExportStatus;
+  encrypted: true;
+  providerCount: number | null;
+  bytes: number | null;
+  fingerprint: string | null;
+  recoveryKeyId: string | null;
+}
+
+export interface PrivilegedBackupExportSummary extends BackupExportSummary {
+  providerSecrets: ProviderSecretExportSummary;
+}
+
 export interface BackupRestoreUploadSummary {
   id: string;
   filename: string;
@@ -67,6 +80,8 @@ export interface BackupRestoreStatus {
  */
 export interface BackupAdminService {
   readonly restoreEnabled: boolean;
+  /** Fail-closed feature capability; omitted by services that only support redacted backups. */
+  readonly privilegedSecretBackupsEnabled?: boolean;
   listExports(actorId: string): Promise<BackupExportSummary[]>;
   requestExport(input: {
     actorId: string;
@@ -74,6 +89,12 @@ export interface BackupAdminService {
     idempotencyKey: string;
   }): Promise<BackupExportSummary>;
   exportContent(actorId: string, exportId: string): Promise<Response>;
+  requestPrivilegedExport?(input: {
+    actorId: string;
+    includeDiagnostics: boolean;
+    idempotencyKey: string;
+  }): Promise<PrivilegedBackupExportSummary>;
+  providerSecretExportContent?(actorId: string, exportId: string): Promise<Response>;
   uploadRestore(input: {
     actorId: string;
     request: Request;

@@ -19,9 +19,11 @@ const fingerprint = "a".repeat(64);
 
 class FakeBackupAdmin implements BackupAdminService {
   restoreEnabled = true;
+  privilegedSecretBackupsEnabled = true;
   maintenance = false;
   maintenanceError = false;
   exportInput: unknown;
+  privilegedExportInput: unknown;
   uploadInput: unknown;
   applyCalls = 0;
   readonly backup: BackupExportSummary = {
@@ -58,6 +60,27 @@ class FakeBackupAdmin implements BackupAdminService {
     return Promise.resolve(
       new Response("archive", {
         headers: { "content-type": "application/vnd.dg-chat.backup" },
+      }),
+    );
+  }
+  requestPrivilegedExport(input: unknown) {
+    this.privilegedExportInput = input;
+    return Promise.resolve({
+      ...this.backup,
+      providerSecrets: {
+        status: "completed" as const,
+        encrypted: true as const,
+        providerCount: 2,
+        bytes: 11,
+        fingerprint: "b".repeat(64),
+        recoveryKeyId: "recovery-2026",
+      },
+    });
+  }
+  providerSecretExportContent() {
+    return Promise.resolve(
+      new Response("encrypted-sidecar", {
+        headers: { "content-type": "application/vnd.dg-chat.provider-secrets" },
       }),
     );
   }
@@ -240,6 +263,133 @@ Deno.test("backup administration is session-only, idempotent, no-store, and fing
   assertEquals(backupAdmin.applyCalls, 1);
   assertEquals(applied.headers.get("cache-control"), "private, no-store");
   assertEquals(applied.headers.get("set-cookie")?.includes("Max-Age=0"), true);
+});
+
+Deno.test("privileged backup routes require capability, fresh auth, exact confirmation, and audit safely", async () => {
+  const { app, backupAdmin, headers, repository } = await fixture();
+  const endpoint = "/api/admin/backups/privileged-exports";
+  const request = (body: unknown, extraHeaders: Record<string, string> = {}) =>
+    app.request(endpoint, {
+      method: "POST",
+      headers: {
+        ...headers,
+        "content-type": "application/json",
+        "idempotency-key": "privileged-export-attempt-1",
+        ...extraHeaders,
+      },
+      body: JSON.stringify(body),
+    });
+
+  for (
+    const body of [
+      { includeDiagnostics: false },
+      { includeDiagnostics: false, confirmation: "export provider secrets" },
+      { includeDiagnostics: false, confirmation: "EXPORT PROVIDER SECRETS", extra: true },
+    ]
+  ) assertEquals((await request(body)).status, 422);
+  assertEquals(backupAdmin.privilegedExportInput, undefined);
+
+  const created = await request({
+    includeDiagnostics: false,
+    confirmation: "EXPORT PROVIDER SECRETS",
+  });
+  assertEquals(created.status, 202, await created.clone().text());
+  assertEquals(created.headers.get("cache-control"), "private, no-store");
+  assertEquals(
+    (backupAdmin.privilegedExportInput as { idempotencyKey: string }).idempotencyKey,
+    "privileged-export-attempt-1",
+  );
+  const payload = await created.json() as {
+    secretsRedacted: boolean;
+    providerSecrets: {
+      status: string;
+      encrypted: boolean;
+      providerCount: number;
+      bytes: number;
+      fingerprint: string;
+      recoveryKeyId: string;
+    };
+  };
+  assertEquals(payload.secretsRedacted, true);
+  assertEquals(payload.providerSecrets, {
+    status: "completed",
+    encrypted: true,
+    providerCount: 2,
+    bytes: 11,
+    fingerprint: "b".repeat(64),
+    recoveryKeyId: "recovery-2026",
+  });
+
+  const sidecar = await app.request(
+    `/api/admin/backups/${backupAdmin.backup.id}/provider-secrets/content`,
+    { headers },
+  );
+  assertEquals(sidecar.status, 200);
+  assertEquals(sidecar.headers.get("cache-control"), "private, no-store");
+  assertEquals(sidecar.headers.get("referrer-policy"), "no-referrer");
+  assertEquals(sidecar.headers.get("x-content-type-options"), "nosniff");
+  assertEquals(
+    sidecar.headers.get("content-disposition"),
+    `attachment; filename="dg-chat-provider-secrets-${backupAdmin.backup.id}.dgsecrets"`,
+  );
+  assertEquals(sidecar.headers.get("content-type"), "application/vnd.dg-chat.provider-secrets");
+  assertEquals(await sidecar.text(), "encrypted-sidecar");
+
+  const audits = (await repository.listAudit()).data.filter((event) =>
+    event.action.startsWith("backup.provider_secrets_")
+  );
+  assertEquals(audits.map((event) => event.action), [
+    "backup.provider_secrets_download_requested",
+    "backup.provider_secrets_export_requested",
+  ]);
+  const auditText = JSON.stringify(audits);
+  assertEquals(auditText.includes("EXPORT PROVIDER SECRETS"), false);
+  assertEquals(auditText.includes("encrypted-sidecar"), false);
+
+  backupAdmin.privilegedSecretBackupsEnabled = false;
+  assertEquals(
+    (await request({
+      includeDiagnostics: false,
+      confirmation: "EXPORT PROVIDER SECRETS",
+    })).status,
+    503,
+  );
+  assertEquals(
+    (await app.request(
+      `/api/admin/backups/${backupAdmin.backup.id}/provider-secrets/content`,
+      { headers },
+    )).status,
+    503,
+  );
+});
+
+Deno.test("privileged backup export and download reject stale authentication before service access", async () => {
+  const { app, backupAdmin, headers } = await fixture({
+    now: () => Date.now() + 11 * 60 * 1_000,
+  });
+  const created = await app.request("/api/admin/backups/privileged-exports", {
+    method: "POST",
+    headers: {
+      ...headers,
+      "content-type": "application/json",
+      "idempotency-key": "privileged-export-stale",
+    },
+    body: JSON.stringify({
+      includeDiagnostics: false,
+      confirmation: "EXPORT PROVIDER SECRETS",
+    }),
+  });
+  assertEquals(created.status, 403);
+  assertEquals(
+    (await created.json() as { error: { code: string } }).error.code,
+    "recent_authentication_required",
+  );
+  assertEquals(backupAdmin.privilegedExportInput, undefined);
+  const content = await app.request(
+    `/api/admin/backups/${backupAdmin.backup.id}/provider-secrets/content`,
+    { headers },
+  );
+  assertEquals(content.status, 403);
 });
 
 Deno.test("restore apply fails closed when browser authentication is older than ten minutes", async () => {
