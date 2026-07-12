@@ -243,3 +243,42 @@ export interface RetriedAdminJob {
   job: AdminJob;
   priorAttempts: number;
 }
+export type RetentionDays = 1 | 7 | 14 | 30 | 90;
+export interface RetentionPolicy {
+  version: number;
+  captureEnabled: boolean;
+  requestBodyDays: RetentionDays;
+  responseBodyDays: RetentionDays;
+  updatedAt: string;
+  updatedBy: string | null;
+}
+export interface RetentionPreview {
+  policyVersion: number;
+  requestCutoffAt: string;
+  responseCutoffAt: string;
+  captures: number;
+  requestBodies: number;
+  responseBodies: number;
+  requestBytes: number;
+  responseBytes: number;
+}
+export type RetentionScrubStatus = "queued" | "running" | "completed" | "failed";
+export interface RetentionScrubRun {
+  id: string;
+  idempotencyKey: string;
+  status: RetentionScrubStatus;
+  policy: RetentionPolicy;
+  requestCutoffAt: string;
+  responseCutoffAt: string;
+  capturesScrubbed: number;
+  requestBodiesScrubbed: number;
+  responseBodiesScrubbed: number;
+  bytesScrubbed: number;
+  createdAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+  error: string | null;
+}
+export interface RetentionScrubRunPage {
+  items: RetentionScrubRun[];
+}

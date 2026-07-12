@@ -1,9 +1,103 @@
 import { assertEquals, assertNotEquals } from "jsr:@std/assert@1.0.14";
 import postgres from "npm:postgres@3.4.7";
-import { claimJob, completeJob, failOrRetryJob } from "./job-queue.ts";
 import { recordIngestionFailure } from "./attachment-ingestion.ts";
+import {
+  claimJob,
+  completeJob,
+  failOrRetryJob,
+  failOrRetryRetentionScrubJob,
+  jobFailureWillRetry,
+  retentionRunIdFromJobAssociation,
+} from "./job-queue.ts";
 
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
+
+Deno.test("job failure retry decision matches the durable attempt budget", () => {
+  assertEquals(jobFailureWillRetry({ attempts: 0 }), true);
+  assertEquals(jobFailureWillRetry({ attempts: 3 }), true);
+  assertEquals(jobFailureWillRetry({ attempts: 4 }), false);
+});
+
+Deno.test("retention run association is recovered only from its exact durable key", () => {
+  const runId = "00000000-0000-4000-8000-000000000077";
+  assertEquals(
+    retentionRunIdFromJobAssociation({
+      type: "retention.scrub",
+      idempotencyKey: `retention.scrub:${runId}`,
+    }),
+    runId,
+  );
+  for (
+    const idempotencyKey of [null, runId, `retention.scrub:${runId}:extra`, "retention.scrub:bad"]
+  ) {
+    assertEquals(
+      retentionRunIdFromJobAssociation({ type: "retention.scrub", idempotencyKey }),
+      undefined,
+    );
+  }
+});
+
+Deno.test({
+  name: "malformed retention payload converges linked job and run without persisting secrets",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 2 });
+    const userId = crypto.randomUUID();
+    const runId = crypto.randomUUID();
+    const jobId = crypto.randomUUID();
+    const sentinel = "super-secret-parser-detail";
+    try {
+      await sql`INSERT INTO users(id,email,name,role,approval_status,state)
+        VALUES(${userId},${`${userId}@retention-worker.test`},'Retention worker','admin','approved','active')`;
+      const policy = await sql<{ current_version: number }[]>`SELECT current_version
+        FROM retention_policy_state WHERE singleton_id=1`;
+      await sql`INSERT INTO retention_scrub_runs(id,idempotency_key,status,policy_version,
+        capture_enabled,request_body_days,response_body_days,request_cutoff_at,response_cutoff_at,
+        requested_by) VALUES(${runId},${`malformed-${runId}`},'queued',${policy[0].current_version},
+        false,30,30,now()-interval '30 days',now()-interval '30 days',${userId})`;
+      await sql`INSERT INTO jobs(id,type,payload,idempotency_key)
+        VALUES(${jobId},'retention.scrub',${sql.json({ malformed: sentinel })},
+          ${`retention.scrub:${runId}`})`;
+      const claimed = await claimJob(sql, "malformed-retention-worker", 60);
+      if (!claimed) throw new Error("retention job was not claimed");
+      const associated = retentionRunIdFromJobAssociation(claimed);
+      assertEquals(associated, runId);
+      assertEquals(
+        await failOrRetryRetentionScrubJob(
+          sql,
+          claimed,
+          associated!,
+          "invalid_job_payload",
+          1,
+        ),
+        true,
+      );
+      const [job] = await sql<{ status: string; last_error: string }[]>`
+        SELECT status,last_error FROM jobs WHERE id=${jobId}`;
+      const [run] = await sql<{ status: string; error: string }[]>`
+        SELECT status,error FROM retention_scrub_runs WHERE id=${runId}`;
+      assertEquals(job, { status: "failed", last_error: "Retention scrub job payload is invalid" });
+      assertEquals(run, {
+        status: "failed",
+        error: "Retention scrub stopped because its durable job payload was invalid",
+      });
+      const audit = JSON.stringify(
+        await sql`SELECT metadata FROM audit_events
+        WHERE target_id=${runId} AND action='retention.scrub.failed'`,
+      );
+      assertEquals(audit.includes(sentinel), false);
+      assertEquals(audit.includes("invalid_job_payload"), true);
+    } finally {
+      await sql`DELETE FROM jobs WHERE id=${jobId}`;
+      await sql`DELETE FROM audit_events WHERE target_id=${runId}`;
+      await sql`DELETE FROM retention_scrub_runs WHERE id=${runId}`;
+      await sql`DELETE FROM users WHERE id=${userId}`;
+      await sql.end();
+    }
+  },
+});
 
 Deno.test({
   name: "stale running jobs are reclaimed and the previous claim is fenced",

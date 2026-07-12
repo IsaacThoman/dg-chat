@@ -17,6 +17,10 @@ import type {
   Model,
   ModelPriceVersion,
   ProviderProtocol,
+  RetentionPolicy,
+  RetentionPreview,
+  RetentionScrubRun,
+  RetentionScrubRunPage,
   RetriedAdminJob,
   Token,
   User,
@@ -644,6 +648,34 @@ export const api = {
     request<AdminJobPage>(`/admin/jobs?${adminJobsQuery(filters, cursor, limit)}`),
   retryAdminJob: (id: string) =>
     request<RetriedAdminJob>(`/admin/jobs/${encodeURIComponent(id)}/retry`, { method: "POST" }),
+  adminRetentionPolicy: () => request<RetentionPolicy>("/admin/retention/policy"),
+  updateAdminRetentionPolicy: (
+    input: Pick<RetentionPolicy, "captureEnabled" | "requestBodyDays" | "responseBodyDays"> & {
+      expectedVersion: number;
+    },
+  ) =>
+    request<RetentionPolicy>("/admin/retention/policy", {
+      method: "PUT",
+      body: JSON.stringify(input),
+    }),
+  previewAdminRetention: (expectedPolicyVersion: number) =>
+    request<RetentionPreview>("/admin/retention/previews", {
+      method: "POST",
+      body: JSON.stringify({ expectedPolicyVersion }),
+    }),
+  createAdminRetentionScrub: (idempotencyKey: string, preview: RetentionPreview) =>
+    request<RetentionScrubRun>("/admin/retention/scrub-runs", {
+      method: "POST",
+      body: JSON.stringify({
+        idempotencyKey,
+        expectedPolicyVersion: preview.policyVersion,
+        requestCutoffAt: preview.requestCutoffAt,
+        responseCutoffAt: preview.responseCutoffAt,
+      }),
+    }),
+  adminRetentionScrubRun: (id: string) =>
+    request<RetentionScrubRun>(`/admin/retention/scrub-runs/${encodeURIComponent(id)}`),
+  adminRetentionScrubRuns: () => request<RetentionScrubRunPage>("/admin/retention/scrub-runs"),
   adminAudit: (filters: AuditFilters = {}, cursor?: string, limit = 50) =>
     request<{ data: AuditEvent[]; nextCursor: string | null }>(
       `/admin/audit?${auditQuery(filters, cursor, limit)}`,

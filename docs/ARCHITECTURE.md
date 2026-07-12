@@ -67,6 +67,13 @@ model, credential, and append-only price mutations use optimistic versions and a
 Usage reservations snapshot the exact effective price version and all rate categories so later
 administrative price changes cannot rewrite historical accounting.
 
+Optional provider diagnostics live outside conversations and accounting records. The current
+versioned retention policy is locked while a capture is admitted; scrub previews return exact
+request and response cutoff timestamps, and enqueue persists those same timestamps under an
+idempotency key. Bounded `SKIP LOCKED` worker batches only null diagnostic bodies and record
+terminal audit events, so a policy change or retry cannot expand a previously reviewed deletion
+boundary.
+
 ## Trust boundaries
 
 All browser input, uploaded content, provider output, tool calls, and fetched URLs are untrusted.

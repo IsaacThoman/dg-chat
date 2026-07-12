@@ -4264,6 +4264,106 @@ export function createApp(options: AppOptions = {}) {
     const retried = await repo.retryFailedJob(id, c.get("user").id);
     return c.json(retried);
   });
+  const retentionDays = [1, 7, 14, 30, 90] as const;
+  const parseRetentionBody = async (c: Context<{ Variables: Variables }>) => {
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      throw new DomainError("validation_error", "Request body must be valid JSON", 422);
+    }
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      throw new DomainError("validation_error", "Retention request is invalid", 422);
+    }
+    return body as Record<string, unknown>;
+  };
+  const noStoreRetention = (c: Context<{ Variables: Variables }>) =>
+    c.header("Cache-Control", "private, no-store");
+  app.get("/api/admin/retention/policy", async (c) => {
+    noStoreRetention(c);
+    return c.json(await repo.getRetentionPolicy());
+  });
+  app.put("/api/admin/retention/policy", async (c) => {
+    noStoreRetention(c);
+    const body = await parseRetentionBody(c);
+    if (
+      Object.keys(body).some((key) =>
+        !["expectedVersion", "captureEnabled", "requestBodyDays", "responseBodyDays"].includes(
+          key,
+        )
+      ) || !Number.isSafeInteger(body.expectedVersion) || Number(body.expectedVersion) < 1 ||
+      typeof body.captureEnabled !== "boolean" ||
+      !retentionDays.includes(body.requestBodyDays as typeof retentionDays[number]) ||
+      !retentionDays.includes(body.responseBodyDays as typeof retentionDays[number])
+    ) throw new DomainError("validation_error", "Retention policy is invalid", 422);
+    return c.json(
+      await repo.updateRetentionPolicy({
+        expectedVersion: Number(body.expectedVersion),
+        captureEnabled: body.captureEnabled,
+        requestBodyDays: body.requestBodyDays as typeof retentionDays[number],
+        responseBodyDays: body.responseBodyDays as typeof retentionDays[number],
+      }, c.get("user").id),
+    );
+  });
+  app.post("/api/admin/retention/previews", async (c) => {
+    noStoreRetention(c);
+    const body = await parseRetentionBody(c);
+    if (
+      Object.keys(body).some((key) => key !== "expectedPolicyVersion") ||
+      !Number.isSafeInteger(body.expectedPolicyVersion) || Number(body.expectedPolicyVersion) < 1
+    ) throw new DomainError("validation_error", "Retention preview request is invalid", 422);
+    const preview = await repo.previewRetentionScrub();
+    if (preview.policyVersion !== body.expectedPolicyVersion) {
+      throw new DomainError("version_conflict", "Retention policy changed", 409);
+    }
+    return c.json(preview);
+  });
+  app.post("/api/admin/retention/scrub-runs", async (c) => {
+    noStoreRetention(c);
+    const body = await parseRetentionBody(c);
+    if (
+      Object.keys(body).some((key) =>
+        !["expectedPolicyVersion", "idempotencyKey", "requestCutoffAt", "responseCutoffAt"]
+          .includes(key)
+      ) ||
+      !Number.isSafeInteger(body.expectedPolicyVersion) || Number(body.expectedPolicyVersion) < 1 ||
+      typeof body.idempotencyKey !== "string" || body.idempotencyKey.length < 8 ||
+      body.idempotencyKey.length > 200 || hasAsciiControl(body.idempotencyKey) ||
+      typeof body.requestCutoffAt !== "string" || body.requestCutoffAt.length > 64 ||
+      !Number.isFinite(Date.parse(body.requestCutoffAt)) ||
+      typeof body.responseCutoffAt !== "string" || body.responseCutoffAt.length > 64 ||
+      !Number.isFinite(Date.parse(body.responseCutoffAt))
+    ) throw new DomainError("validation_error", "Retention scrub request is invalid", 422);
+    const run = await repo.enqueueRetentionScrub({
+      expectedPolicyVersion: Number(body.expectedPolicyVersion),
+      idempotencyKey: body.idempotencyKey,
+      requestCutoffAt: new Date(body.requestCutoffAt).toISOString(),
+      responseCutoffAt: new Date(body.responseCutoffAt).toISOString(),
+    }, c.get("user").id);
+    return c.json(run, 202);
+  });
+  app.get("/api/admin/retention/scrub-runs", async (c) => {
+    noStoreRetention(c);
+    const rawLimit = c.req.query("limit");
+    const limit = rawLimit === undefined ? undefined : Number(rawLimit);
+    const status = c.req.query("status");
+    if (
+      (limit !== undefined && (!Number.isInteger(limit) || limit < 1 || limit > 100)) ||
+      (status !== undefined && !["queued", "running", "completed", "failed"].includes(status))
+    ) throw new DomainError("validation_error", "Retention run query is invalid", 422);
+    return c.json(
+      await repo.listRetentionScrubRuns({
+        ...(limit === undefined ? {} : { limit }),
+        ...(status === undefined
+          ? {}
+          : { status: status as "queued" | "running" | "completed" | "failed" }),
+      }),
+    );
+  });
+  app.get("/api/admin/retention/scrub-runs/:id", async (c) => {
+    noStoreRetention(c);
+    return c.json(await repo.getRetentionScrubRun(requireUuid(c.req.param("id"), "scrub run id")));
+  });
   const parseProviderAdminBody = async <T>(
     c: Context<{ Variables: Variables }>,
     parse: (value: unknown) => T,

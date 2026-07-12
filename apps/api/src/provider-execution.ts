@@ -7,6 +7,7 @@ import type {
   ProviderExecutionClaim,
   ProviderExecutionPlan,
   ProviderExecutionTarget,
+  ProviderPayloadCaptureInput,
   UsagePricingSnapshot,
 } from "@dg-chat/database";
 import { DomainError } from "@dg-chat/database";
@@ -80,6 +81,11 @@ import {
   ImageProviderError,
   type ImageProviderResponse,
 } from "./images.ts";
+import {
+  providerDiagnosticBody,
+  providerDiagnosticError,
+  ProviderStreamDiagnostic,
+} from "./provider-payload-capture.ts";
 
 const OCR_MAX_OUTPUT_TOKENS = 4_096;
 
@@ -793,6 +799,7 @@ export class ProviderExecutionEngine {
     claim: ProviderExecutionClaim,
     plan: ProviderExecutionPlan,
     metrics: Map<string, AttemptMetrics>,
+    attemptIds: Map<string, string>,
     estimatedInput: number,
   ) {
     const attempts = new Map<string, { attempt: ProviderAttempt; startedAt: number }>();
@@ -857,6 +864,7 @@ export class ProviderExecutionEngine {
           breakerBefore: breakerState(event.circuitState),
         });
         attempts.set(eventKey, { attempt: started, startedAt: this.#now() });
+        attemptIds.set(eventKey, started.id);
         metrics.set(eventKey, emptyMetrics(estimatedInput));
         return;
       }
@@ -926,6 +934,15 @@ export class ProviderExecutionEngine {
     };
   }
 
+  async #capture(input: ProviderPayloadCaptureInput): Promise<void> {
+    if (input.requestBody == null && input.responseBody == null) return;
+    try {
+      await this.#repository.captureProviderPayload(input);
+    } catch {
+      // Diagnostics are intentionally best-effort and must never affect provider or accounting.
+    }
+  }
+
   #circuitStore(candidates: Map<string, RuntimeCandidate>): CircuitStore {
     const adapter = new CircuitBreakerStoreAdapter(this.#circuitBreaker, this.#breakerPolicy);
     const circuitId = (candidateId: string) => {
@@ -988,6 +1005,7 @@ export class ProviderExecutionEngine {
     const remainingAttempts = policyFor(plan, undefined, this.#slowStream).maxAttempts -
       claim.consumedAttempts;
     const metrics = new Map<string, AttemptMetrics>();
+    const attemptIds = new Map<string, string>();
     const upstreams = new Map<string, UpstreamStreamOptions>();
     const onAttempt = this.#telemetry(
       usageRunId,
@@ -995,6 +1013,7 @@ export class ProviderExecutionEngine {
       claim,
       plan,
       metrics,
+      attemptIds,
       estimateInputTokens(request),
     );
     try {
@@ -1020,8 +1039,29 @@ export class ProviderExecutionEngine {
             if (observed) observed.dispatched = true;
             const result = await this.#complete(request, attemptSignal, upstream);
             metrics.set(key(candidate.id, context), completionMetrics(result));
+            const providerAttemptId = attemptIds.get(key(candidate.id, context));
+            if (providerAttemptId) {
+              void this.#capture({
+                providerAttemptId,
+                usageRunId,
+                requestBody: providerDiagnosticBody(request),
+                responseBody: providerDiagnosticBody(result.upstream ?? result),
+              });
+            }
             return result;
           } catch (error) {
+            const eventKey = key(candidate.id, context);
+            if (metrics.get(eventKey)?.dispatched) {
+              const providerAttemptId = attemptIds.get(eventKey);
+              if (providerAttemptId) {
+                void this.#capture({
+                  providerAttemptId,
+                  usageRunId,
+                  requestBody: providerDiagnosticBody(request),
+                  responseBody: providerDiagnosticBody({ error: providerDiagnosticError(error) }),
+                });
+              }
+            }
             this.#normalizeError(error, plan);
           }
         },
@@ -1052,6 +1092,7 @@ export class ProviderExecutionEngine {
       claim,
       plan,
       metrics,
+      new Map(),
       estimatedInput,
     );
     try {
@@ -1125,6 +1166,7 @@ export class ProviderExecutionEngine {
       claim,
       plan,
       metrics,
+      new Map(),
       estimateAudioInputTokens(request),
     );
     if (request.stream) {
@@ -1335,6 +1377,7 @@ export class ProviderExecutionEngine {
       claim,
       plan,
       metrics,
+      new Map(),
       estimatedInput,
     );
     if (request.streamFormat === "sse") {
@@ -1522,6 +1565,7 @@ export class ProviderExecutionEngine {
       claim,
       plan,
       metrics,
+      new Map(),
       estimatedInput,
     );
     if (request.stream) {
@@ -1783,6 +1827,7 @@ export class ProviderExecutionEngine {
     const remainingAttempts = policyFor(plan, undefined, this.#slowStream).maxAttempts -
       claim.consumedAttempts;
     const metrics = new Map<string, AttemptMetrics>();
+    const attemptIds = new Map<string, string>();
     const upstreams = new Map<string, UpstreamStreamOptions>();
     const onAttempt = this.#telemetry(
       usageRunId,
@@ -1790,6 +1835,7 @@ export class ProviderExecutionEngine {
       claim,
       plan,
       metrics,
+      attemptIds,
       estimateInputTokens(request),
     );
     try {
@@ -1816,7 +1862,38 @@ export class ProviderExecutionEngine {
           observed.dispatched = true;
           const upstream = this.#stream(request, attemptSignal, upstreamOptions);
           metrics.set(key(candidate.id, context), observed);
-          return this.#observeStream(upstream, observed, plan);
+          const providerAttemptId = attemptIds.get(key(candidate.id, context));
+          const diagnostic = new ProviderStreamDiagnostic();
+          const observedStream = this.#observeStream(upstream, observed, plan);
+          return (async function* (engine: ProviderExecutionEngine) {
+            let completed = false;
+            try {
+              for await (const frame of observedStream) {
+                diagnostic.observe(frame);
+                yield frame;
+              }
+              completed = true;
+            } catch (error) {
+              if (providerAttemptId && observed.dispatched) {
+                void engine.#capture({
+                  providerAttemptId,
+                  usageRunId,
+                  requestBody: providerDiagnosticBody(request),
+                  responseBody: providerDiagnosticBody({ error: providerDiagnosticError(error) }),
+                });
+              }
+              throw error;
+            } finally {
+              if (completed && providerAttemptId) {
+                void engine.#capture({
+                  providerAttemptId,
+                  usageRunId,
+                  requestBody: providerDiagnosticBody(request),
+                  responseBody: diagnostic.body(),
+                });
+              }
+            }
+          })(this);
         },
       });
     } catch (error) {

@@ -73,6 +73,7 @@ import {
 import { api, ApiError } from "./api.ts";
 import type { AdminSearch, AdminSection } from "./adminRouting.ts";
 import { AdminAnalyticsView, AdminJobsView } from "./AdminOperations.tsx";
+import { AdminRetentionView } from "./AdminRetention.tsx";
 import {
   conversationForFirstSend,
   mergeAttachmentIds,
@@ -3078,6 +3079,7 @@ const adminNav: { id: AdminSection; label: string; icon: typeof Gauge }[] = [
   { id: "usage", label: "Usage analytics", icon: BarChart3 },
   { id: "jobs", label: "Background jobs", icon: Boxes },
   { id: "audit", label: "Audit log", icon: Shield },
+  { id: "retention", label: "Retention", icon: Database },
   { id: "storage", label: "Storage & backups", icon: HardDrive },
 ];
 function AdminView(
@@ -3185,6 +3187,9 @@ function AdminSectionContent(
   }
   if (section === "audit") {
     return <AuditLog />;
+  }
+  if (section === "retention") {
+    return <AdminRetentionView search={search} onSearch={setSearch} />;
   }
   return (
     <GenericAdmin

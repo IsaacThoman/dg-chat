@@ -55,6 +55,7 @@ import type {
   DocumentChunkEmbeddingInput,
   DocumentChunkInput,
   EmbeddingProviderAttemptInput,
+  EnqueueRetentionScrubInput,
   EnsureIdempotentReservationInput,
   EnsureUsageReservationInput,
   FailApiRequestInput,
@@ -82,11 +83,20 @@ import type {
   ProviderExecutionPlan,
   ProviderModelRecord,
   ProviderModelRoute,
+  ProviderPayloadCapture,
+  ProviderPayloadCaptureInput,
   ProviderRecord,
   ProviderRetryPolicy,
   RegistryMutationContext,
   ReplaceConversationKnowledgeInput,
   ReserveChildProviderUsageInput,
+  RetentionPolicy,
+  RetentionPreview,
+  RetentionScrubBatchResult,
+  RetentionScrubFailureCode,
+  RetentionScrubPage,
+  RetentionScrubQuery,
+  RetentionScrubRun,
   SearchConversationKnowledgeInput,
   SessionSummary,
   SetProviderModelRouteInput,
@@ -96,6 +106,7 @@ import type {
   UpdateProviderInput,
   UpdateProviderModelInput,
   UpdateProviderRetryPolicyInput,
+  UpdateRetentionPolicyInput,
   UsagePricingSnapshot,
 } from "./repository.ts";
 import {
@@ -449,6 +460,16 @@ export class MemoryRepository {
   readonly providerRetryPolicies = new Map<string, ProviderRetryPolicy>();
   readonly providerModelRoutes = new Map<string, ProviderModelRoute>();
   readonly providerAttempts = new Map<string, ProviderAttempt>();
+  retentionPolicy: RetentionPolicy = {
+    version: 1,
+    captureEnabled: false,
+    requestBodyDays: 30,
+    responseBodyDays: 30,
+    updatedAt: new Date(0).toISOString(),
+    updatedBy: null,
+  };
+  readonly providerPayloadCaptures = new Map<string, ProviderPayloadCapture>();
+  readonly retentionScrubRuns = new Map<string, RetentionScrubRun>();
   readonly conversations = new Map<string, Conversation>();
   readonly messages = new Map<string, MessageNode>();
   readonly idempotency = new Map<string, string>();
@@ -4422,6 +4443,18 @@ export class MemoryRepository {
     if (job.status !== "failed") {
       throw new DomainError("conflict", "Only failed jobs can be retried", 409);
     }
+    if (job.type === "retention.scrub") {
+      const runId = typeof job.payload === "object" && job.payload !== null
+        ? (job.payload as { runId?: unknown }).runId
+        : undefined;
+      const run = typeof runId === "string" ? this.retentionScrubRuns.get(runId) : undefined;
+      if (!run || run.status !== "failed") {
+        throw new DomainError("conflict", "Retention scrub run is not safely retryable", 409);
+      }
+      run.status = "queued";
+      run.error = null;
+      run.completedAt = null;
+    }
     const priorAttempts = job.attempts;
     job.status = "queued";
     job.attempts = 0;
@@ -4452,6 +4485,290 @@ export class MemoryRepository {
       metadata: { type: job.type, priorAttempts },
     });
     return retried;
+  }
+  getRetentionPolicy(): RetentionPolicy {
+    return structuredClone(this.retentionPolicy);
+  }
+  updateRetentionPolicy(input: UpdateRetentionPolicyInput, actorId: string): RetentionPolicy {
+    if (input.expectedVersion !== this.retentionPolicy.version) {
+      throw new DomainError("version_conflict", "Retention policy changed", 409);
+    }
+    if (
+      ![1, 7, 14, 30, 90].includes(input.requestBodyDays) ||
+      ![1, 7, 14, 30, 90].includes(input.responseBodyDays)
+    ) {
+      throw new DomainError("validation_error", "Retention days are invalid", 422);
+    }
+    this.retentionPolicy = {
+      version: this.retentionPolicy.version + 1,
+      captureEnabled: input.captureEnabled,
+      requestBodyDays: input.requestBodyDays,
+      responseBodyDays: input.responseBodyDays,
+      updatedAt: new Date().toISOString(),
+      updatedBy: actorId,
+    };
+    this.recordAudit({
+      actorId,
+      action: "retention.policy.updated",
+      targetType: "retention_policy",
+      targetId: String(this.retentionPolicy.version),
+      metadata: {
+        captureEnabled: input.captureEnabled,
+        requestBodyDays: input.requestBodyDays,
+        responseBodyDays: input.responseBodyDays,
+      },
+    });
+    return structuredClone(this.retentionPolicy);
+  }
+  captureProviderPayload(input: ProviderPayloadCaptureInput): ProviderPayloadCapture | null {
+    if (!this.retentionPolicy.captureEnabled) return null;
+    if (
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
+        input.providerAttemptId,
+      ) || !input.usageRunId ||
+      input.usageRunId.length > 200
+    ) {
+      throw new DomainError("validation_error", "Provider payload linkage is invalid", 422);
+    }
+    const attempt = this.providerAttempts.get(input.providerAttemptId);
+    if (!attempt || attempt.usageRunId !== input.usageRunId) {
+      throw new DomainError("not_found", "Provider attempt not found", 404);
+    }
+    const requestBody = input.requestBody ?? null;
+    const responseBody = input.responseBody ?? null;
+    if (requestBody === null && responseBody === null) {
+      throw new DomainError("validation_error", "A provider payload body is required", 422);
+    }
+    const requestBytes = requestBody === null
+      ? 0
+      : new TextEncoder().encode(requestBody).byteLength;
+    const responseBytes = responseBody === null
+      ? 0
+      : new TextEncoder().encode(responseBody).byteLength;
+    if (requestBytes > 1_048_576 || responseBytes > 1_048_576) {
+      throw new DomainError("validation_error", "Provider payload exceeds one MiB", 422);
+    }
+    const prior = [...this.providerPayloadCaptures.values()].find((value) =>
+      value.providerAttemptId === input.providerAttemptId
+    );
+    if (prior) {
+      if (prior.requestBody !== requestBody || prior.responseBody !== responseBody) {
+        throw new DomainError("idempotency_conflict", "Provider payload capture differs", 409);
+      }
+      return structuredClone(prior);
+    }
+    const capture: ProviderPayloadCapture = {
+      id: crypto.randomUUID(),
+      usageRunId: input.usageRunId,
+      providerAttemptId: input.providerAttemptId,
+      requestBody,
+      responseBody,
+      requestBytes,
+      responseBytes,
+      capturedAt: new Date().toISOString(),
+      scrubbedAt: null,
+    };
+    this.providerPayloadCaptures.set(capture.id, capture);
+    return structuredClone(capture);
+  }
+  previewRetentionScrub(): RetentionPreview {
+    const now = Date.now();
+    const requestCutoff = now - this.retentionPolicy.requestBodyDays * 86_400_000;
+    const responseCutoff = now - this.retentionPolicy.responseBodyDays * 86_400_000;
+    const values = [...this.providerPayloadCaptures.values()];
+    const requests = values.filter((value) =>
+      value.requestBody !== null && Date.parse(value.capturedAt) <= requestCutoff
+    );
+    const responses = values.filter((value) =>
+      value.responseBody !== null && Date.parse(value.capturedAt) <= responseCutoff
+    );
+    return {
+      policyVersion: this.retentionPolicy.version,
+      requestCutoffAt: new Date(requestCutoff).toISOString(),
+      responseCutoffAt: new Date(responseCutoff).toISOString(),
+      captures: new Set([...requests, ...responses].map((value) => value.id)).size,
+      requestBodies: requests.length,
+      responseBodies: responses.length,
+      requestBytes: requests.reduce((sum, value) => sum + value.requestBytes, 0),
+      responseBytes: responses.reduce((sum, value) => sum + value.responseBytes, 0),
+    };
+  }
+  enqueueRetentionScrub(input: EnqueueRetentionScrubInput, actorId: string): RetentionScrubRun {
+    if (
+      !input.idempotencyKey || input.idempotencyKey.length < 8 ||
+      input.idempotencyKey.length > 200 ||
+      !Number.isFinite(Date.parse(input.requestCutoffAt)) ||
+      !Number.isFinite(Date.parse(input.responseCutoffAt))
+    ) {
+      throw new DomainError("validation_error", "Retention idempotency key is invalid", 422);
+    }
+    const prior = [...this.retentionScrubRuns.values()].find((run) =>
+      run.idempotencyKey === input.idempotencyKey
+    );
+    if (prior) {
+      if (
+        prior.policy.version !== input.expectedPolicyVersion ||
+        prior.requestCutoffAt !== new Date(input.requestCutoffAt).toISOString() ||
+        prior.responseCutoffAt !== new Date(input.responseCutoffAt).toISOString()
+      ) {
+        throw new DomainError("idempotency_conflict", "Retention scrub request differs", 409);
+      }
+      return structuredClone(prior);
+    }
+    if (input.expectedPolicyVersion !== this.retentionPolicy.version) {
+      throw new DomainError("version_conflict", "Retention preview is stale", 409);
+    }
+    const maximumRequestCutoff = Date.now() - this.retentionPolicy.requestBodyDays * 86_400_000;
+    const maximumResponseCutoff = Date.now() - this.retentionPolicy.responseBodyDays * 86_400_000;
+    if (
+      Date.parse(input.requestCutoffAt) > maximumRequestCutoff ||
+      Date.parse(input.responseCutoffAt) > maximumResponseCutoff
+    ) {
+      throw new DomainError("validation_error", "Retention preview cutoffs are invalid", 422);
+    }
+    const run: RetentionScrubRun = {
+      id: crypto.randomUUID(),
+      idempotencyKey: input.idempotencyKey,
+      status: "queued",
+      policy: structuredClone(this.retentionPolicy),
+      requestCutoffAt: new Date(input.requestCutoffAt).toISOString(),
+      responseCutoffAt: new Date(input.responseCutoffAt).toISOString(),
+      capturesScrubbed: 0,
+      requestBodiesScrubbed: 0,
+      responseBodiesScrubbed: 0,
+      bytesScrubbed: 0,
+      createdAt: new Date().toISOString(),
+      startedAt: null,
+      completedAt: null,
+      error: null,
+    };
+    this.retentionScrubRuns.set(run.id, run);
+    this.jobs.push({
+      id: crypto.randomUUID(),
+      type: "retention.scrub",
+      payload: { runId: run.id },
+      status: "queued",
+      attempts: 0,
+      availableAt: new Date().toISOString(),
+      lockedAt: null,
+      lockedBy: null,
+      lastError: null,
+      completedAt: null,
+      idempotencyKey: `retention.scrub:${run.id}`,
+      createdAt: new Date().toISOString(),
+    });
+    this.recordAudit({
+      actorId,
+      action: "retention.scrub.enqueued",
+      targetType: "retention_scrub_run",
+      targetId: run.id,
+      metadata: { policyVersion: run.policy.version },
+    });
+    return structuredClone(run);
+  }
+  getRetentionScrubRun(id: string): RetentionScrubRun {
+    if (!/^[0-9a-f-]{36}$/i.test(id)) {
+      throw new DomainError("validation_error", "Retention scrub run id is invalid", 422);
+    }
+    const run = this.retentionScrubRuns.get(id);
+    if (!run) throw new DomainError("not_found", "Retention scrub run not found", 404);
+    return structuredClone(run);
+  }
+  listRetentionScrubRuns(query: RetentionScrubQuery = {}): RetentionScrubPage {
+    const limit = query.limit ?? 50;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new DomainError("validation_error", "Retention page limit is invalid", 422);
+    }
+    if (query.status && !["queued", "running", "completed", "failed"].includes(query.status)) {
+      throw new DomainError("validation_error", "Retention scrub status is invalid", 422);
+    }
+    return {
+      items: [...this.retentionScrubRuns.values()].filter((run) =>
+        !query.status || run.status === query.status
+      ).sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id)).slice(
+        0,
+        limit,
+      ).map((run) => structuredClone(run)),
+    };
+  }
+  scrubRetentionBatch(runId: string, limit = 100): RetentionScrubBatchResult {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
+      throw new DomainError("validation_error", "Retention batch limit is invalid", 422);
+    }
+    if (!/^[0-9a-f-]{36}$/i.test(runId)) {
+      throw new DomainError("validation_error", "Retention scrub run id is invalid", 422);
+    }
+    const run = this.retentionScrubRuns.get(runId);
+    if (!run) throw new DomainError("not_found", "Retention scrub run not found", 404);
+    if (run.status === "failed") {
+      throw new DomainError("conflict", "Retention scrub run failed", 409);
+    }
+    if (run.status === "completed") {
+      return { run: structuredClone(run), processed: 0, completed: true };
+    }
+    run.status = "running";
+    run.startedAt ??= new Date().toISOString();
+    const requestCutoff = Date.parse(run.requestCutoffAt);
+    const responseCutoff = Date.parse(run.responseCutoffAt);
+    const eligible = [...this.providerPayloadCaptures.values()].filter((capture) =>
+      (capture.requestBody !== null && Date.parse(capture.capturedAt) <= requestCutoff) ||
+      (capture.responseBody !== null && Date.parse(capture.capturedAt) <= responseCutoff)
+    ).sort((a, b) => a.capturedAt.localeCompare(b.capturedAt) || a.id.localeCompare(b.id));
+    const selected = eligible.slice(0, limit);
+    for (const capture of selected) {
+      const request = capture.requestBody !== null &&
+        Date.parse(capture.capturedAt) <= requestCutoff;
+      const response = capture.responseBody !== null &&
+        Date.parse(capture.capturedAt) <= responseCutoff;
+      if (request) {
+        capture.requestBody = null;
+        run.requestBodiesScrubbed++;
+        run.bytesScrubbed += capture.requestBytes;
+      }
+      if (response) {
+        capture.responseBody = null;
+        run.responseBodiesScrubbed++;
+        run.bytesScrubbed += capture.responseBytes;
+      }
+      if (capture.requestBody === null && capture.responseBody === null) {
+        capture.scrubbedAt ??= new Date().toISOString();
+        run.capturesScrubbed++;
+      }
+    }
+    const completed = eligible.length <= limit;
+    if (completed) {
+      run.status = "completed";
+      run.completedAt = new Date().toISOString();
+      this.recordAudit({
+        action: "retention.scrub.completed",
+        targetType: "retention_scrub_run",
+        targetId: run.id,
+        metadata: { capturesScrubbed: run.capturesScrubbed, bytesScrubbed: run.bytesScrubbed },
+      });
+    }
+    return { run: structuredClone(run), processed: selected.length, completed };
+  }
+  failRetentionScrubRun(runId: string, code: RetentionScrubFailureCode): RetentionScrubRun {
+    const run = this.retentionScrubRuns.get(runId);
+    if (!run) throw new DomainError("not_found", "Retention scrub run not found", 404);
+    if (run.status === "completed") {
+      throw new DomainError("conflict", "Completed retention scrub run cannot fail", 409);
+    }
+    if (run.status === "failed") return structuredClone(run);
+    run.status = "failed";
+    run.error = code === "worker_retry_exhausted"
+      ? "Retention scrub exhausted its retry budget"
+      : code === "invalid_job_payload"
+      ? "Retention scrub job payload is invalid"
+      : "Retention scrub requires manual recovery";
+    run.completedAt = new Date().toISOString();
+    this.recordAudit({
+      action: "retention.scrub.failed",
+      targetType: "retention_scrub_run",
+      targetId: run.id,
+      metadata: { code },
+    });
+    return structuredClone(run);
   }
   readiness() {
     return { ready: true, storage: this.storageKind };

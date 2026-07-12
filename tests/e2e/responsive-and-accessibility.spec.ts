@@ -46,6 +46,7 @@ test("every admin section is reachable across desktop and mobile", async ({
     ["usage", "Usage analytics", "Usage analytics"],
     ["jobs", "Background jobs", "Background jobs"],
     ["audit", "Audit log", "Audit log"],
+    ["retention", "Retention", "Retention"],
     ["storage", "Storage & backups", "Storage & backups"],
   ] as const;
 
