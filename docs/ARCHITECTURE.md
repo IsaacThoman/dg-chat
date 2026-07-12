@@ -80,8 +80,9 @@ network, read-only inputs, strict resources, and no Docker socket.
 `/health` reports process liveness; `/ready` verifies required dependencies. Deployments should
 remove an instance from service when readiness fails without restarting it solely for a transient
 provider outage. Structured logs carry request, user, conversation, usage-run, and provider-attempt
-correlation IDs while excluding secrets and prompt bodies by default. Metrics and traces use the
-same identifiers.
+correlation IDs while excluding secrets and prompt bodies by default. Prometheus metrics,
+OpenTelemetry traces, and alert rules remain a planned operational milestone and must not be assumed
+present by deployments.
 
 See [SECURITY.md](SECURITY.md) for controls and [DEPLOYMENT.md](DEPLOYMENT.md) for the production
 topology.

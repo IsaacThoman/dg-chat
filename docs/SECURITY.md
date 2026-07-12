@@ -23,11 +23,13 @@ hash-only one-time email verification and password-reset tokens, transactional c
 invalidation, session revocation, and immutable identity audit events are enforced. Email
 verification is opt-in with `REQUIRE_EMAIL_VERIFICATION=true`; leave it false for approval-only
 registration without SMTP. When verification is required, configure SMTP before exposing
-registration. Generic OIDC remains a follow-up integration.
+registration. Generic OIDC is available only when its issuer, client credentials, callback origin,
+and scopes are configured explicitly; callback state, nonce, PKCE, and origin checks fail closed.
 
-Markdown, Mermaid, citations, artifacts, filenames, provider errors, and tool results are rendered
-as hostile content under a restrictive Content Security Policy. Raw HTML is disabled unless passed
-through a maintained sanitizer. Spreadsheet formulas are escaped in CSV exports.
+Markdown, citations, filenames, provider errors, and tool results are rendered as hostile content
+under a restrictive Content Security Policy. Raw HTML is disabled unless passed through a maintained
+sanitizer. Spreadsheet formulas are escaped in CSV exports. Mermaid and artifact rendering are not
+currently exposed by the product.
 
 File upload routes stream multipart bodies through byte and concurrency limits, MIME sniffing,
 filename normalization, immutable object keys, ownership checks, and image dimension/decompression

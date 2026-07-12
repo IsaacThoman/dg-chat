@@ -3189,7 +3189,7 @@ function AdminSectionContent(
   return (
     <GenericAdmin
       title="Storage & backups"
-      subtitle="Manage object storage, retention, exports, and restore points"
+      subtitle="Operator procedures are documented; in-app controls are not available yet"
       icon={HardDrive}
     />
   );
@@ -3239,10 +3239,11 @@ function AdminOverview({ setSection }: { setSection: (section: AdminSection) => 
         />
       </div>
       <div className="admin-grid">
-        <div className="chart-card unavailable-card">
+        <div className="chart-card">
           <BarChart3 size={24} />
-          <h3>Historical request chart unavailable</h3>
-          <p>The administration API currently reports totals, not time-series data.</p>
+          <h3>Usage analytics</h3>
+          <p>Explore request volume, token classes, cost, latency, and provider distributions.</p>
+          <button className="secondary" onClick={() => setSection("usage")}>Open analytics</button>
         </div>
         <div className="health-card">
           <div className="card-title">
@@ -3400,7 +3401,7 @@ function UserManagement() {
   };
   return (
     <>
-      <PageHeader title="Users" subtitle="Manage approval, access, roles, and balances" />
+      <PageHeader title="Users" subtitle="Review access state, roles, and current balances" />
       <div className="table-card full data-table">
         <div className="table-head">
           <span>USER</span>
