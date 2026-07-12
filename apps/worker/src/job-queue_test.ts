@@ -51,6 +51,10 @@ Deno.test({
     try {
       await sql`INSERT INTO users(id,email,name,role,approval_status,state)
         VALUES(${userId},${`${userId}@retention-worker.test`},'Retention worker','admin','approved','active')`;
+      await sql`INSERT INTO retention_policy_versions(version,capture_enabled,request_body_days,
+        response_body_days) VALUES(1,false,30,30) ON CONFLICT(version) DO NOTHING`;
+      await sql`INSERT INTO retention_policy_state(singleton_id,current_version) VALUES(1,1)
+        ON CONFLICT(singleton_id) DO UPDATE SET current_version=EXCLUDED.current_version`;
       const policy = await sql<{ current_version: number }[]>`SELECT current_version
         FROM retention_policy_state WHERE singleton_id=1`;
       await sql`INSERT INTO retention_scrub_runs(id,idempotency_key,status,policy_version,
