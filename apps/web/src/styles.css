@@ -282,7 +282,7 @@ kbd {
 .side-nav button,
 .sidebar-footer > button,
 .settings-nav button,
-.admin-nav button {
+.admin-nav a {
   width: 100%;
   border: 0;
   background: transparent;
@@ -296,6 +296,7 @@ kbd {
   color: #5f5d58;
   font-size: 12px;
   text-align: left;
+  text-decoration: none;
 }
 .side-nav button:hover,
 .sidebar-footer > button:hover,
@@ -1944,7 +1945,7 @@ kbd {
   font-size: 11px;
 }
 .settings-nav button.active,
-.admin-nav button.active {
+.admin-nav a.active {
   color: #56438f;
   background: #ebe7f4;
 }
@@ -2351,8 +2352,8 @@ kbd {
   margin: 0;
   font-size: 15px;
 }
-.admin-nav button {
-  font-size: 10px;
+.admin-nav a {
+  font-size: 14px;
   padding: 9px;
 }
 .admin-content {
@@ -3056,6 +3057,275 @@ kbd {
   color: var(--muted);
   font-size: 9px;
   line-height: 1.5;
+}
+
+/* Operational admin surfaces */
+.ops-page {
+  display: grid;
+  gap: 16px;
+  color: var(--ink);
+}
+.ops-heading {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 16px;
+}
+.ops-heading h1 {
+  margin: 0;
+  font-size: 24px;
+}
+.ops-heading p {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 14px;
+}
+.ops-export-actions {
+  display: grid;
+  justify-items: end;
+  gap: 6px;
+}
+.ops-export-actions span {
+  color: var(--muted);
+  font-size: 12px;
+}
+.ops-target {
+  min-height: 44px;
+}
+.ops-filters {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(130px, 1fr)) auto;
+  gap: 10px;
+  align-items: end;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--card);
+}
+.ops-filters label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+}
+.ops-filters input,
+.ops-filters select {
+  width: 100%;
+  min-height: 44px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--ink);
+  background: var(--panel);
+  font: inherit;
+}
+.ops-job-filters {
+  grid-template-columns: minmax(140px, .7fr) 1fr 1.5fr auto;
+}
+.ops-announcer:empty {
+  display: none;
+}
+.ops-announcer {
+  padding: 10px 12px;
+  border-left: 3px solid #8b6fc4;
+  background: #f3effa;
+  font-size: 14px;
+}
+.ops-validation {
+  margin: 0;
+  color: #a73535;
+  font-size: 13px;
+  font-weight: 600;
+}
+.ops-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+.ops-metric {
+  display: grid;
+  gap: 8px;
+  min-height: 100px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--card);
+}
+.ops-metric span {
+  color: var(--muted);
+  font-size: 13px;
+}
+.ops-metric strong {
+  font-size: 22px;
+}
+.ops-chart-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(280px, .8fr);
+  gap: 12px;
+}
+.ops-chart,
+.ops-table-scroll {
+  margin: 0;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--card);
+}
+.ops-chart figcaption {
+  font-size: 15px;
+  font-weight: 700;
+}
+.ops-chart svg {
+  width: 100%;
+  min-height: 180px;
+  fill: #7258aa;
+}
+.ops-table-scroll {
+  overflow: auto;
+}
+.ops-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+.ops-table caption {
+  margin-bottom: 10px;
+  text-align: left;
+  font-weight: 700;
+}
+.ops-table th,
+.ops-table td {
+  padding: 10px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+}
+.ops-empty {
+  padding: 32px 16px;
+  border: 1px dashed var(--line);
+  border-radius: 11px;
+  text-align: center;
+  color: var(--muted);
+}
+.ops-job-list {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.ops-job-card {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--card);
+}
+.ops-job-primary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.ops-status {
+  padding: 5px 9px;
+  border-radius: 999px;
+  background: #ecebea;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: capitalize;
+}
+.ops-status-failed {
+  color: #8b2525;
+  background: #fae8e8;
+}
+.ops-status-running,
+.ops-status-retrying {
+  color: #614795;
+  background: #eee8f8;
+}
+.ops-status-scheduled {
+  color: #78570d;
+  background: #fff1c7;
+}
+.ops-status-completed {
+  color: #236348;
+  background: #e3f4eb;
+}
+.ops-job-card dl {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin: 0;
+}
+.ops-job-card dl div {
+  min-width: 0;
+}
+.ops-job-card dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+.ops-job-card dd {
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+  font-size: 14px;
+}
+.ops-job-error {
+  grid-column: 1 / -1;
+}
+.ops-job-error dd {
+  color: #8b2525;
+}
+.ops-job-card > button {
+  justify-self: start;
+}
+.ops-pagination {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.ops-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 20px;
+}
+
+@media (max-width: 760px) {
+  .ops-heading {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .ops-filters,
+  .ops-job-filters,
+  .ops-metrics,
+  .ops-chart-layout {
+    grid-template-columns: 1fr;
+  }
+  .ops-job-card dl {
+    grid-template-columns: 1fr 1fr;
+  }
+  .ops-job-card > button,
+  .ops-heading > button,
+  .ops-export-actions,
+  .ops-export-actions button {
+    width: 100%;
+  }
+  .ops-export-actions {
+    justify-items: start;
+  }
+  .ops-pagination button {
+    flex: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ops-page * {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
 }
 .generic-toolbar {
   width: min(650px, 100%);

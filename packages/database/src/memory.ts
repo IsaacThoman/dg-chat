@@ -19,6 +19,13 @@ import {
   validateDocumentChunkInputs,
 } from "./repository.ts";
 import type {
+  AdminAnalytics,
+  AdminAnalyticsDistribution,
+  AdminAnalyticsQuery,
+  AdminJobPage,
+  AdminJobQuery,
+  AdminJobStatus,
+  AdminJobSummary,
   ApiIdempotencyEndpoint,
   ApiIdempotencyRequest,
   ApiReplayQuota,
@@ -136,7 +143,7 @@ export interface UsageRun {
   costMicros: number;
   inputTokens: number;
   outputTokens: number;
-  latencyMs: number;
+  latencyMs: number | null;
   executionEpoch: number;
   executionOwnerLeaseToken: string | null;
   runLeaseToken: string | null;
@@ -455,8 +462,13 @@ export class MemoryRepository {
       id: string;
       type: string;
       payload: unknown;
-      status: string;
+      status: AdminJobStatus;
       attempts: number;
+      availableAt: string;
+      lockedAt: string | null;
+      lockedBy: string | null;
+      lastError: string | null;
+      completedAt: string | null;
       idempotencyKey?: string;
       createdAt: string;
     }
@@ -2408,6 +2420,11 @@ export class MemoryRepository {
       payload: { attachmentId: attachment.id, ownerId: attachment.ownerId },
       status: "queued",
       attempts: 0,
+      availableAt: new Date().toISOString(),
+      lockedAt: null,
+      lockedBy: null,
+      lastError: null,
+      completedAt: null,
       idempotencyKey,
       createdAt: new Date().toISOString(),
     });
@@ -2426,6 +2443,11 @@ export class MemoryRepository {
       payload: { attachmentId: attachment.id, ownerId: attachment.ownerId },
       status: "queued",
       attempts: 0,
+      availableAt: new Date().toISOString(),
+      lockedAt: null,
+      lockedBy: null,
+      lastError: null,
+      completedAt: null,
       idempotencyKey,
       createdAt: new Date().toISOString(),
     });
@@ -3617,7 +3639,7 @@ export class MemoryRepository {
       costMicros: 0,
       inputTokens: 0,
       outputTokens: 0,
-      latencyMs: 0,
+      latencyMs: null,
       executionEpoch: 0,
       executionOwnerLeaseToken: null,
       runLeaseToken: crypto.randomUUID(),
@@ -4219,8 +4241,217 @@ export class MemoryRepository {
       ledger: [...this.ledger],
     };
   }
-  listJobs() {
-    return [...this.jobs];
+  adminAnalytics(query: AdminAnalyticsQuery): AdminAnalytics {
+    const from = Date.parse(query.from);
+    const to = Date.parse(query.to);
+    if (!Number.isFinite(from) || !Number.isFinite(to) || from >= to) {
+      throw new DomainError("validation_error", "Invalid analytics time range", 422);
+    }
+    const range = to - from;
+    if (
+      range > 90 * 86_400_000 || (query.bucket === "hour" && range > 14 * 86_400_000) ||
+      !["hour", "day"].includes(query.bucket)
+    ) {
+      throw new DomainError("validation_error", "Analytics range or bucket is not supported", 422);
+    }
+    if (
+      (query.userId &&
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+          query.userId,
+        )) ||
+      [query.model, query.provider].some((value) =>
+        value !== undefined && (value.length < 1 || value.length > 200)
+      ) ||
+      (query.status && !["reserved", "completed", "failed"].includes(query.status))
+    ) {
+      throw new DomainError("validation_error", "Invalid analytics filter", 422);
+    }
+    const runs = [...this.usageRuns.values()].filter((run) => {
+      const created = Date.parse(run.createdAt);
+      return created >= from && created < to && (!query.userId || run.userId === query.userId) &&
+        (!query.model || run.model === query.model) &&
+        (!query.provider || run.provider === query.provider) &&
+        (!query.status || run.status === query.status);
+    });
+    const average = (values: number[]) =>
+      values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : null;
+    const latencies = runs.map((run) => run.latencyMs).filter((value): value is number =>
+      value !== null
+    ).sort((a, b) => a - b);
+    const percentile = (values: number[]) => {
+      if (!values.length) return null;
+      const position = (values.length - 1) * .95;
+      const lower = Math.floor(position);
+      const fraction = position - lower;
+      return values[lower] +
+        (values[Math.min(lower + 1, values.length - 1)] - values[lower]) * fraction;
+    };
+    const distribution = (key: (run: UsageRun) => string): AdminAnalyticsDistribution[] => {
+      const values = new Map<string, AdminAnalyticsDistribution>();
+      for (const run of runs) {
+        const name = key(run);
+        const value = values.get(name) ?? { key: name, calls: 0, customerCostMicros: 0 };
+        value.calls++;
+        value.customerCostMicros += run.costMicros;
+        values.set(name, value);
+      }
+      return [...values.values()].sort((a, b) =>
+        b.calls - a.calls || b.customerCostMicros - a.customerCostMicros ||
+        a.key.localeCompare(b.key)
+      ).slice(0, 20);
+    };
+    const buckets = new Map<string, UsageRun[]>();
+    for (const run of runs) {
+      const date = new Date(run.createdAt);
+      if (query.bucket === "hour") date.setUTCMinutes(0, 0, 0);
+      else date.setUTCHours(0, 0, 0, 0);
+      const key = date.toISOString();
+      buckets.set(key, [...(buckets.get(key) ?? []), run]);
+    }
+    const completed = runs.filter((run) => run.status === "completed").length;
+    const failed = runs.filter((run) => run.status === "failed").length;
+    return {
+      query: { ...query, from: new Date(from).toISOString(), to: new Date(to).toISOString() },
+      summary: {
+        calls: runs.length,
+        completed,
+        failed,
+        successRate: completed + failed ? completed / (completed + failed) : 0,
+        inputTokens: runs.reduce((sum, run) => sum + run.inputTokens, 0),
+        cachedInputTokens: runs.reduce((sum, run) => sum + run.actualProviderCachedInputTokens, 0),
+        reasoningTokens: runs.reduce((sum, run) => sum + run.actualProviderReasoningTokens, 0),
+        outputTokens: runs.reduce((sum, run) => sum + run.outputTokens, 0),
+        customerCostMicros: runs.reduce((sum, run) => sum + run.costMicros, 0),
+        providerCostMicros: runs.reduce((sum, run) => sum + run.actualProviderCostMicros, 0),
+        avgLatencyMs: average(latencies),
+        p95LatencyMs: percentile(latencies),
+        avgTtftMs: null,
+      },
+      points: [...buckets.entries()].sort(([a], [b]) => a.localeCompare(b)).map((
+        [start, values],
+      ) => ({
+        start,
+        calls: values.length,
+        completed: values.filter((run) => run.status === "completed").length,
+        failed: values.filter((run) => run.status === "failed").length,
+        customerCostMicros: values.reduce((sum, run) => sum + run.costMicros, 0),
+        inputTokens: values.reduce((sum, run) => sum + run.inputTokens, 0),
+        outputTokens: values.reduce((sum, run) => sum + run.outputTokens, 0),
+        avgLatencyMs: average(
+          values.map((run) => run.latencyMs).filter((value): value is number => value !== null),
+        ),
+        avgTtftMs: null,
+      })),
+      models: distribution((run) => run.model),
+      providers: distribution((run) => run.provider),
+      statuses: distribution((run) => run.status),
+    };
+  }
+  listJobs(query: AdminJobQuery = {}): AdminJobPage {
+    const limit = query.limit ?? 50;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new DomainError("validation_error", "Job page limit must be between 1 and 100", 422);
+    }
+    if (
+      (query.status && !["queued", "running", "completed", "failed"].includes(query.status)) ||
+      (query.type !== undefined && (query.type.length < 1 || query.type.length > 200))
+    ) {
+      throw new DomainError("validation_error", "Invalid job filter", 422);
+    }
+    let cursor: { createdAt: string; id: string } | undefined;
+    if (query.cursor) {
+      try {
+        cursor = JSON.parse(atob(query.cursor));
+        if (
+          !cursor || !Number.isFinite(Date.parse(cursor.createdAt)) ||
+          !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+            cursor.id,
+          )
+        ) {
+          throw new Error();
+        }
+      } catch {
+        throw new DomainError("validation_error", "Invalid job cursor", 422);
+      }
+    }
+    const safe = (job: (typeof this.jobs)[number]): AdminJobSummary => ({
+      id: job.id,
+      type: job.type,
+      status: job.status,
+      attempts: job.attempts,
+      availableAt: job.availableAt,
+      lockedAt: job.lockedAt,
+      createdAt: job.createdAt,
+      completedAt: job.completedAt,
+      lastError: job.lastError?.slice(0, 1000) ?? null,
+    });
+    const all = [...this.jobs].filter((job) =>
+      (!query.status || job.status === query.status) && (!query.type || job.type === query.type)
+    )
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
+    const filtered = all.filter((job) =>
+      !cursor || job.createdAt < cursor.createdAt ||
+      (job.createdAt === cursor.createdAt && job.id < cursor.id)
+    );
+    const page = filtered.slice(0, limit);
+    const last = page.at(-1);
+    const newerCount = cursor
+      ? all.filter((job) =>
+        job.createdAt > cursor.createdAt ||
+        (job.createdAt === cursor.createdAt && job.id > cursor.id)
+      ).length
+      : 0;
+    const previousBoundary = cursor && newerCount >= limit ? all[newerCount - limit] : undefined;
+    return {
+      items: page.map(safe),
+      nextCursor: filtered.length > limit && last
+        ? btoa(JSON.stringify({ createdAt: last.createdAt, id: last.id }))
+        : null,
+      hasPrevious: Boolean(cursor),
+      previousCursor: previousBoundary
+        ? btoa(JSON.stringify({ createdAt: previousBoundary.createdAt, id: previousBoundary.id }))
+        : null,
+    };
+  }
+  retryFailedJob(id: string, actorId: string) {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) {
+      throw new DomainError("validation_error", "Invalid job id", 422);
+    }
+    const job = this.jobs.find((value) => value.id === id);
+    if (!job) throw new DomainError("not_found", "Job not found", 404);
+    if (job.status !== "failed") {
+      throw new DomainError("conflict", "Only failed jobs can be retried", 409);
+    }
+    const priorAttempts = job.attempts;
+    job.status = "queued";
+    job.attempts = 0;
+    job.availableAt = new Date().toISOString();
+    job.lockedAt = null;
+    job.lockedBy = null;
+    job.lastError = null;
+    job.completedAt = null;
+    const retried = {
+      job: {
+        id: job.id,
+        type: job.type,
+        status: job.status,
+        attempts: job.attempts,
+        availableAt: job.availableAt,
+        lockedAt: job.lockedAt,
+        createdAt: job.createdAt,
+        completedAt: job.completedAt,
+        lastError: job.lastError,
+      },
+      priorAttempts,
+    };
+    this.recordAudit({
+      actorId,
+      action: "job.retried",
+      targetType: "job",
+      targetId: id,
+      metadata: { type: job.type, priorAttempts },
+    });
+    return retried;
   }
   readiness() {
     return { ready: true, storage: this.storageKind };
@@ -4238,6 +4469,11 @@ export class MemoryRepository {
       payload,
       status: "queued",
       attempts: 0,
+      availableAt: new Date().toISOString(),
+      lockedAt: null,
+      lockedBy: null,
+      lastError: null,
+      completedAt: null,
       createdAt: new Date().toISOString(),
     });
     return id;

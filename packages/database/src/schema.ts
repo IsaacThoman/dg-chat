@@ -343,6 +343,8 @@ export const usageRuns = pgTable("usage_runs", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   completedAt: timestamp("completed_at", { withTimezone: true }),
 }, (table) => [
+  index("usage_runs_analytics_time_idx").on(table.createdAt.desc(), table.id),
+  index("usage_runs_analytics_user_time_idx").on(table.userId, table.createdAt.desc(), table.id),
   check(
     "usage_runs_pricing_snapshot_check",
     sql`(
@@ -419,6 +421,7 @@ export const jobs = pgTable("jobs", {
   completedAt: timestamp("completed_at", { withTimezone: true }),
 }, (table) => [
   index("jobs_claim_idx").on(table.status, table.availableAt),
+  index("jobs_admin_page_idx").on(table.createdAt.desc(), table.id.desc()),
   uniqueIndex("jobs_idempotency_key_uq").on(table.idempotencyKey),
 ]);
 

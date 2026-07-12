@@ -18,6 +18,13 @@ import {
 } from "./repository.ts";
 import type { LedgerEntry, StoredApiToken, StoredSession, StoredUser, UsageRun } from "./memory.ts";
 import type {
+  AdminAnalytics,
+  AdminAnalyticsDistribution,
+  AdminAnalyticsQuery,
+  AdminJobPage,
+  AdminJobQuery,
+  AdminJobStatus,
+  AdminJobSummary,
   ApiIdempotencyEndpoint,
   ApiIdempotencyFrame,
   ApiIdempotencyRequest,
@@ -106,6 +113,17 @@ type Row = Record<string, unknown>;
 const iso = (value: unknown) => value instanceof Date ? value.toISOString() : String(value);
 const nullableIso = (value: unknown) => value == null ? null : iso(value);
 const number = (value: unknown) => Number(value);
+const adminJob = (row: Row): AdminJobSummary => ({
+  id: String(row.id),
+  type: String(row.type),
+  status: row.status as AdminJobStatus,
+  attempts: number(row.attempts),
+  availableAt: iso(row.available_at),
+  lockedAt: nullableIso(row.locked_at),
+  createdAt: iso(row.created_at),
+  completedAt: nullableIso(row.completed_at),
+  lastError: row.last_error == null ? null : String(row.last_error).slice(0, 1000),
+});
 const knowledgeCollection = (row: Row): KnowledgeCollection => ({
   id: String(row.id),
   ownerId: String(row.owner_id),
@@ -5078,6 +5096,121 @@ export class PostgresRepository implements DomainRepository {
       ledger: await this.listAllLedger(),
     };
   }
+  async adminAnalytics(query: AdminAnalyticsQuery): Promise<AdminAnalytics> {
+    const from = Date.parse(query.from);
+    const to = Date.parse(query.to);
+    const range = to - from;
+    if (
+      !Number.isFinite(from) || !Number.isFinite(to) || from >= to || range > 90 * 86_400_000 ||
+      (query.bucket === "hour" && range > 14 * 86_400_000) ||
+      !["hour", "day"].includes(query.bucket)
+    ) {
+      throw new DomainError("validation_error", "Invalid analytics range or bucket", 422);
+    }
+    if (
+      (query.userId &&
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+          query.userId,
+        )) ||
+      [query.model, query.provider].some((value) =>
+        value !== undefined && (value.length < 1 || value.length > 200)
+      ) ||
+      (query.status && !["reserved", "completed", "failed"].includes(query.status))
+    ) {
+      throw new DomainError("validation_error", "Invalid analytics filter", 422);
+    }
+    const fromIso = new Date(from).toISOString();
+    const toIso = new Date(to).toISOString();
+    const userId = query.userId ?? "00000000-0000-0000-0000-000000000000";
+    const model = query.model ?? "";
+    const provider = query.provider ?? "";
+    const status = query.status ?? "";
+    // All panels must describe one point-in-time view even when usage is settling concurrently.
+    return await this.#sql.begin("isolation level repeatable read read only", async (tx) => {
+      const summaryRows = await tx<Row[]>`SELECT count(*)::int calls,
+      count(*) FILTER(WHERE status='completed')::int completed,
+      count(*) FILTER(WHERE status='failed')::int failed,
+      COALESCE(sum(input_tokens),0)::bigint input_tokens,
+      COALESCE(sum(actual_provider_cached_input_tokens),0)::bigint cached_input_tokens,
+      COALESCE(sum(actual_provider_reasoning_tokens),0)::bigint reasoning_tokens,
+      COALESCE(sum(output_tokens),0)::bigint output_tokens,
+      COALESCE(sum(cost_micros),0)::bigint customer_cost_micros,
+      COALESCE(sum(actual_provider_cost_micros),0)::bigint provider_cost_micros,
+      avg(latency_ms)::float8 avg_latency_ms,
+      percentile_cont(0.95) WITHIN GROUP(ORDER BY latency_ms) FILTER(WHERE latency_ms IS NOT NULL)::float8 p95_latency_ms,
+      avg(ttft_ms)::float8 avg_ttft_ms
+      FROM usage_runs WHERE created_at>=${fromIso} AND created_at<${toIso}
+      AND (${query.userId === undefined} OR user_id=${userId}::uuid)
+      AND (${query.model === undefined} OR model=${model})
+      AND (${query.provider === undefined} OR provider=${provider})
+      AND (${query.status === undefined} OR status=${status})`;
+      const bucket = query.bucket === "hour" ? "hour" : "day";
+      const points = await tx<Row[]>`SELECT date_trunc(${bucket},created_at) bucket,
+      count(*)::int calls,count(*) FILTER(WHERE status='completed')::int completed,
+      count(*) FILTER(WHERE status='failed')::int failed,
+      COALESCE(sum(cost_micros),0)::bigint customer_cost_micros,
+      COALESCE(sum(input_tokens),0)::bigint input_tokens,
+      COALESCE(sum(output_tokens),0)::bigint output_tokens,
+      avg(latency_ms)::float8 avg_latency_ms,avg(ttft_ms)::float8 avg_ttft_ms
+      FROM usage_runs WHERE created_at>=${fromIso} AND created_at<${toIso}
+      AND (${query.userId === undefined} OR user_id=${userId}::uuid)
+      AND (${query.model === undefined} OR model=${model})
+      AND (${query.provider === undefined} OR provider=${provider})
+      AND (${query.status === undefined} OR status=${status})
+      GROUP BY bucket ORDER BY bucket`;
+      const distribution = async (dimension: "model" | "provider" | "status") => {
+        const select = tx(dimension);
+        const rows = await tx<Row[]>`SELECT ${select} key,count(*)::int calls,
+        COALESCE(sum(cost_micros),0)::bigint customer_cost_micros
+        FROM usage_runs WHERE created_at>=${fromIso} AND created_at<${toIso}
+        AND (${query.userId === undefined} OR user_id=${userId}::uuid)
+        AND (${query.model === undefined} OR model=${model})
+        AND (${query.provider === undefined} OR provider=${provider})
+        AND (${query.status === undefined} OR status=${status})
+        GROUP BY ${select} ORDER BY calls DESC,customer_cost_micros DESC,key LIMIT 20`;
+        return rows.map((row): AdminAnalyticsDistribution => ({
+          key: String(row.key),
+          calls: number(row.calls),
+          customerCostMicros: number(row.customer_cost_micros),
+        }));
+      };
+      const summary = summaryRows[0];
+      const completed = number(summary.completed);
+      const failed = number(summary.failed);
+      return {
+        query: { ...query, from: fromIso, to: toIso },
+        summary: {
+          calls: number(summary.calls),
+          completed,
+          failed,
+          successRate: completed + failed ? completed / (completed + failed) : 0,
+          inputTokens: number(summary.input_tokens),
+          cachedInputTokens: number(summary.cached_input_tokens),
+          reasoningTokens: number(summary.reasoning_tokens),
+          outputTokens: number(summary.output_tokens),
+          customerCostMicros: number(summary.customer_cost_micros),
+          providerCostMicros: number(summary.provider_cost_micros),
+          avgLatencyMs: summary.avg_latency_ms == null ? null : number(summary.avg_latency_ms),
+          p95LatencyMs: summary.p95_latency_ms == null ? null : number(summary.p95_latency_ms),
+          avgTtftMs: summary.avg_ttft_ms == null ? null : number(summary.avg_ttft_ms),
+        },
+        points: points.map((row) => ({
+          start: iso(row.bucket),
+          calls: number(row.calls),
+          completed: number(row.completed),
+          failed: number(row.failed),
+          customerCostMicros: number(row.customer_cost_micros),
+          inputTokens: number(row.input_tokens),
+          outputTokens: number(row.output_tokens),
+          avgLatencyMs: row.avg_latency_ms == null ? null : number(row.avg_latency_ms),
+          avgTtftMs: row.avg_ttft_ms == null ? null : number(row.avg_ttft_ms),
+        })),
+        models: await distribution("model"),
+        providers: await distribution("provider"),
+        statuses: await distribution("status"),
+      };
+    });
+  }
   private async listAllLedger(): Promise<LedgerEntry[]> {
     return (await this.#sql<Row[]>`SELECT * FROM ledger_entries ORDER BY created_at,id`).map((
       row,
@@ -5091,15 +5224,108 @@ export class PostgresRepository implements DomainRepository {
       createdAt: iso(row.created_at),
     }));
   }
-  async listJobs() {
-    return (await this.#sql<Row[]>`SELECT * FROM jobs ORDER BY created_at DESC`).map((row) => ({
-      id: String(row.id),
-      type: String(row.type),
-      payload: row.payload,
-      status: String(row.status),
-      attempts: number(row.attempts),
-      createdAt: iso(row.created_at),
-    }));
+  async listJobs(query: AdminJobQuery = {}): Promise<AdminJobPage> {
+    const limit = query.limit ?? 50;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new DomainError("validation_error", "Job page limit must be between 1 and 100", 422);
+    }
+    if (
+      (query.status && !["queued", "running", "completed", "failed"].includes(query.status)) ||
+      (query.type !== undefined && (query.type.length < 1 || query.type.length > 200))
+    ) {
+      throw new DomainError("validation_error", "Invalid job filter", 422);
+    }
+    let cursor: { createdAtMicros: string; id: string } | undefined;
+    if (query.cursor) {
+      try {
+        const decoded = JSON.parse(atob(query.cursor));
+        if (
+          typeof decoded.createdAtMicros !== "string" ||
+          !/^\d{1,20}$/u.test(decoded.createdAtMicros) ||
+          BigInt(decoded.createdAtMicros) > 253_402_300_799_999_999n ||
+          typeof decoded.id !== "string" ||
+          !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+            decoded.id,
+          )
+        ) {
+          throw new Error();
+        }
+        cursor = decoded;
+      } catch {
+        throw new DomainError("validation_error", "Invalid job cursor", 422);
+      }
+    }
+    const status = query.status ?? "";
+    const type = query.type ?? "";
+    const previousRows = cursor
+      ? await this.#sql<Row[]>`SELECT id,created_at,
+        floor(extract(epoch FROM created_at)*1000000)::bigint created_at_micros FROM jobs
+        WHERE (${query.status === undefined} OR status=${status})
+        AND (${query.type === undefined} OR type=${type})
+        AND (created_at>to_timestamp(${cursor.createdAtMicros}::numeric/1000000) OR
+          (created_at=to_timestamp(${cursor.createdAtMicros}::numeric/1000000)
+            AND id>${cursor.id}::uuid))
+        ORDER BY created_at ASC,id ASC LIMIT ${limit}`
+      : [];
+    const rows = cursor
+      ? await this.#sql<Row[]>`SELECT id,type,status,attempts,available_at,locked_at,
+        last_error,created_at,completed_at,
+        floor(extract(epoch FROM created_at)*1000000)::bigint created_at_micros FROM jobs
+        WHERE (${query.status === undefined} OR status=${status})
+        AND (${query.type === undefined} OR type=${type})
+        AND (created_at<to_timestamp(${cursor.createdAtMicros}::numeric/1000000) OR
+          (created_at=to_timestamp(${cursor.createdAtMicros}::numeric/1000000)
+            AND id<${cursor.id}::uuid))
+        ORDER BY created_at DESC,id DESC LIMIT ${limit + 1}`
+      : await this.#sql<Row[]>`SELECT id,type,status,attempts,available_at,locked_at,
+        last_error,created_at,completed_at,
+        floor(extract(epoch FROM created_at)*1000000)::bigint created_at_micros FROM jobs
+        WHERE (${query.status === undefined} OR status=${status})
+        AND (${query.type === undefined} OR type=${type})
+        ORDER BY created_at DESC,id DESC LIMIT ${limit + 1}`;
+    const page = rows.slice(0, limit);
+    const last = page.at(-1);
+    const previousBoundary = previousRows.length === limit ? previousRows.at(-1) : undefined;
+    return {
+      items: page.map(adminJob),
+      nextCursor: rows.length > limit && last
+        ? btoa(JSON.stringify({
+          createdAtMicros: String(last.created_at_micros),
+          id: String(last.id),
+        }))
+        : null,
+      hasPrevious: Boolean(cursor),
+      previousCursor: previousBoundary
+        ? btoa(JSON.stringify({
+          createdAtMicros: String(previousBoundary.created_at_micros),
+          id: String(previousBoundary.id),
+        }))
+        : null,
+    };
+  }
+  async retryFailedJob(id: string, actorId: string) {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) {
+      throw new DomainError("validation_error", "Invalid job id", 422);
+    }
+    return await this.#sql.begin(async (tx) => {
+      const rows = await tx<Row[]>`SELECT id,type,status,attempts,available_at,locked_at,last_error,
+        created_at,completed_at FROM jobs WHERE id=${id}::uuid FOR UPDATE`;
+      if (!rows.length) throw new DomainError("not_found", "Job not found", 404);
+      if (rows[0].status !== "failed") {
+        throw new DomainError("conflict", "Only failed jobs can be retried", 409);
+      }
+      const priorAttempts = number(rows[0].attempts);
+      const updated = await tx<Row[]>`UPDATE jobs SET status='queued',attempts=0,available_at=now(),
+        locked_at=NULL,locked_by=NULL,last_error=NULL,completed_at=NULL WHERE id=${id}::uuid
+        RETURNING id,type,status,attempts,available_at,locked_at,last_error,created_at,completed_at`;
+      const auditMetadata = tx.json({
+        type: String(rows[0].type),
+        priorAttempts,
+      } as postgres.JSONValue);
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${actorId}::uuid,'job.retried','job',${id},${auditMetadata})`;
+      return { job: adminJob(updated[0]), priorAttempts };
+    });
   }
   async readiness() {
     try {

@@ -458,6 +458,188 @@ const auditCsv = (events: AuditEvent[]) => {
   ].map((row) => row.map(csvCell).join(",")).join("\r\n") + "\r\n";
 };
 
+const hasAsciiControl = (value: string) =>
+  [...value].some((character) => {
+    const code = character.charCodeAt(0);
+    return code <= 31 || code === 127;
+  });
+
+const isSemanticRfc3339 = (value: string) => {
+  const match =
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(?:Z|([+-])(\d{2}):(\d{2}))$/u
+      .exec(value);
+  if (!match) return false;
+  const [
+    ,
+    yearText,
+    monthText,
+    dayText,
+    hourText,
+    minuteText,
+    secondText,
+    ,
+    offsetHourText,
+    offsetMinuteText,
+  ] = match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const hour = Number(hourText);
+  const minute = Number(minuteText);
+  const second = Number(secondText);
+  const offsetHour = offsetHourText === undefined ? 0 : Number(offsetHourText);
+  const offsetMinute = offsetMinuteText === undefined ? 0 : Number(offsetMinuteText);
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const monthDays = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return month >= 1 && month <= 12 && day >= 1 && day <= monthDays[month - 1] &&
+    hour <= 23 && minute <= 59 && second <= 59 && offsetHour <= 23 && offsetMinute <= 59 &&
+    Number.isFinite(Date.parse(value));
+};
+
+const parseAnalyticsQuery = (c: Context) => {
+  const now = new Date();
+  const defaultTo = now.toISOString();
+  const defaultFrom = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1_000).toISOString();
+  const timestamp = (name: "from" | "to", fallback: string) => {
+    const value = c.req.query(name) ?? fallback;
+    if (
+      value.length > 64 ||
+      !isSemanticRfc3339(value)
+    ) {
+      throw new DomainError("validation_error", `${name} must be an RFC3339 timestamp`, 422);
+    }
+    return new Date(value).toISOString();
+  };
+  const from = timestamp("from", defaultFrom);
+  const to = timestamp("to", defaultTo);
+  const rangeMs = Date.parse(to) - Date.parse(from);
+  if (rangeMs <= 0) {
+    throw new DomainError("validation_error", "from must be earlier than to", 422);
+  }
+  if (rangeMs > 90 * 24 * 60 * 60 * 1_000) {
+    throw new DomainError("validation_error", "Analytics range cannot exceed 90 days", 422);
+  }
+  const bucket = c.req.query("bucket") ?? "day";
+  if (bucket !== "hour" && bucket !== "day") {
+    throw new DomainError("validation_error", "bucket must be hour or day", 422);
+  }
+  if (bucket === "hour" && rangeMs > 14 * 24 * 60 * 60 * 1_000) {
+    throw new DomainError("validation_error", "Hourly analytics range cannot exceed 14 days", 422);
+  }
+  const bounded = (name: "model" | "provider", maximum: number) => {
+    const value = c.req.query(name);
+    if (value === undefined) return undefined;
+    if (!value || value.length > maximum || hasAsciiControl(value)) {
+      throw new DomainError("validation_error", `${name} is invalid`, 422);
+    }
+    return value;
+  };
+  const userId = c.req.query("userId");
+  if (userId !== undefined && !auditUuid.test(userId)) {
+    throw new DomainError("validation_error", "userId must be a valid UUID", 422);
+  }
+  const status = c.req.query("status");
+  if (status !== undefined && !["reserved", "completed", "failed"].includes(status)) {
+    throw new DomainError("validation_error", "status is invalid", 422);
+  }
+  return {
+    from,
+    to,
+    bucket: bucket as "hour" | "day",
+    userId,
+    model: bounded("model", 200),
+    provider: bounded("provider", 200),
+    status: status as "reserved" | "completed" | "failed" | undefined,
+  };
+};
+
+const analyticsCsv = (
+  analytics: Awaited<ReturnType<DomainRepository["adminAnalytics"]>>,
+) => {
+  const rows: unknown[][] = [[
+    "section",
+    "key",
+    "start",
+    "calls",
+    "completed",
+    "failed",
+    "input_tokens",
+    "output_tokens",
+    "customer_cost_micros",
+    "provider_cost_micros",
+    "avg_latency_ms",
+    "avg_ttft_ms",
+  ]];
+  rows.push([
+    "summary",
+    "total",
+    analytics.query.from,
+    analytics.summary.calls,
+    analytics.summary.completed,
+    analytics.summary.failed,
+    analytics.summary.inputTokens,
+    analytics.summary.outputTokens,
+    analytics.summary.customerCostMicros,
+    analytics.summary.providerCostMicros,
+    analytics.summary.avgLatencyMs,
+    analytics.summary.avgTtftMs,
+  ]);
+  for (const point of analytics.points) {
+    rows.push([
+      "point",
+      "",
+      point.start,
+      point.calls,
+      point.completed,
+      point.failed,
+      point.inputTokens,
+      point.outputTokens,
+      point.customerCostMicros,
+      "",
+      point.avgLatencyMs,
+      point.avgTtftMs,
+    ]);
+  }
+  for (
+    const [section, values] of [
+      ["model", analytics.models],
+      ["provider", analytics.providers],
+      ["status", analytics.statuses],
+    ] as const
+  ) {
+    for (const value of values) {
+      rows.push([section, value.key, "", value.calls, "", "", "", "", value.customerCostMicros]);
+    }
+  }
+  return rows.map((row) => row.map(csvCell).join(",")).join("\r\n") + "\r\n";
+};
+
+const parseAdminJobQuery = (c: Context) => {
+  const limitValue = c.req.query("limit");
+  const limit = limitValue === undefined ? 50 : Number(limitValue);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+    throw new DomainError("validation_error", "limit must be an integer from 1 to 100", 422);
+  }
+  const status = c.req.query("status");
+  if (status !== undefined && !["queued", "running", "completed", "failed"].includes(status)) {
+    throw new DomainError("validation_error", "status is invalid", 422);
+  }
+  const type = c.req.query("type");
+  if (type !== undefined && (!type || type.length > 120 || hasAsciiControl(type))) {
+    throw new DomainError("validation_error", "type is invalid", 422);
+  }
+  const cursor = c.req.query("cursor");
+  if (cursor !== undefined && (!cursor || cursor.length > 2048)) {
+    throw new DomainError("validation_error", "cursor is invalid", 422);
+  }
+  return {
+    limit,
+    status: status as "queued" | "running" | "completed" | "failed" | undefined,
+    type,
+    cursor,
+  };
+};
+
 function nodeReadableAsWeb(source: Readable): ReadableStream<Uint8Array> {
   const iterator = source[Symbol.asyncIterator]();
   return new ReadableStream<Uint8Array>({
@@ -4055,9 +4237,33 @@ export function createApp(options: AppOptions = {}) {
   );
   app.get(
     "/api/admin/usage",
-    async (c) => c.json(await repo.adminSummary()),
+    async (c) => {
+      c.header("Cache-Control", "private, no-store");
+      return c.json(await repo.adminSummary());
+    },
   );
-  app.get("/api/admin/jobs", async (c) => c.json({ data: await repo.listJobs() }));
+  app.get("/api/admin/analytics", async (c) => {
+    c.header("Cache-Control", "private, no-store");
+    return c.json(await repo.adminAnalytics(parseAnalyticsQuery(c)));
+  });
+  app.get("/api/admin/analytics.csv", async (c) => {
+    c.header("Cache-Control", "private, no-store");
+    const analytics = await repo.adminAnalytics(parseAnalyticsQuery(c));
+    c.header("Content-Type", "text/csv; charset=utf-8");
+    c.header("Content-Disposition", 'attachment; filename="dg-chat-analytics.csv"');
+    c.header("X-Content-Type-Options", "nosniff");
+    return c.body(analyticsCsv(analytics));
+  });
+  app.get("/api/admin/jobs", async (c) => {
+    c.header("Cache-Control", "private, no-store");
+    return c.json(await repo.listJobs(parseAdminJobQuery(c)));
+  });
+  app.post("/api/admin/jobs/:id/retry", async (c) => {
+    c.header("Cache-Control", "private, no-store");
+    const id = requireUuid(c.req.param("id"), "job id");
+    const retried = await repo.retryFailedJob(id, c.get("user").id);
+    return c.json(retried);
+  });
   const parseProviderAdminBody = async <T>(
     c: Context<{ Variables: Variables }>,
     parse: (value: unknown) => T,
