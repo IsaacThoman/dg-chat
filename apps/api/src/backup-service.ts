@@ -1170,6 +1170,17 @@ export class DefaultBackupAdminService implements BackupAdminService {
         let durable = await providerSecretStoreCall(() =>
           store.findByIdempotency(input.restoreId, input.idempotencyKey)
         ).catch(() => undefined);
+        if (
+          durable &&
+          (durable.sourceObjectKey !== objectKey || durable.archiveSha256 !== staged.digest ||
+            durable.archiveBytes !== staged.bytes ||
+            durable.sidecarId !== authenticated.header.sidecarId ||
+            durable.recoveryKeyId !== authenticated.header.encryption.wrapping.keyId ||
+            durable.baseBackupId !== binding.backupId ||
+            durable.baseArchiveSha256 !== binding.archiveSha256 ||
+            durable.baseContentRootSha256 !== binding.contentRootSha256 ||
+            durable.sourceInstallationId !== binding.sourceInstallationId)
+        ) durable = undefined;
         if (!durable) {
           const active = await providerSecretStoreCall(() =>
             store.getActiveByRestoreOperation(input.restoreId)

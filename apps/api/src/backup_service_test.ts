@@ -656,6 +656,11 @@ class MemoryProviderSecretRestoreStore {
       this.attachment && ["staging", "uploaded", "validated"].includes(this.attachment.status)
     ) {
       if (
+        this.attachment.archiveSha256 !== input.archiveSha256 ||
+        this.attachment.archiveBytes !== input.archiveBytes ||
+        this.attachment.sidecarId !== input.sidecarId
+      ) return Promise.reject(new Error("idempotency metadata conflict"));
+      if (
         this.attachment.status === "uploaded" &&
         this.attachment.idempotencyKey !== input.idempotencyKey
       ) return Promise.reject(new Error("an uploaded attachment is already active"));
@@ -1379,6 +1384,23 @@ Deno.test("provider-secret staging survives missing or lost PUT responses and fo
     retryService.uploadProviderSecretRestore(retryInput("missing-provider-secret-put-first"))
   );
   assertEquals(retryStore.attachment?.status, "staging");
+  assertEquals(retryObjects.values.size, 0);
+  const conflictingSidecar = await iterableBytes(encryptProviderSecretSidecarV1({
+    binding: {
+      backupId: fx.snapshot.manifest.backupId,
+      archiveSha256: base.archiveSha256!,
+      contentRootSha256: fx.snapshot.manifest.contentRootSha256,
+      sourceInstallationId: fx.snapshot.manifest.source.installationId,
+    },
+    kek: { keyId: "recovery-v2", key: recoveryKey },
+    records: [],
+  }));
+  await assertRejects(() =>
+    retryService.uploadProviderSecretRestore({
+      ...retryInput("missing-provider-secret-put-first"),
+      request: providerSecretUploadRequest(conflictingSidecar),
+    })
+  );
   assertEquals(retryObjects.values.size, 0);
   retryStore.throwAfterCreate = true;
   retryStore.throwAfterMarkUploaded = true;
