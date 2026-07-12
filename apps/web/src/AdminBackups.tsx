@@ -14,6 +14,7 @@ import {
 import { api, ApiError } from "./api.ts";
 import type {
   BackupExport,
+  BackupExportPage,
   BackupRestorePreview,
   BackupRestoreStatus,
   BackupRestoreStatusCapability,
@@ -28,6 +29,14 @@ const size = (bytes: number | null) =>
       .format(bytes);
 const terminal = (item: BackupExport) => item.status === "completed" || item.status === "failed";
 export const PRIVILEGED_BACKUP_CONFIRMATION = "EXPORT PROVIDER SECRETS";
+export const mergeBackupExport = (
+  current: BackupExportPage | undefined,
+  item: BackupExport,
+): BackupExportPage => ({
+  items: [item, ...(current?.items ?? []).filter((existing) => existing.id !== item.id)],
+  restoreEnabled: current?.restoreEnabled ?? false,
+  privilegedSecretBackupsEnabled: current?.privilegedSecretBackupsEnabled ?? false,
+});
 export const isRecentAuthenticationRequired = (error: unknown) =>
   error instanceof ApiError && error.status === 403 &&
   error.code === "recent_authentication_required";
@@ -229,10 +238,10 @@ export function AdminBackupsView() {
     mutationFn: () => api.createAdminBackupExport(exportKey.current),
     onSuccess: (item) => {
       exportKey.current = crypto.randomUUID();
-      client.setQueryData(["admin-backups"], (current: typeof backups.data) => ({
-        items: [item, ...(current?.items ?? []).filter((existing) => existing.id !== item.id)],
-        restoreEnabled: current?.restoreEnabled ?? false,
-      }));
+      client.setQueryData(
+        ["admin-backups"],
+        (current: typeof backups.data) => mergeBackupExport(current, item),
+      );
     },
   });
   const privilegedKey = useRef(crypto.randomUUID());
@@ -241,20 +250,41 @@ export function AdminBackupsView() {
       api.createAdminPrivilegedBackupExport(privilegedKey.current, confirmation),
     onSuccess: (item) => {
       privilegedKey.current = crypto.randomUUID();
-      client.setQueryData(["admin-backups"], (current: typeof backups.data) => ({
-        items: [item, ...(current?.items ?? []).filter((existing) => existing.id !== item.id)],
-        restoreEnabled: current?.restoreEnabled ?? false,
-        privilegedSecretBackupsEnabled: current?.privilegedSecretBackupsEnabled ?? false,
-      }));
+      client.setQueryData(
+        ["admin-backups"],
+        (current: typeof backups.data) => mergeBackupExport(current, item),
+      );
     },
   });
   const downloadSecrets = async (item: BackupExport) => {
+    const filename = `dg-chat-provider-secrets-${item.id}.dgsecrets`;
+    const picker = (globalThis as unknown as {
+      showSaveFilePicker?: (options: {
+        suggestedName: string;
+        types: Array<{ description: string; accept: Record<string, string[]> }>;
+      }) => Promise<{ createWritable(): Promise<WritableStream<Uint8Array>> }>;
+    }).showSaveFilePicker;
+    if (picker) {
+      // Open the picker before any network await so the browser still recognizes the click's user
+      // activation. The response then pipes directly to disk instead of entering JS heap memory.
+      const handle = await picker({
+        suggestedName: filename,
+        types: [{
+          description: "DG Chat encrypted provider secrets",
+          accept: { "application/vnd.dg-chat.provider-secrets": [".dgsecrets"] },
+        }],
+      });
+      const writable = await handle.createWritable();
+      await api.downloadAdminProviderSecrets(item.id, writable);
+      return;
+    }
     const blob = await api.downloadAdminProviderSecrets(item.id);
+    if (!blob) return;
     const url = URL.createObjectURL(blob);
     try {
       const anchor = document.createElement("a");
       anchor.href = url;
-      anchor.download = `dg-chat-provider-secrets-${item.id}.dgsecrets`;
+      anchor.download = filename;
       anchor.rel = "noopener";
       anchor.click();
     } finally {
@@ -359,7 +389,10 @@ export function AdminBackups(props: AdminBackupsProps) {
       await props.onDownloadSecrets(item);
       setAnnouncement("Encrypted provider-secret sidecar downloaded.");
     } catch (error) {
-      if (isRecentAuthenticationRequired(error)) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        // Closing the native save picker is an intentional cancellation, not a failed backup.
+        return;
+      } else if (isRecentAuthenticationRequired(error)) {
         setPrivilegedError("Sign in again before downloading provider secrets. Redirecting…");
         globalThis.setTimeout(() => props.onReauthenticate?.(), 900);
       } else setPrivilegedError(message(error));

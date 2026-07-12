@@ -6,6 +6,7 @@ import {
   canApplyBackupRestore,
   createBackupUploadAttempt,
   isRecentAuthenticationRequired,
+  mergeBackupExport,
   monitorBackupRestore,
   PRIVILEGED_BACKUP_CONFIRMATION,
 } from "./AdminBackups.tsx";
@@ -140,6 +141,29 @@ describe("AdminBackups", () => {
     expect(html).toContain("recovery-2026");
     expect(html).toContain(".dgbackup");
     expect(html).toContain(".dgsecrets");
+  });
+
+  it("preserves privileged capability during optimistic ordinary-export updates", () => {
+    const item = {
+      id: "ordinary",
+      status: "queued" as const,
+      formatVersion: 1,
+      includesDiagnostics: false,
+      secretsRedacted: true as const,
+      bytes: null,
+      fingerprint: null,
+      createdAt: "2026-07-12T00:00:00Z",
+      completedAt: null,
+      error: null,
+    };
+    const updated = mergeBackupExport({
+      items: [],
+      restoreEnabled: true,
+      privilegedSecretBackupsEnabled: true,
+    }, item);
+    expect(updated.items).toEqual([item]);
+    expect(updated.restoreEnabled).toBe(true);
+    expect(updated.privilegedSecretBackupsEnabled).toBe(true);
   });
 
   it("requires an exact fingerprint and a blocker-free fresh preview", () => {

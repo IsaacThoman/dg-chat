@@ -847,25 +847,87 @@ export const api = {
   adminBackupContentUrl: (id: string) => `/api/admin/backups/${encodeURIComponent(id)}/content`,
   adminProviderSecretsContentUrl: (id: string) =>
     `/api/admin/backups/${encodeURIComponent(id)}/provider-secrets/content`,
-  downloadAdminProviderSecrets: async (id: string): Promise<Blob> => {
-    const response = await fetch(
-      `/api/admin/backups/${encodeURIComponent(id)}/provider-secrets/content`,
-      { credentials: "include", headers: { Accept: "application/octet-stream" } },
-    );
-    if (!response.ok) {
-      let body: { error?: { code?: string; message?: string } } = {};
-      try {
-        body = await response.json();
-      } catch {
-        // Preserve a useful status-based error when an intermediary returned a non-JSON body.
-      }
-      throw new ApiError(
-        response.status,
-        body.error?.code ?? "request_failed",
-        body.error?.message ?? `Request failed (${response.status})`,
+  downloadAdminProviderSecrets: async (
+    id: string,
+    destination?: WritableStream<Uint8Array>,
+  ): Promise<Blob | undefined> => {
+    let pipingStarted = false;
+    try {
+      const response = await fetch(
+        `/api/admin/backups/${encodeURIComponent(id)}/provider-secrets/content`,
+        { credentials: "include", headers: { Accept: "application/octet-stream" } },
       );
+      if (!response.ok) {
+        let body: { error?: { code?: string; message?: string } } = {};
+        try {
+          body = await response.json();
+        } catch {
+          // Preserve a useful status-based error when an intermediary returned a non-JSON body.
+        }
+        throw new ApiError(
+          response.status,
+          body.error?.code ?? "request_failed",
+          body.error?.message ?? `Request failed (${response.status})`,
+        );
+      }
+      if (destination) {
+        if (!response.body) {
+          throw new ApiError(502, "empty_download", "The provider-secret download was empty");
+        }
+        pipingStarted = true;
+        await response.body.pipeTo(destination);
+        return;
+      }
+
+      // Browsers without the File System Access API cannot stream a download to a chosen file while
+      // retaining structured recent-auth errors. Keep that compatibility path strictly bounded.
+      const maxFallbackBytes = 32 * 1024 * 1024;
+      const declaredLength = Number(response.headers.get("content-length"));
+      if (Number.isFinite(declaredLength) && declaredLength > maxFallbackBytes) {
+        await response.body?.cancel();
+        throw new ApiError(
+          413,
+          "download_too_large_for_browser",
+          "This encrypted sidecar is too large for this browser's safe download fallback. Use a Chromium-based browser with direct file saving enabled.",
+        );
+      }
+      if (!response.body) return new Blob();
+      const reader = response.body.getReader();
+      const chunks: ArrayBuffer[] = [];
+      let total = 0;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          total += value.byteLength;
+          if (total > maxFallbackBytes) {
+            await reader.cancel();
+            throw new ApiError(
+              413,
+              "download_too_large_for_browser",
+              "This encrypted sidecar is too large for this browser's safe download fallback. Use a Chromium-based browser with direct file saving enabled.",
+            );
+          }
+          const copy = new Uint8Array(value.byteLength);
+          copy.set(value);
+          chunks.push(copy.buffer);
+        }
+        return new Blob(chunks, { type: "application/vnd.dg-chat.provider-secrets" });
+      } finally {
+        reader.releaseLock();
+      }
+    } catch (error) {
+      // A picker-created destination exists before fetch begins. Close it on authentication,
+      // transport, or response-validation failure; pipeTo owns aborting once piping has started.
+      if (destination && !pipingStarted) {
+        try {
+          await destination.abort(error);
+        } catch {
+          // Never replace the authoritative network/API error with cleanup failure.
+        }
+      }
+      throw error;
     }
-    return await response.blob();
   },
   uploadAdminBackupRestore: (
     file: File,

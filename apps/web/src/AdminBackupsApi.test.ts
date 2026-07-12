@@ -80,7 +80,7 @@ describe("backup administration API", () => {
       "/api/admin/backups/paired%2F1/provider-secrets/content",
       expect.objectContaining({ credentials: "include" }),
     );
-    expect(blob.size).toBe(3);
+    expect(blob?.size).toBe(3);
     expect(api.adminProviderSecretsContentUrl("paired/1")).toBe(
       "/api/admin/backups/paired%2F1/provider-secrets/content",
     );
@@ -98,6 +98,56 @@ describe("backup administration API", () => {
       code: "recent_authentication_required",
       message: "Sign in again",
     });
+  });
+
+  it("streams provider secrets directly into a supplied file destination", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response(new Uint8Array([1, 2, 3]), { status: 200 })),
+    );
+    const chunks: number[] = [];
+    const destination = new WritableStream<Uint8Array>({
+      write(chunk) {
+        chunks.push(...chunk);
+      },
+    });
+    await expect(api.downloadAdminProviderSecrets("paired", destination)).resolves.toBeUndefined();
+    expect(chunks).toEqual([1, 2, 3]);
+  });
+
+  it("aborts a picker-created destination when authorization fails before streaming", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(Response.json({
+        error: { code: "recent_authentication_required", message: "Sign in again" },
+      }, { status: 403 })),
+    );
+    const abort = vi.fn();
+    const destination = new WritableStream<Uint8Array>({ abort });
+    await expect(api.downloadAdminProviderSecrets("paired", destination)).rejects.toMatchObject({
+      code: "recent_authentication_required",
+    });
+    expect(abort).toHaveBeenCalledOnce();
+    expect(abort.mock.calls[0][0]).toMatchObject({ code: "recent_authentication_required" });
+  });
+
+  it("rejects oversized compatibility downloads before buffering response bytes", async () => {
+    const cancel = vi.fn().mockResolvedValue(undefined);
+    const body = new ReadableStream<Uint8Array>({ cancel });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(body, {
+          status: 200,
+          headers: { "Content-Length": String(32 * 1024 * 1024 + 1) },
+        }),
+      ),
+    );
+    await expect(api.downloadAdminProviderSecrets("oversized")).rejects.toMatchObject({
+      status: 413,
+      code: "download_too_large_for_browser",
+    });
+    expect(cancel).toHaveBeenCalledOnce();
   });
 
   it("wires cancellation to the active XHR while retaining its idempotency header", async () => {
