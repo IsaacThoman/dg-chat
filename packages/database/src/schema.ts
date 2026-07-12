@@ -10,6 +10,7 @@ import {
   pgEnum,
   pgTable,
   primaryKey,
+  smallint,
   text,
   timestamp,
   unique,
@@ -1060,5 +1061,115 @@ export const retentionScrubRuns = pgTable("retention_scrub_runs", {
   check(
     "retention_scrub_runs_error_check",
     sql`${table.error} IS NULL OR char_length(${table.error}) <= 1000`,
+  ),
+]);
+
+export const backupOperations = pgTable("backup_operations", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  kind: text("kind").notNull(),
+  status: text("status").notNull().default("queued"),
+  version: integer("version").notNull().default(1),
+  // Control-plane evidence survives whole-installation replacement of the users table.
+  actorId: uuid("actor_id"),
+  actorEmail: text("actor_email").notNull(),
+  actorName: text("actor_name").notNull(),
+  idempotencyKey: text("idempotency_key").notNull(),
+  stage: text("stage").notNull().default("queued"),
+  sourceObjectKey: text("source_object_key"),
+  artifactObjectKey: text("artifact_object_key"),
+  archiveSha256: text("archive_sha256"),
+  options: jsonb("options").notNull().default({}),
+  manifest: jsonb("manifest"),
+  impact: jsonb("impact"),
+  confirmationFingerprint: text("confirmation_fingerprint"),
+  objectsProcessed: integer("objects_processed").notNull().default(0),
+  objectsTotal: integer("objects_total").notNull().default(0),
+  bytesProcessed: bigint("bytes_processed", { mode: "number" }).notNull().default(0),
+  bytesTotal: bigint("bytes_total", { mode: "number" }).notNull().default(0),
+  error: text("error"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  startedAt: timestamp("started_at", { withTimezone: true }),
+  validatedAt: timestamp("validated_at", { withTimezone: true }),
+  completedAt: timestamp("completed_at", { withTimezone: true }),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("backup_operations_idempotency_uq").on(
+    table.actorId,
+    table.kind,
+    table.idempotencyKey,
+  ),
+  index("backup_operations_status_created_idx").on(table.status, table.createdAt, table.id),
+  index("backup_operations_kind_created_idx").on(
+    table.kind,
+    table.createdAt.desc(),
+    table.id.desc(),
+  ),
+  check("backup_operations_kind_check", sql`${table.kind} IN ('export','restore')`),
+  check(
+    "backup_operations_status_check",
+    sql`${table.status} IN ('queued','running','validated','completed','failed','cancelled')`,
+  ),
+  check("backup_operations_version_check", sql`${table.version} >= 1`),
+  check(
+    "backup_operations_idempotency_check",
+    sql`char_length(${table.idempotencyKey}) BETWEEN 8 AND 200`,
+  ),
+  check("backup_operations_stage_check", sql`char_length(${table.stage}) BETWEEN 1 AND 80`),
+  check(
+    "backup_operations_actor_check",
+    sql`char_length(${table.actorEmail}) BETWEEN 3 AND 320 AND char_length(${table.actorName}) BETWEEN 1 AND 200`,
+  ),
+  check(
+    "backup_operations_object_key_check",
+    sql`(${table.sourceObjectKey} IS NULL OR (char_length(${table.sourceObjectKey}) BETWEEN 1 AND 1024 AND left(${table.sourceObjectKey},1) <> '/')) AND (${table.artifactObjectKey} IS NULL OR (char_length(${table.artifactObjectKey}) BETWEEN 1 AND 1024 AND left(${table.artifactObjectKey},1) <> '/'))`,
+  ),
+  check(
+    "backup_operations_digest_check",
+    sql`${table.archiveSha256} IS NULL OR ${table.archiveSha256} ~ '^[0-9a-f]{64}$'`,
+  ),
+  check(
+    "backup_operations_fingerprint_check",
+    sql`${table.confirmationFingerprint} IS NULL OR ${table.confirmationFingerprint} ~ '^[A-F0-9]{8}$'`,
+  ),
+  check(
+    "backup_operations_json_check",
+    sql`jsonb_typeof(${table.options})='object' AND (${table.manifest} IS NULL OR jsonb_typeof(${table.manifest})='object') AND (${table.impact} IS NULL OR jsonb_typeof(${table.impact})='object')`,
+  ),
+  check(
+    "backup_operations_progress_check",
+    sql`${table.objectsProcessed} >= 0 AND ${table.objectsTotal} >= 0 AND ${table.objectsProcessed} <= ${table.objectsTotal} AND ${table.bytesProcessed} >= 0 AND ${table.bytesTotal} >= 0 AND ${table.bytesProcessed} <= ${table.bytesTotal}`,
+  ),
+  check(
+    "backup_operations_error_check",
+    sql`${table.error} IS NULL OR char_length(${table.error}) BETWEEN 1 AND 1000`,
+  ),
+  check(
+    "backup_operations_time_check",
+    sql`${table.updatedAt} >= ${table.createdAt} AND (${table.startedAt} IS NULL OR ${table.startedAt} >= ${table.createdAt}) AND (${table.validatedAt} IS NULL OR ${table.validatedAt} >= ${table.createdAt}) AND (${table.completedAt} IS NULL OR ${table.completedAt} >= ${table.createdAt})`,
+  ),
+  check(
+    "backup_operations_lifecycle_check",
+    sql`(${table.status}='queued' AND ${table.startedAt} IS NULL AND ${table.completedAt} IS NULL AND ${table.error} IS NULL) OR (${table.status}='running' AND ${table.startedAt} IS NOT NULL AND ${table.completedAt} IS NULL AND ${table.error} IS NULL) OR (${table.status}='validated' AND ${table.kind}='restore' AND ${table.startedAt} IS NOT NULL AND ${table.validatedAt} IS NOT NULL AND ${table.completedAt} IS NULL AND ${table.error} IS NULL AND ${table.archiveSha256} IS NOT NULL AND ${table.impact} IS NOT NULL AND ${table.confirmationFingerprint} IS NOT NULL) OR (${table.status}='completed' AND ${table.startedAt} IS NOT NULL AND ${table.completedAt} IS NOT NULL AND ${table.error} IS NULL AND ${table.archiveSha256} IS NOT NULL) OR (${table.status}='failed' AND ${table.startedAt} IS NOT NULL AND ${table.completedAt} IS NOT NULL AND ${table.error} IS NOT NULL) OR (${table.status}='cancelled' AND ${table.completedAt} IS NOT NULL AND ${table.error} IS NULL)`,
+  ),
+]);
+
+export const installationState = pgTable("installation_state", {
+  singletonId: smallint("singleton_id").primaryKey().default(1),
+  installationId: uuid("installation_id").notNull().defaultRandom(),
+  maintenanceEnabled: boolean("maintenance_enabled").notNull().default(false),
+  version: integer("version").notNull().default(1),
+  restoreEpoch: bigint("restore_epoch", { mode: "number" }).notNull().default(0),
+  activeRestoreId: uuid("active_restore_id").references(() => backupOperations.id, {
+    onDelete: "restrict",
+  }),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("installation_state_installation_uq").on(table.installationId),
+  check("installation_state_singleton_check", sql`${table.singletonId}=1`),
+  check("installation_state_version_check", sql`${table.version} >= 1`),
+  check("installation_state_restore_epoch_check", sql`${table.restoreEpoch} >= 0`),
+  check(
+    "installation_state_maintenance_check",
+    sql`${table.maintenanceEnabled} = (${table.activeRestoreId} IS NOT NULL)`,
   ),
 ]);

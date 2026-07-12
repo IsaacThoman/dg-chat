@@ -1,0 +1,676 @@
+import { createHash } from "node:crypto";
+import type {
+  BackupArchiveSink,
+  BackupDataBatch,
+  BackupDataSource,
+  BackupExportSource,
+  BackupManifestAuthenticator,
+  BackupManifestEntryV1,
+  BackupManifestV1,
+  BackupRestoreImpact,
+  ObjectStore,
+} from "@dg-chat/database";
+import {
+  BACKUP_DATA_BATCH_SIZE,
+  BACKUP_DATA_SCHEMA_VERSION,
+  BACKUP_DATA_TABLES,
+  backupContentRoot,
+  canonicalJson,
+  DEFAULT_BACKUP_LIMITS,
+  dryRunBackupData,
+  ObjectAlreadyExistsError,
+  restoreBackupData,
+  signBackupManifest,
+  verifyBackupDataCatalog,
+  withRepeatableReadBackupSnapshot,
+} from "@dg-chat/database";
+import type {
+  BackupDataPort,
+  BackupExportSnapshot,
+  BackupRestoreSession,
+} from "./backup-service.ts";
+
+const encoder = new TextEncoder();
+const MAX_ENTRIES = 10_000;
+const MAX_LINE_BYTES = 8 * 1024 * 1024;
+const OBJECT_INDEX = "objects/index.ndjson";
+const TABLE_PREFIX = "tables/";
+const SHA256 = /^[0-9a-f]{64}$/u;
+
+type DatabaseAdapter = {
+  verifyCatalog?(databaseUrl: string): Promise<void>;
+  snapshot<T>(
+    databaseUrl: string,
+    consumer: (source: BackupExportSource) => Promise<T>,
+    options: { diagnosticPolicy: "excluded" | "included" },
+  ): Promise<T>;
+  dryRun(databaseUrl: string, source: BackupDataSource): Promise<BackupRestoreImpact>;
+  restore(
+    databaseUrl: string,
+    source: BackupDataSource,
+    options: {
+      restoreOperationId: string;
+      expectedOperationVersion: number;
+      expectedInstallationVersion: number;
+      objectKeyMap: ReadonlyMap<string, string>;
+    },
+  ): Promise<BackupRestoreImpact>;
+};
+
+export interface PostgresBackupDataOptions {
+  databaseUrl: string;
+  objects: ObjectStore;
+  authenticator: BackupManifestAuthenticator;
+  appVersion?: string;
+  /** Dependency seam for deterministic adapter tests. Production uses the database package. */
+  database?: DatabaseAdapter;
+}
+
+interface ObjectReference {
+  objectKey: string;
+  sha256: string;
+  bytes: number;
+  contentType: string;
+}
+interface ObjectIndexRecord extends ObjectReference {
+  entry: string;
+}
+interface TempPayload {
+  path: string;
+  entry: BackupManifestEntryV1;
+}
+
+const defaultDatabase: DatabaseAdapter = {
+  verifyCatalog: verifyBackupDataCatalog,
+  snapshot: withRepeatableReadBackupSnapshot,
+  dryRun: dryRunBackupData,
+  restore: restoreBackupData,
+};
+
+async function writeAll(file: Deno.FsFile, bytes: Uint8Array) {
+  let offset = 0;
+  while (offset < bytes.length) offset += await file.write(bytes.subarray(offset));
+}
+
+async function* filePayload(path: string): AsyncIterable<Uint8Array> {
+  const file = await Deno.open(path, { read: true });
+  try {
+    const buffer = new Uint8Array(64 * 1024);
+    while (true) {
+      const count = await file.read(buffer);
+      if (count === null) return;
+      if (count) yield buffer.slice(0, count);
+    }
+  } finally {
+    file.close();
+  }
+}
+
+class HashedFileWriter {
+  readonly #hash = createHash("sha256");
+  readonly #file: Deno.FsFile;
+  bytes = 0;
+  records = 0;
+  constructor(readonly path: string) {
+    this.#file = Deno.openSync(path, { create: true, write: true, truncate: true });
+  }
+  async line(value: unknown) {
+    const bytes = encoder.encode(`${canonicalJson(value)}\n`);
+    if (bytes.length - 1 > MAX_LINE_BYTES) throw new TypeError("NDJSON line is too large");
+    this.#hash.update(bytes);
+    this.bytes += bytes.length;
+    this.records += 1;
+    await writeAll(this.#file, bytes);
+  }
+  async chunk(value: Uint8Array) {
+    this.#hash.update(value);
+    this.bytes += value.length;
+    await writeAll(this.#file, value);
+  }
+  finish() {
+    this.#file.close();
+    return this.#hash.digest("hex");
+  }
+  close() {
+    try {
+      this.#file.close();
+    } catch { /* already closed */ }
+  }
+}
+
+function exactObjectReference(value: unknown): ObjectReference {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("Backup object reference is invalid");
+  }
+  const row = value as Record<string, unknown>;
+  if (
+    Object.keys(row).sort().join() !== "bytes,contentType,objectKey,sha256" ||
+    typeof row.objectKey !== "string" || !row.objectKey || row.objectKey.length > 1024 ||
+    typeof row.sha256 !== "string" || !SHA256.test(row.sha256) ||
+    !Number.isSafeInteger(row.bytes) || Number(row.bytes) < 0 ||
+    typeof row.contentType !== "string" || !row.contentType || row.contentType.length > 255
+  ) throw new TypeError("Backup object reference is invalid");
+  return row as unknown as ObjectReference;
+}
+
+function attachmentReference(row: Readonly<Record<string, unknown>>): ObjectReference | undefined {
+  if (row.state !== "ready" || row.deleted_at !== null) return undefined;
+  return exactObjectReference({
+    objectKey: row.object_key,
+    sha256: row.sha256,
+    bytes: Number(row.size_bytes),
+    contentType: row.mime_type,
+  });
+}
+
+async function spoolObject(
+  root: string,
+  objects: ObjectStore,
+  reference: ObjectReference,
+): Promise<{ payload: TempPayload; created: boolean }> {
+  const entryName = `objects/${reference.sha256}`;
+  const path = `${root}/object-${reference.sha256}`;
+  try {
+    const stat = await Deno.stat(path);
+    if (stat.size !== reference.bytes) throw new TypeError("Duplicate backup object size differs");
+    return {
+      created: false,
+      payload: {
+        path,
+        entry: { name: entryName, kind: "blob", bytes: stat.size, sha256: reference.sha256 },
+      },
+    };
+  } catch (error) {
+    if (!(error instanceof Deno.errors.NotFound)) throw error;
+  }
+  const stored = await objects.get(reference.objectKey);
+  if (!stored) throw new TypeError("A referenced attachment object is missing");
+  if (stored.contentLength !== null && stored.contentLength !== reference.bytes) {
+    await stored.body.cancel().catch(() => undefined);
+    throw new TypeError("A referenced attachment object has the wrong size");
+  }
+  const writer = new HashedFileWriter(path);
+  try {
+    const reader = stored.body.getReader();
+    try {
+      while (true) {
+        const next = await reader.read();
+        if (next.done) break;
+        if (writer.bytes + next.value.length > reference.bytes) {
+          throw new TypeError("A referenced attachment object exceeds its declared size");
+        }
+        await writer.chunk(next.value);
+      }
+    } finally {
+      await reader.cancel().catch(() => undefined);
+      reader.releaseLock();
+    }
+    const digest = writer.finish();
+    if (writer.bytes !== reference.bytes || digest !== reference.sha256) {
+      throw new TypeError("A referenced attachment object failed integrity validation");
+    }
+    return {
+      created: true,
+      payload: {
+        path,
+        entry: { name: entryName, kind: "blob", bytes: writer.bytes, sha256: digest },
+      },
+    };
+  } catch (error) {
+    writer.close();
+    await Deno.remove(path).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function* ndjson(path: string): AsyncIterable<unknown> {
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let pending = new Uint8Array();
+  for await (const chunk of filePayload(path)) {
+    const joined = new Uint8Array(pending.length + chunk.length);
+    joined.set(pending);
+    joined.set(chunk, pending.length);
+    let start = 0;
+    for (let index = 0; index < joined.length; index++) {
+      if (joined[index] !== 10) continue;
+      const line = joined.subarray(start, index);
+      if (!line.length || line.length > MAX_LINE_BYTES) {
+        throw new TypeError("NDJSON line is invalid");
+      }
+      let parsed;
+      try {
+        const text = decoder.decode(line);
+        parsed = JSON.parse(text);
+        if (canonicalJson(parsed) !== text) throw new Error();
+      } catch {
+        throw new TypeError("NDJSON line is not canonical JSON");
+      }
+      yield parsed;
+      start = index + 1;
+    }
+    pending = joined.slice(start);
+    if (pending.length > MAX_LINE_BYTES) throw new TypeError("NDJSON line is too large");
+  }
+  if (pending.length) throw new TypeError("NDJSON entry must end with a newline");
+}
+
+function fileReadable(path: string): ReadableStream<Uint8Array> {
+  const iterator = filePayload(path)[Symbol.asyncIterator]();
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const next = await iterator.next();
+        if (next.done) controller.close();
+        else controller.enqueue(next.value);
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    async cancel() {
+      await iterator.return?.();
+    },
+  });
+}
+
+function impactCounts(impact: BackupRestoreImpact) {
+  return Object.entries(impact.rowsByTable).map(([resource, count]) => ({
+    resource,
+    create: count,
+    update: 0,
+    skip: 0,
+  }));
+}
+
+export function createPostgresBackupDataPort(options: PostgresBackupDataOptions): BackupDataPort {
+  if (!options.databaseUrl) throw new TypeError("Backup database URL is required");
+  const database = options.database ?? defaultDatabase;
+  const appVersion = options.appVersion ?? "0.1.0";
+  return {
+    async exportSnapshot(input): Promise<BackupExportSnapshot> {
+      await database.verifyCatalog?.(options.databaseUrl);
+      const root = await Deno.makeTempDir({ prefix: "dg-backup-data-" });
+      try {
+        const relational = await database.snapshot(options.databaseUrl, async (source) => {
+          if (source.installationId !== input.installationId) {
+            throw new TypeError("Backup installation changed during export");
+          }
+          const expectedTables = BACKUP_DATA_TABLES.filter((table) =>
+            input.includeDiagnostics || table.name !== "provider_payload_captures"
+          ).map((table) => table.name);
+          if (source.tables.map((table) => table.name).join() !== expectedTables.join()) {
+            throw new TypeError("Backup database table catalog is incomplete");
+          }
+          const payloads = new Map<string, Uint8Array | AsyncIterable<Uint8Array>>();
+          const entries: BackupManifestEntryV1[] = [];
+          const referencesPath = `${root}/object-references.ndjson`;
+          const references = new HashedFileWriter(referencesPath);
+          try {
+            for (const table of source.tables) {
+              const name = `${TABLE_PREFIX}${table.name}.ndjson`;
+              const path = `${root}/table-${table.name}.ndjson`;
+              const writer = new HashedFileWriter(path);
+              try {
+                for await (const batch of source.rows(table.name)) {
+                  for (const row of batch) {
+                    await writer.line(row);
+                    if (table.name === "attachments") {
+                      const reference = attachmentReference(row);
+                      if (reference) await references.line(reference);
+                    }
+                  }
+                }
+                const digest = writer.finish();
+                entries.push({
+                  name,
+                  kind: "ndjson",
+                  bytes: writer.bytes,
+                  sha256: digest,
+                  records: writer.records,
+                });
+                payloads.set(name, filePayload(path));
+              } catch (error) {
+                writer.close();
+                throw error;
+              }
+            }
+          } finally {
+            references.finish();
+          }
+          return {
+            payloads,
+            entries,
+            referencesPath,
+            schemaVersion: source.schemaVersion,
+            installationId: source.installationId,
+          };
+        }, { diagnosticPolicy: input.includeDiagnostics ? "included" : "excluded" });
+
+        // Attachment objects are immutable. Fetch them only after releasing the repeatable-read
+        // database snapshot so slow multi-gigabyte object storage cannot hold back PostgreSQL VACUUM.
+        const objectIndexPath = `${root}/objects-index.ndjson`;
+        const objectIndex = new HashedFileWriter(objectIndexPath);
+        let objectCount = 0;
+        let objectBytes = 0;
+        try {
+          for await (const raw of ndjson(relational.referencesPath)) {
+            const reference = exactObjectReference(raw);
+            const { payload, created } = await spoolObject(root, options.objects, reference);
+            if (created) {
+              if (relational.entries.length >= MAX_ENTRIES - 1) {
+                throw new TypeError("Backup has too many entries");
+              }
+              relational.entries.push(payload.entry);
+              relational.payloads.set(payload.entry.name, filePayload(payload.path));
+              objectCount += 1;
+              objectBytes += payload.entry.bytes;
+            }
+            await objectIndex.line(
+              { ...reference, entry: payload.entry.name } satisfies ObjectIndexRecord,
+            );
+          }
+          const indexDigest = objectIndex.finish();
+          const indexEntry: BackupManifestEntryV1 = {
+            name: OBJECT_INDEX,
+            kind: "ndjson",
+            bytes: objectIndex.bytes,
+            sha256: indexDigest,
+            records: objectIndex.records,
+          };
+          relational.entries.push(indexEntry);
+          relational.payloads.set(OBJECT_INDEX, filePayload(objectIndexPath));
+          const manifest = await signBackupManifest({
+            format: "dg-chat-backup",
+            version: 1,
+            backupId: crypto.randomUUID(),
+            createdAt: new Date().toISOString(),
+            appVersion,
+            schemaVersion: relational.schemaVersion,
+            mode: "system",
+            secretPolicy: "redacted",
+            diagnosticPayloadPolicy: input.includeDiagnostics ? "included" : "excluded",
+            source: { installationId: relational.installationId },
+            objects: { count: objectCount, bytes: objectBytes, indexSha256: indexDigest },
+            requiredProviderKeyIds: [],
+            contentRootSha256: await backupContentRoot(relational.entries),
+            entries: relational.entries,
+          }, options.authenticator);
+          return {
+            manifest,
+            payloads: relational.payloads,
+            objectsTotal: objectCount,
+            bytesTotal: relational.entries.reduce((sum, entry) => sum + entry.bytes, 0),
+            cleanup: () => Deno.remove(root, { recursive: true }).catch(() => undefined),
+          };
+        } catch (error) {
+          objectIndex.close();
+          throw error;
+        }
+      } catch (error) {
+        await Deno.remove(root, { recursive: true }).catch(() => undefined);
+        throw error;
+      }
+    },
+
+    async restoreSession(mode): Promise<BackupRestoreSession> {
+      await database.verifyCatalog?.(options.databaseUrl);
+      const root = await Deno.makeTempDir({ prefix: "dg-restore-data-" });
+      const paths = new Map<string, string>();
+      const entryMetadata = new Map<string, BackupManifestEntryV1>();
+      const active = new Map<string, Deno.FsFile>();
+      const stagedKeys: string[] = [];
+      const restoreNamespace = crypto.randomUUID();
+      let retained = false;
+      let closed = false;
+      let diagnosticsExcluded = false;
+      const cleanup = async (removeObjects: boolean) => {
+        if (closed && !removeObjects) return;
+        for (const file of active.values()) {
+          try {
+            file.close();
+          } catch { /* already closed */ }
+        }
+        active.clear();
+        if (removeObjects && !retained) {
+          for (const key of stagedKeys) await options.objects.delete(key).catch(() => undefined);
+          stagedKeys.length = 0;
+        }
+        await Deno.remove(root, { recursive: true }).catch(() => undefined);
+        closed = true;
+      };
+      const sink: BackupArchiveSink = {
+        async begin(entry) {
+          if (active.size) throw new TypeError("Backup entries must be written sequentially");
+          const path = `${root}/entry-${entry.sha256}-${paths.size}`;
+          const file = await Deno.open(path, { create: true, write: true, truncate: true });
+          paths.set(entry.name, path);
+          entryMetadata.set(entry.name, entry);
+          active.set(entry.name, file);
+        },
+        async write(entry, chunk) {
+          const file = active.get(entry.name);
+          if (!file) throw new TypeError("Backup entry was not opened");
+          await writeAll(file, chunk);
+        },
+        commit(entry) {
+          const file = active.get(entry.name);
+          if (!file) throw new TypeError("Backup entry was not opened");
+          file.close();
+          active.delete(entry.name);
+        },
+        async abort(entry) {
+          const file = active.get(entry.name);
+          try {
+            file?.close();
+          } catch { /* already closed */ }
+          active.delete(entry.name);
+          const path = paths.get(entry.name);
+          if (path) await Deno.remove(path).catch(() => undefined);
+          paths.delete(entry.name);
+          entryMetadata.delete(entry.name);
+        },
+      };
+
+      const source = (): BackupDataSource => ({
+        schemaVersion: BACKUP_DATA_SCHEMA_VERSION,
+        rows(tableName: string): AsyncIterable<BackupDataBatch> {
+          const path = paths.get(`${TABLE_PREFIX}${tableName}.ndjson`);
+          if (!path) {
+            if (diagnosticsExcluded && tableName === "provider_payload_captures") {
+              return (async function* () {})();
+            }
+            throw new TypeError(`Backup table entry is missing: ${tableName}`);
+          }
+          return (async function* () {
+            let batch: Record<string, unknown>[] = [];
+            let records = 0;
+            for await (const row of ndjson(path)) {
+              if (!row || typeof row !== "object" || Array.isArray(row)) {
+                throw new TypeError("Backup table row is invalid");
+              }
+              batch.push(row as Record<string, unknown>);
+              records += 1;
+              if (batch.length === BACKUP_DATA_BATCH_SIZE) {
+                yield batch;
+                batch = [];
+              }
+            }
+            if (batch.length) yield batch;
+            const entry = entryMetadata.get(`${TABLE_PREFIX}${tableName}.ndjson`);
+            if (!entry || entry.records !== records) {
+              throw new TypeError(`Backup table record count does not match: ${tableName}`);
+            }
+          })();
+        },
+      });
+
+      const stageObjects = async (manifest: BackupManifestV1) => {
+        if (manifest.schemaVersion !== BACKUP_DATA_SCHEMA_VERSION) {
+          throw new TypeError("Backup database schema is unsupported");
+        }
+        const expectedTables = BACKUP_DATA_TABLES.filter((table) =>
+          manifest.diagnosticPayloadPolicy !== "excluded" ||
+          table.name !== "provider_payload_captures"
+        ).map((table) => `${TABLE_PREFIX}${table.name}.ndjson`);
+        diagnosticsExcluded = manifest.diagnosticPayloadPolicy === "excluded";
+        const actualTables = manifest.entries.filter((entry) =>
+          entry.name.startsWith(TABLE_PREFIX)
+        );
+        if (
+          actualTables.length !== expectedTables.length ||
+          actualTables.some((entry, index) =>
+            entry.name !== expectedTables[index] || entry.kind !== "ndjson"
+          )
+        ) throw new TypeError("Backup table entry set is incomplete or unexpected");
+        const entryByName = new Map(manifest.entries.map((entry) => [entry.name, entry]));
+        if (
+          manifest.entries.some((entry) =>
+            !expectedTables.includes(entry.name) && entry.name !== OBJECT_INDEX &&
+            !(entry.kind === "blob" && /^objects\/[0-9a-f]{64}$/u.test(entry.name))
+          )
+        ) throw new TypeError("Backup contains an unexpected semantic entry");
+        const indexPath = paths.get(OBJECT_INDEX);
+        if (!indexPath) throw new TypeError("Backup object index is missing");
+        const indexEntry = manifest.entries.find((entry) => entry.name === OBJECT_INDEX);
+        if (!indexEntry || indexEntry.sha256 !== manifest.objects.indexSha256) {
+          throw new TypeError("Backup object index does not match the manifest");
+        }
+        const map = new Map<string, string>();
+        const expectedReferences = new Map<string, number>();
+        const attachmentsPath = paths.get(`${TABLE_PREFIX}attachments.ndjson`);
+        if (!attachmentsPath) throw new TypeError("Backup attachment table is missing");
+        for await (const raw of ndjson(attachmentsPath)) {
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+            throw new TypeError("Backup attachment row is invalid");
+          }
+          const reference = attachmentReference(raw as Record<string, unknown>);
+          if (!reference) continue;
+          const identity = canonicalJson(reference);
+          expectedReferences.set(identity, (expectedReferences.get(identity) ?? 0) + 1);
+        }
+        const uniqueObjects = new Map<string, number>();
+        const referencedEntries = new Set<string>();
+        let records = 0;
+        for await (const raw of ndjson(indexPath)) {
+          records += 1;
+          if (records > DEFAULT_BACKUP_LIMITS.maxNdjsonRecords) {
+            throw new TypeError("Backup object index is too large");
+          }
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+            throw new TypeError("Backup object index is invalid");
+          }
+          const row = raw as Record<string, unknown>;
+          if (Object.keys(row).sort().join() !== "bytes,contentType,entry,objectKey,sha256") {
+            throw new TypeError("Backup object index is invalid");
+          }
+          const reference = exactObjectReference({
+            objectKey: row.objectKey,
+            sha256: row.sha256,
+            bytes: row.bytes,
+            contentType: row.contentType,
+          });
+          const referenceIdentity = canonicalJson(reference);
+          const remaining = expectedReferences.get(referenceIdentity) ?? 0;
+          if (remaining < 1) {
+            throw new TypeError("Backup object index contains an extra attachment reference");
+          }
+          if (remaining === 1) expectedReferences.delete(referenceIdentity);
+          else expectedReferences.set(referenceIdentity, remaining - 1);
+          if (typeof row.entry !== "string" || row.entry !== `objects/${reference.sha256}`) {
+            throw new TypeError("Backup object entry is invalid");
+          }
+          const blobPath = paths.get(row.entry);
+          const blobEntry = entryByName.get(row.entry);
+          if (
+            !blobPath || !blobEntry || blobEntry.kind !== "blob" ||
+            blobEntry.bytes !== reference.bytes || blobEntry.sha256 !== reference.sha256
+          ) throw new TypeError("Backup object payload is missing or invalid");
+          const knownBytes = uniqueObjects.get(reference.sha256);
+          if (knownBytes !== undefined && knownBytes !== reference.bytes) {
+            throw new TypeError("Duplicate backup object metadata is inconsistent");
+          }
+          uniqueObjects.set(reference.sha256, reference.bytes);
+          referencedEntries.add(row.entry);
+          const key = `restores/${restoreNamespace}/${reference.sha256}`;
+          if (mode === "apply") {
+            try {
+              await options.objects.put({
+                key,
+                body: fileReadable(blobPath),
+                contentLength: reference.bytes,
+                contentType: reference.contentType,
+                metadata: { sha256: reference.sha256 },
+              });
+              stagedKeys.push(key);
+            } catch (error) {
+              if (!(error instanceof ObjectAlreadyExistsError)) throw error;
+              const existing = await options.objects.get(key);
+              if (
+                !existing || existing.contentLength !== reference.bytes ||
+                existing.metadata.sha256 !== reference.sha256
+              ) throw new TypeError("Staged backup object conflicts with existing content");
+              await existing.body.cancel().catch(() => undefined);
+            }
+          }
+          const previous = map.get(reference.objectKey);
+          if (previous && previous !== key) throw new TypeError("Backup object key is duplicated");
+          map.set(reference.objectKey, key);
+        }
+        const uniqueBytes = [...uniqueObjects.values()].reduce((sum, count) => sum + count, 0);
+        const blobEntries = manifest.entries.filter((entry) => entry.kind === "blob");
+        if (
+          expectedReferences.size !== 0 || records !== indexEntry.records ||
+          uniqueObjects.size !== manifest.objects.count ||
+          uniqueBytes !== manifest.objects.bytes || blobEntries.length !== referencedEntries.size ||
+          blobEntries.some((entry) => !referencedEntries.has(entry.name))
+        ) {
+          throw new TypeError("Backup object count does not match");
+        }
+        return map;
+      };
+
+      const summarize = async (manifest: BackupManifestV1) => {
+        try {
+          await stageObjects(manifest);
+          const impact = await database.dryRun(options.databaseUrl, source());
+          return {
+            counts: impactCounts(impact),
+            warnings: impact.providersDisabledForRedactedCredentials
+              ? [
+                `${impact.providersDisabledForRedactedCredentials} providers will remain disabled until credentials are replaced.`,
+              ]
+              : [],
+            blockingErrors: [],
+            attachmentsMissing: 0,
+          };
+        } finally {
+          if (mode === "preview") await cleanup(true);
+        }
+      };
+      return {
+        sink,
+        summarize,
+        async commit(manifest, context) {
+          try {
+            const objectKeyMap = await stageObjects(manifest);
+            const impact = await database.restore(options.databaseUrl, source(), {
+              ...context,
+              objectKeyMap,
+            });
+            if (
+              impact.restoreOperationVersion === null || impact.installationVersion === null
+            ) throw new TypeError("Database restore did not return maintenance fence versions");
+            retained = true;
+            return {
+              counts: impactCounts(impact),
+              restoreOperationVersion: impact.restoreOperationVersion,
+              installationVersion: impact.installationVersion,
+            };
+          } finally {
+            await cleanup(!retained);
+          }
+        },
+        rollback: () => cleanup(true),
+      };
+    },
+  };
+}

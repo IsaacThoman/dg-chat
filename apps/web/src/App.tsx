@@ -73,6 +73,7 @@ import { api, ApiError } from "./api.ts";
 import type { AdminSearch, AdminSection } from "./adminRouting.ts";
 import { AdminAnalyticsView, AdminJobsView } from "./AdminOperations.tsx";
 import { AdminRetentionView } from "./AdminRetention.tsx";
+import { AdminBackupsView } from "./AdminBackups.tsx";
 import { PersonalTokenSettings } from "./TokenGovernance.tsx";
 import {
   conversationForFirstSend,
@@ -3012,13 +3013,7 @@ function AdminSectionContent(
   if (section === "retention") {
     return <AdminRetentionView search={search} onSearch={setSearch} />;
   }
-  return (
-    <GenericAdmin
-      title="Storage & backups"
-      subtitle="Operator procedures are documented; in-app controls are not available yet"
-      icon={HardDrive}
-    />
-  );
+  return <AdminBackupsView />;
 }
 function AdminOverview({ setSection }: { setSection: (section: AdminSection) => void }) {
   const users = useQuery({ queryKey: ["admin-users"], queryFn: api.adminUsers });
@@ -3426,26 +3421,6 @@ function AuditLog() {
     </>
   );
 }
-function GenericAdmin(
-  { title, subtitle, icon: Icon }: { title: string; subtitle: string; icon: typeof Users },
-) {
-  return (
-    <>
-      <PageHeader title={title} subtitle={subtitle} />
-      <div className="generic-admin">
-        <span>
-          <Icon size={28} />
-        </span>
-        <h3>{title} workspace</h3>
-        <p>
-          This administration surface is not available yet. Existing deployment backup procedures
-          remain documented for operators while validated export and restore controls are built.
-        </p>
-      </div>
-    </>
-  );
-}
-
 export function App(
   { initialView = "chat", initialAdminSection = "overview", initialAdminSearch = {} }: {
     initialView?: View;

@@ -10,6 +10,11 @@ import type {
   Attachment,
   AuditEvent,
   AuditFilters,
+  BackupExport,
+  BackupExportPage,
+  BackupRestorePreview,
+  BackupRestoreResult,
+  BackupRestoreUpload,
   Conversation,
   ConversationKnowledge,
   DiscoveredProviderModel,
@@ -824,6 +829,66 @@ export const api = {
   adminRetentionScrubRun: (id: string) =>
     request<RetentionScrubRun>(`/admin/retention/scrub-runs/${encodeURIComponent(id)}`),
   adminRetentionScrubRuns: () => request<RetentionScrubRunPage>("/admin/retention/scrub-runs"),
+  adminBackups: () => request<BackupExportPage>("/admin/backups"),
+  createAdminBackupExport: (idempotencyKey: string) =>
+    request<BackupExport>("/admin/backups/exports", {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+      body: JSON.stringify({ includeDiagnostics: false }),
+    }),
+  adminBackupContentUrl: (id: string) => `/api/admin/backups/${encodeURIComponent(id)}/content`,
+  uploadAdminBackupRestore: (
+    file: File,
+    idempotencyKey: string,
+    onProgress?: (percent: number) => void,
+    signal?: AbortSignal,
+  ): Promise<BackupRestoreUpload> =>
+    new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      const form = new FormData();
+      form.append("file", file);
+      xhr.open("POST", "/api/admin/backups/restore-uploads");
+      xhr.withCredentials = true;
+      xhr.setRequestHeader("Idempotency-Key", idempotencyKey);
+      const abort = () => xhr.abort();
+      const cleanup = () => signal?.removeEventListener("abort", abort);
+      if (signal?.aborted) {
+        reject(signal.reason ?? new DOMException("Upload cancelled", "AbortError"));
+        return;
+      }
+      signal?.addEventListener("abort", abort, { once: true });
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) onProgress?.(Math.round(event.loaded / event.total * 100));
+      };
+      xhr.onerror = () => {
+        cleanup();
+        reject(uploadError(xhr));
+      };
+      xhr.onabort = () => {
+        cleanup();
+        reject(new DOMException("Upload cancelled", "AbortError"));
+      };
+      xhr.onload = () => {
+        cleanup();
+        if (xhr.status < 200 || xhr.status >= 300) return reject(uploadError(xhr));
+        try {
+          resolve(JSON.parse(xhr.responseText) as BackupRestoreUpload);
+        } catch {
+          reject(new Error("The server returned an invalid upload response."));
+        }
+      };
+      xhr.send(form);
+    }),
+  previewAdminBackupRestore: (id: string) =>
+    request<BackupRestorePreview>(
+      `/admin/backups/restores/${encodeURIComponent(id)}/dry-run`,
+      { method: "POST" },
+    ),
+  applyAdminBackupRestore: (id: string, fingerprint: string) =>
+    request<BackupRestoreResult>(`/admin/backups/restores/${encodeURIComponent(id)}/apply`, {
+      method: "POST",
+      body: JSON.stringify({ fingerprint }),
+    }),
   adminAudit: (filters: AuditFilters = {}, cursor?: string, limit = 50) =>
     request<{ data: AuditEvent[]; nextCursor: string | null }>(
       `/admin/audit?${auditQuery(filters, cursor, limit)}`,

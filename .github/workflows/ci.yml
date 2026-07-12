@@ -11,6 +11,7 @@ permissions:
 
 env:
   S3_ACCESS_KEY: ci-dgchat
+  BACKUP_SIGNING_KEY: Y2ktYmFja3VwLXNpZ25pbmcta2V5LTMyLWJ5dGVzISE=
   S3_SECRET_KEY: ci-dgchat-application-secret
   SEARXNG_SECRET: ci-searxng-secret-at-least-thirty-two-bytes
 
@@ -87,11 +88,107 @@ jobs:
         run: deno task db:migrate
       - name: Run database integration, concurrency, and backfill tests
         run: |
-          deno test packages/database --allow-env --allow-net --allow-read --allow-write
+          deno test packages/database \
+            --ignore=packages/database/src/backup_restore_migration_test.ts \
+            --ignore=packages/database/src/backup_postgres_test.ts \
+            --ignore=packages/database/src/backup_data_postgres_test.ts \
+            --allow-env --allow-net --allow-read --allow-write
+          deno test packages/database/src/backup_restore_migration_test.ts \
+            --allow-env --allow-net --allow-read --allow-write
+          deno test packages/database/src/backup_postgres_test.ts \
+            --allow-env --allow-net --allow-read --allow-write
+          deno test packages/database/src/backup_data_postgres_test.ts \
+            --allow-env --allow-net --allow-read --allow-write
           deno test apps/api/src/better_auth_postgres_test.ts --allow-env --allow-net --allow-read --allow-write
           deno test apps/api/src/knowledge_context_postgres_test.ts --allow-env --allow-net --allow-read --allow-write
           deno test apps/api/src/tool-execution_postgres_test.ts --allow-env --allow-net --allow-read --allow-write
           deno test --unstable-worker-options apps/worker --allow-env --allow-net --allow-read --allow-write --allow-run
+
+  backup-stack-integration:
+    name: PostgreSQL and S3 backup roundtrip
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: dgchat
+          POSTGRES_PASSWORD: backup-integration-password
+          POSTGRES_DB: dgchat_backup_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U dgchat -d dgchat_backup_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql://dgchat:backup-integration-password@localhost:5432/dgchat_backup_test
+      TEST_DATABASE_URL: postgresql://dgchat:backup-integration-password@localhost:5432/dgchat_backup_test
+      TEST_S3_ENDPOINT: http://127.0.0.1:9000
+      TEST_S3_REGION: us-east-1
+      TEST_S3_BUCKET: dg-chat-backup-test
+      TEST_S3_ACCESS_KEY: backup-integration-user
+      TEST_S3_SECRET_KEY: backup-integration-password-123
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+          cache: true
+      - name: Install dependencies
+        run: deno install --frozen
+      - name: Start isolated MinIO
+        run: |
+          docker run --detach --name backup-integration-minio \
+            --publish 9000:9000 \
+            --env MINIO_ROOT_USER="$TEST_S3_ACCESS_KEY" \
+            --env MINIO_ROOT_PASSWORD="$TEST_S3_SECRET_KEY" \
+            minio/minio:RELEASE.2025-04-22T22-12-26Z server /data
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/live >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs backup-integration-minio
+          exit 1
+      - name: Create isolated test bucket
+        run: |
+          deno eval '
+            import { CreateBucketCommand, S3Client } from "@aws-sdk/client-s3";
+            const client = new S3Client({
+              endpoint: Deno.env.get("TEST_S3_ENDPOINT"),
+              region: Deno.env.get("TEST_S3_REGION"),
+              forcePathStyle: true,
+              credentials: {
+                accessKeyId: Deno.env.get("TEST_S3_ACCESS_KEY"),
+                secretAccessKey: Deno.env.get("TEST_S3_SECRET_KEY"),
+              },
+            });
+            await client.send(new CreateBucketCommand({ Bucket: Deno.env.get("TEST_S3_BUCKET") }));
+            client.destroy();
+          '
+      - name: Apply migrations
+        run: deno task db:migrate
+      - name: Run production backup stack roundtrip
+        run: >-
+          deno test apps/api/src/backup_stack_postgres_s3_test.ts
+          --allow-env --allow-net --allow-read --allow-write --allow-sys
+      - name: Capture MinIO logs
+        if: failure()
+        run: docker logs backup-integration-minio > backup-integration-minio.log 2>&1 || true
+      - name: Upload MinIO logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backup-integration-minio-log
+          path: backup-integration-minio.log
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Stop isolated MinIO
+        if: always()
+        run: docker rm --force backup-integration-minio >/dev/null 2>&1 || true
 
   containers:
     name: Container build

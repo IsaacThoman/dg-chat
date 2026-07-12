@@ -3,9 +3,11 @@ import {
   backfillLegacyRuntimeSnapshot,
   MemoryRepository,
   objectStoreFromEnv,
+  PostgresBackupStore,
   PostgresRepository,
   PostgresToolExecutionStore,
   reconcileBetterAuthIdentities,
+  verifyBackupDataCatalog,
 } from "@dg-chat/database";
 import { MemoryRateLimiter, RedisRateLimiter } from "./rate-limit.ts";
 import { ProviderSecretKeyring } from "./provider-secrets.ts";
@@ -17,6 +19,9 @@ import {
 } from "./audio-concurrency.ts";
 import { createBetterAuthService } from "./better-auth.ts";
 import { smtpIdentityMailer } from "./mail.ts";
+import { backupRuntimeConfig } from "./backup-config.ts";
+import { DefaultBackupAdminService } from "./backup-service.ts";
+import { createPostgresBackupDataPort } from "./postgres-backup-data.ts";
 
 const port = Number(Deno.env.get("PORT") ?? 8000);
 const providerKeyring = ProviderSecretKeyring.fromEnv();
@@ -28,6 +33,38 @@ if (Deno.env.get("DENO_ENV") === "production" && !providerKeyring) {
 const databaseUrl = Deno.env.get("DATABASE_URL");
 const production = Deno.env.get("DENO_ENV") === "production";
 if (production && !databaseUrl) throw new Error("Production requires DATABASE_URL");
+const objectStore = objectStoreFromEnv();
+const backupConfig = await backupRuntimeConfig(Deno.env.toObject(), {
+  dependenciesAvailable: Boolean(databaseUrl && objectStore),
+  production,
+});
+if (backupConfig.enabled && databaseUrl) await verifyBackupDataCatalog(databaseUrl);
+const backupAdmin = backupConfig.enabled && databaseUrl && objectStore && backupConfig.authenticator
+  ? new DefaultBackupAdminService({
+    store: await PostgresBackupStore.connect(databaseUrl),
+    objects: objectStore,
+    data: createPostgresBackupDataPort({
+      databaseUrl,
+      objects: objectStore,
+      authenticator: backupConfig.authenticator,
+      appVersion: "0.1.0",
+    }),
+    authenticator: backupConfig.authenticator,
+    restoreEnabled: backupConfig.restoreEnabled,
+    maxUploadBytes: backupConfig.maxUploadBytes,
+  })
+  : undefined;
+if (backupAdmin) {
+  try {
+    // This must precede identity reconciliation, stale-run reaping, tool recovery, and request
+    // acceptance. Separately deployed worker mutations are fenced by PostgreSQL during restore.
+    await backupAdmin.recoverPending();
+  } catch (error) {
+    await backupAdmin.close();
+    await objectStore?.close();
+    throw new Error("Backup recovery failed during startup", { cause: error });
+  }
+}
 if (databaseUrl) {
   const backfill = await backfillLegacyRuntimeSnapshot(databaseUrl);
   if (backfill.status === "imported") {
@@ -71,7 +108,6 @@ const audioConcurrencyLimiter = Deno.env.get("REDIS_URL")
     leaseMs: audioConcurrencyLeaseMs,
   })
   : new MemoryAudioConcurrencyLimiter({ leaseMs: audioConcurrencyLeaseMs });
-const objectStore = objectStoreFromEnv();
 const requireEmailVerification = Deno.env.get("REQUIRE_EMAIL_VERIFICATION") === "true";
 const mailer = Deno.env.get("SMTP_URL")
   ? smtpIdentityMailer(
@@ -149,6 +185,7 @@ const { app, toolExecutionService } = createApp({
   browserAuth,
   mailer,
   requireEmailVerification,
+  backupAdmin,
 });
 await toolExecutionService.recover();
 const replayMaintenance = setInterval(async () => {
@@ -186,6 +223,7 @@ const shutdown = async (signal: string) => {
   clearInterval(replayMaintenance);
   console.log(JSON.stringify({ level: "info", message: "API shutting down", signal }));
   await server.shutdown();
+  await backupAdmin?.close();
   await Promise.all([
     repository.close(),
     toolExecutionStore?.close(),
