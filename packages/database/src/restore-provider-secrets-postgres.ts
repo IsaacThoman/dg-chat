@@ -477,21 +477,13 @@ export class PostgresRestoreProviderSecretsStore {
     expectedVersion: number,
     actorId: string,
     expectedProviderStateSha256: string,
-    credentials: readonly RestoredProviderCredential[],
+    credentials:
+      | Iterable<RestoredProviderCredential>
+      | AsyncIterable<RestoredProviderCredential>,
   ) {
     positiveVersion(expectedVersion);
     if (!UUID.test(id) || !UUID.test(actorId) || !SHA256.test(expectedProviderStateSha256)) {
       throw new RestoreProviderSecretsStoreError("invalid", "Sidecar apply request is invalid");
-    }
-    const seen = new Set<string>();
-    for (const credential of credentials) {
-      const normalizedProviderId = credential.providerId.toLowerCase();
-      if (
-        !UUID.test(credential.providerId) || !Number.isSafeInteger(credential.expectedVersion) ||
-        credential.expectedVersion < 1 || seen.has(normalizedProviderId)
-      ) throw new RestoreProviderSecretsStoreError("invalid", "Provider restore set is invalid");
-      seen.add(normalizedProviderId);
-      assertEnvelope(credential.envelope, credential.expectedVersion + 1);
     }
     return await this.#sql.begin("isolation level serializable", async (tx) => {
       await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-backup-restore'))`;
@@ -508,27 +500,32 @@ export class PostgresRestoreProviderSecretsStore {
         attachment.provider_state_sha256 !== expectedProviderStateSha256 ||
         attachment.restore_kind !== "restore" || attachment.restore_status !== "completed" ||
         attachment.restore_sha256 !== attachment.base_archive_sha256 ||
-        Number(attachment.record_count) !== credentials.length ||
         attachment.maintenance_enabled !== false || attachment.active_restore_id != null ||
         Number(attachment.restore_epoch) !== Number(attachment.base_restore_epoch)
       ) throw new RestoreProviderSecretsStoreError("conflict", "Sidecar apply is stale");
-      const ordered = [...credentials].sort((a, b) =>
-        a.providerId.toLowerCase().localeCompare(b.providerId.toLowerCase())
-      );
       const persistedPlan = providerPlan(attachment.provider_plan);
-      if (
-        persistedPlan.length !== ordered.length ||
-        persistedPlan.some((entry, index) =>
-          entry.providerId !== ordered[index].providerId.toLowerCase() ||
-          entry.expectedVersion !== ordered[index].expectedVersion
-        )
-      ) {
+      if (Number(attachment.record_count) !== persistedPlan.length) {
         throw new RestoreProviderSecretsStoreError(
           "conflict",
-          "Provider restore plan changed after preview",
+          "Stored provider restore plan is invalid",
         );
       }
-      for (const credential of ordered) {
+      let credentialCount = 0;
+      for await (const credential of credentials) {
+        const expected = persistedPlan[credentialCount];
+        const normalizedProviderId = credential.providerId.toLowerCase();
+        if (
+          !expected || !UUID.test(credential.providerId) ||
+          !Number.isSafeInteger(credential.expectedVersion) || credential.expectedVersion < 1 ||
+          expected.providerId !== normalizedProviderId ||
+          expected.expectedVersion !== credential.expectedVersion
+        ) {
+          throw new RestoreProviderSecretsStoreError(
+            "conflict",
+            "Provider restore plan changed after preview",
+          );
+        }
+        assertEnvelope(credential.envelope, credential.expectedVersion + 1);
         const [provider] = await tx<Row[]>`
           SELECT version,enabled,credential_envelope FROM providers
           WHERE id=${credential.providerId} FOR UPDATE`;
@@ -555,13 +552,20 @@ export class PostgresRestoreProviderSecretsStore {
             "A restored provider changed after preview",
           );
         }
+        credentialCount++;
+      }
+      if (credentialCount !== persistedPlan.length) {
+        throw new RestoreProviderSecretsStoreError(
+          "conflict",
+          "Provider restore plan changed after preview",
+        );
       }
       await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
         VALUES(${actorId},'backup.provider_secrets_restored','backup_operation',
           ${String(attachment.restore_operation_id)},${
         tx.json({
           sidecarId: id,
-          providerCount: credentials.length,
+          providerCount: credentialCount,
           providersRemainDisabled: true,
         })
       })`;

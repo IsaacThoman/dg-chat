@@ -112,7 +112,9 @@ Deno.test({
         validated.version,
         actor,
         validated.providerStateSha256!,
-        [{ providerId, expectedVersion: 4, envelope: envelope(5) }],
+        (async function* () {
+          yield { providerId, expectedVersion: 4, envelope: envelope(5) };
+        })(),
       );
       assertEquals(applied.status, "applied");
       const [provider] = await sql<{
