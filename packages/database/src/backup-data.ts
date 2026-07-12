@@ -1251,9 +1251,10 @@ async function applyBackupData(
           );
         }
         restoreControl = maintenance;
-        // This is transaction-local and is set only after this restore proved ownership while
-        // holding the global advisory lock. It cannot leak into a pooled connection.
-        await tx`SELECT set_config('dg_chat.restore_bypass','on',true)`;
+        // Bind the transaction-local bypass to the durable operation identity. The trigger also
+        // verifies this backend owns the exact transaction advisory lock and that the operation
+        // still owns active maintenance; the caller-controlled setting is not trusted by itself.
+        await tx`SELECT set_config('dg_chat.restore_bypass',${options.restoreOperationId!},true)`;
       }
       const suffix = crypto.randomUUID().replaceAll("-", "").slice(0, 12);
       const { stage, counts } = await stageSource(

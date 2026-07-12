@@ -36,6 +36,7 @@ const MAX_LINE_BYTES = 8 * 1024 * 1024;
 const OBJECT_INDEX = "objects/index.ndjson";
 const TABLE_PREFIX = "tables/";
 const SHA256 = /^[0-9a-f]{64}$/u;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
 type DatabaseAdapter = {
   verifyCatalog?(databaseUrl: string): Promise<void>;
@@ -167,7 +168,9 @@ async function spoolObject(
   root: string,
   objects: ObjectStore,
   reference: ObjectReference,
+  signal?: AbortSignal,
 ): Promise<{ payload: TempPayload; created: boolean }> {
+  signal?.throwIfAborted();
   const entryName = `objects/${reference.sha256}`;
   const path = `${root}/object-${reference.sha256}`;
   try {
@@ -183,8 +186,13 @@ async function spoolObject(
   } catch (error) {
     if (!(error instanceof Deno.errors.NotFound)) throw error;
   }
+  signal?.throwIfAborted();
   const stored = await objects.get(reference.objectKey);
   if (!stored) throw new TypeError("A referenced attachment object is missing");
+  if (signal?.aborted) {
+    await stored.body.cancel(signal.reason).catch(() => undefined);
+    signal.throwIfAborted();
+  }
   if (stored.contentLength !== null && stored.contentLength !== reference.bytes) {
     await stored.body.cancel().catch(() => undefined);
     throw new TypeError("A referenced attachment object has the wrong size");
@@ -192,9 +200,13 @@ async function spoolObject(
   const writer = new HashedFileWriter(path);
   try {
     const reader = stored.body.getReader();
+    const cancelOnAbort = () => void reader.cancel(signal?.reason).catch(() => undefined);
+    signal?.addEventListener("abort", cancelOnAbort, { once: true });
     try {
       while (true) {
+        signal?.throwIfAborted();
         const next = await reader.read();
+        signal?.throwIfAborted();
         if (next.done) break;
         if (writer.bytes + next.value.length > reference.bytes) {
           throw new TypeError("A referenced attachment object exceeds its declared size");
@@ -202,6 +214,7 @@ async function spoolObject(
         await writer.chunk(next.value);
       }
     } finally {
+      signal?.removeEventListener("abort", cancelOnAbort);
       await reader.cancel().catch(() => undefined);
       reader.releaseLock();
     }
@@ -287,10 +300,14 @@ export function createPostgresBackupDataPort(options: PostgresBackupDataOptions)
   const appVersion = options.appVersion ?? "0.1.0";
   return {
     async exportSnapshot(input): Promise<BackupExportSnapshot> {
+      input.signal?.throwIfAborted();
       await database.verifyCatalog?.(options.databaseUrl);
+      input.signal?.throwIfAborted();
       const root = await Deno.makeTempDir({ prefix: "dg-backup-data-" });
       try {
+        input.signal?.throwIfAborted();
         const relational = await database.snapshot(options.databaseUrl, async (source) => {
+          input.signal?.throwIfAborted();
           if (source.installationId !== input.installationId) {
             throw new TypeError("Backup installation changed during export");
           }
@@ -306,12 +323,15 @@ export function createPostgresBackupDataPort(options: PostgresBackupDataOptions)
           const references = new HashedFileWriter(referencesPath);
           try {
             for (const table of source.tables) {
+              input.signal?.throwIfAborted();
               const name = `${TABLE_PREFIX}${table.name}.ndjson`;
               const path = `${root}/table-${table.name}.ndjson`;
               const writer = new HashedFileWriter(path);
               try {
                 for await (const batch of source.rows(table.name)) {
+                  input.signal?.throwIfAborted();
                   for (const row of batch) {
+                    input.signal?.throwIfAborted();
                     await writer.line(row);
                     if (table.name === "attachments") {
                       const reference = attachmentReference(row);
@@ -336,6 +356,7 @@ export function createPostgresBackupDataPort(options: PostgresBackupDataOptions)
           } finally {
             references.finish();
           }
+          input.signal?.throwIfAborted();
           return {
             payloads,
             entries,
@@ -344,6 +365,7 @@ export function createPostgresBackupDataPort(options: PostgresBackupDataOptions)
             installationId: source.installationId,
           };
         }, { diagnosticPolicy: input.includeDiagnostics ? "included" : "excluded" });
+        input.signal?.throwIfAborted();
 
         // Attachment objects are immutable. Fetch them only after releasing the repeatable-read
         // database snapshot so slow multi-gigabyte object storage cannot hold back PostgreSQL VACUUM.
@@ -353,8 +375,15 @@ export function createPostgresBackupDataPort(options: PostgresBackupDataOptions)
         let objectBytes = 0;
         try {
           for await (const raw of ndjson(relational.referencesPath)) {
+            input.signal?.throwIfAborted();
             const reference = exactObjectReference(raw);
-            const { payload, created } = await spoolObject(root, options.objects, reference);
+            const { payload, created } = await spoolObject(
+              root,
+              options.objects,
+              reference,
+              input.signal,
+            );
+            input.signal?.throwIfAborted();
             if (created) {
               if (relational.entries.length >= MAX_ENTRIES - 1) {
                 throw new TypeError("Backup has too many entries");
@@ -368,6 +397,7 @@ export function createPostgresBackupDataPort(options: PostgresBackupDataOptions)
               { ...reference, entry: payload.entry.name } satisfies ObjectIndexRecord,
             );
           }
+          input.signal?.throwIfAborted();
           const indexDigest = objectIndex.finish();
           const indexEntry: BackupManifestEntryV1 = {
             name: OBJECT_INDEX,
@@ -378,6 +408,7 @@ export function createPostgresBackupDataPort(options: PostgresBackupDataOptions)
           };
           relational.entries.push(indexEntry);
           relational.payloads.set(OBJECT_INDEX, filePayload(objectIndexPath));
+          input.signal?.throwIfAborted();
           const manifest = await signBackupManifest({
             format: "dg-chat-backup",
             version: 1,
@@ -394,6 +425,7 @@ export function createPostgresBackupDataPort(options: PostgresBackupDataOptions)
             contentRootSha256: await backupContentRoot(relational.entries),
             entries: relational.entries,
           }, options.authenticator);
+          input.signal?.throwIfAborted();
           return {
             manifest,
             payloads: relational.payloads,
@@ -411,14 +443,20 @@ export function createPostgresBackupDataPort(options: PostgresBackupDataOptions)
       }
     },
 
-    async restoreSession(mode): Promise<BackupRestoreSession> {
+    async restoreSession(mode, sessionContext): Promise<BackupRestoreSession> {
+      if (!UUID.test(sessionContext.restoreOperationId)) {
+        throw new TypeError("Restore operation ID is invalid");
+      }
       await database.verifyCatalog?.(options.databaseUrl);
       const root = await Deno.makeTempDir({ prefix: "dg-restore-data-" });
       const paths = new Map<string, string>();
       const entryMetadata = new Map<string, BackupManifestEntryV1>();
       const active = new Map<string, Deno.FsFile>();
       const stagedKeys: string[] = [];
-      const restoreNamespace = crypto.randomUUID();
+      const stagedKeySet = new Set<string>();
+      // The durable operation UUID is a collision-resistant namespace and lets crash recovery
+      // derive exact keys from the signed archive without requiring unsafe object-store listing.
+      const restoreNamespace = sessionContext.restoreOperationId.toLowerCase();
       let retained = false;
       let closed = false;
       let diagnosticsExcluded = false;
@@ -433,6 +471,7 @@ export function createPostgresBackupDataPort(options: PostgresBackupDataOptions)
         if (removeObjects && !retained) {
           for (const key of stagedKeys) await options.objects.delete(key).catch(() => undefined);
           stagedKeys.length = 0;
+          stagedKeySet.clear();
         }
         await Deno.remove(root, { recursive: true }).catch(() => undefined);
         closed = true;
@@ -549,6 +588,7 @@ export function createPostgresBackupDataPort(options: PostgresBackupDataOptions)
         }
         const uniqueObjects = new Map<string, number>();
         const referencedEntries = new Set<string>();
+        const cleanedEntries = new Set<string>();
         let records = 0;
         for await (const raw of ndjson(indexPath)) {
           records += 1;
@@ -600,7 +640,6 @@ export function createPostgresBackupDataPort(options: PostgresBackupDataOptions)
                 contentType: reference.contentType,
                 metadata: { sha256: reference.sha256 },
               });
-              stagedKeys.push(key);
             } catch (error) {
               if (!(error instanceof ObjectAlreadyExistsError)) throw error;
               const existing = await options.objects.get(key);
@@ -610,6 +649,27 @@ export function createPostgresBackupDataPort(options: PostgresBackupDataOptions)
               ) throw new TypeError("Staged backup object conflicts with existing content");
               await existing.body.cancel().catch(() => undefined);
             }
+            // Track both newly written and previously staged objects. A retry after a pre-commit
+            // crash still owns this deterministic namespace and must be able to remove it exactly.
+            // Conversely, commit ambiguity is resolved by the service before it calls rollback.
+            if (!stagedKeySet.has(key)) {
+              stagedKeySet.add(key);
+              stagedKeys.push(key);
+            }
+          } else if (mode === "cleanup" && !cleanedEntries.has(reference.sha256)) {
+            const existing = await options.objects.get(key);
+            if (existing) {
+              if (
+                existing.contentLength !== reference.bytes ||
+                existing.metadata.sha256 !== reference.sha256
+              ) {
+                await existing.body.cancel().catch(() => undefined);
+                throw new TypeError("Staged backup object conflicts with signed archive metadata");
+              }
+              await existing.body.cancel().catch(() => undefined);
+              await options.objects.delete(key);
+            }
+            cleanedEntries.add(reference.sha256);
           }
           const previous = map.get(reference.objectKey);
           if (previous && previous !== key) throw new TypeError("Backup object key is duplicated");
@@ -649,7 +709,18 @@ export function createPostgresBackupDataPort(options: PostgresBackupDataOptions)
       return {
         sink,
         summarize,
+        async cleanup(manifest) {
+          if (mode !== "cleanup") throw new TypeError("Restore session is not a cleanup session");
+          try {
+            await stageObjects(manifest);
+          } finally {
+            await cleanup(false);
+          }
+        },
         async commit(manifest, context) {
+          if (context.restoreOperationId.toLowerCase() !== restoreNamespace) {
+            throw new TypeError("Restore operation ID changed during staging");
+          }
           try {
             const objectKeyMap = await stageObjects(manifest);
             const impact = await database.restore(options.databaseUrl, source(), {
@@ -666,7 +737,12 @@ export function createPostgresBackupDataPort(options: PostgresBackupDataOptions)
               installationVersion: impact.installationVersion,
             };
           } finally {
-            await cleanup(!retained);
+            // Once the database transaction has been attempted, a thrown driver response does not
+            // prove rollback: PostgreSQL may have committed and advanced the durable operation to
+            // `database_restored`. Remove only local temp files here. The service owns outcome
+            // disambiguation and calls rollback only after it has durably confirmed pre-commit
+            // failure; otherwise staged attachment objects remain available for recovery.
+            await cleanup(false);
           }
         },
         rollback: () => cleanup(true),

@@ -10,7 +10,13 @@ import {
   Upload,
 } from "lucide-react";
 import { api, ApiError } from "./api.ts";
-import type { BackupExport, BackupRestorePreview, BackupRestoreUpload } from "./types.ts";
+import type {
+  BackupExport,
+  BackupRestorePreview,
+  BackupRestoreStatus,
+  BackupRestoreStatusCapability,
+  BackupRestoreUpload,
+} from "./types.ts";
 
 const message = (error: unknown) => error instanceof Error ? error.message : "The request failed.";
 const size = (bytes: number | null) =>
@@ -55,6 +61,156 @@ export async function applyValidatedBackupRestore(
   await applyRestore(preview.restoreId, preview.fingerprint);
   onReauthenticate();
   return true;
+}
+
+export interface MonitorBackupRestoreOptions {
+  restoreId: string;
+  fingerprint: string;
+  capability: BackupRestoreStatusCapability;
+  signal: AbortSignal;
+  apply(signal: AbortSignal): Promise<unknown>;
+  status(signal: AbortSignal): Promise<BackupRestoreStatus>;
+  onStatus(status: BackupRestoreStatus | "transport-ambiguous"): void;
+  pollIntervalMs?: number;
+  now?: () => number;
+}
+
+const abortError = () => new DOMException("Restore monitoring was cancelled", "AbortError");
+
+/**
+ * Dispatches a restore and independently monitors its signed, session-free status capability.
+ * Once dispatch starts, a transport error is ambiguous: only a terminal durable status may tell
+ * the operator whether the transaction committed. Structured API responses remain authoritative
+ * pre-commit failures and are returned immediately.
+ */
+export async function monitorBackupRestore(
+  options: MonitorBackupRestoreOptions,
+): Promise<"completed" | "failed"> {
+  const now = options.now ?? Date.now;
+  const expiresAt = Date.parse(options.capability.expiresAt);
+  if (!Number.isFinite(expiresAt) || expiresAt <= now()) {
+    throw new Error("Restore status authorization expired. Dry-run the backup and try again.");
+  }
+  const applyController = new AbortController();
+  const pollController = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let settled = false;
+  let resolveTerminal!: (outcome: "completed" | "failed") => void;
+  let rejectTerminal!: (error: unknown) => void;
+  const terminal = new Promise<"completed" | "failed">((resolve, reject) => {
+    resolveTerminal = resolve;
+    rejectTerminal = reject;
+  });
+  const finish = (outcome: "completed" | "failed") => {
+    if (settled) return;
+    settled = true;
+    resolveTerminal(outcome);
+  };
+  const fail = (error: unknown) => {
+    if (settled) return;
+    settled = true;
+    rejectTerminal(error);
+  };
+  const cancel = () => {
+    applyController.abort(abortError());
+    pollController.abort(abortError());
+    fail(abortError());
+  };
+  options.signal.addEventListener("abort", cancel, { once: true });
+  if (options.signal.aborted) cancel();
+  const expiryTimer = setTimeout(() => {
+    fail(
+      new Error(
+        "Restore status authorization expired before a terminal result was confirmed. Check server logs before retrying.",
+      ),
+    );
+    applyController.abort(abortError());
+    pollController.abort(abortError());
+  }, Math.max(0, Math.min(2_147_483_647, expiresAt - now())));
+
+  const wait = (milliseconds: number) =>
+    new Promise<void>((resolve, reject) => {
+      if (pollController.signal.aborted) return reject(abortError());
+      const onAbort = () => {
+        if (timer !== undefined) clearTimeout(timer);
+        reject(abortError());
+      };
+      timer = setTimeout(() => {
+        pollController.signal.removeEventListener("abort", onAbort);
+        resolve();
+      }, milliseconds);
+      pollController.signal.addEventListener("abort", onAbort, { once: true });
+    });
+
+  void (async () => {
+    try {
+      await options.apply(applyController.signal);
+      finish("completed");
+    } catch (error) {
+      if (applyController.signal.aborted || settled) return;
+      // These responses are emitted before restore execution begins. Conflict and server errors
+      // can instead represent an unknown commit/finalization outcome and must be disambiguated.
+      if (
+        error instanceof ApiError &&
+        [400, 401, 403, 404, 422, 429].includes(error.status)
+      ) {
+        fail(error);
+        return;
+      }
+      // Fetch/network failure after dispatch cannot establish whether PostgreSQL committed.
+      options.onStatus("transport-ambiguous");
+    }
+  })();
+
+  void (async () => {
+    const interval = Math.max(0, options.pollIntervalMs ?? 2_000);
+    try {
+      while (!settled && !pollController.signal.aborted) {
+        const remaining = expiresAt - now();
+        if (remaining <= 0) {
+          fail(
+            new Error(
+              "Restore status authorization expired before a terminal result was confirmed. Check server logs before retrying.",
+            ),
+          );
+          return;
+        }
+        await wait(Math.min(interval, remaining));
+        if (settled || pollController.signal.aborted) return;
+        try {
+          const status = await options.status(pollController.signal);
+          if (settled || pollController.signal.aborted) return;
+          options.onStatus(status);
+          if (status.status === "completed" || status.status === "failed") {
+            finish(status.status);
+          }
+        } catch (error) {
+          if (pollController.signal.aborted || settled) return;
+          if (error instanceof ApiError && error.status === 404) {
+            fail(
+              new Error(
+                "Restore status authorization expired before a terminal result was confirmed. Check server logs before retrying.",
+              ),
+            );
+          }
+          // Transient status transport failures retry until the signed capability expires.
+        }
+      }
+    } catch (error) {
+      if (!settled) fail(error);
+    }
+  })();
+
+  try {
+    return await terminal;
+  } finally {
+    settled = true;
+    if (timer !== undefined) clearTimeout(timer);
+    clearTimeout(expiryTimer);
+    applyController.abort(abortError());
+    pollController.abort(abortError());
+    options.signal.removeEventListener("abort", cancel);
+  }
 }
 
 export function AdminBackupsView() {
@@ -112,6 +268,7 @@ export function AdminBackups(props: AdminBackupsProps) {
   const restoreHeading = useRef<HTMLHeadingElement>(null);
   const uploadAttempt = useRef<BackupUploadAttempt | undefined>(undefined);
   const uploadController = useRef<AbortController | undefined>(undefined);
+  const restoreController = useRef<AbortController | undefined>(undefined);
   const operationEpoch = useRef(0);
   const mounted = useRef(true);
   const [dragging, setDragging] = useState(false);
@@ -127,6 +284,7 @@ export function AdminBackups(props: AdminBackupsProps) {
   const [applyError, setApplyError] = useState<string>();
   const [reauthRequired, setReauthRequired] = useState(false);
   const [completed, setCompleted] = useState(false);
+  const [restoreStage, setRestoreStage] = useState<string>();
   const [announcement, setAnnouncement] = useState("");
 
   useEffect(() => {
@@ -137,6 +295,7 @@ export function AdminBackups(props: AdminBackupsProps) {
     return () => {
       mounted.current = false;
       uploadController.current?.abort();
+      restoreController.current?.abort();
     };
   }, []);
 
@@ -217,22 +376,48 @@ export function AdminBackups(props: AdminBackupsProps) {
     event.preventDefault();
     if (!preview || confirmation !== preview.fingerprint || preview.blockingErrors.length) return;
     setApplying(true);
+    setRestoreStage("Authorizing restore status…");
     setApplyError(undefined);
+    restoreController.current?.abort();
+    const controller = new AbortController();
+    restoreController.current = controller;
     try {
-      await applyValidatedBackupRestore(
-        preview,
-        confirmation,
-        props.restoreEnabled === true,
-        api.applyAdminBackupRestore,
-        () => {
-          setCompleted(true);
-          setAnnouncement(
-            "Restore completed. All sessions were invalidated; redirecting to sign in.",
+      const capability = await api.issueAdminBackupRestoreStatusCapability(preview.restoreId);
+      const outcome = await monitorBackupRestore({
+        restoreId: preview.restoreId,
+        fingerprint: preview.fingerprint,
+        capability,
+        signal: controller.signal,
+        apply: (signal) =>
+          api.applyAdminBackupRestore(preview.restoreId, preview.fingerprint, signal),
+        status: (signal) =>
+          api.adminBackupRestoreStatus(preview.restoreId, capability.token, signal),
+        onStatus: (status) => {
+          if (!mounted.current) return;
+          setRestoreStage(
+            status === "transport-ambiguous"
+              ? "Restore response was inconclusive; verifying the durable result…"
+              : status.status === "running"
+              ? `Restore in progress: ${status.stage.replaceAll("_", " ")}`
+              : status.status === "validated"
+              ? "Restore is waiting to start"
+              : status.status === "completed"
+              ? "Restore committed successfully"
+              : `Restore failed${status.error ? `: ${status.error}` : ""}`,
           );
-          globalThis.setTimeout(() => props.onReauthenticate?.(), 900);
         },
-      );
+      });
+      if (!mounted.current) return;
+      if (outcome === "failed") {
+        throw new Error("The restore failed. Check server logs before retrying.");
+      }
+      setCompleted(true);
+      setAnnouncement("Restore completed. All sessions were invalidated; redirecting to sign in.");
+      globalThis.setTimeout(() => props.onReauthenticate?.(), 900);
     } catch (error) {
+      if (!mounted.current || (error instanceof DOMException && error.name === "AbortError")) {
+        return;
+      }
       if (isRecentAuthenticationRequired(error)) {
         // Do not retain typed confirmation material or the validated archive fingerprint while
         // handing control to sign-in. The administrator must dry-run again after authenticating.
@@ -247,7 +432,9 @@ export function AdminBackups(props: AdminBackupsProps) {
         setApplyError(message(error));
       }
     } finally {
-      setApplying(false);
+      controller.abort();
+      if (restoreController.current === controller) restoreController.current = undefined;
+      if (mounted.current) setApplying(false);
     }
   };
   const drop = (event: DragEvent) => {
@@ -548,6 +735,7 @@ export function AdminBackups(props: AdminBackupsProps) {
               <button className="danger" disabled={blocked || applying}>
                 {applying ? "Restoring…" : "Apply transactional restore"}
               </button>
+              {applying && restoreStage && <p className="muted" role="status">{restoreStage}</p>}
             </div>
             {applyError && <p className="backup-alert" role="alert">{applyError}</p>}
             {completed && (

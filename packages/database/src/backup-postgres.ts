@@ -34,6 +34,11 @@ export interface BackupOperation {
   bytesProcessed: number;
   bytesTotal: number;
   error: string | null;
+  exportLeaseToken: string | null;
+  exportLeaseExpiresAt: string | null;
+  artifactCleanupCheckedAt: string | null;
+  artifactCleanupLeaseToken: string | null;
+  artifactCleanupLeaseExpiresAt: string | null;
   createdAt: string;
   startedAt: string | null;
   validatedAt: string | null;
@@ -165,6 +170,13 @@ function mapOperation(row: Record<string, unknown>): BackupOperation {
     bytesProcessed: Number(row.bytes_processed),
     bytesTotal: Number(row.bytes_total),
     error: row.error == null ? null : String(row.error),
+    exportLeaseToken: row.export_lease_token == null ? null : String(row.export_lease_token),
+    exportLeaseExpiresAt: nullableIso(row.export_lease_expires_at),
+    artifactCleanupCheckedAt: nullableIso(row.artifact_cleanup_checked_at),
+    artifactCleanupLeaseToken: row.artifact_cleanup_lease_token == null
+      ? null
+      : String(row.artifact_cleanup_lease_token),
+    artifactCleanupLeaseExpiresAt: nullableIso(row.artifact_cleanup_lease_expires_at),
     createdAt: iso(row.created_at),
     startedAt: nullableIso(row.started_at),
     validatedAt: nullableIso(row.validated_at),
@@ -312,11 +324,249 @@ export class PostgresBackupStore {
     const [row] = await this.#sql<Record<string, unknown>[]>`
       UPDATE backup_operations SET status='running',stage='starting',started_at=now(),
         updated_at=now(),version=version+1
-      WHERE id=${id} AND status='queued' AND version=${expectedVersion}
+      WHERE id=${id} AND kind='restore' AND status='queued' AND version=${expectedVersion}
       RETURNING *
     `;
     if (!row) throw new BackupOperationError("conflict", "Backup operation claim is stale");
     return mapOperation(row);
+  }
+
+  /** Atomically claims one export installation-wide. Expired owners are terminalized first. */
+  async claimExport(
+    id: string,
+    expectedVersion: number,
+    leaseToken: string,
+    leaseSeconds: number,
+  ): Promise<BackupOperation> {
+    assertOperationId(id);
+    positiveVersion(expectedVersion);
+    if (
+      !UUID.test(leaseToken) || !Number.isSafeInteger(leaseSeconds) || leaseSeconds < 10 ||
+      leaseSeconds > 3600
+    ) {
+      throw new BackupOperationError("invalid", "Export lease is invalid");
+    }
+    return await this.#sql.begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-backup-export'))`;
+      await tx`UPDATE backup_operations SET status='failed',stage='failed',
+        error=${FAILURE_MESSAGES.operation_timed_out},completed_at=now(),updated_at=now(),
+        version=version+1,export_lease_token=NULL,export_lease_expires_at=NULL
+        WHERE kind='export' AND status='running' AND export_lease_expires_at<=now()`;
+      const active = await tx`SELECT 1 FROM backup_operations
+        WHERE kind='export' AND status='running' AND export_lease_expires_at>now() LIMIT 1`;
+      if (active.length) {
+        throw new BackupOperationError("conflict", "Another export owns the installation lease");
+      }
+      const [row] = await tx<Record<string, unknown>[]>`
+        UPDATE backup_operations SET status='running',stage='starting',started_at=now(),
+          updated_at=now(),version=version+1,export_lease_token=${leaseToken},
+          export_lease_expires_at=now()+(${leaseSeconds}::text || ' seconds')::interval
+        WHERE id=${id} AND kind='export' AND status='queued' AND version=${expectedVersion}
+        RETURNING *`;
+      if (!row) throw new BackupOperationError("conflict", "Backup export claim is stale");
+      return mapOperation(row);
+    });
+  }
+
+  /**
+   * Claims the oldest queued export in the same transaction that arbitrates the
+   * installation-wide lease. This is deliberately not built on `list()`: admin
+   * history pagination must never be able to hide durable work.
+   */
+  async claimNextQueuedExport(
+    leaseToken: string,
+    leaseSeconds: number,
+  ): Promise<BackupOperation | undefined> {
+    if (
+      !UUID.test(leaseToken) || !Number.isSafeInteger(leaseSeconds) || leaseSeconds < 10 ||
+      leaseSeconds > 3600
+    ) {
+      throw new BackupOperationError("invalid", "Export lease is invalid");
+    }
+    return await this.#sql.begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-backup-export'))`;
+      await tx`UPDATE backup_operations SET status='failed',stage='failed',
+        error=${FAILURE_MESSAGES.operation_timed_out},completed_at=now(),updated_at=now(),
+        version=version+1,export_lease_token=NULL,export_lease_expires_at=NULL
+        WHERE kind='export' AND status='running' AND export_lease_expires_at<=now()`;
+      const active = await tx`SELECT 1 FROM backup_operations
+        WHERE kind='export' AND status='running' AND export_lease_expires_at>now() LIMIT 1`;
+      if (active.length) return undefined;
+      const [row] = await tx<Record<string, unknown>[]>`
+        UPDATE backup_operations SET status='running',stage='starting',started_at=now(),
+          updated_at=now(),version=version+1,export_lease_token=${leaseToken},
+          export_lease_expires_at=now()+(${leaseSeconds}::text || ' seconds')::interval
+        WHERE id=(
+          SELECT id FROM backup_operations WHERE kind='export' AND status='queued'
+          ORDER BY created_at ASC,id ASC LIMIT 1 FOR UPDATE SKIP LOCKED
+        )
+        RETURNING *`;
+      return row ? mapOperation(row) : undefined;
+    });
+  }
+
+  /** Returns a bounded batch of durable restore work requiring startup recovery. */
+  async listRecoverableRestores(limit = 100): Promise<BackupOperation[]> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+      throw new BackupOperationError(
+        "invalid",
+        "Recoverable restore limit must be between 1 and 1000",
+      );
+    }
+    const rows = await this.#sql<Record<string, unknown>[]>`
+      SELECT * FROM backup_operations
+      WHERE kind='restore' AND status='running' AND stage<>'database_restored'
+      ORDER BY created_at ASC,id ASC LIMIT ${limit}`;
+    return rows.map(mapOperation);
+  }
+
+  async renewExportLease(id: string, leaseToken: string, leaseSeconds: number): Promise<void> {
+    assertOperationId(id);
+    if (
+      !UUID.test(leaseToken) || !Number.isSafeInteger(leaseSeconds) || leaseSeconds < 10 ||
+      leaseSeconds > 3600
+    ) {
+      throw new BackupOperationError("invalid", "Export lease is invalid");
+    }
+    const rows = await this.#sql`UPDATE backup_operations
+      SET export_lease_expires_at=now()+(${leaseSeconds}::text || ' seconds')::interval,
+        updated_at=now()
+      WHERE id=${id} AND kind='export' AND status='running'
+        AND export_lease_token=${leaseToken} AND export_lease_expires_at>now()
+      RETURNING id`;
+    if (!rows.length) throw new BackupOperationError("conflict", "Export lease was lost");
+  }
+
+  async expireExportLeases(): Promise<number> {
+    return await this.#sql.begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-backup-export'))`;
+      const rows = await tx`UPDATE backup_operations SET status='failed',stage='failed',
+        error=${FAILURE_MESSAGES.operation_timed_out},completed_at=now(),updated_at=now(),
+        version=version+1,export_lease_token=NULL,export_lease_expires_at=NULL
+        WHERE kind='export' AND status='running' AND export_lease_expires_at<=now()
+        RETURNING id`;
+      return rows.length;
+    });
+  }
+
+  /** Durably binds the exact lease-scoped key before any archive bytes are published. */
+  async planExportArtifact(
+    id: string,
+    expectedVersion: number,
+    leaseToken: string,
+    artifactObjectKey: string,
+    archiveSha256: string,
+  ): Promise<BackupOperation> {
+    assertOperationId(id);
+    positiveVersion(expectedVersion);
+    if (
+      !UUID.test(leaseToken) || !validObjectKey(artifactObjectKey) || !SHA256.test(archiveSha256)
+    ) {
+      throw new BackupOperationError("invalid", "Export artifact plan is invalid");
+    }
+    const [row] = await this.#sql<Record<string, unknown>[]>`
+      UPDATE backup_operations SET stage='uploading',artifact_object_key=${artifactObjectKey},
+        archive_sha256=${archiveSha256},updated_at=now(),version=version+1
+      WHERE id=${id} AND kind='export' AND status='running' AND version=${expectedVersion}
+        AND export_lease_token=${leaseToken} AND export_lease_expires_at>now()
+        AND artifact_object_key IS NULL AND archive_sha256 IS NULL
+      RETURNING *`;
+    if (!row) throw new BackupOperationError("conflict", "Export artifact plan is stale");
+    return mapOperation(row);
+  }
+
+  /**
+   * Claims a fair bounded cleanup page installation-wide. Advancing the cursor before object I/O
+   * prevents every replica from hammering the same keys; a crash only delays the retained
+   * tombstone until it rotates back into the next page.
+   */
+  async claimRecoverableExportArtifacts(
+    leaseToken: string,
+    leaseSeconds: number,
+    cooldownMs: number,
+    claimTimeoutMs: number,
+    limit = 100,
+  ): Promise<BackupOperation[]> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+      throw new BackupOperationError(
+        "invalid",
+        "Recoverable export artifact limit must be between 1 and 1000",
+      );
+    }
+    if (
+      !UUID.test(leaseToken) || !Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1 ||
+      leaseSeconds > 3600 || !Number.isSafeInteger(cooldownMs) || cooldownMs < 100 ||
+      cooldownMs > 60 * 60_000 || !Number.isSafeInteger(claimTimeoutMs) || claimTimeoutMs < 1 ||
+      claimTimeoutMs > 30_000
+    ) {
+      throw new BackupOperationError("invalid", "Export artifact cleanup lease is invalid");
+    }
+    return await this.#sql.begin(async (tx) => {
+      await tx`SELECT set_config('statement_timeout',${String(claimTimeoutMs)},true),
+        set_config('lock_timeout',${String(claimTimeoutMs)},true)`;
+      const rows = await tx<Record<string, unknown>[]>`
+        UPDATE backup_operations SET artifact_cleanup_lease_token=${leaseToken},
+          artifact_cleanup_lease_expires_at=now()+(${leaseSeconds}::text || ' seconds')::interval,
+          updated_at=now(),version=version+1
+        WHERE id IN (
+          SELECT id FROM backup_operations
+          WHERE kind='export' AND status IN ('failed','cancelled')
+            AND artifact_object_key IS NOT NULL AND archive_sha256 IS NOT NULL
+            AND (artifact_cleanup_lease_token IS NULL OR artifact_cleanup_lease_expires_at<=now())
+            AND (artifact_cleanup_checked_at IS NULL OR artifact_cleanup_checked_at<=
+              now()-(${cooldownMs}::text || ' milliseconds')::interval)
+          ORDER BY artifact_cleanup_checked_at ASC NULLS FIRST,created_at ASC,id ASC
+          LIMIT ${limit} FOR UPDATE SKIP LOCKED
+        ) RETURNING *`;
+      return rows.map(mapOperation);
+    });
+  }
+
+  async nextRunningExportLeaseExpiry(): Promise<string | null> {
+    const [row] = await this.#sql<Record<string, unknown>[]>`
+      SELECT min(export_lease_expires_at) AS expires_at FROM backup_operations
+      WHERE kind='export' AND status='running'`;
+    return row?.expires_at == null ? null : iso(row.expires_at);
+  }
+
+  /**
+   * Records a successful absence check without erasing the durable artifact tombstone. A stale
+   * cancellation-ignoring PUT can still publish after DELETE/HEAD, so later sweeps must retain the
+   * exact key forever. Completed exports are excluded and can never be reaped by this protocol.
+   */
+  async recordExportArtifactCleanup(
+    id: string,
+    artifactObjectKey: string,
+    archiveSha256: string,
+    leaseToken: string,
+  ): Promise<boolean> {
+    assertOperationId(id);
+    if (
+      !validObjectKey(artifactObjectKey) || !SHA256.test(archiveSha256) || !UUID.test(leaseToken)
+    ) {
+      throw new BackupOperationError("invalid", "Export artifact cleanup is invalid");
+    }
+    const rows = await this.#sql`
+      UPDATE backup_operations SET artifact_cleanup_checked_at=now(),updated_at=now(),
+        artifact_cleanup_lease_token=NULL,artifact_cleanup_lease_expires_at=NULL,version=version+1
+      WHERE id=${id} AND kind='export' AND status IN ('failed','cancelled')
+        AND artifact_object_key=${artifactObjectKey} AND archive_sha256=${archiveSha256}
+        AND artifact_cleanup_lease_token=${leaseToken}
+      RETURNING id`;
+    return rows.length === 1;
+  }
+
+  async releaseExportArtifactCleanup(id: string, leaseToken: string): Promise<boolean> {
+    assertOperationId(id);
+    if (!UUID.test(leaseToken)) {
+      throw new BackupOperationError("invalid", "Cleanup lease is invalid");
+    }
+    const rows = await this.#sql`UPDATE backup_operations
+      SET artifact_cleanup_lease_token=NULL,artifact_cleanup_lease_expires_at=NULL,
+        updated_at=now(),version=version+1
+      WHERE id=${id} AND kind='export' AND status IN ('failed','cancelled')
+        AND artifact_cleanup_lease_token=${leaseToken} RETURNING id`;
+    return rows.length === 1;
   }
 
   async updateProgress(
@@ -451,9 +701,11 @@ export class PostgresBackupStore {
       },
           manifest=COALESCE(${manifest ? tx.json(manifest as never) : null},manifest),
           impact=COALESCE(${impact ? tx.json(impact as never) : null},impact),
-          completed_at=now(),updated_at=now(),version=version+1
+          completed_at=now(),updated_at=now(),version=version+1,
+          export_lease_token=NULL,export_lease_expires_at=NULL
         WHERE id=${id} AND kind='export' AND status='running' AND version=${expectedVersion}
-          AND (archive_sha256 IS NULL OR archive_sha256=${input.archiveSha256})
+          AND archive_sha256=${input.archiveSha256}
+          AND artifact_object_key=${input.artifactObjectKey ?? null}
           AND objects_processed=objects_total AND bytes_processed=bytes_total
         RETURNING *
       `;
@@ -540,7 +792,8 @@ export class PostgresBackupStore {
       }
       const [operation] = await tx<Record<string, unknown>[]>`
         UPDATE backup_operations SET status='failed',stage='failed',error=${message},
-          completed_at=now(),updated_at=now(),version=version+1
+          completed_at=now(),updated_at=now(),version=version+1,
+          export_lease_token=NULL,export_lease_expires_at=NULL
         WHERE id=${operationId} AND kind='restore' AND status='running'
           AND stage<>'database_restored'
           AND version=${expectedOperationVersion} RETURNING *
@@ -571,7 +824,8 @@ export class PostgresBackupStore {
       }
       const [row] = await tx<Record<string, unknown>[]>`
         UPDATE backup_operations SET status='failed',stage='failed',error=${message},
-          completed_at=now(),updated_at=now(),version=version+1
+          completed_at=now(),updated_at=now(),version=version+1,
+          export_lease_token=NULL,export_lease_expires_at=NULL
         WHERE id=${id} AND status='running' AND stage<>'database_restored'
           AND version=${expectedVersion} RETURNING *
       `;
@@ -592,7 +846,8 @@ export class PostgresBackupStore {
       }
       const [row] = await tx<Record<string, unknown>[]>`
         UPDATE backup_operations SET status='cancelled',stage='cancelled',
-          completed_at=now(),updated_at=now(),version=version+1
+          completed_at=now(),updated_at=now(),version=version+1,
+          export_lease_token=NULL,export_lease_expires_at=NULL
         WHERE id=${id} AND status IN ('queued','running','validated')
           AND stage<>'database_restored'
           AND version=${expectedVersion} RETURNING *

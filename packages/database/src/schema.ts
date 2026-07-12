@@ -1087,6 +1087,15 @@ export const backupOperations = pgTable("backup_operations", {
   bytesProcessed: bigint("bytes_processed", { mode: "number" }).notNull().default(0),
   bytesTotal: bigint("bytes_total", { mode: "number" }).notNull().default(0),
   error: text("error"),
+  exportLeaseToken: uuid("export_lease_token"),
+  exportLeaseExpiresAt: timestamp("export_lease_expires_at", { withTimezone: true }),
+  // A terminal export's artifact binding is a durable cleanup tombstone. Never erase it: an
+  // abort-ignoring object-store PUT may publish after a recovery worker observed the key absent.
+  artifactCleanupCheckedAt: timestamp("artifact_cleanup_checked_at", { withTimezone: true }),
+  artifactCleanupLeaseToken: uuid("artifact_cleanup_lease_token"),
+  artifactCleanupLeaseExpiresAt: timestamp("artifact_cleanup_lease_expires_at", {
+    withTimezone: true,
+  }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   startedAt: timestamp("started_at", { withTimezone: true }),
   validatedAt: timestamp("validated_at", { withTimezone: true }),
@@ -1142,6 +1151,14 @@ export const backupOperations = pgTable("backup_operations", {
   check(
     "backup_operations_error_check",
     sql`${table.error} IS NULL OR char_length(${table.error}) BETWEEN 1 AND 1000`,
+  ),
+  check(
+    "backup_operations_export_lease_check",
+    sql`(${table.kind}='export' AND ${table.status}='running' AND ${table.exportLeaseToken} IS NOT NULL AND ${table.exportLeaseExpiresAt} IS NOT NULL) OR (${table.exportLeaseToken} IS NULL AND ${table.exportLeaseExpiresAt} IS NULL)`,
+  ),
+  check(
+    "backup_operations_artifact_cleanup_lease_check",
+    sql`(${table.artifactCleanupLeaseToken} IS NULL AND ${table.artifactCleanupLeaseExpiresAt} IS NULL) OR (${table.kind}='export' AND ${table.status} IN ('failed','cancelled') AND ${table.artifactObjectKey} IS NOT NULL AND ${table.archiveSha256} IS NOT NULL AND ${table.artifactCleanupLeaseToken} IS NOT NULL AND ${table.artifactCleanupLeaseExpiresAt} IS NOT NULL)`,
   ),
   check(
     "backup_operations_time_check",

@@ -75,15 +75,16 @@ Deno.test({
       "backup-stack-integration-v1",
       new Uint8Array(32).fill(73),
     );
+    const data = createPostgresBackupDataPort({
+      databaseUrl: databaseUrl!,
+      objects,
+      authenticator,
+      appVersion: "backup-stack-integration",
+    });
     const service = new DefaultBackupAdminService({
       store,
       objects,
-      data: createPostgresBackupDataPort({
-        databaseUrl: databaseUrl!,
-        objects,
-        authenticator,
-        appVersion: "backup-stack-integration",
-      }),
+      data,
       authenticator,
       restoreEnabled: true,
       maxUploadBytes: 16 * 1024 * 1024,
@@ -300,6 +301,54 @@ Deno.test({
         ),
         1,
       );
+
+      // Model a process exit after deterministic object staging but before the replacement DB
+      // transaction. Startup recovery must replay the verified archive, remove that operation's
+      // exact keys, fail/unfence the precommit operation, and leave committed restore objects intact.
+      const crashForm = new FormData();
+      crashForm.set(
+        "file",
+        new File([archive], "stack-crash-recovery.dgbackup", {
+          type: "application/vnd.dg-chat.backup",
+        }),
+      );
+      const crashRestore = await service.uploadRestore({
+        actorId: userId,
+        request: new Request("http://localhost/api/admin/backups/restore-uploads", {
+          method: "POST",
+          body: crashForm,
+        }),
+        idempotencyKey: `stack-crash-${crypto.randomUUID()}`,
+      });
+      await service.previewRestore(userId, crashRestore.id);
+      let crashOperation = await store.get(crashRestore.id);
+      crashOperation = await store.beginRestoreApply(
+        crashOperation.id,
+        crashOperation.version,
+        crashRestore.fingerprint.slice(0, 8).toUpperCase(),
+      );
+      await store.beginRestoreMaintenance(crashOperation.id, crashOperation.version);
+      const abandoned = await data.restoreSession("apply", {
+        restoreOperationId: crashOperation.id,
+      });
+      const abandonedManifest = await parseBackupArchiveStream(
+        archive,
+        authenticator,
+        abandoned.sink,
+      );
+      await abandoned.summarize(abandonedManifest);
+      const abandonedObjectKey = `restores/${crashOperation.id}/${attachmentDigest}`;
+      const abandonedObject = await objects.get(abandonedObjectKey);
+      assert(abandonedObject);
+      await abandonedObject.body.cancel();
+      await service.recoverPending();
+      assertEquals(await objects.get(abandonedObjectKey), undefined);
+      const committedObject = await objects.get(restoredAttachment.object_key);
+      assert(committedObject);
+      await committedObject.body.cancel();
+      assertEquals((await store.get(crashOperation.id)).status, "failed");
+      assertEquals((await store.installationState()).maintenanceEnabled, false);
+      await abandoned.rollback();
     } finally {
       for (const key of createdObjectKeys) await objects.delete(key).catch(() => undefined);
       // Backup artifacts are namespaced; remove exact keys recorded by the durable control plane.

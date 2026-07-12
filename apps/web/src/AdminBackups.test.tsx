@@ -6,6 +6,7 @@ import {
   canApplyBackupRestore,
   createBackupUploadAttempt,
   isRecentAuthenticationRequired,
+  monitorBackupRestore,
 } from "./AdminBackups.tsx";
 import { ApiError } from "./api.ts";
 
@@ -153,5 +154,134 @@ describe("AdminBackups", () => {
     ).toBe(true);
     expect(isRecentAuthenticationRequired(new ApiError(403, "forbidden", "No"))).toBe(false);
     expect(isRecentAuthenticationRequired(new Error("Sign in again"))).toBe(false);
+  });
+
+  it("keeps polling after an ambiguous apply transport failure and confirms completion", async () => {
+    const controller = new AbortController();
+    const updates: string[] = [];
+    const statuses = [
+      { status: "running" as const, stage: "restore_staging", completedAt: null, error: null },
+      {
+        status: "completed" as const,
+        stage: "completed",
+        completedAt: "2026-07-12T00:01:00Z",
+        error: null,
+      },
+    ];
+    await expect(monitorBackupRestore({
+      restoreId: "restore-1",
+      fingerprint: "a".repeat(64),
+      capability: { token: "payload.signature", expiresAt: "2099-01-01T00:00:00Z" },
+      signal: controller.signal,
+      apply: () => Promise.reject(new TypeError("connection reset")),
+      status: () =>
+        Promise.resolve({ restoreId: "restore-1", ...(statuses.shift() ?? statuses[0]) }),
+      onStatus: (status) => updates.push(typeof status === "string" ? status : status.status),
+      pollIntervalMs: 0,
+    })).resolves.toBe("completed");
+    expect(updates).toEqual(["transport-ambiguous", "running", "completed"]);
+  });
+
+  it("reports a durable failed status after an ambiguous apply transport failure", async () => {
+    await expect(monitorBackupRestore({
+      restoreId: "restore-1",
+      fingerprint: "a".repeat(64),
+      capability: { token: "payload.signature", expiresAt: "2099-01-01T00:00:00Z" },
+      signal: new AbortController().signal,
+      apply: () => Promise.reject(new TypeError("offline")),
+      status: () =>
+        Promise.resolve({
+          restoreId: "restore-1",
+          status: "failed",
+          stage: "failed",
+          completedAt: "2026-07-12T00:01:00Z",
+          error: "internal_error",
+        }),
+      onStatus: () => {},
+      pollIntervalMs: 0,
+    })).resolves.toBe("failed");
+  });
+
+  it("disambiguates a conflict response through durable status after a lost commit response", async () => {
+    const updates: string[] = [];
+    await expect(monitorBackupRestore({
+      restoreId: "restore-1",
+      fingerprint: "a".repeat(64),
+      capability: { token: "payload.signature", expiresAt: "2099-01-01T00:00:00Z" },
+      signal: new AbortController().signal,
+      apply: () => Promise.reject(new ApiError(409, "conflict", "Restore could not complete")),
+      status: () =>
+        Promise.resolve({
+          restoreId: "restore-1",
+          status: "completed",
+          stage: "completed",
+          completedAt: "2026-07-12T00:01:00Z",
+          error: null,
+        }),
+      onStatus: (status) => updates.push(typeof status === "string" ? status : status.status),
+      pollIntervalMs: 0,
+    })).resolves.toBe("completed");
+    expect(updates).toEqual(["transport-ambiguous", "completed"]);
+  });
+
+  it("stops retrying when the signed status capability expires", async () => {
+    let clock = 1_000;
+    await expect(monitorBackupRestore({
+      restoreId: "restore-1",
+      fingerprint: "a".repeat(64),
+      capability: { token: "payload.signature", expiresAt: new Date(1_001).toISOString() },
+      signal: new AbortController().signal,
+      apply: () => Promise.reject(new TypeError("offline")),
+      status: () => {
+        clock = 1_002;
+        return Promise.resolve({
+          restoreId: "restore-1",
+          status: "running",
+          stage: "restore_staging",
+          completedAt: null,
+          error: null,
+        });
+      },
+      onStatus: () => {},
+      pollIntervalMs: 0,
+      now: () => clock,
+    })).rejects.toThrow("authorization expired");
+  });
+
+  it("aborts independent apply and status work when its owner unmounts", async () => {
+    const owner = new AbortController();
+    let applyAborted = false;
+    let statusAborted = false;
+    let statusStarted!: () => void;
+    const started = new Promise<void>((resolve) => statusStarted = resolve);
+    const work = monitorBackupRestore({
+      restoreId: "restore-1",
+      fingerprint: "a".repeat(64),
+      capability: { token: "payload.signature", expiresAt: "2099-01-01T00:00:00Z" },
+      signal: owner.signal,
+      apply: (signal) =>
+        new Promise((_resolve, reject) =>
+          signal.addEventListener("abort", () => {
+            applyAborted = true;
+            reject(signal.reason);
+          }, { once: true })
+        ),
+      status: (signal) => {
+        statusStarted();
+        return new Promise((_resolve, reject) =>
+          signal.addEventListener("abort", () => {
+            statusAborted = true;
+            reject(signal.reason);
+          }, { once: true })
+        );
+      },
+      onStatus: () => {},
+      pollIntervalMs: 0,
+    });
+    await started;
+    owner.abort();
+    await expect(work).rejects.toMatchObject({ name: "AbortError" });
+    expect(applyAborted).toBe(true);
+    expect(statusAborted).toBe(true);
   });
 });

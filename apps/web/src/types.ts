@@ -392,3 +392,14 @@ export interface BackupRestoreResult {
   completedAt: string;
   counts: BackupRestoreCount[];
 }
+export interface BackupRestoreStatusCapability {
+  token: string;
+  expiresAt: string;
+}
+export interface BackupRestoreStatus {
+  restoreId: string;
+  status: "validated" | "running" | "completed" | "failed";
+  stage: string;
+  completedAt: string | null;
+  error: string | null;
+}

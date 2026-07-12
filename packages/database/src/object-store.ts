@@ -22,6 +22,7 @@ export interface PutObjectInput {
   contentLength: number;
   contentType: string;
   metadata?: Record<string, string>;
+  signal?: AbortSignal;
 }
 
 export interface StoredObject {
@@ -49,7 +50,7 @@ export class ObjectAlreadyExistsError extends Error {
 }
 
 type S3Sender = {
-  send(command: unknown): Promise<Record<string, unknown>>;
+  send(command: unknown, options?: { abortSignal?: AbortSignal }): Promise<Record<string, unknown>>;
   destroy?(): void;
 };
 
@@ -162,6 +163,7 @@ export class S3ObjectStore implements ObjectStore {
           Metadata: input.metadata,
           IfNoneMatch: "*",
         }),
+        input.signal ? { abortSignal: input.signal } : undefined,
       );
       return { etag: typeof response.ETag === "string" ? response.ETag : null };
     } catch (error) {

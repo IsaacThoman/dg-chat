@@ -14,6 +14,8 @@ import type {
   BackupExportPage,
   BackupRestorePreview,
   BackupRestoreResult,
+  BackupRestoreStatus,
+  BackupRestoreStatusCapability,
   BackupRestoreUpload,
   Conversation,
   ConversationKnowledge,
@@ -884,10 +886,21 @@ export const api = {
       `/admin/backups/restores/${encodeURIComponent(id)}/dry-run`,
       { method: "POST" },
     ),
-  applyAdminBackupRestore: (id: string, fingerprint: string) =>
+  issueAdminBackupRestoreStatusCapability: (id: string) =>
+    request<BackupRestoreStatusCapability>(
+      `/admin/backups/restores/${encodeURIComponent(id)}/status-capability`,
+      { method: "POST", body: "{}" },
+    ),
+  adminBackupRestoreStatus: (id: string, capability: string, signal?: AbortSignal) =>
+    request<BackupRestoreStatus>(`/backup-restore-status/${encodeURIComponent(id)}`, {
+      headers: { Authorization: `Bearer ${capability}` },
+      signal,
+    }),
+  applyAdminBackupRestore: (id: string, fingerprint: string, signal?: AbortSignal) =>
     request<BackupRestoreResult>(`/admin/backups/restores/${encodeURIComponent(id)}/apply`, {
       method: "POST",
       body: JSON.stringify({ fingerprint }),
+      signal,
     }),
   adminAudit: (filters: AuditFilters = {}, cursor?: string, limit = 50) =>
     request<{ data: AuditEvent[]; nextCursor: string | null }>(

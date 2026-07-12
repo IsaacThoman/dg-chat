@@ -24,6 +24,13 @@ CREATE TABLE backup_operations (
   bytes_processed bigint NOT NULL DEFAULT 0,
   bytes_total bigint NOT NULL DEFAULT 0,
   error text,
+  export_lease_token uuid,
+  export_lease_expires_at timestamptz,
+  -- Durable tombstone cursor for repeated orphan sweeps. The key/digest marker is intentionally
+  -- retained after deletion because a cancellation-ignoring PUT may publish later.
+  artifact_cleanup_checked_at timestamptz,
+  artifact_cleanup_lease_token uuid,
+  artifact_cleanup_lease_expires_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
   started_at timestamptz,
   validated_at timestamptz,
@@ -58,6 +65,15 @@ CREATE TABLE backup_operations (
     bytes_processed <= bytes_total),
   CONSTRAINT backup_operations_error_check CHECK(
     error IS NULL OR char_length(error) BETWEEN 1 AND 1000),
+  CONSTRAINT backup_operations_export_lease_check CHECK(
+    (kind='export' AND status='running' AND export_lease_token IS NOT NULL
+      AND export_lease_expires_at IS NOT NULL) OR
+    (export_lease_token IS NULL AND export_lease_expires_at IS NULL)),
+  CONSTRAINT backup_operations_artifact_cleanup_lease_check CHECK(
+    (artifact_cleanup_lease_token IS NULL AND artifact_cleanup_lease_expires_at IS NULL) OR
+    (kind='export' AND status IN ('failed','cancelled') AND artifact_object_key IS NOT NULL AND
+      archive_sha256 IS NOT NULL AND artifact_cleanup_lease_token IS NOT NULL AND
+      artifact_cleanup_lease_expires_at IS NOT NULL)),
   CONSTRAINT backup_operations_time_check CHECK(
     updated_at >= created_at AND
     (started_at IS NULL OR started_at >= created_at) AND
@@ -101,11 +117,46 @@ INSERT INTO installation_state(singleton_id) VALUES(1);
 -- every existing application table. Only the backup control plane remains writable so it can
 -- record progress and atomically release the fence. The restore transaction uses a transaction-local
 -- setting after proving ownership under the restore advisory lock; it cannot leak through pooling.
+-- The trigger independently re-proves all three facts (operation identity, durable maintenance
+-- ownership, and this backend's exact transaction-level advisory lock). A caller-controlled GUC
+-- alone is therefore never sufficient to bypass the fence.
 CREATE FUNCTION dg_chat_enforce_restore_maintenance() RETURNS trigger
 LANGUAGE plpgsql AS $$
-DECLARE restore_active boolean;
+DECLARE
+  restore_active boolean;
+  bypass_operation text;
+  bypass_valid boolean := false;
 BEGIN
-  IF current_setting('dg_chat.restore_bypass', true) = 'on' THEN
+  bypass_operation := current_setting('dg_chat.restore_bypass', true);
+  IF bypass_operation IS NOT NULL AND bypass_operation ~*
+    '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+  THEN
+    SELECT EXISTS(
+      SELECT 1
+      FROM installation_state state
+      JOIN backup_operations operation ON operation.id=state.active_restore_id
+      WHERE state.singleton_id=1
+        AND state.maintenance_enabled=true
+        AND state.active_restore_id=bypass_operation::uuid
+        AND operation.kind='restore'
+        AND operation.status='running'
+        AND operation.stage='restore_staging'
+        AND EXISTS(
+          SELECT 1 FROM pg_locks held
+          WHERE held.locktype='advisory'
+            AND held.pid=pg_backend_pid()
+            AND held.granted=true
+            AND held.mode='ExclusiveLock'
+            -- pg_advisory_xact_lock(bigint) stores the signed bigint as two unsigned oid halves.
+            AND held.classid::bigint =
+              ((hashtext('dg-chat-backup-restore')::bigint >> 32) & 4294967295)
+            AND held.objid::bigint =
+              (hashtext('dg-chat-backup-restore')::bigint & 4294967295)
+            AND held.objsubid=1
+        )
+    ) INTO bypass_valid;
+  END IF;
+  IF bypass_valid THEN
     RETURN NULL;
   END IF;
   -- The shared row lock makes fence acquisition wait for pre-existing mutation transactions and

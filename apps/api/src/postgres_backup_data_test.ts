@@ -52,6 +52,8 @@ class FakeObjects implements ObjectStore {
     { value: Uint8Array; type: string; metadata: Record<string, string> }
   >();
   readonly putChunkSizes: number[] = [];
+  onObjectRead?: () => void;
+  objectBodyCancels = 0;
   async put(input: PutObjectInput) {
     if (this.values.has(input.key)) throw new ObjectAlreadyExistsError(input.key);
     const chunks: Uint8Array[] = [];
@@ -80,11 +82,24 @@ class FakeObjects implements ObjectStore {
   }
   get(key: string): Promise<StoredObject | undefined> {
     const stored = this.values.get(key);
+    const body = stored && this.onObjectRead
+      ? new ReadableStream<Uint8Array>({
+        pull: (controller) => {
+          controller.enqueue(stored.value.slice());
+          this.onObjectRead?.();
+        },
+        cancel: () => {
+          this.objectBodyCancels += 1;
+        },
+      })
+      : stored
+      ? stream(stored.value)
+      : undefined;
     return Promise.resolve(
       stored
         ? {
           key,
-          body: stream(stored.value),
+          body: body!,
           contentLength: stored.value.length,
           contentType: stored.type,
           etag: null,
@@ -105,6 +120,7 @@ class FakeObjects implements ObjectStore {
 
 const attachmentId = "10000000-0000-4000-8000-000000000001";
 const ownerId = "10000000-0000-4000-8000-000000000002";
+const restoreOperationId = "10000000-0000-4000-8000-000000000004";
 
 async function fixture(
   options: {
@@ -114,6 +130,8 @@ async function fixture(
     oversized?: boolean;
     large?: boolean;
     catalogFailure?: boolean;
+    abortDatabase?: AbortController;
+    throwAfterRestoreCommit?: boolean;
   } = {},
 ) {
   const objects = new FakeObjects();
@@ -197,6 +215,7 @@ async function fixture(
         rows(tableName: string): AsyncIterable<BackupDataBatch> {
           return tableName === "attachments"
             ? (async function* () {
+              options.abortDatabase?.abort(new Error("database snapshot cancelled"));
               yield rows;
             })()
             : (async function* () {})();
@@ -214,7 +233,9 @@ async function fixture(
     ) {
       restoredMap = restoreOptions.objectKeyMap;
       const result = impact(await countRows(source));
-      return { ...result, restoreOperationVersion: 3, installationVersion: 4 };
+      const committed = { ...result, restoreOperationVersion: 3, installationVersion: 4 };
+      if (options.throwAfterRestoreCommit) throw new Error("database commit response lost");
+      return committed;
     },
   };
   const authenticator = await createHmacBackupAuthenticator(
@@ -253,7 +274,7 @@ Deno.test("postgres backup data streams a bounded object roundtrip and retains c
       bytes: fx.body.length,
       indexSha256: snapshot.manifest.objects.indexSha256,
     });
-    const session = await fx.adapter.restoreSession("apply");
+    const session = await fx.adapter.restoreSession("apply", { restoreOperationId });
     const archive = writeBackupArchiveStream(
       snapshot.manifest,
       snapshot.payloads,
@@ -261,7 +282,7 @@ Deno.test("postgres backup data streams a bounded object roundtrip and retains c
     );
     const manifest = await parseBackupArchiveStream(archive, fx.authenticator, session.sink);
     const committed = await session.commit!(manifest, {
-      restoreOperationId: "20000000-0000-4000-8000-000000000001",
+      restoreOperationId,
       expectedOperationVersion: 2,
       expectedInstallationVersion: 3,
     });
@@ -270,7 +291,7 @@ Deno.test("postgres backup data streams a bounded object roundtrip and retains c
     assertEquals(committed.restoreOperationVersion, 3);
     assertEquals(committed.installationVersion, 4);
     const target = fx.restoredMap()?.get("attachments/original");
-    assertEquals(target?.startsWith("restores/"), true);
+    assertEquals(target, `restores/${restoreOperationId}/${fx.digest}`);
     assertEquals(fx.objects.values.get(target!)?.value, fx.body);
     assertEquals(fx.catalogChecks(), 2);
   } finally {
@@ -298,7 +319,7 @@ Deno.test("postgres backup data releases the snapshot before object storage and 
       snapshot.manifest.entries.find((entry) => entry.name === "objects/index.ndjson")?.records,
       2,
     );
-    const session = await fx.adapter.restoreSession("preview");
+    const session = await fx.adapter.restoreSession("preview", { restoreOperationId });
     const putChunksBeforePreview = fx.objects.putChunkSizes.length;
     const manifest = await parseBackupArchiveStream(
       writeBackupArchiveStream(snapshot.manifest, snapshot.payloads, fx.authenticator),
@@ -313,6 +334,89 @@ Deno.test("postgres backup data releases the snapshot before object storage and 
   }
 });
 
+Deno.test("postgres backup data deterministically removes only precommit crash staging", async () => {
+  const fx = await fixture();
+  const snapshot = await fx.adapter.exportSnapshot({
+    includeDiagnostics: false,
+    installationId: "installation-test",
+  });
+  try {
+    const archiveBytes = await payloadBytes(
+      writeBackupArchiveStream(snapshot.manifest, snapshot.payloads, fx.authenticator),
+    );
+    const apply = await fx.adapter.restoreSession("apply", { restoreOperationId });
+    const applyManifest = await parseBackupArchiveStream(
+      archiveBytes,
+      fx.authenticator,
+      apply.sink,
+    );
+    // `summarize` on an apply session exercises the same staging path and intentionally leaves the
+    // object behind, modeling a process exit after object PUT and before the database transaction.
+    await apply.summarize(applyManifest);
+    const stagedKey = `restores/${restoreOperationId}/${fx.digest}`;
+    assertEquals(fx.objects.values.has(stagedKey), true);
+
+    const unrelatedKey = `restores/${crypto.randomUUID()}/${fx.digest}`;
+    fx.objects.values.set(unrelatedKey, {
+      value: fx.body,
+      type: "text/plain",
+      metadata: { sha256: fx.digest },
+    });
+    const cleanup = await fx.adapter.restoreSession("cleanup", { restoreOperationId });
+    const cleanupManifest = await parseBackupArchiveStream(
+      archiveBytes,
+      fx.authenticator,
+      cleanup.sink,
+    );
+    await cleanup.cleanup!(cleanupManifest);
+    await cleanup.rollback();
+    assertEquals(fx.objects.values.has(stagedKey), false);
+    assertEquals(fx.objects.values.has(unrelatedKey), true);
+
+    // Test-process cleanup for the intentionally abandoned first session. It is idempotent after
+    // recovery already removed the deterministic staged object.
+    await apply.rollback();
+    fx.objects.values.delete(unrelatedKey);
+  } finally {
+    await snapshot.cleanup?.();
+  }
+});
+
+Deno.test("postgres backup data preserves staged objects when the database commit response is ambiguous", async () => {
+  const fx = await fixture({ throwAfterRestoreCommit: true });
+  const snapshot = await fx.adapter.exportSnapshot({
+    includeDiagnostics: false,
+    installationId: "installation-test",
+  });
+  try {
+    const session = await fx.adapter.restoreSession("apply", { restoreOperationId });
+    const manifest = await parseBackupArchiveStream(
+      writeBackupArchiveStream(snapshot.manifest, snapshot.payloads, fx.authenticator),
+      fx.authenticator,
+      session.sink,
+    );
+    await assertRejects(
+      () =>
+        session.commit!(manifest, {
+          restoreOperationId,
+          expectedOperationVersion: 2,
+          expectedInstallationVersion: 3,
+        }),
+      Error,
+      "database commit response lost",
+    );
+    const stagedKey = `restores/${restoreOperationId}/${fx.digest}`;
+    assertEquals(fx.objects.values.has(stagedKey), true);
+
+    // A confirmed pre-commit outcome is the only authority that invokes rollback. It remains
+    // exact and idempotent even if the deterministic object predated this session.
+    await session.rollback();
+    assertEquals(fx.objects.values.has(stagedKey), false);
+  } finally {
+    await snapshot.cleanup?.();
+  }
+});
+
 Deno.test("postgres backup data feeds staged blobs through bounded backpressured chunks", async () => {
   const fx = await fixture({ large: true });
   const snapshot = await fx.adapter.exportSnapshot({
@@ -320,14 +424,14 @@ Deno.test("postgres backup data feeds staged blobs through bounded backpressured
     installationId: "installation-test",
   });
   try {
-    const session = await fx.adapter.restoreSession("apply");
+    const session = await fx.adapter.restoreSession("apply", { restoreOperationId });
     const manifest = await parseBackupArchiveStream(
       writeBackupArchiveStream(snapshot.manifest, snapshot.payloads, fx.authenticator),
       fx.authenticator,
       session.sink,
     );
     await session.commit!(manifest, {
-      restoreOperationId: "20000000-0000-4000-8000-000000000001",
+      restoreOperationId,
       expectedOperationVersion: 2,
       expectedInstallationVersion: 3,
     });
@@ -356,7 +460,7 @@ Deno.test("postgres backup data rejects a signed archive with a missing semantic
     }, fx.authenticator);
     const payloads = new Map(snapshot.payloads);
     payloads.delete("tables/users.ndjson");
-    const session = await fx.adapter.restoreSession("preview");
+    const session = await fx.adapter.restoreSession("preview", { restoreOperationId });
     const parsed = await parseBackupArchiveStream(
       writeBackupArchiveStream(manifest, payloads, fx.authenticator),
       fx.authenticator,
@@ -401,7 +505,7 @@ Deno.test("postgres backup data binds the object index exactly to ready attachme
       if (entry.kind === "blob") missingPayloads.delete(entry.name);
     }
     missingPayloads.set("objects/index.ndjson", empty);
-    const missingSession = await fx.adapter.restoreSession("preview");
+    const missingSession = await fx.adapter.restoreSession("preview", { restoreOperationId });
     const missingParsed = await parseBackupArchiveStream(
       writeBackupArchiveStream(missingManifest, missingPayloads, fx.authenticator),
       fx.authenticator,
@@ -426,7 +530,7 @@ Deno.test("postgres backup data binds the object index exactly to ready attachme
     }, fx.authenticator);
     const extraPayloads = new Map(basePayloads);
     extraPayloads.set("tables/attachments.ndjson", empty);
-    const extraSession = await fx.adapter.restoreSession("preview");
+    const extraSession = await fx.adapter.restoreSession("preview", { restoreOperationId });
     const extraParsed = await parseBackupArchiveStream(
       writeBackupArchiveStream(extraManifest, extraPayloads, fx.authenticator),
       fx.authenticator,
@@ -460,7 +564,9 @@ Deno.test("postgres backup data binds the object index exactly to ready attachme
     }, fx.authenticator);
     const inconsistentPayloads = new Map(basePayloads);
     inconsistentPayloads.set("objects/index.ndjson", inconsistentIndex);
-    const inconsistentSession = await fx.adapter.restoreSession("preview");
+    const inconsistentSession = await fx.adapter.restoreSession("preview", {
+      restoreOperationId,
+    });
     const inconsistentParsed = await parseBackupArchiveStream(
       writeBackupArchiveStream(
         inconsistentManifest,
@@ -489,6 +595,58 @@ Deno.test("postgres backup data bounds canonical NDJSON lines before writing", a
     TypeError,
     "line is too large",
   );
+});
+
+Deno.test("postgres backup data rejects an already-aborted export before opening the database", async () => {
+  const fx = await fixture();
+  const controller = new AbortController();
+  controller.abort(new Error("export cancelled before snapshot"));
+  await assertRejects(
+    () =>
+      fx.adapter.exportSnapshot({
+        includeDiagnostics: false,
+        installationId: "installation-test",
+        signal: controller.signal,
+      }),
+    Error,
+    "export cancelled before snapshot",
+  );
+  assertEquals(fx.catalogChecks(), 0);
+  assertEquals(fx.lifecycle, []);
+});
+
+Deno.test("postgres backup data aborts during relational export and closes the snapshot", async () => {
+  const controller = new AbortController();
+  const fx = await fixture({ abortDatabase: controller });
+  await assertRejects(
+    () =>
+      fx.adapter.exportSnapshot({
+        includeDiagnostics: false,
+        installationId: "installation-test",
+        signal: controller.signal,
+      }),
+    Error,
+    "database snapshot cancelled",
+  );
+  assertEquals(fx.lifecycle, ["snapshot-closed"]);
+});
+
+Deno.test("postgres backup data aborts and cancels a body during attachment export", async () => {
+  const controller = new AbortController();
+  const fx = await fixture();
+  fx.objects.onObjectRead = () => controller.abort(new Error("object snapshot cancelled"));
+  await assertRejects(
+    () =>
+      fx.adapter.exportSnapshot({
+        includeDiagnostics: false,
+        installationId: "installation-test",
+        signal: controller.signal,
+      }),
+    Error,
+    "object snapshot cancelled",
+  );
+  assertEquals(fx.lifecycle, ["snapshot-closed"]);
+  assertEquals(fx.objects.objectBodyCancels, 1);
 });
 
 Deno.test("postgres backup data refuses missing attachment objects", async () => {
@@ -533,7 +691,7 @@ Deno.test("postgres backup data fails closed when the production catalog verifie
   const restoreFailure = await fixture();
   restoreFailure.setCatalogFailure(true);
   await assertRejects(
-    () => restoreFailure.adapter.restoreSession("apply"),
+    () => restoreFailure.adapter.restoreSession("apply", { restoreOperationId }),
     Error,
     "future_table",
   );

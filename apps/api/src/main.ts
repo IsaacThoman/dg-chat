@@ -22,6 +22,7 @@ import { smtpIdentityMailer } from "./mail.ts";
 import { backupRuntimeConfig } from "./backup-config.ts";
 import { DefaultBackupAdminService } from "./backup-service.ts";
 import { createPostgresBackupDataPort } from "./postgres-backup-data.ts";
+import { shutdownApi } from "./shutdown.ts";
 
 const port = Number(Deno.env.get("PORT") ?? 8000);
 const providerKeyring = ProviderSecretKeyring.fromEnv();
@@ -215,25 +216,35 @@ const replayMaintenance = setInterval(async () => {
   }
 }, 60_000);
 console.log(JSON.stringify({ level: "info", message: "API listening", port }));
-const server = Deno.serve({ port, onListen: () => {} }, app.fetch);
+const serverAbort = new AbortController();
+const server = Deno.serve({ port, onListen: () => {}, signal: serverAbort.signal }, app.fetch);
 let stopping = false;
 const shutdown = async (signal: string) => {
   if (stopping) return;
   stopping = true;
   clearInterval(replayMaintenance);
   console.log(JSON.stringify({ level: "info", message: "API shutting down", signal }));
-  await server.shutdown();
-  await backupAdmin?.close();
-  await Promise.all([
-    repository.close(),
-    toolExecutionStore?.close(),
-    rateLimiter.close(),
-    circuitBreaker.close(),
-    ocrCache?.close(),
-    audioConcurrencyLimiter.close(),
-    objectStore?.close(),
-    browserAuth?.close(),
-  ]);
+  await shutdownApi({
+    // close() synchronously flips the coordinator to closing and aborts every export controller
+    // before its first await. Start it before the graceful HTTP drain so backup streams cannot
+    // deadlock server.shutdown().
+    cancelBackup: () => backupAdmin?.close(),
+    drainServer: () => server.shutdown(),
+    forceServer: () => serverAbort.abort(new Error("API shutdown deadline exceeded")),
+    closeResources: () =>
+      Promise.all([
+        repository.close(),
+        toolExecutionStore?.close(),
+        rateLimiter.close(),
+        circuitBreaker.close(),
+        ocrCache?.close(),
+        audioConcurrencyLimiter.close(),
+        objectStore?.close(),
+        browserAuth?.close(),
+      ]),
+    drainGraceMs: 10_000,
+    resourceGraceMs: 5_000,
+  });
 };
 for (const signal of ["SIGTERM", "SIGINT"] as const) {
   Deno.addSignalListener(signal, () => void shutdown(signal));

@@ -47,6 +47,19 @@ export interface BackupRestoreResult {
   counts: BackupRestoreCount[];
 }
 
+export interface BackupRestoreStatusCapability {
+  token: string;
+  expiresAt: string;
+}
+
+export interface BackupRestoreStatus {
+  restoreId: string;
+  status: "validated" | "running" | "completed" | "failed";
+  stage: string;
+  completedAt: string | null;
+  error: string | null;
+}
+
 /**
  * Privileged installation-portability boundary. Implementations own durable operation state,
  * archive validation, object staging, and the database maintenance fence. Hono only authenticates
@@ -67,6 +80,11 @@ export interface BackupAdminService {
     idempotencyKey: string;
   }): Promise<BackupRestoreUploadSummary>;
   previewRestore(actorId: string, restoreId: string): Promise<BackupRestorePreview>;
+  issueRestoreStatusCapability(
+    actorId: string,
+    restoreId: string,
+  ): Promise<BackupRestoreStatusCapability>;
+  restoreStatus(restoreId: string, capability: string): Promise<BackupRestoreStatus>;
   applyRestore(input: {
     actorId: string;
     restoreId: string;

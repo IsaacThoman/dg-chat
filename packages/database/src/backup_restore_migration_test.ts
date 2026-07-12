@@ -130,8 +130,62 @@ Deno.test({
       }
       // The control plane must remain writable so recovery can finalize or fail the restore.
       await sql`UPDATE backup_operations SET updated_at=now() WHERE id=${restore.id}`;
+      // A caller-controlled setting, even one naming the active operation, cannot bypass the
+      // database fence without this backend's exact transaction-level restore lock.
+      await assertRejects(
+        () =>
+          sql.begin(async (tx) => {
+            await tx`SELECT set_config('dg_chat.restore_bypass','on',true)`;
+            await tx`INSERT INTO users(id,email,name)
+              VALUES(${crypto.randomUUID()},'forged-setting@example.com','Forged Setting')`;
+          }),
+        Error,
+        "restore maintenance",
+      );
+      await assertRejects(
+        () =>
+          sql.begin(async (tx) => {
+            await tx`SELECT set_config('dg_chat.restore_bypass',${restore.id},true)`;
+            await tx`INSERT INTO users(id,email,name)
+              VALUES(${crypto.randomUUID()},'missing-lock@example.com','Missing Lock')`;
+          }),
+        Error,
+        "restore maintenance",
+      );
+      await assertRejects(
+        () =>
+          sql.begin(async (tx) => {
+            await tx`SELECT pg_advisory_xact_lock(hashtext('some-other-lock'))`;
+            await tx`SELECT set_config('dg_chat.restore_bypass',${restore.id},true)`;
+            await tx`INSERT INTO users(id,email,name)
+              VALUES(${crypto.randomUUID()},'wrong-lock@example.com','Wrong Lock')`;
+          }),
+        Error,
+        "restore maintenance",
+      );
       await sql.begin(async (tx) => {
-        await tx`SELECT set_config('dg_chat.restore_bypass','on',true)`;
+        await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-backup-restore'))`;
+        await tx`SELECT set_config('dg_chat.restore_bypass',${restore.id},true)`;
+        const [proof] = await tx<{ operation_matches: boolean; lock_matches: boolean }[]>`
+          SELECT EXISTS(
+            SELECT 1 FROM installation_state s JOIN backup_operations o
+              ON o.id=s.active_restore_id
+            WHERE s.singleton_id=1 AND s.maintenance_enabled=true
+              AND s.active_restore_id=${restore.id} AND o.kind='restore'
+              AND o.status='running' AND o.stage='restore_staging'
+          ) operation_matches,
+          EXISTS(
+            SELECT 1 FROM pg_locks held WHERE held.locktype='advisory'
+              AND held.pid=pg_backend_pid() AND held.granted=true
+              AND held.mode='ExclusiveLock'
+              AND held.classid::bigint =
+                ((hashtext('dg-chat-backup-restore')::bigint >> 32) & 4294967295)
+              AND held.objid::bigint =
+                (hashtext('dg-chat-backup-restore')::bigint & 4294967295)
+              AND held.objsubid=1
+          ) lock_matches
+        `;
+        assertEquals(proof, { operation_matches: true, lock_matches: true });
         await tx`INSERT INTO users(id,email,name)
           VALUES(${crypto.randomUUID()},'restore-write@example.com','Restore Write')`;
       });

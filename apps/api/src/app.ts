@@ -1673,6 +1673,44 @@ export function createApp(options: AppOptions = {}) {
       },
     }),
   );
+  app.use("*", async (c, next) => {
+    if (!options.backupAdmin) return next();
+    const openAiSurface = c.req.path.startsWith("/v1/");
+    const productSurface = c.req.path.startsWith("/api/");
+    if (!openAiSurface && !productSurface) return next();
+    // Method alone cannot establish that a request is read-only. Better Auth has mutation-capable
+    // GET callbacks and may refresh/provision sessions while authenticating an otherwise ordinary
+    // product GET. Keep this pre-authentication allowlist deliberately tiny: OPTIONS has no route
+    // handler, while setup status performs one repository read and is needed by recovery/setup UI.
+    // Everything under /v1 remains fenced because bearer authentication records last-used data.
+    const restoreStatusRead = ["GET", "HEAD"].includes(c.req.method) &&
+      /^\/api\/backup-restore-status\/[0-9a-f-]{36}$/i.test(c.req.path);
+    const maintenanceSafeProductRead = c.req.method === "OPTIONS" || restoreStatusRead ||
+      (["GET", "HEAD"].includes(c.req.method) && c.req.path === "/api/setup/status");
+    if (productSurface && maintenanceSafeProductRead) return next();
+    const unavailable = (code: string, message: string, retryAfter: number) => {
+      c.header("Retry-After", String(retryAfter));
+      return openAiSurface
+        ? c.json(openAIError(message, code), 503)
+        : c.json({ error: { code, message } }, 503);
+    };
+    let state: Awaited<ReturnType<BackupAdminService["maintenanceState"]>>;
+    try {
+      state = await options.backupAdmin.maintenanceState();
+    } catch {
+      return unavailable(
+        "maintenance_state_unavailable",
+        "Installation maintenance state is temporarily unavailable",
+        5,
+      );
+    }
+    if (!state.enabled) return next();
+    return unavailable(
+      "installation_maintenance",
+      "The installation is temporarily read-only while a restore is running",
+      Math.max(1, state.retryAfterSeconds),
+    );
+  });
   const apiBodyLimit = bodyLimit({ maxSize: 2 * 1024 * 1024 });
   const openAIBodyLimit = bodyLimit({ maxSize: 4 * 1024 * 1024 });
   const speechBodyLimit = bodyLimit({ maxSize: 64 * 1024 });
@@ -2029,34 +2067,6 @@ export function createApp(options: AppOptions = {}) {
       }
       await next();
     };
-
-  app.use("/api/*", async (c, next) => {
-    if (
-      !options.backupAdmin || ["GET", "HEAD", "OPTIONS"].includes(c.req.method) ||
-      c.req.path.startsWith("/api/auth/") ||
-      c.req.path.startsWith("/api/admin/backups")
-    ) return next();
-    let state: Awaited<ReturnType<BackupAdminService["maintenanceState"]>>;
-    try {
-      state = await options.backupAdmin.maintenanceState();
-    } catch {
-      c.header("Retry-After", "5");
-      return c.json({
-        error: {
-          code: "maintenance_state_unavailable",
-          message: "Installation maintenance state is temporarily unavailable",
-        },
-      }, 503);
-    }
-    if (!state.enabled) return next();
-    c.header("Retry-After", String(Math.max(1, state.retryAfterSeconds)));
-    return c.json({
-      error: {
-        code: "installation_maintenance",
-        message: "The installation is temporarily read-only while a restore is running",
-      },
-    }, 503);
-  });
 
   app.get("/health", (c) => c.json({ status: "ok", service: "api" }));
   app.get("/ready", async (c) => {
@@ -4323,6 +4333,23 @@ export function createApp(options: AppOptions = {}) {
     c.header("Pragma", "no-cache");
     c.header("X-Content-Type-Options", "nosniff");
   };
+  // This capability endpoint intentionally has no session middleware. Its signed, operation-bound,
+  // one-hour bearer is issued to a recently authenticated administrator before restore begins, so
+  // polling during the write fence performs exactly one control-plane read and cannot refresh a
+  // session, update last-used metadata, or emit an audit write.
+  app.get("/api/backup-restore-status/:id", async (c) => {
+    noStoreBackupResponse(c);
+    c.header("Referrer-Policy", "no-referrer");
+    const authorization = c.req.header("authorization") ?? "";
+    const match = /^Bearer ([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)$/.exec(authorization);
+    if (!match) throw new DomainError("not_found", "Restore status is unavailable", 404);
+    return c.json(
+      await requireBackupAdmin().restoreStatus(
+        requireUuid(c.req.param("id"), "restoreId"),
+        match[1],
+      ),
+    );
+  });
   app.get("/api/admin/backups", async (c) => {
     noStoreBackupResponse(c);
     const service = requireBackupAdmin();
@@ -4409,6 +4436,22 @@ export function createApp(options: AppOptions = {}) {
       },
     });
     return c.json(preview);
+  });
+  app.post("/api/admin/backups/restores/:id/status-capability", async (c) => {
+    noStoreBackupResponse(c);
+    if (!hasRecentAuthentication(c.get("sessionAuthenticatedAt"), (options.now ?? Date.now)())) {
+      throw new DomainError(
+        "recent_authentication_required",
+        "Sign in again before applying a restore",
+        403,
+      );
+    }
+    return c.json(
+      await requireBackupAdmin().issueRestoreStatusCapability(
+        c.get("user").id,
+        requireUuid(c.req.param("id"), "restoreId"),
+      ),
+    );
   });
   app.post("/api/admin/backups/restores/:id/apply", async (c) => {
     noStoreBackupResponse(c);

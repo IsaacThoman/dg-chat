@@ -1,6 +1,7 @@
 import { assertEquals, assertExists } from "jsr:@std/assert@1.0.14";
 import { MemoryRepository } from "@dg-chat/database";
 import { createApp, hasRecentAuthentication } from "./app.ts";
+import type { BetterAuthService } from "./better-auth.ts";
 import type {
   BackupAdminService,
   BackupExportSummary,
@@ -19,6 +20,7 @@ const fingerprint = "a".repeat(64);
 class FakeBackupAdmin implements BackupAdminService {
   restoreEnabled = true;
   maintenance = false;
+  maintenanceError = false;
   exportInput: unknown;
   uploadInput: unknown;
   applyCalls = 0;
@@ -72,6 +74,19 @@ class FakeBackupAdmin implements BackupAdminService {
   previewRestore() {
     return Promise.resolve(this.preview);
   }
+  issueRestoreStatusCapability() {
+    return Promise.resolve({ token: "payload.signature", expiresAt: "2026-07-12T01:00:00.000Z" });
+  }
+  restoreStatus(restoreId: string, capability: string) {
+    if (capability !== "payload.signature") throw new Error("invalid capability");
+    return Promise.resolve({
+      restoreId,
+      status: this.maintenance ? "running" as const : "completed" as const,
+      stage: this.maintenance ? "restore_staging" : "completed",
+      completedAt: this.maintenance ? null : now,
+      error: null,
+    });
+  }
   applyRestore() {
     this.applyCalls += 1;
     return Promise.resolve({
@@ -82,11 +97,17 @@ class FakeBackupAdmin implements BackupAdminService {
     });
   }
   maintenanceState() {
+    if (this.maintenanceError) throw new Error("maintenance database unavailable");
     return Promise.resolve({ enabled: this.maintenance, retryAfterSeconds: 9 });
   }
 }
 
-async function fixture(options: { now?: () => number } = {}) {
+async function fixture(
+  options: {
+    now?: () => number;
+    providerStream?: NonNullable<Parameters<typeof createApp>[0]>["providerStream"];
+  } = {},
+) {
   const repository = new MemoryRepository();
   const backupAdmin = new FakeBackupAdmin();
   const { app } = createApp({
@@ -94,6 +115,7 @@ async function fixture(options: { now?: () => number } = {}) {
     backupAdmin,
     setupToken: "backup-setup-token",
     now: options.now,
+    providerStream: options.providerStream,
   });
   await app.request("/api/setup/bootstrap", {
     method: "POST",
@@ -250,7 +272,7 @@ Deno.test("recent authentication validation rejects missing, malformed, old, and
   assertEquals(hasRecentAuthentication("2026-07-12T12:01:00.001Z", nowMs), false);
 });
 
-Deno.test("restore maintenance fences ordinary writes but leaves restore control available", async () => {
+Deno.test("restore maintenance fences product routes except the explicit setup-status read", async () => {
   const { app, backupAdmin, headers } = await fixture();
   backupAdmin.maintenance = true;
   const blocked = await app.request("/api/conversations", {
@@ -265,6 +287,161 @@ Deno.test("restore maintenance fences ordinary writes but leaves restore control
     "installation_maintenance",
   );
 
+  // Authenticated GETs are not intrinsically read-only: authentication itself can refresh or
+  // provision a session. Backup administration resumes after the restore fence is released.
   const control = await app.request("/api/admin/backups", { headers });
-  assertEquals(control.status, 200);
+  assertEquals(control.status, 503);
+  assertEquals(control.headers.get("retry-after"), "9");
+
+  const status = await app.request(
+    `/api/backup-restore-status/${backupAdmin.preview.restoreId}`,
+    { headers: { authorization: "Bearer payload.signature" } },
+  );
+  assertEquals(status.status, 200);
+  assertEquals(status.headers.get("cache-control"), "private, no-store");
+  assertEquals(status.headers.get("referrer-policy"), "no-referrer");
+  assertEquals((await status.json() as { status: string }).status, "running");
+  assertEquals(
+    (await app.request(`/api/backup-restore-status/${backupAdmin.preview.restoreId}`)).status,
+    404,
+  );
+
+  const setupStatus = await app.request("/api/setup/status");
+  assertEquals(setupStatus.status, 200);
+});
+
+Deno.test("restore maintenance blocks mutation-capable Better Auth GET routes before auth", async () => {
+  const repository = new MemoryRepository();
+  const backupAdmin = new FakeBackupAdmin();
+  backupAdmin.maintenance = true;
+  let handlerCalls = 0;
+  let sessionCalls = 0;
+  const browserAuth = {
+    oidcEnabled: true,
+    presentedSessionToken: () => undefined,
+    getSession: () => {
+      sessionCalls += 1;
+      return Promise.resolve(null);
+    },
+    handler: () => {
+      handlerCalls += 1;
+      return Promise.resolve(new Response(null, { status: 204 }));
+    },
+  } as unknown as BetterAuthService;
+  const { app } = createApp({ repository, backupAdmin, browserAuth });
+
+  for (
+    const path of [
+      "/api/auth/oidc/callback?state=restore-must-win",
+      "/api/auth/get-session",
+    ]
+  ) {
+    const response = await app.request(path);
+    assertEquals(response.status, 503);
+    assertEquals(response.headers.get("retry-after"), "9");
+    assertEquals(
+      (await response.json() as { error: { code: string } }).error.code,
+      "installation_maintenance",
+    );
+  }
+  assertEquals(handlerCalls, 0);
+  assertEquals(sessionCalls, 0);
+
+  backupAdmin.maintenance = false;
+  backupAdmin.maintenanceError = true;
+  const unavailable = await app.request("/api/auth/get-session");
+  assertEquals(unavailable.status, 503);
+  assertEquals(unavailable.headers.get("retry-after"), "5");
+  assertEquals(handlerCalls, 0);
+  assertEquals(sessionCalls, 0);
+});
+
+Deno.test("restore maintenance fences OpenAI traffic before token and provider side effects", async () => {
+  let providerCalls = 0;
+  const providerStream = async function* () {
+    providerCalls += 1;
+    yield 'data: {"choices":[{"delta":{"content":"must not run"}}]}\n\n';
+  };
+  const { app, backupAdmin, headers, repository } = await fixture({ providerStream });
+  const tokenResponse = await app.request("/api/tokens", {
+    method: "POST",
+    headers: { ...headers, "content-type": "application/json" },
+    body: JSON.stringify({ name: "Maintenance token", scopes: ["models:read", "chat:write"] }),
+  });
+  const token = (await tokenResponse.json() as { token: string }).token;
+  const user = await repository.findUserByEmail("backup@example.com");
+  assertExists(user);
+  assertEquals((await repository.listApiTokens(user.id))[0].lastUsedAt, null);
+
+  backupAdmin.maintenance = true;
+  const models = await app.request("/v1/models", {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  assertEquals(models.status, 503);
+  assertEquals(models.headers.get("retry-after"), "9");
+  const modelError = await models.json() as {
+    error: { code: string; type: string; message: string };
+  };
+  assertEquals(modelError.error.code, "installation_maintenance");
+  assertEquals(modelError.error.type, "invalid_request_error");
+  assertEquals((await repository.listApiTokens(user.id))[0].lastUsedAt, null);
+
+  const chat = await app.request("/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+      "idempotency-key": "maintenance-provider-not-called",
+    },
+    body: JSON.stringify({
+      model: "openai/default",
+      messages: [{ role: "user", content: "do not invoke provider" }],
+      stream: true,
+    }),
+  });
+  assertEquals(chat.status, 503);
+  assertEquals(providerCalls, 0);
+  assertEquals((await repository.listApiTokens(user.id))[0].lastUsedAt, null);
+});
+
+Deno.test("restore maintenance blocks authentication mutations and fails closed", async () => {
+  const { app, backupAdmin } = await fixture();
+  backupAdmin.maintenance = true;
+  for (
+    const [path, body] of [
+      [
+        "/api/auth/sign-up/email",
+        { name: "Blocked Signup", email: "blocked@example.com", password: "correct horse battery" },
+      ],
+      [
+        "/api/auth/sign-in/email",
+        { email: "backup@example.com", password: "correct horse battery" },
+      ],
+    ] as const
+  ) {
+    const response = await app.request(path, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "http://localhost:5173" },
+      body: JSON.stringify(body),
+    });
+    assertEquals(response.status, 503);
+    assertEquals(
+      (await response.json() as { error: { code: string } }).error.code,
+      "installation_maintenance",
+    );
+  }
+
+  backupAdmin.maintenance = false;
+  backupAdmin.maintenanceError = true;
+  const unavailable = await app.request("/api/auth/sign-in/email", {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: "http://localhost:5173" },
+    body: JSON.stringify({ email: "backup@example.com", password: "correct horse battery" }),
+  });
+  assertEquals(unavailable.status, 503);
+  assertEquals(unavailable.headers.get("retry-after"), "5");
+  assertEquals(
+    (await unavailable.json() as { error: { code: string } }).error.code,
+    "maintenance_state_unavailable",
+  );
 });
