@@ -633,6 +633,7 @@ class MemoryProviderSecretRestoreStore {
   failApply = false;
   throwAfterApply = false;
   throwAfterCreate = false;
+  throwAfterMarkUploaded = false;
   staleEpochSweeps = 0;
   abandonedStagingSweeps = 0;
   abandonedAttachmentSweeps = 0;
@@ -654,6 +655,10 @@ class MemoryProviderSecretRestoreStore {
     if (
       this.attachment && ["staging", "uploaded", "validated"].includes(this.attachment.status)
     ) {
+      if (
+        this.attachment.status === "uploaded" &&
+        this.attachment.idempotencyKey !== input.idempotencyKey
+      ) return Promise.reject(new Error("an uploaded attachment is already active"));
       if (this.throwAfterCreate) {
         this.throwAfterCreate = false;
         return Promise.reject(new Error("create response lost"));
@@ -710,7 +715,12 @@ class MemoryProviderSecretRestoreStore {
     }
     this.attachment.status = "uploaded";
     this.attachment.version++;
-    return Promise.resolve(structuredClone(this.attachment));
+    const result = structuredClone(this.attachment);
+    if (this.throwAfterMarkUploaded) {
+      this.throwAfterMarkUploaded = false;
+      return Promise.reject(new Error("mark uploaded response lost"));
+    }
+    return Promise.resolve(result);
   }
   getAppliedResult(id: string, restoreId: string, baseSha: string, sidecarSha: string) {
     const item = this.attachment;
@@ -1371,6 +1381,7 @@ Deno.test("provider-secret staging survives missing or lost PUT responses and fo
   assertEquals(retryStore.attachment?.status, "staging");
   assertEquals(retryObjects.values.size, 0);
   retryStore.throwAfterCreate = true;
+  retryStore.throwAfterMarkUploaded = true;
   assertEquals(
     (await retryService.uploadProviderSecretRestore(
       retryInput("fresh-browser-provider-secret-put-retry"),
@@ -1378,6 +1389,12 @@ Deno.test("provider-secret staging survives missing or lost PUT responses and fo
     "uploaded",
   );
   assertEquals(retryStore.attachment?.status, "uploaded");
+  assertEquals(
+    (await retryService.uploadProviderSecretRestore(
+      retryInput("another-fresh-key-after-uploaded-convergence"),
+    )).id,
+    retryStore.attachment?.id,
+  );
   const cancelled = await retryService.cancelProviderSecretRestore({
     actorId: ACTOR,
     restoreId: base.id,

@@ -1175,7 +1175,8 @@ export class DefaultBackupAdminService implements BackupAdminService {
             store.getActiveByRestoreOperation(input.restoreId)
           ).catch(() => undefined);
           if (
-            active?.status === "staging" && active.archiveSha256 === staged.digest &&
+            active && ["staging", "uploaded"].includes(active.status) &&
+            active.archiveSha256 === staged.digest &&
             active.archiveBytes === staged.bytes &&
             active.sidecarId === authenticated.header.sidecarId &&
             active.recoveryKeyId === authenticated.header.encryption.wrapping.keyId &&
@@ -1185,9 +1186,7 @@ export class DefaultBackupAdminService implements BackupAdminService {
             active.sourceInstallationId === binding.sourceInstallationId
           ) durable = active;
         }
-        if (!durable || (durable.status !== "staging" && durable.sourceObjectKey !== objectKey)) {
-          throw error;
-        }
+        if (!durable) throw error;
         attachment = durable;
       }
       if (attachment.status !== "staging" && attachment.status !== "uploaded") {
@@ -1254,9 +1253,21 @@ export class DefaultBackupAdminService implements BackupAdminService {
       if (storedBytes !== staged.bytes || storedHash.digest("hex") !== staged.digest) {
         throw new BackupServiceError("conflict", "The provider-secret upload failed verification");
       }
-      attachment = await providerSecretStoreCall(() =>
-        store.markUploaded(attachment.id, attachment.version)
-      );
+      try {
+        attachment = await providerSecretStoreCall(() =>
+          store.markUploaded(attachment.id, attachment.version)
+        );
+      } catch (error) {
+        const durable = await providerSecretStoreCall(() =>
+          store.getActiveByRestoreOperation(input.restoreId)
+        ).catch(() => undefined);
+        if (
+          durable?.status !== "uploaded" || durable.id !== attachment.id ||
+          durable.version !== attachment.version + 1 || durable.sourceObjectKey !== objectKey ||
+          durable.archiveSha256 !== staged.digest || durable.archiveBytes !== staged.bytes
+        ) throw error;
+        attachment = durable;
+      }
       return {
         id: attachment.id,
         restoreId: attachment.restoreOperationId,
