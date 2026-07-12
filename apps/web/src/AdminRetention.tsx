@@ -238,6 +238,13 @@ export function AdminRetention(props: AdminRetentionProps) {
           <h1 id={titleId}>Retention</h1>
           <p>Control optional diagnostic payload storage and scrubbing.</p>
         </div>
+        <button
+          className="secondary ops-target"
+          disabled={props.policyLoading || props.savePending || props.scrubPending}
+          onClick={() => void props.onReloadPolicy()}
+        >
+          {props.policyLoading ? "Refreshing…" : "Refresh policy"}
+        </button>
       </header>
       <div className="retention-invariant">
         <ShieldCheck aria-hidden="true" />
