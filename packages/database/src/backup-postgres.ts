@@ -39,6 +39,15 @@ export interface BackupOperation {
   artifactCleanupCheckedAt: string | null;
   artifactCleanupLeaseToken: string | null;
   artifactCleanupLeaseExpiresAt: string | null;
+  providerSecretsRequested: boolean;
+  secretArtifactObjectKey: string | null;
+  secretArchiveSha256: string | null;
+  secretArchiveBytes: number | null;
+  secretProviderCount: number | null;
+  secretRecoveryKeyId: string | null;
+  secretArtifactCleanupCheckedAt: string | null;
+  secretArtifactCleanupLeaseToken: string | null;
+  secretArtifactCleanupLeaseExpiresAt: string | null;
   createdAt: string;
   startedAt: string | null;
   validatedAt: string | null;
@@ -62,6 +71,7 @@ export interface CreateBackupOperationInput {
   options?: JsonObject;
   sourceObjectKey?: string | null;
   archiveSha256?: string | null;
+  providerSecretsRequested?: boolean;
 }
 
 export interface BackupProgressInput {
@@ -79,6 +89,19 @@ export interface BackupCompletionInput {
   artifactObjectKey?: string | null;
   manifest?: JsonObject;
   impact?: JsonObject;
+  secretArtifactObjectKey?: string;
+  secretArchiveSha256?: string;
+  secretArchiveBytes?: number;
+  secretProviderCount?: number;
+  secretRecoveryKeyId?: string;
+}
+
+export interface ProviderSecretArtifactPlan {
+  artifactObjectKey: string;
+  archiveSha256: string;
+  archiveBytes: number;
+  providerCount: number;
+  recoveryKeyId: string;
 }
 
 export type BackupFailureCode =
@@ -109,6 +132,7 @@ export class BackupOperationError extends Error {
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const SHA256 = /^[0-9a-f]{64}$/u;
+const KEY_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 
 function iso(value: unknown): string {
   return value instanceof Date ? value.toISOString() : String(value);
@@ -145,6 +169,17 @@ function assertOperationId(value: string): void {
   }
 }
 
+function assertSecretArtifactPlan(input: ProviderSecretArtifactPlan): void {
+  if (
+    !validObjectKey(input.artifactObjectKey) || !SHA256.test(input.archiveSha256) ||
+    !Number.isSafeInteger(input.archiveBytes) || input.archiveBytes < 1 ||
+    !Number.isSafeInteger(input.providerCount) || input.providerCount < 0 ||
+    !KEY_ID.test(input.recoveryKeyId)
+  ) {
+    throw new BackupOperationError("invalid", "Provider secret artifact plan is invalid");
+  }
+}
+
 function mapOperation(row: Record<string, unknown>): BackupOperation {
   return {
     id: String(row.id),
@@ -177,6 +212,27 @@ function mapOperation(row: Record<string, unknown>): BackupOperation {
       ? null
       : String(row.artifact_cleanup_lease_token),
     artifactCleanupLeaseExpiresAt: nullableIso(row.artifact_cleanup_lease_expires_at),
+    providerSecretsRequested: Boolean(row.provider_secrets_requested),
+    secretArtifactObjectKey: row.secret_artifact_object_key == null
+      ? null
+      : String(row.secret_artifact_object_key),
+    secretArchiveSha256: row.secret_archive_sha256 == null
+      ? null
+      : String(row.secret_archive_sha256),
+    secretArchiveBytes: row.secret_archive_bytes == null ? null : Number(row.secret_archive_bytes),
+    secretProviderCount: row.secret_provider_count == null
+      ? null
+      : Number(row.secret_provider_count),
+    secretRecoveryKeyId: row.secret_recovery_key_id == null
+      ? null
+      : String(row.secret_recovery_key_id),
+    secretArtifactCleanupCheckedAt: nullableIso(row.secret_artifact_cleanup_checked_at),
+    secretArtifactCleanupLeaseToken: row.secret_artifact_cleanup_lease_token == null
+      ? null
+      : String(row.secret_artifact_cleanup_lease_token),
+    secretArtifactCleanupLeaseExpiresAt: nullableIso(
+      row.secret_artifact_cleanup_lease_expires_at,
+    ),
     createdAt: iso(row.created_at),
     startedAt: nullableIso(row.started_at),
     validatedAt: nullableIso(row.validated_at),
@@ -239,15 +295,23 @@ export class PostgresBackupStore {
     if (input.archiveSha256 != null && !SHA256.test(input.archiveSha256)) {
       throw new BackupOperationError("invalid", "Archive digest is invalid");
     }
+    if (
+      input.providerSecretsRequested != null && typeof input.providerSecretsRequested !== "boolean"
+    ) {
+      throw new BackupOperationError("invalid", "Provider secret export selection is invalid");
+    }
+    if (input.providerSecretsRequested === true && input.kind !== "export") {
+      throw new BackupOperationError("invalid", "Provider secrets can only be included in exports");
+    }
     const options = jsonObject(input.options ?? {}, "Backup options");
     return await this.#sql.begin(async (tx) => {
       const inserted = await tx<Record<string, unknown>[]>`
         INSERT INTO backup_operations(
           kind,actor_id,actor_email,actor_name,idempotency_key,options,
-          source_object_key,archive_sha256
+          source_object_key,archive_sha256,provider_secrets_requested
         ) SELECT ${input.kind},u.id,u.email,u.name,${input.idempotencyKey},
           ${tx.json(options as never)},${input.sourceObjectKey ?? null},
-          ${input.archiveSha256 ?? null}
+          ${input.archiveSha256 ?? null},${input.providerSecretsRequested ?? false}
         FROM users u WHERE u.id=${input.actorId}
         ON CONFLICT(actor_id,kind,idempotency_key) DO NOTHING RETURNING *
       `;
@@ -263,7 +327,9 @@ export class PostgresBackupStore {
       }
       if (
         existing.source_object_key !== (input.sourceObjectKey ?? null) ||
-        existing.archive_sha256 !== (input.archiveSha256 ?? null) || existing.options_match !== true
+        existing.archive_sha256 !== (input.archiveSha256 ?? null) ||
+        existing.provider_secrets_requested !== (input.providerSecretsRequested ?? false) ||
+        existing.options_match !== true
       ) {
         throw new BackupOperationError(
           "conflict",
@@ -467,11 +533,53 @@ export class PostgresBackupStore {
     const [row] = await this.#sql<Record<string, unknown>[]>`
       UPDATE backup_operations SET stage='uploading',artifact_object_key=${artifactObjectKey},
         archive_sha256=${archiveSha256},updated_at=now(),version=version+1
-      WHERE id=${id} AND kind='export' AND status='running' AND version=${expectedVersion}
+      WHERE id=${id} AND kind='export' AND provider_secrets_requested=false
+        AND status='running' AND version=${expectedVersion}
         AND export_lease_token=${leaseToken} AND export_lease_expires_at>now()
         AND artifact_object_key IS NULL AND archive_sha256 IS NULL
       RETURNING *`;
     if (!row) throw new BackupOperationError("conflict", "Export artifact plan is stale");
+    return mapOperation(row);
+  }
+
+  /**
+   * Atomically binds both lease-scoped artifact identities before either object is published.
+   * A privileged export can therefore never durably describe only half of its requested pair.
+   */
+  async planPrivilegedExportArtifacts(
+    id: string,
+    expectedVersion: number,
+    leaseToken: string,
+    artifactObjectKey: string,
+    archiveSha256: string,
+    secret: ProviderSecretArtifactPlan,
+  ): Promise<BackupOperation> {
+    assertOperationId(id);
+    positiveVersion(expectedVersion);
+    if (
+      !UUID.test(leaseToken) || !validObjectKey(artifactObjectKey) || !SHA256.test(archiveSha256)
+    ) {
+      throw new BackupOperationError("invalid", "Export artifact plan is invalid");
+    }
+    assertSecretArtifactPlan(secret);
+    if (secret.artifactObjectKey === artifactObjectKey) {
+      throw new BackupOperationError("invalid", "Backup artifacts must use distinct object keys");
+    }
+    const [row] = await this.#sql<Record<string, unknown>[]>`
+      UPDATE backup_operations SET stage='uploading',artifact_object_key=${artifactObjectKey},
+        archive_sha256=${archiveSha256},secret_artifact_object_key=${secret.artifactObjectKey},
+        secret_archive_sha256=${secret.archiveSha256},secret_archive_bytes=${secret.archiveBytes},
+        secret_provider_count=${secret.providerCount},secret_recovery_key_id=${secret.recoveryKeyId},
+        updated_at=now(),version=version+1
+      WHERE id=${id} AND kind='export' AND provider_secrets_requested=true
+        AND status='running' AND version=${expectedVersion}
+        AND export_lease_token=${leaseToken} AND export_lease_expires_at>now()
+        AND artifact_object_key IS NULL AND archive_sha256 IS NULL
+        AND secret_artifact_object_key IS NULL AND secret_archive_sha256 IS NULL
+      RETURNING *`;
+    if (!row) {
+      throw new BackupOperationError("conflict", "Privileged export artifact plan is stale");
+    }
     return mapOperation(row);
   }
 
@@ -566,6 +674,93 @@ export class PostgresBackupStore {
         updated_at=now(),version=version+1
       WHERE id=${id} AND kind='export' AND status IN ('failed','cancelled')
         AND artifact_cleanup_lease_token=${leaseToken} RETURNING id`;
+    return rows.length === 1;
+  }
+
+  /** Sidecar tombstones use an independent lease so base and sidecar deletion can be retried alone. */
+  async claimRecoverableProviderSecretArtifacts(
+    leaseToken: string,
+    leaseSeconds: number,
+    cooldownMs: number,
+    claimTimeoutMs: number,
+    limit = 100,
+  ): Promise<BackupOperation[]> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+      throw new BackupOperationError(
+        "invalid",
+        "Recoverable provider secret artifact limit must be between 1 and 1000",
+      );
+    }
+    if (
+      !UUID.test(leaseToken) || !Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1 ||
+      leaseSeconds > 3600 || !Number.isSafeInteger(cooldownMs) || cooldownMs < 100 ||
+      cooldownMs > 60 * 60_000 || !Number.isSafeInteger(claimTimeoutMs) || claimTimeoutMs < 1 ||
+      claimTimeoutMs > 30_000
+    ) {
+      throw new BackupOperationError(
+        "invalid",
+        "Provider secret artifact cleanup lease is invalid",
+      );
+    }
+    return await this.#sql.begin(async (tx) => {
+      await tx`SELECT set_config('statement_timeout',${String(claimTimeoutMs)},true),
+        set_config('lock_timeout',${String(claimTimeoutMs)},true)`;
+      const rows = await tx<Record<string, unknown>[]>`
+        UPDATE backup_operations
+        SET secret_artifact_cleanup_lease_token=${leaseToken},
+          secret_artifact_cleanup_lease_expires_at=
+            now()+(${leaseSeconds}::text || ' seconds')::interval,
+          updated_at=now(),version=version+1
+        WHERE id IN (
+          SELECT id FROM backup_operations
+          WHERE kind='export' AND status IN ('failed','cancelled')
+            AND secret_artifact_object_key IS NOT NULL AND secret_archive_sha256 IS NOT NULL
+            AND (secret_artifact_cleanup_lease_token IS NULL OR
+              secret_artifact_cleanup_lease_expires_at<=now())
+            AND (secret_artifact_cleanup_checked_at IS NULL OR
+              secret_artifact_cleanup_checked_at<=
+                now()-(${cooldownMs}::text || ' milliseconds')::interval)
+          ORDER BY secret_artifact_cleanup_checked_at ASC NULLS FIRST,created_at ASC,id ASC
+          LIMIT ${limit} FOR UPDATE SKIP LOCKED
+        ) RETURNING *`;
+      return rows.map(mapOperation);
+    });
+  }
+
+  async recordProviderSecretArtifactCleanup(
+    id: string,
+    artifactObjectKey: string,
+    archiveSha256: string,
+    leaseToken: string,
+  ): Promise<boolean> {
+    assertOperationId(id);
+    if (
+      !validObjectKey(artifactObjectKey) || !SHA256.test(archiveSha256) || !UUID.test(leaseToken)
+    ) {
+      throw new BackupOperationError("invalid", "Provider secret artifact cleanup is invalid");
+    }
+    const rows = await this.#sql`
+      UPDATE backup_operations SET secret_artifact_cleanup_checked_at=now(),updated_at=now(),
+        secret_artifact_cleanup_lease_token=NULL,
+        secret_artifact_cleanup_lease_expires_at=NULL,version=version+1
+      WHERE id=${id} AND kind='export' AND status IN ('failed','cancelled')
+        AND secret_artifact_object_key=${artifactObjectKey}
+        AND secret_archive_sha256=${archiveSha256}
+        AND secret_artifact_cleanup_lease_token=${leaseToken}
+      RETURNING id`;
+    return rows.length === 1;
+  }
+
+  async releaseProviderSecretArtifactCleanup(id: string, leaseToken: string): Promise<boolean> {
+    assertOperationId(id);
+    if (!UUID.test(leaseToken)) {
+      throw new BackupOperationError("invalid", "Provider secret cleanup lease is invalid");
+    }
+    const rows = await this.#sql`UPDATE backup_operations
+      SET secret_artifact_cleanup_lease_token=NULL,
+        secret_artifact_cleanup_lease_expires_at=NULL,updated_at=now(),version=version+1
+      WHERE id=${id} AND kind='export' AND status IN ('failed','cancelled')
+        AND secret_artifact_cleanup_lease_token=${leaseToken} RETURNING id`;
     return rows.length === 1;
   }
 
@@ -682,6 +877,36 @@ export class PostgresBackupStore {
     if (input.artifactObjectKey != null && !validObjectKey(input.artifactObjectKey)) {
       throw new BackupOperationError("invalid", "Artifact object key is invalid");
     }
+    const secretValues = [
+      input.secretArtifactObjectKey,
+      input.secretArchiveSha256,
+      input.secretArchiveBytes,
+      input.secretProviderCount,
+      input.secretRecoveryKeyId,
+    ];
+    const hasAnySecret = secretValues.some((value) => value !== undefined);
+    const hasAllSecret = secretValues.every((value) => value !== undefined);
+    if (hasAnySecret !== hasAllSecret) {
+      throw new BackupOperationError(
+        "invalid",
+        "Provider secret artifact completion is incomplete",
+      );
+    }
+    const secret = hasAllSecret
+      ? {
+        artifactObjectKey: input.secretArtifactObjectKey!,
+        archiveSha256: input.secretArchiveSha256!,
+        archiveBytes: input.secretArchiveBytes!,
+        providerCount: input.secretProviderCount!,
+        recoveryKeyId: input.secretRecoveryKeyId!,
+      }
+      : null;
+    if (secret) {
+      assertSecretArtifactPlan(secret);
+      if (secret.artifactObjectKey === input.artifactObjectKey) {
+        throw new BackupOperationError("invalid", "Backup artifacts must use distinct object keys");
+      }
+    }
     const manifest = input.manifest ? jsonObject(input.manifest, "Backup manifest") : null;
     const impact = input.impact ? jsonObject(input.impact, "Restore impact") : null;
     return await this.#sql.begin(async (tx) => {
@@ -706,6 +931,12 @@ export class PostgresBackupStore {
         WHERE id=${id} AND kind='export' AND status='running' AND version=${expectedVersion}
           AND archive_sha256=${input.archiveSha256}
           AND artifact_object_key=${input.artifactObjectKey ?? null}
+          AND provider_secrets_requested=${secret !== null}
+          AND secret_artifact_object_key IS NOT DISTINCT FROM ${secret?.artifactObjectKey ?? null}
+          AND secret_archive_sha256 IS NOT DISTINCT FROM ${secret?.archiveSha256 ?? null}
+          AND secret_archive_bytes IS NOT DISTINCT FROM ${secret?.archiveBytes ?? null}
+          AND secret_provider_count IS NOT DISTINCT FROM ${secret?.providerCount ?? null}
+          AND secret_recovery_key_id IS NOT DISTINCT FROM ${secret?.recoveryKeyId ?? null}
           AND objects_processed=objects_total AND bytes_processed=bytes_total
         RETURNING *
       `;

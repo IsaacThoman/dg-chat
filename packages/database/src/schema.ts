@@ -1096,6 +1096,19 @@ export const backupOperations = pgTable("backup_operations", {
   artifactCleanupLeaseExpiresAt: timestamp("artifact_cleanup_lease_expires_at", {
     withTimezone: true,
   }),
+  providerSecretsRequested: boolean("provider_secrets_requested").notNull().default(false),
+  secretArtifactObjectKey: text("secret_artifact_object_key"),
+  secretArchiveSha256: text("secret_archive_sha256"),
+  secretArchiveBytes: bigint("secret_archive_bytes", { mode: "number" }),
+  secretProviderCount: integer("secret_provider_count"),
+  secretRecoveryKeyId: text("secret_recovery_key_id"),
+  secretArtifactCleanupCheckedAt: timestamp("secret_artifact_cleanup_checked_at", {
+    withTimezone: true,
+  }),
+  secretArtifactCleanupLeaseToken: uuid("secret_artifact_cleanup_lease_token"),
+  secretArtifactCleanupLeaseExpiresAt: timestamp("secret_artifact_cleanup_lease_expires_at", {
+    withTimezone: true,
+  }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   startedAt: timestamp("started_at", { withTimezone: true }),
   validatedAt: timestamp("validated_at", { withTimezone: true }),
@@ -1112,6 +1125,13 @@ export const backupOperations = pgTable("backup_operations", {
     table.kind,
     table.createdAt.desc(),
     table.id.desc(),
+  ),
+  index("backup_operations_secret_cleanup_idx").on(
+    table.secretArtifactCleanupCheckedAt,
+    table.createdAt,
+    table.id,
+  ).where(
+    sql`${table.kind}='export' AND ${table.status} IN ('failed','cancelled') AND ${table.secretArtifactObjectKey} IS NOT NULL AND ${table.secretArchiveSha256} IS NOT NULL`,
   ),
   check("backup_operations_kind_check", sql`${table.kind} IN ('export','restore')`),
   check(
@@ -1159,6 +1179,30 @@ export const backupOperations = pgTable("backup_operations", {
   check(
     "backup_operations_artifact_cleanup_lease_check",
     sql`(${table.artifactCleanupLeaseToken} IS NULL AND ${table.artifactCleanupLeaseExpiresAt} IS NULL) OR (${table.kind}='export' AND ${table.status} IN ('failed','cancelled') AND ${table.artifactObjectKey} IS NOT NULL AND ${table.archiveSha256} IS NOT NULL AND ${table.artifactCleanupLeaseToken} IS NOT NULL AND ${table.artifactCleanupLeaseExpiresAt} IS NOT NULL)`,
+  ),
+  check(
+    "backup_operations_provider_secrets_kind_check",
+    sql`NOT ${table.providerSecretsRequested} OR ${table.kind}='export'`,
+  ),
+  check(
+    "backup_operations_secret_object_key_check",
+    sql`${table.secretArtifactObjectKey} IS NULL OR (char_length(${table.secretArtifactObjectKey}) BETWEEN 1 AND 1024 AND left(${table.secretArtifactObjectKey},1) <> '/')`,
+  ),
+  check(
+    "backup_operations_secret_digest_check",
+    sql`${table.secretArchiveSha256} IS NULL OR ${table.secretArchiveSha256} ~ '^[0-9a-f]{64}$'`,
+  ),
+  check(
+    "backup_operations_secret_metadata_check",
+    sql`(${table.secretArtifactObjectKey} IS NULL AND ${table.secretArchiveSha256} IS NULL AND ${table.secretArchiveBytes} IS NULL AND ${table.secretProviderCount} IS NULL AND ${table.secretRecoveryKeyId} IS NULL) OR (${table.providerSecretsRequested} AND ${table.kind}='export' AND ${table.secretArtifactObjectKey} IS NOT NULL AND ${table.secretArchiveSha256} IS NOT NULL AND ${table.secretArchiveBytes} > 0 AND ${table.secretProviderCount} >= 0 AND char_length(${table.secretRecoveryKeyId}) BETWEEN 1 AND 128)`,
+  ),
+  check(
+    "backup_operations_secret_completion_check",
+    sql`${table.status} <> 'completed' OR NOT ${table.providerSecretsRequested} OR (${table.secretArtifactObjectKey} IS NOT NULL AND ${table.secretArchiveSha256} IS NOT NULL AND ${table.secretArchiveBytes} IS NOT NULL AND ${table.secretProviderCount} IS NOT NULL AND ${table.secretRecoveryKeyId} IS NOT NULL)`,
+  ),
+  check(
+    "backup_operations_secret_cleanup_lease_check",
+    sql`(${table.secretArtifactCleanupLeaseToken} IS NULL AND ${table.secretArtifactCleanupLeaseExpiresAt} IS NULL) OR (${table.kind}='export' AND ${table.status} IN ('failed','cancelled') AND ${table.secretArtifactObjectKey} IS NOT NULL AND ${table.secretArchiveSha256} IS NOT NULL AND ${table.secretArtifactCleanupLeaseToken} IS NOT NULL AND ${table.secretArtifactCleanupLeaseExpiresAt} IS NOT NULL)`,
   ),
   check(
     "backup_operations_time_check",
