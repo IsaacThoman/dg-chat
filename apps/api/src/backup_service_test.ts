@@ -632,6 +632,7 @@ class MemoryProviderSecretRestoreStore {
   appliedCredentials: Array<{ providerId: string; envelope: unknown }> = [];
   failApply = false;
   throwAfterApply = false;
+  throwAfterCreate = false;
   staleEpochSweeps = 0;
   abandonedStagingSweeps = 0;
   abandonedAttachmentSweeps = 0;
@@ -652,7 +653,13 @@ class MemoryProviderSecretRestoreStore {
   }) {
     if (
       this.attachment && ["staging", "uploaded", "validated"].includes(this.attachment.status)
-    ) return Promise.resolve(structuredClone(this.attachment));
+    ) {
+      if (this.throwAfterCreate) {
+        this.throwAfterCreate = false;
+        return Promise.reject(new Error("create response lost"));
+      }
+      return Promise.resolve(structuredClone(this.attachment));
+    }
     const now = new Date().toISOString();
     this.attachment = {
       id: crypto.randomUUID(),
@@ -687,6 +694,10 @@ class MemoryProviderSecretRestoreStore {
       completedAt: null,
       updatedAt: now,
     };
+    if (this.throwAfterCreate) {
+      this.throwAfterCreate = false;
+      return Promise.reject(new Error("create response lost"));
+    }
     return Promise.resolve(structuredClone(this.attachment));
   }
   markUploaded(id: string, version: number) {
@@ -1359,6 +1370,7 @@ Deno.test("provider-secret staging survives missing or lost PUT responses and fo
   );
   assertEquals(retryStore.attachment?.status, "staging");
   assertEquals(retryObjects.values.size, 0);
+  retryStore.throwAfterCreate = true;
   assertEquals(
     (await retryService.uploadProviderSecretRestore(
       retryInput("fresh-browser-provider-secret-put-retry"),

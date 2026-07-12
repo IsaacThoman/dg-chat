@@ -1167,10 +1167,27 @@ export class DefaultBackupAdminService implements BackupAdminService {
       } catch (error) {
         // Reconcile a durable insert whose response was lost. Exact metadata is already enforced by
         // the store's idempotency contract; no object has been published before this point.
-        const durable = await providerSecretStoreCall(() =>
+        let durable = await providerSecretStoreCall(() =>
           store.findByIdempotency(input.restoreId, input.idempotencyKey)
         ).catch(() => undefined);
-        if (!durable || durable.sourceObjectKey !== objectKey) throw error;
+        if (!durable) {
+          const active = await providerSecretStoreCall(() =>
+            store.getActiveByRestoreOperation(input.restoreId)
+          ).catch(() => undefined);
+          if (
+            active?.status === "staging" && active.archiveSha256 === staged.digest &&
+            active.archiveBytes === staged.bytes &&
+            active.sidecarId === authenticated.header.sidecarId &&
+            active.recoveryKeyId === authenticated.header.encryption.wrapping.keyId &&
+            active.baseBackupId === binding.backupId &&
+            active.baseArchiveSha256 === binding.archiveSha256 &&
+            active.baseContentRootSha256 === binding.contentRootSha256 &&
+            active.sourceInstallationId === binding.sourceInstallationId
+          ) durable = active;
+        }
+        if (!durable || (durable.status !== "staging" && durable.sourceObjectKey !== objectKey)) {
+          throw error;
+        }
         attachment = durable;
       }
       if (attachment.status !== "staging" && attachment.status !== "uploaded") {
