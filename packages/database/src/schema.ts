@@ -1214,6 +1214,96 @@ export const backupOperations = pgTable("backup_operations", {
   ),
 ]);
 
+export const backupRestoreSecretSidecars = pgTable("backup_restore_secret_sidecars", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  restoreOperationId: uuid("restore_operation_id").notNull().references(() => backupOperations.id, {
+    onDelete: "restrict",
+  }),
+  status: text("status").$type<"uploaded" | "validated" | "applied" | "failed" | "cancelled">()
+    .notNull().default("uploaded"),
+  version: integer("version").notNull().default(1),
+  idempotencyKey: text("idempotency_key").notNull(),
+  // Control-plane actor evidence intentionally has no users FK so a later full restore cannot
+  // cascade-truncate sidecar history while replacing portable user data.
+  requestedBy: uuid("requested_by"),
+  appliedBy: uuid("applied_by"),
+  sourceObjectKey: text("source_object_key").notNull(),
+  archiveSha256: text("archive_sha256").notNull(),
+  archiveBytes: bigint("archive_bytes", { mode: "number" }).notNull(),
+  sidecarId: uuid("sidecar_id").notNull(),
+  recoveryKeyId: text("recovery_key_id").notNull(),
+  baseBackupId: uuid("base_backup_id").notNull(),
+  baseArchiveSha256: text("base_archive_sha256").notNull(),
+  baseContentRootSha256: text("base_content_root_sha256").notNull(),
+  sourceInstallationId: uuid("source_installation_id").notNull(),
+  recordCount: integer("record_count"),
+  recordsSha256: text("records_sha256"),
+  providerStateSha256: text("provider_state_sha256"),
+  impact: jsonb("impact"),
+  error: text("error"),
+  cleanupCheckedAt: timestamp("cleanup_checked_at", { withTimezone: true }),
+  cleanupLeaseToken: uuid("cleanup_lease_token"),
+  cleanupLeaseExpiresAt: timestamp("cleanup_lease_expires_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  validatedAt: timestamp("validated_at", { withTimezone: true }),
+  appliedAt: timestamp("applied_at", { withTimezone: true }),
+  completedAt: timestamp("completed_at", { withTimezone: true }),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("backup_restore_secret_sidecars_restore_uq").on(table.restoreOperationId),
+  uniqueIndex("backup_restore_secret_sidecars_idempotency_uq").on(
+    table.restoreOperationId,
+    table.idempotencyKey,
+  ),
+  index("backup_restore_secret_sidecars_cleanup_idx").on(
+    table.cleanupCheckedAt,
+    table.completedAt,
+    table.id,
+  ).where(sql`${table.status} IN ('applied','failed','cancelled')`),
+  check(
+    "backup_restore_secret_sidecars_status_check",
+    sql`${table.status} IN ('uploaded','validated','applied','failed','cancelled')`,
+  ),
+  check("backup_restore_secret_sidecars_version_check", sql`${table.version} >= 1`),
+  check(
+    "backup_restore_secret_sidecars_idempotency_check",
+    sql`char_length(${table.idempotencyKey}) BETWEEN 8 AND 200`,
+  ),
+  check(
+    "backup_restore_secret_sidecars_object_key_check",
+    sql`char_length(${table.sourceObjectKey}) BETWEEN 1 AND 1024 AND left(${table.sourceObjectKey},1) <> '/' AND ${table.sourceObjectKey} !~ '(^|/)\.\.(/|$)' AND ${table.sourceObjectKey} !~ '//' AND ${table.sourceObjectKey} !~ '[[:cntrl:]]'`,
+  ),
+  check(
+    "backup_restore_secret_sidecars_digest_check",
+    sql`${table.archiveSha256} ~ '^[0-9a-f]{64}$' AND ${table.baseArchiveSha256} ~ '^[0-9a-f]{64}$' AND ${table.baseContentRootSha256} ~ '^[0-9a-f]{64}$' AND (${table.recordsSha256} IS NULL OR ${table.recordsSha256} ~ '^[0-9a-f]{64}$') AND (${table.providerStateSha256} IS NULL OR ${table.providerStateSha256} ~ '^[0-9a-f]{64}$')`,
+  ),
+  check("backup_restore_secret_sidecars_size_check", sql`${table.archiveBytes} > 0`),
+  check(
+    "backup_restore_secret_sidecars_key_check",
+    sql`${table.recoveryKeyId} ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'`,
+  ),
+  check(
+    "backup_restore_secret_sidecars_validation_check",
+    sql`(${table.recordCount} IS NULL AND ${table.recordsSha256} IS NULL AND ${table.providerStateSha256} IS NULL AND ${table.impact} IS NULL AND ${table.validatedAt} IS NULL) OR (${table.recordCount} >= 0 AND ${table.recordsSha256} IS NOT NULL AND ${table.providerStateSha256} IS NOT NULL AND jsonb_typeof(${table.impact})='object' AND ${table.validatedAt} IS NOT NULL)`,
+  ),
+  check(
+    "backup_restore_secret_sidecars_error_check",
+    sql`${table.error} IS NULL OR char_length(${table.error}) BETWEEN 1 AND 1000`,
+  ),
+  check(
+    "backup_restore_secret_sidecars_cleanup_lease_check",
+    sql`(${table.cleanupLeaseToken} IS NULL AND ${table.cleanupLeaseExpiresAt} IS NULL) OR (${table.status} IN ('applied','failed','cancelled') AND ${table.cleanupLeaseToken} IS NOT NULL AND ${table.cleanupLeaseExpiresAt} IS NOT NULL)`,
+  ),
+  check(
+    "backup_restore_secret_sidecars_time_check",
+    sql`${table.updatedAt} >= ${table.createdAt} AND (${table.validatedAt} IS NULL OR ${table.validatedAt} >= ${table.createdAt}) AND (${table.appliedAt} IS NULL OR ${table.appliedAt} >= ${table.createdAt}) AND (${table.completedAt} IS NULL OR ${table.completedAt} >= ${table.createdAt})`,
+  ),
+  check(
+    "backup_restore_secret_sidecars_lifecycle_check",
+    sql`(${table.status}='uploaded' AND ${table.validatedAt} IS NULL AND ${table.appliedAt} IS NULL AND ${table.completedAt} IS NULL AND ${table.error} IS NULL) OR (${table.status}='validated' AND ${table.validatedAt} IS NOT NULL AND ${table.appliedAt} IS NULL AND ${table.completedAt} IS NULL AND ${table.error} IS NULL) OR (${table.status}='applied' AND ${table.validatedAt} IS NOT NULL AND ${table.appliedAt} IS NOT NULL AND ${table.completedAt} IS NOT NULL AND ${table.error} IS NULL AND ${table.appliedBy} IS NOT NULL) OR (${table.status}='failed' AND ${table.appliedAt} IS NULL AND ${table.completedAt} IS NOT NULL AND ${table.error} IS NOT NULL) OR (${table.status}='cancelled' AND ${table.appliedAt} IS NULL AND ${table.completedAt} IS NOT NULL AND ${table.error} IS NULL)`,
+  ),
+]);
+
 export const installationState = pgTable("installation_state", {
   singletonId: smallint("singleton_id").primaryKey().default(1),
   installationId: uuid("installation_id").notNull().defaultRandom(),

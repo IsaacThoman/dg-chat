@@ -503,6 +503,7 @@ export async function verifyBackupDataCatalog(databaseUrl: string): Promise<void
     const control = new Set([
       ...BACKUP_EPHEMERAL_TABLES,
       "backup_operations",
+      "backup_restore_secret_sidecars",
       "installation_state",
       "repository_migrations",
     ]);
@@ -550,7 +551,14 @@ export async function verifyBackupDataCatalog(databaseUrl: string): Promise<void
         );
       }
     }
-    for (const name of ["backup_operations", "installation_state", "repository_migrations"]) {
+    for (
+      const name of [
+        "backup_operations",
+        "backup_restore_secret_sidecars",
+        "installation_state",
+        "repository_migrations",
+      ]
+    ) {
       if (fenced.has(name)) {
         throw new BackupDataError(
           "invariant",
