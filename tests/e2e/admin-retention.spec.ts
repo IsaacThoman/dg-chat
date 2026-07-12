@@ -151,7 +151,9 @@ test("stale scrub recovery remains operable without horizontal overflow at 320px
   await expect(page.getByLabel("Response body retention")).toBeEnabled();
   await page.getByLabel("Request body retention").selectOption("1");
   policy = { ...policy, version: 5, updatedAt: "2026-07-11T00:01:00.000Z" };
-  await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
+  // TanStack Query's focus manager listens to the window focus event in headless Chromium.
+  // Dispatching only visibilitychange is not deterministic because visibilityState never changed.
+  await page.evaluate(() => globalThis.dispatchEvent(new Event("focus")));
   await expect.poll(() => policyRequests).toBeGreaterThan(1);
   await expect(page.getByRole("alert")).toContainText("changed in another session");
   await expect(page.getByLabel("Request body retention")).toHaveValue("1");
