@@ -67,7 +67,24 @@ Deno.test({
           expires_at timestamptz,
           last_used_at timestamptz,
           created_at timestamptz NOT NULL DEFAULT now(),
-          revoked_at timestamptz
+          revoked_at timestamptz,
+          version integer NOT NULL DEFAULT 1 CHECK(version >= 1),
+          rpm_limit integer CHECK(rpm_limit IS NULL OR rpm_limit BETWEEN 1 AND 60000),
+          burst_limit integer CHECK(burst_limit IS NULL OR burst_limit BETWEEN 1 AND 1000),
+          access_mode text NOT NULL DEFAULT 'inherit' CHECK(access_mode IN ('inherit','restricted')),
+          rotation_family_id uuid NOT NULL,
+          rotation_generation integer NOT NULL DEFAULT 0 CHECK(rotation_generation >= 0),
+          rotated_from_token_id uuid,
+          replaced_by_token_id uuid,
+          overlap_ends_at timestamptz,
+          CHECK(rpm_limit IS NULL OR burst_limit IS NULL OR burst_limit <= rpm_limit),
+          UNIQUE(rotation_family_id,rotation_generation),
+          UNIQUE(rotation_family_id,id),
+          UNIQUE(user_id,id),
+          FOREIGN KEY(rotation_family_id,rotated_from_token_id)
+            REFERENCES api_tokens(rotation_family_id,id) ON DELETE RESTRICT,
+          FOREIGN KEY(rotation_family_id,replaced_by_token_id)
+            REFERENCES api_tokens(rotation_family_id,id) ON DELETE RESTRICT
         );
         CREATE TABLE ledger_entries (
           id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

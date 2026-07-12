@@ -1,6 +1,10 @@
 services:
   app:
     environment:
+      # CI browser journeys intentionally use the deterministic in-process model harness.
+      # Production Compose keeps DENO_ENV=production, where legacy/simulated catalog entries
+      # are excluded and every model must come from the persisted provider registry.
+      DENO_ENV: test
       LOG_LEVEL: warn
       # Browser suites intentionally exercise repeated sign-in journeys from one runner address.
       AUTH_RATE_LIMIT: "1000"

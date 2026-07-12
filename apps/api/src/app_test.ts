@@ -1,11 +1,12 @@
 import { assertEquals, assertExists, assertStringIncludes } from "jsr:@std/assert@1.0.14";
-import { createApp } from "./app.ts";
+import { canonicalJson, createApp, legacyModelHarnessAllowed } from "./app.ts";
 import type { RateLimiter } from "./rate-limit.ts";
 import type { ChatCompletionRequest } from "@dg-chat/contracts";
 import { DomainError, MemoryRepository } from "@dg-chat/database";
 import { type IdentityMailer, TestIdentityMailer } from "./mail.ts";
 import { TestObjectStore } from "./test-object-store.ts";
 import { simulate } from "./models.ts";
+import { sha256Hex } from "./crypto.ts";
 
 async function json(response: Response) {
   // deno-lint-ignore no-explicit-any
@@ -46,6 +47,247 @@ Deno.test("OpenAI endpoint registrations are unique", () => {
       "POST /v1/audio/translations",
     ]
   ) assertEquals(counts.has(expected), true, `Missing OpenAI route registration: ${expected}`);
+});
+
+Deno.test("production disables all legacy and built-in model harnesses", () => {
+  assertEquals(legacyModelHarnessAllowed("production"), false);
+  assertEquals(legacyModelHarnessAllowed("test"), true);
+  assertEquals(legacyModelHarnessAllowed(undefined), true);
+});
+
+Deno.test("admin model-access group user route matches the web contract", async () => {
+  const repository = new MemoryRepository();
+  const { app } = createApp({ setupToken: "model-access-route", repository });
+  await app.request("/api/setup/bootstrap", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-setup-token": "model-access-route" },
+    body: JSON.stringify({
+      email: "model-access@example.com",
+      password: "correct horse battery",
+      name: "Model Access Admin",
+    }),
+  });
+  const login = await app.request("/api/auth/sign-in/email", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email: "model-access@example.com",
+      password: "correct horse battery",
+    }),
+  });
+  const headers = {
+    cookie: sessionCookie(login),
+    origin: "http://localhost:5173",
+    "content-type": "application/json",
+  };
+  const createdResponse = await app.request("/api/admin/model-access/groups", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ name: "Restricted", description: "Route contract" }),
+  });
+  assertEquals(createdResponse.status, 201);
+  const group = await json(createdResponse);
+  const replaced = await app.request(`/api/admin/model-access/groups/${group.id}/users`, {
+    method: "PUT",
+    headers,
+    body: JSON.stringify({ expectedVersion: group.version, ids: [] }),
+  });
+  assertEquals(replaced.status, 200);
+  const replacedGroup = await json(replaced);
+  assertEquals(replacedGroup.userIds, []);
+  const staleShape = await app.request(`/api/admin/model-access/groups/${group.id}/users`, {
+    method: "PUT",
+    headers,
+    body: JSON.stringify({ expectedVersion: group.version, userIds: [] }),
+  });
+  assertEquals(staleShape.status, 422);
+  const impact = await app.request(`/api/admin/model-access/groups/${group.id}/impact`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ proposal: null }),
+  });
+  assertEquals(impact.status, 200);
+  assertEquals(Array.isArray((await json(impact)).modelIdsBecomingPublic), true);
+  const policy = await app.request(`/api/admin/model-access/groups/${group.id}/policy`, {
+    method: "PUT",
+    headers,
+    body: JSON.stringify({
+      expectedVersion: replacedGroup.version,
+      name: "Atomic restricted",
+      description: "All membership changes together",
+      userIds: [],
+      modelIds: [],
+      tokenIds: [],
+    }),
+  });
+  assertEquals(policy.status, 200);
+  assertEquals((await json(policy)).name, "Atomic restricted");
+  const restrictedModelId = crypto.randomUUID();
+  const now = new Date().toISOString();
+  repository.providerModels.set(restrictedModelId, {
+    id: restrictedModelId,
+    providerId: crypto.randomUUID(),
+    publicModelId: "restricted/legacy-route",
+    upstreamModelId: "legacy-route",
+    displayName: "Restricted legacy route",
+    capabilities: ["chat"],
+    contextWindow: 1024,
+    enabled: true,
+    version: 1,
+    customParams: {},
+    createdAt: now,
+    updatedAt: now,
+  });
+  const restricted = repository.replaceAccessGroupModels(
+    group.id,
+    [restrictedModelId],
+    repository.listAccessGroups()[0].version,
+  );
+  const unacknowledged = await app.request(`/api/admin/model-access/groups/${group.id}/models`, {
+    method: "PUT",
+    headers,
+    body: JSON.stringify({ expectedVersion: restricted.version, ids: [] }),
+  });
+  assertEquals(unacknowledged.status, 409);
+  assertEquals(
+    (await json(unacknowledged)).error.code,
+    "model_access_widening_acknowledgement_required",
+  );
+  assertEquals(repository.listAccessGroups()[0].modelIds, [restrictedModelId]);
+  const acknowledged = await app.request(`/api/admin/model-access/groups/${group.id}/models`, {
+    method: "PUT",
+    headers,
+    body: JSON.stringify({
+      expectedVersion: restricted.version,
+      ids: [],
+      acknowledgePublicModelIds: [restrictedModelId],
+    }),
+  });
+  assertEquals(acknowledged.status, 200, await acknowledged.clone().text());
+  const restored = repository.replaceAccessGroupModels(
+    group.id,
+    [restrictedModelId],
+    repository.listAccessGroups()[0].version,
+  );
+  const deleteWithoutAcknowledgement = await app.request(
+    `/api/admin/model-access/groups/${group.id}`,
+    {
+      method: "DELETE",
+      headers,
+      body: JSON.stringify({ expectedVersion: restored.version }),
+    },
+  );
+  assertEquals(deleteWithoutAcknowledgement.status, 409);
+  const deleted = await app.request(`/api/admin/model-access/groups/${group.id}`, {
+    method: "DELETE",
+    headers,
+    body: JSON.stringify({
+      expectedVersion: restored.version,
+      acknowledgePublicModelIds: [restrictedModelId],
+    }),
+  });
+  assertEquals(deleted.status, 204, await deleted.clone().text());
+  const audit = await app.request("/api/admin/audit?limit=20", { headers });
+  const actions = (await json(audit)).data.map((event: { action: string }) => event.action);
+  assertEquals(actions.includes("model_access_group.created"), true);
+  assertEquals(actions.includes("model_access_group.users_replaced"), true);
+  assertEquals(actions.includes("model_access_group.policy_replaced"), true);
+});
+
+Deno.test("token rotation shares quota and family revoke invalidates overlap", async () => {
+  const { app } = createApp({ setupToken: "token-governance-route" });
+  await app.request("/api/setup/bootstrap", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-setup-token": "token-governance-route" },
+    body: JSON.stringify({
+      email: "token-governance@example.com",
+      password: "correct horse battery",
+      name: "Token Admin",
+    }),
+  });
+  const login = await app.request("/api/auth/sign-in/email", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email: "token-governance@example.com",
+      password: "correct horse battery",
+    }),
+  });
+  const loggedIn = await json(login.clone());
+  const sessionHeaders = {
+    cookie: sessionCookie(login),
+    origin: "http://localhost:5173",
+    "content-type": "application/json",
+  };
+  const createdResponse = await app.request("/api/tokens", {
+    method: "POST",
+    headers: sessionHeaders,
+    body: JSON.stringify({
+      name: "Rotating SDK",
+      scopes: ["models:read"],
+      rpmLimit: 10,
+      burstLimit: 1,
+    }),
+  });
+  assertEquals(createdResponse.status, 201);
+  const created = await json(createdResponse);
+  const restrictedResponse = await app.request(
+    `/api/admin/model-access/tokens/${created.id}/access-mode`,
+    {
+      method: "PUT",
+      headers: sessionHeaders,
+      body: JSON.stringify({
+        ownerId: loggedIn.user.id,
+        expectedVersion: created.version,
+        accessMode: "restricted",
+      }),
+    },
+  );
+  assertEquals(restrictedResponse.status, 200);
+  const restricted = await json(restrictedResponse);
+  assertEquals(restricted.accessMode, "restricted");
+  const firstUse = await app.request("/v1/models", {
+    headers: { authorization: `Bearer ${created.token}` },
+  });
+  assertEquals(firstUse.status, 200);
+  assertEquals(
+    (await json(firstUse)).data.some((model: { id: string }) => model.id === "simulated/dg-chat"),
+    true,
+  );
+  const rotationResponse = await app.request(`/api/tokens/${created.id}/rotate`, {
+    method: "POST",
+    headers: sessionHeaders,
+    body: JSON.stringify({ expectedVersion: restricted.version, overlapSeconds: 60 }),
+  });
+  assertEquals(rotationResponse.status, 201);
+  const rotation = await json(rotationResponse);
+  assertEquals(rotation.token.startsWith("dg_"), true);
+  const sharedQuota = await app.request("/v1/models", {
+    headers: { authorization: `Bearer ${rotation.token}` },
+  });
+  assertEquals(sharedQuota.status, 429);
+  assertEquals(sharedQuota.headers.get("x-ratelimit-limit"), "1");
+  assertEquals(sharedQuota.headers.get("x-ratelimit-remaining"), "0");
+  assertEquals(sharedQuota.headers.get("retry-after"), "1");
+
+  const staleRotation = await app.request(`/api/tokens/${created.id}/rotate`, {
+    method: "POST",
+    headers: sessionHeaders,
+    body: JSON.stringify({ expectedVersion: restricted.version, overlapSeconds: 0 }),
+  });
+  assertEquals(staleRotation.status, 409);
+  const revoked = await app.request(`/api/tokens/${rotation.replacement.id}`, {
+    method: "DELETE",
+    headers: sessionHeaders,
+    body: JSON.stringify({ expectedVersion: rotation.replacement.version }),
+  });
+  assertEquals(revoked.status, 204);
+  for (const secret of [created.token, rotation.token]) {
+    const denied = await app.request("/v1/models", {
+      headers: { authorization: `Bearer ${secret}` },
+    });
+    assertEquals(denied.status, 401);
+  }
 });
 
 Deno.test("bootstrap, signup, approval, immutable chat, API token and OpenAI completion", async () => {
@@ -643,6 +885,134 @@ Deno.test("rate limiter outages fail closed with a controlled service error", as
   assertEquals(response.status, 503);
   assertEquals(response.headers.get("retry-after"), "5");
   assertEquals((await json(response)).error.code, "service_unavailable");
+});
+
+Deno.test("post-auth token family limiter outages fail closed", async () => {
+  const limiter: RateLimiter = {
+    consume: (key, limit) =>
+      key.startsWith("token:")
+        ? Promise.reject(new Error("family limiter unavailable"))
+        : Promise.resolve({ allowed: true, limit, remaining: limit - 1, retryAfterSeconds: 60 }),
+    health: () => Promise.resolve(false),
+    close: () => Promise.resolve(),
+  };
+  const { app } = createApp({ setupToken: "family-limiter-outage", rateLimiter: limiter });
+  await app.request("/api/setup/bootstrap", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-setup-token": "family-limiter-outage" },
+    body: JSON.stringify({
+      email: "family-limiter@example.com",
+      password: "correct horse battery",
+      name: "Limiter Admin",
+    }),
+  });
+  const login = await app.request("/api/auth/sign-in/email", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email: "family-limiter@example.com",
+      password: "correct horse battery",
+    }),
+  });
+  const tokenResponse = await app.request("/api/tokens", {
+    method: "POST",
+    headers: {
+      cookie: sessionCookie(login),
+      origin: "http://localhost:5173",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ name: "Default quota", scopes: ["models:read"] }),
+  });
+  const token = await json(tokenResponse);
+  const response = await app.request("/v1/models", {
+    headers: { authorization: `Bearer ${token.token}` },
+  });
+  assertEquals(response.status, 503);
+  assertEquals(response.headers.get("retry-after"), "5");
+  assertEquals((await json(response)).error.code, "service_unavailable");
+});
+
+Deno.test("completed embeddings replay reauthorizes model access without enumeration", async () => {
+  const { app, repository } = createApp({ setupToken: "embedding-replay-access" });
+  const bootstrap = await app.request("/api/setup/bootstrap", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-setup-token": "embedding-replay-access" },
+    body: JSON.stringify({
+      email: "embedding-replay@example.com",
+      password: "correct horse battery",
+      name: "Replay Admin",
+    }),
+  });
+  const owner = (await json(bootstrap)).user;
+  const login = await app.request("/api/auth/sign-in/email", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email: "embedding-replay@example.com",
+      password: "correct horse battery",
+    }),
+  });
+  const tokenResponse = await app.request("/api/tokens", {
+    method: "POST",
+    headers: {
+      cookie: sessionCookie(login),
+      origin: "http://localhost:5173",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ name: "Replay token", scopes: ["chat:write"] }),
+  });
+  const token = await json(tokenResponse);
+  const request = { model: "private/embedding", input: "secret source" };
+  const requestHash = await sha256Hex(canonicalJson({ endpoint: "embeddings", request }));
+  const completed = {
+    id: crypto.randomUUID(),
+    userId: owner.id,
+    endpoint: "embeddings",
+    idempotencyKey: "embedding-replay-denied",
+    requestHash,
+    stream: false,
+    model: request.model,
+    state: "completed",
+    leaseToken: null,
+    leaseExpiresAt: null,
+    usageRunId: "embedding-replay-run",
+    responseStatus: 200,
+    responseHeaders: { "content-type": "application/json" },
+    responseBody: JSON.stringify({ object: "list", data: [] }),
+    responseBodyEncoding: "utf8",
+    failureStartedStream: false,
+    observedInputTokens: 1,
+    observedOutputTokens: 0,
+    observedCostMicros: 1,
+    observedLatencyMs: 1,
+    retentionSeconds: 60,
+    frames: [],
+    createdAt: new Date().toISOString(),
+    completedAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  };
+  Object.assign(repository, {
+    getApiRequest: () => completed,
+    resolveEntitledProviderModel: () => undefined,
+  });
+  const denied = await app.request("/v1/embeddings", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token.token}`,
+      "content-type": "application/json",
+      "idempotency-key": completed.idempotencyKey,
+    },
+    body: JSON.stringify(request),
+  });
+  assertEquals(denied.status, 404);
+  assertEquals(await json(denied), {
+    error: {
+      message: "The requested model is unavailable",
+      type: "invalid_request_error",
+      param: null,
+      code: "model_not_found",
+    },
+  });
 });
 
 Deno.test("rate limiter uses one bucket for equivalent Bearer header spellings", async () => {

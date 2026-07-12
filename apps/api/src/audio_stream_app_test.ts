@@ -26,6 +26,7 @@ async function fixture(
   audioFetch: typeof fetch,
   audioConcurrencyLimiter?: AudioConcurrencyLimiter,
   inputMicrosPerMillion = 0,
+  capability: "transcription" | "translation" = "transcription",
 ) {
   const repository = new MemoryRepository();
   const keyring = new ProviderSecretKeyring({
@@ -65,7 +66,7 @@ async function fixture(
     publicModelId: "audio/stream",
     upstreamModelId: "audio-stream-upstream",
     displayName: "Audio stream",
-    capabilities: ["transcription"],
+    capabilities: [capability],
     contextWindow: 1_024,
   }, mutation);
   repository.createModelPriceVersion({
@@ -97,18 +98,52 @@ async function fixture(
       "file",
       new File([wavFile().buffer as ArrayBuffer], "sample.wav", { type: "audio/wav" }),
     );
-    return app.request("/v1/audio/transcriptions", {
-      method: "POST",
-      headers: {
-        cookie,
-        origin: "http://localhost:5173",
-        "idempotency-key": idempotencyKey,
+    return app.request(
+      `/v1/audio/${capability === "translation" ? "translations" : "transcriptions"}`,
+      {
+        method: "POST",
+        headers: {
+          cookie,
+          origin: "http://localhost:5173",
+          "idempotency-key": idempotencyKey,
+        },
+        body: form as unknown as BodyInit,
       },
-      body: form as unknown as BodyInit,
-    });
+    );
   };
   return { app, cookie, keyring, model, provider, repository, user, request };
 }
+
+Deno.test("completed transcription and translation replays reauthorize model access", async () => {
+  for (const capability of ["transcription", "translation"] as const) {
+    const fx = await fixture(
+      () =>
+        Promise.resolve(
+          new Response(JSON.stringify({ text: "stored-sentinel-transcript" }), {
+            headers: { "content-type": "application/json" },
+          }),
+        ),
+      undefined,
+      0,
+      capability,
+    );
+    const key = `audio-entitlement-replay-${capability}`;
+    const completed = await fx.request(false, key);
+    assertEquals(completed.status, 200, await completed.clone().text());
+    const group = fx.repository.createAccessGroup({ name: `deny-${capability}` });
+    fx.repository.replaceAccessGroupModels(group.id, [fx.model.id], group.version);
+    const denied = await fx.request(false, key);
+    const deniedBody = await denied.text();
+    assertEquals(denied.status, 404, deniedBody);
+    assertEquals(deniedBody.includes("stored-sentinel"), false);
+    assertEquals(JSON.parse(deniedBody).error, {
+      message: "The requested model is unavailable",
+      type: "invalid_request_error",
+      param: null,
+      code: "model_not_found",
+    });
+  }
+});
 
 Deno.test("audio terminal done is withheld until stream accounting is durable", async () => {
   let enterComplete!: () => void;

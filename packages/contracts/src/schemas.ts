@@ -177,11 +177,111 @@ export const webGenerationEventSchema = z.discriminatedUnion("type", [
   ),
 ]);
 
-export const createTokenSchema = z.object({
+const tokenMutableFields = {
   name: z.string().trim().min(1).max(80),
   scopes: z.array(z.enum(["models:read", "chat:write", "files:read", "files:write"])).min(1),
-  expiresAt: z.string().datetime().nullable().optional(),
+  expiresAt: z.string().datetime().nullable(),
+  rpmLimit: z.number().int().min(1).max(60_000).nullable(),
+  burstLimit: z.number().int().min(1).max(1_000).nullable(),
+};
+
+function validTokenLimits(value: { rpmLimit?: number | null; burstLimit?: number | null }) {
+  return value.rpmLimit === undefined || value.rpmLimit === null ||
+    value.burstLimit === undefined ||
+    value.burstLimit === null || value.burstLimit <= value.rpmLimit;
+}
+
+export const createTokenSchema = z.object({
+  ...tokenMutableFields,
+  expiresAt: tokenMutableFields.expiresAt.optional(),
+  rpmLimit: tokenMutableFields.rpmLimit.optional(),
+  burstLimit: tokenMutableFields.burstLimit.optional(),
+}).strict().refine(validTokenLimits, {
+  message: "burstLimit cannot exceed rpmLimit",
+  path: ["burstLimit"],
 });
+
+export const updateTokenSchema = z.object({
+  expectedVersion: z.number().int().min(1),
+  name: tokenMutableFields.name.optional(),
+  scopes: tokenMutableFields.scopes.optional(),
+  expiresAt: tokenMutableFields.expiresAt.optional(),
+  rpmLimit: tokenMutableFields.rpmLimit.optional(),
+  burstLimit: tokenMutableFields.burstLimit.optional(),
+}).strict().refine(validTokenLimits, {
+  message: "burstLimit cannot exceed rpmLimit",
+  path: ["burstLimit"],
+});
+
+export const rotateTokenSchema = z.object({
+  expectedVersion: z.number().int().min(1),
+  overlapSeconds: z.number().int().min(0).max(3_600),
+}).strict();
+
+export const revokeTokenSchema = z.object({
+  expectedVersion: z.number().int().min(1),
+}).strict();
+
+const modelAccessName = z.string().trim().min(1).max(120);
+const modelAccessDescription = z.string().trim().max(500);
+export const createModelAliasSchema = z.object({
+  alias: z.string().trim().min(3).max(255),
+  targetModelId: z.string().trim().min(3).max(255),
+  description: modelAccessDescription.optional(),
+}).strict();
+export const updateModelAliasSchema = z.object({
+  expectedVersion: z.number().int().min(1),
+  alias: z.string().trim().min(3).max(255).optional(),
+  targetModelId: z.string().trim().min(3).max(255).optional(),
+  description: modelAccessDescription.optional(),
+}).strict();
+export const createAccessGroupSchema = z.object({
+  name: modelAccessName,
+  description: modelAccessDescription.optional(),
+}).strict();
+export const updateAccessGroupSchema = z.object({
+  expectedVersion: z.number().int().min(1),
+  name: modelAccessName.optional(),
+  description: modelAccessDescription.optional(),
+}).strict();
+export const replaceAccessGroupIdsSchema = z.object({
+  expectedVersion: z.number().int().min(1),
+  ids: z.array(z.string().uuid()).max(10_000),
+}).strict();
+export const replaceAccessGroupModelsSchema = z.object({
+  expectedVersion: z.number().int().min(1),
+  ids: z.array(z.string().uuid()).max(10_000),
+  acknowledgePublicModelIds: z.array(z.string().uuid()).max(10_000).default([]),
+}).strict();
+export const deleteAccessGroupSchema = z.object({
+  expectedVersion: z.number().int().min(1),
+  acknowledgePublicModelIds: z.array(z.string().uuid()).max(10_000).default([]),
+}).strict();
+export const setTokenAccessGroupsSchema = z.object({
+  ownerId: z.string().uuid(),
+  expectedVersion: z.number().int().min(1),
+  groupIds: z.array(z.string().uuid()).max(1_000),
+}).strict();
+export const replaceAccessGroupPolicySchema = z.object({
+  expectedVersion: z.number().int().min(1),
+  name: modelAccessName.optional(),
+  description: modelAccessDescription.optional(),
+  userIds: z.array(z.string().uuid()).max(10_000),
+  modelIds: z.array(z.string().uuid()).max(10_000),
+  tokenIds: z.array(z.string().uuid()).max(10_000),
+}).strict();
+export const previewAccessGroupPolicySchema = z.object({
+  proposal: z.object({
+    userIds: z.array(z.string().uuid()).max(10_000),
+    modelIds: z.array(z.string().uuid()).max(10_000),
+    tokenIds: z.array(z.string().uuid()).max(10_000),
+  }).strict().nullable().optional(),
+}).strict();
+export const setTokenAccessModeSchema = z.object({
+  ownerId: z.string().uuid(),
+  expectedVersion: z.number().int().min(1),
+  accessMode: z.enum(["inherit", "restricted"]),
+}).strict();
 
 export const chatCompletionSchema = z.object({
   model: z.string().min(1),

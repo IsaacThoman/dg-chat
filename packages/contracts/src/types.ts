@@ -122,6 +122,15 @@ export interface ApiTokenSummary {
   name: string;
   preview: string;
   scopes: string[];
+  version: number;
+  rpmLimit: number | null;
+  burstLimit: number | null;
+  accessMode: "inherit" | "restricted";
+  rotationFamilyId: string;
+  rotationGeneration: number;
+  rotatedFromTokenId: string | null;
+  replacedByTokenId: string | null;
+  overlapEndsAt: string | null;
   expiresAt: string | null;
   revokedAt: string | null;
   lastUsedAt: string | null;

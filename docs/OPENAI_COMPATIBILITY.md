@@ -10,20 +10,20 @@ curl http://localhost:8000/v1/chat/completions \
 ```
 
 The implemented surface is models, chat completions, Responses, embeddings, audio transcription,
-audio translation, speech synthesis, image generation, and the Files lifecycle. Simulated-model chat
-streams use SSE and terminate with `[DONE]`; configured upstream calls currently use non-streaming
-passthrough. Files support upload, list, retrieve, content, and delete through the official
-JavaScript and Python clients. Uploads currently accept only the `assistants` purpose, and list
-responses do not yet implement cursor pagination. Embeddings use admin-configured models with the
-`embeddings` capability, preserve input ordering and float/base64 formats, participate in provider
-fallback and circuit breaking, and are credit-metered and idempotent. Transcription and translation
-accept bounded, signature-validated multipart audio, support JSON, diarized JSON, verbose JSON,
-text, SRT, and VTT response formats, and use capable provider-registry models with the same retry,
-fallback, circuit-breaker, accounting, cancellation, and durable replay behavior. Transcriptions
-also preserve OpenAI-compatible `include[]=logprobs`, automatic or bounded server-VAD chunking,
-known-speaker references, and validated SSE delta/done streams. Speech synthesis supports MP3, Opus,
-AAC, FLAC, WAV, and PCM, custom voice references, instructions, speed control, byte-exact binary
-replay, and canonical `speech.audio.delta`/`speech.audio.done` SSE. Speech models currently require
+audio translation, speech synthesis, image generation, and the Files lifecycle. Simulated and
+configured upstream chat streams use validated SSE and terminate with exactly one `[DONE]`. Files
+support upload, list, retrieve, content, and delete through the official JavaScript and Python
+clients. Uploads currently accept only the `assistants` purpose, and list responses do not yet
+implement cursor pagination. Embeddings use admin-configured models with the `embeddings`
+capability, preserve input ordering and float/base64 formats, participate in provider fallback and
+circuit breaking, and are credit-metered and idempotent. Transcription and translation accept
+bounded, signature-validated multipart audio, support JSON, diarized JSON, verbose JSON, text, SRT,
+and VTT response formats, and use capable provider-registry models with the same retry, fallback,
+circuit-breaker, accounting, cancellation, and durable replay behavior. Transcriptions also preserve
+OpenAI-compatible `include[]=logprobs`, automatic or bounded server-VAD chunking, known-speaker
+references, and validated SSE delta/done streams. Speech synthesis supports MP3, Opus, AAC, FLAC,
+WAV, and PCM, custom voice references, instructions, speed control, byte-exact binary replay, and
+canonical `speech.audio.delta`/`speech.audio.done` SSE. Speech models currently require
 fixed-call-only pricing because raw binary responses do not carry portable usage metadata. Streaming
 retries and fallback remain available until the first visible audio or transcript event; provider
 usage is extracted from terminal events. Image generation supports strict OpenAI-compatible JSON,
@@ -47,6 +47,20 @@ reject the same key with changed input. Audio identity uses the validated file d
 multipart boundary or filename. Client disconnects cancel upstream work where possible, and requests
 reserve a conservative maximum before provider work begins.
 
+Every API token consumes a fixed 60-second rotation-family quota, including tokens that inherit the
+deployment default. Rotation therefore does not reset the effective RPM budget. Every token also
+consumes a fixed one-second family bucket, using its explicit override or
+`TOKEN_DEFAULT_BURST_LIMIT` (20 by default). Responses expose the most restrictive applicable
+`X-RateLimit-Limit` and `X-RateLimit-Remaining`; denied requests use the controlling bucket's
+`Retry-After`. The separate pre-auth credential/deployment limiter remains in place to reject
+abusive traffic before token verification.
+
 The provider-qualified model ID is the stable identifier. Admin aliases may point at it, but clients
 should not assume every model supports tools, vision, reasoning, images, or audio; inspect model
 capability metadata or handle a structured unsupported-capability error.
+
+The built-in `simulated/*` and legacy `OPENAI_*` models exist only in the nonproduction test
+harness. Production catalogs and invocation are registry-only: every model and alias therefore
+passes through the same access-group entitlement checks. To expose deterministic simulator behavior
+in production, register an internal provider/model with explicit pricing and assign it through
+normal access groups.

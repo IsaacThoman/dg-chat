@@ -1,6 +1,7 @@
 import { assertEquals } from "jsr:@std/assert@1.0.14";
 import { Redis } from "ioredis";
 import { RedisRateLimiter } from "./rate-limit.ts";
+import { consumeTokenRateLimits } from "./token-rate-limit.ts";
 
 const redisUrl = Deno.env.get("TEST_REDIS_URL");
 
@@ -34,6 +35,30 @@ Deno.test({
       assertEquals((await first.consume(`orphan:${suffix}`, 1, 1)).allowed, true);
       assertEquals(await first.health(), true);
     } finally {
+      await Promise.all([first.close(), second.close()]);
+      await raw.quit();
+    }
+  },
+});
+
+Deno.test({
+  name: "Redis default token quota is shared across rotation and replicas",
+  ignore: !redisUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const family = crypto.randomUUID();
+    const first = new RedisRateLimiter(redisUrl!);
+    const second = new RedisRateLimiter(redisUrl!);
+    const raw = new Redis(redisUrl!, { lazyConnect: true });
+    const policy = { rotationFamilyId: family, requestsPerMinute: null, burst: null };
+    try {
+      assertEquals((await consumeTokenRateLimits(first, policy, 20, 1)).allowed, true);
+      assertEquals((await consumeTokenRateLimits(second, policy, 20, 1)).allowed, false);
+      assertEquals(await raw.ttl(`dg-chat:rate:token:${family}:rpm`) > 0, true);
+    } finally {
+      await raw.del(`dg-chat:rate:token:${family}:rpm`);
+      await raw.del(`dg-chat:rate:token:${family}:burst`);
       await Promise.all([first.close(), second.close()]);
       await raw.quit();
     }

@@ -190,6 +190,13 @@
       "when": 1783656026000,
       "tag": "0026_privacy_retention",
       "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1783656027000,
+      "tag": "0027_token_governance",
+      "breakpoints": true
     }
   ]
 }

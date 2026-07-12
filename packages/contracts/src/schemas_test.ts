@@ -1,11 +1,13 @@
 import { assertEquals } from "jsr:@std/assert@1.0.14";
 import {
   chatCompletionSchema,
+  createTokenSchema,
   generateMessageSchema,
   responsesSchema,
   setActiveLeafSchema,
   streamGenerationSchema,
   updateConversationSchema,
+  updateTokenSchema,
 } from "./schemas.ts";
 import { isModelCapability, MODEL_CAPABILITIES } from "./types.ts";
 
@@ -148,4 +150,23 @@ Deno.test("active leaf changes require a strict UUID and optimistic version", ()
       .success,
     false,
   );
+});
+
+Deno.test("personal token policies are strict and bounded", () => {
+  const valid = {
+    name: "Automation",
+    scopes: ["chat:write"],
+    expiresAt: null,
+    rpmLimit: 60,
+    burstLimit: 4,
+  };
+  assertEquals(createTokenSchema.safeParse(valid).success, true);
+  assertEquals(createTokenSchema.safeParse({ ...valid, burstLimit: 61 }).success, false);
+  assertEquals(createTokenSchema.safeParse({ ...valid, rpmLimit: 60_001 }).success, false);
+  assertEquals(createTokenSchema.safeParse({ ...valid, tokenHash: "secret" }).success, false);
+  assertEquals(
+    updateTokenSchema.safeParse({ expectedVersion: 1, rpmLimit: null, burstLimit: null }).success,
+    true,
+  );
+  assertEquals(updateTokenSchema.safeParse({ expectedVersion: 0, name: "Nope" }).success, false);
 });

@@ -1,6 +1,7 @@
 import { assertEquals, assertExists } from "jsr:@std/assert@1.0.14";
 import { createApp } from "./app.ts";
 import { ProviderSecretKeyring } from "./provider-secrets.ts";
+import { MemoryRepository } from "@dg-chat/database";
 
 // deno-lint-ignore no-explicit-any
 async function json(response: Response): Promise<any> {
@@ -12,6 +13,118 @@ function sessionCookie(response: Response): string {
   assertExists(value);
   return value;
 }
+
+Deno.test("restricted chat fallback is fenced before buffered, streaming, or Responses dispatch", async () => {
+  const repository = new MemoryRepository();
+  const keyring = new ProviderSecretKeyring({
+    primaryKeyId: "test",
+    keys: new Map([["test", new Uint8Array(32).fill(6)]]),
+  });
+  let bufferedCalls = 0;
+  let streamingCalls = 0;
+  const { app } = createApp({
+    repository,
+    setupToken: "fallback-fence-setup",
+    providerKeyring: keyring,
+    providerComplete: () => {
+      bufferedCalls++;
+      return Promise.resolve({ text: "must-not-run", inputTokens: 1, outputTokens: 1 });
+    },
+    providerStream: async function* () {
+      streamingCalls++;
+      yield "[DONE]";
+    },
+  });
+  const setup = await app.request("/api/setup/bootstrap", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-setup-token": "fallback-fence-setup" },
+    body: JSON.stringify({
+      email: "fallback-fence@example.com",
+      name: "Fallback Fence",
+      password: "correct horse battery staple",
+    }),
+  });
+  const user = (await setup.json()).user;
+  const mutation = { actorId: user.id, action: "test.fallback_fence" };
+  const createModel = async (slug: string) => {
+    const created = repository.createProvider({
+      slug,
+      displayName: slug,
+      baseUrl: `https://${slug}.example/v1`,
+      protocol: "chat_completions",
+    }, mutation);
+    const provider = repository.setProviderCredential(created.id, created.version, {
+      envelope: await keyring.encrypt(created.id, created.version + 1, `${slug}-secret`),
+    }, mutation);
+    const model = repository.createProviderModel({
+      providerId: provider.id,
+      publicModelId: `${slug}/chat`,
+      upstreamModelId: `${slug}-upstream`,
+      displayName: slug,
+      capabilities: ["chat", "streaming"],
+      contextWindow: 4_096,
+    }, mutation);
+    repository.createModelPriceVersion({
+      providerModelId: model.id,
+      expectedModelVersion: model.version,
+      effectiveAt: new Date(Date.now() - 1_000).toISOString(),
+      inputMicrosPerMillion: 1,
+      cachedInputMicrosPerMillion: 1,
+      reasoningMicrosPerMillion: 1,
+      outputMicrosPerMillion: 1,
+      fixedCallMicros: 1,
+      source: "fallback-fence",
+    }, mutation);
+    return model;
+  };
+  const primary = await createModel("fence-primary");
+  const fallback = await createModel("fence-fallback");
+  repository.setProviderModelRoute({
+    sourceModelId: primary.id,
+    expectedVersion: 0,
+    fallbackModelIds: [fallback.id],
+  }, mutation);
+  const group = repository.createAccessGroup({ name: "restricted-fallback" });
+  repository.replaceAccessGroupModels(group.id, [fallback.id], group.version);
+  const login = await app.request("/api/auth/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email: "fallback-fence@example.com",
+      password: "correct horse battery staple",
+    }),
+  });
+  const headers = {
+    cookie: sessionCookie(login),
+    origin: "http://localhost:5173",
+    "content-type": "application/json",
+  };
+  const requests = [
+    ["/v1/chat/completions", {
+      model: primary.publicModelId,
+      messages: [{ role: "user", content: "buffered" }],
+    }],
+    ["/v1/chat/completions", {
+      model: primary.publicModelId,
+      messages: [{ role: "user", content: "stream" }],
+      stream: true,
+    }],
+    ["/v1/responses", { model: primary.publicModelId, input: "response" }],
+  ] as const;
+  for (const [path, payload] of requests) {
+    const response = await app.request(path, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+    });
+    assertEquals(response.status, 404);
+    assertEquals((await json(response)).error.message, "The requested model is unavailable");
+  }
+  assertEquals(bufferedCalls, 0);
+  assertEquals(streamingCalls, 0);
+  assertEquals(repository.usageRuns.size, 0);
+  assertEquals(repository.providerAttempts.size, 0);
+});
 
 Deno.test("admin resilience policies and routes are versioned, cycle-safe, and no-store", async () => {
   const keyring = new ProviderSecretKeyring({

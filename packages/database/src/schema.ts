@@ -265,6 +265,15 @@ export const apiTokens = pgTable(
     tokenHash: text("token_hash").notNull(),
     preview: text("preview").notNull(),
     scopes: jsonb("scopes").$type<string[]>().notNull(),
+    version: integer("version").notNull().default(1),
+    rpmLimit: integer("rpm_limit"),
+    burstLimit: integer("burst_limit"),
+    accessMode: text("access_mode").notNull().default("inherit"),
+    rotationFamilyId: uuid("rotation_family_id").notNull(),
+    rotationGeneration: integer("rotation_generation").notNull().default(0),
+    rotatedFromTokenId: uuid("rotated_from_token_id"),
+    replacedByTokenId: uuid("replaced_by_token_id"),
+    overlapEndsAt: timestamp("overlap_ends_at", { withTimezone: true }),
     expiresAt: timestamp("expires_at", { withTimezone: true }),
     revokedAt: timestamp("revoked_at", { withTimezone: true }),
     lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
@@ -275,6 +284,37 @@ export const apiTokens = pgTable(
   ) => [
     uniqueIndex("api_tokens_hash_uq").on(table.tokenHash),
     index("api_tokens_user_idx").on(table.userId),
+    uniqueIndex("api_tokens_family_generation_uq").on(
+      table.rotationFamilyId,
+      table.rotationGeneration,
+    ),
+    uniqueIndex("api_tokens_family_id_uq").on(table.rotationFamilyId, table.id),
+    uniqueIndex("api_tokens_user_id_uq").on(table.userId, table.id),
+    foreignKey({
+      columns: [table.rotationFamilyId, table.rotatedFromTokenId],
+      foreignColumns: [table.rotationFamilyId, table.id],
+      name: "api_tokens_rotated_from_fk",
+    }).onDelete("restrict"),
+    foreignKey({
+      columns: [table.rotationFamilyId, table.replacedByTokenId],
+      foreignColumns: [table.rotationFamilyId, table.id],
+      name: "api_tokens_replaced_by_fk",
+    }).onDelete("restrict"),
+    check("api_tokens_version_check", sql`${table.version} >= 1`),
+    check("api_tokens_generation_check", sql`${table.rotationGeneration} >= 0`),
+    check(
+      "api_tokens_rpm_check",
+      sql`${table.rpmLimit} IS NULL OR ${table.rpmLimit} BETWEEN 1 AND 60000`,
+    ),
+    check(
+      "api_tokens_burst_check",
+      sql`${table.burstLimit} IS NULL OR ${table.burstLimit} BETWEEN 1 AND 1000`,
+    ),
+    check(
+      "api_tokens_rate_relation_check",
+      sql`${table.rpmLimit} IS NULL OR ${table.burstLimit} IS NULL OR ${table.burstLimit} <= ${table.rpmLimit}`,
+    ),
+    check("api_tokens_access_mode_check", sql`${table.accessMode} IN ('inherit','restricted')`),
   ],
 );
 
@@ -606,6 +646,63 @@ export const providerModels = pgTable("provider_models", {
   check("provider_models_custom_params_check", sql`jsonb_typeof(${table.customParams}) = 'object'`),
   check("provider_models_context_window_check", sql`${table.contextWindow} > 0`),
   check("provider_models_version_check", sql`${table.version} >= 1`),
+]);
+
+export const modelAliases = pgTable("model_aliases", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  alias: text("alias").notNull(),
+  targetModelId: uuid("target_model_id").notNull().references(() => providerModels.id, {
+    onDelete: "restrict",
+  }),
+  description: text("description").notNull().default(""),
+  version: integer("version").notNull().default(1),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("model_aliases_alias_uq").on(table.alias),
+  check("model_aliases_alias_check", sql`${table.alias} ~ '^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$'`),
+  check("model_aliases_version_check", sql`${table.version} >= 1`),
+]);
+
+export const accessGroups = pgTable("access_groups", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: text("name").notNull(),
+  description: text("description").notNull().default(""),
+  version: integer("version").notNull().default(1),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("access_groups_name_uq").on(sql`lower(${table.name})`),
+  check("access_groups_version_check", sql`${table.version} >= 1`),
+]);
+export const accessGroupUsers = pgTable("access_group_users", {
+  groupId: uuid("group_id").notNull().references(() => accessGroups.id, { onDelete: "cascade" }),
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+}, (table) => [primaryKey({ columns: [table.groupId, table.userId] })]);
+export const accessGroupModels = pgTable("access_group_models", {
+  groupId: uuid("group_id").notNull().references(() => accessGroups.id, { onDelete: "cascade" }),
+  providerModelId: uuid("provider_model_id").notNull().references(() => providerModels.id, {
+    onDelete: "cascade",
+  }),
+}, (table) => [
+  primaryKey({ columns: [table.groupId, table.providerModelId] }),
+  index("access_group_models_model_idx").on(table.providerModelId, table.groupId),
+]);
+export const accessGroupTokens = pgTable("access_group_tokens", {
+  groupId: uuid("group_id").notNull(),
+  tokenId: uuid("token_id").notNull(),
+  userId: uuid("user_id").notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.groupId, table.tokenId] }),
+  foreignKey({
+    columns: [table.groupId, table.userId],
+    foreignColumns: [accessGroupUsers.groupId, accessGroupUsers.userId],
+  }).onDelete("cascade"),
+  foreignKey({
+    columns: [table.userId, table.tokenId],
+    foreignColumns: [apiTokens.userId, apiTokens.id],
+  }).onDelete("cascade"),
+  index("access_group_tokens_token_idx").on(table.tokenId, table.groupId),
 ]);
 
 export const modelPriceVersions = pgTable("model_price_versions", {
