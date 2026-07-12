@@ -44,6 +44,9 @@ const BACKUP_MIME = "application/vnd.dg-chat.backup";
 const PROVIDER_SECRETS_MIME = "application/vnd.dg-chat.provider-secrets";
 const MAX_PROVIDER_SECRET_UPLOAD_BYTES = 512 * 1024 * 1024;
 const MAX_DESTINATION_CREDENTIAL_LINE_BYTES = 64 * 1024;
+const ABANDONED_PROVIDER_SECRET_STAGING_MS = 24 * 60 * 60_000;
+const ABANDONED_PROVIDER_SECRET_UPLOAD_MS = 7 * 24 * 60 * 60_000;
+const ABANDONED_PROVIDER_SECRET_VALIDATION_MS = 30 * 24 * 60 * 60_000;
 const MAX_UPLOAD_BYTES = 16 * 1024 * 1024 * 1024;
 const encoder = new TextEncoder();
 
@@ -84,6 +87,11 @@ type ProviderSecretRestoreStorePort = Pick<
   | "get"
   | "findByIdempotency"
   | "create"
+  | "markUploaded"
+  | "getAppliedResult"
+  | "invalidateStaleEpochAttachments"
+  | "expireAbandonedStaging"
+  | "expireAbandonedAttachments"
   | "previewProviders"
   | "validate"
   | "apply"
@@ -511,6 +519,7 @@ export class DefaultBackupAdminService implements BackupAdminService {
   readonly #providerSecretRestoreStore;
   readonly #tasks = new Map<string, Promise<void>>();
   readonly #artifactCleanups = new Set<Promise<void>>();
+  readonly #providerSecretForeground = new Set<Promise<unknown>>();
   readonly #exportControllers = new Map<string, AbortController>();
   #exportPump: Promise<void> | undefined;
   #exportWake: ReturnType<typeof setTimeout> | undefined;
@@ -1062,6 +1071,14 @@ export class DefaultBackupAdminService implements BackupAdminService {
       keyrings: this.#privilegedProviderSecrets,
     };
   }
+  async #trackProviderSecretForeground<T>(work: () => Promise<T>): Promise<T> {
+    if (this.#closing) {
+      throw new BackupServiceError("conflict", "Backup service is shutting down");
+    }
+    const tracked = work().finally(() => this.#providerSecretForeground.delete(tracked));
+    this.#providerSecretForeground.add(tracked);
+    return await tracked;
+  }
   async #authenticateProviderSecretFile(
     path: string,
     binding: ProviderSecretSidecarBinding,
@@ -1086,7 +1103,15 @@ export class DefaultBackupAdminService implements BackupAdminService {
     if (!header) throw new BackupServiceError("conflict", "The provider-secret file is invalid");
     return { header, recordCount: summary.recordCount, recordsSha256: summary.recordsSha256 };
   }
-  async uploadProviderSecretRestore(input: {
+  uploadProviderSecretRestore(input: {
+    actorId: string;
+    restoreId: string;
+    request: Request;
+    idempotencyKey: string;
+  }): Promise<ProviderSecretRestoreUploadSummary> {
+    return this.#trackProviderSecretForeground(() => this.#uploadProviderSecretRestore(input));
+  }
+  async #uploadProviderSecretRestore(input: {
     actorId: string;
     restoreId: string;
     request: Request;
@@ -1101,7 +1126,6 @@ export class DefaultBackupAdminService implements BackupAdminService {
       tempPrefix: "dg-provider-secret-restore-",
       label: "provider-secret",
     });
-    let createdObject = false;
     try {
       let authenticated;
       try {
@@ -1119,6 +1143,36 @@ export class DefaultBackupAdminService implements BackupAdminService {
       );
       const objectKey =
         `backups/restores/${input.restoreId}/provider-secrets/${identity}-${staged.digest}.dgsecrets`;
+      let attachment: Awaited<ReturnType<ProviderSecretRestoreStorePort["create"]>>;
+      try {
+        attachment = await providerSecretStoreCall(() =>
+          store.create({
+            restoreOperationId: input.restoreId,
+            requestedBy: input.actorId,
+            idempotencyKey: input.idempotencyKey,
+            sourceObjectKey: objectKey,
+            archiveSha256: staged.digest,
+            archiveBytes: staged.bytes,
+            sidecarId: authenticated.header.sidecarId,
+            recoveryKeyId: authenticated.header.encryption.wrapping.keyId,
+            baseBackupId: binding.backupId,
+            baseArchiveSha256: binding.archiveSha256,
+            baseContentRootSha256: binding.contentRootSha256,
+            sourceInstallationId: binding.sourceInstallationId,
+          })
+        );
+      } catch (error) {
+        // Reconcile a durable insert whose response was lost. Exact metadata is already enforced by
+        // the store's idempotency contract; no object has been published before this point.
+        const durable = await providerSecretStoreCall(() =>
+          store.findByIdempotency(input.restoreId, input.idempotencyKey)
+        ).catch(() => undefined);
+        if (!durable || durable.sourceObjectKey !== objectKey) throw error;
+        attachment = durable;
+      }
+      if (attachment.status !== "staging" && attachment.status !== "uploaded") {
+        throw new BackupServiceError("conflict", "The provider-secret upload is already terminal");
+      }
       const existing = await this.#objects.get(objectKey);
       if (existing) {
         if (
@@ -1140,7 +1194,6 @@ export class DefaultBackupAdminService implements BackupAdminService {
             contentType: PROVIDER_SECRETS_MIME,
             metadata: { sha256: staged.digest },
           });
-          createdObject = true;
         } catch {
           // A remote object store can durably publish and lose the response. Converge on the exact
           // immutable identity; any mismatch remains a conflict and is never overwritten.
@@ -1156,7 +1209,6 @@ export class DefaultBackupAdminService implements BackupAdminService {
             );
           }
           await raced.body.cancel().catch(() => undefined);
-          createdObject = true;
         }
       }
       const stored = await this.#objects.get(objectKey);
@@ -1165,7 +1217,6 @@ export class DefaultBackupAdminService implements BackupAdminService {
         stored.metadata.sha256 !== staged.digest
       ) {
         if (stored?.body) await stored.body.cancel().catch(() => undefined);
-        if (createdObject) await this.#objects.delete(objectKey).catch(() => undefined);
         throw new BackupServiceError(
           "conflict",
           "The provider-secret upload could not be verified",
@@ -1178,40 +1229,11 @@ export class DefaultBackupAdminService implements BackupAdminService {
         storedBytes += chunk.byteLength;
       }
       if (storedBytes !== staged.bytes || storedHash.digest("hex") !== staged.digest) {
-        if (createdObject) await this.#objects.delete(objectKey).catch(() => undefined);
         throw new BackupServiceError("conflict", "The provider-secret upload failed verification");
       }
-      let attachment;
-      try {
-        attachment = await providerSecretStoreCall(() =>
-          store.create({
-            restoreOperationId: input.restoreId,
-            requestedBy: input.actorId,
-            idempotencyKey: input.idempotencyKey,
-            sourceObjectKey: objectKey,
-            archiveSha256: staged.digest,
-            archiveBytes: staged.bytes,
-            sidecarId: authenticated.header.sidecarId,
-            recoveryKeyId: authenticated.header.encryption.wrapping.keyId,
-            baseBackupId: binding.backupId,
-            baseArchiveSha256: binding.archiveSha256,
-            baseContentRootSha256: binding.contentRootSha256,
-            sourceInstallationId: binding.sourceInstallationId,
-          })
-        );
-      } catch (error) {
-        if (createdObject) {
-          try {
-            const durable = await providerSecretStoreCall(() =>
-              store.findByIdempotency(input.restoreId, input.idempotencyKey)
-            );
-            if (!durable || durable.sourceObjectKey !== objectKey) {
-              await this.#objects.delete(objectKey).catch(() => undefined);
-            }
-          } catch { /* Ambiguous ownership preserves ciphertext for deterministic cleanup. */ }
-        }
-        throw error;
-      }
+      attachment = await providerSecretStoreCall(() =>
+        store.markUploaded(attachment.id, attachment.version)
+      );
       return {
         id: attachment.id,
         restoreId: attachment.restoreOperationId,
@@ -1308,7 +1330,37 @@ export class DefaultBackupAdminService implements BackupAdminService {
       providersRemainDisabled: true,
     };
   }
-  async previewProviderSecretRestore(
+  #providerSecretAppliedResult(attachment: {
+    id: string;
+    restoreOperationId: string;
+    status: string;
+    recordCount: number | null;
+    appliedAt: string | null;
+  }): ProviderSecretRestoreResult {
+    if (
+      attachment.status !== "applied" || attachment.recordCount == null || !attachment.appliedAt
+    ) {
+      throw new BackupServiceError("conflict", "The provider-secret restore result is unavailable");
+    }
+    return {
+      id: attachment.id,
+      restoreId: attachment.restoreOperationId,
+      status: "applied",
+      providerCount: attachment.recordCount,
+      providersRemainDisabled: true,
+      appliedAt: attachment.appliedAt,
+    };
+  }
+  previewProviderSecretRestore(
+    actorId: string,
+    restoreId: string,
+    sidecarId: string,
+  ): Promise<ProviderSecretRestorePreview> {
+    return this.#trackProviderSecretForeground(() =>
+      this.#previewProviderSecretRestore(actorId, restoreId, sidecarId)
+    );
+  }
+  async #previewProviderSecretRestore(
     _actorId: string,
     restoreId: string,
     sidecarId: string,
@@ -1334,7 +1386,13 @@ export class DefaultBackupAdminService implements BackupAdminService {
         abort() {},
       });
     } catch (error) {
-      await store.fail(attachment.id, attachment.version, "archive_invalid").catch(() => undefined);
+      // Missing objects, object-store outages, and unavailable recovery keys are retryable. Only a
+      // fully consumed stream whose outer immutable digest disagrees is proven corrupt here.
+      if (error instanceof BackupServiceError && error.code === "conflict") {
+        await store.fail(attachment.id, attachment.version, "archive_invalid").catch(() =>
+          undefined
+        );
+      }
       throw error instanceof BackupServiceError
         ? error
         : new BackupServiceError("conflict", "The provider-secret upload is invalid");
@@ -1365,10 +1423,22 @@ export class DefaultBackupAdminService implements BackupAdminService {
       };
     });
     if (blockers.length) {
-      throw new BackupServiceError(
-        "conflict",
-        `Provider-secret restore is blocked: ${blockers.join(" ")}`,
-      );
+      // This is an informative, deliberately non-applicable preview. Keep the durable attachment
+      // uploaded so correcting destination state and rerunning the dry check remains possible.
+      return {
+        id: attachment.id,
+        restoreId: attachment.restoreOperationId,
+        status: "validated",
+        version: attachment.version,
+        baseFingerprint: attachment.baseArchiveSha256,
+        sidecarFingerprint: attachment.archiveSha256,
+        recoveryKeyId: attachment.recoveryKeyId,
+        recordCount: summary.recordCount,
+        providers,
+        warnings: [],
+        blockingErrors: blockers,
+        providersRemainDisabled: true,
+      };
     }
     const providerPlan = providerIds.map((providerId) => ({
       providerId,
@@ -1392,7 +1462,17 @@ export class DefaultBackupAdminService implements BackupAdminService {
     );
     return this.#providerSecretPreview(attachment);
   }
-  async applyProviderSecretRestore(input: {
+  applyProviderSecretRestore(input: {
+    actorId: string;
+    restoreId: string;
+    sidecarId: string;
+    expectedVersion: number;
+    baseFingerprint: string;
+    sidecarFingerprint: string;
+  }): Promise<ProviderSecretRestoreResult> {
+    return this.#trackProviderSecretForeground(() => this.#applyProviderSecretRestore(input));
+  }
+  async #applyProviderSecretRestore(input: {
     actorId: string;
     restoreId: string;
     sidecarId: string;
@@ -1402,6 +1482,12 @@ export class DefaultBackupAdminService implements BackupAdminService {
   }): Promise<ProviderSecretRestoreResult> {
     const { store, keyrings } = this.#providerSecretRestoreDependencies();
     const attachment = await providerSecretStoreCall(() => store.get(input.sidecarId));
+    if (
+      attachment.status === "applied" && attachment.restoreOperationId === input.restoreId &&
+      attachment.version === input.expectedVersion + 1 && attachment.appliedBy === input.actorId &&
+      attachment.baseArchiveSha256 === input.baseFingerprint &&
+      attachment.archiveSha256 === input.sidecarFingerprint
+    ) return this.#providerSecretAppliedResult(attachment);
     if (
       attachment.restoreOperationId !== input.restoreId || attachment.status !== "validated" ||
       attachment.version !== input.expectedVersion ||
@@ -1466,23 +1552,37 @@ export class DefaultBackupAdminService implements BackupAdminService {
       ) {
         throw new BackupServiceError("conflict", "The provider-secret restore plan is stale");
       }
-      const applied = await providerSecretStoreCall(() =>
-        store.apply(
-          attachment.id,
-          attachment.version,
-          input.actorId,
-          providerStateSha256,
-          destinationCredentialSpool(spoolPath),
-        )
-      );
-      return {
-        id: applied.id,
-        restoreId: applied.restoreOperationId,
-        status: "applied",
-        providerCount: applied.recordCount!,
-        providersRemainDisabled: true,
-        appliedAt: applied.appliedAt!,
-      };
+      let applied;
+      try {
+        applied = await providerSecretStoreCall(() =>
+          store.apply(
+            attachment.id,
+            attachment.version,
+            input.actorId,
+            providerStateSha256,
+            destinationCredentialSpool(spoolPath),
+          )
+        );
+      } catch (error) {
+        // A serializable transaction can commit while its response is lost. Reconcile only the
+        // exact actor/version/fingerprint result; every other state remains an explicit conflict.
+        const durable = await providerSecretStoreCall(() =>
+          store.getAppliedResult(
+            attachment.id,
+            input.restoreId,
+            input.baseFingerprint,
+            input.sidecarFingerprint,
+          )
+        );
+        if (
+          durable?.status === "applied" && durable.version === attachment.version + 1 &&
+          durable.appliedBy === input.actorId &&
+          durable.baseArchiveSha256 === input.baseFingerprint &&
+          durable.archiveSha256 === input.sidecarFingerprint
+        ) return this.#providerSecretAppliedResult(durable);
+        throw error;
+      }
+      return this.#providerSecretAppliedResult(applied);
     } catch (error) {
       try {
         spool.close();
@@ -1988,6 +2088,13 @@ export class DefaultBackupAdminService implements BackupAdminService {
   async #cleanupAppliedProviderSecretRestoreObjects(signal?: AbortSignal) {
     const store = this.#providerSecretRestoreStore;
     if (!store) return;
+    await store.invalidateStaleEpochAttachments(100);
+    await store.expireAbandonedStaging(ABANDONED_PROVIDER_SECRET_STAGING_MS, 100);
+    await store.expireAbandonedAttachments(
+      ABANDONED_PROVIDER_SECRET_UPLOAD_MS,
+      ABANDONED_PROVIDER_SECRET_VALIDATION_MS,
+      100,
+    );
     const leaseToken = crypto.randomUUID();
     const abandoned = await store.claimCleanup(
       leaseToken,
@@ -2127,18 +2234,28 @@ export class DefaultBackupAdminService implements BackupAdminService {
     for (const controller of this.#exportControllers.values()) {
       controller.abort(new Error("Backup service is shutting down"));
     }
+    const foregroundWork = Promise.allSettled([...this.#providerSecretForeground]);
     const work = Promise.allSettled([
       ...this.#tasks.values(),
       ...this.#artifactCleanups,
+      foregroundWork,
       ...(this.#artifactSweepWork ? [this.#artifactSweepWork] : []),
     ]);
+    let foregroundDrained = false;
+    const foregroundDrain = foregroundWork.then(() => foregroundDrained = true);
     await Promise.race([
       work,
       new Promise<void>((resolve) => setTimeout(resolve, this.#shutdownGraceMs)),
     ]);
-    await Promise.all([
-      this.#store.close(),
-      this.#providerSecretRestoreStore?.close() ?? Promise.resolve(),
-    ]);
+    await this.#store.close();
+    const restoreStore = this.#providerSecretRestoreStore;
+    if (restoreStore) {
+      if (foregroundDrained) await restoreStore.close();
+      else {
+        // Preserve the foreground transaction after bounded shutdown returns; close its dedicated
+        // pool as soon as the HTTP-drained work settles rather than invalidating it mid-commit.
+        void foregroundDrain.finally(() => restoreStore.close()).catch(() => undefined);
+      }
+    }
   }
 }

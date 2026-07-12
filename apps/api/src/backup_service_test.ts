@@ -631,6 +631,11 @@ class MemoryProviderSecretRestoreStore {
   }>();
   appliedCredentials: Array<{ providerId: string; envelope: unknown }> = [];
   failApply = false;
+  throwAfterApply = false;
+  staleEpochSweeps = 0;
+  abandonedStagingSweeps = 0;
+  abandonedAttachmentSweeps = 0;
+  closed = false;
   create(input: {
     restoreOperationId: string;
     requestedBy: string;
@@ -650,7 +655,7 @@ class MemoryProviderSecretRestoreStore {
     this.attachment = {
       id: crypto.randomUUID(),
       restoreOperationId: input.restoreOperationId,
-      status: "uploaded",
+      status: "staging",
       version: 1,
       idempotencyKey: input.idempotencyKey,
       requestedBy: input.requestedBy,
@@ -681,6 +686,27 @@ class MemoryProviderSecretRestoreStore {
       updatedAt: now,
     };
     return Promise.resolve(structuredClone(this.attachment));
+  }
+  markUploaded(id: string, version: number) {
+    if (!this.attachment || this.attachment.id !== id) throw new Error("missing sidecar");
+    if (this.attachment.status === "uploaded" && this.attachment.version === version) {
+      return Promise.resolve(structuredClone(this.attachment));
+    }
+    if (this.attachment.status !== "staging" || this.attachment.version !== version) {
+      throw new Error("stale upload");
+    }
+    this.attachment.status = "uploaded";
+    this.attachment.version++;
+    return Promise.resolve(structuredClone(this.attachment));
+  }
+  getAppliedResult(id: string, restoreId: string, baseSha: string, sidecarSha: string) {
+    const item = this.attachment;
+    return Promise.resolve(
+      item?.id === id && item.restoreOperationId === restoreId && item.status === "applied" &&
+        item.baseArchiveSha256 === baseSha && item.archiveSha256 === sidecarSha
+        ? structuredClone(item)
+        : undefined,
+    );
   }
   get(id: string) {
     if (!this.attachment || this.attachment.id !== id) throw new Error("missing sidecar");
@@ -752,7 +778,9 @@ class MemoryProviderSecretRestoreStore {
       appliedAt: new Date().toISOString(),
       completedAt: new Date().toISOString(),
     });
-    return structuredClone(this.attachment);
+    const result = structuredClone(this.attachment);
+    if (this.throwAfterApply) throw new Error("apply response lost");
+    return result;
   }
   fail(id: string, version: number, error: string) {
     if (!this.attachment || this.attachment.id !== id || this.attachment.version !== version) {
@@ -764,6 +792,18 @@ class MemoryProviderSecretRestoreStore {
   claimCleanup() {
     return Promise.resolve<RestoreProviderSecretsAttachment[]>([]);
   }
+  invalidateStaleEpochAttachments() {
+    this.staleEpochSweeps++;
+    return Promise.resolve<RestoreProviderSecretsAttachment[]>([]);
+  }
+  expireAbandonedStaging() {
+    this.abandonedStagingSweeps++;
+    return Promise.resolve<RestoreProviderSecretsAttachment[]>([]);
+  }
+  expireAbandonedAttachments() {
+    this.abandonedAttachmentSweeps++;
+    return Promise.resolve<RestoreProviderSecretsAttachment[]>([]);
+  }
   recordCleanup() {
     return Promise.resolve(true);
   }
@@ -771,6 +811,7 @@ class MemoryProviderSecretRestoreStore {
     return Promise.resolve(true);
   }
   close() {
+    this.closed = true;
     return Promise.resolve();
   }
 }
@@ -1051,7 +1092,7 @@ Deno.test("privileged export stores and verifies an independently encrypted pair
   await service.close();
 });
 
-Deno.test("provider-secret restore authenticates, previews, re-encrypts through a bounded spool, and applies disabled", async () => {
+Deno.test("provider-secret restore keeps transient previews retriable, reports blockers, reconciles lost apply, and cleans its spool", async () => {
   const fx = await setup();
   await fx.service.close();
   const base = operation("restore", { filename: "base.dgbackup", bytes: 100 }, "sidecar-base");
@@ -1112,6 +1153,38 @@ Deno.test("provider-secret restore authenticates, previews, re-encrypts through 
     idempotencyKey: "restore-provider-secret-upload-1",
   });
   assertEquals(uploaded.status, "uploaded");
+  const originalGet = fx.objects.get.bind(fx.objects);
+  let transientReadFailure = true;
+  fx.objects.get = (key: string) => {
+    if (transientReadFailure && key.includes("/provider-secrets/")) {
+      transientReadFailure = false;
+      return Promise.resolve(undefined);
+    }
+    return originalGet(key);
+  };
+  await assertRejects(
+    () => service.previewProviderSecretRestore(ACTOR, base.id, uploaded.id),
+    BackupServiceError,
+  );
+  assertEquals(restoreStore.attachment?.status, "uploaded");
+  restoreStore.providers.get(providerId)!.enabled = true;
+  const blocked = await service.previewProviderSecretRestore(ACTOR, base.id, uploaded.id);
+  assertEquals(blocked.blockingErrors.length, 1);
+  assertEquals(blocked.providers[0].action, "blocked");
+  assertEquals(restoreStore.attachment?.status, "uploaded");
+  await assertRejects(
+    () =>
+      service.applyProviderSecretRestore({
+        actorId: ACTOR,
+        restoreId: base.id,
+        sidecarId: uploaded.id,
+        expectedVersion: blocked.version,
+        baseFingerprint: blocked.baseFingerprint,
+        sidecarFingerprint: blocked.sidecarFingerprint,
+      }),
+    BackupServiceError,
+  );
+  restoreStore.providers.get(providerId)!.enabled = false;
   const preview = await service.previewProviderSecretRestore(ACTOR, base.id, uploaded.id);
   assertEquals(preview.providers, [{
     providerId,
@@ -1120,16 +1193,19 @@ Deno.test("provider-secret restore authenticates, previews, re-encrypts through 
     reason: null,
   }]);
   assertEquals(preview.providersRemainDisabled, true);
-  const applied = await service.applyProviderSecretRestore({
+  restoreStore.throwAfterApply = true;
+  const applyInput = {
     actorId: ACTOR,
     restoreId: base.id,
     sidecarId: uploaded.id,
     expectedVersion: preview.version,
     baseFingerprint: preview.baseFingerprint,
     sidecarFingerprint: preview.sidecarFingerprint,
-  });
+  };
+  const applied = await service.applyProviderSecretRestore(applyInput);
   assertEquals(applied.providerCount, 1);
   assertEquals(applied.providersRemainDisabled, true);
+  assertEquals((await service.applyProviderSecretRestore(applyInput)).appliedAt, applied.appliedAt);
   const restored = await destinationKeyring.decrypt(
     providerId,
     restoreStore.appliedCredentials[0].envelope as ProviderSecretEnvelope,
@@ -1162,10 +1238,14 @@ Deno.test("provider-secret restore authenticates, previews, re-encrypts through 
     .filter((entry) => entry.name.startsWith("dg-provider-secret-envelopes-"))
     .map((entry) => entry.name);
   assertEquals(after.filter((name) => !before.has(name)), []);
+  await service.recoverPending();
+  assertEquals(restoreStore.staleEpochSweeps > 0, true);
+  assertEquals(restoreStore.abandonedStagingSweeps > 0, true);
+  assertEquals(restoreStore.abandonedAttachmentSweeps > 0, true);
   await service.close();
 });
 
-Deno.test("provider-secret upload converges after a lost object-store PUT response", async () => {
+Deno.test("provider-secret staging survives missing or lost PUT responses and foreground shutdown drains", async () => {
   const fx = await setup();
   await fx.service.close();
   const base = operation("restore", {}, "lost-sidecar-put-base");
@@ -1228,6 +1308,67 @@ Deno.test("provider-secret upload converges after a lost object-store PUT respon
   assertEquals(uploaded.status, "uploaded");
   assertEquals(objects.values.size, 1);
   await service.close();
+
+  class MissingFirstPutObjects extends MemoryObjects {
+    failures = 1;
+    override put(input: PutObjectInput) {
+      if (this.failures-- > 0) return Promise.reject(new Error("storage unavailable"));
+      return super.put(input);
+    }
+  }
+  const retryObjects = new MissingFirstPutObjects();
+  const retryStore = new MemoryProviderSecretRestoreStore();
+  const retryService = new DefaultBackupAdminService({
+    store: fx.store,
+    objects: retryObjects,
+    data: fx.data,
+    authenticator: fx.auth,
+    restoreEnabled: true,
+    privilegedProviderSecrets: { recoveryKeyring, providerKeyring: destinationKeyring },
+    providerSecretRestoreStore: retryStore,
+  });
+  const retryInput = () => ({
+    actorId: ACTOR,
+    restoreId: base.id,
+    request: providerSecretUploadRequest(sidecar),
+    idempotencyKey: "missing-provider-secret-put-retry",
+  });
+  await assertRejects(() => retryService.uploadProviderSecretRestore(retryInput()));
+  assertEquals(retryStore.attachment?.status, "staging");
+  assertEquals(retryObjects.values.size, 0);
+  assertEquals((await retryService.uploadProviderSecretRestore(retryInput())).status, "uploaded");
+  assertEquals(retryStore.attachment?.status, "uploaded");
+  await retryService.close();
+
+  const gatedObjects = new DelayedPutObjects();
+  const gatedStore = new MemoryProviderSecretRestoreStore();
+  const gatedService = new DefaultBackupAdminService({
+    store: fx.store,
+    objects: gatedObjects,
+    data: fx.data,
+    authenticator: fx.auth,
+    restoreEnabled: true,
+    shutdownGraceMs: 20,
+    privilegedProviderSecrets: { recoveryKeyring, providerKeyring: destinationKeyring },
+    providerSecretRestoreStore: gatedStore,
+  });
+  const foregroundUpload = gatedService.uploadProviderSecretRestore({
+    actorId: ACTOR,
+    restoreId: base.id,
+    request: providerSecretUploadRequest(sidecar),
+    idempotencyKey: "foreground-provider-secret-upload",
+  });
+  await gatedObjects.started;
+  const closing = gatedService.close();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assertEquals(gatedStore.closed, false);
+  gatedObjects.release();
+  assertEquals((await foregroundUpload).status, "uploaded");
+  await closing;
+  for (let attempt = 0; attempt < 20 && !gatedStore.closed; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assertEquals(gatedStore.closed, true);
 });
 
 Deno.test("export pump continues after one export fails", async () => {
