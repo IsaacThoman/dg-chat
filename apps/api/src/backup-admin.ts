@@ -114,6 +114,28 @@ export interface ProviderSecretRestoreResult {
   providersRemainDisabled: true;
   appliedAt: string;
 }
+export interface ProviderSecretRestoreState {
+  id: string;
+  restoreId: string;
+  status: "staging" | "uploaded" | "validated" | "applied" | "failed" | "cancelled";
+  version: number;
+  filename: "provider-secrets.dgsecrets";
+  bytes: number;
+  baseFingerprint: string;
+  sidecarFingerprint: string;
+  recoveryKeyId: string;
+  recordCount: number | null;
+  providers: ProviderSecretRestoreImpact[];
+  warnings: string[];
+  blockingErrors: string[];
+  providersRemainDisabled: true;
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
+  appliedAt: string | null;
+  expiresAt: string | null;
+  canCancel: boolean;
+}
 
 /**
  * Privileged installation-portability boundary. Implementations own durable operation state,
@@ -158,6 +180,16 @@ export interface BackupAdminService {
     baseFingerprint: string;
     sidecarFingerprint: string;
   }): Promise<ProviderSecretRestoreResult>;
+  getProviderSecretRestore?(
+    actorId: string,
+    restoreId: string,
+  ): Promise<ProviderSecretRestoreState | null>;
+  cancelProviderSecretRestore?(input: {
+    actorId: string;
+    restoreId: string;
+    sidecarId: string;
+    expectedVersion: number;
+  }): Promise<ProviderSecretRestoreState>;
   uploadRestore(input: {
     actorId: string;
     request: Request;

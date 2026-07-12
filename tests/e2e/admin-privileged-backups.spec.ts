@@ -1,9 +1,35 @@
 import { expect, test } from "@playwright/test";
-import { bootstrap, login } from "./helpers.ts";
+import type { ProviderSecretRestoreState } from "../../apps/web/src/types.ts";
 
-test("admin creates and downloads a separately encrypted provider-secret backup", async ({ page, request }) => {
-  await bootstrap(request);
-  await login(page);
+async function mockAdminSession(page: import("@playwright/test").Page) {
+  await page.route("**/api/**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === "/api/auth/me") {
+      return await route.fulfill({
+        json: {
+          user: {
+            id: "10000000-0000-4000-8000-000000000001",
+            name: "Recovery Admin",
+            email: "admin@example.test",
+            role: "admin",
+            approvalStatus: "approved",
+            state: "active",
+            balanceMicros: 5_000_000,
+          },
+        },
+      });
+    }
+    if (path === "/api/setup/status") {
+      return await route.fulfill({
+        json: { bootstrapRequired: false, setupEnabled: true, oidcEnabled: false },
+      });
+    }
+    return await route.fulfill({ json: { data: [], items: [] } });
+  });
+}
+
+test("admin creates and downloads a separately encrypted provider-secret backup", async ({ page }) => {
+  await mockAdminSession(page);
   const id = "00000000-0000-4000-8000-0000000000b1";
   const createdAt = "2026-07-12T18:00:00.000Z";
   const paired = {
@@ -73,9 +99,8 @@ test("admin creates and downloads a separately encrypted provider-secret backup"
   await expect(page.getByText("Encrypted provider-secret sidecar downloaded.")).toBeVisible();
 });
 
-test("admin dry-runs and exactly confirms provider-secret recovery", async ({ page, request }) => {
-  await bootstrap(request);
-  await login(page);
+test("admin dry-runs and exactly confirms provider-secret recovery", async ({ page }) => {
+  await mockAdminSession(page);
   const restoreId = "10000000-0000-4000-8000-000000000012";
   const sidecarId = "10000000-0000-4000-8000-000000000013";
   const preview = {
@@ -97,6 +122,8 @@ test("admin dry-runs and exactly confirms provider-secret recovery", async ({ pa
     blockingErrors: [],
     providersRemainDisabled: true,
   };
+  let state: ProviderSecretRestoreState | null = null;
+  let requireReauthentication = true;
   await page.route("**/api/admin/backups**", async (route) => {
     const url = new URL(route.request().url());
     if (url.pathname === "/api/admin/backups") {
@@ -109,7 +136,27 @@ test("admin dry-runs and exactly confirms provider-secret recovery", async ({ pa
         },
       });
     }
+    if (
+      url.pathname.endsWith(`/restores/${restoreId}/provider-secrets`) &&
+      route.request().method() === "GET"
+    ) return await route.fulfill({ json: { item: state } });
     if (url.pathname.endsWith("/provider-secrets/uploads")) {
+      state = {
+        ...preview,
+        status: "uploaded",
+        version: 1,
+        filename: "provider-secrets.dgsecrets",
+        bytes: 128,
+        recordCount: null,
+        providers: [],
+        warnings: [],
+        error: null,
+        createdAt: "2026-07-12T18:00:00.000Z",
+        updatedAt: "2026-07-12T18:00:00.000Z",
+        appliedAt: null,
+        expiresAt: "2099-07-19T18:00:00.000Z",
+        canCancel: true,
+      };
       return await route.fulfill({
         status: 201,
         json: {
@@ -126,7 +173,24 @@ test("admin dry-runs and exactly confirms provider-secret recovery", async ({ pa
         },
       });
     }
-    if (url.pathname.endsWith("/dry-run")) return await route.fulfill({ json: preview });
+    if (url.pathname.endsWith("/dry-run")) {
+      if (requireReauthentication) {
+        requireReauthentication = false;
+        return await route.fulfill({
+          status: 403,
+          json: {
+            error: { code: "recent_authentication_required", message: "Sign in again" },
+          },
+        });
+      }
+      state = {
+        ...state!,
+        ...preview,
+        status: "validated",
+        filename: "provider-secrets.dgsecrets",
+      };
+      return await route.fulfill({ json: preview });
+    }
     if (url.pathname.endsWith("/apply")) {
       expect(route.request().postDataJSON()).toEqual({
         confirmation: "RESTORE PROVIDER SECRETS",
@@ -134,30 +198,44 @@ test("admin dry-runs and exactly confirms provider-secret recovery", async ({ pa
         baseFingerprint: preview.baseFingerprint,
         sidecarFingerprint: preview.sidecarFingerprint,
       });
-      return await route.fulfill({
-        json: {
-          id: sidecarId,
-          restoreId,
-          status: "applied",
-          providerCount: 1,
-          providersRemainDisabled: true,
-          appliedAt: "2026-07-12T18:01:00.000Z",
-        },
-      });
+      state = {
+        ...state!,
+        status: "applied",
+        version: 3,
+        appliedAt: "2026-07-12T18:01:00.000Z",
+        updatedAt: "2026-07-12T18:01:00.000Z",
+        expiresAt: null,
+        canCancel: false,
+      };
+      return await route.abort("connectionreset");
     }
     return await route.fallback();
   });
 
   await page.goto("/admin/storage");
   await page.getByLabel("Completed base restore ID").fill(restoreId);
-  await page.locator('input[type="file"][accept*=".dgsecrets"]').setInputFiles({
+  const picker = page.locator('input[type="file"][accept*=".dgsecrets"]');
+  await picker.focus();
+  await expect(picker.locator("..")).toHaveCSS("outline-style", "solid");
+  await picker.setInputFiles({
     name: "recovery.dgsecrets",
     mimeType: "application/vnd.dg-chat.provider-secrets",
     buffer: Buffer.from("encrypted-sidecar"),
   });
   await expect(page.getByText("recovery.dgsecrets", { exact: true })).toBeVisible();
+  await page.reload();
+  await expect(page.getByText("provider-secrets.dgsecrets", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Start over with another sidecar" })).toBeVisible();
+  await page.getByRole("button", { name: "Run dry check", exact: true }).last().click();
+  await expect(page).toHaveURL(/\/login$/);
+  // A successful reauthentication returns to the admin route; safe identifiers in session storage
+  // are sufficient to reload server-owned recovery state without retaining the file or confirmation.
+  await page.goto("/admin/storage");
+  await expect(page.getByText("provider-secrets.dgsecrets", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Run dry check", exact: true }).last().click();
   await expect(page.getByRole("heading", { name: "Provider impact" })).toBeVisible();
+  await expect(page.getByText("Recovery provider", { exact: true })).toBeVisible();
+  await page.reload();
   await expect(page.getByText("Recovery provider", { exact: true })).toBeVisible();
   const apply = page.getByRole("button", { name: "Restore provider secrets", exact: true });
   await expect(apply).toBeDisabled();
@@ -165,5 +243,7 @@ test("admin dry-runs and exactly confirms provider-secret recovery", async ({ pa
     "RESTORE PROVIDER SECRETS",
   );
   await apply.click();
+  await expect(page.getByRole("alert")).toContainText(/failed|network|request/i);
+  await page.reload();
   await expect(page.getByText(/All affected providers remain disabled/)).toBeVisible();
 });

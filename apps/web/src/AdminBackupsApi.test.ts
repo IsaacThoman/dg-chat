@@ -230,6 +230,50 @@ describe("backup administration API", () => {
     );
   });
 
+  it("loads resumable provider-secret state and cancels it with optimistic version binding", async () => {
+    const state = {
+      id: "sidecar/one",
+      restoreId: "restore/one",
+      status: "uploaded" as const,
+      version: 4,
+      filename: "provider-secrets.dgsecrets" as const,
+      bytes: 128,
+      baseFingerprint: "a".repeat(64),
+      sidecarFingerprint: "b".repeat(64),
+      recoveryKeyId: "recovery-2026",
+      recordCount: null,
+      providers: [],
+      warnings: [],
+      blockingErrors: [],
+      providersRemainDisabled: true as const,
+      error: null,
+      createdAt: "2026-07-12T00:00:00Z",
+      updatedAt: "2026-07-12T00:00:00Z",
+      appliedAt: null,
+      expiresAt: "2026-07-19T00:00:00Z",
+      canCancel: true,
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json({ item: state }))
+      .mockResolvedValueOnce(Response.json({ ...state, status: "cancelled", version: 5 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await api.adminProviderSecretRestore(state.restoreId);
+    await api.cancelAdminProviderSecretRestore(state);
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "/api/admin/backups/restores/restore%2Fone/provider-secrets",
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/admin/backups/restores/restore%2Fone/provider-secrets/sidecar%2Fone",
+      expect.objectContaining({
+        method: "DELETE",
+        body: JSON.stringify({ expectedVersion: 4 }),
+      }),
+    );
+  });
+
   it("wires cancellation to the active XHR while retaining its idempotency header", async () => {
     let xhr: FakeXhr | undefined;
     class FakeXhr {

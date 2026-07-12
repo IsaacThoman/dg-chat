@@ -412,6 +412,28 @@ export interface ProviderSecretRestoreResult {
   providersRemainDisabled: true;
   appliedAt: string;
 }
+export interface ProviderSecretRestoreState {
+  id: string;
+  restoreId: string;
+  status: "staging" | "uploaded" | "validated" | "applied" | "failed" | "cancelled";
+  version: number;
+  filename: "provider-secrets.dgsecrets";
+  bytes: number;
+  baseFingerprint: string;
+  sidecarFingerprint: string;
+  recoveryKeyId: string;
+  recordCount: number | null;
+  providers: ProviderSecretRestoreImpact[];
+  warnings: string[];
+  blockingErrors: string[];
+  providersRemainDisabled: true;
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
+  appliedAt: string | null;
+  expiresAt: string | null;
+  canCancel: boolean;
+}
 export interface BackupRestoreUpload {
   id: string;
   filename: string;

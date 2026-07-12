@@ -1,7 +1,11 @@
 import { type FormEvent, useEffect, useId, useRef, useState } from "react";
 import { AlertTriangle, KeyRound, LockKeyhole, Upload } from "lucide-react";
 import { api, ApiError } from "./api.ts";
-import type { ProviderSecretRestorePreview, ProviderSecretRestoreUpload } from "./types.ts";
+import type {
+  ProviderSecretRestorePreview,
+  ProviderSecretRestoreState,
+  ProviderSecretRestoreUpload,
+} from "./types.ts";
 
 export const PROVIDER_SECRET_RESTORE_CONFIRMATION = "RESTORE PROVIDER SECRETS";
 export const canApplyProviderSecretRestore = (
@@ -27,6 +31,7 @@ const byteSize = (bytes: number) =>
 export interface ProviderSecretRestoreProps {
   enabled?: boolean;
   initialRestoreId?: string;
+  initialState?: ProviderSecretRestoreState;
   onReauthenticate?(): void;
   onApplied?(): void;
 }
@@ -37,7 +42,9 @@ export function ProviderSecretRestore(props: ProviderSecretRestoreProps) {
   const attempt = useRef<{ file: File; restoreId: string; key: string } | undefined>(undefined);
   const reauthTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const mounted = useRef(true);
-  const [restoreId, setRestoreId] = useState(props.initialRestoreId ?? "");
+  const [restoreId, setRestoreId] = useState(
+    props.initialRestoreId ?? props.initialState?.restoreId ?? "",
+  );
   const [upload, setUpload] = useState<ProviderSecretRestoreUpload>();
   const [progress, setProgress] = useState<number>();
   const [uploadError, setUploadError] = useState<string>();
@@ -49,6 +56,15 @@ export function ProviderSecretRestore(props: ProviderSecretRestoreProps) {
   const [applyError, setApplyError] = useState<string>();
   const [applied, setApplied] = useState(false);
   const [announcement, setAnnouncement] = useState("");
+  const [serverState, setServerState] = useState<ProviderSecretRestoreState | undefined>(
+    props.initialState,
+  );
+  const [hydrating, setHydrating] = useState(false);
+  const [hydrateError, setHydrateError] = useState<string>();
+  const [cancelling, setCancelling] = useState(false);
+  const attachmentLocked = Boolean(
+    serverState && !["failed", "cancelled"].includes(serverState.status),
+  );
 
   useEffect(() => {
     mounted.current = true;
@@ -61,6 +77,87 @@ export function ProviderSecretRestore(props: ProviderSecretRestoreProps) {
   useEffect(() => {
     if (props.initialRestoreId && !upload && !applied) setRestoreId(props.initialRestoreId);
   }, [props.initialRestoreId]);
+
+  const applyServerState = (state: ProviderSecretRestoreState | null) => {
+    setServerState(state ?? undefined);
+    setUpload(undefined);
+    setPreview(undefined);
+    setApplied(false);
+    setConfirmation("");
+    if (!state) return;
+    if (["uploaded", "validated", "applied"].includes(state.status)) {
+      setUpload({
+        id: state.id,
+        restoreId: state.restoreId,
+        status: "uploaded",
+        version: state.version,
+        filename: state.filename,
+        bytes: state.bytes,
+        baseFingerprint: state.baseFingerprint,
+        sidecarFingerprint: state.sidecarFingerprint,
+        recoveryKeyId: state.recoveryKeyId,
+        createdAt: state.createdAt,
+      });
+    }
+    if (
+      (state.status === "validated" || state.status === "applied") && state.recordCount !== null
+    ) {
+      setPreview({
+        id: state.id,
+        restoreId: state.restoreId,
+        status: "validated",
+        version: state.status === "applied" ? Math.max(1, state.version - 1) : state.version,
+        baseFingerprint: state.baseFingerprint,
+        sidecarFingerprint: state.sidecarFingerprint,
+        recoveryKeyId: state.recoveryKeyId,
+        recordCount: state.recordCount,
+        providers: state.providers,
+        warnings: state.warnings,
+        blockingErrors: state.blockingErrors,
+        providersRemainDisabled: true,
+      });
+    }
+    setApplied(state.status === "applied");
+  };
+
+  const hydrate = async (target: string, announce = false) => {
+    if (!UUID.test(target)) return;
+    setHydrating(true);
+    setHydrateError(undefined);
+    try {
+      const result = await api.adminProviderSecretRestore(target);
+      if (!mounted.current || target !== restoreId) return;
+      applyServerState(result.item);
+      if (announce && result.item) {
+        setAnnouncement(`Recovered provider-secret restore status: ${result.item.status}.`);
+      }
+    } catch (error) {
+      if (!mounted.current || target !== restoreId) return;
+      setHydrateError(errorMessage(error));
+    } finally {
+      if (mounted.current && target === restoreId) setHydrating(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!UUID.test(restoreId)) {
+      try {
+        globalThis.sessionStorage?.removeItem("dg.provider-secret-restore-id");
+      } catch { /* Browser storage can be disabled. */ }
+      return;
+    }
+    try {
+      globalThis.sessionStorage?.setItem("dg.provider-secret-restore-id", restoreId);
+    } catch {
+      // Status remains usable in-memory when browser storage is unavailable.
+    }
+    void hydrate(restoreId, true);
+  }, [restoreId]);
+  useEffect(() => {
+    if (serverState?.status !== "staging") return;
+    const timer = setInterval(() => void hydrate(serverState.restoreId), 2_000);
+    return () => clearInterval(timer);
+  }, [serverState?.status, serverState?.restoreId]);
 
   const recentAuth = (error: unknown, action: string) => {
     if (!isRecentAuthenticationRequired(error)) return false;
@@ -82,6 +179,8 @@ export function ProviderSecretRestore(props: ProviderSecretRestoreProps) {
     setConfirmation("");
     setApplyError(undefined);
     setApplied(false);
+    setServerState(undefined);
+    setHydrateError(undefined);
   };
   const uploadFile = async (file?: File, retry = false) => {
     const nextAttempt = retry
@@ -114,6 +213,28 @@ export function ProviderSecretRestore(props: ProviderSecretRestoreProps) {
       if (!mounted.current) return;
       attempt.current = undefined;
       setUpload(result);
+      setServerState({
+        id: result.id,
+        restoreId: result.restoreId,
+        status: "uploaded",
+        version: result.version,
+        filename: "provider-secrets.dgsecrets",
+        bytes: result.bytes,
+        baseFingerprint: result.baseFingerprint,
+        sidecarFingerprint: result.sidecarFingerprint,
+        recoveryKeyId: result.recoveryKeyId,
+        recordCount: null,
+        providers: [],
+        warnings: [],
+        blockingErrors: [],
+        providersRemainDisabled: true,
+        error: null,
+        createdAt: result.createdAt,
+        updatedAt: result.createdAt,
+        appliedAt: null,
+        expiresAt: null,
+        canCancel: true,
+      });
       setProgress(100);
       setAnnouncement(
         "Encrypted sidecar uploaded. Run the dry check before restoring credentials.",
@@ -140,6 +261,19 @@ export function ProviderSecretRestore(props: ProviderSecretRestoreProps) {
       const result = await api.previewAdminProviderSecretRestore(upload.restoreId, upload.id);
       if (!mounted.current) return;
       setPreview(result);
+      setServerState((current) =>
+        current
+          ? {
+            ...current,
+            status: result.blockingErrors.length ? "uploaded" : "validated",
+            version: result.version,
+            recordCount: result.recordCount,
+            providers: result.providers,
+            warnings: result.warnings,
+            blockingErrors: result.blockingErrors,
+          }
+          : current
+      );
       setAnnouncement(
         result.blockingErrors.length
           ? "Provider-secret dry check found blocking errors."
@@ -163,6 +297,20 @@ export function ProviderSecretRestore(props: ProviderSecretRestoreProps) {
       const result = await api.applyAdminProviderSecretRestore(preview, confirmation);
       if (!mounted.current) return;
       setApplied(true);
+      setServerState((current) =>
+        current
+          ? {
+            ...current,
+            status: "applied",
+            version: preview.version + 1,
+            recordCount: result.providerCount,
+            appliedAt: result.appliedAt,
+            updatedAt: result.appliedAt,
+            expiresAt: null,
+            canCancel: false,
+          }
+          : current
+      );
       setConfirmation("");
       setAnnouncement(
         `${result.providerCount} provider credentials restored. Every provider remains disabled.`,
@@ -174,6 +322,23 @@ export function ProviderSecretRestore(props: ProviderSecretRestoreProps) {
       if (!recentAuth(error, "restoring provider secrets")) setApplyError(errorMessage(error));
     } finally {
       if (mounted.current) setApplying(false);
+    }
+  };
+  const startOver = async () => {
+    if (cancelling) return;
+    setCancelling(true);
+    setHydrateError(undefined);
+    try {
+      if (serverState?.canCancel) await api.cancelAdminProviderSecretRestore(serverState);
+      resetAttachment();
+      setAnnouncement("Provider-secret recovery reset. Choose the matching sidecar again.");
+    } catch (error) {
+      if (!mounted.current) return;
+      if (!recentAuth(error, "starting provider-secret recovery over")) {
+        setHydrateError(errorMessage(error));
+      }
+    } finally {
+      if (mounted.current) setCancelling(false);
     }
   };
 
@@ -227,7 +392,7 @@ export function ProviderSecretRestore(props: ProviderSecretRestoreProps) {
                 spellCheck={false}
                 autoComplete="off"
                 placeholder="00000000-0000-4000-8000-000000000000"
-                disabled={Boolean(upload) || applying || applied}
+                disabled={attachmentLocked || applying || applied}
                 onChange={(event) => {
                   resetAttachment();
                   setRestoreId(event.target.value.trim());
@@ -237,7 +402,74 @@ export function ProviderSecretRestore(props: ProviderSecretRestoreProps) {
                 <small>Enter a valid restore ID.</small>
               )}
             </label>
-            <label className={`backup-secret-picker ${!UUID.test(restoreId) ? "disabled" : ""}`}>
+            {hydrating && (
+              <p className="backup-empty" role="status">
+                Checking for an existing provider-secret restore…
+              </p>
+            )}
+            {hydrateError && (
+              <p className="backup-alert" role="alert">
+                <span>{hydrateError}</span>
+                <button className="secondary" type="button" onClick={() => void hydrate(restoreId)}>
+                  Check status again
+                </button>
+              </p>
+            )}
+            {serverState?.status === "staging" && (
+              <aside className="backup-warning" role="status">
+                <div>
+                  <strong>Recovering an interrupted upload</strong>
+                  <p>
+                    The encrypted sidecar is being reconciled with durable storage. This page checks
+                    automatically; start over if the original upload cannot finish.
+                  </p>
+                </div>
+              </aside>
+            )}
+            {serverState && ["failed", "cancelled"].includes(serverState.status) && (
+              <aside className="backup-alert" role="alert">
+                <div>
+                  <strong>
+                    {serverState.status === "failed"
+                      ? "The previous provider-secret restore failed"
+                      : "The previous provider-secret restore expired or was cancelled"}
+                  </strong>
+                  <p>
+                    {serverState.error ??
+                      "Its encrypted staging object is no longer eligible to be restored."}
+                  </p>
+                </div>
+              </aside>
+            )}
+            {serverState?.expiresAt &&
+              !["applied", "failed", "cancelled"].includes(serverState.status) && (
+              <p className="backup-warning" role="status">
+                This recovery state expires{" "}
+                <time dateTime={serverState.expiresAt}>
+                  {new Date(serverState.expiresAt).toLocaleString()}
+                </time>.
+              </p>
+            )}
+            {serverState && serverState.status !== "applied" &&
+              (serverState.canCancel || ["failed", "cancelled"].includes(serverState.status)) && (
+              <button
+                type="button"
+                className="secondary backup-start-over"
+                disabled={cancelling}
+                onClick={() => void startOver()}
+              >
+                {cancelling
+                  ? "Resetting recovery…"
+                  : serverState.canCancel
+                  ? "Start over with another sidecar"
+                  : "Choose another sidecar"}
+              </button>
+            )}
+            <label
+              className={`backup-secret-picker ${
+                !UUID.test(restoreId) || attachmentLocked || hydrating ? "disabled" : ""
+              }`}
+            >
               <Upload size={20} aria-hidden="true" />
               <strong>Choose the matching .dgsecrets file</strong>
               <span>The encrypted file is validated before any credential can change.</span>
@@ -245,7 +477,8 @@ export function ProviderSecretRestore(props: ProviderSecretRestoreProps) {
                 className="sr-only"
                 type="file"
                 accept=".dgsecrets,application/vnd.dg-chat.provider-secrets,application/octet-stream"
-                disabled={!UUID.test(restoreId) || Boolean(upload) || applying || applied}
+                disabled={!UUID.test(restoreId) || attachmentLocked || hydrating || applying ||
+                  applied}
                 onChange={(event) => {
                   const file = event.target.files?.[0];
                   event.target.value = "";

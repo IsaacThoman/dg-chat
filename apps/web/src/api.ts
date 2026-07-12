@@ -30,6 +30,7 @@ import type {
   ProviderProtocol,
   ProviderSecretRestorePreview,
   ProviderSecretRestoreResult,
+  ProviderSecretRestoreState,
   ProviderSecretRestoreUpload,
   RetentionPolicy,
   RetentionPreview,
@@ -1015,6 +1016,17 @@ export const api = {
           sidecarFingerprint: preview.sidecarFingerprint,
         }),
       },
+    ),
+  adminProviderSecretRestore: (restoreId: string) =>
+    request<{ item: ProviderSecretRestoreState | null }>(
+      `/admin/backups/restores/${encodeURIComponent(restoreId)}/provider-secrets`,
+    ),
+  cancelAdminProviderSecretRestore: (state: ProviderSecretRestoreState) =>
+    request<ProviderSecretRestoreState>(
+      `/admin/backups/restores/${encodeURIComponent(state.restoreId)}/provider-secrets/${
+        encodeURIComponent(state.id)
+      }`,
+      { method: "DELETE", body: JSON.stringify({ expectedVersion: state.version }) },
     ),
   uploadAdminBackupRestore: (
     file: File,

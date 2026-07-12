@@ -20,6 +20,19 @@ const preview = {
   blockingErrors: [],
   providersRemainDisabled: true as const,
 };
+const state = {
+  ...preview,
+  status: "uploaded" as const,
+  filename: "provider-secrets.dgsecrets" as const,
+  bytes: 128,
+  recordCount: 2,
+  error: null,
+  createdAt: "2026-07-12T00:00:00Z",
+  updatedAt: "2026-07-12T00:00:00Z",
+  appliedAt: null,
+  expiresAt: "2099-07-19T00:00:00Z",
+  canCancel: true,
+};
 
 describe("ProviderSecretRestore", () => {
   it("renders a fail-closed disabled policy warning", () => {
@@ -52,5 +65,33 @@ describe("ProviderSecretRestore", () => {
     expect(canApplyProviderSecretRestore(preview, PROVIDER_SECRET_RESTORE_CONFIRMATION, true)).toBe(
       false,
     );
+  });
+
+  it("shows resumable expiry and an explicit start-over action", () => {
+    const html = renderToStaticMarkup(
+      <ProviderSecretRestore enabled initialState={state} />,
+    );
+    expect(html).toContain("This recovery state expires");
+    expect(html).toContain("Start over with another sidecar");
+    expect(html).toContain('class="backup-secret-picker disabled"');
+  });
+
+  it("explains terminal recovery state and allows another sidecar", () => {
+    const html = renderToStaticMarkup(
+      <ProviderSecretRestore
+        enabled
+        initialState={{
+          ...state,
+          status: "cancelled",
+          version: 3,
+          error: "The provider-secret restore expired after seven days",
+          expiresAt: null,
+          canCancel: false,
+        }}
+      />,
+    );
+    expect(html).toContain("expired or was cancelled");
+    expect(html).toContain("expired after seven days");
+    expect(html).toContain("Choose another sidecar");
   });
 });

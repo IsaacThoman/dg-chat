@@ -7,6 +7,7 @@ import type {
   BackupExportSummary,
   BackupRestorePreview,
   ProviderSecretRestorePreview,
+  ProviderSecretRestoreState,
 } from "./backup-admin.ts";
 
 const cookie = (response: Response) => {
@@ -30,6 +31,7 @@ class FakeBackupAdmin implements BackupAdminService {
   applyCalls = 0;
   providerSecretUploadInput: unknown;
   providerSecretApplyInput: unknown;
+  providerSecretState: ProviderSecretRestoreState | null = null;
   readonly backup: BackupExportSummary = {
     id: "10000000-0000-4000-8000-000000000001",
     status: "completed",
@@ -93,7 +95,7 @@ class FakeBackupAdmin implements BackupAdminService {
       restoreId: input.restoreId,
       idempotencyKey: input.idempotencyKey,
     };
-    return Promise.resolve({
+    const upload = {
       id: "10000000-0000-4000-8000-000000000013",
       restoreId: input.restoreId,
       status: "uploaded" as const,
@@ -104,7 +106,22 @@ class FakeBackupAdmin implements BackupAdminService {
       sidecarFingerprint: "d".repeat(64),
       recoveryKeyId: "recovery-2026",
       createdAt: now,
-    });
+    };
+    this.providerSecretState = {
+      ...upload,
+      filename: "provider-secrets.dgsecrets",
+      recordCount: null,
+      providers: [],
+      warnings: [],
+      blockingErrors: [],
+      providersRemainDisabled: true,
+      error: null,
+      updatedAt: now,
+      appliedAt: null,
+      expiresAt: "2026-07-19T00:00:00.000Z",
+      canCancel: true,
+    };
+    return Promise.resolve(upload);
   }
   previewProviderSecretRestore(_actorId: string, restoreId: string, sidecarId: string) {
     return Promise.resolve(
@@ -142,6 +159,31 @@ class FakeBackupAdmin implements BackupAdminService {
       providersRemainDisabled: true as const,
       appliedAt: now,
     });
+  }
+  getProviderSecretRestore(_actorId: string, restoreId: string) {
+    return Promise.resolve(
+      this.providerSecretState?.restoreId === restoreId ? this.providerSecretState : null,
+    );
+  }
+  cancelProviderSecretRestore(input: {
+    restoreId: string;
+    sidecarId: string;
+    expectedVersion: number;
+  }) {
+    if (
+      !this.providerSecretState || this.providerSecretState.restoreId !== input.restoreId ||
+      this.providerSecretState.id !== input.sidecarId ||
+      this.providerSecretState.version !== input.expectedVersion
+    ) throw new Error("stale cancel");
+    this.providerSecretState = {
+      ...this.providerSecretState,
+      status: "cancelled",
+      version: this.providerSecretState.version + 1,
+      canCancel: false,
+      expiresAt: null,
+      updatedAt: now,
+    };
+    return Promise.resolve(this.providerSecretState);
   }
   uploadRestore(input: { idempotencyKey: string }) {
     this.uploadInput = { idempotencyKey: input.idempotencyKey };
@@ -477,6 +519,15 @@ Deno.test("provider-secret restore is recently authenticated, paired, previewed,
     restoreId,
     idempotencyKey: "provider-secret-upload-one",
   });
+  const resumed = await app.request(
+    `/api/admin/backups/restores/${restoreId}/provider-secrets`,
+    { headers },
+  );
+  assertEquals(resumed.status, 200);
+  assertEquals(
+    ((await resumed.json()) as { item: ProviderSecretRestoreState }).item.status,
+    "uploaded",
+  );
 
   const preview = await app.request(
     `/api/admin/backups/restores/${restoreId}/provider-secrets/${sidecarId}/dry-run`,
@@ -523,6 +574,23 @@ Deno.test("provider-secret restore is recently authenticated, paired, previewed,
   const actions = (await repository.listAudit()).data.map((event) => event.action);
   assertEquals(actions.includes("backup.provider_secrets_restore_uploaded"), true);
   assertEquals(actions.includes("backup.provider_secrets_restore_previewed"), true);
+
+  const cancelled = await app.request(
+    `/api/admin/backups/restores/${restoreId}/provider-secrets/${sidecarId}`,
+    {
+      method: "DELETE",
+      headers: { ...headers, "content-type": "application/json" },
+      body: JSON.stringify({ expectedVersion: backupAdmin.providerSecretState?.version }),
+    },
+  );
+  assertEquals(cancelled.status, 200, await cancelled.clone().text());
+  assertEquals((await cancelled.json() as ProviderSecretRestoreState).status, "cancelled");
+  assertEquals(
+    (await repository.listAudit()).data.some((event) =>
+      event.action === "backup.provider_secrets_restore_cancelled"
+    ),
+    true,
+  );
 });
 
 Deno.test("provider-secret restore fails closed and rejects stale authentication before upload", async () => {

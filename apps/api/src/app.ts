@@ -4366,6 +4366,8 @@ export function createApp(options: AppOptions = {}) {
         | "uploadProviderSecretRestore"
         | "previewProviderSecretRestore"
         | "applyProviderSecretRestore"
+        | "getProviderSecretRestore"
+        | "cancelProviderSecretRestore"
       >
     > => {
     const service = requireBackupAdmin();
@@ -4373,7 +4375,9 @@ export function createApp(options: AppOptions = {}) {
       service.providerSecretRestoreEnabled !== true ||
       typeof service.uploadProviderSecretRestore !== "function" ||
       typeof service.previewProviderSecretRestore !== "function" ||
-      typeof service.applyProviderSecretRestore !== "function"
+      typeof service.applyProviderSecretRestore !== "function" ||
+      typeof service.getProviderSecretRestore !== "function" ||
+      typeof service.cancelProviderSecretRestore !== "function"
     ) {
       throw new DomainError(
         "provider_secret_restore_unavailable",
@@ -4389,6 +4393,8 @@ export function createApp(options: AppOptions = {}) {
           | "uploadProviderSecretRestore"
           | "previewProviderSecretRestore"
           | "applyProviderSecretRestore"
+          | "getProviderSecretRestore"
+          | "cancelProviderSecretRestore"
         >
       >;
   };
@@ -4570,6 +4576,52 @@ export function createApp(options: AppOptions = {}) {
     });
     return c.json(upload, 201);
   });
+  app.get("/api/admin/backups/restores/:restoreId/provider-secrets", async (c) => {
+    noStoreBackupResponse(c);
+    const restoreId = requireUuid(c.req.param("restoreId"), "restoreId");
+    return c.json({
+      item: await requireProviderSecretRestoreAdmin().getProviderSecretRestore(
+        c.get("user").id,
+        restoreId,
+      ),
+    });
+  });
+  app.delete(
+    "/api/admin/backups/restores/:restoreId/provider-secrets/:sidecarId",
+    async (c) => {
+      noStoreBackupResponse(c);
+      requireRecentBackupAuthentication(c, "starting provider-secret recovery over");
+      let raw: unknown;
+      try {
+        raw = await c.req.json();
+      } catch {
+        throw new DomainError("invalid_json", "Request body must be valid JSON", 400);
+      }
+      if (
+        !raw || typeof raw !== "object" || Array.isArray(raw) ||
+        Object.keys(raw).length !== 1 ||
+        !Number.isSafeInteger((raw as { expectedVersion?: unknown }).expectedVersion) ||
+        Number((raw as { expectedVersion: number }).expectedVersion) < 1
+      ) {
+        throw new DomainError("validation_error", "Sidecar version is invalid", 422);
+      }
+      const restoreId = requireUuid(c.req.param("restoreId"), "restoreId");
+      const state = await requireProviderSecretRestoreAdmin().cancelProviderSecretRestore({
+        actorId: c.get("user").id,
+        restoreId,
+        sidecarId: requireUuid(c.req.param("sidecarId"), "sidecarId"),
+        expectedVersion: Number((raw as { expectedVersion: number }).expectedVersion),
+      });
+      await repo.recordAudit({
+        actorId: c.get("user").id,
+        action: "backup.provider_secrets_restore_cancelled",
+        targetType: "backup_operation",
+        targetId: restoreId,
+        metadata: { sidecarId: state.id },
+      });
+      return c.json(state);
+    },
+  );
   app.post(
     "/api/admin/backups/restores/:restoreId/provider-secrets/:sidecarId/dry-run",
     async (c) => {
