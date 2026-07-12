@@ -183,6 +183,13 @@
       "when": 1783656025000,
       "tag": "0025_operational_admin_indexes",
       "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1783656026000,
+      "tag": "0026_privacy_retention",
+      "breakpoints": true
     }
   ]
 }

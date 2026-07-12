@@ -30,7 +30,9 @@ describe("admin routing", () => {
       model: undefined,
       provider: undefined,
       type: undefined,
+      run: undefined,
     });
+    expect(parseAdminSearch({ run: "run-123" }).run).toBe("run-123");
     expect(parseAdminSearch({ model: "x".repeat(161), bucket: "week" })).toMatchObject({
       model: undefined,
       bucket: undefined,

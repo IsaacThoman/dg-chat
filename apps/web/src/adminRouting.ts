@@ -9,6 +9,7 @@ export const adminSections = [
   "usage",
   "jobs",
   "audit",
+  "retention",
   "storage",
 ] as const;
 
@@ -27,6 +28,7 @@ export interface AdminSearch {
   provider?: string;
   type?: string;
   cursor?: string;
+  run?: string;
 }
 
 const bounded = (value: unknown, length: number) =>
@@ -52,5 +54,6 @@ export function parseAdminSearch(value: Record<string, unknown>): AdminSearch {
     provider: bounded(value.provider, 160),
     type: bounded(value.type, 120),
     cursor: bounded(value.cursor, 2048),
+    run: bounded(value.run, 100),
   };
 }

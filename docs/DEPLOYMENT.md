@@ -118,6 +118,12 @@ Take a recovery point first, monitor lock waits and free disk, and do not start 
 or workers until migration completion. A future online-migration runner may replace this explicit
 maintenance-window requirement with `CREATE INDEX CONCURRENTLY`.
 
+Migration `0026` adds the disabled-by-default diagnostic capture and retention subsystem. It adds a
+composite uniqueness constraint to `provider_attempts` and creates new policy, capture, and
+scrub-run tables; it does not rewrite existing provider-attempt rows. After deployment, confirm the
+Retention admin screen reports capture disabled, run a zero-result preview, and verify the worker
+can query the new durable job type before enabling capture.
+
 ## Monitoring
 
 Alert on readiness, HTTP error ratio, stream starts without first tokens, queue age, failed jobs,

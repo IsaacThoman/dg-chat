@@ -23,6 +23,181 @@ Deno.test("passwordless domain users are represented without a local credential"
   );
 });
 
+Deno.test("retention policy gates capture and scrub runs are fenced and idempotent", () => {
+  const repo = new MemoryRepository();
+  const actor = repo.createUser({
+    email: "retention-admin@example.com",
+    name: "Retention admin",
+    passwordHash: "x",
+    role: "admin",
+    approvalStatus: "approved",
+  });
+  const attemptId = crypto.randomUUID();
+  repo.providerAttempts.set(attemptId, { usageRunId: "retention-run" } as never);
+  assertEquals(
+    repo.captureProviderPayload({
+      usageRunId: "retention-run",
+      providerAttemptId: attemptId,
+      requestBody: "private request",
+    }),
+    null,
+  );
+  assertEquals(
+    repo.captureProviderPayload({
+      usageRunId: "invalid-disabled-run",
+      providerAttemptId: "not-a-uuid",
+      requestBody: "must remain gated",
+    }),
+    null,
+  );
+  const policy = repo.updateRetentionPolicy({
+    expectedVersion: 1,
+    captureEnabled: true,
+    requestBodyDays: 1,
+    responseBodyDays: 7,
+  }, actor.id);
+  assertEquals(policy.version, 2);
+  assertThrows(
+    () =>
+      repo.updateRetentionPolicy({
+        expectedVersion: 1,
+        captureEnabled: false,
+        requestBodyDays: 1,
+        responseBodyDays: 1,
+      }, actor.id),
+    DomainError,
+    "changed",
+  );
+  const capture = repo.captureProviderPayload({
+    usageRunId: "retention-run",
+    providerAttemptId: attemptId,
+    requestBody: "private request",
+    responseBody: "private response",
+  })!;
+  repo.providerPayloadCaptures.get(capture.id)!.capturedAt = "2020-01-01T00:00:00.000Z";
+  const preview = repo.previewRetentionScrub();
+  assertEquals({
+    policyVersion: preview.policyVersion,
+    captures: preview.captures,
+    requestBodies: preview.requestBodies,
+    responseBodies: preview.responseBodies,
+    requestBytes: preview.requestBytes,
+    responseBytes: preview.responseBytes,
+  }, {
+    policyVersion: 2,
+    captures: 1,
+    requestBodies: 1,
+    responseBodies: 1,
+    requestBytes: 15,
+    responseBytes: 16,
+  });
+  const queued = repo.enqueueRetentionScrub({
+    idempotencyKey: "retention-test-run",
+    expectedPolicyVersion: 2,
+    requestCutoffAt: preview.requestCutoffAt,
+    responseCutoffAt: preview.responseCutoffAt,
+  }, actor.id);
+  assertEquals(repo.jobs.filter((job) => job.type === "retention.scrub").length, 1);
+  assertEquals(
+    repo.enqueueRetentionScrub({
+      idempotencyKey: "retention-test-run",
+      expectedPolicyVersion: 2,
+      requestCutoffAt: preview.requestCutoffAt,
+      responseCutoffAt: preview.responseCutoffAt,
+    }, actor.id).id,
+    queued.id,
+  );
+  const scrubbed = repo.scrubRetentionBatch(queued.id, 1);
+  assertEquals(scrubbed.completed, true);
+  assertEquals(scrubbed.run.requestBodiesScrubbed, 1);
+  assertEquals(scrubbed.run.responseBodiesScrubbed, 1);
+  assertEquals(scrubbed.run.bytesScrubbed, 31);
+  assertEquals(repo.providerPayloadCaptures.get(capture.id)?.requestBody, null);
+  assertEquals(repo.scrubRetentionBatch(queued.id, 1).processed, 0);
+  assertEquals(repo.listRetentionScrubRuns({ status: "completed" }).items.length, 1);
+  const failed = repo.enqueueRetentionScrub({
+    idempotencyKey: "retention-test-failure",
+    expectedPolicyVersion: 2,
+    requestCutoffAt: preview.requestCutoffAt,
+    responseCutoffAt: preview.responseCutoffAt,
+  }, actor.id);
+  assertEquals(repo.failRetentionScrubRun(failed.id, "worker_retry_exhausted").status, "failed");
+  assertEquals(repo.failRetentionScrubRun(failed.id, "manual_recovery").status, "failed");
+  const failedJob = repo.jobs.find((job) =>
+    job.type === "retention.scrub" &&
+    (job.payload as { runId?: string }).runId === failed.id
+  )!;
+  failedJob.status = "failed";
+  failedJob.attempts = 5;
+  assertEquals(repo.retryFailedJob(failedJob.id, actor.id).job.status, "queued");
+  assertEquals(repo.getRetentionScrubRun(failed.id).status, "queued");
+  assertEquals(repo.scrubRetentionBatch(failed.id).completed, true);
+  assertEquals(repo.scrubRetentionBatch(failed.id).processed, 0);
+  assertEquals(
+    repo.auditEvents.filter((event) =>
+      event.targetId === failed.id && event.action === "retention.scrub.failed"
+    ).length,
+    1,
+  );
+  assertEquals(
+    repo.auditEvents.filter((event) =>
+      event.targetId === failed.id && event.action === "retention.scrub.completed"
+    ).length,
+    1,
+  );
+});
+
+Deno.test("retention scrub fixes preview cutoffs across policy changes and batches", () => {
+  const repo = new MemoryRepository();
+  const actor = repo.createUser({ email: "cutoff@example.com", name: "Cutoff", passwordHash: "x" });
+  repo.updateRetentionPolicy({
+    expectedVersion: 1,
+    captureEnabled: true,
+    requestBodyDays: 1,
+    responseBodyDays: 1,
+  }, actor.id);
+  const captures = ["first", "second"].map((body) => {
+    const attemptId = crypto.randomUUID();
+    repo.providerAttempts.set(attemptId, { usageRunId: "cutoff-run" } as never);
+    const capture = repo.captureProviderPayload({
+      usageRunId: "cutoff-run",
+      providerAttemptId: attemptId,
+      requestBody: body,
+    })!;
+    repo.providerPayloadCaptures.get(capture.id)!.capturedAt = "2020-01-01T00:00:00.000Z";
+    return capture;
+  });
+  const preview = repo.previewRetentionScrub();
+  const run = repo.enqueueRetentionScrub({
+    idempotencyKey: "cutoff-bound-run",
+    expectedPolicyVersion: preview.policyVersion,
+    requestCutoffAt: preview.requestCutoffAt,
+    responseCutoffAt: preview.responseCutoffAt,
+  }, actor.id);
+  repo.updateRetentionPolicy({
+    expectedVersion: 2,
+    captureEnabled: true,
+    requestBodyDays: 90,
+    responseBodyDays: 90,
+  }, actor.id);
+  const futureAttempt = crypto.randomUUID();
+  repo.providerAttempts.set(futureAttempt, { usageRunId: "cutoff-run" } as never);
+  const future = repo.captureProviderPayload({
+    usageRunId: "cutoff-run",
+    providerAttemptId: futureAttempt,
+    requestBody: "future",
+  })!;
+  assertEquals(repo.scrubRetentionBatch(run.id, 1).completed, false);
+  const terminal = repo.scrubRetentionBatch(run.id, 1);
+  assertEquals(terminal.completed, true);
+  assertEquals(terminal.run.requestCutoffAt, preview.requestCutoffAt);
+  assertEquals(repo.providerPayloadCaptures.get(future.id)?.requestBody, "future");
+  assertEquals(
+    captures.every((capture) => repo.providerPayloadCaptures.get(capture.id)?.requestBody === null),
+    true,
+  );
+});
+
 Deno.test("admin analytics are bounded, canonical, and deterministically bucketed", () => {
   const repo = new MemoryRepository();
   const base = {

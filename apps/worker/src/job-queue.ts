@@ -8,6 +8,7 @@ export interface ClaimedJob {
   payload: unknown;
   attempts: number;
   claimToken: string;
+  idempotencyKey: string | null;
 }
 
 export async function claimJob(
@@ -17,8 +18,16 @@ export async function claimJob(
 ): Promise<ClaimedJob | undefined> {
   const claimToken = `${workerId}:${crypto.randomUUID()}`;
   return await sql.begin(async (tx) => {
-    const rows = await tx<{ id: string; type: string; payload: unknown; attempts: number }[]>`
-      SELECT id, type, payload, attempts FROM jobs
+    const rows = await tx<
+      {
+        id: string;
+        type: string;
+        payload: unknown;
+        attempts: number;
+        idempotency_key: string | null;
+      }[]
+    >`
+      SELECT id, type, payload, attempts, idempotency_key FROM jobs
       WHERE
         (status = 'queued' AND available_at <= now())
         OR
@@ -38,7 +47,7 @@ export async function claimJob(
       RETURNING id
     `;
     if (!claimed[0]) return undefined;
-    return { ...job, claimToken };
+    return { ...job, idempotencyKey: job.idempotency_key, claimToken };
   });
 }
 
@@ -74,7 +83,7 @@ export async function failOrRetryJob(
   message: string,
   maxAttempts = 5,
 ): Promise<boolean> {
-  const retry = job.attempts + 1 < maxAttempts;
+  const retry = jobFailureWillRetry(job, maxAttempts);
   const rows = await sql<{ id: string }[]>`
     UPDATE jobs
     SET status = ${retry ? "queued" : "failed"}, last_error = ${message},
@@ -84,4 +93,70 @@ export async function failOrRetryJob(
     RETURNING id
   `;
   return Boolean(rows[0]);
+}
+
+/** Atomically fences the claimed job and its scrub run when the retry budget is exhausted. */
+export type RetentionScrubJobFailureCode = "worker_retry_exhausted" | "invalid_job_payload";
+
+const retentionFailure = (code: RetentionScrubJobFailureCode) =>
+  code === "invalid_job_payload"
+    ? {
+      job: "Retention scrub job payload is invalid",
+      run: "Retention scrub stopped because its durable job payload was invalid",
+    }
+    : {
+      job: "Retention scrub attempt failed",
+      run: "Retention scrub failed after the retry limit",
+    };
+
+export function retentionRunIdFromJobAssociation(
+  job: Pick<ClaimedJob, "type" | "idempotencyKey">,
+): string | undefined {
+  if (job.type !== "retention.scrub" || !job.idempotencyKey) return undefined;
+  return job.idempotencyKey.match(
+    /^retention\.scrub:([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/iu,
+  )?.[1];
+}
+
+export async function failOrRetryRetentionScrubJob(
+  sql: Sql,
+  job: ClaimedJob,
+  runId: string,
+  code: RetentionScrubJobFailureCode,
+  maxAttempts = 5,
+): Promise<boolean> {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(runId)) {
+    throw new TypeError("Retention scrub run id is invalid");
+  }
+  const message = retentionFailure(code);
+  const retry = jobFailureWillRetry(job, maxAttempts);
+  return await sql.begin(async (tx) => {
+    const rows = await tx<{ id: string }[]>`
+      UPDATE jobs SET status=${retry ? "queued" : "failed"},last_error=${message.job},
+        available_at=now()+${Math.min(300, 2 ** job.attempts)}*interval '1 second',
+        locked_at=NULL,locked_by=NULL
+      WHERE id=${job.id} AND type='retention.scrub' AND status='running'
+        AND locked_by=${job.claimToken} RETURNING id`;
+    if (!rows[0]) return false;
+    if (!retry) {
+      const failed = await tx<{ id: string; policy_version: number }[]>`
+        UPDATE retention_scrub_runs SET status='failed',
+          error=${message.run},completed_at=now()
+        WHERE id=${runId}::uuid AND status IN ('queued','running')
+        RETURNING id,policy_version`;
+      if (failed[0]) {
+        await tx`INSERT INTO audit_events(action,target_type,target_id,metadata)
+          VALUES('retention.scrub.failed','retention_scrub_run',${runId},
+            ${tx.json({ policyVersion: failed[0].policy_version, code })})`;
+      }
+    }
+    return true;
+  });
+}
+
+export function jobFailureWillRetry(job: Pick<ClaimedJob, "attempts">, maxAttempts = 5): boolean {
+  if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1) {
+    throw new RangeError("Maximum job attempts must be a positive integer");
+  }
+  return job.attempts + 1 < maxAttempts;
 }

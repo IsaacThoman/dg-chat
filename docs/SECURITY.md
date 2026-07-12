@@ -67,6 +67,14 @@ admin responses expose only credential presence/update time, and plaintext is ne
 replacement. Provider discovery reuses the DNS-pinned, HTTPS-only, no-redirect transport and stores
 only bounded failure categories.
 
+Provider request and response diagnostics are disabled by default. When an administrator opts in,
+captures are separately stored, limited to one MiB per side, linked to the immutable usage run and
+provider attempt, and conservatively redact credential-bearing keys, URLs, signed queries, encoded
+media, and normalized provider errors. Retention previews expose aggregate counts and exact cutoff
+timestamps only. A scrub run is fenced to those reviewed cutoffs and permanently nulls eligible
+diagnostic bodies while preserving chats, attachments, usage, costs, attempts, and audit history.
+Worker failures persist fixed public codes and messages rather than exception text.
+
 Public chat snapshots are not implemented in the current release. Conversations remain private to
 their owner. A future sharing implementation must be revocable, read-only, pinned to an immutable
 leaf, independently control identity and attachment exposure, and invalidate cached access on

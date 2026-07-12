@@ -3,6 +3,7 @@ import {
   boolean,
   check,
   doublePrecision,
+  foreignKey,
   index,
   integer,
   jsonb,
@@ -775,6 +776,7 @@ export const providerAttempts = pgTable("provider_attempts", {
   startedAt: timestamp("started_at", { withTimezone: true }).notNull().defaultNow(),
   completedAt: timestamp("completed_at", { withTimezone: true }),
 }, (table) => [
+  unique("provider_attempts_run_id_id_uq").on(table.usageRunId, table.id),
   unique("provider_attempts_run_number_uq").on(table.usageRunId, table.attemptNumber),
   index("provider_attempts_run_idx").on(table.usageRunId, table.attemptNumber),
   check("provider_attempts_attempt_number_check", sql`${table.attemptNumber} BETWEEN 1 AND 16`),
@@ -834,5 +836,132 @@ export const providerAttempts = pgTable("provider_attempts", {
   check(
     "provider_attempts_skipped_check",
     sql`${table.status}<>'skipped' OR (NOT ${table.visibleOutput} AND ${table.inputTokens}=0 AND ${table.outputTokens}=0 AND ${table.costMicros}=0 AND ${table.tokenSource}='none' AND ${table.costSource}='none')`,
+  ),
+]);
+
+export const retentionPolicyVersions = pgTable("retention_policy_versions", {
+  version: integer("version").primaryKey(),
+  captureEnabled: boolean("capture_enabled").notNull(),
+  requestBodyDays: integer("request_body_days").notNull(),
+  responseBodyDays: integer("response_body_days").notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedBy: uuid("updated_by").references(() => users.id, { onDelete: "restrict" }),
+}, (table) => [
+  check("retention_policy_version_check", sql`${table.version} >= 1`),
+  check("retention_policy_request_days_check", sql`${table.requestBodyDays} IN (1,7,14,30,90)`),
+  check("retention_policy_response_days_check", sql`${table.responseBodyDays} IN (1,7,14,30,90)`),
+]);
+
+export const retentionPolicyState = pgTable("retention_policy_state", {
+  singletonId: integer("singleton_id").primaryKey().default(1),
+  currentVersion: integer("current_version").notNull().references(
+    () => retentionPolicyVersions.version,
+    {
+      onDelete: "restrict",
+    },
+  ),
+}, (table) => [check("retention_policy_singleton_check", sql`${table.singletonId} = 1`)]);
+
+export const providerPayloadCaptures = pgTable("provider_payload_captures", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  usageRunId: text("usage_run_id").notNull().references(() => usageRuns.id, {
+    onDelete: "restrict",
+  }),
+  providerAttemptId: uuid("provider_attempt_id").notNull(),
+  requestBody: text("request_body"),
+  responseBody: text("response_body"),
+  requestBytes: integer("request_bytes").notNull().default(0),
+  responseBytes: integer("response_bytes").notNull().default(0),
+  capturedAt: timestamp("captured_at", { withTimezone: true }).notNull().defaultNow(),
+  scrubbedAt: timestamp("scrubbed_at", { withTimezone: true }),
+}, (table) => [
+  uniqueIndex("provider_payload_captures_attempt_uq").on(table.providerAttemptId),
+  foreignKey({
+    columns: [table.usageRunId, table.providerAttemptId],
+    foreignColumns: [providerAttempts.usageRunId, providerAttempts.id],
+    name: "provider_payload_captures_attempt_run_fk",
+  }).onDelete("restrict"),
+  index("provider_payload_captures_request_scrub_idx").on(table.capturedAt, table.id).where(
+    sql`${table.requestBody} IS NOT NULL`,
+  ),
+  index("provider_payload_captures_response_scrub_idx").on(table.capturedAt, table.id).where(
+    sql`${table.responseBody} IS NOT NULL`,
+  ),
+  check(
+    "provider_payload_captures_body_check",
+    sql`${table.requestBody} IS NOT NULL OR ${table.responseBody} IS NOT NULL OR ${table.scrubbedAt} IS NOT NULL`,
+  ),
+  check(
+    "provider_payload_captures_request_bytes_check",
+    sql`${table.requestBytes} BETWEEN 0 AND 1048576`,
+  ),
+  check(
+    "provider_payload_captures_response_bytes_check",
+    sql`${table.responseBytes} BETWEEN 0 AND 1048576`,
+  ),
+  check(
+    "provider_payload_captures_request_size_check",
+    sql`${table.requestBody} IS NULL OR octet_length(${table.requestBody})=${table.requestBytes}`,
+  ),
+  check(
+    "provider_payload_captures_response_size_check",
+    sql`${table.responseBody} IS NULL OR octet_length(${table.responseBody})=${table.responseBytes}`,
+  ),
+]);
+
+export const retentionScrubRuns = pgTable("retention_scrub_runs", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  idempotencyKey: text("idempotency_key").notNull(),
+  status: text("status").notNull().default("queued"),
+  policyVersion: integer("policy_version").notNull().references(
+    () => retentionPolicyVersions.version,
+    {
+      onDelete: "restrict",
+    },
+  ),
+  captureEnabled: boolean("capture_enabled").notNull(),
+  requestBodyDays: integer("request_body_days").notNull(),
+  responseBodyDays: integer("response_body_days").notNull(),
+  requestCutoffAt: timestamp("request_cutoff_at", { withTimezone: true }).notNull(),
+  responseCutoffAt: timestamp("response_cutoff_at", { withTimezone: true }).notNull(),
+  requestedBy: uuid("requested_by").notNull().references(() => users.id, { onDelete: "restrict" }),
+  capturesScrubbed: integer("captures_scrubbed").notNull().default(0),
+  requestBodiesScrubbed: integer("request_bodies_scrubbed").notNull().default(0),
+  responseBodiesScrubbed: integer("response_bodies_scrubbed").notNull().default(0),
+  bytesScrubbed: bigint("bytes_scrubbed", { mode: "number" }).notNull().default(0),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  startedAt: timestamp("started_at", { withTimezone: true }),
+  completedAt: timestamp("completed_at", { withTimezone: true }),
+  error: text("error"),
+}, (table) => [
+  uniqueIndex("retention_scrub_runs_idempotency_uq").on(table.idempotencyKey),
+  index("retention_scrub_runs_status_created_idx").on(table.status, table.createdAt, table.id),
+  check(
+    "retention_scrub_runs_status_check",
+    sql`${table.status} IN ('queued','running','completed','failed')`,
+  ),
+  check(
+    "retention_scrub_runs_days_check",
+    sql`${table.requestBodyDays} IN (1,7,14,30,90) AND ${table.responseBodyDays} IN (1,7,14,30,90)`,
+  ),
+  check(
+    "retention_scrub_runs_counters_check",
+    sql`${table.capturesScrubbed} >= 0 AND ${table.requestBodiesScrubbed} >= 0 AND ${table.responseBodiesScrubbed} >= 0 AND ${table.bytesScrubbed} >= 0`,
+  ),
+  check(
+    "retention_scrub_runs_key_check",
+    sql`char_length(${table.idempotencyKey}) BETWEEN 8 AND 200`,
+  ),
+  check(
+    "retention_scrub_runs_cutoff_check",
+    sql`${table.requestCutoffAt} <= ${table.createdAt} AND ${table.responseCutoffAt} <= ${table.createdAt}`,
+  ),
+  check(
+    "retention_scrub_runs_terminal_check",
+    sql`(${table.status} IN ('queued','running') AND ${table.completedAt} IS NULL AND ${table.error} IS NULL) OR (${table.status}='completed' AND ${table.completedAt} IS NOT NULL AND ${table.error} IS NULL) OR (${table.status}='failed' AND ${table.completedAt} IS NOT NULL AND ${table.error} IS NOT NULL)`,
+  ),
+  check(
+    "retention_scrub_runs_error_check",
+    sql`${table.error} IS NULL OR char_length(${table.error}) <= 1000`,
   ),
 ]);

@@ -12,7 +12,14 @@ import {
   AttachmentInspectionPendingError,
   parseAttachmentInspectionPayload,
 } from "./attachment-inspection.ts";
-import { claimJob, completeJob, deferJob, failOrRetryJob } from "./job-queue.ts";
+import {
+  claimJob,
+  completeJob,
+  deferJob,
+  failOrRetryJob,
+  failOrRetryRetentionScrubJob,
+  retentionRunIdFromJobAssociation,
+} from "./job-queue.ts";
 import {
   parseAttachmentIngestionPayload,
   recordIngestionFailure,
@@ -27,6 +34,7 @@ import {
   sha256,
 } from "./knowledge-embedding.ts";
 import { runAccountedEmbeddingCall } from "../../api/src/embedding-accounting.ts";
+import { parseRetentionScrubPayload, processRetentionScrub } from "./retention-scrub.ts";
 
 const databaseUrl = Deno.env.get("DATABASE_URL");
 const workerId = Deno.env.get("WORKER_ID") ?? `worker-${crypto.randomUUID().slice(0, 8)}`;
@@ -158,7 +166,14 @@ if (knowledgeEmbeddingConfig) {
 }
 
 async function processJob(
-  job: { id: string; type: string; payload: unknown; attempts: number; claimToken: string },
+  job: {
+    id: string;
+    type: string;
+    payload: unknown;
+    attempts: number;
+    claimToken: string;
+    idempotencyKey: string | null;
+  },
 ) {
   switch (job.type) {
     case "attachment.inspect": {
@@ -435,6 +450,17 @@ async function processJob(
       if (!committed) throw new Error("Generated object cleanup claim was reclaimed");
       return true;
     }
+    case "retention.scrub": {
+      const payload = parseRetentionScrubPayload(job.payload);
+      const result = await processRetentionScrub(repository, payload);
+      if (!result.completed) {
+        if (!await deferJob(sql, job, result.processed === 0 ? 1 : 0)) {
+          throw new Error("Retention scrub claim was reclaimed before continuation");
+        }
+        return true;
+      }
+      return false;
+    }
     default:
       throw new Error(`Unsupported job type: ${job.type}`);
   }
@@ -469,6 +495,29 @@ while (!stopping) {
         continue;
       }
       await recordIngestionFailure(sql, job, payload, message);
+    } else if (job.type === "retention.scrub") {
+      let payload;
+      try {
+        payload = parseRetentionScrubPayload(job.payload);
+      } catch {
+        const associatedRunId = retentionRunIdFromJobAssociation(job);
+        if (associatedRunId) {
+          await failOrRetryRetentionScrubJob(
+            sql,
+            job,
+            associatedRunId,
+            "invalid_job_payload",
+            1,
+          );
+        } else await failOrRetryJob(sql, job, "Retention scrub job association is invalid", 1);
+        continue;
+      }
+      await failOrRetryRetentionScrubJob(
+        sql,
+        job,
+        payload.runId,
+        "worker_retry_exhausted",
+      );
     } else await failOrRetryJob(sql, job, message);
   }
 }

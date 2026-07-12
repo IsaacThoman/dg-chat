@@ -8,6 +8,180 @@ import { decodeApiResponseBody, InvalidApiResponseBodyError } from "./repository
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
 
 Deno.test({
+  name: "Postgres retention policy atomically gates capture and bounded scrubbing",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 1 });
+    await sql`TRUNCATE retention_scrub_runs,provider_payload_captures,audit_events,jobs,
+      provider_attempts,model_price_versions,provider_models,providers,ledger_entries,usage_runs,
+      api_tokens,sessions,messages,conversations,users RESTART IDENTITY CASCADE`;
+    await sql`INSERT INTO retention_policy_versions(version,capture_enabled,request_body_days,
+      response_body_days) VALUES(1,false,30,30) ON CONFLICT(version) DO UPDATE SET
+      capture_enabled=false,request_body_days=30,response_body_days=30,updated_by=NULL`;
+    await sql`INSERT INTO retention_policy_state(singleton_id,current_version) VALUES(1,1)
+      ON CONFLICT(singleton_id) DO UPDATE SET current_version=1`;
+    await sql`DELETE FROM retention_policy_versions WHERE version>1`;
+    const userId = crypto.randomUUID();
+    const providerId = crypto.randomUUID();
+    const modelId = crypto.randomUUID();
+    const priceId = crypto.randomUUID();
+    const attemptId = crypto.randomUUID();
+    await sql`INSERT INTO users(id,email,name,role,approval_status,state)
+      VALUES(${userId},'retention-pg@example.com','Retention','admin','approved','active')`;
+    await sql`INSERT INTO usage_runs(id,user_id,model,provider,status)
+      VALUES('retention-pg-run',${userId},'retention/model','retention','completed')`;
+    await sql`INSERT INTO providers(id,slug,display_name,base_url,protocol)
+      VALUES(${providerId},'retention','Retention','https://example.com/v1','responses')`;
+    await sql`INSERT INTO provider_models(id,provider_id,public_model_id,upstream_model_id,
+      display_name,capabilities,context_window) VALUES(${modelId},${providerId},'retention/model',
+      'model','Model','["chat"]',1000)`;
+    await sql`INSERT INTO model_price_versions(id,provider_model_id,effective_at,
+      input_micros_per_million,cached_input_micros_per_million,reasoning_micros_per_million,
+      output_micros_per_million,fixed_call_micros,source) VALUES(${priceId},${modelId},now(),1,1,1,1,1,'test')`;
+    await sql`INSERT INTO provider_attempts(id,usage_run_id,attempt_number,execution_epoch,
+      target_ordinal,retry_number,reason,provider_id,provider_slug,provider_version,protocol,
+      provider_model_id,public_model_id,upstream_model_id,model_version,pricing_version_id,
+      pricing_input_micros_per_million,pricing_cached_input_micros_per_million,
+      pricing_reasoning_micros_per_million,pricing_output_micros_per_million,
+      pricing_fixed_call_micros,pricing_source,status,phase,completed_at)
+      VALUES(${attemptId},'retention-pg-run',1,1,0,0,'primary',${providerId},'retention',1,
+      'responses',${modelId},'retention/model','model',1,${priceId},1,1,1,1,1,'test',
+      'succeeded','complete',now())`;
+    const repo = await PostgresRepository.connect(databaseUrl!);
+    try {
+      assertEquals(
+        await repo.captureProviderPayload({
+          usageRunId: "retention-pg-run",
+          providerAttemptId: attemptId,
+          requestBody: "disabled",
+        }),
+        null,
+      );
+      assertEquals(
+        await repo.captureProviderPayload({
+          usageRunId: "invalid-disabled-run",
+          providerAttemptId: "not-a-uuid",
+          requestBody: "must remain gated",
+        }),
+        null,
+      );
+      const policy = await repo.updateRetentionPolicy({
+        expectedVersion: 1,
+        captureEnabled: true,
+        requestBodyDays: 1,
+        responseBodyDays: 1,
+      }, userId);
+      const capture = await repo.captureProviderPayload({
+        usageRunId: "retention-pg-run",
+        providerAttemptId: attemptId,
+        requestBody: "request",
+        responseBody: "response",
+      });
+      await sql`UPDATE provider_payload_captures SET captured_at=now()-interval '2 days'
+        WHERE id=${capture!.id}`;
+      const secondAttemptId = crypto.randomUUID();
+      await sql`INSERT INTO provider_attempts SELECT ${secondAttemptId},usage_run_id,2,
+        execution_epoch,target_ordinal,retry_number,reason,breaker_before,breaker_after,retryable,
+        provider_id,provider_slug,provider_version,protocol,provider_model_id,public_model_id,
+        upstream_model_id,model_version,pricing_version_id,pricing_input_micros_per_million,
+        pricing_cached_input_micros_per_million,pricing_reasoning_micros_per_million,
+        pricing_output_micros_per_million,pricing_fixed_call_micros,pricing_source,status,phase,
+        error_code,http_status,visible_output,input_tokens,cached_input_tokens,reasoning_tokens,
+        output_tokens,cost_micros,token_source,cost_source,latency_ms,ttft_ms,upstream_request_id,
+        tokens_per_second,started_at,completed_at FROM provider_attempts WHERE id=${attemptId}`;
+      const secondCapture = await repo.captureProviderPayload({
+        usageRunId: "retention-pg-run",
+        providerAttemptId: secondAttemptId,
+        requestBody: "second",
+      });
+      await sql`UPDATE provider_payload_captures SET captured_at=now()-interval '2 days'
+        WHERE id=${secondCapture!.id}`;
+      const preview = await repo.previewRetentionScrub();
+      assertEquals(preview.captures, 2);
+      const concurrentRuns = await Promise.all(
+        Array.from({ length: 4 }, () =>
+          repo.enqueueRetentionScrub({
+            idempotencyKey: "retention-pg-scrub",
+            expectedPolicyVersion: policy.version,
+            requestCutoffAt: preview.requestCutoffAt,
+            responseCutoffAt: preview.responseCutoffAt,
+          }, userId)),
+      );
+      assertEquals(new Set(concurrentRuns.map((run) => run.id)).size, 1);
+      const run = concurrentRuns[0];
+      const failedRun = await repo.enqueueRetentionScrub({
+        idempotencyKey: "retention-pg-failure",
+        expectedPolicyVersion: policy.version,
+        requestCutoffAt: preview.requestCutoffAt,
+        responseCutoffAt: preview.responseCutoffAt,
+      }, userId);
+      await repo.updateRetentionPolicy({
+        expectedVersion: policy.version,
+        captureEnabled: true,
+        requestBodyDays: 90,
+        responseBodyDays: 90,
+      }, userId);
+      const thirdAttemptId = crypto.randomUUID();
+      await sql`INSERT INTO provider_attempts SELECT ${thirdAttemptId},usage_run_id,3,
+        execution_epoch,target_ordinal,retry_number,reason,breaker_before,breaker_after,retryable,
+        provider_id,provider_slug,provider_version,protocol,provider_model_id,public_model_id,
+        upstream_model_id,model_version,pricing_version_id,pricing_input_micros_per_million,
+        pricing_cached_input_micros_per_million,pricing_reasoning_micros_per_million,
+        pricing_output_micros_per_million,pricing_fixed_call_micros,pricing_source,status,phase,
+        error_code,http_status,visible_output,input_tokens,cached_input_tokens,reasoning_tokens,
+        output_tokens,cost_micros,token_source,cost_source,latency_ms,ttft_ms,upstream_request_id,
+        tokens_per_second,started_at,completed_at FROM provider_attempts WHERE id=${attemptId}`;
+      const future = await repo.captureProviderPayload({
+        usageRunId: "retention-pg-run",
+        providerAttemptId: thirdAttemptId,
+        requestBody: "after-preview",
+      });
+      const firstBatch = await repo.scrubRetentionBatch(run.id, 1);
+      assertEquals(firstBatch.completed, false);
+      const result = await repo.scrubRetentionBatch(run.id, 1);
+      assertEquals(result.completed, true);
+      assertEquals(result.run.requestCutoffAt, preview.requestCutoffAt);
+      assertEquals(
+        (await sql`SELECT request_body FROM provider_payload_captures
+        WHERE id=${future!.id}`)[0].request_body,
+        "after-preview",
+      );
+      assertEquals([
+        ...await sql`SELECT request_body,response_body,scrubbed_at IS NOT NULL scrubbed
+        FROM provider_payload_captures WHERE id=${capture!.id}`,
+      ], [{ request_body: null, response_body: null, scrubbed: true }]);
+      await repo.failRetentionScrubRun(failedRun.id, "worker_retry_exhausted");
+      await repo.failRetentionScrubRun(failedRun.id, "manual_recovery");
+      const failedJob = await sql`UPDATE jobs SET status='failed',attempts=5
+        WHERE type='retention.scrub' AND payload->>'runId'=${failedRun.id} RETURNING id`;
+      await repo.retryFailedJob(String(failedJob[0].id), userId);
+      assertEquals((await repo.getRetentionScrubRun(failedRun.id)).status, "queued");
+      assertEquals((await repo.scrubRetentionBatch(failedRun.id)).completed, true);
+      assertEquals((await repo.scrubRetentionBatch(failedRun.id)).processed, 0);
+      assertEquals(
+        Number(
+          (await sql`SELECT count(*) count FROM audit_events WHERE
+        target_id=${failedRun.id} AND action='retention.scrub.failed'`)[0].count,
+        ),
+        1,
+      );
+      assertEquals(
+        Number(
+          (await sql`SELECT count(*) count FROM audit_events WHERE
+        target_id=${failedRun.id} AND action='retention.scrub.completed'`)[0].count,
+        ),
+        1,
+      );
+    } finally {
+      await repo.close();
+      await sql.end();
+    }
+  },
+});
+
+Deno.test({
   name: "Postgres operational analytics and job retry preserve safe canonical semantics",
   ignore: !databaseUrl,
   sanitizeOps: false,

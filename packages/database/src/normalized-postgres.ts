@@ -59,6 +59,7 @@ import type {
   DocumentChunkInput,
   DomainRepository,
   EmbeddingProviderAttemptInput,
+  EnqueueRetentionScrubInput,
   EnsureIdempotentReservationInput,
   EnsureUsageReservationInput,
   FailApiRequestInput,
@@ -84,11 +85,20 @@ import type {
   ProviderExecutionPlan,
   ProviderModelRecord,
   ProviderModelRoute,
+  ProviderPayloadCapture,
+  ProviderPayloadCaptureInput,
   ProviderRecord,
   ProviderRetryPolicy,
   RegistryMutationContext,
   ReplaceConversationKnowledgeInput,
   ReserveChildProviderUsageInput,
+  RetentionPolicy,
+  RetentionPreview,
+  RetentionScrubBatchResult,
+  RetentionScrubFailureCode,
+  RetentionScrubPage,
+  RetentionScrubQuery,
+  RetentionScrubRun,
   SearchConversationKnowledgeInput,
   SessionSummary,
   SetProviderModelRouteInput,
@@ -98,6 +108,7 @@ import type {
   UpdateProviderInput,
   UpdateProviderModelInput,
   UpdateProviderRetryPolicyInput,
+  UpdateRetentionPolicyInput,
   UsagePricingSnapshot,
 } from "./repository.ts";
 import {
@@ -110,6 +121,7 @@ import {
 } from "./repository.ts";
 
 type Row = Record<string, unknown>;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const iso = (value: unknown) => value instanceof Date ? value.toISOString() : String(value);
 const nullableIso = (value: unknown) => value == null ? null : iso(value);
 const number = (value: unknown) => Number(value);
@@ -123,6 +135,43 @@ const adminJob = (row: Row): AdminJobSummary => ({
   createdAt: iso(row.created_at),
   completedAt: nullableIso(row.completed_at),
   lastError: row.last_error == null ? null : String(row.last_error).slice(0, 1000),
+});
+const retentionPolicy = (row: Row): RetentionPolicy => ({
+  version: number(row.policy_version ?? row.version),
+  captureEnabled: Boolean(row.capture_enabled),
+  requestBodyDays: number(row.request_body_days) as RetentionPolicy["requestBodyDays"],
+  responseBodyDays: number(row.response_body_days) as RetentionPolicy["responseBodyDays"],
+  updatedAt: iso(row.policy_updated_at ?? row.updated_at),
+  updatedBy: row.policy_updated_by == null && row.updated_by == null
+    ? null
+    : String(row.policy_updated_by ?? row.updated_by),
+});
+const payloadCapture = (row: Row): ProviderPayloadCapture => ({
+  id: String(row.id),
+  usageRunId: String(row.usage_run_id),
+  providerAttemptId: String(row.provider_attempt_id),
+  requestBody: row.request_body == null ? null : String(row.request_body),
+  responseBody: row.response_body == null ? null : String(row.response_body),
+  requestBytes: number(row.request_bytes),
+  responseBytes: number(row.response_bytes),
+  capturedAt: iso(row.captured_at),
+  scrubbedAt: nullableIso(row.scrubbed_at),
+});
+const retentionRun = (row: Row): RetentionScrubRun => ({
+  id: String(row.id),
+  idempotencyKey: String(row.idempotency_key),
+  status: row.status as RetentionScrubRun["status"],
+  policy: retentionPolicy(row),
+  requestCutoffAt: iso(row.request_cutoff_at),
+  responseCutoffAt: iso(row.response_cutoff_at),
+  capturesScrubbed: number(row.captures_scrubbed),
+  requestBodiesScrubbed: number(row.request_bodies_scrubbed),
+  responseBodiesScrubbed: number(row.response_bodies_scrubbed),
+  bytesScrubbed: number(row.bytes_scrubbed),
+  createdAt: iso(row.created_at),
+  startedAt: nullableIso(row.started_at),
+  completedAt: nullableIso(row.completed_at),
+  error: row.error == null ? null : String(row.error).slice(0, 1000),
 });
 const knowledgeCollection = (row: Row): KnowledgeCollection => ({
   id: String(row.id),
@@ -722,7 +771,7 @@ function validateAttachmentInput(input: CreateAttachmentInput) {
 
 function validateGeneratedObjectStageInput(input: StageGeneratedObjectInput) {
   if (
-    !/^[0-9a-f-]{36}$/i.test(input.ownerId) || !input.usageRunId ||
+    !UUID_PATTERN.test(input.ownerId) || !input.usageRunId ||
     input.usageRunId.length > 200 || !Number.isSafeInteger(input.ordinal) || input.ordinal < 0 ||
     input.ordinal > 16 || !input.objectKey || input.objectKey.length > 1024 ||
     (input.purpose !== undefined && !["output", "edit_input"].includes(input.purpose)) ||
@@ -3831,7 +3880,7 @@ export class PostgresRepository implements DomainRepository {
       !Number.isSafeInteger(input.attemptNumber) || input.attemptNumber < 1 ||
       input.attemptNumber > 16 || !isUsagePricingSnapshot(input.pricing) ||
       !Number.isSafeInteger(input.executionEpoch) || input.executionEpoch < 1 ||
-      !/^[0-9a-f-]{36}$/i.test(input.ownerLeaseToken) ||
+      !UUID_PATTERN.test(input.ownerLeaseToken) ||
       !/^[a-z0-9][a-z0-9-]{0,62}$/.test(input.providerSlug) ||
       input.publicModelId.length < 3 || input.publicModelId.length > 255 ||
       !input.upstreamModelId || input.upstreamModelId.length > 255 ||
@@ -5308,13 +5357,29 @@ export class PostgresRepository implements DomainRepository {
       throw new DomainError("validation_error", "Invalid job id", 422);
     }
     return await this.#sql.begin(async (tx) => {
-      const rows = await tx<Row[]>`SELECT id,type,status,attempts,available_at,locked_at,last_error,
+      const rows = await tx<
+        Row[]
+      >`SELECT id,type,payload,status,attempts,available_at,locked_at,last_error,
         created_at,completed_at FROM jobs WHERE id=${id}::uuid FOR UPDATE`;
       if (!rows.length) throw new DomainError("not_found", "Job not found", 404);
       if (rows[0].status !== "failed") {
         throw new DomainError("conflict", "Only failed jobs can be retried", 409);
       }
       const priorAttempts = number(rows[0].attempts);
+      if (rows[0].type === "retention.scrub") {
+        const payload = rows[0].payload as { runId?: unknown } | null;
+        if (
+          !payload || typeof payload.runId !== "string" ||
+          !UUID_PATTERN.test(payload.runId)
+        ) {
+          throw new DomainError("conflict", "Retention scrub job payload is invalid", 409);
+        }
+        const reset = await tx<Row[]>`UPDATE retention_scrub_runs SET status='queued',error=NULL,
+          completed_at=NULL WHERE id=${payload.runId}::uuid AND status='failed' RETURNING id`;
+        if (!reset.length) {
+          throw new DomainError("conflict", "Retention scrub run is not safely retryable", 409);
+        }
+      }
       const updated = await tx<Row[]>`UPDATE jobs SET status='queued',attempts=0,available_at=now(),
         locked_at=NULL,locked_by=NULL,last_error=NULL,completed_at=NULL WHERE id=${id}::uuid
         RETURNING id,type,status,attempts,available_at,locked_at,last_error,created_at,completed_at`;
@@ -5325,6 +5390,329 @@ export class PostgresRepository implements DomainRepository {
       await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
         VALUES(${actorId}::uuid,'job.retried','job',${id},${auditMetadata})`;
       return { job: adminJob(updated[0]), priorAttempts };
+    });
+  }
+  async getRetentionPolicy(): Promise<RetentionPolicy> {
+    const rows = await this.#sql<Row[]>`SELECT v.* FROM retention_policy_state s
+      JOIN retention_policy_versions v ON v.version=s.current_version WHERE s.singleton_id=1`;
+    if (!rows.length) {
+      throw new DomainError("not_found", "Retention policy is not initialized", 500);
+    }
+    return retentionPolicy(rows[0]);
+  }
+  async updateRetentionPolicy(input: UpdateRetentionPolicyInput, actorId: string) {
+    if (
+      ![1, 7, 14, 30, 90].includes(input.requestBodyDays) ||
+      ![1, 7, 14, 30, 90].includes(input.responseBodyDays)
+    ) {
+      throw new DomainError("validation_error", "Retention days are invalid", 422);
+    }
+    return await this.#sql.begin(async (tx) => {
+      const state = await tx<Row[]>`SELECT current_version FROM retention_policy_state
+        WHERE singleton_id=1 FOR UPDATE`;
+      if (!state.length) {
+        throw new DomainError("not_found", "Retention policy is not initialized", 500);
+      }
+      if (number(state[0].current_version) !== input.expectedVersion) {
+        throw new DomainError("version_conflict", "Retention policy changed", 409);
+      }
+      const version = input.expectedVersion + 1;
+      const rows = await tx<Row[]>`INSERT INTO retention_policy_versions(version,capture_enabled,
+        request_body_days,response_body_days,updated_by) VALUES(${version},${input.captureEnabled},
+        ${input.requestBodyDays},${input.responseBodyDays},${actorId}::uuid) RETURNING *`;
+      await tx`UPDATE retention_policy_state SET current_version=${version} WHERE singleton_id=1`;
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${actorId}::uuid,'retention.policy.updated','retention_policy',${String(version)},
+        ${
+        tx.json(
+          {
+            captureEnabled: input.captureEnabled,
+            requestBodyDays: input.requestBodyDays,
+            responseBodyDays: input.responseBodyDays,
+          } as postgres.JSONValue,
+        )
+      })`;
+      return retentionPolicy(rows[0]);
+    });
+  }
+  async captureProviderPayload(input: ProviderPayloadCaptureInput) {
+    return await this.#sql.begin(async (tx) => {
+      const policy = await tx<Row[]>`SELECT v.capture_enabled FROM retention_policy_state s
+        JOIN retention_policy_versions v ON v.version=s.current_version WHERE s.singleton_id=1
+        FOR SHARE OF s`;
+      if (!policy[0]?.capture_enabled) return null;
+      if (
+        !UUID_PATTERN.test(input.providerAttemptId) || !input.usageRunId ||
+        input.usageRunId.length > 200
+      ) {
+        throw new DomainError("validation_error", "Provider payload linkage is invalid", 422);
+      }
+      const requestBody = input.requestBody ?? null;
+      const responseBody = input.responseBody ?? null;
+      if (requestBody === null && responseBody === null) {
+        throw new DomainError("validation_error", "A provider payload body is required", 422);
+      }
+      const requestBytes = requestBody === null
+        ? 0
+        : new TextEncoder().encode(requestBody).byteLength;
+      const responseBytes = responseBody === null
+        ? 0
+        : new TextEncoder().encode(responseBody).byteLength;
+      if (requestBytes > 1_048_576 || responseBytes > 1_048_576) {
+        throw new DomainError("validation_error", "Provider payload exceeds one MiB", 422);
+      }
+      const rows = await tx<Row[]>`INSERT INTO provider_payload_captures(usage_run_id,
+        provider_attempt_id,request_body,response_body,request_bytes,response_bytes)
+        SELECT ${input.usageRunId},${input.providerAttemptId}::uuid,${requestBody},${responseBody},
+          ${requestBytes},${responseBytes} FROM provider_attempts a
+        WHERE a.id=${input.providerAttemptId}::uuid AND a.usage_run_id=${input.usageRunId}
+        ON CONFLICT(provider_attempt_id) DO NOTHING RETURNING *`;
+      if (rows[0]) return payloadCapture(rows[0]);
+      const prior = await tx<Row[]>`SELECT * FROM provider_payload_captures
+        WHERE provider_attempt_id=${input.providerAttemptId}::uuid`;
+      if (!prior.length) throw new DomainError("not_found", "Provider attempt not found", 404);
+      if (prior[0].request_body !== requestBody || prior[0].response_body !== responseBody) {
+        throw new DomainError("idempotency_conflict", "Provider payload capture differs", 409);
+      }
+      return payloadCapture(prior[0]);
+    });
+  }
+  async previewRetentionScrub(): Promise<RetentionPreview> {
+    const rows = await this.#sql<Row[]>`SELECT v.version policy_version,
+      now()-v.request_body_days*interval '1 day' request_cutoff_at,
+      now()-v.response_body_days*interval '1 day' response_cutoff_at,
+      count(*) FILTER(WHERE (p.request_body IS NOT NULL AND p.captured_at<=now()-v.request_body_days*interval '1 day')
+        OR (p.response_body IS NOT NULL AND p.captured_at<=now()-v.response_body_days*interval '1 day'))::int captures,
+      count(*) FILTER(WHERE p.request_body IS NOT NULL AND p.captured_at<=now()-v.request_body_days*interval '1 day')::int request_bodies,
+      count(*) FILTER(WHERE p.response_body IS NOT NULL AND p.captured_at<=now()-v.response_body_days*interval '1 day')::int response_bodies,
+      COALESCE(sum(p.request_bytes) FILTER(WHERE p.request_body IS NOT NULL AND p.captured_at<=now()-v.request_body_days*interval '1 day'),0)::bigint request_bytes,
+      COALESCE(sum(p.response_bytes) FILTER(WHERE p.response_body IS NOT NULL AND p.captured_at<=now()-v.response_body_days*interval '1 day'),0)::bigint response_bytes
+      FROM retention_policy_state s JOIN retention_policy_versions v ON v.version=s.current_version
+      LEFT JOIN provider_payload_captures p ON true WHERE s.singleton_id=1 GROUP BY v.version`;
+    const row = rows[0];
+    return {
+      policyVersion: number(row.policy_version),
+      requestCutoffAt: iso(row.request_cutoff_at),
+      responseCutoffAt: iso(row.response_cutoff_at),
+      captures: number(row.captures),
+      requestBodies: number(row.request_bodies),
+      responseBodies: number(row.response_bodies),
+      requestBytes: number(row.request_bytes),
+      responseBytes: number(row.response_bytes),
+    };
+  }
+  async enqueueRetentionScrub(input: EnqueueRetentionScrubInput, actorId: string) {
+    if (
+      !input.idempotencyKey || input.idempotencyKey.length < 8 ||
+      input.idempotencyKey.length > 200 ||
+      !Number.isFinite(Date.parse(input.requestCutoffAt)) ||
+      !Number.isFinite(Date.parse(input.responseCutoffAt))
+    ) {
+      throw new DomainError("validation_error", "Retention idempotency key is invalid", 422);
+    }
+    return await this.#sql.begin(async (tx) => {
+      const prior = await tx<Row[]>`SELECT r.*,v.updated_at policy_updated_at,
+        v.updated_by policy_updated_by FROM retention_scrub_runs r
+        JOIN retention_policy_versions v ON v.version=r.policy_version
+        WHERE r.idempotency_key=${input.idempotencyKey}`;
+      if (prior[0]) {
+        if (
+          number(prior[0].policy_version) !== input.expectedPolicyVersion ||
+          iso(prior[0].request_cutoff_at) !== new Date(input.requestCutoffAt).toISOString() ||
+          iso(prior[0].response_cutoff_at) !== new Date(input.responseCutoffAt).toISOString()
+        ) {
+          throw new DomainError("idempotency_conflict", "Retention scrub request differs", 409);
+        }
+        return retentionRun(prior[0]);
+      }
+      const current = await tx<Row[]>`SELECT v.* FROM retention_policy_state s
+        JOIN retention_policy_versions v ON v.version=s.current_version
+        WHERE s.singleton_id=1 FOR UPDATE OF s`;
+      if (!current[0] || number(current[0].version) !== input.expectedPolicyVersion) {
+        throw new DomainError("version_conflict", "Retention preview is stale", 409);
+      }
+      if (
+        Date.parse(input.requestCutoffAt) >
+          Date.now() - number(current[0].request_body_days) * 86_400_000 ||
+        Date.parse(input.responseCutoffAt) >
+          Date.now() - number(current[0].response_body_days) * 86_400_000
+      ) {
+        throw new DomainError("validation_error", "Retention preview cutoffs are invalid", 422);
+      }
+      const concurrent = await tx<Row[]>`SELECT r.*,v.updated_at policy_updated_at,
+        v.updated_by policy_updated_by FROM retention_scrub_runs r
+        JOIN retention_policy_versions v ON v.version=r.policy_version
+        WHERE r.idempotency_key=${input.idempotencyKey}`;
+      if (concurrent[0]) {
+        if (
+          number(concurrent[0].policy_version) !== input.expectedPolicyVersion ||
+          iso(concurrent[0].request_cutoff_at) !== new Date(input.requestCutoffAt).toISOString() ||
+          iso(concurrent[0].response_cutoff_at) !== new Date(input.responseCutoffAt).toISOString()
+        ) {
+          throw new DomainError("idempotency_conflict", "Retention scrub request differs", 409);
+        }
+        return retentionRun(concurrent[0]);
+      }
+      const rows = await tx<Row[]>`INSERT INTO retention_scrub_runs(idempotency_key,status,
+        policy_version,capture_enabled,request_body_days,response_body_days,request_cutoff_at,
+        response_cutoff_at,requested_by)
+        VALUES(${input.idempotencyKey},'queued',${input.expectedPolicyVersion},
+          ${Boolean(current[0].capture_enabled)},${number(current[0].request_body_days)},
+          ${number(current[0].response_body_days)},
+          ${new Date(input.requestCutoffAt).toISOString()},
+          ${new Date(input.responseCutoffAt).toISOString()},${actorId}::uuid) RETURNING *`;
+      await tx`INSERT INTO jobs(type,payload,idempotency_key) VALUES('retention.scrub',
+        ${tx.json({ runId: String(rows[0].id) })},${`retention.scrub:${String(rows[0].id)}`})`;
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${actorId}::uuid,'retention.scrub.enqueued','retention_scrub_run',${
+        String(rows[0].id)
+      },
+          ${tx.json({ policyVersion: input.expectedPolicyVersion } as postgres.JSONValue)})`;
+      return retentionRun({
+        ...rows[0],
+        policy_updated_at: current[0].updated_at,
+        policy_updated_by: current[0].updated_by,
+      });
+    });
+  }
+  async getRetentionScrubRun(id: string) {
+    if (!UUID_PATTERN.test(id)) {
+      throw new DomainError("validation_error", "Retention scrub run id is invalid", 422);
+    }
+    const rows = await this.#sql<Row[]>`SELECT r.*,v.updated_at policy_updated_at,
+      v.updated_by policy_updated_by FROM retention_scrub_runs r
+      JOIN retention_policy_versions v ON v.version=r.policy_version WHERE r.id=${id}::uuid`;
+    if (!rows.length) throw new DomainError("not_found", "Retention scrub run not found", 404);
+    return retentionRun(rows[0]);
+  }
+  async listRetentionScrubRuns(query: RetentionScrubQuery = {}): Promise<RetentionScrubPage> {
+    const limit = query.limit ?? 50;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new DomainError("validation_error", "Retention page limit is invalid", 422);
+    }
+    if (query.status && !["queued", "running", "completed", "failed"].includes(query.status)) {
+      throw new DomainError("validation_error", "Retention scrub status is invalid", 422);
+    }
+    const status = query.status ?? "";
+    const rows = await this.#sql<Row[]>`SELECT r.*,v.updated_at policy_updated_at,
+      v.updated_by policy_updated_by FROM retention_scrub_runs r
+      JOIN retention_policy_versions v ON v.version=r.policy_version
+      WHERE (${query.status === undefined} OR r.status=${status})
+      ORDER BY r.created_at DESC,r.id DESC LIMIT ${limit}`;
+    return { items: rows.map(retentionRun) };
+  }
+  async scrubRetentionBatch(runId: string, limit = 100): Promise<RetentionScrubBatchResult> {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
+      throw new DomainError("validation_error", "Retention batch limit is invalid", 422);
+    }
+    if (!UUID_PATTERN.test(runId)) {
+      throw new DomainError("validation_error", "Retention scrub run id is invalid", 422);
+    }
+    return await this.#sql.begin(async (tx) => {
+      const runs = await tx<Row[]>`SELECT r.*,v.updated_at policy_updated_at,
+        v.updated_by policy_updated_by FROM retention_scrub_runs r
+        JOIN retention_policy_versions v ON v.version=r.policy_version
+        WHERE r.id=${runId}::uuid FOR UPDATE OF r`;
+      if (!runs.length) throw new DomainError("not_found", "Retention scrub run not found", 404);
+      if (runs[0].status === "failed") {
+        throw new DomainError("conflict", "Retention scrub run failed", 409);
+      }
+      if (runs[0].status === "completed") {
+        return { run: retentionRun(runs[0]), processed: 0, completed: true };
+      }
+      const requestCutoff = iso(runs[0].request_cutoff_at);
+      const responseCutoff = iso(runs[0].response_cutoff_at);
+      const scrubbed = await tx<Row[]>`WITH candidates AS (
+        SELECT id,request_bytes,response_bytes,
+          (request_body IS NOT NULL AND captured_at<=${requestCutoff}) request_eligible,
+          (response_body IS NOT NULL AND captured_at<=${responseCutoff}) response_eligible
+        FROM provider_payload_captures WHERE
+          (request_body IS NOT NULL AND captured_at<=${requestCutoff}) OR
+          (response_body IS NOT NULL AND captured_at<=${responseCutoff})
+        ORDER BY captured_at,id FOR UPDATE SKIP LOCKED LIMIT ${limit}
+      ) UPDATE provider_payload_captures p SET
+        request_body=CASE WHEN c.request_eligible THEN NULL ELSE p.request_body END,
+        response_body=CASE WHEN c.response_eligible THEN NULL ELSE p.response_body END,
+        scrubbed_at=CASE WHEN (c.request_eligible OR p.request_body IS NULL) AND
+          (c.response_eligible OR p.response_body IS NULL) THEN now() ELSE p.scrubbed_at END
+        FROM candidates c WHERE p.id=c.id RETURNING c.request_eligible,c.response_eligible,
+          c.request_bytes,c.response_bytes,(p.request_body IS NULL AND p.response_body IS NULL) fully_scrubbed`;
+      const requests = scrubbed.filter((row) => row.request_eligible).length;
+      const responses = scrubbed.filter((row) => row.response_eligible).length;
+      const captures = scrubbed.filter((row) => row.fully_scrubbed).length;
+      const bytes = scrubbed.reduce((sum, row) =>
+        sum +
+        (row.request_eligible ? number(row.request_bytes) : 0) +
+        (row.response_eligible ? number(row.response_bytes) : 0), 0);
+      const remaining = await tx<Row[]>`SELECT EXISTS(SELECT 1 FROM provider_payload_captures WHERE
+        (request_body IS NOT NULL AND captured_at<=${requestCutoff}) OR
+        (response_body IS NOT NULL AND captured_at<=${responseCutoff})) remaining`;
+      const completed = !remaining[0].remaining;
+      const updated = await tx<Row[]>`UPDATE retention_scrub_runs SET status=${
+        completed ? "completed" : "running"
+      },
+        started_at=COALESCE(started_at,now()),completed_at=CASE WHEN ${completed} THEN now() ELSE NULL END,
+        captures_scrubbed=captures_scrubbed+${captures},
+        request_bodies_scrubbed=request_bodies_scrubbed+${requests},
+        response_bodies_scrubbed=response_bodies_scrubbed+${responses},bytes_scrubbed=bytes_scrubbed+${bytes}
+        WHERE id=${runId}::uuid RETURNING *`;
+      if (completed) {
+        await tx`INSERT INTO audit_events(action,target_type,target_id,metadata)
+          VALUES('retention.scrub.completed','retention_scrub_run',${runId},
+          ${
+          tx.json(
+            {
+              capturesScrubbed: number(updated[0].captures_scrubbed),
+              bytesScrubbed: number(updated[0].bytes_scrubbed),
+            } as postgres.JSONValue,
+          )
+        })`;
+      }
+      return {
+        run: retentionRun({
+          ...updated[0],
+          policy_updated_at: runs[0].policy_updated_at,
+          policy_updated_by: runs[0].policy_updated_by,
+        }),
+        processed: scrubbed.length,
+        completed,
+      };
+    });
+  }
+  async failRetentionScrubRun(runId: string, code: RetentionScrubFailureCode) {
+    if (
+      !UUID_PATTERN.test(runId) ||
+      !["worker_retry_exhausted", "invalid_job_payload", "manual_recovery"].includes(code)
+    ) {
+      throw new DomainError("validation_error", "Retention scrub failure is invalid", 422);
+    }
+    const error = code === "worker_retry_exhausted"
+      ? "Retention scrub exhausted its retry budget"
+      : code === "invalid_job_payload"
+      ? "Retention scrub job payload is invalid"
+      : "Retention scrub requires manual recovery";
+    return await this.#sql.begin(async (tx) => {
+      const rows = await tx<Row[]>`UPDATE retention_scrub_runs SET status='failed',
+        error=${error.slice(0, 1000)},completed_at=now() WHERE id=${runId}::uuid
+        AND status IN ('queued','running') RETURNING *`;
+      if (!rows.length) {
+        const prior = await tx<Row[]>`SELECT r.*,v.updated_at policy_updated_at,
+          v.updated_by policy_updated_by FROM retention_scrub_runs r
+          JOIN retention_policy_versions v ON v.version=r.policy_version
+          WHERE r.id=${runId}::uuid`;
+        if (!prior.length) throw new DomainError("not_found", "Retention scrub run not found", 404);
+        if (prior[0].status === "completed") {
+          throw new DomainError("conflict", "Completed retention scrub run cannot fail", 409);
+        }
+        return retentionRun(prior[0]);
+      }
+      const policyVersion = number(rows[0].policy_version);
+      await tx`INSERT INTO audit_events(action,target_type,target_id,metadata)
+        VALUES('retention.scrub.failed','retention_scrub_run',${runId},
+        ${tx.json({ code } as postgres.JSONValue)})`;
+      const policy = await tx<Row[]>`SELECT updated_at policy_updated_at,
+        updated_by policy_updated_by FROM retention_policy_versions WHERE version=${policyVersion}`;
+      return retentionRun({ ...rows[0], ...policy[0] });
     });
   }
   async readiness() {

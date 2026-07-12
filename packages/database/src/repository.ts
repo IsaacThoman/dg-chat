@@ -826,6 +826,87 @@ export interface RetriedAdminJob {
   job: AdminJobSummary;
   priorAttempts: number;
 }
+export type RetentionDays = 1 | 7 | 14 | 30 | 90;
+export interface RetentionPolicy {
+  version: number;
+  captureEnabled: boolean;
+  requestBodyDays: RetentionDays;
+  responseBodyDays: RetentionDays;
+  updatedAt: string;
+  updatedBy: string | null;
+}
+export interface UpdateRetentionPolicyInput {
+  expectedVersion: number;
+  captureEnabled: boolean;
+  requestBodyDays: RetentionDays;
+  responseBodyDays: RetentionDays;
+}
+export interface ProviderPayloadCaptureInput {
+  usageRunId: string;
+  providerAttemptId: string;
+  requestBody?: string | null;
+  responseBody?: string | null;
+}
+export interface ProviderPayloadCapture {
+  id: string;
+  usageRunId: string;
+  providerAttemptId: string;
+  requestBody: string | null;
+  responseBody: string | null;
+  requestBytes: number;
+  responseBytes: number;
+  capturedAt: string;
+  scrubbedAt: string | null;
+}
+export interface RetentionPreview {
+  policyVersion: number;
+  requestCutoffAt: string;
+  responseCutoffAt: string;
+  captures: number;
+  requestBodies: number;
+  responseBodies: number;
+  requestBytes: number;
+  responseBytes: number;
+}
+export type RetentionScrubStatus = "queued" | "running" | "completed" | "failed";
+export type RetentionScrubFailureCode =
+  | "worker_retry_exhausted"
+  | "invalid_job_payload"
+  | "manual_recovery";
+export interface RetentionScrubRun {
+  id: string;
+  idempotencyKey: string;
+  status: RetentionScrubStatus;
+  policy: RetentionPolicy;
+  requestCutoffAt: string;
+  responseCutoffAt: string;
+  capturesScrubbed: number;
+  requestBodiesScrubbed: number;
+  responseBodiesScrubbed: number;
+  bytesScrubbed: number;
+  createdAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+  error: string | null;
+}
+export interface RetentionScrubQuery {
+  status?: RetentionScrubStatus;
+  limit?: number;
+}
+export interface RetentionScrubPage {
+  items: RetentionScrubRun[];
+}
+export interface RetentionScrubBatchResult {
+  run: RetentionScrubRun;
+  processed: number;
+  completed: boolean;
+}
+export interface EnqueueRetentionScrubInput {
+  idempotencyKey: string;
+  expectedPolicyVersion: number;
+  requestCutoffAt: string;
+  responseCutoffAt: string;
+}
 export type ApiIdempotencyEndpoint =
   | "chat.completions"
   | "responses"
@@ -1667,5 +1748,25 @@ export interface DomainRepository {
   listJobs(query?: AdminJobQuery): MaybePromise<AdminJobPage>;
   /** Atomically requeues a failed job and records the privileged actor in the audit log. */
   retryFailedJob(id: string, actorId: string): MaybePromise<RetriedAdminJob>;
+  getRetentionPolicy(): MaybePromise<RetentionPolicy>;
+  updateRetentionPolicy(
+    input: UpdateRetentionPolicyInput,
+    actorId: string,
+  ): MaybePromise<RetentionPolicy>;
+  captureProviderPayload(
+    input: ProviderPayloadCaptureInput,
+  ): MaybePromise<ProviderPayloadCapture | null>;
+  previewRetentionScrub(): MaybePromise<RetentionPreview>;
+  enqueueRetentionScrub(
+    input: EnqueueRetentionScrubInput,
+    actorId: string,
+  ): MaybePromise<RetentionScrubRun>;
+  getRetentionScrubRun(id: string): MaybePromise<RetentionScrubRun>;
+  listRetentionScrubRuns(query?: RetentionScrubQuery): MaybePromise<RetentionScrubPage>;
+  scrubRetentionBatch(runId: string, limit?: number): MaybePromise<RetentionScrubBatchResult>;
+  failRetentionScrubRun(
+    runId: string,
+    code: RetentionScrubFailureCode,
+  ): MaybePromise<RetentionScrubRun>;
   readiness(): MaybePromise<{ ready: boolean; storage: string }>;
 }
