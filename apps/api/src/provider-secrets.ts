@@ -1,4 +1,7 @@
 const encoder = new TextEncoder();
+const decoder = new TextDecoder("utf-8", { fatal: true });
+const MAX_SECRET_BYTES = 32_768;
+const KEY_ID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
 
 export interface ProviderSecretEnvelope {
   version: 1;
@@ -31,6 +34,26 @@ function encodeBase64(value: Uint8Array): string {
   return btoa(binary);
 }
 
+function decodeEnvelopeField(value: unknown, maximumBytes: number): Uint8Array {
+  if (
+    typeof value !== "string" || value.length === 0 ||
+    value.length > Math.ceil(maximumBytes / 3) * 4 || value.length % 4 !== 0 ||
+    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)
+  ) {
+    throw new Error("Provider credential envelope is invalid");
+  }
+  try {
+    const decoded = decodeBase64(value);
+    if (decoded.byteLength > maximumBytes) {
+      decoded.fill(0);
+      throw new Error("Provider credential envelope is invalid");
+    }
+    return decoded;
+  } catch {
+    throw new Error("Provider credential envelope is invalid");
+  }
+}
+
 function aad(providerId: string, credentialVersion: number, purpose: "wrap" | "content") {
   return encoder.encode(
     `dg-chat:provider-secret:v1:${providerId}:${credentialVersion}:${purpose}`,
@@ -43,6 +66,22 @@ function validateProviderId(providerId: string) {
   ) {
     throw new TypeError("Provider ID must be a UUID");
   }
+}
+
+function validateCredentialVersion(credentialVersion: number) {
+  if (!Number.isSafeInteger(credentialVersion) || credentialVersion < 1) {
+    throw new TypeError("Credential version must be a positive integer");
+  }
+}
+
+function validateEnvelope(envelope: ProviderSecretEnvelope) {
+  if (envelope.version !== 1 || envelope.algorithm !== "AES-256-GCM") {
+    throw new Error("Unsupported provider credential envelope");
+  }
+  if (typeof envelope.keyId !== "string" || !KEY_ID_PATTERN.test(envelope.keyId)) {
+    throw new Error("Provider credential envelope is invalid");
+  }
+  validateCredentialVersion(envelope.credentialVersion);
 }
 
 async function importAesKey(bytes: Uint8Array, usages: KeyUsage[]) {
@@ -62,7 +101,7 @@ export class ProviderSecretKeyring {
   readonly #keys: ReadonlyMap<string, Uint8Array>;
 
   constructor(options: ProviderSecretKeyringOptions) {
-    if (!/^[A-Za-z0-9._-]{1,64}$/.test(options.primaryKeyId)) {
+    if (!KEY_ID_PATTERN.test(options.primaryKeyId)) {
       throw new Error("Provider encryption primary key ID is invalid");
     }
     if (!options.keys.has(options.primaryKeyId) || options.keys.size === 0) {
@@ -70,7 +109,7 @@ export class ProviderSecretKeyring {
     }
     const copied = new Map<string, Uint8Array>();
     for (const [id, bytes] of options.keys) {
-      if (!/^[A-Za-z0-9._-]{1,64}$/.test(id) || bytes.byteLength !== 32) {
+      if (!KEY_ID_PATTERN.test(id) || bytes.byteLength !== 32) {
         throw new Error("Every provider encryption key must have a valid ID and 32 bytes");
       }
       copied.set(id, bytes.slice());
@@ -119,14 +158,27 @@ export class ProviderSecretKeyring {
     credentialVersion: number,
     secret: string,
   ): Promise<ProviderSecretEnvelope> {
-    validateProviderId(providerId);
-    if (!Number.isSafeInteger(credentialVersion) || credentialVersion < 1) {
-      throw new TypeError("Credential version must be a positive integer");
+    const secretBytes = encoder.encode(secret);
+    try {
+      return await this.encryptBytes(providerId, credentialVersion, secretBytes);
+    } finally {
+      secretBytes.fill(0);
     }
-    if (!secret || secret.length > 32_768) throw new TypeError("Provider credential is invalid");
+  }
+
+  async encryptBytes(
+    providerId: string,
+    credentialVersion: number,
+    secret: Uint8Array,
+  ): Promise<ProviderSecretEnvelope> {
+    validateProviderId(providerId);
+    validateCredentialVersion(credentialVersion);
+    if (secret.byteLength < 1 || secret.byteLength > MAX_SECRET_BYTES) {
+      throw new TypeError("Provider credential is invalid");
+    }
     const kekBytes = this.#keys.get(this.#primaryKeyId)!;
     const dekBytes = crypto.getRandomValues(new Uint8Array(32));
-    const secretBytes = encoder.encode(secret);
+    const secretBytes = secret.slice();
     const wrapNonce = nonce();
     const contentNonce = nonce();
     try {
@@ -171,21 +223,38 @@ export class ProviderSecretKeyring {
   }
 
   async decrypt(providerId: string, envelope: ProviderSecretEnvelope): Promise<string> {
-    validateProviderId(providerId);
-    if (envelope.version !== 1 || envelope.algorithm !== "AES-256-GCM") {
-      throw new Error("Unsupported provider credential envelope");
+    const plaintext = await this.decryptBytes(providerId, envelope);
+    try {
+      return decoder.decode(plaintext);
+    } catch {
+      throw new Error("Provider credential could not be decrypted");
+    } finally {
+      plaintext.fill(0);
     }
+  }
+
+  async decryptBytes(
+    providerId: string,
+    envelope: ProviderSecretEnvelope,
+  ): Promise<Uint8Array> {
+    validateProviderId(providerId);
+    validateEnvelope(envelope);
     const kekBytes = this.#keys.get(envelope.keyId);
     if (!kekBytes) throw new Error("Provider credential key is unavailable");
-    const wrappedKeyNonce = decodeBase64(envelope.wrappedKeyNonce);
-    const contentNonce = decodeBase64(envelope.contentNonce);
+    const wrappedKeyNonce = decodeEnvelopeField(envelope.wrappedKeyNonce, 12);
+    const contentNonce = decodeEnvelopeField(envelope.contentNonce, 12);
     if (wrappedKeyNonce.byteLength !== 12 || contentNonce.byteLength !== 12) {
       throw new Error("Provider credential envelope is invalid");
     }
     let dekBytes: Uint8Array | undefined;
-    let plaintext: Uint8Array | undefined;
+    let wrappedKey: Uint8Array | undefined;
+    let ciphertext: Uint8Array | undefined;
     try {
       const kek = await importAesKey(kekBytes, ["decrypt"]);
+      wrappedKey = decodeEnvelopeField(envelope.wrappedKey, 48);
+      if (wrappedKey.byteLength !== 48) {
+        throw new Error("Provider credential envelope is invalid");
+      }
       dekBytes = new Uint8Array(
         await crypto.subtle.decrypt(
           {
@@ -194,12 +263,16 @@ export class ProviderSecretKeyring {
             additionalData: buffer(aad(providerId, envelope.credentialVersion, "wrap")),
           },
           kek,
-          buffer(decodeBase64(envelope.wrappedKey)),
+          buffer(wrappedKey),
         ),
       );
       if (dekBytes.byteLength !== 32) throw new Error("Provider credential envelope is invalid");
       const dek = await importAesKey(dekBytes, ["decrypt"]);
-      plaintext = new Uint8Array(
+      ciphertext = decodeEnvelopeField(envelope.ciphertext, MAX_SECRET_BYTES + 16);
+      if (ciphertext.byteLength < 17) {
+        throw new Error("Provider credential envelope is invalid");
+      }
+      const plaintext = new Uint8Array(
         await crypto.subtle.decrypt(
           {
             name: "AES-GCM",
@@ -207,15 +280,20 @@ export class ProviderSecretKeyring {
             additionalData: buffer(aad(providerId, envelope.credentialVersion, "content")),
           },
           dek,
-          buffer(decodeBase64(envelope.ciphertext)),
+          buffer(ciphertext),
         ),
       );
-      return new TextDecoder("utf-8", { fatal: true }).decode(plaintext);
+      if (plaintext.byteLength < 1 || plaintext.byteLength > MAX_SECRET_BYTES) {
+        plaintext.fill(0);
+        throw new Error("Provider credential envelope is invalid");
+      }
+      return plaintext;
     } catch {
       throw new Error("Provider credential could not be decrypted");
     } finally {
       dekBytes?.fill(0);
-      plaintext?.fill(0);
+      wrappedKey?.fill(0);
+      ciphertext?.fill(0);
     }
   }
 
@@ -224,17 +302,20 @@ export class ProviderSecretKeyring {
     envelope: ProviderSecretEnvelope,
   ): Promise<ProviderSecretEnvelope> {
     validateProviderId(providerId);
-    if (envelope.version !== 1 || envelope.algorithm !== "AES-256-GCM") {
-      throw new Error("Unsupported provider credential envelope");
-    }
+    validateEnvelope(envelope);
     if (envelope.keyId === this.#primaryKeyId) return structuredClone(envelope);
     const oldKekBytes = this.#keys.get(envelope.keyId);
     if (!oldKekBytes) throw new Error("Provider credential key is unavailable");
-    const wrapNonce = decodeBase64(envelope.wrappedKeyNonce);
+    const wrapNonce = decodeEnvelopeField(envelope.wrappedKeyNonce, 12);
     if (wrapNonce.byteLength !== 12) throw new Error("Provider credential envelope is invalid");
     let dekBytes: Uint8Array | undefined;
+    let wrappedKeyBytes: Uint8Array | undefined;
     try {
       const oldKek = await importAesKey(oldKekBytes, ["decrypt"]);
+      wrappedKeyBytes = decodeEnvelopeField(envelope.wrappedKey, 48);
+      if (wrappedKeyBytes.byteLength !== 48) {
+        throw new Error("Provider credential envelope is invalid");
+      }
       dekBytes = new Uint8Array(
         await crypto.subtle.decrypt(
           {
@@ -243,7 +324,7 @@ export class ProviderSecretKeyring {
             additionalData: buffer(aad(providerId, envelope.credentialVersion, "wrap")),
           },
           oldKek,
-          buffer(decodeBase64(envelope.wrappedKey)),
+          buffer(wrappedKeyBytes),
         ),
       );
       if (dekBytes.byteLength !== 32) throw new Error("Provider credential envelope is invalid");
@@ -268,6 +349,7 @@ export class ProviderSecretKeyring {
       throw new Error("Provider credential could not be rewrapped");
     } finally {
       dekBytes?.fill(0);
+      wrappedKeyBytes?.fill(0);
     }
   }
 }

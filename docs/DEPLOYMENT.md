@@ -14,6 +14,7 @@ APP_SECRET=... # at least 32 random bytes
 ENCRYPTION_KEY=... # exactly 32 random bytes encoded as base64
 BACKUP_SIGNING_KEY=... # independent, exactly 32 random bytes encoded as base64
 BACKUP_SIGNING_KEY_ID=installation-v1 # stable identifier recorded in every archive
+ENABLE_PRIVILEGED_SECRET_BACKUPS=false # privileged provider-secret recovery is a separate opt-in
 SETUP_TOKEN=... # one-time bootstrap secret
 APP_URL=https://chat.example.com
 WEB_URL=https://chat.example.com
@@ -26,6 +27,14 @@ not reuse either key for the other purpose. For rolling provider-secret rotation
 each provider credential has been explicitly replaced through the admin console under the new
 primary key; an online bulk rewrap command is not yet shipped. `ENCRYPTION_KEY` remains the
 supported single-key form.
+
+Privileged provider-secret recovery artifacts are disabled by default. To prepare their independent
+key domain, set `BACKUP_SECRET_KEYRING` to a JSON object of stable key IDs and canonical base64
+32-byte keys, set `BACKUP_SECRET_PRIMARY_KEY_ID` to the key used for new artifacts, and explicitly
+set `ENABLE_PRIVILEGED_SECRET_BACKUPS=true`. Generate these keys independently: startup rejects any
+recovery key that equals a configured provider-encryption or backup-signing key. Rotation changes
+the primary ID while retaining prior keys until every recovery artifact encrypted with them has
+expired. Never publish or include this keyring in an ordinary `.dgbackup` archive.
 
 The bundled `minio-init` service creates the private bucket and provisions this application identity
 with only list, location, read, write, and delete permissions for that bucket. Never set

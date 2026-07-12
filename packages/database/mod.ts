@@ -14,3 +14,4 @@ export * from "./src/backup-postgres.ts";
 export * from "./src/backup-data.ts";
 export * from "./src/backup-format.ts";
 export * from "./src/backup-archive.ts";
+export * from "./src/provider-secret-sidecar.ts";
