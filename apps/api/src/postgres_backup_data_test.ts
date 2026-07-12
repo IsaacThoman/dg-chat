@@ -15,6 +15,7 @@ import type {
   BackupExportSource,
   BackupRestoreImpact,
   ObjectStore,
+  PrivilegedBackupExportSource,
   PutObjectInput,
   StoredObject,
 } from "@dg-chat/database";
@@ -132,6 +133,7 @@ async function fixture(
     catalogFailure?: boolean;
     abortDatabase?: AbortController;
     throwAfterRestoreCommit?: boolean;
+    providerCredentials?: boolean;
   } = {},
 ) {
   const objects = new FakeObjects();
@@ -223,6 +225,44 @@ async function fixture(
       });
       return result.finally(() => lifecycle.push("snapshot-closed"));
     },
+    privilegedSnapshot<T>(
+      _url: string,
+      consumer: (source: PrivilegedBackupExportSource) => Promise<T>,
+    ) {
+      const result = consumer({
+        schemaVersion: "0028",
+        installationId: "installation-test",
+        tables: BACKUP_DATA_TABLES.filter((table) => table.name !== "provider_payload_captures"),
+        rows(tableName: string): AsyncIterable<BackupDataBatch> {
+          return tableName === "attachments"
+            ? (async function* () {
+              yield rows;
+            })()
+            : (async function* () {})();
+        },
+        providerCredentials() {
+          return (async function* () {
+            if (options.providerCredentials) {
+              lifecycle.push("credential-spooled");
+              yield [{
+                providerId: "20000000-0000-4000-8000-000000000001",
+                envelope: {
+                  version: 1 as const,
+                  algorithm: "AES-256-GCM" as const,
+                  keyId: "source-key",
+                  credentialVersion: 7,
+                  wrappedKeyNonce: "d3JhcC1ub25jZQ==",
+                  wrappedKey: "d3JhcHBlZC1rZXk=",
+                  contentNonce: "Y29udGVudC1ub25jZQ==",
+                  ciphertext: "Y2lwaGVydGV4dA==",
+                },
+              }];
+            }
+          })();
+        },
+      });
+      return result.finally(() => lifecycle.push("snapshot-closed"));
+    },
     async dryRun(_url: string, source: BackupDataSource) {
       return impact(await countRows(source));
     },
@@ -261,6 +301,60 @@ async function fixture(
     restoredMap: () => restoredMap,
   };
 }
+
+Deno.test("postgres privileged backup spools encrypted credentials for bounded replay", async () => {
+  const fx = await fixture({ providerCredentials: true });
+  const ordinary = await fx.adapter.exportSnapshot({
+    includeDiagnostics: false,
+    installationId: "installation-test",
+  });
+  try {
+    assertEquals("providerCredentials" in ordinary, false);
+  } finally {
+    await ordinary.cleanup?.();
+  }
+
+  const snapshot = await fx.adapter.exportPrivilegedSnapshot({
+    includeDiagnostics: false,
+    installationId: "installation-test",
+  });
+  try {
+    assertEquals(fx.lifecycle.includes("credential-spooled"), true);
+    assertEquals(fx.lifecycle.at(-1), "snapshot-closed");
+    assertEquals(snapshot.manifest.secretPolicy, "redacted");
+    assertEquals(
+      snapshot.manifest.entries.some((entry) => entry.name.includes("credential")),
+      false,
+    );
+    const read = async () => {
+      const records = [];
+      for await (const credential of snapshot.providerCredentials()) records.push(credential);
+      return records;
+    };
+    const first = await read();
+    const second = await read();
+    assertEquals(first, second);
+    assertEquals(first.length, 1);
+    assertEquals(first[0].providerId, "20000000-0000-4000-8000-000000000001");
+    assertEquals(first[0].envelope.credentialVersion, 7);
+
+    const active = snapshot.providerCredentials()[Symbol.asyncIterator]();
+    assertEquals((await active.next()).done, false);
+    await assertRejects(
+      async () => {
+        await snapshot.providerCredentials()[Symbol.asyncIterator]().next();
+      },
+      TypeError,
+      "already being read",
+    );
+    await active.return?.();
+  } finally {
+    await snapshot.cleanup?.();
+  }
+  await assertRejects(async () => {
+    for await (const _credential of snapshot.providerCredentials()) { /* no-op */ }
+  });
+});
 
 Deno.test("postgres backup data streams a bounded object roundtrip and retains committed staging", async () => {
   const fx = await fixture();
