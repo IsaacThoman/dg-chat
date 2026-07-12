@@ -62,7 +62,6 @@ import {
   Sparkles,
   Square,
   Sun,
-  Terminal,
   Trash2,
   Upload,
   UserCheck,
@@ -74,11 +73,11 @@ import { api, ApiError } from "./api.ts";
 import type { AdminSearch, AdminSection } from "./adminRouting.ts";
 import { AdminAnalyticsView, AdminJobsView } from "./AdminOperations.tsx";
 import { AdminRetentionView } from "./AdminRetention.tsx";
+import { PersonalTokenSettings } from "./TokenGovernance.tsx";
 import {
   conversationForFirstSend,
   mergeAttachmentIds,
   refreshConversationGraph,
-  tokenScopesFromSelection,
 } from "./chatWorkflow.ts";
 import {
   chatStreamAdapter,
@@ -124,15 +123,7 @@ import {
   imageMutationBelongsToQuery,
   useImageGeneration,
 } from "./images/index.ts";
-import type {
-  Attachment,
-  AuditFilters,
-  Conversation,
-  Message,
-  Model,
-  Token,
-  User,
-} from "./types.ts";
+import type { Attachment, AuditFilters, Conversation, Message, Model, User } from "./types.ts";
 
 type View = "chat" | "archived" | "trash" | "knowledge" | "settings" | "tokens" | "admin";
 const cn = (...v: Array<string | false | null | undefined>) => v.filter(Boolean).join(" ");
@@ -2796,7 +2787,7 @@ function SettingsView(
               </div>
             </>
           )}
-          {section === "tokens" && <TokenSettings />}
+          {section === "tokens" && <PersonalTokenSettings />}
           {section === "usage" && <UsageSettings />}
         </section>
       </div>
@@ -2840,176 +2831,6 @@ function ToggleRow(
   );
 }
 
-function TokenSettings() {
-  const [tokens, setTokens] = useState<Token[]>([]);
-  const [modal, setModal] = useState(false);
-  const [revealed, setRevealed] = useState("");
-  const [name, setName] = useState("");
-  const [chatScope, setChatScope] = useState(true);
-  const [modelsScope, setModelsScope] = useState(true);
-  const [filesReadScope, setFilesReadScope] = useState(false);
-  const [filesWriteScope, setFilesWriteScope] = useState(false);
-  useEffect(() => {
-    api.tokens().then(setTokens).catch(() => setTokens([]));
-  }, []);
-  const create = async () => {
-    const scopes = tokenScopesFromSelection({
-      chat: chatScope,
-      models: modelsScope,
-      filesRead: filesReadScope,
-      filesWrite: filesWriteScope,
-    });
-    if (!scopes.length) return;
-    const result = await api.createToken(name || "New token", scopes);
-    setTokens((
-      x,
-    ) => [...x, {
-      id: crypto.randomUUID(),
-      name: name || "New token",
-      preview: "dg_sk_••••" + result.token.slice(-4).toUpperCase(),
-      scopes: [
-        ...(chatScope ? ["chat"] : []),
-        ...(modelsScope ? ["models"] : []),
-        ...(filesReadScope ? ["files:read"] : []),
-        ...(filesWriteScope ? ["files:write"] : []),
-      ],
-      createdAt: "Just now",
-    }]);
-    setRevealed(result.token);
-  };
-  return (
-    <>
-      <div className="title-action">
-        <SectionTitle
-          title="API tokens"
-          subtitle="Use the OpenAI-compatible API from your own tools"
-        />
-        <button
-          className="primary"
-          onClick={() => {
-            setModal(true);
-            setRevealed("");
-          }}
-        >
-          <Plus size={16} /> Create token
-        </button>
-      </div>
-      <div className="api-hint">
-        <Terminal size={20} />
-        <div>
-          <strong>OpenAI-compatible endpoint</strong>
-          <code>{location.origin}/v1</code>
-        </div>
-        <IconButton
-          label="Copy endpoint"
-          onClick={() => navigator.clipboard?.writeText(`${location.origin}/v1`)}
-        >
-          <Copy size={16} />
-        </IconButton>
-      </div>
-      <div className="token-list">
-        {tokens.map((t) => (
-          <div className="token-row" key={t.id}>
-            <span className="token-icon">
-              <KeyRound size={18} />
-            </span>
-            <div>
-              <strong>{t.name}</strong>
-              <code>{t.preview}</code>
-              <small>Created {t.createdAt}{t.lastUsed ? ` · Used ${t.lastUsed}` : ""}</small>
-            </div>
-            <span className="scope-list">{t.scopes.map((s) => <i key={s}>{s}</i>)}</span>
-            <IconButton label="Token options (not available yet)" disabled>
-              <MoreHorizontal size={17} />
-            </IconButton>
-          </div>
-        ))}
-      </div>
-      {modal && (
-        <Modal
-          title={revealed ? "Token created" : "Create API token"}
-          close={() => setModal(false)}
-        >
-          {revealed
-            ? (
-              <div className="secret-created">
-                <div className="success-icon">
-                  <Check size={22} />
-                </div>
-                <p>Copy this token now. For your security, it will never be shown again.</p>
-                <div className="secret">
-                  <code>{revealed}</code>
-                  <IconButton
-                    label="Copy token"
-                    onClick={() => navigator.clipboard?.writeText(revealed)}
-                  >
-                    <Copy size={17} />
-                  </IconButton>
-                </div>
-                <button className="primary wide" onClick={() => setModal(false)}>Done</button>
-              </div>
-            )
-            : (
-              <div>
-                <label className="field">
-                  <span>Name</span>
-                  <input
-                    autoFocus
-                    placeholder="e.g. Local scripts"
-                    value={name}
-                    onChange={(e) => setName(e.target.value)}
-                  />
-                </label>
-                <p className="form-label">SCOPES</p>
-                <label className="check-row">
-                  <input
-                    type="checkbox"
-                    checked={chatScope}
-                    onChange={(event) => setChatScope(event.target.checked)}
-                  />{" "}
-                  Chat completions
-                </label>
-                <label className="check-row">
-                  <input
-                    type="checkbox"
-                    checked={modelsScope}
-                    onChange={(event) => setModelsScope(event.target.checked)}
-                  />{" "}
-                  List models
-                </label>
-                <label className="check-row">
-                  <input
-                    type="checkbox"
-                    checked={filesReadScope}
-                    onChange={(event) => setFilesReadScope(event.target.checked)}
-                  />{" "}
-                  Read files
-                </label>
-                <label className="check-row">
-                  <input
-                    type="checkbox"
-                    checked={filesWriteScope}
-                    onChange={(event) => setFilesWriteScope(event.target.checked)}
-                  />{" "}
-                  Upload and delete files
-                </label>
-                <div className="modal-actions">
-                  <button className="secondary" onClick={() => setModal(false)}>Cancel</button>
-                  <button
-                    className="primary"
-                    disabled={!chatScope && !modelsScope && !filesReadScope && !filesWriteScope}
-                    onClick={create}
-                  >
-                    Create token
-                  </button>
-                </div>
-              </div>
-            )}
-        </Modal>
-      )}
-    </>
-  );
-}
 function UsageSettings() {
   const usage = useQuery({ queryKey: ["usage"], queryFn: api.usage });
   const data = usage.data;

@@ -17,9 +17,12 @@ import {
   appendMessageSchema,
   approvalSchema,
   chatCompletionSchema,
+  createAccessGroupSchema,
   createConversationSchema,
   createKnowledgeCollectionSchema,
+  createModelAliasSchema,
   createTokenSchema,
+  deleteAccessGroupSchema,
   embeddingsSchema,
   generateMessageSchema,
   identityTokenSchema,
@@ -28,13 +31,24 @@ import {
   loginSchema,
   passwordResetRequestSchema,
   passwordResetSchema,
+  previewAccessGroupPolicySchema,
   registerSchema,
+  replaceAccessGroupIdsSchema,
+  replaceAccessGroupModelsSchema,
+  replaceAccessGroupPolicySchema,
   replaceConversationKnowledgeSchema,
   responsesSchema,
+  revokeTokenSchema,
+  rotateTokenSchema,
   setActiveLeafSchema,
+  setTokenAccessGroupsSchema,
+  setTokenAccessModeSchema,
   streamGenerationSchema,
+  updateAccessGroupSchema,
   updateConversationSchema,
   updateKnowledgeCollectionSchema,
+  updateModelAliasSchema,
+  updateTokenSchema,
 } from "@dg-chat/contracts";
 import type {
   ChatCompletionRequest,
@@ -59,8 +73,10 @@ import {
   ObjectAlreadyExistsError,
   type ObjectStore,
   parseEmbeddingBillingConfig,
+  type ProviderExecutionPlan,
   type ProviderModelRecord,
   type ProviderRecord,
+  type TokenAccessSubject,
   type UsagePricingSnapshot,
   usagePricingSnapshotsEqual,
 } from "@dg-chat/database";
@@ -120,6 +136,7 @@ import {
   requestClientKey,
   requestTrustedClientKey,
 } from "./rate-limit.ts";
+import { consumeTokenRateLimits, type TokenRatePolicy } from "./token-rate-limit.ts";
 import {
   safeUploadObjectKey,
   secureUploadStream,
@@ -191,6 +208,7 @@ type Variables = {
   sessionLimited?: boolean;
   tokenId?: string;
   tokenScopes?: string[];
+  tokenRatePolicy?: TokenRatePolicy;
   imageAssetOwnerId?: string;
 };
 type WebGenerationEventInput = WebGenerationEvent extends infer Event
@@ -252,6 +270,10 @@ export interface AppOptions {
   toolRateLimitPerMinute?: number;
   toolReserveMicros?: number;
   browserAuth?: BetterAuthService;
+}
+
+export function legacyModelHarnessAllowed(environment: string | undefined): boolean {
+  return environment !== "production";
 }
 
 interface StagedUpload {
@@ -663,7 +685,7 @@ function nodeReadableAsWeb(source: Readable): ReadableStream<Uint8Array> {
 
 const DUMMY_PASSWORD_HASH =
   "pbkdf2_sha256$210000$dg-chat-dummy-login-salt$18NUXRu_COEHJHYjLomFDBvS1D9vIlVzCYYqox7WSUw";
-const canonicalJson = (value: unknown): string => {
+export const canonicalJson = (value: unknown): string => {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   const object = value as Record<string, unknown>;
@@ -1145,6 +1167,13 @@ export function createApp(options: AppOptions = {}) {
   const configuredOpenAILimit = positiveInteger("OPENAI_RATE_LIMIT", 120);
   const configuredProviderAdminLimit = positiveInteger("PROVIDER_ADMIN_RATE_LIMIT", 30);
   const configuredRateWindow = positiveInteger("RATE_LIMIT_WINDOW_SECONDS", 60);
+  const effectiveTokenRpmLimit = Math.ceil(
+    configuredOpenAILimit * 60 / configuredRateWindow,
+  );
+  const configuredTokenDefaultBurst = positiveInteger("TOKEN_DEFAULT_BURST_LIMIT", 20);
+  if (configuredTokenDefaultBurst > 1_000) {
+    throw new Error("TOKEN_DEFAULT_BURST_LIMIT must be between 1 and 1000");
+  }
   const uploadMaxBytes = positiveInteger("UPLOAD_MAX_BYTES", 25 * 1024 * 1024);
   const uploadMaxConcurrent = positiveInteger("UPLOAD_MAX_CONCURRENT", 4);
   const uploadMaxConcurrentPerUser = positiveInteger("UPLOAD_MAX_CONCURRENT_PER_USER", 2);
@@ -1207,7 +1236,8 @@ export function createApp(options: AppOptions = {}) {
   };
   const trustProxyHeaders = options.trustProxyHeaders ??
     Deno.env.get("TRUST_PROXY_HEADERS") === "true";
-  const builtInProviderConfigured = Boolean(
+  const legacyHarnessEnabled = legacyModelHarnessAllowed(Deno.env.get("DENO_ENV"));
+  const builtInProviderConfigured = legacyHarnessEnabled && Boolean(
     (Deno.env.get("OPENAI_BASE_URL") && Deno.env.get("OPENAI_API_KEY")) ||
       options.providerStream || options.providerComplete || options.webComplete,
   );
@@ -1223,12 +1253,14 @@ export function createApp(options: AppOptions = {}) {
         displayName: model,
       }))
     : [];
-  const modelCatalog = [
-    ...models.filter((model) => model.id !== "openai/default" || builtInProviderConfigured),
-    ...configuredUpstreamModels.filter((candidate) =>
-      !models.some((model) => model.id === candidate.id)
-    ),
-  ];
+  const modelCatalog = legacyHarnessEnabled
+    ? [
+      ...models.filter((model) => model.id !== "openai/default" || builtInProviderConfigured),
+      ...configuredUpstreamModels.filter((candidate) =>
+        !models.some((model) => model.id === candidate.id)
+      ),
+    ]
+    : [];
   const providerKeyring = options.providerKeyring ?? ProviderSecretKeyring.fromEnv();
   const circuitBreaker = options.circuitBreaker ?? new MemoryCircuitBreaker();
   const breakerPolicy = options.breakerPolicy ?? {
@@ -1435,15 +1467,15 @@ export function createApp(options: AppOptions = {}) {
         source: price.source,
       }
       : undefined;
-  const runtimeModelCatalog = async (): Promise<ModelInfo[]> => {
+  const runtimeModelCatalog = async (subject: TokenAccessSubject): Promise<ModelInfo[]> => {
     const registry = await Promise.all(
-      (await repo.listProviderModels(undefined, true)).map(async (model) => {
-        const resolved = await resolveRuntimeModel(model.publicModelId) ??
-          await resolveEmbeddingsRuntimeModel(model.publicModelId) ??
-          await resolveAudioRuntimeModel(model.publicModelId, "transcription") ??
-          await resolveAudioRuntimeModel(model.publicModelId, "translation") ??
-          await resolveAudioRuntimeModel(model.publicModelId, "speech") ??
-          await resolveImageRuntimeModel(model.publicModelId);
+      (await repo.listEntitledProviderModels(subject)).map(async (model) => {
+        const resolved = await resolveRuntimeModel(model.publicModelId, subject) ??
+          await resolveEmbeddingsRuntimeModel(model.publicModelId, subject) ??
+          await resolveAudioRuntimeModel(model.publicModelId, "transcription", subject) ??
+          await resolveAudioRuntimeModel(model.publicModelId, "translation", subject) ??
+          await resolveAudioRuntimeModel(model.publicModelId, "speech", subject) ??
+          await resolveImageRuntimeModel(model.publicModelId, "image_generation", subject);
         return resolved?.registryModel ? resolved.info : undefined;
       }),
     );
@@ -1454,10 +1486,13 @@ export function createApp(options: AppOptions = {}) {
       ),
     ];
   };
-  const resolveRuntimeModel = async (id: string): Promise<RuntimeModel | undefined> => {
+  const resolveRuntimeModel = async (
+    id: string,
+    subject: TokenAccessSubject,
+  ): Promise<RuntimeModel | undefined> => {
     const builtIn = modelCatalog.find((candidate) => candidate.id === id);
     if (builtIn) return { info: builtIn };
-    const model = await repo.findProviderModel(id);
+    const model = (await repo.resolveEntitledProviderModel(subject, id))?.model;
     if (!model?.enabled || !model.capabilities.includes("chat")) return undefined;
     const provider = await repo.findProvider(model.providerId);
     if (
@@ -1486,8 +1521,11 @@ export function createApp(options: AppOptions = {}) {
       },
     };
   };
-  const resolveEmbeddingsRuntimeModel = async (id: string): Promise<RuntimeModel | undefined> => {
-    const model = await repo.findProviderModel(id);
+  const resolveEmbeddingsRuntimeModel = async (
+    id: string,
+    subject: TokenAccessSubject,
+  ): Promise<RuntimeModel | undefined> => {
+    const model = (await repo.resolveEntitledProviderModel(subject, id))?.model;
     if (!model?.enabled || !model.capabilities.includes("embeddings")) return undefined;
     const provider = await repo.findProvider(model.providerId);
     // Embeddings are an OpenAI-compatible side endpoint and are independent of whether the
@@ -1514,8 +1552,9 @@ export function createApp(options: AppOptions = {}) {
   const resolveAudioRuntimeModel = async (
     id: string,
     capability: "transcription" | "translation" | "speech",
+    subject: TokenAccessSubject,
   ): Promise<RuntimeModel | undefined> => {
-    const model = await repo.findProviderModel(id);
+    const model = (await repo.resolveEntitledProviderModel(subject, id))?.model;
     if (!model?.enabled || !model.capabilities.includes(capability)) return undefined;
     const provider = await repo.findProvider(model.providerId);
     if (!provider?.enabled || !provider.hasCredential || !providerKeyring) return undefined;
@@ -1535,9 +1574,10 @@ export function createApp(options: AppOptions = {}) {
   };
   const resolveImageRuntimeModel = async (
     id: string,
-    capability: "image_generation" | "image_editing" = "image_generation",
+    capability: "image_generation" | "image_editing",
+    subject: TokenAccessSubject,
   ): Promise<RuntimeModel | undefined> => {
-    const model = await repo.findProviderModel(id);
+    const model = (await repo.resolveEntitledProviderModel(subject, id))?.model;
     if (!model?.enabled || !model.capabilities.includes(capability)) return undefined;
     const provider = await repo.findProvider(model.providerId);
     if (!provider?.enabled || !provider.hasCredential || !providerKeyring) return undefined;
@@ -1555,8 +1595,49 @@ export function createApp(options: AppOptions = {}) {
     if (!resolved.price) return undefined;
     return resolved;
   };
+  const replayModelIsEntitled = async (
+    c: Context<{ Variables: Variables }>,
+    modelId: string,
+    capability:
+      | "embeddings"
+      | "chat"
+      | "image_generation"
+      | "image_editing"
+      | "transcription"
+      | "translation"
+      | "speech",
+  ): Promise<boolean> => {
+    const subject = accessSubject(c);
+    if (capability === "chat") {
+      return Boolean(await resolveRuntimeModel(modelId, subject));
+    }
+    const entitled = await repo.resolveEntitledProviderModel(subject, modelId);
+    if (!entitled?.model.enabled || !entitled.model.capabilities.includes(capability)) return false;
+    const provider = await repo.findProvider(entitled.model.providerId);
+    return Boolean(provider?.enabled);
+  };
   let bootstrapInProgress = false;
   const app = new Hono<{ Variables: Variables }>();
+  const accessSubject = (c: Context<{ Variables: Variables }>): TokenAccessSubject => ({
+    userId: c.get("user").id,
+    tokenId: c.get("authType") === "token" ? c.get("tokenId") ?? null : null,
+  });
+  const resolveEntitledPlan = async (
+    subject: TokenAccessSubject,
+    sourceModelId: string,
+  ): Promise<ProviderExecutionPlan> => {
+    if (!providerExecution) {
+      throw new DomainError("model_not_found", "The requested model is unavailable", 404);
+    }
+    const plan = await providerExecution.resolvePlan(sourceModelId);
+    for (const target of plan.targets) {
+      const entitled = await repo.resolveEntitledProviderModel(subject, target.publicModelId);
+      if (!entitled || entitled.model.id !== target.providerModelId) {
+        throw new DomainError("model_not_found", "The requested model is unavailable", 404);
+      }
+    }
+    return plan;
+  };
   app.use(
     "*",
     logger((message, ...rest) => console.log(redactRequestLog(message), ...rest)),
@@ -1812,7 +1893,7 @@ export function createApp(options: AppOptions = {}) {
       getCookie(c, sessionCookie) ?? legacySession;
     if (!raw) return c.json(openAIError("Authentication required", "unauthorized"), 401);
     const hash = await sha256(raw);
-    const apiToken = await repo.findApiTokenByHash(hash);
+    const apiToken = await repo.authenticateApiToken(hash);
     if (apiToken) {
       const user = await repo.findUser(apiToken.userId);
       if (
@@ -1825,6 +1906,11 @@ export function createApp(options: AppOptions = {}) {
       c.set("authType", "token");
       c.set("tokenId", apiToken.id);
       c.set("tokenScopes", apiToken.scopes);
+      c.set("tokenRatePolicy", {
+        rotationFamilyId: apiToken.rotationFamilyId,
+        requestsPerMinute: apiToken.rpmLimit,
+        burst: apiToken.burstLimit,
+      });
       return next();
     }
     const session = await repo.getSession(hash);
@@ -1850,7 +1936,7 @@ export function createApp(options: AppOptions = {}) {
   const authenticateApiToken: MiddlewareHandler<{ Variables: Variables }> = async (c, next) => {
     const raw = c.req.header("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
     if (!raw) return c.json(openAIError("Authentication required", "unauthorized"), 401);
-    const apiToken = await repo.findApiTokenByHash(await sha256(raw));
+    const apiToken = await repo.authenticateApiToken(await sha256(raw));
     const user = apiToken ? await repo.findUser(apiToken.userId) : undefined;
     if (
       !apiToken || !user || user.state !== "active" || user.passwordResetPending === true ||
@@ -1862,6 +1948,11 @@ export function createApp(options: AppOptions = {}) {
     c.set("authType", "token");
     c.set("tokenId", apiToken.id);
     c.set("tokenScopes", apiToken.scopes);
+    c.set("tokenRatePolicy", {
+      rotationFamilyId: apiToken.rotationFamilyId,
+      requestsPerMinute: apiToken.rpmLimit,
+      burst: apiToken.burstLimit,
+    });
     return next();
   };
   const approved: MiddlewareHandler<{ Variables: Variables }> = async (c, next) => {
@@ -3143,10 +3234,10 @@ export function createApp(options: AppOptions = {}) {
       body.content,
       body.toolExecutionIds,
     );
-    const resolvedModel = await resolveRuntimeModel(body.model);
+    const resolvedModel = await resolveRuntimeModel(body.model, accessSubject(c));
     const model = resolvedModel?.info;
     if (!model) {
-      throw new DomainError("model_not_found", `Model '${body.model}' does not exist`, 404);
+      throw new DomainError("model_not_found", "The requested model is unavailable", 404);
     }
     const before = await repo.detail(conversationId, ownerId);
     const byId = new Map(before.messages.map((message) => [message.id, message]));
@@ -3160,7 +3251,7 @@ export function createApp(options: AppOptions = {}) {
     // Claim the immutable operation before reading attachment objects so a completed replay
     // remains available even after its library attachment has been tombstoned.
     const providerPlan = resolvedModel.registryModel && providerExecution
-      ? await providerExecution.resolvePlan(resolvedModel.registryModel.id)
+      ? await resolveEntitledPlan(accessSubject(c), resolvedModel.registryModel.id)
       : undefined;
     const directWebReservation = Math.max(
       priceUsage(model, model.contextWindow, 0).costMicros,
@@ -3404,10 +3495,10 @@ export function createApp(options: AppOptions = {}) {
     const messageContent = body.mode === "send"
       ? await materializeToolContext(ownerId, body.content, body.toolExecutionIds)
       : undefined;
-    const resolvedModel = await resolveRuntimeModel(body.model);
+    const resolvedModel = await resolveRuntimeModel(body.model, accessSubject(c));
     const model = resolvedModel?.info;
     if (!model) {
-      throw new DomainError("model_not_found", `Model '${body.model}' does not exist`, 404);
+      throw new DomainError("model_not_found", "The requested model is unavailable", 404);
     }
     if (!model.capabilities.includes("streaming")) {
       throw new DomainError(
@@ -3433,7 +3524,7 @@ export function createApp(options: AppOptions = {}) {
     const runId = `${ownerId}:web-generation:${body.idempotencyKey}`;
     const generationId = await stableGenerationId(runId);
     const providerPlan = resolvedModel.registryModel && providerExecution
-      ? await providerExecution.resolvePlan(resolvedModel.registryModel.id)
+      ? await resolveEntitledPlan(accessSubject(c), resolvedModel.registryModel.id)
       : undefined;
     const directReservation = Math.max(
       priceUsage(model, model.contextWindow, 0).costMicros,
@@ -4034,8 +4125,37 @@ export function createApp(options: AppOptions = {}) {
     });
     return c.json({ token: secret, ...summary }, 201);
   });
+  app.patch("/api/tokens/:id", async (c) => {
+    const body = await parseJson(c, updateTokenSchema);
+    const summary = await repo.updateApiToken(c.get("user").id, c.req.param("id"), body);
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: "api_token.updated",
+      targetType: "api_token",
+      targetId: c.req.param("id"),
+    });
+    return c.json(summary);
+  });
+  app.post("/api/tokens/:id/rotate", async (c) => {
+    const body = await parseJson(c, rotateTokenSchema);
+    const secret = randomToken("dg_");
+    const rotated = await repo.rotateApiToken(c.get("user").id, c.req.param("id"), {
+      ...body,
+      tokenHash: await sha256(secret),
+      preview: `${secret.slice(0, 7)}…${secret.slice(-4)}`,
+    });
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: "api_token.rotated",
+      targetType: "api_token",
+      targetId: rotated.replacement.id,
+      metadata: { previousTokenId: rotated.previous.id, overlapSeconds: body.overlapSeconds },
+    });
+    return c.json({ token: secret, ...rotated }, 201);
+  });
   app.delete("/api/tokens/:id", async (c) => {
-    await repo.revokeApiToken(c.req.param("id"), c.get("user").id);
+    const body = await parseJson(c, revokeTokenSchema);
+    await repo.revokeApiTokenFamily(c.req.param("id"), c.get("user").id, body.expectedVersion);
     await repo.recordAudit({
       actorId: c.get("user").id,
       action: "api_token.revoked",
@@ -4056,7 +4176,7 @@ export function createApp(options: AppOptions = {}) {
     authenticate,
     approved,
     sessionOnly,
-    async (c) => c.json({ data: await runtimeModelCatalog() }),
+    async (c) => c.json({ data: await runtimeModelCatalog(accessSubject(c)) }),
   );
 
   app.use("/api/tools/*", authenticate, approved, sessionOnly);
@@ -4122,6 +4242,222 @@ export function createApp(options: AppOptions = {}) {
   });
 
   app.use("/api/admin/*", authenticate, approved, sessionOnly, admin);
+  app.get(
+    "/api/admin/model-access/aliases",
+    async (c) => c.json({ data: await repo.listModelAliases() }),
+  );
+  app.post("/api/admin/model-access/aliases", async (c) => {
+    const alias = await repo.createModelAlias(await parseJson(c, createModelAliasSchema));
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: "model_alias.created",
+      targetType: "model_alias",
+      targetId: alias.id,
+    });
+    return c.json(alias, 201);
+  });
+  app.patch("/api/admin/model-access/aliases/:id", async (c) => {
+    const alias = await repo.updateModelAlias(
+      c.req.param("id"),
+      await parseJson(c, updateModelAliasSchema),
+    );
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: "model_alias.updated",
+      targetType: "model_alias",
+      targetId: alias.id,
+    });
+    return c.json(alias);
+  });
+  app.delete("/api/admin/model-access/aliases/:id", async (c) => {
+    const { expectedVersion } = await parseJson(c, revokeTokenSchema);
+    await repo.deleteModelAlias(c.req.param("id"), expectedVersion);
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: "model_alias.deleted",
+      targetType: "model_alias",
+      targetId: c.req.param("id"),
+    });
+    return c.body(null, 204);
+  });
+  app.get(
+    "/api/admin/model-access/groups",
+    async (c) => c.json({ data: await repo.listAccessGroups() }),
+  );
+  app.post("/api/admin/model-access/groups", async (c) => {
+    const group = await repo.createAccessGroup(await parseJson(c, createAccessGroupSchema));
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: "model_access_group.created",
+      targetType: "model_access_group",
+      targetId: group.id,
+    });
+    return c.json(group, 201);
+  });
+  app.patch("/api/admin/model-access/groups/:id", async (c) => {
+    const group = await repo.updateAccessGroup(
+      c.req.param("id"),
+      await parseJson(c, updateAccessGroupSchema),
+    );
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: "model_access_group.updated",
+      targetType: "model_access_group",
+      targetId: group.id,
+    });
+    return c.json(group);
+  });
+  const requireModelWideningAcknowledgement = (
+    actual: string[],
+    acknowledged: string[],
+  ) => {
+    const expected = [...new Set(actual)].sort();
+    const supplied = [...new Set(acknowledged)].sort();
+    if (
+      expected.length !== supplied.length || expected.some((id, index) => id !== supplied[index])
+    ) {
+      throw new DomainError(
+        "model_access_widening_acknowledgement_required",
+        `Acknowledge the exact models that will become public before applying this change: ${
+          expected.join(", ")
+        }`,
+        409,
+      );
+    }
+  };
+  app.delete("/api/admin/model-access/groups/:id", async (c) => {
+    const { expectedVersion, acknowledgePublicModelIds } = await parseJson(
+      c,
+      deleteAccessGroupSchema,
+    );
+    const impact = await repo.previewAccessGroupPolicyImpact(c.req.param("id"), {
+      userIds: [],
+      modelIds: [],
+      tokenIds: [],
+    });
+    requireModelWideningAcknowledgement(
+      impact.modelIdsBecomingPublic,
+      acknowledgePublicModelIds,
+    );
+    await repo.deleteAccessGroup(c.req.param("id"), expectedVersion);
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: "model_access_group.deleted",
+      targetType: "model_access_group",
+      targetId: c.req.param("id"),
+    });
+    return c.body(null, 204);
+  });
+  app.put("/api/admin/model-access/groups/:id/users", async (c) => {
+    const body = await parseJson(c, replaceAccessGroupIdsSchema);
+    const group = await repo.replaceAccessGroupUsers(
+      c.req.param("id"),
+      body.ids,
+      body.expectedVersion,
+    );
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: "model_access_group.users_replaced",
+      targetType: "model_access_group",
+      targetId: group.id,
+      metadata: { userCount: body.ids.length },
+    });
+    return c.json(group);
+  });
+  app.put("/api/admin/model-access/groups/:id/models", async (c) => {
+    const body = await parseJson(c, replaceAccessGroupModelsSchema);
+    const current = (await repo.listAccessGroups()).find((group) => group.id === c.req.param("id"));
+    if (!current) throw new DomainError("not_found", "Access group not found", 404);
+    const impact = await repo.previewAccessGroupPolicyImpact(c.req.param("id"), {
+      userIds: current.userIds,
+      modelIds: body.ids,
+      tokenIds: current.tokenIds,
+    });
+    requireModelWideningAcknowledgement(
+      impact.modelIdsBecomingPublic,
+      body.acknowledgePublicModelIds,
+    );
+    const group = await repo.replaceAccessGroupModels(
+      c.req.param("id"),
+      body.ids,
+      body.expectedVersion,
+    );
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: "model_access_group.models_replaced",
+      targetType: "model_access_group",
+      targetId: group.id,
+      metadata: { modelCount: body.ids.length },
+    });
+    return c.json(group);
+  });
+  app.put("/api/admin/model-access/groups/:id/policy", async (c) => {
+    const body = await parseJson(c, replaceAccessGroupPolicySchema);
+    const group = await repo.replaceAccessGroupPolicy(c.req.param("id"), body);
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: "model_access_group.policy_replaced",
+      targetType: "model_access_group",
+      targetId: group.id,
+      metadata: {
+        userCount: body.userIds.length,
+        modelCount: body.modelIds.length,
+        tokenCount: body.tokenIds.length,
+      },
+    });
+    return c.json(group);
+  });
+  app.post("/api/admin/model-access/groups/:id/impact", async (c) => {
+    const body = await parseJson(c, previewAccessGroupPolicySchema);
+    return c.json(await repo.previewAccessGroupPolicyImpact(c.req.param("id"), body.proposal));
+  });
+  app.get("/api/admin/model-access/tokens", async (c) => {
+    const query = c.req.query("query")?.trim();
+    const cursor = c.req.query("cursor")?.trim();
+    const requestedLimit = Number(c.req.query("limit") ?? 50);
+    if (!Number.isSafeInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > 100) {
+      throw new DomainError("invalid_request", "limit must be between 1 and 100", 422);
+    }
+    if ((query?.length ?? 0) > 200 || (cursor?.length ?? 0) > 500) {
+      throw new DomainError("invalid_request", "Token search parameters are invalid", 422);
+    }
+    if (cursor) requireUuid(cursor, "cursor");
+    return c.json(await repo.searchApiTokens(query, requestedLimit, cursor));
+  });
+  app.put("/api/admin/model-access/tokens/:id/groups", async (c) => {
+    const body = await parseJson(c, setTokenAccessGroupsSchema);
+    const token = await repo.setTokenAccessGroups(
+      body.ownerId,
+      c.req.param("id"),
+      body.groupIds,
+      body.expectedVersion,
+    );
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: "api_token.access_groups_set",
+      targetType: "api_token",
+      targetId: token.id,
+      metadata: { groupCount: body.groupIds.length },
+    });
+    return c.json(token);
+  });
+  app.put("/api/admin/model-access/tokens/:id/access-mode", async (c) => {
+    const body = await parseJson(c, setTokenAccessModeSchema);
+    const token = await repo.setTokenAccessMode(
+      body.ownerId,
+      c.req.param("id"),
+      body.accessMode,
+      body.expectedVersion,
+    );
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: "api_token.access_mode_set",
+      targetType: "api_token",
+      targetId: token.id,
+      metadata: { accessMode: body.accessMode },
+    });
+    return c.json(token);
+  });
   app.get("/api/admin/tools", async (c) => c.json({ data: await toolExecution.listPolicies() }));
   app.put("/api/admin/tools/:toolId/policy", async (c) => {
     let body: unknown;
@@ -4714,6 +5050,51 @@ export function createApp(options: AppOptions = {}) {
   // bearer-only. The in-memory adapter remains a test/development harness for
   // legacy route-level suites that authenticate through its local session.
   app.use("/v1/*", browserAuth ? authenticateApiToken : authenticate, approved);
+  app.use("/v1/*", async (c, next) => {
+    if (c.get("authType") !== "token") return next();
+    const policy = c.get("tokenRatePolicy");
+    if (!policy) {
+      return c.json(openAIError("Invalid or expired token", "unauthorized"), 401);
+    }
+    let result;
+    try {
+      result = await consumeTokenRateLimits(
+        rateLimiter,
+        policy,
+        effectiveTokenRpmLimit,
+        configuredTokenDefaultBurst,
+      );
+    } catch {
+      c.header("Retry-After", "5");
+      return c.json(
+        openAIError("Rate limiter is temporarily unavailable", "service_unavailable"),
+        503,
+      );
+    }
+    if (result) {
+      const deploymentLimit = Number(c.res.headers.get("X-RateLimit-Limit"));
+      const deploymentRemaining = Number(c.res.headers.get("X-RateLimit-Remaining"));
+      c.header(
+        "X-RateLimit-Limit",
+        String(
+          Number.isFinite(deploymentLimit) ? Math.min(deploymentLimit, result.limit) : result.limit,
+        ),
+      );
+      c.header(
+        "X-RateLimit-Remaining",
+        String(
+          Number.isFinite(deploymentRemaining)
+            ? Math.min(deploymentRemaining, result.remaining)
+            : result.remaining,
+        ),
+      );
+      if (!result.allowed) {
+        c.header("Retry-After", String(result.retryAfterSeconds));
+        return c.json(openAIError("Rate limit exceeded", "rate_limit_exceeded"), 429);
+      }
+    }
+    await next();
+  });
   const replayResponse = (request: ApiIdempotencyRequest) => {
     // A streaming request can fail before the first event is exposed. In that case the
     // original response is the stored JSON error, not an empty event stream.
@@ -4875,6 +5256,28 @@ export function createApp(options: AppOptions = {}) {
         idempotency: { id: result.request.id, leaseToken: result.leaseToken },
         executionLeaseToken: result.leaseToken,
         runLease: false as const,
+      };
+    }
+    const replayCapability = endpoint === "chat.completions" || endpoint === "responses"
+      ? "chat"
+      : endpoint === "embeddings"
+      ? "embeddings"
+      : endpoint === "images.generations"
+      ? "image_generation"
+      : endpoint === "images.edits"
+      ? "image_editing"
+      : endpoint === "audio.transcriptions"
+      ? "transcription"
+      : endpoint === "audio.translations"
+      ? "translation"
+      : "speech";
+    if (!await replayModelIsEntitled(c, result.request.model, replayCapability)) {
+      return {
+        kind: "replay" as const,
+        response: new Response(
+          JSON.stringify(openAIError("The requested model is unavailable", "model_not_found")),
+          { status: 404, headers: { "content-type": "application/json" } },
+        ),
       };
     }
     return { kind: "replay" as const, response: replayResponse(result.request) };
@@ -5220,7 +5623,13 @@ export function createApp(options: AppOptions = {}) {
         409,
       );
     }
-    if (existing && existing.state !== "in_progress") return replayResponse(existing);
+    if (existing && existing.state !== "in_progress") {
+      const capability = operation === "edit" ? "image_editing" : "image_generation";
+      if (!await replayModelIsEntitled(c, existing.model, capability)) {
+        return c.json(openAIError("The requested model is unavailable", "model_not_found"), 404);
+      }
+      return replayResponse(existing);
+    }
     if (pendingEditJson) {
       try {
         const sources = await Promise.all(
@@ -5289,9 +5698,20 @@ export function createApp(options: AppOptions = {}) {
       existing?.state === "in_progress" && existing.leaseToken && existing.leaseExpiresAt &&
         Date.parse(existing.leaseExpiresAt) <= Date.now() && finalized.length,
     );
+    if (
+      recoverableFinalization && existing &&
+      !await replayModelIsEntitled(
+        c,
+        existing.model,
+        operation === "edit" ? "image_editing" : "image_generation",
+      )
+    ) {
+      return c.json(openAIError("The requested model is unavailable", "model_not_found"), 404);
+    }
     const resolved = await resolveImageRuntimeModel(
       request.model,
       operation === "edit" ? "image_editing" : "image_generation",
+      accessSubject(c),
     );
     const recoveryPricing = finalized[0]?.pricingSnapshot;
     const model = resolved?.info ?? (recoveryPricing && finalized[0]
@@ -5316,14 +5736,14 @@ export function createApp(options: AppOptions = {}) {
       !model || !providerExecution || !sourcePricing ||
       (!recoverableFinalization && !resolved?.registryModel)
     ) {
-      return c.json(openAIError(`Model '${request.model}' does not exist`, "model_not_found"), 404);
+      return c.json(openAIError("The requested model is unavailable", "model_not_found"), 404);
     }
     if (!objectStore) {
       return c.json(openAIError("Object storage is not configured", "storage_not_configured"), 503);
     }
     const providerPlan = recoverableFinalization
       ? undefined
-      : await providerExecution.resolvePlan(resolved!.registryModel!.id);
+      : await resolveEntitledPlan(accessSubject(c), resolved!.registryModel!.id);
     const estimatedInput = estimateImageInputTokens(request);
     const maximumOutputTokens = model.contextWindow * request.n;
     if (!Number.isSafeInteger(maximumOutputTokens) || maximumOutputTokens < 1) {
@@ -5444,7 +5864,7 @@ export function createApp(options: AppOptions = {}) {
           if (
             prior.some((asset) =>
               asset.requestHash !== requestHash || asset.usageRunId !== runId ||
-              asset.publicModelId !== request.model || asset.deletedAt !== null ||
+              asset.publicModelId !== model.id || asset.deletedAt !== null ||
               !usagePricingSnapshotsEqual(asset.pricingSnapshot, prior[0].pricingSnapshot)
             ) || prior.length !== request.n
           ) {
@@ -5692,7 +6112,7 @@ export function createApp(options: AppOptions = {}) {
               ownerId: c.get("user").id,
               usageRunId: runId,
               providerModelId: executionTarget.providerModelId,
-              publicModelId: request.model,
+              publicModelId: model.id,
               upstreamModelId: executionTarget.upstreamModelId,
               providerSlug: executionTarget.providerSlug,
               pricingSnapshot: sourcePricing,
@@ -5854,7 +6274,7 @@ export function createApp(options: AppOptions = {}) {
         ownerId: c.get("user").id,
         usageRunId: runId,
         providerModelId: executionTarget.providerModelId,
-        publicModelId: request.model,
+        publicModelId: model.id,
         upstreamModelId: executionTarget.upstreamModelId,
         providerSlug: executionTarget.providerSlug,
         pricingSnapshot: sourcePricing,
@@ -6000,7 +6420,7 @@ export function createApp(options: AppOptions = {}) {
     async (c) =>
       c.json({
         object: "list",
-        data: (await runtimeModelCatalog()).map((m) => ({
+        data: (await runtimeModelCatalog(accessSubject(c))).map((m) => ({
           id: m.id,
           object: "model",
           created: 0,
@@ -6030,7 +6450,15 @@ export function createApp(options: AppOptions = {}) {
             409,
           );
         }
-        if (existing.state !== "in_progress") return replayResponse(existing);
+        if (existing.state !== "in_progress") {
+          if (!await replayModelIsEntitled(c, existing.model, "embeddings")) {
+            return c.json(
+              openAIError("The requested model is unavailable", "model_not_found"),
+              404,
+            );
+          }
+          return replayResponse(existing);
+        }
         return new Response(
           JSON.stringify(
             openAIError("An identical request is still in progress", "idempotency_in_progress"),
@@ -6048,15 +6476,15 @@ export function createApp(options: AppOptions = {}) {
         );
       }
     }
-    const resolved = await resolveEmbeddingsRuntimeModel(request.model);
+    const resolved = await resolveEmbeddingsRuntimeModel(request.model, accessSubject(c));
     const model = resolved?.info;
     if (!model || !resolved?.upstream) {
-      return c.json(openAIError(`Model '${request.model}' does not exist`, "model_not_found"), 404);
+      return c.json(openAIError("The requested model is unavailable", "model_not_found"), 404);
     }
     const upstream = resolved.upstream;
     const estimatedInput = estimateInputTokens({ input: request.input });
     const providerPlan = resolved.registryModel && providerExecution
-      ? await providerExecution.resolvePlan(resolved.registryModel.id)
+      ? await resolveEntitledPlan(accessSubject(c), resolved.registryModel.id)
       : undefined;
     const reserveMicros = providerPlan && providerExecution
       ? providerExecution.reservationMicros(providerPlan, estimatedInput, 0)
@@ -6167,14 +6595,14 @@ export function createApp(options: AppOptions = {}) {
   });
   const chatHandler = async (c: Context<{ Variables: Variables }>) => {
     const request = await parseJson<ChatCompletionRequest>(c, chatCompletionSchema);
-    const resolvedModel = await resolveRuntimeModel(request.model);
+    const resolvedModel = await resolveRuntimeModel(request.model, accessSubject(c));
     const model = resolvedModel?.info;
     if (!model) {
-      return c.json(openAIError(`Model '${request.model}' does not exist`, "model_not_found"), 404);
+      return c.json(openAIError("The requested model is unavailable", "model_not_found"), 404);
     }
     const maxOutput = request.max_tokens ?? request.max_completion_tokens ?? 4096;
     const providerPlan = resolvedModel.registryModel && providerExecution
-      ? await providerExecution.resolvePlan(resolvedModel.registryModel.id)
+      ? await resolveEntitledPlan(accessSubject(c), resolvedModel.registryModel.id)
       : undefined;
     const reserveMicros = providerPlan && providerExecution
       ? providerExecution.reservationMicros(
@@ -6686,10 +7114,10 @@ export function createApp(options: AppOptions = {}) {
       }
       throw error;
     }
-    const resolvedModel = await resolveRuntimeModel(body.model);
+    const resolvedModel = await resolveRuntimeModel(body.model, accessSubject(c));
     const model = resolvedModel?.info;
     if (!model) {
-      return c.json(openAIError(`Model '${body.model}' does not exist`, "model_not_found"), 404);
+      return c.json(openAIError("The requested model is unavailable", "model_not_found"), 404);
     }
     const maxResponseOutput = body.max_output_tokens ?? 4096;
     // Responses replay repeats the final text in several terminal events. Reject requests whose
@@ -6698,7 +7126,7 @@ export function createApp(options: AppOptions = {}) {
       throw new DomainError("response_too_large", "Requested output exceeds replay storage", 413);
     }
     const providerPlan = resolvedModel.registryModel && providerExecution
-      ? await providerExecution.resolvePlan(resolvedModel.registryModel.id)
+      ? await resolveEntitledPlan(accessSubject(c), resolvedModel.registryModel.id)
       : undefined;
     const responseReservation = providerPlan && providerExecution
       ? providerExecution.reservationMicros(
@@ -7008,7 +7436,15 @@ export function createApp(options: AppOptions = {}) {
           if (existing.requestHash !== requestHash || existing.stream !== Boolean(request.stream)) {
             throw new DomainError("idempotency_conflict", "Idempotency key payload differs", 409);
           }
-          if (existing.state !== "in_progress") return replayResponse(existing);
+          if (existing.state !== "in_progress") {
+            if (!await replayModelIsEntitled(c, existing.model, capability)) {
+              return c.json(
+                openAIError("The requested model is unavailable", "model_not_found"),
+                404,
+              );
+            }
+            return replayResponse(existing);
+          }
           return new Response(
             JSON.stringify(
               openAIError("An identical request is still in progress", "idempotency_in_progress"),
@@ -7026,15 +7462,15 @@ export function createApp(options: AppOptions = {}) {
           );
         }
       }
-      const resolved = await resolveAudioRuntimeModel(request.model, capability);
+      const resolved = await resolveAudioRuntimeModel(request.model, capability, accessSubject(c));
       const model = resolved?.info;
       if (!model || !resolved?.registryModel || !providerExecution) {
         return c.json(
-          openAIError(`Model '${request.model}' does not exist`, "model_not_found"),
+          openAIError("The requested model is unavailable", "model_not_found"),
           404,
         );
       }
-      const providerPlan = await providerExecution.resolvePlan(resolved.registryModel.id);
+      const providerPlan = await resolveEntitledPlan(accessSubject(c), resolved.registryModel.id);
       // Audio token counts are only known after transcription. Reserve against the configured
       // model ceiling so provider-reported usage can never create an unreserved debit.
       const reserveMicros = providerExecution.reservationMicros(
@@ -7441,7 +7877,15 @@ export function createApp(options: AppOptions = {}) {
         ) {
           throw new DomainError("idempotency_conflict", "Idempotency key payload differs", 409);
         }
-        if (existing.state !== "in_progress") return replayResponse(existing);
+        if (existing.state !== "in_progress") {
+          if (!await replayModelIsEntitled(c, existing.model, "speech")) {
+            return c.json(
+              openAIError("The requested model is unavailable", "model_not_found"),
+              404,
+            );
+          }
+          return replayResponse(existing);
+        }
         return new Response(
           JSON.stringify(
             openAIError("An identical request is still in progress", "idempotency_in_progress"),
@@ -7460,12 +7904,12 @@ export function createApp(options: AppOptions = {}) {
       }
     }
 
-    const resolved = await resolveAudioRuntimeModel(request.model, "speech");
+    const resolved = await resolveAudioRuntimeModel(request.model, "speech", accessSubject(c));
     const model = resolved?.info;
     const sourcePricing = pricingSnapshot(resolved?.price);
     if (!model || !resolved?.registryModel || !providerExecution || !sourcePricing) {
       return c.json(
-        openAIError(`Model '${request.model}' does not exist`, "model_not_found"),
+        openAIError("The requested model is unavailable", "model_not_found"),
         404,
       );
     }
@@ -7475,7 +7919,7 @@ export function createApp(options: AppOptions = {}) {
       if (!(error instanceof SpeechProviderError)) throw error;
       return c.json(openAIError(error.message, error.code), error.status as 500);
     }
-    const providerPlan = await providerExecution.resolvePlan(resolved.registryModel.id);
+    const providerPlan = await resolveEntitledPlan(accessSubject(c), resolved.registryModel.id);
     const estimatedInputTokens = estimateSpeechInputTokens(request);
     const reserveMicros = priceUsage(model, estimatedInputTokens, 0).costMicros;
     const usage = await beginOpenAIUsage(

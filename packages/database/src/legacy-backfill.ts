@@ -76,9 +76,9 @@ export async function backfillLegacyRuntimeSnapshot(url: string): Promise<Legacy
         )})`;
       }
       for (const [, value] of snapshot.tokens ?? []) {
-        await tx`INSERT INTO api_tokens(id,user_id,name,token_hash,preview,scopes,expires_at,revoked_at,last_used_at,created_at) VALUES(${value.id},${value.userId},${value.name},${value.tokenHash},${value.preview},${
+        await tx`INSERT INTO api_tokens(id,user_id,name,token_hash,preview,scopes,expires_at,revoked_at,last_used_at,created_at,rotation_family_id) VALUES(${value.id},${value.userId},${value.name},${value.tokenHash},${value.preview},${
           tx.json(value.scopes as postgres.JSONValue)
-        },${value.expiresAt},${value.revokedAt},${value.lastUsedAt},${value.createdAt})`;
+        },${value.expiresAt},${value.revokedAt},${value.lastUsedAt},${value.createdAt},${value.id})`;
       }
       for (const [, value] of snapshot.conversations ?? []) {
         await tx`INSERT INTO conversations(id,owner_id,title,active_leaf_id,version,pinned,temporary,archived_at,deleted_at,created_at,updated_at) VALUES(${value.id},${value.ownerId},${value.title},NULL,${value.version},${value.pinned},${

@@ -483,6 +483,28 @@ Deno.test("OpenAI embeddings route enforces capability, billing, safe failures, 
       ["fallback", "succeeded", fallbackModel.id],
     ],
   );
+  const restrictedFallbackGroup = await repository.createAccessGroup({
+    name: "restricted-embedding-fallback",
+  });
+  const restrictedFallbackPolicy = await repository.replaceAccessGroupModels(
+    restrictedFallbackGroup.id,
+    [fallbackModel.id],
+    restrictedFallbackGroup.version,
+  );
+  const callsBeforeDeniedFallback = calls;
+  const runsBeforeDeniedFallback = (repository as MemoryRepository).usageRuns.size;
+  const balanceBeforeDeniedFallback = adminUser.balanceMicros;
+  const deniedFallback = await app.request("/v1/embeddings", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ model: embeddingModel.publicModelId, input: "must not dispatch" }),
+  });
+  assertEquals(deniedFallback.status, 404);
+  assertEquals((await body(deniedFallback)).error.message, "The requested model is unavailable");
+  assertEquals(calls, callsBeforeDeniedFallback);
+  assertEquals((repository as MemoryRepository).usageRuns.size, runsBeforeDeniedFallback);
+  assertEquals(adminUser.balanceMicros, balanceBeforeDeniedFallback);
+  await repository.deleteAccessGroup(restrictedFallbackGroup.id, restrictedFallbackPolicy.version);
   await repository.setProviderModelRoute({
     sourceModelId: embeddingModel.id,
     expectedVersion: fallbackRoute.version,
@@ -521,8 +543,9 @@ Deno.test("OpenAI embeddings route enforces capability, billing, safe failures, 
     headers: { ...headers, "idempotency-key": "embeddings-success-replay" },
     body: JSON.stringify(request),
   });
-  assertEquals(disabledReplay.status, 200);
-  assertEquals(disabledReplay.headers.get("x-idempotent-replay"), "true");
+  assertEquals(disabledReplay.status, 404);
+  assertEquals(disabledReplay.headers.get("x-idempotent-replay"), null);
+  assertEquals((await body(disabledReplay)).error.message, "The requested model is unavailable");
   const disabledConflict = await app.request("/v1/embeddings", {
     method: "POST",
     headers: { ...headers, "idempotency-key": "embeddings-success-replay" },

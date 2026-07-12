@@ -18,6 +18,9 @@ import {
 } from "./repository.ts";
 import type { LedgerEntry, StoredApiToken, StoredSession, StoredUser, UsageRun } from "./memory.ts";
 import type {
+  AccessGroup,
+  AccessGroupPolicyImpact,
+  AccessGroupPolicyProposal,
   AdminAnalytics,
   AdminAnalyticsDistribution,
   AdminAnalyticsQuery,
@@ -25,6 +28,7 @@ import type {
   AdminJobQuery,
   AdminJobStatus,
   AdminJobSummary,
+  AdminTokenLookupPage,
   ApiIdempotencyEndpoint,
   ApiIdempotencyFrame,
   ApiIdempotencyRequest,
@@ -45,10 +49,12 @@ import type {
   CompleteApiRequestInput,
   CompleteGenerationInput,
   ConversationPatch,
+  CreateAccessGroupInput,
   CreateApiTokenInput,
   CreateAttachmentInput,
   CreateAttachmentResult,
   CreateKnowledgeCollectionInput,
+  CreateModelAliasInput,
   CreateModelPriceVersionInput,
   CreateProviderInput,
   CreateProviderModelInput,
@@ -62,6 +68,7 @@ import type {
   EnqueueRetentionScrubInput,
   EnsureIdempotentReservationInput,
   EnsureUsageReservationInput,
+  EntitledProviderModel,
   FailApiRequestInput,
   FailGenerationInput,
   FinalizeEmbeddingProviderUsageInput,
@@ -77,6 +84,7 @@ import type {
   KnowledgeConversationBinding,
   KnowledgeRetrievalMode,
   KnowledgeSearchHit,
+  ModelAlias,
   ModelPriceVersion,
   ProviderAttempt,
   ProviderCredentialEnvelope,
@@ -90,6 +98,7 @@ import type {
   ProviderRecord,
   ProviderRetryPolicy,
   RegistryMutationContext,
+  ReplaceAccessGroupPolicyInput,
   ReplaceConversationKnowledgeInput,
   ReserveChildProviderUsageInput,
   RetentionPolicy,
@@ -99,12 +108,18 @@ import type {
   RetentionScrubPage,
   RetentionScrubQuery,
   RetentionScrubRun,
+  RotateApiTokenInput,
+  RotatedApiToken,
   SearchConversationKnowledgeInput,
   SessionSummary,
   SetProviderModelRouteInput,
   StageGeneratedObjectInput,
   StartProviderAttemptInput,
   StoredProviderCredential,
+  TokenAccessSubject,
+  UpdateAccessGroupInput,
+  UpdateApiTokenInput,
+  UpdateModelAliasInput,
   UpdateProviderInput,
   UpdateProviderModelInput,
   UpdateProviderRetryPolicyInput,
@@ -260,11 +275,33 @@ function token(row: Row): StoredApiToken {
     tokenHash: String(row.token_hash),
     preview: String(row.preview),
     scopes: row.scopes as string[],
+    version: number(row.version),
+    rpmLimit: row.rpm_limit == null ? null : number(row.rpm_limit),
+    burstLimit: row.burst_limit == null ? null : number(row.burst_limit),
+    accessMode: row.access_mode as "inherit" | "restricted",
+    rotationFamilyId: String(row.rotation_family_id),
+    rotationGeneration: number(row.rotation_generation),
+    rotatedFromTokenId: row.rotated_from_token_id == null
+      ? null
+      : String(row.rotated_from_token_id),
+    replacedByTokenId: row.replaced_by_token_id == null ? null : String(row.replaced_by_token_id),
+    overlapEndsAt: nullableIso(row.overlap_ends_at),
     expiresAt: nullableIso(row.expires_at),
     revokedAt: nullableIso(row.revoked_at),
     lastUsedAt: nullableIso(row.last_used_at),
     createdAt: iso(row.created_at),
   };
+}
+function tokenSummary(value: StoredApiToken) {
+  const { tokenHash: _hash, userId: _userId, ...summary } = value;
+  return summary;
+}
+function validateTokenRates(rpm: number | null, burst: number | null) {
+  if (
+    (rpm !== null && (!Number.isInteger(rpm) || rpm < 1 || rpm > 60_000)) ||
+    (burst !== null && (!Number.isInteger(burst) || burst < 1 || burst > 1_000)) ||
+    (rpm !== null && burst !== null && burst > rpm)
+  ) throw new DomainError("validation_error", "Token rate policy is invalid", 422);
 }
 function run(row: Row): UsageRun {
   const pricingSnapshot = row.pricing_version_id
@@ -3300,7 +3337,15 @@ export class PostgresRepository implements DomainRepository {
     validateProviderModelInput(input);
     try {
       return await this.#sql.begin(async (tx) => {
+        await tx`SELECT pg_advisory_xact_lock(hashtext('model-public-id-namespace'))`;
         const providerRows = await tx`SELECT id FROM providers WHERE id=${input.providerId}`;
+        if ((await tx`SELECT 1 FROM model_aliases WHERE alias=${input.publicModelId}`).length) {
+          throw new DomainError(
+            "model_id_taken",
+            "Public model ID already exists as an alias",
+            409,
+          );
+        }
         if (!providerRows.length) throw new DomainError("not_found", "Provider not found", 404);
         const rows = await tx<Row[]>`
           INSERT INTO provider_models(provider_id,public_model_id,upstream_model_id,display_name,
@@ -3333,12 +3378,23 @@ export class PostgresRepository implements DomainRepository {
     validateProviderModelInput(input);
     try {
       return await this.#sql.begin(async (tx) => {
+        await tx`SELECT pg_advisory_xact_lock(hashtext('model-public-id-namespace'))`;
         const currentRows = await tx<
           Row[]
         >`SELECT * FROM provider_models WHERE id=${id} FOR UPDATE`;
         if (!currentRows[0]) throw new DomainError("not_found", "Provider model not found", 404);
         const current = providerModel(currentRows[0]);
         if (current.version !== expectedVersion) throw registryConflict();
+        if (
+          input.publicModelId &&
+          (await tx`SELECT 1 FROM model_aliases WHERE alias=${input.publicModelId}`).length
+        ) {
+          throw new DomainError(
+            "model_id_taken",
+            "Public model ID already exists as an alias",
+            409,
+          );
+        }
         const rows = await tx<Row[]>`
           UPDATE provider_models SET public_model_id=${
           input.publicModelId ?? current.publicModelId
@@ -4302,17 +4358,26 @@ export class PostgresRepository implements DomainRepository {
   }
 
   async createApiToken(userId: string, input: CreateApiTokenInput) {
+    validateTokenRates(input.rpmLimit ?? null, input.burstLimit ?? null);
+    const id = crypto.randomUUID();
     const rows = await this.#sql<
       Row[]
-    >`INSERT INTO api_tokens(user_id,name,token_hash,preview,scopes,expires_at) VALUES(${userId},${input.name},${input.tokenHash},${input.preview},${
+    >`INSERT INTO api_tokens(id,user_id,name,token_hash,preview,scopes,expires_at,rpm_limit,burst_limit,rotation_family_id) VALUES(${id},${userId},${input.name},${input.tokenHash},${input.preview},${
       this.#sql.json(input.scopes)
-    },${input.expiresAt ?? null}) RETURNING *`;
+    },${input.expiresAt ?? null},${input.rpmLimit ?? null},${
+      input.burstLimit ?? null
+    },${id}) RETURNING *`;
     return token(rows[0]);
   }
   async findApiTokenByHash(hash: string) {
+    return await this.authenticateApiToken(hash);
+  }
+  async authenticateApiToken(hash: string) {
     const rows = await this.#sql<
       Row[]
-    >`UPDATE api_tokens SET last_used_at=now() WHERE token_hash=${hash} RETURNING *`;
+    >`UPDATE api_tokens SET last_used_at=now() WHERE token_hash=${hash} AND revoked_at IS NULL
+      AND (expires_at IS NULL OR expires_at>now())
+      AND (replaced_by_token_id IS NULL OR overlap_ends_at>now()) RETURNING *`;
     return rows[0] ? token(rows[0]) : undefined;
   }
   async listApiTokens(userId: string) {
@@ -4324,11 +4389,593 @@ export class PostgresRepository implements DomainRepository {
     });
   }
   async revokeApiToken(id: string, userId: string) {
-    const rows = await this
-      .#sql`UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,now()) WHERE id=${id} AND user_id=${userId} RETURNING id`;
-    if (!rows.length) throw new DomainError("not_found", "Token not found", 404);
+    const current = await this.#sql<
+      Row[]
+    >`SELECT version FROM api_tokens WHERE id=${id} AND user_id=${userId}`;
+    if (!current[0]) throw new DomainError("not_found", "Token not found", 404);
+    await this.revokeApiTokenFamily(id, userId, number(current[0].version));
+  }
+  async revokeApiTokenFamily(id: string, userId: string, expectedVersion: number) {
+    await this.#sql.begin(async (tx) => {
+      const family = await tx<
+        Row[]
+      >`SELECT rotation_family_id FROM api_tokens WHERE id=${id} AND user_id=${userId}`;
+      if (!family[0]) throw new DomainError("not_found", "Token not found", 404);
+      await tx`SELECT pg_advisory_xact_lock(hashtext(${String(family[0].rotation_family_id)}))`;
+      const selected = await tx<
+        Row[]
+      >`SELECT rotation_family_id,version FROM api_tokens WHERE id=${id} AND user_id=${userId} FOR UPDATE`;
+      if (!selected[0]) throw new DomainError("not_found", "Token not found", 404);
+      if (number(selected[0].version) !== expectedVersion) {
+        throw new DomainError("version_conflict", "Token was modified", 409);
+      }
+      await tx`UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,now()),version=version+1 WHERE rotation_family_id=${
+        String(selected[0].rotation_family_id)
+      }`;
+    });
+  }
+  async updateApiToken(userId: string, id: string, input: UpdateApiTokenInput) {
+    return await this.#sql.begin(async (tx) => {
+      const family = await tx<
+        Row[]
+      >`SELECT rotation_family_id FROM api_tokens WHERE id=${id} AND user_id=${userId}`;
+      if (!family[0]) throw new DomainError("not_found", "Token not found", 404);
+      await tx`SELECT pg_advisory_xact_lock(hashtext(${String(family[0].rotation_family_id)}))`;
+      const rows = await tx<
+        Row[]
+      >`SELECT * FROM api_tokens WHERE id=${id} AND user_id=${userId} FOR UPDATE`;
+      if (!rows[0]) throw new DomainError("not_found", "Token not found", 404);
+      const old = token(rows[0]);
+      if (old.version !== input.expectedVersion) {
+        throw new DomainError("version_conflict", "Token was modified", 409);
+      }
+      const rpm = input.rpmLimit === undefined ? old.rpmLimit : input.rpmLimit;
+      const burst = input.burstLimit === undefined ? old.burstLimit : input.burstLimit;
+      validateTokenRates(rpm, burst);
+      await tx`UPDATE api_tokens SET name=${input.name ?? old.name},scopes=${
+        tx.json(input.scopes ?? old.scopes)
+      },expires_at=${
+        input.expiresAt === undefined ? old.expiresAt : input.expiresAt
+      },rpm_limit=${rpm},burst_limit=${burst},version=version+1 WHERE rotation_family_id=${old.rotationFamilyId}`;
+      const updated = await tx<Row[]>`SELECT * FROM api_tokens WHERE id=${id}`;
+      return tokenSummary(token(updated[0]));
+    });
+  }
+  async rotateApiToken(
+    userId: string,
+    id: string,
+    input: RotateApiTokenInput,
+  ): Promise<RotatedApiToken> {
+    if (
+      !Number.isInteger(input.overlapSeconds) || input.overlapSeconds < 0 ||
+      input.overlapSeconds > 3600
+    ) {
+      throw new DomainError(
+        "validation_error",
+        "Rotation overlap must be between 0 and 3600 seconds",
+        422,
+      );
+    }
+    return await this.#sql.begin(async (tx) => {
+      const family = await tx<
+        Row[]
+      >`SELECT rotation_family_id FROM api_tokens WHERE id=${id} AND user_id=${userId}`;
+      if (!family[0]) throw new DomainError("not_found", "Token not found", 404);
+      await tx`SELECT pg_advisory_xact_lock(hashtext(${String(family[0].rotation_family_id)}))`;
+      const rows = await tx<
+        Row[]
+      >`SELECT * FROM api_tokens WHERE id=${id} AND user_id=${userId} FOR UPDATE`;
+      if (!rows[0]) throw new DomainError("not_found", "Token not found", 404);
+      const old = token(rows[0]);
+      if (old.version !== input.expectedVersion) {
+        throw new DomainError("version_conflict", "Token was modified", 409);
+      }
+      if (
+        old.revokedAt || old.replacedByTokenId ||
+        (old.expiresAt && Date.parse(old.expiresAt) <= Date.now())
+      ) {
+        throw new DomainError(
+          "invalid_state",
+          "Only the current active token generation can be rotated",
+          409,
+        );
+      }
+      const nextId = crypto.randomUUID();
+      let inserted: Row[];
+      try {
+        inserted = await tx<
+          Row[]
+        >`INSERT INTO api_tokens(id,user_id,name,token_hash,preview,scopes,expires_at,rpm_limit,burst_limit,access_mode,rotation_family_id,rotation_generation,rotated_from_token_id) VALUES(${nextId},${userId},${old.name},${input.tokenHash},${input.preview},${
+          tx.json(old.scopes)
+        },${old.expiresAt},${old.rpmLimit},${old.burstLimit},${old.accessMode},${old.rotationFamilyId},${
+          old.rotationGeneration + 1
+        },${old.id}) RETURNING *`;
+      } catch (error) {
+        if ((error as { code?: string }).code === "23505") {
+          throw new DomainError("conflict", "Token hash or generation already exists", 409);
+        }
+        throw error;
+      }
+      await tx`INSERT INTO access_group_tokens(group_id,token_id,user_id) SELECT group_id,${nextId},user_id FROM access_group_tokens WHERE token_id=${old.id}`;
+      const previous = await tx<
+        Row[]
+      >`UPDATE api_tokens SET replaced_by_token_id=${nextId},overlap_ends_at=now()+${input.overlapSeconds}*interval '1 second',version=version+1 WHERE id=${old.id} RETURNING *`;
+      return {
+        previous: tokenSummary(token(previous[0])),
+        replacement: tokenSummary(token(inserted[0])),
+      };
+    });
+  }
+  async searchApiTokens(query = "", limit = 50, cursor?: string): Promise<AdminTokenLookupPage> {
+    if (cursor && !UUID_PATTERN.test(cursor)) {
+      throw new DomainError("validation_error", "cursor must be a valid UUID", 422);
+    }
+    const bounded = Math.min(100, Math.max(1, limit));
+    const q = `%${query.trim()}%`;
+    const rows = await this.#sql<
+      Row[]
+    >`SELECT t.id,t.name token_name,t.preview,t.user_id,t.version,t.revoked_at,t.access_mode,u.email,u.name owner_name,COALESCE(array_agg(gt.group_id) FILTER(WHERE gt.group_id IS NOT NULL),'{}') group_ids FROM api_tokens t JOIN users u ON u.id=t.user_id LEFT JOIN access_group_tokens gt ON gt.token_id=t.id WHERE (${
+      query.trim() === ""
+    } OR t.name ILIKE ${q} OR t.preview ILIKE ${q} OR u.email ILIKE ${q}) AND (${
+      cursor ?? null
+    }::uuid IS NULL OR t.id>${cursor ?? null}) GROUP BY t.id,u.id ORDER BY t.id LIMIT ${
+      bounded + 1
+    }`;
+    const page = rows.slice(0, bounded);
+    return {
+      data: page.map((r) => ({
+        id: String(r.id),
+        name: String(r.token_name),
+        preview: String(r.preview),
+        ownerId: String(r.user_id),
+        ownerEmail: String(r.email),
+        ownerName: String(r.owner_name),
+        version: number(r.version),
+        groupIds: (r.group_ids as unknown[]).map(String),
+        revokedAt: nullableIso(r.revoked_at),
+        accessMode: r.access_mode as "inherit" | "restricted",
+      })),
+      nextCursor: rows.length > bounded ? String(page.at(-1)!.id) : null,
+    };
   }
 
+  async listModelAliases(): Promise<ModelAlias[]> {
+    return (await this.#sql<Row[]>`SELECT * FROM model_aliases ORDER BY alias`).map((r) => ({
+      id: String(r.id),
+      alias: String(r.alias),
+      targetModelId: String(r.target_model_id),
+      description: String(r.description),
+      version: number(r.version),
+      createdAt: iso(r.created_at),
+      updatedAt: iso(r.updated_at),
+    }));
+  }
+  async createModelAlias(input: CreateModelAliasInput) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$/.test(input.alias)) {
+      throw new DomainError("validation_error", "Invalid model alias", 422);
+    }
+    const r = await this.#sql.begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtext('model-public-id-namespace'))`;
+      if ((await tx`SELECT 1 FROM provider_models WHERE public_model_id=${input.alias}`).length) {
+        throw new DomainError("conflict", "Alias collides with a canonical model", 409);
+      }
+      return await tx<
+        Row[]
+      >`INSERT INTO model_aliases(alias,target_model_id,description) VALUES(${input.alias},${input.targetModelId},${
+        input.description ?? ""
+      }) RETURNING *`;
+    });
+    return {
+      id: String(r[0].id),
+      alias: String(r[0].alias),
+      targetModelId: String(r[0].target_model_id),
+      description: String(r[0].description),
+      version: number(r[0].version),
+      createdAt: iso(r[0].created_at),
+      updatedAt: iso(r[0].updated_at),
+    };
+  }
+  async updateModelAlias(id: string, input: UpdateModelAliasInput) {
+    const r = await this.#sql.begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtext('model-public-id-namespace'))`;
+      if (
+        input.alias &&
+        (await tx`SELECT 1 FROM provider_models WHERE public_model_id=${input.alias}`).length
+      ) throw new DomainError("conflict", "Alias collides with a canonical model", 409);
+      return await tx<Row[]>`UPDATE model_aliases SET alias=COALESCE(${
+        input.alias ?? null
+      },alias),target_model_id=COALESCE(${
+        input.targetModelId ?? null
+      }::uuid,target_model_id),description=COALESCE(${
+        input.description ?? null
+      },description),version=version+1,updated_at=now() WHERE id=${id} AND version=${input.expectedVersion} RETURNING *`;
+    });
+    if (!r[0]) throw new DomainError("version_conflict", "Model alias not found or modified", 409);
+    return {
+      id: String(r[0].id),
+      alias: String(r[0].alias),
+      targetModelId: String(r[0].target_model_id),
+      description: String(r[0].description),
+      version: number(r[0].version),
+      createdAt: iso(r[0].created_at),
+      updatedAt: iso(r[0].updated_at),
+    };
+  }
+  async deleteModelAlias(id: string, expectedVersion: number) {
+    const r = await this
+      .#sql`DELETE FROM model_aliases WHERE id=${id} AND version=${expectedVersion} RETURNING id`;
+    if (!r.length) {
+      throw new DomainError("version_conflict", "Model alias not found or modified", 409);
+    }
+  }
+  async #loadAccessGroup(tx: postgres.Sql, id: string): Promise<AccessGroup> {
+    const r = (await tx<Row[]>`SELECT * FROM access_groups WHERE id=${id}`)[0];
+    if (!r) throw new DomainError("not_found", "Access group not found", 404);
+    const u = await tx<Row[]>`SELECT user_id FROM access_group_users WHERE group_id=${id}`;
+    const m = await tx<
+      Row[]
+    >`SELECT provider_model_id FROM access_group_models WHERE group_id=${id}`;
+    const t = await tx<
+      Row[]
+    >`SELECT token_id,user_id FROM access_group_tokens WHERE group_id=${id}`;
+    return {
+      id: String(r.id),
+      name: String(r.name),
+      description: String(r.description),
+      version: number(r.version),
+      userIds: u.map((x) => String(x.user_id)),
+      modelIds: m.map((x) => String(x.provider_model_id)),
+      tokenIds: t.map((x) => String(x.token_id)),
+      tokenOwners: t.map((x) => ({ tokenId: String(x.token_id), ownerId: String(x.user_id) })),
+      createdAt: iso(r.created_at),
+      updatedAt: iso(r.updated_at),
+    };
+  }
+  async listAccessGroups() {
+    const rows = await this.#sql<Row[]>`SELECT g.*,
+      ARRAY(SELECT gu.user_id FROM access_group_users gu WHERE gu.group_id=g.id ORDER BY gu.user_id) user_ids,
+      ARRAY(SELECT gm.provider_model_id FROM access_group_models gm WHERE gm.group_id=g.id ORDER BY gm.provider_model_id) model_ids,
+      ARRAY(SELECT gt.token_id FROM access_group_tokens gt WHERE gt.group_id=g.id ORDER BY gt.token_id) token_ids,
+      COALESCE((SELECT jsonb_agg(jsonb_build_object('tokenId',gt.token_id,'ownerId',gt.user_id) ORDER BY gt.token_id) FROM access_group_tokens gt WHERE gt.group_id=g.id),'[]'::jsonb) token_owners
+      FROM access_groups g ORDER BY g.name`;
+    return rows.map((row) => ({
+      id: String(row.id),
+      name: String(row.name),
+      description: String(row.description),
+      version: number(row.version),
+      userIds: (row.user_ids as unknown[]).map(String),
+      modelIds: (row.model_ids as unknown[]).map(String),
+      tokenIds: (row.token_ids as unknown[]).map(String),
+      tokenOwners: (row.token_owners as Array<{ tokenId: string; ownerId: string }>).map((
+        entry,
+      ) => ({ tokenId: String(entry.tokenId), ownerId: String(entry.ownerId) })),
+      createdAt: iso(row.created_at),
+      updatedAt: iso(row.updated_at),
+    }));
+  }
+  async createAccessGroup(input: CreateAccessGroupInput) {
+    const r = await this.#sql<
+      Row[]
+    >`INSERT INTO access_groups(name,description) VALUES(${input.name.trim()},${
+      input.description ?? ""
+    }) RETURNING id`;
+    return await this.#loadAccessGroup(this.#sql, String(r[0].id));
+  }
+  async updateAccessGroup(id: string, input: UpdateAccessGroupInput) {
+    const r = await this.#sql`UPDATE access_groups SET name=COALESCE(${
+      input.name ?? null
+    },name),description=COALESCE(${
+      input.description ?? null
+    },description),version=version+1,updated_at=now() WHERE id=${id} AND version=${input.expectedVersion} RETURNING id`;
+    if (!r.length) {
+      throw new DomainError("version_conflict", "Access group not found or modified", 409);
+    }
+    return await this.#loadAccessGroup(this.#sql, id);
+  }
+  async deleteAccessGroup(id: string, expectedVersion: number) {
+    const r = await this
+      .#sql`DELETE FROM access_groups WHERE id=${id} AND version=${expectedVersion} RETURNING id`;
+    if (!r.length) {
+      throw new DomainError("version_conflict", "Access group not found or modified", 409);
+    }
+  }
+  async replaceAccessGroupUsers(id: string, userIds: string[], expectedVersion: number) {
+    return await this.#sql.begin(async (tx) => {
+      const r =
+        await tx`UPDATE access_groups SET version=version+1,updated_at=now() WHERE id=${id} AND version=${expectedVersion} RETURNING id`;
+      if (!r.length) {
+        throw new DomainError("version_conflict", "Access group not found or modified", 409);
+      }
+      const desired = [...new Set(userIds)];
+      await tx`DELETE FROM access_group_users WHERE group_id=${id} AND NOT (user_id = ANY(${
+        tx.array(desired)
+      }::uuid[]))`;
+      for (const uid of desired) {
+        await tx`INSERT INTO access_group_users(group_id,user_id) VALUES(${id},${uid}) ON CONFLICT DO NOTHING`;
+      }
+      return await this.#loadAccessGroup(tx, id);
+    });
+  }
+  async replaceAccessGroupModels(id: string, modelIds: string[], expectedVersion: number) {
+    return await this.#sql.begin(async (tx) => {
+      const r =
+        await tx`UPDATE access_groups SET version=version+1,updated_at=now() WHERE id=${id} AND version=${expectedVersion} RETURNING id`;
+      if (!r.length) {
+        throw new DomainError("version_conflict", "Access group not found or modified", 409);
+      }
+      await tx`DELETE FROM access_group_models WHERE group_id=${id}`;
+      for (const mid of new Set(modelIds)) {
+        await tx`INSERT INTO access_group_models(group_id,provider_model_id) VALUES(${id},${mid})`;
+      }
+      return await this.#loadAccessGroup(tx, id);
+    });
+  }
+  async replaceAccessGroupPolicy(id: string, input: ReplaceAccessGroupPolicyInput) {
+    return await this.#sql.begin(async (tx) => {
+      const changed = await tx`UPDATE access_groups SET name=COALESCE(${
+        input.name ?? null
+      },name),description=COALESCE(${
+        input.description ?? null
+      },description),version=version+1,updated_at=now() WHERE id=${id} AND version=${input.expectedVersion} RETURNING id`;
+      if (!changed.length) {
+        throw new DomainError("version_conflict", "Access group not found or modified", 409);
+      }
+      const userIds = [...new Set(input.userIds)],
+        modelIds = [...new Set(input.modelIds)];
+      const requestedTokenIds = [...new Set(input.tokenIds)];
+      const requestedExisting = requestedTokenIds.length
+        ? await tx<Row[]>`SELECT id FROM api_tokens WHERE id=ANY(${
+          tx.array(requestedTokenIds)
+        }::uuid[])`
+        : [];
+      if (requestedExisting.length !== requestedTokenIds.length) {
+        throw new DomainError("not_found", "Token not found", 404);
+      }
+      const initialExistingRows = await tx<
+        Row[]
+      >`SELECT token_id FROM access_group_tokens WHERE group_id=${id}`;
+      const initialTokenIds = [
+        ...new Set([
+          ...requestedTokenIds,
+          ...initialExistingRows.map((row) => String(row.token_id)),
+        ]),
+      ];
+      const familyRows = initialTokenIds.length
+        ? await tx<Row[]>`SELECT DISTINCT rotation_family_id FROM api_tokens WHERE id=ANY(${
+          tx.array(initialTokenIds)
+        }::uuid[]) ORDER BY rotation_family_id`
+        : [];
+      // Rotation and every family-wide token mutation use the same locks. Taking all locks in
+      // UUID order prevents both a newly rotated generation from escaping this replacement and
+      // deadlocks when one policy spans multiple families.
+      for (const row of familyRows) {
+        await tx`SELECT pg_advisory_xact_lock(hashtext(${String(row.rotation_family_id)}))`;
+      }
+      const desiredRows = requestedTokenIds.length
+        ? await tx<
+          Row[]
+        >`SELECT id FROM api_tokens WHERE rotation_family_id IN (SELECT rotation_family_id FROM api_tokens WHERE id=ANY(${
+          tx.array(requestedTokenIds)
+        }::uuid[])) ORDER BY id`
+        : [];
+      const tokenIds = desiredRows.map((row) => String(row.id));
+      const existingRows = await tx<
+        Row[]
+      >`SELECT token_id FROM access_group_tokens WHERE group_id=${id}`;
+      const rawExistingTokenIds = existingRows.map((row) => String(row.token_id));
+      const expandedExisting = rawExistingTokenIds.length
+        ? await tx<
+          Row[]
+        >`SELECT id FROM api_tokens WHERE rotation_family_id IN (SELECT rotation_family_id FROM api_tokens WHERE id=ANY(${
+          tx.array(rawExistingTokenIds)
+        }::uuid[])) ORDER BY id`
+        : [];
+      const existingTokenIds = expandedExisting.map((row) => String(row.id));
+      const affected = [...new Set([...existingTokenIds, ...tokenIds])].sort();
+      const locked = affected.length
+        ? await tx<Row[]>`SELECT id,user_id FROM api_tokens WHERE id=ANY(${
+          tx.array(affected)
+        }::uuid[]) ORDER BY id FOR UPDATE`
+        : [];
+      const owners = new Map(locked.map((row) => [String(row.id), String(row.user_id)]));
+      if (owners.size !== affected.length) {
+        throw new DomainError("not_found", "Token not found", 404);
+      }
+      for (const tokenId of tokenIds) {
+        const owner = owners.get(tokenId)!;
+        if (!userIds.includes(owner)) {
+          throw new DomainError(
+            "validation_error",
+            "Every token owner must be included in the group",
+            422,
+          );
+        }
+      }
+      await tx`DELETE FROM access_group_tokens WHERE group_id=${id}`;
+      await tx`DELETE FROM access_group_users WHERE group_id=${id}`;
+      await tx`DELETE FROM access_group_models WHERE group_id=${id}`;
+      for (const userId of userIds) {
+        await tx`INSERT INTO access_group_users(group_id,user_id) VALUES(${id},${userId})`;
+      }
+      for (const modelId of modelIds) {
+        await tx`INSERT INTO access_group_models(group_id,provider_model_id) VALUES(${id},${modelId})`;
+      }
+      for (const tokenId of tokenIds) {
+        const owner = owners.get(tokenId)!;
+        await tx`INSERT INTO access_group_tokens(group_id,token_id,user_id) VALUES(${id},${tokenId},${owner})`;
+      }
+      const changedTokens = affected.filter((tokenId) =>
+        existingTokenIds.includes(tokenId) !== tokenIds.includes(tokenId)
+      );
+      if (changedTokens.length) {
+        await tx`UPDATE api_tokens SET access_mode='restricted',version=version+1 WHERE id=ANY(${
+          tx.array(changedTokens)
+        }::uuid[])`;
+      }
+      return await this.#loadAccessGroup(tx, id);
+    });
+  }
+  async previewAccessGroupPolicyImpact(
+    id: string,
+    proposal: AccessGroupPolicyProposal | null = null,
+  ): Promise<AccessGroupPolicyImpact> {
+    const group = await this.#loadAccessGroup(this.#sql, id);
+    const nextModels = new Set(proposal?.modelIds ?? []);
+    const proposedTokenIds = [...new Set(proposal?.tokenIds ?? [])];
+    const expandedProposed = proposedTokenIds.length
+      ? await this.#sql<Row[]>`SELECT id FROM api_tokens WHERE rotation_family_id IN
+        (SELECT rotation_family_id FROM api_tokens WHERE id=ANY(${
+        this.#sql.array(proposedTokenIds)
+      }::uuid[]))`
+      : [];
+    const nextTokens = new Set(expandedProposed.map((row) => String(row.id)));
+    const models: string[] = [];
+    for (const modelId of group.modelIds) {
+      if (
+        !nextModels.has(modelId) &&
+        !(await this
+          .#sql`SELECT 1 FROM access_group_models WHERE provider_model_id=${modelId} AND group_id<>${id} LIMIT 1`)
+          .length
+      ) models.push(modelId);
+    }
+    const tokens = group.tokenIds.filter((tokenId) => !nextTokens.has(tokenId));
+    return {
+      modelIdsBecomingPublic: models,
+      tokenIdsLosingGroupAccess: tokens,
+      tokenIdsRevertingToOwnerInheritance: [],
+    };
+  }
+  async setTokenAccessGroups(
+    userId: string,
+    tokenId: string,
+    groupIds: string[],
+    expectedVersion: number,
+  ) {
+    return await this.#sql.begin(async (tx) => {
+      for (const groupId of new Set(groupIds)) {
+        const membership =
+          await tx`SELECT 1 FROM access_group_users WHERE group_id=${groupId} AND user_id=${userId}`;
+        if (!membership.length) {
+          throw new DomainError("forbidden", "Token groups must be held by the owner", 403);
+        }
+      }
+      const seed = await tx<
+        Row[]
+      >`SELECT rotation_family_id FROM api_tokens WHERE id=${tokenId} AND user_id=${userId}`;
+      if (!seed[0]) throw new DomainError("not_found", "Token not found", 404);
+      const familyId = String(seed[0].rotation_family_id);
+      await tx`SELECT pg_advisory_xact_lock(hashtext(${familyId}))`;
+      const current = await tx<
+        Row[]
+      >`SELECT * FROM api_tokens WHERE id=${tokenId} AND user_id=${userId} FOR UPDATE`;
+      if (!current[0] || number(current[0].version) !== expectedVersion) {
+        throw new DomainError("version_conflict", "Token not found or modified", 409);
+      }
+      await tx`DELETE FROM access_group_tokens WHERE token_id IN (SELECT id FROM api_tokens WHERE rotation_family_id=${familyId})`;
+      for (const gid of new Set(groupIds)) {
+        await tx`INSERT INTO access_group_tokens(group_id,token_id,user_id) SELECT ${gid},id,user_id FROM api_tokens WHERE rotation_family_id=${familyId}`;
+      }
+      await tx`UPDATE api_tokens SET access_mode='restricted',version=version+1 WHERE rotation_family_id=${familyId}`;
+      const updated = await tx<Row[]>`SELECT * FROM api_tokens WHERE id=${tokenId}`;
+      return tokenSummary(token(updated[0]));
+    });
+  }
+  async setTokenAccessMode(
+    userId: string,
+    tokenId: string,
+    mode: "inherit" | "restricted",
+    expectedVersion: number,
+  ) {
+    return await this.#sql.begin(async (tx) => {
+      const seed = await tx<
+        Row[]
+      >`SELECT rotation_family_id FROM api_tokens WHERE id=${tokenId} AND user_id=${userId}`;
+      if (!seed[0]) throw new DomainError("not_found", "Token not found", 404);
+      const familyId = String(seed[0].rotation_family_id);
+      await tx`SELECT pg_advisory_xact_lock(hashtext(${familyId}))`;
+      const current = await tx<
+        Row[]
+      >`SELECT * FROM api_tokens WHERE id=${tokenId} AND user_id=${userId} FOR UPDATE`;
+      if (!current[0] || number(current[0].version) !== expectedVersion) {
+        throw new DomainError("version_conflict", "Token not found or modified", 409);
+      }
+      if (mode === "inherit") {
+        await tx`DELETE FROM access_group_tokens WHERE token_id IN (SELECT id FROM api_tokens WHERE rotation_family_id=${familyId})`;
+      }
+      await tx`UPDATE api_tokens SET access_mode=${mode},version=version+1 WHERE rotation_family_id=${familyId}`;
+      const updated = await tx<Row[]>`SELECT * FROM api_tokens WHERE id=${tokenId}`;
+      return tokenSummary(token(updated[0]));
+    });
+  }
+  async listEntitledProviderModels(subject: TokenAccessSubject) {
+    const rows = await this.#sql<
+      Row[]
+    >`SELECT m.* FROM provider_models m WHERE m.enabled AND (${
+      subject.tokenId ?? null
+    }::uuid IS NULL OR EXISTS(SELECT 1 FROM api_tokens at WHERE at.id=${
+      subject.tokenId ?? null
+    } AND at.user_id=${subject.userId} AND at.revoked_at IS NULL AND (at.expires_at IS NULL OR at.expires_at>now()) AND (at.replaced_by_token_id IS NULL OR at.overlap_ends_at>now()))) AND (NOT EXISTS(SELECT 1 FROM access_group_models gm WHERE gm.provider_model_id=m.id) OR EXISTS(SELECT 1 FROM access_group_models gm JOIN access_group_users gu ON gu.group_id=gm.group_id WHERE gm.provider_model_id=m.id AND gu.user_id=${subject.userId} AND (${
+      subject.tokenId ?? null
+    }::uuid IS NULL OR (SELECT access_mode FROM api_tokens WHERE id=${
+      subject.tokenId ?? null
+    })='inherit' OR EXISTS(SELECT 1 FROM access_group_tokens gt WHERE gt.token_id=${
+      subject.tokenId ?? null
+    } AND gt.group_id=gm.group_id))))`;
+    return rows.map(providerModel);
+  }
+  async resolveEntitledProviderModel(
+    subject: TokenAccessSubject,
+    requestedId: string,
+  ): Promise<EntitledProviderModel | undefined> {
+    const row = (await this.#sql<
+      Row[]
+    >`SELECT m.*,a.id alias_id,a.alias alias_name,a.description alias_description,a.version alias_version,a.created_at alias_created_at,a.updated_at alias_updated_at FROM provider_models m LEFT JOIN model_aliases a ON a.target_model_id=m.id AND a.alias=${requestedId} WHERE m.public_model_id=${requestedId} OR a.alias=${requestedId} ORDER BY (m.public_model_id=${requestedId}) DESC LIMIT 1`)[
+      0
+    ];
+    if (!row) return undefined;
+    if (!row.enabled) return undefined;
+    const access = await this.#sql<Row[]>`SELECT ((${
+      subject.tokenId ?? null
+    }::uuid IS NULL OR EXISTS(SELECT 1 FROM api_tokens at WHERE at.id=${
+      subject.tokenId ?? null
+    } AND at.user_id=${subject.userId} AND at.revoked_at IS NULL AND (at.expires_at IS NULL OR at.expires_at>now()) AND (at.replaced_by_token_id IS NULL OR at.overlap_ends_at>now()))) AND (NOT EXISTS(SELECT 1 FROM access_group_models gm WHERE gm.provider_model_id=${
+      String(row.id)
+    }) OR EXISTS(SELECT 1 FROM access_group_models gm JOIN access_group_users gu ON gu.group_id=gm.group_id WHERE gm.provider_model_id=${
+      String(row.id)
+    } AND gu.user_id=${subject.userId} AND (${
+      subject.tokenId ?? null
+    }::uuid IS NULL OR (SELECT access_mode FROM api_tokens WHERE id=${
+      subject.tokenId ?? null
+    })='inherit' OR EXISTS(SELECT 1 FROM access_group_tokens gt WHERE gt.token_id=${
+      subject.tokenId ?? null
+    } AND gt.group_id=gm.group_id))))) allowed`;
+    if (!access[0]?.allowed) return undefined;
+    const model = providerModel(row);
+    const groups = await this.#sql<
+      Row[]
+    >`SELECT gm.group_id FROM access_group_models gm JOIN access_group_users gu ON gu.group_id=gm.group_id WHERE gm.provider_model_id=${model.id} AND gu.user_id=${subject.userId} AND (${
+      subject.tokenId ?? null
+    }::uuid IS NULL OR (SELECT access_mode FROM api_tokens WHERE id=${
+      subject.tokenId ?? null
+    })='inherit' OR EXISTS(SELECT 1 FROM access_group_tokens gt WHERE gt.token_id=${
+      subject.tokenId ?? null
+    } AND gt.group_id=gm.group_id))`;
+    return {
+      model,
+      alias: row.alias_id
+        ? {
+          id: String(row.alias_id),
+          alias: String(row.alias_name),
+          targetModelId: model.id,
+          description: String(row.alias_description),
+          version: number(row.alias_version),
+          createdAt: iso(row.alias_created_at),
+          updatedAt: iso(row.alias_updated_at),
+        }
+        : null,
+      matchedGroupIds: groups.map((g) => String(g.group_id)),
+    };
+  }
   async reserve(
     userId: string,
     runId: string,

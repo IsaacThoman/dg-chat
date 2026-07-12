@@ -202,6 +202,33 @@ async function fixture(options: {
   };
 }
 
+Deno.test("completed speech replay reauthorizes model access", async () => {
+  const fx = await fixture();
+  const key = "speech-entitlement-replay";
+  const completed = await fx.request({
+    model: fx.model.publicModelId,
+    input: "stored-sentinel-speech-body",
+    voice: "alloy",
+  }, key);
+  assertEquals(completed.status, 200, await completed.clone().text());
+  const group = fx.repository.createAccessGroup({ name: "deny-speech-replay" });
+  fx.repository.replaceAccessGroupModels(group.id, [fx.model.id], group.version);
+  const denied = await fx.request({
+    model: fx.model.publicModelId,
+    input: "stored-sentinel-speech-body",
+    voice: "alloy",
+  }, key);
+  const deniedBody = await denied.text();
+  assertEquals(denied.status, 404, deniedBody);
+  assertEquals(deniedBody.includes("stored-sentinel"), false);
+  assertEquals(JSON.parse(deniedBody).error, {
+    message: "The requested model is unavailable",
+    type: "invalid_request_error",
+    param: null,
+    code: "model_not_found",
+  });
+});
+
 Deno.test("speech returns and replays exact binary while source pricing survives fallback", async () => {
   const value = await fixture({ fallback: true });
   const models = await value.app.request("/v1/models", {

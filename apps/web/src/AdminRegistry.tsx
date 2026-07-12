@@ -11,6 +11,7 @@ import type {
   ModelPriceVersion,
   ProviderProtocol,
 } from "./types.ts";
+import { AdminModelAccess } from "./AdminModelAccess.tsx";
 
 const capabilities = MODEL_CAPABILITIES;
 const errorMessage = (error: unknown) =>
@@ -830,6 +831,7 @@ export function AdminModels() {
         A model appears in chat only when the model and provider are enabled, the provider has a
         credential and supported protocol, and an effective pricing revision exists.
       </p>
+      <AdminModelAccess models={models.data ?? []} />
       <label className="registry-search">
         <Search size={16} />
         <input

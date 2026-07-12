@@ -112,8 +112,70 @@ export interface Token {
   preview: string;
   scopes: string[];
   createdAt: string;
-  lastUsed?: string;
-  expires?: string;
+  lastUsedAt: string | null;
+  expiresAt: string | null;
+  revokedAt: string | null;
+  version: number;
+  rpmLimit: number | null;
+  burstLimit: number | null;
+  accessMode: "inherit" | "restricted";
+  rotatedFromTokenId: string | null;
+  replacedByTokenId: string | null;
+  overlapEndsAt: string | null;
+  rotationFamilyId: string;
+  rotationGeneration: number;
+}
+
+export interface TokenSecret extends Token {
+  token: string;
+}
+
+export interface TokenRotation {
+  token: string;
+  previous: Token;
+  replacement: Token;
+}
+
+export interface ModelAccessGroup {
+  id: string;
+  name: string;
+  description: string;
+  version: number;
+  userIds: string[];
+  tokenIds: string[];
+  tokenOwners: Array<{ tokenId: string; ownerId: string }>;
+  modelIds: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AccessGroupPolicyImpact {
+  modelIdsBecomingPublic: string[];
+  tokenIdsLosingGroupAccess: string[];
+  tokenIdsRevertingToOwnerInheritance: string[];
+}
+
+export interface AdminTokenAccessItem {
+  id: string;
+  name: string;
+  preview: string;
+  ownerId: string;
+  ownerEmail: string;
+  ownerName: string;
+  version: number;
+  groupIds: string[];
+  accessMode: "inherit" | "restricted";
+  revokedAt: string | null;
+}
+
+export interface ModelAlias {
+  id: string;
+  alias: string;
+  targetModelId: string;
+  description: string;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface Attachment {

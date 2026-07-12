@@ -1,10 +1,12 @@
 import type {
+  AccessGroupPolicyImpact,
   AdminAnalyticsData,
   AdminAnalyticsFilters,
   AdminJobFilters,
   AdminJobPage,
   AdminModel,
   AdminProvider,
+  AdminTokenAccessItem,
   Attachment,
   AuditEvent,
   AuditFilters,
@@ -15,6 +17,8 @@ import type {
   KnowledgeMode,
   Message,
   Model,
+  ModelAccessGroup,
+  ModelAlias,
   ModelPriceVersion,
   ProviderProtocol,
   RetentionPolicy,
@@ -23,6 +27,8 @@ import type {
   RetentionScrubRunPage,
   RetriedAdminJob,
   Token,
+  TokenRotation,
+  TokenSecret,
   User,
 } from "./types.ts";
 import { demoConversations, demoMessages, demoModels, demoTokens, demoUser } from "./demo.ts";
@@ -504,10 +510,37 @@ export const api = {
         body: JSON.stringify({ title, idempotencyKey }),
       }),
     ),
-  createToken: (name: string, scopes: string[] = ["chat:write", "models:read"]) =>
-    request<{ token: string }>("/tokens", {
+  createToken: (input: {
+    name: string;
+    scopes: string[];
+    expiresAt: string | null;
+    rpmLimit: number | null;
+    burstLimit: number | null;
+  }) =>
+    request<TokenSecret>("/tokens", {
       method: "POST",
-      body: JSON.stringify({ name, scopes }),
+      body: JSON.stringify(input),
+    }),
+  updateToken: (token: Token, input: {
+    name: string;
+    scopes: string[];
+    expiresAt: string | null;
+    rpmLimit: number | null;
+    burstLimit: number | null;
+  }) =>
+    request<Token>(`/tokens/${encodeURIComponent(token.id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ expectedVersion: token.version, ...input }),
+    }),
+  rotateToken: (token: Token, overlapSeconds: number) =>
+    request<TokenRotation>(`/tokens/${encodeURIComponent(token.id)}/rotate`, {
+      method: "POST",
+      body: JSON.stringify({ expectedVersion: token.version, overlapSeconds }),
+    }),
+  revokeToken: (token: Token) =>
+    request<void>(`/tokens/${encodeURIComponent(token.id)}`, {
+      method: "DELETE",
+      body: JSON.stringify({ expectedVersion: token.version }),
     }),
   generate: async (
     conversation: Conversation,
@@ -590,6 +623,121 @@ export const api = {
       { method: "POST", body: JSON.stringify({ expectedVersion: provider.version }) },
     ),
   adminModels: async () => (await request<{ data: AdminModel[] }>("/admin/models")).data,
+  adminModelAccessGroups: async () =>
+    (await request<{ data: ModelAccessGroup[] }>("/admin/model-access/groups")).data,
+  createAdminModelAccessGroup: (input: { name: string; description: string }) =>
+    request<ModelAccessGroup>("/admin/model-access/groups", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  updateAdminModelAccessGroup: (
+    group: ModelAccessGroup,
+    input: { name: string; description: string },
+  ) =>
+    request<ModelAccessGroup>(`/admin/model-access/groups/${encodeURIComponent(group.id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ expectedVersion: group.version, ...input }),
+    }),
+  replaceAdminModelAccessGroupMembers: (group: ModelAccessGroup, userIds: string[]) =>
+    request<ModelAccessGroup>(
+      `/admin/model-access/groups/${encodeURIComponent(group.id)}/users`,
+      {
+        method: "PUT",
+        body: JSON.stringify({ expectedVersion: group.version, ids: userIds }),
+      },
+    ),
+  replaceAdminModelAccessGroupModels: (group: ModelAccessGroup, modelIds: string[]) =>
+    request<ModelAccessGroup>(
+      `/admin/model-access/groups/${encodeURIComponent(group.id)}/models`,
+      {
+        method: "PUT",
+        body: JSON.stringify({ expectedVersion: group.version, ids: modelIds }),
+      },
+    ),
+  previewAdminModelAccessGroupPolicy: (
+    group: ModelAccessGroup,
+    proposal: { userIds: string[]; modelIds: string[]; tokenIds: string[] } | null,
+  ) =>
+    request<AccessGroupPolicyImpact>(
+      `/admin/model-access/groups/${encodeURIComponent(group.id)}/impact`,
+      { method: "POST", body: JSON.stringify({ proposal }) },
+    ),
+  replaceAdminModelAccessGroupPolicy: (
+    group: ModelAccessGroup,
+    input: {
+      name: string;
+      description: string;
+      userIds: string[];
+      modelIds: string[];
+      tokenIds: string[];
+    },
+  ) =>
+    request<ModelAccessGroup>(
+      `/admin/model-access/groups/${encodeURIComponent(group.id)}/policy`,
+      {
+        method: "PUT",
+        body: JSON.stringify({ expectedVersion: group.version, ...input }),
+      },
+    ),
+  deleteAdminModelAccessGroup: (group: ModelAccessGroup) =>
+    request<void>(`/admin/model-access/groups/${encodeURIComponent(group.id)}`, {
+      method: "DELETE",
+      body: JSON.stringify({ expectedVersion: group.version }),
+    }),
+  adminModelAccessTokens: (query = "", cursor?: string, limit = 100, signal?: AbortSignal) => {
+    const params = new URLSearchParams({ query, limit: String(limit) });
+    if (cursor) params.set("cursor", cursor);
+    return request<{ data: AdminTokenAccessItem[]; nextCursor: string | null }>(
+      `/admin/model-access/tokens?${params}`,
+      { signal },
+    );
+  },
+  setAdminTokenAccessGroups: (token: AdminTokenAccessItem, groupIds: string[]) =>
+    request<Token>(`/admin/model-access/tokens/${encodeURIComponent(token.id)}/groups`, {
+      method: "PUT",
+      body: JSON.stringify({
+        ownerId: token.ownerId,
+        expectedVersion: token.version,
+        groupIds,
+      }),
+    }),
+  setAdminTokenAccessMode: (
+    token: AdminTokenAccessItem,
+    accessMode: "inherit" | "restricted",
+  ) =>
+    request<Token>(`/admin/model-access/tokens/${encodeURIComponent(token.id)}/access-mode`, {
+      method: "PUT",
+      body: JSON.stringify({
+        ownerId: token.ownerId,
+        expectedVersion: token.version,
+        accessMode,
+      }),
+    }),
+  adminModelAliases: async () =>
+    (await request<{ data: ModelAlias[] }>("/admin/model-access/aliases")).data,
+  createAdminModelAlias: (input: {
+    alias: string;
+    targetModelId: string;
+    description: string;
+  }) =>
+    request<ModelAlias>("/admin/model-access/aliases", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  updateAdminModelAlias: (alias: ModelAlias, input: {
+    alias: string;
+    targetModelId: string;
+    description: string;
+  }) =>
+    request<ModelAlias>(`/admin/model-access/aliases/${encodeURIComponent(alias.id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ expectedVersion: alias.version, ...input }),
+    }),
+  deleteAdminModelAlias: (alias: ModelAlias) =>
+    request<void>(`/admin/model-access/aliases/${encodeURIComponent(alias.id)}`, {
+      method: "DELETE",
+      body: JSON.stringify({ expectedVersion: alias.version }),
+    }),
   adminTools: async () => (await request<{ data: AdminTool[] }>("/admin/tools")).data,
   updateAdminTool: (
     tool: AdminTool,

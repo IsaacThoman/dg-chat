@@ -19,6 +19,9 @@ import {
   validateDocumentChunkInputs,
 } from "./repository.ts";
 import type {
+  AccessGroup,
+  AccessGroupPolicyImpact,
+  AccessGroupPolicyProposal,
   AdminAnalytics,
   AdminAnalyticsDistribution,
   AdminAnalyticsQuery,
@@ -26,6 +29,7 @@ import type {
   AdminJobQuery,
   AdminJobStatus,
   AdminJobSummary,
+  AdminTokenLookupPage,
   ApiIdempotencyEndpoint,
   ApiIdempotencyRequest,
   ApiReplayQuota,
@@ -43,9 +47,12 @@ import type {
   BeginGenerationResult,
   CompleteApiRequestInput,
   CompleteGenerationInput,
+  CreateAccessGroupInput,
+  CreateApiTokenInput,
   CreateAttachmentInput,
   CreateAttachmentResult,
   CreateKnowledgeCollectionInput,
+  CreateModelAliasInput,
   CreateModelPriceVersionInput,
   CreateProviderInput,
   CreateProviderModelInput,
@@ -58,6 +65,7 @@ import type {
   EnqueueRetentionScrubInput,
   EnsureIdempotentReservationInput,
   EnsureUsageReservationInput,
+  EntitledProviderModel,
   FailApiRequestInput,
   FailGenerationInput,
   FinalizeEmbeddingProviderUsageInput,
@@ -75,6 +83,7 @@ import type {
   KnowledgeConversationBinding,
   KnowledgeRetrievalMode,
   KnowledgeSearchHit,
+  ModelAlias,
   ModelPriceVersion,
   ProviderAttempt,
   ProviderCredentialEnvelope,
@@ -88,6 +97,7 @@ import type {
   ProviderRecord,
   ProviderRetryPolicy,
   RegistryMutationContext,
+  ReplaceAccessGroupPolicyInput,
   ReplaceConversationKnowledgeInput,
   ReserveChildProviderUsageInput,
   RetentionPolicy,
@@ -97,12 +107,18 @@ import type {
   RetentionScrubPage,
   RetentionScrubQuery,
   RetentionScrubRun,
+  RotateApiTokenInput,
+  RotatedApiToken,
   SearchConversationKnowledgeInput,
   SessionSummary,
   SetProviderModelRouteInput,
   StageGeneratedObjectInput,
   StartProviderAttemptInput,
   StoredProviderCredential,
+  TokenAccessSubject,
+  UpdateAccessGroupInput,
+  UpdateApiTokenInput,
+  UpdateModelAliasInput,
   UpdateProviderInput,
   UpdateProviderModelInput,
   UpdateProviderRetryPolicyInput,
@@ -456,6 +472,8 @@ export class MemoryRepository {
   readonly knowledgeIdempotency = new Map<string, string>();
   readonly providers = new Map<string, StoredProvider>();
   readonly providerModels = new Map<string, ProviderModelRecord>();
+  readonly modelAliases = new Map<string, ModelAlias>();
+  readonly accessGroups = new Map<string, AccessGroup>();
   readonly modelPriceVersions = new Map<string, ModelPriceVersion[]>();
   readonly providerRetryPolicies = new Map<string, ProviderRetryPolicy>();
   readonly providerModelRoutes = new Map<string, ProviderModelRoute>();
@@ -2659,7 +2677,10 @@ export class MemoryRepository {
       throw new DomainError("not_found", "Provider not found", 404);
     }
     if (
-      [...this.providerModels.values()].some((model) => model.publicModelId === input.publicModelId)
+      [...this.providerModels.values()].some((model) =>
+        model.publicModelId === input.publicModelId
+      ) ||
+      [...this.modelAliases.values()].some((alias) => alias.alias === input.publicModelId)
     ) {
       throw new DomainError("model_id_taken", "Public model ID already exists", 409);
     }
@@ -2699,9 +2720,9 @@ export class MemoryRepository {
     if (model.version !== expectedVersion) throw registryConflict();
     if (
       input.publicModelId !== undefined &&
-      [...this.providerModels.values()].some((candidate) =>
-        candidate.id !== id && candidate.publicModelId === input.publicModelId
-      )
+        [...this.providerModels.values()].some((candidate) =>
+          candidate.id !== id && candidate.publicModelId === input.publicModelId
+        ) || [...this.modelAliases.values()].some((alias) => alias.alias === input.publicModelId)
     ) throw new DomainError("model_id_taken", "Public model ID already exists", 409);
     if (input.publicModelId !== undefined) model.publicModelId = input.publicModelId;
     if (input.upstreamModelId !== undefined) model.upstreamModelId = input.upstreamModelId.trim();
@@ -3566,22 +3587,27 @@ export class MemoryRepository {
 
   createApiToken(
     userId: string,
-    input: {
-      name: string;
-      scopes: string[];
-      tokenHash: string;
-      preview: string;
-      expiresAt?: string | null;
-    },
+    input: CreateApiTokenInput,
   ): StoredApiToken {
+    this.#validateTokenRates(input.rpmLimit ?? null, input.burstLimit ?? null);
     const now = new Date().toISOString();
+    const id = crypto.randomUUID();
     const token: StoredApiToken = {
-      id: crypto.randomUUID(),
+      id,
       userId,
       name: input.name,
       scopes: input.scopes,
       tokenHash: input.tokenHash,
       preview: input.preview,
+      version: 1,
+      rpmLimit: input.rpmLimit ?? null,
+      burstLimit: input.burstLimit ?? null,
+      accessMode: "inherit",
+      rotationFamilyId: id,
+      rotationGeneration: 0,
+      rotatedFromTokenId: null,
+      replacedByTokenId: null,
+      overlapEndsAt: null,
       expiresAt: input.expiresAt ?? null,
       revokedAt: null,
       lastUsedAt: null,
@@ -3592,7 +3618,18 @@ export class MemoryRepository {
   }
 
   findApiTokenByHash(hash: string) {
-    return [...this.tokens.values()].find((t) => t.tokenHash === hash);
+    return this.authenticateApiToken(hash);
+  }
+  authenticateApiToken(hash: string) {
+    const token = [...this.tokens.values()].find((t) => t.tokenHash === hash);
+    if (!token) return undefined;
+    const now = Date.now();
+    if (
+      token.revokedAt || (token.expiresAt && Date.parse(token.expiresAt) <= now) ||
+      (token.replacedByTokenId && (!token.overlapEndsAt || Date.parse(token.overlapEndsAt) <= now))
+    ) return undefined;
+    token.lastUsedAt = new Date(now).toISOString();
+    return structuredClone(token);
   }
   listApiTokens(userId: string): ApiTokenSummary[] {
     return [...this.tokens.values()].filter((t) => t.userId === userId).map((
@@ -3604,7 +3641,487 @@ export class MemoryRepository {
     if (!token || token.userId !== userId) {
       throw new DomainError("not_found", "Token not found", 404);
     }
-    token.revokedAt = new Date().toISOString();
+    this.#revokeFamily(token.rotationFamilyId);
+  }
+  revokeApiTokenFamily(id: string, userId: string, expectedVersion: number) {
+    const token = this.tokens.get(id);
+    if (!token || token.userId !== userId) {
+      throw new DomainError("not_found", "Token not found", 404);
+    }
+    if (token.version !== expectedVersion) {
+      throw new DomainError("version_conflict", "Token was modified", 409);
+    }
+    this.#revokeFamily(token.rotationFamilyId);
+  }
+  #revokeFamily(familyId: string) {
+    const now = new Date().toISOString();
+    for (const token of this.tokens.values()) {
+      if (token.rotationFamilyId === familyId) {
+        token.revokedAt ??= now;
+        token.version++;
+      }
+    }
+  }
+  #validateTokenRates(rpm: number | null, burst: number | null) {
+    if (
+      rpm !== null && (!Number.isInteger(rpm) || rpm < 1 || rpm > 60_000) ||
+      burst !== null && (!Number.isInteger(burst) || burst < 1 || burst > 1_000) ||
+      rpm !== null && burst !== null && burst > rpm
+    ) {
+      throw new DomainError("validation_error", "Token rate policy is invalid", 422);
+    }
+  }
+  #tokenSummary(token: StoredApiToken): ApiTokenSummary {
+    const { userId: _u, tokenHash: _h, ...summary } = token;
+    return structuredClone(summary);
+  }
+  #familyTokens(token: StoredApiToken) {
+    return [...this.tokens.values()].filter((candidate) =>
+      candidate.rotationFamilyId === token.rotationFamilyId
+    );
+  }
+  updateApiToken(userId: string, id: string, input: UpdateApiTokenInput) {
+    const token = this.tokens.get(id);
+    if (!token || token.userId !== userId) {
+      throw new DomainError("not_found", "Token not found", 404);
+    }
+    if (token.version !== input.expectedVersion) {
+      throw new DomainError("version_conflict", "Token was modified", 409);
+    }
+    const rpm = input.rpmLimit === undefined ? token.rpmLimit : input.rpmLimit;
+    const burst = input.burstLimit === undefined ? token.burstLimit : input.burstLimit;
+    this.#validateTokenRates(rpm, burst);
+    for (const generation of this.#familyTokens(token)) {
+      if (input.name !== undefined) generation.name = input.name;
+      if (input.scopes !== undefined) generation.scopes = structuredClone(input.scopes);
+      if (input.expiresAt !== undefined) generation.expiresAt = input.expiresAt;
+      generation.rpmLimit = rpm;
+      generation.burstLimit = burst;
+      generation.version++;
+    }
+    return this.#tokenSummary(token);
+  }
+  rotateApiToken(userId: string, id: string, input: RotateApiTokenInput): RotatedApiToken {
+    if (
+      !Number.isInteger(input.overlapSeconds) || input.overlapSeconds < 0 ||
+      input.overlapSeconds > 3600
+    ) {
+      throw new DomainError(
+        "validation_error",
+        "Rotation overlap must be between 0 and 3600 seconds",
+        422,
+      );
+    }
+    const old = this.tokens.get(id);
+    if (!old || old.userId !== userId) throw new DomainError("not_found", "Token not found", 404);
+    if (old.version !== input.expectedVersion) {
+      throw new DomainError("version_conflict", "Token was modified", 409);
+    }
+    if (
+      old.revokedAt || old.replacedByTokenId ||
+      old.expiresAt && Date.parse(old.expiresAt) <= Date.now()
+    ) {
+      throw new DomainError(
+        "invalid_state",
+        "Only the current active token generation can be rotated",
+        409,
+      );
+    }
+    if ([...this.tokens.values()].some((t) => t.tokenHash === input.tokenHash)) {
+      throw new DomainError("conflict", "Token hash already exists", 409);
+    }
+    const now = new Date();
+    const replacementId = crypto.randomUUID();
+    const replacement: StoredApiToken = {
+      ...structuredClone(old),
+      id: replacementId,
+      tokenHash: input.tokenHash,
+      preview: input.preview,
+      version: 1,
+      rotationGeneration: old.rotationGeneration + 1,
+      rotatedFromTokenId: old.id,
+      replacedByTokenId: null,
+      overlapEndsAt: null,
+      revokedAt: null,
+      lastUsedAt: null,
+      createdAt: now.toISOString(),
+    };
+    old.replacedByTokenId = replacementId;
+    old.overlapEndsAt = new Date(now.getTime() + input.overlapSeconds * 1000).toISOString();
+    old.version++;
+    this.tokens.set(replacementId, replacement);
+    for (const group of this.accessGroups.values()) {
+      if (group.tokenIds.includes(old.id)) {
+        group.tokenIds.push(replacementId);
+        group.tokenOwners.push({ tokenId: replacementId, ownerId: old.userId });
+      }
+    }
+    return { previous: this.#tokenSummary(old), replacement: this.#tokenSummary(replacement) };
+  }
+  searchApiTokens(query = "", limit = 50, cursor?: string): AdminTokenLookupPage {
+    if (
+      cursor &&
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
+        cursor,
+      )
+    ) {
+      throw new DomainError("validation_error", "cursor must be a valid UUID", 422);
+    }
+    const bounded = Math.min(100, Math.max(1, limit));
+    const q = query.trim().toLowerCase();
+    const all = [...this.tokens.values()].filter((t) =>
+      !q || t.name.toLowerCase().includes(q) || t.preview.toLowerCase().includes(q) ||
+      (this.users.get(t.userId)?.email ?? "").toLowerCase().includes(q)
+    ).sort((a, b) => a.id.localeCompare(b.id));
+    const start = cursor ? Math.max(0, all.findIndex((t) => t.id === cursor) + 1) : 0;
+    const page = all.slice(start, start + bounded);
+    return {
+      data: page.map((t) => ({
+        id: t.id,
+        name: t.name,
+        preview: t.preview,
+        ownerId: t.userId,
+        ownerEmail: this.users.get(t.userId)?.email ?? "",
+        ownerName: this.users.get(t.userId)?.name ?? "",
+        version: t.version,
+        groupIds: [...this.accessGroups.values()].filter((g) => g.tokenIds.includes(t.id)).map((
+          g,
+        ) => g.id),
+        revokedAt: t.revokedAt,
+        accessMode: t.accessMode,
+      })),
+      nextCursor: start + bounded < all.length ? page.at(-1)!.id : null,
+    };
+  }
+  listModelAliases() {
+    return structuredClone([...this.modelAliases.values()]);
+  }
+  createModelAlias(input: CreateModelAliasInput) {
+    if (
+      !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$/.test(input.alias) ||
+      [...this.modelAliases.values()].some((a) => a.alias === input.alias) ||
+      [...this.providerModels.values()].some((m) => m.publicModelId === input.alias)
+    ) throw new DomainError("conflict", "Model alias is invalid or already used", 409);
+    if (!this.providerModels.has(input.targetModelId)) {
+      throw new DomainError("not_found", "Target model not found", 404);
+    }
+    const now = new Date().toISOString();
+    const value: ModelAlias = {
+      id: crypto.randomUUID(),
+      alias: input.alias,
+      targetModelId: input.targetModelId,
+      description: input.description ?? "",
+      version: 1,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.modelAliases.set(value.id, value);
+    return structuredClone(value);
+  }
+  updateModelAlias(id: string, input: UpdateModelAliasInput) {
+    const value = this.modelAliases.get(id);
+    if (!value) throw new DomainError("not_found", "Model alias not found", 404);
+    if (value.version !== input.expectedVersion) {
+      throw new DomainError("version_conflict", "Model alias was modified", 409);
+    }
+    const alias = input.alias ?? value.alias;
+    if (
+      !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$/.test(alias) ||
+      [...this.modelAliases.values()].some((a) => a.id !== id && a.alias === alias) ||
+      [...this.providerModels.values()].some((m) => m.publicModelId === alias)
+    ) throw new DomainError("conflict", "Model alias is invalid or already used", 409);
+    if (input.targetModelId !== undefined && !this.providerModels.has(input.targetModelId)) {
+      throw new DomainError("not_found", "Target model not found", 404);
+    }
+    value.alias = alias;
+    value.targetModelId = input.targetModelId ?? value.targetModelId;
+    value.description = input.description ?? value.description;
+    value.version++;
+    value.updatedAt = new Date().toISOString();
+    return structuredClone(value);
+  }
+  deleteModelAlias(id: string, expectedVersion: number) {
+    const value = this.modelAliases.get(id);
+    if (!value) throw new DomainError("not_found", "Model alias not found", 404);
+    if (value.version !== expectedVersion) {
+      throw new DomainError("version_conflict", "Model alias was modified", 409);
+    }
+    this.modelAliases.delete(id);
+  }
+  listAccessGroups() {
+    return structuredClone([...this.accessGroups.values()]);
+  }
+  createAccessGroup(input: CreateAccessGroupInput) {
+    if (
+      !input.name.trim() ||
+      [...this.accessGroups.values()].some((g) =>
+        g.name.toLowerCase() === input.name.trim().toLowerCase()
+      )
+    ) throw new DomainError("conflict", "Access group name is already used", 409);
+    const now = new Date().toISOString();
+    const value: AccessGroup = {
+      id: crypto.randomUUID(),
+      name: input.name.trim(),
+      description: input.description ?? "",
+      version: 1,
+      userIds: [],
+      modelIds: [],
+      tokenIds: [],
+      tokenOwners: [],
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.accessGroups.set(value.id, value);
+    return structuredClone(value);
+  }
+  updateAccessGroup(id: string, input: UpdateAccessGroupInput) {
+    const g = this.#group(id, input.expectedVersion);
+    if (
+      input.name !== undefined &&
+      [...this.accessGroups.values()].some((other) =>
+        other.id !== id && other.name.toLowerCase() === input.name!.trim().toLowerCase()
+      )
+    ) throw new DomainError("conflict", "Access group name is already used", 409);
+    if (input.name !== undefined) g.name = input.name.trim();
+    if (input.description !== undefined) g.description = input.description;
+    g.version++;
+    g.updatedAt = new Date().toISOString();
+    return structuredClone(g);
+  }
+  deleteAccessGroup(id: string, expectedVersion: number) {
+    this.#group(id, expectedVersion);
+    this.accessGroups.delete(id);
+  }
+  replaceAccessGroupUsers(id: string, userIds: string[], expectedVersion: number) {
+    const g = this.#group(id, expectedVersion);
+    for (const uid of userIds) {
+      if (!this.users.has(uid)) throw new DomainError("not_found", "User not found", 404);
+    }
+    g.userIds = [...new Set(userIds)];
+    g.tokenIds = g.tokenIds.filter((tid) => g.userIds.includes(this.tokens.get(tid)?.userId ?? ""));
+    g.tokenOwners = g.tokenIds.map((tokenId) => ({
+      tokenId,
+      ownerId: this.tokens.get(tokenId)!.userId,
+    }));
+    g.version++;
+    g.updatedAt = new Date().toISOString();
+    return structuredClone(g);
+  }
+  replaceAccessGroupModels(id: string, modelIds: string[], expectedVersion: number) {
+    const g = this.#group(id, expectedVersion);
+    for (const mid of modelIds) {
+      if (!this.providerModels.has(mid)) {
+        throw new DomainError("not_found", "Model not found", 404);
+      }
+    }
+    g.modelIds = [...new Set(modelIds)];
+    g.version++;
+    g.updatedAt = new Date().toISOString();
+    return structuredClone(g);
+  }
+  replaceAccessGroupPolicy(id: string, input: ReplaceAccessGroupPolicyInput) {
+    const group = this.#group(id, input.expectedVersion);
+    if (
+      input.name !== undefined &&
+      [...this.accessGroups.values()].some((other) =>
+        other.id !== id && other.name.toLowerCase() === input.name!.trim().toLowerCase()
+      )
+    ) throw new DomainError("conflict", "Access group name is already used", 409);
+    const userIds = [...new Set(input.userIds)];
+    const modelIds = [...new Set(input.modelIds)];
+    const tokenIds = [
+      ...new Set(input.tokenIds.flatMap((tokenId) => {
+        const token = this.tokens.get(tokenId);
+        return token ? this.#familyTokens(token).map((generation) => generation.id) : [tokenId];
+      })),
+    ];
+    for (const userId of userIds) {
+      if (!this.users.has(userId)) throw new DomainError("not_found", "User not found", 404);
+    }
+    for (const modelId of modelIds) {
+      if (!this.providerModels.has(modelId)) {
+        throw new DomainError("not_found", "Model not found", 404);
+      }
+    }
+    for (const tokenId of tokenIds) {
+      const token = this.tokens.get(tokenId);
+      if (!token) throw new DomainError("not_found", "Token not found", 404);
+      if (!userIds.includes(token.userId)) {
+        throw new DomainError(
+          "validation_error",
+          "Every token owner must be included in the group",
+          422,
+        );
+      }
+    }
+    if (input.name !== undefined) group.name = input.name.trim();
+    if (input.description !== undefined) group.description = input.description;
+    const priorTokenIds = [...group.tokenIds];
+    group.userIds = userIds;
+    group.modelIds = modelIds;
+    group.tokenIds = tokenIds;
+    group.tokenOwners = tokenIds.map((tokenId) => ({
+      tokenId,
+      ownerId: this.tokens.get(tokenId)!.userId,
+    }));
+    for (const tokenId of new Set([...priorTokenIds, ...tokenIds])) {
+      if (priorTokenIds.includes(tokenId) !== tokenIds.includes(tokenId)) {
+        const token = this.tokens.get(tokenId)!;
+        token.accessMode = "restricted";
+        token.version++;
+      }
+    }
+    group.version++;
+    group.updatedAt = new Date().toISOString();
+    return structuredClone(group);
+  }
+  previewAccessGroupPolicyImpact(
+    id: string,
+    proposal: AccessGroupPolicyProposal | null = null,
+  ): AccessGroupPolicyImpact {
+    const group = this.accessGroups.get(id);
+    if (!group) throw new DomainError("not_found", "Access group not found", 404);
+    const nextModels = new Set(proposal?.modelIds ?? []);
+    const nextTokens = new Set((proposal?.tokenIds ?? []).flatMap((tokenId) => {
+      const token = this.tokens.get(tokenId);
+      return token ? this.#familyTokens(token).map((generation) => generation.id) : [tokenId];
+    }));
+    const modelIdsBecomingPublic = group.modelIds.filter((modelId) =>
+      !nextModels.has(modelId) &&
+      ![...this.accessGroups.values()].some((other) =>
+        other.id !== id && other.modelIds.includes(modelId)
+      )
+    );
+    const tokenIdsLosingGroupAccess = group.tokenIds.filter((tokenId) => !nextTokens.has(tokenId));
+    const tokenIdsRevertingToOwnerInheritance = tokenIdsLosingGroupAccess.filter((tokenId) =>
+      this.tokens.get(tokenId)?.accessMode === "inherit"
+    );
+    return {
+      modelIdsBecomingPublic,
+      tokenIdsLosingGroupAccess,
+      tokenIdsRevertingToOwnerInheritance,
+    };
+  }
+  #group(id: string, version: number) {
+    const g = this.accessGroups.get(id);
+    if (!g) throw new DomainError("not_found", "Access group not found", 404);
+    if (g.version !== version) {
+      throw new DomainError("version_conflict", "Access group was modified", 409);
+    }
+    return g;
+  }
+  setTokenAccessGroups(
+    userId: string,
+    tokenId: string,
+    groupIds: string[],
+    expectedVersion: number,
+  ) {
+    const token = this.tokens.get(tokenId);
+    if (!token || token.userId !== userId) {
+      throw new DomainError("not_found", "Token not found", 404);
+    }
+    if (token.version !== expectedVersion) {
+      throw new DomainError("version_conflict", "Token was modified", 409);
+    }
+    for (const gid of groupIds) {
+      const g = this.accessGroups.get(gid);
+      if (!g || !g.userIds.includes(userId)) {
+        throw new DomainError("forbidden", "Token groups must be held by the owner", 403);
+      }
+    }
+    const family = this.#familyTokens(token);
+    const familyIds = new Set(family.map((generation) => generation.id));
+    for (const g of this.accessGroups.values()) {
+      g.tokenIds = g.tokenIds.filter((id) => !familyIds.has(id));
+      g.tokenOwners = g.tokenOwners.filter((entry) => !familyIds.has(entry.tokenId));
+    }
+    for (const gid of new Set(groupIds)) {
+      this.accessGroups.get(gid)!.tokenIds.push(...familyIds);
+      this.accessGroups.get(gid)!.tokenOwners.push(
+        ...family.map((generation) => ({ tokenId: generation.id, ownerId: generation.userId })),
+      );
+    }
+    for (const generation of family) {
+      generation.accessMode = "restricted";
+      generation.version++;
+    }
+    return this.#tokenSummary(token);
+  }
+  setTokenAccessMode(
+    userId: string,
+    tokenId: string,
+    mode: "inherit" | "restricted",
+    expectedVersion: number,
+  ) {
+    const token = this.tokens.get(tokenId);
+    if (!token || token.userId !== userId) {
+      throw new DomainError("not_found", "Token not found", 404);
+    }
+    if (token.version !== expectedVersion) {
+      throw new DomainError("version_conflict", "Token was modified", 409);
+    }
+    const family = this.#familyTokens(token);
+    const familyIds = new Set(family.map((generation) => generation.id));
+    if (mode === "inherit") {
+      for (const group of this.accessGroups.values()) {
+        group.tokenIds = group.tokenIds.filter((id) => !familyIds.has(id));
+        group.tokenOwners = group.tokenOwners.filter((entry) => !familyIds.has(entry.tokenId));
+      }
+    }
+    for (const generation of family) {
+      generation.accessMode = mode;
+      generation.version++;
+    }
+    return this.#tokenSummary(token);
+  }
+  listEntitledProviderModels(subject: TokenAccessSubject) {
+    return [...this.providerModels.values()].filter((m) =>
+      m.enabled && this.#modelEntitled(subject, m.id)
+    ).map((model) => structuredClone(model));
+  }
+  resolveEntitledProviderModel(
+    subject: TokenAccessSubject,
+    requestedId: string,
+  ): EntitledProviderModel | undefined {
+    const canonical = [...this.providerModels.values()].find((m) =>
+      m.publicModelId === requestedId
+    );
+    const alias = canonical
+      ? null
+      : [...this.modelAliases.values()].find((a) => a.alias === requestedId) ?? null;
+    const model = canonical ?? (alias ? this.providerModels.get(alias.targetModelId) : undefined);
+    if (!model || !model.enabled || !this.#modelEntitled(subject, model.id)) return undefined;
+    const matchedGroupIds = [...this.accessGroups.values()].filter((g) =>
+      g.modelIds.includes(model.id) && this.#effectiveGroups(subject).has(g.id)
+    ).map((g) => g.id);
+    return {
+      model: structuredClone(model),
+      alias: alias && structuredClone(alias),
+      matchedGroupIds,
+    };
+  }
+  #effectiveGroups(subject: TokenAccessSubject) {
+    const userGroups = new Set(
+      [...this.accessGroups.values()].filter((g) => g.userIds.includes(subject.userId)).map((g) =>
+        g.id
+      ),
+    );
+    if (!subject.tokenId) return userGroups;
+    const token = this.tokens.get(subject.tokenId);
+    if (!token || token.userId !== subject.userId || !this.authenticateApiToken(token.tokenHash)) {
+      return new Set<string>();
+    }
+    const explicit = [...this.accessGroups.values()].filter((g) =>
+      g.tokenIds.includes(subject.tokenId!)
+    ).map((g) => g.id);
+    return token.accessMode === "restricted"
+      ? new Set(explicit.filter((id) => userGroups.has(id)))
+      : userGroups;
+  }
+  #modelEntitled(subject: TokenAccessSubject, modelId: string) {
+    const restricted = [...this.accessGroups.values()].filter((g) => g.modelIds.includes(modelId));
+    return restricted.length === 0 ||
+      restricted.some((g) => this.#effectiveGroups(subject).has(g.id));
   }
 
   credit(userId: string, usageRunId: string, kind: LedgerEntry["kind"], amountMicros: number) {

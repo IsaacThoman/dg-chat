@@ -629,6 +629,107 @@ export interface CreateApiTokenInput {
   tokenHash: string;
   preview: string;
   expiresAt?: string | null;
+  rpmLimit?: number | null;
+  burstLimit?: number | null;
+}
+export interface UpdateApiTokenInput {
+  expectedVersion: number;
+  name?: string;
+  scopes?: string[];
+  expiresAt?: string | null;
+  rpmLimit?: number | null;
+  burstLimit?: number | null;
+}
+export interface RotateApiTokenInput {
+  expectedVersion: number;
+  tokenHash: string;
+  preview: string;
+  overlapSeconds: number;
+}
+export interface RotatedApiToken {
+  previous: ApiTokenSummary;
+  replacement: ApiTokenSummary;
+}
+export interface TokenAccessSubject {
+  userId: string;
+  tokenId?: string | null;
+}
+export interface ModelAlias {
+  id: string;
+  alias: string;
+  targetModelId: string;
+  description: string;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+}
+export interface CreateModelAliasInput {
+  alias: string;
+  targetModelId: string;
+  description?: string;
+}
+export interface UpdateModelAliasInput {
+  expectedVersion: number;
+  alias?: string;
+  targetModelId?: string;
+  description?: string;
+}
+export interface AccessGroup {
+  id: string;
+  name: string;
+  description: string;
+  version: number;
+  userIds: string[];
+  modelIds: string[];
+  tokenIds: string[];
+  tokenOwners: Array<{ tokenId: string; ownerId: string }>;
+  createdAt: string;
+  updatedAt: string;
+}
+export interface CreateAccessGroupInput {
+  name: string;
+  description?: string;
+}
+export interface UpdateAccessGroupInput {
+  expectedVersion: number;
+  name?: string;
+  description?: string;
+}
+export interface ReplaceAccessGroupPolicyInput extends UpdateAccessGroupInput {
+  userIds: string[];
+  modelIds: string[];
+  tokenIds: string[];
+}
+export interface AccessGroupPolicyProposal {
+  userIds: string[];
+  modelIds: string[];
+  tokenIds: string[];
+}
+export interface AccessGroupPolicyImpact {
+  modelIdsBecomingPublic: string[];
+  tokenIdsLosingGroupAccess: string[];
+  tokenIdsRevertingToOwnerInheritance: string[];
+}
+export interface EntitledProviderModel {
+  model: ProviderModelRecord;
+  alias: ModelAlias | null;
+  matchedGroupIds: string[];
+}
+export interface AdminTokenLookupItem {
+  id: string;
+  name: string;
+  preview: string;
+  ownerId: string;
+  ownerEmail: string;
+  ownerName: string;
+  version: number;
+  groupIds: string[];
+  revokedAt: string | null;
+  accessMode: "inherit" | "restricted";
+}
+export interface AdminTokenLookupPage {
+  data: AdminTokenLookupItem[];
+  nextCursor: string | null;
 }
 
 /** Immutable effective pricing copied onto a usage run when credit is reserved. */
@@ -1592,9 +1693,69 @@ export interface DomainRepository {
     input: ReplaceConversationKnowledgeInput,
   ): MaybePromise<KnowledgeConversationBinding[]>;
   createApiToken(userId: string, input: CreateApiTokenInput): MaybePromise<StoredApiToken>;
+  authenticateApiToken(hash: string): MaybePromise<StoredApiToken | undefined>;
   findApiTokenByHash(hash: string): MaybePromise<StoredApiToken | undefined>;
   listApiTokens(userId: string): MaybePromise<ApiTokenSummary[]>;
   revokeApiToken(id: string, userId: string): MaybePromise<void>;
+  updateApiToken(
+    userId: string,
+    id: string,
+    input: UpdateApiTokenInput,
+  ): MaybePromise<ApiTokenSummary>;
+  rotateApiToken(
+    userId: string,
+    id: string,
+    input: RotateApiTokenInput,
+  ): MaybePromise<RotatedApiToken>;
+  revokeApiTokenFamily(id: string, userId: string, expectedVersion: number): MaybePromise<void>;
+  searchApiTokens(
+    query?: string,
+    limit?: number,
+    cursor?: string,
+  ): MaybePromise<AdminTokenLookupPage>;
+  listModelAliases(): MaybePromise<ModelAlias[]>;
+  createModelAlias(input: CreateModelAliasInput): MaybePromise<ModelAlias>;
+  updateModelAlias(id: string, input: UpdateModelAliasInput): MaybePromise<ModelAlias>;
+  deleteModelAlias(id: string, expectedVersion: number): MaybePromise<void>;
+  listAccessGroups(): MaybePromise<AccessGroup[]>;
+  createAccessGroup(input: CreateAccessGroupInput): MaybePromise<AccessGroup>;
+  updateAccessGroup(id: string, input: UpdateAccessGroupInput): MaybePromise<AccessGroup>;
+  deleteAccessGroup(id: string, expectedVersion: number): MaybePromise<void>;
+  replaceAccessGroupUsers(
+    id: string,
+    userIds: string[],
+    expectedVersion: number,
+  ): MaybePromise<AccessGroup>;
+  replaceAccessGroupModels(
+    id: string,
+    modelIds: string[],
+    expectedVersion: number,
+  ): MaybePromise<AccessGroup>;
+  replaceAccessGroupPolicy(
+    id: string,
+    input: ReplaceAccessGroupPolicyInput,
+  ): MaybePromise<AccessGroup>;
+  previewAccessGroupPolicyImpact(
+    id: string,
+    proposal?: AccessGroupPolicyProposal | null,
+  ): MaybePromise<AccessGroupPolicyImpact>;
+  setTokenAccessGroups(
+    userId: string,
+    tokenId: string,
+    groupIds: string[],
+    expectedVersion: number,
+  ): MaybePromise<ApiTokenSummary>;
+  setTokenAccessMode(
+    userId: string,
+    tokenId: string,
+    mode: "inherit" | "restricted",
+    expectedVersion: number,
+  ): MaybePromise<ApiTokenSummary>;
+  listEntitledProviderModels(subject: TokenAccessSubject): MaybePromise<ProviderModelRecord[]>;
+  resolveEntitledProviderModel(
+    subject: TokenAccessSubject,
+    requestedId: string,
+  ): MaybePromise<EntitledProviderModel | undefined>;
   createProvider(
     input: CreateProviderInput,
     mutation: RegistryMutationContext,

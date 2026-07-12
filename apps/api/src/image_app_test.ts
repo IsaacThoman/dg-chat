@@ -311,8 +311,61 @@ async function fixture(options: {
     calledModels,
     fallbackModel,
     fallbackProvider,
+    model,
+    user,
   };
 }
+
+Deno.test("completed image generation and edit replays reauthorize model access", async () => {
+  for (const editing of [false, true]) {
+    const fx = await fixture({ editing });
+    const key = `image-entitlement-replay-${editing ? "edit" : "generation"}`;
+    const headers = { cookie: fx.cookie, "idempotency-key": key };
+    const request = () => {
+      if (!editing) {
+        return fx.app.request("/v1/images/generations", {
+          method: "POST",
+          headers: { ...headers, "content-type": "application/json" },
+          body: JSON.stringify({
+            model: fx.model.publicModelId,
+            prompt: "stored-sentinel-image-body",
+            response_format: "b64_json",
+          }),
+        });
+      }
+      const form = new FormData();
+      form.set("model", fx.model.publicModelId);
+      form.set("prompt", "stored-sentinel-edit-body");
+      form.set("response_format", "b64_json");
+      form.set(
+        "image[]",
+        new Blob([Uint8Array.from(atob(png), (part) => part.charCodeAt(0))], {
+          type: "image/png",
+        }),
+        "source.png",
+      );
+      return fx.app.request("/v1/images/edits", {
+        method: "POST",
+        headers,
+        body: form,
+      });
+    };
+    const completed = await request();
+    assertEquals(completed.status, 200, await completed.clone().text());
+    const group = fx.repository.createAccessGroup({ name: `deny-${editing}` });
+    fx.repository.replaceAccessGroupModels(group.id, [fx.model.id], group.version);
+    const denied = await request();
+    const deniedBody = await denied.text();
+    assertEquals(denied.status, 404, deniedBody);
+    assertEquals(deniedBody.includes("stored-sentinel"), false);
+    assertEquals(JSON.parse(deniedBody).error, {
+      message: "The requested model is unavailable",
+      type: "invalid_request_error",
+      param: null,
+      code: "model_not_found",
+    });
+  }
+});
 
 Deno.test("image streaming persists and settles before its terminal event and replays exactly", async () => {
   const { app, repository, objectStore, cookie, calls } = await fixture({
@@ -1106,7 +1159,7 @@ Deno.test("crash-left objects plus attachment dedup schedule durable cleanup for
   assertEquals(pending.every((stage) => stage.cleanupAttachment === false), true);
 });
 
-Deno.test("completed image replay remains exact after provider and model rename and disable", async () => {
+Deno.test("completed image replay is denied after provider and model disable", async () => {
   const { app, repository, cookie, calls } = await fixture();
   const headers = {
     cookie,
@@ -1115,7 +1168,6 @@ Deno.test("completed image replay remains exact after provider and model rename 
   };
   const body = JSON.stringify({ model: "images/public", prompt: "immutable replay robot" });
   const first = await app.request("/v1/images/generations", { method: "POST", headers, body });
-  const firstBody = await first.text();
   assertEquals(first.status, 200);
   const model = repository.findProviderModel("images/public")!;
   const provider = repository.findProvider(model.providerId)!;
@@ -1130,9 +1182,15 @@ Deno.test("completed image replay remains exact after provider and model rename 
     enabled: false,
   }, { actorId, action: "test.provider-disabled" });
   const replay = await app.request("/v1/images/generations", { method: "POST", headers, body });
-  assertEquals(replay.status, 200);
-  assertEquals(replay.headers.get("x-idempotent-replay"), "true");
-  assertEquals(await replay.text(), firstBody);
+  assertEquals(replay.status, 404);
+  assertEquals(await replay.json(), {
+    error: {
+      message: "The requested model is unavailable",
+      type: "invalid_request_error",
+      param: null,
+      code: "model_not_found",
+    },
+  });
   assertEquals(calls(), 1);
 });
 
@@ -1241,7 +1299,7 @@ Deno.test("completed provider work is charged when immutable storage fails", asy
   assertEquals(repository.listGeneratedAssets(run.userId).length, 0);
 });
 
-Deno.test("reclaimed image idempotency uses its immutable pricing without provider redispatch", async () => {
+Deno.test("stale image finalization reauthorizes its stored canonical model before reclaim", async () => {
   const { app, repository, cookie, calls } = await fixture();
   const originalComplete = repository.completeApiJson.bind(repository);
   const originalFail = repository.failApiRequest.bind(repository);
@@ -1310,17 +1368,68 @@ Deno.test("reclaimed image idempotency uses its immutable pricing without provid
     headers,
     body,
   });
-  assertEquals(recovered.status, 200);
-  assertEquals((await recovered.json()).data[0].b64_json, png);
+  assertEquals(recovered.status, 404);
+  assertEquals((await recovered.json()).error, {
+    message: "The requested model is unavailable",
+    type: "invalid_request_error",
+    param: null,
+    code: "model_not_found",
+  });
   assertEquals(calls(), 1);
-  assertEquals(request.state, "completed");
-  assertEquals([...repository.usageRuns.values()].at(-1)?.costMicros, 25);
+  assertEquals(request.state, "in_progress");
+  assertEquals([...repository.usageRuns.values()].at(-1)?.costMicros, 0);
   const immutable = [...repository.generatedAssets.values()][0];
   assertEquals([immutable.publicModelId, immutable.upstreamModelId, immutable.providerSlug], [
     "images/public",
     "upstream-image",
     "image-primary",
   ]);
+});
+
+Deno.test("buffered image crash recovery accepts an alias for its canonical asset", async () => {
+  const { app, repository, cookie, calls, model } = await fixture();
+  repository.createModelAlias({ alias: "images/buffered-recovery-alias", targetModelId: model.id });
+  const originalComplete = repository.completeApiJson.bind(repository);
+  const originalFail = repository.failApiRequest.bind(repository);
+  let crashComplete = true;
+  let crashFailure = true;
+  repository.completeApiJson = (input) => {
+    if (crashComplete) {
+      crashComplete = false;
+      throw new Error("simulated crash after aliased asset finalization");
+    }
+    return originalComplete(input);
+  };
+  repository.failApiRequest = (input) => {
+    if (crashFailure) {
+      crashFailure = false;
+      throw new Error("simulated accounting transport loss");
+    }
+    return originalFail(input);
+  };
+  const headers = {
+    cookie,
+    "content-type": "application/json",
+    "idempotency-key": "image-alias-buffered-crash-key",
+  };
+  const body = JSON.stringify({
+    model: "images/buffered-recovery-alias",
+    prompt: "recover aliased buffered robot",
+  });
+  const interrupted = await app.request("/v1/images/generations", {
+    method: "POST",
+    headers,
+    body,
+  });
+  assertEquals(interrupted.status, 500);
+  const stored = [...repository.apiIdempotencyRequests.values()].find((candidate) =>
+    candidate.idempotencyKey === "image-alias-buffered-crash-key"
+  )!;
+  stored.leaseExpiresAt = new Date(Date.now() - 1_000).toISOString();
+  const recovered = await app.request("/v1/images/generations", { method: "POST", headers, body });
+  assertEquals(recovered.status, 200, await recovered.clone().text());
+  assertEquals(calls(), 1);
+  assertEquals([...repository.generatedAssets.values()][0].publicModelId, model.publicModelId);
 });
 
 Deno.test("stream crash recovery preserves exact partial SSE frames and provider timestamp", async () => {
@@ -1346,13 +1455,18 @@ Deno.test("stream crash recovery preserves exact partial SSE frames and provider
     }
     return originalFail(input);
   };
+  const canonical = repository.findProviderModel("images/public")!;
+  repository.createModelAlias({
+    alias: "images/stream-recovery-alias",
+    targetModelId: canonical.id,
+  });
   const headers = {
     cookie,
     "content-type": "application/json",
     "idempotency-key": "image-partial-crash-key",
   };
   const body = JSON.stringify({
-    model: "images/public",
+    model: "images/stream-recovery-alias",
     prompt: "recover progressive robot",
     stream: true,
     partial_images: 1,
