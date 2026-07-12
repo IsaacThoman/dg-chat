@@ -51,6 +51,8 @@ jobs:
           docker compose -f docker-compose.yml -f docker-compose.ci.yml config --quiet
           docker compose -f docker-compose.yml -f docker-compose.ci.yml -f docker-compose.contracts.yml config --quiet
           docker compose -f docker-compose.yml -f docker-compose.ci.yml -f docker-compose.oidc.yml config --quiet
+          test "$(docker compose -f docker-compose.yml config --format json | jq -r '.services.app.environment.DENO_ENV')" = production
+          test "$(docker compose -f docker-compose.yml -f docker-compose.ci.yml config --format json | jq -r '.services.app.environment.DENO_ENV')" = test
 
   postgres-integration:
     name: PostgreSQL integration and concurrency
