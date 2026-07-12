@@ -9,6 +9,7 @@ import {
   RouterProvider,
 } from "@tanstack/react-router";
 import { App, AuthScreen, PendingScreen, SetupScreen } from "./App.tsx";
+import { isAdminSection, parseAdminSearch } from "./adminRouting.ts";
 import "./styles.css";
 
 const rootRoute = createRootRoute({ component: () => <Outlet /> });
@@ -28,7 +29,29 @@ const pendingRoute = createRoute({
   path: "/pending",
   component: PendingScreen,
 });
-const routeTree = rootRoute.addChildren([indexRoute, loginRoute, setupRoute, pendingRoute]);
+const adminRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/admin/$section",
+  validateSearch: parseAdminSearch,
+  component: () => {
+    const { section } = adminRoute.useParams();
+    const search = adminRoute.useSearch();
+    return (
+      <App
+        initialView="admin"
+        initialAdminSection={isAdminSection(section) ? section : "overview"}
+        initialAdminSearch={search}
+      />
+    );
+  },
+});
+const routeTree = rootRoute.addChildren([
+  indexRoute,
+  loginRoute,
+  setupRoute,
+  pendingRoute,
+  adminRoute,
+]);
 const router = createRouter({ routeTree });
 declare module "@tanstack/react-router" {
   interface Register {

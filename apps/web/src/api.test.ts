@@ -1,8 +1,68 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { api, responseError, uploadAttachment } from "./api.ts";
+import {
+  adminAnalyticsQuery,
+  adminJobsQuery,
+  api,
+  responseError,
+  uploadAttachment,
+} from "./api.ts";
 import type { Conversation, KnowledgeCollection } from "./types.ts";
 
 afterEach(() => vi.unstubAllGlobals());
+
+describe("operational admin API", () => {
+  const analytics = {
+    from: "2026-07-01T00:00:00.000Z",
+    to: "2026-07-12T00:00:00.000Z",
+    bucket: "day" as const,
+    userId: "00000000-0000-4000-8000-000000000001",
+    model: "provider/model",
+    provider: "provider",
+    status: "completed" as const,
+  };
+
+  it("encodes bounded analytics and job filters without losing cursor values", () => {
+    const analyticsParams = new URLSearchParams(adminAnalyticsQuery(analytics));
+    expect(Object.fromEntries(analyticsParams)).toEqual(analytics);
+    const jobParams = new URLSearchParams(
+      adminJobsQuery({ status: "failed", type: "attachment.ingest" }, "opaque+/=", 25),
+    );
+    expect(Object.fromEntries(jobParams)).toEqual({
+      limit: "25",
+      status: "failed",
+      type: "attachment.ingest",
+      cursor: "opaque+/=",
+    });
+  });
+
+  it("uses same-origin CSV and failed-job retry endpoints", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      Response.json({
+        job: {
+          id: "00000000-0000-4000-8000-000000000002",
+          type: "attachment.ingest",
+          status: "queued",
+          attempts: 0,
+          availableAt: "2026-07-11T00:00:00.000Z",
+          lockedAt: null,
+          createdAt: "2026-07-10T00:00:00.000Z",
+          completedAt: null,
+          lastError: null,
+        },
+        priorAttempts: 3,
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    expect(api.adminAnalyticsCsvUrl(analytics)).toBe(
+      `/api/admin/analytics.csv?${adminAnalyticsQuery(analytics)}`,
+    );
+    await api.retryAdminJob("00000000-0000-4000-8000-000000000002");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/admin/jobs/00000000-0000-4000-8000-000000000002/retry",
+      expect.objectContaining({ method: "POST", credentials: "include" }),
+    );
+  });
+});
 
 describe("authentication errors", () => {
   it("normalizes Better Auth's top-level error envelope", async () => {

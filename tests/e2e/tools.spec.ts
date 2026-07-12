@@ -29,7 +29,7 @@ test("admin enables web search and a user explicitly reviews and cancels a tool 
   if (mobile) {
     await page.getByRole("combobox", { name: "Admin section" }).selectOption("tools");
   } else {
-    await page.getByRole("button", { name: "Tools & search", exact: true }).click();
+    await page.getByRole("link", { name: "Tools & search", exact: true }).click();
   }
   await expect(page.getByRole("heading", { name: "Tools & web search" })).toBeVisible();
   const card = page.locator("article", { hasText: "Web search" });

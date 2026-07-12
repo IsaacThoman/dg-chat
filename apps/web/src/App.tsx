@@ -10,6 +10,7 @@ import {
   useState,
 } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { Link, useNavigate } from "@tanstack/react-router";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
@@ -70,6 +71,8 @@ import {
   X,
 } from "lucide-react";
 import { api, ApiError } from "./api.ts";
+import type { AdminSearch, AdminSection } from "./adminRouting.ts";
+import { AdminAnalyticsView, AdminJobsView } from "./AdminOperations.tsx";
 import {
   conversationForFirstSend,
   mergeAttachmentIds,
@@ -131,18 +134,6 @@ import type {
 } from "./types.ts";
 
 type View = "chat" | "archived" | "trash" | "knowledge" | "settings" | "tokens" | "admin";
-type AdminSection =
-  | "overview"
-  | "applicants"
-  | "users"
-  | "providers"
-  | "models"
-  | "resilience"
-  | "tools"
-  | "usage"
-  | "jobs"
-  | "audit"
-  | "storage";
 const cn = (...v: Array<string | false | null | undefined>) => v.filter(Boolean).join(" ");
 
 function Brand({ compact = false }: { compact?: boolean }) {
@@ -3089,8 +3080,19 @@ const adminNav: { id: AdminSection; label: string; icon: typeof Gauge }[] = [
   { id: "audit", label: "Audit log", icon: Shield },
   { id: "storage", label: "Storage & backups", icon: HardDrive },
 ];
-function AdminView({ onMenu }: { onMenu: () => void }) {
-  const [section, setSection] = useState<AdminSection>("overview");
+function AdminView(
+  { onMenu, section, setSection, search, setSearch }: {
+    onMenu: () => void;
+    section: AdminSection;
+    setSection: (section: AdminSection) => void;
+    search: AdminSearch;
+    setSearch: (search: AdminSearch) => void;
+  },
+) {
+  const currentLabel = adminNav.find((item) => item.id === section)?.label ?? "Admin";
+  useEffect(() => {
+    document.title = `${currentLabel} · DG Chat Admin`;
+  }, [currentLabel]);
   return (
     <main className="admin-main">
       <header className="admin-mobile-head">
@@ -3113,19 +3115,26 @@ function AdminView({ onMenu }: { onMenu: () => void }) {
             <h2>Workspace</h2>
           </div>
           {adminNav.map(({ id, label, icon: Icon }) => (
-            <button
+            <Link
               key={id}
-              onClick={() => setSection(id)}
+              to="/admin/$section"
+              params={{ section: id }}
+              search={{}}
               className={section === id ? "active" : ""}
               aria-current={section === id ? "page" : undefined}
             >
               <Icon size={17} />
               {label}
-            </button>
+            </Link>
           ))}
         </nav>
         <section className="admin-content">
-          <AdminSectionContent section={section} setSection={setSection} />
+          <AdminSectionContent
+            section={section}
+            setSection={setSection}
+            search={search}
+            setSearch={setSearch}
+          />
         </section>
       </div>
     </main>
@@ -3133,7 +3142,12 @@ function AdminView({ onMenu }: { onMenu: () => void }) {
 }
 
 function AdminSectionContent(
-  { section, setSection }: { section: AdminSection; setSection: (s: AdminSection) => void },
+  { section, setSection, search, setSearch }: {
+    section: AdminSection;
+    setSection: (s: AdminSection) => void;
+    search: AdminSearch;
+    setSearch: (search: AdminSearch) => void;
+  },
 ) {
   if (section === "overview") {
     return <AdminOverview setSection={setSection} />;
@@ -3141,11 +3155,7 @@ function AdminSectionContent(
   if (section === "applicants") {
     return (
       <>
-        <PageHeader title="Applicants" subtitle="Review people waiting to join your workspace">
-          <button className="secondary">
-            <SlidersHorizontal size={16} /> Filter
-          </button>
-        </PageHeader>
+        <PageHeader title="Applicants" subtitle="Review people waiting to join your workspace" />
         <div className="table-card full">
           <Applicants />
         </div>
@@ -3168,22 +3178,10 @@ function AdminSectionContent(
     return <UserManagement />;
   }
   if (section === "usage") {
-    return (
-      <GenericAdmin
-        title="Usage analytics"
-        subtitle="Explore request volume, latency, tokens, and provider cost"
-        icon={BarChart3}
-      />
-    );
+    return <AdminAnalyticsView search={search} onSearch={setSearch} />;
   }
   if (section === "jobs") {
-    return (
-      <GenericAdmin
-        title="Background jobs"
-        subtitle="Monitor document ingestion, retention, and retry queues"
-        icon={Boxes}
-      />
-    );
+    return <AdminJobsView search={search} onSearch={setSearch} />;
   }
   if (section === "audit") {
     return <AuditLog />;
@@ -3606,36 +3604,29 @@ function GenericAdmin(
 ) {
   return (
     <>
-      <PageHeader title={title} subtitle={subtitle}>
-        <button className="secondary">
-          <Download size={16} /> Export CSV
-        </button>
-      </PageHeader>
+      <PageHeader title={title} subtitle={subtitle} />
       <div className="generic-admin">
         <span>
           <Icon size={28} />
         </span>
         <h3>{title} workspace</h3>
         <p>
-          Search, filtering, bulk actions, and detailed controls are ready to connect to the typed
-          administration API.
+          This administration surface is not available yet. Existing deployment backup procedures
+          remain documented for operators while validated export and restore controls are built.
         </p>
-        <div className="generic-toolbar">
-          <label className="search">
-            <Search size={16} />
-            <input placeholder={`Search ${title.toLowerCase()}`} />
-          </label>
-          <button className="primary">
-            <Plus size={16} /> Add new
-          </button>
-        </div>
-        <div className="skeleton-table">{[1, 2, 3, 4, 5].map((x) => <i key={x} />)}</div>
       </div>
     </>
   );
 }
 
-export function App() {
+export function App(
+  { initialView = "chat", initialAdminSection = "overview", initialAdminSearch = {} }: {
+    initialView?: View;
+    initialAdminSection?: AdminSection;
+    initialAdminSearch?: AdminSearch;
+  } = {},
+) {
+  const navigate = useNavigate();
   const queryClient = useQueryClient();
   const setupQuery = useQuery({ queryKey: ["setup-status"], queryFn: api.setupStatus });
   const userQuery = useQuery({ queryKey: ["me"], queryFn: api.me });
@@ -3663,7 +3654,27 @@ export function App() {
       return "";
     }
   });
-  const [view, setView] = useState<View>("chat");
+  const [view, setViewState] = useState<View>(initialView);
+  const [adminSection, setAdminSectionState] = useState<AdminSection>(initialAdminSection);
+  useEffect(() => setViewState(initialView), [initialView]);
+  useEffect(() => setAdminSectionState(initialAdminSection), [initialAdminSection]);
+  const setView = (next: View) => {
+    if (next === "admin") {
+      void navigate({ to: "/admin/$section", params: { section: adminSection } });
+      return;
+    }
+    if (view === "admin") {
+      void navigate({ to: "/" });
+    }
+    setViewState(next);
+  };
+  const setAdminSection = (next: AdminSection) => {
+    setAdminSectionState(next);
+    void navigate({ to: "/admin/$section", params: { section: next }, search: {} });
+  };
+  const setAdminSearch = (search: AdminSearch) => {
+    void navigate({ to: "/admin/$section", params: { section: adminSection }, search });
+  };
   const lifecycleQuery = view === "trash" ? deletedConversationQuery : conversationQuery;
   const lifecycleLoading = lifecycleQuery.isLoading;
   const lifecycleBlockingError = lifecycleQuery.isError && lifecycleQuery.data === undefined;
@@ -3913,7 +3924,15 @@ export function App() {
           onMenu={() => setMobile(true)}
         />
       )}
-      {view === "admin" && <AdminView onMenu={() => setMobile(true)} />}
+      {view === "admin" && (
+        <AdminView
+          onMenu={() => setMobile(true)}
+          section={adminSection}
+          setSection={setAdminSection}
+          search={initialAdminSearch}
+          setSearch={setAdminSearch}
+        />
+      )}
       {view === "knowledge" && <KnowledgeView onMenu={() => setMobile(true)} />}
     </div>
   );

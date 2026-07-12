@@ -8,6 +8,100 @@ import { decodeApiResponseBody, InvalidApiResponseBodyError } from "./repository
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
 
 Deno.test({
+  name: "Postgres operational analytics and job retry preserve safe canonical semantics",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 1 });
+    await sql`TRUNCATE jobs, ledger_entries, usage_runs, api_tokens, sessions, messages,
+      conversations, users RESTART IDENTITY CASCADE`;
+    const repo = await PostgresRepository.connect(databaseUrl!);
+    try {
+      const user = await repo.bootstrapAdmin({
+        email: "operational-admin-pg@example.com",
+        name: "Operational admin",
+        passwordHash: "hash",
+      }, 1_000);
+      await sql`INSERT INTO usage_runs(id,user_id,model,provider,status,cost_micros,input_tokens,
+        output_tokens,latency_ms,ttft_ms,actual_provider_cost_micros,
+        actual_provider_input_tokens,actual_provider_cached_input_tokens,
+        actual_provider_reasoning_tokens,actual_provider_output_tokens,created_at)
+        VALUES ('analytics-run',${user.id},'provider/model','provider','completed',40,10,5,100,20,
+        25,10,2,1,5,'2026-01-01T00:00:00Z')`;
+      const analytics = await repo.adminAnalytics({
+        from: "2026-01-01T00:00:00Z",
+        to: "2026-01-02T00:00:00Z",
+        bucket: "day",
+      });
+      assertEquals(analytics.summary.calls, 1);
+      assertEquals(analytics.summary.cachedInputTokens, 2);
+      assertEquals(analytics.summary.providerCostMicros, 25);
+      const jobRows =
+        await sql`INSERT INTO jobs(type,payload,status,attempts,last_error,completed_at)
+        VALUES ('attachment.ingest',${sql.json({ secret: "redacted" })},'failed',3,'failure',now())
+        RETURNING id`;
+      await sql`INSERT INTO jobs(type,payload,status,attempts,last_error,completed_at,created_at)
+        VALUES ('attachment.inspect',${sql.json({})},'failed',1,'older',now(),
+          now()-interval '1 hour'),
+        ('attachment.inspect',${sql.json({})},'failed',1,'oldest',now(),
+          now()-interval '2 hours')`;
+      const page = await repo.listJobs({ status: "failed", limit: 1 });
+      assertEquals(page.items[0].id, String(jobRows[0].id));
+      assertEquals("payload" in page.items[0], false);
+      const secondPage = await repo.listJobs({
+        status: "failed",
+        limit: 1,
+        cursor: page.nextCursor!,
+      });
+      const thirdPage = await repo.listJobs({
+        status: "failed",
+        limit: 1,
+        cursor: secondPage.nextCursor!,
+      });
+      assertEquals(secondPage.hasPrevious, true);
+      assertEquals(secondPage.previousCursor, null);
+      assertEquals(thirdPage.previousCursor, page.nextCursor);
+      await assertRejects(
+        () =>
+          repo.listJobs({
+            cursor: btoa(JSON.stringify({
+              createdAtMicros: "99999999999999999999",
+              id: crypto.randomUUID(),
+            })),
+          }),
+        DomainError,
+        "Invalid job cursor",
+      );
+      const retried = await repo.retryFailedJob(page.items[0].id, user.id);
+      assertEquals(retried.priorAttempts, 3);
+      assertEquals(retried.job.status, "queued");
+      const retriedJobId = page.items[0].id;
+      const audit = await sql<{ actor_id: string; metadata: { priorAttempts: number } }[]>`
+        SELECT actor_id,metadata FROM audit_events
+        WHERE action='job.retried' AND target_id=${retriedJobId}`;
+      assertEquals(String(audit[0].actor_id), user.id);
+      assertEquals(audit[0].metadata.priorAttempts, 3);
+      await assertRejects(
+        () => repo.retryFailedJob(page.items[0].id, user.id),
+        DomainError,
+        "Only failed",
+      );
+      const rollbackRows = await sql<{ id: string }[]>`INSERT INTO jobs
+        (type,payload,status,attempts,last_error,completed_at)
+        VALUES ('attachment.inspect',${sql.json({})},'failed',2,'failure',now()) RETURNING id`;
+      await assertRejects(() => repo.retryFailedJob(rollbackRows[0].id, "not-a-uuid"));
+      const rolledBack = await sql<{ status: string; attempts: number }[]>`
+        SELECT status,attempts FROM jobs WHERE id=${rollbackRows[0].id}::uuid`;
+      assertEquals(rolledBack[0], { status: "failed", attempts: 2 });
+    } finally {
+      await repo.close();
+      await sql.end();
+    }
+  },
+});
+
+Deno.test({
   name:
     "Postgres binary API replay round-trips decoded bytes and rejects malformed Base64 atomically",
   ignore: !databaseUrl,
@@ -2181,7 +2275,7 @@ Deno.test({
       assertEquals(new Set(concurrent.map((result) => result.inspectionJobId)).size, 1);
       assertEquals(concurrent.map((result) => result.deduplicated).sort(), [false, true]);
       assertEquals(
-        (await repo.listJobs()).filter((job) => job.type === "attachment.inspect").length,
+        (await repo.listJobs()).items.filter((job) => job.type === "attachment.inspect").length,
         1,
       );
       const attachment = concurrent[0].attachment;
@@ -2599,7 +2693,7 @@ Deno.test({
       });
       assertEquals(created.attachment.ingestionStatus, "queued");
       const jobs = await repo.listJobs();
-      assertEquals(jobs.filter((job) => job.type === "attachment.ingest").length, 1);
+      assertEquals(jobs.items.filter((job) => job.type === "attachment.ingest").length, 1);
       const mutate = postgres(databaseUrl!, { max: 1 });
       await mutate`UPDATE attachments SET ingestion_status='processing' WHERE id=${created.attachment.id}`;
       await mutate.end();
@@ -2748,7 +2842,7 @@ Deno.test({
         );
       }
       assertEquals(
-        (await repo.listJobs()).filter((job) => job.type === "attachment.ingest").length,
+        (await repo.listJobs()).items.filter((job) => job.type === "attachment.ingest").length,
         2,
       );
 
@@ -2776,7 +2870,7 @@ Deno.test({
         );
       }
       assertEquals(
-        (await repo.listJobs()).filter((job) => job.type === "attachment.ingest").length,
+        (await repo.listJobs()).items.filter((job) => job.type === "attachment.ingest").length,
         2,
       );
     } finally {

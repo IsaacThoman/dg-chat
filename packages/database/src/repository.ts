@@ -748,13 +748,83 @@ export interface AdminSummary {
   balanceMicros: number;
   ledger: LedgerEntry[];
 }
-export interface JobSummary {
+export type AnalyticsBucket = "hour" | "day";
+export type AdminAnalyticsStatus = "reserved" | "completed" | "failed";
+export interface AdminAnalyticsQuery {
+  from: string;
+  to: string;
+  bucket: AnalyticsBucket;
+  userId?: string;
+  model?: string;
+  provider?: string;
+  status?: AdminAnalyticsStatus;
+}
+export interface AdminAnalyticsSummary {
+  calls: number;
+  completed: number;
+  failed: number;
+  successRate: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  reasoningTokens: number;
+  outputTokens: number;
+  customerCostMicros: number;
+  providerCostMicros: number;
+  avgLatencyMs: number | null;
+  p95LatencyMs: number | null;
+  avgTtftMs: number | null;
+}
+export interface AdminAnalyticsPoint {
+  start: string;
+  calls: number;
+  completed: number;
+  failed: number;
+  customerCostMicros: number;
+  inputTokens: number;
+  outputTokens: number;
+  avgLatencyMs: number | null;
+  avgTtftMs: number | null;
+}
+export interface AdminAnalyticsDistribution {
+  key: string;
+  calls: number;
+  customerCostMicros: number;
+}
+export interface AdminAnalytics {
+  query: AdminAnalyticsQuery;
+  summary: AdminAnalyticsSummary;
+  points: AdminAnalyticsPoint[];
+  models: AdminAnalyticsDistribution[];
+  providers: AdminAnalyticsDistribution[];
+  statuses: AdminAnalyticsDistribution[];
+}
+export type AdminJobStatus = "queued" | "running" | "completed" | "failed";
+export interface AdminJobQuery {
+  status?: AdminJobStatus;
+  type?: string;
+  cursor?: string;
+  limit?: number;
+}
+export interface AdminJobSummary {
   id: string;
   type: string;
-  payload: unknown;
-  status: string;
+  status: AdminJobStatus;
   attempts: number;
+  availableAt: string;
+  lockedAt: string | null;
   createdAt: string;
+  completedAt: string | null;
+  lastError: string | null;
+}
+export interface AdminJobPage {
+  items: AdminJobSummary[];
+  nextCursor: string | null;
+  previousCursor: string | null;
+  hasPrevious: boolean;
+}
+export interface RetriedAdminJob {
+  job: AdminJobSummary;
+  priorAttempts: number;
 }
 export type ApiIdempotencyEndpoint =
   | "chat.completions"
@@ -1593,6 +1663,9 @@ export interface DomainRepository {
   listLedger(userId: string): MaybePromise<LedgerEntry[]>;
   enqueueJob(type: string, payload: unknown, availableAt?: string): MaybePromise<string>;
   adminSummary(): MaybePromise<AdminSummary>;
-  listJobs(): MaybePromise<JobSummary[]>;
+  adminAnalytics(query: AdminAnalyticsQuery): MaybePromise<AdminAnalytics>;
+  listJobs(query?: AdminJobQuery): MaybePromise<AdminJobPage>;
+  /** Atomically requeues a failed job and records the privileged actor in the audit log. */
+  retryFailedJob(id: string, actorId: string): MaybePromise<RetriedAdminJob>;
   readiness(): MaybePromise<{ ready: boolean; storage: string }>;
 }

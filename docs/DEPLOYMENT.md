@@ -111,6 +111,13 @@ later during a maintenance window with
 `ALTER TABLE usage_runs VALIDATE CONSTRAINT usage_runs_pricing_snapshot_check`; installations that
 need reverse price-to-usage lookups may then add a partial pricing-version index concurrently.
 
+Migration `0025` adds operational analytics and job-pagination indexes using transactional
+`CREATE INDEX`. On installations with large `usage_runs` or `jobs` tables, schedule this migration
+inside a maintenance window because PostgreSQL can briefly block writes while each index is built.
+Take a recovery point first, monitor lock waits and free disk, and do not start the new application
+or workers until migration completion. A future online-migration runner may replace this explicit
+maintenance-window requirement with `CREATE INDEX CONCURRENTLY`.
+
 ## Monitoring
 
 Alert on readiness, HTTP error ratio, stream starts without first tokens, queue age, failed jobs,

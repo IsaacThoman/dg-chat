@@ -1,4 +1,8 @@
 import type {
+  AdminAnalyticsData,
+  AdminAnalyticsFilters,
+  AdminJobFilters,
+  AdminJobPage,
   AdminModel,
   AdminProvider,
   Attachment,
@@ -13,6 +17,7 @@ import type {
   Model,
   ModelPriceVersion,
   ProviderProtocol,
+  RetriedAdminJob,
   Token,
   User,
 } from "./types.ts";
@@ -244,6 +249,31 @@ function auditQuery(filters: AuditFilters, cursor?: string, limit = 50) {
   for (const [key, value] of Object.entries(filters)) {
     if (value) query.set(key, value);
   }
+  if (cursor) query.set("cursor", cursor);
+  return query.toString();
+}
+
+export function adminAnalyticsQuery(filters: AdminAnalyticsFilters) {
+  const query = new URLSearchParams({
+    from: filters.from,
+    to: filters.to,
+    bucket: filters.bucket,
+  });
+  for (const key of ["userId", "model", "provider", "status"] as const) {
+    const value = filters[key];
+    if (value) query.set(key, value);
+  }
+  return query.toString();
+}
+
+export function adminJobsQuery(
+  filters: AdminJobFilters = {},
+  cursor?: string,
+  limit = 50,
+) {
+  const query = new URLSearchParams({ limit: String(limit) });
+  if (filters.status) query.set("status", filters.status);
+  if (filters.type) query.set("type", filters.type);
   if (cursor) query.set("cursor", cursor);
   return query.toString();
 }
@@ -520,6 +550,10 @@ export const api = {
     request<{ calls: number; users: number; balanceMicros: number; ledger: unknown[] }>(
       "/admin/usage",
     ),
+  adminAnalytics: (filters: AdminAnalyticsFilters) =>
+    request<AdminAnalyticsData>(`/admin/analytics?${adminAnalyticsQuery(filters)}`),
+  adminAnalyticsCsvUrl: (filters: AdminAnalyticsFilters) =>
+    `/api/admin/analytics.csv?${adminAnalyticsQuery(filters)}`,
   adminProviders: async () => (await request<{ data: AdminProvider[] }>("/admin/providers")).data,
   createAdminProvider: (input: {
     slug: string;
@@ -606,7 +640,10 @@ export const api = {
         expectedModelVersion: model.version,
       }),
     }),
-  adminJobs: async () => (await request<{ data: unknown[] }>("/admin/jobs")).data,
+  adminJobs: (filters: AdminJobFilters = {}, cursor?: string, limit = 50) =>
+    request<AdminJobPage>(`/admin/jobs?${adminJobsQuery(filters, cursor, limit)}`),
+  retryAdminJob: (id: string) =>
+    request<RetriedAdminJob>(`/admin/jobs/${encodeURIComponent(id)}/retry`, { method: "POST" }),
   adminAudit: (filters: AuditFilters = {}, cursor?: string, limit = 50) =>
     request<{ data: AuditEvent[]; nextCursor: string | null }>(
       `/admin/audit?${auditQuery(filters, cursor, limit)}`,

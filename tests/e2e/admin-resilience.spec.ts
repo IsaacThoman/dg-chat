@@ -79,7 +79,7 @@ async function openResilience(page: Page, mobile: boolean) {
   if (mobile) {
     await page.getByRole("combobox", { name: "Admin section" }).selectOption("resilience");
   } else {
-    await page.getByRole("button", { name: "Routing resilience", exact: true }).click();
+    await page.getByRole("link", { name: "Routing resilience", exact: true }).click();
   }
   await expect(page.getByRole("heading", { name: "Routing resilience", exact: true }))
     .toBeVisible();

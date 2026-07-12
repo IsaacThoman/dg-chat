@@ -23,6 +23,157 @@ Deno.test("passwordless domain users are represented without a local credential"
   );
 });
 
+Deno.test("admin analytics are bounded, canonical, and deterministically bucketed", () => {
+  const repo = new MemoryRepository();
+  const base = {
+    userId: crypto.randomUUID(),
+    model: "provider/model",
+    provider: "provider",
+    reservedMicros: 0,
+    executionEpoch: 0,
+    executionOwnerLeaseToken: null,
+    runLeaseToken: null,
+    runLeaseExpiresAt: null,
+    pricingSnapshot: null,
+    generationLeaseToken: null,
+    generationLeaseExpiresAt: null,
+  };
+  repo.usageRuns.set("run-1", {
+    ...base,
+    id: "run-1",
+    status: "completed",
+    costMicros: 40,
+    inputTokens: 10,
+    outputTokens: 5,
+    latencyMs: 100,
+    actualProviderCostMicros: 20,
+    actualProviderInputTokens: 10,
+    actualProviderCachedInputTokens: 2,
+    actualProviderReasoningTokens: 1,
+    actualProviderOutputTokens: 5,
+    createdAt: "2026-01-01T00:00:00.000Z",
+  });
+  repo.usageRuns.set("run-2", {
+    ...base,
+    id: "run-2",
+    status: "failed",
+    costMicros: 7,
+    inputTokens: 3,
+    outputTokens: 0,
+    latencyMs: 200,
+    actualProviderCostMicros: 6,
+    actualProviderInputTokens: 3,
+    actualProviderCachedInputTokens: 0,
+    actualProviderReasoningTokens: 0,
+    actualProviderOutputTokens: 0,
+    createdAt: "2026-01-01T01:00:00.000Z",
+  });
+  repo.usageRuns.set("run-reserved", {
+    ...base,
+    id: "run-reserved",
+    status: "reserved",
+    costMicros: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    latencyMs: null,
+    actualProviderCostMicros: 0,
+    actualProviderInputTokens: 0,
+    actualProviderCachedInputTokens: 0,
+    actualProviderReasoningTokens: 0,
+    actualProviderOutputTokens: 0,
+    createdAt: "2026-01-01T01:30:00.000Z",
+  });
+  const analytics = repo.adminAnalytics({
+    from: "2026-01-01T00:00:00Z",
+    to: "2026-01-02T00:00:00Z",
+    bucket: "hour",
+  });
+  assertEquals(analytics.summary.calls, 3);
+  assertEquals(analytics.summary.successRate, 0.5);
+  assertEquals(analytics.summary.customerCostMicros, 47);
+  assertEquals(analytics.summary.providerCostMicros, 26);
+  assertEquals(analytics.summary.p95LatencyMs, 195);
+  assertEquals(analytics.summary.avgLatencyMs, 150);
+  assertEquals(analytics.points.map((point) => point.start), [
+    "2026-01-01T00:00:00.000Z",
+    "2026-01-01T01:00:00.000Z",
+  ]);
+  assertThrows(
+    () => repo.adminAnalytics({ from: "2026-01-02", to: "2026-01-01", bucket: "day" }),
+    DomainError,
+    "Invalid analytics",
+  );
+});
+
+Deno.test("admin jobs are redacted, paginated, and failed-only retry is atomic", () => {
+  const repo = new MemoryRepository();
+  const actorId = crypto.randomUUID();
+  repo.jobs.push({
+    id: "00000000-0000-4000-8000-000000000001",
+    type: "attachment.ingest",
+    payload: { secret: "never expose" },
+    status: "failed",
+    attempts: 3,
+    availableAt: "2026-01-01T00:00:00.000Z",
+    lockedAt: "2026-01-01T00:00:00.000Z",
+    lockedBy: "private-worker-id",
+    lastError: "failure",
+    completedAt: "2026-01-01T00:01:00.000Z",
+    createdAt: "2026-01-01T00:00:00.000Z",
+  });
+  for (
+    const [index, createdAt] of [
+      "2025-12-31T23:00:00.000Z",
+      "2025-12-31T22:00:00.000Z",
+    ].entries()
+  ) {
+    repo.jobs.push({
+      id: `00000000-0000-4000-8000-00000000000${index + 2}`,
+      type: "attachment.inspect",
+      payload: {},
+      status: "completed",
+      attempts: 1,
+      availableAt: createdAt,
+      lockedAt: null,
+      lockedBy: null,
+      lastError: null,
+      completedAt: createdAt,
+      createdAt,
+    });
+  }
+  const page = repo.listJobs({ limit: 1 });
+  assertEquals(page.items[0], {
+    id: "00000000-0000-4000-8000-000000000001",
+    type: "attachment.ingest",
+    status: "failed",
+    attempts: 3,
+    availableAt: "2026-01-01T00:00:00.000Z",
+    lockedAt: "2026-01-01T00:00:00.000Z",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    completedAt: "2026-01-01T00:01:00.000Z",
+    lastError: "failure",
+  });
+  const second = repo.listJobs({ limit: 1, cursor: page.nextCursor! });
+  const third = repo.listJobs({ limit: 1, cursor: second.nextCursor! });
+  assertEquals(second.hasPrevious, true);
+  assertEquals(second.previousCursor, null);
+  assertEquals(third.previousCursor, page.nextCursor);
+  assertEquals(
+    repo.listJobs({ limit: 1, cursor: third.previousCursor! }).items[0].id,
+    second.items[0].id,
+  );
+  const retried = repo.retryFailedJob(page.items[0].id, actorId);
+  assertEquals(retried.priorAttempts, 3);
+  assertEquals(retried.job.status, "queued");
+  assertEquals(
+    repo.listAudit({ action: "job.retried", targetId: page.items[0].id }).data[0].metadata,
+    { type: retried.job.type, priorAttempts: 3 },
+  );
+  assertEquals(retried.job.attempts, 0);
+  assertEquals(retried.job.lockedAt, null);
+  assertThrows(() => repo.retryFailedJob(page.items[0].id, actorId), DomainError, "Only failed");
+});
+
 Deno.test("binary API replay validates Base64 and charges quota by decoded bytes", () => {
   const repo = new MemoryRepository();
   const user = repo.createUser({
@@ -1681,7 +1832,7 @@ Deno.test("attachments deduplicate, inspect, link immutably, and preserve tombst
   assertEquals(replay.attachment.id, created.attachment.id);
   assertEquals(replay.inspectionJobId, created.inspectionJobId);
   assertEquals(replay.deduplicated, true);
-  assertEquals(repo.listJobs().filter((job) => job.type === "attachment.inspect").length, 1);
+  assertEquals(repo.listJobs().items.filter((job) => job.type === "attachment.inspect").length, 1);
   assertThrows(
     () => repo.getAttachment(created.attachment.id, stranger.id),
     DomainError,
@@ -1819,7 +1970,7 @@ Deno.test("text ingestion is separate, idempotent, replaceable, retryable, and o
   });
   assertEquals(created.attachment.state, "ready");
   assertEquals(created.attachment.ingestionStatus, "queued");
-  assertEquals(repo.listJobs().filter((job) => job.type === "attachment.ingest").length, 1);
+  assertEquals(repo.listJobs().items.filter((job) => job.type === "attachment.ingest").length, 1);
   const replay = repo.createAttachment({
     ownerId: owner.id,
     objectKey: `uploads/${owner.id}/duplicate.txt`,
@@ -1830,7 +1981,7 @@ Deno.test("text ingestion is separate, idempotent, replaceable, retryable, and o
     state: "ready",
   });
   assertEquals(replay.attachment.id, created.attachment.id);
-  assertEquals(repo.listJobs().filter((job) => job.type === "attachment.ingest").length, 1);
+  assertEquals(repo.listJobs().items.filter((job) => job.type === "attachment.ingest").length, 1);
   repo.beginAttachmentIngestion(created.attachment.id, owner.id);
   const first = [{
     id: "00000000-0000-8000-8000-000000000001",
@@ -1960,7 +2111,7 @@ Deno.test("PDF and DOCX ingestion eligibility queues and retries while unsupport
     );
     assertEquals(repo.retryAttachmentIngestion(attachment.id, owner.id).ingestionStatus, "queued");
   }
-  assertEquals(repo.listJobs().filter((job) => job.type === "attachment.ingest").length, 2);
+  assertEquals(repo.listJobs().items.filter((job) => job.type === "attachment.ingest").length, 2);
 
   for (
     const mimeType of [
@@ -1985,7 +2136,7 @@ Deno.test("PDF and DOCX ingestion eligibility queues and retries while unsupport
       "cannot be ingested",
     );
   }
-  assertEquals(repo.listJobs().filter((job) => job.type === "attachment.ingest").length, 2);
+  assertEquals(repo.listJobs().items.filter((job) => job.type === "attachment.ingest").length, 2);
 });
 
 Deno.test("ledger reserve settle and refund are idempotent", () => {

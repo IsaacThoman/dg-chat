@@ -91,7 +91,7 @@ test("provider credentials, failures, and modal focus are safely managed", async
   if (mobile) {
     await page.getByRole("combobox", { name: "Admin section" }).selectOption("providers");
   } else {
-    await page.getByRole("button", { name: "Providers", exact: true }).click();
+    await page.getByRole("link", { name: "Providers", exact: true }).click();
   }
 
   const addProvider = page.getByRole("button", { name: "Add provider", exact: true });
@@ -133,7 +133,7 @@ test(
     if (mobile) {
       await page.getByRole("combobox", { name: "Admin section" }).selectOption("audit");
     } else {
-      await page.getByRole("button", { name: "Audit log", exact: true }).click();
+      await page.getByRole("link", { name: "Audit log", exact: true }).click();
     }
 
     const filters = page.getByRole("form", { name: "Audit filters" });

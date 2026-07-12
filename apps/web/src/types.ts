@@ -166,3 +166,80 @@ export interface AuditFilters {
   from?: string;
   to?: string;
 }
+
+export type AnalyticsBucket = "hour" | "day";
+export type AdminAnalyticsStatus = "reserved" | "completed" | "failed";
+export interface AdminAnalyticsFilters {
+  from: string;
+  to: string;
+  bucket: AnalyticsBucket;
+  userId?: string;
+  model?: string;
+  provider?: string;
+  status?: AdminAnalyticsStatus;
+}
+export interface AdminAnalyticsSummary {
+  calls: number;
+  completed: number;
+  failed: number;
+  successRate: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  reasoningTokens: number;
+  outputTokens: number;
+  customerCostMicros: number;
+  providerCostMicros: number;
+  avgLatencyMs: number | null;
+  p95LatencyMs: number | null;
+  avgTtftMs: number | null;
+}
+export interface AdminAnalyticsPoint {
+  start: string;
+  calls: number;
+  completed: number;
+  failed: number;
+  customerCostMicros: number;
+  inputTokens: number;
+  outputTokens: number;
+  avgLatencyMs: number | null;
+  avgTtftMs: number | null;
+}
+export interface AdminAnalyticsDistribution {
+  key: string;
+  calls: number;
+  customerCostMicros: number;
+}
+export interface AdminAnalyticsData {
+  query: AdminAnalyticsFilters;
+  summary: AdminAnalyticsSummary;
+  points: AdminAnalyticsPoint[];
+  models: AdminAnalyticsDistribution[];
+  providers: AdminAnalyticsDistribution[];
+  statuses: AdminAnalyticsDistribution[];
+}
+export type AdminJobStatus = "queued" | "running" | "completed" | "failed";
+export interface AdminJobFilters {
+  status?: AdminJobStatus;
+  type?: string;
+}
+export interface AdminJob {
+  id: string;
+  type: string;
+  status: AdminJobStatus;
+  attempts: number;
+  availableAt: string;
+  lockedAt: string | null;
+  createdAt: string;
+  completedAt: string | null;
+  lastError: string | null;
+}
+export interface AdminJobPage {
+  items: AdminJob[];
+  nextCursor: string | null;
+  previousCursor: string | null;
+  hasPrevious: boolean;
+}
+export interface RetriedAdminJob {
+  job: AdminJob;
+  priorAttempts: number;
+}

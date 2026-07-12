@@ -176,6 +176,13 @@
       "when": 1783656024000,
       "tag": "0024_better_auth_bridge",
       "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1783656025000,
+      "tag": "0025_operational_admin_indexes",
+      "breakpoints": true
     }
   ]
 }
