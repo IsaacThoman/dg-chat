@@ -5,6 +5,7 @@ import {
   objectStoreFromEnv,
   PostgresBackupStore,
   PostgresRepository,
+  PostgresRestoreProviderSecretsStore,
   PostgresToolExecutionStore,
   reconcileBetterAuthIdentities,
   verifyBackupDataCatalog,
@@ -63,6 +64,9 @@ const backupAdmin = backupConfig.enabled && databaseUrl && objectStore && backup
         recoveryKeyring: privilegedBackupSecrets.keyring,
         providerKeyring,
       }
+      : undefined,
+    providerSecretRestoreStore: privilegedBackupSecrets.enabled && backupConfig.restoreEnabled
+      ? await PostgresRestoreProviderSecretsStore.connect(databaseUrl)
       : undefined,
   })
   : undefined;

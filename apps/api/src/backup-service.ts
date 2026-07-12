@@ -8,11 +8,17 @@ import type {
   BackupOperation,
   ObjectStore,
   PostgresBackupStore,
+  PostgresRestoreProviderSecretsStore,
   ProviderSecretKek,
+  ProviderSecretSidecarBinding,
+  ProviderSecretSidecarHeaderV1,
 } from "@dg-chat/database";
 import {
+  canonicalJson,
   encryptProviderSecretSidecarV1,
   parseBackupArchiveStream,
+  restoreProviderSecretSidecarV1,
+  RestoreProviderSecretsStoreError,
   sha256Hex,
   writeBackupArchiveStream,
 } from "@dg-chat/database";
@@ -27,12 +33,17 @@ import type {
   BackupRestoreStatusCapability,
   BackupRestoreUploadSummary,
   PrivilegedBackupExportSummary,
+  ProviderSecretRestorePreview,
+  ProviderSecretRestoreResult,
+  ProviderSecretRestoreUploadSummary,
 } from "./backup-admin.ts";
 import type { PrivilegedBackupSecretKeyring } from "./backup-secret-keyring.ts";
 import type { ProviderSecretEnvelope, ProviderSecretKeyring } from "./provider-secrets.ts";
 
 const BACKUP_MIME = "application/vnd.dg-chat.backup";
 const PROVIDER_SECRETS_MIME = "application/vnd.dg-chat.provider-secrets";
+const MAX_PROVIDER_SECRET_UPLOAD_BYTES = 512 * 1024 * 1024;
+const MAX_DESTINATION_CREDENTIAL_LINE_BYTES = 64 * 1024;
 const MAX_UPLOAD_BYTES = 16 * 1024 * 1024 * 1024;
 const encoder = new TextEncoder();
 
@@ -66,6 +77,20 @@ type BackupStorePort = Pick<
   | "failRestore"
   | "complete"
   | "fail"
+  | "close"
+>;
+type ProviderSecretRestoreStorePort = Pick<
+  PostgresRestoreProviderSecretsStore,
+  | "get"
+  | "findByIdempotency"
+  | "create"
+  | "previewProviders"
+  | "validate"
+  | "apply"
+  | "fail"
+  | "claimCleanup"
+  | "recordCleanup"
+  | "releaseCleanup"
   | "close"
 >;
 
@@ -143,8 +168,9 @@ export interface BackupServiceOptions {
   artifactCleanupLeaseSeconds?: number;
   privilegedProviderSecrets?: {
     recoveryKeyring: PrivilegedBackupSecretKeyring;
-    providerKeyring: Pick<ProviderSecretKeyring, "decryptBytes">;
+    providerKeyring: Pick<ProviderSecretKeyring, "decryptBytes" | "encryptBytes">;
   };
+  providerSecretRestoreStore?: ProviderSecretRestoreStorePort;
 }
 
 function aborted(signal: AbortSignal): Error {
@@ -161,6 +187,20 @@ async function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T
       signal.addEventListener("abort", () => reject(aborted(signal)), { once: true })
     ),
   ]);
+}
+async function providerSecretStoreCall<T>(work: () => Promise<T>): Promise<T> {
+  try {
+    return await work();
+  } catch (error) {
+    if (error instanceof BackupServiceError) throw error;
+    if (error instanceof RestoreProviderSecretsStoreError) {
+      throw new BackupServiceError(
+        error.code === "not_found" ? "not_found" : "conflict",
+        error.message,
+      );
+    }
+    throw error;
+  }
 }
 
 function exportSummary(operation: BackupOperation): BackupExportSummary {
@@ -194,9 +234,25 @@ function privilegedExportSummary(operation: BackupOperation): PrivilegedBackupEx
     },
   };
 }
-function safeFilename(value: string) {
+function providerSecretBaseBinding(operation: BackupOperation): ProviderSecretSidecarBinding {
+  const manifest = operation.manifest;
+  const source = manifest?.source;
+  if (
+    operation.kind !== "restore" || operation.status !== "completed" ||
+    !operation.archiveSha256 || !manifest || typeof manifest.backupId !== "string" ||
+    typeof manifest.contentRootSha256 !== "string" || !source || typeof source !== "object" ||
+    Array.isArray(source) || typeof (source as Record<string, unknown>).installationId !== "string"
+  ) throw new BackupServiceError("conflict", "The completed base restore is unavailable");
+  return {
+    backupId: manifest.backupId,
+    archiveSha256: operation.archiveSha256,
+    contentRootSha256: manifest.contentRootSha256,
+    sourceInstallationId: String((source as Record<string, unknown>).installationId),
+  };
+}
+function safeFilename(value: string, suffix = ".dgbackup") {
   return /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(value) &&
-    value.toLowerCase().endsWith(".dgbackup");
+    value.toLowerCase().endsWith(suffix);
 }
 const statusCapabilityEncoder = new TextEncoder();
 const statusCapabilityId =
@@ -231,17 +287,99 @@ async function fileStream(path: string) {
   return file.readable;
 }
 
-async function stageMultipart(request: Request, maxBytes: number) {
+async function* destinationCredentialSpool(path: string): AsyncGenerator<{
+  providerId: string;
+  expectedVersion: number;
+  envelope: ProviderSecretEnvelope;
+}> {
+  const file = await Deno.open(path, { read: true });
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let pending = new Uint8Array();
+  try {
+    const buffer = new Uint8Array(64 * 1024);
+    while (true) {
+      const count = await file.read(buffer);
+      if (count === null) break;
+      const joined = new Uint8Array(pending.byteLength + count);
+      joined.set(pending);
+      joined.set(buffer.subarray(0, count), pending.byteLength);
+      let start = 0;
+      for (let index = 0; index < joined.byteLength; index++) {
+        if (joined[index] !== 10) continue;
+        const line = joined.subarray(start, index);
+        if (!line.byteLength || line.byteLength > MAX_DESTINATION_CREDENTIAL_LINE_BYTES) {
+          throw new TypeError("Destination credential spool is invalid");
+        }
+        const text = decoder.decode(line);
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          throw new TypeError("Destination credential spool is invalid");
+        }
+        if (
+          canonicalJson(parsed) !== text || !parsed || typeof parsed !== "object" ||
+          Array.isArray(parsed) ||
+          Object.keys(parsed).sort().join() !== "envelope,expectedVersion,providerId"
+        ) throw new TypeError("Destination credential spool is invalid");
+        const value = parsed as {
+          providerId?: unknown;
+          expectedVersion?: unknown;
+          envelope?: unknown;
+        };
+        if (
+          typeof value.providerId !== "string" ||
+          !Number.isSafeInteger(value.expectedVersion) || !value.envelope ||
+          typeof value.envelope !== "object" || Array.isArray(value.envelope)
+        ) throw new TypeError("Destination credential spool is invalid");
+        yield {
+          providerId: value.providerId,
+          expectedVersion: Number(value.expectedVersion),
+          envelope: value.envelope as ProviderSecretEnvelope,
+        };
+        start = index + 1;
+      }
+      pending = joined.slice(start);
+      if (pending.byteLength > MAX_DESTINATION_CREDENTIAL_LINE_BYTES) {
+        throw new TypeError("Destination credential spool line is too large");
+      }
+    }
+    if (pending.byteLength) throw new TypeError("Destination credential spool is truncated");
+  } finally {
+    pending.fill(0);
+    file.close();
+  }
+}
+
+async function stageMultipart(
+  request: Request,
+  maxBytes: number,
+  spec: {
+    suffix: ".dgbackup" | ".dgsecrets";
+    mime: string;
+    tempPrefix: string;
+    label: string;
+  } = {
+    suffix: ".dgbackup",
+    mime: BACKUP_MIME,
+    tempPrefix: "dg-restore-",
+    label: "backup",
+  },
+) {
+  const required = `A ${spec.label} file upload is required`;
+  const invalid = `The ${spec.label} file is invalid`;
+  const malformed = `The ${spec.label} upload is malformed`;
+  const tooLarge = `The ${spec.label} upload exceeds the size limit`;
   const contentType = request.headers.get("content-type") ?? "";
   if (!contentType.toLowerCase().startsWith("multipart/form-data;")) {
-    throw new BackupServiceError("invalid_upload", "A backup file upload is required");
+    throw new BackupServiceError("invalid_upload", required);
   }
   const declared = Number(request.headers.get("content-length"));
   if (Number.isFinite(declared) && declared > maxBytes + 128 * 1024) {
-    throw new BackupServiceError("invalid_upload", "The backup upload exceeds the size limit");
+    throw new BackupServiceError("invalid_upload", tooLarge);
   }
   if (!request.body) {
-    throw new BackupServiceError("invalid_upload", "A backup file upload is required");
+    throw new BackupServiceError("invalid_upload", required);
   }
   let result:
     | Promise<{ path: string; filename: string; bytes: number; digest: string }>
@@ -261,19 +399,19 @@ async function stageMultipart(request: Request, maxBytes: number) {
       },
     });
   } catch {
-    throw new BackupServiceError("invalid_upload", "The backup upload is malformed");
+    throw new BackupServiceError("invalid_upload", malformed);
   }
   busboy.on("file", (field, input, filename, _encoding, mime) => {
     if (
-      result || field !== "file" || !safeFilename(filename) ||
-      ![BACKUP_MIME, "application/octet-stream"].includes(mime.toLowerCase())
+      result || field !== "file" || !safeFilename(filename, spec.suffix) ||
+      ![spec.mime, "application/octet-stream"].includes(mime.toLowerCase())
     ) {
-      failure ??= new BackupServiceError("invalid_upload", "The backup file is invalid");
+      failure ??= new BackupServiceError("invalid_upload", invalid);
       input.resume();
       return;
     }
     result = (async () => {
-      const path = await Deno.makeTempFile({ prefix: "dg-restore-", suffix: ".dgbackup" });
+      const path = await Deno.makeTempFile({ prefix: spec.tempPrefix, suffix: spec.suffix });
       const digest = createHash("sha256");
       let bytes = 0;
       const output = await Deno.open(path, { write: true, truncate: true });
@@ -284,7 +422,7 @@ async function stageMultipart(request: Request, maxBytes: number) {
           if (bytes > maxBytes) {
             throw new BackupServiceError(
               "invalid_upload",
-              "The backup upload exceeds the size limit",
+              tooLarge,
             );
           }
           digest.update(data);
@@ -292,7 +430,7 @@ async function stageMultipart(request: Request, maxBytes: number) {
           while (offset < data.length) offset += await output.write(data.subarray(offset));
         }
         if (input.truncated || bytes === 0) {
-          throw new BackupServiceError("invalid_upload", "The backup upload is incomplete");
+          throw new BackupServiceError("invalid_upload", `The ${spec.label} upload is incomplete`);
         }
         return { path, filename, bytes, digest: digest.digest("hex") };
       } catch (error) {
@@ -306,12 +444,13 @@ async function stageMultipart(request: Request, maxBytes: number) {
   });
   busboy.on(
     "field",
-    () => failure ??= new BackupServiceError("invalid_upload", "Unexpected backup form field"),
+    () =>
+      failure ??= new BackupServiceError("invalid_upload", `Unexpected ${spec.label} form field`),
   );
   for (const event of ["filesLimit", "fieldsLimit", "partsLimit"] as const) {
     busboy.on(
       event,
-      () => failure ??= new BackupServiceError("invalid_upload", "The backup upload is malformed"),
+      () => failure ??= new BackupServiceError("invalid_upload", malformed),
     );
   }
   const finished = new Promise<void>((resolve, reject) => {
@@ -333,7 +472,7 @@ async function stageMultipart(request: Request, maxBytes: number) {
     try {
       busboy.destroy();
     } catch { /* sanitized below */ }
-    failure ??= new BackupServiceError("invalid_upload", "The backup upload is malformed");
+    failure ??= new BackupServiceError("invalid_upload", malformed);
   } finally {
     await reader.cancel().catch(() => undefined);
     reader.releaseLock();
@@ -348,7 +487,7 @@ async function stageMultipart(request: Request, maxBytes: number) {
     if (staged) await Deno.remove(staged.path).catch(() => undefined);
     throw failure instanceof BackupServiceError
       ? failure
-      : new BackupServiceError("invalid_upload", "The backup upload is malformed");
+      : new BackupServiceError("invalid_upload", malformed);
   }
   return staged;
 }
@@ -356,6 +495,7 @@ async function stageMultipart(request: Request, maxBytes: number) {
 export class DefaultBackupAdminService implements BackupAdminService {
   readonly restoreEnabled: boolean;
   readonly privilegedSecretBackupsEnabled: boolean;
+  readonly providerSecretRestoreEnabled: boolean;
   readonly #store;
   readonly #objects;
   readonly #data;
@@ -368,6 +508,7 @@ export class DefaultBackupAdminService implements BackupAdminService {
   readonly #artifactCleanupLeaseSeconds;
   readonly #artifactClaimTimeoutMs;
   readonly #privilegedProviderSecrets;
+  readonly #providerSecretRestoreStore;
   readonly #tasks = new Map<string, Promise<void>>();
   readonly #artifactCleanups = new Set<Promise<void>>();
   readonly #exportControllers = new Map<string, AbortController>();
@@ -385,8 +526,13 @@ export class DefaultBackupAdminService implements BackupAdminService {
     this.#authenticator = options.authenticator;
     this.restoreEnabled = options.restoreEnabled === true;
     this.#privilegedProviderSecrets = options.privilegedProviderSecrets;
+    this.#providerSecretRestoreStore = options.providerSecretRestoreStore;
     this.privilegedSecretBackupsEnabled = Boolean(
       options.privilegedProviderSecrets && options.data.exportPrivilegedSnapshot,
+    );
+    this.providerSecretRestoreEnabled = Boolean(
+      this.restoreEnabled && options.privilegedProviderSecrets &&
+        options.providerSecretRestoreStore,
     );
     this.#maxUploadBytes = options.maxUploadBytes ?? MAX_UPLOAD_BYTES;
     this.#exportLeaseSeconds = options.exportLeaseSeconds ?? 60;
@@ -906,6 +1052,448 @@ export class DefaultBackupAdminService implements BackupAdminService {
     if (stored.contentLength != null) headers.set("content-length", String(stored.contentLength));
     return new Response(stored.body, { headers });
   }
+  #providerSecretRestoreDependencies() {
+    if (
+      !this.providerSecretRestoreEnabled || !this.#providerSecretRestoreStore ||
+      !this.#privilegedProviderSecrets
+    ) throw new BackupServiceError("restore_disabled", "Provider-secret restore is unavailable");
+    return {
+      store: this.#providerSecretRestoreStore,
+      keyrings: this.#privilegedProviderSecrets,
+    };
+  }
+  async #authenticateProviderSecretFile(
+    path: string,
+    binding: ProviderSecretSidecarBinding,
+  ): Promise<
+    { header: ProviderSecretSidecarHeaderV1; recordCount: number; recordsSha256: string }
+  > {
+    const { keyrings } = this.#providerSecretRestoreDependencies();
+    let header: ProviderSecretSidecarHeaderV1 | undefined;
+    const summary = await restoreProviderSecretSidecarV1({
+      source: webChunks(await fileStream(path)),
+      keyring: keyrings.recoveryKeyring,
+      expectedBinding: binding,
+      sink: {
+        begin(value) {
+          header = value;
+        },
+        write() {},
+        commit() {},
+        abort() {},
+      },
+    });
+    if (!header) throw new BackupServiceError("conflict", "The provider-secret file is invalid");
+    return { header, recordCount: summary.recordCount, recordsSha256: summary.recordsSha256 };
+  }
+  async uploadProviderSecretRestore(input: {
+    actorId: string;
+    restoreId: string;
+    request: Request;
+    idempotencyKey: string;
+  }): Promise<ProviderSecretRestoreUploadSummary> {
+    const { store } = this.#providerSecretRestoreDependencies();
+    const base = await this.#store.get(input.restoreId);
+    const binding = providerSecretBaseBinding(base);
+    const staged = await stageMultipart(input.request, MAX_PROVIDER_SECRET_UPLOAD_BYTES, {
+      suffix: ".dgsecrets",
+      mime: PROVIDER_SECRETS_MIME,
+      tempPrefix: "dg-provider-secret-restore-",
+      label: "provider-secret",
+    });
+    let createdObject = false;
+    try {
+      let authenticated;
+      try {
+        authenticated = await this.#authenticateProviderSecretFile(staged.path, binding);
+      } catch {
+        throw new BackupServiceError(
+          "invalid_upload",
+          "The provider-secret file is invalid or does not match this backup",
+        );
+      }
+      const identity = await sha256Hex(
+        encoder.encode(
+          `${input.actorId}\n${input.restoreId}\n${input.idempotencyKey}\n${staged.digest}`,
+        ),
+      );
+      const objectKey =
+        `backups/restores/${input.restoreId}/provider-secrets/${identity}-${staged.digest}.dgsecrets`;
+      const existing = await this.#objects.get(objectKey);
+      if (existing) {
+        if (
+          existing.metadata.sha256 !== staged.digest || existing.contentLength !== staged.bytes
+        ) {
+          await existing.body.cancel().catch(() => undefined);
+          throw new BackupServiceError(
+            "conflict",
+            "The provider-secret upload conflicts with existing storage",
+          );
+        }
+        await existing.body.cancel().catch(() => undefined);
+      } else {
+        try {
+          await this.#objects.put({
+            key: objectKey,
+            body: await fileStream(staged.path),
+            contentLength: staged.bytes,
+            contentType: PROVIDER_SECRETS_MIME,
+            metadata: { sha256: staged.digest },
+          });
+          createdObject = true;
+        } catch {
+          // A remote object store can durably publish and lose the response. Converge on the exact
+          // immutable identity; any mismatch remains a conflict and is never overwritten.
+          const raced = await this.#objects.get(objectKey);
+          if (
+            !raced || raced.metadata.sha256 !== staged.digest ||
+            raced.contentLength !== staged.bytes
+          ) {
+            if (raced?.body) await raced.body.cancel().catch(() => undefined);
+            throw new BackupServiceError(
+              "conflict",
+              "The provider-secret upload could not be stored",
+            );
+          }
+          await raced.body.cancel().catch(() => undefined);
+          createdObject = true;
+        }
+      }
+      const stored = await this.#objects.get(objectKey);
+      if (
+        !stored?.body || stored.contentLength !== staged.bytes ||
+        stored.metadata.sha256 !== staged.digest
+      ) {
+        if (stored?.body) await stored.body.cancel().catch(() => undefined);
+        if (createdObject) await this.#objects.delete(objectKey).catch(() => undefined);
+        throw new BackupServiceError(
+          "conflict",
+          "The provider-secret upload could not be verified",
+        );
+      }
+      const storedHash = createHash("sha256");
+      let storedBytes = 0;
+      for await (const chunk of webChunks(stored.body)) {
+        storedHash.update(chunk);
+        storedBytes += chunk.byteLength;
+      }
+      if (storedBytes !== staged.bytes || storedHash.digest("hex") !== staged.digest) {
+        if (createdObject) await this.#objects.delete(objectKey).catch(() => undefined);
+        throw new BackupServiceError("conflict", "The provider-secret upload failed verification");
+      }
+      let attachment;
+      try {
+        attachment = await providerSecretStoreCall(() =>
+          store.create({
+            restoreOperationId: input.restoreId,
+            requestedBy: input.actorId,
+            idempotencyKey: input.idempotencyKey,
+            sourceObjectKey: objectKey,
+            archiveSha256: staged.digest,
+            archiveBytes: staged.bytes,
+            sidecarId: authenticated.header.sidecarId,
+            recoveryKeyId: authenticated.header.encryption.wrapping.keyId,
+            baseBackupId: binding.backupId,
+            baseArchiveSha256: binding.archiveSha256,
+            baseContentRootSha256: binding.contentRootSha256,
+            sourceInstallationId: binding.sourceInstallationId,
+          })
+        );
+      } catch (error) {
+        if (createdObject) {
+          try {
+            const durable = await providerSecretStoreCall(() =>
+              store.findByIdempotency(input.restoreId, input.idempotencyKey)
+            );
+            if (!durable || durable.sourceObjectKey !== objectKey) {
+              await this.#objects.delete(objectKey).catch(() => undefined);
+            }
+          } catch { /* Ambiguous ownership preserves ciphertext for deterministic cleanup. */ }
+        }
+        throw error;
+      }
+      return {
+        id: attachment.id,
+        restoreId: attachment.restoreOperationId,
+        status: "uploaded",
+        version: attachment.version,
+        filename: staged.filename,
+        bytes: attachment.archiveBytes,
+        baseFingerprint: attachment.baseArchiveSha256,
+        sidecarFingerprint: attachment.archiveSha256,
+        recoveryKeyId: attachment.recoveryKeyId,
+        createdAt: attachment.createdAt,
+      };
+    } finally {
+      await Deno.remove(staged.path).catch(() => undefined);
+    }
+  }
+  async #readProviderSecretAttachment(
+    attachment: {
+      sourceObjectKey: string;
+      archiveSha256: string;
+      archiveBytes: number;
+      baseBackupId: string;
+      baseArchiveSha256: string;
+      baseContentRootSha256: string;
+      sourceInstallationId: string;
+    },
+    sink: Parameters<typeof restoreProviderSecretSidecarV1>[0]["sink"],
+  ) {
+    const { keyrings } = this.#providerSecretRestoreDependencies();
+    const stored = await this.#objects.get(attachment.sourceObjectKey);
+    if (
+      !stored?.body || stored.contentLength !== attachment.archiveBytes ||
+      stored.metadata.sha256 !== attachment.archiveSha256
+    ) {
+      if (stored?.body) await stored.body.cancel().catch(() => undefined);
+      throw new BackupServiceError("not_found", "The provider-secret upload is unavailable");
+    }
+    const digest = createHash("sha256");
+    let size = 0;
+    async function* source() {
+      for await (const chunk of webChunks(stored!.body)) {
+        digest.update(chunk);
+        size += chunk.byteLength;
+        yield chunk;
+      }
+    }
+    const summary = await restoreProviderSecretSidecarV1({
+      source: source(),
+      keyring: keyrings.recoveryKeyring,
+      expectedBinding: {
+        backupId: attachment.baseBackupId,
+        archiveSha256: attachment.baseArchiveSha256,
+        contentRootSha256: attachment.baseContentRootSha256,
+        sourceInstallationId: attachment.sourceInstallationId,
+      },
+      sink,
+    });
+    if (size !== attachment.archiveBytes || digest.digest("hex") !== attachment.archiveSha256) {
+      throw new BackupServiceError("conflict", "The provider-secret upload failed verification");
+    }
+    return summary;
+  }
+  #providerSecretPreview(attachment: {
+    id: string;
+    restoreOperationId: string;
+    status: string;
+    version: number;
+    baseArchiveSha256: string;
+    archiveSha256: string;
+    recoveryKeyId: string;
+    recordCount: number | null;
+    impact: Record<string, unknown> | null;
+  }): ProviderSecretRestorePreview {
+    const impact = attachment.impact as unknown as {
+      providers?: ProviderSecretRestorePreview["providers"];
+      warnings?: string[];
+      blockingErrors?: string[];
+    };
+    if (attachment.status !== "validated" || attachment.recordCount == null) {
+      throw new BackupServiceError("conflict", "The provider-secret preview is unavailable");
+    }
+    return {
+      id: attachment.id,
+      restoreId: attachment.restoreOperationId,
+      status: "validated",
+      version: attachment.version,
+      baseFingerprint: attachment.baseArchiveSha256,
+      sidecarFingerprint: attachment.archiveSha256,
+      recoveryKeyId: attachment.recoveryKeyId,
+      recordCount: attachment.recordCount,
+      providers: impact.providers ?? [],
+      warnings: impact.warnings ?? [],
+      blockingErrors: impact.blockingErrors ?? [],
+      providersRemainDisabled: true,
+    };
+  }
+  async previewProviderSecretRestore(
+    _actorId: string,
+    restoreId: string,
+    sidecarId: string,
+  ): Promise<ProviderSecretRestorePreview> {
+    const { store } = this.#providerSecretRestoreDependencies();
+    let attachment = await providerSecretStoreCall(() => store.get(sidecarId));
+    if (attachment.restoreOperationId !== restoreId) {
+      throw new BackupServiceError("not_found", "The provider-secret restore was not found");
+    }
+    if (attachment.status === "validated") return this.#providerSecretPreview(attachment);
+    if (attachment.status !== "uploaded") {
+      throw new BackupServiceError("conflict", "The provider-secret restore cannot be previewed");
+    }
+    const providerIds: string[] = [];
+    let summary;
+    try {
+      summary = await this.#readProviderSecretAttachment(attachment, {
+        begin() {},
+        write(record) {
+          providerIds.push(record.providerId);
+        },
+        commit() {},
+        abort() {},
+      });
+    } catch (error) {
+      await store.fail(attachment.id, attachment.version, "archive_invalid").catch(() => undefined);
+      throw error instanceof BackupServiceError
+        ? error
+        : new BackupServiceError("conflict", "The provider-secret upload is invalid");
+    }
+    const destinations = await providerSecretStoreCall(() =>
+      store.previewProviders(
+        attachment.id,
+        attachment.version,
+        providerIds,
+      )
+    );
+    const byId = new Map(destinations.map((provider) => [provider.providerId, provider]));
+    const blockers: string[] = [];
+    const providers = providerIds.map((providerId) => {
+      const provider = byId.get(providerId);
+      let reason: string | null = null;
+      if (!provider) reason = "The provider is missing from the restored backup.";
+      else if (provider.enabled) reason = "The provider was enabled after the base restore.";
+      else if (provider.credentialPresent) {
+        reason = "The provider already has a credential and will not be overwritten.";
+      }
+      if (reason) blockers.push(`${provider?.displayName ?? providerId}: ${reason}`);
+      return {
+        providerId,
+        displayName: provider?.displayName ?? "Missing provider",
+        action: reason ? "blocked" as const : "restore" as const,
+        reason,
+      };
+    });
+    if (blockers.length) {
+      throw new BackupServiceError(
+        "conflict",
+        `Provider-secret restore is blocked: ${blockers.join(" ")}`,
+      );
+    }
+    const providerPlan = providerIds.map((providerId) => ({
+      providerId,
+      expectedVersion: byId.get(providerId)!.version,
+    }));
+    const impact = {
+      providers,
+      warnings: [
+        "Restored providers remain disabled until an administrator tests and enables them.",
+      ],
+      blockingErrors: [],
+      providersRemainDisabled: true,
+    };
+    attachment = await providerSecretStoreCall(() =>
+      store.validate(attachment.id, attachment.version, {
+        recordCount: summary.recordCount,
+        recordsSha256: summary.recordsSha256,
+        providerPlan,
+        impact,
+      })
+    );
+    return this.#providerSecretPreview(attachment);
+  }
+  async applyProviderSecretRestore(input: {
+    actorId: string;
+    restoreId: string;
+    sidecarId: string;
+    expectedVersion: number;
+    baseFingerprint: string;
+    sidecarFingerprint: string;
+  }): Promise<ProviderSecretRestoreResult> {
+    const { store, keyrings } = this.#providerSecretRestoreDependencies();
+    const attachment = await providerSecretStoreCall(() => store.get(input.sidecarId));
+    if (
+      attachment.restoreOperationId !== input.restoreId || attachment.status !== "validated" ||
+      attachment.version !== input.expectedVersion ||
+      attachment.baseArchiveSha256 !== input.baseFingerprint ||
+      attachment.archiveSha256 !== input.sidecarFingerprint ||
+      !attachment.providerPlan || !attachment.providerStateSha256 ||
+      !attachment.recordsSha256
+    ) throw new BackupServiceError("conflict", "The provider-secret confirmation is stale");
+    const providerStateSha256 = attachment.providerStateSha256;
+    const spoolPath = await Deno.makeTempFile({
+      prefix: "dg-provider-secret-envelopes-",
+      suffix: ".ndjson",
+    });
+    await Deno.chmod(spoolPath, 0o600);
+    const spool = await Deno.open(spoolPath, { write: true, truncate: true });
+    let index = 0;
+    let summary;
+    try {
+      try {
+        summary = await this.#readProviderSecretAttachment(attachment, {
+          begin() {},
+          async write(record) {
+            const plan = attachment.providerPlan![index++];
+            if (!plan || plan.providerId !== record.providerId) {
+              throw new TypeError("Provider-secret restore plan does not match the sidecar");
+            }
+            const envelope = await keyrings.providerKeyring.encryptBytes(
+              record.providerId,
+              plan.expectedVersion + 1,
+              record.secret,
+            );
+            const line = encoder.encode(`${
+              canonicalJson({
+                providerId: record.providerId,
+                expectedVersion: plan.expectedVersion,
+                envelope,
+              })
+            }\n`);
+            if (line.byteLength - 1 > MAX_DESTINATION_CREDENTIAL_LINE_BYTES) {
+              line.fill(0);
+              throw new RangeError("Destination credential envelope is too large");
+            }
+            try {
+              let offset = 0;
+              while (offset < line.byteLength) {
+                offset += await spool.write(line.subarray(offset));
+              }
+            } finally {
+              line.fill(0);
+            }
+          },
+          commit() {},
+          abort() {},
+        });
+      } finally {
+        spool.close();
+      }
+      if (
+        index !== attachment.providerPlan.length ||
+        summary.recordCount !== attachment.recordCount ||
+        summary.recordsSha256 !== attachment.recordsSha256
+      ) {
+        throw new BackupServiceError("conflict", "The provider-secret restore plan is stale");
+      }
+      const applied = await providerSecretStoreCall(() =>
+        store.apply(
+          attachment.id,
+          attachment.version,
+          input.actorId,
+          providerStateSha256,
+          destinationCredentialSpool(spoolPath),
+        )
+      );
+      return {
+        id: applied.id,
+        restoreId: applied.restoreOperationId,
+        status: "applied",
+        providerCount: applied.recordCount!,
+        providersRemainDisabled: true,
+        appliedAt: applied.appliedAt!,
+      };
+    } catch (error) {
+      try {
+        spool.close();
+      } catch { /* already closed */ }
+      throw error instanceof BackupServiceError
+        ? error
+        : new BackupServiceError("conflict", "The provider-secret upload is invalid");
+    } finally {
+      await Deno.remove(spoolPath).catch(() => undefined);
+    }
+  }
   async uploadRestore(
     input: { actorId: string; request: Request; idempotencyKey: string },
   ): Promise<BackupRestoreUploadSummary> {
@@ -1397,12 +1985,58 @@ export class DefaultBackupAdminService implements BackupAdminService {
       throw error;
     }
   }
+  async #cleanupAppliedProviderSecretRestoreObjects(signal?: AbortSignal) {
+    const store = this.#providerSecretRestoreStore;
+    if (!store) return;
+    const leaseToken = crypto.randomUUID();
+    const abandoned = await store.claimCleanup(
+      leaseToken,
+      this.#artifactCleanupLeaseSeconds,
+      this.#artifactSweepIntervalMs,
+      100,
+    );
+    if (signal?.aborted || this.#closing) {
+      await Promise.allSettled(
+        abandoned.map((attachment) => store.releaseCleanup(attachment.id, leaseToken)),
+      );
+      throw aborted(signal ?? AbortSignal.abort());
+    }
+    try {
+      for (const attachment of abandoned) {
+        if (signal?.aborted || this.#closing) throw aborted(signal ?? AbortSignal.abort());
+        const deletion = this.#objects.delete(attachment.sourceObjectKey);
+        if (signal) await abortable(deletion, signal);
+        else await deletion;
+        const lookup = this.#objects.get(attachment.sourceObjectKey);
+        const remaining = signal ? await abortable(lookup, signal) : await lookup;
+        if (remaining) {
+          await remaining.body.cancel().catch(() => undefined);
+          throw new Error("Provider-secret restore object remained after cleanup");
+        }
+        if (signal?.aborted || this.#closing) throw aborted(signal ?? AbortSignal.abort());
+        const completion = store.recordCleanup(
+          attachment.id,
+          attachment.sourceObjectKey,
+          attachment.archiveSha256,
+          leaseToken,
+        );
+        if (signal) await abortable(completion, signal);
+        else await completion;
+      }
+    } catch (error) {
+      await Promise.allSettled(
+        abandoned.map((attachment) => store.releaseCleanup(attachment.id, leaseToken)),
+      );
+      throw error;
+    }
+  }
   async #cleanupRecoverableExportArtifacts(signal?: AbortSignal) {
     // The two tombstone domains are deliberately independent. An outage or malformed legacy row
     // affecting one artifact must never starve cleanup of its paired artifact.
     const results = await Promise.allSettled([
       this.#cleanupRecoverableBaseExportArtifacts(signal),
       this.#cleanupRecoverableProviderSecretArtifacts(signal),
+      this.#cleanupAppliedProviderSecretRestoreObjects(signal),
     ]);
     const failures = results.filter((result): result is PromiseRejectedResult =>
       result.status === "rejected"
@@ -1502,6 +2136,9 @@ export class DefaultBackupAdminService implements BackupAdminService {
       work,
       new Promise<void>((resolve) => setTimeout(resolve, this.#shutdownGraceMs)),
     ]);
-    await this.#store.close();
+    await Promise.all([
+      this.#store.close(),
+      this.#providerSecretRestoreStore?.close() ?? Promise.resolve(),
+    ]);
   }
 }

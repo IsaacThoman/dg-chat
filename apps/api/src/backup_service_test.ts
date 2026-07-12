@@ -1,9 +1,16 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.14";
-import type { BackupOperation, ObjectStore, PutObjectInput, StoredObject } from "@dg-chat/database";
+import type {
+  BackupOperation,
+  ObjectStore,
+  PutObjectInput,
+  RestoreProviderSecretsAttachment,
+  StoredObject,
+} from "@dg-chat/database";
 import {
   backupContentRoot,
   BackupOperationError,
   createHmacBackupAuthenticator,
+  encryptProviderSecretSidecarV1,
   importProviderSecretKek,
   restoreProviderSecretSidecarV1,
   sha256Hex,
@@ -11,6 +18,7 @@ import {
   writeBackupArchive,
 } from "@dg-chat/database";
 import { ProviderSecretKeyring } from "./provider-secrets.ts";
+import type { ProviderSecretEnvelope } from "./provider-secrets.ts";
 import {
   BackupDataPort,
   BackupExportSnapshot,
@@ -37,6 +45,9 @@ async function bytes(stream: ReadableStream<Uint8Array>) {
     offset += chunk.length;
   }
   return result;
+}
+async function iterableBytes(stream: AsyncIterable<Uint8Array>) {
+  return await bytes(ReadableStream.from(stream));
 }
 class MemoryObjects implements ObjectStore {
   values = new Map<string, { bytes: Uint8Array; input: PutObjectInput }>();
@@ -610,6 +621,159 @@ class MemoryStore {
     return Promise.resolve();
   }
 }
+class MemoryProviderSecretRestoreStore {
+  attachment: RestoreProviderSecretsAttachment | undefined;
+  readonly providers = new Map<string, {
+    displayName: string;
+    version: number;
+    enabled: boolean;
+    credentialPresent: boolean;
+  }>();
+  appliedCredentials: Array<{ providerId: string; envelope: unknown }> = [];
+  failApply = false;
+  create(input: {
+    restoreOperationId: string;
+    requestedBy: string;
+    idempotencyKey: string;
+    sourceObjectKey: string;
+    archiveSha256: string;
+    archiveBytes: number;
+    sidecarId: string;
+    recoveryKeyId: string;
+    baseBackupId: string;
+    baseArchiveSha256: string;
+    baseContentRootSha256: string;
+    sourceInstallationId: string;
+  }) {
+    if (this.attachment) return Promise.resolve(structuredClone(this.attachment));
+    const now = new Date().toISOString();
+    this.attachment = {
+      id: crypto.randomUUID(),
+      restoreOperationId: input.restoreOperationId,
+      status: "uploaded",
+      version: 1,
+      idempotencyKey: input.idempotencyKey,
+      requestedBy: input.requestedBy,
+      appliedBy: null,
+      sourceObjectKey: input.sourceObjectKey,
+      archiveSha256: input.archiveSha256,
+      archiveBytes: input.archiveBytes,
+      sidecarId: input.sidecarId,
+      recoveryKeyId: input.recoveryKeyId,
+      baseBackupId: input.baseBackupId,
+      baseArchiveSha256: input.baseArchiveSha256,
+      baseContentRootSha256: input.baseContentRootSha256,
+      sourceInstallationId: input.sourceInstallationId,
+      baseRestoreEpoch: 1,
+      recordCount: null,
+      recordsSha256: null,
+      providerStateSha256: null,
+      providerPlan: null,
+      impact: null,
+      error: null,
+      cleanupCheckedAt: null,
+      cleanupLeaseToken: null,
+      cleanupLeaseExpiresAt: null,
+      createdAt: now,
+      validatedAt: null,
+      appliedAt: null,
+      completedAt: null,
+      updatedAt: now,
+    };
+    return Promise.resolve(structuredClone(this.attachment));
+  }
+  get(id: string) {
+    if (!this.attachment || this.attachment.id !== id) throw new Error("missing sidecar");
+    return Promise.resolve(structuredClone(this.attachment));
+  }
+  findByIdempotency(restoreId: string, key: string) {
+    const item = this.attachment;
+    return Promise.resolve(
+      item?.restoreOperationId === restoreId && item.idempotencyKey === key
+        ? structuredClone(item)
+        : undefined,
+    );
+  }
+  previewProviders(_id: string, _version: number, providerIds: readonly string[]) {
+    return Promise.resolve(providerIds.flatMap((providerId) => {
+      const provider = this.providers.get(providerId);
+      return provider ? [{ providerId, ...provider }] : [];
+    }));
+  }
+  validate(
+    id: string,
+    version: number,
+    input: {
+      recordCount: number;
+      recordsSha256: string;
+      providerPlan: readonly { providerId: string; expectedVersion: number }[];
+      impact: Record<string, unknown>;
+    },
+  ) {
+    if (!this.attachment || this.attachment.id !== id || this.attachment.version !== version) {
+      throw new Error("stale");
+    }
+    Object.assign(this.attachment, {
+      status: "validated",
+      version: version + 1,
+      recordCount: input.recordCount,
+      recordsSha256: input.recordsSha256,
+      providerStateSha256: "9".repeat(64),
+      providerPlan: structuredClone(input.providerPlan),
+      impact: structuredClone(input.impact),
+      validatedAt: new Date().toISOString(),
+    });
+    return Promise.resolve(structuredClone(this.attachment));
+  }
+  async apply(
+    id: string,
+    version: number,
+    actorId: string,
+    _state: string,
+    credentials:
+      | Iterable<{ providerId: string; expectedVersion: number; envelope: ProviderSecretEnvelope }>
+      | AsyncIterable<{
+        providerId: string;
+        expectedVersion: number;
+        envelope: ProviderSecretEnvelope;
+      }>,
+  ) {
+    for await (const credential of credentials) {
+      this.appliedCredentials.push(structuredClone(credential));
+    }
+    if (this.failApply) throw new Error("apply failed");
+    if (!this.attachment || this.attachment.id !== id || this.attachment.version !== version) {
+      throw new Error("stale");
+    }
+    Object.assign(this.attachment, {
+      status: "applied",
+      version: version + 1,
+      appliedBy: actorId,
+      appliedAt: new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+    });
+    return structuredClone(this.attachment);
+  }
+  fail(id: string, version: number, error: string) {
+    if (!this.attachment || this.attachment.id !== id || this.attachment.version !== version) {
+      throw new Error("stale");
+    }
+    Object.assign(this.attachment, { status: "failed", version: version + 1, error });
+    return Promise.resolve(structuredClone(this.attachment));
+  }
+  claimCleanup() {
+    return Promise.resolve<RestoreProviderSecretsAttachment[]>([]);
+  }
+  recordCleanup() {
+    return Promise.resolve(true);
+  }
+  releaseCleanup() {
+    return Promise.resolve(true);
+  }
+  close() {
+    return Promise.resolve();
+  }
+}
 async function setup(
   options: {
     failApplySession?: boolean;
@@ -727,6 +891,17 @@ function uploadRequest(archive: Uint8Array, filename = "installation.dgbackup") 
     filename,
   );
   return new Request("http://local/upload", { method: "POST", body: form });
+}
+function providerSecretUploadRequest(sidecar: Uint8Array, filename = "provider-secrets.dgsecrets") {
+  const form = new FormData();
+  form.append(
+    "file",
+    new Blob([new Uint8Array(sidecar).buffer], {
+      type: "application/vnd.dg-chat.provider-secrets",
+    }),
+    filename,
+  );
+  return new Request("http://local/upload-provider-secrets", { method: "POST", body: form });
 }
 async function completed(store: MemoryStore, id: string) {
   for (let attempt = 0; attempt < 100; attempt++) {
@@ -873,6 +1048,185 @@ Deno.test("privileged export stores and verifies an independently encrypted pair
   });
   assertEquals(restoredSecret, "source-provider-secret");
   assertEquals(committed, true);
+  await service.close();
+});
+
+Deno.test("provider-secret restore authenticates, previews, re-encrypts through a bounded spool, and applies disabled", async () => {
+  const fx = await setup();
+  await fx.service.close();
+  const base = operation("restore", { filename: "base.dgbackup", bytes: 100 }, "sidecar-base");
+  Object.assign(base, {
+    status: "completed",
+    stage: "completed",
+    archiveSha256: "a".repeat(64),
+    manifest: fx.snapshot.manifest,
+    completedAt: new Date().toISOString(),
+  });
+  fx.store.items.set(base.id, base);
+  const providerId = "66666666-6666-4666-8666-666666666666";
+  const recoveryKey = await importProviderSecretKek(new Uint8Array(32).fill(44));
+  const recoveryKeyring = {
+    primaryKeyId: "recovery-v1",
+    primary: () => Promise.resolve({ keyId: "recovery-v1", key: recoveryKey }),
+    resolve: (keyId: string) => Promise.resolve(keyId === "recovery-v1" ? recoveryKey : undefined),
+  };
+  const destinationKeyring = new ProviderSecretKeyring({
+    primaryKeyId: "destination-v1",
+    keys: new Map([["destination-v1", new Uint8Array(32).fill(55)]]),
+  });
+  const sourceSecret = encoder.encode("portable-provider-secret");
+  const sidecar = await iterableBytes(encryptProviderSecretSidecarV1({
+    binding: {
+      backupId: fx.snapshot.manifest.backupId,
+      archiveSha256: base.archiveSha256!,
+      contentRootSha256: fx.snapshot.manifest.contentRootSha256,
+      sourceInstallationId: fx.snapshot.manifest.source.installationId,
+    },
+    kek: { keyId: "recovery-v1", key: recoveryKey },
+    records: [{ providerId, credentialVersion: 8, secret: sourceSecret }],
+  }));
+  sourceSecret.fill(0);
+  const restoreStore = new MemoryProviderSecretRestoreStore();
+  restoreStore.providers.set(providerId, {
+    displayName: "Portable provider",
+    version: 4,
+    enabled: false,
+    credentialPresent: false,
+  });
+  const service = new DefaultBackupAdminService({
+    store: fx.store,
+    objects: fx.objects,
+    data: fx.data,
+    authenticator: fx.auth,
+    restoreEnabled: true,
+    privilegedProviderSecrets: {
+      recoveryKeyring,
+      providerKeyring: destinationKeyring,
+    },
+    providerSecretRestoreStore: restoreStore,
+  });
+  const uploaded = await service.uploadProviderSecretRestore({
+    actorId: ACTOR,
+    restoreId: base.id,
+    request: providerSecretUploadRequest(sidecar),
+    idempotencyKey: "restore-provider-secret-upload-1",
+  });
+  assertEquals(uploaded.status, "uploaded");
+  const preview = await service.previewProviderSecretRestore(ACTOR, base.id, uploaded.id);
+  assertEquals(preview.providers, [{
+    providerId,
+    displayName: "Portable provider",
+    action: "restore",
+    reason: null,
+  }]);
+  assertEquals(preview.providersRemainDisabled, true);
+  const applied = await service.applyProviderSecretRestore({
+    actorId: ACTOR,
+    restoreId: base.id,
+    sidecarId: uploaded.id,
+    expectedVersion: preview.version,
+    baseFingerprint: preview.baseFingerprint,
+    sidecarFingerprint: preview.sidecarFingerprint,
+  });
+  assertEquals(applied.providerCount, 1);
+  assertEquals(applied.providersRemainDisabled, true);
+  const restored = await destinationKeyring.decrypt(
+    providerId,
+    restoreStore.appliedCredentials[0].envelope as ProviderSecretEnvelope,
+  );
+  assertEquals(restored, "portable-provider-secret");
+
+  // A database failure occurs only after the encrypted spool is consumed. The service must still
+  // remove the mode-0600 temporary file on every exit path.
+  restoreStore.attachment!.status = "validated";
+  restoreStore.attachment!.version = preview.version;
+  restoreStore.failApply = true;
+  const before = new Set(
+    [...Deno.readDirSync(Deno.env.get("TMPDIR") ?? "/tmp")]
+      .filter((entry) => entry.name.startsWith("dg-provider-secret-envelopes-"))
+      .map((entry) => entry.name),
+  );
+  await assertRejects(
+    () =>
+      service.applyProviderSecretRestore({
+        actorId: ACTOR,
+        restoreId: base.id,
+        sidecarId: uploaded.id,
+        expectedVersion: preview.version,
+        baseFingerprint: preview.baseFingerprint,
+        sidecarFingerprint: preview.sidecarFingerprint,
+      }),
+    BackupServiceError,
+  );
+  const after = [...Deno.readDirSync(Deno.env.get("TMPDIR") ?? "/tmp")]
+    .filter((entry) => entry.name.startsWith("dg-provider-secret-envelopes-"))
+    .map((entry) => entry.name);
+  assertEquals(after.filter((name) => !before.has(name)), []);
+  await service.close();
+});
+
+Deno.test("provider-secret upload converges after a lost object-store PUT response", async () => {
+  const fx = await setup();
+  await fx.service.close();
+  const base = operation("restore", {}, "lost-sidecar-put-base");
+  Object.assign(base, {
+    status: "completed",
+    stage: "completed",
+    archiveSha256: "b".repeat(64),
+    manifest: fx.snapshot.manifest,
+    completedAt: new Date().toISOString(),
+  });
+  fx.store.items.set(base.id, base);
+  const recoveryKey = await importProviderSecretKek(new Uint8Array(32).fill(66));
+  const recoveryKeyring = {
+    primaryKeyId: "recovery-v2",
+    primary: () => Promise.resolve({ keyId: "recovery-v2", key: recoveryKey }),
+    resolve: (keyId: string) => Promise.resolve(keyId === "recovery-v2" ? recoveryKey : undefined),
+  };
+  const sidecar = await iterableBytes(encryptProviderSecretSidecarV1({
+    binding: {
+      backupId: fx.snapshot.manifest.backupId,
+      archiveSha256: base.archiveSha256!,
+      contentRootSha256: fx.snapshot.manifest.contentRootSha256,
+      sourceInstallationId: fx.snapshot.manifest.source.installationId,
+    },
+    kek: { keyId: "recovery-v2", key: recoveryKey },
+    records: [],
+  }));
+  class LostResponseObjects extends MemoryObjects {
+    first = true;
+    override async put(input: PutObjectInput) {
+      const result = await super.put(input);
+      if (this.first) {
+        this.first = false;
+        throw new Error("response lost");
+      }
+      return result;
+    }
+  }
+  const objects = new LostResponseObjects();
+  const restoreStore = new MemoryProviderSecretRestoreStore();
+  const destinationKeyring = new ProviderSecretKeyring({
+    primaryKeyId: "destination-v2",
+    keys: new Map([["destination-v2", new Uint8Array(32).fill(77)]]),
+  });
+  const service = new DefaultBackupAdminService({
+    store: fx.store,
+    objects,
+    data: fx.data,
+    authenticator: fx.auth,
+    restoreEnabled: true,
+    privilegedProviderSecrets: { recoveryKeyring, providerKeyring: destinationKeyring },
+    providerSecretRestoreStore: restoreStore,
+  });
+  const uploaded = await service.uploadProviderSecretRestore({
+    actorId: ACTOR,
+    restoreId: base.id,
+    request: providerSecretUploadRequest(sidecar),
+    idempotencyKey: "lost-provider-secret-put-response",
+  });
+  assertEquals(uploaded.status, "uploaded");
+  assertEquals(objects.values.size, 1);
   await service.close();
 });
 
