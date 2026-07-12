@@ -55,6 +55,12 @@ Deno.test({
             version: 1,
           })
         }) RETURNING id`;
+        const [state] = await sql<{ restore_epoch: string }[]>`
+          UPDATE installation_state SET restore_epoch=restore_epoch+1,version=version+1,
+            updated_at=now() WHERE singleton_id=1 RETURNING restore_epoch`;
+        await sql`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+          VALUES(${actor},'backup.restore.database_committed','backup_operation',${row.id},
+            ${sql.json({ restoreEpoch: Number(state.restore_epoch) })})`;
         return row.id;
       };
       const restoreId = await makeRestore("sidecar-store-restore-one");
@@ -72,8 +78,9 @@ Deno.test({
         baseContentRootSha256: base.contentRootSha256,
         sourceInstallationId: base.sourceInstallationId,
       };
-      const uploaded = await store.create(create);
-      assertEquals((await store.create(create)).id, uploaded.id);
+      const concurrent = await Promise.all([store.create(create), store.create(create)]);
+      const uploaded = concurrent[0];
+      assertEquals(concurrent[1].id, uploaded.id);
       await assertRejects(
         () => store.create({ ...create, idempotencyKey: "different-upload-key" }),
         RestoreProviderSecretsStoreError,
@@ -87,10 +94,17 @@ Deno.test({
           id,slug,display_name,base_url,protocol,enabled,version,health_status
         ) VALUES(${providerId},'restored','Restored','https://example.com/v1','chat_completions',
           false,4,'disabled')`;
+      assertEquals(await store.previewProviders(uploaded.id, uploaded.version, [providerId]), [{
+        providerId,
+        displayName: "Restored",
+        version: 4,
+        enabled: false,
+        credentialPresent: false,
+      }]);
       const validated = await store.validate(uploaded.id, uploaded.version, {
         recordCount: 1,
         recordsSha256: digest("d"),
-        providerStateSha256: digest("e"),
+        providerPlan: [{ providerId, expectedVersion: 4 }],
         impact: { ready: 1, blocked: 0 },
       });
       const applied = await store.apply(
@@ -145,9 +159,36 @@ Deno.test({
       const rollbackValidated = await store.validate(rollbackUpload.id, rollbackUpload.version, {
         recordCount: 2,
         recordsSha256: digest("f"),
-        providerStateSha256: digest("1"),
+        providerPlan: [
+          { providerId: first, expectedVersion: 2 },
+          { providerId: second, expectedVersion: 3 },
+        ].sort((a, b) => a.providerId.localeCompare(b.providerId)),
         impact: { ready: 2 },
       });
+      const substitute = crypto.randomUUID();
+      await sql`INSERT INTO providers(
+          id,slug,display_name,base_url,protocol,enabled,version,health_status
+        ) VALUES(${substitute},'substitute','Substitute','https://substitute.example/v1',
+          'chat_completions',false,3,'disabled')`;
+      await assertRejects(
+        () =>
+          store.apply(
+            rollbackValidated.id,
+            rollbackValidated.version,
+            actor,
+            rollbackValidated.providerStateSha256!,
+            [
+              { providerId: first, expectedVersion: 2, envelope: envelope(3) },
+              { providerId: substitute, expectedVersion: 3, envelope: envelope(4) },
+            ],
+          ),
+        RestoreProviderSecretsStoreError,
+      );
+      assertEquals(
+        (await sql<{ credential_envelope: unknown }[]>`
+          SELECT credential_envelope FROM providers WHERE id=${first}`)[0].credential_envelope,
+        null,
+      );
       await sql`UPDATE providers SET version=4 WHERE id=${second}`;
       await assertRejects(
         () =>
@@ -167,6 +208,45 @@ Deno.test({
         SELECT credential_envelope,version FROM providers WHERE id=${first}`;
       assertEquals(rolledBack, { credential_envelope: null, version: 2 });
       assertEquals((await store.get(rollbackValidated.id)).status, "validated");
+
+      const epochRestoreId = await makeRestore("sidecar-store-restore-epoch");
+      const epochUpload = await store.create({
+        ...create,
+        restoreOperationId: epochRestoreId,
+        idempotencyKey: "sidecar-store-upload-epoch",
+        sourceObjectKey: `backups/restores/${epochRestoreId}/provider-secrets.dgsecrets`,
+        sidecarId: crypto.randomUUID(),
+      });
+      const epochProvider = crypto.randomUUID();
+      await sql`INSERT INTO providers(
+          id,slug,display_name,base_url,protocol,enabled,version,health_status
+        ) VALUES(${epochProvider},'epoch','Epoch','https://epoch.example/v1','chat_completions',
+          false,6,'disabled')`;
+      const epochValidated = await store.validate(epochUpload.id, epochUpload.version, {
+        recordCount: 1,
+        recordsSha256: digest("2"),
+        providerPlan: [{ providerId: epochProvider, expectedVersion: 6 }],
+        impact: { ready: 1 },
+      });
+      await sql`UPDATE installation_state SET restore_epoch=restore_epoch+1,version=version+1
+        WHERE singleton_id=1`;
+      await assertRejects(
+        () =>
+          store.apply(
+            epochValidated.id,
+            epochValidated.version,
+            actor,
+            epochValidated.providerStateSha256!,
+            [{ providerId: epochProvider, expectedVersion: 6, envelope: envelope(7) }],
+          ),
+        RestoreProviderSecretsStoreError,
+      );
+      assertEquals(
+        (await sql<{ credential_envelope: unknown }[]>`
+          SELECT credential_envelope FROM providers WHERE id=${epochProvider}`)[0]
+          .credential_envelope,
+        null,
+      );
     } finally {
       await store.close();
       await sql.end();

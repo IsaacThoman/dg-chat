@@ -1,5 +1,6 @@
 import postgres from "npm:postgres@3.4.7";
 import type { ProviderCredentialEnvelope } from "./repository.ts";
+import { encodeCanonicalJson, sha256Hex } from "./backup-format.ts";
 
 type Sql = ReturnType<typeof postgres>;
 type JsonObject = Record<string, unknown>;
@@ -29,9 +30,11 @@ export interface RestoreProviderSecretsAttachment {
   baseArchiveSha256: string;
   baseContentRootSha256: string;
   sourceInstallationId: string;
+  baseRestoreEpoch: number;
   recordCount: number | null;
   recordsSha256: string | null;
   providerStateSha256: string | null;
+  providerPlan: readonly RestoreProviderPlanEntry[] | null;
   impact: JsonObject | null;
   error: string | null;
   cleanupCheckedAt: string | null;
@@ -62,8 +65,21 @@ export interface CreateRestoreProviderSecretsAttachment {
 export interface ValidateRestoreProviderSecretsAttachment {
   recordCount: number;
   recordsSha256: string;
-  providerStateSha256: string;
+  providerPlan: readonly RestoreProviderPlanEntry[];
   impact: JsonObject;
+}
+
+export interface RestoreProviderPlanEntry {
+  providerId: string;
+  expectedVersion: number;
+}
+
+export interface RestoreProviderPreview {
+  providerId: string;
+  displayName: string;
+  version: number;
+  enabled: boolean;
+  credentialPresent: boolean;
 }
 
 export interface RestoredProviderCredential {
@@ -130,11 +146,13 @@ function map(row: Row): RestoreProviderSecretsAttachment {
     baseArchiveSha256: String(row.base_archive_sha256),
     baseContentRootSha256: String(row.base_content_root_sha256),
     sourceInstallationId: String(row.source_installation_id),
+    baseRestoreEpoch: Number(row.base_restore_epoch),
     recordCount: row.record_count == null ? null : Number(row.record_count),
     recordsSha256: row.records_sha256 == null ? null : String(row.records_sha256),
     providerStateSha256: row.provider_state_sha256 == null
       ? null
       : String(row.provider_state_sha256),
+    providerPlan: row.provider_plan == null ? null : providerPlan(row.provider_plan),
     impact: row.impact == null ? null : json(row.impact, "Stored sidecar impact"),
     error: row.error == null ? null : String(row.error),
     cleanupCheckedAt: nullableIso(row.cleanup_checked_at),
@@ -146,6 +164,63 @@ function map(row: Row): RestoreProviderSecretsAttachment {
     completedAt: nullableIso(row.completed_at),
     updatedAt: iso(row.updated_at),
   };
+}
+
+function providerPlan(value: unknown): readonly RestoreProviderPlanEntry[] {
+  if (!Array.isArray(value)) {
+    throw new RestoreProviderSecretsStoreError("invalid", "Stored provider plan is invalid");
+  }
+  let previous = "";
+  return value.map((entry) => {
+    if (
+      !entry || typeof entry !== "object" || Array.isArray(entry) ||
+      Object.keys(entry).sort().join() !== "expectedVersion,providerId"
+    ) throw new RestoreProviderSecretsStoreError("invalid", "Stored provider plan is invalid");
+    const providerId = String((entry as Row).providerId);
+    const normalizedProviderId = providerId.toLowerCase();
+    const expectedVersion = Number((entry as Row).expectedVersion);
+    if (
+      !UUID.test(providerId) || normalizedProviderId <= previous ||
+      !Number.isSafeInteger(expectedVersion) ||
+      expectedVersion < 1
+    ) throw new RestoreProviderSecretsStoreError("invalid", "Stored provider plan is invalid");
+    previous = normalizedProviderId;
+    return Object.freeze({ providerId: normalizedProviderId, expectedVersion });
+  });
+}
+
+function providerIds(value: readonly string[]): readonly string[] {
+  let previous = "";
+  return value.map((raw) => {
+    const id = raw.toLowerCase();
+    if (!UUID.test(raw) || id <= previous) {
+      throw new RestoreProviderSecretsStoreError(
+        "invalid",
+        "Provider IDs must be unique and sorted",
+      );
+    }
+    previous = id;
+    return id;
+  });
+}
+
+/** Canonical digest used to bind a validated sidecar to exact provider membership and versions. */
+export async function restoreProviderPlanSha256(plan: readonly RestoreProviderPlanEntry[]) {
+  return await sha256Hex(encodeCanonicalJson(providerPlan(plan)));
+}
+
+function exactCreateMatch(
+  item: RestoreProviderSecretsAttachment,
+  input: CreateRestoreProviderSecretsAttachment,
+): boolean {
+  return item.idempotencyKey === input.idempotencyKey &&
+    item.sourceObjectKey === input.sourceObjectKey && item.archiveSha256 === input.archiveSha256 &&
+    item.archiveBytes === input.archiveBytes && item.sidecarId === input.sidecarId.toLowerCase() &&
+    item.recoveryKeyId === input.recoveryKeyId &&
+    item.baseBackupId === input.baseBackupId.toLowerCase() &&
+    item.baseArchiveSha256 === input.baseArchiveSha256 &&
+    item.baseContentRootSha256 === input.baseContentRootSha256 &&
+    item.sourceInstallationId === input.sourceInstallationId.toLowerCase();
 }
 
 function validateCreate(input: CreateRestoreProviderSecretsAttachment): void {
@@ -216,61 +291,134 @@ export class PostgresRestoreProviderSecretsStore {
     return row ? map(row) : undefined;
   }
 
+  async previewProviders(
+    id: string,
+    expectedVersion: number,
+    requestedProviderIds: readonly string[],
+  ): Promise<readonly RestoreProviderPreview[]> {
+    positiveVersion(expectedVersion);
+    if (!UUID.test(id) || requestedProviderIds.length > 10_000) {
+      throw new RestoreProviderSecretsStoreError("invalid", "Provider preview is invalid");
+    }
+    const ids = providerIds(requestedProviderIds);
+    return await this.#sql.begin("isolation level serializable", async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-backup-restore'))`;
+      const [attachment] = await tx<Row[]>`
+        SELECT s.status,s.version,s.base_restore_epoch,i.restore_epoch,i.maintenance_enabled,
+          i.active_restore_id
+        FROM backup_restore_secret_sidecars s CROSS JOIN installation_state i
+        WHERE s.id=${id} AND i.singleton_id=1 FOR SHARE OF s,i`;
+      if (
+        !attachment || attachment.status !== "uploaded" ||
+        Number(attachment.version) !== expectedVersion ||
+        attachment.maintenance_enabled !== false ||
+        attachment.active_restore_id != null ||
+        Number(attachment.restore_epoch) !== Number(attachment.base_restore_epoch)
+      ) throw new RestoreProviderSecretsStoreError("conflict", "Provider preview is stale");
+      if (!ids.length) return [];
+      const rows = await tx<Row[]>`
+        SELECT id,display_name,version,enabled,credential_envelope IS NOT NULL credential_present
+        FROM providers WHERE id=ANY(${ids}::uuid[]) ORDER BY id FOR SHARE`;
+      return rows.map((row) =>
+        Object.freeze({
+          providerId: String(row.id),
+          displayName: String(row.display_name),
+          version: Number(row.version),
+          enabled: Boolean(row.enabled),
+          credentialPresent: Boolean(row.credential_present),
+        })
+      );
+    });
+  }
+
   async create(input: CreateRestoreProviderSecretsAttachment) {
     validateCreate(input);
-    return await this.#sql.begin(async (tx) => {
-      const [restore] = await tx<Row[]>`
-        SELECT kind,status,archive_sha256,manifest FROM backup_operations
-        WHERE id=${input.restoreOperationId} FOR SHARE`;
-      if (!restore) {
-        throw new RestoreProviderSecretsStoreError("not_found", "Base restore was not found");
-      }
-      const manifest = restore.manifest == null ? null : json(restore.manifest, "Base manifest");
-      const source = manifest?.source && typeof manifest.source === "object" &&
-          !Array.isArray(manifest.source)
-        ? manifest.source as JsonObject
-        : null;
-      if (
-        restore.kind !== "restore" || restore.status !== "completed" ||
-        restore.archive_sha256 !== input.baseArchiveSha256 ||
-        manifest?.backupId !== input.baseBackupId ||
-        manifest?.contentRootSha256 !== input.baseContentRootSha256 ||
-        source?.installationId !== input.sourceInstallationId
-      ) {
+    try {
+      return await this.#sql.begin(async (tx) => {
+        await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-backup-restore'))`;
+        const [restore] = await tx<Row[]>`
+          SELECT o.kind,o.status,o.archive_sha256,o.manifest,s.restore_epoch,
+            (SELECT (a.metadata->>'restoreEpoch')::bigint FROM audit_events a
+              WHERE a.action='backup.restore.database_committed'
+                AND a.target_type='backup_operation' AND a.target_id=o.id::text
+              ORDER BY a.created_at DESC,a.id DESC LIMIT 1) committed_restore_epoch
+          FROM backup_operations o CROSS JOIN installation_state s
+          WHERE o.id=${input.restoreOperationId} AND s.singleton_id=1
+            AND s.maintenance_enabled=false AND s.active_restore_id IS NULL
+          FOR SHARE OF o,s`;
+        if (!restore) {
+          throw new RestoreProviderSecretsStoreError("not_found", "Base restore was not found");
+        }
+        const manifest = restore.manifest == null ? null : json(restore.manifest, "Base manifest");
+        const source = manifest?.source && typeof manifest.source === "object" &&
+            !Array.isArray(manifest.source)
+          ? manifest.source as JsonObject
+          : null;
+        const restoreEpoch = Number(restore.restore_epoch);
+        if (
+          restore.kind !== "restore" || restore.status !== "completed" ||
+          restore.archive_sha256 !== input.baseArchiveSha256 ||
+          manifest?.backupId !== input.baseBackupId ||
+          manifest?.contentRootSha256 !== input.baseContentRootSha256 ||
+          source?.installationId !== input.sourceInstallationId ||
+          !Number.isSafeInteger(restoreEpoch) || restoreEpoch < 1 ||
+          Number(restore.committed_restore_epoch) !== restoreEpoch
+        ) {
+          throw new RestoreProviderSecretsStoreError(
+            "conflict",
+            "Provider-secret sidecar does not match the current completed restore",
+          );
+        }
+        const existing = await tx<Row[]>`
+          SELECT * FROM backup_restore_secret_sidecars
+          WHERE restore_operation_id=${input.restoreOperationId} FOR UPDATE`;
+        if (existing[0]) {
+          const item = map(existing[0]);
+          if (exactCreateMatch(item, input) && item.baseRestoreEpoch === restoreEpoch) return item;
+          throw new RestoreProviderSecretsStoreError(
+            "conflict",
+            "A sidecar is already paired with this restore",
+          );
+        }
+        const [row] = await tx<Row[]>`INSERT INTO backup_restore_secret_sidecars(
+            restore_operation_id,idempotency_key,requested_by,source_object_key,archive_sha256,
+            archive_bytes,sidecar_id,recovery_key_id,base_backup_id,base_archive_sha256,
+            base_content_root_sha256,source_installation_id,base_restore_epoch
+          ) VALUES(
+            ${input.restoreOperationId},${input.idempotencyKey},${input.requestedBy},
+            ${input.sourceObjectKey},${input.archiveSha256},${input.archiveBytes},${input.sidecarId},
+            ${input.recoveryKeyId},${input.baseBackupId},${input.baseArchiveSha256},
+            ${input.baseContentRootSha256},${input.sourceInstallationId},${restoreEpoch}
+          ) ON CONFLICT(restore_operation_id) DO NOTHING RETURNING *`;
+        if (row) return map(row);
+        const [winner] = await tx<Row[]>`
+          SELECT * FROM backup_restore_secret_sidecars
+          WHERE restore_operation_id=${input.restoreOperationId} FOR UPDATE`;
+        const item = winner && map(winner);
+        if (item && exactCreateMatch(item, input) && item.baseRestoreEpoch === restoreEpoch) {
+          return item;
+        }
         throw new RestoreProviderSecretsStoreError(
           "conflict",
-          "Provider-secret sidecar does not match the completed restore",
+          "A sidecar is already paired with this restore",
         );
-      }
-      const existing = await tx<Row[]>`
-        SELECT * FROM backup_restore_secret_sidecars
-        WHERE restore_operation_id=${input.restoreOperationId} FOR UPDATE`;
-      if (existing[0]) {
-        const item = map(existing[0]);
-        if (
-          item.idempotencyKey === input.idempotencyKey &&
-          item.sourceObjectKey === input.sourceObjectKey &&
-          item.archiveSha256 === input.archiveSha256 &&
-          item.archiveBytes === input.archiveBytes && item.sidecarId === input.sidecarId &&
-          item.recoveryKeyId === input.recoveryKeyId
-        ) return item;
+      });
+    } catch (error) {
+      // Concurrent inserts can race before one transaction's row is visible to ON CONFLICT's
+      // statement snapshot. Re-read after the winner commits and converge only on an exact match.
+      if ((error as { code?: string }).code === "23505") {
+        const existing = await this.findByIdempotency(
+          input.restoreOperationId,
+          input.idempotencyKey,
+        );
+        if (existing && exactCreateMatch(existing, input)) return existing;
         throw new RestoreProviderSecretsStoreError(
           "conflict",
           "A sidecar is already paired with this restore",
         );
       }
-      const [row] = await tx<Row[]>`INSERT INTO backup_restore_secret_sidecars(
-          restore_operation_id,idempotency_key,requested_by,source_object_key,archive_sha256,
-          archive_bytes,sidecar_id,recovery_key_id,base_backup_id,base_archive_sha256,
-          base_content_root_sha256,source_installation_id
-        ) VALUES(
-          ${input.restoreOperationId},${input.idempotencyKey},${input.requestedBy},
-          ${input.sourceObjectKey},${input.archiveSha256},${input.archiveBytes},${input.sidecarId},
-          ${input.recoveryKeyId},${input.baseBackupId},${input.baseArchiveSha256},
-          ${input.baseContentRootSha256},${input.sourceInstallationId}
-        ) RETURNING *`;
-      return map(row);
-    });
+      throw error;
+    }
   }
 
   async validate(
@@ -279,20 +427,49 @@ export class PostgresRestoreProviderSecretsStore {
     input: ValidateRestoreProviderSecretsAttachment,
   ) {
     positiveVersion(expectedVersion);
+    const plan = providerPlan(input.providerPlan);
     if (
       !UUID.test(id) || !Number.isSafeInteger(input.recordCount) || input.recordCount < 0 ||
-      !SHA256.test(input.recordsSha256) || !SHA256.test(input.providerStateSha256)
+      !SHA256.test(input.recordsSha256) || plan.length !== input.recordCount
     ) throw new RestoreProviderSecretsStoreError("invalid", "Sidecar validation result is invalid");
     const impact = json(input.impact, "Sidecar impact");
-    const [row] = await this.#sql<Row[]>`UPDATE backup_restore_secret_sidecars SET
-        status='validated',record_count=${input.recordCount},records_sha256=${input.recordsSha256},
-        provider_state_sha256=${input.providerStateSha256},impact=${
-      this.#sql.json(impact as never)
-    },
-        validated_at=now(),updated_at=now(),version=version+1
-      WHERE id=${id} AND status='uploaded' AND version=${expectedVersion} RETURNING *`;
-    if (!row) throw new RestoreProviderSecretsStoreError("conflict", "Sidecar validation is stale");
-    return map(row);
+    const providerStateSha256 = await restoreProviderPlanSha256(plan);
+    return await this.#sql.begin("isolation level serializable", async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-backup-restore'))`;
+      const [attachment] = await tx<Row[]>`
+        SELECT s.*,i.restore_epoch,i.maintenance_enabled,i.active_restore_id
+        FROM backup_restore_secret_sidecars s CROSS JOIN installation_state i
+        WHERE s.id=${id} AND i.singleton_id=1 FOR UPDATE OF s,i`;
+      if (
+        !attachment || attachment.status !== "uploaded" ||
+        Number(attachment.version) !== expectedVersion ||
+        attachment.maintenance_enabled !== false || attachment.active_restore_id != null ||
+        Number(attachment.restore_epoch) !== Number(attachment.base_restore_epoch)
+      ) throw new RestoreProviderSecretsStoreError("conflict", "Sidecar validation is stale");
+      for (const entry of plan) {
+        const [provider] = await tx<Row[]>`
+          SELECT version,enabled,credential_envelope FROM providers WHERE id=${entry.providerId}
+          FOR UPDATE`;
+        if (
+          !provider || Number(provider.version) !== entry.expectedVersion ||
+          provider.enabled !== false || provider.credential_envelope != null
+        ) {
+          throw new RestoreProviderSecretsStoreError(
+            "conflict",
+            "Provider state changed before sidecar validation",
+          );
+        }
+      }
+      const [row] = await tx<Row[]>`UPDATE backup_restore_secret_sidecars SET
+          status='validated',record_count=${input.recordCount},records_sha256=${input.recordsSha256},
+          provider_state_sha256=${providerStateSha256},provider_plan=${tx.json(plan as never)},
+          impact=${tx.json(impact as never)},validated_at=now(),updated_at=now(),version=version+1
+        WHERE id=${id} AND status='uploaded' AND version=${expectedVersion} RETURNING *`;
+      if (!row) {
+        throw new RestoreProviderSecretsStoreError("conflict", "Sidecar validation is stale");
+      }
+      return map(row);
+    });
   }
 
   async apply(
@@ -308,28 +485,49 @@ export class PostgresRestoreProviderSecretsStore {
     }
     const seen = new Set<string>();
     for (const credential of credentials) {
+      const normalizedProviderId = credential.providerId.toLowerCase();
       if (
         !UUID.test(credential.providerId) || !Number.isSafeInteger(credential.expectedVersion) ||
-        credential.expectedVersion < 1 || seen.has(credential.providerId)
+        credential.expectedVersion < 1 || seen.has(normalizedProviderId)
       ) throw new RestoreProviderSecretsStoreError("invalid", "Provider restore set is invalid");
-      seen.add(credential.providerId);
+      seen.add(normalizedProviderId);
       assertEnvelope(credential.envelope, credential.expectedVersion + 1);
     }
     return await this.#sql.begin("isolation level serializable", async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-backup-restore'))`;
       const [attachment] = await tx<Row[]>`
-        SELECT s.*,o.kind restore_kind,o.status restore_status,o.archive_sha256 restore_sha256
+        SELECT s.*,o.kind restore_kind,o.status restore_status,o.archive_sha256 restore_sha256,
+          i.restore_epoch,i.maintenance_enabled,i.active_restore_id
         FROM backup_restore_secret_sidecars s
         JOIN backup_operations o ON o.id=s.restore_operation_id
-        WHERE s.id=${id} FOR UPDATE OF s,o`;
+        CROSS JOIN installation_state i
+        WHERE s.id=${id} AND i.singleton_id=1 FOR UPDATE OF s,o,i`;
       if (
         !attachment || attachment.status !== "validated" ||
         Number(attachment.version) !== expectedVersion ||
         attachment.provider_state_sha256 !== expectedProviderStateSha256 ||
         attachment.restore_kind !== "restore" || attachment.restore_status !== "completed" ||
         attachment.restore_sha256 !== attachment.base_archive_sha256 ||
-        Number(attachment.record_count) !== credentials.length
+        Number(attachment.record_count) !== credentials.length ||
+        attachment.maintenance_enabled !== false || attachment.active_restore_id != null ||
+        Number(attachment.restore_epoch) !== Number(attachment.base_restore_epoch)
       ) throw new RestoreProviderSecretsStoreError("conflict", "Sidecar apply is stale");
-      const ordered = [...credentials].sort((a, b) => a.providerId.localeCompare(b.providerId));
+      const ordered = [...credentials].sort((a, b) =>
+        a.providerId.toLowerCase().localeCompare(b.providerId.toLowerCase())
+      );
+      const persistedPlan = providerPlan(attachment.provider_plan);
+      if (
+        persistedPlan.length !== ordered.length ||
+        persistedPlan.some((entry, index) =>
+          entry.providerId !== ordered[index].providerId.toLowerCase() ||
+          entry.expectedVersion !== ordered[index].expectedVersion
+        )
+      ) {
+        throw new RestoreProviderSecretsStoreError(
+          "conflict",
+          "Provider restore plan changed after preview",
+        );
+      }
       for (const credential of ordered) {
         const [provider] = await tx<Row[]>`
           SELECT version,enabled,credential_envelope FROM providers

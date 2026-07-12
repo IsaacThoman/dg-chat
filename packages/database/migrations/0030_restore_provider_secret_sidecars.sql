@@ -19,9 +19,11 @@ CREATE TABLE backup_restore_secret_sidecars (
   base_archive_sha256 text NOT NULL,
   base_content_root_sha256 text NOT NULL,
   source_installation_id uuid NOT NULL,
+  base_restore_epoch bigint NOT NULL,
   record_count integer,
   records_sha256 text,
   provider_state_sha256 text,
+  provider_plan jsonb,
   impact jsonb,
   error text,
   cleanup_checked_at timestamptz,
@@ -51,12 +53,14 @@ CREATE TABLE backup_restore_secret_sidecars (
     (records_sha256 IS NULL OR records_sha256 ~ '^[0-9a-f]{64}$') AND
     (provider_state_sha256 IS NULL OR provider_state_sha256 ~ '^[0-9a-f]{64}$')),
   CONSTRAINT backup_restore_secret_sidecars_size_check CHECK(archive_bytes > 0),
+  CONSTRAINT backup_restore_secret_sidecars_restore_epoch_check CHECK(base_restore_epoch > 0),
   CONSTRAINT backup_restore_secret_sidecars_key_check
     CHECK(recovery_key_id ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'),
   CONSTRAINT backup_restore_secret_sidecars_validation_check CHECK(
     (record_count IS NULL AND records_sha256 IS NULL AND provider_state_sha256 IS NULL AND
-      impact IS NULL AND validated_at IS NULL) OR
+      provider_plan IS NULL AND impact IS NULL AND validated_at IS NULL) OR
     (record_count >= 0 AND records_sha256 IS NOT NULL AND provider_state_sha256 IS NOT NULL AND
+      jsonb_typeof(provider_plan)='array' AND jsonb_array_length(provider_plan)=record_count AND
       jsonb_typeof(impact)='object' AND validated_at IS NOT NULL)),
   CONSTRAINT backup_restore_secret_sidecars_error_check
     CHECK(error IS NULL OR char_length(error) BETWEEN 1 AND 1000),

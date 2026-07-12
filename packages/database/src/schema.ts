@@ -1236,9 +1236,11 @@ export const backupRestoreSecretSidecars = pgTable("backup_restore_secret_sideca
   baseArchiveSha256: text("base_archive_sha256").notNull(),
   baseContentRootSha256: text("base_content_root_sha256").notNull(),
   sourceInstallationId: uuid("source_installation_id").notNull(),
+  baseRestoreEpoch: bigint("base_restore_epoch", { mode: "number" }).notNull(),
   recordCount: integer("record_count"),
   recordsSha256: text("records_sha256"),
   providerStateSha256: text("provider_state_sha256"),
+  providerPlan: jsonb("provider_plan"),
   impact: jsonb("impact"),
   error: text("error"),
   cleanupCheckedAt: timestamp("cleanup_checked_at", { withTimezone: true }),
@@ -1279,12 +1281,16 @@ export const backupRestoreSecretSidecars = pgTable("backup_restore_secret_sideca
   ),
   check("backup_restore_secret_sidecars_size_check", sql`${table.archiveBytes} > 0`),
   check(
+    "backup_restore_secret_sidecars_restore_epoch_check",
+    sql`${table.baseRestoreEpoch} > 0`,
+  ),
+  check(
     "backup_restore_secret_sidecars_key_check",
     sql`${table.recoveryKeyId} ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'`,
   ),
   check(
     "backup_restore_secret_sidecars_validation_check",
-    sql`(${table.recordCount} IS NULL AND ${table.recordsSha256} IS NULL AND ${table.providerStateSha256} IS NULL AND ${table.impact} IS NULL AND ${table.validatedAt} IS NULL) OR (${table.recordCount} >= 0 AND ${table.recordsSha256} IS NOT NULL AND ${table.providerStateSha256} IS NOT NULL AND jsonb_typeof(${table.impact})='object' AND ${table.validatedAt} IS NOT NULL)`,
+    sql`(${table.recordCount} IS NULL AND ${table.recordsSha256} IS NULL AND ${table.providerStateSha256} IS NULL AND ${table.providerPlan} IS NULL AND ${table.impact} IS NULL AND ${table.validatedAt} IS NULL) OR (${table.recordCount} >= 0 AND ${table.recordsSha256} IS NOT NULL AND ${table.providerStateSha256} IS NOT NULL AND jsonb_typeof(${table.providerPlan})='array' AND jsonb_array_length(${table.providerPlan})=${table.recordCount} AND jsonb_typeof(${table.impact})='object' AND ${table.validatedAt} IS NOT NULL)`,
   ),
   check(
     "backup_restore_secret_sidecars_error_check",

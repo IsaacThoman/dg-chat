@@ -43,16 +43,16 @@ Deno.test({
       const [sidecar] = await sql<{ id: string }[]>`INSERT INTO backup_restore_secret_sidecars(
           restore_operation_id,idempotency_key,requested_by,source_object_key,archive_sha256,
           archive_bytes,sidecar_id,recovery_key_id,base_backup_id,base_archive_sha256,
-          base_content_root_sha256,source_installation_id
+          base_content_root_sha256,source_installation_id,base_restore_epoch
         ) VALUES(${values.restoreId},'sidecar-upload-key',${actor},${values.objectKey},
           ${"b".repeat(64)},128,${values.sidecarId},'recovery-v1',${values.backupId},
-          ${"a".repeat(64)},${"c".repeat(64)},${values.installationId}) RETURNING id`;
+          ${"a".repeat(64)},${"c".repeat(64)},${values.installationId},1) RETURNING id`;
       await assertRejects(() =>
         sql`UPDATE backup_restore_secret_sidecars SET status='validated' WHERE id=${sidecar.id}`
       );
       await sql`UPDATE backup_restore_secret_sidecars SET status='validated',record_count=0,
         records_sha256=${"d".repeat(64)},provider_state_sha256=${"e".repeat(64)},impact='{}',
-        validated_at=now() WHERE id=${sidecar.id}`;
+        provider_plan='[]',validated_at=now() WHERE id=${sidecar.id}`;
       await assertRejects(() =>
         sql`UPDATE backup_restore_secret_sidecars SET status='applied',applied_at=now(),
           completed_at=now() WHERE id=${sidecar.id}`
@@ -79,10 +79,10 @@ Deno.test({
         sql`INSERT INTO backup_restore_secret_sidecars(
           restore_operation_id,idempotency_key,source_object_key,archive_sha256,archive_bytes,
           sidecar_id,recovery_key_id,base_backup_id,base_archive_sha256,
-          base_content_root_sha256,source_installation_id
+          base_content_root_sha256,source_installation_id,base_restore_epoch
         ) VALUES(${values.restoreId},'other-sidecar-key','/absolute',${"b".repeat(64)},1,
           ${crypto.randomUUID()},'key',${crypto.randomUUID()},${"a".repeat(64)},
-          ${"c".repeat(64)},${crypto.randomUUID()})`
+          ${"c".repeat(64)},${crypto.randomUUID()},1)`
       );
     } finally {
       await sql.unsafe(`DROP SCHEMA IF EXISTS ${schema} CASCADE`).catch(() => undefined);
