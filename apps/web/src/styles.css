@@ -4584,6 +4584,69 @@ kbd {
   border-radius: 12px;
   background: var(--card);
 }
+.backup-privileged {
+  border-color: color-mix(in srgb, #b24747 42%, var(--line));
+  background: color-mix(in srgb, var(--card) 97%, #a73535 3%);
+}
+.backup-privileged h2,
+.backup-secret-summary,
+.backup-downloads {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.backup-privileged-form {
+  display: grid;
+  gap: 12px;
+}
+.backup-privileged-form > label {
+  display: grid;
+  gap: 4px;
+  font-size: 13px;
+}
+.backup-privileged-form small,
+.backup-privileged .backup-alert p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.backup-privileged-action {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) auto;
+  gap: 10px;
+}
+.backup-privileged-action input {
+  min-height: 42px;
+  padding: 0 11px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--ink);
+  background: var(--panel);
+  font: 13px ui-monospace, monospace;
+}
+.backup-privileged-action .danger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 42px;
+  border: 1px solid color-mix(in srgb, #b24747 70%, var(--line));
+  border-radius: 8px;
+  color: white;
+  background: #9d3838;
+  font-weight: 700;
+}
+.backup-privileged-action .danger:hover:not(:disabled) {
+  background: #842e2e;
+}
+.backup-privileged-action .danger:disabled {
+  opacity: 0.45;
+}
+.backup-downloads {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
 .backup-section-heading,
 .backup-uploaded {
   display: flex;
@@ -4743,6 +4806,14 @@ kbd {
   .backup-confirmation button {
     width: 100%;
     min-height: 44px;
+  }
+  .backup-privileged-action {
+    grid-template-columns: 1fr;
+  }
+  .backup-privileged-action button,
+  .backup-downloads,
+  .backup-downloads > * {
+    width: 100%;
   }
   .backup-export-list li {
     grid-template-columns: auto 1fr;

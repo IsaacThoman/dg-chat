@@ -357,10 +357,19 @@ export interface BackupExport {
   createdAt: string;
   completedAt: string | null;
   error: string | null;
+  providerSecrets?: {
+    status: BackupExportStatus;
+    encrypted: true;
+    providerCount: number | null;
+    bytes: number | null;
+    fingerprint: string | null;
+    recoveryKeyId: string | null;
+  };
 }
 export interface BackupExportPage {
   items: BackupExport[];
   restoreEnabled: boolean;
+  privilegedSecretBackupsEnabled: boolean;
 }
 export interface BackupRestoreUpload {
   id: string;

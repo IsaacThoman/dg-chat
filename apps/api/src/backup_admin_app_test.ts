@@ -183,6 +183,11 @@ Deno.test("backup administration is session-only, idempotent, no-store, and fing
   assertEquals(listed.status, 200);
   assertEquals(listed.headers.get("cache-control"), "private, no-store");
   assertEquals(listed.headers.get("x-content-type-options"), "nosniff");
+  assertEquals(
+    (await listed.clone().json() as { privilegedSecretBackupsEnabled: boolean })
+      .privilegedSecretBackupsEnabled,
+    true,
+  );
 
   const missingKey = await app.request("/api/admin/backups/exports", {
     method: "POST",

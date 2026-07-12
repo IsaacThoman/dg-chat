@@ -4397,6 +4397,7 @@ export function createApp(options: AppOptions = {}) {
     return c.json({
       items: await service.listExports(c.get("user").id),
       restoreEnabled: service.restoreEnabled,
+      privilegedSecretBackupsEnabled: service.privilegedSecretBackupsEnabled === true,
     });
   });
   app.post("/api/admin/backups/exports", async (c) => {

@@ -45,6 +45,61 @@ describe("backup administration API", () => {
     );
   });
 
+  it("requires the exact privileged confirmation and downloads the sidecar separately", async () => {
+    const paired = {
+      id: "paired/1",
+      status: "queued",
+      providerSecrets: { status: "queued", encrypted: true },
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json(paired, { status: 202 }))
+      .mockResolvedValueOnce(new Response(new Uint8Array([1, 2, 3]), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.createAdminPrivilegedBackupExport(
+      "privileged-attempt",
+      "EXPORT PROVIDER SECRETS",
+    );
+    const blob = await api.downloadAdminProviderSecrets("paired/1");
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "/api/admin/backups/privileged-exports",
+      expect.objectContaining({
+        method: "POST",
+        credentials: "include",
+        headers: expect.objectContaining({ "Idempotency-Key": "privileged-attempt" }),
+        body: JSON.stringify({
+          includeDiagnostics: false,
+          confirmation: "EXPORT PROVIDER SECRETS",
+        }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/admin/backups/paired%2F1/provider-secrets/content",
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(blob.size).toBe(3);
+    expect(api.adminProviderSecretsContentUrl("paired/1")).toBe(
+      "/api/admin/backups/paired%2F1/provider-secrets/content",
+    );
+  });
+
+  it("preserves the dedicated recent-auth error while downloading provider secrets", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(Response.json({
+        error: { code: "recent_authentication_required", message: "Sign in again" },
+      }, { status: 403 })),
+    );
+    await expect(api.downloadAdminProviderSecrets("paired")).rejects.toMatchObject({
+      status: 403,
+      code: "recent_authentication_required",
+      message: "Sign in again",
+    });
+  });
+
   it("wires cancellation to the active XHR while retaining its idempotency header", async () => {
     let xhr: FakeXhr | undefined;
     class FakeXhr {

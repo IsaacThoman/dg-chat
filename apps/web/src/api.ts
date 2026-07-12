@@ -838,7 +838,35 @@ export const api = {
       headers: { "Idempotency-Key": idempotencyKey },
       body: JSON.stringify({ includeDiagnostics: false }),
     }),
+  createAdminPrivilegedBackupExport: (idempotencyKey: string, confirmation: string) =>
+    request<BackupExport>("/admin/backups/privileged-exports", {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+      body: JSON.stringify({ includeDiagnostics: false, confirmation }),
+    }),
   adminBackupContentUrl: (id: string) => `/api/admin/backups/${encodeURIComponent(id)}/content`,
+  adminProviderSecretsContentUrl: (id: string) =>
+    `/api/admin/backups/${encodeURIComponent(id)}/provider-secrets/content`,
+  downloadAdminProviderSecrets: async (id: string): Promise<Blob> => {
+    const response = await fetch(
+      `/api/admin/backups/${encodeURIComponent(id)}/provider-secrets/content`,
+      { credentials: "include", headers: { Accept: "application/octet-stream" } },
+    );
+    if (!response.ok) {
+      let body: { error?: { code?: string; message?: string } } = {};
+      try {
+        body = await response.json();
+      } catch {
+        // Preserve a useful status-based error when an intermediary returned a non-JSON body.
+      }
+      throw new ApiError(
+        response.status,
+        body.error?.code ?? "request_failed",
+        body.error?.message ?? `Request failed (${response.status})`,
+      );
+    }
+    return await response.blob();
+  },
   uploadAdminBackupRestore: (
     file: File,
     idempotencyKey: string,
