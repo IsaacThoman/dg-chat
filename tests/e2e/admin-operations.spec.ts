@@ -114,9 +114,11 @@ test("admin analytics and jobs are bookmarkable, accessible, and operable", asyn
     .toBeFocused();
   await page.getByRole("button", { name: "Retry attachment.ingest", exact: true }).click();
   await page.getByRole("button", { name: "Retry job", exact: true }).click();
-  await expect(page.getByRole("button", { name: "Close", exact: true })).toBeDisabled();
-  await expect(page.getByRole("button", { name: "Cancel", exact: true })).toBeDisabled();
-  await expect(page.getByRole("button", { name: "Retrying…", exact: true })).toBeDisabled();
+  const retryDialog = page.getByRole("dialog", { name: "Retry failed job?" });
+  await expect(retryDialog.getByRole("button", { name: "Close", exact: true })).toBeDisabled();
+  await expect(retryDialog.getByRole("button", { name: "Cancel", exact: true })).toBeDisabled();
+  await expect(retryDialog.getByRole("button", { name: "Retrying…", exact: true }))
+    .toBeDisabled();
   await page.keyboard.press("Escape");
   await expect(page.getByRole("dialog")).toBeVisible();
   releaseRetry();
@@ -170,5 +172,7 @@ test("job cursors preserve filters across bookmarks and browser history", async 
   await page.goForward();
   await expect(page).toHaveURL(/cursor=two/u);
   await expect(page.getByText("page-2", { exact: true })).toBeVisible();
-  await expect(page.getByLabel("Status", { exact: true })).toHaveValue("failed");
+  await expect(
+    page.getByRole("form", { name: "Job filters" }).locator('select[name="status"]'),
+  ).toHaveValue("failed");
 });

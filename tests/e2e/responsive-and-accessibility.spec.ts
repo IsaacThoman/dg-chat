@@ -64,7 +64,7 @@ test("every admin section is reachable across desktop and mobile", async ({
   }
 
   for (const [_value, label, heading] of sections) {
-    await page.getByRole("button", { name: label, exact: true }).click();
+    await page.getByRole("link", { name: label, exact: true }).click();
     await expect(page.getByRole("heading", { name: heading, exact: true })).toBeVisible();
   }
 });
