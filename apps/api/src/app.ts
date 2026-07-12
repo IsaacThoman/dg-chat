@@ -201,10 +201,13 @@ import { SearxngSearchAdapter } from "./web-search.ts";
 import { WebSearchToolAdapter } from "./search-tool.ts";
 import type { OcrCache } from "./ocr-interception.ts";
 import type { BetterAuthService } from "./better-auth.ts";
+import type { BackupAdminService } from "./backup-admin.ts";
+import { BackupServiceError } from "./backup-service.ts";
 
 type Variables = {
   user: PublicUser;
   authType: "session" | "token";
+  sessionAuthenticatedAt?: string;
   sessionLimited?: boolean;
   tokenId?: string;
   tokenScopes?: string[];
@@ -270,6 +273,21 @@ export interface AppOptions {
   toolRateLimitPerMinute?: number;
   toolReserveMicros?: number;
   browserAuth?: BetterAuthService;
+  backupAdmin?: BackupAdminService;
+  /** Testable wall clock for security decisions. */
+  now?: () => number;
+}
+
+const RECENT_AUTHENTICATION_MAX_AGE_MS = 10 * 60 * 1_000;
+const RECENT_AUTHENTICATION_CLOCK_SKEW_MS = 60 * 1_000;
+
+export function hasRecentAuthentication(authenticatedAt: string | undefined, now: number): boolean {
+  if (!authenticatedAt) return false;
+  const timestamp = Date.parse(authenticatedAt);
+  if (!Number.isFinite(timestamp)) return false;
+  const age = now - timestamp;
+  return age >= -RECENT_AUTHENTICATION_CLOCK_SKEW_MS &&
+    age <= RECENT_AUTHENTICATION_MAX_AGE_MS;
 }
 
 export function legacyModelHarnessAllowed(environment: string | undefined): boolean {
@@ -1655,6 +1673,44 @@ export function createApp(options: AppOptions = {}) {
       },
     }),
   );
+  app.use("*", async (c, next) => {
+    if (!options.backupAdmin) return next();
+    const openAiSurface = c.req.path.startsWith("/v1/");
+    const productSurface = c.req.path.startsWith("/api/");
+    if (!openAiSurface && !productSurface) return next();
+    // Method alone cannot establish that a request is read-only. Better Auth has mutation-capable
+    // GET callbacks and may refresh/provision sessions while authenticating an otherwise ordinary
+    // product GET. Keep this pre-authentication allowlist deliberately tiny: OPTIONS has no route
+    // handler, while setup status performs one repository read and is needed by recovery/setup UI.
+    // Everything under /v1 remains fenced because bearer authentication records last-used data.
+    const restoreStatusRead = ["GET", "HEAD"].includes(c.req.method) &&
+      /^\/api\/backup-restore-status\/[0-9a-f-]{36}$/i.test(c.req.path);
+    const maintenanceSafeProductRead = c.req.method === "OPTIONS" || restoreStatusRead ||
+      (["GET", "HEAD"].includes(c.req.method) && c.req.path === "/api/setup/status");
+    if (productSurface && maintenanceSafeProductRead) return next();
+    const unavailable = (code: string, message: string, retryAfter: number) => {
+      c.header("Retry-After", String(retryAfter));
+      return openAiSurface
+        ? c.json(openAIError(message, code), 503)
+        : c.json({ error: { code, message } }, 503);
+    };
+    let state: Awaited<ReturnType<BackupAdminService["maintenanceState"]>>;
+    try {
+      state = await options.backupAdmin.maintenanceState();
+    } catch {
+      return unavailable(
+        "maintenance_state_unavailable",
+        "Installation maintenance state is temporarily unavailable",
+        5,
+      );
+    }
+    if (!state.enabled) return next();
+    return unavailable(
+      "installation_maintenance",
+      "The installation is temporarily read-only while a restore is running",
+      Math.max(1, state.retryAfterSeconds),
+    );
+  });
   const apiBodyLimit = bodyLimit({ maxSize: 2 * 1024 * 1024 });
   const openAIBodyLimit = bodyLimit({ maxSize: 4 * 1024 * 1024 });
   const speechBodyLimit = bodyLimit({ maxSize: 64 * 1024 });
@@ -1662,6 +1718,7 @@ export function createApp(options: AppOptions = {}) {
     "/api/*",
     (c, next) =>
       c.req.path.startsWith("/api/attachments") ||
+        c.req.path === "/api/admin/backups/restore-uploads" ||
         c.req.path === "/api/audio/transcriptions"
         ? next()
         : apiBodyLimit(c, next),
@@ -1877,6 +1934,7 @@ export function createApp(options: AppOptions = {}) {
         c.set("user", publicUser(legacyUser)!);
         c.set("authType", "session");
         c.set("sessionLimited", legacySession.limited);
+        c.set("sessionAuthenticatedAt", legacySession.createdAt);
         return next();
       }
       const user = await repo.findUser(session.userId);
@@ -1886,6 +1944,7 @@ export function createApp(options: AppOptions = {}) {
       c.set("user", publicUser(user)!);
       c.set("authType", "session");
       c.set("sessionLimited", session.limited);
+      c.set("sessionAuthenticatedAt", session.authenticatedAt);
       return next();
     }
     const legacySession = production ? getCookie(c, "dg_session") : undefined;
@@ -1921,6 +1980,7 @@ export function createApp(options: AppOptions = {}) {
     c.set("user", publicUser(user)!);
     c.set("authType", "session");
     c.set("sessionLimited", session.limited);
+    c.set("sessionAuthenticatedAt", session.createdAt);
     if (legacySession && raw === legacySession) {
       setCookie(c, sessionCookie, legacySession, {
         httpOnly: true,
@@ -4242,6 +4302,209 @@ export function createApp(options: AppOptions = {}) {
   });
 
   app.use("/api/admin/*", authenticate, approved, sessionOnly, admin);
+  const requireBackupAdmin = (): BackupAdminService => {
+    if (!options.backupAdmin) {
+      throw new DomainError(
+        "backup_unavailable",
+        "Application backups require PostgreSQL and object storage",
+        503,
+      );
+    }
+    return options.backupAdmin;
+  };
+  const backupIdempotencyKey = (c: Context<{ Variables: Variables }>): string => {
+    const value = c.req.header("idempotency-key")?.trim();
+    if (
+      !value || value.length < 8 || value.length > 200 ||
+      [...value].some((character) =>
+        character.charCodeAt(0) <= 31 || character.charCodeAt(0) === 127
+      )
+    ) {
+      throw new DomainError(
+        "idempotency_key_required",
+        "A valid Idempotency-Key header is required",
+        422,
+      );
+    }
+    return value;
+  };
+  const noStoreBackupResponse = (c: Context<{ Variables: Variables }>) => {
+    c.header("Cache-Control", "private, no-store");
+    c.header("Pragma", "no-cache");
+    c.header("X-Content-Type-Options", "nosniff");
+  };
+  // This capability endpoint intentionally has no session middleware. Its signed, operation-bound,
+  // one-hour bearer is issued to a recently authenticated administrator before restore begins, so
+  // polling during the write fence performs exactly one control-plane read and cannot refresh a
+  // session, update last-used metadata, or emit an audit write.
+  app.get("/api/backup-restore-status/:id", async (c) => {
+    noStoreBackupResponse(c);
+    c.header("Referrer-Policy", "no-referrer");
+    const authorization = c.req.header("authorization") ?? "";
+    const match = /^Bearer ([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)$/.exec(authorization);
+    if (!match) throw new DomainError("not_found", "Restore status is unavailable", 404);
+    return c.json(
+      await requireBackupAdmin().restoreStatus(
+        requireUuid(c.req.param("id"), "restoreId"),
+        match[1],
+      ),
+    );
+  });
+  app.get("/api/admin/backups", async (c) => {
+    noStoreBackupResponse(c);
+    const service = requireBackupAdmin();
+    return c.json({
+      items: await service.listExports(c.get("user").id),
+      restoreEnabled: service.restoreEnabled,
+    });
+  });
+  app.post("/api/admin/backups/exports", async (c) => {
+    noStoreBackupResponse(c);
+    let raw: unknown;
+    try {
+      raw = await c.req.json();
+    } catch {
+      throw new DomainError("invalid_json", "Request body must be valid JSON", 400);
+    }
+    if (
+      !raw || typeof raw !== "object" || Array.isArray(raw) ||
+      Object.keys(raw).some((key) => key !== "includeDiagnostics") ||
+      typeof (raw as { includeDiagnostics?: unknown }).includeDiagnostics !== "boolean"
+    ) throw new DomainError("validation_error", "Backup export options are invalid", 422);
+    const backup = await requireBackupAdmin().requestExport({
+      actorId: c.get("user").id,
+      includeDiagnostics: (raw as { includeDiagnostics: boolean }).includeDiagnostics,
+      idempotencyKey: backupIdempotencyKey(c),
+    });
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: "backup.export_requested",
+      targetType: "backup_operation",
+      targetId: backup.id,
+      metadata: { includeDiagnostics: backup.includesDiagnostics, secretsRedacted: true },
+    });
+    return c.json(backup, 202);
+  });
+  app.get("/api/admin/backups/:id/content", async (c) => {
+    noStoreBackupResponse(c);
+    const id = requireUuid(c.req.param("id"), "backupId");
+    const response = await requireBackupAdmin().exportContent(c.get("user").id, id);
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: "backup.export_downloaded",
+      targetType: "backup_operation",
+      targetId: id,
+    });
+    const headers = new Headers(response.headers);
+    headers.set("Cache-Control", "private, no-store");
+    headers.set("Pragma", "no-cache");
+    headers.set("X-Content-Type-Options", "nosniff");
+    headers.set("Content-Disposition", `attachment; filename="dg-chat-backup-${id}.dgbackup"`);
+    return new Response(response.body, { status: response.status, headers });
+  });
+  app.post("/api/admin/backups/restore-uploads", async (c) => {
+    noStoreBackupResponse(c);
+    const upload = await requireBackupAdmin().uploadRestore({
+      actorId: c.get("user").id,
+      request: c.req.raw,
+      idempotencyKey: backupIdempotencyKey(c),
+    });
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: "backup.restore_uploaded",
+      targetType: "backup_operation",
+      targetId: upload.id,
+      metadata: { bytes: upload.bytes, fingerprint: upload.fingerprint },
+    });
+    return c.json(upload, 201);
+  });
+  app.post("/api/admin/backups/restores/:id/dry-run", async (c) => {
+    noStoreBackupResponse(c);
+    const preview = await requireBackupAdmin().previewRestore(
+      c.get("user").id,
+      requireUuid(c.req.param("id"), "restoreId"),
+    );
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: "backup.restore_previewed",
+      targetType: "backup_operation",
+      targetId: preview.restoreId,
+      metadata: {
+        fingerprint: preview.fingerprint,
+        blockingErrorCount: preview.blockingErrors.length,
+        warningCount: preview.warnings.length,
+      },
+    });
+    return c.json(preview);
+  });
+  app.post("/api/admin/backups/restores/:id/status-capability", async (c) => {
+    noStoreBackupResponse(c);
+    if (!hasRecentAuthentication(c.get("sessionAuthenticatedAt"), (options.now ?? Date.now)())) {
+      throw new DomainError(
+        "recent_authentication_required",
+        "Sign in again before applying a restore",
+        403,
+      );
+    }
+    return c.json(
+      await requireBackupAdmin().issueRestoreStatusCapability(
+        c.get("user").id,
+        requireUuid(c.req.param("id"), "restoreId"),
+      ),
+    );
+  });
+  app.post("/api/admin/backups/restores/:id/apply", async (c) => {
+    noStoreBackupResponse(c);
+    const service = requireBackupAdmin();
+    if (!service.restoreEnabled) {
+      throw new DomainError(
+        "restore_disabled",
+        "In-application restore is disabled for this installation",
+        403,
+      );
+    }
+    if (!hasRecentAuthentication(c.get("sessionAuthenticatedAt"), (options.now ?? Date.now)())) {
+      throw new DomainError(
+        "recent_authentication_required",
+        "Sign in again before applying a restore",
+        403,
+      );
+    }
+    let raw: unknown;
+    try {
+      raw = await c.req.json();
+    } catch {
+      throw new DomainError("invalid_json", "Request body must be valid JSON", 400);
+    }
+    const fingerprint = raw && typeof raw === "object" && !Array.isArray(raw) &&
+        Object.keys(raw).length === 1 &&
+        typeof (raw as { fingerprint?: unknown }).fingerprint === "string"
+      ? (raw as { fingerprint: string }).fingerprint
+      : "";
+    if (!/^[0-9a-f]{64}$/u.test(fingerprint)) {
+      throw new DomainError("validation_error", "Restore fingerprint is invalid", 422);
+    }
+    const restoreId = requireUuid(c.req.param("id"), "restoreId");
+    const result = await service.applyRestore({
+      actorId: c.get("user").id,
+      restoreId,
+      fingerprint,
+    });
+    // The restore coordinator records a destination-local audit event inside the replacement
+    // transaction. The initiating administrator may not exist in the restored user set, so a
+    // post-commit repository audit here could turn a successful restore into an HTTP 500.
+    for (
+      const name of [
+        sessionCookie,
+        "dg_session",
+        "dg_chat.session_token",
+        "__Secure-dg_chat.session_token",
+      ]
+    ) {
+      deleteCookie(c, name, { path: "/", secure: production || name.startsWith("__Secure-") });
+    }
+    return c.json(result);
+  });
   app.get(
     "/api/admin/model-access/aliases",
     async (c) => c.json({ data: await repo.listModelAliases() }),
@@ -8383,6 +8646,16 @@ export function createApp(options: AppOptions = {}) {
       return c.req.path.startsWith("/v1/")
         ? c.json(openAIError(error.message, error.code), error.status as 400)
         : c.json({ error: { code: error.code, message: error.message } }, error.status as 400);
+    }
+    if (error instanceof BackupServiceError) {
+      const status = error.code === "not_found"
+        ? 404
+        : error.code === "forbidden" || error.code === "restore_disabled"
+        ? 403
+        : error.code === "invalid_upload"
+        ? 422
+        : 409;
+      return c.json({ error: { code: error.code, message: error.message } }, status as 403);
     }
     if (error instanceof DomainError) {
       if (c.req.path.startsWith("/v1/")) {

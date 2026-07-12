@@ -344,3 +344,62 @@ export interface RetentionScrubRun {
 export interface RetentionScrubRunPage {
   items: RetentionScrubRun[];
 }
+
+export type BackupExportStatus = "queued" | "running" | "completed" | "failed";
+export interface BackupExport {
+  id: string;
+  status: BackupExportStatus;
+  formatVersion: number;
+  includesDiagnostics: boolean;
+  secretsRedacted: boolean;
+  bytes: number | null;
+  fingerprint: string | null;
+  createdAt: string;
+  completedAt: string | null;
+  error: string | null;
+}
+export interface BackupExportPage {
+  items: BackupExport[];
+  restoreEnabled: boolean;
+}
+export interface BackupRestoreUpload {
+  id: string;
+  filename: string;
+  bytes: number;
+  fingerprint: string;
+  createdAt: string;
+}
+export interface BackupRestoreCount {
+  resource: string;
+  create: number;
+  update: number;
+  skip: number;
+}
+export interface BackupRestorePreview {
+  restoreId: string;
+  fingerprint: string;
+  formatVersion: number;
+  createdAt: string;
+  counts: BackupRestoreCount[];
+  warnings: string[];
+  blockingErrors: string[];
+  secretsRedacted: boolean;
+  attachmentsMissing: number;
+}
+export interface BackupRestoreResult {
+  restoreId: string;
+  status: "completed";
+  completedAt: string;
+  counts: BackupRestoreCount[];
+}
+export interface BackupRestoreStatusCapability {
+  token: string;
+  expiresAt: string;
+}
+export interface BackupRestoreStatus {
+  restoreId: string;
+  status: "validated" | "running" | "completed" | "failed";
+  stage: string;
+  completedAt: string | null;
+  error: string | null;
+}

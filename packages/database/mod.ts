@@ -10,3 +10,7 @@ export * from "./src/attachment-policy.ts";
 export * from "./src/tool-store.ts";
 export * from "./src/embedding-billing.ts";
 export * from "./src/better-auth-reconciliation.ts";
+export * from "./src/backup-postgres.ts";
+export * from "./src/backup-data.ts";
+export * from "./src/backup-format.ts";
+export * from "./src/backup-archive.ts";

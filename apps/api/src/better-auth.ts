@@ -36,6 +36,8 @@ export interface BetterAuthServiceOptions {
 export interface BetterAuthBrowserSession {
   userId: string;
   limited: boolean;
+  /** Time the user proved their identity, not the session's rolling refresh time. */
+  authenticatedAt: string;
 }
 
 /**
@@ -261,10 +263,22 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
       ) return null;
       const domainLimited = domainUser.approvalStatus !== "approved" ||
         ((options.requireEmailVerification ?? false) && !domainUser.emailVerifiedAt);
+      const createdAt = (result.session as typeof result.session & {
+        createdAt?: Date | string;
+      }).createdAt;
+      const authenticatedAt = createdAt instanceof Date
+        ? createdAt
+        : typeof createdAt === "string"
+        ? new Date(createdAt)
+        : undefined;
+      // Recent-authentication gates must fail closed if the auth adapter cannot identify when
+      // the session was minted. Never substitute updatedAt because rolling refresh is not proof.
+      if (!authenticatedAt || !Number.isFinite(authenticatedAt.getTime())) return null;
       return {
         userId: result.user.id,
         limited: domainLimited ||
           Boolean((result.session as typeof result.session & { limited?: boolean }).limited),
+        authenticatedAt: authenticatedAt.toISOString(),
       };
     },
     invalidateUserSessions: async (userId: string) => {

@@ -12,13 +12,16 @@ S3_ACCESS_KEY=... # bucket-scoped application identity, different from the root 
 S3_SECRET_KEY=...
 APP_SECRET=... # at least 32 random bytes
 ENCRYPTION_KEY=... # exactly 32 random bytes encoded as base64
+BACKUP_SIGNING_KEY=... # independent, exactly 32 random bytes encoded as base64
+BACKUP_SIGNING_KEY_ID=installation-v1 # stable identifier recorded in every archive
 SETUP_TOKEN=... # one-time bootstrap secret
 APP_URL=https://chat.example.com
 WEB_URL=https://chat.example.com
 ```
 
-Generate a single installation key with `openssl rand -base64 32`. For rolling provider-secret
-rotation, set `ENCRYPTION_KEYRING` to a JSON object mapping stable key IDs to base64 keys and set
+Generate independent provider-encryption and backup-signing keys with `openssl rand -base64 32`. Do
+not reuse either key for the other purpose. For rolling provider-secret rotation, set
+`ENCRYPTION_KEYRING` to a JSON object mapping stable key IDs to base64 keys and set
 `ENCRYPTION_PRIMARY_KEY_ID` to the key used for new credentials. Keep old keys in the keyring until
 each provider credential has been explicitly replaced through the admin console under the new
 primary key; an online bulk rewrap command is not yet shipped. `ENCRYPTION_KEY` remains the
@@ -69,6 +72,12 @@ The app is published on `${PORT:-8000}`. Put it behind a TLS-terminating reverse
 the original scheme and host. Preserve streaming responses by disabling proxy buffering for `/v1/*`
 and chat streams and by setting idle timeouts above the maximum generation timeout.
 
+Every application migration that creates a portable or explicitly cleared business table must also
+attach the `dg_chat_restore_maintenance_fence` statement trigger. Backup catalog validation fails
+closed when either the table's portability policy or its fence is missing. Do not attach that
+trigger to `backup_operations`, `installation_state`, or `repository_migrations`; restore recovery
+must be able to update those control tables while the fence is active.
+
 The default images are version-tagged but operators should pin image digests after validation. Run
 the app and worker at the same release during migrations. Apply expand/contract migrations in
 separate releases so rolling upgrades remain compatible.
@@ -82,21 +91,58 @@ application retention policy, and CORS only if direct browser uploads are enable
 
 ## Backups and restore
 
-Back up PostgreSQL and the object bucket as one recovery set. Redis does not require backup for
-correctness. Keep encrypted backups outside the deployment host and test restoration regularly.
+The Storage section of the admin console creates a versioned `.dgbackup` recovery artifact
+containing a repeatable-read relational snapshot and every referenced immutable object. The manifest
+and every entry are integrity checked and authenticated with `BACKUP_SIGNING_KEY`; normal exports
+redact provider credentials and exclude diagnostic request/response bodies by default. They still
+contain password hashes, API-token hashes, chat content, attachments, and accounting data, so
+encrypt them at rest, restrict access, and copy them off the application object store. Losing a
+signing key makes its archives unverifiable. Retain old signing keys and their IDs for as long as
+their archives exist; the current v1 runtime accepts the configured key ID only, so restore an old
+archive with the matching key in an isolated deployment.
+
+Exports spool data under `/tmp`. `BACKUP_MAX_UPLOAD_BYTES` defaults to 1 GiB and is a hard restore
+upload bound (maximum 16 GiB). Compose gives `/tmp` a 2 GiB tmpfs by default; set
+`BACKUP_TEMP_STORAGE_SIZE` above the largest expected archive plus working overhead, while
+accounting for concurrent ordinary uploads and available RAM. Large installations should continue
+using native, streaming database and object-store backups because the application export is
+currently a single replica-local job.
+
+Restore is deliberately disabled until `ALLOW_IN_APP_RESTORE=true`. Before enabling it:
+
+1. Take and verify a native PostgreSQL and object-store recovery point.
+2. Put the installation in an operator maintenance window and stop all but one API replica and all
+   workers. The application also establishes a durable write fence while applying the archive.
+3. Upload the `.dgbackup`, run the dry-run, resolve every blocker, and compare its full SHA-256
+   fingerprint to the expected out-of-band value.
+4. Type the requested fingerprint confirmation and apply. Restore replaces portable installation
+   tables transactionally, stages objects before database references, clears ephemeral jobs and
+   replay state, and invalidates every browser session. Provider credentials remain disabled because
+   normal exports contain redacted placeholders; re-enter them after signing in again.
+5. Keep the API process running until completion. If it exits after the database commit, restart the
+   same release with the same database, object store, and signing key; startup recovery finalizes
+   the durable operation and releases maintenance without replaying the replacement.
+6. Sign in, verify users, balances, a branched conversation and its attachments, create a fresh API
+   token, reconnect providers, then restart workers and additional API replicas.
+
+Dry-run uses the same strict parser and relational validation as apply but writes only temporary
+staging tables. A successful dry-run is not permission to restore an archive from an untrusted
+source: signatures prove possession of the installation key, not that its contents are desirable.
+
+Native disaster-recovery backups remain recommended in addition to portable exports. Back up
+PostgreSQL and the object bucket as one recovery set. Redis does not require backup for correctness.
+Keep encrypted backups outside the deployment host and test restoration regularly.
 
 1. Quiesce writes or take a database snapshot with a matching object-store version marker.
 2. Export PostgreSQL in a format supported by the target server version.
 3. Replicate the private bucket, including object versions when enabled.
 4. Record the application image digest, migration version, and encryption-key identifiers.
 5. Restore into an isolated environment, run migrations and readiness checks, then verify login, a
-   branched conversation, token authentication, and ledger totals. The application-level validated
-   restore dry-run and attachment lifecycle are not implemented yet; use native PostgreSQL restore
-   validation until those features ship.
+   branched conversation, token authentication, attachments, and ledger totals.
 
 Never discard an encryption key while provider credentials or privileged exports still depend on it.
-Secret-bearing backup exports require separate encryption and must not be placed in the normal chat
-export path.
+Provider-secret-bearing privileged export is not currently shipped. Do not assume a normal portable
+export can restore providers without manual credential re-entry.
 
 ## Upgrades and rollback
 

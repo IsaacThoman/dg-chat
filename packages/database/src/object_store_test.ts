@@ -33,11 +33,13 @@ Deno.test("object store environment configuration is explicit and validates cred
 
 Deno.test("S3 object store streams put/get and supports delete/readiness", async () => {
   const commands: Array<{ constructor: { name: string }; input: Record<string, unknown> }> = [];
+  const sendOptions: Array<{ abortSignal?: AbortSignal } | undefined> = [];
   let destroyed = false;
   const client = {
-    send(command: unknown) {
+    send(command: unknown, options?: { abortSignal?: AbortSignal }) {
       const value = command as { constructor: { name: string }; input: Record<string, unknown> };
       commands.push(value);
+      sendOptions.push(options);
       if (value.constructor.name === "PutObjectCommand") {
         return Promise.resolve({ ETag: "etag-put" });
       }
@@ -66,17 +68,20 @@ Deno.test("S3 object store streams put/get and supports delete/readiness", async
     region: "us-east-1",
     forcePathStyle: true,
   }, client);
+  const uploadController = new AbortController();
   const put = await store.put({
     key: "users/user/files/file.txt",
     body: new Blob(["stored"]).stream(),
     contentLength: 6,
     contentType: "text/plain",
     metadata: { sha256: "a".repeat(64) },
+    signal: uploadController.signal,
   });
   assertEquals(put.etag, "etag-put");
   assertEquals(commands[0].input.Bucket, "dg-chat-files");
   assertEquals(commands[0].input.ContentLength, 6);
   assertEquals(commands[0].input.IfNoneMatch, "*");
+  assertEquals(sendOptions[0]?.abortSignal, uploadController.signal);
   const found = await store.get("users/user/files/file.txt");
   assertEquals(await new Response(found!.body).text(), "stored");
   assertEquals(found!.contentType, "text/plain");

@@ -226,6 +226,9 @@ Deno.test({
       assertEquals(oidcIdentity.user.email, "oidc-new@e2e.invalid");
       assertEquals(oidcIdentity.user.approvalStatus, "pending");
       assertEquals(oidcIdentity.limited, true);
+      const oidcSession = await service.getSession(new Headers({ cookie: oidcSessionCookie }));
+      assert(oidcSession);
+      assertMatch(oidcSession.authenticatedAt, /^\d{4}-\d{2}-\d{2}T/u);
       const oidcState = await mockOidc.fetch(
         new Request("http://mock-oidc:4020/control/state", {
           headers: { authorization: "Bearer test-control-token" },
@@ -268,10 +271,13 @@ Deno.test({
       assertEquals(legacySignin.status, 200, await legacySignin.clone().text());
       const legacyCookie = legacySignin.headers.get("set-cookie")?.split(";", 1)[0];
       assert(legacyCookie);
+      const legacySession = await service.getSession(new Headers({ cookie: legacyCookie }));
+      assert(legacySession);
       assertEquals(
-        await service.getSession(new Headers({ cookie: legacyCookie })),
+        { userId: legacySession.userId, limited: legacySession.limited },
         { userId: legacyId, limited: false },
       );
+      assertMatch(legacySession.authenticatedAt, /^\d{4}-\d{2}-\d{2}T/u);
       const bootstrap = await repository.bootstrapAdmin({
         email: "admin@example.com",
         name: "Bootstrap Admin",
@@ -494,7 +500,12 @@ Deno.test({
       assert(cookie);
       assert(!cookie.includes("correct horse battery staple"));
       const session = await service.getSession(new Headers({ cookie }));
-      assertEquals(session, { userId: body.user.id, limited: true });
+      assert(session);
+      assertEquals(
+        { userId: session.userId, limited: session.limited },
+        { userId: body.user.id, limited: true },
+      );
+      assertMatch(session.authenticatedAt, /^\d{4}-\d{2}-\d{2}T/u);
       assertEquals((await app.request("/api/auth/me", { headers: { cookie } })).status, 200);
       assertEquals((await app.request("/v1/models", { headers: { cookie } })).status, 401);
       assertEquals(
@@ -533,10 +544,13 @@ Deno.test({
       assertEquals(approvedSignin.status, 200, await approvedSignin.clone().text());
       const approvedCookie = approvedSignin.headers.get("set-cookie")?.split(";", 1)[0];
       assert(approvedCookie);
+      const approvedSession = await service.getSession(new Headers({ cookie: approvedCookie }));
+      assert(approvedSession);
       assertEquals(
-        await service.getSession(new Headers({ cookie: approvedCookie })),
+        { userId: approvedSession.userId, limited: approvedSession.limited },
         { userId: body.user.id, limited: false },
       );
+      assertMatch(approvedSession.authenticatedAt, /^\d{4}-\d{2}-\d{2}T/u);
       await repository.setUserState(body.user.id, "suspended");
       assertEquals(await service.getSession(new Headers({ cookie: approvedCookie })), null);
 
