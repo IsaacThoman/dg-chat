@@ -8,8 +8,14 @@ import type {
   BackupOperation,
   ObjectStore,
   PostgresBackupStore,
+  ProviderSecretKek,
 } from "@dg-chat/database";
-import { parseBackupArchiveStream, sha256Hex, writeBackupArchiveStream } from "@dg-chat/database";
+import {
+  encryptProviderSecretSidecarV1,
+  parseBackupArchiveStream,
+  sha256Hex,
+  writeBackupArchiveStream,
+} from "@dg-chat/database";
 import { BackupOperationError } from "@dg-chat/database";
 import type {
   BackupAdminService,
@@ -20,9 +26,13 @@ import type {
   BackupRestoreStatus,
   BackupRestoreStatusCapability,
   BackupRestoreUploadSummary,
+  PrivilegedBackupExportSummary,
 } from "./backup-admin.ts";
+import type { PrivilegedBackupSecretKeyring } from "./backup-secret-keyring.ts";
+import type { ProviderSecretEnvelope, ProviderSecretKeyring } from "./provider-secrets.ts";
 
 const BACKUP_MIME = "application/vnd.dg-chat.backup";
+const PROVIDER_SECRETS_MIME = "application/vnd.dg-chat.provider-secrets";
 const MAX_UPLOAD_BYTES = 16 * 1024 * 1024 * 1024;
 const encoder = new TextEncoder();
 
@@ -40,9 +50,13 @@ type BackupStorePort = Pick<
   | "renewExportLease"
   | "expireExportLeases"
   | "planExportArtifact"
+  | "planPrivilegedExportArtifacts"
   | "claimRecoverableExportArtifacts"
+  | "claimRecoverableProviderSecretArtifacts"
   | "recordExportArtifactCleanup"
+  | "recordProviderSecretArtifactCleanup"
   | "releaseExportArtifactCleanup"
+  | "releaseProviderSecretArtifactCleanup"
   | "nextRunningExportLeaseExpiry"
   | "updateProgress"
   | "validateRestore"
@@ -61,6 +75,13 @@ export interface BackupExportSnapshot {
   objectsTotal: number;
   bytesTotal: number;
   cleanup?(): Promise<void>;
+}
+export interface EncryptedProviderCredential {
+  readonly providerId: string;
+  readonly envelope: ProviderSecretEnvelope;
+}
+export interface PrivilegedBackupExportSnapshot extends BackupExportSnapshot {
+  providerCredentials(): AsyncIterable<EncryptedProviderCredential>;
 }
 export interface BackupRestoreSession {
   sink: BackupArchiveSink;
@@ -90,6 +111,9 @@ export interface BackupDataPort {
   exportSnapshot(
     input: { includeDiagnostics: boolean; installationId: string; signal?: AbortSignal },
   ): Promise<BackupExportSnapshot>;
+  exportPrivilegedSnapshot?(
+    input: { includeDiagnostics: boolean; installationId: string; signal?: AbortSignal },
+  ): Promise<PrivilegedBackupExportSnapshot>;
   restoreSession(
     mode: "preview" | "apply" | "cleanup",
     context: { restoreOperationId: string },
@@ -117,6 +141,10 @@ export interface BackupServiceOptions {
   shutdownGraceMs?: number;
   artifactSweepIntervalMs?: number;
   artifactCleanupLeaseSeconds?: number;
+  privilegedProviderSecrets?: {
+    recoveryKeyring: PrivilegedBackupSecretKeyring;
+    providerKeyring: Pick<ProviderSecretKeyring, "decryptBytes">;
+  };
 }
 
 function aborted(signal: AbortSignal): Error {
@@ -149,6 +177,21 @@ function exportSummary(operation: BackupOperation): BackupExportSummary {
     createdAt: operation.createdAt,
     completedAt: operation.completedAt,
     error: operation.error,
+  };
+}
+function privilegedExportSummary(operation: BackupOperation): PrivilegedBackupExportSummary {
+  return {
+    ...exportSummary(operation),
+    providerSecrets: {
+      status: operation.status === "validated" || operation.status === "cancelled"
+        ? "failed"
+        : operation.status,
+      encrypted: true,
+      providerCount: operation.secretProviderCount,
+      bytes: operation.status === "completed" ? operation.secretArchiveBytes : null,
+      fingerprint: operation.secretArchiveSha256,
+      recoveryKeyId: operation.secretRecoveryKeyId,
+    },
   };
 }
 function safeFilename(value: string) {
@@ -312,6 +355,7 @@ async function stageMultipart(request: Request, maxBytes: number) {
 
 export class DefaultBackupAdminService implements BackupAdminService {
   readonly restoreEnabled: boolean;
+  readonly privilegedSecretBackupsEnabled: boolean;
   readonly #store;
   readonly #objects;
   readonly #data;
@@ -323,6 +367,7 @@ export class DefaultBackupAdminService implements BackupAdminService {
   readonly #artifactSweepIntervalMs;
   readonly #artifactCleanupLeaseSeconds;
   readonly #artifactClaimTimeoutMs;
+  readonly #privilegedProviderSecrets;
   readonly #tasks = new Map<string, Promise<void>>();
   readonly #artifactCleanups = new Set<Promise<void>>();
   readonly #exportControllers = new Map<string, AbortController>();
@@ -339,6 +384,10 @@ export class DefaultBackupAdminService implements BackupAdminService {
     this.#data = options.data;
     this.#authenticator = options.authenticator;
     this.restoreEnabled = options.restoreEnabled === true;
+    this.#privilegedProviderSecrets = options.privilegedProviderSecrets;
+    this.privilegedSecretBackupsEnabled = Boolean(
+      options.privilegedProviderSecrets && options.data.exportPrivilegedSnapshot,
+    );
     this.#maxUploadBytes = options.maxUploadBytes ?? MAX_UPLOAD_BYTES;
     this.#exportLeaseSeconds = options.exportLeaseSeconds ?? 60;
     this.#exportDeadlineMs = options.exportDeadlineMs ?? 30 * 60_000;
@@ -357,7 +406,11 @@ export class DefaultBackupAdminService implements BackupAdminService {
       : 300;
   }
   async listExports(_actorId: string) {
-    return (await this.#store.list("export", 100)).map(exportSummary);
+    return (await this.#store.list("export", 100)).map((operation) =>
+      operation.providerSecretsRequested
+        ? privilegedExportSummary(operation)
+        : exportSummary(operation)
+    );
   }
   async requestExport(
     input: { actorId: string; includeDiagnostics: boolean; idempotencyKey: string },
@@ -368,11 +421,36 @@ export class DefaultBackupAdminService implements BackupAdminService {
       idempotencyKey: input.idempotencyKey,
       options: { includeDiagnostics: input.includeDiagnostics },
     });
+    if (operation.providerSecretsRequested) {
+      throw new BackupServiceError("conflict", "The backup export conflicts with an existing job");
+    }
     if (operation.status === "queued") {
       this.#exportGeneration++;
       this.#scheduleExportPump();
     }
     return exportSummary(operation);
+  }
+  async requestPrivilegedExport(
+    input: { actorId: string; includeDiagnostics: boolean; idempotencyKey: string },
+  ): Promise<PrivilegedBackupExportSummary> {
+    if (!this.privilegedSecretBackupsEnabled) {
+      throw new BackupServiceError("conflict", "Privileged backup export is unavailable");
+    }
+    const operation = await this.#store.create({
+      kind: "export",
+      actorId: input.actorId,
+      idempotencyKey: input.idempotencyKey,
+      options: { includeDiagnostics: input.includeDiagnostics },
+      providerSecretsRequested: true,
+    });
+    if (!operation.providerSecretsRequested) {
+      throw new BackupServiceError("conflict", "The backup export conflicts with an existing job");
+    }
+    if (operation.status === "queued") {
+      this.#exportGeneration++;
+      this.#scheduleExportPump();
+    }
+    return privilegedExportSummary(operation);
   }
   #scheduleExportPump() {
     if (this.#closing || this.#exportPump) return;
@@ -491,18 +569,25 @@ export class DefaultBackupAdminService implements BackupAdminService {
     }, Math.max(1_000, Math.floor(this.#exportLeaseSeconds * 1_000 / 3)));
     let path: string | undefined;
     let snapshot: BackupExportSnapshot | undefined;
+    let secretPath: string | undefined;
     let artifactKey: string | undefined;
     let artifactDigest: string | undefined;
     let putWork: Promise<unknown> | undefined;
+    let secretArtifactKey: string | undefined;
+    let secretArtifactDigest: string | undefined;
+    let secretPutWork: Promise<unknown> | undefined;
     let artifactAttached = false;
     let completionAttempted = false;
     try {
       const installation = await this.#store.installationState();
-      const snapshotWork = this.#data.exportSnapshot({
+      const snapshotInput = {
         includeDiagnostics: operation.options.includeDiagnostics === true,
         installationId: installation.installationId,
         signal: controller.signal,
-      });
+      };
+      const snapshotWork = operation.providerSecretsRequested
+        ? this.#data.exportPrivilegedSnapshot!(snapshotInput)
+        : this.#data.exportSnapshot(snapshotInput);
       // A production adapter should stop cooperatively on `signal`, but cleanup must still happen
       // if a legacy or temporarily stuck adapter resolves after the deadline has won the race.
       void snapshotWork.then((late) => {
@@ -540,18 +625,97 @@ export class DefaultBackupAdminService implements BackupAdminService {
         file.close();
       }
       const digest = hash.digest("hex");
+      let secretSize: number | undefined;
+      let secretProviderCount: number | undefined;
+      let secretRecoveryKey: ProviderSecretKek | undefined;
+      if (operation.providerSecretsRequested) {
+        const privileged = snapshot as PrivilegedBackupExportSnapshot;
+        const configured = this.#privilegedProviderSecrets;
+        if (!configured) throw new Error("Privileged backup keyrings are unavailable");
+        secretRecoveryKey = await configured.recoveryKeyring.primary();
+        secretPath = await Deno.makeTempFile({ prefix: "dg-export-", suffix: ".dgsecrets" });
+        const secretFile = await Deno.open(secretPath, { write: true, truncate: true });
+        const secretHash = createHash("sha256");
+        secretSize = 0;
+        secretProviderCount = 0;
+        const records = (async function* () {
+          for await (const credential of privileged.providerCredentials()) {
+            controller.signal.throwIfAborted();
+            const plaintext = await configured.providerKeyring.decryptBytes(
+              credential.providerId,
+              credential.envelope,
+            );
+            secretProviderCount!++;
+            try {
+              yield {
+                providerId: credential.providerId,
+                credentialVersion: credential.envelope.credentialVersion,
+                secret: plaintext,
+              };
+            } finally {
+              plaintext.fill(0);
+            }
+          }
+        })();
+        try {
+          for await (
+            const chunk of encryptProviderSecretSidecarV1({
+              binding: {
+                backupId: snapshot.manifest.backupId,
+                archiveSha256: digest,
+                contentRootSha256: snapshot.manifest.contentRootSha256,
+                sourceInstallationId: snapshot.manifest.source.installationId,
+              },
+              createdAt: snapshot.manifest.createdAt,
+              kek: secretRecoveryKey,
+              records,
+            })
+          ) {
+            controller.signal.throwIfAborted();
+            secretHash.update(chunk);
+            secretSize += chunk.byteLength;
+            let offset = 0;
+            while (offset < chunk.length) {
+              offset += await secretFile.write(chunk.subarray(offset));
+            }
+          }
+          secretArtifactDigest = secretHash.digest("hex");
+        } finally {
+          secretFile.close();
+          await records.return?.();
+        }
+      }
       // A lease-scoped key makes ownership exact. A worker whose lease expires can safely remove
       // its own late upload without racing a replacement worker exporting the same operation.
       const key = `backups/exports/${operation.id}/${leaseToken}-${digest}.dgbackup`;
       artifactKey = key;
       artifactDigest = digest;
-      operation = await this.#store.planExportArtifact(
-        operation.id,
-        operation.version,
-        leaseToken,
-        key,
-        digest,
-      );
+      if (operation.providerSecretsRequested) {
+        secretArtifactKey =
+          `backups/secrets/${operation.id}/${leaseToken}-${secretArtifactDigest}.dgsecrets`;
+        operation = await this.#store.planPrivilegedExportArtifacts(
+          operation.id,
+          operation.version,
+          leaseToken,
+          key,
+          digest,
+          {
+            artifactObjectKey: secretArtifactKey,
+            archiveSha256: secretArtifactDigest!,
+            archiveBytes: secretSize!,
+            providerCount: secretProviderCount!,
+            recoveryKeyId: secretRecoveryKey!.keyId,
+          },
+        );
+      } else {
+        operation = await this.#store.planExportArtifact(
+          operation.id,
+          operation.version,
+          leaseToken,
+          key,
+          digest,
+        );
+      }
       const body = await fileStream(path);
       putWork = this.#objects.put({
         key,
@@ -565,6 +729,17 @@ export class DefaultBackupAdminService implements BackupAdminService {
         putWork,
         controller.signal,
       );
+      if (secretArtifactKey) {
+        secretPutWork = this.#objects.put({
+          key: secretArtifactKey,
+          body: await fileStream(secretPath!),
+          contentLength: secretSize!,
+          contentType: PROVIDER_SECRETS_MIME,
+          metadata: { sha256: secretArtifactDigest! },
+          signal: controller.signal,
+        });
+        await abortable(secretPutWork, controller.signal);
+      }
       const verified = await this.#objects.get(key);
       if (!verified?.body) throw new Error("Stored backup is unavailable");
       const storedHash = createHash("sha256");
@@ -574,9 +749,32 @@ export class DefaultBackupAdminService implements BackupAdminService {
         storedHash.update(chunk);
         storedBytes += chunk.length;
       }
-      if (storedBytes !== size || storedHash.digest("hex") !== digest) {
+      if (
+        storedBytes !== size || storedHash.digest("hex") !== digest ||
+        verified.contentLength !== size || verified.metadata.sha256 !== digest
+      ) {
         await this.#objects.delete(key).catch(() => undefined);
         throw new Error("Stored backup failed integrity verification");
+      }
+      if (secretArtifactKey) {
+        const storedSecret = await this.#objects.get(secretArtifactKey);
+        if (!storedSecret?.body) throw new Error("Stored provider secrets are unavailable");
+        const storedSecretHash = createHash("sha256");
+        let storedSecretBytes = 0;
+        for await (const chunk of webChunks(storedSecret.body)) {
+          controller.signal.throwIfAborted();
+          storedSecretHash.update(chunk);
+          storedSecretBytes += chunk.byteLength;
+        }
+        if (
+          storedSecretBytes !== secretSize ||
+          storedSecretHash.digest("hex") !== secretArtifactDigest ||
+          storedSecret.contentLength !== secretSize ||
+          storedSecret.metadata.sha256 !== secretArtifactDigest
+        ) {
+          await this.#objects.delete(secretArtifactKey).catch(() => undefined);
+          throw new Error("Stored provider secrets failed integrity verification");
+        }
       }
       operation = await this.#store.updateProgress(operation.id, operation.version, {
         stage: "stored",
@@ -590,9 +788,20 @@ export class DefaultBackupAdminService implements BackupAdminService {
         archiveSha256: digest,
         artifactObjectKey: key,
         manifest: snapshot.manifest as unknown as Record<string, unknown>,
+        ...(secretArtifactKey
+          ? {
+            secretArtifactObjectKey: secretArtifactKey,
+            secretArchiveSha256: secretArtifactDigest!,
+            secretArchiveBytes: secretSize!,
+            secretProviderCount: secretProviderCount!,
+            secretRecoveryKeyId: secretRecoveryKey!.keyId,
+          }
+          : {}),
       });
       artifactAttached = true;
-      return exportSummary(operation);
+      return operation.providerSecretsRequested
+        ? privilegedExportSummary(operation)
+        : exportSummary(operation);
     } catch {
       await this.#store.fail(operation.id, operation.version, "internal_error").catch(() =>
         undefined
@@ -603,6 +812,7 @@ export class DefaultBackupAdminService implements BackupAdminService {
       clearInterval(heartbeat);
       this.#exportControllers.delete(operation.id);
       if (path) await Deno.remove(path).catch(() => undefined);
+      if (secretPath) await Deno.remove(secretPath).catch(() => undefined);
       await snapshot?.cleanup?.().catch(() => undefined);
       if (artifactKey && artifactDigest && !artifactAttached) {
         const cleanupKey = artifactKey;
@@ -634,6 +844,30 @@ export class DefaultBackupAdminService implements BackupAdminService {
         const tracked = cleanup().finally(() => this.#artifactCleanups.delete(tracked));
         this.#artifactCleanups.add(tracked);
       }
+      if (secretArtifactKey && secretArtifactDigest && !artifactAttached) {
+        const cleanupKey = secretArtifactKey;
+        const cleanupDigest = secretArtifactDigest;
+        const cleanup = async () => {
+          await secretPutWork?.catch(() => undefined);
+          if (!completionAttempted) {
+            await this.#objects.delete(cleanupKey).catch(() => undefined);
+            return;
+          }
+          let durable: BackupOperation;
+          try {
+            durable = await this.#store.get(operation.id);
+          } catch {
+            return;
+          }
+          if (
+            durable.status === "completed" && durable.secretArtifactObjectKey === cleanupKey &&
+            durable.secretArchiveSha256 === cleanupDigest
+          ) return;
+          await this.#objects.delete(cleanupKey).catch(() => undefined);
+        };
+        const tracked = cleanup().finally(() => this.#artifactCleanups.delete(tracked));
+        this.#artifactCleanups.add(tracked);
+      }
     }
   }
   async exportContent(_actorId: string, exportId: string) {
@@ -648,6 +882,26 @@ export class DefaultBackupAdminService implements BackupAdminService {
     const headers = new Headers({
       "content-type": BACKUP_MIME,
       "x-backup-sha256": operation.archiveSha256,
+    });
+    if (stored.contentLength != null) headers.set("content-length", String(stored.contentLength));
+    return new Response(stored.body, { headers });
+  }
+  async providerSecretExportContent(_actorId: string, exportId: string) {
+    const operation = await this.#store.get(exportId);
+    if (
+      operation.status !== "completed" || !operation.providerSecretsRequested ||
+      !operation.secretArtifactObjectKey || !operation.secretArchiveSha256
+    ) throw new BackupServiceError("conflict", "The provider secret export is not ready");
+    const stored = await this.#objects.get(operation.secretArtifactObjectKey);
+    if (
+      !stored || stored.metadata.sha256 !== operation.secretArchiveSha256 ||
+      stored.contentLength !== operation.secretArchiveBytes
+    ) {
+      throw new BackupServiceError("not_found", "The provider secret export is unavailable");
+    }
+    const headers = new Headers({
+      "content-type": PROVIDER_SECRETS_MIME,
+      "x-backup-sha256": operation.secretArchiveSha256,
     });
     if (stored.contentLength != null) headers.set("content-length", String(stored.contentLength));
     return new Response(stored.body, { headers });
@@ -1031,7 +1285,7 @@ export class DefaultBackupAdminService implements BackupAdminService {
       await session.rollback().catch(() => undefined);
     }
   }
-  async #cleanupRecoverableExportArtifacts(signal?: AbortSignal) {
+  async #cleanupRecoverableBaseExportArtifacts(signal?: AbortSignal) {
     // One rotating durable page per pass avoids an infinite loop now that tombstones are retained.
     // Repeated passes are essential: DELETE followed by a missing HEAD cannot prove that an old,
     // cancellation-ignoring PUT will not publish later.
@@ -1090,6 +1344,74 @@ export class DefaultBackupAdminService implements BackupAdminService {
         ),
       );
       throw error;
+    }
+  }
+  async #cleanupRecoverableProviderSecretArtifacts(signal?: AbortSignal) {
+    const leaseToken = crypto.randomUUID();
+    const abandoned = await this.#store.claimRecoverableProviderSecretArtifacts(
+      leaseToken,
+      this.#artifactCleanupLeaseSeconds,
+      this.#artifactSweepIntervalMs,
+      this.#artifactClaimTimeoutMs,
+      100,
+    );
+    if (signal?.aborted || this.#closing) {
+      await Promise.allSettled(
+        abandoned.map((operation) =>
+          this.#store.releaseProviderSecretArtifactCleanup(operation.id, leaseToken)
+        ),
+      );
+      throw aborted(signal ?? AbortSignal.abort());
+    }
+    try {
+      for (const operation of abandoned) {
+        if (signal?.aborted || this.#closing) throw aborted(signal ?? AbortSignal.abort());
+        const key = operation.secretArtifactObjectKey!;
+        const digest = operation.secretArchiveSha256!;
+        const deletion = this.#objects.delete(key);
+        if (signal) await abortable(deletion, signal);
+        else await deletion;
+        if (signal?.aborted || this.#closing) throw aborted(signal ?? AbortSignal.abort());
+        const lookup = this.#objects.get(key);
+        const remaining = signal ? await abortable(lookup, signal) : await lookup;
+        if (remaining) {
+          await remaining.body.cancel().catch(() => undefined);
+          throw new Error("Provider secret artifact remained after cleanup");
+        }
+        if (signal?.aborted || this.#closing) throw aborted(signal ?? AbortSignal.abort());
+        const completion = this.#store.recordProviderSecretArtifactCleanup(
+          operation.id,
+          key,
+          digest,
+          leaseToken,
+        );
+        if (signal) await abortable(completion, signal);
+        else await completion;
+      }
+    } catch (error) {
+      await Promise.allSettled(
+        abandoned.map((operation) =>
+          this.#store.releaseProviderSecretArtifactCleanup(operation.id, leaseToken)
+        ),
+      );
+      throw error;
+    }
+  }
+  async #cleanupRecoverableExportArtifacts(signal?: AbortSignal) {
+    // The two tombstone domains are deliberately independent. An outage or malformed legacy row
+    // affecting one artifact must never starve cleanup of its paired artifact.
+    const results = await Promise.allSettled([
+      this.#cleanupRecoverableBaseExportArtifacts(signal),
+      this.#cleanupRecoverableProviderSecretArtifacts(signal),
+    ]);
+    const failures = results.filter((result): result is PromiseRejectedResult =>
+      result.status === "rejected"
+    );
+    if (failures.length) {
+      throw new AggregateError(
+        failures.map((failure) => failure.reason),
+        "Backup artifact cleanup did not complete",
+      );
     }
   }
   #scheduleArtifactSweep(delayMs = this.#artifactSweepIntervalMs) {

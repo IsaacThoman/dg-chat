@@ -4,10 +4,13 @@ import {
   backupContentRoot,
   BackupOperationError,
   createHmacBackupAuthenticator,
+  importProviderSecretKek,
+  restoreProviderSecretSidecarV1,
   sha256Hex,
   signBackupManifest,
   writeBackupArchive,
 } from "@dg-chat/database";
+import { ProviderSecretKeyring } from "./provider-secrets.ts";
 import {
   BackupDataPort,
   BackupExportSnapshot,
@@ -17,6 +20,8 @@ import {
 } from "./backup-service.ts";
 
 const ACTOR = "11111111-1111-4111-8111-111111111111";
+const INSTALLATION_ID = "33333333-3333-4333-8333-333333333333";
+const BACKUP_ID = "44444444-4444-4444-8444-444444444444";
 const encoder = new TextEncoder();
 async function bytes(stream: ReadableStream<Uint8Array>) {
   const chunks: Uint8Array[] = [];
@@ -151,6 +156,15 @@ function operation(
     artifactCleanupCheckedAt: null,
     artifactCleanupLeaseToken: null,
     artifactCleanupLeaseExpiresAt: null,
+    providerSecretsRequested: false,
+    secretArtifactObjectKey: null,
+    secretArchiveSha256: null,
+    secretArchiveBytes: null,
+    secretProviderCount: null,
+    secretRecoveryKeyId: null,
+    secretArtifactCleanupCheckedAt: null,
+    secretArtifactCleanupLeaseToken: null,
+    secretArtifactCleanupLeaseExpiresAt: null,
     createdAt: now,
     startedAt: null,
     validatedAt: null,
@@ -171,6 +185,7 @@ class MemoryStore {
       options?: Record<string, unknown>;
       sourceObjectKey?: string | null;
       archiveSha256?: string | null;
+      providerSecretsRequested?: boolean;
     },
   ) {
     const prior = [...this.items.values()].find((item) =>
@@ -181,6 +196,7 @@ class MemoryStore {
       if (
         prior.sourceObjectKey !== (input.sourceObjectKey ?? null) ||
         prior.archiveSha256 !== (input.archiveSha256 ?? null) ||
+        prior.providerSecretsRequested !== (input.providerSecretsRequested ?? false) ||
         JSON.stringify(prior.options) !== JSON.stringify(input.options ?? {})
       ) throw new Error("idempotency conflict");
       return Promise.resolve(structuredClone(prior));
@@ -188,6 +204,7 @@ class MemoryStore {
     const item = operation(input.kind, input.options ?? {}, input.idempotencyKey);
     item.sourceObjectKey = input.sourceObjectKey ?? null;
     item.archiveSha256 = input.archiveSha256 ?? null;
+    item.providerSecretsRequested = input.providerSecretsRequested ?? false;
     this.items.set(item.id, item);
     if (this.throwAfterCreate) throw new Error("create response lost");
     return Promise.resolve(structuredClone(item));
@@ -212,7 +229,7 @@ class MemoryStore {
   }
   installationState() {
     return Promise.resolve({
-      installationId: "installation-test",
+      installationId: INSTALLATION_ID,
       maintenanceEnabled: this.maintenance,
       version: this.installVersion,
       restoreEpoch: 0,
@@ -321,6 +338,36 @@ class MemoryStore {
       archiveSha256,
     });
   }
+  planPrivilegedExportArtifacts(
+    id: string,
+    version: number,
+    leaseToken: string,
+    artifactObjectKey: string,
+    archiveSha256: string,
+    secret: {
+      artifactObjectKey: string;
+      archiveSha256: string;
+      archiveBytes: number;
+      providerCount: number;
+      recoveryKeyId: string;
+    },
+  ) {
+    const item = this.items.get(id);
+    if (
+      !item || !item.providerSecretsRequested || item.exportLeaseToken !== leaseToken ||
+      item.status !== "running" || item.artifactObjectKey || item.archiveSha256
+    ) return Promise.reject(new BackupOperationError("conflict", "artifact plan stale"));
+    return this.mutate(id, version, {
+      stage: "uploading",
+      artifactObjectKey,
+      archiveSha256,
+      secretArtifactObjectKey: secret.artifactObjectKey,
+      secretArchiveSha256: secret.archiveSha256,
+      secretArchiveBytes: secret.archiveBytes,
+      secretProviderCount: secret.providerCount,
+      secretRecoveryKeyId: secret.recoveryKeyId,
+    });
+  }
   claimRecoverableExportArtifacts(
     leaseToken: string,
     leaseSeconds: number,
@@ -375,6 +422,63 @@ class MemoryStore {
     Object.assign(item, {
       artifactCleanupLeaseToken: null,
       artifactCleanupLeaseExpiresAt: null,
+      version: item.version + 1,
+      updatedAt: new Date().toISOString(),
+    });
+    return Promise.resolve(true);
+  }
+  claimRecoverableProviderSecretArtifacts(
+    leaseToken: string,
+    leaseSeconds: number,
+    cooldownMs: number,
+    _claimTimeoutMs: number,
+    limit = 100,
+  ) {
+    const now = Date.now();
+    const claimed = [...this.items.values()].filter((item) =>
+      item.kind === "export" && ["failed", "cancelled"].includes(item.status) &&
+      item.secretArtifactObjectKey && item.secretArchiveSha256 &&
+      (!item.secretArtifactCleanupLeaseToken ||
+        Date.parse(item.secretArtifactCleanupLeaseExpiresAt ?? "") <= now) &&
+      (!item.secretArtifactCleanupCheckedAt ||
+        Date.parse(item.secretArtifactCleanupCheckedAt) <= now - cooldownMs)
+    ).slice(0, limit);
+    for (const item of claimed) {
+      item.secretArtifactCleanupLeaseToken = leaseToken;
+      item.secretArtifactCleanupLeaseExpiresAt = new Date(now + leaseSeconds * 1_000).toISOString();
+      item.version++;
+    }
+    return Promise.resolve(claimed.map((item) => structuredClone(item)));
+  }
+  recordProviderSecretArtifactCleanup(
+    id: string,
+    key: string,
+    digest: string,
+    leaseToken: string,
+  ) {
+    const item = this.items.get(id);
+    if (
+      !item || !["failed", "cancelled"].includes(item.status) ||
+      item.secretArtifactObjectKey !== key || item.secretArchiveSha256 !== digest ||
+      item.secretArtifactCleanupLeaseToken !== leaseToken
+    ) return Promise.resolve(false);
+    Object.assign(item, {
+      secretArtifactCleanupCheckedAt: new Date().toISOString(),
+      secretArtifactCleanupLeaseToken: null,
+      secretArtifactCleanupLeaseExpiresAt: null,
+      version: item.version + 1,
+      updatedAt: new Date().toISOString(),
+    });
+    return Promise.resolve(true);
+  }
+  releaseProviderSecretArtifactCleanup(id: string, leaseToken: string) {
+    const item = this.items.get(id);
+    if (!item || item.secretArtifactCleanupLeaseToken !== leaseToken) {
+      return Promise.resolve(false);
+    }
+    Object.assign(item, {
+      secretArtifactCleanupLeaseToken: null,
+      secretArtifactCleanupLeaseExpiresAt: null,
       version: item.version + 1,
       updatedAt: new Date().toISOString(),
     });
@@ -466,6 +570,11 @@ class MemoryStore {
       artifactObjectKey?: string | null;
       manifest?: Record<string, unknown>;
       impact?: Record<string, unknown>;
+      secretArtifactObjectKey?: string;
+      secretArchiveSha256?: string;
+      secretArchiveBytes?: number;
+      secretProviderCount?: number;
+      secretRecoveryKeyId?: string;
     },
   ) {
     if (this.failCompleteExport && this.items.get(id)?.kind === "export") {
@@ -526,14 +635,14 @@ async function setup(
   const manifest = await signBackupManifest({
     format: "dg-chat-backup",
     version: 1,
-    backupId: "backup-test",
+    backupId: BACKUP_ID,
     createdAt: "2026-07-12T00:00:00.000Z",
     appVersion: "1.0.0",
     schemaVersion: "0028",
     mode: "system",
     secretPolicy: "redacted",
     diagnosticPayloadPolicy: "excluded",
-    source: { installationId: "installation-test" },
+    source: { installationId: INSTALLATION_ID },
     objects: { count: 0, bytes: 0, indexSha256: await sha256Hex(new Uint8Array()) },
     requiredProviderKeyIds: [],
     contentRootSha256: await backupContentRoot(entries),
@@ -683,6 +792,88 @@ Deno.test("restore status capability is signed, actor-bound at issue, operation-
     BackupServiceError,
   );
   await fx.service.close();
+});
+
+Deno.test("privileged export stores and verifies an independently encrypted paired sidecar", async () => {
+  const fx = await setup();
+  await fx.service.close();
+  const providerId = "55555555-5555-4555-8555-555555555555";
+  const sourceSecret = encoder.encode("source-provider-secret");
+  const providerKeyring = new ProviderSecretKeyring({
+    primaryKeyId: "provider-source",
+    keys: new Map([["provider-source", new Uint8Array(32).fill(21)]]),
+  });
+  const envelope = await providerKeyring.encryptBytes(providerId, 3, sourceSecret);
+  sourceSecret.fill(0);
+  const recoveryKey = await importProviderSecretKek(new Uint8Array(32).fill(42));
+  const recoveryKeyring = {
+    primaryKeyId: "recovery-2026",
+    primary: () => Promise.resolve({ keyId: "recovery-2026", key: recoveryKey }),
+    resolve: (keyId: string) =>
+      Promise.resolve(keyId === "recovery-2026" ? recoveryKey : undefined),
+  };
+  const privilegedSnapshot = Object.assign(fx.snapshot, {
+    providerCredentials: () =>
+      (async function* () {
+        yield { providerId, envelope };
+      })(),
+  });
+  const data = Object.assign(fx.data, {
+    exportPrivilegedSnapshot: () => Promise.resolve(privilegedSnapshot),
+  });
+  const service = new DefaultBackupAdminService({
+    store: fx.store,
+    objects: fx.objects,
+    data,
+    authenticator: fx.auth,
+    privilegedProviderSecrets: { recoveryKeyring, providerKeyring },
+  });
+  assertEquals(service.privilegedSecretBackupsEnabled, true);
+  const queued = await service.requestPrivilegedExport({
+    actorId: ACTOR,
+    includeDiagnostics: false,
+    idempotencyKey: "privileged-export-test-1",
+  });
+  assertEquals(queued.providerSecrets.encrypted, true);
+  const finished = await completed(fx.store, queued.id);
+  assertEquals(finished.status, "completed");
+  assertEquals(finished.secretProviderCount, 1);
+  assertEquals(finished.secretRecoveryKeyId, "recovery-2026");
+  assertEquals(fx.objects.values.size, 2);
+  const listed = await service.listExports(ACTOR);
+  assertEquals(
+    (listed[0] as { providerSecrets?: { providerCount: number | null } }).providerSecrets
+      ?.providerCount,
+    1,
+  );
+  const response = await service.providerSecretExportContent(ACTOR, queued.id);
+  assertEquals(response.headers.get("content-type"), "application/vnd.dg-chat.provider-secrets");
+  assertEquals(response.headers.get("x-backup-sha256"), finished.secretArchiveSha256);
+  let restoredSecret = "";
+  let committed = false;
+  await restoreProviderSecretSidecarV1({
+    source: response.body!,
+    keyring: recoveryKeyring,
+    expectedBinding: {
+      backupId: fx.snapshot.manifest.backupId,
+      archiveSha256: finished.archiveSha256!,
+      contentRootSha256: fx.snapshot.manifest.contentRootSha256,
+      sourceInstallationId: fx.snapshot.manifest.source.installationId,
+    },
+    sink: {
+      begin() {},
+      write(record) {
+        restoredSecret = new TextDecoder().decode(record.secret);
+      },
+      commit() {
+        committed = true;
+      },
+      abort() {},
+    },
+  });
+  assertEquals(restoredSecret, "source-provider-secret");
+  assertEquals(committed, true);
+  await service.close();
 });
 
 Deno.test("export pump continues after one export fails", async () => {
@@ -1316,6 +1507,62 @@ Deno.test("startup isolates S3 tombstone failure and schedules a retry", async (
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   assertEquals(objects.values.has(key), false);
+  await service.close();
+});
+
+Deno.test("base artifact cleanup failure cannot starve paired provider-secret cleanup", async () => {
+  const fx = await setup();
+  await fx.service.close();
+  class BaseFailureObjects extends CountingObjects {
+    override delete(key: string) {
+      if (key.includes("/exports/")) return Promise.reject(new Error("base storage unavailable"));
+      return super.delete(key);
+    }
+  }
+  const objects = new BaseFailureObjects();
+  const item = operation("export", { includeDiagnostics: false }, "independent-secret-cleanup");
+  const baseDigest = "6".repeat(64);
+  const secretDigest = "7".repeat(64);
+  const lease = crypto.randomUUID();
+  const baseKey = `backups/exports/${item.id}/${lease}-${baseDigest}.dgbackup`;
+  const secretKey = `backups/secrets/${item.id}/${lease}-${secretDigest}.dgsecrets`;
+  Object.assign(item, {
+    status: "failed",
+    stage: "failed",
+    providerSecretsRequested: true,
+    artifactObjectKey: baseKey,
+    archiveSha256: baseDigest,
+    secretArtifactObjectKey: secretKey,
+    secretArchiveSha256: secretDigest,
+    secretArchiveBytes: 6,
+    secretProviderCount: 0,
+    secretRecoveryKeyId: "recovery-2026",
+  });
+  fx.store.items.set(item.id, item);
+  for (
+    const [key, digest, mime] of [
+      [baseKey, baseDigest, "application/vnd.dg-chat.backup"],
+      [secretKey, secretDigest, "application/vnd.dg-chat.provider-secrets"],
+    ] as const
+  ) {
+    await objects.put({
+      key,
+      body: new Blob(["orphan"]).stream(),
+      contentLength: 6,
+      contentType: mime,
+      metadata: { sha256: digest },
+    });
+  }
+  const service = new DefaultBackupAdminService({
+    store: fx.store,
+    objects,
+    data: fx.data,
+    authenticator: fx.auth,
+  });
+  await service.recoverPending();
+  assertEquals(objects.values.has(baseKey), true);
+  assertEquals(objects.values.has(secretKey), false);
+  assertEquals((await fx.store.get(item.id)).secretArtifactCleanupCheckedAt !== null, true);
   await service.close();
 });
 

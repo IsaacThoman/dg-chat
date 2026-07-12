@@ -35,9 +35,9 @@ if (Deno.env.get("DENO_ENV") === "production" && !providerKeyring) {
 const databaseUrl = Deno.env.get("DATABASE_URL");
 const production = Deno.env.get("DENO_ENV") === "production";
 if (production && !databaseUrl) throw new Error("Production requires DATABASE_URL");
-// Parse even before sidecar routes are wired: an explicit opt-in must never start with an
-// incomplete, reused, or malformed recovery key domain.
-privilegedBackupSecretConfig(Deno.env.toObject());
+// Parse before constructing services: an explicit opt-in must never start with an incomplete,
+// reused, or malformed recovery key domain.
+const privilegedBackupSecrets = privilegedBackupSecretConfig(Deno.env.toObject());
 const objectStore = objectStoreFromEnv();
 const backupConfig = await backupRuntimeConfig(Deno.env.toObject(), {
   dependenciesAvailable: Boolean(databaseUrl && objectStore),
@@ -57,6 +57,13 @@ const backupAdmin = backupConfig.enabled && databaseUrl && objectStore && backup
     authenticator: backupConfig.authenticator,
     restoreEnabled: backupConfig.restoreEnabled,
     maxUploadBytes: backupConfig.maxUploadBytes,
+    privilegedProviderSecrets: privilegedBackupSecrets.enabled && privilegedBackupSecrets.keyring &&
+        providerKeyring
+      ? {
+        recoveryKeyring: privilegedBackupSecrets.keyring,
+        providerKeyring,
+      }
+      : undefined,
   })
   : undefined;
 if (backupAdmin) {
