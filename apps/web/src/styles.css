@@ -2530,6 +2530,16 @@ kbd {
   font-size: 12px;
   line-height: 1.5;
 }
+.share-deleted-note {
+  margin-top: 14px;
+  padding: 11px 13px;
+  border: 1px solid color-mix(in srgb, var(--warning) 45%, var(--line));
+  border-radius: 9px;
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 9%, var(--card));
+  font-size: 12px;
+  line-height: 1.5;
+}
 .share-options {
   display: grid;
   gap: 8px;

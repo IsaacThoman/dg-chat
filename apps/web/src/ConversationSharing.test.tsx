@@ -56,6 +56,24 @@ describe("conversation sharing", () => {
     expect(temporary).toContain("disabled");
   });
 
+  it("keeps snapshot management reachable from a deleted conversation", () => {
+    const deleted = renderToString(
+      <ConversationShareButton
+        conversation={{
+          id: "conversation-1",
+          title: "Deleted",
+          preview: "",
+          updatedAt: "now",
+          deleted: true,
+        }}
+        messages={[]}
+        disabled
+      />,
+    );
+    expect(deleted).toContain("Manage shared snapshots");
+    expect(deleted).not.toContain("disabled");
+  });
+
   it("sends the capability and idempotency header only to the authenticated create route", async () => {
     const fetch = vi.fn().mockResolvedValue(
       new Response(

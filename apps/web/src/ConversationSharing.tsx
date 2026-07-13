@@ -44,12 +44,14 @@ export function ConversationShareButton({
   disabled?: boolean;
 }) {
   const [open, setOpen] = useState(false);
-  const unavailable = disabled || conversation.temporary || conversation.deleted ||
-    !conversation.activeLeafId || conversation.version === undefined;
+  const unavailable = !conversation.deleted && (
+    disabled || conversation.temporary || !conversation.activeLeafId ||
+    conversation.version === undefined
+  );
   const reason = conversation.temporary
     ? "Temporary chats cannot be shared"
     : conversation.deleted
-    ? "Restore this conversation before sharing"
+    ? "Manage shared snapshots"
     : disabled
     ? "Wait for the current response to finish"
     : !conversation.activeLeafId
@@ -256,114 +258,126 @@ function ShareDialog({
           )
           : (
             <>
-              <fieldset className="share-options">
-                <legend>Identity</legend>
-                <label>
-                  <input
-                    type="radio"
-                    name="share-identity"
-                    checked={identityVisibility === "anonymous"}
-                    onChange={() => setIdentityVisibility("anonymous")}
-                  />
-                  <span>
-                    <strong>Anonymous</strong>
-                    <small>Do not show your account name.</small>
-                  </span>
-                </label>
-                <label>
-                  <input
-                    type="radio"
-                    name="share-identity"
-                    checked={identityVisibility === "owner"}
-                    onChange={() =>
-                      setIdentityVisibility("owner")}
-                  />
-                  <span>
-                    <strong>Show my name</strong>
-                    <small>Display your current profile name.</small>
-                  </span>
-                </label>
-              </fieldset>
-              <fieldset className="share-options">
-                <legend>Attachments</legend>
-                <label>
-                  <input
-                    type="radio"
-                    name="share-attachments"
-                    checked={attachmentPolicy === "redact"}
-                    onChange={() =>
-                      setAttachmentPolicy("redact")}
-                  />
-                  <span>
-                    <strong>Redact all</strong>
-                    <small>Share message text without files.</small>
-                  </span>
-                </label>
-                <label>
-                  <input
-                    type="radio"
-                    name="share-attachments"
-                    checked={attachmentPolicy === "include"}
-                    onChange={() => setAttachmentPolicy("include")}
-                    disabled={attachments.length === 0}
-                  />
-                  <span>
-                    <strong>Include all</strong>
-                    <small>
-                      {attachments.length === 0
-                        ? "This path has no attachments."
-                        : `Include ${attachments.length} file${
-                          attachments.length === 1 ? "" : "s"
-                        }.`}
-                    </small>
-                  </span>
-                </label>
-                {attachments.length > 0 && (
+              {conversation.deleted && (
+                <div className="share-deleted-note" role="note">
+                  This conversation is in Trash. New snapshots are disabled, but existing links
+                  remain available until you revoke them below.
+                </div>
+              )}
+              {!conversation.deleted && (
+                <fieldset className="share-options">
+                  <legend>Identity</legend>
+                  <label>
+                    <input
+                      type="radio"
+                      name="share-identity"
+                      checked={identityVisibility === "anonymous"}
+                      onChange={() => setIdentityVisibility("anonymous")}
+                    />
+                    <span>
+                      <strong>Anonymous</strong>
+                      <small>Do not show your account name.</small>
+                    </span>
+                  </label>
+                  <label>
+                    <input
+                      type="radio"
+                      name="share-identity"
+                      checked={identityVisibility === "owner"}
+                      onChange={() =>
+                        setIdentityVisibility("owner")}
+                    />
+                    <span>
+                      <strong>Show my name</strong>
+                      <small>Display your current profile name.</small>
+                    </span>
+                  </label>
+                </fieldset>
+              )}
+              {!conversation.deleted && (
+                <fieldset className="share-options">
+                  <legend>Attachments</legend>
                   <label>
                     <input
                       type="radio"
                       name="share-attachments"
-                      checked={attachmentPolicy === "selected"}
-                      onChange={() => setAttachmentPolicy("selected")}
+                      checked={attachmentPolicy === "redact"}
+                      onChange={() => setAttachmentPolicy("redact")}
                     />
                     <span>
-                      <strong>Choose files</strong>
-                      <small>Include only selected attachments.</small>
+                      <strong>Redact all</strong>
+                      <small>Share message text without files.</small>
                     </span>
                   </label>
-                )}
-                {attachmentPolicy === "selected" && (
-                  <div className="share-attachment-list" aria-label="Attachments to include">
-                    {attachments.map((attachment) => (
-                      <label key={attachment.id}>
-                        <input
-                          type="checkbox"
-                          checked={selectedAttachmentIds.includes(attachment.id)}
-                          onChange={(event) =>
-                            setSelectedAttachmentIds((current) =>
-                              event.currentTarget.checked
-                                ? [...current, attachment.id]
-                                : current.filter((id) => id !== attachment.id)
-                            )}
-                        />
-                        <span>{attachment.filename}</span>
-                      </label>
-                    ))}
-                  </div>
-                )}
-              </fieldset>
-              <label className="field share-expiry">
-                <span>Link expiry</span>
-                <select
-                  value={expiry}
-                  onChange={(event) => setExpiry(event.currentTarget.value as typeof expiry)}
-                >
-                  <option value="never">Never</option>
-                  <option value="day">24 hours</option>
-                  <option value="week">7 days</option>
-                  <option value="month">30 days</option>
-                </select>
-              </label>
+                  <label>
+                    <input
+                      type="radio"
+                      name="share-attachments"
+                      checked={attachmentPolicy === "include"}
+                      onChange={() =>
+                        setAttachmentPolicy("include")}
+                      disabled={attachments.length === 0}
+                    />
+                    <span>
+                      <strong>Include all</strong>
+                      <small>
+                        {attachments.length === 0
+                          ? "This path has no attachments."
+                          : `Include ${attachments.length} file${
+                            attachments.length === 1 ? "" : "s"
+                          }.`}
+                      </small>
+                    </span>
+                  </label>
+                  {attachments.length > 0 && (
+                    <label>
+                      <input
+                        type="radio"
+                        name="share-attachments"
+                        checked={attachmentPolicy === "selected"}
+                        onChange={() => setAttachmentPolicy("selected")}
+                      />
+                      <span>
+                        <strong>Choose files</strong>
+                        <small>Include only selected attachments.</small>
+                      </span>
+                    </label>
+                  )}
+                  {attachmentPolicy === "selected" && (
+                    <div className="share-attachment-list" aria-label="Attachments to include">
+                      {attachments.map((attachment) => (
+                        <label key={attachment.id}>
+                          <input
+                            type="checkbox"
+                            checked={selectedAttachmentIds.includes(attachment.id)}
+                            onChange={(event) =>
+                              setSelectedAttachmentIds((current) =>
+                                event.currentTarget.checked
+                                  ? [...current, attachment.id]
+                                  : current.filter((id) => id !== attachment.id)
+                              )}
+                          />
+                          <span>{attachment.filename}</span>
+                        </label>
+                      ))}
+                    </div>
+                  )}
+                </fieldset>
+              )}
+              {!conversation.deleted && (
+                <label className="field share-expiry">
+                  <span>Link expiry</span>
+                  <select
+                    value={expiry}
+                    onChange={(event) => setExpiry(event.currentTarget.value as typeof expiry)}
+                  >
+                    <option value="never">Never</option>
+                    <option value="day">24 hours</option>
+                    <option value="week">7 days</option>
+                    <option value="month">30 days</option>
+                  </select>
+                </label>
+              )}
             </>
           )}
         {error && <p className="inline-error" role="alert">{error}</p>}
@@ -424,7 +438,7 @@ function ShareDialog({
         >
           Close
         </button>
-        {!createdUrl && (
+        {!createdUrl && !conversation.deleted && (
           <button
             type="button"
             className="primary"

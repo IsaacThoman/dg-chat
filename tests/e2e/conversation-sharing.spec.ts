@@ -24,6 +24,15 @@ test.beforeEach(async ({ page, request }) => {
   await login(page);
 });
 
+async function openSidebar(page: import("@playwright/test").Page) {
+  if ((page.viewportSize()?.width ?? 1280) > 800) return;
+  const sidebar = page.getByRole("dialog", { name: "Workspace navigation" });
+  if (await sidebar.isVisible()) return;
+  const menu = page.getByRole("button", { name: "Open menu", exact: true });
+  if (await menu.isVisible()) await menu.click();
+  await expect(sidebar).toBeVisible();
+}
+
 test("creates and revokes an immutable snapshot with conservative defaults", async ({ page }) => {
   await createChat(page);
   await page.getByRole("textbox", { name: "Message" }).fill("A snapshot-safe prompt");
@@ -165,4 +174,68 @@ test("renders a redacted public snapshot safely without workspace chrome", async
   const external = page.getByRole("link", { name: "the guide" });
   await expect(external).toHaveAttribute("rel", "noopener noreferrer");
   await expect(page.locator('meta[name="referrer"]')).toHaveAttribute("content", "no-referrer");
+});
+
+test("real stack pins a snapshot and revocation invalidates its public link", async ({ page }) => {
+  await createChat(page);
+  const prompt = `real immutable share ${crypto.randomUUID()}`;
+  await page.getByRole("textbox", { name: "Message" }).fill(prompt);
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(page.locator(".assistant-message")).toContainText(prompt);
+  await expect(page.getByRole("button", { name: "Stop generating" })).toBeHidden({
+    timeout: 20_000,
+  });
+  const conversationId = await page.locator(
+    ".conversation-row.active [data-conversation-actions]",
+  ).getAttribute("data-conversation-actions");
+  expect(conversationId).toBeTruthy();
+
+  await page.getByRole("button", { name: "Share an immutable snapshot" }).click();
+  const dialog = page.getByRole("dialog", { name: "Share conversation" });
+  await dialog.getByRole("button", { name: "Create snapshot" }).click();
+  const link = dialog.getByLabel("Share link");
+  await expect(link).toBeVisible();
+  const publicUrl = await link.inputValue();
+  expect(publicUrl).toMatch(/\/share\/[A-Za-z0-9_-]{43}$/);
+  const publicCapability = new URL(publicUrl).pathname.split("/").at(-1)!;
+  const publicApiPath = `/api/public/shares/${publicCapability}`;
+
+  const listed = await page.request.get("/api/shares");
+  expect(listed.ok()).toBeTruthy();
+  const shares = await listed.json() as {
+    data: Array<{ id: string; conversationId: string; version: number }>;
+  };
+  const share = shares.data.find((item) => item.conversationId === conversationId);
+  expect(share).toBeTruthy();
+
+  page.once("dialog", (prompt) => prompt.accept());
+  await dialog.locator(".modal-actions").getByRole("button", { name: "Close" }).click();
+  await openSidebar(page);
+  const actions = page.locator(`[data-conversation-actions="${conversationId}"]`);
+  await actions.click();
+  await page.getByRole("menuitem", { name: "Move to trash", exact: true }).click();
+  await page.getByRole("button", { name: "Move to trash", exact: true }).click();
+  await openSidebar(page);
+  await page.getByRole("button", { name: "Trash", exact: true }).click();
+  if ((page.viewportSize()?.width ?? 1280) <= 800) {
+    await expect(page.getByRole("dialog", { name: "Workspace navigation" })).toBeHidden();
+    await openSidebar(page);
+  }
+  await expect(actions).toBeVisible();
+  await actions.locator("..").locator(".conversation-open").click();
+  await expect(
+    page.locator(`.conversation-row.active [data-conversation-actions="${conversationId}"]`),
+  ).toHaveCount(1);
+
+  const stillPublic = await page.request.get(publicApiPath);
+  expect(stillPublic.ok()).toBeTruthy();
+  await page.getByRole("button", { name: "Manage shared snapshots" }).click();
+  const manageDialog = page.getByRole("dialog", { name: "Share conversation" });
+  await expect(manageDialog).toContainText("existing links remain available until you revoke");
+  page.once("dialog", (prompt) => prompt.accept());
+  await manageDialog.getByRole("button", { name: "Revoke" }).click();
+  await expect(manageDialog.getByText("revoked", { exact: true })).toBeVisible();
+  expect((await page.request.get(publicApiPath)).status()).toBe(404);
+  await page.goto(publicUrl);
+  await expect(page.getByRole("heading", { name: "Snapshot unavailable" })).toBeVisible();
 });
