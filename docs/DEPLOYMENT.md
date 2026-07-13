@@ -154,10 +154,10 @@ Normal portable exports always redact provider credentials. When privileged secr
 explicitly enabled, an administrator can create a separate recovery-key-encrypted `.dgsecrets`
 sidecar bound to the exact `.dgbackup` digest and content root. Store and transfer the two files as
 a pair, retain every referenced recovery key, and require recent authentication for export,
-download, upload, dry-run, and apply. On restore, apply the normal archive first, sign in again as an
-administrator from the restored installation, then dry-run and apply its matching sidecar. Secrets
-are re-encrypted under the destination provider keyring and every restored provider remains disabled
-until it is tested and deliberately enabled.
+download, upload, dry-run, and apply. On restore, apply the normal archive first, sign in again as
+an administrator from the restored installation, then dry-run and apply its matching sidecar.
+Secrets are re-encrypted under the destination provider keyring and every restored provider remains
+disabled until it is tested and deliberately enabled.
 
 ## Upgrades and rollback
 
