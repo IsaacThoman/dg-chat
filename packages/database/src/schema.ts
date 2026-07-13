@@ -872,6 +872,10 @@ export const providers = pgTable("providers", {
   index("providers_health_idx").on(table.healthStatus, table.healthCheckedAt.desc()),
   check("providers_slug_check", sql`${table.slug} ~ '^[a-z0-9][a-z0-9-]{0,62}$'`),
   check(
+    "providers_base_url_check",
+    sql`char_length(${table.baseUrl}) BETWEEN 1 AND 2048 AND ${table.baseUrl} ~ '^https?://[^/?#@]+(?:/[^?#@]*)?$'`,
+  ),
+  check(
     "providers_protocol_check",
     sql`${table.protocol} IN ('chat_completions','responses')`,
   ),

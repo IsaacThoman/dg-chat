@@ -1821,6 +1821,66 @@ Deno.test({
 });
 
 Deno.test({
+  name: "Postgres provider registry honors the exact test-only HTTP host exception",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const previousEnvironment = Deno.env.get("DENO_ENV");
+    const previousHost = Deno.env.get("OPENAI_TEST_ALLOW_HTTP_HOST");
+    const sql = postgres(databaseUrl!, { max: 1 });
+    await sql`TRUNCATE providers, audit_events, users RESTART IDENTITY CASCADE`;
+    await sql.end();
+    const repo = await PostgresRepository.connect(databaseUrl!);
+    try {
+      Deno.env.set("DENO_ENV", "test");
+      Deno.env.set("OPENAI_TEST_ALLOW_HTTP_HOST", "mock-provider");
+      const actor = await repo.bootstrapAdmin({
+        email: "provider-http@database.test",
+        name: "Provider HTTP",
+        passwordHash: "hash",
+      }, 1);
+      const provider = await repo.createProvider({
+        slug: "contract-http",
+        displayName: "Contract HTTP",
+        baseUrl: "http://mock-provider:4010/v1/",
+        protocol: "responses",
+      }, { actorId: actor.id, action: "provider.create" });
+      assertEquals(provider.baseUrl, "http://mock-provider:4010/v1");
+      await assertRejects(
+        () =>
+          repo.createProvider({
+            slug: "wrong-http-host",
+            displayName: "Wrong HTTP host",
+            baseUrl: "http://different-provider:4010/v1",
+            protocol: "responses",
+          }, { actorId: actor.id, action: "provider.create" }),
+        DomainError,
+        "Provider base URL is invalid",
+      );
+      Deno.env.set("DENO_ENV", "production");
+      await assertRejects(
+        () =>
+          repo.createProvider({
+            slug: "production-http-host",
+            displayName: "Production HTTP host",
+            baseUrl: "http://mock-provider:4010/v1",
+            protocol: "responses",
+          }, { actorId: actor.id, action: "provider.create" }),
+        DomainError,
+        "Provider base URL is invalid",
+      );
+    } finally {
+      await repo.close();
+      if (previousEnvironment === undefined) Deno.env.delete("DENO_ENV");
+      else Deno.env.set("DENO_ENV", previousEnvironment);
+      if (previousHost === undefined) Deno.env.delete("OPENAI_TEST_ALLOW_HTTP_HOST");
+      else Deno.env.set("OPENAI_TEST_ALLOW_HTTP_HOST", previousHost);
+    }
+  },
+});
+
+Deno.test({
   name: "Postgres serializes OCR graph edits and protocol default invariants",
   ignore: !databaseUrl,
   sanitizeOps: false,
