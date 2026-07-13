@@ -393,6 +393,8 @@ kbd {
   background: #e5e4df;
 }
 .conversation-scroll {
+  position: relative;
+  z-index: 2;
   flex: 1;
   overflow-y: auto;
   padding-top: 7px;
@@ -400,6 +402,8 @@ kbd {
   scrollbar-color: #d0cec7 transparent;
 }
 .workspace-navigation {
+  position: relative;
+  z-index: 1;
   max-height: 34vh;
   overflow-y: auto;
   padding: 5px 2px 8px;

@@ -278,6 +278,7 @@ export function WorkspaceNavigation({
               <span>{creating === "folder" ? "Project name" : "Tag name"}</span>
               <input
                 autoFocus
+                data-autofocus
                 maxLength={creating === "folder" ? 120 : 64}
                 value={name}
                 onChange={(event) => setName(event.target.value)}

@@ -1,7 +1,11 @@
 import { type ReactNode, useEffect, useId, useRef } from "react";
 import { createPortal } from "react-dom";
 import { X } from "lucide-react";
-import { modalFocusableElements, modalShouldRestoreFocus } from "./modalFocus.ts";
+import {
+  modalFocusableElements,
+  modalInitialFocus,
+  modalShouldRestoreFocus,
+} from "./modalFocus.ts";
 
 export function Modal(
   { title, close, children, dismissible = true, variant = "default", restoreFocus = true }: {
@@ -31,11 +35,7 @@ export function Modal(
       restoreFrame.current = null;
     }
     const dialog = dialogRef.current;
-    const focusable = dialog ? modalFocusableElements(dialog) : [];
-    const autofocus = focusable.find((element) =>
-      element.hasAttribute("data-autofocus") || element.hasAttribute("autofocus")
-    );
-    (autofocus ?? focusable[0] ?? dialog)?.focus();
+    if (dialog) modalInitialFocus(dialog).focus();
     const keydown = (event: KeyboardEvent) => {
       if (event.key === "Escape" && dismissibleRef.current) {
         event.preventDefault();

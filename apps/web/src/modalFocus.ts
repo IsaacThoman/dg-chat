@@ -20,3 +20,12 @@ export function modalFocusableElements(dialog: HTMLElement): HTMLElement[] {
 export function modalShouldRestoreFocus(value: boolean | (() => boolean)): boolean {
   return typeof value === "function" ? value() : value;
 }
+
+export function modalInitialFocus(
+  dialog: HTMLElement,
+  focusable = modalFocusableElements(dialog),
+): HTMLElement {
+  return focusable.find((element) =>
+    element.hasAttribute("data-autofocus") || element.hasAttribute("autofocus")
+  ) ?? focusable[0] ?? dialog;
+}

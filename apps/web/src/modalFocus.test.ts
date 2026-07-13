@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   MODAL_FOCUSABLE_SELECTOR,
   modalFocusableElements,
+  modalInitialFocus,
   modalShouldRestoreFocus,
 } from "./modalFocus.ts";
 
@@ -11,6 +12,7 @@ type FakeElement = {
   ariaDisabled?: boolean;
   ariaHidden?: boolean;
   inert?: boolean;
+  autofocus?: boolean;
 };
 
 function element(value: FakeElement): HTMLElement {
@@ -20,6 +22,8 @@ function element(value: FakeElement): HTMLElement {
       selector === ":disabled, [aria-disabled='true'], [aria-hidden='true']" &&
       Boolean(value.disabled || value.ariaDisabled || value.ariaHidden),
     closest: (selector: string) => selector === "[inert]" && value.inert ? {} : null,
+    hasAttribute: (name: string) =>
+      Boolean(value.autofocus && (name === "autofocus" || name === "data-autofocus")),
   } as HTMLElement;
 }
 
@@ -50,5 +54,19 @@ describe("modal focus targets", () => {
     } as unknown as HTMLElement;
 
     expect(modalFocusableElements(dialog)).toEqual([included]);
+  });
+
+  it("prefers an explicitly requested field over the modal close button", () => {
+    const close = element({ tabIndex: 0 });
+    const projectName = element({ tabIndex: 0, autofocus: true });
+    const dialog = element({ tabIndex: -1 });
+    expect(modalInitialFocus(dialog, [close, projectName])).toBe(projectName);
+  });
+
+  it("falls back to the first control and then the dialog", () => {
+    const close = element({ tabIndex: 0 });
+    const dialog = element({ tabIndex: -1 });
+    expect(modalInitialFocus(dialog, [close])).toBe(close);
+    expect(modalInitialFocus(dialog, [])).toBe(dialog);
   });
 });
