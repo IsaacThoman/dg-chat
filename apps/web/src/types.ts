@@ -36,6 +36,7 @@ export interface Conversation {
   archived?: boolean;
   deleted?: boolean;
   temporary?: boolean;
+  temporaryExpiresAt?: string | null;
   project?: string;
   activeLeafId?: string | null;
   version?: number;
@@ -491,4 +492,20 @@ export interface BackupRestoreStatus {
   stage: string;
   completedAt: string | null;
   error: string | null;
+}
+
+export interface ConversationPortabilityImportResult {
+  dryRun: boolean;
+  replayed: boolean;
+  conversations: number;
+  messages: number;
+  attachments: number;
+  folders: number;
+  tags: number;
+  idMap: Record<string, string>;
+}
+
+export interface ConversationPortabilityDownload {
+  blob: Blob;
+  filename: string;
 }

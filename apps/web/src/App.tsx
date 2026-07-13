@@ -77,6 +77,7 @@ import { AdminAnalyticsView, AdminJobsView } from "./AdminOperations.tsx";
 import { AdminRetentionView } from "./AdminRetention.tsx";
 import { AdminBackupsView } from "./AdminBackups.tsx";
 import { PersonalTokenSettings } from "./TokenGovernance.tsx";
+import { UserPortability } from "./UserPortability.tsx";
 import {
   conversationForFirstSend,
   mergeAttachmentIds,
@@ -2026,6 +2027,7 @@ function ChatView({
   balance,
   onConversationCreated,
   onUpdateConversation,
+  onKeepConversation,
   readOnly: readOnlyProp = false,
   saveHistory = true,
   modelPreferenceError = "",
@@ -2045,6 +2047,7 @@ function ChatView({
     conversation: Conversation,
     patch: { title?: string; pinned?: boolean; archived?: boolean; deleted?: boolean },
   ) => Promise<void>;
+  onKeepConversation: (conversation: Conversation) => Promise<Conversation>;
   readOnly?: boolean;
   saveHistory?: boolean;
   modelPreferenceError?: string;
@@ -2167,6 +2170,8 @@ function ChatView({
   const [branchBusy, setBranchBusy] = useState(false);
   const [sendError, setSendError] = useState("");
   const [renaming, setRenaming] = useState(false);
+  const [keepingTemporary, setKeepingTemporary] = useState(false);
+  const [keepTemporaryError, setKeepTemporaryError] = useState("");
   const initialConversation = conversations.find((c) => c.id === activeId);
   const [conversation, setConversation] = useState(initialConversation);
   const syncConversation = (next: Conversation) => {
@@ -2596,6 +2601,42 @@ function ChatView({
             <Pencil size={14} /> Rename
           </button>
         </div>
+        {conversation?.temporary && (
+          <div className="temporary-chat-banner" role="status">
+            <div>
+              <strong>Temporary chat</strong>
+              <span>
+                This chat is excluded from organization and user exports and will be deleted
+                {conversation.temporaryExpiresAt
+                  ? ` after ${new Date(conversation.temporaryExpiresAt).toLocaleString()}`
+                  : " automatically"}.
+              </span>
+              {keepTemporaryError && <span role="alert">{keepTemporaryError}</span>}
+            </div>
+            {!readOnly && (
+              <button
+                type="button"
+                className="secondary"
+                disabled={keepingTemporary || generationBusy}
+                onClick={async () => {
+                  setKeepingTemporary(true);
+                  setKeepTemporaryError("");
+                  try {
+                    syncConversation(await onKeepConversation(conversation));
+                  } catch (error) {
+                    setKeepTemporaryError(
+                      error instanceof Error ? error.message : "This chat could not be kept.",
+                    );
+                  } finally {
+                    setKeepingTemporary(false);
+                  }
+                }}
+              >
+                {keepingTemporary ? "Keeping…" : "Keep chat"}
+              </button>
+            )}
+          </div>
+        )}
         {activePath.map((m) => (
           <MessageItem
             key={m.id}
@@ -2857,7 +2898,13 @@ function SettingsView(
                   <strong>{user.name}</strong>
                   <small>{user.email}</small>
                 </div>
-                <button className="secondary push">Change avatar</button>
+                <button
+                  className="secondary push"
+                  disabled
+                  title="Avatar editing is not available yet"
+                >
+                  Change avatar
+                </button>
               </div>
               <Field label="Display name" value={user.name} />
               <Field label="Email address" value={user.email} />
@@ -2866,7 +2913,13 @@ function SettingsView(
                   <strong>Password</strong>
                   <small>Last changed 3 months ago</small>
                 </span>
-                <button className="secondary">Change password</button>
+                <button
+                  className="secondary"
+                  disabled
+                  title="Password changes are not available in the app yet"
+                >
+                  Change password
+                </button>
               </div>
               <div className="danger-zone">
                 <h3>Danger zone</h3>
@@ -2875,7 +2928,13 @@ function SettingsView(
                     <strong>Delete account</strong>
                     <small>Schedule your account and data for deletion.</small>
                   </span>
-                  <button className="danger-button">Delete account</button>
+                  <button
+                    className="danger-button"
+                    disabled
+                    title="Self-service account deletion is not available yet"
+                  >
+                    Delete account
+                  </button>
                 </div>
               </div>
             </>
@@ -2901,19 +2960,14 @@ function SettingsView(
                 title="Data & privacy"
                 subtitle="Control storage, exports, and retention"
               />
-              <ToggleRow
-                title="Store provider payloads"
-                subtitle="Off by default; intended for debugging only"
-              />
               <div className="setting-row">
                 <span>
-                  <strong>Export your data</strong>
-                  <small>Download conversations, files, and settings as JSON.</small>
+                  <strong>Provider payload storage</strong>
+                  <small>Managed by your administrator and off by default.</small>
                 </span>
-                <button className="secondary">
-                  <Download size={16} /> Export
-                </button>
+                <span className="status muted">Administrator controlled</span>
               </div>
+              <UserPortability />
             </>
           )}
           {section === "tokens" && <PersonalTokenSettings />}
@@ -2935,31 +2989,10 @@ function Field({ label, value }: { label: string; value: string }) {
   return (
     <label className="field">
       <span>{label}</span>
-      <input defaultValue={value} />
+      <input value={value} readOnly aria-readonly="true" />
     </label>
   );
 }
-function ToggleRow(
-  { title, subtitle, on = false }: { title: string; subtitle: string; on?: boolean },
-) {
-  const [enabled, setEnabled] = useState(on);
-  return (
-    <div className="setting-row">
-      <span>
-        <strong>{title}</strong>
-        <small>{subtitle}</small>
-      </span>
-      <button
-        aria-label={title}
-        className={cn("toggle", enabled && "on")}
-        onClick={() => setEnabled(!enabled)}
-      >
-        <i />
-      </button>
-    </div>
-  );
-}
-
 function UsageSettings() {
   const usage = useQuery({ queryKey: ["usage"], queryFn: api.usage });
   const data = usage.data;
@@ -3749,6 +3782,15 @@ export function App(
       });
     }
   };
+  const keepConversation = async (conversation: Conversation) => {
+    const updated = await api.keepConversation(conversation);
+    queryClient.setQueryData<Conversation[]>(
+      ["conversations"],
+      (current) => mergeConversationSnapshot(current, updated),
+    );
+    await conversationQuery.refetch();
+    return updated;
+  };
   if (!user) {
     return <DiscoveryLoading unavailable={setupQuery.isError && userQuery.isError} />;
   }
@@ -3815,6 +3857,7 @@ export function App(
           balance={user.balance}
           onConversationCreated={conversationCreated}
           onUpdateConversation={updateConversation}
+          onKeepConversation={keepConversation}
           readOnly={view !== "chat"}
           saveHistory={!temporaryChatUntilPreferencesResolve(demoMode, preferencesQuery.data)}
           modelPreferenceError={modelPreferenceError}

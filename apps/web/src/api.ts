@@ -21,6 +21,8 @@ import type {
   ConversationFolder,
   ConversationFolderMembership,
   ConversationKnowledge,
+  ConversationPortabilityDownload,
+  ConversationPortabilityImportResult,
   ConversationTag,
   ConversationTagBinding,
   ConversationTagSet,
@@ -71,6 +73,7 @@ type RawConversation = {
   version: number;
   pinned: boolean;
   temporary?: boolean;
+  temporaryExpiresAt?: string | null;
   archivedAt: string | null;
   deletedAt: string | null;
   updatedAt: string;
@@ -147,6 +150,7 @@ export function mapConversation(value: RawConversation): Conversation {
     updatedAt: new Date(value.updatedAt).toLocaleString(),
     pinned: value.pinned,
     temporary: value.temporary ?? false,
+    temporaryExpiresAt: value.temporaryExpiresAt ?? null,
     archived: Boolean(value.archivedAt),
     deleted: Boolean(value.deletedAt),
     activeLeafId: value.activeLeafId,
@@ -245,6 +249,50 @@ export async function responseError(response: Response): Promise<ApiError> {
   } catch {
     return new ApiError(response.status, "request_failed", fallback);
   }
+}
+
+const portabilityFilename = (header: string | null): string => {
+  const match = header?.match(/filename="([^"\\/]+)"/i);
+  return match?.[1] ?? `dg-chat-export-${new Date().toISOString().slice(0, 10)}.dgchat`;
+};
+
+export async function downloadConversationPortability(
+  options: { includeDeleted: boolean; includeTemporary: boolean },
+): Promise<ConversationPortabilityDownload> {
+  const query = new URLSearchParams({
+    includeDeleted: String(options.includeDeleted),
+    includeTemporary: String(options.includeTemporary),
+  });
+  const response = await fetch(`/api/portability/export?${query}`, {
+    credentials: "include",
+    headers: { Accept: "application/json" },
+  });
+  if (!response.ok) throw await responseError(response);
+  return {
+    blob: await response.blob(),
+    filename: portabilityFilename(response.headers.get("content-disposition")),
+  };
+}
+
+export async function importConversationPortability(
+  archive: string,
+  dryRun: boolean,
+  idempotencyKey?: string,
+): Promise<ConversationPortabilityImportResult> {
+  const response = await fetch(
+    dryRun ? "/api/portability/import/dry-run" : "/api/portability/import",
+    {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+        ...(dryRun ? {} : { "Idempotency-Key": idempotencyKey ?? "" }),
+      },
+      body: archive,
+    },
+  );
+  if (!response.ok) throw await responseError(response);
+  return await response.json() as ConversationPortabilityImportResult;
 }
 
 async function request<T>(path: string, init?: RequestInit, fallback?: T): Promise<T> {
@@ -453,7 +501,16 @@ export const api = {
         body: JSON.stringify({ expectedVersion: conversation.version, ...patch }),
       }),
     ),
+  keepConversation: async (conversation: Pick<Conversation, "id" | "version">) =>
+    mapConversation(
+      await request<RawConversation>(`/conversations/${conversation.id}/keep`, {
+        method: "POST",
+        body: JSON.stringify({ expectedVersion: conversation.version }),
+      }),
+    ),
   preferences: () => request<UserPreferences>("/preferences"),
+  downloadConversationPortability,
+  importConversationPortability,
   updatePreferences: (
     preferences: UserPreferences,
     patch: Partial<

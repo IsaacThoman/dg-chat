@@ -20,6 +20,8 @@ import {
   canonicalJson,
   DEFAULT_BACKUP_LIMITS,
   dryRunBackupData,
+  isSupportedBackupDataSchemaVersion,
+  LEGACY_BACKUP_DATA_OMITTED_TABLES,
   ObjectAlreadyExistsError,
   restoreBackupData,
   signBackupManifest,
@@ -638,11 +640,16 @@ export function createPostgresBackupDataPort(
         },
       };
 
+      let stagedSchemaVersion: string = BACKUP_DATA_SCHEMA_VERSION;
       const source = (): BackupDataSource => ({
-        schemaVersion: BACKUP_DATA_SCHEMA_VERSION,
+        schemaVersion: stagedSchemaVersion,
         rows(tableName: string): AsyncIterable<BackupDataBatch> {
           const path = paths.get(`${TABLE_PREFIX}${tableName}.ndjson`);
           if (!path) {
+            if (
+              stagedSchemaVersion === "0028" &&
+              LEGACY_BACKUP_DATA_OMITTED_TABLES.has(tableName)
+            ) return (async function* () {})();
             if (diagnosticsExcluded && tableName === "provider_payload_captures") {
               return (async function* () {})();
             }
@@ -672,23 +679,36 @@ export function createPostgresBackupDataPort(
       });
 
       const stageObjects = async (manifest: BackupManifestV1) => {
-        if (manifest.schemaVersion !== BACKUP_DATA_SCHEMA_VERSION) {
+        if (!isSupportedBackupDataSchemaVersion(manifest.schemaVersion)) {
           throw new TypeError("Backup database schema is unsupported");
         }
-        const expectedTables = BACKUP_DATA_TABLES.filter((table) =>
+        stagedSchemaVersion = manifest.schemaVersion;
+        const currentExpectedTables = BACKUP_DATA_TABLES.filter((table) =>
           manifest.diagnosticPayloadPolicy !== "excluded" ||
           table.name !== "provider_payload_captures"
         ).map((table) => `${TABLE_PREFIX}${table.name}.ndjson`);
+        const legacyExpectedTables = currentExpectedTables.filter((name) =>
+          !LEGACY_BACKUP_DATA_OMITTED_TABLES.has(
+            name.slice(TABLE_PREFIX.length, -".ndjson".length),
+          )
+        );
         diagnosticsExcluded = manifest.diagnosticPayloadPolicy === "excluded";
         const actualTables = manifest.entries.filter((entry) =>
           entry.name.startsWith(TABLE_PREFIX)
         );
-        if (
-          actualTables.length !== expectedTables.length ||
-          actualTables.some((entry, index) =>
-            entry.name !== expectedTables[index] || entry.kind !== "ndjson"
-          )
-        ) throw new TypeError("Backup table entry set is incomplete or unexpected");
+        const matches = (expected: readonly string[]) =>
+          actualTables.length === expected.length &&
+          actualTables.every((entry, index) =>
+            entry.name === expected[index] && entry.kind === "ndjson"
+          );
+        const expectedTables = matches(currentExpectedTables)
+          ? currentExpectedTables
+          : manifest.schemaVersion === "0028" && matches(legacyExpectedTables)
+          ? legacyExpectedTables
+          : null;
+        if (!expectedTables) {
+          throw new TypeError("Backup table entry set is incomplete or unexpected");
+        }
         const entryByName = new Map(manifest.entries.map((entry) => [entry.name, entry]));
         if (
           manifest.entries.some((entry) =>

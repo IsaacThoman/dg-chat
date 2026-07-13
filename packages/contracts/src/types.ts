@@ -63,6 +63,8 @@ export interface Conversation {
   version: number;
   pinned: boolean;
   temporary: boolean;
+  /** Exact lifecycle deadline for temporary chats; null for saved chats. */
+  temporaryExpiresAt: string | null;
   archivedAt: string | null;
   deletedAt: string | null;
   createdAt: string;

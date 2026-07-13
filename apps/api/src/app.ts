@@ -17,6 +17,7 @@ import {
   appendMessageSchema,
   approvalSchema,
   chatCompletionSchema,
+  conversationPortabilityV1Schema,
   createAccessGroupSchema,
   createConversationFolderSchema,
   createConversationSchema,
@@ -29,6 +30,7 @@ import {
   embeddingsSchema,
   generateMessageSchema,
   identityTokenSchema,
+  keepTemporaryConversationSchema,
   knowledgeBindingSchema,
   knowledgeExpectedVersionSchema,
   loginSchema,
@@ -83,6 +85,7 @@ import {
   ObjectAlreadyExistsError,
   type ObjectStore,
   parseEmbeddingBillingConfig,
+  parseTemporaryLifecycleConfig,
   type ProviderExecutionPlan,
   type ProviderModelRecord,
   type ProviderRecord,
@@ -255,6 +258,7 @@ export interface AppOptions {
   generationHeartbeatMs?: number;
   generationLeaseSeconds?: number;
   generationStopPollMs?: number;
+  temporaryRetentionDays?: number;
   webComplete?: typeof complete;
   objectStore?: ObjectStore;
   attachmentContextMaxRawBytes?: number;
@@ -958,6 +962,57 @@ const requireIdempotencyKey = (value: string | undefined): string => {
   }
   return key;
 };
+const requirePortabilityIdempotencyKey = (value: string | undefined): string => {
+  if (value === undefined || value.trim() === "") return requireIdempotencyKey(value);
+  try {
+    return requireIdempotencyKey(value);
+  } catch {
+    throw new DomainError(
+      "invalid_idempotency_key",
+      "Idempotency-Key must be 8 to 200 characters without control characters",
+      422,
+    );
+  }
+};
+
+const PORTABILITY_IMPORT_MAX_BYTES = 16 * 1024 * 1024;
+const portabilityImportPaths = new Set([
+  "/api/portability/import",
+  "/api/portability/import/dry-run",
+]);
+const parsePortabilityQuery = (c: Context) => {
+  const url = new URL(c.req.url);
+  const allowed = new Set(["includeDeleted", "includeTemporary"]);
+  for (const key of url.searchParams.keys()) {
+    if (!allowed.has(key) || url.searchParams.getAll(key).length !== 1) {
+      throw new DomainError("validation_error", "Export query parameters are invalid", 422);
+    }
+  }
+  const boolean = (name: string) => {
+    const value = url.searchParams.get(name);
+    if (value === null) return false;
+    if (value !== "true" && value !== "false") {
+      throw new DomainError("validation_error", `${name} must be true or false`, 422);
+    }
+    return value === "true";
+  };
+  return {
+    includeDeleted: boolean("includeDeleted"),
+    includeTemporary: boolean("includeTemporary"),
+  };
+};
+const parsePortabilityArchive = async (c: Context) => {
+  const mediaType = (c.req.header("content-type") ?? "").split(";", 1)[0].trim().toLowerCase();
+  if (mediaType !== "application/json") {
+    throw new DomainError("unsupported_media_type", "Content-Type must be application/json", 415);
+  }
+  return await parseJson(c, conversationPortabilityV1Schema);
+};
+const privateNoStore = (c: Context) => {
+  c.header("Cache-Control", "private, no-store");
+  c.header("Pragma", "no-cache");
+  c.header("X-Content-Type-Options", "nosniff");
+};
 
 async function stageMultipartUpload(
   request: Request,
@@ -1148,6 +1203,13 @@ export function createApp(options: AppOptions = {}) {
     !Number.isSafeInteger(generationStopPollMs) || generationStopPollMs < 100 ||
     generationStopPollMs > 5_000
   ) throw new Error("GENERATION_STOP_POLL_MS must be an integer between 100 and 5000");
+  const temporaryRetentionDays = options.temporaryRetentionDays ?? parseTemporaryLifecycleConfig({
+    TEMPORARY_CHAT_RETENTION_DAYS: Deno.env.get("TEMPORARY_CHAT_RETENTION_DAYS"),
+  }).retentionDays;
+  if (
+    !Number.isSafeInteger(temporaryRetentionDays) || temporaryRetentionDays < 1 ||
+    temporaryRetentionDays > 3650
+  ) throw new Error("Temporary chat retention must be an integer between 1 and 3650 days");
   const webComplete = options.webComplete ?? complete;
   const activeWebGenerations = new Map<string, AbortController>();
   const setupToken = options.setupToken ?? Deno.env.get("SETUP_TOKEN") ?? "";
@@ -1738,6 +1800,7 @@ export function createApp(options: AppOptions = {}) {
     );
   });
   const apiBodyLimit = bodyLimit({ maxSize: 2 * 1024 * 1024 });
+  const portabilityBodyLimit = bodyLimit({ maxSize: PORTABILITY_IMPORT_MAX_BYTES });
   const openAIBodyLimit = bodyLimit({ maxSize: 4 * 1024 * 1024 });
   const speechBodyLimit = bodyLimit({ maxSize: 64 * 1024 });
   app.use(
@@ -1752,6 +1815,8 @@ export function createApp(options: AppOptions = {}) {
             )) ||
         c.req.path === "/api/audio/transcriptions"
         ? next()
+        : portabilityImportPaths.has(c.req.path.replace(/\/+$/, ""))
+        ? portabilityBodyLimit(c, next)
         : apiBodyLimit(c, next),
   );
   app.use(
@@ -3225,6 +3290,78 @@ export function createApp(options: AppOptions = {}) {
 
   app.use("/api/conversations/*", authenticate, approved, sessionOnly);
   app.use("/api/conversations", authenticate, approved, sessionOnly);
+  app.use("/api/portability/*", authenticate, approved, sessionOnly);
+  app.get("/api/portability/export", async (c) => {
+    privateNoStore(c);
+    const exportOptions = parsePortabilityQuery(c);
+    const archive = await repo.exportConversationPortability(
+      c.get("user").id,
+      exportOptions,
+    );
+    await repo.recordAudit({
+      action: "conversation.portability_exported",
+      actorId: c.get("user").id,
+      targetType: "user",
+      targetId: c.get("user").id,
+      metadata: {
+        conversations: archive.conversations.length,
+        attachments: archive.attachments.length,
+        includeDeleted: exportOptions.includeDeleted,
+        includeTemporary: exportOptions.includeTemporary,
+      },
+    });
+    c.header(
+      "Content-Disposition",
+      `attachment; filename="dg-chat-export-${new Date().toISOString().slice(0, 10)}.dgchat"`,
+    );
+    return c.json(archive);
+  });
+  app.post("/api/portability/import/dry-run", async (c) => {
+    privateNoStore(c);
+    const result = await repo.importConversationPortability(
+      c.get("user").id,
+      await parsePortabilityArchive(c),
+      "dry-run-not-persisted",
+      true,
+    );
+    await repo.recordAudit({
+      action: "conversation.portability_import_previewed",
+      actorId: c.get("user").id,
+      targetType: "user",
+      targetId: c.get("user").id,
+      metadata: {
+        conversations: result.conversations,
+        messages: result.messages,
+        attachments: result.attachments,
+      },
+    });
+    return c.json(result);
+  });
+  app.post("/api/portability/import", async (c) => {
+    privateNoStore(c);
+    // Reject missing replay protection before spending memory and CPU parsing a potentially
+    // large archive. The repository remains the authority for stable replay and payload drift.
+    const idempotencyKey = requirePortabilityIdempotencyKey(c.req.header("idempotency-key"));
+    const result = await repo.importConversationPortability(
+      c.get("user").id,
+      await parsePortabilityArchive(c),
+      idempotencyKey,
+    );
+    if (result.replayed) {
+      await repo.recordAudit({
+        action: "conversation.portability_import_replayed",
+        actorId: c.get("user").id,
+        targetType: "user",
+        targetId: c.get("user").id,
+        metadata: {
+          conversations: result.conversations,
+          messages: result.messages,
+          attachments: result.attachments,
+        },
+      });
+    }
+    return c.json(result, result.replayed ? 200 : 201);
+  });
   app.use("/api/preferences", authenticate, approved, sessionOnly);
   app.get("/api/preferences", async (c) => {
     c.header("Cache-Control", "private, no-store");
@@ -3354,8 +3491,21 @@ export function createApp(options: AppOptions = {}) {
         body.title,
         body.temporary,
         c.req.header("idempotency-key"),
+        temporaryRetentionDays,
       ),
       201,
+    );
+  });
+  app.post("/api/conversations/:id/keep", async (c) => {
+    const ownerId = c.get("user").id;
+    const conversationId = requireUuid(c.req.param("id"), "conversationId");
+    const body = await parseJson(c, keepTemporaryConversationSchema);
+    return c.json(
+      await repo.promoteTemporaryConversation(
+        ownerId,
+        conversationId,
+        body.expectedVersion,
+      ),
     );
   });
   app.get(
@@ -9072,6 +9222,14 @@ export function createApp(options: AppOptions = {}) {
       if (c.req.path.startsWith("/v1/")) {
         const code = error.status === 413 ? "request_too_large" : "request_error";
         return c.json(openAIError(error.message, code), error.status as 400);
+      }
+      if (error.status === 413) {
+        return c.json({
+          error: {
+            code: "request_too_large",
+            message: "Request body exceeds the allowed size",
+          },
+        }, 413);
       }
       return error.getResponse();
     }

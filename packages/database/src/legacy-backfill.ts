@@ -81,8 +81,12 @@ export async function backfillLegacyRuntimeSnapshot(url: string): Promise<Legacy
         },${value.expiresAt},${value.revokedAt},${value.lastUsedAt},${value.createdAt},${value.id})`;
       }
       for (const [, value] of snapshot.conversations ?? []) {
-        await tx`INSERT INTO conversations(id,owner_id,title,active_leaf_id,version,pinned,temporary,archived_at,deleted_at,created_at,updated_at) VALUES(${value.id},${value.ownerId},${value.title},NULL,${value.version},${value.pinned},${
+        await tx`INSERT INTO conversations(id,owner_id,title,active_leaf_id,version,pinned,temporary,temporary_expires_at,archived_at,deleted_at,created_at,updated_at) VALUES(${value.id},${value.ownerId},${value.title},NULL,${value.version},${value.pinned},${
           value.temporary ?? false
+        },${
+          value.temporary
+            ? new Date(Date.parse(value.createdAt) + 30 * 86_400_000).toISOString()
+            : null
         },${value.archivedAt},${value.deletedAt},${value.createdAt},${value.updatedAt})`;
       }
       const idempotencyByMessage = new Map<string, string>();

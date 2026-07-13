@@ -6,6 +6,7 @@ import type {
   ConversationDetail,
   ConversationFolder,
   ConversationFolderMembership,
+  ConversationPortabilityV1,
   ConversationTag,
   ConversationTagBinding,
   ConversationTagSet,
@@ -25,6 +26,23 @@ export {
 } from "./attachment-policy.ts";
 
 export type MaybePromise<T> = T | Promise<T>;
+
+export interface ConversationPortabilityExportOptions {
+  includeTemporary?: boolean;
+  includeDeleted?: boolean;
+}
+
+export interface ConversationPortabilityImportResult {
+  dryRun: boolean;
+  replayed: boolean;
+  conversations: number;
+  messages: number;
+  attachments: number;
+  folders: number;
+  tags: number;
+  /** Old archive identifiers mapped to newly allocated owner-scoped identifiers. */
+  idMap: Record<string, string>;
+}
 
 export interface CreateUserInput {
   id?: string;
@@ -850,6 +868,18 @@ export interface ConversationPatch {
   archived?: boolean;
   deleted?: boolean;
 }
+export type LifecycleConversation = Conversation;
+export type LifecycleConversationDetail = ConversationDetail;
+export interface PurgeTemporaryConversationsInput {
+  /** Omit only from trusted maintenance code to purge across owners. */
+  ownerId?: string;
+  limit?: number;
+  /** Injectable cutoff for deterministic maintenance jobs and tests. */
+  now?: string;
+}
+export interface PurgeTemporaryConversationsResult {
+  conversationIds: string[];
+}
 /** Locale-independent workspace identity: display Unicode is preserved; ASCII case is folded. */
 export function canonicalWorkspaceName(value: string): string {
   return value.replace(/[A-Z]/g, (character) => character.toLowerCase());
@@ -1554,15 +1584,37 @@ export interface DomainRepository {
     title: string,
     temporary?: boolean,
     idempotencyKey?: string,
-  ): MaybePromise<Conversation>;
-  listConversations(ownerId: string, includeDeleted?: boolean): MaybePromise<Conversation[]>;
+    temporaryRetentionDays?: number,
+  ): MaybePromise<LifecycleConversation>;
+  listConversations(
+    ownerId: string,
+    includeDeleted?: boolean,
+  ): MaybePromise<LifecycleConversation[]>;
   updateConversation(
     ownerId: string,
     id: string,
     patch: ConversationPatch,
-  ): MaybePromise<Conversation>;
-  detail(id: string, ownerId: string): MaybePromise<ConversationDetail>;
+  ): MaybePromise<LifecycleConversation>;
+  detail(id: string, ownerId: string): MaybePromise<LifecycleConversationDetail>;
+  promoteTemporaryConversation(
+    ownerId: string,
+    id: string,
+    expectedVersion: number,
+  ): MaybePromise<LifecycleConversation>;
+  purgeExpiredTemporaryConversations(
+    input: PurgeTemporaryConversationsInput,
+  ): MaybePromise<PurgeTemporaryConversationsResult>;
   getUserPreferences(ownerId: string): MaybePromise<UserPreferences>;
+  exportConversationPortability(
+    ownerId: string,
+    options?: ConversationPortabilityExportOptions,
+  ): MaybePromise<ConversationPortabilityV1>;
+  importConversationPortability(
+    ownerId: string,
+    archive: ConversationPortabilityV1,
+    idempotencyKey: string,
+    dryRun?: boolean,
+  ): MaybePromise<ConversationPortabilityImportResult>;
   updateUserPreferences(
     ownerId: string,
     patch: UserPreferencesPatch,

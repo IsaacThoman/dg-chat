@@ -1,8 +1,10 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.14";
 import {
+  BACKUP_DATA_SCHEMA_VERSION,
   BACKUP_DATA_TABLES,
   backupContentRoot,
   createHmacBackupAuthenticator,
+  LEGACY_BACKUP_DATA_OMITTED_TABLES,
   ObjectAlreadyExistsError,
   parseBackupArchiveStream,
   sha256Hex,
@@ -211,7 +213,7 @@ async function fixture(
       consumer: (source: BackupExportSource) => Promise<T>,
     ) {
       const result = consumer({
-        schemaVersion: "0028",
+        schemaVersion: BACKUP_DATA_SCHEMA_VERSION,
         installationId: "installation-test",
         tables: BACKUP_DATA_TABLES.filter((table) => table.name !== "provider_payload_captures"),
         rows(tableName: string): AsyncIterable<BackupDataBatch> {
@@ -230,7 +232,7 @@ async function fixture(
       consumer: (source: PrivilegedBackupExportSource) => Promise<T>,
     ) {
       const result = consumer({
-        schemaVersion: "0028",
+        schemaVersion: BACKUP_DATA_SCHEMA_VERSION,
         installationId: "installation-test",
         tables: BACKUP_DATA_TABLES.filter((table) => table.name !== "provider_payload_captures"),
         rows(tableName: string): AsyncIterable<BackupDataBatch> {
@@ -562,6 +564,57 @@ Deno.test("postgres backup data rejects a signed archive with a missing semantic
     );
     await assertRejects(() => session.summarize(parsed), TypeError, "table entry set");
     await session.rollback();
+  } finally {
+    await snapshot.cleanup?.();
+  }
+});
+
+Deno.test("postgres backup data previews and applies a signed legacy 0028 table catalog", async () => {
+  const fx = await fixture();
+  const snapshot = await fx.adapter.exportSnapshot({
+    includeDiagnostics: false,
+    installationId: "installation-test",
+  });
+  try {
+    const omittedNames = new Set(
+      [...LEGACY_BACKUP_DATA_OMITTED_TABLES].map((name) => `tables/${name}.ndjson`),
+    );
+    const entries = snapshot.manifest.entries.filter((entry) => !omittedNames.has(entry.name));
+    const { signature: _signature, ...unsigned } = snapshot.manifest;
+    const manifest = await signBackupManifest({
+      ...unsigned,
+      schemaVersion: "0028",
+      entries,
+      contentRootSha256: await backupContentRoot(entries),
+    }, fx.authenticator);
+    const payloads = new Map(snapshot.payloads);
+    for (const name of omittedNames) payloads.delete(name);
+    const archiveBytes = await payloadBytes(
+      writeBackupArchiveStream(manifest, payloads, fx.authenticator),
+    );
+    const session = await fx.adapter.restoreSession("preview", { restoreOperationId });
+    const parsed = await parseBackupArchiveStream(
+      archiveBytes,
+      fx.authenticator,
+      session.sink,
+    );
+    const preview = await session.summarize(parsed);
+    assertEquals(preview.counts.find((row) => row.resource === "attachments")?.create, 1);
+    await session.rollback();
+
+    const apply = await fx.adapter.restoreSession("apply", { restoreOperationId });
+    const applyManifest = await parseBackupArchiveStream(
+      archiveBytes,
+      fx.authenticator,
+      apply.sink,
+    );
+    const committed = await apply.commit!(applyManifest, {
+      restoreOperationId,
+      expectedOperationVersion: 2,
+      expectedInstallationVersion: 3,
+    });
+    if (Array.isArray(committed)) throw new Error("versioned commit result expected");
+    assertEquals(committed.counts.find((row) => row.resource === "attachments")?.create, 1);
   } finally {
     await snapshot.cleanup?.();
   }

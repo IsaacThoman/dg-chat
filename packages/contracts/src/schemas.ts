@@ -25,6 +25,10 @@ export const createConversationSchema = z.object({
   temporary: z.boolean().default(false),
 });
 
+export const keepTemporaryConversationSchema = z.object({
+  expectedVersion: z.number().int().nonnegative(),
+}).strict();
+
 export const updateConversationSchema = z.object({
   expectedVersion: z.number().int().nonnegative(),
   title: z.string().trim().min(1).max(200).optional(),

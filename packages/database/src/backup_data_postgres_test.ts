@@ -69,6 +69,7 @@ Deno.test({
       await sql`INSERT INTO installation_state(singleton_id) VALUES(1)`;
       const userId = crypto.randomUUID();
       const conversationId = crypto.randomUUID();
+      const temporaryConversationId = crypto.randomUUID();
       const messageId = crypto.randomUUID();
       const attachmentId = crypto.randomUUID();
       const providerId = crypto.randomUUID();
@@ -96,6 +97,9 @@ Deno.test({
       )`;
       await sql`INSERT INTO conversations(id,owner_id,title)
         VALUES(${conversationId},${userId},'Portable conversation')`;
+      await sql`INSERT INTO conversations(id,owner_id,title,temporary,temporary_expires_at)
+        VALUES(${temporaryConversationId},${userId},'Portable temporary conversation',true,
+          '2026-08-11T00:00:00Z')`;
       await sql`INSERT INTO user_preferences(
         user_id,theme,compact_conversations,reduce_motion,custom_instructions,
         use_memory,save_history,preferred_model_id
@@ -225,8 +229,25 @@ Deno.test({
       const preview = await dryRunBackupData(databaseUrl!, source);
       assertEquals(preview.users, 1);
       assertEquals(preview.providersDisabledForRedactedCredentials, 1);
-      assertEquals(Number((await sql`SELECT count(*) count FROM conversations`)[0].count), 2);
+      assertEquals(Number((await sql`SELECT count(*) count FROM conversations`)[0].count), 3);
       assertEquals(Number((await sql`SELECT count(*) count FROM sessions`)[0].count), 1);
+
+      const legacyCaptured = structuredClone(captured);
+      legacyCaptured.set(
+        "conversations",
+        legacyCaptured.get("conversations")!.map((batch) =>
+          batch.map(({ temporary_expires_at: _expiry, ...row }) => row)
+        ),
+      );
+      const legacyPreview = await dryRunBackupData(databaseUrl!, {
+        schemaVersion: "0028",
+        rows(name) {
+          return (async function* () {
+            for (const batch of legacyCaptured.get(name) ?? []) yield structuredClone(batch);
+          })();
+        },
+      });
+      assertEquals(legacyPreview.conversations, preview.conversations);
 
       let operation = await store.create({
         kind: "restore",
@@ -271,7 +292,13 @@ Deno.test({
         { archiveSha256: "b".repeat(64), impact: restored as unknown as Record<string, unknown> },
       );
 
-      assertEquals(Number((await sql`SELECT count(*) count FROM conversations`)[0].count), 1);
+      assertEquals(Number((await sql`SELECT count(*) count FROM conversations`)[0].count), 2);
+      const restoredTemporary = await sql<{ temporary_expires_at: Date }[]>`
+        SELECT temporary_expires_at FROM conversations WHERE id=${temporaryConversationId}`;
+      assertEquals(
+        restoredTemporary[0].temporary_expires_at.toISOString(),
+        "2026-08-11T00:00:00.000Z",
+      );
       assertEquals(
         [
           ...await sql`SELECT theme,compact_conversations,reduce_motion,custom_instructions,

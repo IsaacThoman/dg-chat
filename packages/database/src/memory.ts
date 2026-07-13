@@ -1,12 +1,12 @@
-import { isModelCapability } from "@dg-chat/contracts";
+import { isModelCapability, parseConversationPortabilityV1 } from "@dg-chat/contracts";
 import type {
   AccountState,
   ApiTokenSummary,
   ApprovalStatus,
   Conversation,
-  ConversationDetail,
   ConversationFolder,
   ConversationFolderMembership,
+  ConversationPortabilityV1,
   ConversationTag,
   ConversationTagBinding,
   ConversationTagSet,
@@ -18,6 +18,7 @@ import type {
   UserRole,
 } from "@dg-chat/contracts";
 import { isIngestibleDocumentMime } from "./attachment-policy.ts";
+import { canonicalJson, sha256Hex } from "./backup-format.ts";
 import {
   apiResponseBodyByteLength,
   canonicalWorkspaceName,
@@ -54,6 +55,7 @@ import type {
   BeginGenerationResult,
   CompleteApiRequestInput,
   CompleteGenerationInput,
+  ConversationPortabilityImportResult,
   CreateAccessGroupInput,
   CreateApiTokenInput,
   CreateAttachmentInput,
@@ -90,6 +92,7 @@ import type {
   KnowledgeConversationBinding,
   KnowledgeRetrievalMode,
   KnowledgeSearchHit,
+  LifecycleConversationDetail,
   ModelAlias,
   ModelPriceVersion,
   ProviderAttempt,
@@ -103,6 +106,8 @@ import type {
   ProviderPayloadCaptureInput,
   ProviderRecord,
   ProviderRetryPolicy,
+  PurgeTemporaryConversationsInput,
+  PurgeTemporaryConversationsResult,
   RegistryMutationContext,
   ReplaceAccessGroupPolicyInput,
   ReplaceConversationKnowledgeInput,
@@ -460,6 +465,10 @@ export class MemoryRepository {
   }>();
   readonly auditEvents: AuditEvent[] = [];
   readonly attachments = new Map<string, AttachmentRecord>();
+  readonly attachmentDimensions = new Map<
+    string,
+    { width: number | null; height: number | null }
+  >();
   readonly generatedAssets = new Map<string, GeneratedAssetRecord>();
   readonly generatedObjectStages = new Map<string, GeneratedObjectStage>();
   readonly messageAttachments = new Map<string, Set<string>>();
@@ -504,6 +513,10 @@ export class MemoryRepository {
   readonly conversationTagBindings = new Map<string, ConversationTagBinding>();
   readonly messages = new Map<string, MessageNode>();
   readonly idempotency = new Map<string, string>();
+  readonly conversationPortabilityImports = new Map<string, {
+    payloadHash: string;
+    result: ConversationPortabilityImportResult;
+  }>();
   readonly ledger: LedgerEntry[] = [];
   readonly usageRuns = new Map<string, UsageRun>();
   readonly generationControls = new Map<string, GenerationControl>();
@@ -851,12 +864,29 @@ export class MemoryRepository {
     title: string,
     temporary = false,
     idempotencyKey?: string,
+    temporaryRetentionDays = 30,
   ): Conversation {
+    if (
+      temporary &&
+      (!Number.isInteger(temporaryRetentionDays) || temporaryRetentionDays < 1 ||
+        temporaryRetentionDays > 3650)
+    ) {
+      throw new DomainError(
+        "validation_error",
+        "Temporary retention days must be between 1 and 3650",
+        422,
+      );
+    }
     if (idempotencyKey) {
       const priorId = this.idempotency.get(`conversation:${ownerId}:${idempotencyKey}`);
       if (priorId) {
         const prior = this.conversations.get(priorId)!;
-        if (prior.title !== title || prior.temporary !== temporary) {
+        if (
+          prior.title !== title || prior.temporary !== temporary ||
+          (temporary &&
+            Date.parse(prior.temporaryExpiresAt!) - Date.parse(prior.createdAt) !==
+              temporaryRetentionDays * 86_400_000)
+        ) {
           throw new DomainError("idempotency_conflict", "Conversation replay payload differs", 409);
         }
         return prior;
@@ -871,6 +901,9 @@ export class MemoryRepository {
       version: 0,
       pinned: false,
       temporary,
+      temporaryExpiresAt: temporary
+        ? new Date(Date.parse(now) + temporaryRetentionDays * 86_400_000).toISOString()
+        : null,
       archivedAt: null,
       deletedAt: null,
       createdAt: now,
@@ -881,6 +914,91 @@ export class MemoryRepository {
       this.idempotency.set(`conversation:${ownerId}:${idempotencyKey}`, conversation.id);
     }
     return conversation;
+  }
+
+  promoteTemporaryConversation(ownerId: string, id: string, expectedVersion: number) {
+    const value = this.conversations.get(id);
+    if (!value || value.ownerId !== ownerId) {
+      throw new DomainError("not_found", "Conversation not found", 404);
+    }
+    if (value.version !== expectedVersion) {
+      throw new DomainError("version_conflict", "Conversation changed in another request", 409);
+    }
+    if (!value.temporary) {
+      throw new DomainError("not_temporary", "Conversation is already saved", 409);
+    }
+    value.temporary = false;
+    value.temporaryExpiresAt = null;
+    value.version++;
+    value.updatedAt = new Date().toISOString();
+    this.recordAudit({
+      actorId: ownerId,
+      action: "conversation.temporary_kept",
+      targetType: "conversation",
+      targetId: id,
+      metadata: { source: "temporary_lifecycle" },
+    });
+    return value;
+  }
+
+  purgeExpiredTemporaryConversations(
+    input: PurgeTemporaryConversationsInput,
+  ): PurgeTemporaryConversationsResult {
+    const limit = input.limit ?? 100;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
+      throw new DomainError("validation_error", "Purge limit must be between 1 and 1000", 422);
+    }
+    const cutoff = Date.parse(input.now ?? new Date().toISOString());
+    if (!Number.isFinite(cutoff)) {
+      throw new DomainError("validation_error", "Invalid purge cutoff", 422);
+    }
+    const conversationIds = [...this.conversations.values()]
+      .filter((value) =>
+        (input.ownerId === undefined || value.ownerId === input.ownerId) && value.temporary &&
+        value.temporaryExpiresAt !== null &&
+        Date.parse(value.temporaryExpiresAt) <= cutoff
+      )
+      .sort((a, b) =>
+        a.temporaryExpiresAt!.localeCompare(b.temporaryExpiresAt!) || a.id.localeCompare(b.id)
+      )
+      .slice(0, limit)
+      .map((value) => value.id);
+    const purged = new Set(conversationIds);
+    const messageIds = new Set(
+      [...this.messages.values()].filter((value) => purged.has(value.conversationId)).map((value) =>
+        value.id
+      ),
+    );
+    for (const id of conversationIds) this.conversations.delete(id);
+    for (const id of conversationIds) {
+      this.conversationFolderMemberships.delete(id);
+      this.conversationTagSets.delete(id);
+      for (const [key, binding] of this.conversationTagBindings) {
+        if (binding.conversationId === id) this.conversationTagBindings.delete(key);
+      }
+      for (const [key, binding] of this.knowledgeBindings) {
+        if (binding.conversationId === id) this.knowledgeBindings.delete(key);
+      }
+    }
+    for (const id of messageIds) {
+      this.messages.delete(id);
+      this.messageAttachments.delete(id);
+    }
+    for (const [runId, control] of this.generationControls) {
+      if (purged.has(control.conversationId)) this.generationControls.delete(runId);
+    }
+    for (const [key, resultId] of this.idempotency) {
+      if (purged.has(resultId) || messageIds.has(resultId)) this.idempotency.delete(key);
+    }
+    for (const id of conversationIds) {
+      this.recordAudit({
+        action: "conversation.temporary_purged",
+        targetType: "conversation",
+        targetId: id,
+        metadata: { source: "temporary_lifecycle" },
+      });
+    }
+    return { conversationIds };
   }
 
   listConversations(ownerId: string, includeDeleted = false) {
@@ -928,7 +1046,7 @@ export class MemoryRepository {
     return value;
   }
 
-  detail(id: string, ownerId: string): ConversationDetail {
+  detail(id: string, ownerId: string): LifecycleConversationDetail {
     const conversation = this.conversations.get(id);
     if (!conversation || conversation.ownerId !== ownerId) {
       throw new DomainError("not_found", "Conversation not found", 404);
@@ -961,6 +1079,345 @@ export class MemoryRepository {
       this.userPreferences.set(ownerId, value);
     }
     return { ...value };
+  }
+
+  exportConversationPortability(
+    ownerId: string,
+    options: import("./repository.ts").ConversationPortabilityExportOptions = {},
+  ): ConversationPortabilityV1 {
+    const preferences = this.getUserPreferences(ownerId);
+    const selected = [...this.conversations.values()].filter((value) =>
+      value.ownerId === ownerId && (options.includeTemporary || !value.temporary) &&
+      (options.includeDeleted || value.deletedAt === null)
+    ).sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+    const selectedIds = new Set(selected.map((value) => value.id));
+    const nodes = [...this.messages.values()].filter((value) =>
+      selectedIds.has(value.conversationId)
+    );
+    if (nodes.some((value) => value.status === "streaming")) {
+      throw new DomainError(
+        "export_in_progress",
+        "Finish or stop active generations before exporting conversations",
+        409,
+      );
+    }
+    const linkedAttachmentIds = new Set<string>();
+    for (const node of nodes) {
+      for (const id of this.messageAttachments.get(node.id) ?? []) linkedAttachmentIds.add(id);
+    }
+    const memberships = [...this.conversationFolderMemberships.values()].filter((value) =>
+      selectedIds.has(value.conversationId)
+    );
+    const folderIds = new Set(memberships.map((value) => value.folderId));
+    const bindings = [...this.conversationTagBindings.values()].filter((value) =>
+      selectedIds.has(value.conversationId)
+    );
+    const tagIds = new Set(bindings.map((value) => value.tagId));
+    const archive = {
+      format: "dgchat.owner-export" as const,
+      version: 1 as const,
+      scope: "owner" as const,
+      exportedAt: new Date().toISOString(),
+      preferences: {
+        theme: preferences.theme,
+        compactConversations: preferences.compactConversations,
+        reduceMotion: preferences.reduceMotion,
+        customInstructions: preferences.customInstructions,
+        useMemory: preferences.useMemory,
+        saveHistory: preferences.saveHistory,
+        preferredModelId: preferences.preferredModelId,
+      },
+      folders: [...this.conversationFolders.values()].filter((value) => folderIds.has(value.id))
+        .sort((a, b) => a.position - b.position || a.id.localeCompare(b.id)).map((
+          value,
+          position,
+        ) => ({
+          id: value.id,
+          name: value.name,
+          position,
+          createdAt: value.createdAt,
+          updatedAt: value.updatedAt,
+        })),
+      tags: [...this.conversationTags.values()].filter((value) => tagIds.has(value.id))
+        .sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id)).map((value) => ({
+          id: value.id,
+          name: value.name,
+          color: value.color,
+          createdAt: value.createdAt,
+          updatedAt: value.updatedAt,
+        })),
+      attachments: [...linkedAttachmentIds].sort().map((id) => {
+        const value = this.attachments.get(id);
+        if (!value || value.ownerId !== ownerId) {
+          throw new DomainError(
+            "invalid_attachment",
+            "Conversation attachment is unavailable",
+            409,
+          );
+        }
+        return {
+          id: value.id,
+          filename: value.filename,
+          mimeType: value.mimeType,
+          byteSize: value.sizeBytes,
+          sha256: value.sha256,
+          width: this.attachmentDimensions.get(value.id)?.width ?? null,
+          height: this.attachmentDimensions.get(value.id)?.height ?? null,
+          createdAt: value.createdAt,
+          content: { included: false as const },
+        };
+      }),
+      conversations: selected.map((value) => {
+        const membership = memberships.find((item) => item.conversationId === value.id);
+        const conversationBindings = bindings.filter((item) => item.conversationId === value.id);
+        return {
+          id: value.id,
+          title: value.title,
+          activeLeafId: value.activeLeafId,
+          pinned: value.pinned,
+          temporary: value.temporary,
+          archivedAt: value.archivedAt,
+          deletedAt: value.deletedAt,
+          createdAt: value.createdAt,
+          updatedAt: value.updatedAt,
+          folderId: membership?.folderId ?? null,
+          folderPosition: membership?.position ?? null,
+          tagIds: conversationBindings.map((item) => item.tagId).sort(),
+          messages: nodes.filter((node) => node.conversationId === value.id)
+            .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
+            .map((node) => ({
+              id: node.id,
+              parentId: node.parentId,
+              supersedesId: node.supersedesId,
+              generationId: node.generationId,
+              siblingIndex: node.siblingIndex,
+              role: node.role,
+              content: node.content,
+              model: node.model,
+              status: node.status as "complete" | "stopped" | "error" | "tombstoned",
+              metadata: structuredClone(node.metadata),
+              attachments: [...(this.messageAttachments.get(node.id) ?? [])].map(
+                (attachmentId, position) => ({ attachmentId, position }),
+              ),
+              createdAt: node.createdAt,
+            })),
+        };
+      }),
+    };
+    return parseConversationPortabilityV1(archive);
+  }
+
+  async importConversationPortability(
+    ownerId: string,
+    input: ConversationPortabilityV1,
+    idempotencyKey: string,
+    dryRun = false,
+  ): Promise<ConversationPortabilityImportResult> {
+    if (!this.users.has(ownerId)) throw new DomainError("not_found", "User not found", 404);
+    if (!idempotencyKey || idempotencyKey.length > 200) {
+      throw new DomainError("validation_error", "Import idempotency key is invalid", 422);
+    }
+    const archive = parseConversationPortabilityV1(input);
+    const payloadHash = await sha256Hex(new TextEncoder().encode(canonicalJson(archive)));
+    const replayKey = `${ownerId}:${idempotencyKey}`;
+    const prior = this.conversationPortabilityImports.get(replayKey);
+    if (!dryRun && prior) {
+      if (prior.payloadHash !== payloadHash) {
+        throw new DomainError("idempotency_conflict", "Import replay payload differs", 409);
+      }
+      return { ...structuredClone(prior.result), replayed: true };
+    }
+    const idMap: Record<string, string> = {};
+    const allocate = (oldId: string) => idMap[oldId] ??= crypto.randomUUID();
+    for (const folder of archive.folders) allocate(folder.id);
+    for (const tag of archive.tags) allocate(tag.id);
+    for (const attachment of archive.attachments) allocate(attachment.id);
+    for (const conversation of archive.conversations) {
+      allocate(conversation.id);
+      for (const node of conversation.messages) {
+        allocate(node.id);
+        if (node.generationId) allocate(node.generationId);
+      }
+    }
+    const result: ConversationPortabilityImportResult = {
+      dryRun,
+      replayed: false,
+      conversations: archive.conversations.length,
+      messages: archive.conversations.reduce((total, value) => total + value.messages.length, 0),
+      attachments: archive.attachments.length,
+      folders: archive.folders.length,
+      tags: archive.tags.length,
+      idMap,
+    };
+    if (dryRun) return result;
+
+    const now = new Date().toISOString();
+    const currentPreferences = this.getUserPreferences(ownerId);
+    this.userPreferences.set(ownerId, {
+      ...currentPreferences,
+      ...archive.preferences,
+      userId: ownerId,
+      version: currentPreferences.version + 1,
+      updatedAt: now,
+    });
+    const usedFolderNames = new Set(
+      [...this.conversationFolders.values()].filter((value) => value.ownerId === ownerId).map((
+        value,
+      ) => canonicalWorkspaceName(value.name)),
+    );
+    const usedTagNames = new Set(
+      [...this.conversationTags.values()].filter((value) => value.ownerId === ownerId).map((
+        value,
+      ) => canonicalWorkspaceName(value.name)),
+    );
+    const uniqueName = (name: string, used: Set<string>, max: number) => {
+      let candidate = name.slice(0, max);
+      for (let suffix = 2; used.has(canonicalWorkspaceName(candidate)); suffix++) {
+        const marker = ` (import ${suffix})`;
+        candidate = `${name.slice(0, max - marker.length)}${marker}`;
+      }
+      used.add(canonicalWorkspaceName(candidate));
+      return candidate;
+    };
+    const folderOffset = Math.max(
+      -1,
+      ...[...this.conversationFolders.values()].filter((value) => value.ownerId === ownerId).map((
+        value,
+      ) => value.position),
+    ) + 1;
+    for (const folder of archive.folders) {
+      this.conversationFolders.set(idMap[folder.id], {
+        id: idMap[folder.id],
+        ownerId,
+        name: uniqueName(folder.name, usedFolderNames, 120),
+        position: folderOffset + folder.position,
+        version: 1,
+        membershipVersion: 0,
+        createdAt: folder.createdAt,
+        updatedAt: folder.updatedAt,
+      });
+    }
+    for (const tag of archive.tags) {
+      this.conversationTags.set(idMap[tag.id], {
+        id: idMap[tag.id],
+        ownerId,
+        name: uniqueName(tag.name, usedTagNames, 64),
+        color: tag.color,
+        version: 1,
+        createdAt: tag.createdAt,
+        updatedAt: tag.updatedAt,
+      });
+    }
+    for (const value of archive.attachments) {
+      const id = idMap[value.id];
+      this.attachments.set(id, {
+        id,
+        ownerId,
+        objectKey: `imports/${ownerId}/${id}/manifest-only`,
+        filename: value.filename,
+        mimeType: value.mimeType,
+        sizeBytes: value.byteSize,
+        sha256: value.sha256,
+        state: "failed",
+        inspectionError: "Attachment bytes were not included in the .dgchat manifest",
+        ingestionStatus: "failed",
+        ingestionError: "Attachment bytes require a separate restore",
+        ingestedAt: null,
+        createdAt: value.createdAt,
+        updatedAt: now,
+        deletedAt: now,
+      });
+      this.attachmentDimensions.set(id, { width: value.width, height: value.height });
+    }
+    for (const value of archive.conversations) {
+      const conversationId = idMap[value.id];
+      this.conversations.set(conversationId, {
+        id: conversationId,
+        ownerId,
+        title: value.title,
+        activeLeafId: value.activeLeafId ? idMap[value.activeLeafId] : null,
+        version: 0,
+        pinned: value.pinned,
+        temporary: value.temporary,
+        temporaryExpiresAt: value.temporary
+          ? new Date(Date.now() + 30 * 86_400_000).toISOString()
+          : null,
+        archivedAt: value.archivedAt,
+        deletedAt: value.deletedAt,
+        createdAt: value.createdAt,
+        updatedAt: value.updatedAt,
+      });
+      for (const node of value.messages) {
+        const messageId = idMap[node.id];
+        this.messages.set(messageId, {
+          id: messageId,
+          conversationId,
+          parentId: node.parentId ? idMap[node.parentId] : null,
+          supersedesId: node.supersedesId ? idMap[node.supersedesId] : null,
+          generationId: node.generationId ? idMap[node.generationId] : null,
+          siblingIndex: node.siblingIndex,
+          role: node.role as MessageRole,
+          content: node.content,
+          model: node.model,
+          status: node.status,
+          metadata: structuredClone(node.metadata),
+          createdAt: node.createdAt,
+        });
+        if (node.attachments.length) {
+          this.messageAttachments.set(
+            messageId,
+            new Set(
+              node.attachments.sort((a, b) => a.position - b.position).map((link) =>
+                idMap[link.attachmentId]
+              ),
+            ),
+          );
+        }
+      }
+      if (value.folderId) {
+        const folderId = idMap[value.folderId];
+        this.conversationFolderMemberships.set(conversationId, {
+          folderId,
+          conversationId,
+          ownerId,
+          position: value.folderPosition!,
+          createdAt: now,
+          updatedAt: now,
+        });
+        this.conversationFolders.get(folderId)!.membershipVersion++;
+      }
+      this.conversationTagSets.set(conversationId, {
+        conversationId,
+        ownerId,
+        version: value.tagIds.length ? 1 : 0,
+        updatedAt: now,
+      });
+      for (const tagId of value.tagIds) {
+        const mappedTagId = idMap[tagId];
+        this.conversationTagBindings.set(`${conversationId}:${mappedTagId}`, {
+          conversationId,
+          tagId: mappedTagId,
+          ownerId,
+          createdAt: now,
+        });
+      }
+    }
+    this.conversationPortabilityImports.set(replayKey, {
+      payloadHash,
+      result: structuredClone(result),
+    });
+    this.recordAudit({
+      action: "conversation.portability_imported",
+      actorId: ownerId,
+      targetType: "user",
+      targetId: ownerId,
+      metadata: {
+        conversations: result.conversations,
+        messages: result.messages,
+        attachments: result.attachments,
+      },
+    });
+    return result;
   }
 
   updateUserPreferences(ownerId: string, patch: import("./repository.ts").UserPreferencesPatch) {

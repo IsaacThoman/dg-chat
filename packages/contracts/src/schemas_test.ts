@@ -5,6 +5,7 @@ import {
   createConversationTagSchema,
   createTokenSchema,
   generateMessageSchema,
+  keepTemporaryConversationSchema,
   reorderConversationFoldersSchema,
   replaceConversationTagsSchema,
   replaceFolderMembershipsSchema,
@@ -151,6 +152,17 @@ Deno.test("conversation patches are strict, bounded, and normalized", () => {
   );
   assertEquals(
     updateConversationSchema.safeParse({ pinned: true, expectedVersion: -1 }).success,
+    false,
+  );
+});
+
+Deno.test("temporary keep input accepts only a non-negative CAS version", () => {
+  assertEquals(keepTemporaryConversationSchema.parse({ expectedVersion: 0 }), {
+    expectedVersion: 0,
+  });
+  assertEquals(keepTemporaryConversationSchema.safeParse({ expectedVersion: -1 }).success, false);
+  assertEquals(
+    keepTemporaryConversationSchema.safeParse({ expectedVersion: 0, ownerId: "spoofed" }).success,
     false,
   );
 });

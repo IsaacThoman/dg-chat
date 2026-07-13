@@ -23,7 +23,13 @@ import { sql } from "npm:drizzle-orm@0.45.2";
 export const approvalStatus = pgEnum("approval_status", ["pending", "approved", "rejected"]);
 export const userRole = pgEnum("user_role", ["user", "admin"]);
 export const accountState = pgEnum("account_state", ["active", "suspended", "deleted"]);
-export const messageRole = pgEnum("message_role", ["system", "user", "assistant", "tool"]);
+export const messageRole = pgEnum("message_role", [
+  "system",
+  "developer",
+  "user",
+  "assistant",
+  "tool",
+]);
 export const messageStatus = pgEnum("message_status", [
   "complete",
   "streaming",
@@ -153,13 +159,25 @@ export const conversations = pgTable("conversations", {
   version: integer("version").notNull().default(0),
   pinned: boolean("pinned").notNull().default(false),
   temporary: boolean("temporary").notNull().default(false),
+  temporaryExpiresAt: timestamp("temporary_expires_at", { withTimezone: true }),
   archivedAt: timestamp("archived_at", { withTimezone: true }),
   deletedAt: timestamp("deleted_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [
   index("conversations_owner_updated_idx").on(table.ownerId, table.updatedAt),
+  index("conversations_owner_temporary_expiry_idx").on(
+    table.ownerId,
+    table.temporaryExpiresAt,
+    table.id,
+  ).where(sql`${table.temporary} = true`),
+  index("conversations_temporary_expiry_global_idx").on(table.temporaryExpiresAt, table.id)
+    .where(sql`${table.temporary} = true`),
   unique("conversations_id_owner_uq").on(table.id, table.ownerId),
+  check(
+    "conversations_temporary_expiry_check",
+    sql`(${table.temporary} = true AND ${table.temporaryExpiresAt} IS NOT NULL) OR (${table.temporary} = false AND ${table.temporaryExpiresAt} IS NULL)`,
+  ),
 ]);
 
 export const userPreferences = pgTable("user_preferences", {
@@ -183,12 +201,31 @@ export const userPreferences = pgTable("user_preferences", {
   ),
 ]);
 
+export const conversationPortabilityImports = pgTable("conversation_portability_imports", {
+  ownerId: uuid("owner_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  idempotencyKey: text("idempotency_key").notNull(),
+  payloadHash: text("payload_hash").notNull(),
+  result: jsonb("result").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  primaryKey({ columns: [table.ownerId, table.idempotencyKey] }),
+  index("conversation_portability_imports_owner_created_idx").on(table.ownerId, table.createdAt),
+  check(
+    "conversation_portability_imports_key_check",
+    sql`char_length(${table.idempotencyKey}) BETWEEN 1 AND 200`,
+  ),
+  check(
+    "conversation_portability_imports_hash_check",
+    sql`${table.payloadHash} ~ '^[0-9a-f]{64}$'`,
+  ),
+]);
+
 export const conversationFolders = pgTable("conversation_folders", {
   id: uuid("id").primaryKey().defaultRandom(),
   ownerId: uuid("owner_id").notNull().references(() => users.id, { onDelete: "cascade" }),
   name: text("name").notNull(),
   normalizedName: text("normalized_name").notNull(),
-  position: integer("position").notNull(),
+  position: integer("position").notNull().default(0),
   version: integer("version").notNull().default(1),
   membershipVersion: integer("membership_version").notNull().default(0),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -320,6 +357,8 @@ export const attachments = pgTable("attachments", {
   mimeType: text("mime_type").notNull(),
   sizeBytes: bigint("size_bytes", { mode: "number" }).notNull(),
   sha256: text("sha256").notNull(),
+  width: integer("width"),
+  height: integer("height"),
   state: text("state").notNull().default("pending"),
   inspectionError: text("inspection_error"),
   ingestionStatus: text("ingestion_status").notNull().default("not_applicable"),
@@ -333,12 +372,21 @@ export const attachments = pgTable("attachments", {
   uniqueIndex("attachments_owner_active_hash_uq").on(table.ownerId, table.sha256).where(
     sql`${table.deletedAt} IS NULL`,
   ),
+  check(
+    "attachments_dimensions_check",
+    sql`(${table.width} IS NULL AND ${table.height} IS NULL) OR (${table.width} BETWEEN 1 AND 100000 AND ${table.height} BETWEEN 1 AND 100000)`,
+  ),
 ]);
 
 export const messageAttachments = pgTable("message_attachments", {
   messageId: uuid("message_id").notNull().references(() => messages.id, { onDelete: "cascade" }),
   attachmentId: uuid("attachment_id").notNull().references(() => attachments.id),
-}, (table) => [primaryKey({ columns: [table.messageId, table.attachmentId] })]);
+  position: integer("position").notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.messageId, table.attachmentId] }),
+  unique("message_attachments_message_position_uq").on(table.messageId, table.position),
+  check("message_attachments_position_check", sql`${table.position} >= 0`),
+]);
 
 export const knowledgeCollections = pgTable("knowledge_collections", {
   id: uuid("id").primaryKey().defaultRandom(),
