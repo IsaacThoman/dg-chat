@@ -1,5 +1,10 @@
 import { assertEquals } from "jsr:@std/assert@1.0.14";
 import {
+  adminAccountStateSchema,
+  adminApprovalSchema,
+  adminDeleteUserSchema,
+  adminRoleSchema,
+  adminUserQuerySchema,
   chatCompletionSchema,
   createConversationFolderSchema,
   createConversationTagSchema,
@@ -464,4 +469,58 @@ Deno.test("personal token policies are strict and bounded", () => {
     true,
   );
   assertEquals(updateTokenSchema.safeParse({ expectedVersion: 0, name: "Nope" }).success, false);
+});
+
+Deno.test("admin account lifecycle contracts are strict, versioned, and bounded", () => {
+  assertEquals(adminUserQuerySchema.parse({}), { limit: 50 });
+  assertEquals(adminUserQuerySchema.parse({ search: "  person@example.com  ", limit: 100 }), {
+    search: "person@example.com",
+    limit: 100,
+  });
+  assertEquals(adminUserQuerySchema.safeParse({ limit: 101 }).success, false);
+  assertEquals(adminUserQuerySchema.safeParse({ search: "x".repeat(201) }).success, false);
+  assertEquals(adminUserQuerySchema.safeParse({ state: "deleted" }).success, false);
+  assertEquals(adminUserQuerySchema.safeParse({ unknown: true }).success, false);
+
+  assertEquals(
+    adminApprovalSchema.safeParse({ status: "approved", expectedVersion: 1 }).success,
+    true,
+  );
+  assertEquals(
+    adminApprovalSchema.safeParse({ status: "rejected", expectedVersion: 1 }).success,
+    false,
+  );
+  assertEquals(
+    adminApprovalSchema.safeParse({
+      status: "rejected",
+      expectedVersion: 1,
+      reason: "Policy violation",
+    }).success,
+    true,
+  );
+  assertEquals(
+    adminApprovalSchema.safeParse({ status: "approved", expectedVersion: 0 }).success,
+    false,
+  );
+  assertEquals(
+    adminRoleSchema.safeParse({ role: "admin", expectedVersion: 1, reason: "Support coverage" })
+      .success,
+    true,
+  );
+  assertEquals(
+    adminAccountStateSchema.safeParse({ state: "suspended", expectedVersion: 1 }).success,
+    false,
+  );
+  assertEquals(
+    adminAccountStateSchema.safeParse({
+      state: "suspended",
+      expectedVersion: 1,
+      reason: "Security review",
+    }).success,
+    true,
+  );
+  assertEquals(
+    adminDeleteUserSchema.safeParse({ expectedVersion: 1, reason: " " }).success,
+    false,
+  );
 });

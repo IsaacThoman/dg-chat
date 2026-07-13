@@ -1,6 +1,7 @@
 export type ApprovalStatus = "pending" | "approved" | "rejected";
 export type UserRole = "user" | "admin";
-export type AccountState = "active" | "suspended" | "deleted";
+/** Whether an account may obtain authority. Soft deletion is tracked independently. */
+export type AccountState = "active" | "suspended";
 
 /** Canonical provider-model capabilities shared by persistence, API validation, and clients. */
 export const MODEL_CAPABILITIES = [
@@ -30,7 +31,35 @@ export interface PublicUser {
   state: AccountState;
   balanceMicros: number;
   emailVerifiedAt?: string | null;
+  /** Independent soft-deletion marker. A deleted account is never eligible for authority. */
+  deletedAt: string | null;
+  /** Optimistic lifecycle version used by administrative mutations. */
+  version: number;
   createdAt: string;
+  updatedAt: string;
+}
+
+/** Administrative projection with an explicit derived authority invariant. */
+export interface AdminUser extends PublicUser {
+  effectiveAdmin: boolean;
+}
+
+export type AdminUserDeletionFilter = "present" | "deleted" | "all";
+
+export interface AdminUserQuery {
+  search?: string;
+  role?: UserRole;
+  approvalStatus?: ApprovalStatus;
+  state?: AccountState;
+  deletion?: AdminUserDeletionFilter;
+  emailVerified?: boolean;
+  cursor?: string;
+  limit?: number;
+}
+
+export interface AdminUserPage {
+  data: AdminUser[];
+  nextCursor: string | null;
 }
 
 export interface SessionResponse {

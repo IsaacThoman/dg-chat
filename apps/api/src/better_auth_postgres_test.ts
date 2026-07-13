@@ -54,6 +54,7 @@ Deno.test({
           role user_role NOT NULL DEFAULT 'user',
           approval_status approval_status NOT NULL DEFAULT 'pending',
           state account_state NOT NULL DEFAULT 'active',
+          version integer NOT NULL DEFAULT 1,
           balance_micros bigint NOT NULL DEFAULT 0,
           email_verified_at timestamptz,
           created_at timestamptz NOT NULL DEFAULT now(),
@@ -789,6 +790,17 @@ Deno.test({
         { userId: body.user.id, limited: false },
       );
       assertMatch(approvedSession.authenticatedAt, /^\d{4}-\d{2}-\d{2}T/u);
+      const approvedTokenResponse = await app.request("/api/tokens", {
+        method: "POST",
+        headers: {
+          cookie: approvedCookie,
+          origin: "http://localhost:5173",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ name: "Deleted account regression", scopes: ["models:read"] }),
+      });
+      assertEquals(approvedTokenResponse.status, 201);
+      const approvedToken = (await approvedTokenResponse.json() as { token: string }).token;
 
       rejectVerificationDelivery = true;
       const deliveryFailureSignup = await app.request("/api/auth/sign-up/email", {
@@ -839,6 +851,43 @@ Deno.test({
         ).length >= 2
       );
       rejectVerificationDelivery = false;
+
+      await adminSql`UPDATE users SET deleted_at=now() WHERE id=${body.user.id}`;
+      assertEquals(await service.getSession(new Headers({ cookie: approvedCookie })), null);
+      const passwordResetCount = passwordResetDeliveries.length;
+      assertEquals(
+        (await app.request("/api/auth/password-reset/request", {
+          method: "POST",
+          headers: {
+            origin: "http://localhost:5173",
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ email: "bridge@example.com" }),
+        })).status,
+        202,
+      );
+      assertEquals(passwordResetDeliveries.length, passwordResetCount);
+      assertEquals(
+        (await app.request("/v1/models", {
+          headers: { authorization: `Bearer ${approvedToken}` },
+        })).status,
+        401,
+      );
+      const deletedSignin = await app.request("/api/auth/sign-in/email", {
+        method: "POST",
+        headers: {
+          origin: "http://localhost:5173",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          email: "bridge@example.com",
+          password: "correct horse battery staple",
+        }),
+      });
+      assertEquals(deletedSignin.status, 401);
+      assertEquals(deletedSignin.headers.has("set-cookie"), false);
+      await adminSql`UPDATE users SET deleted_at=NULL WHERE id=${body.user.id}`;
+      assert(await service.getSession(new Headers({ cookie: approvedCookie })));
 
       await repository.setUserState(body.user.id, "suspended");
       assertEquals(await service.getSession(new Headers({ cookie: approvedCookie })), null);

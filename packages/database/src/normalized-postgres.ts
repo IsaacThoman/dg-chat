@@ -6,6 +6,9 @@ import {
 } from "@dg-chat/contracts";
 import type {
   AccountState,
+  AdminUser,
+  AdminUserPage,
+  AdminUserQuery,
   ConversationFolder,
   ConversationFolderMembership,
   ConversationPortabilityV1,
@@ -55,10 +58,14 @@ import type {
   AdminAnalytics,
   AdminAnalyticsDistribution,
   AdminAnalyticsQuery,
+  AdminApprovalCommand,
+  AdminDeletionCommand,
   AdminJobPage,
   AdminJobQuery,
   AdminJobStatus,
   AdminJobSummary,
+  AdminRoleCommand,
+  AdminStateCommand,
   AdminTokenLookupPage,
   ApiIdempotencyEndpoint,
   ApiIdempotencyFrame,
@@ -165,7 +172,9 @@ import type {
   UsagePricingSnapshot,
 } from "./repository.ts";
 import {
+  decodeAdminUserCursor,
   decodeAuditCursor,
+  encodeAdminUserCursor,
   encodeAuditPostgresCursor,
   isUsagePricingSnapshot,
   sameGeneratedAssetFinalization,
@@ -178,6 +187,57 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3
 const iso = (value: unknown) => value instanceof Date ? value.toISOString() : String(value);
 const nullableIso = (value: unknown) => value == null ? null : iso(value);
 const number = (value: unknown) => Number(value);
+
+const isEffectiveAdminRow = (row: Row): boolean =>
+  row.role === "admin" && row.approval_status === "approved" && row.state === "active" &&
+  row.deleted_at == null;
+
+function adminUser(row: Row): AdminUser {
+  const stored = user(row);
+  return { ...publicUser(stored), effectiveAdmin: isEffectiveAdminRow(row) };
+}
+
+function validateAdminCommand(input: {
+  expectedVersion: number;
+  reason?: string;
+}): string | undefined {
+  if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) {
+    throw new DomainError("validation_error", "Expected version must be a positive integer", 422);
+  }
+  const reason = input.reason?.trim();
+  if (reason && reason.length > 500) {
+    throw new DomainError("validation_error", "Administrative reason is too long", 422);
+  }
+  return reason || undefined;
+}
+
+function adminMutationBefore(row: Row): Record<string, unknown> {
+  return {
+    role: row.role,
+    approvalStatus: row.approval_status,
+    state: row.state,
+    deleted: row.deleted_at != null,
+    version: number(row.version),
+  };
+}
+
+function adminMutationMetadata(
+  before: Record<string, unknown>,
+  row: Row,
+  reason?: string,
+): Record<string, unknown> {
+  return {
+    before,
+    after: {
+      role: row.role,
+      approvalStatus: row.approval_status,
+      state: row.state,
+      deleted: row.deleted_at != null,
+      version: number(row.version),
+    },
+    ...(reason ? { reason } : {}),
+  };
+}
 const adminJob = (row: Row): AdminJobSummary => ({
   id: String(row.id),
   type: String(row.type),
@@ -267,12 +327,27 @@ function user(row: Row): StoredUser {
     state: row.state as StoredUser["state"],
     balanceMicros: number(row.balance_micros),
     emailVerifiedAt: nullableIso(row.email_verified_at),
+    deletedAt: nullableIso(row.deleted_at),
+    version: number(row.version),
     createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
   };
 }
 function publicUser(value: StoredUser): PublicUser {
-  const { passwordHash: _passwordHash, ...safe } = value;
-  return safe;
+  return {
+    id: value.id,
+    email: value.email,
+    name: value.name,
+    role: value.role,
+    approvalStatus: value.approvalStatus,
+    state: value.state,
+    balanceMicros: value.balanceMicros,
+    emailVerifiedAt: value.emailVerifiedAt,
+    deletedAt: value.deletedAt,
+    version: value.version,
+    createdAt: value.createdAt,
+    updatedAt: value.updatedAt,
+  };
 }
 function conversation(row: Row): LifecycleConversation {
   return {
@@ -1074,6 +1149,48 @@ export class PostgresRepository implements DomainRepository {
       publicUser,
     );
   }
+  async listAdminUsers(query: AdminUserQuery = {}): Promise<AdminUserPage> {
+    const limit = query.limit ?? 50;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new DomainError("validation_error", "User limit must be between 1 and 100", 422);
+    }
+    const search = query.search?.trim() || undefined;
+    if (search && search.length > 200) {
+      throw new DomainError("validation_error", "User search is too long", 422);
+    }
+    const cursor = query.cursor ? decodeAdminUserCursor(query.cursor, query) : undefined;
+    if (query.cursor && !cursor) {
+      throw new DomainError("validation_error", "Invalid user cursor", 422);
+    }
+    const deletion = query.deletion ?? "present";
+    const rows = await this.#sql<Row[]>`
+      SELECT * FROM users
+      WHERE (${search ?? null}::text IS NULL OR
+          strpos(lower(email),lower(${search ?? null}))>0 OR
+          strpos(lower(name),lower(${search ?? null}))>0)
+        AND (${query.role ?? null}::text IS NULL OR role::text=${query.role ?? null})
+        AND (${query.approvalStatus ?? null}::text IS NULL OR
+          approval_status::text=${query.approvalStatus ?? null})
+        AND (${query.state ?? null}::text IS NULL OR state::text=${query.state ?? null})
+        AND (${query.emailVerified ?? null}::boolean IS NULL OR
+          (email_verified_at IS NOT NULL)=${query.emailVerified ?? null})
+        AND (${deletion}='all' OR (${deletion}='deleted')=(deleted_at IS NOT NULL))
+        AND (${cursor?.createdAt ?? null}::timestamptz IS NULL OR
+          (date_trunc('milliseconds',created_at),id)<
+            (${cursor?.createdAt ?? null}::timestamptz,${cursor?.id ?? null}::uuid))
+      ORDER BY date_trunc('milliseconds',created_at) DESC,id DESC
+      LIMIT ${limit + 1}`;
+    const data = rows.slice(0, limit).map(adminUser);
+    return {
+      data,
+      nextCursor: rows.length > limit ? encodeAdminUserCursor(data[data.length - 1], query) : null,
+    };
+  }
+  async getAdminUser(id: string): Promise<AdminUser> {
+    const rows = await this.#sql<Row[]>`SELECT * FROM users WHERE id=${id}`;
+    if (!rows[0]) throw new DomainError("not_found", "User not found", 404);
+    return adminUser(rows[0]);
+  }
   async createSession(userId: string, tokenHash: string, limited: boolean) {
     const rows = await this.#sql<
       Row[]
@@ -1158,7 +1275,11 @@ export class PostgresRepository implements DomainRepository {
     return await this.#sql.begin(async (tx) => {
       const tokens = await tx<
         Row[]
-      >`UPDATE identity_tokens SET consumed_at=now() WHERE token_hash=${tokenHash} AND purpose='email_verification' AND consumed_at IS NULL AND expires_at>now() RETURNING user_id`;
+      >`UPDATE identity_tokens t SET consumed_at=now() FROM users u
+        WHERE t.token_hash=${tokenHash} AND t.purpose='email_verification'
+          AND t.consumed_at IS NULL AND t.expires_at>now() AND u.id=t.user_id
+          AND u.state='active' AND u.deleted_at IS NULL
+        RETURNING t.user_id`;
       if (!tokens[0]) {
         throw new DomainError(
           "invalid_identity_token",
@@ -1182,7 +1303,7 @@ export class PostgresRepository implements DomainRepository {
     const rows = await this.#sql<Row[]>`
       UPDATE users
       SET email_verified_at=COALESCE(email_verified_at,now()),updated_at=now()
-      WHERE id=${userId}
+      WHERE id=${userId} AND state='active' AND deleted_at IS NULL
       RETURNING *
     `;
     if (!rows[0]) throw new DomainError("not_found", "User not found", 404);
@@ -1192,7 +1313,11 @@ export class PostgresRepository implements DomainRepository {
     return await this.#sql.begin(async (tx) => {
       const tokens = await tx<
         Row[]
-      >`UPDATE identity_tokens SET consumed_at=now() WHERE token_hash=${tokenHash} AND purpose='password_reset' AND consumed_at IS NULL AND expires_at>now() RETURNING user_id`;
+      >`UPDATE identity_tokens t SET consumed_at=now() FROM users u
+        WHERE t.token_hash=${tokenHash} AND t.purpose='password_reset'
+          AND t.consumed_at IS NULL AND t.expires_at>now() AND u.id=t.user_id
+          AND u.state='active' AND u.deleted_at IS NULL
+        RETURNING t.user_id`;
       if (!tokens[0]) {
         throw new DomainError("invalid_identity_token", "Reset token is invalid or expired", 400);
       }
@@ -1227,7 +1352,7 @@ export class PostgresRepository implements DomainRepository {
       }
       const userId = verifications[0].value;
       const users = await tx<Row[]>`SELECT * FROM users WHERE id=${userId} FOR UPDATE`;
-      if (!users[0] || users[0].state !== "active") {
+      if (!users[0] || users[0].state !== "active" || users[0].deleted_at !== null) {
         throw new DomainError("account_unavailable", "Account is unavailable", 403);
       }
       const identifier = `reset-password:${token}`;
@@ -1257,6 +1382,7 @@ export class PostgresRepository implements DomainRepository {
         password_reset_pending=false,password_reset_token_identifier=NULL,
         updated_at=now()
         WHERE id=${userId} AND password_reset_pending=true
+          AND state='active' AND deleted_at IS NULL
           AND password_reset_token_identifier=${`reset-password:${token}`} RETURNING id`;
       if (!users.length) {
         throw new DomainError("password_reset_guard_mismatch", "Password reset guard changed", 409);
@@ -1345,6 +1471,236 @@ export class PostgresRepository implements DomainRepository {
     };
   }
 
+  async decideUserApproval(input: AdminApprovalCommand): Promise<AdminUser> {
+    const reason = validateAdminCommand(input);
+    if (
+      !Number.isSafeInteger(input.startingCreditMicros) || input.startingCreditMicros < 0 ||
+      input.startingCreditMicros > 1_000_000_000
+    ) throw new DomainError("validation_error", "Starting credit is invalid", 422);
+    return await this.#sql.begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-final-admin'))`;
+      const rows = await tx<Row[]>`SELECT * FROM users WHERE id=${input.targetUserId} FOR UPDATE`;
+      const row = rows[0];
+      if (!row) throw new DomainError("not_found", "User not found", 404);
+      if (number(row.version) !== input.expectedVersion) {
+        throw new DomainError(
+          "version_conflict",
+          "User was modified by another administrator",
+          409,
+        );
+      }
+      if (row.approval_status === input.status) {
+        throw new DomainError("no_state_change", "Approval status is unchanged", 409);
+      }
+      if (input.actorId === input.targetUserId && input.status === "rejected") {
+        throw new DomainError("self_action_forbidden", "You cannot reject your own account", 403);
+      }
+      if (input.status === "approved" && input.requireEmailVerification && !row.email_verified_at) {
+        throw new DomainError("email_not_verified", "Email must be verified before approval", 409);
+      }
+      const remainsEffective = row.role === "admin" && input.status === "approved" &&
+        row.state === "active" && row.deleted_at == null;
+      if (isEffectiveAdminRow(row) && !remainsEffective) {
+        const others = await tx<{ count: number }[]>`
+          SELECT count(*)::int count FROM users WHERE id<>${input.targetUserId}
+            AND role='admin' AND approval_status='approved' AND state='active'
+            AND deleted_at IS NULL`;
+        if (others[0].count === 0) {
+          throw new DomainError("final_admin", "The final active administrator is protected", 409);
+        }
+      }
+      const before = adminMutationBefore(row);
+      let balance = number(row.balance_micros);
+      if (input.status === "approved" && input.startingCreditMicros > 0) {
+        const usageRunId = `approval:${input.targetUserId}`;
+        const prior = await tx`SELECT id FROM ledger_entries
+          WHERE usage_run_id=${usageRunId} AND kind='grant' LIMIT 1`;
+        if (!prior.length) {
+          const nextBalance = balance + input.startingCreditMicros;
+          if (!Number.isSafeInteger(nextBalance)) {
+            throw new DomainError(
+              "validation_error",
+              "Starting credit would overflow balance",
+              422,
+            );
+          }
+          await tx`INSERT INTO ledger_entries
+            (user_id,usage_run_id,kind,amount_micros,balance_after_micros)
+            VALUES(${input.targetUserId},${usageRunId},'grant',${input.startingCreditMicros},
+              ${nextBalance})`;
+          balance = nextBalance;
+        }
+      }
+      const updated = await tx<Row[]>`UPDATE users SET approval_status=${input.status},
+        balance_micros=${balance},version=version+1,updated_at=now()
+        WHERE id=${input.targetUserId} RETURNING *`;
+      if (input.status === "rejected") {
+        await tx`UPDATE sessions SET invalidated_at=now()
+          WHERE user_id=${input.targetUserId} AND limited=false AND invalidated_at IS NULL`;
+        await tx`DELETE FROM auth_sessions WHERE user_id=${input.targetUserId} AND limited=false`;
+        await tx`UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,now())
+          WHERE user_id=${input.targetUserId}`;
+      }
+      const result = updated[0];
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${input.actorId},${`user.approval.${input.status}`},'user',${input.targetUserId},
+          ${tx.json(adminMutationMetadata(before, result, reason) as postgres.JSONValue)})`;
+      return adminUser(result);
+    });
+  }
+
+  async setAdminUserRole(input: AdminRoleCommand): Promise<AdminUser> {
+    const reason = validateAdminCommand(input);
+    return await this.#sql.begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-final-admin'))`;
+      const rows = await tx<Row[]>`SELECT * FROM users WHERE id=${input.targetUserId} FOR UPDATE`;
+      const row = rows[0];
+      if (!row) throw new DomainError("not_found", "User not found", 404);
+      if (number(row.version) !== input.expectedVersion) {
+        throw new DomainError(
+          "version_conflict",
+          "User was modified by another administrator",
+          409,
+        );
+      }
+      if (row.role === input.role) {
+        throw new DomainError("no_state_change", "Role is unchanged", 409);
+      }
+      if (input.actorId === input.targetUserId && input.role !== "admin") {
+        throw new DomainError("self_action_forbidden", "You cannot demote your own account", 403);
+      }
+      if (
+        input.role === "admin" &&
+        (row.approval_status !== "approved" || row.state !== "active" || row.deleted_at != null)
+      ) {
+        throw new DomainError(
+          "invalid_transition",
+          "Only available approved users can be promoted",
+          409,
+        );
+      }
+      const remainsEffective = input.role === "admin" && row.approval_status === "approved" &&
+        row.state === "active" && row.deleted_at == null;
+      if (isEffectiveAdminRow(row) && !remainsEffective) {
+        const others = await tx<{ count: number }[]>`
+          SELECT count(*)::int count FROM users WHERE id<>${input.targetUserId}
+            AND role='admin' AND approval_status='approved' AND state='active'
+            AND deleted_at IS NULL`;
+        if (others[0].count === 0) {
+          throw new DomainError("final_admin", "The final active administrator is protected", 409);
+        }
+      }
+      const before = adminMutationBefore(row);
+      const updated = await tx<Row[]>`UPDATE users SET role=${input.role},version=version+1,
+        updated_at=now() WHERE id=${input.targetUserId} RETURNING *`;
+      const result = updated[0];
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${input.actorId},${`user.role.${input.role}`},'user',${input.targetUserId},
+          ${tx.json(adminMutationMetadata(before, result, reason) as postgres.JSONValue)})`;
+      return adminUser(result);
+    });
+  }
+
+  async setAdminUserState(input: AdminStateCommand): Promise<AdminUser> {
+    const reason = validateAdminCommand(input);
+    return await this.#sql.begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-final-admin'))`;
+      const rows = await tx<Row[]>`SELECT * FROM users WHERE id=${input.targetUserId} FOR UPDATE`;
+      const row = rows[0];
+      if (!row) throw new DomainError("not_found", "User not found", 404);
+      if (number(row.version) !== input.expectedVersion) {
+        throw new DomainError(
+          "version_conflict",
+          "User was modified by another administrator",
+          409,
+        );
+      }
+      if (row.state === input.state) {
+        throw new DomainError("no_state_change", "Account state is unchanged", 409);
+      }
+      if (input.actorId === input.targetUserId && input.state === "suspended") {
+        throw new DomainError("self_action_forbidden", "You cannot suspend your own account", 403);
+      }
+      const remainsEffective = row.role === "admin" && row.approval_status === "approved" &&
+        input.state === "active" && row.deleted_at == null;
+      if (isEffectiveAdminRow(row) && !remainsEffective) {
+        const others = await tx<{ count: number }[]>`
+          SELECT count(*)::int count FROM users WHERE id<>${input.targetUserId}
+            AND role='admin' AND approval_status='approved' AND state='active'
+            AND deleted_at IS NULL`;
+        if (others[0].count === 0) {
+          throw new DomainError("final_admin", "The final active administrator is protected", 409);
+        }
+      }
+      const before = adminMutationBefore(row);
+      const updated = await tx<Row[]>`UPDATE users SET state=${input.state},version=version+1,
+        updated_at=now() WHERE id=${input.targetUserId} RETURNING *`;
+      if (input.state === "suspended") {
+        await tx`UPDATE sessions SET invalidated_at=now()
+          WHERE user_id=${input.targetUserId} AND limited=false AND invalidated_at IS NULL`;
+        await tx`DELETE FROM auth_sessions WHERE user_id=${input.targetUserId} AND limited=false`;
+        await tx`UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,now())
+          WHERE user_id=${input.targetUserId}`;
+      }
+      const result = updated[0];
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${input.actorId},${`user.state.${input.state}`},'user',${input.targetUserId},
+          ${tx.json(adminMutationMetadata(before, result, reason) as postgres.JSONValue)})`;
+      return adminUser(result);
+    });
+  }
+
+  async setAdminUserDeleted(input: AdminDeletionCommand): Promise<AdminUser> {
+    const reason = validateAdminCommand(input);
+    return await this.#sql.begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-final-admin'))`;
+      const rows = await tx<Row[]>`SELECT * FROM users WHERE id=${input.targetUserId} FOR UPDATE`;
+      const row = rows[0];
+      if (!row) throw new DomainError("not_found", "User not found", 404);
+      if (number(row.version) !== input.expectedVersion) {
+        throw new DomainError(
+          "version_conflict",
+          "User was modified by another administrator",
+          409,
+        );
+      }
+      if ((row.deleted_at != null) === input.deleted) {
+        throw new DomainError("no_state_change", "Deletion status is unchanged", 409);
+      }
+      if (input.actorId === input.targetUserId && input.deleted) {
+        throw new DomainError("self_action_forbidden", "You cannot delete your own account", 403);
+      }
+      const remainsEffective = row.role === "admin" && row.approval_status === "approved" &&
+        row.state === "active" && !input.deleted;
+      if (isEffectiveAdminRow(row) && !remainsEffective) {
+        const others = await tx<{ count: number }[]>`
+          SELECT count(*)::int count FROM users WHERE id<>${input.targetUserId}
+            AND role='admin' AND approval_status='approved' AND state='active'
+            AND deleted_at IS NULL`;
+        if (others[0].count === 0) {
+          throw new DomainError("final_admin", "The final active administrator is protected", 409);
+        }
+      }
+      const before = adminMutationBefore(row);
+      const updated = await tx<Row[]>`UPDATE users SET deleted_at=${
+        input.deleted ? new Date() : null
+      },version=version+1,updated_at=now() WHERE id=${input.targetUserId} RETURNING *`;
+      if (input.deleted) {
+        await tx`UPDATE sessions SET invalidated_at=now()
+          WHERE user_id=${input.targetUserId} AND limited=false AND invalidated_at IS NULL`;
+        await tx`DELETE FROM auth_sessions WHERE user_id=${input.targetUserId} AND limited=false`;
+        await tx`UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,now())
+          WHERE user_id=${input.targetUserId}`;
+      }
+      const result = updated[0];
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${input.actorId},${input.deleted ? "user.deleted" : "user.restored"},'user',
+          ${input.targetUserId},
+          ${tx.json(adminMutationMetadata(before, result, reason) as postgres.JSONValue)})`;
+      return adminUser(result);
+    });
+  }
+
   async approveUser(
     id: string,
     status: "approved" | "rejected",
@@ -1361,7 +1717,8 @@ export class PostgresRepository implements DomainRepository {
       if (rows[0].role === "admin" && status === "rejected") {
         const count = await tx<
           { count: number }[]
-        >`SELECT count(*)::int AS count FROM users WHERE role='admin' AND state='active' AND approval_status='approved'`;
+        >`SELECT count(*)::int AS count FROM users WHERE role='admin' AND state='active'
+          AND approval_status='approved' AND deleted_at IS NULL`;
         if (count[0].count <= 1) {
           throw new DomainError(
             "final_admin",
@@ -1385,7 +1742,8 @@ export class PostgresRepository implements DomainRepository {
       }
       const updated = await tx<
         Row[]
-      >`UPDATE users SET approval_status=${status},balance_micros=${balance},updated_at=now() WHERE id=${id} RETURNING *`;
+      >`UPDATE users SET approval_status=${status},balance_micros=${balance},
+        version=version+1,updated_at=now() WHERE id=${id} RETURNING *`;
       if (status === "rejected") {
         await tx`UPDATE sessions SET invalidated_at=now()
           WHERE user_id=${id} AND limited=false AND invalidated_at IS NULL`;
@@ -1403,16 +1761,16 @@ export class PostgresRepository implements DomainRepository {
       if (rows[0].role === "admin" && state !== "active") {
         const count = await tx<
           { count: number }[]
-        >`SELECT count(*)::int AS count FROM users WHERE role='admin' AND state='active' AND approval_status='approved'`;
+        >`SELECT count(*)::int AS count FROM users WHERE role='admin' AND state='active'
+          AND approval_status='approved' AND deleted_at IS NULL`;
         if (count[0].count <= 1) {
           throw new DomainError("final_admin", "The final active administrator is protected", 409);
         }
       }
       const updated = await tx<
         Row[]
-      >`UPDATE users SET state=${state},deleted_at=${
-        state === "deleted" ? new Date() : null
-      },updated_at=now() WHERE id=${id} RETURNING *`;
+      >`UPDATE users SET state=${state},version=version+1,updated_at=now()
+        WHERE id=${id} RETURNING *`;
       if (state !== "active") {
         await tx`UPDATE sessions SET invalidated_at=now() WHERE user_id=${id}`;
         await tx`DELETE FROM auth_sessions WHERE user_id=${id}`;
@@ -1979,6 +2337,12 @@ export class PostgresRepository implements DomainRepository {
       secretHash: input.secretHash,
     })));
     return await this.#sql.begin(async (tx) => {
+      const owners = await tx<Row[]>`SELECT approval_status,state,deleted_at FROM users
+        WHERE id=${ownerId} FOR SHARE`;
+      if (
+        !owners[0] || owners[0].approval_status !== "approved" ||
+        owners[0].state !== "active" || owners[0].deleted_at !== null
+      ) throw new DomainError("account_unavailable", "Account cannot create shares", 403);
       await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-share-idempotency'),hashtext(${`${ownerId}:${input.idempotencyKey}`}))`;
       const prior = await tx<Row[]>`SELECT * FROM conversation_share_snapshots
         WHERE owner_id=${ownerId} AND idempotency_key=${input.idempotencyKey}`;
@@ -2006,12 +2370,16 @@ export class PostgresRepository implements DomainRepository {
       ) {
         throw new DomainError("secret_conflict", "Share capability already exists", 409);
       }
-      const rows = await tx<Row[]>`SELECT c.*,u.name owner_name,u.approval_status,u.state
+      const rows = await tx<Row[]>`SELECT c.*,u.name owner_name,u.approval_status,u.state,
+        u.deleted_at owner_deleted_at
         FROM conversations c JOIN users u ON u.id=c.owner_id
         WHERE c.id=${input.conversationId} AND c.owner_id=${ownerId} FOR UPDATE OF c`;
       const row = rows[0];
       if (!row || row.deleted_at) throw new DomainError("not_found", "Conversation not found", 404);
-      if (row.approval_status !== "approved" || row.state !== "active") {
+      if (
+        row.approval_status !== "approved" || row.state !== "active" ||
+        row.owner_deleted_at !== null
+      ) {
         throw new DomainError("account_unavailable", "Account cannot create shares", 403);
       }
       if (row.temporary) {
@@ -2255,7 +2623,7 @@ export class PostgresRepository implements DomainRepository {
     const rows = await this.#sql<Row[]>`SELECT s.public_snapshot FROM conversation_share_snapshots s
       JOIN users u ON u.id=s.owner_id WHERE s.secret_hash=${secretHash}
         AND s.revoked_at IS NULL AND (s.expires_at IS NULL OR s.expires_at>${now})
-        AND u.approval_status='approved' AND u.state='active'`;
+        AND u.approval_status='approved' AND u.state='active' AND u.deleted_at IS NULL`;
     return rows[0] ? parsePublicConversationShare(rows[0].public_snapshot) : undefined;
   }
 
@@ -2275,7 +2643,7 @@ export class PostgresRepository implements DomainRepository {
       FROM conversation_share_snapshots s JOIN users u ON u.id=s.owner_id
       WHERE s.secret_hash=${secretHash} AND s.revoked_at IS NULL
         AND (s.expires_at IS NULL OR s.expires_at>${now})
-        AND u.approval_status='approved' AND u.state='active'`;
+        AND u.approval_status='approved' AND u.state='active' AND u.deleted_at IS NULL`;
     if (!rows[0]) return undefined;
     const snapshot = parsePublicConversationShare(rows[0].public_snapshot);
     const publicAttachment = snapshot.attachments.find((value) => value.id === publicAttachmentId);

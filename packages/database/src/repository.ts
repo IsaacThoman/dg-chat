@@ -1,5 +1,8 @@
 import type {
   AccountState,
+  AdminUser,
+  AdminUserPage,
+  AdminUserQuery,
   ApiTokenSummary,
   ApprovalStatus,
   Conversation,
@@ -91,6 +94,78 @@ export interface CreateUserInput {
   approvalStatus?: ApprovalStatus;
   state?: AccountState;
   emailVerified?: boolean;
+}
+
+export interface AdminUserCommand {
+  actorId: string;
+  targetUserId: string;
+  expectedVersion: number;
+  reason?: string;
+}
+
+export interface AdminApprovalCommand extends AdminUserCommand {
+  status: "approved" | "rejected";
+  startingCreditMicros: number;
+  requireEmailVerification?: boolean;
+}
+
+export interface AdminRoleCommand extends AdminUserCommand {
+  role: UserRole;
+}
+
+export interface AdminStateCommand extends AdminUserCommand {
+  state: AccountState;
+}
+
+export interface AdminDeletionCommand extends AdminUserCommand {
+  deleted: boolean;
+}
+
+const ADMIN_USER_CURSOR_VERSION = 1;
+
+/** Bind pagination cursors to the normalized filters that produced them. */
+export function adminUserQueryFingerprint(query: AdminUserQuery): string {
+  return JSON.stringify({
+    search: query.search?.trim().toLocaleLowerCase() || null,
+    role: query.role ?? null,
+    approvalStatus: query.approvalStatus ?? null,
+    state: query.state ?? null,
+    deletion: query.deletion ?? "present",
+    emailVerified: query.emailVerified ?? null,
+  });
+}
+
+export function encodeAdminUserCursor(
+  value: Pick<PublicUser, "createdAt" | "id">,
+  query: AdminUserQuery,
+): string {
+  return btoa(JSON.stringify([
+    ADMIN_USER_CURSOR_VERSION,
+    value.createdAt,
+    value.id,
+    adminUserQueryFingerprint(query),
+  ])).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
+export function decodeAdminUserCursor(
+  cursor: string,
+  query: AdminUserQuery,
+): { createdAt: string; id: string } | undefined {
+  try {
+    const base64 = cursor.replaceAll("-", "+").replaceAll("_", "/");
+    const value = JSON.parse(atob(base64.padEnd(Math.ceil(base64.length / 4) * 4, "=")));
+    if (
+      !Array.isArray(value) || value.length !== 4 || value[0] !== ADMIN_USER_CURSOR_VERSION ||
+      typeof value[1] !== "string" || !Number.isFinite(Date.parse(value[1])) ||
+      typeof value[2] !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+        .test(value[2]) ||
+      value[3] !== adminUserQueryFingerprint(query)
+    ) return undefined;
+    return { createdAt: new Date(value[1]).toISOString(), id: value[2] };
+  } catch {
+    return undefined;
+  }
 }
 export type IdentityTokenPurpose = "email_verification" | "password_reset";
 export interface SessionSummary {
@@ -1716,6 +1791,8 @@ export interface DomainRepository {
   findUser(id: string): MaybePromise<StoredUser | undefined>;
   findUserByEmail(email: string): MaybePromise<StoredUser | undefined>;
   listUsers(): MaybePromise<PublicUser[]>;
+  listAdminUsers(query?: AdminUserQuery): MaybePromise<AdminUserPage>;
+  getAdminUser(id: string): MaybePromise<AdminUser>;
   createSession(userId: string, tokenHash: string, limited: boolean): MaybePromise<StoredSession>;
   getSession(tokenHash: string): MaybePromise<StoredSession | undefined>;
   invalidateUserSessions(userId: string): MaybePromise<void>;
@@ -1742,6 +1819,10 @@ export interface DomainRepository {
     requireEmailVerification?: boolean,
   ): MaybePromise<StoredUser>;
   setUserState(id: string, state: AccountState): MaybePromise<StoredUser>;
+  decideUserApproval(input: AdminApprovalCommand): MaybePromise<AdminUser>;
+  setAdminUserRole(input: AdminRoleCommand): MaybePromise<AdminUser>;
+  setAdminUserState(input: AdminStateCommand): MaybePromise<AdminUser>;
+  setAdminUserDeleted(input: AdminDeletionCommand): MaybePromise<AdminUser>;
   createConversation(
     ownerId: string,
     title: string,

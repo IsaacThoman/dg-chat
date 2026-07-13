@@ -58,6 +58,73 @@ Deno.test("OpenAI endpoint registrations are unique", () => {
   ) assertEquals(counts.has(expected), true, `Missing OpenAI route registration: ${expected}`);
 });
 
+Deno.test("soft-deleted active users cannot sign in, reuse sessions, or use API tokens", async () => {
+  const repository = new MemoryRepository();
+  const mailer = new TestIdentityMailer();
+  const { app } = createApp({ repository, setupToken: "deleted-user-setup", mailer });
+  const bootstrap = await app.request("/api/setup/bootstrap", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-setup-token": "deleted-user-setup" },
+    body: JSON.stringify({
+      email: "deleted-auth@example.com",
+      password: "correct horse battery",
+      name: "Deleted Auth",
+    }),
+  });
+  assertEquals(bootstrap.status, 201);
+  const identity = await json(bootstrap);
+  const login = await app.request("/api/auth/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email: "deleted-auth@example.com",
+      password: "correct horse battery",
+    }),
+  });
+  assertEquals(login.status, 200);
+  const cookie = sessionCookie(login);
+  const tokenResponse = await app.request("/api/tokens", {
+    method: "POST",
+    headers: {
+      cookie,
+      origin: "http://localhost:5173",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ name: "Deleted user token", scopes: ["models:read"] }),
+  });
+  assertEquals(tokenResponse.status, 201);
+  const token = (await json(tokenResponse)).token as string;
+
+  repository.users.get(identity.user.id)!.deletedAt = new Date().toISOString();
+  assertEquals(repository.users.get(identity.user.id)!.state, "active");
+
+  const protectedAction = await app.request("/api/conversations", { headers: { cookie } });
+  assertEquals(protectedAction.status, 401);
+  assertEquals((await json(protectedAction)).error.code, "unauthorized");
+  const openAIRequest = await app.request("/v1/models", {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  assertEquals(openAIRequest.status, 401);
+  assertEquals((await json(openAIRequest)).error.code, "unauthorized");
+  const relogin = await app.request("/api/auth/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email: "deleted-auth@example.com",
+      password: "correct horse battery",
+    }),
+  });
+  assertEquals(relogin.status, 403);
+  assertEquals((await json(relogin)).error.code, "account_unavailable");
+  const resetRequest = await app.request("/api/auth/password-reset/request", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email: "deleted-auth@example.com" }),
+  });
+  assertEquals(resetRequest.status, 202);
+  assertEquals(mailer.messages.length, 0);
+});
+
 Deno.test("Chat stream replay fragment overflow terminalizes durably", async () => {
   const repository = new MemoryRepository();
   let providerCalls = 0;
@@ -825,7 +892,7 @@ Deno.test("bootstrap, signup, approval, immutable chat, API token and OpenAI com
   const approval = await app.request(`/api/admin/users/${signed.user.id}/approval`, {
     method: "PATCH",
     headers: adminAuth,
-    body: JSON.stringify({ status: "approved" }),
+    body: JSON.stringify({ status: "approved", expectedVersion: signed.user.version }),
   });
   assertEquals(approval.status, 200);
   const staleLimitedSession = await app.request("/api/conversations", {
@@ -1599,7 +1666,7 @@ Deno.test("email verification defaults off and SMTP failures do not break identi
     (await app.request(`/api/admin/users/${signed.user.id}/approval`, {
       method: "PATCH",
       headers: adminHeaders,
-      body: JSON.stringify({ status: "approved" }),
+      body: JSON.stringify({ status: "approved", expectedVersion: signed.user.version }),
     })).status,
     200,
   );
@@ -2605,7 +2672,7 @@ Deno.test("attachment and OpenAI Files routes enforce security, ownership, scope
     (await app.request(`/api/admin/users/${other.id}/approval`, {
       method: "PATCH",
       headers: { ...adminSession, "content-type": "application/json" },
-      body: JSON.stringify({ status: "approved" }),
+      body: JSON.stringify({ status: "approved", expectedVersion: other.version }),
     })).status,
     200,
   );

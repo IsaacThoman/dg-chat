@@ -3,7 +3,7 @@ import { passwordPolicyError } from "../../../packages/contracts/src/password-po
 
 export type AuthStatus = {
   approvalStatus: "pending" | "approved" | "rejected";
-  state: "active" | "suspended" | "deleted";
+  state: "active" | "suspended";
   emailVerified: boolean;
   emailVerificationRequired: boolean;
   sessionLimited: boolean;

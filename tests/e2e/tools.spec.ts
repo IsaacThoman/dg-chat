@@ -188,18 +188,22 @@ test("a second approved user cannot inspect another user's tool execution", asyn
   await expect(page).toHaveURL(/\/pending$/);
   await page.context().clearCookies();
   await login(page);
-  const usersResponse = await authenticatedRequest(page, "/api/admin/users");
+  const usersResponse = await authenticatedRequest(
+    page,
+    `/api/admin/users?search=${encodeURIComponent(applicant.email)}&limit=1`,
+  );
   expect(usersResponse.status).toBe(200);
   const users = (usersResponse.body as {
     data: Array<{
       id: string;
       email: string;
+      version: number;
     }>;
   }).data;
   const user = users.find((candidate) => candidate.email === applicant.email)!;
   const approval = await authenticatedRequest(page, `/api/admin/users/${user.id}/approval`, {
     method: "PATCH",
-    body: { status: "approved" },
+    body: { status: "approved", expectedVersion: user.version },
   });
   expect(approval.status).toBe(200);
   await page.context().clearCookies();

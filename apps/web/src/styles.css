@@ -3816,6 +3816,122 @@ kbd {
   color: #3b7d61;
   font-size: 8px;
 }
+.admin-user-filters {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.7fr) repeat(3, minmax(120px, 0.8fr)) auto;
+  align-items: end;
+  gap: 9px;
+  margin-bottom: 12px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--card);
+}
+.admin-user-filters label,
+.admin-user-reason {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 600;
+}
+.admin-user-filters input,
+.admin-user-filters select,
+.admin-user-reason input,
+.admin-user-reason textarea {
+  width: 100%;
+  min-height: 40px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  color: var(--ink);
+  background: var(--card);
+  font: inherit;
+}
+.admin-user-search > span:last-child {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 40px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0 10px;
+  background: var(--card);
+}
+.admin-user-search input {
+  min-height: 36px;
+  border: 0;
+  padding: 0;
+  outline: 0;
+}
+.admin-user-table .table-head {
+  grid-template-columns: 1.5fr 0.7fr 0.7fr auto;
+}
+.admin-user-balance {
+  display: grid;
+  gap: 3px;
+}
+.admin-lifecycle-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.admin-user-balance small {
+  display: none;
+}
+.admin-user-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 9px;
+  margin-top: 12px;
+}
+.admin-user-pagination span {
+  color: var(--muted);
+  font-size: 10px;
+}
+.admin-user-pagination button,
+.admin-user-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+.admin-user-summary {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+}
+.admin-user-summary > span:nth-child(2) {
+  display: grid;
+  gap: 3px;
+}
+.admin-user-summary small {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.admin-user-actions {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-top: 16px;
+}
+.admin-user-actions button {
+  min-height: 44px;
+  white-space: normal;
+}
+.admin-user-reason {
+  margin-top: 16px;
+}
+.admin-user-reason textarea {
+  resize: vertical;
+  line-height: 1.45;
+}
 .activity-row {
   min-height: 52px;
   display: flex;
@@ -5518,6 +5634,72 @@ kbd {
   }
 }
 @media (max-width: 760px) {
+  .admin-user-filters {
+    grid-template-columns: 1fr;
+  }
+  .admin-user-filters > button {
+    min-height: 44px;
+  }
+  .admin-user-table,
+  .admin-applicant-table {
+    min-width: 0;
+  }
+  .admin-user-table .table-head,
+  .admin-applicant-table .table-head {
+    display: none;
+  }
+  .admin-user-table .applicant-row,
+  .admin-applicant-table .applicant-row {
+    min-height: 0;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: start;
+    gap: 8px 10px;
+    padding: 14px 10px;
+  }
+  .admin-user-table .applicant-row strong,
+  .admin-user-table .applicant-row small,
+  .admin-applicant-table .applicant-row strong,
+  .admin-applicant-table .applicant-row small,
+  .admin-applicant-table .applicant-row time {
+    font-size: 12px;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+  }
+  .admin-user-table .applicant-row > :not(.avatar):not(:nth-child(2)),
+  .admin-applicant-table .applicant-row > :not(.avatar):not(:nth-child(2)) {
+    grid-column: 2;
+  }
+  .admin-user-table .applicant-row > button,
+  .admin-applicant-table .applicant-actions {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
+  .admin-user-table .applicant-row > button,
+  .admin-applicant-table .applicant-actions button {
+    min-height: 44px;
+  }
+  .admin-applicant-table .applicant-actions {
+    display: grid;
+    grid-template-columns: 1fr auto;
+  }
+  .admin-user-balance small {
+    display: block;
+  }
+  .admin-user-pagination {
+    justify-content: space-between;
+  }
+  .admin-user-pagination button {
+    min-height: 44px;
+  }
+  .admin-user-actions {
+    grid-template-columns: 1fr;
+  }
+  .admin-user-summary {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+  .admin-user-summary > :nth-child(n + 3) {
+    grid-column: 2;
+  }
   .audit-filters {
     grid-template-columns: 1fr;
   }

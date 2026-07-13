@@ -2683,6 +2683,24 @@ Deno.test("identity tokens are one-time and password reset invalidates credentia
   assertEquals(token.userId, user.id);
 });
 
+Deno.test("identity tokens cannot mutate a soft-deleted active account", () => {
+  const repo = new MemoryRepository();
+  const user = repo.createUser({
+    email: "deleted-identity@example.com",
+    name: "Deleted Identity",
+    passwordHash: "old",
+  });
+  const expiry = new Date(Date.now() + 60_000).toISOString();
+  repo.createIdentityToken(user.id, "email_verification", "deleted-verify", expiry);
+  repo.createIdentityToken(user.id, "password_reset", "deleted-reset", expiry);
+  repo.users.get(user.id)!.deletedAt = new Date().toISOString();
+
+  assertThrows(() => repo.verifyEmail("deleted-verify"), DomainError, "invalid or expired");
+  assertThrows(() => repo.resetPassword("deleted-reset", "new"), DomainError, "invalid or expired");
+  assertThrows(() => repo.markUserEmailVerified(user.id), DomainError, "unavailable");
+  assertThrows(() => repo.secureAfterPasswordReset(user.id, "ignored"), DomainError, "unavailable");
+});
+
 Deno.test("durable API idempotency lifecycle reserves once, replays frames, and fences stale leases", () => {
   const repo = new MemoryRepository();
   const user = repo.createUser({

@@ -154,12 +154,30 @@ Deno.test("memory share excludes tombstoned and hidden-instruction nodes and re-
   assertEquals(JSON.stringify(hiddenSnapshot).includes("private custom instructions"), false);
 });
 
-Deno.test("memory share revocation, expiry, owner suspension, and attachment deletion fail closed", async () => {
+Deno.test("memory share revocation, expiry, owner suspension/deletion, and attachment deletion fail closed", async () => {
   const { repo, owner, attachmentId, input } = setup();
   const created = await repo.createConversationShare(owner.id, input);
   repo.setUserState(owner.id, "suspended");
   assertEquals(repo.resolvePublicConversationShare(input.secretHash), undefined);
   repo.setUserState(owner.id, "active");
+  repo.users.get(owner.id)!.deletedAt = new Date().toISOString();
+  assertEquals(repo.resolvePublicConversationShare(input.secretHash), undefined);
+  assertRejects(
+    () => repo.createConversationShare(owner.id, input),
+    DomainError,
+    "cannot create shares",
+  );
+  assertRejects(
+    () =>
+      repo.createConversationShare(owner.id, {
+        ...input,
+        idempotencyKey: "deleted-owner-share",
+        secretHash: "f".repeat(64),
+      }),
+    DomainError,
+    "cannot create shares",
+  );
+  repo.users.get(owner.id)!.deletedAt = null;
   const publicAttachmentId =
     repo.resolvePublicConversationShare(input.secretHash)!.attachments[0].id;
   repo.attachments.get(attachmentId)!.deletedAt = new Date().toISOString();

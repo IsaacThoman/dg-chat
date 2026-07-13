@@ -33,16 +33,20 @@ test("OIDC creates a pending applicant and approval enables a fresh SSO session"
 
   await page.context().clearCookies();
   await login(page, adminEmail, adminPassword);
-  const usersResponse = await page.request.get(`${apiURL}/api/admin/users`);
+  const usersResponse = await page.request.get(
+    `${apiURL}/api/admin/users?search=${encodeURIComponent(oidcEmail)}&limit=1`,
+  );
   expect(usersResponse.ok()).toBeTruthy();
-  const users = await usersResponse.json() as { data: Array<{ id: string; email: string }> };
+  const users = await usersResponse.json() as {
+    data: Array<{ id: string; email: string; version: number }>;
+  };
   const applicant = users.data.find((user) => user.email === oidcEmail);
   expect(applicant).toBeTruthy();
   const approval = await page.request.patch(
     `${apiURL}/api/admin/users/${applicant!.id}/approval`,
     {
       headers: { origin: new URL(page.url()).origin },
-      data: { status: "approved" },
+      data: { status: "approved", expectedVersion: applicant!.version },
     },
   );
   expect(approval.ok()).toBeTruthy();
