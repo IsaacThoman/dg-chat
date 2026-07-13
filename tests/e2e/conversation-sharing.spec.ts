@@ -134,7 +134,6 @@ test("renders a redacted public snapshot safely without workspace chrome", async
               parentId: null,
               role: "user",
               content: "Hello <img src=x onerror=alert(1)>",
-              model: null,
               status: "complete",
               attachmentIds: [],
               createdAt,
@@ -145,7 +144,6 @@ test("renders a redacted public snapshot safely without workspace chrome", async
               role: "assistant",
               content:
                 "Read [the guide](https://example.com). ![tracking pixel](https://tracker.invalid/pixel.png)",
-              model: "simulator/fast",
               status: "complete",
               attachmentIds: [],
               createdAt,

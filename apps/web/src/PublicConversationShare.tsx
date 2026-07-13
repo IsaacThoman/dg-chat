@@ -120,7 +120,6 @@ export function PublicConversationShareView({ capability }: { capability: string
                     ? "Tool"
                     : "Assistant"}
                 </span>
-                {message.model && <small>{message.model}</small>}
               </div>
               {message.attachmentIds.length > 0 && (
                 <div className="public-share-attachments">
