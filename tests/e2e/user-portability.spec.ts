@@ -48,8 +48,10 @@ test("previews and explicitly confirms a portable import", async ({ page }) => {
   await expect(page.getByLabel("Include temporary conversations")).not.toBeChecked();
   await page.getByRole("button", { name: "Choose archive" }).click();
   const dialog = page.getByRole("dialog", { name: "Import chat data" });
+  const fileInput = dialog.locator('input[type="file"]');
+  await expect(fileInput).toBeHidden();
   expect(await dialog.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
-  await dialog.locator('input[type="file"]').setInputFiles({
+  await fileInput.setInputFiles({
     name: `${"a".repeat(247)}.dgchat`,
     mimeType: "application/json",
     buffer: Buffer.from(JSON.stringify({ format: "dgchat.owner-export", version: 1 })),

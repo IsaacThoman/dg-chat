@@ -272,6 +272,7 @@ function ImportDialog({ close }: { close: () => void }) {
                   ref={input}
                   className="visually-hidden"
                   type="file"
+                  hidden
                   accept="application/json,.dgchat,.json"
                   aria-hidden="true"
                   tabIndex={-1}

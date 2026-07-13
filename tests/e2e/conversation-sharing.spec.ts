@@ -108,7 +108,7 @@ test("creates and revokes an immutable snapshot with conservative defaults", asy
   await expect(dialog.getByRole("heading", { name: "Snapshot ready" })).toBeVisible();
   const createdCapability = String(createBodies[1]?.capability);
   await expect(dialog.getByLabel("Share link")).toHaveValue(
-    `http://localhost:5173/share/${createdCapability}`,
+    `${new URL(page.url()).origin}/share/${createdCapability}`,
   );
   expect(createBodies[1]).toMatchObject({
     identityVisibility: "anonymous",
