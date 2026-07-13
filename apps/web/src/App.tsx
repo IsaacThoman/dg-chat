@@ -351,7 +351,7 @@ function Sidebar({
           )
           : <kbd>⌘F</kbd>}
       </div>
-      <span className="sr-only" role="status" aria-live="polite">
+      <span className="sr-only" aria-live="polite" aria-atomic="true">
         {query ? `${filtered.length} conversation${filtered.length === 1 ? "" : "s"} found` : ""}
       </span>
       <nav className="side-nav">
