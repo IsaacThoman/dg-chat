@@ -142,11 +142,13 @@ Deno.test("owner portability routes export privately and import with stable repl
       .length,
     1,
   );
-  assertExists(
-    (await repository.listAudit({ action: "conversation.portability_exported" })).data[0],
-  );
+  const ownerExportAudit = (await repository.listAudit({
+    action: "conversation.portability_exported",
+    actorId: owner.user.id,
+  })).data[0];
+  assertExists(ownerExportAudit);
   assertEquals(
-    (await repository.listAudit({ action: "conversation.portability_exported" })).data[0].metadata,
+    ownerExportAudit.metadata,
     { conversations: 1, attachments: 0, includeDeleted: false, includeTemporary: false },
   );
 });
