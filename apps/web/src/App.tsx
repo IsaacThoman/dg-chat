@@ -837,19 +837,18 @@ function RenameConversationDialog(
 }
 
 function BranchControl(
-  { branch, onTree, onSelect, busy, readOnly = false }: {
+  { branch, onTree, onSelect, busy }: {
     branch: MessageBranch;
     onTree: () => void;
     onSelect: (messageId: string) => void;
     busy: boolean;
-    readOnly?: boolean;
   },
 ) {
   return (
     <div className="branch-control" aria-label={`Branch ${branch.index} of ${branch.total}`}>
       <IconButton
         label="Previous branch"
-        disabled={!branch.previousId || busy || readOnly}
+        disabled={!branch.previousId || busy}
         onClick={() => branch.previousId && onSelect(branch.previousId)}
       >
         <ChevronLeft size={15} />
@@ -857,7 +856,7 @@ function BranchControl(
       <span aria-live="polite">{branch.index} / {branch.total}</span>
       <IconButton
         label="Next branch"
-        disabled={!branch.nextId || busy || readOnly}
+        disabled={!branch.nextId || busy}
         onClick={() => branch.nextId && onSelect(branch.nextId)}
       >
         <ChevronRight size={15} />
@@ -903,10 +902,15 @@ function MessageItem(
   },
 ) {
   const [copied, setCopied] = useState(false);
-  const copy = () => {
-    navigator.clipboard?.writeText(message.content);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1200);
+  const copy = async () => {
+    try {
+      if (!navigator.clipboard) return;
+      await navigator.clipboard.writeText(message.content);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } catch {
+      // Keep the copy affordance unchanged when browser permissions deny the write.
+    }
   };
   if (message.role === "user") {
     return (
@@ -949,7 +953,7 @@ function MessageItem(
           </div>
           <div className="message-actions user-actions">
             <span>{message.createdAt}</span>
-            <IconButton label="Copy" onClick={copy}>
+            <IconButton label="Copy" onClick={() => void copy()}>
               {copied ? <Check size={15} /> : <Copy size={15} />}
             </IconButton>
             {!readOnly && (
@@ -967,7 +971,6 @@ function MessageItem(
                 onTree={onTree}
                 onSelect={onSelectBranch}
                 busy={branchBusy || generationBusy}
-                readOnly={readOnly}
               />
             )}
           </div>
@@ -1013,7 +1016,7 @@ function MessageItem(
           )
           : null}
         <div className="message-actions">
-          <IconButton label="Copy response" onClick={copy}>
+          <IconButton label="Copy response" onClick={() => void copy()}>
             {copied ? <Check size={15} /> : <Copy size={15} />}
           </IconButton>
           {speech
@@ -1066,7 +1069,6 @@ function MessageItem(
               onTree={onTree}
               onSelect={onSelectBranch}
               busy={branchBusy || generationBusy}
-              readOnly={readOnly}
             />
           )}
           <span className="response-meta">{message.latency}</span>
@@ -1193,6 +1195,14 @@ export function Composer(
   };
   const [uploads, setUploads] = useState<UploadItem[]>([]);
   const [excludedEditAttachments, setExcludedEditAttachments] = useState<Set<string>>(new Set());
+  const editDraftRef = useRef<
+    {
+      value: string;
+      toolContexts: Array<{ id: string }>;
+      generatedAssets: GeneratedAsset[];
+    } | null
+  >(null);
+  const previousEditIdRef = useRef<string | null>(null);
   const uploadControllers = useRef(new Map<string, AbortController>());
   const fileRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -1203,10 +1213,33 @@ export function Composer(
   useEffect(() => {
     setExcludedEditAttachments(new Set());
     if (edit) {
+      if (previousEditIdRef.current === null) {
+        editDraftRef.current = {
+          value,
+          toolContexts,
+          generatedAssets: selectedGeneratedAssets,
+        };
+      }
+      previousEditIdRef.current = edit.id;
       setValue(edit.content);
       setToolContexts((edit.toolExecutionIds ?? []).map((id) => ({ id })));
+      setSelectedGeneratedAssets([]);
+    } else {
+      previousEditIdRef.current = null;
     }
   }, [edit]);
+  const cancelCurrentEdit = () => {
+    const draft = editDraftRef.current;
+    if (draft) {
+      setValue(draft.value);
+      setToolContexts(draft.toolContexts);
+      setSelectedGeneratedAssets(draft.generatedAssets);
+    }
+    editDraftRef.current = null;
+    previousEditIdRef.current = null;
+    setExcludedEditAttachments(new Set());
+    cancelEdit();
+  };
   const retainedAttachments = (edit?.attachments ?? []).filter((attachment) =>
     !excludedEditAttachments.has(attachment.id)
   );
@@ -1302,9 +1335,15 @@ export function Composer(
   };
   const addGeneratedAsset = (asset: GeneratedAsset) => {
     if (!asset.attachmentId || asset.status !== "ready") return;
-    setSelectedGeneratedAssets((current) =>
-      current.some((item) => item.id === asset.id) ? current : [...current, asset]
-    );
+    setSelectedGeneratedAssets((current) => {
+      if (current.some((item) => item.id === asset.id)) return current;
+      if (uploads.length + retainedAttachments.length + current.length >= 10) {
+        setSelectionError("You can attach up to 10 files or generated images to one message.");
+        return current;
+      }
+      setSelectionError("");
+      return [...current, asset];
+    });
   };
   const openImageEditorFromGallery = (asset?: GeneratedAsset) => {
     imageModalHandoff.current = true;
@@ -1369,12 +1408,15 @@ export function Composer(
     const allowed = files.filter((file) => file.size <= 25 * 1024 * 1024);
     const selected = allowed.slice(
       0,
-      Math.max(0, 10 - uploads.length - retainedAttachments.length),
+      Math.max(
+        0,
+        10 - uploads.length - retainedAttachments.length - selectedGeneratedAssets.length,
+      ),
     );
     if (allowed.length !== files.length) {
       setSelectionError("Each attachment must be 25 MB or smaller.");
     } else if (selected.length !== files.length) {
-      setSelectionError("You can attach up to 10 files to one message.");
+      setSelectionError("You can attach up to 10 files or generated images to one message.");
     } else {
       setSelectionError("");
     }
@@ -1433,6 +1475,8 @@ export function Composer(
     e.preventDefault();
     if (!canSubmit) return;
     if (await onSend(value.trim(), readyAttachmentIds, toolContexts.map((context) => context.id))) {
+      editDraftRef.current = null;
+      previousEditIdRef.current = null;
       setValue("");
       setUploads([]);
       setSelectedGeneratedAssets([]);
@@ -1463,7 +1507,7 @@ export function Composer(
             <strong>Create a new branch</strong>
             <small>The original message and every response after it will stay intact.</small>
           </span>
-          <IconButton label="Cancel edit" onClick={cancelEdit}>
+          <IconButton label="Cancel edit" onClick={cancelCurrentEdit}>
             <X size={16} />
           </IconButton>
         </div>
@@ -1602,7 +1646,7 @@ export function Composer(
             }
           }}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) void submit(e);
+            if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) void submit(e);
           }}
           placeholder="Message DG Chat…"
           aria-label="Message"
@@ -1840,7 +1884,6 @@ function TreePanel({
   close,
   onSelect,
   busy,
-  readOnly = false,
   returnFocus,
 }: {
   messages: Message[];
@@ -1848,7 +1891,6 @@ function TreePanel({
   close: () => void;
   onSelect: (messageId: string) => void;
   busy: boolean;
-  readOnly?: boolean;
   returnFocus?: HTMLElement | null;
 }) {
   const roots = conversationTree(messages, activeLeafId);
@@ -1954,7 +1996,6 @@ function TreePanel({
                 node={root}
                 onSelect={onSelect}
                 busy={busy}
-                readOnly={readOnly}
               />
             ))
             : <p className="muted">This conversation does not have any messages yet.</p>}
@@ -1971,14 +2012,13 @@ function TreePanel({
   );
 }
 function TreeNode(
-  { node, onSelect, busy, readOnly }: {
+  { node, onSelect, busy }: {
     node: MessageTreeNode;
     onSelect: (messageId: string) => void;
     busy: boolean;
-    readOnly: boolean;
   },
 ) {
-  const disabled = busy || readOnly;
+  const disabled = busy;
   return (
     <div
       className="tree-subtree"
@@ -2014,7 +2054,6 @@ function TreeNode(
               node={child}
               onSelect={onSelect}
               busy={busy}
-              readOnly={readOnly}
             />
           ))}
         </div>
@@ -2181,7 +2220,9 @@ function ChatView({
   const [keepTemporaryError, setKeepTemporaryError] = useState("");
   const initialConversation = conversations.find((c) => c.id === activeId);
   const [conversation, setConversation] = useState(initialConversation);
+  const [previewLeafId, setPreviewLeafId] = useState<string | null>(null);
   const syncConversation = (next: Conversation) => {
+    setPreviewLeafId(null);
     setConversation(next);
     for (const queryKey of [["conversations"], ["conversations", "deleted"]] as const) {
       queryClient.setQueryData<Conversation[]>(
@@ -2192,10 +2233,14 @@ function ChatView({
   };
   const readOnly = readOnlyProp || Boolean(conversation?.archived || conversation?.deleted);
   useEffect(() => setLocalMessages(messages), [messages]);
-  useEffect(() => setConversation(initialConversation), [initialConversation]);
+  useEffect(() => {
+    setPreviewLeafId(null);
+    setConversation(initialConversation);
+  }, [activeId, initialConversation]);
+  const effectiveActiveLeafId = previewLeafId ?? conversation?.activeLeafId;
   const activePath = useMemo(
-    () => activeMessagePath(localMessages, conversation?.activeLeafId),
-    [localMessages, conversation?.activeLeafId],
+    () => activeMessagePath(localMessages, effectiveActiveLeafId),
+    [localMessages, effectiveActiveLeafId],
   );
   const streaming = Boolean(activeStream);
   const generationBusy = streaming || queue.length > 0;
@@ -2209,7 +2254,7 @@ function ChatView({
   );
   useEffect(() => speechPlayback.controller.cancel(), [
     activeId,
-    conversation?.activeLeafId,
+    effectiveActiveLeafId,
     speechContentFingerprint,
     speechModel,
     speechVoice,
@@ -2223,9 +2268,13 @@ function ChatView({
     });
   }, [activeStream?.assistant.content]);
   const selectBranch = async (messageId: string) => {
-    if (!conversation || branchInFlightRef.current || readOnly) return;
+    if (!conversation || branchInFlightRef.current) return;
     const leafId = preferredLeaf(localMessages, messageId);
-    if (leafId === conversation.activeLeafId) return;
+    if (leafId === effectiveActiveLeafId) return;
+    if (readOnly) {
+      setPreviewLeafId(leafId);
+      return;
+    }
     branchInFlightRef.current = true;
     setBranchBusy(true);
     setSendError("");
@@ -2841,11 +2890,10 @@ function ChatView({
       {tree && (
         <TreePanel
           messages={localMessages}
-          activeLeafId={conversation?.activeLeafId}
+          activeLeafId={effectiveActiveLeafId}
           close={() => setTree(false)}
           onSelect={selectBranch}
           busy={branchBusy || streaming || queue.length > 0}
-          readOnly={readOnly}
           returnFocus={treeReturnFocusRef.current}
         />
       )}

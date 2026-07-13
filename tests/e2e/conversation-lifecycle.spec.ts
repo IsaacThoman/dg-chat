@@ -141,7 +141,7 @@ test("lifecycle lists show loading before empty state", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "Start a new conversation" })).toBeVisible();
 });
 
-test("archived branch controls are read-only", async ({ page }) => {
+test("archived chats keep immutable branches navigable without becoming editable", async ({ page }) => {
   await createChat(page);
   const conversationId = await page.locator(
     ".conversation-row.active [data-conversation-actions]",
@@ -170,13 +170,20 @@ test("archived branch controls are read-only", async ({ page }) => {
     `.conversation-row:has([data-conversation-actions="${conversationId}"]) > button`,
   )
     .first().click();
-  await expect(page.getByRole("button", { name: "Previous branch" }).first()).toBeDisabled();
+  const previousBranch = page.getByRole("button", { name: "Previous branch" }).first();
+  await expect(previousBranch).toBeEnabled();
+  await previousBranch.click();
+  await expect(page.getByText(
+    "This is a simulated response to: Original lifecycle branch",
+    { exact: true },
+  )).toBeVisible();
+  await expect(page.getByRole("textbox", { name: /message/i })).toBeHidden();
   const treeTrigger = page.getByRole("button", { name: "View conversation tree" }).first();
   await treeTrigger.press("Enter");
   const treeDialog = page.getByRole("dialog", { name: "Conversation tree" });
   await expect(treeDialog).toBeVisible();
   await expect(treeDialog.getByRole("button", { name: "Close" })).toBeFocused();
-  await expect(page.getByRole("treeitem").first()).toHaveAttribute("aria-disabled", "true");
+  await expect(page.getByRole("treeitem").first()).not.toHaveAttribute("aria-disabled", "true");
   await page.keyboard.press("Escape");
   await expect(treeDialog).toBeHidden();
   await expect(treeTrigger).toBeFocused();

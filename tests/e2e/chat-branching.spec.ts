@@ -47,6 +47,33 @@ test("composer supports keyboard submission and does not submit Shift+Enter", as
     .toBeVisible();
 });
 
+test("composer ignores IME composition Enter and sends only after composition ends", async ({ page }) => {
+  const composer = page.getByRole("textbox", { name: /message/i });
+  await composer.fill("正在输入");
+  await composer.evaluate((element) => {
+    element.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", bubbles: true, isComposing: true }),
+    );
+  });
+  await expect(composer).toHaveValue("正在输入");
+  await expect(page.locator("article.user-message")).toHaveCount(0);
+  await composer.press("Enter");
+  await expect(page.getByText("正在输入", { exact: true })).toBeVisible();
+});
+
+test("canceling an immutable edit restores the existing draft", async ({ page }) => {
+  const composer = page.getByRole("textbox", { name: /message/i });
+  await composer.fill("Saved message");
+  await composer.press("Enter");
+  await expect(page.getByText(/simulated response to: Saved message/i)).toBeVisible();
+  await composer.fill("Unsent draft that must survive");
+  const prompt = page.getByText("Saved message", { exact: true });
+  await prompt.locator("xpath=ancestor::article[1]").getByRole("button", { name: /edit/i }).click();
+  await expect(composer).toHaveValue("Saved message");
+  await page.getByRole("button", { name: "Cancel edit" }).click();
+  await expect(composer).toHaveValue("Unsent draft that must survive");
+});
+
 test("editing preserves the original Markdown source exactly", async ({ page }) => {
   const markdown = "**Bold** and `code` with _emphasis_";
   const composer = page.getByRole("textbox", { name: /message/i });

@@ -1,4 +1,4 @@
-import { type FormEvent, type ReactNode, useMemo, useState } from "react";
+import { type FormEvent, type ReactNode, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Activity, Bot, Cloud, Plus, RefreshCw, Search } from "lucide-react";
 import { api, ApiError } from "./api.ts";
@@ -14,6 +14,15 @@ import type {
 import { AdminModelAccess } from "./AdminModelAccess.tsx";
 
 const capabilities = MODEL_CAPABILITIES;
+export const OCR_ACCESS_POLICY_NOTE =
+  "OCR targets are privileged internal service dependencies. Access groups control direct model selection, but do not block a configured OCR call. Extracted-text cache entries remain isolated per user.";
+export const providerProtocolOptions: ReadonlyArray<{
+  value: ProviderProtocol;
+  label: string;
+}> = [
+  { value: "chat_completions", label: "OpenAI Chat Completions" },
+  { value: "responses", label: "OpenAI Responses" },
+];
 const errorMessage = (error: unknown) =>
   error instanceof ApiError || error instanceof Error ? error.message : "The request failed";
 const dateTime = (value: string | null) => value ? new Date(value).toLocaleString() : "Never";
@@ -42,10 +51,56 @@ export function modelAvailabilityBlockers(
   else {
     if (!provider.enabled) blockers.push("Provider disabled");
     if (!provider.hasCredential) blockers.push("Credential required");
-    if (provider.protocol !== "chat_completions") blockers.push("Protocol unsupported");
   }
   if (!price) blockers.push("Pricing required");
   return blockers;
+}
+
+export function providerProtocolLabel(provider: AdminProvider | undefined): string {
+  if (!provider) return "Unknown provider";
+  return provider.protocol === "responses" ? "Responses" : "Chat Completions";
+}
+
+export function ocrTargetAvailabilityBlockers(
+  target: AdminModel | undefined,
+  provider: AdminProvider | undefined,
+  expectedProviderId: string,
+  price: ModelPriceVersion | undefined,
+): string[] {
+  if (!target) return ["Target missing"];
+  const blockers = modelAvailabilityBlockers(target, provider, price);
+  if (target.providerId !== expectedProviderId) blockers.unshift("Provider mismatch");
+  if (!target.capabilities.includes("chat")) blockers.push("Chat capability required");
+  if (!target.capabilities.includes("vision")) blockers.push("Vision capability required");
+  if (target.customParams.ocr && typeof target.customParams.ocr === "object") {
+    blockers.push("Recursive OCR is not allowed");
+  }
+  return blockers;
+}
+
+export function ocrTargetCandidates(
+  models: readonly AdminModel[],
+  providers: readonly AdminProvider[],
+  providerId: string,
+  sourceModelId?: string,
+): AdminModel[] {
+  return models.filter((candidate) => {
+    const provider = providers.find((item) => item.id === candidate.providerId);
+    return candidate.providerId === providerId && candidate.id !== sourceModelId &&
+      candidate.capabilities.includes("vision") && candidate.capabilities.includes("chat") &&
+      candidate.enabled && provider?.enabled &&
+      provider.hasCredential && Boolean(effectivePrice(candidate.prices)) &&
+      !(candidate.customParams.ocr && typeof candidate.customParams.ocr === "object");
+  });
+}
+
+export function ocrTargetSelectionValue(
+  configuredModel: string,
+  candidates: readonly AdminModel[],
+): string {
+  return candidates.find((candidate) =>
+    candidate.id === configuredModel || candidate.publicModelId === configuredModel
+  )?.id ?? configuredModel;
 }
 
 export function selectionAfterSuccessfulImports(
@@ -117,6 +172,12 @@ function ProviderForm({ provider, close }: { provider?: AdminProvider; close: ()
   });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const errorRef = useRef<HTMLParagraphElement>(null);
+  useEffect(() => {
+    if (!error) return;
+    errorRef.current?.scrollIntoView({ block: "center" });
+    errorRef.current?.focus({ preventScroll: true });
+  }, [error]);
   const set = <K extends keyof ProviderDraft>(key: K, value: ProviderDraft[K]) =>
     setDraft((current) => ({ ...current, [key]: value }));
   const save = async (event: FormEvent) => {
@@ -178,7 +239,11 @@ function ProviderForm({ provider, close }: { provider?: AdminProvider; close: ()
       dismissible={!busy}
     >
       <form onSubmit={save} aria-busy={busy}>
-        {error && <p className="form-error" role="alert">{error}</p>}
+        {error && (
+          <p className="form-error" role="alert" ref={errorRef} tabIndex={-1}>
+            {error}
+          </p>
+        )}
         <label className="field">
           <span>Display name</span>
           <input
@@ -220,10 +285,13 @@ function ProviderForm({ provider, close }: { provider?: AdminProvider; close: ()
             value={draft.protocol}
             onChange={(e) => set("protocol", e.target.value as ProviderProtocol)}
           >
-            <option value="chat_completions">OpenAI Chat Completions</option>
+            {providerProtocolOptions.map((option) => (
+              <option key={option.value} value={option.value}>{option.label}</option>
+            ))}
           </select>
           <small>
-            Responses protocol providers will be enabled after the upstream adapter is available.
+            Select the native protocol exposed by this provider. DG Chat translates its canonical
+            chat contract without exposing provider-specific conversation state.
           </small>
         </label>
         <label className="check-row">
@@ -449,6 +517,12 @@ export function AdminProviders() {
                   <strong>{provider.hasCredential ? "Stored" : "Missing"}</strong>
                 </span>
                 <span>
+                  <small>Protocol</small>
+                  <strong>
+                    {provider.protocol === "responses" ? "Responses" : "Chat Completions"}
+                  </strong>
+                </span>
+                <span>
                   <small>Models</small>
                   <strong>{provider.modelCount}</strong>
                 </span>
@@ -560,10 +634,112 @@ type ModelDraft = {
   contextWindow: string;
   enabled: boolean;
   capabilities: ModelCapability[];
+  customParamsJson: string;
+  ocr: OcrDraft;
 };
+
+export type OcrDraft = {
+  enabled: boolean;
+  providerId: string;
+  model: string;
+  prompt: string;
+  cacheTtlSeconds: string;
+  timeoutMs: string;
+  maxBytes: string;
+  maxPixels: string;
+  maxDimension: string;
+  maxRedirects: string;
+};
+
+const defaultOcrDraft = (): OcrDraft => ({
+  enabled: false,
+  providerId: "",
+  model: "",
+  prompt: "Extract all visible text faithfully. Preserve reading order and layout where useful.",
+  cacheTtlSeconds: "86400",
+  timeoutMs: "15000",
+  maxBytes: String(10 * 1024 * 1024),
+  maxPixels: "40000000",
+  maxDimension: "16384",
+  maxRedirects: "2",
+});
+
+export function modelSettingsDraft(customParams: Record<string, unknown> = {}): {
+  customParamsJson: string;
+  ocr: OcrDraft;
+} {
+  const { ocr: rawOcr, ...advanced } = customParams;
+  const ocr = rawOcr && typeof rawOcr === "object" && !Array.isArray(rawOcr)
+    ? rawOcr as Record<string, unknown>
+    : {};
+  const defaults = defaultOcrDraft();
+  const value = (key: Exclude<keyof OcrDraft, "enabled">) =>
+    String(ocr[key] === undefined ? defaults[key] : ocr[key]);
+  return {
+    customParamsJson: JSON.stringify(advanced, null, 2),
+    ocr: {
+      enabled: ocr.enabled === true,
+      providerId: value("providerId"),
+      model: value("model"),
+      prompt: value("prompt"),
+      cacheTtlSeconds: value("cacheTtlSeconds"),
+      timeoutMs: value("timeoutMs"),
+      maxBytes: value("maxBytes"),
+      maxPixels: value("maxPixels"),
+      maxDimension: value("maxDimension"),
+      maxRedirects: value("maxRedirects"),
+    },
+  };
+}
+
+function ocrInteger(value: string, label: string): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) throw new TypeError(`${label} must be a whole number.`);
+  return parsed;
+}
+
+export function modelCustomParamsInput(
+  customParamsJson: string,
+  ocr: OcrDraft,
+): Record<string, unknown> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(customParamsJson || "{}");
+  } catch {
+    throw new TypeError("Advanced provider parameters must be valid JSON.");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new TypeError("Advanced provider parameters must be a JSON object.");
+  }
+  const advanced = parsed as Record<string, unknown>;
+  if (Object.hasOwn(advanced, "ocr")) {
+    throw new TypeError("Configure OCR with the typed OCR controls, not advanced JSON.");
+  }
+  if (!ocr.enabled) return advanced;
+  if (!ocr.providerId.trim() || !ocr.model.trim() || !ocr.prompt.trim()) {
+    throw new TypeError("OCR provider, model, and prompt are required when OCR is enabled.");
+  }
+  return {
+    ...advanced,
+    ocr: {
+      enabled: true,
+      providerId: ocr.providerId.trim(),
+      model: ocr.model.trim(),
+      prompt: ocr.prompt,
+      cacheTtlSeconds: ocrInteger(ocr.cacheTtlSeconds, "OCR cache TTL"),
+      timeoutMs: ocrInteger(ocr.timeoutMs, "OCR timeout"),
+      maxBytes: ocrInteger(ocr.maxBytes, "OCR byte limit"),
+      maxPixels: ocrInteger(ocr.maxPixels, "OCR pixel limit"),
+      maxDimension: ocrInteger(ocr.maxDimension, "OCR dimension limit"),
+      maxRedirects: ocrInteger(ocr.maxRedirects, "OCR redirect limit"),
+    },
+  };
+}
+
 function ModelForm(
-  { model, providers, close }: {
+  { model, models, providers, close }: {
     model?: AdminModel;
+    models: AdminModel[];
     providers: AdminProvider[];
     close: () => void;
   },
@@ -571,6 +747,7 @@ function ModelForm(
   const queryClient = useQueryClient();
   const initialProvider = providers.find((provider) => provider.id === model?.providerId) ??
     providers[0];
+  const settings = modelSettingsDraft(model?.customParams);
   const [draft, setDraft] = useState<ModelDraft>({
     providerId: model?.providerId ?? initialProvider?.id ?? "",
     publicModelId: model?.publicModelId ?? `${initialProvider?.slug ?? "provider"}/`,
@@ -579,22 +756,46 @@ function ModelForm(
     contextWindow: String(model?.contextWindow ?? 128000),
     enabled: model?.enabled ?? false,
     capabilities: model?.capabilities ?? ["chat", "streaming"],
+    ...settings,
   });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const errorRef = useRef<HTMLParagraphElement>(null);
+  const ocrTargetHelpId = useId();
+  const selectedProvider = providers.find((provider) => provider.id === draft.providerId);
+  const ocrTargets = ocrTargetCandidates(models, providers, draft.ocr.providerId, model?.id);
+  const ocrTargetValue = ocrTargetSelectionValue(draft.ocr.model, ocrTargets);
+  useEffect(() => {
+    if (!error) return;
+    errorRef.current?.scrollIntoView({ block: "center" });
+    errorRef.current?.focus({ preventScroll: true });
+  }, [error]);
   const save = async (event: FormEvent) => {
     event.preventDefault();
     setBusy(true);
     setError("");
     try {
+      const customParams = modelCustomParamsInput(draft.customParamsJson, draft.ocr);
       if (model) {
         await api.updateAdminModel(model, {
           displayName: draft.displayName,
           contextWindow: Number(draft.contextWindow),
           capabilities: draft.capabilities,
           enabled: draft.enabled,
+          customParams,
         });
-      } else await api.createAdminModel({ ...draft, contextWindow: Number(draft.contextWindow) });
+      } else {
+        await api.createAdminModel({
+          providerId: draft.providerId,
+          publicModelId: draft.publicModelId,
+          upstreamModelId: draft.upstreamModelId,
+          displayName: draft.displayName,
+          contextWindow: Number(draft.contextWindow),
+          capabilities: draft.capabilities,
+          enabled: draft.enabled,
+          customParams,
+        });
+      }
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["admin-models"] }),
         queryClient.invalidateQueries({ queryKey: ["models"] }),
@@ -625,7 +826,11 @@ function ModelForm(
       dismissible={!busy}
     >
       <form onSubmit={save} aria-busy={busy}>
-        {error && <p className="form-error" role="alert">{error}</p>}
+        {error && (
+          <p className="form-error" role="alert" ref={errorRef} tabIndex={-1}>
+            {error}
+          </p>
+        )}
         <label className="field">
           <span>Provider</span>
           <select
@@ -698,6 +903,150 @@ function ModelForm(
               {capability}
             </label>
           ))}
+        </fieldset>
+        <details className="model-advanced-settings">
+          <summary>Advanced provider defaults</summary>
+          <p className="muted">
+            {selectedProvider?.protocol === "responses"
+              ? "Responses providers accept temperature, top_p, response_format, and parallel_tool_calls."
+              : "Chat Completions providers also accept presence/frequency penalties, seed, and stop."}
+            {"  "}
+            Values supplied by a request always take precedence. Routing, prompts, tools, identity,
+            streaming, and token limits cannot be overridden here.
+          </p>
+          <label className="field">
+            <span>Safe defaults (JSON)</span>
+            <textarea
+              rows={7}
+              spellCheck={false}
+              value={draft.customParamsJson}
+              onChange={(event) =>
+                setDraft((current) => ({
+                  ...current,
+                  customParamsJson: event.target.value,
+                }))}
+              aria-describedby="custom-params-help"
+            />
+            <small id="custom-params-help">
+              Stored configuration is bounded and validated again by the server.
+            </small>
+          </label>
+        </details>
+        <fieldset className="capability-field model-ocr-settings">
+          <legend>OCR interception</legend>
+          <label className="check-row">
+            <input
+              type="checkbox"
+              checked={draft.ocr.enabled}
+              onChange={(event) =>
+                setDraft((current) => ({
+                  ...current,
+                  ocr: {
+                    ...current.ocr,
+                    enabled: event.target.checked,
+                    providerId: current.ocr.providerId || current.providerId,
+                  },
+                }))}
+            />{" "}
+            Enable bounded OCR for images sent to this model
+          </label>
+          {draft.ocr.enabled && (
+            <div className="model-ocr-grid">
+              <label className="field">
+                <span>OCR provider</span>
+                <select
+                  required
+                  value={draft.ocr.providerId}
+                  onChange={(event) =>
+                    setDraft((current) => ({
+                      ...current,
+                      ocr: { ...current.ocr, providerId: event.target.value, model: "" },
+                    }))}
+                >
+                  <option value="" disabled>Select a provider</option>
+                  {providers.map((provider) => (
+                    <option key={provider.id} value={provider.id}>{provider.displayName}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="field">
+                <span>Vision model</span>
+                <select
+                  required
+                  value={ocrTargetValue}
+                  aria-describedby={ocrTargets.length === 0 ? ocrTargetHelpId : undefined}
+                  aria-invalid={ocrTargets.length === 0 ? true : undefined}
+                  onChange={(event) =>
+                    setDraft((current) => ({
+                      ...current,
+                      ocr: { ...current.ocr, model: event.target.value },
+                    }))}
+                >
+                  <option value="" disabled>Select an available vision model</option>
+                  {draft.ocr.model && ocrTargetValue === draft.ocr.model &&
+                    !ocrTargets.some((candidate) => candidate.id === draft.ocr.model) && (
+                    <option value={draft.ocr.model} disabled>
+                      Current target is unavailable — choose another
+                    </option>
+                  )}
+                  {ocrTargets.map((candidate) => (
+                    <option key={candidate.id} value={candidate.id}>
+                      {candidate.displayName} ({candidate.publicModelId})
+                    </option>
+                  ))}
+                </select>
+                {ocrTargets.length === 0 && (
+                  <small id={ocrTargetHelpId} role="status">
+                    No enabled, credentialed, priced vision model is available from this provider.
+                  </small>
+                )}
+              </label>
+              <label className="field model-ocr-prompt">
+                <span>OCR prompt</span>
+                <textarea
+                  required
+                  rows={3}
+                  maxLength={8192}
+                  value={draft.ocr.prompt}
+                  onChange={(event) =>
+                    setDraft((current) => ({
+                      ...current,
+                      ocr: { ...current.ocr, prompt: event.target.value },
+                    }))}
+                />
+              </label>
+              {([
+                ["cacheTtlSeconds", "Cache TTL (seconds)", 1, 2_592_000],
+                ["timeoutMs", "Timeout (ms)", 100, 120_000],
+                ["maxBytes", "Maximum bytes", 1_024, 50 * 1024 * 1024],
+                ["maxPixels", "Maximum pixels", 1, 100_000_000],
+                ["maxDimension", "Maximum dimension", 1, 65_535],
+                ["maxRedirects", "Maximum redirects", 0, 5],
+              ] as const).map(([key, label, min, max]) => (
+                <label className="field" key={key}>
+                  <span>{label}</span>
+                  <input
+                    type="number"
+                    required
+                    min={min}
+                    max={max}
+                    step="1"
+                    value={draft.ocr[key]}
+                    onChange={(event) =>
+                      setDraft((current) => ({
+                        ...current,
+                        ocr: { ...current.ocr, [key]: event.target.value },
+                      }))}
+                  />
+                </label>
+              ))}
+              <p className="muted model-ocr-note">
+                The selected model must be enabled, priced, and vision-capable. Remote images remain
+                subject to private-network, MIME, redirect, size, and dimension checks. Do not
+                enable OCR on the OCR target model itself. {OCR_ACCESS_POLICY_NOTE}
+              </p>
+            </div>
+          )}
         </fieldset>
         <label className="check-row">
           <input
@@ -856,6 +1205,30 @@ export function AdminModels() {
             const current = effectivePrice(model.prices);
             const blockers = modelAvailabilityBlockers(model, provider, current);
             const available = blockers.length === 0;
+            const ocr = model.customParams.ocr && typeof model.customParams.ocr === "object" &&
+                !Array.isArray(model.customParams.ocr)
+              ? model.customParams.ocr as Record<string, unknown>
+              : undefined;
+            const ocrTarget = ocr?.enabled === true
+              ? models.data?.find((candidate) =>
+                candidate.id === ocr.model || candidate.publicModelId === ocr.model
+              )
+              : undefined;
+            const ocrProvider = ocrTarget
+              ? providers.data?.find((candidate) => candidate.id === ocrTarget.providerId)
+              : undefined;
+            const ocrBlockers = ocr?.enabled === true
+              ? ocrTargetAvailabilityBlockers(
+                ocrTarget,
+                ocrProvider,
+                String(ocr.providerId ?? ""),
+                ocrTarget ? effectivePrice(ocrTarget.prices) : undefined,
+              )
+              : [];
+            const customDefaultCount = Object.keys(model.customParams).filter((key) =>
+              key !== "ocr"
+            )
+              .length;
             return (
               <article className="model-card" key={model.id}>
                 <div className="model-card-head">
@@ -876,6 +1249,12 @@ export function AdminModels() {
                 <p>
                   {provider?.displayName ?? "Unknown provider"} · upstream {model.upstreamModelId}
                 </p>
+                {ocr?.enabled === true && (
+                  <p className={ocrBlockers.length ? "model-blockers" : "model-routing"}>
+                    OCR → {ocrTarget?.displayName ?? String(ocr.model ?? "Unavailable target")}
+                    {ocrBlockers.length > 0 && ` · unavailable: ${ocrBlockers.join(" · ")}`}
+                  </p>
+                )}
                 <div className="capabilities">
                   {model.capabilities.map((capability) => <i key={capability}>{capability}</i>)}
                 </div>
@@ -895,6 +1274,14 @@ export function AdminModels() {
                   <div>
                     <dt>Price revisions</dt>
                     <dd>{model.prices.length}</dd>
+                  </div>
+                  <div>
+                    <dt>Protocol</dt>
+                    <dd>{providerProtocolLabel(provider)}</dd>
+                  </div>
+                  <div>
+                    <dt>Custom defaults</dt>
+                    <dd>{customDefaultCount}</dd>
                   </div>
                 </dl>
                 {model.prices.length > 0 && (
@@ -950,6 +1337,7 @@ export function AdminModels() {
       {editing && (
         <ModelForm
           model={editing === "new" ? undefined : editing}
+          models={models.data ?? []}
           providers={providers.data ?? []}
           close={() => setEditing(undefined)}
         />
