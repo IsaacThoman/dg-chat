@@ -67,6 +67,7 @@ RUN set -eux; \
     for attempt in 1 2 3 4 5; do \
       rm -rf /var/lib/apt/lists/*; \
       if apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update \
+        && apt-get upgrade -y --no-install-recommends \
         && apt-get install -y --no-install-recommends ca-certificates busybox; then \
         installed=1; \
         break; \
@@ -90,6 +91,7 @@ RUN set -eux; \
     for attempt in 1 2 3 4 5; do \
       rm -rf /var/lib/apt/lists/*; \
       if apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update \
+        && apt-get upgrade -y --no-install-recommends \
         && apt-get install -y --no-install-recommends ca-certificates postgresql-client; then \
         installed=1; \
         break; \
