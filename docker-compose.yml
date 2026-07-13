@@ -138,7 +138,7 @@ services:
       target: web
     restart: unless-stopped
     ports:
-      - "${PORT:-8000}:8080"
+      - "${WEB_HOST_PORT:-8000}:8080"
     depends_on:
       app:
         condition: service_healthy
