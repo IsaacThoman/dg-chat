@@ -17,6 +17,12 @@ async function authenticatedRequest(
   }, { path, method: options.method ?? "GET", body: options.body });
 }
 
+async function currentConversationVersion(page: Page, conversationId: string): Promise<number> {
+  const response = await authenticatedRequest(page, `/api/conversations/${conversationId}`);
+  expect(response.status).toBe(200);
+  return (response.body as { version: number }).version;
+}
+
 test("admin enables web search and a user explicitly reviews and cancels a tool call", async ({
   page,
   request,
@@ -69,17 +75,16 @@ test("admin enables web search and a user explicitly reviews and cancels a tool 
   await expect(page.getByText("Status: succeeded")).toBeVisible({ timeout: 20_000 });
   await page.getByRole("button", { name: "Add to next message" }).click();
   await expect(page.getByText("Approved web search", { exact: true })).toBeVisible();
-  await page.getByLabel("Message").fill("Summarize the attached verified search result.");
+  const prompt = `Summarize the attached verified search result ${crypto.randomUUID()}.`;
+  await page.getByLabel("Message").fill(prompt);
   await page.getByRole("button", { name: "Send", exact: true }).click();
-  await expect(page.getByText("Summarize the attached verified search result.", { exact: true }))
-    .toBeVisible();
+  await expect(page.getByText(prompt, { exact: true })).toBeVisible();
   await expect.poll(
     () => page.locator(".assistant-message .markdown").last().textContent(),
     { timeout: 20_000, message: "the generation to commit before reloading" },
   ).not.toBe("");
   await page.reload();
-  await expect(page.getByText("Summarize the attached verified search result.", { exact: true }))
-    .toBeVisible();
+  await expect(page.getByText(prompt, { exact: true })).toBeVisible();
   const conversationId = await page.locator(
     ".conversation-row.active [data-conversation-actions]",
   ).getAttribute("data-conversation-actions");
@@ -89,13 +94,14 @@ test("admin enables web search and a user explicitly reviews and cancels a tool 
     `/api/conversations/${conversationId}`,
     {
       method: "PATCH",
-      body: { title: "Concurrent edit retry test" },
+      body: {
+        title: "Concurrent edit retry test",
+        expectedVersion: await currentConversationVersion(page, conversationId),
+      },
     },
   );
   expect(concurrentEditRename.status).toBe(200);
-  const original = page.getByText("Summarize the attached verified search result.", {
-    exact: true,
-  });
+  const original = page.getByText(prompt, { exact: true });
   await original.hover();
   await original.locator("xpath=ancestor::*[self::article or @data-message-id][1]")
     .getByRole("button", { name: /edit/i }).click();
@@ -124,7 +130,10 @@ test("admin enables web search and a user explicitly reviews and cancels a tool 
     `/api/conversations/${conversationId}`,
     {
       method: "PATCH",
-      body: { title: "Concurrent branch navigation test" },
+      body: {
+        title: "Concurrent branch navigation test",
+        expectedVersion: await currentConversationVersion(page, conversationId),
+      },
     },
   );
   expect(concurrentRename.status).toBe(200);

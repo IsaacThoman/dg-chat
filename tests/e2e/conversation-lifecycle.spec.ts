@@ -76,6 +76,8 @@ test("pinning, menu keyboard behavior, and modal focus are accessible", async ({
   await actions.press("Enter");
   await expect(page.getByRole("menuitem", { name: "Rename" })).toBeFocused();
   await page.getByRole("menuitem", { name: "Rename" }).press("ArrowDown");
+  await expect(page.getByRole("menuitem", { name: "Organize" })).toBeFocused();
+  await page.getByRole("menuitem", { name: "Organize" }).press("ArrowDown");
   await expect(page.getByRole("menuitem", { name: "Pin" })).toBeFocused();
   await page.getByRole("menuitem", { name: "Pin" }).press("Escape");
   await expect(actions).toBeFocused();

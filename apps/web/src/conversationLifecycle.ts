@@ -22,3 +22,14 @@ export function fallbackConversationId(
     conversation.id !== removedId
   )?.id ?? "";
 }
+
+export function mergeConversationSnapshot(
+  conversations: Conversation[] | undefined,
+  incoming: Conversation,
+): Conversation[] | undefined {
+  if (!conversations) return conversations;
+  return conversations.map((current) => {
+    if (current.id !== incoming.id) return current;
+    return (incoming.version ?? -1) >= (current.version ?? -1) ? incoming : current;
+  });
+}

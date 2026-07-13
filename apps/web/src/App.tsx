@@ -103,6 +103,7 @@ import {
   type ConversationListView,
   conversationsForView,
   fallbackConversationId,
+  mergeConversationSnapshot,
 } from "./conversationLifecycle.ts";
 import { Modal } from "./Modal.tsx";
 import { drawerShouldHandleEscape, modalOverlayPresent } from "./modalFocus.ts";
@@ -2156,6 +2157,15 @@ function ChatView({
   const [renaming, setRenaming] = useState(false);
   const initialConversation = conversations.find((c) => c.id === activeId);
   const [conversation, setConversation] = useState(initialConversation);
+  const syncConversation = (next: Conversation) => {
+    setConversation(next);
+    for (const queryKey of [["conversations"], ["conversations", "deleted"]] as const) {
+      queryClient.setQueryData<Conversation[]>(
+        queryKey,
+        (current) => mergeConversationSnapshot(current, next),
+      );
+    }
+  };
   const readOnly = readOnlyProp || Boolean(conversation?.archived || conversation?.deleted);
   useEffect(() => setLocalMessages(messages), [messages]);
   useEffect(() => setConversation(initialConversation), [initialConversation]);
@@ -2191,7 +2201,7 @@ function ChatView({
     setBranchBusy(true);
     setSendError("");
     try {
-      setConversation(await api.setActiveLeaf(conversation, leafId));
+      syncConversation(await api.setActiveLeaf(conversation, leafId));
     } catch (error) {
       let refreshed: Awaited<ReturnType<typeof api.conversationGraph>>;
       try {
@@ -2207,7 +2217,7 @@ function ChatView({
         return;
       }
       queryClient.setQueryData(["messages", conversation.id], refreshed.messages);
-      setConversation(refreshed.conversation);
+      syncConversation(refreshed.conversation);
       setLocalMessages(refreshed.messages);
       if (error instanceof ApiError && error.code !== "version_conflict") {
         setSendError(error.message);
@@ -2217,7 +2227,7 @@ function ChatView({
         const refreshedLeafId = preferredLeaf(refreshed.messages, messageId);
         if (refreshedLeafId === refreshed.conversation.activeLeafId) return;
         try {
-          setConversation(await api.setActiveLeaf(refreshed.conversation, refreshedLeafId));
+          syncConversation(await api.setActiveLeaf(refreshed.conversation, refreshedLeafId));
           return;
         } catch (retryError) {
           if (retryError instanceof ApiError && retryError.code !== "version_conflict") {
@@ -2359,7 +2369,7 @@ function ChatView({
             queryClient.setQueryData(["messages", event.conversation.id], next);
             return next;
           });
-          setConversation(event.conversation);
+          syncConversation(event.conversation);
           setEdit(undefined);
           if (resolved.created) await onConversationCreated(event.conversation.id);
         }
@@ -2390,7 +2400,7 @@ function ChatView({
             refreshedAfterFailure = true;
             queryClient.setQueryData(["messages", targetConversationId], refreshed.messages);
             setLocalMessages(refreshed.messages);
-            setConversation(refreshed.conversation);
+            syncConversation(refreshed.conversation);
             const recovered = acceptedUserId
               ? refreshed.messages.find((message) =>
                 message.id === refreshed.conversation.activeLeafId &&
@@ -2437,7 +2447,7 @@ function ChatView({
           const refreshed = await api.conversationGraph(targetConversationId);
           queryClient.setQueryData(["messages", targetConversationId], refreshed.messages);
           setLocalMessages(refreshed.messages);
-          setConversation(refreshed.conversation);
+          syncConversation(refreshed.conversation);
         } catch {
           // Keep the local immutable path visible when recovery is temporarily unavailable.
         }
