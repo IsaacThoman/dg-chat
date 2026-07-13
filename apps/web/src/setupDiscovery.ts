@@ -2,6 +2,8 @@ export interface SetupStatus {
   bootstrapRequired: boolean;
   setupEnabled: boolean;
   oidcEnabled: boolean;
+  emailEnabled: boolean;
+  requireEmailVerification: boolean;
 }
 
 export function setupDestination(

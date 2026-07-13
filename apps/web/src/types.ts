@@ -32,7 +32,20 @@ export interface User {
   role: Role;
   status: UserStatus;
   balance: number;
+  limited: boolean;
+  emailVerifiedAt: string | null;
   avatar?: string;
+}
+
+export interface UserSession {
+  id: string;
+  userId: string;
+  source?: "better_auth" | "legacy";
+  limited: boolean;
+  current: boolean;
+  createdAt: string;
+  expiresAt: string;
+  invalidatedAt: string | null;
 }
 export interface Conversation {
   id: string;

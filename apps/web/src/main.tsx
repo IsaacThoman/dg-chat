@@ -11,6 +11,11 @@ import {
 import { App, AuthScreen, PendingScreen, SetupScreen } from "./App.tsx";
 import { isAdminSection, parseAdminSearch } from "./adminRouting.ts";
 import { PublicConversationShareView } from "./PublicConversationShare.tsx";
+import {
+  ForgotPasswordScreen,
+  ResetPasswordScreen,
+  VerifyEmailScreen,
+} from "./IdentityRecovery.tsx";
 import "./styles.css";
 
 const rootRoute = createRootRoute({ component: () => <Outlet /> });
@@ -29,6 +34,21 @@ const pendingRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/pending",
   component: PendingScreen,
+});
+const forgotPasswordRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/forgot-password",
+  component: ForgotPasswordScreen,
+});
+const resetPasswordRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/reset-password",
+  component: ResetPasswordScreen,
+});
+const verifyEmailRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/verify-email",
+  component: VerifyEmailScreen,
 });
 const publicShareRoute = createRoute({
   getParentRoute: () => rootRoute,
@@ -59,6 +79,9 @@ const routeTree = rootRoute.addChildren([
   loginRoute,
   setupRoute,
   pendingRoute,
+  forgotPasswordRoute,
+  resetPasswordRoute,
+  verifyEmailRoute,
   publicShareRoute,
   adminRoute,
 ]);

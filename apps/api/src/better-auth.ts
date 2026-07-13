@@ -10,8 +10,14 @@ import {
   DomainError,
   type DomainRepository,
 } from "@dg-chat/database";
-import { hashPassword, verifyPassword } from "./crypto.ts";
+import { hashPassword, sha256, verifyPassword } from "./crypto.ts";
 import { type OidcConfig, oidcPlugin } from "./oidc.ts";
+import {
+  boundedIdentityDelivery,
+  DEFAULT_IDENTITY_DELIVERY_TIMEOUT_MS,
+  drainIdentityDeliverySet,
+  IdentityDeliveryTimeoutError,
+} from "./identity-delivery.ts";
 
 export interface BetterAuthServiceOptions {
   databaseUrl: string;
@@ -21,16 +27,17 @@ export interface BetterAuthServiceOptions {
   webOrigin: string;
   oidc?: Omit<OidcConfig, "appUrl" | "webOrigin">;
   requireEmailVerification?: boolean;
+  identityDeliveryTimeoutMs?: number;
   sendVerificationEmail?: (input: {
     email: string;
     url: string;
     token: string;
-  }) => Promise<void>;
+  }, signal?: AbortSignal) => Promise<void>;
   sendPasswordResetEmail?: (input: {
     email: string;
     url: string;
     token: string;
-  }) => Promise<void>;
+  }, signal?: AbortSignal) => Promise<void>;
 }
 
 export interface BetterAuthBrowserSession {
@@ -104,6 +111,72 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
       }
       : undefined;
   };
+  const presentedSessionToken = (headers: Headers): string | undefined => {
+    const cookie = headers.get("cookie");
+    if (!cookie) return undefined;
+    for (const segment of cookie.split(";")) {
+      const separator = segment.indexOf("=");
+      if (separator < 1) continue;
+      const name = segment.slice(0, separator).trim();
+      if (name !== "dg_chat.session_token" && name !== "__Secure-dg_chat.session_token") continue;
+      const value = segment.slice(separator + 1).trim();
+      if (value) return value;
+    }
+    return undefined;
+  };
+  const identityDeliveryTimeoutMs = options.identityDeliveryTimeoutMs ??
+    DEFAULT_IDENTITY_DELIVERY_TIMEOUT_MS;
+  const pendingIdentityDeliveries = new Map<Promise<void>, AbortController>();
+  const recordDeliveryAudit = async (
+    userId: string,
+    actorId: string | null,
+    action: string,
+  ) => {
+    try {
+      await options.repository.recordAudit({
+        actorId,
+        action,
+        targetType: "user",
+        targetId: userId,
+      });
+    } catch (error) {
+      console.error(JSON.stringify({
+        level: "error",
+        message: "Identity delivery audit persistence failed",
+        userId,
+        action,
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    }
+  };
+  const dispatchIdentityEmail = (
+    userId: string,
+    actorId: string | null,
+    delivery: (signal: AbortSignal) => Promise<void>,
+    sentAction: string,
+    failedAction: string,
+  ) => {
+    // SMTP latency and failure must never reveal whether a public reset address exists or leave
+    // a newly-created identity half-created. Delivery remains observable through immutable audit
+    // events while the accepted authentication request completes independently.
+    const controller = new AbortController();
+    const pending = boundedIdentityDelivery(delivery, controller, identityDeliveryTimeoutMs)
+      .then(
+        () => recordDeliveryAudit(userId, actorId, sentAction),
+        (error) =>
+          recordDeliveryAudit(
+            userId,
+            actorId,
+            error instanceof IdentityDeliveryTimeoutError
+              ? failedAction.replace(/_failed$/, "_outcome_unknown")
+              : failedAction,
+          ),
+      );
+    pendingIdentityDeliveries.set(pending, controller);
+    void pending.finally(() => pendingIdentityDeliveries.delete(pending));
+  };
+  const drainIdentityDeliveries = (abortAfterMs?: number) =>
+    drainIdentityDeliverySet(pendingIdentityDeliveries, abortAfterMs);
 
   const auth = betterAuth({
     appName: "DG Chat",
@@ -160,8 +233,16 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
         verify: ({ hash, password }) => verifyPassword(password, hash),
       },
       sendResetPassword: options.sendPasswordResetEmail
-        ? ({ user, url, token }) =>
-          options.sendPasswordResetEmail!({ email: user.email, url, token })
+        ? ({ user, url, token }) => {
+          dispatchIdentityEmail(
+            user.id,
+            null,
+            (signal) => options.sendPasswordResetEmail!({ email: user.email, url, token }, signal),
+            "identity.password_reset_requested",
+            "identity.password_reset_delivery_failed",
+          );
+          return Promise.resolve();
+        }
         : undefined,
       onPasswordReset: async ({ user }, request) => {
         const token = request?.headers.get("x-dg-password-reset-token");
@@ -185,8 +266,22 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
     emailVerification: options.sendVerificationEmail
       ? {
         sendOnSignUp: options.requireEmailVerification ?? false,
-        sendVerificationEmail: ({ user, url, token }) =>
-          options.sendVerificationEmail!({ email: user.email, url, token }),
+        sendVerificationEmail: async ({ user, url, token }) => {
+          const domainUser = await provisionDomainUser(user);
+          await options.repository.createIdentityToken(
+            domainUser.id,
+            "email_verification",
+            await sha256(token),
+            new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+          );
+          dispatchIdentityEmail(
+            user.id,
+            null,
+            (signal) => options.sendVerificationEmail!({ email: user.email, url, token }, signal),
+            "identity.verification_sent",
+            "identity.verification_delivery_failed",
+          );
+        },
       }
       : undefined,
     databaseHooks: {
@@ -200,9 +295,9 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
           after: async (authUser) => {
             if (authUser.emailVerified) {
               await options.repository.markUserEmailVerified(authUser.id);
-              // Verification changes the authorization inputs. Reauthentication deliberately
-              // prevents an older limited session from silently gaining workspace privileges.
-              await sql`DELETE FROM auth_sessions WHERE user_id=${authUser.id}`;
+              // The status-only session remains limited by its immutable session field. Keeping
+              // it alive lets the pending screen observe verification without silently granting
+              // workspace access; a fresh sign-in is still required for a full session.
             }
           },
         },
@@ -234,19 +329,7 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
     auth,
     oidcEnabled: Boolean(options.oidc),
     handler: (request: Request) => auth.handler(request),
-    presentedSessionToken(headers: Headers): string | undefined {
-      const cookie = headers.get("cookie");
-      if (!cookie) return undefined;
-      for (const segment of cookie.split(";")) {
-        const separator = segment.indexOf("=");
-        if (separator < 1) continue;
-        const name = segment.slice(0, separator).trim();
-        if (name !== "dg_chat.session_token" && name !== "__Secure-dg_chat.session_token") continue;
-        const value = segment.slice(separator + 1).trim();
-        if (value) return value;
-      }
-      return undefined;
-    },
+    presentedSessionToken,
     async getSession(headers: Headers): Promise<BetterAuthBrowserSession | null> {
       const result = await auth.api.getSession({ headers });
       if (!result) return null;
@@ -258,7 +341,6 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
       });
       if (
         !domainUser || domainUser.state !== "active" || domainUser.passwordResetPending === true ||
-        domainUser.approvalStatus === "rejected" ||
         normalizeEmail(domainUser.email) !== normalizeEmail(result.user.email)
       ) return null;
       const domainLimited = domainUser.approvalStatus !== "approved" ||
@@ -284,14 +366,19 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
     invalidateUserSessions: async (userId: string) => {
       await sql`DELETE FROM auth_sessions WHERE user_id=${userId}`;
     },
-    listUserSessions: async (userId: string) => {
+    listUserSessions: async (userId: string, headers?: Headers) => {
+      // Better Auth signs its browser cookie, while auth_sessions.token stores the unsigned
+      // value. Resolve the authenticated session through Better Auth instead of comparing the
+      // wire cookie directly to the durable token.
+      const currentSession = headers ? await auth.api.getSession({ headers }) : null;
+      const currentSessionId = currentSession?.session.id;
       const rows = await sql<
         Array<{
           id: string;
           user_id: string;
           limited: boolean;
-          expires_at: Date;
-          created_at: Date;
+          expires_at: Date | string;
+          created_at: Date | string;
         }>
       >`
         SELECT id,user_id,limited,expires_at,created_at
@@ -301,9 +388,10 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
       return rows.map((row) => ({
         id: String(row.id),
         userId: String(row.user_id),
+        current: Boolean(currentSessionId && String(row.id) === currentSessionId),
         limited: Boolean(row.limited),
-        expiresAt: row.expires_at.toISOString(),
-        createdAt: row.created_at.toISOString(),
+        expiresAt: new Date(row.expires_at).toISOString(),
+        createdAt: new Date(row.created_at).toISOString(),
         invalidatedAt: null,
       }));
     },
@@ -317,7 +405,11 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
       const deleted = await sql`DELETE FROM auth_sessions WHERE id=${sessionId} RETURNING id`;
       if (!deleted.length) throw new DomainError("not_found", "Session not found", 404);
     },
-    close: () => sql.end({ timeout: 5 }),
+    drainIdentityDeliveries,
+    close: async () => {
+      await drainIdentityDeliveries();
+      await sql.end({ timeout: 5 });
+    },
   };
 }
 

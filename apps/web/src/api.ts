@@ -54,6 +54,7 @@ import type {
   TokenSecret,
   User,
   UserPreferences,
+  UserSession,
 } from "./types.ts";
 import { demoConversations, demoMessages, demoModels, demoTokens, demoUser } from "./demo.ts";
 import type { SetupStatus } from "./setupDiscovery.ts";
@@ -70,6 +71,7 @@ type RawUser = {
   approvalStatus: "pending" | "approved" | "rejected";
   state: "active" | "suspended" | "deleted";
   balanceMicros: number;
+  emailVerifiedAt?: string | null;
 };
 type RawConversation = {
   id: string;
@@ -141,11 +143,17 @@ export type ToolExecution = {
   updatedAt: string;
 };
 
-function mapUser(user: RawUser): User {
+function mapUser(user: RawUser, limited = false): User {
   const status = user.state === "suspended" || user.state === "deleted"
     ? user.state
     : user.approvalStatus;
-  return { ...user, status, balance: user.balanceMicros / 1_000_000 };
+  return {
+    ...user,
+    status,
+    balance: user.balanceMicros / 1_000_000,
+    limited,
+    emailVerifiedAt: user.emailVerifiedAt ?? null,
+  };
 }
 export function mapConversation(value: RawConversation): Conversation {
   return {
@@ -369,7 +377,9 @@ async function request<T>(path: string, init?: RequestInit, fallback?: T): Promi
     });
     if (!response.ok) throw await responseError(response);
     if (response.status === 204) return undefined as T;
-    return await response.json() as T;
+    const responseBody = await response.text();
+    if (!responseBody.trim()) return undefined as T;
+    return JSON.parse(responseBody) as T;
   } catch (error) {
     if (demoMode && fallback !== undefined) return structuredClone(fallback);
     throw error;
@@ -478,10 +488,38 @@ export const api = {
       bootstrapRequired: false,
       setupEnabled: true,
       oidcEnabled: false,
+      emailEnabled: false,
+      requireEmailVerification: false,
     }),
-  me: async () =>
-    demoMode ? demoUser : mapUser((await request<{ user: RawUser }>("/auth/me")).user),
-  status: () => request<{ approvalStatus: string; state: string }>("/auth/status"),
+  me: async () => {
+    if (demoMode) return demoUser;
+    const result = await request<{ user: RawUser; limited: boolean }>("/auth/me");
+    return mapUser(result.user, result.limited);
+  },
+  status: () => request<import("./identityState.ts").AuthStatus>("/auth/status"),
+  requestPasswordReset: (email: string) =>
+    request<void>("/auth/password-reset/request", {
+      method: "POST",
+      body: JSON.stringify({ email }),
+    }),
+  resetPassword: (token: string, password: string) =>
+    request<void>("/auth/password-reset", {
+      method: "POST",
+      body: JSON.stringify({ token, password }),
+    }),
+  verifyEmail: async (token: string) =>
+    mapUser(
+      (await request<{ user: RawUser }>("/auth/verify-email", {
+        method: "POST",
+        body: JSON.stringify({ token }),
+      })).user,
+      true,
+    ),
+  requestEmailVerification: () =>
+    request<void>("/auth/verify-email/request", { method: "POST", body: "{}" }),
+  sessions: async () => (await request<{ data: UserSession[] }>("/sessions")).data,
+  revokeSession: (id: string) =>
+    request<void>(`/sessions/${encodeURIComponent(id)}`, { method: "DELETE" }),
   conversations: async () =>
     demoMode
       ? structuredClone(demoConversations)
@@ -704,7 +742,8 @@ export const api = {
       outputTokens: number;
       spentMicros: number;
     }>("/usage"),
-  adminUsers: async () => (await request<{ data: RawUser[] }>("/admin/users")).data.map(mapUser),
+  adminUsers: async () =>
+    (await request<{ data: RawUser[] }>("/admin/users")).data.map((user) => mapUser(user)),
   approveUser: async (id: string, status: "approved" | "rejected") =>
     mapUser(
       await request<RawUser>(`/admin/users/${id}/approval`, {

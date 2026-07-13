@@ -65,6 +65,7 @@ import {
   workspaceDeleteSchema,
 } from "@dg-chat/contracts";
 import type {
+  AuthStatusResponse,
   ChatCompletionRequest,
   ModelInfo,
   PublicUser,
@@ -144,6 +145,12 @@ import {
 import { estimateInputTokens, priceUsage, reservationPrice } from "./pricing.ts";
 import { responseObject } from "./responses.ts";
 import { type IdentityMailer, smtpIdentityMailer } from "./mail.ts";
+import {
+  boundedIdentityDelivery,
+  DEFAULT_IDENTITY_DELIVERY_TIMEOUT_MS,
+  drainIdentityDeliverySet,
+  IdentityDeliveryTimeoutError,
+} from "./identity-delivery.ts";
 import {
   authorizationCredentialIdentity,
   MemoryRateLimiter,
@@ -261,6 +268,7 @@ export interface AppOptions {
   trustProxyHeaders?: boolean;
   authClientRateLimit?: number;
   mailer?: IdentityMailer;
+  identityDeliveryTimeoutMs?: number;
   requireEmailVerification?: boolean;
   generationHeartbeatMs?: number;
   generationLeaseSeconds?: number;
@@ -1312,6 +1320,50 @@ export function createApp(options: AppOptions = {}) {
       Deno.env.get("SMTP_FROM") ?? "DG Chat <no-reply@localhost>",
     )
     : undefined);
+  const identityDeliveryTimeoutMs = options.identityDeliveryTimeoutMs ??
+    DEFAULT_IDENTITY_DELIVERY_TIMEOUT_MS;
+  const pendingIdentityDeliveries = new Map<Promise<void>, AbortController>();
+  const dispatchIdentityDelivery = (
+    userId: string,
+    actorId: string | null,
+    delivery: (signal: AbortSignal) => Promise<void>,
+    sentAction: string,
+    failedAction: string,
+  ) => {
+    const audit = async (action: string): Promise<void> => {
+      try {
+        await repo.recordAudit({
+          actorId,
+          action,
+          targetType: "user",
+          targetId: userId,
+        });
+      } catch (error) {
+        console.error(JSON.stringify({
+          level: "error",
+          message: "Identity delivery audit persistence failed",
+          userId,
+          action,
+          error: error instanceof Error ? error.message : String(error),
+        }));
+      }
+    };
+    const controller = new AbortController();
+    const pending = boundedIdentityDelivery(delivery, controller, identityDeliveryTimeoutMs)
+      .then(
+        () => audit(sentAction),
+        (error) =>
+          audit(
+            error instanceof IdentityDeliveryTimeoutError
+              ? failedAction.replace(/_failed$/, "_outcome_unknown")
+              : failedAction,
+          ),
+      );
+    pendingIdentityDeliveries.set(pending, controller);
+    void pending.finally(() => pendingIdentityDeliveries.delete(pending));
+  };
+  const drainIdentityDeliveries = (abortAfterMs?: number) =>
+    drainIdentityDeliverySet(pendingIdentityDeliveries, abortAfterMs);
   const requireEmailVerification = options.requireEmailVerification ??
     Deno.env.get("REQUIRE_EMAIL_VERIFICATION") === "true";
   const production = Deno.env.get("DENO_ENV") === "production";
@@ -1979,25 +2031,42 @@ export function createApp(options: AppOptions = {}) {
           ];
         result = results.find((candidate) => !candidate.allowed) ?? results[0];
       } else if (authRoute) {
-        let accountIdentity = "unknown-account";
+        let accountIdentity: string | undefined;
         try {
-          const candidate = await c.req.raw.clone().json() as { email?: unknown };
+          const candidate = await c.req.raw.clone().json() as {
+            email?: unknown;
+            token?: unknown;
+          };
           if (typeof candidate.email === "string") {
             const email = candidate.email.trim().toLowerCase();
             if (email.length >= 3 && email.length <= 320) {
               accountIdentity = `email:${await sha256(email)}`;
             }
+          } else if (
+            typeof candidate.token === "string" && candidate.token.length >= 16 &&
+            candidate.token.length <= 512
+          ) {
+            accountIdentity = `token:${await sha256(candidate.token)}`;
           }
         } catch {
-          // Malformed bodies share a small fallback bucket and are rejected by route parsing.
+          // Malformed bodies are rejected by route parsing and remain subject to the client
+          // bucket below; never let them poison a shared installation-wide account bucket.
         }
-        const results = [
-          await rateLimiter.consume(
-            `auth:account:${accountIdentity}`,
-            configuredAuthLimit,
-            configuredRateWindow,
-          ),
-        ];
+        if (!accountIdentity) {
+          const presentedSession = browserAuth?.presentedSessionToken(c.req.raw.headers) ??
+            getCookie(c, sessionCookie) ??
+            (production ? getCookie(c, "dg_session") : undefined);
+          if (presentedSession) accountIdentity = `session:${await sha256(presentedSession)}`;
+        }
+        const results = accountIdentity
+          ? [
+            await rateLimiter.consume(
+              `auth:account:${accountIdentity}`,
+              configuredAuthLimit,
+              configuredRateWindow,
+            ),
+          ]
+          : [];
         const trustedClient = requestTrustedClientKey(c.req.raw.headers, trustProxyHeaders);
         if (trustedClient) {
           results.push(
@@ -2741,7 +2810,7 @@ export function createApp(options: AppOptions = {}) {
           to: user.email,
           kind: "email_verification",
           token: verificationToken,
-          url: `${webOrigin}/verify-email?token=${encodeURIComponent(verificationToken)}`,
+          url: `${webOrigin}/verify-email#token=${encodeURIComponent(verificationToken)}`,
         });
         await repo.recordAudit({
           action: "identity.verification_sent",
@@ -2813,8 +2882,28 @@ export function createApp(options: AppOptions = {}) {
     if (browserAuth && !body.token.startsWith("verify_")) {
       const url = new URL(c.req.url);
       url.pathname = "/api/auth/verify-email";
-      url.search = new URLSearchParams({ token: body.token, callbackURL: "/pending" }).toString();
-      return browserAuth.handler(new Request(url, { method: "GET", headers: c.req.raw.headers }));
+      url.search = new URLSearchParams({ token: body.token }).toString();
+      const response = await browserAuth.handler(
+        new Request(url, { method: "GET", headers: c.req.raw.headers }),
+      );
+      if (!response.ok) {
+        throw new DomainError(
+          "invalid_identity_token",
+          "Verification token is invalid or expired",
+          400,
+        );
+      }
+      // The digest was registered when the mail was emitted. Consuming it after Better Auth's
+      // signature/expiry check provides an atomic, one-response-only replay fence without ever
+      // trusting JWT payload fields for identity lookup.
+      const verified = await repo.verifyEmail(await sha256(body.token));
+      await repo.recordAudit({
+        actorId: verified.id,
+        action: "identity.email_verified",
+        targetType: "user",
+        targetId: verified.id,
+      });
+      return c.json({ user: publicUser(verified) });
     }
     const user = await repo.verifyEmail(await sha256(body.token));
     await repo.recordAudit({
@@ -2853,7 +2942,7 @@ export function createApp(options: AppOptions = {}) {
       to: user.email,
       kind: "email_verification",
       token,
-      url: `${webOrigin}/verify-email?token=${encodeURIComponent(token)}`,
+      url: `${webOrigin}/verify-email#token=${encodeURIComponent(token)}`,
     });
     await repo.recordAudit({
       actorId: user.id,
@@ -2866,10 +2955,20 @@ export function createApp(options: AppOptions = {}) {
   app.post("/api/auth/password-reset/request", async (c) => {
     if (browserAuth) {
       const body = await parseJson(c, passwordResetRequestSchema);
-      return forwardBetterAuthJson(c, "/api/auth/request-password-reset", {
+      const response = await forwardBetterAuthJson(c, "/api/auth/request-password-reset", {
         email: body.email,
         redirectTo: `${webOrigin}/reset-password`,
       });
+      // Better Auth deliberately does not disclose whether the account exists. Normalize its
+      // successful response too so local and durable auth have the same product contract.
+      if (!response.ok) {
+        console.error(JSON.stringify({
+          level: "error",
+          message: "Password reset request could not be processed",
+          status: response.status,
+        }));
+      }
+      return c.body(null, 202);
     }
     const body = await parseJson(c, passwordResetRequestSchema);
     const user = await repo.findUserByEmail(body.email);
@@ -2881,25 +2980,19 @@ export function createApp(options: AppOptions = {}) {
         await sha256(token),
         new Date(Date.now() + 60 * 60 * 1000).toISOString(),
       );
-      try {
-        await mailer.send({
-          to: user.email,
-          kind: "password_reset",
-          token,
-          url: `${webOrigin}/reset-password?token=${encodeURIComponent(token)}`,
-        });
-        await repo.recordAudit({
-          action: "identity.password_reset_requested",
-          targetType: "user",
-          targetId: user.id,
-        });
-      } catch {
-        await repo.recordAudit({
-          action: "identity.password_reset_delivery_failed",
-          targetType: "user",
-          targetId: user.id,
-        });
-      }
+      dispatchIdentityDelivery(
+        user.id,
+        null,
+        (signal) =>
+          mailer.send({
+            to: user.email,
+            kind: "password_reset",
+            token,
+            url: `${webOrigin}/reset-password#token=${encodeURIComponent(token)}`,
+          }, signal),
+        "identity.password_reset_requested",
+        "identity.password_reset_delivery_failed",
+      );
     }
     return c.body(null, 202);
   });
@@ -2911,13 +3004,14 @@ export function createApp(options: AppOptions = {}) {
       url.pathname = "/api/auth/reset-password";
       const headers = new Headers(c.req.raw.headers);
       headers.set("x-dg-password-reset-token", body.token);
-      return browserAuth.handler(
+      const response = await browserAuth.handler(
         new Request(url, {
           method: "POST",
           headers,
           body: JSON.stringify({ token: body.token, newPassword: body.password }),
         }),
       );
+      return response.ok ? c.body(null, 204) : response;
     }
     const user = await repo.resetPassword(
       await sha256(body.token),
@@ -3039,29 +3133,58 @@ export function createApp(options: AppOptions = {}) {
   app.get(
     "/api/auth/status",
     authenticate,
-    (c) => c.json({ approvalStatus: c.get("user").approvalStatus, state: c.get("user").state }),
+    (c) => {
+      const user = c.get("user");
+      const emailVerified = Boolean(user.emailVerifiedAt);
+      const sessionLimited = Boolean(c.get("sessionLimited"));
+      const fullSessionEligible = user.state === "active" &&
+        user.approvalStatus === "approved" &&
+        (!requireEmailVerification || emailVerified);
+      const status: AuthStatusResponse = {
+        approvalStatus: user.approvalStatus,
+        state: user.state,
+        emailVerified,
+        emailVerificationRequired: requireEmailVerification,
+        sessionLimited,
+        fullSessionEligible,
+        fullAccess: fullSessionEligible && !sessionLimited,
+      };
+      return c.json(status);
+    },
   );
   app.get(
     "/api/sessions",
     authenticate,
     sessionOnly,
-    async (c) =>
-      c.json({
-        data: browserAuth
-          ? [
-            ...(await browserAuth.listUserSessions(c.get("user").id)).map((session) => ({
-              ...session,
-              id: `better_auth:${session.id}`,
-              source: "better_auth" as const,
-            })),
-            ...(await repo.listSessions(c.get("user").id)).map((session) => ({
-              ...session,
-              id: `legacy:${session.id}`,
-              source: "legacy" as const,
-            })),
-          ]
-          : await repo.listSessions(c.get("user").id),
-      }),
+    async (c) => {
+      const ownerId = c.get("user").id;
+      const presentedBetterAuth = browserAuth?.presentedSessionToken(c.req.raw.headers);
+      const legacySessions = await repo.listSessions(ownerId);
+      let currentLegacyId: string | undefined;
+      if (!presentedBetterAuth) {
+        const legacyToken = getCookie(c, sessionCookie) ??
+          (production ? getCookie(c, "dg_session") : undefined);
+        const currentLegacy = legacyToken
+          ? await repo.getSession(await sha256(legacyToken))
+          : undefined;
+        if (currentLegacy?.userId === ownerId) currentLegacyId = currentLegacy.id;
+      }
+      const legacy = legacySessions.map((session) => ({
+        ...session,
+        id: browserAuth ? `legacy:${session.id}` : session.id,
+        source: "legacy" as const,
+        current: session.id === currentLegacyId,
+      }));
+      if (!browserAuth) return c.json({ data: legacy });
+      const durable = (await browserAuth.listUserSessions(ownerId, c.req.raw.headers)).map(
+        (session) => ({
+          ...session,
+          id: `better_auth:${session.id}`,
+          source: "better_auth" as const,
+        }),
+      );
+      return c.json({ data: [...durable, ...legacy] });
+    },
   );
   app.delete("/api/sessions/:id", authenticate, sessionOnly, async (c) => {
     const requestedId = c.req.param("id");
@@ -3093,17 +3216,21 @@ export function createApp(options: AppOptions = {}) {
       }, 409);
     app.post("/api/auth/change-password", credentialChangeUnavailable);
     app.post("/api/auth/set-password", credentialChangeUnavailable);
+    app.post("/api/auth/request-password-reset", credentialChangeUnavailable);
     // The product wrapper performs fail-closed authority revocation before
     // Better Auth changes the credential. Do not expose the raw route.
     app.post("/api/auth/reset-password", credentialChangeUnavailable);
+    app.post("/api/auth/send-verification-email", credentialChangeUnavailable);
+    app.get("/api/auth/verify-email", credentialChangeUnavailable);
+    app.get("/api/auth/reset-password/:token", credentialChangeUnavailable);
   }
 
   if (browserAuth) {
-    app.on(
-      ["GET", "POST"],
-      "/api/auth/*",
-      (c) => browserAuth.handler(c.req.raw),
-    );
+    // Better Auth contains additional profile/session mutation endpoints whose state and audit
+    // semantics do not match the product domain. Expose only the OIDC plugin endpoints that must
+    // remain provider-controlled; every credential and session flow above has an explicit wrapper.
+    app.post("/api/auth/sign-in/oidc", (c) => browserAuth.handler(c.req.raw));
+    app.get("/api/auth/oidc/callback", (c) => browserAuth.handler(c.req.raw));
   }
 
   app.use("/api/attachments/*", authenticate, approved, sessionOnly);
@@ -9510,5 +9637,11 @@ export function createApp(options: AppOptions = {}) {
     return c.json(openAIError(`Internal server error (${correlationId})`, "internal_error"), 500);
   });
   app.notFound((c) => c.json(openAIError("Route not found", "not_found"), 404));
-  return { app, repository: repo, circuitBreaker, toolExecutionService: toolExecution };
+  return {
+    app,
+    repository: repo,
+    circuitBreaker,
+    toolExecutionService: toolExecution,
+    drainIdentityDeliveries,
+  };
 }

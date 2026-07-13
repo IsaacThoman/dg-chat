@@ -7,6 +7,7 @@ export interface MailOptions {
 
 export interface Transport {
   sendMail(options: MailOptions): Promise<unknown>;
+  close(): void;
 }
 
 declare const nodemailer: {

@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { setupDestination, type SetupStatus } from "./setupDiscovery.ts";
 
-const ready: SetupStatus = { bootstrapRequired: false, setupEnabled: true, oidcEnabled: false };
+const ready: SetupStatus = {
+  bootstrapRequired: false,
+  setupEnabled: true,
+  oidcEnabled: false,
+  emailEnabled: true,
+  requireEmailVerification: true,
+};
 const required: SetupStatus = { ...ready, bootstrapRequired: true };
 
 describe("setup discovery routing", () => {
