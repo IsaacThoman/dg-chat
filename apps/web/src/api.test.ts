@@ -355,7 +355,11 @@ describe("conversation creation API", () => {
       expect.objectContaining({
         method: "POST",
         headers: expect.objectContaining({ "Idempotency-Key": "operation-stable-1" }),
-        body: JSON.stringify({ title: "New chat", idempotencyKey: "operation-stable-1" }),
+        body: JSON.stringify({
+          title: "New chat",
+          idempotencyKey: "operation-stable-1",
+          temporary: false,
+        }),
       }),
     );
   });
@@ -401,7 +405,7 @@ describe("conversation lifecycle API", () => {
       }),
     );
     vi.stubGlobal("fetch", fetchMock);
-    await api.updateConversation("chat", {
+    await api.updateConversation({ id: "chat", version: 3 }, {
       title: "Renamed",
       pinned: true,
       archived: true,
@@ -411,7 +415,13 @@ describe("conversation lifecycle API", () => {
       "/api/conversations/chat",
       expect.objectContaining({
         method: "PATCH",
-        body: JSON.stringify({ title: "Renamed", pinned: true, archived: true, deleted: false }),
+        body: JSON.stringify({
+          expectedVersion: 3,
+          title: "Renamed",
+          pinned: true,
+          archived: true,
+          deleted: false,
+        }),
       }),
     );
   });
@@ -570,6 +580,80 @@ describe("attachment API", () => {
       2,
       "/api/attachments/attachment%2F1",
       expect.objectContaining({ method: "DELETE" }),
+    );
+  });
+});
+
+describe("workspace and preference API", () => {
+  it("uses preference and conversation versions for optimistic updates", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          userId: "owner",
+          version: 4,
+          theme: "dark",
+          compactConversations: false,
+          reduceMotion: false,
+          customInstructions: "",
+          useMemory: false,
+          saveHistory: true,
+          preferredModelId: null,
+          createdAt: "",
+          updatedAt: "",
+        }),
+        { headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    await api.updatePreferences({
+      userId: "owner",
+      version: 3,
+      theme: "light",
+      compactConversations: false,
+      reduceMotion: false,
+      customInstructions: "",
+      useMemory: false,
+      saveHistory: true,
+      preferredModelId: null,
+      createdAt: "",
+      updatedAt: "",
+    }, { theme: "dark" });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/preferences",
+      expect.objectContaining({
+        method: "PATCH",
+        body: JSON.stringify({ expectedVersion: 3, theme: "dark" }),
+      }),
+    );
+  });
+
+  it("binds folder moves to every affected membership version", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ data: [], memberships: [] }), {
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const folder = {
+      id: "target",
+      ownerId: "owner",
+      name: "Target",
+      position: 1,
+      version: 2,
+      membershipVersion: 7,
+      createdAt: "",
+      updatedAt: "",
+    };
+    await api.setFolderConversations(folder, ["conversation"], { source: 4, target: 7 });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/folders/target/conversations",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({
+          conversationIds: ["conversation"],
+          expectedMembershipVersions: { source: 4, target: 7 },
+        }),
+      }),
     );
   });
 });

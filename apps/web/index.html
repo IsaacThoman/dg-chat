@@ -7,6 +7,22 @@
     <meta name="description" content="DG Chat — your private AI workspace" />
     <title>DG Chat</title>
   </head>
+  <script>
+  try {
+    const saved = localStorage.getItem("dg-chat.theme");
+    const preference = saved === "dark" || saved === "light" ? saved : "system";
+    const theme = preference === "system" && matchMedia("(prefers-color-scheme: dark)").matches
+      ? "dark"
+      : preference === "system"
+      ? "light"
+      : preference;
+    document.documentElement.dataset.theme = theme;
+    document.documentElement.dataset.themePreference = preference;
+    document.documentElement.style.colorScheme = theme;
+  } catch {
+    document.documentElement.dataset.theme = "light";
+  }
+  </script>
   <body>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>

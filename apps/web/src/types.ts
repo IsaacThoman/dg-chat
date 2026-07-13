@@ -1,4 +1,20 @@
-import type { ModelCapability } from "../../../packages/contracts/src/types.ts";
+import type {
+  ConversationFolder,
+  ConversationFolderMembership,
+  ConversationTag,
+  ConversationTagBinding,
+  ConversationTagSet,
+  ModelCapability,
+  UserPreferences,
+} from "../../../packages/contracts/src/types.ts";
+export type {
+  ConversationFolder,
+  ConversationFolderMembership,
+  ConversationTag,
+  ConversationTagBinding,
+  ConversationTagSet,
+  UserPreferences,
+};
 
 export type Role = "user" | "admin";
 export type UserStatus = "pending" | "approved" | "suspended" | "rejected" | "deleted";
@@ -19,6 +35,7 @@ export interface Conversation {
   pinned?: boolean;
   archived?: boolean;
   deleted?: boolean;
+  temporary?: boolean;
   project?: string;
   activeLeafId?: string | null;
   version?: number;
