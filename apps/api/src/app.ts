@@ -3373,11 +3373,13 @@ export function createApp(options: AppOptions = {}) {
     const ownerId = c.get("user").id;
     const conversationId = requireUuid(c.req.param("id"), "conversationId");
     const body = await parseJson(c, keepTemporaryConversationSchema);
-    return c.json(await repo.promoteTemporaryConversation(
-      ownerId,
-      conversationId,
-      body.expectedVersion,
-    ));
+    return c.json(
+      await repo.promoteTemporaryConversation(
+        ownerId,
+        conversationId,
+        body.expectedVersion,
+      ),
+    );
   });
   app.get(
     "/api/conversations/:id",
