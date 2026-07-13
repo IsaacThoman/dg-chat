@@ -2384,6 +2384,142 @@ kbd {
   color: var(--muted);
   line-height: 1.4;
 }
+.portability-card {
+  margin-top: 16px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel, #fff);
+}
+.portability-card-head {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+}
+.portability-card-head > span:last-child {
+  display: grid;
+  gap: 3px;
+}
+.portability-card-head strong {
+  font-size: 12px;
+}
+.portability-card-head small,
+.portability-card p,
+.portability-options small {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+.portability-icon {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  color: var(--purple);
+  background: var(--purple-soft);
+}
+.portability-options {
+  display: grid;
+  gap: 8px;
+  margin: 14px 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+}
+.portability-options legend {
+  padding: 0 4px;
+  font-size: 12px;
+  font-weight: 700;
+}
+.portability-options label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+.portability-dialog {
+  min-width: min(520px, 78vw);
+}
+.portability-drop {
+  display: grid;
+  justify-items: center;
+  gap: 7px;
+  padding: 24px 16px;
+  border: 1px dashed #aaa2bc;
+  border-radius: 11px;
+  background: var(--card);
+  text-align: center;
+}
+.portability-drop.dragging {
+  border-color: var(--purple);
+  background: var(--purple-soft);
+}
+.portability-drop small,
+.portability-preview p,
+.portability-success p {
+  color: var(--muted);
+  font-size: 12px;
+}
+.portability-progress {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.portability-preview {
+  margin-top: 15px;
+  padding: 13px;
+  border-radius: 10px;
+  background: var(--card);
+}
+.portability-preview h3 {
+  margin: 0 0 10px;
+  font-size: 12px;
+}
+.portability-summary {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 6px;
+  margin: 0;
+}
+.portability-summary > div {
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  text-align: center;
+}
+.portability-summary dt {
+  color: var(--muted);
+  font-size: 11px;
+}
+.portability-summary dd {
+  margin: 3px 0 0;
+  font-size: 13px;
+  font-weight: 700;
+}
+.portability-success {
+  display: grid;
+  justify-items: center;
+  text-align: center;
+  gap: 8px;
+}
+.portability-success .portability-summary {
+  width: 100%;
+}
+.inline-error {
+  color: var(--danger) !important;
+}
+@media (max-width: 600px) {
+  .portability-dialog {
+    min-width: 0;
+  }
+  .portability-summary {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .portability-card {
+    padding: 13px;
+  }
+}
 .danger-zone {
   margin-top: 38px;
   border: 1px solid #edcccc;

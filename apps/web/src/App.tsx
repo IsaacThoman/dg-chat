@@ -77,6 +77,7 @@ import { AdminAnalyticsView, AdminJobsView } from "./AdminOperations.tsx";
 import { AdminRetentionView } from "./AdminRetention.tsx";
 import { AdminBackupsView } from "./AdminBackups.tsx";
 import { PersonalTokenSettings } from "./TokenGovernance.tsx";
+import { UserPortability } from "./UserPortability.tsx";
 import {
   conversationForFirstSend,
   mergeAttachmentIds,
@@ -2966,15 +2967,7 @@ function SettingsView(
                 </span>
                 <span className="status muted">Administrator controlled</span>
               </div>
-              <div className="setting-row">
-                <span>
-                  <strong>Export your data</strong>
-                  <small>Download conversations, files, and settings as JSON.</small>
-                </span>
-                <button className="secondary">
-                  <Download size={16} /> Export
-                </button>
-              </div>
+              <UserPortability />
             </>
           )}
           {section === "tokens" && <PersonalTokenSettings />}

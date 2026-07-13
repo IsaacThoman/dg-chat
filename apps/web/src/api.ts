@@ -21,6 +21,8 @@ import type {
   ConversationFolder,
   ConversationFolderMembership,
   ConversationKnowledge,
+  ConversationPortabilityDownload,
+  ConversationPortabilityImportResult,
   ConversationTag,
   ConversationTagBinding,
   ConversationTagSet,
@@ -249,6 +251,50 @@ export async function responseError(response: Response): Promise<ApiError> {
   }
 }
 
+const portabilityFilename = (header: string | null): string => {
+  const match = header?.match(/filename="([^"\\/]+)"/i);
+  return match?.[1] ?? `dg-chat-export-${new Date().toISOString().slice(0, 10)}.dgchat`;
+};
+
+export async function downloadConversationPortability(
+  options: { includeDeleted: boolean; includeTemporary: boolean },
+): Promise<ConversationPortabilityDownload> {
+  const query = new URLSearchParams({
+    includeDeleted: String(options.includeDeleted),
+    includeTemporary: String(options.includeTemporary),
+  });
+  const response = await fetch(`/api/portability/export?${query}`, {
+    credentials: "include",
+    headers: { Accept: "application/json" },
+  });
+  if (!response.ok) throw await responseError(response);
+  return {
+    blob: await response.blob(),
+    filename: portabilityFilename(response.headers.get("content-disposition")),
+  };
+}
+
+export async function importConversationPortability(
+  archive: string,
+  dryRun: boolean,
+  idempotencyKey?: string,
+): Promise<ConversationPortabilityImportResult> {
+  const response = await fetch(
+    dryRun ? "/api/portability/import/dry-run" : "/api/portability/import",
+    {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+        ...(dryRun ? {} : { "Idempotency-Key": idempotencyKey ?? "" }),
+      },
+      body: archive,
+    },
+  );
+  if (!response.ok) throw await responseError(response);
+  return await response.json() as ConversationPortabilityImportResult;
+}
+
 async function request<T>(path: string, init?: RequestInit, fallback?: T): Promise<T> {
   try {
     const response = await fetch(`/api${path}`, {
@@ -463,6 +509,8 @@ export const api = {
       }),
     ),
   preferences: () => request<UserPreferences>("/preferences"),
+  downloadConversationPortability,
+  importConversationPortability,
   updatePreferences: (
     preferences: UserPreferences,
     patch: Partial<

@@ -493,3 +493,19 @@ export interface BackupRestoreStatus {
   completedAt: string | null;
   error: string | null;
 }
+
+export interface ConversationPortabilityImportResult {
+  dryRun: boolean;
+  replayed: boolean;
+  conversations: number;
+  messages: number;
+  attachments: number;
+  folders: number;
+  tags: number;
+  idMap: Record<string, string>;
+}
+
+export interface ConversationPortabilityDownload {
+  blob: Blob;
+  filename: string;
+}
