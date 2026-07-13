@@ -72,6 +72,8 @@ Deno.test({
       const messageId = crypto.randomUUID();
       const attachmentId = crypto.randomUUID();
       const providerId = crypto.randomUUID();
+      const folderId = crypto.randomUUID();
+      const tagId = crypto.randomUUID();
       await sql`INSERT INTO users(
         id,email,name,password_hash,role,approval_status,state,balance_micros,email_verified_at
       ) VALUES(
@@ -94,6 +96,24 @@ Deno.test({
       )`;
       await sql`INSERT INTO conversations(id,owner_id,title)
         VALUES(${conversationId},${userId},'Portable conversation')`;
+      await sql`INSERT INTO user_preferences(
+        user_id,theme,compact_conversations,reduce_motion,custom_instructions,
+        use_memory,save_history,preferred_model_id
+      ) VALUES(
+        ${userId},'dark',true,true,'Keep portable instructions',true,false,'portable/model'
+      )`;
+      await sql`INSERT INTO conversation_folders(
+        id,owner_id,name,normalized_name,position,membership_version
+      ) VALUES(${folderId},${userId},'Portable project','portable project',0,1)`;
+      await sql`INSERT INTO conversation_folder_memberships(
+        folder_id,conversation_id,owner_id,position
+      ) VALUES(${folderId},${conversationId},${userId},0)`;
+      await sql`INSERT INTO conversation_tags(id,owner_id,name,normalized_name,color)
+        VALUES(${tagId},${userId},'Portable tag','portable tag','#123ABC')`;
+      await sql`INSERT INTO conversation_tag_sets(conversation_id,owner_id,version)
+        VALUES(${conversationId},${userId},1)`;
+      await sql`INSERT INTO conversation_tag_bindings(conversation_id,tag_id,owner_id)
+        VALUES(${conversationId},${tagId},${userId})`;
       await sql`INSERT INTO messages(
         id,conversation_id,sibling_index,role,content,status,metadata,idempotency_key
       ) VALUES(
@@ -252,6 +272,42 @@ Deno.test({
       );
 
       assertEquals(Number((await sql`SELECT count(*) count FROM conversations`)[0].count), 1);
+      assertEquals(
+        [
+          ...await sql`SELECT theme,compact_conversations,reduce_motion,custom_instructions,
+          use_memory,save_history,preferred_model_id FROM user_preferences
+          WHERE user_id=${userId}`,
+        ],
+        [{
+          theme: "dark",
+          compact_conversations: true,
+          reduce_motion: true,
+          custom_instructions: "Keep portable instructions",
+          use_memory: true,
+          save_history: false,
+          preferred_model_id: "portable/model",
+        }],
+      );
+      assertEquals(
+        [
+          ...await sql`SELECT f.name,f.membership_version,m.position
+          FROM conversation_folders f JOIN conversation_folder_memberships m
+            ON m.folder_id=f.id AND m.owner_id=f.owner_id
+          WHERE f.id=${folderId} AND m.conversation_id=${conversationId}`,
+        ],
+        [{ name: "Portable project", membership_version: 1, position: 0 }],
+      );
+      assertEquals(
+        [
+          ...await sql`SELECT t.name,t.color,s.version
+          FROM conversation_tags t JOIN conversation_tag_bindings b
+            ON b.tag_id=t.id AND b.owner_id=t.owner_id
+          JOIN conversation_tag_sets s
+            ON s.conversation_id=b.conversation_id AND s.owner_id=b.owner_id
+          WHERE t.id=${tagId} AND b.conversation_id=${conversationId}`,
+        ],
+        [{ name: "Portable tag", color: "#123ABC", version: 1 }],
+      );
       assertEquals(
         (await sql`SELECT object_key FROM attachments WHERE id=${attachmentId}`)[0].object_key,
         `restores/${operation.id}/portable.txt`,
