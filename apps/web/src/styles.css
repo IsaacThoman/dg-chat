@@ -2449,6 +2449,11 @@ kbd {
   background: var(--card);
   text-align: center;
 }
+.portability-drop strong {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
 .portability-drop.dragging {
   border-color: var(--purple);
   background: var(--purple-soft);
