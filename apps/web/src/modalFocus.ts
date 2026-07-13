@@ -21,6 +21,12 @@ export function modalShouldRestoreFocus(value: boolean | (() => boolean)): boole
   return typeof value === "function" ? value() : value;
 }
 
+export function modalOverlayPresent(
+  root: Pick<Document, "querySelector"> = document,
+): boolean {
+  return Boolean(root.querySelector(".modal-overlay"));
+}
+
 export function modalInitialFocus(
   dialog: HTMLElement,
   focusable = modalFocusableElements(dialog),

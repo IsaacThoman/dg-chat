@@ -3,6 +3,7 @@ import {
   MODAL_FOCUSABLE_SELECTOR,
   modalFocusableElements,
   modalInitialFocus,
+  modalOverlayPresent,
   modalShouldRestoreFocus,
 } from "./modalFocus.ts";
 
@@ -40,6 +41,13 @@ describe("modal focus targets", () => {
     expect(modalShouldRestoreFocus(() => !handoff)).toBe(false);
     handoff = false;
     expect(modalShouldRestoreFocus(() => !handoff)).toBe(true);
+  });
+
+  it("lets an underlying drawer defer Escape while a modal is open", () => {
+    expect(modalOverlayPresent({ querySelector: () => ({}) } as Pick<Document, "querySelector">))
+      .toBe(true);
+    expect(modalOverlayPresent({ querySelector: () => null } as Pick<Document, "querySelector">))
+      .toBe(false);
   });
 
   it("filters disabled, hidden, inert, and negative-tab-index matches", () => {

@@ -105,6 +105,7 @@ import {
   fallbackConversationId,
 } from "./conversationLifecycle.ts";
 import { Modal } from "./Modal.tsx";
+import { modalOverlayPresent } from "./modalFocus.ts";
 import { AdminModels, AdminProviders } from "./AdminRegistry.tsx";
 import { AdminResilience } from "./AdminResilience.tsx";
 import { AdminTools } from "./AdminTools.tsx";
@@ -266,6 +267,7 @@ function Sidebar({
     panel?.querySelector<HTMLButtonElement>('[aria-label="Close sidebar"]')?.focus();
     const keydown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
+        if (modalOverlayPresent()) return;
         event.preventDefault();
         closeMobileRef.current();
         return;
