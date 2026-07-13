@@ -585,6 +585,45 @@ describe("attachment API", () => {
 });
 
 describe("workspace and preference API", () => {
+  it("uses stable idempotency keys for workspace creation and membership CAS for deletion", async () => {
+    const folder = {
+      id: "folder",
+      ownerId: "owner",
+      name: "Project",
+      position: 0,
+      version: 2,
+      membershipVersion: 5,
+      createdAt: "",
+      updatedAt: "",
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(folder), {
+          headers: { "Content-Type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await api.createFolder("Project", "workspace-operation-1");
+    await api.deleteFolder(folder);
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "/api/folders",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({ "Idempotency-Key": "workspace-operation-1" }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/folders/folder",
+      expect.objectContaining({
+        method: "DELETE",
+        body: JSON.stringify({ expectedVersion: 2, expectedMembershipVersion: 5 }),
+      }),
+    );
+  });
+
   it("uses preference and conversation versions for optimistic updates", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(

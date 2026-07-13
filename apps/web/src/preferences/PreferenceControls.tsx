@@ -158,13 +158,13 @@ export function PersonalizationPreferences() {
           </button>
         </div>
       </form>
-      <PreferenceSwitch
-        label="Use conversation memory"
-        description="Allow relevant details to carry between conversations"
-        checked={value.useMemory}
-        disabled={busy}
-        onChange={(checked) => save({ useMemory: checked })}
-      />
+      <div className="setting-row">
+        <span>
+          <strong>Conversation memory</strong>
+          <small>Cross-chat memory is not available in this release.</small>
+        </span>
+        <button type="button" className="secondary" disabled>Unavailable</button>
+      </div>
       <PreferenceSwitch
         label="Save conversation history"
         description="Temporary chats are never included"

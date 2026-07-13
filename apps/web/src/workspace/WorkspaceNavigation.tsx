@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowDown, ArrowUp, Check, Ellipsis, Folder, Plus, X } from "lucide-react";
-import { type FormEvent, useState } from "react";
+import { type FormEvent, useRef, useState } from "react";
 import { api } from "../api.ts";
 import type {
   Conversation,
@@ -23,6 +23,18 @@ export type TagData = {
   bindings: ConversationTagBinding[];
   tagSets: ConversationTagSet[];
 };
+export type WorkspaceCreateAttempt = { kind: "folder" | "tag"; name: string; key: string };
+
+export function workspaceCreateAttempt(
+  previous: WorkspaceCreateAttempt | null,
+  kind: "folder" | "tag",
+  name: string,
+  createId: () => string = () => crypto.randomUUID(),
+): WorkspaceCreateAttempt {
+  return previous?.kind === kind && previous.name === name
+    ? previous
+    : { kind, name, key: createId() };
+}
 
 export function useWorkspace() {
   const folders = useQuery({ queryKey: foldersKey, queryFn: api.folders });
@@ -62,6 +74,10 @@ export function WorkspaceNavigation({
   selectedTags,
   onSelectFolder,
   onToggleTag,
+  foldersError = false,
+  tagsError = false,
+  retryFolders,
+  retryTags,
 }: {
   folders?: FolderData;
   tags?: TagData;
@@ -69,6 +85,10 @@ export function WorkspaceNavigation({
   selectedTags: string[];
   onSelectFolder: (id: string | null) => void;
   onToggleTag: (id: string) => void;
+  foldersError?: boolean;
+  tagsError?: boolean;
+  retryFolders: () => void;
+  retryTags: () => void;
 }) {
   const client = useQueryClient();
   const [creating, setCreating] = useState<"folder" | "tag" | null>(null);
@@ -77,8 +97,10 @@ export function WorkspaceNavigation({
   const [editing, setEditing] = useState<ConversationFolder | null>(null);
   const [editingTag, setEditingTag] = useState<ConversationTag | null>(null);
   const [tagColor, setTagColor] = useState("#7660bf");
+  const createAttempt = useRef<WorkspaceCreateAttempt | null>(null);
+  const [workspaceError, setWorkspaceError] = useState("");
   const createFolder = useMutation({
-    mutationFn: () => api.createFolder(name.trim()),
+    mutationFn: ({ name, key }: { name: string; key: string }) => api.createFolder(name, key),
     onSuccess: async (folder) => {
       await client.invalidateQueries({ queryKey: foldersKey });
       setCreating(null);
@@ -88,7 +110,8 @@ export function WorkspaceNavigation({
     onError: () => setError("Couldn’t create the project."),
   });
   const createTag = useMutation({
-    mutationFn: () => api.createTag(name.trim(), "#7660bf"),
+    mutationFn: ({ name, key }: { name: string; key: string }) =>
+      api.createTag(name, "#7660bf", key),
     onSuccess: async () => {
       await client.invalidateQueries({ queryKey: tagsKey });
       setCreating(null);
@@ -116,8 +139,11 @@ export function WorkspaceNavigation({
   });
   const reorderFolders = useMutation({
     mutationFn: (ordered: ConversationFolder[]) => api.reorderFolders(ordered),
-    onSuccess: () => client.invalidateQueries({ queryKey: foldersKey }),
-    onError: () => setError("Couldn’t reorder projects. Refresh and try again."),
+    onSuccess: () => {
+      setWorkspaceError("");
+      return client.invalidateQueries({ queryKey: foldersKey });
+    },
+    onError: () => setWorkspaceError("Couldn’t reorder projects. Refresh and try again."),
   });
   const updateTag = useMutation({
     mutationFn: () => api.updateTag(editingTag!, { name: name.trim(), color: tagColor }),
@@ -143,8 +169,13 @@ export function WorkspaceNavigation({
     setError("");
     if (editingTag) updateTag.mutate();
     else if (editing) updateFolder.mutate();
-    else if (creating === "folder") createFolder.mutate();
-    else createTag.mutate();
+    else if (creating) {
+      const trimmed = name.trim();
+      const attempt = workspaceCreateAttempt(createAttempt.current, creating, trimmed);
+      createAttempt.current = attempt;
+      if (creating === "folder") createFolder.mutate(attempt);
+      else createTag.mutate(attempt);
+    }
   };
   return (
     <div className="workspace-navigation">
@@ -156,6 +187,7 @@ export function WorkspaceNavigation({
           onClick={() => {
             setName("");
             setError("");
+            createAttempt.current = null;
             setCreating("folder");
           }}
         >
@@ -227,6 +259,7 @@ export function WorkspaceNavigation({
           onClick={() => {
             setName("");
             setError("");
+            createAttempt.current = null;
             setCreating("tag");
           }}
         >
@@ -268,6 +301,40 @@ export function WorkspaceNavigation({
           </button>
         )}
       </div>
+      {(foldersError || tagsError) && (
+        <div className="workspace-error" role="alert">
+          <span>
+            {foldersError && tagsError
+              ? "Projects and tags couldn’t be loaded."
+              : foldersError
+              ? "Projects couldn’t be loaded."
+              : "Tags couldn’t be loaded."}
+          </span>
+          <button
+            type="button"
+            onClick={() => {
+              if (foldersError) retryFolders();
+              if (tagsError) retryTags();
+            }}
+          >
+            Retry
+          </button>
+        </div>
+      )}
+      {workspaceError && (
+        <div className="workspace-error" role="alert">
+          <span>{workspaceError}</span>
+          <button
+            type="button"
+            onClick={() => {
+              setWorkspaceError("");
+              retryFolders();
+            }}
+          >
+            Refresh
+          </button>
+        </div>
+      )}
       {creating && (
         <Modal
           title={creating === "folder" ? "Create project" : "Create tag"}
@@ -310,6 +377,7 @@ export function WorkspaceNavigation({
               <span>Project name</span>
               <input
                 autoFocus
+                data-autofocus
                 maxLength={120}
                 value={name}
                 onChange={(event) => setName(event.target.value)}
@@ -350,6 +418,7 @@ export function WorkspaceNavigation({
               <span>Tag name</span>
               <input
                 autoFocus
+                data-autofocus
                 maxLength={64}
                 value={name}
                 onChange={(event) => setName(event.target.value)}

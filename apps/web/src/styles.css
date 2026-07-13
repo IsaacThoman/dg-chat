@@ -433,6 +433,42 @@ kbd {
 .workspace-navigation button:hover {
   color: var(--ink);
 }
+.workspace-error {
+  margin: 5px 7px;
+  padding: 7px 8px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid color-mix(in srgb, var(--danger) 28%, var(--line));
+  border-radius: 8px;
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 8%, var(--card));
+  font-size: 10px;
+}
+.workspace-error span {
+  flex: 1;
+}
+.workspace-error button {
+  min-height: 30px;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  font-weight: 700;
+  cursor: pointer;
+}
+[data-theme="dark"] .sidebar .side-nav button,
+[data-theme="dark"] .sidebar .sidebar-footer > button,
+[data-theme="dark"] .settings-nav button,
+[data-theme="dark"] .admin-nav a {
+  color: var(--muted);
+}
+[data-theme="dark"] .sidebar .side-nav button.selected,
+[data-theme="dark"] .sidebar .sidebar-footer > button.selected,
+[data-theme="dark"] .settings-nav button.active,
+[data-theme="dark"] .admin-nav a.active {
+  color: var(--ink);
+  background: #39324f;
+}
 .workspace-heading {
   min-height: 28px;
   margin-top: 3px;
@@ -4482,6 +4518,15 @@ kbd {
 @media (max-width: 760px) {
   .mobile-only {
     display: inline-grid;
+  }
+  .workspace-navigation > button,
+  .workspace-heading button,
+  .workspace-folder-row > button:first-child,
+  .workspace-folder-row > button:not(:first-child),
+  .tag-filter-list button,
+  .workspace-error button {
+    min-width: 44px;
+    min-height: 44px;
   }
   .sidebar {
     position: fixed;

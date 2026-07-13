@@ -477,9 +477,10 @@ export const api = {
     request<{ data: ConversationFolder[]; memberships: ConversationFolderMembership[] }>(
       "/folders",
     ),
-  createFolder: (name: string) =>
+  createFolder: (name: string, idempotencyKey: string) =>
     request<ConversationFolder>("/folders", {
       method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
       body: JSON.stringify({ name }),
     }),
   updateFolder: (folder: ConversationFolder, name: string) =>
@@ -490,7 +491,10 @@ export const api = {
   deleteFolder: (folder: ConversationFolder) =>
     request<void>(`/folders/${encodeURIComponent(folder.id)}`, {
       method: "DELETE",
-      body: JSON.stringify({ expectedVersion: folder.version }),
+      body: JSON.stringify({
+        expectedVersion: folder.version,
+        expectedMembershipVersion: folder.membershipVersion,
+      }),
     }),
   reorderFolders: async (folders: ConversationFolder[]) =>
     (await request<{ data: ConversationFolder[] }>(
@@ -526,9 +530,10 @@ export const api = {
       bindings: ConversationTagBinding[];
       tagSets: ConversationTagSet[];
     }>("/tags"),
-  createTag: (name: string, color: string) =>
+  createTag: (name: string, color: string, idempotencyKey: string) =>
     request<ConversationTag>("/tags", {
       method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
       body: JSON.stringify({ name, color }),
     }),
   updateTag: (tag: ConversationTag, patch: { name?: string; color?: string }) =>

@@ -3,6 +3,7 @@ import {
   conversationIdsForWorkspace,
   type FolderData,
   type TagData,
+  workspaceCreateAttempt,
 } from "./WorkspaceNavigation.tsx";
 import type { Conversation } from "../types.ts";
 
@@ -55,5 +56,15 @@ describe("conversationIdsForWorkspace", () => {
       "b",
       "c",
     ]);
+  });
+});
+
+describe("workspaceCreateAttempt", () => {
+  it("reuses a key for an exact retry and rotates it when the payload changes", () => {
+    const ids = ["first", "second"];
+    const createId = () => ids.shift()!;
+    const first = workspaceCreateAttempt(null, "folder", "Project", createId);
+    expect(workspaceCreateAttempt(first, "folder", "Project", createId)).toBe(first);
+    expect(workspaceCreateAttempt(first, "folder", "Renamed", createId).key).toBe("second");
   });
 });

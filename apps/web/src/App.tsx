@@ -138,6 +138,10 @@ import {
   usePreferences,
 } from "./preferences/usePreferences.ts";
 import {
+  historyPreferenceWarning,
+  temporaryChatUntilPreferencesResolve,
+} from "./preferences/chatPrivacy.ts";
+import {
   conversationIdsForWorkspace,
   OrganizeConversationDialog,
   useWorkspace,
@@ -382,6 +386,10 @@ function Sidebar({
             setSelectedTags((current) =>
               current.includes(id) ? current.filter((value) => value !== id) : [...current, id]
             )}
+          foldersError={workspace.folders.isError}
+          tagsError={workspace.tags.isError}
+          retryFolders={() => void workspace.folders.refetch()}
+          retryTags={() => void workspace.tags.refetch()}
         />
       )}
       <div className="conversation-scroll">
@@ -2010,6 +2018,7 @@ function ChatView({
   readOnly: readOnlyProp = false,
   saveHistory = true,
   modelPreferenceError = "",
+  historyPreferenceWarning = "",
 }: {
   conversations: Conversation[];
   activeId: string;
@@ -2027,6 +2036,7 @@ function ChatView({
   readOnly?: boolean;
   saveHistory?: boolean;
   modelPreferenceError?: string;
+  historyPreferenceWarning?: string;
 }) {
   const queryClient = useQueryClient();
   const chatModels = useMemo(
@@ -2493,6 +2503,9 @@ function ChatView({
         <ModelPicker models={chatModels} selected={selectedModel} setSelected={setSelectedModel} />
         {modelPreferenceError && (
           <span className="model-preference-error" role="alert">{modelPreferenceError}</span>
+        )}
+        {historyPreferenceWarning && (
+          <span className="model-preference-error" role="alert">{historyPreferenceWarning}</span>
         )}
         <div className="header-actions">
           {speechModels.length > 0 && (
@@ -3632,7 +3645,7 @@ export function App(
       const resolved = await api.createConversation(
         "New chat",
         crypto.randomUUID(),
-        preferencesQuery.data?.saveHistory === false,
+        temporaryChatUntilPreferencesResolve(demoMode, preferencesQuery.data),
       );
       queryClient.setQueryData<Conversation[]>(
         ["conversations"],
@@ -3769,8 +3782,9 @@ export function App(
           onConversationCreated={conversationCreated}
           onUpdateConversation={updateConversation}
           readOnly={view !== "chat"}
-          saveHistory={preferencesQuery.data?.saveHistory ?? true}
+          saveHistory={!temporaryChatUntilPreferencesResolve(demoMode, preferencesQuery.data)}
           modelPreferenceError={modelPreferenceError}
+          historyPreferenceWarning={historyPreferenceWarning(demoMode, preferencesQuery.isError)}
         />
       )}
       {(view === "chat" || view === "archived" || view === "trash") && !creatingConversation &&
