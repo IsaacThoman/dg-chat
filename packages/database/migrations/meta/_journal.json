@@ -246,6 +246,20 @@
       "when": 1783915200000,
       "tag": "0034_immutable_sharing_snapshots",
       "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "7",
+      "when": 1783998000000,
+      "tag": "0035_api_replay_reservations",
+      "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "7",
+      "when": 1783998001000,
+      "tag": "0036_provider_test_http",
+      "breakpoints": true
     }
   ]
 }

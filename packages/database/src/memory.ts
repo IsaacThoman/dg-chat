@@ -27,13 +27,25 @@ import type {
 import { isIngestibleDocumentMime } from "./attachment-policy.ts";
 import { canonicalJson, sha256Hex } from "./backup-format.ts";
 import {
+  providerCustomParamsViolation,
+  providerDefaultsViolation,
+  providerModelOcrGraphViolation,
+  providerOcrTargetProviderViolation,
+} from "./provider-model-invariants.ts";
+import {
+  API_SSE_REPLAY_FRAGMENT_MAX_BYTES,
+  API_SSE_REPLAY_REQUEST_MAX_BYTES,
+  API_SSE_REPLAY_REQUEST_MAX_EVENTS,
   apiResponseBodyByteLength,
   canonicalWorkspaceName,
+  DEFAULT_API_REPLAY_QUOTA,
   MAX_ACTIVE_CONVERSATION_SHARES,
   MAX_CONVERSATION_SHARE_ATTACHMENTS,
   MAX_CONVERSATION_SHARE_CONTENT_CHARS,
   MAX_CONVERSATION_SHARE_MESSAGES,
   normalizeKnowledgeSearchLimit,
+  planAbandonedApiReplay,
+  splitApiSseReplayFrame,
   validateChunkEmbeddings,
   validateDocumentChunkInputs,
 } from "./repository.ts";
@@ -292,8 +304,11 @@ function normalizeProviderBaseUrl(value: string): string {
   }
   try {
     const url = new URL(value);
+    const testHttp = Deno.env.get("DENO_ENV") === "test" && url.protocol === "http:" &&
+      Deno.env.get("OPENAI_TEST_ALLOW_HTTP_HOST")?.toLowerCase() === url.hostname.toLowerCase();
     if (
-      url.protocol !== "https:" || url.username || url.password || url.search || url.hash ||
+      (!testHttp && url.protocol !== "https:") || url.username || url.password || url.search ||
+      url.hash ||
       url.port === "0"
     ) {
       throw new Error();
@@ -361,10 +376,10 @@ function validateProviderModelInput(
       new Set(input.capabilities).size !== input.capabilities.length ||
       input.capabilities.some((value) => !isModelCapability(value)))
   ) throw new DomainError("validation_error", "Model capabilities are invalid", 422);
-  if (
-    input.customParams !== undefined &&
-    (input.customParams === null || Array.isArray(input.customParams))
-  ) throw new DomainError("validation_error", "Model custom parameters are invalid", 422);
+  if (input.customParams !== undefined) {
+    const violation = providerCustomParamsViolation(input.customParams, input.publicModelId);
+    if (violation) throw new DomainError(violation.code, violation.message, 422);
+  }
 }
 
 function validatePriceInput(input: CreateModelPriceVersionInput) {
@@ -1790,7 +1805,13 @@ export class MemoryRepository {
     if (!source || !attachment || !current || current.state !== "ready" || current.deletedAt) {
       return undefined;
     }
-    return { shareId, ownerId: stored.ownerId, attachment, objectKey: source.objectKey };
+    return {
+      shareId,
+      ownerId: stored.ownerId,
+      attachment,
+      objectKey: source.objectKey,
+      sha256: current.sha256,
+    };
   }
 
   updateUserPreferences(ownerId: string, patch: import("./repository.ts").UserPreferencesPatch) {
@@ -3793,6 +3814,25 @@ export class MemoryRepository {
     const stored = this.providers.get(id);
     if (!stored) throw new DomainError("not_found", "Provider not found", 404);
     if (stored.version !== expectedVersion) throw registryConflict();
+    if (input.enabled === false && stored.enabled) {
+      const violation = providerOcrTargetProviderViolation(
+        [...this.providerModels.values()],
+        [...this.providers.values()].map((provider) => ({
+          id: provider.id,
+          enabled: provider.id === id ? false : provider.enabled,
+        })),
+      );
+      if (violation) throw new DomainError(violation.code, violation.message, 422);
+    }
+    if (input.protocol !== undefined && input.protocol !== stored.protocol) {
+      const violation = [...this.providerModels.values()]
+        .filter((model) => model.providerId === id)
+        .map((model) =>
+          providerDefaultsViolation(input.protocol!, model.customParams, model.publicModelId)
+        )
+        .find(Boolean);
+      if (violation) throw new DomainError(violation.code, violation.message, 422);
+    }
     if (
       input.slug !== undefined &&
       [...this.providers.values()].some((provider) =>
@@ -3908,6 +3948,16 @@ export class MemoryRepository {
       createdAt: now,
       updatedAt: now,
     };
+    const defaultsViolation = providerDefaultsViolation(
+      this.providers.get(input.providerId)!.protocol,
+      model.customParams,
+      model.publicModelId,
+    );
+    if (defaultsViolation) {
+      throw new DomainError(defaultsViolation.code, defaultsViolation.message, 422);
+    }
+    const graphViolation = providerModelOcrGraphViolation([...this.providerModels.values(), model]);
+    if (graphViolation) throw new DomainError(graphViolation.code, graphViolation.message, 422);
     this.providerModels.set(model.id, model);
     this.registryAudit(mutation, "provider_model", model.id, {
       providerId: model.providerId,
@@ -3933,6 +3983,30 @@ export class MemoryRepository {
           candidate.id !== id && candidate.publicModelId === input.publicModelId
         ) || [...this.modelAliases.values()].some((alias) => alias.alias === input.publicModelId)
     ) throw new DomainError("model_id_taken", "Public model ID already exists", 409);
+    const candidate = structuredClone(model);
+    if (input.publicModelId !== undefined) candidate.publicModelId = input.publicModelId;
+    if (input.upstreamModelId !== undefined) {
+      candidate.upstreamModelId = input.upstreamModelId.trim();
+    }
+    if (input.displayName !== undefined) candidate.displayName = input.displayName.trim();
+    if (input.capabilities !== undefined) candidate.capabilities = [...input.capabilities];
+    if (input.contextWindow !== undefined) candidate.contextWindow = input.contextWindow;
+    if (input.enabled !== undefined) candidate.enabled = input.enabled;
+    if (input.customParams !== undefined) {
+      candidate.customParams = structuredClone(input.customParams);
+    }
+    const defaultsViolation = providerDefaultsViolation(
+      this.providers.get(candidate.providerId)!.protocol,
+      candidate.customParams,
+      candidate.publicModelId,
+    );
+    if (defaultsViolation) {
+      throw new DomainError(defaultsViolation.code, defaultsViolation.message, 422);
+    }
+    const graphViolation = providerModelOcrGraphViolation(
+      [...this.providerModels.values()].map((item) => item.id === id ? candidate : item),
+    );
+    if (graphViolation) throw new DomainError(graphViolation.code, graphViolation.message, 422);
     if (input.publicModelId !== undefined) model.publicModelId = input.publicModelId;
     if (input.upstreamModelId !== undefined) model.upstreamModelId = input.upstreamModelId.trim();
     if (input.displayName !== undefined) model.displayName = input.displayName.trim();
@@ -4147,13 +4221,11 @@ export class MemoryRepository {
     if (input.retryPolicyId != null && !this.providerRetryPolicies.has(input.retryPolicyId)) {
       throw new DomainError("not_found", "Retry policy not found", 404);
     }
-    const sourceProvider = this.providers.get(source.providerId);
     const compatible = input.fallbackModelIds.every((id) => {
       const target = this.providerModels.get(id)!;
       const provider = this.providers.get(target.providerId);
       return target.enabled && provider?.enabled && provider.hasCredential &&
-        this.effectiveModelPrice(target.id) !== undefined && sourceProvider &&
-        provider.protocol === sourceProvider.protocol &&
+        this.effectiveModelPrice(target.id) !== undefined &&
         target.contextWindow >= source.contextWindow &&
         source.capabilities.every((capability) => target.capabilities.includes(capability));
     });
@@ -4209,14 +4281,12 @@ export class MemoryRepository {
     };
     flatten(sourceModelId);
     const source = this.providerModels.get(sourceModelId);
-    const sourceProvider = source ? this.providers.get(source.providerId) : undefined;
     const targets: ProviderExecutionPlan["targets"] = [];
     for (const id of ids) {
       const model = this.providerModels.get(id);
       const provider = model ? this.providers.get(model.providerId) : undefined;
       const price = model ? this.effectiveModelPrice(model.id, at) : undefined;
-      const compatible = source && sourceProvider && model && provider &&
-        provider.protocol === sourceProvider.protocol &&
+      const compatible = source && model && provider &&
         model.contextWindow >= source.contextWindow &&
         source.capabilities.every((capability) => model.capabilities.includes(capability));
       const unavailable = !model || !provider || !model.enabled || !provider.enabled ||
@@ -5475,7 +5545,7 @@ export class MemoryRepository {
     return request;
   }
   #replayQuota(quota?: ApiReplayQuota): ApiReplayQuota {
-    const value = quota ?? { maxRequests: 256, maxBytes: 67_108_864, maxEvents: 20_000 };
+    const value = quota ?? DEFAULT_API_REPLAY_QUOTA;
     if (
       !Number.isSafeInteger(value.maxRequests) || value.maxRequests < 1 ||
       !Number.isSafeInteger(value.maxBytes) || value.maxBytes < 1 ||
@@ -5491,6 +5561,11 @@ export class MemoryRepository {
     for (const request of this.apiIdempotencyRequests.values()) {
       if (request.userId !== userId || Date.parse(request.expiresAt) <= Date.now()) continue;
       requests++;
+      if (request.state === "in_progress" && request.replayReservedBytes > 0) {
+        events += request.replayReservedEvents;
+        bytes += request.replayReservedBytes;
+        continue;
+      }
       events += request.frames.length;
       bytes += request.frames.reduce((sum, item) => sum + encoder.encode(item.frame).length, 0);
       if (request.responseBody) {
@@ -5512,7 +5587,12 @@ export class MemoryRepository {
       input.idempotencyKey.length < 8 || input.idempotencyKey.length > 200 ||
       !/^[0-9a-f]{64}$/.test(input.requestHash) || input.reserveMicros < 0 ||
       (input.leaseSeconds ?? 120) < 1 ||
-      (input.retentionSeconds ?? 86400) < 60 || (input.retentionSeconds ?? 86400) > 2_592_000
+      (input.retentionSeconds ?? 86400) < 60 || (input.retentionSeconds ?? 86400) > 2_592_000 ||
+      !Number.isSafeInteger(input.replayReservedBytes ?? 0) ||
+      (input.replayReservedBytes ?? 0) < 0 ||
+      !Number.isSafeInteger(input.replayReservedEvents ?? 0) ||
+      (input.replayReservedEvents ?? 0) < 0 ||
+      ((input.replayReservedBytes ?? 0) === 0 && (input.replayReservedEvents ?? 0) > 0)
     ) throw new DomainError("validation_error", "Invalid idempotent request parameters", 422);
     const key = this.#apiKey(input.userId, input.endpoint, input.idempotencyKey);
     let priorId = this.apiIdempotencyKeys.get(key);
@@ -5542,9 +5622,14 @@ export class MemoryRepository {
       };
     }
     const quota = this.#replayQuota(input.quota);
-    if (this.#replayTotals(input.userId).requests >= quota.maxRequests) {
+    const replayTotals = this.#replayTotals(input.userId);
+    if (replayTotals.requests >= quota.maxRequests) {
       throw new DomainError("replay_quota_exceeded", "Replay request quota exceeded", 429);
     }
+    if (
+      replayTotals.bytes + (input.replayReservedBytes ?? 0) > quota.maxBytes ||
+      replayTotals.events + (input.replayReservedEvents ?? 0) > quota.maxEvents
+    ) throw new DomainError("replay_quota_exceeded", "Replay storage quota exceeded", 429);
     const usageRun = this.reserve(
       input.userId,
       input.runId,
@@ -5570,6 +5655,8 @@ export class MemoryRepository {
       leaseToken,
       leaseExpiresAt: new Date(now.getTime() + (input.leaseSeconds ?? 120) * 1000).toISOString(),
       usageRunId: input.runId,
+      replayReservedBytes: input.replayReservedBytes ?? 0,
+      replayReservedEvents: input.replayReservedEvents ?? 0,
       responseStatus: null,
       responseHeaders: {},
       responseBody: null,
@@ -5636,7 +5723,7 @@ export class MemoryRepository {
     if (frames.length === 0) return structuredClone(request);
     const encoder = new TextEncoder();
     const encodedBytes = frames.map(({ frame }) => encoder.encode(frame).length);
-    if (encodedBytes.some((bytes) => bytes > 1_048_576)) {
+    if (encodedBytes.some((bytes) => bytes > API_SSE_REPLAY_FRAGMENT_MAX_BYTES)) {
       throw new DomainError("response_too_large", "SSE frame exceeds replay limit", 413);
     }
     const total = request.frames.reduce(
@@ -5661,12 +5748,20 @@ export class MemoryRepository {
       (sum, item) => sum + encoder.encode(item.frame).length,
       0,
     );
-    if (request.frames.length + pending.length > 10_000 || total + pendingBytes > 16_777_216) {
+    if (
+      request.frames.length + pending.length > API_SSE_REPLAY_REQUEST_MAX_EVENTS ||
+      total + pendingBytes > API_SSE_REPLAY_REQUEST_MAX_BYTES
+    ) {
       throw new DomainError("response_too_large", "SSE replay exceeds storage limit", 413);
     }
     const quota = this.#replayQuota(quotaInput);
     const aggregate = this.#replayTotals(request.userId);
-    if (
+    if (request.replayReservedBytes > 0 || request.replayReservedEvents > 0) {
+      if (
+        request.frames.length + pending.length > request.replayReservedEvents ||
+        total + pendingBytes > request.replayReservedBytes
+      ) throw new DomainError("replay_quota_exceeded", "Reserved replay capacity exceeded", 429);
+    } else if (
       aggregate.events + pending.length > quota.maxEvents ||
       aggregate.bytes + pendingBytes > quota.maxBytes
     ) throw new DomainError("replay_quota_exceeded", "User replay storage quota exceeded", 429);
@@ -5737,7 +5832,7 @@ export class MemoryRepository {
     const pending: Array<{ sequence: number; frame: string; createdAt: string }> = [];
     for (const item of input.frames ?? []) {
       const bytes = encoder.encode(item.frame).length;
-      if (bytes > 1_048_576) {
+      if (bytes > API_SSE_REPLAY_FRAGMENT_MAX_BYTES) {
         throw new DomainError("response_too_large", "SSE frame exceeds replay limit", 413);
       }
       const existing = request.frames[item.sequence];
@@ -5759,23 +5854,34 @@ export class MemoryRepository {
     const responseBytes = input.responseBody
       ? apiResponseBodyByteLength(input.responseBody, responseBodyEncoding)
       : 0;
-    if (responseBytes > 16_777_216) {
+    if (responseBytes > API_SSE_REPLAY_REQUEST_MAX_BYTES) {
       throw new DomainError("response_too_large", "Replay response exceeds storage limit", 413);
     }
-    const terminalBytes = input.terminalFrame ? encoder.encode(input.terminalFrame).length : 0;
+    const terminalFragments = stream && input.terminalFrame !== undefined
+      ? splitApiSseReplayFrame(input.terminalFrame)
+      : [];
+    const terminalBytes = terminalFragments.reduce(
+      (sum, frame) => sum + encoder.encode(frame).length,
+      0,
+    );
     const existingBytes = request.frames.reduce(
       (sum, item) => sum + encoder.encode(item.frame).length,
       0,
     );
-    if (terminalBytes > 1_048_576) {
-      throw new DomainError("response_too_large", "Terminal SSE frame exceeds replay limit", 413);
-    }
     if (
-      request.frames.length + pending.length + (input.terminalFrame ? 1 : 0) > 10_000 ||
-      existingBytes + pendingBytes + terminalBytes > 16_777_216
+      request.frames.length + pending.length + terminalFragments.length >
+        API_SSE_REPLAY_REQUEST_MAX_EVENTS ||
+      existingBytes + pendingBytes + terminalBytes > API_SSE_REPLAY_REQUEST_MAX_BYTES
     ) throw new DomainError("response_too_large", "SSE replay exceeds storage limit", 413);
-    if (
-      aggregate.events + pending.length + (input.terminalFrame ? 1 : 0) > quota.maxEvents ||
+    if (request.replayReservedBytes > 0 || request.replayReservedEvents > 0) {
+      if (
+        request.frames.length + pending.length + terminalFragments.length >
+          request.replayReservedEvents ||
+        existingBytes + responseBytes + pendingBytes + terminalBytes >
+          request.replayReservedBytes
+      ) throw new DomainError("replay_quota_exceeded", "Reserved replay capacity exceeded", 429);
+    } else if (
+      aggregate.events + pending.length + terminalFragments.length > quota.maxEvents ||
       aggregate.bytes + responseBytes + pendingBytes + terminalBytes > quota.maxBytes
     ) throw new DomainError("replay_quota_exceeded", "User replay storage quota exceeded", 429);
     const run = this.usageRuns.get(request.usageRunId);
@@ -5793,12 +5899,14 @@ export class MemoryRepository {
       input.latencyMs,
     );
     request.frames.push(...pending);
-    if (stream && input.terminalFrame !== undefined) {
-      request.frames.push({
-        sequence: request.frames.length,
-        frame: input.terminalFrame,
-        createdAt: new Date().toISOString(),
-      });
+    if (stream) {
+      for (const frame of terminalFragments) {
+        request.frames.push({
+          sequence: request.frames.length,
+          frame,
+          createdAt: new Date().toISOString(),
+        });
+      }
     }
     request.state = "completed";
     request.leaseToken = null;
@@ -5832,13 +5940,58 @@ export class MemoryRepository {
       ) throw new DomainError("insufficient_credit", "Actual cost exceeds available credit", 402);
     }
     const failureStartedStream = request.frames.length > 0 || input.terminalFrame !== undefined;
+    const encoder = new TextEncoder();
+    const responseBytes = encoder.encode(input.responseBody).length;
+    if (responseBytes > API_SSE_REPLAY_REQUEST_MAX_BYTES) {
+      throw new DomainError("response_too_large", "Replay response exceeds storage limit", 413);
+    }
     if (input.terminalFrame !== undefined) {
-      this.appendApiSseFrame(
-        request.id,
-        input.leaseToken,
-        request.frames.length,
-        input.terminalFrame,
+      const fragments = splitApiSseReplayFrame(input.terminalFrame);
+      const currentBytes = request.frames.reduce(
+        (sum, item) => sum + encoder.encode(item.frame).length,
+        0,
       );
+      const fragmentBytes = fragments.reduce(
+        (sum, frame) => sum + encoder.encode(frame).length,
+        0,
+      );
+      const quota = this.#replayQuota(input.quota);
+      const aggregate = this.#replayTotals(request.userId);
+      if (
+        request.frames.length + fragments.length > API_SSE_REPLAY_REQUEST_MAX_EVENTS ||
+        currentBytes + fragmentBytes > API_SSE_REPLAY_REQUEST_MAX_BYTES
+      ) throw new DomainError("response_too_large", "SSE replay exceeds storage limit", 413);
+      if (request.replayReservedBytes > 0 || request.replayReservedEvents > 0) {
+        if (
+          request.frames.length + fragments.length > request.replayReservedEvents ||
+          currentBytes + responseBytes + fragmentBytes > request.replayReservedBytes
+        ) throw new DomainError("replay_quota_exceeded", "Reserved replay capacity exceeded", 429);
+      } else if (
+        aggregate.events + fragments.length > quota.maxEvents ||
+        aggregate.bytes + responseBytes + fragmentBytes > quota.maxBytes
+      ) throw new DomainError("replay_quota_exceeded", "User replay storage quota exceeded", 429);
+      for (const frame of fragments) {
+        request.frames.push({
+          sequence: request.frames.length,
+          frame,
+          createdAt: new Date().toISOString(),
+        });
+      }
+    } else {
+      const currentBytes = request.frames.reduce(
+        (sum, item) => sum + encoder.encode(item.frame).length,
+        0,
+      );
+      const quota = this.#replayQuota(input.quota);
+      const aggregate = this.#replayTotals(request.userId);
+      if (
+        (request.replayReservedBytes > 0 || request.replayReservedEvents > 0) &&
+        currentBytes + responseBytes > request.replayReservedBytes
+      ) throw new DomainError("replay_quota_exceeded", "Reserved replay capacity exceeded", 429);
+      if (
+        request.replayReservedBytes === 0 && request.replayReservedEvents === 0 &&
+        aggregate.bytes + responseBytes > quota.maxBytes
+      ) throw new DomainError("replay_quota_exceeded", "User replay storage quota exceeded", 429);
     }
     if (input.billing.mode === "refund") this.refund(request.usageRunId);
     else {
@@ -5862,7 +6015,8 @@ export class MemoryRepository {
     request.expiresAt = new Date(Date.now() + request.retentionSeconds * 1000).toISOString();
     return structuredClone(request);
   }
-  reapStaleApiRequests(limit = 100) {
+  reapStaleApiRequests(limit = 100, quotaInput?: ApiReplayQuota) {
+    const quota = this.#replayQuota(quotaInput);
     let count = 0;
     for (const request of this.apiIdempotencyRequests.values()) {
       if (count >= limit) break;
@@ -5874,15 +6028,6 @@ export class MemoryRepository {
         request.endpoint === "images.generations" &&
         [...this.generatedAssets.values()].some((asset) => asset.usageRunId === request.usageRunId)
       ) continue;
-      if (request.observedCostMicros > 0) {
-        this.settle(
-          request.usageRunId,
-          request.observedCostMicros,
-          request.observedInputTokens,
-          request.observedOutputTokens,
-          request.observedLatencyMs,
-        );
-      } else this.refund(request.usageRunId);
       for (const attempt of this.providerAttempts.values()) {
         if (attempt.usageRunId !== request.usageRunId || attempt.status !== "running") continue;
         attempt.status = "cancelled";
@@ -5893,24 +6038,45 @@ export class MemoryRepository {
         attempt.latencyMs = Math.max(0, Date.now() - Date.parse(attempt.startedAt));
         attempt.completedAt = new Date().toISOString();
       }
+      if (request.observedCostMicros > 0) {
+        this.settle(
+          request.usageRunId,
+          request.observedCostMicros,
+          request.observedInputTokens,
+          request.observedOutputTokens,
+          request.observedLatencyMs,
+        );
+        this.usageRuns.get(request.usageRunId)!.status = "failed";
+      } else this.refund(request.usageRunId);
       request.state = "failed";
-      request.responseStatus = 500;
-      request.responseBody = JSON.stringify({
-        error: {
-          message: "Request interrupted before completion",
-          type: "server_error",
-          code: "request_abandoned",
-        },
+      const encoder = new TextEncoder();
+      const aggregate = this.#replayTotals(request.userId);
+      const eventBytes = request.frames.reduce(
+        (sum, frame) => sum + encoder.encode(frame.frame).length,
+        0,
+      );
+      const recovery = planAbandonedApiReplay({
+        endpoint: request.endpoint,
+        eventCount: request.frames.length,
+        eventBytes,
+        replayReservedBytes: request.replayReservedBytes,
+        replayReservedEvents: request.replayReservedEvents,
+        aggregateBytes: aggregate.bytes,
+        aggregateEvents: aggregate.events,
+        quota,
       });
+      request.responseBody = recovery.responseBody;
       request.responseBodyEncoding = "utf8";
       request.failureStartedStream = request.frames.length > 0;
-      if (request.failureStartedStream) {
-        const frame = request.endpoint === "responses"
-          ? `event: error\ndata: ${request.responseBody}\n\n`
-          : `data: ${request.responseBody}\n\n`;
+      request.responseHeaders = {
+        "content-type": request.failureStartedStream ? "text/event-stream" : "application/json",
+        ...(request.failureStartedStream ? { "cache-control": "no-cache" } : {}),
+      };
+      request.responseStatus = request.failureStartedStream ? 200 : 500;
+      if (recovery.terminalFrame !== null) {
         request.frames.push({
           sequence: request.frames.length,
-          frame,
+          frame: recovery.terminalFrame,
           createdAt: new Date().toISOString(),
         });
       }
@@ -5970,7 +6136,7 @@ export class MemoryRepository {
     const user = this.users.get(userId);
     if (!user) throw new DomainError("not_found", "User not found", 404);
     const runs = [...this.usageRuns.values()].filter((r) =>
-      r.userId === userId && r.status === "completed"
+      r.userId === userId && (r.status === "completed" || r.costMicros > 0)
     );
     return {
       balanceMicros: user.balanceMicros,

@@ -106,6 +106,94 @@ Deno.test("Chat Completions preserves common SDK fields and tool-call history", 
   assertEquals(parsed.response_format, { type: "json_object" });
 });
 
+Deno.test("OpenAI schemas preserve explicit nullable SDK options", () => {
+  const chat = chatCompletionSchema.parse({
+    model: "openai/default",
+    messages: [{ role: "user", content: "hello" }],
+    temperature: null,
+    max_completion_tokens: null,
+    stop: null,
+  });
+  assertEquals(chat.temperature, undefined);
+  assertEquals(chat.max_completion_tokens, undefined);
+  assertEquals(chat.stop, undefined);
+  assertEquals(Object.hasOwn(chat, "temperature"), false);
+  assertEquals(Object.hasOwn(chat, "max_completion_tokens"), false);
+  assertEquals(Object.hasOwn(chat, "stop"), false);
+
+  const responses = responsesSchema.parse({
+    model: "openai/default",
+    input: "hello",
+    instructions: null,
+    stream: null,
+    stream_options: null,
+    temperature: null,
+    top_p: null,
+    parallel_tool_calls: null,
+    max_output_tokens: null,
+    reasoning: null,
+    store: null,
+  });
+  assertEquals(responses.instructions, undefined);
+  assertEquals(responses.stream, undefined);
+  assertEquals(responses.stream_options, undefined);
+  assertEquals(responses.temperature, undefined);
+  assertEquals(responses.top_p, undefined);
+  assertEquals(responses.parallel_tool_calls, undefined);
+  assertEquals(responses.max_output_tokens, undefined);
+  assertEquals(responses.reasoning, undefined);
+  assertEquals(responses.store, undefined);
+  for (
+    const field of [
+      "instructions",
+      "stream",
+      "stream_options",
+      "temperature",
+      "top_p",
+      "parallel_tool_calls",
+      "max_output_tokens",
+      "reasoning",
+      "store",
+    ]
+  ) assertEquals(Object.hasOwn(responses, field), false);
+  assertEquals(
+    responsesSchema.safeParse({ model: "openai/default", input: "hello", store: "false" })
+      .success,
+    false,
+  );
+});
+
+Deno.test("Responses schema bounds stream obfuscation options", () => {
+  const base = { model: "openai/default", input: "hello" };
+  assertEquals(
+    responsesSchema.parse({ ...base, stream_options: { include_obfuscation: false } })
+      .stream_options,
+    { include_obfuscation: false },
+  );
+  assertEquals(
+    responsesSchema.safeParse({ ...base, stream_options: { unknown: true } }).success,
+    false,
+  );
+});
+
+Deno.test("Responses metadata follows the bounded OpenAI string map contract", () => {
+  const base = { model: "openai/default", input: "hello" };
+  assertEquals(
+    responsesSchema.parse({ ...base, metadata: { trace: "request-1" } }).metadata,
+    { trace: "request-1" },
+  );
+  for (
+    const metadata of [
+      Object.fromEntries(Array.from({ length: 17 }, (_, index) => [`key-${index}`, "value"])),
+      { ["k".repeat(65)]: "value" },
+      { key: "v".repeat(513) },
+      { key: { nested: "not supported" } },
+    ]
+  ) {
+    assertEquals(responsesSchema.safeParse({ ...base, metadata }).success, false);
+  }
+});
+
 Deno.test("Responses accepts multimodal content items without stripping options", () => {
   const parsed = responsesSchema.parse({
     model: "openai/default",
@@ -149,6 +237,40 @@ Deno.test("Responses accepts bounded developer and function-call history items",
         call_id: "call_1",
         name: "x".repeat(129),
         arguments: "{}",
+      }],
+    }).success,
+    false,
+  );
+});
+
+Deno.test("Responses accepts bounded stateless reasoning and output history", () => {
+  const parsed = responsesSchema.parse({
+    model: "openai/default",
+    input: [
+      {
+        type: "reasoning",
+        id: "rs_1",
+        summary: [{ type: "summary_text", text: "Use the prior result" }],
+        encrypted_content: "opaque-state",
+        status: "completed",
+      },
+      {
+        type: "message",
+        id: "msg_1",
+        status: "completed",
+        role: "assistant",
+        content: [{ type: "output_text", text: "Prior answer" }],
+      },
+      { type: "message", role: "user", content: "Continue" },
+    ],
+  });
+  assertEquals(Array.isArray(parsed.input), true);
+  assertEquals(
+    responsesSchema.safeParse({
+      model: "openai/default",
+      input: [{
+        type: "reasoning",
+        summary: [{ type: "summary_text", text: "x".repeat(2_000_001) }],
       }],
     }).success,
     false,

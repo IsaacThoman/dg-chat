@@ -15,6 +15,7 @@ function cookie(response: Response): string {
 
 Deno.test("OpenAI gateway preserves public identity, visible stream billing, and Responses fields", async () => {
   const completedRequests: ChatCompletionRequest[] = [];
+  const streamedRequests: ChatCompletionRequest[] = [];
   const providerComplete = (request: ChatCompletionRequest) => {
     completedRequests.push(structuredClone(request));
     const prompt = JSON.stringify(request.messages);
@@ -90,7 +91,50 @@ Deno.test("OpenAI gateway preserves public identity, visible stream billing, and
     });
   };
   const providerStream = async function* (request: ChatCompletionRequest) {
+    streamedRequests.push(structuredClone(request));
     const prompt = JSON.stringify(request.messages);
+    if (prompt.includes("tool response")) {
+      yield JSON.stringify({
+        id: "private-tool-stream-id",
+        model: "private-tool-model",
+        object: "chat.completion.chunk",
+        secret_extension: "must-not-leak",
+        choices: [{
+          index: 0,
+          delta: {
+            reasoning_content: "checked policy",
+            reasoning_summary: "policy summary",
+            refusal: "policy refusal",
+            tool_calls: [{
+              index: 0,
+              id: "call_lookup",
+              type: "function",
+              function: { name: "lookup", arguments: '{"q":"' },
+            }],
+          },
+          finish_reason: null,
+        }],
+      });
+      yield JSON.stringify({
+        id: "private-tool-stream-id",
+        model: "private-tool-model",
+        object: "chat.completion.chunk",
+        choices: [{
+          index: 0,
+          delta: { tool_calls: [{ index: 0, function: { arguments: 'x"}' } }] },
+          finish_reason: "tool_calls",
+        }],
+        usage: {
+          prompt_tokens: 8,
+          completion_tokens: 14,
+          total_tokens: 22,
+          prompt_tokens_details: { cached_tokens: 2 },
+          completion_tokens_details: { reasoning_tokens: 4 },
+        },
+      });
+      yield "[DONE]";
+      return;
+    }
     if (prompt.includes("reasoning then fail")) {
       yield JSON.stringify({
         id: "upstream-reasoning-id",
@@ -108,6 +152,16 @@ Deno.test("OpenAI gateway preserves public identity, visible stream billing, and
         choices: [{ index: 0, delta: { refusal: "visible refusal" } }],
       });
       throw new Error("provider failed after refusal");
+    }
+    if (prompt.includes("usage then fail")) {
+      yield JSON.stringify({
+        id: "upstream-usage-id",
+        model: "fallback/usage-model",
+        object: "chat.completion.chunk",
+        choices: [],
+        usage: { prompt_tokens: 8, completion_tokens: 3, total_tokens: 11 },
+      });
+      throw new Error("provider failed after reporting usage");
     }
     yield JSON.stringify({
       id: "upstream-stream-id",
@@ -197,6 +251,7 @@ Deno.test("OpenAI gateway preserves public identity, visible stream billing, and
   assertEquals(JSON.stringify(streamPayloads).includes("fallback/stream-model"), false);
   assertEquals(JSON.stringify(streamPayloads).includes("upstream-stream-id"), false);
   assertEquals(JSON.stringify(streamPayloads).includes("must-not-leak"), false);
+  assertEquals(streamedRequests.at(-1)?.stream_options?.include_usage, true);
 
   for (const prompt of ["reasoning then fail", "refusal then fail"]) {
     const before = await repository.usage(me.user.id);
@@ -220,6 +275,28 @@ Deno.test("OpenAI gateway preserves public identity, visible stream billing, and
     assertEquals(after.balanceMicros < before.balanceMicros, true);
   }
 
+  const beforeUsageFailure = await repository.usage(me.user.id);
+  const usageFailure = await app.request("/v1/responses", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model: "openai/default",
+      input: "usage then fail",
+      stream: true,
+    }),
+  });
+  const usageFailureEvents = (await usageFailure.text()).split("\n").filter((line) =>
+    line.startsWith("data: {")
+  ).map((line) => JSON.parse(line.slice(6)));
+  const usageFailureError = usageFailureEvents.at(-1);
+  assertEquals(usageFailureError.type, "error");
+  assertEquals(usageFailureError.param, null);
+  const afterUsageFailure = await repository.usage(me.user.id);
+  assertEquals(afterUsageFailure.calls, beforeUsageFailure.calls + 1);
+  assertEquals(afterUsageFailure.inputTokens, beforeUsageFailure.inputTokens + 8);
+  assertEquals(afterUsageFailure.outputTokens, beforeUsageFailure.outputTokens + 3);
+  assertEquals(afterUsageFailure.spentMicros > beforeUsageFailure.spentMicros, true);
+
   const supported = await app.request("/v1/responses", {
     method: "POST",
     headers,
@@ -236,6 +313,7 @@ Deno.test("OpenAI gateway preserves public identity, visible stream billing, and
       tools: [{ type: "function", name: "lookup", parameters: { type: "object" } }],
       tool_choice: { type: "function", name: "lookup" },
       reasoning: { effort: "medium", summary: "none" },
+      metadata: { trace: "chat-provider" },
     }),
   });
   assertEquals(supported.status, 200);
@@ -253,6 +331,8 @@ Deno.test("OpenAI gateway preserves public identity, visible stream billing, and
   }]);
   assertEquals(converted.reasoning_effort, "medium");
   const supportedBody = await json(supported);
+  assertEquals(supportedBody.store, false);
+  assertEquals(supportedBody.metadata, { trace: "chat-provider" });
   const citedText = supportedBody.output.flatMap(
     (item: { content?: Array<Record<string, unknown>> }) => item.content ?? [],
   ).find((part: { type?: string }) => part.type === "output_text");
@@ -306,6 +386,7 @@ Deno.test("OpenAI gateway preserves public identity, visible stream billing, and
   assertEquals(richResponse.status, 200);
   const richBody = await json(richResponse);
   assertEquals(JSON.stringify(richBody).includes("must-not-leak"), false);
+  assertEquals(richBody.store, false);
   assertEquals(
     richBody.output.some((item: { type: string }) => item.type === "function_call"),
     true,
@@ -327,6 +408,14 @@ Deno.test("OpenAI gateway preserves public identity, visible stream billing, and
   const richEvents = (await richStream.text()).split("\n").filter((line) =>
     line.startsWith("data: {")
   ).map((line) => JSON.parse(line.slice(6)));
+  assertEquals(
+    richEvents.map((event, index) => event.sequence_number === index).every(Boolean),
+    true,
+  );
+  assertEquals(richEvents.slice(0, 2).map((event) => event.type), [
+    "response.created",
+    "response.in_progress",
+  ]);
   const added = richEvents.filter((event) => event.type === "response.output_item.added");
   for (const event of added) {
     assertEquals(event.item.status, "in_progress");
@@ -359,6 +448,19 @@ Deno.test("OpenAI gateway preserves public identity, visible stream billing, and
 
   const callsBeforeUnsupported = completedRequests.length;
   const usageBeforeUnsupported = await repository.usage(me.user.id);
+  const stored = await app.request("/v1/responses", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model: "openai/default",
+      input: "do not claim unsupported storage",
+      store: true,
+    }),
+  });
+  assertEquals(stored.status, 400);
+  assertEquals((await json(stored)).error.code, "unsupported_parameter");
+  assertEquals(completedRequests.length, callsBeforeUnsupported);
+  assertEquals(await repository.usage(me.user.id), usageBeforeUnsupported);
   const unsupported = await app.request("/v1/responses", {
     method: "POST",
     headers,

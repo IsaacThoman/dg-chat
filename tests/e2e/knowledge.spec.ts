@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { strToU8, zipSync } from "fflate";
 import { Buffer } from "node:buffer";
-import { apiURL, bootstrap, createChat, login } from "./helpers.ts";
+import { apiURL, bootstrap, createChat, login, openSidebar } from "./helpers.ts";
 
 const DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 
@@ -48,13 +48,6 @@ test.beforeEach(async ({ page, request }) => {
   await login(page);
   await createChat(page);
 });
-
-async function openSidebar(page: import("@playwright/test").Page) {
-  if ((page.viewportSize()?.width ?? 1280) <= 800) {
-    if (await page.getByRole("dialog", { name: "Workspace navigation" }).isVisible()) return;
-    await page.getByRole("button", { name: "Open menu", exact: true }).click();
-  }
-}
 
 const workspaceNavigation = (page: import("@playwright/test").Page) =>
   page.getByLabel("Workspace navigation", { exact: true });

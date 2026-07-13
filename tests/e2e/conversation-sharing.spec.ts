@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { bootstrap, createChat, login } from "./helpers.ts";
+import { bootstrap, createChat, login, openSidebar } from "./helpers.ts";
 
 const capability = "a".repeat(43);
 const createdAt = "2026-07-13T04:00:00.000Z";
@@ -23,15 +23,6 @@ test.beforeEach(async ({ page, request }) => {
   await bootstrap(request);
   await login(page);
 });
-
-async function openSidebar(page: import("@playwright/test").Page) {
-  if ((page.viewportSize()?.width ?? 1280) > 800) return;
-  const sidebar = page.getByRole("dialog", { name: "Workspace navigation" });
-  if (await sidebar.isVisible()) return;
-  const menu = page.getByRole("button", { name: "Open menu", exact: true });
-  if (await menu.isVisible()) await menu.click();
-  await expect(sidebar).toBeVisible();
-}
 
 test("creates and revokes an immutable snapshot with conservative defaults", async ({ page }) => {
   await createChat(page);
@@ -218,10 +209,7 @@ test("real stack pins a snapshot and revocation invalidates its public link", as
   await page.getByRole("button", { name: "Move to trash", exact: true }).click();
   await openSidebar(page);
   await page.getByRole("button", { name: "Trash", exact: true }).click();
-  if ((page.viewportSize()?.width ?? 1280) <= 800) {
-    await expect(page.getByRole("dialog", { name: "Workspace navigation" })).toBeHidden();
-    await openSidebar(page);
-  }
+  await openSidebar(page);
   await expect(actions).toBeVisible();
   await actions.locator("..").locator(".conversation-open").click();
   await expect(

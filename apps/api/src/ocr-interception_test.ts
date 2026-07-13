@@ -20,6 +20,50 @@ const png = (width = 1, height = 1) => {
   return bytes;
 };
 const data = (bytes = png()) => `data:image/png;base64,${btoa(String.fromCharCode(...bytes))}`;
+const inline = (mime: string, bytes: Uint8Array) =>
+  `data:${mime};base64,${btoa(String.fromCharCode(...bytes))}`;
+const gif = (frames = 1) => {
+  const bytes = [
+    ...new TextEncoder().encode("GIF89a"),
+    1,
+    0,
+    1,
+    0,
+    0,
+    0,
+    0,
+  ];
+  for (let index = 0; index < frames; index++) {
+    bytes.push(
+      0x2c,
+      0,
+      0,
+      0,
+      0,
+      1,
+      0,
+      1,
+      0,
+      0,
+      2,
+      2,
+      0x4c,
+      0x01,
+      0,
+    );
+  }
+  bytes.push(0x3b);
+  return new Uint8Array(bytes);
+};
+const animatedWebp = () => {
+  const bytes = new Uint8Array(30);
+  bytes.set(new TextEncoder().encode("RIFF"), 0);
+  new DataView(bytes.buffer).setUint32(4, 22, true);
+  bytes.set(new TextEncoder().encode("WEBPVP8X"), 8);
+  new DataView(bytes.buffer).setUint32(16, 10, true);
+  bytes[20] = 0x02;
+  return bytes;
+};
 const request = (url = data()): ChatCompletionRequest => ({
   model: "visionless",
   messages: [{
@@ -146,11 +190,99 @@ Deno.test("OCR cache expires and prompt changes invalidate its hashed key", asyn
   assertEquals(calls, 3);
 });
 
+Deno.test("OCR cache is isolated by user and invalidated by provider execution revisions", async () => {
+  const cache = new MemoryOcrCache();
+  let calls = 0;
+  const recognize = () => Promise.resolve(String(++calls));
+  const scope = {
+    userId: "user-a",
+    providerVersion: 2,
+    credentialUpdatedAt: "2026-07-13T00:00:00.000Z",
+    modelVersion: 3,
+    upstreamModelId: "vision-v1",
+  };
+  const run = (cacheScope: typeof scope) =>
+    interceptOcrImages(
+      request(),
+      config,
+      { cache, recognize, cacheScope },
+      new AbortController().signal,
+    );
+  await run(scope);
+  await run(scope);
+  assertEquals(calls, 1);
+  await run({ ...scope, userId: "user-b" });
+  await run({ ...scope, providerVersion: 3 });
+  await run({ ...scope, credentialUpdatedAt: "2026-07-13T01:00:00.000Z" });
+  await run({ ...scope, modelVersion: 4 });
+  await run({ ...scope, upstreamModelId: "vision-v2" });
+  assertEquals(calls, 6);
+});
+
+Deno.test("memory OCR cache eagerly expires entries and evicts least-recently-used values", async () => {
+  let now = 0;
+  const cache = new MemoryOcrCache(() => now, { maxEntries: 2, maxBytes: 6 });
+  await cache.set("one", "111", 10);
+  await cache.set("two", "22", 10);
+  assertEquals(await cache.get("one"), "111");
+  await cache.set("three", "3", 10);
+  assertEquals(await cache.get("two"), null);
+  assertEquals(await cache.get("one"), "111");
+  assertEquals(await cache.get("three"), "3");
+
+  now = 10_001;
+  await cache.set("four", "4444", 10);
+  assertEquals(await cache.get("one"), null);
+  assertEquals(await cache.get("three"), null);
+  assertEquals(await cache.get("four"), "4444");
+  assertThrows(() => cache.set("oversized", "1234567", 10), TypeError, "safe bounds");
+});
+
+Deno.test("OCR rejects animated GIF and WebP images before recognition", async () => {
+  let recognitions = 0;
+  const dependencies = {
+    cache: new MemoryOcrCache(),
+    recognize: () => {
+      recognitions++;
+      return Promise.resolve("text");
+    },
+  };
+  const staticResult = await interceptOcrImages(
+    request(inline("image/gif", gif())),
+    config,
+    dependencies,
+    new AbortController().signal,
+  );
+  assertEquals(staticResult.messages[0].content?.[1], {
+    type: "text",
+    text: "[OCR image 1.2]\ntext",
+  });
+  for (
+    const [value, message] of [
+      [inline("image/gif", gif(2)), "Animated GIF"],
+      [inline("image/webp", animatedWebp()), "Animated WebP"],
+    ] as const
+  ) {
+    await assertRejects(
+      () =>
+        interceptOcrImages(
+          request(value),
+          config,
+          dependencies,
+          new AbortController().signal,
+        ),
+      OcrInterceptionError,
+      message,
+    );
+  }
+  assertEquals(recognitions, 1);
+});
+
 Deno.test("OCR rejects MIME confusion, oversized dimensions, and private targets with context", async () => {
   const dependencies = { cache: new MemoryOcrCache(), recognize: () => Promise.resolve("x") };
   for (
     const [input, detail] of [
-      [data(new Uint8Array([71, 73, 70, 56, 57, 97, 1, 0, 1, 0])), "declared MIME"],
+      [data(gif()), "declared MIME"],
       [data(png(11, 1)), "dimensions"],
       ["https://127.0.0.1/secret.png", "private"],
     ] as const
@@ -201,6 +333,41 @@ Deno.test("OCR remote fetch enforces redirect, MIME, and streamed byte limits", 
       detail,
     );
   }
+});
+
+Deno.test("OCR cancels rejected remote response bodies", async () => {
+  let cancellations = 0;
+  const rejectedResponse = (
+    mode: "status" | "mime" | "length",
+  ) =>
+    new Response(
+      new ReadableStream<Uint8Array>({
+        pull() {},
+        cancel() {
+          cancellations++;
+        },
+      }),
+      {
+        status: mode === "status" ? 500 : 200,
+        headers: mode === "mime"
+          ? { "content-type": "text/html" }
+          : mode === "length"
+          ? { "content-type": "image/png", "content-length": "1025" }
+          : { "content-type": "image/png" },
+      },
+    );
+  for (const mode of ["status", "mime", "length"] as const) {
+    await assertRejects(
+      () =>
+        interceptOcrImages(request("https://example.test/a.png"), config, {
+          cache: new MemoryOcrCache(),
+          recognize: () => Promise.resolve("must not run"),
+          fetch: () => Promise.resolve(rejectedResponse(mode)),
+        }, new AbortController().signal),
+      OcrInterceptionError,
+    );
+  }
+  assertEquals(cancellations, 3);
 });
 
 Deno.test("OCR uses one deadline across fetch and provider recognition", async () => {

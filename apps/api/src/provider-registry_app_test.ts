@@ -84,7 +84,7 @@ Deno.test("admin provider registry protects credentials and powers dynamic OpenA
     origin: "http://localhost:5173",
     "content-type": "application/json",
   };
-  const unsupportedProtocol = await app.request("/api/admin/providers", {
+  const responsesProvider = await app.request("/api/admin/providers", {
     method: "POST",
     headers,
     body: JSON.stringify({
@@ -94,7 +94,8 @@ Deno.test("admin provider registry protects credentials and powers dynamic OpenA
       protocol: "responses",
     }),
   });
-  assertEquals(unsupportedProtocol.status, 422);
+  assertEquals(responsesProvider.status, 201);
+  assertEquals((await body(responsesProvider)).protocol, "responses");
   const reservedProvider = await app.request("/api/admin/providers", {
     method: "POST",
     headers,
@@ -303,12 +304,266 @@ Deno.test("admin provider registry protects credentials and powers dynamic OpenA
   const listedJson = JSON.stringify(listed);
   assertEquals(listedJson.includes(secret), false);
   assertEquals(listedJson.includes("ciphertext"), false);
-  assertEquals(listed.data[0].modelCount, 1);
+  assertEquals(listed.data.find((item: { slug: string }) => item.slug === "vendor")?.modelCount, 1);
   assertEquals(
     (await repository.listAudit()).data.some((event) =>
       event.action === "provider.credential_replaced"
     ),
     true,
+  );
+});
+
+Deno.test("model OCR configuration requires an available non-recursive vision target", async () => {
+  const keyring = new ProviderSecretKeyring({
+    primaryKeyId: "test",
+    keys: new Map([["test", new Uint8Array(32).fill(6)]]),
+  });
+  const { app } = createApp({
+    setupToken: "ocr-registry-setup",
+    providerKeyring: keyring,
+  });
+  await app.request("/api/setup/bootstrap", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-setup-token": "ocr-registry-setup" },
+    body: JSON.stringify({
+      email: "ocr-admin@example.com",
+      name: "OCR Admin",
+      password: "correct horse battery staple",
+    }),
+  });
+  const login = await app.request("/api/auth/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email: "ocr-admin@example.com",
+      password: "correct horse battery staple",
+    }),
+  });
+  const headers = {
+    cookie: cookie(login),
+    origin: "http://localhost:5173",
+    "content-type": "application/json",
+  };
+  const provider = await body(
+    await app.request("/api/admin/providers", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        slug: "ocr-vendor",
+        displayName: "OCR Vendor",
+        baseUrl: "https://ocr.example/v1",
+        protocol: "chat_completions",
+      }),
+    }),
+  );
+  const credentialed = await body(
+    await app.request(`/api/admin/providers/${provider.id}/credential`, {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({ expectedVersion: provider.version, credential: "ocr-secret" }),
+    }),
+  );
+  const createModel = async (id: string, capabilities: string[]) =>
+    await body(
+      await app.request("/api/admin/models", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          providerId: provider.id,
+          publicModelId: `ocr-vendor/${id}`,
+          upstreamModelId: id,
+          displayName: id,
+          capabilities,
+          contextWindow: 16_384,
+        }),
+      }),
+    );
+  const vision = await createModel("vision", ["chat", "vision"]);
+  const unpricedVision = await createModel("unpriced", ["chat", "vision"]);
+  const secondVision = await createModel("second-vision", ["chat", "vision"]);
+  const visionOnly = await createModel("vision-only", ["vision"]);
+  assertEquals(
+    (await app.request(`/api/admin/models/${vision.id}/prices`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        providerModelId: vision.id,
+        expectedModelVersion: vision.version,
+        effectiveAt: new Date(Date.now() - 1_000).toISOString(),
+        inputMicrosPerMillion: 1,
+        cachedInputMicrosPerMillion: 1,
+        reasoningMicrosPerMillion: 1,
+        outputMicrosPerMillion: 1,
+        fixedCallMicros: 0,
+        source: "test",
+      }),
+    })).status,
+    201,
+  );
+  assertEquals(
+    (await app.request(`/api/admin/models/${visionOnly.id}/prices`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        providerModelId: visionOnly.id,
+        expectedModelVersion: visionOnly.version,
+        effectiveAt: new Date(Date.now() - 1_000).toISOString(),
+        inputMicrosPerMillion: 1,
+        cachedInputMicrosPerMillion: 1,
+        reasoningMicrosPerMillion: 1,
+        outputMicrosPerMillion: 1,
+        fixedCallMicros: 0,
+        source: "test",
+      }),
+    })).status,
+    201,
+  );
+  assertEquals(
+    (await app.request(`/api/admin/models/${secondVision.id}/prices`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        providerModelId: secondVision.id,
+        expectedModelVersion: secondVision.version,
+        effectiveAt: new Date(Date.now() - 1_000).toISOString(),
+        inputMicrosPerMillion: 1,
+        cachedInputMicrosPerMillion: 1,
+        reasoningMicrosPerMillion: 1,
+        outputMicrosPerMillion: 1,
+        fixedCallMicros: 0,
+        source: "test",
+      }),
+    })).status,
+    201,
+  );
+  const ocr = (model: string) => ({
+    enabled: true,
+    providerId: provider.id,
+    model,
+    prompt: "Extract all visible text.",
+  });
+  const unavailable = await app.request("/api/admin/models", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      providerId: provider.id,
+      publicModelId: "ocr-vendor/unavailable-source",
+      upstreamModelId: "unavailable-source",
+      displayName: "Unavailable source",
+      capabilities: ["chat"],
+      contextWindow: 16_384,
+      customParams: { ocr: ocr(unpricedVision.id) },
+    }),
+  });
+  assertEquals(unavailable.status, 409);
+  const incapable = await app.request("/api/admin/models", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      providerId: provider.id,
+      publicModelId: "ocr-vendor/incapable-source",
+      upstreamModelId: "incapable-source",
+      displayName: "Incapable source",
+      capabilities: ["chat"],
+      contextWindow: 16_384,
+      customParams: { ocr: ocr(visionOnly.id) },
+    }),
+  });
+  assertEquals(incapable.status, 422);
+  assertEquals((await body(incapable)).error.code, "ocr_target_invalid");
+
+  const sourceResponse = await app.request("/api/admin/models", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      providerId: provider.id,
+      publicModelId: "ocr-vendor/source",
+      upstreamModelId: "source",
+      displayName: "OCR source",
+      capabilities: ["chat", "vision"],
+      contextWindow: 16_384,
+      customParams: { ocr: ocr(vision.id) },
+    }),
+  });
+  assertEquals(sourceResponse.status, 201, await sourceResponse.clone().text());
+  const source = await body(sourceResponse);
+  const recursive = await app.request(`/api/admin/models/${source.id}`, {
+    method: "PATCH",
+    headers,
+    body: JSON.stringify({
+      expectedVersion: source.version,
+      customParams: { ocr: ocr(source.id) },
+    }),
+  });
+  assertEquals(recursive.status, 422);
+  assertEquals((await body(recursive)).error.code, "ocr_target_recursive");
+
+  const listed = await body(await app.request("/api/admin/models", { headers }));
+  const currentVision = listed.data.find((item: { id: string }) => item.id === vision.id);
+  const referencedTarget = await app.request(`/api/admin/models/${vision.id}`, {
+    method: "PATCH",
+    headers,
+    body: JSON.stringify({
+      expectedVersion: currentVision.version,
+      customParams: { ocr: ocr(secondVision.id) },
+    }),
+  });
+  assertEquals(referencedTarget.status, 422);
+  assertEquals((await body(referencedTarget)).error.code, "ocr_target_recursive");
+
+  const disableTarget = await app.request(`/api/admin/models/${vision.id}`, {
+    method: "PATCH",
+    headers,
+    body: JSON.stringify({ expectedVersion: currentVision.version, enabled: false }),
+  });
+  assertEquals(disableTarget.status, 422);
+  assertEquals((await body(disableTarget)).error.code, "ocr_target_unavailable");
+
+  const disableProvider = await app.request(`/api/admin/providers/${provider.id}`, {
+    method: "PATCH",
+    headers,
+    body: JSON.stringify({ expectedVersion: credentialed.version, enabled: false }),
+  });
+  assertEquals(disableProvider.status, 409);
+  assertEquals((await body(disableProvider)).error.code, "ocr_target_unavailable");
+
+  const stopModel = await app.request("/api/admin/models", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      providerId: provider.id,
+      publicModelId: "ocr-vendor/chat-defaults",
+      upstreamModelId: "chat-defaults",
+      displayName: "Chat defaults",
+      capabilities: ["chat"],
+      contextWindow: 16_384,
+      customParams: { stop: "END" },
+    }),
+  });
+  assertEquals(stopModel.status, 201);
+  const incompatibleSwitch = await app.request(`/api/admin/providers/${provider.id}`, {
+    method: "PATCH",
+    headers,
+    body: JSON.stringify({ expectedVersion: credentialed.version, protocol: "responses" }),
+  });
+  assertEquals(incompatibleSwitch.status, 422);
+  assertEquals((await body(incompatibleSwitch)).error.code, "provider_defaults_incompatible");
+
+  const disabledSource = await app.request(`/api/admin/models/${source.id}`, {
+    method: "PATCH",
+    headers,
+    body: JSON.stringify({ expectedVersion: source.version, enabled: false }),
+  });
+  assertEquals(disabledSource.status, 200, await disabledSource.clone().text());
+  const providerDisabledAfterSource = await app.request(`/api/admin/providers/${provider.id}`, {
+    method: "PATCH",
+    headers,
+    body: JSON.stringify({ expectedVersion: credentialed.version, enabled: false }),
+  });
+  assertEquals(
+    providerDisabledAfterSource.status,
+    200,
+    await providerDisabledAfterSource.clone().text(),
   );
 });
 

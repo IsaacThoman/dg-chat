@@ -644,7 +644,9 @@ Deno.test({
       });
       if (api.kind !== "started") throw new Error("API request did not start");
       await sql`UPDATE usage_runs SET execution_epoch=1 WHERE id=${api.usageRun.id}`;
-      await sql`UPDATE api_idempotency_requests SET lease_expires_at=now()-interval '1 second'
+      await sql`UPDATE api_idempotency_requests SET lease_expires_at=now()-interval '1 second',
+        observed_cost_micros=25,observed_input_tokens=5,observed_output_tokens=2,
+        observed_latency_ms=10
         WHERE id=${api.request.id}`;
       await insertUncertainAttempt(api.usageRun.id);
       const apiBalanceBefore = await sql<
@@ -658,11 +660,31 @@ Deno.test({
         { balance: string }[]
       >`SELECT balance_micros::text balance FROM users WHERE id=${user.id}`;
       const apiAttempts = await sql<
-        { status: string; error_code: string | null }[]
-      >`SELECT status,error_code FROM provider_attempts WHERE usage_run_id=${api.usageRun.id}`;
-      assertEquals([...apiRun], [{ status: "failed", cost: "0" }]);
-      assertEquals(Number(apiBalanceAfter[0].balance), Number(apiBalanceBefore[0].balance) + 100);
-      assertEquals([...apiAttempts], [{ status: "cancelled", error_code: "api_lease_expired" }]);
+        { status: string; error_code: string | null; retryable: boolean }[]
+      >`SELECT status,error_code,retryable FROM provider_attempts
+        WHERE usage_run_id=${api.usageRun.id}`;
+      assertEquals([...apiRun], [{ status: "failed", cost: "25" }]);
+      assertEquals(Number(apiBalanceAfter[0].balance), Number(apiBalanceBefore[0].balance) + 75);
+      assertEquals([...apiAttempts], [{
+        status: "cancelled",
+        error_code: "api_lease_expired",
+        retryable: true,
+      }]);
+      assertEquals(await repo.usage(user.id), {
+        balanceMicros: Number(apiBalanceAfter[0].balance),
+        calls: 3,
+        inputTokens: 104,
+        outputTokens: 11,
+        spentMicros: 126,
+      });
+      const analytics = await repo.adminAnalytics({
+        from: new Date(Date.now() - 60_000).toISOString(),
+        to: new Date(Date.now() + 60_000).toISOString(),
+        bucket: "hour",
+        userId: user.id,
+      });
+      assertEquals(analytics.summary.completed, 2);
+      assertEquals(analytics.summary.failed, 3);
 
       const conversation = await repo.createConversation(user.id, "Uncertain generation");
       const generation = await repo.beginGeneration({
@@ -1088,6 +1110,155 @@ Deno.test({
         latencyMs: 8,
       });
       assertEquals(terminal.frames.length, 3);
+      const largeTerminal = `event: response.completed\ndata: ${
+        JSON.stringify({ text: `${"\u0000".repeat(200_000)}${"🦖".repeat(80_000)}` })
+      }\n\n`;
+      const chunkedReplay = await repo.beginApiRequest({
+        ...replayInput,
+        idempotencyKey: "postgres-replay-chunked",
+        requestHash: "9".repeat(64),
+        runId: "postgres-replay-chunked-run",
+      });
+      if (chunkedReplay.kind !== "started") throw new Error("missing chunked replay request");
+      const chunkedTerminal = await repo.completeApiStream({
+        id: chunkedReplay.request.id,
+        leaseToken: chunkedReplay.leaseToken,
+        responseStatus: 200,
+        terminalFrame: largeTerminal,
+        costMicros: 20_000,
+        inputTokens: 4,
+        outputTokens: 2,
+        latencyMs: 8,
+      });
+      assertEquals(chunkedTerminal.frames.length > 1, true);
+      assertEquals(chunkedTerminal.frames.map((frame) => frame.frame).join(""), largeTerminal);
+      assertEquals(
+        chunkedTerminal.frames.every((frame) =>
+          new TextEncoder().encode(frame.frame).length <= 1_048_576
+        ),
+        true,
+      );
+      const replayReservationUser = await repo.createUser({
+        email: "replay-reservation@database.test",
+        name: "Replay reservation",
+        passwordHash: "hash",
+        emailVerified: true,
+      });
+      await repo.approveUser(replayReservationUser.id, "approved", 1_000_000);
+      const reservationQuota = { maxRequests: 10, maxEvents: 20_000, maxBytes: 67_108_864 };
+      await assertRejects(
+        () =>
+          repo.beginApiRequest({
+            userId: replayReservationUser.id,
+            endpoint: "responses",
+            idempotencyKey: "postgres-invalid-replay-reservation",
+            requestHash: "e".repeat(64),
+            stream: true,
+            model: "test/model",
+            runId: "postgres-invalid-replay-reservation-run",
+            reserveMicros: 1,
+            provider: "test",
+            quota: reservationQuota,
+            replayReservedBytes: 0,
+            replayReservedEvents: 1,
+          }),
+        DomainError,
+        "Invalid idempotent request parameters",
+      );
+      const reservationStarts = await Promise.allSettled(
+        ["a", "b"].map((suffix) =>
+          repo.beginApiRequest({
+            userId: replayReservationUser.id,
+            endpoint: "responses",
+            idempotencyKey: `postgres-replay-reservation-${suffix}`,
+            requestHash: suffix.repeat(64),
+            stream: true,
+            model: "test/model",
+            runId: `postgres-replay-reservation-run-${suffix}`,
+            reserveMicros: 1,
+            provider: "test",
+            quota: reservationQuota,
+            replayReservedBytes: 40_000_000,
+            replayReservedEvents: 9_000,
+          })
+        ),
+      );
+      assertEquals(
+        reservationStarts.map((result) => result.status).sort(),
+        ["fulfilled", "rejected"],
+      );
+      const failureReservation = await repo.beginApiRequest({
+        userId: replayReservationUser.id,
+        endpoint: "responses",
+        idempotencyKey: "postgres-failure-reservation",
+        requestHash: "f".repeat(64),
+        stream: true,
+        model: "test/model",
+        runId: "postgres-failure-reservation-run",
+        reserveMicros: 1,
+        provider: "test",
+        quota: reservationQuota,
+        replayReservedBytes: 16,
+        replayReservedEvents: 1,
+      });
+      if (failureReservation.kind !== "started") {
+        throw new Error("missing failure reservation request");
+      }
+      await assertRejects(
+        () =>
+          repo.failApiRequest({
+            id: failureReservation.request.id,
+            leaseToken: failureReservation.leaseToken,
+            responseStatus: 500,
+            responseBody: '{"error":"provider failed"}',
+            terminalFrame: "event: response.failed\ndata: {}\n\n",
+            billing: { mode: "refund" },
+          }),
+        DomainError,
+        "Reserved replay capacity",
+      );
+      const failureReservationState = await repo.getApiRequest(
+        replayReservationUser.id,
+        "responses",
+        "postgres-failure-reservation",
+      );
+      assertEquals(failureReservationState?.state, "in_progress");
+      assertEquals(failureReservationState?.frames, []);
+      const failureQuotaUser = await repo.createUser({
+        email: "failure-quota@database.test",
+        name: "Failure quota",
+        passwordHash: "hash",
+        emailVerified: true,
+      });
+      await repo.approveUser(failureQuotaUser.id, "approved", 1_000_000);
+      const failureQuotaRequest = await repo.beginApiRequest({
+        userId: failureQuotaUser.id,
+        endpoint: "chat.completions",
+        idempotencyKey: "postgres-failure-custom-quota",
+        requestHash: "a".repeat(64),
+        stream: false,
+        model: "test/model",
+        runId: "postgres-failure-custom-quota-run",
+        reserveMicros: 1,
+        provider: "test",
+        quota: { maxRequests: 10, maxEvents: 10, maxBytes: 100 },
+      });
+      if (failureQuotaRequest.kind !== "started") {
+        throw new Error("missing custom failure quota request");
+      }
+      await assertRejects(
+        () =>
+          repo.failApiRequest({
+            id: failureQuotaRequest.request.id,
+            leaseToken: failureQuotaRequest.leaseToken,
+            responseStatus: 500,
+            responseBody: "x".repeat(101),
+            quota: { maxRequests: 10, maxEvents: 10, maxBytes: 100 },
+            billing: { mode: "refund" },
+          }),
+        DomainError,
+        "User replay storage quota exceeded",
+      );
       const mutate = postgres(databaseUrl!, { max: 1 });
 
       const atomicRejected = await repo.beginApiRequest({
@@ -1144,7 +1315,7 @@ Deno.test({
       });
       const replayed = await repo.beginApiRequest(replayInput);
       assertEquals(replayed.kind, "completed");
-      assertEquals((await repo.usage(applicant.id)).balanceMicros, 945_000);
+      assertEquals((await repo.usage(applicant.id)).balanceMicros, 925_000);
       await assertRejects(
         () => repo.beginApiRequest({ ...replayInput, requestHash: "d".repeat(64) }),
         DomainError,
@@ -1296,9 +1467,32 @@ Deno.test({
           ciphertext: "Y2lwaGVy",
         },
       }, { actorId: actor.id, action: "provider.credential" });
-      const makeModel = async (name: string) => {
+      const responsesProvider = await repo.createProvider({
+        slug: "resilience-responses",
+        displayName: "Resilience Responses",
+        baseUrl: "https://responses-resilience.database.test/v1",
+        protocol: "responses",
+      }, { actorId: actor.id, action: "provider.create" });
+      const credentialedResponses = await repo.setProviderCredential(
+        responsesProvider.id,
+        responsesProvider.version,
+        {
+          envelope: {
+            version: 1,
+            algorithm: "AES-256-GCM",
+            keyId: "test",
+            credentialVersion: 1,
+            wrappedKeyNonce: "bm9uY2U=",
+            wrappedKey: "d3JhcA==",
+            contentNonce: "bm9uY2U=",
+            ciphertext: "Y2lwaGVy",
+          },
+        },
+        { actorId: actor.id, action: "provider.credential" },
+      );
+      const makeModel = async (name: string, targetProvider = credentialed) => {
         const model = await repo.createProviderModel({
-          providerId: provider.id,
+          providerId: targetProvider.id,
           publicModelId: `resilience/${name}`,
           upstreamModelId: name,
           displayName: name,
@@ -1318,7 +1512,9 @@ Deno.test({
         }, { actorId: actor.id, action: "price.create" });
         return { model: (await repo.findProviderModel(model.id))!, price };
       };
-      const a = await makeModel("a"), b = await makeModel("b"), c = await makeModel("c");
+      const a = await makeModel("a"),
+        b = await makeModel("b"),
+        c = await makeModel("c", credentialedResponses);
       const routeA = await repo.setProviderModelRoute({
         sourceModelId: a.model.id,
         expectedVersion: 0,
@@ -1642,6 +1838,306 @@ Deno.test({
       assertEquals((await repo.findProvider(disabled.id))?.displayName, "Database Provider");
     } finally {
       await repo.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "Postgres provider registry honors the exact test-only HTTP host exception",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const previousEnvironment = Deno.env.get("DENO_ENV");
+    const previousHost = Deno.env.get("OPENAI_TEST_ALLOW_HTTP_HOST");
+    const sql = postgres(databaseUrl!, { max: 1 });
+    await sql`TRUNCATE providers, audit_events, users RESTART IDENTITY CASCADE`;
+    await sql.end();
+    const repo = await PostgresRepository.connect(databaseUrl!);
+    try {
+      Deno.env.set("DENO_ENV", "test");
+      Deno.env.set("OPENAI_TEST_ALLOW_HTTP_HOST", "mock-provider");
+      const actor = await repo.bootstrapAdmin({
+        email: "provider-http@database.test",
+        name: "Provider HTTP",
+        passwordHash: "hash",
+      }, 1);
+      const provider = await repo.createProvider({
+        slug: "contract-http",
+        displayName: "Contract HTTP",
+        baseUrl: "http://mock-provider:4010/v1/",
+        protocol: "responses",
+      }, { actorId: actor.id, action: "provider.create" });
+      assertEquals(provider.baseUrl, "http://mock-provider:4010/v1");
+      await assertRejects(
+        () =>
+          repo.createProvider({
+            slug: "wrong-http-host",
+            displayName: "Wrong HTTP host",
+            baseUrl: "http://different-provider:4010/v1",
+            protocol: "responses",
+          }, { actorId: actor.id, action: "provider.create" }),
+        DomainError,
+        "Provider base URL is invalid",
+      );
+      Deno.env.set("DENO_ENV", "production");
+      await assertRejects(
+        () =>
+          repo.createProvider({
+            slug: "production-http-host",
+            displayName: "Production HTTP host",
+            baseUrl: "http://mock-provider:4010/v1",
+            protocol: "responses",
+          }, { actorId: actor.id, action: "provider.create" }),
+        DomainError,
+        "Provider base URL is invalid",
+      );
+    } finally {
+      await repo.close();
+      if (previousEnvironment === undefined) Deno.env.delete("DENO_ENV");
+      else Deno.env.set("DENO_ENV", previousEnvironment);
+      if (previousHost === undefined) Deno.env.delete("OPENAI_TEST_ALLOW_HTTP_HOST");
+      else Deno.env.set("OPENAI_TEST_ALLOW_HTTP_HOST", previousHost);
+    }
+  },
+});
+
+Deno.test({
+  name: "Postgres stale API reaping never exceeds an exact replay reservation",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 1 });
+    await sql`TRUNCATE api_idempotency_requests, usage_runs, ledger_entries, users
+      RESTART IDENTITY CASCADE`;
+    await sql.end();
+    const repo = await PostgresRepository.connect(databaseUrl!);
+    const mutate = postgres(databaseUrl!, { max: 1 });
+    try {
+      const user = await repo.bootstrapAdmin({
+        email: "api-reaper-bound@database.test",
+        name: "API reaper bound",
+        passwordHash: "hash",
+      }, 1_000_000);
+      const prefix = 'data: {"delta":"bounded"}\n\n';
+      const prefixBytes = new TextEncoder().encode(prefix).length;
+      const begun = await repo.beginApiRequest({
+        userId: user.id,
+        endpoint: "chat.completions",
+        idempotencyKey: "postgres-reaper-exact-bound",
+        requestHash: "f".repeat(64),
+        stream: true,
+        model: "test/model",
+        runId: "postgres-reaper-exact-bound-run",
+        reserveMicros: 100,
+        provider: "test",
+        replayReservedBytes: prefixBytes,
+        replayReservedEvents: 1,
+      });
+      if (begun.kind !== "started") throw new Error("expected started request");
+      await repo.appendApiSseFrame(begun.request.id, begun.leaseToken, 0, prefix);
+      await mutate`UPDATE api_idempotency_requests
+        SET lease_expires_at=now()-interval '1 second' WHERE id=${begun.request.id}`;
+
+      assertEquals(await repo.reapStaleApiRequests(), 1);
+      const failed = (await repo.getApiRequest(
+        user.id,
+        "chat.completions",
+        "postgres-reaper-exact-bound",
+      ))!;
+      assertEquals(failed.state, "failed");
+      assertEquals(failed.frames.map(({ frame }) => frame), [prefix]);
+      assertEquals(failed.responseBody, null);
+      assertEquals(failed.failureStartedStream, true);
+      assertEquals(failed.responseStatus, 200);
+      assertEquals(failed.responseHeaders["content-type"], "text/event-stream");
+      assertEquals(failed.responseHeaders["cache-control"], "no-cache");
+      const usage = await repo.usage(user.id);
+      assertEquals(usage.balanceMicros, 1_000_000);
+
+      await mutate`UPDATE api_idempotency_requests SET expires_at=now()-interval '1 second'
+        WHERE id=${begun.request.id}`;
+      assertEquals(await repo.pruneExpiredApiRequests(), 1);
+      const quota = { maxRequests: 1, maxBytes: prefixBytes, maxEvents: 1 };
+      const legacy = await repo.beginApiRequest({
+        userId: user.id,
+        endpoint: "responses",
+        idempotencyKey: "postgres-reaper-custom-quota",
+        requestHash: "e".repeat(64),
+        stream: true,
+        model: "test/model",
+        runId: "postgres-reaper-custom-quota-run",
+        reserveMicros: 100,
+        provider: "test",
+        quota,
+      });
+      if (legacy.kind !== "started") throw new Error("expected legacy request to start");
+      await repo.appendApiSseFrame(
+        legacy.request.id,
+        legacy.leaseToken,
+        0,
+        prefix,
+        120,
+        undefined,
+        quota,
+      );
+      await mutate`UPDATE api_idempotency_requests
+        SET lease_expires_at=now()-interval '1 second' WHERE id=${legacy.request.id}`;
+      assertEquals(await repo.reapStaleApiRequests(100, quota), 1);
+      const legacyFailed = (await repo.getApiRequest(
+        user.id,
+        "responses",
+        "postgres-reaper-custom-quota",
+      ))!;
+      assertEquals(legacyFailed.frames.map(({ frame }) => frame), [prefix]);
+      assertEquals(legacyFailed.responseBody, null);
+      assertEquals(legacyFailed.responseStatus, 200);
+    } finally {
+      await mutate.end();
+      await repo.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "Postgres serializes OCR graph edits and protocol default invariants",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 1 });
+    await sql`TRUNCATE model_price_versions, provider_models, providers, audit_events,
+      ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users
+      RESTART IDENTITY CASCADE`;
+    await sql.end();
+    const firstRepo = await PostgresRepository.connect(databaseUrl!);
+    const secondRepo = await PostgresRepository.connect(databaseUrl!);
+    try {
+      const actor = await firstRepo.bootstrapAdmin({
+        email: "model-invariants@database.test",
+        name: "Model invariants",
+        passwordHash: "hash",
+      }, 1);
+      const mutation = { actorId: actor.id, action: "model.invariant" };
+      const provider = await firstRepo.createProvider({
+        slug: "model-invariants",
+        displayName: "Model invariants",
+        baseUrl: "https://invariants.database.test/v1",
+        protocol: "chat_completions",
+      }, mutation);
+      const model = (name: string) =>
+        firstRepo.createProviderModel({
+          providerId: provider.id,
+          publicModelId: `model-invariants/${name}`,
+          upstreamModelId: name,
+          displayName: name,
+          capabilities: ["chat", "vision"],
+          contextWindow: 8_192,
+        }, mutation);
+      const a = await model("a");
+      const b = await model("b");
+      const ocr = (target: string) => ({
+        ocr: { enabled: true, providerId: provider.id, model: target, prompt: "Extract text" },
+      });
+      const edits = await Promise.allSettled([
+        firstRepo.updateProviderModel(a.id, a.version, { customParams: ocr(b.id) }, mutation),
+        secondRepo.updateProviderModel(b.id, b.version, { customParams: ocr(a.id) }, mutation),
+      ]);
+      assertEquals(edits.filter((result) => result.status === "fulfilled").length, 1);
+      assertEquals(edits.filter((result) => result.status === "rejected").length, 1);
+      const rejected = edits.find((result): result is PromiseRejectedResult =>
+        result.status === "rejected"
+      );
+      assertEquals(rejected?.reason instanceof DomainError, true);
+      const persisted = await firstRepo.listProviderModels(provider.id);
+      const ocrSource = persisted.find((model) =>
+        model.customParams.ocr && typeof model.customParams.ocr === "object"
+      )!;
+      const targetId = String((ocrSource.customParams.ocr as Record<string, unknown>).model);
+      const ocrTarget = (await firstRepo.findProviderModel(targetId))!;
+      await assertRejects(
+        () =>
+          firstRepo.updateProvider(
+            provider.id,
+            provider.version,
+            { enabled: false },
+            mutation,
+          ),
+        DomainError,
+        "must remain enabled",
+      );
+      await assertRejects(
+        () =>
+          firstRepo.updateProviderModel(ocrTarget.id, ocrTarget.version, {
+            capabilities: ["vision"],
+          }, mutation),
+        DomainError,
+        "both chat and vision",
+      );
+
+      const stopModel = await model("stop");
+      await firstRepo.updateProviderModel(stopModel.id, stopModel.version, {
+        customParams: { stop: "END" },
+      }, mutation);
+      await assertRejects(
+        () =>
+          firstRepo.updateProvider(
+            provider.id,
+            provider.version,
+            { protocol: "responses" },
+            mutation,
+          ),
+        DomainError,
+        "not supported by Responses providers",
+      );
+      const currentSource = (await firstRepo.findProviderModel(ocrSource.id))!;
+      await firstRepo.updateProviderModel(currentSource.id, currentSource.version, {
+        enabled: false,
+      }, mutation);
+      const currentTarget = (await firstRepo.findProviderModel(ocrTarget.id))!;
+      await firstRepo.updateProviderModel(currentTarget.id, currentTarget.version, {
+        enabled: false,
+      }, mutation);
+      const currentProvider = (await firstRepo.findProvider(provider.id))!;
+      await firstRepo.updateProvider(
+        currentProvider.id,
+        currentProvider.version,
+        { enabled: false },
+        mutation,
+      );
+      const disabledSource = (await firstRepo.findProviderModel(currentSource.id))!;
+      await assertRejects(
+        () =>
+          firstRepo.updateProviderModel(disabledSource.id, disabledSource.version, {
+            enabled: true,
+          }, mutation),
+        DomainError,
+        "must remain enabled",
+      );
+      const responses = await firstRepo.createProvider({
+        slug: "responses-invariants",
+        displayName: "Responses invariants",
+        baseUrl: "https://responses.database.test/v1",
+        protocol: "responses",
+      }, mutation);
+      await assertRejects(
+        () =>
+          firstRepo.createProviderModel({
+            providerId: responses.id,
+            publicModelId: "responses-invariants/invalid",
+            upstreamModelId: "invalid",
+            displayName: "Invalid",
+            capabilities: ["chat"],
+            contextWindow: 8_192,
+            customParams: { seed: 7 },
+          }, mutation),
+        DomainError,
+        "not supported by Responses providers",
+      );
+    } finally {
+      await firstRepo.close();
+      await secondRepo.close();
     }
   },
 });

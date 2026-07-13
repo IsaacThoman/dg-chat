@@ -478,6 +478,29 @@ Deno.test("idempotent image stream replay capacity is rejected before dispatch a
   assertEquals(accepted.calls(), 1);
 });
 
+Deno.test("rich image replay reserves metadata rather than an unused base64 payload", async () => {
+  const fx = await fixture({ replayMaxBytes: 8 * 1024 * 1024 });
+  const response = await fx.app.request("/api/images/generations", {
+    method: "POST",
+    headers: {
+      cookie: fx.cookie,
+      origin: "http://localhost:5173",
+      "content-type": "application/json",
+      "idempotency-key": "rich-image-metadata-replay",
+    },
+    body: JSON.stringify({
+      model: "images/public",
+      prompt: "Asset metadata should fit without reserving base64 bytes",
+      response_format: "url",
+    }),
+  });
+  assertEquals(response.status, 200, await response.clone().text());
+  assertEquals(fx.calls(), 1);
+  const body = await response.json();
+  assertEquals(body.assets.length, 1);
+  assertEquals(typeof body.assets[0].contentUrl, "string");
+});
+
 Deno.test("completed image stream replay survives a lower quota after restart", async () => {
   const required = maximumImageStreamReplayBytes({ partialImages: 1 });
   const original = await fixture({

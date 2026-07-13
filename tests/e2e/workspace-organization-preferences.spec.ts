@@ -1,12 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { bootstrap, createChat, login } from "./helpers.ts";
-
-async function openSidebar(page: import("@playwright/test").Page) {
-  if ((page.viewportSize()?.width ?? 1280) > 800) return;
-  if (await page.locator("aside.sidebar.mobile-open").count()) return;
-  const menu = page.getByRole("button", { name: "Open menu", exact: true });
-  if (await menu.isVisible()) await menu.click();
-}
+import { bootstrap, createChat, login, openSidebar } from "./helpers.ts";
 
 async function createProject(page: import("@playwright/test").Page, name: string) {
   await openSidebar(page);

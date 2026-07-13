@@ -24,14 +24,26 @@ import { DomainError } from "./memory.ts";
 import { INGESTIBLE_DOCUMENT_MIME_TYPES, isIngestibleDocumentMime } from "./attachment-policy.ts";
 import { canonicalJson, sha256Hex } from "./backup-format.ts";
 import {
+  providerCustomParamsViolation,
+  providerDefaultsViolation,
+  providerModelOcrGraphViolation,
+  providerOcrTargetProviderViolation,
+} from "./provider-model-invariants.ts";
+import {
+  API_SSE_REPLAY_FRAGMENT_MAX_BYTES,
+  API_SSE_REPLAY_REQUEST_MAX_BYTES,
+  API_SSE_REPLAY_REQUEST_MAX_EVENTS,
   apiResponseBodyByteLength,
   canonicalWorkspaceName,
+  DEFAULT_API_REPLAY_QUOTA,
   KNOWLEDGE_EMBEDDING_DIMENSIONS,
   MAX_ACTIVE_CONVERSATION_SHARES,
   MAX_CONVERSATION_SHARE_ATTACHMENTS,
   MAX_CONVERSATION_SHARE_CONTENT_CHARS,
   MAX_CONVERSATION_SHARE_MESSAGES,
   normalizeKnowledgeSearchLimit,
+  planAbandonedApiReplay,
+  splitApiSseReplayFrame,
   validateChunkEmbeddings,
   validateDocumentChunkInputs,
 } from "./repository.ts";
@@ -234,7 +246,7 @@ const knowledgeBinding = (row: Row): KnowledgeConversationBinding => ({
   updatedAt: iso(row.updated_at),
 });
 const replayQuota = (quota?: ApiReplayQuota): ApiReplayQuota => {
-  const value = quota ?? { maxRequests: 256, maxBytes: 67_108_864, maxEvents: 20_000 };
+  const value = quota ?? DEFAULT_API_REPLAY_QUOTA;
   if (
     !Number.isSafeInteger(value.maxRequests) || value.maxRequests < 1 ||
     !Number.isSafeInteger(value.maxBytes) || value.maxBytes < 1 ||
@@ -710,8 +722,11 @@ function normalizeProviderBaseUrl(value: string): string {
   }
   try {
     const url = new URL(value);
+    const testHttp = Deno.env.get("DENO_ENV") === "test" && url.protocol === "http:" &&
+      Deno.env.get("OPENAI_TEST_ALLOW_HTTP_HOST")?.toLowerCase() === url.hostname.toLowerCase();
     if (
-      url.protocol !== "https:" || url.username || url.password || url.search || url.hash ||
+      (!testHttp && url.protocol !== "https:") || url.username || url.password || url.search ||
+      url.hash ||
       url.port === "0"
     ) {
       throw new Error();
@@ -778,10 +793,10 @@ function validateProviderModelInput(
       new Set(input.capabilities).size !== input.capabilities.length ||
       input.capabilities.some((value) => !isModelCapability(value)))
   ) throw new DomainError("validation_error", "Model capabilities are invalid", 422);
-  if (
-    input.customParams !== undefined &&
-    (input.customParams === null || Array.isArray(input.customParams))
-  ) throw new DomainError("validation_error", "Model custom parameters are invalid", 422);
+  if (input.customParams !== undefined) {
+    const violation = providerCustomParamsViolation(input.customParams, input.publicModelId);
+    if (violation) throw new DomainError(violation.code, violation.message, 422);
+  }
 }
 function validatePriceInput(input: CreateModelPriceVersionInput) {
   if (!Number.isFinite(Date.parse(input.effectiveAt))) {
@@ -956,6 +971,8 @@ function apiRequest(row: Row, frames: ApiIdempotencyFrame[] = []): ApiIdempotenc
     leaseToken: row.lease_token == null ? null : String(row.lease_token),
     leaseExpiresAt: nullableIso(row.lease_expires_at),
     usageRunId: String(row.usage_run_id),
+    replayReservedBytes: number(row.replay_reserved_bytes ?? 0),
+    replayReservedEvents: number(row.replay_reserved_events ?? 0),
     responseStatus: row.response_status == null ? null : number(row.response_status),
     responseHeaders: (row.response_headers ?? {}) as Record<string, string>,
     responseBody: row.response_body == null ? null : String(row.response_body),
@@ -2271,7 +2288,7 @@ export class PostgresRepository implements DomainRepository {
     }
     const attachmentId = (source as Record<string, unknown>).attachmentId;
     if (typeof attachmentId !== "string") return undefined;
-    const attachments = await this.#sql<Row[]>`SELECT object_key FROM attachments
+    const attachments = await this.#sql<Row[]>`SELECT object_key,sha256 FROM attachments
       WHERE id=${attachmentId} AND owner_id=${String(rows[0].owner_id)}
         AND state='ready' AND deleted_at IS NULL`;
     if (!attachments[0]) return undefined;
@@ -2280,6 +2297,7 @@ export class PostgresRepository implements DomainRepository {
       ownerId: String(rows[0].owner_id),
       attachment: publicAttachment,
       objectKey: String(attachments[0].object_key),
+      sha256: String(attachments[0].sha256),
     };
   }
 
@@ -4575,10 +4593,28 @@ export class PostgresRepository implements DomainRepository {
     validateProviderInput(input);
     try {
       return await this.#sql.begin(async (tx) => {
+        await tx`SELECT pg_advisory_xact_lock(hashtext('provider-model-invariants'))`;
         const currentRows = await tx<Row[]>`SELECT * FROM providers WHERE id=${id} FOR UPDATE`;
         if (!currentRows[0]) throw new DomainError("not_found", "Provider not found", 404);
         const current = provider(currentRows[0]);
         if (current.version !== expectedVersion) throw registryConflict();
+        if (input.enabled === false && current.enabled) {
+          const models = (await tx<Row[]>`SELECT * FROM provider_models`).map(providerModel);
+          const providers = (await tx<Row[]>`SELECT id,enabled FROM providers`).map((row) => ({
+            id: String(row.id),
+            enabled: String(row.id) === id ? false : Boolean(row.enabled),
+          }));
+          const violation = providerOcrTargetProviderViolation(models, providers);
+          if (violation) throw new DomainError(violation.code, violation.message, 422);
+        }
+        if (input.protocol !== undefined && input.protocol !== current.protocol) {
+          const models = (await tx<Row[]>`SELECT * FROM provider_models WHERE provider_id=${id}`)
+            .map(providerModel);
+          const violation = models.map((model) =>
+            providerDefaultsViolation(input.protocol!, model.customParams, model.publicModelId)
+          ).find(Boolean);
+          if (violation) throw new DomainError(violation.code, violation.message, 422);
+        }
         const enabled = input.enabled ?? current.enabled;
         let healthStatus = input.healthStatus ?? current.healthStatus;
         if (!enabled) healthStatus = "disabled";
@@ -4681,8 +4717,11 @@ export class PostgresRepository implements DomainRepository {
     validateProviderModelInput(input);
     try {
       return await this.#sql.begin(async (tx) => {
+        await tx`SELECT pg_advisory_xact_lock(hashtext('provider-model-invariants'))`;
         await tx`SELECT pg_advisory_xact_lock(hashtext('model-public-id-namespace'))`;
-        const providerRows = await tx`SELECT id FROM providers WHERE id=${input.providerId}`;
+        const providerRows = await tx<
+          Row[]
+        >`SELECT id,protocol FROM providers WHERE id=${input.providerId}`;
         if ((await tx`SELECT 1 FROM model_aliases WHERE alias=${input.publicModelId}`).length) {
           throw new DomainError(
             "model_id_taken",
@@ -4691,6 +4730,14 @@ export class PostgresRepository implements DomainRepository {
           );
         }
         if (!providerRows.length) throw new DomainError("not_found", "Provider not found", 404);
+        const defaultsViolation = providerDefaultsViolation(
+          providerRows[0].protocol as "chat_completions" | "responses",
+          input.customParams ?? {},
+          input.publicModelId,
+        );
+        if (defaultsViolation) {
+          throw new DomainError(defaultsViolation.code, defaultsViolation.message, 422);
+        }
         const rows = await tx<Row[]>`
           INSERT INTO provider_models(provider_id,public_model_id,upstream_model_id,display_name,
             capabilities,context_window,enabled,custom_params)
@@ -4698,6 +4745,10 @@ export class PostgresRepository implements DomainRepository {
             ${input.displayName.trim()},${tx.json(input.capabilities)},${input.contextWindow},
             ${input.enabled ?? true},${tx.json((input.customParams ?? {}) as never)}) RETURNING *`;
         const value = providerModel(rows[0]);
+        const graphViolation = providerModelOcrGraphViolation(
+          (await tx<Row[]>`SELECT * FROM provider_models`).map(providerModel),
+        );
+        if (graphViolation) throw new DomainError(graphViolation.code, graphViolation.message, 422);
         await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
           VALUES(${mutation.actorId ?? null},${mutation.action},'provider_model',${value.id},${
           tx.json({ ...mutation.metadata, providerId: value.providerId, version: value.version })
@@ -4722,6 +4773,7 @@ export class PostgresRepository implements DomainRepository {
     validateProviderModelInput(input);
     try {
       return await this.#sql.begin(async (tx) => {
+        await tx`SELECT pg_advisory_xact_lock(hashtext('provider-model-invariants'))`;
         await tx`SELECT pg_advisory_xact_lock(hashtext('model-public-id-namespace'))`;
         const currentRows = await tx<
           Row[]
@@ -4729,6 +4781,31 @@ export class PostgresRepository implements DomainRepository {
         if (!currentRows[0]) throw new DomainError("not_found", "Provider model not found", 404);
         const current = providerModel(currentRows[0]);
         if (current.version !== expectedVersion) throw registryConflict();
+        const candidate: ProviderModelRecord = {
+          ...current,
+          ...(input.publicModelId === undefined ? {} : { publicModelId: input.publicModelId }),
+          ...(input.upstreamModelId === undefined
+            ? {}
+            : { upstreamModelId: input.upstreamModelId.trim() }),
+          ...(input.displayName === undefined ? {} : { displayName: input.displayName.trim() }),
+          ...(input.capabilities === undefined ? {} : { capabilities: [...input.capabilities] }),
+          ...(input.contextWindow === undefined ? {} : { contextWindow: input.contextWindow }),
+          ...(input.enabled === undefined ? {} : { enabled: input.enabled }),
+          ...(input.customParams === undefined
+            ? {}
+            : { customParams: structuredClone(input.customParams) }),
+        };
+        const providerRows = await tx<
+          Row[]
+        >`SELECT protocol FROM providers WHERE id=${current.providerId}`;
+        const defaultsViolation = providerDefaultsViolation(
+          providerRows[0].protocol as "chat_completions" | "responses",
+          candidate.customParams,
+          candidate.publicModelId,
+        );
+        if (defaultsViolation) {
+          throw new DomainError(defaultsViolation.code, defaultsViolation.message, 422);
+        }
         if (
           input.publicModelId &&
           (await tx`SELECT 1 FROM model_aliases WHERE alias=${input.publicModelId}`).length
@@ -4751,6 +4828,10 @@ export class PostgresRepository implements DomainRepository {
             custom_params=${tx.json((input.customParams ?? current.customParams) as never)},
             version=version+1,updated_at=now() WHERE id=${id} RETURNING *`;
         const value = providerModel(rows[0]);
+        const graphViolation = providerModelOcrGraphViolation(
+          (await tx<Row[]>`SELECT * FROM provider_models`).map(providerModel),
+        );
+        if (graphViolation) throw new DomainError(graphViolation.code, graphViolation.message, 422);
         await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
           VALUES(${mutation.actorId ?? null},${mutation.action},'provider_model',${value.id},${
           tx.json({ ...mutation.metadata, providerId: value.providerId, version: value.version })
@@ -4978,7 +5059,7 @@ export class PostgresRepository implements DomainRepository {
       if (
         targets.some((target) =>
           !target.enabled || !target.provider_enabled || target.credential_envelope == null ||
-          !target.priced || target.protocol !== sourceRow.protocol ||
+          !target.priced ||
           number(target.context_window) < number(sourceRow.context_window) ||
           sourceCapabilities.some((capability) =>
             !(target.capabilities as string[]).includes(capability)
@@ -5114,7 +5195,7 @@ export class PostgresRepository implements DomainRepository {
         WHERE m.id=${id}`;
       const row = rows[0];
       if (id === sourceModelId) sourceRow = row;
-      const compatible = row && sourceRow && row.protocol === sourceRow.protocol &&
+      const compatible = row && sourceRow &&
         number(row.context_window) >= number(sourceRow.context_window) &&
         (sourceRow.capabilities as string[]).every((capability) =>
           (row.capabilities as string[]).includes(capability)
@@ -6473,7 +6554,12 @@ export class PostgresRepository implements DomainRepository {
     }
     if (
       input.reserveMicros < 0 || leaseSeconds < 1 || retentionSeconds < 60 ||
-      retentionSeconds > 2_592_000
+      retentionSeconds > 2_592_000 ||
+      !Number.isSafeInteger(input.replayReservedBytes ?? 0) ||
+      (input.replayReservedBytes ?? 0) < 0 ||
+      !Number.isSafeInteger(input.replayReservedEvents ?? 0) ||
+      (input.replayReservedEvents ?? 0) < 0 ||
+      ((input.replayReservedBytes ?? 0) === 0 && (input.replayReservedEvents ?? 0) > 0)
     ) throw new DomainError("validation_error", "Invalid idempotent request parameters", 422);
     if (input.pricingSnapshot !== undefined && !isUsagePricingSnapshot(input.pricingSnapshot)) {
       throw new DomainError("validation_error", "Usage pricing snapshot is invalid", 422);
@@ -6488,7 +6574,11 @@ export class PostgresRepository implements DomainRepository {
       const id = crypto.randomUUID();
       const inserted = await tx<
         Row[]
-      >`INSERT INTO api_idempotency_requests(id,user_id,endpoint,idempotency_key,request_hash,stream,model,state,lease_token,lease_expires_at,usage_run_id,retention_seconds,expires_at) VALUES(${id},${input.userId},${input.endpoint},${input.idempotencyKey},${input.requestHash},${input.stream},${input.model},'in_progress',${leaseToken},now()+${leaseSeconds}*interval '1 second',${input.runId},${retentionSeconds},now()+${retentionSeconds}*interval '1 second') ON CONFLICT(user_id,endpoint,idempotency_key) DO NOTHING RETURNING *`;
+      >`INSERT INTO api_idempotency_requests(id,user_id,endpoint,idempotency_key,request_hash,stream,model,state,lease_token,lease_expires_at,usage_run_id,replay_reserved_bytes,replay_reserved_events,retention_seconds,expires_at) VALUES(${id},${input.userId},${input.endpoint},${input.idempotencyKey},${input.requestHash},${input.stream},${input.model},'in_progress',${leaseToken},now()+${leaseSeconds}*interval '1 second',${input.runId},${
+        input.replayReservedBytes ?? 0
+      },${
+        input.replayReservedEvents ?? 0
+      },${retentionSeconds},now()+${retentionSeconds}*interval '1 second') ON CONFLICT(user_id,endpoint,idempotency_key) DO NOTHING RETURNING *`;
       if (!inserted[0]) {
         const rows = await tx<
           Row[]
@@ -6517,10 +6607,24 @@ export class PostgresRepository implements DomainRepository {
       }
       const quota = replayQuota(input.quota);
       const live = await tx<
-        { count: number }[]
-      >`SELECT count(*)::int count FROM api_idempotency_requests WHERE user_id=${input.userId} AND expires_at>now()`;
+        { count: number; bytes: number; events: number }[]
+      >`SELECT count(*)::int count,
+        COALESCE(sum(CASE WHEN state='in_progress' AND replay_reserved_bytes>0
+          THEN replay_reserved_bytes
+          ELSE COALESCE(CASE response_body_encoding WHEN 'base64'
+            THEN octet_length(decode(response_body,'base64')) ELSE octet_length(response_body) END,0) +
+            COALESCE((SELECT sum(octet_length(frame)) FROM api_idempotency_events e WHERE e.request_id=r.id),0)
+        END),0)::bigint bytes,
+        COALESCE(sum(CASE WHEN state='in_progress' AND replay_reserved_events>0
+          THEN replay_reserved_events
+          ELSE (SELECT count(*) FROM api_idempotency_events e WHERE e.request_id=r.id)
+        END),0)::bigint events
+        FROM api_idempotency_requests r WHERE user_id=${input.userId} AND expires_at>now()`;
       if (live[0].count > quota.maxRequests) {
         throw new DomainError("replay_quota_exceeded", "Replay request quota exceeded", 429);
+      }
+      if (number(live[0].bytes) > quota.maxBytes || number(live[0].events) > quota.maxEvents) {
+        throw new DomainError("replay_quota_exceeded", "Replay storage quota exceeded", 429);
       }
       const balance = number(users[0].balance_micros);
       if (balance < input.reserveMicros) {
@@ -6596,7 +6700,7 @@ export class PostgresRepository implements DomainRepository {
     }
     const encoder = new TextEncoder();
     const frameBytes = frames.map(({ frame }) => encoder.encode(frame).length);
-    if (frameBytes.some((bytes) => bytes > 1_048_576)) {
+    if (frameBytes.some((bytes) => bytes > API_SSE_REPLAY_FRAGMENT_MAX_BYTES)) {
       throw new DomainError("response_too_large", "SSE frame exceeds replay limit", 413);
     }
     return await this.#sql.begin(async (tx) => {
@@ -6638,26 +6742,41 @@ export class PostgresRepository implements DomainRepository {
         (sum, item) => sum + encoder.encode(item.frame).length,
         0,
       );
-      if (stats[0].count + pending.length > 10_000 || stats[0].bytes + pendingBytes > 16_777_216) {
+      if (
+        stats[0].count + pending.length > API_SSE_REPLAY_REQUEST_MAX_EVENTS ||
+        stats[0].bytes + pendingBytes > API_SSE_REPLAY_REQUEST_MAX_BYTES
+      ) {
         throw new DomainError("response_too_large", "SSE replay exceeds storage limit", 413);
       }
       const quota = replayQuota(quotaInput);
+      const reservedBytes = number(rows[0].replay_reserved_bytes ?? 0);
+      const reservedEvents = number(rows[0].replay_reserved_events ?? 0);
+      if (
+        (reservedBytes > 0 || reservedEvents > 0) &&
+        (stats[0].count + pending.length > reservedEvents ||
+          stats[0].bytes + pendingBytes > reservedBytes)
+      ) throw new DomainError("replay_quota_exceeded", "Reserved replay capacity exceeded", 429);
       const aggregate = await tx<
         { events: number; bytes: number }[]
       >`SELECT
-        (SELECT count(*)::int FROM api_idempotency_events e JOIN api_idempotency_requests r ON r.id=e.request_id WHERE r.user_id=${
+        COALESCE(sum(CASE WHEN state='in_progress' AND replay_reserved_events>0
+          THEN replay_reserved_events
+          ELSE (SELECT count(*) FROM api_idempotency_events e WHERE e.request_id=r.id)
+        END),0)::bigint events,
+        COALESCE(sum(CASE WHEN state='in_progress' AND replay_reserved_bytes>0
+          THEN replay_reserved_bytes
+          ELSE COALESCE(CASE response_body_encoding WHEN 'base64'
+            THEN octet_length(decode(response_body,'base64')) ELSE octet_length(response_body) END,0) +
+            COALESCE((SELECT sum(octet_length(frame)) FROM api_idempotency_events e WHERE e.request_id=r.id),0)
+        END),0)::bigint bytes
+        FROM api_idempotency_requests r WHERE user_id=${
         String(rows[0].user_id)
-      } AND r.expires_at>now()) events,
-        ((SELECT COALESCE(sum(octet_length(e.frame)),0)::bigint FROM api_idempotency_events e JOIN api_idempotency_requests r ON r.id=e.request_id WHERE r.user_id=${
-        String(rows[0].user_id)
-      } AND r.expires_at>now()) +
-         (SELECT COALESCE(sum(CASE response_body_encoding WHEN 'base64'
-           THEN octet_length(decode(response_body,'base64')) ELSE octet_length(response_body) END),0)::bigint FROM api_idempotency_requests WHERE user_id=${
-        String(rows[0].user_id)
-      } AND expires_at>now())) bytes`;
+      } AND expires_at>now()`;
       if (
-        number(aggregate[0].events) + pending.length > quota.maxEvents ||
-        number(aggregate[0].bytes) + pendingBytes > quota.maxBytes
+        reservedBytes === 0 && reservedEvents === 0 && (
+          number(aggregate[0].events) + pending.length > quota.maxEvents ||
+          number(aggregate[0].bytes) + pendingBytes > quota.maxBytes
+        )
       ) throw new DomainError("replay_quota_exceeded", "User replay storage quota exceeded", 429);
       if (pending.length > 0) {
         await tx`INSERT INTO api_idempotency_events ${
@@ -6728,7 +6847,7 @@ export class PostgresRepository implements DomainRepository {
     const decodedResponseBytes = input.responseBody
       ? apiResponseBodyByteLength(input.responseBody, responseBodyEncoding)
       : 0;
-    if (decodedResponseBytes > 16_777_216) {
+    if (decodedResponseBytes > API_SSE_REPLAY_REQUEST_MAX_BYTES) {
       throw new DomainError("response_too_large", "Replay response exceeds storage limit", 413);
     }
     return await this.#sql.begin(async (tx) => {
@@ -6762,7 +6881,11 @@ export class PostgresRepository implements DomainRepository {
         { count: number; bytes: number }[]
       >`SELECT count(*)::int count,COALESCE(sum(octet_length(frame)),0)::int bytes FROM api_idempotency_events WHERE request_id=${input.id}`;
       const frameInputs = input.frames ?? [];
-      if (frameInputs.some(({ frame }) => encoder.encode(frame).length > 1_048_576)) {
+      if (
+        frameInputs.some(({ frame }) =>
+          encoder.encode(frame).length > API_SSE_REPLAY_FRAGMENT_MAX_BYTES
+        )
+      ) {
         throw new DomainError("response_too_large", "SSE frame exceeds replay limit", 413);
       }
       const existingBySequence = new Map<number, Row>();
@@ -6792,41 +6915,57 @@ export class PostgresRepository implements DomainRepository {
         (sum, item) => sum + encoder.encode(item.frame).length,
         0,
       );
-      const terminalBytes = input.terminalFrame ? encoder.encode(input.terminalFrame).length : 0;
-      if (terminalBytes > 1_048_576) {
-        throw new DomainError("response_too_large", "Terminal SSE frame exceeds replay limit", 413);
-      }
+      const terminalFragments = stream && input.terminalFrame !== undefined
+        ? splitApiSseReplayFrame(input.terminalFrame)
+        : [];
+      const terminalBytes = terminalFragments.reduce(
+        (sum, frame) => sum + encoder.encode(frame).length,
+        0,
+      );
       if (
-        stats[0].count + pending.length + (input.terminalFrame ? 1 : 0) > 10_000 ||
-        stats[0].bytes + pendingBytes + terminalBytes > 16_777_216
+        stats[0].count + pending.length + terminalFragments.length >
+          API_SSE_REPLAY_REQUEST_MAX_EVENTS ||
+        stats[0].bytes + pendingBytes + terminalBytes > API_SSE_REPLAY_REQUEST_MAX_BYTES
       ) throw new DomainError("response_too_large", "SSE replay exceeds storage limit", 413);
       const quota = replayQuota(input.quota);
+      const responseBytes = decodedResponseBytes;
+      const reservedBytes = number(row.replay_reserved_bytes ?? 0);
+      const reservedEvents = number(row.replay_reserved_events ?? 0);
+      if (
+        (reservedBytes > 0 || reservedEvents > 0) &&
+        (stats[0].count + pending.length + terminalFragments.length > reservedEvents ||
+          stats[0].bytes + responseBytes + pendingBytes + terminalBytes > reservedBytes)
+      ) throw new DomainError("replay_quota_exceeded", "Reserved replay capacity exceeded", 429);
       await tx`SELECT id FROM users WHERE id=${String(row.user_id)} FOR UPDATE`;
       const aggregate = await tx<
         { events: number; bytes: number }[]
       >`SELECT
-        (SELECT count(*)::int FROM api_idempotency_events e JOIN api_idempotency_requests r ON r.id=e.request_id WHERE r.user_id=${
-        String(row.user_id)
-      } AND r.expires_at>now()) events,
-        ((SELECT COALESCE(sum(octet_length(e.frame)),0)::bigint FROM api_idempotency_events e JOIN api_idempotency_requests r ON r.id=e.request_id WHERE r.user_id=${
-        String(row.user_id)
-      } AND r.expires_at>now()) +
-         (SELECT COALESCE(sum(CASE response_body_encoding WHEN 'base64'
-           THEN octet_length(decode(response_body,'base64')) ELSE octet_length(response_body) END),0)::bigint FROM api_idempotency_requests WHERE user_id=${
-        String(row.user_id)
-      } AND expires_at>now())) bytes`;
-      const responseBytes = decodedResponseBytes;
+        COALESCE(sum(CASE WHEN state='in_progress' AND replay_reserved_events>0
+          THEN replay_reserved_events
+          ELSE (SELECT count(*) FROM api_idempotency_events e WHERE e.request_id=r.id)
+        END),0)::bigint events,
+        COALESCE(sum(CASE WHEN state='in_progress' AND replay_reserved_bytes>0
+          THEN replay_reserved_bytes
+          ELSE COALESCE(CASE response_body_encoding WHEN 'base64'
+            THEN octet_length(decode(response_body,'base64')) ELSE octet_length(response_body) END,0) +
+            COALESCE((SELECT sum(octet_length(frame)) FROM api_idempotency_events e WHERE e.request_id=r.id),0)
+        END),0)::bigint bytes
+        FROM api_idempotency_requests r WHERE user_id=${String(row.user_id)} AND expires_at>now()`;
       if (
-        number(aggregate[0].events) + pending.length + (input.terminalFrame ? 1 : 0) >
-          quota.maxEvents ||
-        number(aggregate[0].bytes) + responseBytes + pendingBytes + terminalBytes > quota.maxBytes
+        reservedBytes === 0 && reservedEvents === 0 && (
+          number(aggregate[0].events) + pending.length + terminalFragments.length >
+            quota.maxEvents ||
+          number(aggregate[0].bytes) + responseBytes + pendingBytes + terminalBytes > quota.maxBytes
+        )
       ) throw new DomainError("replay_quota_exceeded", "User replay storage quota exceeded", 429);
       const completingFrames = [...pending];
-      if (stream && input.terminalFrame !== undefined) {
-        completingFrames.push({
-          sequence: stats[0].count + pending.length,
-          frame: input.terminalFrame,
-        });
+      if (stream) {
+        for (const frame of terminalFragments) {
+          completingFrames.push({
+            sequence: stats[0].count + completingFrames.length,
+            frame,
+          });
+        }
       }
       if (completingFrames.length > 0) {
         await tx`INSERT INTO api_idempotency_events ${
@@ -6899,7 +7038,8 @@ export class PostgresRepository implements DomainRepository {
     return this.#completeApi(input, true);
   }
   async failApiRequest(input: FailApiRequestInput) {
-    if (new TextEncoder().encode(input.responseBody).length > 16_777_216) {
+    const responseBytes = new TextEncoder().encode(input.responseBody).length;
+    if (responseBytes > API_SSE_REPLAY_REQUEST_MAX_BYTES) {
       throw new DomainError("response_too_large", "Replay response exceeds storage limit", 413);
     }
     return await this.#sql.begin(async (tx) => {
@@ -6926,17 +7066,79 @@ export class PostgresRepository implements DomainRepository {
       >`SELECT count(*)::int count,COALESCE(sum(octet_length(frame)),0)::int bytes FROM api_idempotency_events WHERE request_id=${input.id}`;
       eventCount = stats[0].count;
       const failureStartedStream = eventCount > 0 || input.terminalFrame !== undefined;
-      if (input.terminalFrame !== undefined) {
-        const terminalBytes = new TextEncoder().encode(input.terminalFrame).length;
-        if (terminalBytes > 1_048_576 || stats[0].bytes + terminalBytes > 16_777_216) {
+      const terminalFragments = input.terminalFrame === undefined
+        ? []
+        : splitApiSseReplayFrame(input.terminalFrame);
+      const terminalBytes = input.terminalFrame === undefined
+        ? 0
+        : new TextEncoder().encode(input.terminalFrame).length;
+      if (
+        eventCount + terminalFragments.length > API_SSE_REPLAY_REQUEST_MAX_EVENTS ||
+        stats[0].bytes + terminalBytes > API_SSE_REPLAY_REQUEST_MAX_BYTES
+      ) {
+        throw new DomainError(
+          "response_too_large",
+          "SSE replay exceeds storage limit",
+          413,
+        );
+      }
+      const reservedBytes = number(row.replay_reserved_bytes ?? 0);
+      const reservedEvents = number(row.replay_reserved_events ?? 0);
+      if (
+        (reservedBytes > 0 || reservedEvents > 0) &&
+        (eventCount + terminalFragments.length > reservedEvents ||
+          stats[0].bytes + responseBytes + terminalBytes > reservedBytes)
+      ) {
+        throw new DomainError(
+          "replay_quota_exceeded",
+          "Reserved replay capacity exceeded",
+          429,
+        );
+      }
+      await tx`SELECT id FROM users WHERE id=${String(row.user_id)} FOR UPDATE`;
+      if (reservedBytes === 0 && reservedEvents === 0) {
+        const quota = replayQuota(input.quota);
+        const aggregate = await tx<
+          { events: number; bytes: number }[]
+        >`SELECT
+          COALESCE(sum(CASE WHEN state='in_progress' AND replay_reserved_events>0
+            THEN replay_reserved_events
+            ELSE (SELECT count(*) FROM api_idempotency_events e WHERE e.request_id=r.id)
+          END),0)::bigint events,
+          COALESCE(sum(CASE WHEN state='in_progress' AND replay_reserved_bytes>0
+            THEN replay_reserved_bytes
+            ELSE COALESCE(CASE response_body_encoding WHEN 'base64'
+              THEN octet_length(decode(response_body,'base64')) ELSE octet_length(response_body) END,0) +
+              COALESCE((SELECT sum(octet_length(frame)) FROM api_idempotency_events e WHERE e.request_id=r.id),0)
+          END),0)::bigint bytes
+          FROM api_idempotency_requests r WHERE user_id=${
+          String(row.user_id)
+        } AND expires_at>now()`;
+        if (
+          number(aggregate[0].events) + terminalFragments.length > quota.maxEvents ||
+          number(aggregate[0].bytes) + responseBytes + terminalBytes > quota.maxBytes
+        ) {
           throw new DomainError(
-            "response_too_large",
-            "Terminal SSE frame exceeds replay limit",
-            413,
+            "replay_quota_exceeded",
+            "User replay storage quota exceeded",
+            429,
           );
         }
-        await tx`INSERT INTO api_idempotency_events(request_id,sequence,frame) VALUES(${input.id},${eventCount},${input.terminalFrame})`;
-        eventCount++;
+      }
+      if (input.terminalFrame !== undefined) {
+        await tx`INSERT INTO api_idempotency_events ${
+          tx(
+            terminalFragments.map((frame, index) => ({
+              request_id: input.id,
+              sequence: eventCount + index,
+              frame,
+            })),
+            "request_id",
+            "sequence",
+            "frame",
+          )
+        }`;
+        eventCount += terminalFragments.length;
       }
       const runs = await tx<Row[]>`SELECT *,EXISTS(SELECT 1 FROM provider_attempts
         WHERE usage_run_id=usage_runs.id AND status='running') AS provider_accounting_uncertain
@@ -7010,7 +7212,8 @@ export class PostgresRepository implements DomainRepository {
       return apiRequest(updated[0], events.map(apiFrame));
     });
   }
-  async reapStaleApiRequests(limit = 100) {
+  async reapStaleApiRequests(limit = 100, quotaInput?: ApiReplayQuota) {
+    const quota = replayQuota(quotaInput);
     return await this.#sql.begin(async (tx) => {
       const rows = await tx<
         Row[]
@@ -7060,26 +7263,52 @@ export class PostgresRepository implements DomainRepository {
               : "request lease expired"
           },completed_at=now() WHERE id=${String(row.usage_run_id)}`;
         }
+        await tx`SELECT id FROM users WHERE id=${String(row.user_id)} FOR UPDATE`;
         const stats = await tx<
-          { count: number }[]
-        >`SELECT count(*)::int count FROM api_idempotency_events WHERE request_id=${id}`;
-        const errorBody = JSON.stringify({
-          error: {
-            message: "Request interrupted before completion",
-            type: "server_error",
-            param: null,
-            code: "request_abandoned",
-          },
+          { count: number; bytes: number }[]
+        >`SELECT count(*)::int count,COALESCE(sum(octet_length(frame)),0)::int bytes
+          FROM api_idempotency_events WHERE request_id=${id}`;
+        const aggregate = await tx<
+          { events: number; bytes: number }[]
+        >`SELECT
+          COALESCE(sum(CASE WHEN state='in_progress' AND replay_reserved_events>0
+            THEN replay_reserved_events
+            ELSE (SELECT count(*) FROM api_idempotency_events e WHERE e.request_id=r.id)
+          END),0)::bigint events,
+          COALESCE(sum(CASE WHEN state='in_progress' AND replay_reserved_bytes>0
+            THEN replay_reserved_bytes
+            ELSE COALESCE(CASE response_body_encoding WHEN 'base64'
+              THEN octet_length(decode(response_body,'base64')) ELSE octet_length(response_body) END,0) +
+              COALESCE((SELECT sum(octet_length(frame)) FROM api_idempotency_events e
+                WHERE e.request_id=r.id),0)
+          END),0)::bigint bytes
+          FROM api_idempotency_requests r WHERE user_id=${
+          String(row.user_id)
+        } AND expires_at>now()`;
+        const recovery = planAbandonedApiReplay({
+          endpoint: row.endpoint as ApiIdempotencyEndpoint,
+          eventCount: stats[0].count,
+          eventBytes: stats[0].bytes,
+          replayReservedBytes: number(row.replay_reserved_bytes ?? 0),
+          replayReservedEvents: number(row.replay_reserved_events ?? 0),
+          aggregateBytes: number(aggregate[0].bytes),
+          aggregateEvents: number(aggregate[0].events),
+          quota,
         });
-        if (stats[0].count > 0) {
-          const frame = row.endpoint === "responses"
-            ? `event: error\ndata: ${errorBody}\n\n`
-            : `data: ${errorBody}\n\n`;
+        if (recovery.terminalFrame !== null) {
           await tx`INSERT INTO api_idempotency_events(request_id,sequence,frame) VALUES(${id},${
             stats[0].count
-          },${frame})`;
+          },${recovery.terminalFrame})`;
         }
-        await tx`UPDATE api_idempotency_requests SET state='failed',lease_token=NULL,lease_expires_at=NULL,response_status=500,response_headers='{"content-type":"application/json"}'::jsonb,response_body=${errorBody},failure_started_stream=${
+        const responseHeaders = {
+          "content-type": stats[0].count > 0 ? "text/event-stream" : "application/json",
+          ...(stats[0].count > 0 ? { "cache-control": "no-cache" } : {}),
+        };
+        await tx`UPDATE api_idempotency_requests SET state='failed',lease_token=NULL,lease_expires_at=NULL,response_status=${
+          stats[0].count > 0 ? 200 : 500
+        },response_headers=${
+          tx.json(responseHeaders)
+        },response_body=${recovery.responseBody},failure_started_stream=${
           stats[0].count > 0
         },completed_at=now(),updated_at=now(),expires_at=now()+retention_seconds*interval '1 second' WHERE id=${id}`;
       }
@@ -7094,7 +7323,12 @@ export class PostgresRepository implements DomainRepository {
   async usage(userId: string) {
     const rows = await this.#sql<
       Row[]
-    >`SELECT u.balance_micros,count(r.id) FILTER(WHERE r.status='completed')::int calls,COALESCE(sum(r.input_tokens) FILTER(WHERE r.status='completed'),0)::bigint input_tokens,COALESCE(sum(r.output_tokens) FILTER(WHERE r.status='completed'),0)::bigint output_tokens,COALESCE(sum(r.cost_micros) FILTER(WHERE r.status='completed'),0)::bigint spent_micros FROM users u LEFT JOIN usage_runs r ON r.user_id=u.id WHERE u.id=${userId} GROUP BY u.id`;
+    >`SELECT u.balance_micros,
+      count(r.id) FILTER(WHERE r.status='completed' OR r.cost_micros>0)::int calls,
+      COALESCE(sum(r.input_tokens) FILTER(WHERE r.status='completed' OR r.cost_micros>0),0)::bigint input_tokens,
+      COALESCE(sum(r.output_tokens) FILTER(WHERE r.status='completed' OR r.cost_micros>0),0)::bigint output_tokens,
+      COALESCE(sum(r.cost_micros) FILTER(WHERE r.status='completed' OR r.cost_micros>0),0)::bigint spent_micros
+      FROM users u LEFT JOIN usage_runs r ON r.user_id=u.id WHERE u.id=${userId} GROUP BY u.id`;
     if (!rows[0]) throw new DomainError("not_found", "User not found", 404);
     return {
       balanceMicros: number(rows[0].balance_micros),

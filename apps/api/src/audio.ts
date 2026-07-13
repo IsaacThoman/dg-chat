@@ -78,16 +78,14 @@ export function estimateAudioInputTokens(request: Pick<AudioRequest, "file" | "p
 
 function audioEndpoint(baseUrl: string, endpoint: AudioEndpoint): URL {
   const url = new URL(baseUrl);
-  const testHost = Deno.env.get("DENO_ENV") === "test" &&
+  const testHttp = Deno.env.get("DENO_ENV") === "test" && url.protocol === "http:" &&
     Deno.env.get("OPENAI_TEST_ALLOW_HTTP_HOST")?.toLowerCase() === url.hostname.toLowerCase();
   if (
-    url.protocol !== "https:" || url.username || url.password || url.hash || url.search
+    (!testHttp && url.protocol !== "https:") || url.username || url.password || url.hash ||
+    url.search
   ) {
     throw new AudioProviderError("Provider base URL is invalid", 500, "provider_config_error");
   }
-  // Persisted provider URLs remain production-safe HTTPS. Contract tests may downgrade exactly
-  // one explicitly allowlisted in-network hostname, matching chat and embeddings transports.
-  if (testHost) url.protocol = "http:";
   url.pathname = `${url.pathname.replace(/\/$/, "")}/audio/${endpoint}`;
   return url;
 }

@@ -346,29 +346,15 @@ Deno.test("speech admission failure is refunded once and replays without reacqui
   assertEquals(value.repository.usage(value.user.id).calls, 0);
 });
 
-Deno.test("speech replay persistence failure settles completed provider work durably", async () => {
+Deno.test("speech replay capacity rejects before provider work", async () => {
   const value = await fixture({ replayBytes: 2 });
   const key = "speech-replay-quota";
   const response = await value.request(undefined, key);
-  assertEquals(response.status, 429);
-  assertEquals((await response.json()).error.code, "replay_persistence_error");
-  const replay = await value.request(undefined, key);
-  assertEquals(replay.status, 429);
-  assertEquals(replay.headers.get("x-idempotent-replay"), "true");
-  assertEquals((await replay.json()).error.code, "replay_persistence_error");
-  assertEquals(value.providerCalls, 1);
-  const stored = value.repository.getApiRequest(value.user.id, "audio.speech", key);
-  assertExists(stored);
-  const run = value.repository.usageRuns.get(stored.usageRunId);
-  assertEquals({
-    status: run?.status,
-    cost: run?.costMicros,
-    providerCost: run?.actualProviderCostMicros,
-  }, {
-    status: "completed",
-    cost: 10,
-    providerCost: 10,
-  });
+  assertEquals(response.status, 413);
+  assertEquals((await response.json()).error.code, "response_too_large");
+  assertEquals(value.providerCalls, 0);
+  assertEquals(value.repository.getApiRequest(value.user.id, "audio.speech", key), undefined);
+  assertEquals(value.repository.usage(value.user.id).calls, 0);
 });
 
 Deno.test("speech response is withheld until binary replay and settlement are durable", async () => {

@@ -1,6 +1,20 @@
-import { assertEquals, assertThrows } from "jsr:@std/assert@1.0.14";
+import { assertEquals, assertStringIncludes, assertThrows } from "jsr:@std/assert@1.0.14";
 import { DomainError, MemoryRepository } from "./memory.ts";
-import { decodeApiResponseBody, InvalidApiResponseBodyError } from "./repository.ts";
+import {
+  decodeApiResponseBody,
+  InvalidApiResponseBodyError,
+  splitApiSseReplayFrame,
+} from "./repository.ts";
+
+Deno.test("SSE replay splitting preserves astral and unpaired UTF-16 exactly", () => {
+  const value = `a🦖b${String.fromCharCode(0xd800)}c🧪`;
+  const fragments = splitApiSseReplayFrame(value, 4);
+  assertEquals(fragments.join(""), value);
+  assertEquals(
+    fragments.every((fragment) => new TextEncoder().encode(fragment).length <= 4),
+    true,
+  );
+});
 
 Deno.test("passwordless domain users are represented without a local credential", () => {
   const repo = new MemoryRepository();
@@ -583,6 +597,165 @@ Deno.test("provider registry hides credentials, versions mutations, and preserve
       }, { actorId: actor.id, action: "provider.create" }),
     DomainError,
     "URL",
+  );
+});
+
+Deno.test("provider registry HTTP exception is exact-host and test-only", () => {
+  const previousEnvironment = Deno.env.get("DENO_ENV");
+  const previousHost = Deno.env.get("OPENAI_TEST_ALLOW_HTTP_HOST");
+  try {
+    Deno.env.set("DENO_ENV", "test");
+    Deno.env.set("OPENAI_TEST_ALLOW_HTTP_HOST", "127.0.0.1");
+    const repo = new MemoryRepository();
+    const actor = repo.createUser({
+      email: "contract-local@example.com",
+      name: "Contract local",
+      passwordHash: "hash",
+      role: "admin",
+      approvalStatus: "approved",
+    });
+    const mutation = { actorId: actor.id, action: "provider.create" };
+    const provider = repo.createProvider({
+      slug: "contract-local",
+      displayName: "Contract local",
+      baseUrl: "http://127.0.0.1:4010/v1/",
+      protocol: "responses",
+    }, mutation);
+    assertEquals(provider.baseUrl, "http://127.0.0.1:4010/v1");
+    assertThrows(
+      () =>
+        repo.createProvider({
+          slug: "contract-wrong-host",
+          displayName: "Wrong host",
+          baseUrl: "http://localhost:4010/v1",
+          protocol: "responses",
+        }, mutation),
+      DomainError,
+      "Provider base URL is invalid",
+    );
+  } finally {
+    if (previousEnvironment === undefined) Deno.env.delete("DENO_ENV");
+    else Deno.env.set("DENO_ENV", previousEnvironment);
+    if (previousHost === undefined) Deno.env.delete("OPENAI_TEST_ALLOW_HTTP_HOST");
+    else Deno.env.set("OPENAI_TEST_ALLOW_HTTP_HOST", previousHost);
+  }
+});
+
+Deno.test("provider model defaults and OCR graphs remain valid across edit order", () => {
+  const repo = new MemoryRepository();
+  const actor = repo.bootstrapAdmin({
+    email: "model-invariants@example.com",
+    name: "Model invariants",
+    passwordHash: "hash",
+  }, 1);
+  const mutation = { actorId: actor.id, action: "model.invariant" };
+  const provider = repo.createProvider({
+    slug: "invariants",
+    displayName: "Invariants",
+    baseUrl: "https://invariants.example/v1",
+    protocol: "chat_completions",
+  }, mutation);
+  const model = (name: string) =>
+    repo.createProviderModel({
+      providerId: provider.id,
+      publicModelId: `invariants/${name}`,
+      upstreamModelId: name,
+      displayName: name,
+      capabilities: ["chat", "vision"],
+      contextWindow: 8_192,
+    }, mutation);
+  const first = model("first");
+  const second = model("second");
+  const ocr = (target: string) => ({
+    ocr: {
+      enabled: true,
+      providerId: provider.id,
+      model: target,
+      prompt: "Extract text",
+    },
+  });
+  const firstUpdated = repo.updateProviderModel(first.id, first.version, {
+    customParams: ocr(second.id),
+  }, mutation);
+  assertThrows(
+    () => repo.updateProvider(provider.id, provider.version, { enabled: false }, mutation),
+    DomainError,
+    "must remain enabled",
+  );
+  assertThrows(
+    () =>
+      repo.updateProviderModel(
+        second.id,
+        second.version,
+        { customParams: ocr(first.id) },
+        mutation,
+      ),
+    DomainError,
+    "cannot intercept OCR itself",
+  );
+  assertThrows(
+    () =>
+      repo.updateProviderModel(second.id, second.version, { capabilities: ["vision"] }, mutation),
+    DomainError,
+    "both chat and vision",
+  );
+  assertThrows(
+    () =>
+      repo.updateProviderModel(
+        second.id,
+        second.version,
+        { customParams: ocr(second.id) },
+        mutation,
+      ),
+    DomainError,
+    "cannot intercept OCR itself",
+  );
+  const stoppedFirst = repo.updateProviderModel(first.id, firstUpdated.version, {
+    customParams: { stop: "END" },
+  }, mutation);
+  const protocolError = assertThrows(
+    () => repo.updateProvider(provider.id, provider.version, { protocol: "responses" }, mutation),
+    DomainError,
+    "not supported by Responses providers",
+  );
+  assertStringIncludes(protocolError.message, "invariants/first");
+
+  const disabledSource = repo.updateProviderModel(first.id, stoppedFirst.version, {
+    enabled: false,
+    customParams: ocr(second.id),
+  }, mutation);
+  repo.updateProviderModel(second.id, second.version, { enabled: false }, mutation);
+  const currentProvider = repo.findProvider(provider.id)!;
+  repo.updateProvider(currentProvider.id, currentProvider.version, { enabled: false }, mutation);
+  assertEquals(repo.findProviderModel(disabledSource.id)?.enabled, false);
+  assertThrows(
+    () =>
+      repo.updateProviderModel(disabledSource.id, disabledSource.version, {
+        enabled: true,
+      }, mutation),
+    DomainError,
+    "must remain enabled",
+  );
+
+  const responses = repo.createProvider({
+    slug: "responses-invariants",
+    displayName: "Responses invariants",
+    baseUrl: "https://responses.example/v1",
+    protocol: "responses",
+  }, mutation);
+  assertThrows(
+    () =>
+      repo.createProviderModel({
+        providerId: responses.id,
+        publicModelId: "responses-invariants/invalid",
+        upstreamModelId: "invalid",
+        displayName: "Invalid",
+        capabilities: ["chat"],
+        contextWindow: 8_192,
+        customParams: { stop: "END" },
+      }, mutation),
+    DomainError,
+    "not supported by Responses providers",
   );
 });
 
@@ -2627,6 +2800,152 @@ Deno.test("durable API idempotency lifecycle reserves once, replays frames, and 
   assertEquals(repo.pruneExpiredApiRequests(), 1);
 });
 
+Deno.test("stale API reaping never exceeds an exact replay reservation", () => {
+  const repo = new MemoryRepository();
+  const user = repo.createUser({
+    email: "api-reaper-bound@example.com",
+    name: "Reaper bound",
+    passwordHash: "x",
+  });
+  repo.credit(user.id, "api-reaper-bound-grant", "grant", 1_000_000);
+  const prefix = 'data: {"delta":"bounded"}\n\n';
+  const prefixBytes = new TextEncoder().encode(prefix).length;
+  const begun = repo.beginApiRequest({
+    userId: user.id,
+    endpoint: "chat.completions",
+    idempotencyKey: "reaper-exact-bound",
+    requestHash: "f".repeat(64),
+    stream: true,
+    model: "test/model",
+    runId: "reaper-exact-bound-run",
+    reserveMicros: 100,
+    provider: "test",
+    replayReservedBytes: prefixBytes,
+    replayReservedEvents: 1,
+  });
+  if (begun.kind !== "started") throw new Error("expected started request");
+  repo.appendApiSseFrame(begun.request.id, begun.leaseToken, 0, prefix);
+  repo.apiIdempotencyRequests.get(begun.request.id)!.leaseExpiresAt = new Date(0).toISOString();
+
+  assertEquals(repo.reapStaleApiRequests(), 1);
+  const failed = repo.getApiRequest(
+    user.id,
+    "chat.completions",
+    "reaper-exact-bound",
+  )!;
+  assertEquals(failed.state, "failed");
+  assertEquals(failed.frames.map(({ frame }) => frame), [prefix]);
+  assertEquals(failed.responseBody, null);
+  assertEquals(failed.failureStartedStream, true);
+  assertEquals(failed.responseStatus, 200);
+  assertEquals(failed.responseHeaders["content-type"], "text/event-stream");
+  assertEquals(failed.responseHeaders["cache-control"], "no-cache");
+
+  repo.apiIdempotencyRequests.get(begun.request.id)!.expiresAt = new Date(0).toISOString();
+  assertEquals(repo.pruneExpiredApiRequests(), 1);
+  const legacy = repo.beginApiRequest({
+    userId: user.id,
+    endpoint: "responses",
+    idempotencyKey: "reaper-custom-quota-bound",
+    requestHash: "e".repeat(64),
+    stream: true,
+    model: "test/model",
+    runId: "reaper-custom-quota-bound-run",
+    reserveMicros: 100,
+    provider: "test",
+    quota: { maxRequests: 1, maxBytes: prefixBytes, maxEvents: 1 },
+  });
+  if (legacy.kind !== "started") throw new Error("expected legacy request to start");
+  repo.appendApiSseFrame(
+    legacy.request.id,
+    legacy.leaseToken,
+    0,
+    prefix,
+    120,
+    undefined,
+    { maxRequests: 1, maxBytes: prefixBytes, maxEvents: 1 },
+  );
+  repo.apiIdempotencyRequests.get(legacy.request.id)!.leaseExpiresAt = new Date(0).toISOString();
+  assertEquals(
+    repo.reapStaleApiRequests(100, {
+      maxRequests: 1,
+      maxBytes: prefixBytes,
+      maxEvents: 1,
+    }),
+    1,
+  );
+  const legacyFailed = repo.getApiRequest(
+    user.id,
+    "responses",
+    "reaper-custom-quota-bound",
+  )!;
+  assertEquals(legacyFailed.frames.map(({ frame }) => frame), [prefix]);
+  assertEquals(legacyFailed.responseBody, null);
+  assertEquals(legacyFailed.responseStatus, 200);
+});
+
+Deno.test("stale API reaping preserves partial spend and its explicit attempt cause", () => {
+  const repo = new MemoryRepository();
+  const user = repo.createUser({
+    email: "api-reaper-partial@example.com",
+    name: "Partial reaper",
+    passwordHash: "x",
+  });
+  repo.credit(user.id, "api-reaper-partial-grant", "grant", 1_000);
+  const begun = repo.beginApiRequest({
+    userId: user.id,
+    endpoint: "chat.completions",
+    idempotencyKey: "reaper-partial-accounting",
+    requestHash: "d".repeat(64),
+    stream: true,
+    model: "test/model",
+    runId: "reaper-partial-accounting-run",
+    reserveMicros: 100,
+    provider: "test",
+  });
+  if (begun.kind !== "started") throw new Error("expected started request");
+  const run = repo.usageRuns.get(begun.usageRun.id)!;
+  run.executionEpoch = 1;
+  repo.providerAttempts.set("reaper-partial-attempt", {
+    usageRunId: run.id,
+    status: "running",
+    startedAt: new Date(Date.now() - 1_000).toISOString(),
+  } as never);
+  repo.appendApiSseFrame(
+    begun.request.id,
+    begun.leaseToken,
+    0,
+    'data: {"delta":"partial"}\n\n',
+    120,
+    { inputTokens: 5, outputTokens: 2, costMicros: 25, latencyMs: 10 },
+  );
+  repo.apiIdempotencyRequests.get(begun.request.id)!.leaseExpiresAt = new Date(0).toISOString();
+
+  assertEquals(repo.reapStaleApiRequests(), 1);
+  assertEquals(run.status, "failed");
+  assertEquals(repo.usage(user.id), {
+    balanceMicros: 975,
+    calls: 1,
+    inputTokens: 5,
+    outputTokens: 2,
+    spentMicros: 25,
+  });
+  const attempt = repo.providerAttempts.get("reaper-partial-attempt")!;
+  assertEquals(
+    { status: attempt.status, errorCode: attempt.errorCode, retryable: attempt.retryable },
+    { status: "cancelled", errorCode: "api_lease_expired", retryable: true },
+  );
+  const analytics = repo.adminAnalytics({
+    from: new Date(Date.now() - 60_000).toISOString(),
+    to: new Date(Date.now() + 60_000).toISOString(),
+    bucket: "hour",
+  });
+  assertEquals(
+    { completed: analytics.summary.completed, failed: analytics.summary.failed },
+    { completed: 0, failed: 1 },
+  );
+});
+
 Deno.test("durable API SSE batches validate atomically and preserve contiguous order", () => {
   const repo = new MemoryRepository();
   const user = repo.createUser({
@@ -2683,6 +3002,40 @@ Deno.test("durable API SSE batches validate atomically and preserve contiguous o
   assertEquals(completed.state, "completed");
   assertEquals(completed.frames.at(-1)?.frame.includes("response.completed"), true);
   assertEquals(completed.responseHeaders["cache-control"], "no-cache");
+
+  const chunked = repo.beginApiRequest({
+    userId: user.id,
+    endpoint: "responses",
+    idempotencyKey: "batch-request-chunked",
+    requestHash: "9".repeat(64),
+    stream: true,
+    model: "test/model",
+    runId: "batch-run-chunked",
+    reserveMicros: 50_000,
+    provider: "test",
+  });
+  if (chunked.kind !== "started") throw new Error("expected chunked request");
+  const largeTerminal = `event: response.completed\ndata: ${
+    JSON.stringify({ text: `${"\u0000".repeat(200_000)}${"🦖".repeat(80_000)}` })
+  }\n\n`;
+  const chunkedCompleted = repo.completeApiStream({
+    id: chunked.request.id,
+    leaseToken: chunked.leaseToken,
+    responseStatus: 200,
+    terminalFrame: largeTerminal,
+    costMicros: 10_000,
+    inputTokens: 2,
+    outputTokens: 3,
+    latencyMs: 5,
+  });
+  assertEquals(chunkedCompleted.frames.length > 1, true);
+  assertEquals(chunkedCompleted.frames.map((frame) => frame.frame).join(""), largeTerminal);
+  assertEquals(
+    chunkedCompleted.frames.every((frame) =>
+      new TextEncoder().encode(frame.frame).length <= 1_048_576
+    ),
+    true,
+  );
 
   const atomic = repo.beginApiRequest({
     userId: user.id,
@@ -2806,6 +3159,115 @@ Deno.test("per-user replay quotas bound live requests, events, and bytes", () =>
       }),
     DomainError,
     "storage quota",
+  );
+  assertThrows(
+    () =>
+      repo.failApiRequest({
+        id: second.request.id,
+        leaseToken: second.leaseToken,
+        responseStatus: 500,
+        responseBody: "x".repeat(20),
+        quota,
+        billing: { mode: "refund" },
+      }),
+    DomainError,
+    "storage quota",
+  );
+});
+
+Deno.test("replay capacity reservations fence concurrent provider dispatch", () => {
+  const repo = new MemoryRepository();
+  const user = repo.createUser({
+    email: "replay-reservation@example.com",
+    name: "Replay reservation",
+    passwordHash: "x",
+  });
+  repo.credit(user.id, "replay-reservation-grant", "grant", 1_000_000);
+  const quota = { maxRequests: 10, maxEvents: 20_000, maxBytes: 67_108_864 };
+  assertThrows(
+    () =>
+      repo.beginApiRequest({
+        userId: user.id,
+        endpoint: "responses",
+        idempotencyKey: "invalid-event-only-reservation",
+        requestHash: "e".repeat(64),
+        stream: true,
+        model: "test/model",
+        runId: "invalid-event-only-reservation-run",
+        reserveMicros: 1,
+        provider: "test",
+        quota,
+        replayReservedBytes: 0,
+        replayReservedEvents: 1,
+      }),
+    DomainError,
+    "Invalid idempotent request parameters",
+  );
+  const first = repo.beginApiRequest({
+    userId: user.id,
+    endpoint: "responses",
+    idempotencyKey: "reserved-replay-first",
+    requestHash: "a".repeat(64),
+    stream: true,
+    model: "test/model",
+    runId: "reserved-replay-run-first",
+    reserveMicros: 1,
+    provider: "test",
+    quota,
+    replayReservedBytes: 40_000_000,
+    replayReservedEvents: 9_000,
+  });
+  assertEquals(first.kind, "started");
+  assertThrows(
+    () =>
+      repo.beginApiRequest({
+        userId: user.id,
+        endpoint: "responses",
+        idempotencyKey: "reserved-replay-second",
+        requestHash: "b".repeat(64),
+        stream: true,
+        model: "test/model",
+        runId: "reserved-replay-run-second",
+        reserveMicros: 1,
+        provider: "test",
+        quota,
+        replayReservedBytes: 40_000_000,
+        replayReservedEvents: 9_000,
+      }),
+    DomainError,
+    "quota",
+  );
+  assertEquals(repo.usageRuns.has("reserved-replay-run-second"), false);
+  const failure = repo.beginApiRequest({
+    userId: user.id,
+    endpoint: "responses",
+    idempotencyKey: "reserved-replay-failure",
+    requestHash: "f".repeat(64),
+    stream: true,
+    model: "test/model",
+    runId: "reserved-replay-run-failure",
+    reserveMicros: 1,
+    provider: "test",
+    quota,
+    replayReservedBytes: 16,
+    replayReservedEvents: 1,
+  });
+  if (failure.kind !== "started") throw new Error("missing failure reservation");
+  assertThrows(
+    () =>
+      repo.failApiRequest({
+        id: failure.request.id,
+        leaseToken: failure.leaseToken,
+        responseStatus: 500,
+        responseBody: '{"error":"provider failed"}',
+        billing: { mode: "refund" },
+      }),
+    DomainError,
+    "Reserved replay capacity",
+  );
+  assertEquals(
+    repo.getApiRequest(user.id, "responses", "reserved-replay-failure")?.state,
+    "in_progress",
   );
 });
 

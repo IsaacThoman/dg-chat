@@ -5,6 +5,7 @@ import {
   createImageGeneration,
   decodeImage,
   ImageProviderError,
+  maximumImageJsonReplayBytes,
   parseImageGenerationRequest,
 } from "./images.ts";
 
@@ -16,6 +17,20 @@ const request = () =>
     prompt: "a polished robot",
     response_format: "b64_json",
   });
+
+Deno.test("buffered image replay bounds distinguish binary and asset-only responses", () => {
+  const parsed = parseImageGenerationRequest({
+    model: "images/test",
+    prompt: "bounded",
+    n: 10,
+    response_format: "b64_json",
+  });
+  const binary = maximumImageJsonReplayBytes(parsed, false);
+  const rich = maximumImageJsonReplayBytes(parsed, true);
+  assertEquals(binary > 32 * 1024 * 1024, true);
+  assertEquals(rich < 8 * 1024 * 1024, true);
+  assertEquals(binary - rich, Math.ceil((32 * 1024 * 1024) / 3) * 4);
+});
 
 Deno.test("image generation request parsing is strict and normalizes cross-field constraints", () => {
   assertEquals(request(), {

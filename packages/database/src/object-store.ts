@@ -66,6 +66,28 @@ function assertKey(key: string) {
   if (!validKey(key)) throw new TypeError("Object key is invalid");
 }
 
+function isPrivateOrContainerHostname(hostname: string) {
+  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (normalized === "localhost" || normalized.endsWith(".localhost")) return true;
+  // A single-label DNS name is the normal service-discovery address for bundled MinIO and other
+  // container orchestrators. It cannot name a public DNS host without a local search domain.
+  if (
+    !normalized.includes(".") &&
+    /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(normalized)
+  ) return true;
+  const ipv4 = normalized.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ipv4) {
+    const octets = ipv4.slice(1).map(Number);
+    if (octets.some((octet) => octet > 255)) return false;
+    return octets[0] === 10 || octets[0] === 127 ||
+      (octets[0] === 169 && octets[1] === 254) ||
+      (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) ||
+      (octets[0] === 192 && octets[1] === 168);
+  }
+  return normalized === "::1" || /^(?:fc|fd)[0-9a-f]{2}:/.test(normalized) ||
+    /^fe[89ab][0-9a-f]:/.test(normalized);
+}
+
 export function objectStoreConfigFromEnv(
   env: Record<string, string | undefined> = Deno.env.toObject(),
 ): ObjectStoreConfig | undefined {
@@ -93,12 +115,29 @@ export function objectStoreConfigFromEnv(
   }
   let endpoint: string | undefined;
   if (env.S3_ENDPOINT?.trim()) {
-    const url = new URL(env.S3_ENDPOINT);
+    let url: URL;
+    try {
+      url = new URL(env.S3_ENDPOINT);
+    } catch {
+      throw new Error("S3_ENDPOINT is invalid");
+    }
     if (
       !["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search ||
       url.hash
     ) {
       throw new Error("S3_ENDPOINT is invalid");
+    }
+    if (url.protocol === "http:") {
+      if (env.S3_ALLOW_INSECURE !== "true") {
+        throw new Error(
+          "S3_ENDPOINT must use HTTPS unless S3_ALLOW_INSECURE=true is explicitly configured",
+        );
+      }
+      if (!isPrivateOrContainerHostname(url.hostname)) {
+        throw new Error(
+          "Insecure S3 endpoints are restricted to loopback, private-network, or container hosts",
+        );
+      }
     }
     endpoint = url.toString().replace(/\/$/, "");
   }

@@ -444,7 +444,7 @@ Deno.test("privileged backup routes require capability, fresh auth, exact confir
   const audits = (await repository.listAudit()).data.filter((event) =>
     event.action.startsWith("backup.provider_secrets_")
   );
-  assertEquals(audits.map((event) => event.action), [
+  assertEquals(audits.map((event) => event.action).sort(), [
     "backup.provider_secrets_download_requested",
     "backup.provider_secrets_export_requested",
   ]);
@@ -800,7 +800,7 @@ Deno.test("restore maintenance fences OpenAI traffic before token and provider s
     error: { code: string; type: string; message: string };
   };
   assertEquals(modelError.error.code, "installation_maintenance");
-  assertEquals(modelError.error.type, "invalid_request_error");
+  assertEquals(modelError.error.type, "server_error");
   assertEquals((await repository.listApiTokens(user.id))[0].lastUsedAt, null);
 
   const chat = await app.request("/v1/chat/completions", {

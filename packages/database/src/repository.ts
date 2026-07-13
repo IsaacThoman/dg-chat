@@ -78,6 +78,8 @@ export interface ConversationShareAttachmentAccess {
   ownerId: string;
   attachment: PublicConversationShareAttachment;
   objectKey: string;
+  /** Internal immutable digest used to validate the object before public streaming. */
+  sha256: string;
 }
 
 export interface CreateUserInput {
@@ -1178,6 +1180,126 @@ export interface ApiReplayQuota {
   maxBytes: number;
   maxEvents: number;
 }
+export const API_SSE_REPLAY_FRAGMENT_MAX_BYTES = 1_048_576;
+export const API_SSE_REPLAY_REQUEST_MAX_BYTES = 268_435_456;
+export const API_SSE_REPLAY_REQUEST_MAX_EVENTS = 20_000;
+export const DEFAULT_API_REPLAY_QUOTA: Readonly<ApiReplayQuota> = {
+  maxRequests: 256,
+  maxBytes: 67_108_864,
+  maxEvents: 20_000,
+};
+
+export const ABANDONED_API_ERROR_BODY = JSON.stringify({
+  error: {
+    message: "Request interrupted before completion",
+    type: "server_error",
+    param: null,
+    code: "request_abandoned",
+  },
+});
+
+export interface AbandonedApiReplayPlanInput {
+  endpoint: ApiIdempotencyEndpoint;
+  eventCount: number;
+  eventBytes: number;
+  replayReservedBytes: number;
+  replayReservedEvents: number;
+  aggregateBytes: number;
+  aggregateEvents: number;
+  quota?: ApiReplayQuota;
+}
+
+/**
+ * Plans crash-recovery storage without violating replay limits. When an interrupted
+ * stream has exhausted its reservation, the bounded fallback retains its immutable
+ * prefix and closes it without manufacturing an event or JSON body beyond capacity.
+ */
+export function planAbandonedApiReplay(
+  input: AbandonedApiReplayPlanInput,
+): { responseBody: string | null; terminalFrame: string | null } {
+  const encoder = new TextEncoder();
+  const quota = input.quota ?? DEFAULT_API_REPLAY_QUOTA;
+  const hasStreamPrefix = input.eventCount > 0;
+  const terminalFrame = hasStreamPrefix
+    ? input.endpoint === "responses"
+      ? `event: error\ndata: ${ABANDONED_API_ERROR_BODY}\n\n`
+      : `data: ${ABANDONED_API_ERROR_BODY}\n\n`
+    : null;
+  const candidates = hasStreamPrefix
+    ? [
+      { responseBody: ABANDONED_API_ERROR_BODY, terminalFrame },
+      { responseBody: null, terminalFrame },
+      { responseBody: null, terminalFrame: null },
+    ]
+    : [
+      { responseBody: ABANDONED_API_ERROR_BODY, terminalFrame: null },
+      { responseBody: null, terminalFrame: null },
+    ];
+  const reserved = input.replayReservedBytes > 0 || input.replayReservedEvents > 0;
+  for (const candidate of candidates) {
+    const bodyBytes = candidate.responseBody === null
+      ? 0
+      : encoder.encode(candidate.responseBody).length;
+    const frameBytes = candidate.terminalFrame === null
+      ? 0
+      : encoder.encode(candidate.terminalFrame).length;
+    const addedEvents = candidate.terminalFrame === null ? 0 : 1;
+    if (
+      bodyBytes > API_SSE_REPLAY_REQUEST_MAX_BYTES ||
+      input.eventCount + addedEvents > API_SSE_REPLAY_REQUEST_MAX_EVENTS ||
+      input.eventBytes + frameBytes > API_SSE_REPLAY_REQUEST_MAX_BYTES
+    ) continue;
+    if (reserved) {
+      if (
+        input.eventCount + addedEvents > input.replayReservedEvents ||
+        input.eventBytes + bodyBytes + frameBytes > input.replayReservedBytes
+      ) continue;
+    } else if (
+      input.aggregateEvents + addedEvents > quota.maxEvents ||
+      input.aggregateBytes + bodyBytes + frameBytes > quota.maxBytes
+    ) continue;
+    return candidate;
+  }
+  // The final candidate adds no storage and therefore always fits valid persisted state.
+  return { responseBody: null, terminalFrame: null };
+}
+
+/** Splits replay records without changing their exact string concatenation. */
+export function splitApiSseReplayFrame(
+  frame: string,
+  maximumBytes = API_SSE_REPLAY_FRAGMENT_MAX_BYTES,
+): string[] {
+  if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 4) {
+    throw new TypeError("SSE replay fragment size must be an integer of at least four bytes");
+  }
+  if (frame.length === 0) return [""];
+  const chunks: string[] = [];
+  let start = 0;
+  let bytes = 0;
+  for (let index = 0; index < frame.length;) {
+    const first = frame.charCodeAt(index);
+    const paired = first >= 0xd800 && first <= 0xdbff && index + 1 < frame.length &&
+      frame.charCodeAt(index + 1) >= 0xdc00 && frame.charCodeAt(index + 1) <= 0xdfff;
+    const width = paired ? 2 : 1;
+    const codePoint = paired ? frame.codePointAt(index)! : first;
+    const encodedBytes = codePoint <= 0x7f
+      ? 1
+      : codePoint <= 0x7ff
+      ? 2
+      : codePoint <= 0xffff
+      ? 3
+      : 4;
+    if (bytes + encodedBytes > maximumBytes) {
+      chunks.push(frame.slice(start, index));
+      start = index;
+      bytes = 0;
+    }
+    bytes += encodedBytes;
+    index += width;
+  }
+  chunks.push(frame.slice(start));
+  return chunks;
+}
 export interface ApiSseFrameInput {
   sequence: number;
   frame: string;
@@ -1194,6 +1316,8 @@ export interface ApiIdempotencyRequest {
   leaseToken: string | null;
   leaseExpiresAt: string | null;
   usageRunId: string;
+  replayReservedBytes: number;
+  replayReservedEvents: number;
   responseStatus: number | null;
   responseHeaders: Record<string, string>;
   responseBody: string | null;
@@ -1224,6 +1348,8 @@ export interface BeginApiRequestInput {
   leaseSeconds?: number;
   retentionSeconds?: number;
   quota?: ApiReplayQuota;
+  replayReservedBytes?: number;
+  replayReservedEvents?: number;
 }
 export type BeginApiRequestResult =
   | { kind: "started"; request: ApiIdempotencyRequest; leaseToken: string; usageRun: UsageRun }
@@ -1251,6 +1377,7 @@ export interface FailApiRequestInput {
   responseHeaders?: Record<string, string>;
   responseBody: string;
   terminalFrame?: string;
+  quota?: ApiReplayQuota;
   billing: { mode: "refund" } | {
     mode: "settle";
     costMicros: number;
@@ -2097,7 +2224,7 @@ export interface DomainRepository {
   completeApiJson(input: CompleteApiRequestInput): MaybePromise<ApiIdempotencyRequest>;
   completeApiStream(input: CompleteApiRequestInput): MaybePromise<ApiIdempotencyRequest>;
   failApiRequest(input: FailApiRequestInput): MaybePromise<ApiIdempotencyRequest>;
-  reapStaleApiRequests(limit?: number): MaybePromise<number>;
+  reapStaleApiRequests(limit?: number, quota?: ApiReplayQuota): MaybePromise<number>;
   pruneExpiredApiRequests(limit?: number): MaybePromise<number>;
   usage(userId: string): MaybePromise<UsageSummary>;
   listLedger(userId: string): MaybePromise<LedgerEntry[]>;

@@ -47,6 +47,11 @@ Compose stack passes them to both services and holds startup until `minio-init` 
 bucket-scoped identity. Custom deployments must preserve that ordering because text/JSON ingestion
 reads immutable objects directly from the worker.
 
+Object-storage endpoints must use HTTPS by default. The bundled private MinIO network deliberately
+uses HTTP and therefore sets `S3_ALLOW_INSECURE=true`; that opt-in is accepted only for loopback,
+private IP addresses, and single-label container service names such as `minio`. Never enable it for
+a public or externally routed endpoint. Terminate TLS at the object store for those deployments.
+
 Uploads default to 25 MiB with at most four concurrent uploads per application replica and two per
 user. Tune `UPLOAD_MAX_BYTES`, `UPLOAD_MAX_CONCURRENT`, and `UPLOAD_MAX_CONCURRENT_PER_USER` while
 keeping the application `/tmp` tmpfs large enough for the resulting worst-case staged bytes.
@@ -58,8 +63,8 @@ Redis-backed admission uses renewable, crash-safe leases. `AUDIO_CONCURRENCY_LEA
 to 120 seconds; keep it comfortably longer than transient Redis outages. Each active request keeps a
 validated audio body and a bounded retry body in memory.
 
-For an external object store, set `S3_ENDPOINT`, `S3_REGION`, and `S3_FORCE_PATH_STYLE` as required
-by that service in addition to the bucket and scoped credentials.
+For an external object store, set an HTTPS `S3_ENDPOINT`, `S3_REGION`, and `S3_FORCE_PATH_STYLE` as
+required by that service in addition to the bucket and scoped credentials.
 
 Validate and launch:
 

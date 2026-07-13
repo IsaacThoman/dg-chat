@@ -58,7 +58,7 @@ const failureKey = `contract-mock-error-${crypto.randomUUID()}`;
 const failed = await completion("mock-error", "Structured provider failure", failureKey);
 const failureWire = await failed.text();
 const expectedFailure =
-  'data: {"error":{"message":"Provider stream failed","type":"invalid_request_error","param":null,"code":"provider_error"}}\n\n';
+  'data: {"error":{"message":"Provider stream failed","type":"server_error","param":null,"code":"provider_error"}}\n\n';
 assert(failed.status === 200, `Provider stream failure returned HTTP ${failed.status}`);
 assert(
   failed.headers.get("content-type")?.startsWith("text/event-stream"),

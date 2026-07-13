@@ -162,6 +162,21 @@ import type { Attachment, AuditFilters, Conversation, Message, Model, User } fro
 
 type View = "chat" | "archived" | "trash" | "knowledge" | "settings" | "tokens" | "admin";
 const cn = (...v: Array<string | false | null | undefined>) => v.filter(Boolean).join(" ");
+const mobileSidebarQuery = "(max-width: 760px)";
+
+function useMediaQuery(query: string): boolean {
+  const [matches, setMatches] = useState(() =>
+    typeof globalThis.matchMedia === "function" && globalThis.matchMedia(query).matches
+  );
+  useEffect(() => {
+    const media = globalThis.matchMedia(query);
+    const update = () => setMatches(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, [query]);
+  return matches;
+}
 
 function Brand({ compact = false }: { compact?: boolean }) {
   return (
@@ -214,6 +229,22 @@ function Avatar({ user, small = false }: { user: User; small?: boolean }) {
   );
 }
 
+function conversationDialogFocusTarget(conversationId: string): HTMLButtonElement | null {
+  const candidates = [
+    document.querySelector<HTMLButtonElement>(
+      `[data-conversation-actions="${CSS.escape(conversationId)}"]`,
+    ),
+    document.querySelector<HTMLButtonElement>('aside.sidebar [aria-label="Close sidebar"]'),
+    ...document.querySelectorAll<HTMLButtonElement>('[aria-label="Open menu"]'),
+    ...document.querySelectorAll<HTMLButtonElement>("[data-conversation-actions]"),
+    ...document.querySelectorAll<HTMLButtonElement>(".lifecycle-empty button, .new-chat"),
+  ];
+  return candidates.find((candidate) =>
+    candidate?.isConnected && candidate.getClientRects().length > 0 &&
+    !candidate.closest("[inert]") && !candidate.disabled
+  ) ?? null;
+}
+
 function Sidebar({
   conversations,
   active,
@@ -221,6 +252,7 @@ function Sidebar({
   view,
   setView,
   mobileOpen,
+  drawerMode,
   closeMobile,
   user,
   onUpdate,
@@ -237,11 +269,13 @@ function Sidebar({
   view: View;
   setView: (v: View) => void;
   mobileOpen: boolean;
+  drawerMode: boolean;
   closeMobile: () => void;
   user: User;
   onUpdate: (
     conversation: Conversation,
     patch: { title?: string; pinned?: boolean; archived?: boolean; deleted?: boolean },
+    options?: { restoreLifecycleFocus?: boolean },
   ) => Promise<void>;
   listError: boolean;
   listLoading: boolean;
@@ -251,6 +285,7 @@ function Sidebar({
   busyConversationId: string;
 }) {
   const sidebarRef = useRef<HTMLElement>(null);
+  const menuPortalRef = useRef<HTMLDivElement>(null);
   const previousFocus = useRef<HTMLElement | null>(null);
   const closeMobileRef = useRef(closeMobile);
   closeMobileRef.current = closeMobile;
@@ -258,6 +293,25 @@ function Sidebar({
   const [query, setQuery] = useState("");
   const [selectedFolder, setSelectedFolder] = useState<string | null>(null);
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
+  const [activeRowDialogId, setActiveRowDialogId] = useState<string | null>(null);
+  const previousRowDialogId = useRef<string | null>(null);
+  const setRowDialogOpen = useCallback((id: string, open: boolean) => {
+    setActiveRowDialogId((current) => open ? id : current === id ? null : current);
+  }, []);
+  useEffect(() => {
+    const previous = previousRowDialogId.current;
+    previousRowDialogId.current = activeRowDialogId;
+    if (previous === null || activeRowDialogId !== null) return;
+    const frame = requestAnimationFrame(() => {
+      const activeElement = document.activeElement as HTMLElement | null;
+      if (
+        activeElement && activeElement !== document.body && activeElement.isConnected &&
+        !activeElement.closest("[inert]")
+      ) return;
+      conversationDialogFocusTarget(previous)?.focus();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [activeRowDialogId]);
   const workspace = useWorkspace();
   const listView: ConversationListView = view === "archived" || view === "trash" ? view : "chat";
   const visible = conversationsForView(conversations, listView);
@@ -277,7 +331,7 @@ function Sidebar({
     closeMobile();
   };
   useEffect(() => {
-    if (!mobileOpen) return;
+    if (!drawerMode || !mobileOpen) return;
     previousFocus.current = document.activeElement as HTMLElement;
     const panel = sidebarRef.current;
     panel?.querySelector<HTMLButtonElement>('[aria-label="Close sidebar"]')?.focus();
@@ -305,16 +359,44 @@ function Sidebar({
     document.addEventListener("keydown", keydown);
     return () => {
       document.removeEventListener("keydown", keydown);
-      requestAnimationFrame(() => previousFocus.current?.focus());
+      requestAnimationFrame(() => {
+        const target = previousFocus.current;
+        if (target?.isConnected && target.getClientRects().length > 0) {
+          target.focus();
+          return;
+        }
+        const destinationMenu = [...document.querySelectorAll<HTMLElement>(
+          '[aria-label="Open menu"]',
+        )].find((element) => element.isConnected && element.getClientRects().length > 0);
+        if (destinationMenu) {
+          destinationMenu.focus();
+          return;
+        }
+        const composer = document.querySelector<HTMLElement>(".composer textarea");
+        if (composer?.getClientRects().length) {
+          composer.focus();
+          return;
+        }
+        const heading = document.querySelector<HTMLElement>("main h1, main h2");
+        if (heading) {
+          heading.tabIndex = -1;
+          heading.focus();
+        }
+      });
     };
-  }, [mobileOpen]);
+  }, [drawerMode, mobileOpen]);
+  const closedDrawer = drawerMode && !mobileOpen;
+  const openDrawer = drawerMode && mobileOpen;
+  const nestedDrawerDialog = openDrawer && activeRowDialogId !== null;
   return (
     <aside
       ref={sidebarRef}
       className={cn("sidebar", mobileOpen && "mobile-open")}
       aria-label="Workspace navigation"
-      aria-modal={mobileOpen || undefined}
-      role={mobileOpen ? "dialog" : undefined}
+      aria-hidden={closedDrawer || nestedDrawerDialog || undefined}
+      aria-modal={openDrawer && !nestedDrawerDialog || undefined}
+      inert={closedDrawer || nestedDrawerDialog || undefined}
+      role={openDrawer && !nestedDrawerDialog ? "dialog" : undefined}
     >
       <div className="sidebar-head">
         <Brand />
@@ -444,6 +526,8 @@ function Sidebar({
                 folders={workspace.folders.data}
                 tags={workspace.tags.data}
                 mutationLocked={busyConversationId === c.id}
+                menuPortalRef={menuPortalRef}
+                onDialogChange={setRowDialogOpen}
               />
             ))}
             <p className="section-label">RECENT</p>
@@ -459,6 +543,8 @@ function Sidebar({
                 folders={workspace.folders.data}
                 tags={workspace.tags.data}
                 mutationLocked={busyConversationId === c.id}
+                menuPortalRef={menuPortalRef}
+                onDialogChange={setRowDialogOpen}
               />
             ))}
             {!filtered.length && (
@@ -500,12 +586,24 @@ function Sidebar({
           <MoreHorizontal size={17} className="push" />
         </button>
       </div>
+      <div ref={menuPortalRef} className="sidebar-menu-portal-root" />
     </aside>
   );
 }
 
 function ConversationRow(
-  { c, active, onOpen, listView, onUpdate, folders, tags, mutationLocked }: {
+  {
+    c,
+    active,
+    onOpen,
+    listView,
+    onUpdate,
+    folders,
+    tags,
+    mutationLocked,
+    menuPortalRef,
+    onDialogChange,
+  }: {
     c: Conversation;
     active: boolean;
     onOpen: (id: string) => void;
@@ -513,10 +611,13 @@ function ConversationRow(
     onUpdate: (
       conversation: Conversation,
       patch: { title?: string; pinned?: boolean; archived?: boolean; deleted?: boolean },
+      options?: { restoreLifecycleFocus?: boolean },
     ) => Promise<void>;
     folders?: import("./workspace/WorkspaceNavigation.tsx").FolderData;
     tags?: import("./workspace/WorkspaceNavigation.tsx").TagData;
     mutationLocked: boolean;
+    menuPortalRef: RefObject<HTMLDivElement | null>;
+    onDialogChange: (id: string, open: boolean) => void;
   },
 ) {
   const [menu, setMenu] = useState(false);
@@ -529,6 +630,22 @@ function ConversationRow(
   const rowRef = useRef<HTMLDivElement>(null);
   const actionRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+  useEffect(() => () => onDialogChange(c.id, false), [c.id, onDialogChange]);
+  const restoreDialogFocus = useCallback(
+    () => conversationDialogFocusTarget(c.id),
+    [c.id],
+  );
+  const openRowDialog = (open: () => void) => {
+    setError("");
+    actionRef.current?.focus();
+    onDialogChange(c.id, true);
+    setMenu(false);
+    open();
+  };
+  const closeRowDialog = (close: () => void) => {
+    close();
+    onDialogChange(c.id, false);
+  };
   useEffect(() => {
     if (!menu) return;
     const dismiss = (event: PointerEvent) => {
@@ -563,11 +680,14 @@ function ConversationRow(
     setMenu(false);
     requestAnimationFrame(() => actionRef.current?.focus());
   };
-  const update = async (patch: Parameters<typeof onUpdate>[1]) => {
+  const update = async (
+    patch: Parameters<typeof onUpdate>[1],
+    options?: Parameters<typeof onUpdate>[2],
+  ) => {
     setBusy(true);
     setError("");
     try {
-      await onUpdate(c, patch);
+      await onUpdate(c, patch, options);
       if (patch.pinned !== undefined) {
         setMenu(false);
         requestAnimationFrame(() => {
@@ -630,7 +750,7 @@ function ConversationRow(
       >
         <Ellipsis size={16} />
       </button>
-      {menu && createPortal(
+      {menu && menuPortalRef.current && createPortal(
         <div
           ref={menuRef}
           className="conversation-menu conversation-menu-portal"
@@ -665,11 +785,7 @@ function ConversationRow(
             <button
               autoFocus
               role="menuitem"
-              onClick={() => {
-                actionRef.current?.focus();
-                setRename(true);
-                setMenu(false);
-              }}
+              onClick={() => openRowDialog(() => setRename(true))}
             >
               <Pencil size={14} /> Rename
             </button>
@@ -677,11 +793,7 @@ function ConversationRow(
           {listView === "chat" && folders && tags && (
             <button
               role="menuitem"
-              onClick={() => {
-                actionRef.current?.focus();
-                setOrganize(true);
-                setMenu(false);
-              }}
+              onClick={() => openRowDialog(() => setOrganize(true))}
             >
               <Folder size={14} /> Organize
             </button>
@@ -728,26 +840,23 @@ function ConversationRow(
             <button
               className="menu-danger"
               role="menuitem"
-              onClick={() => {
-                actionRef.current?.focus();
-                setConfirmDelete(true);
-                setMenu(false);
-              }}
+              onClick={() => openRowDialog(() => setConfirmDelete(true))}
             >
               <Trash2 size={14} /> Move to trash
             </button>
           )}
         </div>,
-        document.body,
+        menuPortalRef.current,
       )}
       {error && <span className="conversation-error" role="status">{error}</span>}
       {rename && (
         <RenameConversationDialog
           conversation={c}
-          close={() => setRename(false)}
+          close={() => closeRowDialog(() => setRename(false))}
+          restoreFocusTarget={restoreDialogFocus}
           save={async (title) => {
             const saved = await update({ title });
-            if (saved) setRename(false);
+            if (saved) closeRowDialog(() => setRename(false));
             return saved;
           }}
         />
@@ -755,19 +864,27 @@ function ConversationRow(
       {confirmDelete && (
         <Modal
           title="Move conversation to trash?"
-          close={() => setConfirmDelete(false)}
+          close={() => closeRowDialog(() => setConfirmDelete(false))}
           dismissible={!busy}
+          restoreFocusTarget={restoreDialogFocus}
         >
           <p className="muted">“{c.title}” can be restored later from Trash.</p>
+          {error && <p className="form-error" role="alert">{error}</p>}
           <div className="modal-actions">
-            <button className="secondary" disabled={busy} onClick={() => setConfirmDelete(false)}>
+            <button
+              className="secondary"
+              disabled={busy}
+              onClick={() => closeRowDialog(() => setConfirmDelete(false))}
+            >
               Cancel
             </button>
             <button
               className="danger-button"
               disabled={busy}
               onClick={async () => {
-                if (await update({ deleted: true })) setConfirmDelete(false);
+                if (await update({ deleted: true }, { restoreLifecycleFocus: false })) {
+                  closeRowDialog(() => setConfirmDelete(false));
+                }
               }}
             >
               Move to trash
@@ -780,7 +897,8 @@ function ConversationRow(
           conversation={c}
           folders={folders}
           tags={tags}
-          close={() => setOrganize(false)}
+          close={() => closeRowDialog(() => setOrganize(false))}
+          restoreFocusTarget={restoreDialogFocus}
         />
       )}
     </div>
@@ -788,10 +906,11 @@ function ConversationRow(
 }
 
 function RenameConversationDialog(
-  { conversation, close, save }: {
+  { conversation, close, save, restoreFocusTarget }: {
     conversation: Conversation;
     close: () => void;
     save: (title: string) => Promise<boolean>;
+    restoreFocusTarget?: () => HTMLElement | null;
   },
 ) {
   const [title, setTitle] = useState(conversation.title);
@@ -812,7 +931,12 @@ function RenameConversationDialog(
     }
   };
   return (
-    <Modal title="Rename conversation" close={close} dismissible={!busy}>
+    <Modal
+      title="Rename conversation"
+      close={close}
+      dismissible={!busy}
+      restoreFocusTarget={restoreFocusTarget}
+    >
       <form onSubmit={submit}>
         <label className="field">
           <span>Conversation title</span>
@@ -837,19 +961,18 @@ function RenameConversationDialog(
 }
 
 function BranchControl(
-  { branch, onTree, onSelect, busy, readOnly = false }: {
+  { branch, onTree, onSelect, busy }: {
     branch: MessageBranch;
     onTree: () => void;
     onSelect: (messageId: string) => void;
     busy: boolean;
-    readOnly?: boolean;
   },
 ) {
   return (
     <div className="branch-control" aria-label={`Branch ${branch.index} of ${branch.total}`}>
       <IconButton
         label="Previous branch"
-        disabled={!branch.previousId || busy || readOnly}
+        disabled={!branch.previousId || busy}
         onClick={() => branch.previousId && onSelect(branch.previousId)}
       >
         <ChevronLeft size={15} />
@@ -857,12 +980,12 @@ function BranchControl(
       <span aria-live="polite">{branch.index} / {branch.total}</span>
       <IconButton
         label="Next branch"
-        disabled={!branch.nextId || busy || readOnly}
+        disabled={!branch.nextId || busy}
         onClick={() => branch.nextId && onSelect(branch.nextId)}
       >
         <ChevronRight size={15} />
       </IconButton>
-      <IconButton label="View conversation tree" onClick={onTree}>
+      <IconButton label="View conversation tree" disabled={busy} onClick={onTree}>
         <GitBranch size={15} />
       </IconButton>
     </div>
@@ -880,6 +1003,7 @@ function MessageItem(
     onContinue,
     branchBusy,
     generationBusy,
+    editing,
     speech,
     readOnly = false,
   }: {
@@ -892,6 +1016,7 @@ function MessageItem(
     onContinue: (message: Message) => void;
     branchBusy: boolean;
     generationBusy: boolean;
+    editing: boolean;
     speech?: {
       model: string;
       voice: string;
@@ -903,10 +1028,15 @@ function MessageItem(
   },
 ) {
   const [copied, setCopied] = useState(false);
-  const copy = () => {
-    navigator.clipboard?.writeText(message.content);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1200);
+  const copy = async () => {
+    try {
+      if (!navigator.clipboard) return;
+      await navigator.clipboard.writeText(message.content);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } catch {
+      // Keep the copy affordance unchanged when browser permissions deny the write.
+    }
   };
   if (message.role === "user") {
     return (
@@ -949,13 +1079,13 @@ function MessageItem(
           </div>
           <div className="message-actions user-actions">
             <span>{message.createdAt}</span>
-            <IconButton label="Copy" onClick={copy}>
+            <IconButton label="Copy" onClick={() => void copy()}>
               {copied ? <Check size={15} /> : <Copy size={15} />}
             </IconButton>
             {!readOnly && (
               <IconButton
                 label="Edit without overwriting"
-                disabled={generationBusy || branchBusy}
+                disabled={generationBusy || branchBusy || editing}
                 onClick={() => onEdit(message)}
               >
                 <Pencil size={15} />
@@ -966,8 +1096,7 @@ function MessageItem(
                 branch={branch}
                 onTree={onTree}
                 onSelect={onSelectBranch}
-                busy={branchBusy || generationBusy}
-                readOnly={readOnly}
+                busy={branchBusy || generationBusy || editing}
               />
             )}
           </div>
@@ -1013,7 +1142,7 @@ function MessageItem(
           )
           : null}
         <div className="message-actions">
-          <IconButton label="Copy response" onClick={copy}>
+          <IconButton label="Copy response" onClick={() => void copy()}>
             {copied ? <Check size={15} /> : <Copy size={15} />}
           </IconButton>
           {speech
@@ -1042,7 +1171,7 @@ function MessageItem(
           {!readOnly && (
             <IconButton
               label="Regenerate response in a new branch"
-              disabled={generationBusy}
+              disabled={generationBusy || editing}
               onClick={() => onRegenerate(message)}
             >
               <RefreshCw size={15} />
@@ -1051,7 +1180,7 @@ function MessageItem(
           {!readOnly && (
             <IconButton
               label="Continue response"
-              disabled={generationBusy}
+              disabled={generationBusy || editing}
               onClick={() => onContinue(message)}
             >
               <ArrowRight size={15} />
@@ -1065,8 +1194,7 @@ function MessageItem(
               branch={branch}
               onTree={onTree}
               onSelect={onSelectBranch}
-              busy={branchBusy || generationBusy}
-              readOnly={readOnly}
+              busy={branchBusy || generationBusy || editing}
             />
           )}
           <span className="response-meta">{message.latency}</span>
@@ -1185,28 +1313,97 @@ export function Composer(
     | "delete-failed";
   type UploadItem = {
     key: string;
+    scope: string;
     file: File;
     status: UploadState;
     progress: number;
     attachment?: Attachment;
     error?: string;
   };
+  const draftUploadScope = "draft";
+  const uploadScopeForEdit = (messageId: string) => `edit:${messageId}`;
   const [uploads, setUploads] = useState<UploadItem[]>([]);
+  const uploadsRef = useRef<UploadItem[]>(uploads);
+  uploadsRef.current = uploads;
+  const activeUploadScope = edit ? uploadScopeForEdit(edit.id) : draftUploadScope;
+  const activeUploads = uploads.filter((item) => item.scope === activeUploadScope);
   const [excludedEditAttachments, setExcludedEditAttachments] = useState<Set<string>>(new Set());
+  const editDraftRef = useRef<
+    {
+      value: string;
+      toolContexts: Array<{ id: string }>;
+      generatedAssets: GeneratedAsset[];
+      selectionError: string;
+    } | null
+  >(null);
+  const previousEditIdRef = useRef<string | null>(null);
   const uploadControllers = useRef(new Map<string, AbortController>());
+  const liveUploadKeys = useRef(new Set<string>());
+  const claimedRetryKeys = useRef(new Set<string>());
   const fileRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   useEffect(() => () => {
+    liveUploadKeys.current.clear();
+    claimedRetryKeys.current.clear();
     for (const controller of uploadControllers.current.values()) controller.abort();
     uploadControllers.current.clear();
   }, []);
+  const discardUploadScope = (scope: string) => {
+    const discarded = uploadsRef.current.filter((item) => item.scope === scope);
+    for (const item of discarded) {
+      liveUploadKeys.current.delete(item.key);
+      claimedRetryKeys.current.delete(item.key);
+      uploadControllers.current.get(item.key)?.abort();
+      if (item.attachment) {
+        void api.deleteAttachment(item.attachment.id).catch(() => {
+          // Attachment garbage collection remains a server-side safety net when immediate
+          // best-effort cleanup is unavailable.
+        });
+      }
+    }
+    setUploads((current) => current.filter((item) => item.scope !== scope));
+  };
+  // This transition deliberately follows only the selected immutable message. Draft state is
+  // captured once on entry; including live composer fields would overwrite that snapshot while
+  // the user types the edit.
   useEffect(() => {
     setExcludedEditAttachments(new Set());
     if (edit) {
+      if (previousEditIdRef.current === null) {
+        editDraftRef.current = {
+          value,
+          toolContexts,
+          generatedAssets: selectedGeneratedAssets,
+          selectionError,
+        };
+      } else if (previousEditIdRef.current !== edit.id) {
+        discardUploadScope(uploadScopeForEdit(previousEditIdRef.current));
+      }
+      previousEditIdRef.current = edit.id;
       setValue(edit.content);
       setToolContexts((edit.toolExecutionIds ?? []).map((id) => ({ id })));
+      setSelectedGeneratedAssets([]);
+      setSelectionError("");
+    } else {
+      previousEditIdRef.current = null;
     }
   }, [edit]);
+  const cancelCurrentEdit = () => {
+    const draft = editDraftRef.current;
+    if (draft) {
+      setValue(draft.value);
+      setToolContexts(draft.toolContexts);
+      setSelectedGeneratedAssets(draft.generatedAssets);
+      setSelectionError(draft.selectionError);
+    } else {
+      setSelectionError("");
+    }
+    editDraftRef.current = null;
+    if (edit) discardUploadScope(uploadScopeForEdit(edit.id));
+    previousEditIdRef.current = null;
+    setExcludedEditAttachments(new Set());
+    cancelEdit();
+  };
   const retainedAttachments = (edit?.attachments ?? []).filter((attachment) =>
     !excludedEditAttachments.has(attachment.id)
   );
@@ -1302,9 +1499,15 @@ export function Composer(
   };
   const addGeneratedAsset = (asset: GeneratedAsset) => {
     if (!asset.attachmentId || asset.status !== "ready") return;
-    setSelectedGeneratedAssets((current) =>
-      current.some((item) => item.id === asset.id) ? current : [...current, asset]
-    );
+    setSelectedGeneratedAssets((current) => {
+      if (current.some((item) => item.id === asset.id)) return current;
+      if (activeUploads.length + retainedAttachments.length + current.length >= 10) {
+        setSelectionError("You can attach up to 10 files or generated images to one message.");
+        return current;
+      }
+      setSelectionError("");
+      return [...current, asset];
+    });
   };
   const openImageEditorFromGallery = (asset?: GeneratedAsset) => {
     imageModalHandoff.current = true;
@@ -1330,6 +1533,12 @@ export function Composer(
       controller.signal,
     ).then((attachment) => {
       uploadControllers.current.delete(key);
+      if (!liveUploadKeys.current.has(key)) {
+        void api.deleteAttachment(attachment.id).catch(() => {
+          // The durable attachment cleanup worker remains a fallback for this abort/resolve race.
+        });
+        return;
+      }
       setUploads((current) =>
         current.map((item) =>
           item.key === key
@@ -1364,35 +1573,56 @@ export function Composer(
       );
     });
   };
+  const retryUpload = (item: UploadItem) => {
+    if (claimedRetryKeys.current.has(item.key)) return;
+    claimedRetryKeys.current.add(item.key);
+    const retryKey = crypto.randomUUID();
+    liveUploadKeys.current.delete(item.key);
+    liveUploadKeys.current.add(retryKey);
+    setUploads((current) =>
+      current.map((candidate) =>
+        candidate.key === item.key
+          ? { ...candidate, key: retryKey, status: "uploading", progress: 0, error: undefined }
+          : candidate
+      )
+    );
+    queueMicrotask(() => beginUpload(retryKey, item.file));
+  };
   const addFiles = (files: File[]) => {
     if (disabled || !files.length) return;
     const allowed = files.filter((file) => file.size <= 25 * 1024 * 1024);
     const selected = allowed.slice(
       0,
-      Math.max(0, 10 - uploads.length - retainedAttachments.length),
+      Math.max(
+        0,
+        10 - activeUploads.length - retainedAttachments.length - selectedGeneratedAssets.length,
+      ),
     );
     if (allowed.length !== files.length) {
       setSelectionError("Each attachment must be 25 MB or smaller.");
     } else if (selected.length !== files.length) {
-      setSelectionError("You can attach up to 10 files to one message.");
+      setSelectionError("You can attach up to 10 files or generated images to one message.");
     } else {
       setSelectionError("");
     }
     for (const file of selected) {
       const key = crypto.randomUUID();
+      liveUploadKeys.current.add(key);
       setUploads((current) => [
         ...current,
-        { key, file, status: "uploading", progress: 0 },
+        { key, scope: activeUploadScope, file, status: "uploading", progress: 0 },
       ]);
       queueMicrotask(() => beginUpload(key, file));
     }
   };
   const removeUpload = async (item: UploadItem) => {
     if (item.status === "uploading") {
+      liveUploadKeys.current.delete(item.key);
       uploadControllers.current.get(item.key)?.abort();
       return;
     }
     if (!item.attachment) {
+      liveUploadKeys.current.delete(item.key);
       setUploads((current) => current.filter((candidate) => candidate.key !== item.key));
       return;
     }
@@ -1405,6 +1635,7 @@ export function Composer(
     );
     try {
       await api.deleteAttachment(item.attachment.id);
+      liveUploadKeys.current.delete(item.key);
       setUploads((current) => current.filter((candidate) => candidate.key !== item.key));
     } catch {
       setUploads((current) =>
@@ -1416,11 +1647,11 @@ export function Composer(
       );
     }
   };
-  const blockedByUpload = uploads.some((item) => item.status !== "ready");
+  const blockedByUpload = activeUploads.some((item) => item.status !== "ready");
   const readyAttachmentIds = mergeAttachmentIds(
     retainedAttachments.map((attachment) => attachment.id),
     [
-      ...uploads.flatMap((item) =>
+      ...activeUploads.flatMap((item) =>
         item.status === "ready" && item.attachment ? [item.attachment.id] : []
       ),
       ...selectedGeneratedAssets.flatMap((asset) => asset.attachmentId ? [asset.attachmentId] : []),
@@ -1432,11 +1663,19 @@ export function Composer(
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     if (!canSubmit) return;
+    const submittedUploadScope = activeUploadScope;
+    const preservedDraft = edit ? editDraftRef.current : null;
     if (await onSend(value.trim(), readyAttachmentIds, toolContexts.map((context) => context.id))) {
-      setValue("");
-      setUploads([]);
-      setSelectedGeneratedAssets([]);
-      setToolContexts([]);
+      editDraftRef.current = null;
+      previousEditIdRef.current = null;
+      for (const item of uploadsRef.current) {
+        if (item.scope === submittedUploadScope) liveUploadKeys.current.delete(item.key);
+      }
+      setUploads((current) => current.filter((item) => item.scope !== submittedUploadScope));
+      setValue(preservedDraft?.value ?? "");
+      setSelectedGeneratedAssets(preservedDraft?.generatedAssets ?? []);
+      setToolContexts(preservedDraft?.toolContexts ?? []);
+      setSelectionError(preservedDraft?.selectionError ?? "");
     }
   };
   return (
@@ -1463,12 +1702,12 @@ export function Composer(
             <strong>Create a new branch</strong>
             <small>The original message and every response after it will stay intact.</small>
           </span>
-          <IconButton label="Cancel edit" onClick={cancelEdit}>
+          <IconButton label="Cancel edit" onClick={cancelCurrentEdit}>
             <X size={16} />
           </IconButton>
         </div>
       )}
-      {(retainedAttachments.length > 0 || uploads.length > 0 ||
+      {(retainedAttachments.length > 0 || activeUploads.length > 0 ||
         selectedGeneratedAssets.length > 0) && (
         <div className="upload-list" aria-label="Selected attachments" aria-live="polite">
           {retainedAttachments.map((attachment) => (
@@ -1489,7 +1728,7 @@ export function Composer(
               </IconButton>
             </div>
           ))}
-          {uploads.map((item) => (
+          {activeUploads.map((item) => (
             <div className={cn("upload-chip", `upload-${item.status}`)} key={item.key}>
               <FileText size={18} aria-hidden="true" />
               <span>
@@ -1514,7 +1753,7 @@ export function Composer(
               {(item.status === "failed" || item.status === "cancelled") && (
                 <IconButton
                   label={`Retry upload ${item.file.name}`}
-                  onClick={() => beginUpload(item.key, item.file)}
+                  onClick={() => retryUpload(item)}
                 >
                   <RefreshCw size={15} />
                 </IconButton>
@@ -1602,7 +1841,7 @@ export function Composer(
             }
           }}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) void submit(e);
+            if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) void submit(e);
           }}
           placeholder="Message DG Chat…"
           aria-label="Message"
@@ -1840,7 +2079,6 @@ function TreePanel({
   close,
   onSelect,
   busy,
-  readOnly = false,
   returnFocus,
 }: {
   messages: Message[];
@@ -1848,7 +2086,6 @@ function TreePanel({
   close: () => void;
   onSelect: (messageId: string) => void;
   busy: boolean;
-  readOnly?: boolean;
   returnFocus?: HTMLElement | null;
 }) {
   const roots = conversationTree(messages, activeLeafId);
@@ -1954,7 +2191,6 @@ function TreePanel({
                 node={root}
                 onSelect={onSelect}
                 busy={busy}
-                readOnly={readOnly}
               />
             ))
             : <p className="muted">This conversation does not have any messages yet.</p>}
@@ -1971,14 +2207,13 @@ function TreePanel({
   );
 }
 function TreeNode(
-  { node, onSelect, busy, readOnly }: {
+  { node, onSelect, busy }: {
     node: MessageTreeNode;
     onSelect: (messageId: string) => void;
     busy: boolean;
-    readOnly: boolean;
   },
 ) {
-  const disabled = busy || readOnly;
+  const disabled = busy;
   return (
     <div
       className="tree-subtree"
@@ -2014,7 +2249,6 @@ function TreeNode(
               node={child}
               onSelect={onSelect}
               busy={busy}
-              readOnly={readOnly}
             />
           ))}
         </div>
@@ -2160,6 +2394,8 @@ function ChatView({
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const followStreamRef = useRef(true);
   const [localMessages, setLocalMessages] = useState(messages);
+  const localMessagesRef = useRef(localMessages);
+  localMessagesRef.current = localMessages;
   const [tree, setTree] = useState(false);
   const treeReturnFocusRef = useRef<HTMLElement | null>(null);
   const [edit, setEdit] = useState<Message>();
@@ -2181,7 +2417,9 @@ function ChatView({
   const [keepTemporaryError, setKeepTemporaryError] = useState("");
   const initialConversation = conversations.find((c) => c.id === activeId);
   const [conversation, setConversation] = useState(initialConversation);
+  const [previewLeafId, setPreviewLeafId] = useState<string | null>(null);
   const syncConversation = (next: Conversation) => {
+    setPreviewLeafId(null);
     setConversation(next);
     for (const queryKey of [["conversations"], ["conversations", "deleted"]] as const) {
       queryClient.setQueryData<Conversation[]>(
@@ -2192,10 +2430,14 @@ function ChatView({
   };
   const readOnly = readOnlyProp || Boolean(conversation?.archived || conversation?.deleted);
   useEffect(() => setLocalMessages(messages), [messages]);
-  useEffect(() => setConversation(initialConversation), [initialConversation]);
+  useEffect(() => {
+    setPreviewLeafId(null);
+    setConversation(initialConversation);
+  }, [activeId, initialConversation]);
+  const effectiveActiveLeafId = previewLeafId ?? conversation?.activeLeafId;
   const activePath = useMemo(
-    () => activeMessagePath(localMessages, conversation?.activeLeafId),
-    [localMessages, conversation?.activeLeafId],
+    () => activeMessagePath(localMessages, effectiveActiveLeafId),
+    [localMessages, effectiveActiveLeafId],
   );
   const streaming = Boolean(activeStream);
   const generationBusy = streaming || queue.length > 0;
@@ -2209,7 +2451,7 @@ function ChatView({
   );
   useEffect(() => speechPlayback.controller.cancel(), [
     activeId,
-    conversation?.activeLeafId,
+    effectiveActiveLeafId,
     speechContentFingerprint,
     speechModel,
     speechVoice,
@@ -2223,9 +2465,13 @@ function ChatView({
     });
   }, [activeStream?.assistant.content]);
   const selectBranch = async (messageId: string) => {
-    if (!conversation || branchInFlightRef.current || readOnly) return;
+    if (!conversation || branchInFlightRef.current) return;
     const leafId = preferredLeaf(localMessages, messageId);
-    if (leafId === conversation.activeLeafId) return;
+    if (leafId === effectiveActiveLeafId) return;
+    if (readOnly) {
+      setPreviewLeafId(leafId);
+      return;
+    }
     branchInFlightRef.current = true;
     setBranchBusy(true);
     setSendError("");
@@ -2390,17 +2636,21 @@ function ChatView({
           );
         } else {
           terminalAssistant = event.assistant;
-          setLocalMessages((current) => {
-            const nextById = new Map(current.map((message) => [message.id, message]));
-            nextById.set(event.user.id, event.user);
-            nextById.set(event.assistant.id, event.assistant);
-            const next = [...nextById.values()];
-            queryClient.setQueryData(["messages", event.conversation.id], next);
-            return next;
-          });
+          const nextById = new Map(
+            localMessagesRef.current.map((message) => [message.id, message]),
+          );
+          nextById.set(event.user.id, event.user);
+          nextById.set(event.assistant.id, event.assistant);
+          const next = [...nextById.values()];
+          localMessagesRef.current = next;
+          queryClient.setQueryData(["messages", event.conversation.id], next);
           syncConversation(event.conversation);
           setEdit(undefined);
-          if (resolved.created) await onConversationCreated(event.conversation.id);
+          if (resolved.created) {
+            // Do not expose controls on the temporary ChatView: activating one during the keyed
+            // remount can lose the click and silently dispose media or upload work.
+            await onConversationCreated(event.conversation.id);
+          } else setLocalMessages(next);
         }
       }
     } catch (error) {
@@ -2673,6 +2923,7 @@ function ChatView({
               )}
             branchBusy={branchBusy}
             generationBusy={streaming || queue.length > 0}
+            editing={Boolean(edit)}
             speech={speechModel
               ? {
                 model: speechModel,
@@ -2711,6 +2962,7 @@ function ChatView({
                 onContinue={() => undefined}
                 branchBusy
                 generationBusy
+                editing={false}
                 speech={undefined}
               />
             )}
@@ -2724,6 +2976,7 @@ function ChatView({
               onContinue={() => undefined}
               branchBusy
               generationBusy
+              editing={false}
               speech={speechModel
                 ? {
                   model: speechModel,
@@ -2841,11 +3094,10 @@ function ChatView({
       {tree && (
         <TreePanel
           messages={localMessages}
-          activeLeafId={conversation?.activeLeafId}
+          activeLeafId={effectiveActiveLeafId}
           close={() => setTree(false)}
           onSelect={selectBranch}
-          busy={branchBusy || streaming || queue.length > 0}
-          readOnly={readOnly}
+          busy={branchBusy || streaming || queue.length > 0 || Boolean(edit)}
           returnFocus={treeReturnFocusRef.current}
         />
       )}
@@ -3667,6 +3919,10 @@ export function App(
   const lifecycleBlockingError = lifecycleQuery.isError && lifecycleQuery.data === undefined;
   const lifecycleStaleWarning = lifecycleQuery.isError && lifecycleQuery.data !== undefined;
   const [mobile, setMobile] = useState(false);
+  const mobileSidebar = useMediaQuery(mobileSidebarQuery);
+  useEffect(() => {
+    if (!mobileSidebar) setMobile(false);
+  }, [mobileSidebar]);
   const conversationSearchRef = useRef<HTMLInputElement>(null);
   const [creatingConversation, setCreatingConversation] = useState(false);
   const [selectedModel, setSelectedModel] = useState(models[0]?.id ?? "openai/gpt-4.1");
@@ -3747,12 +4003,16 @@ export function App(
       }),
   });
   const conversationCreated = async (id: string) => {
-    await conversationQuery.refetch();
+    // The terminal generation event has already populated both conversation and message caches.
+    // Activate it before the network refresh so controls cannot start work on the temporary
+    // ChatView and then be silently disposed when that refresh eventually changes the key.
     setActiveId(id);
+    await conversationQuery.refetch();
   };
   const updateConversation = async (
     conversation: Conversation,
     patch: { title?: string; pinned?: boolean; archived?: boolean; deleted?: boolean },
+    options: { restoreLifecycleFocus?: boolean } = {},
   ) => {
     const updated = await api.updateConversation(conversation, patch);
     const replace = (current: Conversation[] = []) =>
@@ -3784,6 +4044,7 @@ export function App(
     if (!conversationsForView(refreshed, listView).some((item) => item.id === activeId)) {
       const nextId = fallbackConversationId(refreshed, listView, conversation.id);
       setActiveId(nextId);
+      if (options.restoreLifecycleFocus === false) return;
       requestAnimationFrame(() => {
         const nextAction = nextId
           ? document.querySelector<HTMLButtonElement>(
@@ -3818,6 +4079,7 @@ export function App(
         view={view}
         setView={setView}
         mobileOpen={mobile}
+        drawerMode={mobileSidebar}
         closeMobile={() => setMobile(false)}
         user={user}
         onUpdate={updateConversation}

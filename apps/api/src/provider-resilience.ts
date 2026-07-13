@@ -93,6 +93,10 @@ export class ProviderAttemptError extends Error {
       status?: number;
       transient?: boolean;
       retryAfterMs?: number;
+      /** OpenAI-compatible public error code when the upstream supplied a safe one. */
+      code?: string;
+      /** The request is valid, but this candidate's upstream protocol cannot represent it. */
+      candidateLocal?: boolean;
     } = {},
   ) {
     super(message);
@@ -412,7 +416,12 @@ async function candidateSequence(
         retryAfterMs: safeRetryAfterMs(result.error),
         ...(breakerAfter ? { breakerAfter } : {}),
       });
-      if (result.visible || !classified.transient) {
+      if (result.visible) throw result.error;
+      if (!classified.transient) {
+        if (
+          result.error instanceof ProviderAttemptError &&
+          result.error.options.candidateLocal === true && candidate.fallbackId
+        ) break;
         throw result.error;
       }
       if (permit.state === "half_open") break;
@@ -480,7 +489,9 @@ export function openAIVisibleUnits(chunk: unknown): number {
     const delta = (item as Record<string, unknown>).delta;
     if (!delta || typeof delta !== "object" || Array.isArray(delta)) continue;
     const fields = delta as Record<string, unknown>;
-    for (const name of ["content", "reasoning_content", "reasoning", "refusal"]) {
+    for (
+      const name of ["content", "reasoning_content", "reasoning", "reasoning_summary", "refusal"]
+    ) {
       if (typeof fields[name] === "string") units += fields[name].length;
     }
     if (Array.isArray(fields.tool_calls) && fields.tool_calls.length > 0) units += 1;
@@ -605,6 +616,11 @@ export async function* streamProviderRequest<T>(
     visibleUnits?: (chunk: T) => number;
     /** Accept a validated stream whose buffered events contain no user-visible units. */
     allowNoVisibleOutput?: boolean;
+    /**
+     * Accept a no-visible stream only after a protocol-specific validator proves its terminal
+     * lifecycle. This is preferable to allowNoVisibleOutput for structured text protocols.
+     */
+    validateNoVisibleOutput?: (buffered: readonly T[]) => void | Promise<void>;
   },
 ): AsyncGenerator<T> {
   const policy = validateResiliencePolicy(options.policy);
@@ -650,7 +666,9 @@ export async function* streamProviderRequest<T>(
         );
         if (item.done) {
           if (!visible) {
-            if (!options.allowNoVisibleOutput) {
+            if (options.validateNoVisibleOutput) {
+              await options.validateNoVisibleOutput(buffered);
+            } else if (!options.allowNoVisibleOutput) {
               throw new ProviderAttemptError("Provider stream ended before visible output", {
                 category: "invalid_response",
                 transient: true,

@@ -808,6 +808,8 @@ export const apiIdempotencyRequests = pgTable("api_idempotency_requests", {
   usageRunId: text("usage_run_id").notNull().unique(
     "api_idempotency_requests_usage_run_id_key",
   ).references(() => usageRuns.id),
+  replayReservedBytes: integer("replay_reserved_bytes").notNull().default(0),
+  replayReservedEvents: integer("replay_reserved_events").notNull().default(0),
   responseStatus: integer("response_status"),
   responseHeaders: jsonb("response_headers").$type<Record<string, string>>().notNull().default({}),
   responseBody: text("response_body"),
@@ -831,6 +833,10 @@ export const apiIdempotencyRequests = pgTable("api_idempotency_requests", {
     sql`${table.state} = 'in_progress'`,
   ),
   index("api_idempotency_expiry_idx").on(table.expiresAt),
+  check(
+    "api_idempotency_requests_replay_reservation_check",
+    sql`${table.replayReservedBytes} >= 0 AND ${table.replayReservedEvents} >= 0`,
+  ),
 ]);
 
 export const apiIdempotencyEvents = pgTable("api_idempotency_events", {
@@ -865,6 +871,10 @@ export const providers = pgTable("providers", {
   index("providers_enabled_display_idx").on(table.enabled, table.displayName, table.id),
   index("providers_health_idx").on(table.healthStatus, table.healthCheckedAt.desc()),
   check("providers_slug_check", sql`${table.slug} ~ '^[a-z0-9][a-z0-9-]{0,62}$'`),
+  check(
+    "providers_base_url_check",
+    sql`char_length(${table.baseUrl}) BETWEEN 1 AND 2048 AND ${table.baseUrl} ~ '^https?://[^/?#@]+(?:/[^?#@]*)?$'`,
+  ),
   check(
     "providers_protocol_check",
     sql`${table.protocol} IN ('chat_completions','responses')`,

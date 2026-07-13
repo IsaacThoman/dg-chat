@@ -1,5 +1,5 @@
 import { expect, type Page, test } from "@playwright/test";
-import { bootstrap, login, uniqueUser } from "./helpers.ts";
+import { bootstrap, login, openSidebar, uniqueUser } from "./helpers.ts";
 
 async function authenticatedRequest(
   page: Page,
@@ -30,7 +30,7 @@ test("admin enables web search and a user explicitly reviews and cancels a tool 
   await bootstrap(request);
   await login(page);
   const mobile = testInfo.project.name.includes("mobile");
-  if (mobile) await page.getByRole("button", { name: "Open menu", exact: true }).click();
+  await openSidebar(page);
   await page.getByRole("button", { name: "Admin console", exact: true }).click();
   if (mobile) {
     await page.getByRole("combobox", { name: "Admin section" }).selectOption("tools");
@@ -54,7 +54,7 @@ test("admin enables web search and a user explicitly reviews and cancels a tool 
   }
   await expect(policyVersion.first()).toBeVisible();
 
-  if (mobile) await page.getByRole("button", { name: "Open menu", exact: true }).click();
+  await openSidebar(page);
   await page.getByRole("button", { name: "New chat ⌘ K", exact: true }).click();
   await page.getByRole("button", { name: "Open web search" }).click();
   await expect(page.getByRole("dialog", { name: "Web search" })).toBeVisible();

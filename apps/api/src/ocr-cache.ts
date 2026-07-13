@@ -18,7 +18,7 @@ export interface RedisOcrCacheOptions {
   client?: RedisOcrClient;
 }
 
-const OCR_CACHE_KEY = /^ocr:v1:[0-9a-f]{64}$/;
+const OCR_CACHE_KEY = /^ocr:v2:[0-9a-f]{64}$/;
 const MAX_CACHED_TEXT_BYTES = 2_000_000;
 
 /**

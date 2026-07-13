@@ -76,6 +76,8 @@ Deno.test({
       const revokedShareId = crypto.randomUUID();
       const expiredShareId = crypto.randomUUID();
       const providerId = crypto.randomUUID();
+      const ocrTargetId = crypto.randomUUID();
+      const ocrSourceId = crypto.randomUUID();
       const folderId = crypto.randomUUID();
       const tagId = crypto.randomUUID();
       await sql`INSERT INTO users(
@@ -181,6 +183,25 @@ Deno.test({
           ciphertext: "secret",
         })
       },now()
+      )`;
+      await sql`INSERT INTO provider_models(
+        id,provider_id,public_model_id,upstream_model_id,display_name,capabilities,
+        context_window,enabled,custom_params
+      ) VALUES(
+        ${ocrTargetId},${providerId},'portable/ocr-target','ocr-target','OCR target',
+        '["chat","vision"]'::jsonb,8192,true,'{}'::jsonb
+      ),(
+        ${ocrSourceId},${providerId},'portable/ocr-source','ocr-source','OCR source',
+        '["chat"]'::jsonb,8192,true,${
+        sql.json({
+          ocr: {
+            enabled: true,
+            providerId,
+            model: ocrTargetId,
+            prompt: "Read the image",
+          },
+        })
+      }
       )`;
       await sql`INSERT INTO retention_policy_versions(
         version,capture_enabled,request_body_days,response_body_days,updated_by
@@ -392,6 +413,25 @@ Deno.test({
       const [provider] = await sql<{ enabled: boolean; credential_envelope: unknown }[]>`
         SELECT enabled,credential_envelope FROM providers WHERE id=${providerId}`;
       assertEquals(provider, { enabled: false, credential_envelope: null });
+      assertEquals(
+        [
+          ...await sql`SELECT id,enabled,custom_params FROM provider_models
+          WHERE id IN (${ocrTargetId},${ocrSourceId}) ORDER BY id`,
+        ],
+        [{
+          id: ocrSourceId,
+          enabled: false,
+          custom_params: {
+            ocr: {
+              enabled: true,
+              providerId,
+              model: ocrTargetId,
+              prompt: "Read the image",
+            },
+          },
+        }, { id: ocrTargetId, enabled: true, custom_params: {} }]
+          .sort((left, right) => left.id.localeCompare(right.id)),
+      );
       assertEquals(Number((await sql`SELECT count(*) count FROM sessions`)[0].count), 0);
       assertEquals(Number((await sql`SELECT count(*) count FROM auth_sessions`)[0].count), 0);
       assertEquals(Number((await sql`SELECT count(*) count FROM auth_verifications`)[0].count), 0);
@@ -551,7 +591,7 @@ Deno.test({
 });
 
 Deno.test({
-  name: "backup dry-run rejects conversation cycles and nonterminal durable state in staging",
+  name: "backup dry-run rejects graph, provider, and nonterminal invariant violations",
   ignore: !databaseUrl,
   sanitizeOps: false,
   sanitizeResources: false,
@@ -580,6 +620,110 @@ Deno.test({
         BackupDataError,
       );
       assertEquals(Number((await sql`SELECT count(*) count FROM messages`)[0].count), before);
+
+      const providerBatches = structuredClone(captured.get("providers")!);
+      const provider = providerBatches.flat()[0] as Record<string, unknown>;
+      provider.protocol = "responses";
+      const modelId = crypto.randomUUID();
+      const model: Record<string, unknown> = {
+        id: modelId,
+        provider_id: provider.id,
+        public_model_id: "portable/restored-model",
+        upstream_model_id: "restored-model",
+        display_name: "Restored model",
+        capabilities: ["chat", "vision"],
+        context_window: 8_192,
+        enabled: true,
+        version: 1,
+        custom_params: { stop: "END" },
+        created_at: "2026-01-01T00:00:00.000Z",
+        updated_at: "2026-01-01T00:00:00.000Z",
+      };
+      const incompatible = new Map(captured);
+      incompatible.set("providers", providerBatches);
+      incompatible.set("provider_models", [[model]]);
+      await assertRejects(
+        () => dryRunBackupData(databaseUrl!, replaySource(incompatible)),
+        BackupDataError,
+        "stop is not supported by Responses providers",
+      );
+
+      provider.protocol = "chat_completions";
+      model.custom_params = { temperature: "hot" };
+      const malformedDefaults = new Map(captured);
+      malformedDefaults.set("providers", providerBatches);
+      malformedDefaults.set("provider_models", [[model]]);
+      await assertRejects(
+        () => dryRunBackupData(databaseUrl!, replaySource(malformedDefaults)),
+        BackupDataError,
+        "customParams.temperature is invalid",
+      );
+
+      model.custom_params = {};
+      model.capabilities = ["chat", "chat"];
+      const duplicateCapabilities = new Map(captured);
+      duplicateCapabilities.set("providers", providerBatches);
+      duplicateCapabilities.set("provider_models", [[model]]);
+      await assertRejects(
+        () => dryRunBackupData(databaseUrl!, replaySource(duplicateCapabilities)),
+        BackupDataError,
+        "violates schema constraints",
+      );
+
+      model.capabilities = ["chat", "unrecognized"];
+      const unknownCapabilities = new Map(captured);
+      unknownCapabilities.set("providers", providerBatches);
+      unknownCapabilities.set("provider_models", [[model]]);
+      await assertRejects(
+        () => dryRunBackupData(databaseUrl!, replaySource(unknownCapabilities)),
+        BackupDataError,
+        "violates schema constraints",
+      );
+
+      model.capabilities = ["chat", "vision"];
+      model.custom_params = {
+        ocr: {
+          enabled: true,
+          providerId: provider.id,
+          model: modelId,
+          prompt: "Read the image",
+        },
+      };
+      const recursiveOcr = new Map(captured);
+      recursiveOcr.set("providers", providerBatches);
+      recursiveOcr.set("provider_models", [[model]]);
+      await assertRejects(
+        () => dryRunBackupData(databaseUrl!, replaySource(recursiveOcr)),
+        BackupDataError,
+        "cannot intercept OCR itself",
+      );
+
+      provider.enabled = false;
+      model.custom_params = {};
+      const source: Record<string, unknown> = {
+        ...model,
+        id: crypto.randomUUID(),
+        public_model_id: "portable/ocr-source",
+        upstream_model_id: "ocr-source",
+        display_name: "OCR source",
+        capabilities: ["chat"],
+        custom_params: {
+          ocr: {
+            enabled: true,
+            providerId: provider.id,
+            model: modelId,
+            prompt: "Read the image",
+          },
+        },
+      };
+      const disabledOcrProvider = new Map(captured);
+      disabledOcrProvider.set("providers", providerBatches);
+      disabledOcrProvider.set("provider_models", [[model, source]]);
+      await assertRejects(
+        () => dryRunBackupData(databaseUrl!, replaySource(disabledOcrProvider)),
+        BackupDataError,
+        "must remain enabled",
+      );
     } finally {
       await sql.end();
     }

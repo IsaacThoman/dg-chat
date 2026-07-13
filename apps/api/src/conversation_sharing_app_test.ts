@@ -104,7 +104,7 @@ Deno.test("sharing routes create one immutable redacted snapshot, stream authori
     body: new Response(bytes).body!,
     contentLength: bytes.byteLength,
     contentType: "text/plain",
-    metadata: { owner: owner.user.id },
+    metadata: { owner: owner.user.id, sha256: "a".repeat(64) },
   });
   const attachment = repository.createAttachment({
     ownerId: owner.user.id,
@@ -187,6 +187,19 @@ Deno.test("sharing routes create one immutable redacted snapshot, stream authori
       (content.headers.get("content-disposition") ?? "").includes("\n"),
     false,
   );
+  const stored = objects.objects.get(objectKey)!;
+  stored.metadata.sha256 = "b".repeat(64);
+  assertEquals(
+    (await app.request(`/api/public/shares/${secret}/attachments/${publicAttachmentId}`)).status,
+    503,
+  );
+  stored.metadata.sha256 = "a".repeat(64);
+  stored.metadata.owner = foreign.user.id;
+  assertEquals(
+    (await app.request(`/api/public/shares/${secret}/attachments/${publicAttachmentId}`)).status,
+    503,
+  );
+  stored.metadata.owner = owner.user.id;
   assertEquals(
     (await app.request(`/api/public/shares/${secret}/attachments/${crypto.randomUUID()}`)).status,
     404,

@@ -20,19 +20,85 @@ export interface OcrCache {
   set(key: string, value: string, ttlSeconds: number): Promise<void>;
 }
 
+export interface OcrCacheScope {
+  /** OCR results may contain sensitive text and are never shared across users. */
+  userId: string;
+  providerVersion: number;
+  credentialUpdatedAt: string | null;
+  modelVersion: number;
+  upstreamModelId: string;
+}
+
 export class MemoryOcrCache implements OcrCache {
-  #values = new Map<string, { value: string; expiresAt: number }>();
-  constructor(private readonly now: () => number = Date.now) {}
-  get(key: string): Promise<string | null> {
-    const hit = this.#values.get(key);
-    if (!hit || hit.expiresAt <= this.now()) {
-      if (hit) this.#values.delete(key);
-      return Promise.resolve(null);
+  #values = new Map<string, { value: string; expiresAt: number; bytes: number }>();
+  #bytes = 0;
+  readonly #maxEntries: number;
+  readonly #maxBytes: number;
+
+  constructor(
+    private readonly now: () => number = Date.now,
+    options: { maxEntries?: number; maxBytes?: number } = {},
+  ) {
+    this.#maxEntries = options.maxEntries ?? 512;
+    this.#maxBytes = options.maxBytes ?? 16 * 1024 * 1024;
+    if (
+      !Number.isSafeInteger(this.#maxEntries) || this.#maxEntries < 1 || this.#maxEntries > 10_000
+    ) {
+      throw new TypeError("Memory OCR cache entry limit is outside safe bounds");
     }
+    if (
+      !Number.isSafeInteger(this.#maxBytes) || this.#maxBytes < 1 ||
+      this.#maxBytes > 64 * 1024 * 1024
+    ) {
+      throw new TypeError("Memory OCR cache byte limit is outside safe bounds");
+    }
+  }
+
+  #remove(key: string) {
+    const current = this.#values.get(key);
+    if (!current) return;
+    this.#bytes -= current.bytes;
+    this.#values.delete(key);
+  }
+
+  #sweepExpired(now: number) {
+    for (const [key, entry] of this.#values) {
+      if (entry.expiresAt <= now) this.#remove(key);
+    }
+  }
+
+  #evictToBounds() {
+    while (this.#values.size > this.#maxEntries || this.#bytes > this.#maxBytes) {
+      const oldest = this.#values.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.#remove(oldest);
+    }
+  }
+
+  get(key: string): Promise<string | null> {
+    const now = this.now();
+    this.#sweepExpired(now);
+    const hit = this.#values.get(key);
+    if (!hit) return Promise.resolve(null);
+    // Refresh insertion order so bounded eviction is deterministic LRU.
+    this.#values.delete(key);
+    this.#values.set(key, hit);
     return Promise.resolve(hit.value);
   }
   set(key: string, value: string, ttlSeconds: number): Promise<void> {
-    this.#values.set(key, { value, expiresAt: this.now() + ttlSeconds * 1_000 });
+    if (!Number.isSafeInteger(ttlSeconds) || ttlSeconds < 1 || ttlSeconds > 2_592_000) {
+      throw new TypeError("Memory OCR cache TTL is outside safe bounds");
+    }
+    const bytes = new TextEncoder().encode(value).byteLength;
+    if (!value || bytes > OCR_MAX_TEXT_BYTES || bytes > this.#maxBytes) {
+      throw new TypeError("Memory OCR cache value is outside safe bounds");
+    }
+    const now = this.now();
+    this.#sweepExpired(now);
+    this.#remove(key);
+    this.#values.set(key, { value, expiresAt: now + ttlSeconds * 1_000, bytes });
+    this.#bytes += bytes;
+    this.#evictToBounds();
     return Promise.resolve();
   }
 }
@@ -124,6 +190,115 @@ function u32be(bytes: Uint8Array, offset: number) {
   return bytes[offset] * 0x1000000 + bytes[offset + 1] * 0x10000 +
     bytes[offset + 2] * 0x100 + bytes[offset + 3];
 }
+function u32le(bytes: Uint8Array, offset: number) {
+  return bytes[offset] + bytes[offset + 1] * 0x100 + bytes[offset + 2] * 0x10000 +
+    bytes[offset + 3] * 0x1000000;
+}
+
+function skipGifSubBlocks(bytes: Uint8Array, offset: number): number {
+  while (true) {
+    if (offset >= bytes.length) throw new Error("Malformed GIF sub-block stream");
+    const length = bytes[offset++];
+    if (length === 0) return offset;
+    if (offset + length > bytes.length) throw new Error("Malformed GIF sub-block stream");
+    offset += length;
+  }
+}
+
+function gifMetadata(bytes: Uint8Array): { mime: string; width: number; height: number } {
+  if (bytes.length < 14) throw new Error("Malformed GIF image");
+  const width = bytes[6] + bytes[7] * 256;
+  const height = bytes[8] + bytes[9] * 256;
+  if (!width || !height) throw new Error("Malformed GIF dimensions");
+  let offset = 13;
+  if (bytes[10] & 0x80) offset += 3 * 2 ** ((bytes[10] & 0x07) + 1);
+  if (offset > bytes.length) throw new Error("Malformed GIF color table");
+  let frames = 0;
+  while (offset < bytes.length) {
+    const marker = bytes[offset++];
+    if (marker === 0x3b) {
+      if (frames !== 1) throw new Error("GIF images must contain exactly one frame");
+      if (offset !== bytes.length) throw new Error("Malformed GIF trailing data");
+      return { mime: "image/gif", width, height };
+    }
+    if (marker === 0x21) {
+      if (offset >= bytes.length) throw new Error("Malformed GIF extension");
+      offset++; // Extension label.
+      offset = skipGifSubBlocks(bytes, offset);
+      continue;
+    }
+    if (marker !== 0x2c || offset + 9 > bytes.length) {
+      throw new Error("Malformed GIF image descriptor");
+    }
+    const left = bytes[offset] + bytes[offset + 1] * 256;
+    const top = bytes[offset + 2] + bytes[offset + 3] * 256;
+    const frameWidth = bytes[offset + 4] + bytes[offset + 5] * 256;
+    const frameHeight = bytes[offset + 6] + bytes[offset + 7] * 256;
+    const packed = bytes[offset + 8];
+    offset += 9;
+    if (
+      !frameWidth || !frameHeight || left + frameWidth > width || top + frameHeight > height
+    ) throw new Error("GIF frame dimensions exceed the logical canvas");
+    frames++;
+    if (frames > 1) throw new Error("Animated GIF images are not supported for OCR");
+    if (packed & 0x80) offset += 3 * 2 ** ((packed & 0x07) + 1);
+    if (offset >= bytes.length) throw new Error("Malformed GIF image data");
+    offset++; // LZW minimum code size.
+    offset = skipGifSubBlocks(bytes, offset);
+  }
+  throw new Error("Malformed GIF image without a trailer");
+}
+
+function webpMetadata(bytes: Uint8Array): { mime: string; width: number; height: number } {
+  if (
+    bytes.length < 30 || decoder.decode(bytes.subarray(0, 4)) !== "RIFF" ||
+    decoder.decode(bytes.subarray(8, 12)) !== "WEBP"
+  ) {
+    throw new Error("Malformed WebP image");
+  }
+  if (u32le(bytes, 4) + 8 !== bytes.length) throw new Error("Malformed WebP container size");
+  let offset = 12;
+  let firstKind = "";
+  let firstPayload = 0;
+  while (offset < bytes.length) {
+    if (offset + 8 > bytes.length) throw new Error("Malformed WebP chunk header");
+    const kind = decoder.decode(bytes.subarray(offset, offset + 4));
+    const length = u32le(bytes, offset + 4);
+    const payload = offset + 8;
+    const next = payload + length + (length & 1);
+    if (next > bytes.length) throw new Error("Malformed WebP chunk length");
+    if (!firstKind) {
+      firstKind = kind;
+      firstPayload = payload;
+    }
+    if (kind === "ANIM" || kind === "ANMF") {
+      throw new Error("Animated WebP images are not supported for OCR");
+    }
+    offset = next;
+  }
+  if (firstKind === "VP8X") {
+    if (firstPayload + 10 > bytes.length) throw new Error("Malformed WebP VP8X header");
+    if (bytes[firstPayload] & 0x02) {
+      throw new Error("Animated WebP images are not supported for OCR");
+    }
+    return {
+      mime: "image/webp",
+      width: u24le(bytes, firstPayload + 4) + 1,
+      height: u24le(bytes, firstPayload + 7) + 1,
+    };
+  }
+  if (firstKind === "VP8L" && firstPayload + 5 <= bytes.length && bytes[firstPayload] === 0x2f) {
+    const bits = bytes[firstPayload + 1] | bytes[firstPayload + 2] << 8 |
+      bytes[firstPayload + 3] << 16 | bytes[firstPayload + 4] << 24;
+    return {
+      mime: "image/webp",
+      width: (bits & 0x3fff) + 1,
+      height: (bits >>> 14 & 0x3fff) + 1,
+    };
+  }
+  throw new Error("Unsupported WebP encoding");
+}
+
 function imageMetadata(bytes: Uint8Array): { mime: string; width: number; height: number } {
   if (
     bytes.length >= 24 &&
@@ -131,23 +306,9 @@ function imageMetadata(bytes: Uint8Array): { mime: string; width: number; height
   ) return { mime: "image/png", width: u32be(bytes, 16), height: u32be(bytes, 20) };
   const header = decoder.decode(bytes.subarray(0, 12));
   if (bytes.length >= 10 && (header.startsWith("GIF87a") || header.startsWith("GIF89a"))) {
-    return {
-      mime: "image/gif",
-      width: bytes[6] + bytes[7] * 256,
-      height: bytes[8] + bytes[9] * 256,
-    };
+    return gifMetadata(bytes);
   }
-  if (bytes.length >= 30 && header.startsWith("RIFF") && header.slice(8) === "WEBP") {
-    const kind = decoder.decode(bytes.subarray(12, 16));
-    if (kind === "VP8X") {
-      return { mime: "image/webp", width: u24le(bytes, 24) + 1, height: u24le(bytes, 27) + 1 };
-    }
-    if (kind === "VP8L" && bytes[20] === 0x2f) {
-      const bits = bytes[21] | bytes[22] << 8 | bytes[23] << 16 | bytes[24] << 24;
-      return { mime: "image/webp", width: (bits & 0x3fff) + 1, height: (bits >>> 14 & 0x3fff) + 1 };
-    }
-    throw new Error("Unsupported WebP encoding");
-  }
+  if (header.startsWith("RIFF") && header.slice(8) === "WEBP") return webpMetadata(bytes);
   if (bytes.length >= 4 && bytes[0] === 0xff && bytes[1] === 0xd8) {
     let offset = 2;
     while (offset + 4 <= bytes.length) {
@@ -190,6 +351,7 @@ function validateUrl(url: URL) {
 async function boundedBody(response: Response, limit: number, signal: AbortSignal) {
   const declared = response.headers.get("content-length");
   if (declared && (!/^\d+$/.test(declared) || Number(declared) > limit)) {
+    await response.body?.cancel().catch(() => undefined);
     throw new Error("OCR image exceeds the byte limit");
   }
   if (!response.body) throw new Error("OCR image response has no body");
@@ -207,6 +369,7 @@ async function boundedBody(response: Response, limit: number, signal: AbortSigna
     }
   } finally {
     await reader.cancel().catch(() => {});
+    reader.releaseLock();
   }
   const bytes = new Uint8Array(total);
   let offset = 0;
@@ -259,10 +422,16 @@ async function loadImage(
       url = new URL(location, url);
       validateUrl(url);
     }
-    if (!response.ok) throw new Error(`OCR image fetch failed with HTTP ${response.status}`);
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => undefined);
+      throw new Error(`OCR image fetch failed with HTTP ${response.status}`);
+    }
     declaredMime = response.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase() ??
       "";
-    if (!ALLOWED_MIMES.has(declaredMime)) throw new Error("OCR image response MIME is not allowed");
+    if (!ALLOWED_MIMES.has(declaredMime)) {
+      await response.body?.cancel().catch(() => undefined);
+      throw new Error("OCR image response MIME is not allowed");
+    }
     bytes = await boundedBody(response, config.maxBytes, signal);
   }
   const metadata = imageMetadata(bytes);
@@ -279,9 +448,19 @@ async function loadImage(
   return { bytes, ...metadata };
 }
 
-function cacheKey(config: OcrInterceptionConfig, image: OcrImage) {
+function cacheKey(config: OcrInterceptionConfig, image: OcrImage, scope?: OcrCacheScope) {
   const hash = createHash("sha256");
-  hash.update("dg-chat-ocr-v1\0");
+  hash.update("dg-chat-ocr-v2\0");
+  hash.update(scope?.userId ?? "internal");
+  hash.update("\0");
+  hash.update(String(scope?.providerVersion ?? 0));
+  hash.update("\0");
+  hash.update(scope?.credentialUpdatedAt ?? "no-credential");
+  hash.update("\0");
+  hash.update(String(scope?.modelVersion ?? 0));
+  hash.update("\0");
+  hash.update(scope?.upstreamModelId ?? config.model);
+  hash.update("\0");
   hash.update(config.providerId);
   hash.update("\0");
   hash.update(config.model);
@@ -289,13 +468,18 @@ function cacheKey(config: OcrInterceptionConfig, image: OcrImage) {
   hash.update(config.prompt);
   hash.update("\0");
   hash.update(image.bytes);
-  return `ocr:v1:${hash.digest("hex")}`;
+  return `ocr:v2:${hash.digest("hex")}`;
 }
 
 export async function interceptOcrImages(
   request: ChatCompletionRequest,
   config: OcrInterceptionConfig,
-  dependencies: { cache: OcrCache; recognize: OcrRecognize; fetch?: typeof fetch },
+  dependencies: {
+    cache: OcrCache;
+    recognize: OcrRecognize;
+    fetch?: typeof fetch;
+    cacheScope?: OcrCacheScope;
+  },
   signal: AbortSignal,
 ): Promise<ChatCompletionRequest> {
   const timeout = AbortSignal.timeout(config.timeoutMs);
@@ -320,7 +504,7 @@ export async function interceptOcrImages(
           combined,
           dependencies.fetch ?? pinnedProviderFetch,
         );
-        const key = cacheKey(config, image);
+        const key = cacheKey(config, image, dependencies.cacheScope);
         let text = await dependencies.cache.get(key);
         if (text === null) {
           text = (await dependencies.recognize({

@@ -1,6 +1,14 @@
 import postgres from "npm:postgres@3.4.7";
-import { parsePublicConversationShare } from "@dg-chat/contracts";
+import { isModelCapability, parsePublicConversationShare } from "@dg-chat/contracts";
 import type { ProviderCredentialEnvelope } from "./repository.ts";
+import {
+  providerCustomParamsViolation,
+  providerDefaultsViolation,
+  type ProviderModelInvariantRecord,
+  providerModelOcrGraphViolation,
+  providerOcrTargetProviderViolation,
+  type ProviderProtocol,
+} from "./provider-model-invariants.ts";
 
 export const BACKUP_DATA_SCHEMA_VERSION = "0034" as const;
 const PREVIOUS_BACKUP_DATA_SCHEMA_VERSION = "0033" as const;
@@ -1041,12 +1049,23 @@ async function stageSource(
         });
         return `(${placeholders.join(",")})`;
       });
-      await tx.unsafe(
-        `INSERT INTO ${safeIdentifier(temporary)} (${
-          definition.columns.map(safeIdentifier).join(",")
-        }) VALUES ${tuples.join(",")}`,
-        values as never[],
-      );
+      try {
+        await tx.unsafe(
+          `INSERT INTO ${safeIdentifier(temporary)} (${
+            definition.columns.map(safeIdentifier).join(",")
+          }) VALUES ${tuples.join(",")}`,
+          values as never[],
+        );
+      } catch (error) {
+        const code = (error as { code?: unknown }).code;
+        if (typeof code === "string" && (code.startsWith("22") || code.startsWith("23"))) {
+          throw new BackupDataError(
+            "invalid_source",
+            `${definition.name} violates schema constraints`,
+          );
+        }
+        throw error;
+      }
       count += batch.length;
     }
     counts[definition.name] = count;
@@ -1061,6 +1080,25 @@ function insertSelection(definition: BackupDataTable): string {
     }
     return safeIdentifier(column);
   }).join(",");
+}
+
+/**
+ * Credential-redacted restores deliberately stage affected providers as disabled. An enabled OCR
+ * source is an operational dependency on its target provider, so stage that source as disabled as
+ * well. Its configuration remains intact and will be validated again if an administrator later
+ * enables it after restoring credentials and the target provider.
+ */
+async function disableRedactedOcrSources(
+  tx: postgres.TransactionSql,
+  stage: ReadonlyMap<string, string>,
+): Promise<void> {
+  const models = safeIdentifier(stage.get("provider_models")!);
+  const providers = safeIdentifier(stage.get("providers")!);
+  await tx.unsafe(`UPDATE ${models} source SET enabled=false FROM ${providers} target_provider
+    WHERE source.enabled=true AND target_provider.credential_redacted=true
+      AND jsonb_typeof(source.custom_params->'ocr')='object'
+      AND source.custom_params->'ocr'->>'enabled'='true'
+      AND source.custom_params->'ocr'->>'providerId'=target_provider.id::text`);
 }
 
 interface BackupRelation {
@@ -1344,6 +1382,71 @@ const RELATIONS: readonly BackupRelation[] = Object.freeze([
   },
 ]);
 
+async function validateProviderModels(
+  tx: postgres.TransactionSql,
+  providersTable: string,
+  modelsTable: string,
+): Promise<void> {
+  const providers = await tx.unsafe<{ id: string; protocol: string; enabled: boolean }[]>(
+    `SELECT id,protocol,enabled FROM ${safeIdentifier(providersTable)}`,
+  );
+  const protocols = new Map(providers.map((provider) => [provider.id, provider.protocol]));
+  const rows = await tx.unsafe<{
+    id: string;
+    provider_id: string;
+    public_model_id: string;
+    enabled: boolean;
+    capabilities: unknown;
+    custom_params: unknown;
+  }[]>(
+    `SELECT id,provider_id,public_model_id,enabled,capabilities,custom_params FROM ${
+      safeIdentifier(modelsTable)
+    }`,
+  );
+  const models: ProviderModelInvariantRecord[] = rows.map((row) => {
+    if (
+      !Array.isArray(row.capabilities) ||
+      row.capabilities.length > 64 ||
+      !row.capabilities.every((capability) =>
+        typeof capability === "string" && isModelCapability(capability)
+      ) ||
+      new Set(row.capabilities).size !== row.capabilities.length ||
+      !row.custom_params || typeof row.custom_params !== "object" ||
+      Array.isArray(row.custom_params)
+    ) {
+      throw new BackupDataError("invariant", `Backup model ${row.public_model_id} is malformed`);
+    }
+    const protocol = protocols.get(row.provider_id);
+    if (protocol !== "chat_completions" && protocol !== "responses") {
+      throw new BackupDataError(
+        "invariant",
+        `Backup model ${row.public_model_id} belongs to an invalid provider protocol`,
+      );
+    }
+    const customParams = row.custom_params as Record<string, unknown>;
+    const invalid = providerCustomParamsViolation(customParams, row.public_model_id);
+    if (invalid) throw new BackupDataError("invariant", invalid.message);
+    const defaults = providerDefaultsViolation(
+      protocol as ProviderProtocol,
+      customParams,
+      row.public_model_id,
+    );
+    if (defaults) throw new BackupDataError("invariant", defaults.message);
+    return {
+      id: row.id,
+      providerId: row.provider_id,
+      publicModelId: row.public_model_id,
+      enabled: row.enabled,
+      capabilities: row.capabilities as string[],
+      customParams,
+    };
+  });
+  const graph = providerModelOcrGraphViolation(models);
+  if (graph) throw new BackupDataError("invariant", graph.message);
+  const providerDependency = providerOcrTargetProviderViolation(models, providers);
+  if (providerDependency) throw new BackupDataError("invariant", providerDependency.message);
+}
+
 async function validateStagedDatabase(
   tx: postgres.TransactionSql,
   stage: ReadonlyMap<string, string>,
@@ -1375,6 +1478,7 @@ async function validateStagedDatabase(
   if (!admins || admins.count < 1) {
     throw new BackupDataError("invariant", "Restore must contain an active approved administrator");
   }
+  await validateProviderModels(tx, stage.get("providers")!, stage.get("provider_models")!);
   for await (
     const rows of tx.unsafe(`SELECT id,title,conversation_version,identity_visibility,
       attachment_policy,owner_name_snapshot,public_snapshot,source_attachments,expires_at
@@ -1490,6 +1594,7 @@ async function validateRestoredDatabase(tx: postgres.TransactionSql): Promise<vo
   if (!admins || admins.count < 1) {
     throw new BackupDataError("invariant", "Restore must contain an active approved administrator");
   }
+  await validateProviderModels(tx, "providers", "provider_models");
   const cycles = await tx`
     WITH RECURSIVE walk AS (
       SELECT id,conversation_id,parent_id,ARRAY[id] path,false cycle FROM messages
@@ -1576,6 +1681,7 @@ async function applyBackupData(
         suffix,
         options.objectKeyMap ?? new Map(),
       );
+      await disableRedactedOcrSources(tx, stage);
       if (source.schemaVersion !== BACKUP_DATA_SCHEMA_VERSION) {
         const legacyLinks = safeIdentifier(stage.get("message_attachments")!);
         await tx.unsafe(`WITH ranked AS (

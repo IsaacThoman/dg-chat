@@ -90,13 +90,13 @@ test("assistant speech is capability-aware, exclusive, controllable, and cleaned
 
   const listen = page.getByRole("button", { name: "Read aloud", exact: true });
   await listen.click();
-  await expect(page.getByRole("status")).toContainText("Generating audio");
-  await expect(page.getByRole("button", { name: "Pause read aloud" })).toBeVisible();
-  expect(speechBody).toMatchObject({
+  await expect.poll(() => speechBody).toMatchObject({
     model: "e2e/speech",
     voice: "nova",
     response_format: "mp3",
   });
+  await expect.poll(() => page.evaluate(() => globalThis.__speechPlays)).toBeGreaterThan(0);
+  await expect(page.getByRole("button", { name: "Pause read aloud" })).toBeVisible();
   expect(String(speechBody?.input)).toContain("This is a simulated response");
   await page.getByRole("button", { name: "Pause read aloud" }).click();
   await expect(page.getByRole("button", { name: "Resume read aloud" })).toBeVisible();

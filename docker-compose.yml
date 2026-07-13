@@ -9,6 +9,7 @@ x-app-environment: &app-environment
   # The bundled nginx overwrites X-Real-IP with the connecting address.
   TRUST_PROXY_HEADERS: "true"
   S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
+  S3_ALLOW_INSECURE: ${S3_ALLOW_INSECURE:-true}
   S3_REGION: ${S3_REGION:-us-east-1}
   S3_BUCKET: ${S3_BUCKET:-dg-chat}
   S3_ACCESS_KEY: ${S3_ACCESS_KEY:?S3_ACCESS_KEY is required}
@@ -192,6 +193,7 @@ services:
       DOCUMENT_EXTRACTION_MAX_ZIP_EXPANDED_BYTES: ${DOCUMENT_EXTRACTION_MAX_ZIP_EXPANDED_BYTES:-104857600}
       DOCUMENT_EXTRACTION_MAX_ZIP_RATIO: ${DOCUMENT_EXTRACTION_MAX_ZIP_RATIO:-200}
       S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
+      S3_ALLOW_INSECURE: ${S3_ALLOW_INSECURE:-true}
       S3_REGION: ${S3_REGION:-us-east-1}
       S3_BUCKET: ${S3_BUCKET:-dg-chat}
       S3_ACCESS_KEY: ${S3_ACCESS_KEY:?S3_ACCESS_KEY is required}

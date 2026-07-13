@@ -1,4 +1,5 @@
 import type { ChatCompletionRequest, ModelInfo } from "@dg-chat/contracts";
+import { DEFAULT_PROVIDER_RESPONSE_BYTES, providerResponseByteLimit } from "./provider-limits.ts";
 import { isSpecialUseIp, pinnedProviderFetch } from "./provider_transport.ts";
 import { ProviderAttemptError } from "./provider-resilience.ts";
 
@@ -44,13 +45,12 @@ export function simulate(request: ChatCompletionRequest): string {
   const last = [...request.messages].reverse().find((m) => m.role === "user");
   const prompt = last ? contentText(last.content) : "Hello";
   const response = `This is a simulated response to: ${prompt}`;
-  const maxTokens = request.max_tokens ?? request.max_completion_tokens;
-  return maxTokens === undefined ? response : response.slice(0, maxTokens * 4);
+  const maxTokens = request.max_tokens ?? request.max_completion_tokens ?? 4_096;
+  return response.slice(0, maxTokens * 4);
 }
 
 const MAX_TOKEN_COUNT = 1_000_000_000;
 const MAX_PROVIDER_TEXT_LENGTH = 8_388_608;
-const DEFAULT_MAX_RESPONSE_BYTES = 16_777_216;
 
 function providerEndpoint(baseUrl: string): string {
   const url = new URL(baseUrl);
@@ -82,6 +82,10 @@ export interface UpstreamStreamOptions {
   baseUrl?: string;
   apiKey?: string;
   upstreamModel?: string;
+  /** Protocol selected by the frozen execution-plan target. */
+  protocol?: "chat_completions" | "responses";
+  /** Validated model defaults. Dispatch adapters intentionally decide which keys they support. */
+  customParams?: Readonly<Record<string, unknown>>;
   timeoutMs?: number;
   maxResponseBytes?: number;
   fetch?: typeof fetch;
@@ -99,16 +103,6 @@ function retryAfterMs(headers: Headers): number | undefined {
 }
 
 const MAX_SSE_BUFFER_LENGTH = 1_048_576;
-function maxResponseBytes(override?: number): number {
-  const value = override ?? Number(
-    Deno.env.get("OPENAI_MAX_RESPONSE_BYTES") ?? DEFAULT_MAX_RESPONSE_BYTES,
-  );
-  if (!Number.isSafeInteger(value) || value < 1_024 || value > 67_108_864) {
-    throw new Error("OPENAI_MAX_RESPONSE_BYTES must be between 1024 and 67108864");
-  }
-  return value;
-}
-
 async function readBoundedBody(response: Response, limit: number): Promise<string> {
   const declared = Number(response.headers.get("content-length"));
   if (Number.isFinite(declared) && declared > limit) {
@@ -259,6 +253,97 @@ function nextSSELine(buffer: string, streamEnded: boolean) {
   return undefined;
 }
 
+function invalidChatStream(message: string): ProviderAttemptError {
+  return new ProviderAttemptError(message, {
+    category: "invalid_response",
+    transient: true,
+  });
+}
+
+/** Proves the terminal lifecycle for both parsed upstream SSE and injected provider streams. */
+export class ChatStreamTerminalValidator {
+  #sawFinish = false;
+  #sawDone = false;
+
+  observe(frame: string): void {
+    if (frame === "[DONE]") {
+      if (this.#sawDone) throw invalidChatStream("Provider Chat stream sent duplicate [DONE]");
+      if (!this.#sawFinish) {
+        throw invalidChatStream("Provider Chat stream sent [DONE] before finish_reason");
+      }
+      this.#sawDone = true;
+      return;
+    }
+    if (this.#sawDone) throw invalidChatStream("Provider Chat stream sent data after [DONE]");
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(frame);
+    } catch {
+      throw invalidChatStream("Provider Chat stream emitted malformed JSON");
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw invalidChatStream("Provider Chat stream emitted a non-object event");
+    }
+    const choices = (parsed as Record<string, unknown>).choices;
+    if (choices === undefined) {
+      if (this.#sawFinish) {
+        throw invalidChatStream("Provider Chat stream sent a non-usage event after finish_reason");
+      }
+      return;
+    }
+    if (!Array.isArray(choices)) {
+      throw invalidChatStream("Provider Chat stream choices are invalid");
+    }
+    if (this.#sawFinish) {
+      if (choices.length === 0) {
+        const usage = (parsed as Record<string, unknown>).usage;
+        if (!usage || typeof usage !== "object" || Array.isArray(usage)) {
+          throw invalidChatStream(
+            "Provider Chat stream sent a non-usage event after finish_reason",
+          );
+        }
+        validateUsage(usage);
+        const fields = usage as Record<string, unknown>;
+        if (
+          !["prompt_tokens", "completion_tokens", "total_tokens"].every((field) =>
+            Number.isSafeInteger(fields[field]) && Number(fields[field]) >= 0
+          )
+        ) {
+          throw invalidChatStream("Provider Chat stream sent incomplete usage after finish_reason");
+        }
+        return;
+      }
+      throw invalidChatStream("Provider Chat stream sent choices after finish_reason");
+    }
+    for (const rawChoice of choices) {
+      if (!rawChoice || typeof rawChoice !== "object" || Array.isArray(rawChoice)) {
+        throw invalidChatStream("Provider Chat stream choice is invalid");
+      }
+      const finishReason = (rawChoice as Record<string, unknown>).finish_reason;
+      if (finishReason === undefined || finishReason === null) continue;
+      if (
+        typeof finishReason !== "string" ||
+        !["stop", "length", "tool_calls", "function_call", "content_filter"].includes(
+          finishReason,
+        )
+      ) {
+        throw invalidChatStream("Provider Chat stream finish_reason is invalid");
+      }
+      if (this.#sawFinish) {
+        throw invalidChatStream("Provider Chat stream sent duplicate finish_reason");
+      }
+      this.#sawFinish = true;
+    }
+  }
+
+  finish(): void {
+    if (!this.#sawFinish) {
+      throw invalidChatStream("Provider Chat stream ended without finish_reason");
+    }
+    if (!this.#sawDone) throw invalidChatStream("Provider Chat stream ended without [DONE]");
+  }
+}
+
 function validateOpenAIChunk(data: string, usageBounds?: UsageBounds): number {
   if (data === "[DONE]") return 0;
   let parsed: unknown;
@@ -320,8 +405,18 @@ function validateOpenAIChunk(data: string, usageBounds?: UsageBounds): number {
       throw new Error("Upstream sent an invalid chat completion delta");
     }
     const fields = delta as Record<string, unknown>;
-    const content = boundedString(fields.content, "delta content", true);
-    if (content) outputBytes += new TextEncoder().encode(content).length;
+    for (
+      const name of [
+        "content",
+        "refusal",
+        "reasoning_content",
+        "reasoning",
+        "reasoning_summary",
+      ] as const
+    ) {
+      const content = boundedString(fields[name], `delta ${name}`, true);
+      if (content) outputBytes += new TextEncoder().encode(content).length;
+    }
     if (
       fields.role !== undefined &&
       (typeof fields.role !== "string" ||
@@ -345,7 +440,7 @@ export async function* parseOpenAIEventStream(
   body: ReadableStream<Uint8Array>,
   signal: AbortSignal,
   usageBounds?: UsageBounds,
-  maxStreamBytes = DEFAULT_MAX_RESPONSE_BYTES,
+  maxStreamBytes = DEFAULT_PROVIDER_RESPONSE_BYTES,
 ): AsyncGenerator<string> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
@@ -355,6 +450,7 @@ export async function* parseOpenAIEventStream(
   let outputBytes = 0;
   let receivedBytes = 0;
   let sawDone = false;
+  const terminal = new ChatStreamTerminalValidator();
   const abortReader = () => {
     void reader.cancel(signal.reason).catch(() => undefined);
   };
@@ -366,6 +462,7 @@ export async function* parseOpenAIEventStream(
     dataLines = [];
     dataLength = 0;
     outputBytes += validateOpenAIChunk(data, usageBounds);
+    terminal.observe(data);
     if (usageBounds && outputBytes > usageBounds.completionTokens * 4) {
       throw new Error("Upstream output exceeds the requested output bound");
     }
@@ -422,6 +519,7 @@ export async function* parseOpenAIEventStream(
       if (dataLines.length) throw new Error("Upstream event stream ended mid-frame");
       throw new Error("Upstream event stream ended without [DONE]");
     }
+    terminal.finish();
   } finally {
     signal.removeEventListener("abort", abortReader);
     await reader.cancel(signal.aborted ? signal.reason : undefined).catch(() => undefined);
@@ -460,10 +558,18 @@ export async function* streamChatCompletion(
       authorization: `Bearer ${apiKey}`,
       "content-type": "application/json",
     },
-    body: JSON.stringify({ ...request, model: upstreamModel, stream: true }),
+    body: JSON.stringify({
+      ...options.customParams,
+      ...request,
+      model: upstreamModel,
+      stream: true,
+    }),
   });
   if (!response.ok) {
-    const payload = await readBoundedBody(response, maxResponseBytes(options.maxResponseBytes));
+    const payload = await readBoundedBody(
+      response,
+      providerResponseByteLimit(options.maxResponseBytes),
+    );
     let message = `Provider returned ${response.status}`;
     try {
       const parsed = JSON.parse(payload) as unknown;
@@ -519,7 +625,7 @@ export async function* streamChatCompletion(
     yield* parseOpenAIEventStream(response.body, combinedSignal, {
       promptTokens: new TextEncoder().encode(JSON.stringify(request)).length,
       completionTokens: request.max_tokens ?? request.max_completion_tokens ?? 4096,
-    }, maxResponseBytes(options.maxResponseBytes));
+    }, providerResponseByteLimit(options.maxResponseBytes));
   } catch (error) {
     if (combinedSignal.aborted || error instanceof ProviderAttemptError) throw error;
     throw new ProviderAttemptError(
@@ -565,9 +671,17 @@ async function completeAttempt(
     signal: AbortSignal.any([signal, timeout]),
     redirect: "error",
     headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
-    body: JSON.stringify({ ...request, model: upstreamModel, stream: false }),
+    body: JSON.stringify({
+      ...options.customParams,
+      ...request,
+      model: upstreamModel,
+      stream: false,
+    }),
   });
-  const body = await readBoundedBody(response, maxResponseBytes(options.maxResponseBytes));
+  const body = await readBoundedBody(
+    response,
+    providerResponseByteLimit(options.maxResponseBytes),
+  );
   if (!response.ok) {
     let message: string | undefined;
     try {

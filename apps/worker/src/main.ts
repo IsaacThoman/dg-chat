@@ -49,6 +49,8 @@ const documentProcessingConfig = parseDocumentProcessingConfig({
   DOCUMENT_CHUNKER_VERSION: Deno.env.get("DOCUMENT_CHUNKER_VERSION"),
 });
 const knowledgeEmbeddingConfig = parseKnowledgeEmbeddingConfig({
+  DENO_ENV: Deno.env.get("DENO_ENV"),
+  OPENAI_TEST_ALLOW_HTTP_HOST: Deno.env.get("OPENAI_TEST_ALLOW_HTTP_HOST"),
   KNOWLEDGE_EMBEDDING_BASE_URL: Deno.env.get("KNOWLEDGE_EMBEDDING_BASE_URL"),
   KNOWLEDGE_EMBEDDING_API_KEY: Deno.env.get("KNOWLEDGE_EMBEDDING_API_KEY"),
   KNOWLEDGE_EMBEDDING_MODEL: Deno.env.get("KNOWLEDGE_EMBEDDING_MODEL"),

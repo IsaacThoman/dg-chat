@@ -33,8 +33,11 @@ describe("SpeechPlaybackControl", () => {
       .toContain('aria-label="Pause read aloud"');
     expect(renderToStaticMarkup(<SpeechPlaybackControl {...props} state={state("paused")} />))
       .toContain('aria-label="Resume read aloud"');
-    expect(renderToStaticMarkup(<SpeechPlaybackControl {...props} state={state("loading")} />))
-      .toContain('role="status"');
+    const loading = renderToStaticMarkup(
+      <SpeechPlaybackControl {...props} state={state("loading")} />,
+    );
+    expect(loading).toContain('role="status"');
+    expect(loading).toContain("Generating audio");
     expect(renderToStaticMarkup(<SpeechPlaybackControl {...props} state={state("error")} />))
       .toContain('role="alert"');
   });

@@ -137,6 +137,7 @@ Deno.test("provider diagnostic capture is sanitized, repository-gated, and failu
         api_key: "sk-stream-secret-value",
         source_url: "https://objects.example/stream?signature=secret",
       });
+      yield JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] });
       yield "[DONE]";
     },
   });

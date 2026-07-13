@@ -225,6 +225,58 @@ Deno.test("non-transient failures do not retry or fall back and fallback cycles 
   );
 });
 
+Deno.test("candidate-local protocol incompatibilities skip only that fallback target", async () => {
+  const calls: string[] = [];
+  const result = await executeProviderRequest({
+    initialCandidateId: "chat-primary",
+    resolveCandidate: (id) => ({
+      id,
+      fallbackId: id === "chat-primary"
+        ? "responses-incompatible"
+        : id === "responses-incompatible"
+        ? "chat-compatible"
+        : null,
+    }),
+    policy: { ...policy, maxRetries: 0 },
+    signal: new AbortController().signal,
+    attempt: (candidate) => {
+      calls.push(candidate.id);
+      if (candidate.id === "chat-primary") {
+        throw new ProviderAttemptError("unavailable", { status: 503 });
+      }
+      if (candidate.id === "responses-incompatible") {
+        throw new ProviderAttemptError("stop cannot be represented by Responses", {
+          category: "invalid_request",
+          transient: false,
+          candidateLocal: true,
+        });
+      }
+      return Promise.resolve("later Chat fallback won");
+    },
+  });
+  assertEquals(result, "later Chat fallback won");
+  assertEquals(calls, ["chat-primary", "responses-incompatible", "chat-compatible"]);
+
+  await assertRejects(
+    () =>
+      executeProviderRequest({
+        initialCandidateId: "responses-only",
+        resolveCandidate: (id) => ({ id }),
+        policy: { ...policy, maxRetries: 0 },
+        signal: new AbortController().signal,
+        attempt: () => {
+          throw new ProviderAttemptError("unsupported stop", {
+            category: "invalid_request",
+            transient: false,
+            candidateLocal: true,
+          });
+        },
+      }),
+    ProviderAttemptError,
+    "unsupported stop",
+  );
+});
+
 Deno.test("stream buffers role and keepalive chunks, retries before visibility, then publishes", async () => {
   let calls = 0;
   const chunks: unknown[] = [];
@@ -252,6 +304,59 @@ Deno.test("stream buffers role and keepalive chunks, retries before visibility, 
     "[DONE]",
   ]);
   assertEquals(openAIVisibleUnits({ choices: [{ delta: { tool_calls: [{}] } }] }), 1);
+});
+
+Deno.test("no-visible streams require an explicit validator before buffered publication", async () => {
+  const frames = [
+    { choices: [{ delta: { role: "assistant" }, finish_reason: null }] },
+    { choices: [{ delta: {}, finish_reason: "stop" }] },
+    "[DONE]",
+  ];
+  const published: unknown[] = [];
+  let validated = 0;
+  for await (
+    const chunk of streamProviderRequest<unknown>({
+      initialCandidateId: "empty",
+      resolveCandidate: (id) => ({ id }),
+      policy,
+      signal: new AbortController().signal,
+      visibleUnits: () => 0,
+      validateNoVisibleOutput(buffered) {
+        validated++;
+        assertEquals(buffered, frames);
+      },
+      attempt: async function* () {
+        yield* frames;
+      },
+    })
+  ) published.push(chunk);
+  assertEquals(validated, 1);
+  assertEquals(published, frames);
+
+  await assertRejects(
+    async () => {
+      for await (
+        const _chunk of streamProviderRequest<unknown>({
+          initialCandidateId: "invalid-empty",
+          resolveCandidate: (id) => ({ id }),
+          policy: { ...policy, maxRetries: 0 },
+          signal: new AbortController().signal,
+          visibleUnits: () => 0,
+          validateNoVisibleOutput() {
+            throw new ProviderAttemptError("terminal validation failed", {
+              category: "invalid_response",
+              transient: false,
+            });
+          },
+          attempt: async function* () {
+            yield "[DONE]";
+          },
+        })
+      ) { /* consume */ }
+    },
+    ProviderAttemptError,
+    "terminal validation failed",
+  );
 });
 
 Deno.test("pre-visible buffering is bounded before fallback", async () => {
@@ -438,6 +543,10 @@ Deno.test("refusal and reasoning deltas count as visible output", () => {
   assertEquals(
     openAIVisibleUnits({ choices: [{ delta: { reasoning_content: "private thought" } }] }),
     15,
+  );
+  assertEquals(
+    openAIVisibleUnits({ choices: [{ delta: { reasoning_summary: "short summary" } }] }),
+    13,
   );
 });
 

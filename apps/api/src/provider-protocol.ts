@@ -1,10 +1,14 @@
-const MAX_PAYLOAD_BYTES = 4 * 1024 * 1024;
+export const MAX_PROVIDER_PROTOCOL_PAYLOAD_BYTES = 4 * 1024 * 1024;
+const MAX_PAYLOAD_BYTES = MAX_PROVIDER_PROTOCOL_PAYLOAD_BYTES;
 const MAX_MESSAGES = 256;
 const MAX_PARTS = 256;
 const MAX_TOOLS = 128;
 const MAX_TEXT_BYTES = 2_000_000;
 const MAX_ID_BYTES = 512;
 const encoder = new TextEncoder();
+
+export const MAX_RESPONSE_CITATIONS = 256;
+export const MAX_RESPONSE_CITATION_COLLECTION_BYTES = 1_048_576;
 
 export type CanonicalRole = "system" | "developer" | "user" | "assistant" | "tool";
 export type CanonicalContentPart =
@@ -16,6 +20,51 @@ export interface CanonicalUrlCitation {
   endIndex: number;
   title: string;
   url: string;
+}
+
+function publicCitationProjection(citation: CanonicalUrlCitation) {
+  return {
+    type: citation.type,
+    start_index: citation.startIndex,
+    end_index: citation.endIndex,
+    title: citation.title,
+    url: citation.url,
+  };
+}
+
+/** Bounds the exact citation array shape emitted by both Responses projectors. */
+export class ResponseCitationBudget {
+  #count = 0;
+  #bytes = 2; // JSON array brackets.
+
+  add(citation: CanonicalUrlCitation, path = "response.annotations"): void {
+    if (this.#count >= MAX_RESPONSE_CITATIONS) {
+      throw new ProviderProtocolError(
+        "payload_too_large",
+        `Provider response contains more than ${MAX_RESPONSE_CITATIONS} citations`,
+        path,
+      );
+    }
+    const bytes = this.#bytes + (this.#count > 0 ? 1 : 0) +
+      encoder.encode(JSON.stringify(publicCitationProjection(citation))).byteLength;
+    if (bytes > MAX_RESPONSE_CITATION_COLLECTION_BYTES) {
+      throw new ProviderProtocolError(
+        "payload_too_large",
+        "Provider response citations exceed the size limit",
+        path,
+      );
+    }
+    this.#count++;
+    this.#bytes = bytes;
+  }
+}
+
+export function assertResponseCitationBudget(
+  citations: readonly CanonicalUrlCitation[],
+  path = "response.annotations",
+): void {
+  const budget = new ResponseCitationBudget();
+  for (const citation of citations) budget.add(citation, path);
 }
 export interface CanonicalToolCall {
   id: string;
@@ -76,9 +125,15 @@ export interface CanonicalResult {
 export type CanonicalStreamEvent =
   | { type: "started"; id: string; model?: string }
   | { type: "role"; role: CanonicalRole }
-  | { type: "text_delta"; text: string }
+  | { type: "text_delta"; text: string; outputIndex?: number; contentIndex?: number }
   | { type: "reasoning_delta"; text: string; summary: boolean }
   | { type: "refusal_delta"; text: string }
+  | {
+    type: "annotation";
+    annotation: CanonicalUrlCitation;
+    outputIndex?: number;
+    contentIndex?: number;
+  }
   | { type: "tool_call_delta"; index: number; id?: string; name?: string; arguments?: string }
   | { type: "usage"; usage: CanonicalUsage }
   | { type: "finish"; state: CanonicalResult["finishState"] }
@@ -225,6 +280,23 @@ function reasoningEffort(value: unknown, path: string): string {
   }
   return effort;
 }
+function reasoningSummary(value: unknown, path: string): string {
+  const summary = string(value, path, 32, false);
+  if (!["none", "auto", "concise", "detailed"].includes(summary)) {
+    fail(`${path} is invalid`, path);
+  }
+  return summary;
+}
+function responseMetadata(value: unknown, path: string): Record<string, string> {
+  const metadata = object(value, path);
+  if (Object.keys(metadata).length > 16) fail(`${path} must contain at most 16 entries`, path);
+  return Object.fromEntries(
+    Object.entries(metadata).map(([key, entry]) => [
+      string(key, `${path} key`, 64, false),
+      string(entry, `${path}.${key}`, 512),
+    ]),
+  );
+}
 function allowedKeys(value: Record<string, unknown>, allowed: readonly string[], path: string) {
   const extra = Object.keys(value).find((key) => !allowed.includes(key));
   if (extra) unsupported(path, `${path} contains an unsupported field`);
@@ -282,6 +354,20 @@ function responseParts(value: unknown, path: string): CanonicalContentPart[] {
       allowedKeys(part, ["type", "text"], `${path}[${index}]`);
       return { type: "text", text: string(part.text, `${path}[${index}].text`) };
     }
+    if (part.type === "output_text") {
+      allowedKeys(part, ["type", "text", "annotations", "logprobs"], `${path}[${index}]`);
+      if (part.annotations !== undefined) {
+        array(part.annotations, `${path}[${index}].annotations`, MAX_PARTS);
+      }
+      if (part.logprobs !== undefined && part.logprobs !== null) {
+        array(part.logprobs, `${path}[${index}].logprobs`, MAX_PARTS);
+      }
+      return { type: "text", text: string(part.text, `${path}[${index}].text`) };
+    }
+    if (part.type === "refusal") {
+      allowedKeys(part, ["type", "refusal"], `${path}[${index}]`);
+      return { type: "text", text: string(part.refusal, `${path}[${index}].refusal`) };
+    }
     if (part.type === "input_image") {
       allowedKeys(part, ["type", "image_url", "detail"], `${path}[${index}]`);
       const imageDetail = detail(part.detail, `${path}[${index}].detail`);
@@ -322,8 +408,8 @@ function chatTool(raw: unknown, path: string) {
   }
   const fn = object(tool.function, `${path}.function`);
   allowedKeys(fn, ["name", "description", "parameters", "strict"], `${path}.function`);
-  if (fn.strict !== undefined && typeof fn.strict !== "boolean") {
-    fail(`${path}.function.strict must be boolean`, `${path}.function.strict`);
+  if (fn.strict !== undefined && fn.strict !== null && typeof fn.strict !== "boolean") {
+    fail(`${path}.function.strict must be boolean or null`, `${path}.function.strict`);
   }
   return {
     type: "function",
@@ -331,10 +417,10 @@ function chatTool(raw: unknown, path: string) {
     ...(fn.description === undefined
       ? {}
       : { description: string(fn.description, `${path}.function.description`, 8_192) }),
-    ...(fn.parameters === undefined
-      ? {}
-      : { parameters: object(fn.parameters, `${path}.function.parameters`) }),
-    ...(fn.strict === undefined ? {} : { strict: fn.strict }),
+    parameters: fn.parameters === undefined || fn.parameters === null
+      ? null
+      : object(fn.parameters, `${path}.function.parameters`),
+    strict: fn.strict === undefined ? null : fn.strict,
   };
 }
 function responseTool(raw: unknown, path: string) {
@@ -343,8 +429,8 @@ function responseTool(raw: unknown, path: string) {
   if (tool.type !== "function") {
     unsupported(`${path}.type`, "Only function tools can be transformed");
   }
-  if (tool.strict !== undefined && typeof tool.strict !== "boolean") {
-    fail(`${path}.strict must be boolean`, `${path}.strict`);
+  if (tool.strict !== undefined && tool.strict !== null && typeof tool.strict !== "boolean") {
+    fail(`${path}.strict must be boolean or null`, `${path}.strict`);
   }
   return {
     type: "function",
@@ -353,7 +439,7 @@ function responseTool(raw: unknown, path: string) {
       ...(tool.description === undefined
         ? {}
         : { description: string(tool.description, `${path}.description`, 8_192) }),
-      ...(tool.parameters === undefined
+      ...(tool.parameters === undefined || tool.parameters === null
         ? {}
         : { parameters: object(tool.parameters, `${path}.parameters`) }),
       ...(tool.strict === undefined ? {} : { strict: tool.strict }),
@@ -413,6 +499,56 @@ function responseToolChoice(value: unknown, path: string): unknown {
   };
 }
 
+function chatResponseFormat(value: unknown, path: string): Record<string, unknown> {
+  const format = object(value, path);
+  allowedKeys(format, ["type", "json_schema"], path);
+  const type = string(format.type, `${path}.type`, 32, false);
+  if (type === "text" || type === "json_object") {
+    if (format.json_schema !== undefined) unsupported(`${path}.json_schema`);
+    return { type };
+  }
+  if (type !== "json_schema") unsupported(`${path}.type`);
+  const schema = object(format.json_schema, `${path}.json_schema`);
+  allowedKeys(schema, ["name", "description", "schema", "strict"], `${path}.json_schema`);
+  if (schema.strict !== undefined && typeof schema.strict !== "boolean") {
+    fail(`${path}.json_schema.strict must be boolean`, `${path}.json_schema.strict`);
+  }
+  return {
+    type: "json_schema",
+    name: string(schema.name, `${path}.json_schema.name`, 128, false),
+    ...(schema.description === undefined
+      ? {}
+      : { description: string(schema.description, `${path}.json_schema.description`, 8_192) }),
+    schema: object(schema.schema, `${path}.json_schema.schema`),
+    ...(schema.strict === undefined ? {} : { strict: schema.strict }),
+  };
+}
+
+function responsesTextFormat(value: unknown, path: string): Record<string, unknown> {
+  const format = object(value, path);
+  const type = string(format.type, `${path}.type`, 32, false);
+  if (type === "text" || type === "json_object") {
+    allowedKeys(format, ["type"], path);
+    return { type };
+  }
+  if (type !== "json_schema") unsupported(`${path}.type`);
+  allowedKeys(format, ["type", "name", "description", "schema", "strict"], path);
+  if (format.strict !== undefined && typeof format.strict !== "boolean") {
+    fail(`${path}.strict must be boolean`, `${path}.strict`);
+  }
+  return {
+    type: "json_schema",
+    json_schema: {
+      name: string(format.name, `${path}.name`, 128, false),
+      ...(format.description === undefined
+        ? {}
+        : { description: string(format.description, `${path}.description`, 8_192) }),
+      schema: object(format.schema, `${path}.schema`),
+      ...(format.strict === undefined ? {} : { strict: format.strict }),
+    },
+  };
+}
+
 const chatRequestKeys = [
   "model",
   "messages",
@@ -433,14 +569,15 @@ const chatRequestKeys = [
   "n",
   "user",
   "reasoning_effort",
+  "reasoning_summary",
 ];
 
 /** Converts a Chat Completions request into a Responses API request without silent field loss. */
 export function chatCompletionsRequestToResponses(input: unknown): Record<string, unknown> {
   const body = object(clonePayload(input), "request");
   allowedKeys(body, chatRequestKeys, "request");
-  for (const field of ["stop", "frequency_penalty", "presence_penalty", "seed", "user"] as const) {
-    if (body[field] !== undefined) unsupported(`request.${field}`);
+  for (const field of ["stop", "frequency_penalty", "presence_penalty", "seed"] as const) {
+    if (body[field] !== undefined && body[field] !== null) unsupported(`request.${field}`);
   }
   if (body.n !== undefined && body.n !== 1) unsupported("request.n");
   if (body.stream_options !== undefined) {
@@ -452,7 +589,8 @@ export function chatCompletionsRequestToResponses(input: unknown): Record<string
   }
   const maxTokens = body.max_completion_tokens ?? body.max_tokens;
   if (
-    body.max_tokens !== undefined && body.max_completion_tokens !== undefined &&
+    body.max_tokens !== undefined && body.max_tokens !== null &&
+    body.max_completion_tokens !== undefined && body.max_completion_tokens !== null &&
     body.max_tokens !== body.max_completion_tokens
   ) {
     lossy(
@@ -485,6 +623,12 @@ export function chatCompletionsRequestToResponses(input: unknown): Record<string
       );
     }
     if (messageRole === "tool") {
+      if (message.tool_calls !== undefined) {
+        fail(
+          "Tool result messages cannot contain tool_calls",
+          `request.messages[${index}].tool_calls`,
+        );
+      }
       if (message.tool_call_id === undefined) {
         fail("Tool result requires tool_call_id", `request.messages[${index}].tool_call_id`);
       }
@@ -503,6 +647,12 @@ export function chatCompletionsRequestToResponses(input: unknown): Record<string
         output: parts.map((part) => part.type === "text" ? part.text : "").join(""),
       });
       continue;
+    }
+    if (message.tool_call_id !== undefined) {
+      fail(
+        "Only tool result messages may contain tool_call_id",
+        `request.messages[${index}].tool_call_id`,
+      );
     }
     const content = chatParts(message.content, `request.messages[${index}].content`);
     if (content.length || !message.tool_calls) {
@@ -534,12 +684,15 @@ export function chatCompletionsRequestToResponses(input: unknown): Record<string
   }
   output.input = items;
   if (body.stream !== undefined) output.stream = boolean(body.stream, "request.stream");
-  if (body.temperature !== undefined) {
+  if (body.temperature !== undefined && body.temperature !== null) {
     output.temperature = numberInRange(body.temperature, "request.temperature", 0, 2);
   }
   if (body.top_p !== undefined) output.top_p = numberInRange(body.top_p, "request.top_p", 0, 1);
   if (body.parallel_tool_calls !== undefined) {
     output.parallel_tool_calls = boolean(body.parallel_tool_calls, "request.parallel_tool_calls");
+  }
+  if (body.user !== undefined && body.user !== null) {
+    output.user = string(body.user, "request.user", 512, false);
   }
   if (maxTokens !== undefined) {
     output.max_output_tokens = integer(maxTokens, "request.max_output_tokens", 131_072);
@@ -556,11 +709,16 @@ export function chatCompletionsRequestToResponses(input: unknown): Record<string
     output.tool_choice = chatToolChoice(body.tool_choice, "request.tool_choice");
   }
   if (body.response_format !== undefined) {
-    output.text = { format: object(body.response_format, "request.response_format") };
+    output.text = { format: chatResponseFormat(body.response_format, "request.response_format") };
   }
-  if (body.reasoning_effort !== undefined) {
+  if (body.reasoning_effort !== undefined || body.reasoning_summary !== undefined) {
     output.reasoning = {
-      effort: reasoningEffort(body.reasoning_effort, "request.reasoning_effort"),
+      ...(body.reasoning_effort === undefined
+        ? {}
+        : { effort: reasoningEffort(body.reasoning_effort, "request.reasoning_effort") }),
+      ...(body.reasoning_summary === undefined
+        ? {}
+        : { summary: reasoningSummary(body.reasoning_summary, "request.reasoning_summary") }),
     };
   }
   return output;
@@ -585,24 +743,58 @@ const responsesRequestKeys = [
   "metadata",
   "background",
   "user",
+  "stream_options",
 ];
+
+/** Identifies Responses input items that cannot be represented losslessly for a Chat target. */
+export function responsesRequestRequiresNativeInput(input: unknown): boolean {
+  const body = object(input, "request");
+  if (!Array.isArray(body.input)) return false;
+  return body.input.some((raw) => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
+    const item = raw as Record<string, unknown>;
+    if (item.type === "reasoning") return true;
+    if (item.type === "function_call") {
+      // call_id is the semantic tool correlation key. The Responses item id is transport
+      // identity only, and a completed call maps losslessly to an assistant Chat tool call.
+      // Partial calls cannot be represented faithfully by Chat Completions.
+      return item.status === "in_progress" || item.status === "incomplete";
+    }
+    if (item.type !== "message") return false;
+    if (item.id !== undefined || item.status !== undefined) return true;
+    return Array.isArray(item.content) &&
+      item.content.some((part) =>
+        !!part && typeof part === "object" && !Array.isArray(part) &&
+        ["output_text", "refusal"].includes(String((part as Record<string, unknown>).type))
+      );
+  });
+}
 
 /** Converts a Responses request into a Chat Completions request without silent field loss. */
 export function responsesRequestToChatCompletions(input: unknown): Record<string, unknown> {
   const body = object(clonePayload(input), "request");
   allowedKeys(body, responsesRequestKeys, "request");
-  for (
-    const field of [
-      "previous_response_id",
-      "include",
-      "store",
-      "metadata",
-      "background",
-      "user",
-    ] as const
-  ) if (body[field] !== undefined) unsupported(`request.${field}`);
+  if (body.previous_response_id !== undefined && body.previous_response_id !== null) {
+    unsupported("request.previous_response_id", "Stored response continuation is not implemented");
+  }
+  if (body.include !== undefined) {
+    const include = array(body.include, "request.include", 32);
+    if (include.length > 0) unsupported("request.include");
+  }
+  if (body.store !== undefined && body.store !== null) {
+    boolean(body.store, "request.store");
+  }
+  if (body.metadata !== undefined && body.metadata !== null) {
+    responseMetadata(body.metadata, "request.metadata");
+  }
+  if (body.background !== undefined && body.background !== null) {
+    if (boolean(body.background, "request.background")) unsupported("request.background");
+  }
+  const responseUser = body.user === undefined || body.user === null
+    ? undefined
+    : string(body.user, "request.user", 512, false);
   const messages: Array<Record<string, unknown>> = [];
-  if (body.instructions !== undefined) {
+  if (body.instructions !== undefined && body.instructions !== null) {
     messages.push({ role: "system", content: string(body.instructions, "request.instructions") });
   }
   if (typeof body.input === "string") {
@@ -612,7 +804,6 @@ export function responsesRequestToChatCompletions(input: unknown): Record<string
       const item = object(raw, `request.input[${index}]`);
       if (item.type === "function_call") {
         const call = toolCall(item, `request.input[${index}]`);
-        if (call.status !== undefined) lossy(`request.input[${index}].status`);
         const serialized = {
           id: call.id,
           type: "function",
@@ -636,8 +827,87 @@ export function responsesRequestToChatCompletions(input: unknown): Record<string
           ),
           content: string(item.output, `request.input[${index}].output`),
         });
+      } else if (item.type === "reasoning") {
+        allowedKeys(
+          item,
+          ["type", "id", "summary", "content", "encrypted_content", "status"],
+          `request.input[${index}]`,
+        );
+        if (item.id !== undefined) {
+          string(item.id, `request.input[${index}].id`, MAX_ID_BYTES, false);
+        }
+        if (
+          item.status !== undefined &&
+          !["in_progress", "completed", "incomplete"].includes(String(item.status))
+        ) {
+          fail(`request.input[${index}].status is invalid`, `request.input[${index}].status`);
+        }
+        if (item.summary !== undefined) {
+          for (
+            const [partIndex, rawPart] of array(
+              item.summary,
+              `request.input[${index}].summary`,
+              MAX_PARTS,
+            ).entries()
+          ) {
+            const part = object(rawPart, `request.input[${index}].summary[${partIndex}]`);
+            allowedKeys(part, ["type", "text"], `request.input[${index}].summary[${partIndex}]`);
+            if (part.type !== "summary_text") {
+              fail(
+                "Reasoning summary part type is invalid",
+                `request.input[${index}].summary[${partIndex}].type`,
+              );
+            }
+            string(part.text, `request.input[${index}].summary[${partIndex}].text`);
+          }
+        }
+        if (item.content !== undefined) {
+          for (
+            const [partIndex, rawPart] of array(
+              item.content,
+              `request.input[${index}].content`,
+              MAX_PARTS,
+            ).entries()
+          ) {
+            const part = object(rawPart, `request.input[${index}].content[${partIndex}]`);
+            allowedKeys(part, ["type", "text"], `request.input[${index}].content[${partIndex}]`);
+            if (part.type !== "reasoning_text") {
+              fail(
+                "Reasoning content part type is invalid",
+                `request.input[${index}].content[${partIndex}].type`,
+              );
+            }
+            string(part.text, `request.input[${index}].content[${partIndex}].text`);
+          }
+        }
+        if (item.encrypted_content !== undefined) {
+          string(item.encrypted_content, `request.input[${index}].encrypted_content`);
+        }
+        // The native provider receives the original item. This bounded shadow retains its token
+        // weight for reservation/telemetry but is never dispatched to a Chat candidate.
+        messages.push({ role: "assistant", content: JSON.stringify(item) });
       } else {
-        allowedKeys(item, ["type", "role", "content"], `request.input[${index}]`);
+        const outputMessage = item.type === "message" &&
+          (item.id !== undefined || item.status !== undefined ||
+            (Array.isArray(item.content) &&
+              item.content.some((part) =>
+                !!part && typeof part === "object" && !Array.isArray(part) &&
+                ["output_text", "refusal"].includes(String((part as Record<string, unknown>).type))
+              )));
+        allowedKeys(
+          item,
+          outputMessage ? ["type", "id", "status", "role", "content"] : ["type", "role", "content"],
+          `request.input[${index}]`,
+        );
+        if (item.id !== undefined) {
+          string(item.id, `request.input[${index}].id`, MAX_ID_BYTES, false);
+        }
+        if (
+          item.status !== undefined &&
+          !["in_progress", "completed", "incomplete"].includes(String(item.status))
+        ) {
+          fail(`request.input[${index}].status is invalid`, `request.input[${index}].status`);
+        }
         messages.push({
           role: role(item.role, `request.input[${index}].role`),
           content: toChatContent(responseParts(item.content, `request.input[${index}].content`)),
@@ -648,16 +918,40 @@ export function responsesRequestToChatCompletions(input: unknown): Record<string
   const output: Record<string, unknown> = {
     model: string(body.model, "request.model", 200, false),
     messages,
+    ...(responseUser === undefined ? {} : { user: responseUser }),
   };
-  if (body.stream !== undefined) output.stream = boolean(body.stream, "request.stream");
-  if (body.temperature !== undefined) {
+  if (body.stream !== undefined && body.stream !== null) {
+    output.stream = boolean(body.stream, "request.stream");
+  }
+  if (body.stream_options !== undefined && body.stream_options !== null) {
+    const streamOptions = object(body.stream_options, "request.stream_options");
+    allowedKeys(streamOptions, ["include_obfuscation"], "request.stream_options");
+    if (
+      streamOptions.include_obfuscation !== undefined &&
+      typeof streamOptions.include_obfuscation !== "boolean"
+    ) {
+      fail(
+        "include_obfuscation must be boolean",
+        "request.stream_options.include_obfuscation",
+      );
+    }
+    if (streamOptions.include_obfuscation === true) {
+      unsupported(
+        "request.stream_options.include_obfuscation",
+        "Responses stream obfuscation is not implemented",
+      );
+    }
+  }
+  if (body.temperature !== undefined && body.temperature !== null) {
     output.temperature = numberInRange(body.temperature, "request.temperature", 0, 2);
   }
-  if (body.top_p !== undefined) output.top_p = numberInRange(body.top_p, "request.top_p", 0, 1);
-  if (body.parallel_tool_calls !== undefined) {
+  if (body.top_p !== undefined && body.top_p !== null) {
+    output.top_p = numberInRange(body.top_p, "request.top_p", 0, 1);
+  }
+  if (body.parallel_tool_calls !== undefined && body.parallel_tool_calls !== null) {
     output.parallel_tool_calls = boolean(body.parallel_tool_calls, "request.parallel_tool_calls");
   }
-  if (body.max_output_tokens !== undefined) {
+  if (body.max_output_tokens !== undefined && body.max_output_tokens !== null) {
     output.max_completion_tokens = integer(
       body.max_output_tokens,
       "request.max_output_tokens",
@@ -679,15 +973,20 @@ export function responsesRequestToChatCompletions(input: unknown): Record<string
     const text = object(body.text, "request.text");
     allowedKeys(text, ["format", "verbosity"], "request.text");
     if (text.verbosity !== undefined) unsupported("request.text.verbosity");
-    if (text.format !== undefined) output.response_format = text.format;
+    if (text.format !== undefined) {
+      output.response_format = responsesTextFormat(text.format, "request.text.format");
+    }
   }
-  if (body.reasoning !== undefined) {
+  if (body.reasoning !== undefined && body.reasoning !== null) {
     const reasoning = object(body.reasoning, "request.reasoning");
     allowedKeys(reasoning, ["effort", "summary"], "request.reasoning");
-    if (reasoning.summary !== undefined && reasoning.summary !== "none") {
-      unsupported("request.reasoning.summary");
+    if (reasoning.summary !== undefined && reasoning.summary !== null) {
+      output.reasoning_summary = reasoningSummary(
+        reasoning.summary,
+        "request.reasoning.summary",
+      );
     }
-    if (reasoning.effort !== undefined) {
+    if (reasoning.effort !== undefined && reasoning.effort !== null) {
       output.reasoning_effort = reasoningEffort(reasoning.effort, "request.reasoning.effort");
     }
   }
@@ -779,6 +1078,7 @@ export function normalizeChatCompletionResult(input: unknown): CanonicalResult {
       (annotation, index) =>
         canonicalChatCitation(annotation, `response.choices[0].message.annotations[${index}]`),
     );
+  assertResponseCitationBudget(annotations, "response.choices[0].message.annotations");
   if (annotations.some((annotation) => annotation.endIndex > text.length)) {
     fail(
       "Citation range exceeds the assistant message content",
@@ -818,15 +1118,37 @@ export function normalizeChatCompletionResult(input: unknown): CanonicalResult {
 
 export function normalizeResponsesResult(input: unknown): CanonicalResult {
   const body = object(clonePayload(input), "response");
+  if (body.object !== undefined && body.object !== "response") {
+    fail("response.object is invalid", "response.object");
+  }
+  const responseStatus = string(body.status, "response.status", 32, false);
+  if (!["completed", "incomplete", "failed", "cancelled"].includes(responseStatus)) {
+    fail("response.status is invalid", "response.status");
+  }
   let text = "";
   let refusal = "";
   let reasoningContent = "";
   let reasoningSummary = "";
+  const annotations: CanonicalUrlCitation[] = [];
   const resultContent: CanonicalContentPart[] = [];
   const toolCalls: CanonicalToolCall[] = [];
   for (const [index, raw] of array(body.output, "response.output", MAX_PARTS).entries()) {
     const item = object(raw, `response.output[${index}]`);
+    string(item.id, `response.output[${index}].id`, MAX_ID_BYTES, false);
+    const itemStatus = string(item.status, `response.output[${index}].status`, 32, false);
+    if (!["completed", "incomplete"].includes(itemStatus)) {
+      fail(`response.output[${index}].status is invalid`, `response.output[${index}].status`);
+    }
+    if (responseStatus === "completed" && itemStatus !== "completed") {
+      fail(
+        `response.output[${index}] is incomplete in a completed response`,
+        `response.output[${index}].status`,
+      );
+    }
     if (item.type === "message") {
+      if (item.role !== "assistant") {
+        fail(`response.output[${index}].role must be assistant`, `response.output[${index}].role`);
+      }
       for (
         const [partIndex, rawPart] of array(
           item.content,
@@ -840,21 +1162,39 @@ export function normalizeResponsesResult(input: unknown): CanonicalResult {
             part.text,
             `response.output[${index}].content[${partIndex}].text`,
           );
+          const textOffset = text.length;
+          if (part.annotations !== undefined) {
+            for (
+              const [annotationIndex, rawAnnotation] of array(
+                part.annotations,
+                `response.output[${index}].content[${partIndex}].annotations`,
+                256,
+              ).entries()
+            ) {
+              const citation = canonicalResponsesCitation(
+                rawAnnotation,
+                `response.output[${index}].content[${partIndex}].annotations[${annotationIndex}]`,
+              );
+              if (citation.endIndex > partText.length) {
+                fail(
+                  "Citation range exceeds its Responses output_text part",
+                  `response.output[${index}].content[${partIndex}].annotations[${annotationIndex}]`,
+                );
+              }
+              annotations.push({
+                ...citation,
+                startIndex: citation.startIndex + textOffset,
+                endIndex: citation.endIndex + textOffset,
+              });
+            }
+          }
           text += partText;
           resultContent.push({ type: "text", text: partText });
         } else if (part.type === "output_image") {
-          const imageDetail = detail(
-            part.detail,
-            `response.output[${index}].content[${partIndex}].detail`,
+          unsupported(
+            `response.output[${index}].content[${partIndex}].type`,
+            "Chat Completions output cannot represent a Responses output_image without loss",
           );
-          resultContent.push({
-            type: "image",
-            url: safeUrl(
-              part.image_url,
-              `response.output[${index}].content[${partIndex}].image_url`,
-            ),
-            ...(imageDetail ? { detail: imageDetail } : {}),
-          });
         } else if (part.type === "refusal") {
           refusal += string(
             part.refusal,
@@ -894,6 +1234,7 @@ export function normalizeResponsesResult(input: unknown): CanonicalResult {
   const incompleteReason = body.incomplete_details === undefined
     ? undefined
     : object(body.incomplete_details, "response.incomplete_details").reason;
+  assertResponseCitationBudget(annotations, "response.output.annotations");
   return {
     id: string(body.id, "response.id", MAX_ID_BYTES, false),
     model: string(body.model, "response.model", 200, false),
@@ -902,6 +1243,7 @@ export function normalizeResponsesResult(input: unknown): CanonicalResult {
       : { createdAt: integer(body.created_at, "response.created_at", 4_294_967_295) }),
     content: resultContent,
     text,
+    ...(annotations.length ? { annotations } : {}),
     ...(refusal ? { refusal } : {}),
     ...(body.error === undefined || body.error === null ? {} : {
       error: (() => {
@@ -922,9 +1264,9 @@ export function normalizeResponsesResult(input: unknown): CanonicalResult {
       }
       : {}),
     toolCalls,
-    finishState: finish(
-      body.status === "incomplete" ? incompleteReason ?? "incomplete" : body.status,
-    ),
+    finishState: responseStatus === "completed" && toolCalls.length
+      ? "tool_calls"
+      : finish(responseStatus === "incomplete" ? incompleteReason ?? "incomplete" : responseStatus),
     ...(body.usage === undefined
       ? {}
       : { usage: usage(body.usage, "responses", "response.usage")! }),
@@ -963,6 +1305,16 @@ export function normalizeChatStreamChunk(input: unknown): CanonicalStreamEvent[]
         text: string(delta.content, `event.choices[${index}].delta.content`),
       });
     }
+    if (delta.reasoning_summary !== undefined && delta.reasoning_summary !== null) {
+      events.push({
+        type: "reasoning_delta",
+        text: string(
+          delta.reasoning_summary,
+          `event.choices[${index}].delta.reasoning_summary`,
+        ),
+        summary: true,
+      });
+    }
     const reasoning = delta.reasoning_content ?? delta.reasoning;
     if (reasoning !== undefined && reasoning !== null) {
       events.push({
@@ -976,6 +1328,23 @@ export function normalizeChatStreamChunk(input: unknown): CanonicalStreamEvent[]
         type: "refusal_delta",
         text: string(delta.refusal, `event.choices[${index}].delta.refusal`),
       });
+    }
+    if (delta.annotations !== undefined) {
+      for (
+        const [annotationIndex, annotation] of array(
+          delta.annotations,
+          `event.choices[${index}].delta.annotations`,
+          256,
+        ).entries()
+      ) {
+        events.push({
+          type: "annotation",
+          annotation: canonicalChatCitation(
+            annotation,
+            `event.choices[${index}].delta.annotations[${annotationIndex}]`,
+          ),
+        });
+      }
     }
     if (delta.tool_calls !== undefined) {
       for (
@@ -1046,6 +1415,32 @@ function canonicalChatCitation(value: unknown, path: string): CanonicalUrlCitati
     startIndex,
     endIndex,
     title: string(citation.title, `${path}.url_citation.title`, 8_192),
+    url,
+  };
+}
+
+function canonicalResponsesCitation(value: unknown, path: string): CanonicalUrlCitation {
+  const citation = object(value, path);
+  allowedKeys(citation, ["type", "start_index", "end_index", "title", "url"], path);
+  if (citation.type !== "url_citation") unsupported(`${path}.type`);
+  const startIndex = integer(citation.start_index, `${path}.start_index`, 2_000_000);
+  const endIndex = integer(citation.end_index, `${path}.end_index`, 2_000_000);
+  if (endIndex < startIndex) fail("Citation end_index precedes start_index", path);
+  const url = string(citation.url, `${path}.url`, 16_384, false);
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    fail(`${path}.url is invalid`, `${path}.url`);
+  }
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    fail(`${path}.url has an invalid protocol`, `${path}.url`);
+  }
+  return {
+    type: "url_citation",
+    startIndex,
+    endIndex,
+    title: string(citation.title, `${path}.title`, 8_192),
     url,
   };
 }
@@ -1233,12 +1628,32 @@ export function publicChatStreamChunk(
     if (rawDelta.role !== undefined) {
       delta.role = role(rawDelta.role, `event.choices[${index}].delta.role`);
     }
-    for (const name of ["content", "refusal", "reasoning_content", "reasoning"] as const) {
+    for (
+      const name of [
+        "content",
+        "refusal",
+        "reasoning_content",
+        "reasoning",
+        "reasoning_summary",
+      ] as const
+    ) {
       if (rawDelta[name] !== undefined) {
         delta[name] = rawDelta[name] === null
           ? null
           : string(rawDelta[name], `event.choices[${index}].delta.${name}`);
       }
+    }
+    if (rawDelta.annotations !== undefined) {
+      delta.annotations = array(
+        rawDelta.annotations,
+        `event.choices[${index}].delta.annotations`,
+        256,
+      ).map((annotation, annotationIndex) =>
+        publicCitation(
+          annotation,
+          `event.choices[${index}].delta.annotations[${annotationIndex}]`,
+        )
+      );
     }
     if (rawDelta.tool_calls !== undefined) {
       delta.tool_calls = array(
@@ -1303,7 +1718,7 @@ export function normalizeResponsesStreamEvent(input: unknown): CanonicalStreamEv
   if (input === "[DONE]") return [{ type: "done" }];
   const event = object(clonePayload(input), "event");
   const type = string(event.type, "event.type", 120, false);
-  if (type === "response.created" || type === "response.in_progress") {
+  if (type === "response.created") {
     const response = object(event.response, "event.response");
     return [{
       type: "started",
@@ -1313,11 +1728,36 @@ export function normalizeResponsesStreamEvent(input: unknown): CanonicalStreamEv
         : { model: string(response.model, "event.response.model", 200) }),
     }];
   }
+  if (type === "response.in_progress" || type === "response.queued") {
+    object(event.response, "event.response");
+    return [];
+  }
   if (type === "response.output_text.delta") {
-    return [{ type: "text_delta", text: string(event.delta, "event.delta") }];
+    return [{
+      type: "text_delta",
+      text: string(event.delta, "event.delta"),
+      ...(event.output_index === undefined
+        ? {}
+        : { outputIndex: integer(event.output_index, "event.output_index", 127) }),
+      ...(event.content_index === undefined
+        ? {}
+        : { contentIndex: integer(event.content_index, "event.content_index", 255) }),
+    }];
   }
   if (type === "response.refusal.delta") {
     return [{ type: "refusal_delta", text: string(event.delta, "event.delta") }];
+  }
+  if (type === "response.output_text.annotation.added") {
+    return [{
+      type: "annotation",
+      annotation: canonicalResponsesCitation(event.annotation, "event.annotation"),
+      ...(event.output_index === undefined
+        ? {}
+        : { outputIndex: integer(event.output_index, "event.output_index", 127) }),
+      ...(event.content_index === undefined
+        ? {}
+        : { contentIndex: integer(event.content_index, "event.content_index", 255) }),
+    }];
   }
   if (
     type === "response.reasoning_summary_text.delta" || type === "response.reasoning_text.delta"
@@ -1332,9 +1772,6 @@ export function normalizeResponsesStreamEvent(input: unknown): CanonicalStreamEv
     return [{
       type: "tool_call_delta",
       index: integer(event.output_index ?? 0, "event.output_index", 127),
-      ...(event.item_id === undefined
-        ? {}
-        : { id: string(event.item_id, "event.item_id", MAX_ID_BYTES) }),
       ...(event.name === undefined ? {} : { name: string(event.name, "event.name", 128) }),
       arguments: string(event.delta, "event.delta", 1_000_000),
     }];
@@ -1356,8 +1793,15 @@ export function normalizeResponsesStreamEvent(input: unknown): CanonicalStreamEv
       arguments: optionalString(item.arguments, "event.item.arguments", 1_000_000) ?? "",
     }];
   }
-  if (type === "response.completed") {
+  if (type === "response.completed" || type === "response.incomplete") {
     const response = object(event.response, "event.response");
+    const normalized = normalizeResponsesResult(response);
+    if (
+      (type === "response.completed" && normalized.finishState !== "stop" &&
+        normalized.finishState !== "tool_calls") ||
+      (type === "response.incomplete" && normalized.finishState !== "length" &&
+        normalized.finishState !== "content_filter" && normalized.finishState !== "incomplete")
+    ) fail(`${type} conflicts with response.status`, "event.response.status");
     const events: CanonicalStreamEvent[] = [];
     if (response.usage !== undefined) {
       events.push({
@@ -1365,25 +1809,42 @@ export function normalizeResponsesStreamEvent(input: unknown): CanonicalStreamEv
         usage: usage(response.usage, "responses", "event.response.usage")!,
       });
     }
-    events.push({ type: "finish", state: finish(response.status) });
+    const incompleteReason = response.incomplete_details === undefined
+      ? undefined
+      : object(response.incomplete_details, "event.response.incomplete_details").reason;
+    events.push({
+      type: "finish",
+      state: finish(
+        type === "response.incomplete" ? incompleteReason ?? "incomplete" : response.status,
+      ),
+    });
     events.push({ type: "done" });
     return events;
   }
   if (type === "response.failed" || type === "error") {
-    const error = object(
-      event.error ?? object(event.response, "event.response").error,
-      "event.error",
-    );
-    return [{
+    const response = event.response === undefined
+      ? undefined
+      : object(event.response, "event.response");
+    const error = object(event.error ?? response?.error, "event.error");
+    const events: CanonicalStreamEvent[] = [];
+    if (response?.usage !== undefined) {
+      events.push({
+        type: "usage",
+        usage: usage(response.usage, "responses", "event.response.usage")!,
+      });
+    }
+    events.push({
       type: "error",
       code: optionalString(error.code, "event.error.code", 120) ?? "provider_error",
       message: optionalString(error.message, "event.error.message", 500) ??
         "Provider response failed",
-    }];
+    });
+    return events;
   }
   if (
     [
       "response.output_text.done",
+      "response.refusal.done",
       "response.reasoning_summary_text.done",
       "response.reasoning_text.done",
       "response.function_call_arguments.done",

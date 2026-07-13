@@ -327,6 +327,7 @@ Deno.test("provider execution retries through the breaker, falls back, and persi
             refusal: "declined",
             tool_calls: toolCalls,
           },
+          finish_reason: "stop",
         }],
       });
       yield "[DONE]";
@@ -383,7 +384,7 @@ Deno.test("provider execution retries through the breaker, falls back, and persi
     stream: async function* () {
       yield JSON.stringify({ choices: [{ delta: { content: "estimated first" } }] });
       yield JSON.stringify({
-        choices: [],
+        choices: [{ delta: {}, finish_reason: "stop" }],
         usage: {
           prompt_tokens: 17,
           completion_tokens: 9,
@@ -454,6 +455,7 @@ Deno.test("provider execution retries through the breaker, falls back, and persi
         usage: { prompt_tokens: 23, completion_tokens: 1 },
       });
       yield JSON.stringify({ choices: [{ delta: { content: "output after early usage" } }] });
+      yield JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] });
       yield "[DONE]";
     },
   });
@@ -472,8 +474,8 @@ Deno.test("provider execution retries through the breaker, falls back, and persi
   ) { /* consume */ }
   const partialStreamAttempt = repo.listProviderAttempts(partialStreamRun)[0];
   assertEquals(partialStreamAttempt.inputTokens, 23);
-  assertEquals(partialStreamAttempt.outputTokens > 1, true);
-  assertEquals(partialStreamAttempt.tokenSource, "estimated");
+  assertEquals(partialStreamAttempt.outputTokens, 1);
+  assertEquals(partialStreamAttempt.tokenSource, "provider");
 
   const partialCompleteRun = "provider-partial-complete-usage";
   const partialCompleteLease = reservePartialRun(partialCompleteRun);
@@ -721,6 +723,81 @@ async function singleProviderFixture(
   if (!run.runLeaseToken) throw new Error("execution lease missing");
   return { repo, user, keyring, provider, model, price, runId, run };
 }
+
+Deno.test("chat execution accepts only terminally valid empty streams and rejects bare DONE", async () => {
+  const valid = await singleProviderFixture("chat_completions");
+  const validEngine = new ProviderExecutionEngine({
+    repository: valid.repo,
+    keyring: valid.keyring,
+    circuitBreaker: new MemoryCircuitBreaker(),
+    breakerPolicy: {
+      failureThreshold: 3,
+      failureWindowSeconds: 60,
+      openSeconds: 30,
+      halfOpenLeaseSeconds: 5,
+    },
+    stream: async function* () {
+      yield JSON.stringify({
+        choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+      });
+      yield JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "content_filter" }] });
+      yield "[DONE]";
+    },
+  });
+  const validFrames: string[] = [];
+  for await (
+    const frame of validEngine.stream(
+      valid.model.id,
+      valid.runId,
+      valid.run.runLeaseToken!,
+      {
+        model: valid.model.publicModelId,
+        messages: [{ role: "user", content: "empty is valid" }],
+        stream: true,
+      },
+      new AbortController().signal,
+    )
+  ) validFrames.push(frame);
+  assertEquals(validFrames.at(-1), "[DONE]");
+  assertEquals(valid.repo.listProviderAttempts(valid.runId)[0].status, "succeeded");
+
+  const invalid = await singleProviderFixture("chat_completions");
+  const invalidEngine = new ProviderExecutionEngine({
+    repository: invalid.repo,
+    keyring: invalid.keyring,
+    circuitBreaker: new MemoryCircuitBreaker(),
+    breakerPolicy: {
+      failureThreshold: 3,
+      failureWindowSeconds: 60,
+      openSeconds: 30,
+      halfOpenLeaseSeconds: 5,
+    },
+    stream: async function* () {
+      yield JSON.stringify({ choices: [{ index: 0, delta: { content: "partial" } }] });
+      yield "[DONE]";
+    },
+  });
+  await assertRejects(
+    async () => {
+      for await (
+        const _frame of invalidEngine.stream(
+          invalid.model.id,
+          invalid.runId,
+          invalid.run.runLeaseToken!,
+          {
+            model: invalid.model.publicModelId,
+            messages: [{ role: "user", content: "reject bare done" }],
+            stream: true,
+          },
+          new AbortController().signal,
+        )
+      ) { /* consume */ }
+    },
+    ProviderAttemptError,
+    "before finish_reason",
+  );
+  assertEquals(invalid.repo.listProviderAttempts(invalid.runId)[0].status, "failed");
+});
 
 Deno.test("speech provider execution retries 429, preserves telemetry, and requires capability and fixed pricing", async () => {
   const fixture = await singleProviderFixture("chat_completions", ["speech"], true);
@@ -1135,9 +1212,61 @@ Deno.test("audio resilience preserves upstream 429 and honors Retry-After before
   assertEquals(attempts.map((attempt) => attempt.status), ["failed", "succeeded"]);
 });
 
-Deno.test("provider execution rejects native Responses targets before dispatch", async () => {
+Deno.test("provider execution dispatches native Responses targets", async () => {
   const fixture = await singleProviderFixture("responses");
-  let calls = 0;
+  let capturedBody: Record<string, unknown> = {};
+  const engine = new ProviderExecutionEngine({
+    repository: fixture.repo,
+    keyring: fixture.keyring,
+    circuitBreaker: new MemoryCircuitBreaker(),
+    breakerPolicy: {
+      failureThreshold: 1,
+      failureWindowSeconds: 60,
+      openSeconds: 30,
+      halfOpenLeaseSeconds: 5,
+    },
+    responsesFetch: (_input, init) => {
+      capturedBody = JSON.parse(String(init?.body));
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            id: "resp_native",
+            model: "single-upstream",
+            status: "completed",
+            output: [{
+              id: "msg_native",
+              type: "message",
+              status: "completed",
+              role: "assistant",
+              content: [{ type: "output_text", text: "native" }],
+            }],
+            usage: { input_tokens: 2, output_tokens: 1, total_tokens: 3 },
+          }),
+          { headers: { "content-type": "application/json" } },
+        ),
+      );
+    },
+  });
+  const result = await engine.complete(
+    fixture.model.id,
+    fixture.runId,
+    fixture.run.runLeaseToken!,
+    { model: fixture.model.publicModelId, messages: [{ role: "user", content: "hello" }] },
+    new AbortController().signal,
+    undefined,
+    undefined,
+    { store: false, metadata: { trace: "native" } },
+  );
+  assertEquals(result.text, "native");
+  assertEquals(capturedBody.model, "single-upstream");
+  assertEquals(capturedBody.store, false);
+  assertEquals(capturedBody.metadata, { trace: "native" });
+  assertEquals(fixture.repo.listProviderAttempts(fixture.runId)[0].status, "succeeded");
+});
+
+Deno.test("provider execution rejects store=true before a Chat dispatch", async () => {
+  const fixture = await singleProviderFixture("chat_completions");
+  let dispatched = false;
   const engine = new ProviderExecutionEngine({
     repository: fixture.repo,
     keyring: fixture.keyring,
@@ -1149,11 +1278,11 @@ Deno.test("provider execution rejects native Responses targets before dispatch",
       halfOpenLeaseSeconds: 5,
     },
     complete: () => {
-      calls++;
-      throw new Error("must not dispatch");
+      dispatched = true;
+      return Promise.reject(new Error("must not dispatch"));
     },
   });
-  await assertRejects(
+  const error = await assertRejects(
     () =>
       engine.complete(
         fixture.model.id,
@@ -1161,12 +1290,388 @@ Deno.test("provider execution rejects native Responses targets before dispatch",
         fixture.run.runLeaseToken!,
         { model: fixture.model.publicModelId, messages: [{ role: "user", content: "hello" }] },
         new AbortController().signal,
+        undefined,
+        undefined,
+        { store: true },
       ),
     ProviderAttemptError,
-    "Native Responses provider execution is not enabled",
+    "cannot preserve",
   );
-  assertEquals(calls, 0);
-  assertEquals(fixture.repo.listProviderAttempts(fixture.runId), []);
+  assertEquals(error.options.candidateLocal, true);
+  assertEquals(dispatched, false);
+  const [attempt] = fixture.repo.listProviderAttempts(fixture.runId);
+  assertEquals(attempt.costMicros, 0);
+  assertEquals(attempt.inputTokens, 0);
+});
+
+Deno.test("provider execution skips Chat transport for native-only stateless input", async () => {
+  const fixture = await singleProviderFixture("chat_completions");
+  let dispatched = false;
+  const engine = new ProviderExecutionEngine({
+    repository: fixture.repo,
+    keyring: fixture.keyring,
+    circuitBreaker: new MemoryCircuitBreaker(),
+    breakerPolicy: {
+      failureThreshold: 1,
+      failureWindowSeconds: 60,
+      openSeconds: 30,
+      halfOpenLeaseSeconds: 5,
+    },
+    complete: () => {
+      dispatched = true;
+      return Promise.reject(new Error("must not dispatch"));
+    },
+  });
+  const error = await assertRejects(
+    () =>
+      engine.complete(
+        fixture.model.id,
+        fixture.runId,
+        fixture.run.runLeaseToken!,
+        { model: fixture.model.publicModelId, messages: [{ role: "user", content: "shadow" }] },
+        new AbortController().signal,
+        undefined,
+        undefined,
+        {
+          store: false,
+          input: [{ type: "reasoning", encrypted_content: "opaque" }],
+          requiresNativeInput: true,
+        },
+      ),
+    ProviderAttemptError,
+    "cannot preserve",
+  );
+  assertEquals(error.options.candidateLocal, true);
+  assertEquals(dispatched, false);
+  const [attempt] = fixture.repo.listProviderAttempts(fixture.runId);
+  assertEquals(attempt.costMicros, 0);
+  assertEquals(attempt.inputTokens, 0);
+});
+
+Deno.test("provider execution keeps gateway-owned Responses metadata across a Chat dispatch", async () => {
+  const fixture = await singleProviderFixture("chat_completions");
+  let dispatched = false;
+  const engine = new ProviderExecutionEngine({
+    repository: fixture.repo,
+    keyring: fixture.keyring,
+    circuitBreaker: new MemoryCircuitBreaker(),
+    breakerPolicy: {
+      failureThreshold: 1,
+      failureWindowSeconds: 60,
+      openSeconds: 30,
+      halfOpenLeaseSeconds: 5,
+    },
+    complete: () => {
+      dispatched = true;
+      return Promise.resolve({
+        text: "metadata remains in the public response",
+        inputTokens: 3,
+        outputTokens: 2,
+        upstream: {
+          id: "chatcmpl_metadata",
+          choices: [{ message: { role: "assistant", content: "metadata remains" } }],
+          usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+        },
+      });
+    },
+  });
+  await engine.complete(
+    fixture.model.id,
+    fixture.runId,
+    fixture.run.runLeaseToken!,
+    { model: fixture.model.publicModelId, messages: [{ role: "user", content: "hello" }] },
+    new AbortController().signal,
+    undefined,
+    undefined,
+    { store: false, metadata: { trace: "gateway-owned" } },
+  );
+  assertEquals(dispatched, true);
+});
+
+Deno.test("provider execution falls back across Chat Completions and Responses protocols", async () => {
+  const fixture = await singleProviderFixture("chat_completions");
+  const mutation = { actorId: fixture.user.id, action: "test.cross-protocol" };
+  const created = fixture.repo.createProvider({
+    slug: "responses-fallback",
+    displayName: "Responses fallback",
+    baseUrl: "https://responses-fallback.example/v1",
+    protocol: "responses",
+  }, mutation);
+  const provider = fixture.repo.setProviderCredential(created.id, created.version, {
+    envelope: await fixture.keyring.encrypt(created.id, created.version + 1, "fallback-secret"),
+  }, mutation);
+  const fallback = fixture.repo.createProviderModel({
+    providerId: provider.id,
+    publicModelId: "fallback/responses",
+    upstreamModelId: "responses-upstream",
+    displayName: "Responses fallback",
+    capabilities: ["chat"],
+    contextWindow: 8_192,
+  }, mutation);
+  fixture.repo.createModelPriceVersion({
+    providerModelId: fallback.id,
+    expectedModelVersion: fallback.version,
+    effectiveAt: "2026-01-01T00:00:00.000Z",
+    inputMicrosPerMillion: 100_000,
+    cachedInputMicrosPerMillion: 50_000,
+    reasoningMicrosPerMillion: 200_000,
+    outputMicrosPerMillion: 300_000,
+    fixedCallMicros: 10,
+    source: "test",
+  }, mutation);
+  const policy = fixture.repo.createProviderRetryPolicy({
+    name: "Cross-protocol policy",
+    maxAttempts: 2,
+    maxRetries: 0,
+    baseDelayMs: 0,
+    maxDelayMs: 0,
+    backoffMultiplierBps: 10_000,
+    jitterBps: 0,
+    firstTokenTimeoutMs: 1_000,
+    idleTimeoutMs: 1_000,
+    totalTimeoutMs: 10_000,
+    retryableStatuses: [503],
+  }, mutation);
+  fixture.repo.setProviderModelRoute({
+    sourceModelId: fixture.model.id,
+    expectedVersion: 0,
+    retryPolicyId: policy.id,
+    fallbackModelIds: [fallback.id],
+  }, mutation);
+  let chatCalls = 0;
+  let responsesCalls = 0;
+  const engine = new ProviderExecutionEngine({
+    repository: fixture.repo,
+    keyring: fixture.keyring,
+    circuitBreaker: new MemoryCircuitBreaker(),
+    breakerPolicy: {
+      failureThreshold: 1,
+      failureWindowSeconds: 60,
+      openSeconds: 30,
+      halfOpenLeaseSeconds: 5,
+    },
+    complete: () => {
+      chatCalls++;
+      return Promise.reject(new ProviderAttemptError("unavailable", { status: 503 }));
+    },
+    responsesFetch: () => {
+      responsesCalls++;
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            id: "resp_fallback",
+            model: "responses-upstream",
+            status: "completed",
+            output: [{
+              id: "msg_fallback",
+              type: "message",
+              status: "completed",
+              role: "assistant",
+              content: [{ type: "output_text", text: "fallback" }],
+            }],
+            usage: { input_tokens: 2, output_tokens: 2, total_tokens: 4 },
+          }),
+          { headers: { "content-type": "application/json" } },
+        ),
+      );
+    },
+  });
+  const result = await engine.complete(
+    fixture.model.id,
+    fixture.runId,
+    fixture.run.runLeaseToken!,
+    { model: fixture.model.publicModelId, messages: [{ role: "user", content: "hello" }] },
+    new AbortController().signal,
+  );
+  assertEquals(result.text, "fallback");
+  assertEquals(chatCalls, 1);
+  assertEquals(responsesCalls, 1);
+  assertEquals(fixture.repo.listProviderAttempts(fixture.runId).map((attempt) => attempt.status), [
+    "failed",
+    "succeeded",
+  ]);
+});
+
+Deno.test("provider execution skips an incompatible Responses target and reaches a later Chat fallback", async () => {
+  const fixture = await singleProviderFixture("chat_completions");
+  const mutation = { actorId: fixture.user.id, action: "test.cross-protocol-skip" };
+  const createTarget = async (slug: string, protocol: "chat_completions" | "responses") => {
+    const created = fixture.repo.createProvider({
+      slug,
+      displayName: slug,
+      baseUrl: `https://${slug}.example/v1`,
+      protocol,
+    }, mutation);
+    const provider = fixture.repo.setProviderCredential(created.id, created.version, {
+      envelope: await fixture.keyring.encrypt(created.id, created.version + 1, `${slug}-secret`),
+    }, mutation);
+    const model = fixture.repo.createProviderModel({
+      providerId: provider.id,
+      publicModelId: `${slug}/chat`,
+      upstreamModelId: `${slug}-upstream`,
+      displayName: slug,
+      capabilities: ["chat"],
+      contextWindow: 8_192,
+    }, mutation);
+    fixture.repo.createModelPriceVersion({
+      providerModelId: model.id,
+      expectedModelVersion: model.version,
+      effectiveAt: "2026-01-01T00:00:00.000Z",
+      inputMicrosPerMillion: 100_000,
+      cachedInputMicrosPerMillion: 50_000,
+      reasoningMicrosPerMillion: 200_000,
+      outputMicrosPerMillion: 300_000,
+      fixedCallMicros: 10,
+      source: "test",
+    }, mutation);
+    return model;
+  };
+  const incompatible = await createTarget("responses-incompatible", "responses");
+  const finalChat = await createTarget("chat-final", "chat_completions");
+  const policy = fixture.repo.createProviderRetryPolicy({
+    name: "Cross-protocol candidate skip",
+    maxAttempts: 3,
+    maxRetries: 0,
+    baseDelayMs: 0,
+    maxDelayMs: 0,
+    backoffMultiplierBps: 10_000,
+    jitterBps: 0,
+    firstTokenTimeoutMs: 1_000,
+    idleTimeoutMs: 1_000,
+    totalTimeoutMs: 10_000,
+    retryableStatuses: [503],
+  }, mutation);
+  fixture.repo.setProviderModelRoute({
+    sourceModelId: fixture.model.id,
+    expectedVersion: 0,
+    retryPolicyId: policy.id,
+    fallbackModelIds: [incompatible.id, finalChat.id],
+  }, mutation);
+
+  const chatCalls: string[] = [];
+  let responsesCalls = 0;
+  const engine = new ProviderExecutionEngine({
+    repository: fixture.repo,
+    keyring: fixture.keyring,
+    circuitBreaker: new MemoryCircuitBreaker(),
+    breakerPolicy: {
+      failureThreshold: 1,
+      failureWindowSeconds: 60,
+      openSeconds: 30,
+      halfOpenLeaseSeconds: 5,
+    },
+    complete: (_request, _signal, options) => {
+      const model = options?.upstreamModel ?? "missing";
+      chatCalls.push(model);
+      if (model === fixture.model.upstreamModelId) {
+        return Promise.reject(new ProviderAttemptError("unavailable", { status: 503 }));
+      }
+      return Promise.resolve({
+        text: "later Chat fallback won",
+        inputTokens: 2,
+        outputTokens: 3,
+        upstream: {
+          id: "chatcmpl_final",
+          usage: { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 },
+        },
+      });
+    },
+    responsesFetch: () => {
+      responsesCalls++;
+      throw new Error("the incompatible Responses request must not reach transport");
+    },
+  });
+  const result = await engine.complete(
+    fixture.model.id,
+    fixture.runId,
+    fixture.run.runLeaseToken!,
+    {
+      model: fixture.model.publicModelId,
+      messages: [{ role: "user", content: "hello" }],
+      stop: "END",
+    },
+    new AbortController().signal,
+  );
+  assertEquals(result.text, "later Chat fallback won");
+  assertEquals(chatCalls, [fixture.model.upstreamModelId, finalChat.upstreamModelId]);
+  assertEquals(responsesCalls, 0);
+  const attempts = fixture.repo.listProviderAttempts(fixture.runId);
+  assertEquals(attempts.map((attempt) => attempt.status), ["failed", "failed", "succeeded"]);
+  assertEquals(attempts[1].protocol, "responses");
+  assertEquals(attempts[1].costMicros, 0);
+  assertEquals(attempts[1].inputTokens, 0);
+
+  const streamRunId = "cross-protocol-candidate-skip-stream";
+  const streamRun = fixture.repo.reserve(
+    fixture.user.id,
+    streamRunId,
+    fixture.model.publicModelId,
+    1_000_000,
+    fixture.provider.slug,
+  );
+  if (!streamRun.runLeaseToken) throw new Error("stream execution lease missing");
+  const streamCalls: string[] = [];
+  const streamEngine = new ProviderExecutionEngine({
+    repository: fixture.repo,
+    keyring: fixture.keyring,
+    circuitBreaker: new MemoryCircuitBreaker(),
+    breakerPolicy: {
+      failureThreshold: 1,
+      failureWindowSeconds: 60,
+      openSeconds: 30,
+      halfOpenLeaseSeconds: 5,
+    },
+    stream: async function* (_request, _signal, options) {
+      const model = options?.upstreamModel ?? "missing";
+      streamCalls.push(model);
+      yield JSON.stringify({
+        id: "chatcmpl_stream",
+        model,
+        choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+      });
+      if (model === fixture.model.upstreamModelId) {
+        throw new ProviderAttemptError("unavailable", { status: 503 });
+      }
+      yield JSON.stringify({
+        id: "chatcmpl_stream",
+        model,
+        choices: [{ index: 0, delta: { content: "stream won" }, finish_reason: null }],
+      });
+      yield JSON.stringify({
+        id: "chatcmpl_stream",
+        model,
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        usage: { prompt_tokens: 2, completion_tokens: 2, total_tokens: 4 },
+      });
+      yield "[DONE]";
+    },
+    responsesFetch: () => {
+      responsesCalls++;
+      throw new Error("the incompatible Responses stream must not reach transport");
+    },
+  });
+  const frames: string[] = [];
+  for await (
+    const frame of streamEngine.stream(
+      fixture.model.id,
+      streamRunId,
+      streamRun.runLeaseToken,
+      {
+        model: fixture.model.publicModelId,
+        messages: [{ role: "user", content: "hello" }],
+        stop: "END",
+        stream: true,
+      },
+      new AbortController().signal,
+    )
+  ) frames.push(frame);
+  assertEquals(frames.some((frame) => frame.includes("stream won")), true);
+  assertEquals(streamCalls, [fixture.model.upstreamModelId, finalChat.upstreamModelId]);
+  assertEquals(responsesCalls, 0);
+  const streamAttempts = fixture.repo.listProviderAttempts(streamRunId);
+  assertEquals(streamAttempts.map((attempt) => attempt.status), ["failed", "failed", "succeeded"]);
+  assertEquals(streamAttempts[1].costMicros, 0);
+  assertEquals(streamAttempts[1].inputTokens, 0);
 });
 
 Deno.test("terminal attempt persistence retries idempotently without another provider call", async () => {

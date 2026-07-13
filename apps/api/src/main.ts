@@ -201,7 +201,7 @@ const browserAuth = databaseUrl
       : undefined,
   })
   : undefined;
-const { app, toolExecutionService, drainIdentityDeliveries } = createApp({
+const { app, toolExecutionService, drainIdentityDeliveries, replayQuota } = createApp({
   repository,
   rateLimiter,
   objectStore,
@@ -219,7 +219,7 @@ const { app, toolExecutionService, drainIdentityDeliveries } = createApp({
 await toolExecutionService.recover();
 const replayMaintenance = setInterval(async () => {
   try {
-    const reaped = await repository.reapStaleApiRequests(100);
+    const reaped = await repository.reapStaleApiRequests(100, replayQuota);
     const reapedGenerations = await repository.reapStaleGenerations(100);
     const reapedProviderRuns = await repository.reapStaleProviderExecutionLeases(100);
     const pruned = await repository.pruneExpiredApiRequests(100);

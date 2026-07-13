@@ -5,6 +5,14 @@ import {
   formatMicrosAsUsd,
   microsToUsd,
   modelAvailabilityBlockers,
+  modelCustomParamsInput,
+  modelSettingsDraft,
+  OCR_ACCESS_POLICY_NOTE,
+  ocrTargetAvailabilityBlockers,
+  ocrTargetCandidates,
+  ocrTargetSelectionValue,
+  providerProtocolLabel,
+  providerProtocolOptions,
   selectionAfterSuccessfulImports,
   usdToMicros,
 } from "./AdminRegistry.tsx";
@@ -24,6 +32,23 @@ const price = (id: string, effectiveAt: string): ModelPriceVersion => ({
 });
 
 describe("admin registry presentation", () => {
+  it("explains that OCR targets are privileged internal dependencies", () => {
+    expect(OCR_ACCESS_POLICY_NOTE).toContain("Access groups control direct model selection");
+    expect(OCR_ACCESS_POLICY_NOTE).toContain("isolated per user");
+  });
+
+  it("offers both supported native upstream protocols", () => {
+    expect(providerProtocolOptions.map((option) => option.value)).toEqual([
+      "chat_completions",
+      "responses",
+    ]);
+  });
+
+  it("does not mislabel a missing provider as Chat Completions", () => {
+    expect(providerProtocolLabel(undefined)).toBe("Unknown provider");
+    expect(providerProtocolLabel({ protocol: "responses" } as AdminProvider)).toBe("Responses");
+  });
+
   it("selects the latest effective price without activating future revisions", () => {
     const prices = [
       price("old", "2026-01-01T00:00:00.000Z"),
@@ -72,6 +97,128 @@ describe("admin registry presentation", () => {
         "2026-01-01T00:00:00.000Z",
       ),
     )).toEqual(["Model disabled", "Provider missing"]);
+    expect(modelAvailabilityBlockers(
+      model,
+      { ...provider, hasCredential: true, protocol: "responses" },
+      price("active", "2026-01-01T00:00:00.000Z"),
+    )).toEqual([]);
+  });
+
+  it("round-trips safe provider defaults separately from typed OCR settings", () => {
+    const draft = modelSettingsDraft({
+      temperature: 0.2,
+      ocr: {
+        enabled: true,
+        providerId: "provider-id",
+        model: "provider/vision",
+        prompt: "Read the image",
+        timeoutMs: 1200,
+      },
+    });
+    expect(JSON.parse(draft.customParamsJson)).toEqual({ temperature: 0.2 });
+    expect(draft.ocr).toMatchObject({
+      enabled: true,
+      providerId: "provider-id",
+      model: "provider/vision",
+      prompt: "Read the image",
+      timeoutMs: "1200",
+      cacheTtlSeconds: "86400",
+    });
+    expect(modelCustomParamsInput(draft.customParamsJson, draft.ocr)).toMatchObject({
+      temperature: 0.2,
+      ocr: {
+        enabled: true,
+        providerId: "provider-id",
+        model: "provider/vision",
+        timeoutMs: 1200,
+      },
+    });
+  });
+
+  it("keeps OCR out of the untyped JSON editor and validates required typed fields", () => {
+    const draft = modelSettingsDraft();
+    expect(() => modelCustomParamsInput("[]", draft.ocr)).toThrow("JSON object");
+    expect(() => modelCustomParamsInput('{"ocr":{"enabled":true}}', draft.ocr)).toThrow(
+      "typed OCR controls",
+    );
+    expect(() =>
+      modelCustomParamsInput("{}", {
+        ...draft.ocr,
+        enabled: true,
+      })
+    ).toThrow("provider, model, and prompt");
+  });
+
+  it("offers only operational one-hop vision models as OCR targets", () => {
+    const provider = {
+      id: "provider",
+      enabled: true,
+      hasCredential: true,
+    } as AdminProvider;
+    const target = {
+      id: "vision",
+      providerId: provider.id,
+      publicModelId: "provider/vision",
+      capabilities: ["chat", "vision"],
+      enabled: true,
+      customParams: {},
+      prices: [price("active", "2026-01-01T00:00:00.000Z")],
+    } as AdminModel;
+    const recursive = {
+      ...target,
+      id: "recursive",
+      customParams: { ocr: { enabled: true } },
+    };
+    const unpriced = { ...target, id: "unpriced", prices: [] };
+    const textOnly = { ...target, id: "text", capabilities: ["chat"] } as AdminModel;
+    const visionOnly = { ...target, id: "vision-only", capabilities: ["vision"] } as AdminModel;
+    expect(
+      ocrTargetCandidates(
+        [target, recursive, unpriced, textOnly, visionOnly],
+        [provider],
+        provider.id,
+        "text",
+      ).map((model) => model.id),
+    ).toEqual(["vision"]);
+    expect(ocrTargetCandidates([target], [{ ...provider, enabled: false }], provider.id)).toEqual(
+      [],
+    );
+  });
+
+  it("normalizes a supported public OCR model ID for the target selector", () => {
+    const target = {
+      id: "vision-id",
+      publicModelId: "provider/vision",
+    } as AdminModel;
+    expect(ocrTargetSelectionValue("provider/vision", [target])).toBe("vision-id");
+    expect(ocrTargetSelectionValue("vision-id", [target])).toBe("vision-id");
+    expect(ocrTargetSelectionValue("missing/vision", [target])).toBe("missing/vision");
+  });
+
+  it("surfaces every operational blocker for a configured OCR target", () => {
+    const target = {
+      providerId: "actual-provider",
+      enabled: false,
+      capabilities: ["chat"],
+      customParams: {},
+    } as AdminModel;
+    const provider = {
+      id: "actual-provider",
+      enabled: false,
+      hasCredential: false,
+    } as AdminProvider;
+    expect(ocrTargetAvailabilityBlockers(target, provider, "configured-provider", undefined))
+      .toEqual([
+        "Provider mismatch",
+        "Model disabled",
+        "Provider disabled",
+        "Credential required",
+        "Pricing required",
+        "Vision capability required",
+      ]);
+    expect(ocrTargetAvailabilityBlockers(undefined, undefined, "provider", undefined)).toEqual([
+      "Target missing",
+    ]);
   });
 
   it("leaves only failed discovery imports selected for a safe retry", () => {

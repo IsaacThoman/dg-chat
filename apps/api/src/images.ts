@@ -6,6 +6,28 @@ export const IMAGE_MAX_PIXELS = 64 * 1024 * 1024;
 export const IMAGE_MAX_TOTAL_BYTES = 32 * 1024 * 1024;
 const IMAGE_MAX_WIRE_BYTES = 48 * 1024 * 1024;
 const IMAGE_MAX_EVENT_BYTES = 40 * 1024 * 1024;
+const IMAGE_MAX_TEXT_CHARACTERS = 32_000;
+const MAX_JSON_BYTES_PER_CHARACTER = 6;
+const IMAGE_JSON_ITEM_ENVELOPE_BYTES = 65_536;
+
+/**
+ * Conservative replay-storage bound for a buffered image response. The OpenAI surface can carry
+ * the full aggregate image payload as base64, while the richer web surface stores only immutable
+ * asset metadata. Both surfaces can repeat the request and provider-revised prompt for every item,
+ * and JSON control-character escaping can expand one character to six bytes.
+ */
+export function maximumImageJsonReplayBytes(
+  request: Pick<ImageGenerationRequest, "n" | "responseFormat">,
+  richApi: boolean,
+): number {
+  const textMetadata = request.n *
+    (2 * IMAGE_MAX_TEXT_CHARACTERS * MAX_JSON_BYTES_PER_CHARACTER +
+      IMAGE_JSON_ITEM_ENVELOPE_BYTES);
+  const encodedImages = richApi || request.responseFormat === "url"
+    ? 0
+    : Math.ceil(IMAGE_MAX_TOTAL_BYTES / 3) * 4;
+  return encodedImages + textMetadata + IMAGE_JSON_ITEM_ENVELOPE_BYTES;
+}
 
 /** Conservative replay storage bound for normalized partial and terminal SSE events. */
 export function maximumImageStreamReplayBytes(
@@ -15,6 +37,15 @@ export function maximumImageStreamReplayBytes(
   // Normalized event metadata is ASCII and tightly bounded; reserve ample fixed framing space so
   // admission never depends on a provider-controlled timestamp or JSON representation.
   return (request.partialImages + 1) * (encodedImage + 2_048);
+}
+
+/** Maximum persisted fragments for normalized partial and terminal image events. */
+export function maximumImageStreamReplayEvents(
+  request: Pick<ImageGenerationRequest, "partialImages">,
+  fragmentBytes = 1_048_576,
+): number {
+  const encodedImage = Math.ceil(IMAGE_MAX_BYTES / 3) * 4;
+  return (request.partialImages + 1) * Math.ceil((encodedImage + 2_048) / fragmentBytes);
 }
 
 export type ImageOutputFormat = "png" | "jpeg" | "webp";
@@ -551,12 +582,14 @@ function usage(value: unknown, request: ImageGenerationRequest): ImageProviderUs
 
 function endpoint(baseUrl: string, operation: "generations" | "edits" = "generations"): URL {
   const url = new URL(baseUrl);
-  const test = Deno.env.get("DENO_ENV") === "test" &&
+  const testHttp = Deno.env.get("DENO_ENV") === "test" && url.protocol === "http:" &&
     Deno.env.get("OPENAI_TEST_ALLOW_HTTP_HOST")?.toLowerCase() === url.hostname.toLowerCase();
-  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) {
+  if (
+    (!testHttp && url.protocol !== "https:") || url.username || url.password || url.search ||
+    url.hash
+  ) {
     throw new ImageProviderError("Provider base URL is invalid", 500, "provider_config_error");
   }
-  if (test) url.protocol = "http:";
   url.pathname = `${url.pathname.replace(/\/$/, "")}/images/${operation}`;
   return url;
 }

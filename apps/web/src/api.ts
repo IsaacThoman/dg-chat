@@ -1057,10 +1057,16 @@ export const api = {
     capabilities: string[];
     contextWindow: number;
     enabled: boolean;
+    customParams?: Record<string, unknown>;
   }) => request<AdminModel>("/admin/models", { method: "POST", body: JSON.stringify(input) }),
   updateAdminModel: (
     model: AdminModel,
-    patch: Partial<Pick<AdminModel, "displayName" | "capabilities" | "contextWindow" | "enabled">>,
+    patch: Partial<
+      Pick<
+        AdminModel,
+        "displayName" | "capabilities" | "contextWindow" | "enabled" | "customParams"
+      >
+    >,
   ) =>
     request<AdminModel>(`/admin/models/${encodeURIComponent(model.id)}`, {
       method: "PATCH",

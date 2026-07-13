@@ -11,6 +11,23 @@ import { normalizeProviderBaseUrl } from "./provider-admin.ts";
 export class ProviderValidationError extends Error {}
 
 export const MAX_PROVIDER_CONTEXT_WINDOW = 4_194_304;
+export const MAX_PROVIDER_CUSTOM_PARAMS_BYTES = 16 * 1024;
+const MAX_PROVIDER_CUSTOM_PARAMS_DEPTH = 8;
+const MAX_PROVIDER_CUSTOM_PARAMS_NODES = 512;
+const MAX_PROVIDER_CUSTOM_PARAMS_ARRAY = 64;
+const MAX_PROVIDER_CUSTOM_PARAMS_STRING = 8_192;
+const UNSAFE_JSON_KEYS = new Set(["__proto__", "prototype", "constructor"]);
+const CUSTOM_PARAM_KEYS = new Set([
+  "temperature",
+  "top_p",
+  "presence_penalty",
+  "frequency_penalty",
+  "seed",
+  "stop",
+  "response_format",
+  "parallel_tool_calls",
+  "ocr",
+]);
 
 function record(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -56,8 +73,8 @@ export function providerCreate(value: unknown): CreateProviderInput {
   if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(slug)) {
     throw new ProviderValidationError("slug is invalid");
   }
-  if (body.protocol !== "chat_completions") {
-    throw new ProviderValidationError("Only the Chat Completions upstream protocol is supported");
+  if (body.protocol !== "chat_completions" && body.protocol !== "responses") {
+    throw new ProviderValidationError("protocol is invalid");
   }
   return {
     slug,
@@ -82,10 +99,8 @@ export function providerPatch(
     patch.baseUrl = normalizeProviderBaseUrl(string(body.baseUrl, "baseUrl", 2_048));
   }
   if (body.protocol !== undefined) {
-    if (body.protocol !== "chat_completions") {
-      throw new ProviderValidationError(
-        "Only the Chat Completions upstream protocol is supported",
-      );
+    if (body.protocol !== "chat_completions" && body.protocol !== "responses") {
+      throw new ProviderValidationError("protocol is invalid");
     }
     patch.protocol = body.protocol;
   }
@@ -129,16 +144,229 @@ function capabilities(value: unknown): ModelCapability[] {
   return result as ModelCapability[];
 }
 
-function customParams(value: unknown): Record<string, unknown> {
-  if (value === undefined) return {};
-  const result = record(value);
-  if (Object.keys(result).length > 64) {
-    throw new ProviderValidationError("customParams are invalid");
+function plainRecord(value: unknown, name: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ProviderValidationError(`${name} is invalid`);
   }
-  if (Object.keys(result).length) {
-    throw new ProviderValidationError("Custom provider parameters are not yet supported");
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new ProviderValidationError(`${name} is invalid`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function boundedNumber(value: unknown, name: string, min: number, max: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < min || value > max) {
+    throw new ProviderValidationError(`${name} is invalid`);
+  }
+  return value;
+}
+
+function assertSafeJson(
+  value: unknown,
+  path: string,
+  state: { nodes: number },
+  depth = 0,
+): void {
+  state.nodes++;
+  if (state.nodes > MAX_PROVIDER_CUSTOM_PARAMS_NODES || depth > MAX_PROVIDER_CUSTOM_PARAMS_DEPTH) {
+    throw new ProviderValidationError(`${path} exceeds the safe JSON complexity limit`);
+  }
+  if (value === null || typeof value === "boolean") return;
+  if (typeof value === "string") {
+    if (value.length > MAX_PROVIDER_CUSTOM_PARAMS_STRING) {
+      throw new ProviderValidationError(`${path} contains an oversized string`);
+    }
+    return;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || Math.abs(value) > Number.MAX_SAFE_INTEGER) {
+      throw new ProviderValidationError(`${path} contains an invalid number`);
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    if (value.length > MAX_PROVIDER_CUSTOM_PARAMS_ARRAY) {
+      throw new ProviderValidationError(`${path} contains an oversized array`);
+    }
+    value.forEach((item, index) => assertSafeJson(item, `${path}[${index}]`, state, depth + 1));
+    return;
+  }
+  const object = plainRecord(value, path);
+  const entries = Object.entries(object);
+  if (entries.length > 64) throw new ProviderValidationError(`${path} has too many fields`);
+  for (const [key, item] of entries) {
+    if (key.length > 128 || UNSAFE_JSON_KEYS.has(key)) {
+      throw new ProviderValidationError(`${path} contains an unsafe field`);
+    }
+    assertSafeJson(item, `${path}.${key}`, state, depth + 1);
+  }
+}
+
+function responseFormat(value: unknown): Record<string, unknown> {
+  const format = plainRecord(value, "customParams.response_format");
+  exact(format, ["type", "json_schema"]);
+  if (
+    typeof format.type !== "string" ||
+    !["text", "json_object", "json_schema"].includes(format.type)
+  ) {
+    throw new ProviderValidationError("customParams.response_format.type is invalid");
+  }
+  if (format.type !== "json_schema") {
+    if (format.json_schema !== undefined) {
+      throw new ProviderValidationError(
+        "customParams.response_format.json_schema requires type json_schema",
+      );
+    }
+    return structuredClone(format);
+  }
+  const schema = plainRecord(
+    format.json_schema,
+    "customParams.response_format.json_schema",
+  );
+  exact(schema, ["name", "description", "schema", "strict"]);
+  const name = string(schema.name, "customParams.response_format.json_schema.name", 64);
+  if (!/^[A-Za-z0-9_-]+$/.test(name)) {
+    throw new ProviderValidationError("customParams.response_format.json_schema.name is invalid");
+  }
+  if (schema.description !== undefined && typeof schema.description !== "string") {
+    throw new ProviderValidationError(
+      "customParams.response_format.json_schema.description is invalid",
+    );
+  }
+  if (typeof schema.description === "string" && schema.description.length > 1_024) {
+    throw new ProviderValidationError(
+      "customParams.response_format.json_schema.description is invalid",
+    );
+  }
+  const jsonSchema = plainRecord(
+    schema.schema,
+    "customParams.response_format.json_schema.schema",
+  );
+  if (schema.strict !== undefined && typeof schema.strict !== "boolean") {
+    throw new ProviderValidationError("customParams.response_format.json_schema.strict is invalid");
+  }
+  return {
+    type: "json_schema",
+    json_schema: {
+      name,
+      ...(schema.description === undefined ? {} : { description: schema.description }),
+      schema: structuredClone(jsonSchema),
+      ...(schema.strict === undefined ? {} : { strict: schema.strict }),
+    },
+  };
+}
+
+function ocrParams(value: unknown): Record<string, unknown> {
+  const ocr = plainRecord(value, "customParams.ocr");
+  exact(ocr, [
+    "enabled",
+    "providerId",
+    "model",
+    "prompt",
+    "cacheTtlSeconds",
+    "timeoutMs",
+    "maxBytes",
+    "maxPixels",
+    "maxDimension",
+    "maxRedirects",
+  ]);
+  if (ocr.enabled !== true) {
+    throw new ProviderValidationError(
+      "customParams.ocr.enabled must be true or OCR must be omitted",
+    );
+  }
+  const result: Record<string, unknown> = {
+    enabled: true,
+    providerId: string(ocr.providerId, "customParams.ocr.providerId", 200),
+    model: string(ocr.model, "customParams.ocr.model", 200),
+    prompt: string(ocr.prompt, "customParams.ocr.prompt", 8_192),
+  };
+  const bounds = {
+    cacheTtlSeconds: [1, 2_592_000],
+    timeoutMs: [100, 120_000],
+    maxBytes: [1_024, 50 * 1024 * 1024],
+    maxPixels: [1, 100_000_000],
+    maxDimension: [1, 65_535],
+    maxRedirects: [0, 5],
+  } as const;
+  for (const [key, [minimum, maximum]] of Object.entries(bounds)) {
+    if (ocr[key] !== undefined) {
+      result[key] = integer(ocr[key], `customParams.ocr.${key}`, minimum, maximum);
+    }
+  }
+  return result;
+}
+
+export function providerModelCustomParams(value: unknown): Record<string, unknown> {
+  if (value === undefined) return {};
+  const input = plainRecord(value, "customParams");
+  const unknown = Object.keys(input).find((key) => !CUSTOM_PARAM_KEYS.has(key));
+  if (unknown) throw new ProviderValidationError(`customParams.${unknown} is not allowed`);
+  const result: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(input)) {
+    switch (key) {
+      case "temperature":
+        result[key] = boundedNumber(item, `customParams.${key}`, 0, 2);
+        break;
+      case "top_p":
+        result[key] = boundedNumber(item, `customParams.${key}`, 0, 1);
+        break;
+      case "presence_penalty":
+      case "frequency_penalty":
+        result[key] = boundedNumber(item, `customParams.${key}`, -2, 2);
+        break;
+      case "seed":
+        result[key] = integer(item, `customParams.${key}`, -2_147_483_648, 2_147_483_647);
+        break;
+      case "parallel_tool_calls":
+        if (typeof item !== "boolean") {
+          throw new ProviderValidationError(`customParams.${key} is invalid`);
+        }
+        result[key] = item;
+        break;
+      case "stop": {
+        const values = typeof item === "string" ? [item] : item;
+        if (
+          !Array.isArray(values) || values.length < 1 || values.length > 4 ||
+          values.some((value) => typeof value !== "string" || !value.length || value.length > 1_024)
+        ) throw new ProviderValidationError("customParams.stop is invalid");
+        result[key] = typeof item === "string" ? item : [...values];
+        break;
+      }
+      case "response_format":
+        result[key] = responseFormat(item);
+        break;
+      case "ocr":
+        result[key] = ocrParams(item);
+        break;
+    }
+  }
+  assertSafeJson(result, "customParams", { nodes: 0 });
+  const serialized = JSON.stringify(result);
+  if (new TextEncoder().encode(serialized).length > MAX_PROVIDER_CUSTOM_PARAMS_BYTES) {
+    throw new ProviderValidationError("customParams exceed the serialized size limit");
   }
   return structuredClone(result);
+}
+
+/** Returns only generation defaults safe to merge into an upstream request. */
+export function providerUpstreamDefaults(
+  value: unknown,
+  protocol: "chat_completions" | "responses",
+): Record<string, unknown> {
+  const params = providerModelCustomParams(value);
+  delete params.ocr;
+  if (protocol === "responses") {
+    const unsupported = ["presence_penalty", "frequency_penalty", "seed", "stop"]
+      .find((key) => params[key] !== undefined);
+    if (unsupported) {
+      throw new ProviderValidationError(
+        `customParams.${unsupported} is not supported by Responses providers`,
+      );
+    }
+  }
+  return params;
 }
 
 export function providerModelCreate(value: unknown): CreateProviderModelInput {
@@ -172,7 +400,7 @@ export function providerModelCreate(value: unknown): CreateProviderModelInput {
       MAX_PROVIDER_CONTEXT_WINDOW,
     ),
     enabled: optionalBoolean(body.enabled, "enabled"),
-    customParams: customParams(body.customParams),
+    customParams: providerModelCustomParams(body.customParams),
   };
 }
 
@@ -202,7 +430,9 @@ export function providerModelPatch(
     );
   }
   patch.enabled = optionalBoolean(body.enabled, "enabled");
-  if (body.customParams !== undefined) patch.customParams = customParams(body.customParams);
+  if (body.customParams !== undefined) {
+    patch.customParams = providerModelCustomParams(body.customParams);
+  }
   if (Object.values(patch).every((item) => item === undefined)) {
     throw new ProviderValidationError("At least one model field must change");
   }

@@ -461,11 +461,13 @@ export function OrganizeConversationDialog({
   folders,
   tags,
   close,
+  restoreFocusTarget,
 }: {
   conversation: Conversation;
   folders: FolderData;
   tags: TagData;
   close: () => void;
+  restoreFocusTarget?: () => HTMLElement | null;
 }) {
   const client = useQueryClient();
   const currentFolder =
@@ -523,7 +525,12 @@ export function OrganizeConversationDialog({
     }
   };
   return (
-    <Modal title="Organize conversation" close={close} dismissible={!busy}>
+    <Modal
+      title="Organize conversation"
+      close={close}
+      dismissible={!busy}
+      restoreFocusTarget={restoreFocusTarget}
+    >
       <label className="field">
         <span>Project</span>
         <select

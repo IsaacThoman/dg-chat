@@ -230,6 +230,239 @@ test("uploads, retains attachments on edit branches, and removes unsent uploads"
   await expect(remove).toBeHidden();
 });
 
+test("isolates draft uploads from immutable edits and restores them afterward", async ({ page }) => {
+  const uploadedAttachments = [
+    {
+      id: "draft-upload",
+      filename: "draft-notes.txt",
+      mimeType: "text/plain",
+      sizeBytes: 11,
+      state: "ready",
+      createdAt: "2026-07-10T00:00:00.000Z",
+    },
+    {
+      id: "cancelled-edit-upload",
+      filename: "cancelled-edit.txt",
+      mimeType: "text/plain",
+      sizeBytes: 12,
+      state: "ready",
+      createdAt: "2026-07-10T00:00:00.000Z",
+    },
+    {
+      id: "submitted-edit-upload",
+      filename: "submitted-edit.txt",
+      mimeType: "text/plain",
+      sizeBytes: 13,
+      state: "ready",
+      createdAt: "2026-07-10T00:00:00.000Z",
+    },
+  ];
+  let uploadIndex = 0;
+  const deletedAttachmentIds: string[] = [];
+  const generationBodies: Array<Record<string, unknown>> = [];
+
+  await page.route("**/api/attachments", async (route) => {
+    const attachment = uploadedAttachments[uploadIndex++];
+    expect(attachment).toBeDefined();
+    await route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify({ attachment }),
+    });
+  });
+  await page.route("**/api/attachments/*", async (route) => {
+    deletedAttachmentIds.push(new URL(route.request().url()).pathname.split("/").at(-1)!);
+    await route.fulfill({ status: 204, body: "" });
+  });
+  await page.route("**/api/conversations/*/generate/stream", async (route) => {
+    const body = route.request().postDataJSON() as Record<string, unknown>;
+    generationBodies.push(body);
+    const generationNumber = generationBodies.length;
+    const conversationId = new URL(route.request().url()).pathname.split("/").at(-3)!;
+    const now = "2026-07-10T00:00:00.000Z";
+    const userId = `isolated-upload-user-${generationNumber}`;
+    const assistantId = `isolated-upload-assistant-${generationNumber}`;
+    const generationId = `isolated-upload-generation-${generationNumber}`;
+    const attachmentIds = Array.isArray(body.attachmentIds) ? body.attachmentIds as string[] : [];
+    const user = {
+      id: userId,
+      parentId: body.parentId ?? null,
+      supersedesId: body.supersedesId ?? null,
+      siblingIndex: generationNumber - 1,
+      role: "user",
+      content: body.content,
+      model: body.model,
+      metadata: {},
+      createdAt: now,
+      attachments: uploadedAttachments.filter((attachment) =>
+        attachmentIds.includes(attachment.id)
+      ),
+    };
+    const assistant = {
+      id: assistantId,
+      parentId: userId,
+      supersedesId: null,
+      siblingIndex: 0,
+      role: "assistant",
+      content: `Isolated upload response ${generationNumber}`,
+      model: body.model,
+      metadata: {},
+      createdAt: now,
+    };
+    const conversation = {
+      id: conversationId,
+      title: "New chat",
+      activeLeafId: assistantId,
+      version: Number(body.expectedVersion ?? 0) + 2,
+      pinned: false,
+      archivedAt: null,
+      deletedAt: null,
+      updatedAt: now,
+    };
+    await route.fulfill({
+      status: 200,
+      contentType: "text/event-stream",
+      body: [
+        {
+          type: "generation.started",
+          generationId,
+          sequence: 0,
+          user,
+          conversation: {
+            ...conversation,
+            activeLeafId: userId,
+            version: conversation.version - 1,
+          },
+        },
+        { type: "generation.completed", generationId, sequence: 1, assistant, conversation },
+      ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
+    });
+  });
+
+  const composer = page.getByRole("textbox", { name: "Message" });
+  const fileInput = page.locator('input[type="file"]');
+  await composer.fill("Saved prompt");
+  await composer.press("Enter");
+  await expect(page.getByText("Isolated upload response 1", { exact: true })).toBeVisible();
+
+  await composer.fill("Unsent draft text");
+  await fileInput.setInputFiles({
+    name: "draft-notes.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("draft notes"),
+  });
+  await expect(page.getByText("draft-notes.txt", { exact: true })).toBeVisible();
+  await page.locator(".composer-wrap").evaluate((element) => {
+    const transfer = new DataTransfer();
+    const oversized = new File(["oversized"], "oversized.txt", { type: "text/plain" });
+    Object.defineProperty(oversized, "size", { value: 25 * 1024 * 1024 + 1 });
+    transfer.items.add(oversized);
+    const event = new Event("drop", { bubbles: true, cancelable: true });
+    Object.defineProperty(event, "dataTransfer", { value: transfer });
+    element.dispatchEvent(event);
+  });
+  const draftSelectionError = page.getByText(
+    "Each attachment must be 25 MB or smaller.",
+    { exact: true },
+  );
+  await expect(draftSelectionError).toBeVisible();
+
+  await page.getByRole("button", { name: "Edit without overwriting" }).click();
+  await expect(page.getByText("draft-notes.txt", { exact: true })).toBeHidden();
+  await expect(draftSelectionError).toBeHidden();
+  await fileInput.setInputFiles({
+    name: "cancelled-edit.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("cancel edit"),
+  });
+  await expect(page.getByText("cancelled-edit.txt", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Cancel edit" }).click();
+  await expect(page.getByText("cancelled-edit.txt", { exact: true })).toBeHidden();
+  await expect(page.getByText("draft-notes.txt", { exact: true })).toBeVisible();
+  await expect(composer).toHaveValue("Unsent draft text");
+  await expect(draftSelectionError).toBeVisible();
+  await expect.poll(() => deletedAttachmentIds).toContain("cancelled-edit-upload");
+
+  await page.getByRole("button", { name: "Edit without overwriting" }).click();
+  await expect(page.getByText("draft-notes.txt", { exact: true })).toBeHidden();
+  await expect(draftSelectionError).toBeHidden();
+  await fileInput.setInputFiles({
+    name: "submitted-edit.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("submit edit"),
+  });
+  await expect(page.getByText("submitted-edit.txt", { exact: true })).toBeVisible();
+  await composer.fill("Edited prompt");
+  await composer.press("Enter");
+  await expect.poll(() => generationBodies.length).toBe(2);
+  expect(generationBodies[1]?.attachmentIds).toEqual(["submitted-edit-upload"]);
+  expect(generationBodies[1]?.attachmentIds).not.toContain("draft-upload");
+  await expect(page.getByRole("button", { name: "Remove attachment submitted-edit.txt" }))
+    .toBeHidden();
+  await expect(page.getByText("draft-notes.txt", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Remove attachment draft-notes.txt" }))
+    .toBeVisible();
+  await expect(composer).toHaveValue("Unsent draft text");
+  await expect(draftSelectionError).toBeVisible();
+});
+
+test("double-clicking upload retry claims one request and leaves no orphan object", async ({ page }) => {
+  let attempts = 0;
+  const createdAttachmentIds: string[] = [];
+  const deletedAttachmentIds: string[] = [];
+  await page.route("**/api/attachments", async (route) => {
+    attempts += 1;
+    if (attempts === 1) {
+      await route.fulfill({
+        status: 503,
+        contentType: "application/json",
+        body: JSON.stringify({ error: { message: "Retry this upload" } }),
+      });
+      return;
+    }
+    const id = `claimed-retry-${attempts}`;
+    createdAttachmentIds.push(id);
+    await route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify({
+        attachment: {
+          id,
+          filename: "double-retry.txt",
+          mimeType: "text/plain",
+          sizeBytes: 5,
+          state: "ready",
+          createdAt: "2026-07-10T00:00:00.000Z",
+        },
+      }),
+    });
+  });
+  await page.route("**/api/attachments/*", async (route) => {
+    deletedAttachmentIds.push(new URL(route.request().url()).pathname.split("/").at(-1)!);
+    await route.fulfill({ status: 204, body: "" });
+  });
+
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "double-retry.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("retry"),
+  });
+  await expect(page.getByText("Retry this upload", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Retry upload double-retry.txt", exact: true })
+    .dblclick();
+  await expect(page.locator(".upload-ready").filter({ hasText: "double-retry.txt" }))
+    .toContainText("Ready");
+  await expect.poll(() => attempts).toBe(2);
+  expect(createdAttachmentIds).toEqual(["claimed-retry-2"]);
+
+  await page.getByRole("button", {
+    name: "Remove attachment double-retry.txt",
+    exact: true,
+  }).click();
+  await expect.poll(() => deletedAttachmentIds).toEqual(["claimed-retry-2"]);
+  expect(createdAttachmentIds.filter((id) => !deletedAttachmentIds.includes(id))).toEqual([]);
+});
+
 test("failed and cancelled uploads block send and can be retried", async ({ page }) => {
   let attempts = 0;
   await page.route("**/api/attachments", async (route) => {
@@ -285,4 +518,8 @@ test("failed and cancelled uploads block send and can be retried", async ({ page
   await expect(page.getByText("Upload cancelled.", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Retry upload cancel.txt" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Send" })).toBeDisabled();
+  await page.getByRole("button", { name: "Retry upload cancel.txt" }).click();
+  const retried = page.locator(".upload-ready").filter({ hasText: "cancel.txt" });
+  await expect(retried).toContainText("Ready");
+  await expect(page.getByRole("button", { name: "Send" })).toBeEnabled();
 });

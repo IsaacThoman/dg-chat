@@ -5,12 +5,21 @@ api_url="${CONTRACT_API_URL:-http://localhost:8000}"
 web_origin="${CONTRACT_WEB_ORIGIN:-$api_url}"
 export OPENAI_BASE_URL="${OPENAI_BASE_URL:-$api_url/v1}"
 compose=(docker compose -f docker-compose.yml -f docker-compose.ci.yml -f docker-compose.contracts.yml)
+mock_provider_base_url="${CONTRACT_MOCK_PROVIDER_BASE_URL:-http://mock-provider:4010/v1}"
+mock_control_url="${CONTRACT_MOCK_CONTROL_URL:-}"
+mock_control_token="${CONTRACT_MOCK_CONTROL_TOKEN:-ci-mock-control-token}"
 
 mock_request() {
   local method="$1"
   local path="$2"
+  if [[ -n "$mock_control_url" ]]; then
+    curl --fail --silent --show-error --request "$method" \
+      --header "authorization: Bearer $mock_control_token" \
+      "${mock_control_url%/}$path"
+    return
+  fi
   "${compose[@]}" exec -T mock-provider deno eval \
-    "fetch('http://127.0.0.1:4010$path',{method:'$method',headers:{authorization:'Bearer ci-mock-control-token'}}).then(async r=>{const body=await r.text();console.log(body);if(!r.ok)Deno.exit(1)})"
+    "fetch('http://127.0.0.1:4010$path',{method:'$method',headers:{authorization:'Bearer $mock_control_token'}}).then(async r=>{const body=await r.text();console.log(body);if(!r.ok)Deno.exit(1)})"
 }
 
 if [[ -z "${OPENAI_API_KEY:-}" ]]; then
@@ -59,12 +68,62 @@ if [[ -z "${CONTRACT_SESSION_COOKIE:-}" ]]; then
   exit 1
 fi
 
+create_contract_token() {
+  local name="$1"
+  local rpm_limit="$2"
+  local burst_limit="$3"
+  curl --fail --silent --show-error --request POST \
+    "$api_url/api/tokens" --header 'content-type: application/json' --header "origin: $web_origin" \
+    --cookie "$CONTRACT_SESSION_COOKIE" \
+    --data "$(jq --null-input --compact-output --arg name "$name" \
+      --argjson rpmLimit "$rpm_limit" --argjson burstLimit "$burst_limit" \
+      '{name:$name,scopes:["models:read","chat:write"],rpmLimit:$rpmLimit,burstLimit:$burstLimit}')" |
+    jq --raw-output '.token'
+}
+
+export CONTRACT_JS_RATE_API_KEY="${CONTRACT_JS_RATE_API_KEY:-$(
+  create_contract_token "JavaScript rate-limit contract" 1 1
+)}"
+export CONTRACT_PYTHON_RATE_API_KEY="${CONTRACT_PYTHON_RATE_API_KEY:-$(
+  create_contract_token "Python rate-limit contract" 1 1
+)}"
+
+if [[ -z "${CONTRACT_EMPTY_CREDIT_API_KEY:-}" ]]; then
+  empty_suffix="$(date +%s)-$$"
+  empty_email="empty-credit-$empty_suffix@dg-chat.invalid"
+  empty_password='Contract-Empty-Credit-42!'
+  empty_cookie_jar="/tmp/dg-chat-empty-credit-$empty_suffix.cookies"
+  empty_signup="$(curl --fail --silent --show-error --request POST \
+    "$api_url/api/auth/sign-up/email" --header 'content-type: application/json' \
+    --header "origin: $web_origin" \
+    --data "$(jq --null-input --compact-output --arg email "$empty_email" \
+      --arg password "$empty_password" \
+      '{name:"Empty Credit Contract",email:$email,password:$password}')")"
+  empty_user_id="$(jq --raw-output '.user.id' <<<"$empty_signup")"
+  curl --fail --silent --show-error --request PATCH \
+    "$api_url/api/admin/users/$empty_user_id/approval" --header 'content-type: application/json' \
+    --header "origin: $web_origin" --cookie "$CONTRACT_SESSION_COOKIE" \
+    --data '{"status":"approved","startingCreditMicros":0}' >/dev/null
+  curl --fail --silent --show-error --cookie-jar "$empty_cookie_jar" --request POST \
+    "$api_url/api/auth/sign-in/email" --header 'content-type: application/json' \
+    --header "origin: $web_origin" \
+    --data "$(jq --null-input --compact-output --arg email "$empty_email" \
+      --arg password "$empty_password" '{email:$email,password:$password}')" >/dev/null
+  export CONTRACT_EMPTY_CREDIT_API_KEY="$(curl --fail --silent --show-error --request POST \
+    "$api_url/api/tokens" --header 'content-type: application/json' --header "origin: $web_origin" \
+    --cookie "$empty_cookie_jar" \
+    --data '{"name":"Insufficient credit contract","scopes":["chat:write"]}' |
+    jq --raw-output '.token')"
+  rm -f "$empty_cookie_jar"
+fi
+
 mock_request POST /__test/reset >/dev/null
 
 provider="$(curl --fail --silent --show-error --request POST \
   "$api_url/api/admin/providers" --header 'content-type: application/json' \
   --header "origin: $web_origin" --cookie "$CONTRACT_SESSION_COOKIE" \
-  --data '{"slug":"contracts","displayName":"Contract Mock Provider","baseUrl":"https://mock-provider:4010/v1","protocol":"chat_completions"}')"
+  --data "$(jq --null-input --compact-output --arg baseUrl "$mock_provider_base_url" \
+    '{slug:"contracts",displayName:"Contract Mock Provider",baseUrl:$baseUrl,protocol:"chat_completions"}')")"
 provider_id="$(jq --raw-output '.id' <<<"$provider")"
 provider_version="$(jq --raw-output '.version' <<<"$provider")"
 provider="$(curl --fail --silent --show-error --request PUT \
@@ -103,6 +162,28 @@ curl --fail --silent --show-error --request POST \
   "$api_url/api/admin/models/$image_model_id/prices" --header 'content-type: application/json' \
   --header "origin: $web_origin" --cookie "$CONTRACT_SESSION_COOKIE" \
   --data "{\"providerModelId\":\"$image_model_id\",\"expectedModelVersion\":$image_model_version,\"effectiveAt\":\"2020-01-01T00:00:00.000Z\",\"inputMicrosPerMillion\":0,\"cachedInputMicrosPerMillion\":0,\"reasoningMicrosPerMillion\":0,\"outputMicrosPerMillion\":0,\"fixedCallMicros\":1000,\"source\":\"contract\"}" >/dev/null
+
+responses_provider="$(curl --fail --silent --show-error --request POST \
+  "$api_url/api/admin/providers" --header 'content-type: application/json' \
+  --header "origin: $web_origin" --cookie "$CONTRACT_SESSION_COOKIE" \
+  --data "$(jq --null-input --compact-output --arg baseUrl "$mock_provider_base_url" \
+    '{slug:"contracts-responses",displayName:"Contract Native Responses Provider",baseUrl:$baseUrl,protocol:"responses"}')")"
+responses_provider_id="$(jq --raw-output '.id' <<<"$responses_provider")"
+responses_provider_version="$(jq --raw-output '.version' <<<"$responses_provider")"
+responses_provider="$(curl --fail --silent --show-error --request PUT \
+  "$api_url/api/admin/providers/$responses_provider_id/credential" --header 'content-type: application/json' \
+  --header "origin: $web_origin" --cookie "$CONTRACT_SESSION_COOKIE" \
+  --data "{\"expectedVersion\":$responses_provider_version,\"credential\":\"ci-mock-provider-key\"}")"
+responses_model="$(curl --fail --silent --show-error --request POST \
+  "$api_url/api/admin/models" --header 'content-type: application/json' \
+  --header "origin: $web_origin" --cookie "$CONTRACT_SESSION_COOKIE" \
+  --data "{\"providerId\":\"$responses_provider_id\",\"publicModelId\":\"contracts-responses/mock-responses\",\"upstreamModelId\":\"mock-responses\",\"displayName\":\"Contract Native Responses\",\"capabilities\":[\"chat\",\"streaming\",\"tools\",\"vision\"],\"contextWindow\":8192}")"
+responses_model_id="$(jq --raw-output '.id' <<<"$responses_model")"
+responses_model_version="$(jq --raw-output '.version' <<<"$responses_model")"
+curl --fail --silent --show-error --request POST \
+  "$api_url/api/admin/models/$responses_model_id/prices" --header 'content-type: application/json' \
+  --header "origin: $web_origin" --cookie "$CONTRACT_SESSION_COOKIE" \
+  --data "{\"providerModelId\":\"$responses_model_id\",\"expectedModelVersion\":$responses_model_version,\"effectiveAt\":\"2020-01-01T00:00:00.000Z\",\"inputMicrosPerMillion\":100000,\"cachedInputMicrosPerMillion\":100000,\"reasoningMicrosPerMillion\":0,\"outputMicrosPerMillion\":200000,\"fixedCallMicros\":10,\"source\":\"contract\"}" >/dev/null
 
 echo "Explicitly unsupported contract TODOs:"
 jq --raw-output '.[] | "TODO  \(.endpoint): \(.reason)"' \
@@ -144,6 +225,23 @@ jq -e '
   .images.lastPrompt == "Python image edit contract"
 ' <<<"$audio_state" >/dev/null
 echo "Official SDK image generation/editing, streaming, PNG validation, and exact replay contracts passed"
+jq -e '
+  .scenarios["mock-responses"].opened == 18 and
+  .scenarios["mock-responses"].completed == 18 and
+  .scenarios["mock-responses"].lastAuthorized == true and
+  .scenarios["mock-responses"].lastPath == "/v1/responses" and
+  .scenarios["mock-responses"].lastHasInput == true and
+  .scenarios["mock-responses"].lastHasMessages == false and
+  .scenarios["mock-responses"].responsesPathViolations == 0 and
+  .scenarios["mock-responses"].responsesMissingInput == 0 and
+  .scenarios["mock-responses"].responsesMessagesViolations == 0 and
+  .scenarios["mock-responses"].sawResponsesStoreFalse == true and
+  .scenarios["mock-responses"].authorizationViolations == 0 and
+  .scenarios["mock-responses"].sawResponsesTools == true and
+  .scenarios["mock-responses"].sawResponsesImage == true and
+  .scenarios["mock-responses"].sawResponsesToolResult == true
+' <<<"$audio_state" >/dev/null
+echo "Official SDK native Responses upstream translation contracts passed"
 
 deno run --no-config --allow-env --allow-net \
   tests/contracts/upstream-stream.ts

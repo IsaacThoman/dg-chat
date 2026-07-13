@@ -7,6 +7,45 @@ export interface ResponseUsage {
   reasoningTokens?: number;
 }
 
+export interface ResponseRequestEcho {
+  background?: boolean;
+  instructions?: unknown;
+  maxOutputTokens?: number;
+  metadata?: Record<string, unknown>;
+  parallelToolCalls?: boolean;
+  previousResponseId?: string;
+  reasoning?: unknown;
+  store?: boolean;
+  temperature?: number;
+  text?: unknown;
+  toolChoice?: unknown;
+  tools?: unknown[];
+  topP?: number;
+  user?: string;
+}
+
+/** Required, public request fields repeated on every official Responses object. */
+export function responseRequestFields(input: ResponseRequestEcho = {}) {
+  return {
+    background: input.background ?? false,
+    instructions: input.instructions ?? null,
+    max_output_tokens: input.maxOutputTokens ?? null,
+    max_tool_calls: null,
+    metadata: structuredClone(input.metadata ?? {}),
+    parallel_tool_calls: input.parallelToolCalls ?? true,
+    previous_response_id: input.previousResponseId ?? null,
+    reasoning: structuredClone(input.reasoning ?? { effort: null, summary: null }),
+    store: input.store ?? false,
+    temperature: input.temperature ?? 1,
+    text: structuredClone(input.text ?? { format: { type: "text" } }),
+    tool_choice: input.toolChoice ?? "auto",
+    tools: structuredClone(input.tools ?? []),
+    top_p: input.topP ?? 1,
+    truncation: "disabled",
+    user: input.user ?? null,
+  };
+}
+
 export function responseMessage(messageId: string, text: string, status = "completed") {
   return {
     id: messageId,
@@ -17,13 +56,17 @@ export function responseMessage(messageId: string, text: string, status = "compl
   };
 }
 
-export function responseOutput(result: CanonicalResult, messageId: string) {
+export function responseOutput(
+  result: CanonicalResult,
+  messageId: string,
+  itemStatus: "completed" | "incomplete" = "completed",
+) {
   const output: Record<string, unknown>[] = [];
   if (result.reasoning?.content || result.reasoning?.summary) {
     output.push({
       id: `rs_${crypto.randomUUID()}`,
       type: "reasoning",
-      status: "completed",
+      status: itemStatus,
       summary: result.reasoning.summary
         ? [{ type: "summary_text", text: result.reasoning.summary }]
         : [],
@@ -50,7 +93,7 @@ export function responseOutput(result: CanonicalResult, messageId: string) {
     output.push({
       id: messageId,
       type: "message",
-      status: "completed",
+      status: itemStatus,
       role: "assistant",
       content,
     });
@@ -59,7 +102,7 @@ export function responseOutput(result: CanonicalResult, messageId: string) {
     output.push({
       id: `fc_${crypto.randomUUID()}`,
       type: "function_call",
-      status: call.status ?? "completed",
+      status: itemStatus === "incomplete" ? "incomplete" : call.status ?? "completed",
       call_id: call.id,
       name: call.name,
       arguments: call.arguments,
@@ -73,25 +116,45 @@ export function responseObject(input: {
   messageId: string;
   model: string;
   createdAt: number;
-  status: "in_progress" | "completed";
+  status: "in_progress" | "completed" | "incomplete";
   text?: string;
   usage?: ResponseUsage;
   result?: CanonicalResult;
+  request?: ResponseRequestEcho;
 }) {
-  const completed = input.status === "completed";
+  const terminal = input.status !== "in_progress";
+  const outputText = terminal ? input.result?.text ?? input.text ?? "" : "";
   return {
     id: input.id,
     object: "response" as const,
     created_at: input.createdAt,
-    completed_at: completed ? Math.floor(Date.now() / 1000) : null,
+    completed_at: input.status === "completed" ? Math.floor(Date.now() / 1000) : null,
     status: input.status,
     error: null,
-    incomplete_details: null,
+    incomplete_details: input.status === "incomplete"
+      ? input.result?.finishState === "unknown" ? null : {
+        reason: input.result?.finishState === "content_filter"
+          ? "content_filter"
+          : "max_output_tokens",
+      }
+      : null,
     model: input.model,
-    output: completed
+    output_text: outputText,
+    ...responseRequestFields(input.request),
+    output: terminal
       ? input.result
-        ? responseOutput(input.result, input.messageId)
-        : [responseMessage(input.messageId, input.text ?? "")]
+        ? responseOutput(
+          input.result,
+          input.messageId,
+          input.status === "incomplete" ? "incomplete" : "completed",
+        )
+        : [
+          responseMessage(
+            input.messageId,
+            input.text ?? "",
+            input.status === "incomplete" ? "incomplete" : "completed",
+          ),
+        ]
       : [],
     usage: input.usage
       ? {

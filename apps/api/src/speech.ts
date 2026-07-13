@@ -174,12 +174,14 @@ export function assertSpeechFixedPricing(pricing: UsagePricingSnapshot): void {
 
 function endpoint(baseUrl: string): URL {
   const url = new URL(baseUrl);
-  const testHost = Deno.env.get("DENO_ENV") === "test" &&
+  const testHttp = Deno.env.get("DENO_ENV") === "test" && url.protocol === "http:" &&
     Deno.env.get("OPENAI_TEST_ALLOW_HTTP_HOST")?.toLowerCase() === url.hostname.toLowerCase();
-  if (url.protocol !== "https:" || url.username || url.password || url.hash || url.search) {
+  if (
+    (!testHttp && url.protocol !== "https:") || url.username || url.password || url.hash ||
+    url.search
+  ) {
     throw new SpeechProviderError("Provider base URL is invalid", 500, "provider_config_error");
   }
-  if (testHost) url.protocol = "http:";
   url.pathname = `${url.pathname.replace(/\/$/, "")}/audio/speech`;
   return url;
 }

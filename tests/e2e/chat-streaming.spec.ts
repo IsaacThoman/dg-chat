@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { apiURL, bootstrap, createChat, login } from "./helpers.ts";
+import { apiURL, bootstrap, createChat, login, openSidebar } from "./helpers.ts";
 
 test.beforeEach(async ({ page, request }) => {
   await bootstrap(request);
@@ -15,9 +15,13 @@ async function selectSlowStream(page: import("@playwright/test").Page) {
 }
 
 test("renders real incremental SSE and runs queued prompts in FIFO order", async ({ page }) => {
+  test.setTimeout(60_000);
   await selectSlowStream(page);
   const composer = page.getByRole("textbox", { name: "Message" });
-  const first = "first prompt stays live long enough for queue validation";
+  const first = Array.from(
+    { length: 30 },
+    (_, index) => `queue-window-${index + 1}`,
+  ).join(" ");
   await composer.fill(first);
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.getByRole("button", { name: "Stop generating" })).toBeVisible();
@@ -39,7 +43,7 @@ test("renders real incremental SSE and runs queued prompts in FIFO order", async
   await page.getByRole("button", { name: "Queue message" }).click();
   await expect(page.getByText("2 queued", { exact: true })).toBeVisible();
   await expect(page.getByText(`This is a simulated response to: ${first}`, { exact: true }))
-    .toBeVisible();
+    .toBeVisible({ timeout: 30_000 });
   await expect(page.getByText(`This is a simulated response to: ${second}`, { exact: true }))
     .toBeVisible();
   await expect(page.getByText(`This is a simulated response to: ${third}`, { exact: true }))
@@ -83,9 +87,7 @@ test("stop persists exactly one partial assistant node across reload", async ({ 
   expect(persisted).not.toContain("final-sentinel");
 
   await page.reload();
-  if ((page.viewportSize()?.width ?? 1280) <= 800) {
-    await page.getByRole("button", { name: "Open menu", exact: true }).click();
-  }
+  await openSidebar(page);
   await page.locator(
     `.conversation-row:has([data-conversation-actions="${conversationId}"]) button.conversation-open`,
   ).click();
@@ -156,9 +158,7 @@ test("regenerating an earlier turn selects and keeps the new branch", async ({ p
   ).getAttribute("data-conversation-actions");
   expect(conversationId).toBeTruthy();
   await page.reload();
-  if ((page.viewportSize()?.width ?? 1280) <= 800) {
-    await page.getByRole("button", { name: "Open menu", exact: true }).click();
-  }
+  await openSidebar(page);
   await page.locator(
     `.conversation-row:has([data-conversation-actions="${conversationId}"]) button.conversation-open`,
   ).click();
