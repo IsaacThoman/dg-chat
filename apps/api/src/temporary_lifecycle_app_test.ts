@@ -33,6 +33,20 @@ Deno.test("temporary chats expose expiry and authenticated owner-scoped CAS keep
     temporaryRetentionDays: 7,
   });
   const headers = await approvedSession(app, "temporary-route", "temporary@example.test");
+  const foreignOwner = repository.createUser({ email: "foreign@example.test", name: "Foreign" });
+  const foreign = repository.createConversation(
+    foreignOwner.id,
+    "Foreign scratch",
+    true,
+    undefined,
+    7,
+  );
+  const foreignKeep = await app.request(`/api/conversations/${foreign.id}/keep`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ expectedVersion: foreign.version }),
+  });
+  assertEquals(foreignKeep.status, 404);
   const createdResponse = await app.request("/api/conversations", {
     method: "POST",
     headers,
