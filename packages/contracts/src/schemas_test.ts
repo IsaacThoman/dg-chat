@@ -6,6 +6,8 @@ import {
   createTokenSchema,
   generateMessageSchema,
   keepTemporaryConversationSchema,
+  passwordResetSchema,
+  registerSchema,
   reorderConversationFoldersSchema,
   replaceConversationTagsSchema,
   replaceFolderMembershipsSchema,
@@ -20,6 +22,28 @@ import {
   workspaceDeleteSchema,
 } from "./schemas.ts";
 import { isModelCapability, MODEL_CAPABILITIES } from "./types.ts";
+import {
+  PASSWORD_MAX_LENGTH,
+  PASSWORD_MIN_LENGTH,
+  passwordPolicyError,
+} from "./password-policy.ts";
+
+Deno.test("identity password policy is shared by registration and recovery", () => {
+  const base = { email: "person@example.com", name: "Person" };
+  const short = "a".repeat(PASSWORD_MIN_LENGTH - 1);
+  const valid = "a".repeat(PASSWORD_MIN_LENGTH);
+  const long = "a".repeat(PASSWORD_MAX_LENGTH + 1);
+  assertEquals(registerSchema.safeParse({ ...base, password: short }).success, false);
+  assertEquals(registerSchema.safeParse({ ...base, password: valid }).success, true);
+  assertEquals(registerSchema.safeParse({ ...base, password: long }).success, false);
+  assertEquals(
+    passwordResetSchema.safeParse({ token: "x".repeat(32), password: valid }).success,
+    true,
+  );
+  assertEquals(passwordPolicyError(short), `Use at least ${PASSWORD_MIN_LENGTH} characters.`);
+  assertEquals(passwordPolicyError(valid), null);
+  assertEquals(passwordPolicyError(long), `Use no more than ${PASSWORD_MAX_LENGTH} characters.`);
+});
 
 Deno.test("model capabilities are canonical and reject near-miss values", () => {
   assertEquals(new Set(MODEL_CAPABILITIES).size, MODEL_CAPABILITIES.length);

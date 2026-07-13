@@ -25,6 +25,8 @@ import { privilegedBackupSecretConfig } from "./backup-secret-keyring.ts";
 import { DefaultBackupAdminService } from "./backup-service.ts";
 import { createPostgresBackupDataPort } from "./postgres-backup-data.ts";
 import { shutdownApi } from "./shutdown.ts";
+import { IDENTITY_SHUTDOWN_ABORT_MS } from "./identity-delivery.ts";
+import { closeIdentityAwareResources } from "./resource-shutdown.ts";
 
 const port = Number(Deno.env.get("PORT") ?? 8000);
 const providerKeyring = ProviderSecretKeyring.fromEnv();
@@ -180,15 +182,26 @@ const browserAuth = databaseUrl
     oidc,
     requireEmailVerification,
     sendVerificationEmail: mailer
-      ? ({ email, url, token }) =>
-        mailer.send({ to: email, kind: "email_verification", url, token })
+      ? ({ email, token }, signal) =>
+        mailer.send({
+          to: email,
+          kind: "email_verification",
+          url: `${webOrigin}/verify-email#token=${encodeURIComponent(token)}`,
+          token,
+        }, signal)
       : undefined,
     sendPasswordResetEmail: mailer
-      ? ({ email, url, token }) => mailer.send({ to: email, kind: "password_reset", url, token })
+      ? ({ email, token }, signal) =>
+        mailer.send({
+          to: email,
+          kind: "password_reset",
+          url: `${webOrigin}/reset-password#token=${encodeURIComponent(token)}`,
+          token,
+        }, signal)
       : undefined,
   })
   : undefined;
-const { app, toolExecutionService } = createApp({
+const { app, toolExecutionService, drainIdentityDeliveries } = createApp({
   repository,
   rateLimiter,
   objectStore,
@@ -246,17 +259,24 @@ const shutdown = async (signal: string) => {
     cancelBackup: () => backupAdmin?.close(),
     drainServer: () => server.shutdown(),
     forceServer: () => serverAbort.abort(new Error("API shutdown deadline exceeded")),
-    closeResources: () =>
-      Promise.all([
-        repository.close(),
-        toolExecutionStore?.close(),
-        rateLimiter.close(),
-        circuitBreaker.close(),
-        ocrCache?.close(),
-        audioConcurrencyLimiter.close(),
-        objectStore?.close(),
-        browserAuth?.close(),
-      ]),
+    closeResources: async () => {
+      await closeIdentityAwareResources({
+        abortDeliveriesAfterMs: IDENTITY_SHUTDOWN_ABORT_MS,
+        closeMailer: mailer?.close ? () => mailer.close!() : undefined,
+        drainLegacyDeliveries: drainIdentityDeliveries,
+        drainBrowserDeliveries: browserAuth?.drainIdentityDeliveries,
+        closeResources: [
+          () => repository.close(),
+          () => toolExecutionStore?.close(),
+          () => rateLimiter.close(),
+          () => circuitBreaker.close(),
+          () => ocrCache?.close(),
+          () => audioConcurrencyLimiter.close(),
+          () => objectStore?.close(),
+          () => browserAuth?.close(),
+        ],
+      });
+    },
     drainGraceMs: 10_000,
     resourceGraceMs: 5_000,
   });

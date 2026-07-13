@@ -14,6 +14,15 @@ function schemaDatabaseUrl(source: string, schema: string): string {
   return url.toString();
 }
 
+async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("Timed out waiting for asynchronous identity delivery");
+}
+
 Deno.test({
   name: "Better Auth creates UUID-backed pending identities and limited sessions",
   ignore: !databaseUrl,
@@ -26,6 +35,9 @@ Deno.test({
     let repository: PostgresRepository | undefined;
     const verificationDeliveries: Array<{ email: string; url: string; token: string }> = [];
     const passwordResetDeliveries: Array<{ email: string; url: string; token: string }> = [];
+    let rejectPasswordResetDelivery = false;
+    let rejectVerificationDelivery = false;
+    let heldPasswordResetDelivery: Promise<void> | undefined;
     try {
       await adminSql.unsafe(`CREATE SCHEMA ${schema}`);
       await adminSql.unsafe(`SET search_path TO ${schema},public`);
@@ -56,6 +68,15 @@ Deno.test({
           expires_at timestamptz NOT NULL,
           created_at timestamptz NOT NULL DEFAULT now(),
           invalidated_at timestamptz
+        );
+        CREATE TABLE identity_tokens (
+          id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+          user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          purpose text NOT NULL CHECK (purpose IN ('email_verification','password_reset')),
+          token_hash text NOT NULL UNIQUE,
+          expires_at timestamptz NOT NULL,
+          consumed_at timestamptz,
+          created_at timestamptz NOT NULL DEFAULT now()
         );
         CREATE TABLE api_tokens (
           id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -153,10 +174,17 @@ Deno.test({
         },
         requireEmailVerification: true,
         sendVerificationEmail: (delivery) => {
+          if (rejectVerificationDelivery) {
+            return Promise.reject(new Error("injected verification delivery failure"));
+          }
           verificationDeliveries.push(delivery);
           return Promise.resolve();
         },
         sendPasswordResetEmail: (delivery) => {
+          if (heldPasswordResetDelivery) return heldPasswordResetDelivery;
+          if (rejectPasswordResetDelivery) {
+            return Promise.reject(new Error("injected SMTP delivery failure"));
+          }
           passwordResetDeliveries.push(delivery);
           return Promise.resolve();
         },
@@ -250,10 +278,19 @@ Deno.test({
       );
       assertEquals(firstOidcApproval.balanceMicros, 5_000_000);
       assertEquals(repeatedOidcApproval.balanceMicros, 5_000_000);
-      assertEquals(
-        (await app.request("/api/auth/me", { headers: { cookie: oidcSessionCookie } })).status,
-        401,
-      );
+      const approvedOidcStatus = await app.request("/api/auth/status", {
+        headers: { cookie: oidcSessionCookie },
+      });
+      assertEquals(approvedOidcStatus.status, 200);
+      assertEquals(await approvedOidcStatus.json(), {
+        approvalStatus: "approved",
+        state: "active",
+        emailVerified: true,
+        emailVerificationRequired: true,
+        sessionLimited: true,
+        fullSessionEligible: true,
+        fullAccess: false,
+      });
 
       const legacySignin = await service.handler(
         new Request("http://localhost:8000/api/auth/sign-in/email", {
@@ -326,7 +363,27 @@ Deno.test({
         },
         body: JSON.stringify({ email: "admin@example.com" }),
       });
-      assertEquals(resetRequest.status, 200, await resetRequest.clone().text());
+      assertEquals(resetRequest.status, 202, await resetRequest.clone().text());
+      const unknownResetRequest = await app.request("/api/auth/password-reset/request", {
+        method: "POST",
+        headers: {
+          origin: "http://localhost:5173",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ email: "unknown-reset-account@example.com" }),
+      });
+      assertEquals(unknownResetRequest.status, resetRequest.status);
+      assertEquals(await unknownResetRequest.text(), await resetRequest.clone().text());
+      const rawResetRequest = await app.request("/api/auth/request-password-reset", {
+        method: "POST",
+        headers: {
+          origin: "http://localhost:5173",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ email: "admin@example.com" }),
+      });
+      assertEquals(rawResetRequest.status, 409);
+      await waitFor(() => passwordResetDeliveries.length === 1);
       assertEquals(passwordResetDeliveries.length, 1);
       const resetCallback = await service.handler(
         new Request(passwordResetDeliveries[0].url, {
@@ -398,7 +455,8 @@ Deno.test({
         },
         body: JSON.stringify({ email: "admin@example.com" }),
       });
-      assertEquals(replacementRequest.status, 200, await replacementRequest.clone().text());
+      assertEquals(replacementRequest.status, 202, await replacementRequest.clone().text());
+      await waitFor(() => passwordResetDeliveries.length === 2);
       assertEquals(passwordResetDeliveries.length, 2);
       const replacementCallback = await service.handler(
         new Request(passwordResetDeliveries[1].url, { redirect: "manual" }),
@@ -417,7 +475,79 @@ Deno.test({
           password: "final bootstrap password valid",
         }),
       });
-      assertEquals(reset.status, 200, await reset.clone().text());
+      assertEquals(reset.status, 204, await reset.clone().text());
+      for (
+        const token of [
+          replacementToken,
+          "invalid_better_auth_password_reset_token_0000000000",
+        ]
+      ) {
+        const rejectedReset = await app.request("/api/auth/password-reset", {
+          method: "POST",
+          headers: {
+            origin: "http://localhost:5173",
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ token, password: "another secure replacement password" }),
+        });
+        assertEquals(rejectedReset.status, 400);
+        assertEquals(await rejectedReset.json(), {
+          error: {
+            code: "invalid_identity_token",
+            message: "Reset token is invalid or expired",
+          },
+        });
+      }
+      rejectPasswordResetDelivery = true;
+      const rejectedDeliveryKnown = await app.request("/api/auth/password-reset/request", {
+        method: "POST",
+        headers: { origin: "http://localhost:5173", "content-type": "application/json" },
+        body: JSON.stringify({ email: "admin@example.com" }),
+      });
+      const rejectedDeliveryUnknown = await app.request("/api/auth/password-reset/request", {
+        method: "POST",
+        headers: { origin: "http://localhost:5173", "content-type": "application/json" },
+        body: JSON.stringify({ email: "no-such-user@example.com" }),
+      });
+      assertEquals(rejectedDeliveryKnown.status, 202);
+      assertEquals(rejectedDeliveryUnknown.status, 202);
+      assertEquals(
+        await rejectedDeliveryKnown.text(),
+        await rejectedDeliveryUnknown.text(),
+      );
+      await waitFor(async () =>
+        (await repository!.listAudit()).data.some((event) =>
+          event.action === "identity.password_reset_delivery_failed"
+        )
+      );
+      const resetDeliveryFailure = (await repository.listAudit()).data.find((event) =>
+        event.action === "identity.password_reset_delivery_failed"
+      );
+      assert(resetDeliveryFailure);
+      assertEquals(resetDeliveryFailure.actorId, null);
+      assertEquals(resetDeliveryFailure.targetId, bootstrap.id);
+      rejectPasswordResetDelivery = false;
+
+      let releaseHeldDelivery!: () => void;
+      heldPasswordResetDelivery = new Promise<void>((resolve) => {
+        releaseHeldDelivery = resolve;
+      });
+      const heldDeliveryRequest = await app.request("/api/auth/password-reset/request", {
+        method: "POST",
+        headers: { origin: "http://localhost:5173", "content-type": "application/json" },
+        body: JSON.stringify({ email: "admin@example.com" }),
+      });
+      assertEquals(heldDeliveryRequest.status, 202);
+      let deliveryDrained = false;
+      const drainingDeliveries = service.drainIdentityDeliveries().then(() => {
+        deliveryDrained = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      assertEquals(deliveryDrained, false);
+      releaseHeldDelivery();
+      await drainingDeliveries;
+      assertEquals(deliveryDrained, true);
+      heldPasswordResetDelivery = undefined;
       assertEquals(
         (await app.request("/v1/models", {
           headers: { authorization: `Bearer ${apiToken}` },
@@ -507,6 +637,13 @@ Deno.test({
       );
       assertMatch(session.authenticatedAt, /^\d{4}-\d{2}-\d{2}T/u);
       assertEquals((await app.request("/api/auth/me", { headers: { cookie } })).status, 200);
+      const directSessions = await service.listUserSessions(body.user.id, new Headers({ cookie }));
+      assertEquals(directSessions.length >= 1, true);
+      assertEquals((await repository.listSessions(body.user.id)).length, 0);
+      const listedSessions = await (await app.request("/api/sessions", { headers: { cookie } }))
+        .json() as { data: Array<{ id: string; current: boolean }> };
+      assertEquals(listedSessions.data.some((candidate) => candidate.current), true);
+      assertEquals(listedSessions.data.filter((candidate) => candidate.current).length, 1);
       assertEquals((await app.request("/v1/models", { headers: { cookie } })).status, 401);
       assertEquals(
         (await app.request("/api/auth/me", {
@@ -514,20 +651,121 @@ Deno.test({
         })).status,
         401,
       );
+      await waitFor(() => verificationDeliveries.length === 1);
       assertEquals(verificationDeliveries.length, 1);
       assertEquals(verificationDeliveries[0].email, "bridge@example.com");
-      const verification = await service.handler(
-        new Request(verificationDeliveries[0].url, {
-          headers: { origin: "http://localhost:5173" },
-        }),
+      await waitFor(async () =>
+        (await repository!.listAudit()).data.some((event) =>
+          event.action === "identity.verification_sent" && event.targetId === body.user.id
+        )
       );
-      assertEquals(verification.status, 302);
-      assertEquals(verification.headers.get("location"), "http://localhost:5173/pending");
+      const verifyThroughProduct = (token: string) =>
+        app.request("/api/auth/verify-email", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            origin: "http://localhost:5173",
+          },
+          body: JSON.stringify({ token }),
+        });
+      const concurrentVerification = await Promise.all([
+        verifyThroughProduct(verificationDeliveries[0].token),
+        verifyThroughProduct(verificationDeliveries[0].token),
+      ]);
+      assertEquals(concurrentVerification.map((response) => response.status).sort(), [200, 400]);
+      const verification = concurrentVerification.find((response) => response.status === 200)!;
+      assertEquals(
+        (await verification.json() as { user: { id: string } }).user.id,
+        body.user.id,
+      );
       assert((await repository.findUser(body.user.id))?.emailVerifiedAt);
+      assertEquals(
+        Number(
+          (await adminSql`
+          SELECT count(*)::int AS count FROM audit_events
+          WHERE action='identity.email_verified' AND target_id=${body.user.id}
+        `)[0].count,
+        ),
+        1,
+      );
+      assertEquals(
+        (await app.request(`/api/auth/verify-email?token=${verificationDeliveries[0].token}`))
+          .status,
+        409,
+      );
+      assertEquals(
+        (await app.request(`/api/auth/reset-password/${verificationDeliveries[0].token}`)).status,
+        409,
+      );
+      assertEquals(
+        (await app.request("/api/auth/send-verification-email", {
+          method: "POST",
+          headers: { origin: "http://localhost:5173", "content-type": "application/json" },
+          body: JSON.stringify({ email: "bridge@example.com" }),
+        })).status,
+        409,
+      );
+      for (const path of ["update-user", "revoke-sessions", "revoke-other-sessions"]) {
+        assertEquals(
+          (await app.request(`/api/auth/${path}`, {
+            method: "POST",
+            headers: {
+              cookie,
+              origin: "http://localhost:5173",
+              "content-type": "application/json",
+            },
+            body: "{}",
+          })).status,
+          404,
+        );
+      }
+      for (
+        const token of [
+          verificationDeliveries[0].token,
+          "invalid_better_auth_verification_token_0000000000",
+        ]
+      ) {
+        const rejectedVerification = await verifyThroughProduct(token);
+        assertEquals(rejectedVerification.status, 400);
+        assertEquals(await rejectedVerification.json(), {
+          error: {
+            code: "invalid_identity_token",
+            message: "Verification token is invalid or expired",
+          },
+        });
+      }
+      assertEquals(
+        await (await app.request("/api/auth/status", { headers: { cookie } })).json(),
+        {
+          approvalStatus: "pending",
+          state: "active",
+          emailVerified: true,
+          emailVerificationRequired: true,
+          sessionLimited: true,
+          fullSessionEligible: false,
+          fullAccess: false,
+        },
+      );
 
       await repository.approveUser(body.user.id, "approved", 5_000_000, true);
-      await service.invalidateUserSessions(body.user.id);
-      assertEquals(await service.getSession(new Headers({ cookie })), null);
+      assertEquals(
+        await (await app.request("/api/auth/status", { headers: { cookie } })).json(),
+        {
+          approvalStatus: "approved",
+          state: "active",
+          emailVerified: true,
+          emailVerificationRequired: true,
+          sessionLimited: true,
+          fullSessionEligible: true,
+          fullAccess: false,
+        },
+      );
+      const staleWorkspace = await app.request("/api/conversations", { headers: { cookie } });
+      assertEquals(staleWorkspace.status, 403);
+      assertEquals(
+        (await staleWorkspace.json() as { error: { code: string } }).error.code,
+        "session_refresh_required",
+      );
       const approvedSignin = await service.handler(
         new Request("http://localhost:8000/api/auth/sign-in/email", {
           method: "POST",
@@ -551,6 +789,57 @@ Deno.test({
         { userId: body.user.id, limited: false },
       );
       assertMatch(approvedSession.authenticatedAt, /^\d{4}-\d{2}-\d{2}T/u);
+
+      rejectVerificationDelivery = true;
+      const deliveryFailureSignup = await app.request("/api/auth/sign-up/email", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          origin: "http://localhost:5173",
+        },
+        body: JSON.stringify({
+          name: "Delivery Failure",
+          email: "verification-failure@example.com",
+          password: "correct horse battery staple",
+        }),
+      });
+      assertEquals(deliveryFailureSignup.status, 200, await deliveryFailureSignup.clone().text());
+      const failedIdentity = await deliveryFailureSignup.json() as { user: { id: string } };
+      const failedCookie = deliveryFailureSignup.headers.get("set-cookie")?.split(";", 1)[0];
+      assert(failedCookie);
+      assertEquals(
+        (await app.request("/api/auth/me", { headers: { cookie: failedCookie } })).status,
+        200,
+      );
+      await waitFor(async () =>
+        (await repository!.listAudit()).data.some((event) =>
+          event.action === "identity.verification_delivery_failed" &&
+          event.targetId === failedIdentity.user.id
+        )
+      );
+      const verificationDeliveryFailure = (await repository.listAudit()).data.find((event) =>
+        event.action === "identity.verification_delivery_failed" &&
+        event.targetId === failedIdentity.user.id
+      );
+      assert(verificationDeliveryFailure);
+      assertEquals(verificationDeliveryFailure.actorId, null);
+      const resendAfterFailure = await app.request("/api/auth/verify-email/request", {
+        method: "POST",
+        headers: {
+          cookie: failedCookie,
+          origin: "http://localhost:5173",
+          "content-type": "application/json",
+        },
+      });
+      assertEquals(resendAfterFailure.ok, true, await resendAfterFailure.clone().text());
+      await waitFor(async () =>
+        (await repository!.listAudit()).data.filter((event) =>
+          event.action === "identity.verification_delivery_failed" &&
+          event.targetId === failedIdentity.user.id
+        ).length >= 2
+      );
+      rejectVerificationDelivery = false;
+
       await repository.setUserState(body.user.id, "suspended");
       assertEquals(await service.getSession(new Headers({ cookie: approvedCookie })), null);
 

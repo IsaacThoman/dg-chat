@@ -38,6 +38,21 @@ export interface SessionResponse {
   limited: boolean;
 }
 
+/** Authoritative account and current-session state used by approval/verification screens. */
+export interface AuthStatusResponse {
+  approvalStatus: ApprovalStatus;
+  state: AccountState;
+  emailVerified: boolean;
+  /** Whether this deployment requires verified email before a full session may be issued. */
+  emailVerificationRequired: boolean;
+  /** The presented session remains status-only and can never gain workspace privilege in place. */
+  sessionLimited: boolean;
+  /** The account may obtain a full session by signing in again. */
+  fullSessionEligible: boolean;
+  /** The presented session currently has full workspace eligibility and privilege. */
+  fullAccess: boolean;
+}
+
 export type MessageRole = "system" | "developer" | "user" | "assistant" | "tool";
 
 export interface MessageNode {

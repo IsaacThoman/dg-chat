@@ -89,11 +89,51 @@ describe("authentication errors", () => {
       expect.objectContaining({ method: "POST", credentials: "include", body: "{}" }),
     );
   });
+
+  it("uses product wrappers for recovery, verification, and session revocation", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(null, { status: 202 }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(Response.json({ data: [] }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.requestPasswordReset("person@example.com");
+    await api.resetPassword("reset-token", "Valid-Pass-42");
+    await api.requestEmailVerification();
+    await expect(api.sessions()).resolves.toEqual([]);
+    await api.revokeSession("legacy:session/1");
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "/api/auth/password-reset/request",
+      expect.objectContaining({ body: JSON.stringify({ email: "person@example.com" }) }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/auth/password-reset",
+      expect.objectContaining({
+        body: JSON.stringify({ token: "reset-token", password: "Valid-Pass-42" }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      5,
+      "/api/sessions/legacy%3Asession%2F1",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+  });
 });
 
 describe("setup discovery API", () => {
   it("reads bootstrap and OIDC capabilities from the public status endpoint", async () => {
-    const status = { bootstrapRequired: true, setupEnabled: true, oidcEnabled: false };
+    const status = {
+      bootstrapRequired: true,
+      setupEnabled: true,
+      oidcEnabled: false,
+      emailEnabled: true,
+      requireEmailVerification: true,
+    };
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify(status), {
         status: 200,

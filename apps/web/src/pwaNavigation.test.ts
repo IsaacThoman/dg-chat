@@ -18,5 +18,8 @@ describe("PWA navigation fallback", () => {
     expect(denied("/")).toBe(false);
     expect(denied("/login")).toBe(false);
     expect(denied("/pending")).toBe(false);
+    expect(denied("/forgot-password")).toBe(false);
+    expect(denied("/reset-password?token=opaque")).toBe(false);
+    expect(denied("/verify-email?token=opaque")).toBe(false);
   });
 });

@@ -716,6 +716,19 @@ export class MemoryRepository {
     tokenHash: string,
     expiresAt: string,
   ) {
+    const existing = this.identityTokens.get(tokenHash);
+    if (existing) {
+      if (
+        existing.userId !== userId || existing.purpose !== purpose || existing.consumedAt !== null
+      ) {
+        throw new DomainError(
+          "identity_token_conflict",
+          "Identity token registration conflicts with existing authority",
+          409,
+        );
+      }
+      return;
+    }
     this.identityTokens.set(tokenHash, { userId, purpose, expiresAt, consumedAt: null });
   }
   verifyEmail(tokenHash: string) {
@@ -861,15 +874,10 @@ export class MemoryRepository {
     if (status === "approved" && creditMicros > 0 && !alreadyGranted) {
       this.credit(id, `approval:${id}`, "grant", creditMicros);
     }
-    if (status === "approved") {
-      for (const [hash, session] of this.sessions) {
-        if (session.userId === id && session.limited) {
-          this.sessions.delete(hash);
-        }
-      }
-    }
     if (status === "rejected") {
-      this.invalidateUserSessions(id);
+      for (const [hash, session] of this.sessions) {
+        if (session.userId === id && !session.limited) this.sessions.delete(hash);
+      }
       for (const token of this.tokens.values()) {
         if (token.userId === id && !token.revokedAt) token.revokedAt = new Date().toISOString();
       }

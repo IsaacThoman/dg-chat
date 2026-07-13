@@ -2400,10 +2400,11 @@ Deno.test("approval grant is minted once and rejection revokes sessions and toke
   });
   repo.createSession(user.id, "limited-session", true);
   repo.approveUser(user.id, "approved", 100);
-  assertEquals(repo.getSession("limited-session"), undefined);
+  assertEquals(repo.getSession("limited-session")?.limited, true);
   repo.reserve(user.id, "spend", "model", 100);
   repo.settle("spend", 100, 1, 1, 1);
   repo.approveUser(user.id, "rejected", 100);
+  assertEquals(repo.getSession("limited-session")?.limited, true);
   repo.approveUser(user.id, "approved", 100);
   assertEquals(user.balanceMicros, 0);
   repo.createSession(user.id, "session", false);
@@ -2415,6 +2416,7 @@ Deno.test("approval grant is minted once and rejection revokes sessions and toke
   });
   repo.approveUser(user.id, "rejected", 100);
   assertEquals(repo.getSession("session"), undefined);
+  assertEquals(repo.getSession("limited-session")?.limited, true);
   assertEquals(Boolean(token.revokedAt), true);
 });
 
@@ -2432,6 +2434,30 @@ Deno.test("identity tokens are one-time and password reset invalidates credentia
     "verify-hash",
     new Date(Date.now() + 60_000).toISOString(),
   );
+  // A provider may resend the same still-valid token. Registration is idempotent only while its
+  // exact authority remains unconsumed and owner/purpose-identical.
+  repo.createIdentityToken(
+    user.id,
+    "email_verification",
+    "verify-hash",
+    new Date(Date.now() + 60_000).toISOString(),
+  );
+  const otherUser = repo.createUser({
+    email: "identity-other@example.com",
+    name: "Other Identity",
+    passwordHash: "old",
+  });
+  assertThrows(
+    () =>
+      repo.createIdentityToken(
+        otherUser.id,
+        "email_verification",
+        "verify-hash",
+        new Date(Date.now() + 60_000).toISOString(),
+      ),
+    DomainError,
+    "conflicts",
+  );
   repo.createIdentityToken(
     user.id,
     "email_verification",
@@ -2439,6 +2465,17 @@ Deno.test("identity tokens are one-time and password reset invalidates credentia
     new Date(Date.now() + 60_000).toISOString(),
   );
   assertEquals(repo.verifyEmail("verify-hash").emailVerifiedAt !== null, true);
+  assertThrows(
+    () =>
+      repo.createIdentityToken(
+        user.id,
+        "email_verification",
+        "verify-hash",
+        new Date(Date.now() + 60_000).toISOString(),
+      ),
+    DomainError,
+    "conflicts",
+  );
   assertEquals(repo.verifyEmail("verify-hash-concurrent").emailVerifiedAt !== null, true);
   assertThrows(() => repo.verifyEmail("verify-hash"), DomainError, "invalid or expired");
   const session = repo.createSession(user.id, "session-hash", false);

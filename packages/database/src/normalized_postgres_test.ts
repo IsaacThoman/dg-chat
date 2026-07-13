@@ -757,10 +757,14 @@ Deno.test({
       assertEquals(oidcOnly.passwordHash, null);
       const limitedSession = await repo.createSession(applicant.id, "limited-session-hash", true);
       await repo.approveUser(applicant.id, "approved", 1_000_000);
-      assertEquals(await repo.getSession(limitedSession.tokenHash), undefined);
+      assertEquals((await repo.getSession(limitedSession.tokenHash))?.limited, true);
       const session = await repo.createSession(applicant.id, "session-hash", false);
       assertEquals((await repo.getSession(session.tokenHash))?.userId, applicant.id);
       assertEquals((await repo.listSessions(applicant.id))[0].id, session.id);
+      await repo.approveUser(applicant.id, "rejected", 0);
+      assertEquals(await repo.getSession(session.tokenHash), undefined);
+      assertEquals((await repo.getSession(limitedSession.tokenHash))?.limited, true);
+      await repo.approveUser(applicant.id, "approved", 0);
 
       const identityUser = await repo.createUser({
         email: "identity@database.test",

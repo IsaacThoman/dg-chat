@@ -78,6 +78,13 @@ import { AdminBackupsView } from "./AdminBackups.tsx";
 import { PersonalTokenSettings } from "./TokenGovernance.tsx";
 import { UserPortability } from "./UserPortability.tsx";
 import { ConversationShareButton } from "./ConversationSharing.tsx";
+import { identityDestination, pendingMode } from "./identityState.ts";
+import { SessionCenter } from "./SessionCenter.tsx";
+import {
+  PASSWORD_MAX_LENGTH,
+  PASSWORD_MIN_LENGTH,
+  passwordPolicyError,
+} from "../../../packages/contracts/src/password-policy.ts";
 import {
   conversationForFirstSend,
   mergeAttachmentIds,
@@ -2925,6 +2932,7 @@ function SettingsView(
                   Change password
                 </button>
               </div>
+              <SessionCenter />
               <div className="danger-zone">
                 <h3>Danger zone</h3>
                 <div className="setting-row">
@@ -3608,6 +3616,9 @@ export function App(
   const [modelPreferenceError, setModelPreferenceError] = useState("");
   const demoMode = import.meta.env.VITE_DEMO_MODE === "true";
   const user = userQuery.data ?? (demoMode ? demoUser : undefined);
+  useEffect(() => {
+    if (user?.limited) location.replace("/pending");
+  }, [user?.limited]);
   const conversations = conversationQuery.data ?? (demoMode ? demoConversations : []);
   const deletedConversations = deletedConversationQuery.data ?? [];
   const allConversations = [
@@ -3795,7 +3806,7 @@ export function App(
     await conversationQuery.refetch();
     return updated;
   };
-  if (!user) {
+  if (!user || user.limited) {
     return <DiscoveryLoading unavailable={setupQuery.isError && userQuery.isError} />;
   }
   return (
@@ -3967,7 +3978,7 @@ export function App(
   );
 }
 
-function AuthCard(
+export function AuthCard(
   { children, title, subtitle }: { children: ReactNode; title: string; subtitle: string },
 ) {
   return (
@@ -4032,19 +4043,21 @@ export function AuthScreen() {
       : ""
   );
   const [busy, setBusy] = useState(false);
+  const signupPasswordError = signup && password ? passwordPolicyError(password) : null;
   useEffect(() => {
     const destination = setupDestination("/login", setupQuery.data);
     if (destination) location.replace(destination);
   }, [setupQuery.data]);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
+    if (signup && passwordPolicyError(password)) return;
     setBusy(true);
     setError("");
     try {
       const user = signup
         ? await api.signUp(name, email, password)
         : await api.signIn(email, password);
-      location.assign(user.status === "approved" ? "/" : "/pending");
+      location.assign(identityDestination(user));
     } catch {
       setError("We couldn't sign you in. Check your details and try again.");
     } finally {
@@ -4098,20 +4111,45 @@ export function AuthScreen() {
           <span>Password</span>
           <input
             required
-            minLength={8}
+            minLength={signup ? PASSWORD_MIN_LENGTH : 1}
+            maxLength={PASSWORD_MAX_LENGTH}
             autoComplete={signup ? "new-password" : "current-password"}
             type="password"
+            aria-describedby={signup ? "signup-password-guidance" : undefined}
+            aria-invalid={signup ? Boolean(signupPasswordError) : undefined}
             placeholder="••••••••••••"
             value={password}
-            onChange={(e) => setPassword(e.target.value)}
+            onChange={(e) => {
+              setPassword(e.target.value);
+              setError("");
+            }}
           />
         </label>
-        {error && <p className="form-error">{error}</p>}
-        <button className="primary wide" type="submit" disabled={busy}>
+        {signup && (
+          <p
+            id="signup-password-guidance"
+            className={`password-guidance${signupPasswordError ? " invalid" : ""}`}
+            aria-live="polite"
+          >
+            {signupPasswordError ??
+              `Use ${PASSWORD_MIN_LENGTH}–${PASSWORD_MAX_LENGTH} characters.`}
+          </p>
+        )}
+        {error && <p className="form-error" role="alert">{error}</p>}
+        <button
+          className="primary wide"
+          type="submit"
+          disabled={busy || Boolean(signupPasswordError)}
+        >
           {busy ? "Please wait…" : signup ? "Request access" : "Continue"}
           <ArrowRight size={17} />
         </button>
       </form>
+      {!signup && (
+        <p className="auth-help-link">
+          <a href="/forgot-password">Forgot your password?</a>
+        </p>
+      )}
       {setupQuery.data?.oidcEnabled && (
         <>
           <div className="divider">
@@ -4137,12 +4175,14 @@ export function SetupScreen() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const setupPasswordError = password ? passwordPolicyError(password) : null;
   useEffect(() => {
     const destination = setupDestination("/setup", setupQuery.data);
     if (destination) location.replace(destination);
   }, [setupQuery.data]);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
+    if (passwordPolicyError(password)) return;
     setBusy(true);
     setError("");
     try {
@@ -4219,15 +4259,32 @@ export function SetupScreen() {
           <span>Password</span>
           <input
             required
-            minLength={10}
+            minLength={PASSWORD_MIN_LENGTH}
+            maxLength={PASSWORD_MAX_LENGTH}
             type="password"
+            aria-describedby="setup-password-guidance"
+            aria-invalid={Boolean(setupPasswordError)}
             value={password}
-            onChange={(event) => setPassword(event.target.value)}
-            placeholder="At least 10 characters"
+            onChange={(event) => {
+              setPassword(event.target.value);
+              setError("");
+            }}
+            placeholder={`${PASSWORD_MIN_LENGTH}–${PASSWORD_MAX_LENGTH} characters`}
           />
         </label>
-        {error && <p className="form-error">{error}</p>}
-        <button className="primary wide" type="submit" disabled={busy}>
+        <p
+          id="setup-password-guidance"
+          className={`password-guidance${setupPasswordError ? " invalid" : ""}`}
+          aria-live="polite"
+        >
+          {setupPasswordError ?? `Use ${PASSWORD_MIN_LENGTH}–${PASSWORD_MAX_LENGTH} characters.`}
+        </p>
+        {error && <p className="form-error" role="alert">{error}</p>}
+        <button
+          className="primary wide"
+          type="submit"
+          disabled={busy || Boolean(setupPasswordError)}
+        >
           {busy ? "Creating…" : "Create workspace"} <ArrowRight size={17} />
         </button>
       </form>
@@ -4236,26 +4293,60 @@ export function SetupScreen() {
 }
 export function PendingScreen() {
   const me = useQuery({ queryKey: ["pending-me"], queryFn: api.me, refetchInterval: 5000 });
+  const setup = useQuery({ queryKey: ["setup-status"], queryFn: api.setupStatus });
   const status = useQuery({
     queryKey: ["approval-status"],
     queryFn: api.status,
     refetchInterval: 5000,
   });
+  const [resending, setResending] = useState(false);
+  const [resendMessage, setResendMessage] = useState("");
+  const [resendFailed, setResendFailed] = useState(false);
+  const mode = pendingMode(status.data);
   useEffect(() => {
-    if (status.data?.approvalStatus === "approved" && status.data.state === "active") {
+    if (mode === "ready") {
       location.assign("/");
     }
-    if (status.isError) location.assign("/login");
-  }, [status.data, status.isError]);
+    if (status.error instanceof ApiError && status.error.status === 401) location.assign("/login");
+  }, [mode, status.error]);
   const signOut = async () => {
     await api.signOut();
     location.assign("/login");
   };
+  const resend = async () => {
+    setResending(true);
+    setResendMessage("");
+    setResendFailed(false);
+    try {
+      await api.requestEmailVerification();
+      setResendMessage("A fresh verification link is on the way. Check your inbox.");
+    } catch {
+      setResendFailed(true);
+      setResendMessage("We couldn't send a new link right now. Please try again.");
+    } finally {
+      setResending(false);
+    }
+  };
+  const title = mode === "verification"
+    ? "Verify your email"
+    : mode === "refresh"
+    ? "Sign in again"
+    : mode === "rejected"
+    ? "Access was not approved"
+    : mode === "unavailable"
+    ? "Account unavailable"
+    : "Your request is pending";
+  const subtitle = mode === "verification"
+    ? "Your account is approved. Verify your email before entering the workspace."
+    : mode === "refresh"
+    ? "Your account is ready. A fresh sign-in safely activates full access."
+    : mode === "rejected"
+    ? "An administrator declined this account request."
+    : mode === "unavailable"
+    ? "This account cannot enter the workspace in its current state."
+    : "An administrator needs to approve your account before you can enter the workspace.";
   return (
-    <AuthCard
-      title="Your request is pending"
-      subtitle="An administrator needs to approve your account before you can enter the workspace."
-    >
+    <AuthCard title={title} subtitle={subtitle}>
       <div className="pending-visual">
         <div>
           <UserCheck size={29} />
@@ -4263,15 +4354,54 @@ export function PendingScreen() {
         <span className="pulse-ring" />
       </div>
       <div className="pending-card">
-        <span className="status-chip">Waiting for approval</span>
+        <span className="status-chip">
+          {mode === "verification"
+            ? "Email verification needed"
+            : mode === "refresh"
+            ? "Ready for a fresh session"
+            : mode === "rejected"
+            ? "Request declined"
+            : mode === "unavailable"
+            ? "Access unavailable"
+            : "Waiting for approval"}
+        </span>
         <p>
           Signed in as <strong>{me.data?.email ?? "your account"}</strong>
         </p>
-        <small>This page will update automatically.</small>
+        <small>
+          {mode === "verification"
+            ? "Verification links expire after 24 hours and can only be used once."
+            : mode === "refresh"
+            ? "Your limited status session is never promoted silently."
+            : "This page will update automatically."}
+        </small>
       </div>
-      <button className="secondary wide" onClick={() => status.refetch()}>
-        <RefreshCw size={16} /> Check status
-      </button>
+      {mode === "verification" && setup.data?.emailEnabled && (
+        <button
+          className="secondary wide"
+          disabled={resending}
+          onClick={() => void resend()}
+        >
+          <RefreshCw className={resending ? "spin" : ""} size={16} />
+          {resending ? "Sending…" : "Send a new verification link"}
+        </button>
+      )}
+      {resendMessage && (
+        <p className="pending-announcement" role={resendFailed ? "alert" : "status"}>
+          {resendMessage}
+        </p>
+      )}
+      {mode === "refresh"
+        ? (
+          <button className="primary wide" onClick={() => void signOut()}>
+            <LogOut size={16} /> Continue to sign in
+          </button>
+        )
+        : (
+          <button className="secondary wide" onClick={() => void status.refetch()}>
+            <RefreshCw size={16} /> Check status
+          </button>
+        )}
       <button className="text-button" onClick={signOut}>
         <LogOut size={15} /> Sign out
       </button>

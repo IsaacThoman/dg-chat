@@ -6,7 +6,7 @@ import { DomainError, MemoryRepository } from "@dg-chat/database";
 import { type IdentityMailer, TestIdentityMailer } from "./mail.ts";
 import { TestObjectStore } from "./test-object-store.ts";
 import { simulate } from "./models.ts";
-import { sha256Hex } from "./crypto.ts";
+import { sha256, sha256Hex } from "./crypto.ts";
 
 async function json(response: Response) {
   // deno-lint-ignore no-explicit-any
@@ -23,6 +23,15 @@ function sessionCookie(response: Response): string {
   const cookie = response.headers.get("set-cookie")?.split(";", 1)[0];
   assertExists(cookie);
   return cookie;
+}
+
+async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 1_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error("Timed out waiting for asynchronous test condition");
 }
 
 Deno.test("OpenAI endpoint registrations are unique", () => {
@@ -503,7 +512,8 @@ Deno.test("bootstrap, signup, approval, immutable chat, API token and OpenAI com
   const staleLimitedSession = await app.request("/api/conversations", {
     headers: userAuth,
   });
-  assertEquals(staleLimitedSession.status, 401);
+  assertEquals(staleLimitedSession.status, 403);
+  assertEquals((await json(staleLimitedSession)).error.code, "session_refresh_required");
   const approvedLogin = await app.request("/api/auth/sign-in/email", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -844,6 +854,7 @@ Deno.test("bootstrap, signup, approval, immutable chat, API token and OpenAI com
     session.invalidatedAt === null
   );
   assertExists(activeSession);
+  assertEquals(activeSession.current, true);
   assertEquals(
     (await app.request(`/api/sessions/${activeSession.id}`, {
       method: "DELETE",
@@ -914,6 +925,229 @@ Deno.test("bootstrap, signup, approval, immutable chat, API token and OpenAI com
     (await app.request("/health")).headers.get("content-security-policy") ?? "",
     "default-src 'self'",
   );
+});
+
+Deno.test("auth status keeps limited sessions pollable through approval and verification", async () => {
+  const mailer = new TestIdentityMailer();
+  const { app, repository } = createApp({
+    mailer,
+    requireEmailVerification: true,
+  });
+  const signup = await app.request("/api/auth/sign-up/email", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email: "status-transition@example.com",
+      password: "correct horse battery",
+      name: "Status Transition",
+    }),
+  });
+  assertEquals(signup.status, 201);
+  const signed = await json(signup);
+  const limitedAuth = { cookie: sessionCookie(signup) };
+
+  assertEquals(await json(await app.request("/api/auth/status", { headers: limitedAuth })), {
+    approvalStatus: "pending",
+    state: "active",
+    emailVerified: false,
+    emailVerificationRequired: true,
+    sessionLimited: true,
+    fullSessionEligible: false,
+    fullAccess: false,
+  });
+
+  // Approved-but-unverified is a valid imported/configuration-transition state. Approval must
+  // not elevate or destroy the status-only session.
+  await repository.approveUser(signed.user.id, "approved", 0, false);
+  assertEquals(await json(await app.request("/api/auth/status", { headers: limitedAuth })), {
+    approvalStatus: "approved",
+    state: "active",
+    emailVerified: false,
+    emailVerificationRequired: true,
+    sessionLimited: true,
+    fullSessionEligible: false,
+    fullAccess: false,
+  });
+
+  const verificationMessage = mailer.messages.findLast((message) =>
+    message.kind === "email_verification"
+  );
+  assertExists(verificationMessage);
+  assertStringIncludes(verificationMessage.url, "/verify-email#token=");
+  const verificationToken = verificationMessage.token;
+  assertExists(verificationToken);
+  const verification = await app.request("/api/auth/verify-email", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token: verificationToken }),
+  });
+  assertEquals(verification.status, 200);
+  assertEquals(await json(await app.request("/api/auth/status", { headers: limitedAuth })), {
+    approvalStatus: "approved",
+    state: "active",
+    emailVerified: true,
+    emailVerificationRequired: true,
+    sessionLimited: true,
+    fullSessionEligible: true,
+    fullAccess: false,
+  });
+
+  const blocked = await app.request("/api/conversations", { headers: limitedAuth });
+  assertEquals(blocked.status, 403);
+  assertEquals((await json(blocked)).error.code, "session_refresh_required");
+
+  const freshLogin = await app.request("/api/auth/sign-in/email", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email: "status-transition@example.com",
+      password: "correct horse battery",
+    }),
+  });
+  assertEquals(freshLogin.status, 200);
+  assertEquals(
+    await json(
+      await app.request("/api/auth/status", {
+        headers: { cookie: sessionCookie(freshLogin) },
+      }),
+    ),
+    {
+      approvalStatus: "approved",
+      state: "active",
+      emailVerified: true,
+      emailVerificationRequired: true,
+      sessionLimited: false,
+      fullSessionEligible: true,
+      fullAccess: true,
+    },
+  );
+});
+
+Deno.test("rejected applicants retain only a status session", async () => {
+  const { app, repository } = createApp();
+  const signup = await app.request("/api/auth/sign-up/email", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email: "rejected-status@example.com",
+      password: "correct horse battery",
+      name: "Rejected Status",
+    }),
+  });
+  const signed = await json(signup);
+  const headers = { cookie: sessionCookie(signup) };
+  await repository.approveUser(signed.user.id, "rejected", 0);
+  assertEquals(await json(await app.request("/api/auth/status", { headers })), {
+    approvalStatus: "rejected",
+    state: "active",
+    emailVerified: false,
+    emailVerificationRequired: false,
+    sessionLimited: true,
+    fullSessionEligible: false,
+    fullAccess: false,
+  });
+  const privileged = await app.request("/api/conversations", { headers });
+  assertEquals(privileged.status, 403);
+  assertEquals((await json(privileged)).error.code, "session_refresh_required");
+});
+
+Deno.test("legacy identity tokens return stable safe errors and reset requests do not enumerate", async () => {
+  const mailer = new TestIdentityMailer();
+  const { app, repository } = createApp({ mailer, requireEmailVerification: true });
+  const signup = await app.request("/api/auth/sign-up/email", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email: "safe-errors@example.com",
+      password: "correct horse battery",
+      name: "Safe Errors",
+    }),
+  });
+  const signed = await json(signup);
+  const verificationToken = mailer.messages.findLast((message) =>
+    message.kind === "email_verification"
+  )?.token;
+  assertExists(verificationToken);
+  const expiredVerification = "verify_expired_contract_token_000000000000";
+  await repository.createIdentityToken(
+    signed.user.id,
+    "email_verification",
+    await sha256(expiredVerification),
+    new Date(Date.now() - 1_000).toISOString(),
+  );
+  const verificationRequest = (token: string) =>
+    app.request("/api/auth/verify-email", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token }),
+    });
+  assertEquals((await verificationRequest(verificationToken)).status, 200);
+  for (
+    const token of [
+      "verify_invalid_contract_token_000000000000",
+      expiredVerification,
+      verificationToken,
+    ]
+  ) {
+    const response = await verificationRequest(token);
+    assertEquals(response.status, 400);
+    assertEquals(await json(response), {
+      error: {
+        code: "invalid_identity_token",
+        message: "Verification token is invalid or expired",
+      },
+    });
+  }
+
+  const knownReset = await app.request("/api/auth/password-reset/request", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email: "safe-errors@example.com" }),
+  });
+  const unknownReset = await app.request("/api/auth/password-reset/request", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email: "not-a-user@example.com" }),
+  });
+  assertEquals(knownReset.status, unknownReset.status);
+  assertEquals(knownReset.status, 202);
+  assertEquals(await knownReset.text(), await unknownReset.text());
+
+  const resetMessage = mailer.messages.findLast((message) => message.kind === "password_reset");
+  assertExists(resetMessage);
+  assertStringIncludes(resetMessage.url, "/reset-password#token=");
+  const resetToken = resetMessage.token;
+  assertExists(resetToken);
+  const expiredReset = "reset_expired_contract_token_0000000000000";
+  await repository.createIdentityToken(
+    signed.user.id,
+    "password_reset",
+    await sha256(expiredReset),
+    new Date(Date.now() - 1_000).toISOString(),
+  );
+  const resetRequest = (token: string) =>
+    app.request("/api/auth/password-reset", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token, password: "replacement correct horse battery" }),
+    });
+  assertEquals((await resetRequest(resetToken)).status, 204);
+  for (
+    const token of [
+      "reset_invalid_contract_token_0000000000000",
+      expiredReset,
+      resetToken,
+    ]
+  ) {
+    const response = await resetRequest(token);
+    assertEquals(response.status, 400);
+    assertEquals(await json(response), {
+      error: {
+        code: "invalid_identity_token",
+        message: "Reset token is invalid or expired",
+      },
+    });
+  }
 });
 
 Deno.test("email verification defaults off and SMTP failures do not break identity requests", async () => {
@@ -988,6 +1222,11 @@ Deno.test("email verification defaults off and SMTP failures do not break identi
     })).status,
     202,
   );
+  await waitFor(async () =>
+    (await repository.listAudit()).data.some((event) =>
+      event.action === "identity.password_reset_delivery_failed"
+    )
+  );
   assertEquals(
     (await app.request("/api/auth/password-reset/request", {
       method: "POST",
@@ -996,12 +1235,104 @@ Deno.test("email verification defaults off and SMTP failures do not break identi
     })).status,
     202,
   );
-  assertEquals(
-    (await repository.listAudit()).data.some((event) =>
-      event.action === "identity.password_reset_delivery_failed"
-    ),
-    true,
+  const deliveryFailure = (await repository.listAudit()).data.find((event) =>
+    event.action === "identity.password_reset_delivery_failed"
   );
+  assertExists(deliveryFailure);
+  assertEquals(deliveryFailure.actorId, null);
+  assertEquals(deliveryFailure.targetId, signed.user.id);
+});
+
+Deno.test("password reset acceptance never awaits identity delivery", async () => {
+  let deliveryStarted = false;
+  let releaseDelivery!: () => void;
+  const deliveryGate = new Promise<void>((resolve) => {
+    releaseDelivery = resolve;
+  });
+  const blockedMailer: IdentityMailer = {
+    send: () => {
+      deliveryStarted = true;
+      return deliveryGate;
+    },
+  };
+  const { app, drainIdentityDeliveries } = createApp({
+    setupToken: "async-reset-delivery",
+    mailer: blockedMailer,
+  });
+  assertEquals(
+    (await app.request("/api/setup/bootstrap", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-setup-token": "async-reset-delivery",
+      },
+      body: JSON.stringify({
+        email: "async-reset@example.com",
+        password: "correct horse battery",
+        name: "Async Reset",
+      }),
+    })).status,
+    201,
+  );
+  const accepted = await Promise.race([
+    app.request("/api/auth/password-reset/request", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "async-reset@example.com" }),
+    }),
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), 1_000)),
+  ]);
+  assertExists(accepted);
+  assertEquals(accepted.status, 202);
+  await waitFor(() => deliveryStarted);
+  let drained = false;
+  const draining = drainIdentityDeliveries().then(() => {
+    drained = true;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assertEquals(drained, false);
+  releaseDelivery();
+  await draining;
+  assertEquals(drained, true);
+});
+
+Deno.test("timed-out identity delivery drains and records a durable failure audit", async () => {
+  const blockedMailer: IdentityMailer = { send: () => new Promise(() => {}) };
+  const { app, repository, drainIdentityDeliveries } = createApp({
+    setupToken: "timed-out-reset-delivery",
+    mailer: blockedMailer,
+    identityDeliveryTimeoutMs: 5,
+  });
+  const created = await app.request("/api/setup/bootstrap", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-setup-token": "timed-out-reset-delivery",
+    },
+    body: JSON.stringify({
+      email: "timed-out-reset@example.com",
+      password: "correct horse battery",
+      name: "Timed Out Reset",
+    }),
+  });
+  assertEquals(created.status, 201);
+  const user = (await created.json()).user as { id: string };
+
+  assertEquals(
+    (await app.request("/api/auth/password-reset/request", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "timed-out-reset@example.com" }),
+    })).status,
+    202,
+  );
+  await drainIdentityDeliveries();
+  const failure = (await repository.listAudit()).data.find((event) =>
+    event.action === "identity.password_reset_delivery_outcome_unknown"
+  );
+  assertExists(failure);
+  assertEquals(failure.actorId, null);
+  assertEquals(failure.targetId, user.id);
 });
 
 Deno.test("bootstrap is consumed once under concurrent requests", async () => {
@@ -1269,6 +1600,61 @@ Deno.test("authentication rate limits isolate account identities behind one prox
   assertEquals(keys[1], "auth:client:untrusted-deployment");
   assertEquals(keys[1], keys[3]);
   assertEquals(keys[1], keys[5]);
+});
+
+Deno.test("identity token rate limits isolate token digests behind one proxy", async () => {
+  const keys: string[] = [];
+  const limiter: RateLimiter = {
+    consume: (key, limit) => {
+      keys.push(key);
+      return Promise.resolve({ allowed: true, limit, remaining: limit - 1, retryAfterSeconds: 60 });
+    },
+    health: () => Promise.resolve(true),
+    close: () => Promise.resolve(),
+  };
+  const { app } = createApp({ rateLimiter: limiter });
+  const verify = (token: string) =>
+    app.request("/api/auth/verify-email", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token }),
+    });
+  await verify("verify_first_identity_token_0000000000000000");
+  await verify("verify_second_identity_token_000000000000000");
+  assertEquals(keys.length, 4);
+  assertEquals(keys[0].startsWith("auth:account:token:"), true);
+  assertEquals(keys[2].startsWith("auth:account:token:"), true);
+  assertEquals(keys[0] === keys[2], false);
+  assertEquals(keys[1], keys[3]);
+});
+
+Deno.test("verification resend rate limits isolate session identities behind one proxy", async () => {
+  const keys: string[] = [];
+  const limiter: RateLimiter = {
+    consume: (key, limit) => {
+      keys.push(key);
+      return Promise.resolve({ allowed: true, limit, remaining: limit - 1, retryAfterSeconds: 60 });
+    },
+    health: () => Promise.resolve(true),
+    close: () => Promise.resolve(),
+  };
+  const { app } = createApp({ rateLimiter: limiter, trustProxyHeaders: true });
+  for (const session of ["first-session-token", "second-session-token"]) {
+    await app.request("/api/auth/verify-email/request", {
+      method: "POST",
+      headers: {
+        cookie: `dg_session=${session}`,
+        "x-real-ip": "198.51.100.44",
+      },
+    });
+  }
+  assertEquals(keys.length, 4);
+  assertEquals(keys[0].startsWith("auth:account:session:"), true);
+  assertEquals(keys[2].startsWith("auth:account:session:"), true);
+  assertEquals(keys[0] === keys[2], false);
+  assertEquals(keys[1], "auth:client:198.51.100.44");
+  assertEquals(keys[1], keys[3]);
+  assertEquals(keys.some((key) => key.includes("unknown-account")), false);
 });
 
 Deno.test("trusted clients consume both account and higher client auth buckets", async () => {

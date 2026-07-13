@@ -1120,8 +1120,22 @@ export class PostgresRepository implements DomainRepository {
     tokenHash: string,
     expiresAt: string,
   ) {
-    await this
-      .#sql`INSERT INTO identity_tokens(user_id,purpose,token_hash,expires_at) VALUES(${userId},${purpose},${tokenHash},${expiresAt})`;
+    const rows = await this.#sql<{ user_id: string }[]>`
+      INSERT INTO identity_tokens(user_id,purpose,token_hash,expires_at)
+      VALUES(${userId},${purpose},${tokenHash},${expiresAt})
+      ON CONFLICT(token_hash) DO UPDATE SET token_hash=EXCLUDED.token_hash
+      WHERE identity_tokens.user_id=EXCLUDED.user_id
+        AND identity_tokens.purpose=EXCLUDED.purpose
+        AND identity_tokens.consumed_at IS NULL
+      RETURNING user_id
+    `;
+    if (!rows[0]) {
+      throw new DomainError(
+        "identity_token_conflict",
+        "Identity token registration conflicts with existing authority",
+        409,
+      );
+    }
   }
   async verifyEmail(tokenHash: string) {
     return await this.#sql.begin(async (tx) => {
@@ -1144,7 +1158,6 @@ export class PostgresRepository implements DomainRepository {
         UPDATE auth_users SET email_verified=true,updated_at=now()
         WHERE id=${String(tokens[0].user_id)}
       `;
-      await tx`DELETE FROM auth_sessions WHERE user_id=${String(tokens[0].user_id)}`;
       return user(rows[0]);
     });
   }
@@ -1356,14 +1369,10 @@ export class PostgresRepository implements DomainRepository {
       const updated = await tx<
         Row[]
       >`UPDATE users SET approval_status=${status},balance_micros=${balance},updated_at=now() WHERE id=${id} RETURNING *`;
-      if (status === "approved") {
-        await tx`UPDATE sessions SET invalidated_at=now()
-          WHERE user_id=${id} AND limited=true AND invalidated_at IS NULL`;
-        await tx`DELETE FROM auth_sessions WHERE user_id=${id} AND limited=true`;
-      }
       if (status === "rejected") {
-        await tx`UPDATE sessions SET invalidated_at=now() WHERE user_id=${id} AND invalidated_at IS NULL`;
-        await tx`DELETE FROM auth_sessions WHERE user_id=${id}`;
+        await tx`UPDATE sessions SET invalidated_at=now()
+          WHERE user_id=${id} AND limited=false AND invalidated_at IS NULL`;
+        await tx`DELETE FROM auth_sessions WHERE user_id=${id} AND limited=false`;
         await tx`UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,now()) WHERE user_id=${id}`;
       }
       return user(updated[0]);

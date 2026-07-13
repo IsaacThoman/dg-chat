@@ -7,6 +7,8 @@ export const demoUser: User = {
   role: "admin",
   status: "approved",
   balance: 4.82,
+  limited: false,
+  emailVerifiedAt: "2026-01-01T00:00:00.000Z",
 };
 export const demoConversations: Conversation[] = [
   {
