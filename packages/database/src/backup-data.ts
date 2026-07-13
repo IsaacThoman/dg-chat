@@ -1,7 +1,8 @@
 import postgres from "npm:postgres@3.4.7";
 import type { ProviderCredentialEnvelope } from "./repository.ts";
 
-export const BACKUP_DATA_SCHEMA_VERSION = "0032" as const;
+export const BACKUP_DATA_SCHEMA_VERSION = "0033" as const;
+const PREVIOUS_BACKUP_DATA_SCHEMA_VERSION = "0032" as const;
 const LEGACY_BACKUP_DATA_SCHEMA_VERSION = "0028" as const;
 export const LEGACY_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
   new Set([
@@ -14,7 +15,8 @@ export const LEGACY_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
   ]),
 );
 export function isSupportedBackupDataSchemaVersion(value: string): boolean {
-  return value === BACKUP_DATA_SCHEMA_VERSION || value === LEGACY_BACKUP_DATA_SCHEMA_VERSION;
+  return value === BACKUP_DATA_SCHEMA_VERSION || value === PREVIOUS_BACKUP_DATA_SCHEMA_VERSION ||
+    value === LEGACY_BACKUP_DATA_SCHEMA_VERSION;
 }
 export const BACKUP_DATA_BATCH_SIZE = 100;
 export const BACKUP_DATA_MAX_BATCH_SIZE = 500;
@@ -231,10 +233,12 @@ export const BACKUP_DATA_TABLES: readonly BackupDataTable[] = Object.freeze([
   T("access_group_tokens", "group_id token_id user_id", "group_id,token_id"),
   T(
     "attachments",
-    "id owner_id object_key filename mime_type size_bytes sha256 state created_at inspection_error updated_at deleted_at ingestion_status ingestion_error ingested_at",
+    "id owner_id object_key filename mime_type size_bytes sha256 width height state created_at inspection_error updated_at deleted_at ingestion_status ingestion_error ingested_at",
     "id",
     {
       size_bytes: "bigint",
+      width: "integer",
+      height: "integer",
     },
   ),
   T(
@@ -294,7 +298,12 @@ export const BACKUP_DATA_TABLES: readonly BackupDataTable[] = Object.freeze([
       metadata: "json",
     },
   ),
-  T("message_attachments", "message_id attachment_id", "message_id,attachment_id"),
+  T(
+    "message_attachments",
+    "message_id attachment_id position",
+    "message_id,position,attachment_id",
+    { position: "integer" },
+  ),
   T(
     "knowledge_collections",
     "id owner_id name description idempotency_key version created_at updated_at deleted_at",
@@ -679,6 +688,7 @@ export const BACKUP_EPHEMERAL_TABLES = Object.freeze(
     "auth_verifications",
     "identity_tokens",
     "operation_idempotency",
+    "conversation_portability_imports",
     "api_idempotency_events",
     "api_idempotency_requests",
     "generation_controls",
@@ -880,6 +890,23 @@ function exactSourceRow(
   value: unknown,
   schemaVersion: string,
 ): Record<string, unknown> {
+  if (
+    schemaVersion !== BACKUP_DATA_SCHEMA_VERSION && definition.name === "attachments" && value &&
+    typeof value === "object" && !Array.isArray(value) && !("width" in value) &&
+    !("height" in value)
+  ) {
+    return exactRow(definition, {
+      ...(value as Record<string, unknown>),
+      width: null,
+      height: null,
+    });
+  }
+  if (
+    schemaVersion !== BACKUP_DATA_SCHEMA_VERSION && definition.name === "message_attachments" &&
+    value && typeof value === "object" && !Array.isArray(value) && !("position" in value)
+  ) {
+    return exactRow(definition, { ...(value as Record<string, unknown>), position: null });
+  }
   if (
     schemaVersion === LEGACY_BACKUP_DATA_SCHEMA_VERSION && definition.name === "conversations" &&
     value && typeof value === "object" && !Array.isArray(value) &&
@@ -1478,6 +1505,16 @@ async function applyBackupData(
         suffix,
         options.objectKeyMap ?? new Map(),
       );
+      if (source.schemaVersion !== BACKUP_DATA_SCHEMA_VERSION) {
+        const legacyLinks = safeIdentifier(stage.get("message_attachments")!);
+        await tx.unsafe(`WITH ranked AS (
+          SELECT message_id,attachment_id,
+            row_number() OVER(PARTITION BY message_id ORDER BY attachment_id)-1 position
+          FROM ${legacyLinks}
+        ) UPDATE ${legacyLinks} links SET position=ranked.position
+          FROM ranked WHERE ranked.message_id=links.message_id
+            AND ranked.attachment_id=links.attachment_id`);
+      }
       await validateStagedDatabase(tx, stage);
       const [redacted] = await tx.unsafe<{ count: number }[]>(
         `SELECT count(*)::int count FROM ${

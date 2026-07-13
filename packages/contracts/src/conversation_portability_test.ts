@@ -61,6 +61,7 @@ function fixture() {
       createdAt: NOW,
       updatedAt: NOW,
       folderId: IDS.folder,
+      folderPosition: 0,
       tagIds: [IDS.tag],
       messages: [{
         id: IDS.root,
@@ -141,6 +142,7 @@ Deno.test("conversation portability v1 rejects dangling and cross-conversation m
     id: IDS.otherConversation,
     activeLeafId: null,
     folderId: null,
+    folderPosition: null,
     tagIds: [],
     messages: [],
   });
@@ -166,6 +168,7 @@ Deno.test("conversation portability v1 rejects supersession cycles and archive-w
     id: IDS.otherConversation,
     activeLeafId: IDS.root,
     folderId: null,
+    folderPosition: null,
     tagIds: [],
     messages: [structuredClone(collision.conversations[0].messages[0])],
   });
@@ -236,6 +239,14 @@ Deno.test("conversation portability v1 requires deterministic folder and attachm
   const attachmentGap: any = fixture();
   attachmentGap.conversations[0].messages[0].attachments[0].position = 1;
   assertEquals(conversationPortabilityV1Schema.safeParse(attachmentGap).success, false);
+
+  const missingMembershipPosition: any = fixture();
+  missingMembershipPosition.conversations[0].folderPosition = null;
+  assertEquals(conversationPortabilityV1Schema.safeParse(missingMembershipPosition).success, false);
+
+  const membershipGap: any = fixture();
+  membershipGap.conversations[0].folderPosition = 1;
+  assertEquals(conversationPortabilityV1Schema.safeParse(membershipGap).success, false);
 });
 
 Deno.test("conversation portability v1 rejects invalid supersession and duplicate attachment ordering", () => {

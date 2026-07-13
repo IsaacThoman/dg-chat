@@ -150,6 +150,7 @@ const conversationSchema = z.object({
   createdAt: timestamp,
   updatedAt: timestamp,
   folderId: id.nullable(),
+  folderPosition: z.number().int().nonnegative().nullable(),
   tagIds: z.array(id).max(DGCHAT_LIMITS.tagsPerConversation).refine(
     (ids) => new Set(ids).size === ids.length,
     "Conversation tag identifiers must be unique",
@@ -187,6 +188,13 @@ export const conversationPortabilityV1Schema = z.object({
     const base = ["conversations", conversationIndex];
     if (conversation.folderId !== null && !folderIds.has(conversation.folderId)) {
       addIssue(context, [...base, "folderId"], "Conversation references a missing folder");
+    }
+    if ((conversation.folderId === null) !== (conversation.folderPosition === null)) {
+      addIssue(
+        context,
+        [...base, "folderPosition"],
+        "Folder position must be present exactly when a folder is assigned",
+      );
     }
     for (const [tagIndex, tagId] of conversation.tagIds.entries()) {
       if (!tagIds.has(tagId)) {
@@ -327,6 +335,18 @@ export const conversationPortabilityV1Schema = z.object({
       addIssue(context, [...base, "activeLeafId"], "Active leaf references a missing message");
     } else if ((childCounts.get(conversation.activeLeafId) ?? 0) !== 0) {
       addIssue(context, [...base, "activeLeafId"], "Active leaf must not have child messages");
+    }
+  }
+
+  for (const folderId of folderIds) {
+    const positions = archive.conversations.filter((value) => value.folderId === folderId)
+      .map((value) => value.folderPosition!).sort((a, b) => a - b);
+    if (positions.some((value, index) => value !== index)) {
+      addIssue(
+        context,
+        ["conversations"],
+        "Folder membership positions must be contiguous from zero",
+      );
     }
   }
 

@@ -232,6 +232,13 @@
       "when": 1783656032000,
       "tag": "0032_temporary_conversation_lifecycle",
       "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1783656033000,
+      "tag": "0033_conversation_portability",
+      "breakpoints": true
     }
   ]
 }

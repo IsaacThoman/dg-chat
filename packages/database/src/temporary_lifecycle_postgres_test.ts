@@ -31,7 +31,7 @@ Deno.test({
         undefined,
         1,
       );
-      const expired = await repo.createConversation(owner.id, "expired", true, undefined, 1);
+      const expired = await repo.createConversation(owner.id, "expired", true, "expired-replay", 1);
       const later = await repo.createConversation(owner.id, "later", true, undefined, 1);
       const foreign = await repo.createConversation(other.id, "foreign", true, undefined, 1);
       assertEquals(promotedCandidate.temporaryExpiresAt !== null, true);
@@ -89,6 +89,28 @@ Deno.test({
       assertEquals((await repo.detail(later.id, owner.id)).id, later.id);
       assertEquals((await repo.detail(foreign.id, other.id)).id, foreign.id);
       assertEquals((await repo.detail(promoted.id, owner.id)).temporary, false);
+      assertEquals(
+        (await repo.listAudit({
+          action: "conversation.temporary_kept",
+          targetId: promoted.id,
+        })).data.length,
+        1,
+      );
+      const recreated = await repo.createConversation(
+        owner.id,
+        "expired",
+        true,
+        "expired-replay",
+        1,
+      );
+      assertEquals(recreated.id === expired.id, false);
+      assertEquals(
+        (await repo.listAudit({
+          action: "conversation.temporary_purged",
+          targetId: expired.id,
+        })).data.length,
+        1,
+      );
     } finally {
       await sql`DELETE FROM attachments WHERE owner_id IN (${owner.id},${other.id})`;
       await sql`DELETE FROM users WHERE id IN (${owner.id},${other.id})`;

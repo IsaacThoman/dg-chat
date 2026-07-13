@@ -1,9 +1,10 @@
 import postgres from "npm:postgres@3.4.7";
-import { isModelCapability } from "@dg-chat/contracts";
+import { isModelCapability, parseConversationPortabilityV1 } from "@dg-chat/contracts";
 import type {
   AccountState,
   ConversationFolder,
   ConversationFolderMembership,
+  ConversationPortabilityV1,
   ConversationTag,
   ConversationTagBinding,
   ConversationTagSet,
@@ -14,6 +15,7 @@ import type {
 } from "@dg-chat/contracts";
 import { DomainError } from "./memory.ts";
 import { INGESTIBLE_DOCUMENT_MIME_TYPES, isIngestibleDocumentMime } from "./attachment-policy.ts";
+import { canonicalJson, sha256Hex } from "./backup-format.ts";
 import {
   apiResponseBodyByteLength,
   canonicalWorkspaceName,
@@ -55,6 +57,8 @@ import type {
   CompleteApiRequestInput,
   CompleteGenerationInput,
   ConversationPatch,
+  ConversationPortabilityExportOptions,
+  ConversationPortabilityImportResult,
   CreateAccessGroupInput,
   CreateApiTokenInput,
   CreateAttachmentInput,
@@ -1402,18 +1406,25 @@ export class PostgresRepository implements DomainRepository {
     });
   }
   async promoteTemporaryConversation(ownerId: string, id: string, expectedVersion: number) {
-    const rows = await this.#sql<Row[]>`UPDATE conversations
-      SET temporary=false,temporary_expires_at=NULL,version=version+1,updated_at=now()
-      WHERE id=${id} AND owner_id=${ownerId} AND version=${expectedVersion} AND temporary=true
-      RETURNING *`;
-    if (rows[0]) return conversation(rows[0]);
-    const existing = await this.#sql<Row[]>`SELECT version,temporary FROM conversations
-      WHERE id=${id} AND owner_id=${ownerId}`;
-    if (!existing[0]) throw new DomainError("not_found", "Conversation not found", 404);
-    if (number(existing[0].version) !== expectedVersion) {
-      throw new DomainError("version_conflict", "Conversation changed in another request", 409);
-    }
-    throw new DomainError("not_temporary", "Conversation is already saved", 409);
+    return await this.#sql.begin(async (tx) => {
+      const rows = await tx<Row[]>`UPDATE conversations
+        SET temporary=false,temporary_expires_at=NULL,version=version+1,updated_at=now()
+        WHERE id=${id} AND owner_id=${ownerId} AND version=${expectedVersion} AND temporary=true
+        RETURNING *`;
+      if (rows[0]) {
+        await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+          VALUES(${ownerId},'conversation.temporary_kept','conversation',${id},
+            ${tx.json({ source: "temporary_lifecycle" })})`;
+        return conversation(rows[0]);
+      }
+      const existing = await tx<Row[]>`SELECT version,temporary FROM conversations
+        WHERE id=${id} AND owner_id=${ownerId}`;
+      if (!existing[0]) throw new DomainError("not_found", "Conversation not found", 404);
+      if (number(existing[0].version) !== expectedVersion) {
+        throw new DomainError("version_conflict", "Conversation changed in another request", 409);
+      }
+      throw new DomainError("not_temporary", "Conversation is already saved", 409);
+    });
   }
   async purgeExpiredTemporaryConversations(input: PurgeTemporaryConversationsInput) {
     const limit = input.limit ?? 100;
@@ -1425,13 +1436,33 @@ export class PostgresRepository implements DomainRepository {
       throw new DomainError("validation_error", "Invalid purge cutoff", 422);
     }
     return await this.#sql.begin(async (tx) => {
-      const selected = await tx<Row[]>`SELECT id FROM conversations
-        WHERE owner_id=${input.ownerId} AND temporary=true AND temporary_expires_at<=${cutoff}
-        ORDER BY temporary_expires_at,id FOR UPDATE SKIP LOCKED LIMIT ${limit}`;
+      const selected = input.ownerId
+        ? await tx<Row[]>`SELECT id,owner_id FROM conversations
+          WHERE owner_id=${input.ownerId} AND temporary=true AND temporary_expires_at<=${cutoff}
+          ORDER BY temporary_expires_at,id FOR UPDATE SKIP LOCKED LIMIT ${limit}`
+        : await tx<Row[]>`SELECT id,owner_id FROM conversations
+          WHERE temporary=true AND temporary_expires_at<=${cutoff}
+          ORDER BY temporary_expires_at,id FOR UPDATE SKIP LOCKED LIMIT ${limit}`;
       const conversationIds = selected.map((row) => String(row.id));
       if (conversationIds.length) {
-        await tx`DELETE FROM conversations WHERE owner_id=${input.ownerId}
-          AND id=ANY(${conversationIds}::uuid[]) AND temporary=true AND temporary_expires_at<=${cutoff}`;
+        for (const row of selected) {
+          await tx`DELETE FROM operation_idempotency
+            WHERE owner_id=${String(row.owner_id)} AND operation='conversation.create'
+              AND result_id=${String(row.id)}`;
+        }
+        if (input.ownerId) {
+          await tx`DELETE FROM conversations WHERE owner_id=${input.ownerId}
+            AND id=ANY(${conversationIds}::uuid[]) AND temporary=true
+            AND temporary_expires_at<=${cutoff}`;
+        } else {
+          await tx`DELETE FROM conversations WHERE id=ANY(${conversationIds}::uuid[])
+            AND temporary=true AND temporary_expires_at<=${cutoff}`;
+        }
+        for (const row of selected) {
+          await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+            VALUES(NULL,'conversation.temporary_purged','conversation',${String(row.id)},
+              ${tx.json({ source: "temporary_lifecycle", ownerId: String(row.owner_id) })})`;
+        }
       }
       return { conversationIds };
     });
@@ -1507,6 +1538,329 @@ export class PostgresRepository implements DomainRepository {
       rows = await this.#sql<Row[]>`SELECT * FROM user_preferences WHERE user_id=${ownerId}`;
     }
     return preferences(rows[0]);
+  }
+  async exportConversationPortability(
+    ownerId: string,
+    options: ConversationPortabilityExportOptions = {},
+  ): Promise<ConversationPortabilityV1> {
+    return await this.#sql.begin("isolation level repeatable read", async (tx) => {
+      const preferenceRows = await tx<
+        Row[]
+      >`SELECT * FROM user_preferences WHERE user_id=${ownerId}`;
+      if (!preferenceRows[0]) {
+        const exists = await tx`SELECT 1 FROM users WHERE id=${ownerId}`;
+        if (!exists.length) throw new DomainError("not_found", "User not found", 404);
+        await tx`INSERT INTO user_preferences(user_id) VALUES(${ownerId}) ON CONFLICT DO NOTHING`;
+      }
+      const preference = preferences(
+        (await tx<Row[]>`SELECT * FROM user_preferences WHERE user_id=${ownerId}`)[0],
+      );
+      const conversationRows = await tx<Row[]>`SELECT * FROM conversations
+        WHERE owner_id=${ownerId}
+          AND (${Boolean(options.includeTemporary)} OR temporary=false)
+          AND (${Boolean(options.includeDeleted)} OR deleted_at IS NULL)
+        ORDER BY created_at,id`;
+      const conversationIds = conversationRows.map((row) => String(row.id));
+      const messageRows = conversationIds.length
+        ? await tx<
+          Row[]
+        >`SELECT * FROM messages WHERE conversation_id=ANY(${conversationIds}::uuid[])
+            ORDER BY created_at,id`
+        : [];
+      if (messageRows.some((row) => row.status === "streaming")) {
+        throw new DomainError(
+          "export_in_progress",
+          "Finish or stop active generations before exporting conversations",
+          409,
+        );
+      }
+      const messageIds = messageRows.map((row) => String(row.id));
+      const linkRows = messageIds.length
+        ? await tx<Row[]>`SELECT ma.message_id,ma.attachment_id FROM message_attachments ma
+            WHERE ma.message_id=ANY(${messageIds}::uuid[]) ORDER BY ma.message_id,ma.position`
+        : [];
+      const attachmentIds = [...new Set(linkRows.map((row) => String(row.attachment_id)))];
+      const attachmentRows = attachmentIds.length
+        ? await tx<Row[]>`SELECT * FROM attachments WHERE owner_id=${ownerId}
+            AND id=ANY(${attachmentIds}::uuid[]) ORDER BY id`
+        : [];
+      if (attachmentRows.length !== attachmentIds.length) {
+        throw new DomainError("invalid_attachment", "Conversation attachment is unavailable", 409);
+      }
+      const membershipRows = conversationIds.length
+        ? await tx<Row[]>`SELECT * FROM conversation_folder_memberships WHERE owner_id=${ownerId}
+            AND conversation_id=ANY(${conversationIds}::uuid[]) ORDER BY folder_id,position`
+        : [];
+      const folderIds = [...new Set(membershipRows.map((row) => String(row.folder_id)))];
+      const folderRows = folderIds.length
+        ? await tx<Row[]>`SELECT * FROM conversation_folders WHERE owner_id=${ownerId}
+            AND id=ANY(${folderIds}::uuid[]) ORDER BY position,id`
+        : [];
+      const bindingRows = conversationIds.length
+        ? await tx<Row[]>`SELECT * FROM conversation_tag_bindings WHERE owner_id=${ownerId}
+            AND conversation_id=ANY(${conversationIds}::uuid[]) ORDER BY conversation_id,tag_id`
+        : [];
+      const tagIds = [...new Set(bindingRows.map((row) => String(row.tag_id)))];
+      const tagRows = tagIds.length
+        ? await tx<Row[]>`SELECT * FROM conversation_tags WHERE owner_id=${ownerId}
+            AND id=ANY(${tagIds}::uuid[]) ORDER BY normalized_name,id`
+        : [];
+      return parseConversationPortabilityV1({
+        format: "dgchat.owner-export",
+        version: 1,
+        scope: "owner",
+        exportedAt: new Date().toISOString(),
+        preferences: {
+          theme: preference.theme,
+          compactConversations: preference.compactConversations,
+          reduceMotion: preference.reduceMotion,
+          customInstructions: preference.customInstructions,
+          useMemory: preference.useMemory,
+          saveHistory: preference.saveHistory,
+          preferredModelId: preference.preferredModelId,
+        },
+        folders: folderRows.map((row, position) => ({
+          id: String(row.id),
+          name: String(row.name),
+          position,
+          createdAt: iso(row.created_at),
+          updatedAt: iso(row.updated_at),
+        })),
+        tags: tagRows.map((row) => ({
+          id: String(row.id),
+          name: String(row.name),
+          color: String(row.color),
+          createdAt: iso(row.created_at),
+          updatedAt: iso(row.updated_at),
+        })),
+        attachments: attachmentRows.map((row) => ({
+          id: String(row.id),
+          filename: String(row.filename),
+          mimeType: String(row.mime_type),
+          byteSize: number(row.size_bytes),
+          sha256: String(row.sha256),
+          width: row.width == null ? null : number(row.width),
+          height: row.height == null ? null : number(row.height),
+          createdAt: iso(row.created_at),
+          content: { included: false },
+        })),
+        conversations: conversationRows.map((row) => {
+          const id = String(row.id);
+          const membership = membershipRows.find((item) => String(item.conversation_id) === id);
+          return {
+            id,
+            title: String(row.title),
+            activeLeafId: row.active_leaf_id == null ? null : String(row.active_leaf_id),
+            pinned: Boolean(row.pinned),
+            temporary: Boolean(row.temporary),
+            archivedAt: nullableIso(row.archived_at),
+            deletedAt: nullableIso(row.deleted_at),
+            createdAt: iso(row.created_at),
+            updatedAt: iso(row.updated_at),
+            folderId: membership ? String(membership.folder_id) : null,
+            folderPosition: membership ? number(membership.position) : null,
+            tagIds: bindingRows.filter((item) => String(item.conversation_id) === id)
+              .map((item) => String(item.tag_id)),
+            messages: messageRows.filter((item) => String(item.conversation_id) === id).map(
+              (item) => {
+                const messageId = String(item.id);
+                return {
+                  id: messageId,
+                  parentId: item.parent_id == null ? null : String(item.parent_id),
+                  supersedesId: item.supersedes_id == null ? null : String(item.supersedes_id),
+                  generationId: item.generation_id == null ? null : String(item.generation_id),
+                  siblingIndex: number(item.sibling_index),
+                  role: String(item.role),
+                  content: String(item.content),
+                  model: item.model == null ? null : String(item.model),
+                  status: String(item.status),
+                  metadata: item.metadata ?? {},
+                  attachments: linkRows.filter((link) => String(link.message_id) === messageId)
+                    .map((link, position) => ({
+                      attachmentId: String(link.attachment_id),
+                      position,
+                    })),
+                  createdAt: iso(item.created_at),
+                };
+              },
+            ),
+          };
+        }),
+      });
+    });
+  }
+
+  async importConversationPortability(
+    ownerId: string,
+    input: ConversationPortabilityV1,
+    idempotencyKey: string,
+    dryRun = false,
+  ): Promise<ConversationPortabilityImportResult> {
+    if (!idempotencyKey || idempotencyKey.length > 200) {
+      throw new DomainError("validation_error", "Import idempotency key is invalid", 422);
+    }
+    const archive = parseConversationPortabilityV1(input);
+    const payloadHash = await sha256Hex(new TextEncoder().encode(canonicalJson(archive)));
+    const allocateIds = () => {
+      const idMap: Record<string, string> = {};
+      const allocate = (id: string) => idMap[id] ??= crypto.randomUUID();
+      for (const value of archive.folders) allocate(value.id);
+      for (const value of archive.tags) allocate(value.id);
+      for (const value of archive.attachments) allocate(value.id);
+      for (const value of archive.conversations) {
+        allocate(value.id);
+        for (const node of value.messages) {
+          allocate(node.id);
+          if (node.generationId) allocate(node.generationId);
+        }
+      }
+      return idMap;
+    };
+    const summary = (idMap: Record<string, string>): ConversationPortabilityImportResult => ({
+      dryRun,
+      replayed: false,
+      conversations: archive.conversations.length,
+      messages: archive.conversations.reduce((total, value) => total + value.messages.length, 0),
+      attachments: archive.attachments.length,
+      folders: archive.folders.length,
+      tags: archive.tags.length,
+      idMap,
+    });
+    if (dryRun) {
+      const exists = await this.#sql`SELECT 1 FROM users WHERE id=${ownerId}`;
+      if (!exists.length) throw new DomainError("not_found", "User not found", 404);
+      return summary(allocateIds());
+    }
+    return await this.#sql.begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-portability'),hashtext(${ownerId}))`;
+      const userRows = await tx`SELECT 1 FROM users WHERE id=${ownerId} FOR UPDATE`;
+      if (!userRows.length) throw new DomainError("not_found", "User not found", 404);
+      const prior = await tx<Row[]>`SELECT payload_hash,result FROM conversation_portability_imports
+        WHERE owner_id=${ownerId} AND idempotency_key=${idempotencyKey}`;
+      if (prior[0]) {
+        if (String(prior[0].payload_hash) !== payloadHash) {
+          throw new DomainError("idempotency_conflict", "Import replay payload differs", 409);
+        }
+        return { ...(prior[0].result as ConversationPortabilityImportResult), replayed: true };
+      }
+      const idMap = allocateIds();
+      const result = summary(idMap);
+      await tx`INSERT INTO user_preferences(
+        user_id,theme,compact_conversations,reduce_motion,custom_instructions,use_memory,
+        save_history,preferred_model_id,version,updated_at
+      ) VALUES(${ownerId},${archive.preferences.theme},${archive.preferences.compactConversations},
+        ${archive.preferences.reduceMotion},${archive.preferences.customInstructions},
+        ${archive.preferences.useMemory},${archive.preferences.saveHistory},
+        ${archive.preferences.preferredModelId},1,now())
+      ON CONFLICT(user_id) DO UPDATE SET
+        theme=excluded.theme,compact_conversations=excluded.compact_conversations,
+        reduce_motion=excluded.reduce_motion,custom_instructions=excluded.custom_instructions,
+        use_memory=excluded.use_memory,save_history=excluded.save_history,
+        preferred_model_id=excluded.preferred_model_id,
+        version=user_preferences.version+1,updated_at=now()`;
+      const folderNames = new Set((await tx<Row[]>`SELECT normalized_name FROM conversation_folders
+        WHERE owner_id=${ownerId}`).map((row) => String(row.normalized_name)));
+      const tagNames = new Set((await tx<Row[]>`SELECT normalized_name FROM conversation_tags
+        WHERE owner_id=${ownerId}`).map((row) => String(row.normalized_name)));
+      const uniqueName = (name: string, used: Set<string>, max: number) => {
+        let candidate = name.slice(0, max);
+        for (let suffix = 2; used.has(canonicalWorkspaceName(candidate)); suffix++) {
+          const marker = ` (import ${suffix})`;
+          candidate = `${name.slice(0, max - marker.length)}${marker}`;
+        }
+        used.add(canonicalWorkspaceName(candidate));
+        return candidate;
+      };
+      const offsets = await tx<{ next: number }[]>`SELECT COALESCE(max(position)+1,0)::int next
+        FROM conversation_folders WHERE owner_id=${ownerId}`;
+      for (const value of archive.folders) {
+        const name = uniqueName(value.name, folderNames, 120);
+        await tx`INSERT INTO conversation_folders(
+          id,owner_id,name,normalized_name,position,version,membership_version,created_at,updated_at
+        ) VALUES(${idMap[value.id]},${ownerId},${name},${canonicalWorkspaceName(name)},
+          ${offsets[0].next + value.position},1,0,${value.createdAt},${value.updatedAt})`;
+      }
+      for (const value of archive.tags) {
+        const name = uniqueName(value.name, tagNames, 64);
+        await tx`INSERT INTO conversation_tags(
+          id,owner_id,name,normalized_name,color,version,created_at,updated_at
+        ) VALUES(${idMap[value.id]},${ownerId},${name},${
+          canonicalWorkspaceName(name)
+        },${value.color},
+          1,${value.createdAt},${value.updatedAt})`;
+      }
+      const importedAt = new Date().toISOString();
+      for (const value of archive.attachments) {
+        const id = idMap[value.id];
+        await tx`INSERT INTO attachments(
+          id,owner_id,object_key,filename,mime_type,size_bytes,sha256,state,inspection_error,
+          ingestion_status,ingestion_error,width,height,created_at,updated_at,deleted_at
+        ) VALUES(${id},${ownerId},${`imports/${ownerId}/${id}/manifest-only`},${value.filename},
+          ${value.mimeType},${value.byteSize},${value.sha256},'failed',
+          'Attachment bytes were not included in the .dgchat manifest','failed',
+          'Attachment bytes require a separate restore',${value.width},${value.height},
+          ${value.createdAt},${importedAt},${importedAt})`;
+      }
+      const foldersWithMemberships = new Set<string>();
+      for (const value of archive.conversations) {
+        const conversationId = idMap[value.id];
+        const temporaryExpiresAt = value.temporary
+          ? new Date(Date.now() + 30 * 86_400_000).toISOString()
+          : null;
+        await tx`INSERT INTO conversations(
+          id,owner_id,title,active_leaf_id,version,pinned,temporary,temporary_expires_at,
+          archived_at,deleted_at,created_at,updated_at
+        ) VALUES(${conversationId},${ownerId},${value.title},
+          ${
+          value.activeLeafId ? idMap[value.activeLeafId] : null
+        },0,${value.pinned},${value.temporary},
+          ${temporaryExpiresAt},${value.archivedAt},${value.deletedAt},${value.createdAt},${value.updatedAt})`;
+        for (const node of value.messages) {
+          await tx`INSERT INTO messages(
+            id,conversation_id,parent_id,supersedes_id,generation_id,sibling_index,role,content,
+            model,status,metadata,idempotency_key,created_at
+          ) VALUES(${idMap[node.id]},${conversationId},${
+            node.parentId ? idMap[node.parentId] : null
+          },
+            ${node.supersedesId ? idMap[node.supersedesId] : null},
+            ${
+            node.generationId ? idMap[node.generationId] : null
+          },${node.siblingIndex},${node.role},
+            ${node.content},${node.model},${node.status},
+            ${
+            tx.json(node.metadata as postgres.JSONValue)
+          },${`import:${node.id}`},${node.createdAt})`;
+          for (const link of [...node.attachments].sort((a, b) => a.position - b.position)) {
+            await tx`INSERT INTO message_attachments(message_id,attachment_id,position)
+              VALUES(${idMap[node.id]},${idMap[link.attachmentId]},${link.position})`;
+          }
+        }
+        if (value.folderId) {
+          const folderId = idMap[value.folderId];
+          foldersWithMemberships.add(folderId);
+          await tx`INSERT INTO conversation_folder_memberships(
+            folder_id,conversation_id,owner_id,position,created_at,updated_at
+          ) VALUES(${folderId},${conversationId},${ownerId},${value
+            .folderPosition!},${importedAt},${importedAt})`;
+        }
+        await tx`INSERT INTO conversation_tag_sets(conversation_id,owner_id,version,updated_at)
+          VALUES(${conversationId},${ownerId},${value.tagIds.length ? 1 : 0},${importedAt})`;
+        for (const tagId of value.tagIds) {
+          await tx`INSERT INTO conversation_tag_bindings(conversation_id,tag_id,owner_id,created_at)
+            VALUES(${conversationId},${idMap[tagId]},${ownerId},${importedAt})`;
+        }
+      }
+      for (const folderId of foldersWithMemberships) {
+        await tx`UPDATE conversation_folders SET membership_version=1 WHERE id=${folderId}
+          AND owner_id=${ownerId}`;
+      }
+      await tx`INSERT INTO conversation_portability_imports(
+        owner_id,idempotency_key,payload_hash,result
+      ) VALUES(${ownerId},${idempotencyKey},${payloadHash},${
+        tx.json(result as unknown as postgres.JSONValue)
+      })`;
+      return result;
+    });
   }
   async updateUserPreferences(
     ownerId: string,
@@ -2157,10 +2511,10 @@ export class PostgresRepository implements DomainRepository {
         VALUES(${input.runId},${
         input.generationId ?? crypto.randomUUID()
       },${input.message.conversationId},${input.message.ownerId},${String(nodes[0].id)})`;
-      for (const attachmentId of attachmentIds) {
+      for (const [position, attachmentId] of attachmentIds.entries()) {
         await tx`
-          INSERT INTO message_attachments(message_id,attachment_id)
-          VALUES(${String(nodes[0].id)},${attachmentId})
+          INSERT INTO message_attachments(message_id,attachment_id,position)
+          VALUES(${String(nodes[0].id)},${attachmentId},${position})
         `;
       }
       const after = balance - input.reserveMicros;
@@ -2807,12 +3161,13 @@ export class PostgresRepository implements DomainRepository {
       const ready = await tx`SELECT id FROM attachments WHERE id=${attachmentId}
         AND owner_id=${ownerId} AND state='ready' AND deleted_at IS NULL FOR UPDATE`;
       const message = await tx`SELECT m.id FROM messages m JOIN conversations c
-        ON c.id=m.conversation_id WHERE m.id=${messageId} AND c.owner_id=${ownerId}`;
+        ON c.id=m.conversation_id WHERE m.id=${messageId} AND c.owner_id=${ownerId} FOR UPDATE OF m`;
       if (!ready.length || !message.length) {
         throw new DomainError("attachment_not_ready", "Message or ready attachment not found", 409);
       }
-      await tx`INSERT INTO message_attachments(message_id,attachment_id)
-        VALUES(${messageId},${attachmentId}) ON CONFLICT DO NOTHING`;
+      await tx`INSERT INTO message_attachments(message_id,attachment_id,position)
+        SELECT ${messageId},${attachmentId},count(*)::int FROM message_attachments
+        WHERE message_id=${messageId} ON CONFLICT DO NOTHING`;
     });
   }
 
@@ -2822,7 +3177,7 @@ export class PostgresRepository implements DomainRepository {
     if (!message.length) throw new DomainError("not_found", "Message not found", 404);
     return (await this.#sql<
       Row[]
-    >`SELECT a.* FROM attachments a JOIN message_attachments ma ON ma.attachment_id=a.id WHERE ma.message_id=${messageId} ORDER BY a.created_at,a.id`)
+    >`SELECT a.* FROM attachments a JOIN message_attachments ma ON ma.attachment_id=a.id WHERE ma.message_id=${messageId} ORDER BY ma.position`)
       .map(attachment);
   }
 

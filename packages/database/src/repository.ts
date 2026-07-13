@@ -6,6 +6,7 @@ import type {
   ConversationDetail,
   ConversationFolder,
   ConversationFolderMembership,
+  ConversationPortabilityV1,
   ConversationTag,
   ConversationTagBinding,
   ConversationTagSet,
@@ -25,6 +26,23 @@ export {
 } from "./attachment-policy.ts";
 
 export type MaybePromise<T> = T | Promise<T>;
+
+export interface ConversationPortabilityExportOptions {
+  includeTemporary?: boolean;
+  includeDeleted?: boolean;
+}
+
+export interface ConversationPortabilityImportResult {
+  dryRun: boolean;
+  replayed: boolean;
+  conversations: number;
+  messages: number;
+  attachments: number;
+  folders: number;
+  tags: number;
+  /** Old archive identifiers mapped to newly allocated owner-scoped identifiers. */
+  idMap: Record<string, string>;
+}
 
 export interface CreateUserInput {
   id?: string;
@@ -850,12 +868,11 @@ export interface ConversationPatch {
   archived?: boolean;
   deleted?: boolean;
 }
-export type LifecycleConversation = Conversation & { temporaryExpiresAt: string | null };
-export type LifecycleConversationDetail = ConversationDetail & {
-  temporaryExpiresAt: string | null;
-};
+export type LifecycleConversation = Conversation;
+export type LifecycleConversationDetail = ConversationDetail;
 export interface PurgeTemporaryConversationsInput {
-  ownerId: string;
+  /** Omit only from trusted maintenance code to purge across owners. */
+  ownerId?: string;
   limit?: number;
   /** Injectable cutoff for deterministic maintenance jobs and tests. */
   now?: string;
@@ -1588,6 +1605,16 @@ export interface DomainRepository {
     input: PurgeTemporaryConversationsInput,
   ): MaybePromise<PurgeTemporaryConversationsResult>;
   getUserPreferences(ownerId: string): MaybePromise<UserPreferences>;
+  exportConversationPortability(
+    ownerId: string,
+    options?: ConversationPortabilityExportOptions,
+  ): MaybePromise<ConversationPortabilityV1>;
+  importConversationPortability(
+    ownerId: string,
+    archive: ConversationPortabilityV1,
+    idempotencyKey: string,
+    dryRun?: boolean,
+  ): MaybePromise<ConversationPortabilityImportResult>;
   updateUserPreferences(
     ownerId: string,
     patch: UserPreferencesPatch,
