@@ -15,6 +15,7 @@ import { Link, useNavigate } from "@tanstack/react-router";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
+import { createPortal } from "react-dom";
 import {
   Activity,
   Archive,
@@ -141,6 +142,7 @@ import {
   useWorkspace,
   WorkspaceNavigation,
 } from "./workspace/WorkspaceNavigation.tsx";
+import { conversationMenuPosition } from "./workspace/conversationMenu.ts";
 import type { Attachment, AuditFilters, Conversation, Message, Model, User } from "./types.ts";
 
 type View = "chat" | "archived" | "trash" | "knowledge" | "settings" | "tokens" | "admin";
@@ -494,7 +496,7 @@ function ConversationRow(
   },
 ) {
   const [menu, setMenu] = useState(false);
-  const [menuUp, setMenuUp] = useState(false);
+  const [menuPosition, setMenuPosition] = useState({ left: 8, top: 8 });
   const [rename, setRename] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [organize, setOrganize] = useState(false);
@@ -502,13 +504,36 @@ function ConversationRow(
   const [error, setError] = useState("");
   const rowRef = useRef<HTMLDivElement>(null);
   const actionRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!menu) return;
     const dismiss = (event: PointerEvent) => {
-      if (!rowRef.current?.contains(event.target as Node)) setMenu(false);
+      if (
+        !rowRef.current?.contains(event.target as Node) &&
+        !menuRef.current?.contains(event.target as Node)
+      ) setMenu(false);
     };
+    const reposition = () => {
+      const trigger = actionRef.current?.getBoundingClientRect();
+      if (!trigger) return;
+      setMenuPosition(conversationMenuPosition(
+        trigger,
+        { width: globalThis.innerWidth, height: globalThis.innerHeight },
+        {
+          width: menuRef.current?.offsetWidth ?? 180,
+          height: menuRef.current?.offsetHeight ?? 210,
+        },
+      ));
+    };
+    reposition();
     document.addEventListener("pointerdown", dismiss);
-    return () => document.removeEventListener("pointerdown", dismiss);
+    globalThis.addEventListener("resize", reposition);
+    globalThis.addEventListener("scroll", reposition, true);
+    return () => {
+      document.removeEventListener("pointerdown", dismiss);
+      globalThis.removeEventListener("resize", reposition);
+      globalThis.removeEventListener("scroll", reposition, true);
+    };
   }, [menu]);
   const closeMenu = () => {
     setMenu(false);
@@ -564,19 +589,32 @@ function ConversationRow(
         data-conversation-actions={c.id}
         onClick={() => {
           if (!menu) {
-            const rowBottom = rowRef.current?.getBoundingClientRect().bottom ?? 0;
-            setMenuUp(rowBottom + 190 > globalThis.innerHeight);
+            const trigger = actionRef.current?.getBoundingClientRect();
+            if (trigger) {
+              setMenuPosition(conversationMenuPosition(
+                trigger,
+                { width: globalThis.innerWidth, height: globalThis.innerHeight },
+                { width: 180, height: 210 },
+              ));
+            }
           }
           setMenu(!menu);
         }}
       >
         <Ellipsis size={16} />
       </button>
-      {menu && (
+      {menu && createPortal(
         <div
-          className={cn("conversation-menu", menuUp && "menu-up")}
+          ref={menuRef}
+          className="conversation-menu conversation-menu-portal"
+          style={{ left: menuPosition.left, top: menuPosition.top }}
           role="menu"
           onKeyDown={(event) => {
+            if (event.key === "Escape") {
+              event.preventDefault();
+              closeMenu();
+              return;
+            }
             const items = [
               ...event.currentTarget.querySelectorAll<HTMLButtonElement>(
                 '[role="menuitem"]:not(:disabled)',
@@ -672,7 +710,8 @@ function ConversationRow(
               <Trash2 size={14} /> Move to trash
             </button>
           )}
-        </div>
+        </div>,
+        document.body,
       )}
       {error && <span className="conversation-error" role="status">{error}</span>}
       {rename && (
