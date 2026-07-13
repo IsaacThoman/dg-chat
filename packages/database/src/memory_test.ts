@@ -1,6 +1,20 @@
 import { assertEquals, assertStringIncludes, assertThrows } from "jsr:@std/assert@1.0.14";
 import { DomainError, MemoryRepository } from "./memory.ts";
-import { decodeApiResponseBody, InvalidApiResponseBodyError } from "./repository.ts";
+import {
+  decodeApiResponseBody,
+  InvalidApiResponseBodyError,
+  splitApiSseReplayFrame,
+} from "./repository.ts";
+
+Deno.test("SSE replay splitting preserves astral and unpaired UTF-16 exactly", () => {
+  const value = `a🦖b${String.fromCharCode(0xd800)}c🧪`;
+  const fragments = splitApiSseReplayFrame(value, 4);
+  assertEquals(fragments.join(""), value);
+  assertEquals(
+    fragments.every((fragment) => new TextEncoder().encode(fragment).length <= 4),
+    true,
+  );
+});
 
 Deno.test("passwordless domain users are represented without a local credential", () => {
   const repo = new MemoryRepository();
@@ -2843,6 +2857,40 @@ Deno.test("durable API SSE batches validate atomically and preserve contiguous o
   assertEquals(completed.frames.at(-1)?.frame.includes("response.completed"), true);
   assertEquals(completed.responseHeaders["cache-control"], "no-cache");
 
+  const chunked = repo.beginApiRequest({
+    userId: user.id,
+    endpoint: "responses",
+    idempotencyKey: "batch-request-chunked",
+    requestHash: "9".repeat(64),
+    stream: true,
+    model: "test/model",
+    runId: "batch-run-chunked",
+    reserveMicros: 50_000,
+    provider: "test",
+  });
+  if (chunked.kind !== "started") throw new Error("expected chunked request");
+  const largeTerminal = `event: response.completed\ndata: ${
+    JSON.stringify({ text: `${"\u0000".repeat(200_000)}${"🦖".repeat(80_000)}` })
+  }\n\n`;
+  const chunkedCompleted = repo.completeApiStream({
+    id: chunked.request.id,
+    leaseToken: chunked.leaseToken,
+    responseStatus: 200,
+    terminalFrame: largeTerminal,
+    costMicros: 10_000,
+    inputTokens: 2,
+    outputTokens: 3,
+    latencyMs: 5,
+  });
+  assertEquals(chunkedCompleted.frames.length > 1, true);
+  assertEquals(chunkedCompleted.frames.map((frame) => frame.frame).join(""), largeTerminal);
+  assertEquals(
+    chunkedCompleted.frames.every((frame) =>
+      new TextEncoder().encode(frame.frame).length <= 1_048_576
+    ),
+    true,
+  );
+
   const atomic = repo.beginApiRequest({
     userId: user.id,
     endpoint: "responses",
@@ -2965,6 +3013,115 @@ Deno.test("per-user replay quotas bound live requests, events, and bytes", () =>
       }),
     DomainError,
     "storage quota",
+  );
+  assertThrows(
+    () =>
+      repo.failApiRequest({
+        id: second.request.id,
+        leaseToken: second.leaseToken,
+        responseStatus: 500,
+        responseBody: "x".repeat(20),
+        quota,
+        billing: { mode: "refund" },
+      }),
+    DomainError,
+    "storage quota",
+  );
+});
+
+Deno.test("replay capacity reservations fence concurrent provider dispatch", () => {
+  const repo = new MemoryRepository();
+  const user = repo.createUser({
+    email: "replay-reservation@example.com",
+    name: "Replay reservation",
+    passwordHash: "x",
+  });
+  repo.credit(user.id, "replay-reservation-grant", "grant", 1_000_000);
+  const quota = { maxRequests: 10, maxEvents: 20_000, maxBytes: 67_108_864 };
+  assertThrows(
+    () =>
+      repo.beginApiRequest({
+        userId: user.id,
+        endpoint: "responses",
+        idempotencyKey: "invalid-event-only-reservation",
+        requestHash: "e".repeat(64),
+        stream: true,
+        model: "test/model",
+        runId: "invalid-event-only-reservation-run",
+        reserveMicros: 1,
+        provider: "test",
+        quota,
+        replayReservedBytes: 0,
+        replayReservedEvents: 1,
+      }),
+    DomainError,
+    "Invalid idempotent request parameters",
+  );
+  const first = repo.beginApiRequest({
+    userId: user.id,
+    endpoint: "responses",
+    idempotencyKey: "reserved-replay-first",
+    requestHash: "a".repeat(64),
+    stream: true,
+    model: "test/model",
+    runId: "reserved-replay-run-first",
+    reserveMicros: 1,
+    provider: "test",
+    quota,
+    replayReservedBytes: 40_000_000,
+    replayReservedEvents: 9_000,
+  });
+  assertEquals(first.kind, "started");
+  assertThrows(
+    () =>
+      repo.beginApiRequest({
+        userId: user.id,
+        endpoint: "responses",
+        idempotencyKey: "reserved-replay-second",
+        requestHash: "b".repeat(64),
+        stream: true,
+        model: "test/model",
+        runId: "reserved-replay-run-second",
+        reserveMicros: 1,
+        provider: "test",
+        quota,
+        replayReservedBytes: 40_000_000,
+        replayReservedEvents: 9_000,
+      }),
+    DomainError,
+    "quota",
+  );
+  assertEquals(repo.usageRuns.has("reserved-replay-run-second"), false);
+  const failure = repo.beginApiRequest({
+    userId: user.id,
+    endpoint: "responses",
+    idempotencyKey: "reserved-replay-failure",
+    requestHash: "f".repeat(64),
+    stream: true,
+    model: "test/model",
+    runId: "reserved-replay-run-failure",
+    reserveMicros: 1,
+    provider: "test",
+    quota,
+    replayReservedBytes: 16,
+    replayReservedEvents: 1,
+  });
+  if (failure.kind !== "started") throw new Error("missing failure reservation");
+  assertThrows(
+    () =>
+      repo.failApiRequest({
+        id: failure.request.id,
+        leaseToken: failure.leaseToken,
+        responseStatus: 500,
+        responseBody: '{"error":"provider failed"}',
+        billing: { mode: "refund" },
+      }),
+    DomainError,
+    "Reserved replay capacity",
+  );
+  assertEquals(
+    repo.getApiRequest(user.id, "responses", "reserved-replay-failure")?.state,
+    "in_progress",
   );
 });
 

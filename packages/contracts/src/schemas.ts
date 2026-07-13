@@ -417,6 +417,13 @@ export const chatCompletionSchema = z.object({
   user: z.string().optional(),
 }).passthrough().transform(omitUndefined);
 
+const responsesMetadataSchema = z.record(
+  z.string().min(1).max(64),
+  z.string().max(512),
+).refine((value) => Object.keys(value).length <= 16, {
+  message: "Metadata must contain at most 16 entries",
+});
+
 export const responsesSchema = z.object({
   model: z.string().min(1).max(200),
   input: z.union([
@@ -444,6 +451,24 @@ export const responsesSchema = z.object({
           call_id: z.string().min(1).max(512),
           output: z.string().max(2_000_000),
         }).passthrough(),
+        z.object({
+          type: z.literal("reasoning"),
+          id: z.string().min(1).max(512).optional(),
+          summary: z.array(
+            z.object({
+              type: z.literal("summary_text"),
+              text: z.string().max(2_000_000),
+            }).passthrough(),
+          ).max(256).optional(),
+          content: z.array(
+            z.object({
+              type: z.literal("reasoning_text"),
+              text: z.string().max(2_000_000),
+            }).passthrough(),
+          ).max(256).optional(),
+          encrypted_content: z.string().max(2_000_000).optional(),
+          status: z.enum(["in_progress", "completed", "incomplete"]).optional(),
+        }).passthrough(),
       ]),
     ).min(1).max(256),
   ]),
@@ -461,6 +486,8 @@ export const responsesSchema = z.object({
   max_output_tokens: z.number().int().positive().max(131_072).nullable().optional().transform(
     (value) => value ?? undefined,
   ),
+  store: z.boolean().nullable().optional().transform((value) => value ?? undefined),
+  metadata: responsesMetadataSchema.nullable().optional().transform((value) => value ?? undefined),
   reasoning: z.unknown().nullable().optional().transform((value) => value ?? undefined),
 }).passthrough().transform(omitUndefined);
 

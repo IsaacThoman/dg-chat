@@ -237,9 +237,6 @@ select:focus-visible {
 .push {
   margin-left: auto;
 }
-.mobile-only {
-  display: none;
-}
 .icon-button {
   display: inline-grid;
   place-items: center;
@@ -253,14 +250,20 @@ select:focus-visible {
   cursor: pointer;
   transition: 0.15s;
 }
+.mobile-only {
+  display: none;
+}
 .icon-button:hover {
   color: var(--ink);
-  background: #e9e8e3;
+  background: color-mix(in srgb, var(--panel) 90%, var(--ink));
 }
 .icon-button:disabled {
   opacity: 0.32;
   cursor: default;
   background: transparent;
+}
+.sidebar-menu-portal-root {
+  display: contents;
 }
 .brand {
   height: 38px;
@@ -311,12 +314,13 @@ select:focus-visible {
 .new-chat {
   margin: 3px 2px 9px;
   height: 42px;
-  border: 1px solid #dfded7;
+  border: 1px solid var(--line);
   display: flex;
   align-items: center;
   gap: 9px;
   padding: 0 11px;
-  background: #fafaf8;
+  color: var(--ink);
+  background: var(--card);
   border-radius: 10px;
   font-weight: 600;
   font-size: 13px;
@@ -324,8 +328,8 @@ select:focus-visible {
   box-shadow: 0 1px 2px #00000006;
 }
 .new-chat:hover {
-  background: #fff;
-  border-color: #d0cec5;
+  background: color-mix(in srgb, var(--card) 85%, var(--panel));
+  border-color: color-mix(in srgb, var(--line) 75%, var(--ink));
 }
 kbd {
   margin-left: auto;
@@ -343,12 +347,12 @@ kbd {
   padding: 0 10px;
   border: 1px solid transparent;
   border-radius: 9px;
-  color: #918e87;
-  background: #e9e9e5;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--panel) 94%, var(--ink));
 }
 .search:focus-within {
-  background: #fff;
-  border-color: #cfcac0;
+  background: var(--card);
+  border-color: var(--line);
 }
 .search input {
   border: 0;
@@ -1229,7 +1233,7 @@ kbd {
   position: relative;
   flex: none;
   padding: 12px max(20px, calc((100% - 780px) / 2)) 7px;
-  background: linear-gradient(to top, #fff 78%, #ffffff00);
+  background: linear-gradient(to top, var(--bg) 78%, transparent);
   z-index: 8;
 }
 .composer-wrap.dragging::before {

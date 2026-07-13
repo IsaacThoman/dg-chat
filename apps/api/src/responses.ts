@@ -35,7 +35,7 @@ export function responseRequestFields(input: ResponseRequestEcho = {}) {
     parallel_tool_calls: input.parallelToolCalls ?? true,
     previous_response_id: input.previousResponseId ?? null,
     reasoning: structuredClone(input.reasoning ?? { effort: null, summary: null }),
-    store: input.store ?? true,
+    store: input.store ?? false,
     temperature: input.temperature ?? 1,
     text: structuredClone(input.text ?? { format: { type: "text" } }),
     tool_choice: input.toolChoice ?? "auto",

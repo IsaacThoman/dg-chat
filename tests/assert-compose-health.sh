@@ -6,7 +6,9 @@ compose=(docker compose "$@")
 container_id() {
   local service="$1"
   local id
-  id="$("${compose[@]}" ps -q "$service")"
+  # One-shot initialization services have already exited by the time readiness succeeds.
+  # Compose omits stopped containers from `ps -q` unless `--all` is explicit.
+  id="$("${compose[@]}" ps --all --quiet "$service")"
   if [[ -z "$id" ]]; then
     echo "$service container was not created" >&2
     exit 1

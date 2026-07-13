@@ -14,7 +14,12 @@ import { DomainError } from "@dg-chat/database";
 import type { ChatCompletionRequest } from "@dg-chat/contracts";
 import { Buffer } from "node:buffer";
 import { type ProviderSecretEnvelope, ProviderSecretKeyring } from "./provider-secrets.ts";
-import { complete, streamChatCompletion, type UpstreamStreamOptions } from "./models.ts";
+import {
+  ChatStreamTerminalValidator,
+  complete,
+  streamChatCompletion,
+  type UpstreamStreamOptions,
+} from "./models.ts";
 import {
   completeResponsesChat,
   type NativeResponsesRequestFields,
@@ -106,16 +111,18 @@ function assertResponseFieldsCompatible(
   protocol: UpstreamStreamOptions["protocol"],
   fields?: NativeResponsesRequestFields,
 ): void {
-  if (
-    protocol !== "responses" &&
-    (fields?.store === true ||
-      (fields?.metadata !== undefined && Object.keys(fields.metadata).length > 0))
-  ) {
+  if (protocol !== "responses" && (fields?.store === true || fields?.requiresNativeInput)) {
     throw new ProviderAttemptError(
       "This Responses request contains fields that a Chat Completions provider cannot preserve",
       { category: "invalid_request", transient: false, candidateLocal: true },
     );
   }
+}
+
+function validateNoVisibleChatStream(frames: readonly string[]): void {
+  const terminal = new ChatStreamTerminalValidator();
+  for (const frame of frames) terminal.observe(frame);
+  terminal.finish();
 }
 
 interface AttemptMetrics {
@@ -1907,11 +1914,14 @@ export class ProviderExecutionEngine {
     observed: AttemptMetrics,
     plan: ProviderExecutionPlan,
   ): AsyncGenerator<string> {
+    const terminal = new ChatStreamTerminalValidator();
     try {
       for await (const data of upstream) {
+        terminal.observe(data);
         observeChunk(observed, data, this.#now());
         yield data;
       }
+      terminal.finish();
     } catch (error) {
       if (error instanceof ProviderAttemptError && error.options.candidateLocal === true) {
         observed.dispatched = false;
@@ -1964,6 +1974,7 @@ export class ProviderExecutionEngine {
         circuitStore: this.#circuitStore(candidates),
         onAttempt,
         visibleUnits: openAIVisibleUnits,
+        validateNoVisibleOutput: validateNoVisibleChatStream,
         beforeAttempt: async (candidate, _signal, context) => {
           upstreams.set(
             key(candidate.id, context),

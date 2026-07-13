@@ -248,6 +248,8 @@ if "nullable Chat contract" not in (nullable_completion.choices[0].message.conte
 response = client.responses.create(model=model, input="Python Responses contract")
 if "Python Responses contract" not in response.output_text:
     raise RuntimeError("Python Responses result did not contain the expected content")
+if response.store is not False:
+    raise RuntimeError("Python Responses result claimed unsupported persistent storage")
 
 response_stream = client.responses.create(
     model=model,
@@ -370,6 +372,48 @@ native_response = client.responses.create(
 if "native Responses public contract" not in native_response.output_text:
     raise RuntimeError("Python Responses API did not use a native Responses upstream")
 
+stateless_native_response = client.responses.create(
+    model=responses_model,
+    input=[
+        {
+            "id": "rs_python_previous",
+            "type": "reasoning",
+            "summary": [{
+                "type": "summary_text",
+                "text": "Preserve this prior reasoning item",
+            }],
+            "encrypted_content": "opaque-python-reasoning-state",
+            "status": "completed",
+        },
+        *[item.model_dump(exclude_none=True) for item in native_response.output],
+        {
+            "id": "fc_python_previous",
+            "type": "function_call",
+            "call_id": "call_python_previous",
+            "name": "lookup_previous",
+            "arguments": '{"query":"python"}',
+            "status": "completed",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_python_previous",
+            "output": "prior Python tool result",
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": "Python stateless continuation",
+            }],
+        },
+    ],
+)
+if "Python stateless continuation" not in stateless_native_response.output_text:
+    raise RuntimeError(
+        "Python Responses stateless output/reasoning continuation was not preserved"
+    )
+
 native_response_stream = client.responses.create(
     model=responses_model,
     input="Python native Responses public stream",
@@ -390,6 +434,19 @@ if (
     or any(event.sequence_number != index for index, event in enumerate(native_response_events))
 ):
     raise RuntimeError("Python Responses stream lifecycle or sequence numbers were invalid")
+
+empty_incomplete_stream = client.responses.create(
+    model=responses_model,
+    input="Python empty incomplete stream",
+    max_output_tokens=1,
+    stream=True,
+)
+empty_incomplete_events = list(empty_incomplete_stream)
+if (
+    empty_incomplete_events[-1].type != "response.incomplete"
+    or any(event.type == "error" for event in empty_incomplete_events)
+):
+    raise RuntimeError("Python valid empty incomplete Responses stream was rejected")
 native_terminal = native_response_events[-1].response
 if (
     native_terminal.status != "completed"
@@ -466,7 +523,7 @@ finally:
             pass
 
 
-def expect_api_error(label, call, status, code=None):
+def expect_api_error(label, call, status, code=None, error_type=None):
     try:
         call()
     except Exception as error:
@@ -474,6 +531,8 @@ def expect_api_error(label, call, status, code=None):
             raise RuntimeError(f"{label} did not return HTTP {status}") from error
         if code is not None and getattr(error, "code", None) != code:
             raise RuntimeError(f"{label} did not return error code {code}") from error
+        if error_type is not None and getattr(error, "type", None) != error_type:
+            raise RuntimeError(f"{label} did not return error type {error_type}") from error
     else:
         raise RuntimeError(f"{label} was accepted")
 
@@ -482,11 +541,20 @@ expect_api_error(
     "Python malformed Chat Completions request",
     lambda: client.chat.completions.create(model=model, messages=[]),
     422,
+    error_type="invalid_request_error",
 )
 expect_api_error(
     "Python malformed Responses request",
     lambda: client.responses.create(model=model, input=[], max_output_tokens=-1),
     422,
+    error_type="invalid_request_error",
+)
+expect_api_error(
+    "Python unsupported stored Response",
+    lambda: client.responses.create(model=model, input="must not store", store=True),
+    400,
+    "unsupported_parameter",
+    "invalid_request_error",
 )
 
 rate_api_key = os.environ.get("CONTRACT_PYTHON_RATE_API_KEY")
@@ -500,6 +568,7 @@ expect_api_error(
     lambda: rate_client.models.list(),
     429,
     "rate_limit_exceeded",
+    "rate_limit_error",
 )
 empty_credit_client = OpenAI(
     api_key=empty_credit_api_key,

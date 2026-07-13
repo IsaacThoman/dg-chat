@@ -306,6 +306,59 @@ Deno.test("stream buffers role and keepalive chunks, retries before visibility, 
   assertEquals(openAIVisibleUnits({ choices: [{ delta: { tool_calls: [{}] } }] }), 1);
 });
 
+Deno.test("no-visible streams require an explicit validator before buffered publication", async () => {
+  const frames = [
+    { choices: [{ delta: { role: "assistant" }, finish_reason: null }] },
+    { choices: [{ delta: {}, finish_reason: "stop" }] },
+    "[DONE]",
+  ];
+  const published: unknown[] = [];
+  let validated = 0;
+  for await (
+    const chunk of streamProviderRequest<unknown>({
+      initialCandidateId: "empty",
+      resolveCandidate: (id) => ({ id }),
+      policy,
+      signal: new AbortController().signal,
+      visibleUnits: () => 0,
+      validateNoVisibleOutput(buffered) {
+        validated++;
+        assertEquals(buffered, frames);
+      },
+      attempt: async function* () {
+        yield* frames;
+      },
+    })
+  ) published.push(chunk);
+  assertEquals(validated, 1);
+  assertEquals(published, frames);
+
+  await assertRejects(
+    async () => {
+      for await (
+        const _chunk of streamProviderRequest<unknown>({
+          initialCandidateId: "invalid-empty",
+          resolveCandidate: (id) => ({ id }),
+          policy: { ...policy, maxRetries: 0 },
+          signal: new AbortController().signal,
+          visibleUnits: () => 0,
+          validateNoVisibleOutput() {
+            throw new ProviderAttemptError("terminal validation failed", {
+              category: "invalid_response",
+              transient: false,
+            });
+          },
+          attempt: async function* () {
+            yield "[DONE]";
+          },
+        })
+      ) { /* consume */ }
+    },
+    ProviderAttemptError,
+    "terminal validation failed",
+  );
+});
+
 Deno.test("pre-visible buffering is bounded before fallback", async () => {
   const chunks: unknown[] = [];
   let calls = 0;

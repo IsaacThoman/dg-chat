@@ -808,6 +808,8 @@ export const apiIdempotencyRequests = pgTable("api_idempotency_requests", {
   usageRunId: text("usage_run_id").notNull().unique(
     "api_idempotency_requests_usage_run_id_key",
   ).references(() => usageRuns.id),
+  replayReservedBytes: integer("replay_reserved_bytes").notNull().default(0),
+  replayReservedEvents: integer("replay_reserved_events").notNull().default(0),
   responseStatus: integer("response_status"),
   responseHeaders: jsonb("response_headers").$type<Record<string, string>>().notNull().default({}),
   responseBody: text("response_body"),
@@ -831,6 +833,10 @@ export const apiIdempotencyRequests = pgTable("api_idempotency_requests", {
     sql`${table.state} = 'in_progress'`,
   ),
   index("api_idempotency_expiry_idx").on(table.expiresAt),
+  check(
+    "api_idempotency_requests_replay_reservation_check",
+    sql`${table.replayReservedBytes} >= 0 AND ${table.replayReservedEvents} >= 0`,
+  ),
 ]);
 
 export const apiIdempotencyEvents = pgTable("api_idempotency_events", {

@@ -68,6 +68,7 @@ interface ScenarioState {
   sawResponsesTools: boolean;
   sawResponsesImage: boolean;
   sawResponsesToolResult: boolean;
+  sawResponsesStoreFalse: boolean;
 }
 
 const scenarios = new Map<string, ScenarioState>();
@@ -161,6 +162,7 @@ function stateFor(model: string): ScenarioState {
     sawResponsesTools: false,
     sawResponsesImage: false,
     sawResponsesToolResult: false,
+    sawResponsesStoreFalse: false,
   };
   scenarios.set(model, state);
   return state;
@@ -187,6 +189,7 @@ function observe(request: Request, model: string, body: Record<string, unknown>)
       (item.content as Record<string, unknown>[]).some((part) => part.type === "input_image")
     );
     state.sawResponsesToolResult ||= input.some((item) => item.type === "function_call_output");
+    state.sawResponsesStoreFalse ||= body.store === false;
   }
   return state;
 }
@@ -353,7 +356,8 @@ async function handleResponses(request: Request): Promise<Response> {
   const failure = maybeFail(model);
   if (failure) return failure;
   const id = `resp_${crypto.randomUUID().replaceAll("-", "")}`;
-  const content = completionText(model, textFrom(body));
+  const prompt = textFrom(body);
+  const content = completionText(model, prompt);
   const tools = Array.isArray(body.tools) ? body.tools as Record<string, unknown>[] : [];
   const requestedTool = tools[0];
   if (requestedTool) {
@@ -375,10 +379,50 @@ async function handleResponses(request: Request): Promise<Response> {
     });
   }
   if (body.stream === true) {
+    if (prompt.includes("empty incomplete stream")) {
+      const events = [{
+        type: "response.created",
+        response: { id, object: "response", status: "in_progress", model },
+      }, {
+        type: "response.incomplete",
+        response: {
+          id,
+          object: "response",
+          status: "incomplete",
+          model,
+          output: [],
+          incomplete_details: { reason: "max_output_tokens" },
+          usage: { input_tokens: 8, output_tokens: 0, total_tokens: 8 },
+        },
+      }];
+      state.completed++;
+      return new Response(
+        events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""),
+        { headers: { ...headers, "content-type": "text/event-stream" } },
+      );
+    }
     const events = [
       {
         type: "response.created",
         response: { id, object: "response", status: "in_progress", model },
+      },
+      {
+        type: "response.output_item.added",
+        output_index: 0,
+        item: {
+          id: "msg_mock",
+          type: "message",
+          role: "assistant",
+          status: "in_progress",
+          content: [],
+        },
+      },
+      {
+        type: "response.content_part.added",
+        item_id: "msg_mock",
+        output_index: 0,
+        content_index: 0,
+        part: { type: "output_text", text: "", annotations: [] },
       },
       {
         type: "response.output_text.delta",
@@ -393,6 +437,24 @@ async function handleResponses(request: Request): Promise<Response> {
         output_index: 0,
         content_index: 0,
         text: content,
+      },
+      {
+        type: "response.content_part.done",
+        item_id: "msg_mock",
+        output_index: 0,
+        content_index: 0,
+        part: { type: "output_text", text: content, annotations: [] },
+      },
+      {
+        type: "response.output_item.done",
+        output_index: 0,
+        item: {
+          id: "msg_mock",
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [{ type: "output_text", text: content, annotations: [] }],
+        },
       },
       {
         type: "response.completed",

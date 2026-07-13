@@ -162,6 +162,21 @@ import type { Attachment, AuditFilters, Conversation, Message, Model, User } fro
 
 type View = "chat" | "archived" | "trash" | "knowledge" | "settings" | "tokens" | "admin";
 const cn = (...v: Array<string | false | null | undefined>) => v.filter(Boolean).join(" ");
+const mobileSidebarQuery = "(max-width: 760px)";
+
+function useMediaQuery(query: string): boolean {
+  const [matches, setMatches] = useState(() =>
+    typeof globalThis.matchMedia === "function" && globalThis.matchMedia(query).matches
+  );
+  useEffect(() => {
+    const media = globalThis.matchMedia(query);
+    const update = () => setMatches(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, [query]);
+  return matches;
+}
 
 function Brand({ compact = false }: { compact?: boolean }) {
   return (
@@ -221,6 +236,7 @@ function Sidebar({
   view,
   setView,
   mobileOpen,
+  drawerMode,
   closeMobile,
   user,
   onUpdate,
@@ -237,6 +253,7 @@ function Sidebar({
   view: View;
   setView: (v: View) => void;
   mobileOpen: boolean;
+  drawerMode: boolean;
   closeMobile: () => void;
   user: User;
   onUpdate: (
@@ -251,6 +268,7 @@ function Sidebar({
   busyConversationId: string;
 }) {
   const sidebarRef = useRef<HTMLElement>(null);
+  const menuPortalRef = useRef<HTMLDivElement>(null);
   const previousFocus = useRef<HTMLElement | null>(null);
   const closeMobileRef = useRef(closeMobile);
   closeMobileRef.current = closeMobile;
@@ -277,7 +295,7 @@ function Sidebar({
     closeMobile();
   };
   useEffect(() => {
-    if (!mobileOpen) return;
+    if (!drawerMode || !mobileOpen) return;
     previousFocus.current = document.activeElement as HTMLElement;
     const panel = sidebarRef.current;
     panel?.querySelector<HTMLButtonElement>('[aria-label="Close sidebar"]')?.focus();
@@ -305,16 +323,43 @@ function Sidebar({
     document.addEventListener("keydown", keydown);
     return () => {
       document.removeEventListener("keydown", keydown);
-      requestAnimationFrame(() => previousFocus.current?.focus());
+      requestAnimationFrame(() => {
+        const target = previousFocus.current;
+        if (target?.isConnected && target.getClientRects().length > 0) {
+          target.focus();
+          return;
+        }
+        const destinationMenu = [...document.querySelectorAll<HTMLElement>(
+          '[aria-label="Open menu"]',
+        )].find((element) => element.isConnected && element.getClientRects().length > 0);
+        if (destinationMenu) {
+          destinationMenu.focus();
+          return;
+        }
+        const composer = document.querySelector<HTMLElement>(".composer textarea");
+        if (composer?.getClientRects().length) {
+          composer.focus();
+          return;
+        }
+        const heading = document.querySelector<HTMLElement>("main h1, main h2");
+        if (heading) {
+          heading.tabIndex = -1;
+          heading.focus();
+        }
+      });
     };
-  }, [mobileOpen]);
+  }, [drawerMode, mobileOpen]);
+  const closedDrawer = drawerMode && !mobileOpen;
+  const openDrawer = drawerMode && mobileOpen;
   return (
     <aside
       ref={sidebarRef}
       className={cn("sidebar", mobileOpen && "mobile-open")}
       aria-label="Workspace navigation"
-      aria-modal={mobileOpen || undefined}
-      role={mobileOpen ? "dialog" : undefined}
+      aria-hidden={closedDrawer || undefined}
+      aria-modal={openDrawer || undefined}
+      inert={closedDrawer || undefined}
+      role={openDrawer ? "dialog" : undefined}
     >
       <div className="sidebar-head">
         <Brand />
@@ -444,6 +489,7 @@ function Sidebar({
                 folders={workspace.folders.data}
                 tags={workspace.tags.data}
                 mutationLocked={busyConversationId === c.id}
+                menuPortalRef={menuPortalRef}
               />
             ))}
             <p className="section-label">RECENT</p>
@@ -459,6 +505,7 @@ function Sidebar({
                 folders={workspace.folders.data}
                 tags={workspace.tags.data}
                 mutationLocked={busyConversationId === c.id}
+                menuPortalRef={menuPortalRef}
               />
             ))}
             {!filtered.length && (
@@ -500,12 +547,13 @@ function Sidebar({
           <MoreHorizontal size={17} className="push" />
         </button>
       </div>
+      <div ref={menuPortalRef} className="sidebar-menu-portal-root" />
     </aside>
   );
 }
 
 function ConversationRow(
-  { c, active, onOpen, listView, onUpdate, folders, tags, mutationLocked }: {
+  { c, active, onOpen, listView, onUpdate, folders, tags, mutationLocked, menuPortalRef }: {
     c: Conversation;
     active: boolean;
     onOpen: (id: string) => void;
@@ -517,6 +565,7 @@ function ConversationRow(
     folders?: import("./workspace/WorkspaceNavigation.tsx").FolderData;
     tags?: import("./workspace/WorkspaceNavigation.tsx").TagData;
     mutationLocked: boolean;
+    menuPortalRef: RefObject<HTMLDivElement | null>;
   },
 ) {
   const [menu, setMenu] = useState(false);
@@ -630,7 +679,7 @@ function ConversationRow(
       >
         <Ellipsis size={16} />
       </button>
-      {menu && createPortal(
+      {menu && menuPortalRef.current && createPortal(
         <div
           ref={menuRef}
           className="conversation-menu conversation-menu-portal"
@@ -738,7 +787,7 @@ function ConversationRow(
             </button>
           )}
         </div>,
-        document.body,
+        menuPortalRef.current,
       )}
       {error && <span className="conversation-error" role="status">{error}</span>}
       {rename && (
@@ -861,7 +910,7 @@ function BranchControl(
       >
         <ChevronRight size={15} />
       </IconButton>
-      <IconButton label="View conversation tree" onClick={onTree}>
+      <IconButton label="View conversation tree" disabled={busy} onClick={onTree}>
         <GitBranch size={15} />
       </IconButton>
     </div>
@@ -879,6 +928,7 @@ function MessageItem(
     onContinue,
     branchBusy,
     generationBusy,
+    editing,
     speech,
     readOnly = false,
   }: {
@@ -891,6 +941,7 @@ function MessageItem(
     onContinue: (message: Message) => void;
     branchBusy: boolean;
     generationBusy: boolean;
+    editing: boolean;
     speech?: {
       model: string;
       voice: string;
@@ -959,7 +1010,7 @@ function MessageItem(
             {!readOnly && (
               <IconButton
                 label="Edit without overwriting"
-                disabled={generationBusy || branchBusy}
+                disabled={generationBusy || branchBusy || editing}
                 onClick={() => onEdit(message)}
               >
                 <Pencil size={15} />
@@ -970,7 +1021,7 @@ function MessageItem(
                 branch={branch}
                 onTree={onTree}
                 onSelect={onSelectBranch}
-                busy={branchBusy || generationBusy}
+                busy={branchBusy || generationBusy || editing}
               />
             )}
           </div>
@@ -1045,7 +1096,7 @@ function MessageItem(
           {!readOnly && (
             <IconButton
               label="Regenerate response in a new branch"
-              disabled={generationBusy}
+              disabled={generationBusy || editing}
               onClick={() => onRegenerate(message)}
             >
               <RefreshCw size={15} />
@@ -1054,7 +1105,7 @@ function MessageItem(
           {!readOnly && (
             <IconButton
               label="Continue response"
-              disabled={generationBusy}
+              disabled={generationBusy || editing}
               onClick={() => onContinue(message)}
             >
               <ArrowRight size={15} />
@@ -1068,7 +1119,7 @@ function MessageItem(
               branch={branch}
               onTree={onTree}
               onSelect={onSelectBranch}
-              busy={branchBusy || generationBusy}
+              busy={branchBusy || generationBusy || editing}
             />
           )}
           <span className="response-meta">{message.latency}</span>
@@ -1187,29 +1238,59 @@ export function Composer(
     | "delete-failed";
   type UploadItem = {
     key: string;
+    scope: string;
     file: File;
     status: UploadState;
     progress: number;
     attachment?: Attachment;
     error?: string;
   };
+  const draftUploadScope = "draft";
+  const uploadScopeForEdit = (messageId: string) => `edit:${messageId}`;
   const [uploads, setUploads] = useState<UploadItem[]>([]);
+  const uploadsRef = useRef<UploadItem[]>(uploads);
+  uploadsRef.current = uploads;
+  const activeUploadScope = edit ? uploadScopeForEdit(edit.id) : draftUploadScope;
+  const activeUploads = uploads.filter((item) => item.scope === activeUploadScope);
   const [excludedEditAttachments, setExcludedEditAttachments] = useState<Set<string>>(new Set());
   const editDraftRef = useRef<
     {
       value: string;
       toolContexts: Array<{ id: string }>;
       generatedAssets: GeneratedAsset[];
+      selectionError: string;
     } | null
   >(null);
   const previousEditIdRef = useRef<string | null>(null);
   const uploadControllers = useRef(new Map<string, AbortController>());
+  const liveUploadKeys = useRef(new Set<string>());
+  const claimedRetryKeys = useRef(new Set<string>());
   const fileRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   useEffect(() => () => {
+    liveUploadKeys.current.clear();
+    claimedRetryKeys.current.clear();
     for (const controller of uploadControllers.current.values()) controller.abort();
     uploadControllers.current.clear();
   }, []);
+  const discardUploadScope = (scope: string) => {
+    const discarded = uploadsRef.current.filter((item) => item.scope === scope);
+    for (const item of discarded) {
+      liveUploadKeys.current.delete(item.key);
+      claimedRetryKeys.current.delete(item.key);
+      uploadControllers.current.get(item.key)?.abort();
+      if (item.attachment) {
+        void api.deleteAttachment(item.attachment.id).catch(() => {
+          // Attachment garbage collection remains a server-side safety net when immediate
+          // best-effort cleanup is unavailable.
+        });
+      }
+    }
+    setUploads((current) => current.filter((item) => item.scope !== scope));
+  };
+  // This transition deliberately follows only the selected immutable message. Draft state is
+  // captured once on entry; including live composer fields would overwrite that snapshot while
+  // the user types the edit.
   useEffect(() => {
     setExcludedEditAttachments(new Set());
     if (edit) {
@@ -1218,12 +1299,16 @@ export function Composer(
           value,
           toolContexts,
           generatedAssets: selectedGeneratedAssets,
+          selectionError,
         };
+      } else if (previousEditIdRef.current !== edit.id) {
+        discardUploadScope(uploadScopeForEdit(previousEditIdRef.current));
       }
       previousEditIdRef.current = edit.id;
       setValue(edit.content);
       setToolContexts((edit.toolExecutionIds ?? []).map((id) => ({ id })));
       setSelectedGeneratedAssets([]);
+      setSelectionError("");
     } else {
       previousEditIdRef.current = null;
     }
@@ -1234,8 +1319,12 @@ export function Composer(
       setValue(draft.value);
       setToolContexts(draft.toolContexts);
       setSelectedGeneratedAssets(draft.generatedAssets);
+      setSelectionError(draft.selectionError);
+    } else {
+      setSelectionError("");
     }
     editDraftRef.current = null;
+    if (edit) discardUploadScope(uploadScopeForEdit(edit.id));
     previousEditIdRef.current = null;
     setExcludedEditAttachments(new Set());
     cancelEdit();
@@ -1337,7 +1426,7 @@ export function Composer(
     if (!asset.attachmentId || asset.status !== "ready") return;
     setSelectedGeneratedAssets((current) => {
       if (current.some((item) => item.id === asset.id)) return current;
-      if (uploads.length + retainedAttachments.length + current.length >= 10) {
+      if (activeUploads.length + retainedAttachments.length + current.length >= 10) {
         setSelectionError("You can attach up to 10 files or generated images to one message.");
         return current;
       }
@@ -1369,6 +1458,12 @@ export function Composer(
       controller.signal,
     ).then((attachment) => {
       uploadControllers.current.delete(key);
+      if (!liveUploadKeys.current.has(key)) {
+        void api.deleteAttachment(attachment.id).catch(() => {
+          // The durable attachment cleanup worker remains a fallback for this abort/resolve race.
+        });
+        return;
+      }
       setUploads((current) =>
         current.map((item) =>
           item.key === key
@@ -1403,6 +1498,21 @@ export function Composer(
       );
     });
   };
+  const retryUpload = (item: UploadItem) => {
+    if (claimedRetryKeys.current.has(item.key)) return;
+    claimedRetryKeys.current.add(item.key);
+    const retryKey = crypto.randomUUID();
+    liveUploadKeys.current.delete(item.key);
+    liveUploadKeys.current.add(retryKey);
+    setUploads((current) =>
+      current.map((candidate) =>
+        candidate.key === item.key
+          ? { ...candidate, key: retryKey, status: "uploading", progress: 0, error: undefined }
+          : candidate
+      )
+    );
+    queueMicrotask(() => beginUpload(retryKey, item.file));
+  };
   const addFiles = (files: File[]) => {
     if (disabled || !files.length) return;
     const allowed = files.filter((file) => file.size <= 25 * 1024 * 1024);
@@ -1410,7 +1520,7 @@ export function Composer(
       0,
       Math.max(
         0,
-        10 - uploads.length - retainedAttachments.length - selectedGeneratedAssets.length,
+        10 - activeUploads.length - retainedAttachments.length - selectedGeneratedAssets.length,
       ),
     );
     if (allowed.length !== files.length) {
@@ -1422,19 +1532,22 @@ export function Composer(
     }
     for (const file of selected) {
       const key = crypto.randomUUID();
+      liveUploadKeys.current.add(key);
       setUploads((current) => [
         ...current,
-        { key, file, status: "uploading", progress: 0 },
+        { key, scope: activeUploadScope, file, status: "uploading", progress: 0 },
       ]);
       queueMicrotask(() => beginUpload(key, file));
     }
   };
   const removeUpload = async (item: UploadItem) => {
     if (item.status === "uploading") {
+      liveUploadKeys.current.delete(item.key);
       uploadControllers.current.get(item.key)?.abort();
       return;
     }
     if (!item.attachment) {
+      liveUploadKeys.current.delete(item.key);
       setUploads((current) => current.filter((candidate) => candidate.key !== item.key));
       return;
     }
@@ -1447,6 +1560,7 @@ export function Composer(
     );
     try {
       await api.deleteAttachment(item.attachment.id);
+      liveUploadKeys.current.delete(item.key);
       setUploads((current) => current.filter((candidate) => candidate.key !== item.key));
     } catch {
       setUploads((current) =>
@@ -1458,11 +1572,11 @@ export function Composer(
       );
     }
   };
-  const blockedByUpload = uploads.some((item) => item.status !== "ready");
+  const blockedByUpload = activeUploads.some((item) => item.status !== "ready");
   const readyAttachmentIds = mergeAttachmentIds(
     retainedAttachments.map((attachment) => attachment.id),
     [
-      ...uploads.flatMap((item) =>
+      ...activeUploads.flatMap((item) =>
         item.status === "ready" && item.attachment ? [item.attachment.id] : []
       ),
       ...selectedGeneratedAssets.flatMap((asset) => asset.attachmentId ? [asset.attachmentId] : []),
@@ -1474,13 +1588,19 @@ export function Composer(
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     if (!canSubmit) return;
+    const submittedUploadScope = activeUploadScope;
+    const preservedDraft = edit ? editDraftRef.current : null;
     if (await onSend(value.trim(), readyAttachmentIds, toolContexts.map((context) => context.id))) {
       editDraftRef.current = null;
       previousEditIdRef.current = null;
-      setValue("");
-      setUploads([]);
-      setSelectedGeneratedAssets([]);
-      setToolContexts([]);
+      for (const item of uploadsRef.current) {
+        if (item.scope === submittedUploadScope) liveUploadKeys.current.delete(item.key);
+      }
+      setUploads((current) => current.filter((item) => item.scope !== submittedUploadScope));
+      setValue(preservedDraft?.value ?? "");
+      setSelectedGeneratedAssets(preservedDraft?.generatedAssets ?? []);
+      setToolContexts(preservedDraft?.toolContexts ?? []);
+      setSelectionError(preservedDraft?.selectionError ?? "");
     }
   };
   return (
@@ -1512,7 +1632,7 @@ export function Composer(
           </IconButton>
         </div>
       )}
-      {(retainedAttachments.length > 0 || uploads.length > 0 ||
+      {(retainedAttachments.length > 0 || activeUploads.length > 0 ||
         selectedGeneratedAssets.length > 0) && (
         <div className="upload-list" aria-label="Selected attachments" aria-live="polite">
           {retainedAttachments.map((attachment) => (
@@ -1533,7 +1653,7 @@ export function Composer(
               </IconButton>
             </div>
           ))}
-          {uploads.map((item) => (
+          {activeUploads.map((item) => (
             <div className={cn("upload-chip", `upload-${item.status}`)} key={item.key}>
               <FileText size={18} aria-hidden="true" />
               <span>
@@ -1558,7 +1678,7 @@ export function Composer(
               {(item.status === "failed" || item.status === "cancelled") && (
                 <IconButton
                   label={`Retry upload ${item.file.name}`}
-                  onClick={() => beginUpload(item.key, item.file)}
+                  onClick={() => retryUpload(item)}
                 >
                   <RefreshCw size={15} />
                 </IconButton>
@@ -2199,6 +2319,8 @@ function ChatView({
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const followStreamRef = useRef(true);
   const [localMessages, setLocalMessages] = useState(messages);
+  const localMessagesRef = useRef(localMessages);
+  localMessagesRef.current = localMessages;
   const [tree, setTree] = useState(false);
   const treeReturnFocusRef = useRef<HTMLElement | null>(null);
   const [edit, setEdit] = useState<Message>();
@@ -2439,17 +2561,21 @@ function ChatView({
           );
         } else {
           terminalAssistant = event.assistant;
-          setLocalMessages((current) => {
-            const nextById = new Map(current.map((message) => [message.id, message]));
-            nextById.set(event.user.id, event.user);
-            nextById.set(event.assistant.id, event.assistant);
-            const next = [...nextById.values()];
-            queryClient.setQueryData(["messages", event.conversation.id], next);
-            return next;
-          });
+          const nextById = new Map(
+            localMessagesRef.current.map((message) => [message.id, message]),
+          );
+          nextById.set(event.user.id, event.user);
+          nextById.set(event.assistant.id, event.assistant);
+          const next = [...nextById.values()];
+          localMessagesRef.current = next;
+          queryClient.setQueryData(["messages", event.conversation.id], next);
           syncConversation(event.conversation);
           setEdit(undefined);
-          if (resolved.created) await onConversationCreated(event.conversation.id);
+          if (resolved.created) {
+            // Do not expose controls on the temporary ChatView: activating one during the keyed
+            // remount can lose the click and silently dispose media or upload work.
+            await onConversationCreated(event.conversation.id);
+          } else setLocalMessages(next);
         }
       }
     } catch (error) {
@@ -2722,6 +2848,7 @@ function ChatView({
               )}
             branchBusy={branchBusy}
             generationBusy={streaming || queue.length > 0}
+            editing={Boolean(edit)}
             speech={speechModel
               ? {
                 model: speechModel,
@@ -2760,6 +2887,7 @@ function ChatView({
                 onContinue={() => undefined}
                 branchBusy
                 generationBusy
+                editing={false}
                 speech={undefined}
               />
             )}
@@ -2773,6 +2901,7 @@ function ChatView({
               onContinue={() => undefined}
               branchBusy
               generationBusy
+              editing={false}
               speech={speechModel
                 ? {
                   model: speechModel,
@@ -2893,7 +3022,7 @@ function ChatView({
           activeLeafId={effectiveActiveLeafId}
           close={() => setTree(false)}
           onSelect={selectBranch}
-          busy={branchBusy || streaming || queue.length > 0}
+          busy={branchBusy || streaming || queue.length > 0 || Boolean(edit)}
           returnFocus={treeReturnFocusRef.current}
         />
       )}
@@ -3715,6 +3844,10 @@ export function App(
   const lifecycleBlockingError = lifecycleQuery.isError && lifecycleQuery.data === undefined;
   const lifecycleStaleWarning = lifecycleQuery.isError && lifecycleQuery.data !== undefined;
   const [mobile, setMobile] = useState(false);
+  const mobileSidebar = useMediaQuery(mobileSidebarQuery);
+  useEffect(() => {
+    if (!mobileSidebar) setMobile(false);
+  }, [mobileSidebar]);
   const conversationSearchRef = useRef<HTMLInputElement>(null);
   const [creatingConversation, setCreatingConversation] = useState(false);
   const [selectedModel, setSelectedModel] = useState(models[0]?.id ?? "openai/gpt-4.1");
@@ -3795,8 +3928,11 @@ export function App(
       }),
   });
   const conversationCreated = async (id: string) => {
-    await conversationQuery.refetch();
+    // The terminal generation event has already populated both conversation and message caches.
+    // Activate it before the network refresh so controls cannot start work on the temporary
+    // ChatView and then be silently disposed when that refresh eventually changes the key.
     setActiveId(id);
+    await conversationQuery.refetch();
   };
   const updateConversation = async (
     conversation: Conversation,
@@ -3866,6 +4002,7 @@ export function App(
         view={view}
         setView={setView}
         mobileOpen={mobile}
+        drawerMode={mobileSidebar}
         closeMobile={() => setMobile(false)}
         user={user}
         onUpdate={updateConversation}

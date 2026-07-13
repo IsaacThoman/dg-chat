@@ -3,6 +3,7 @@ import { embeddingsSchema } from "@dg-chat/contracts";
 import {
   createEmbeddings,
   EmbeddingsProviderError,
+  maximumEmbeddingsReplayBytes,
   validateEmbeddingsResponse,
 } from "./embeddings.ts";
 
@@ -20,6 +21,17 @@ Deno.test("embeddings request validation is strict and bounded", () => {
     embeddingsSchema.safeParse({ model: "embed", input: [], dimensions: 0 }).success,
     false,
   );
+});
+
+Deno.test("embeddings replay bounds scale with requested cardinality and dimensions", () => {
+  const small = embeddingsSchema.parse({ model: "embed", input: "hello", dimensions: 2 });
+  const large = embeddingsSchema.parse({
+    model: "embed",
+    input: ["a", "b"],
+    dimensions: 4_096,
+  });
+  assertEquals(maximumEmbeddingsReplayBytes(small) < maximumEmbeddingsReplayBytes(large), true);
+  assertEquals(maximumEmbeddingsReplayBytes(large) <= 64 * 1024 * 1024, true);
 });
 
 Deno.test("embeddings adapter rewrites only the model and normalizes ordered output", async () => {

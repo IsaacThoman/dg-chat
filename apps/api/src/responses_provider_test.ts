@@ -1,6 +1,14 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.14";
 import { ProviderAttemptError } from "./provider-resilience.ts";
-import { completeResponsesChat, streamResponsesChat } from "./responses-provider.ts";
+import { ResponsesStreamProjector } from "./responses-stream.ts";
+import { responseRequestFields } from "./responses.ts";
+import {
+  completeResponsesChat,
+  responsesBufferedReplayUpperBound,
+  responsesStreamReplayUpperBound,
+  responsesTerminalReplayUpperBound,
+  streamResponsesChat,
+} from "./responses-provider.ts";
 
 const request = {
   model: "public/model",
@@ -22,9 +30,160 @@ const request = {
   user: "caller-123",
 };
 
+const messageLifecycle = (outputIndex: number, itemId: string, contentIndex = 0) => [{
+  type: "response.output_item.added",
+  output_index: outputIndex,
+  item: { id: itemId, type: "message", status: "in_progress", role: "assistant" },
+}, {
+  type: "response.content_part.added",
+  item_id: itemId,
+  output_index: outputIndex,
+  content_index: contentIndex,
+  part: { type: "output_text", text: "", annotations: [] },
+}];
+
+Deno.test("Responses terminal replay bound covers duplicate text and JSON escaping", () => {
+  assertEquals(responsesTerminalReplayUpperBound(4_096, 0), 13_697_024);
+  assertEquals(responsesTerminalReplayUpperBound(0, 123), 1_114_235);
+  assertEquals(responsesBufferedReplayUpperBound(0), 12_648_448);
+  assertEquals(responsesStreamReplayUpperBound(4_096, 0, 20_000), 61_685_760);
+});
+
+Deno.test("Responses stream replay bound covers every escaped projector lifecycle projection", () => {
+  const maxOutputTokens = 4_096;
+  const text = "\u0000".repeat(maxOutputTokens * 256);
+  const projector = new ResponsesStreamProjector({
+    responseId: "resp_replay_bound",
+    messageId: "msg_replay_bound",
+    model: "public/model",
+    createdAt: 1,
+  });
+  const events: Record<string, unknown>[] = [
+    projector.createdEvent(),
+    projector.inProgressEvent(),
+  ];
+  // Keep each provider event within the protocol's per-payload ceiling while the accumulated
+  // output reaches the long-token byte bound that terminal lifecycle events repeat in full.
+  for (const delta of [text.slice(0, 500_000), text.slice(500_000)]) {
+    events.push(...projector.push(JSON.stringify({
+      choices: [{ index: 0, delta: { content: delta }, finish_reason: null }],
+    })));
+  }
+  events.push(...projector.push(JSON.stringify({
+    choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+    usage: {
+      prompt_tokens: 1,
+      completion_tokens: maxOutputTokens,
+      total_tokens: maxOutputTokens + 1,
+    },
+  })));
+  projector.push("[DONE]");
+  events.push(...projector.finish().terminalEvents);
+  const frames = events.map((event, sequence) => {
+    const payload = { ...event, sequence_number: sequence };
+    return `event: ${String(event.type)}\ndata: ${JSON.stringify(payload)}\n\n`;
+  });
+  const actualBytes = frames.reduce(
+    (total, frame) => total + new TextEncoder().encode(frame).byteLength,
+    0,
+  );
+  const bound = responsesStreamReplayUpperBound(maxOutputTokens, 0, frames.length);
+  assertEquals(actualBytes <= bound, true);
+
+  // This is the former delta-plus-terminal estimate. The assertion keeps the regression capable
+  // of detecting the repeated value/part/item done projections that originally exceeded it.
+  const visibleBytes = maxOutputTokens * 256;
+  const formerBound = responsesTerminalReplayUpperBound(maxOutputTokens, 0) + Math.max(
+    visibleBytes * 6 + frames.length * 512,
+    16_777_216,
+  );
+  assertEquals(actualBytes > formerBound, true);
+});
+
+Deno.test("Responses stream replay bound covers created and in-progress request echoes", () => {
+  const requestEcho = {
+    tools: [{
+      type: "function",
+      name: "large_echo",
+      description: "\u0000".repeat(500_000),
+      parameters: { type: "object" },
+    }],
+  };
+  const echoedRequestBytes = new TextEncoder().encode(
+    JSON.stringify(responseRequestFields(requestEcho)),
+  ).byteLength;
+  const projector = new ResponsesStreamProjector({
+    responseId: "resp_request_echo",
+    messageId: "msg_request_echo",
+    model: "public/model",
+    createdAt: 1,
+    request: requestEcho,
+  });
+  const events: Record<string, unknown>[] = [projector.createdEvent(), projector.inProgressEvent()];
+  events.push(...projector.push(JSON.stringify({
+    choices: [{ index: 0, delta: { content: "ok" }, finish_reason: "stop" }],
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+  })));
+  projector.push("[DONE]");
+  events.push(...projector.finish().terminalEvents);
+  const actualBytes = events.reduce((total, event, sequence) =>
+    total + new TextEncoder().encode(
+      `event: ${String(event.type)}\ndata: ${
+        JSON.stringify({
+          ...event,
+          sequence_number: sequence,
+        })
+      }\n\n`,
+    ).byteLength, 0);
+  const bound = responsesStreamReplayUpperBound(
+    1,
+    echoedRequestBytes,
+    events.length,
+    1_024,
+  );
+  assertEquals(actualBytes <= bound, true);
+  assertEquals(actualBytes > bound - echoedRequestBytes * 2, true);
+});
+
+const messageDone = (
+  outputIndex: number,
+  itemId: string,
+  text: string,
+  status: "completed" | "incomplete" = "completed",
+  contentIndex = 0,
+) => [{
+  type: "response.output_text.done",
+  item_id: itemId,
+  output_index: outputIndex,
+  content_index: contentIndex,
+  text,
+}, {
+  type: "response.content_part.done",
+  item_id: itemId,
+  output_index: outputIndex,
+  content_index: contentIndex,
+  part: { type: "output_text", text, annotations: [] },
+}, {
+  type: "response.output_item.done",
+  output_index: outputIndex,
+  item: {
+    id: itemId,
+    type: "message",
+    status,
+    role: "assistant",
+    content: [{ type: "output_text", text, annotations: [] }],
+  },
+}];
+
 Deno.test("native Responses buffered adapter transforms the request and preserves canonical output", async () => {
   let capturedUrl = "";
   let capturedBody: Record<string, unknown> = {};
+  const nativeInput = [{
+    id: "rs_previous",
+    type: "reasoning",
+    summary: [],
+    encrypted_content: "opaque-reasoning-state",
+  }, { role: "user", content: "continue" }];
   const result = await completeResponsesChat(request, new AbortController().signal, {
     baseUrl: "https://provider.example/v1",
     apiKey: "secret",
@@ -37,7 +196,12 @@ Deno.test("native Responses buffered adapter transforms the request and preserve
       model: "forbidden",
       stream: true,
     },
-    requestFields: { store: false, metadata: { trace: "buffered" } },
+    requestFields: {
+      store: false,
+      metadata: { trace: "buffered" },
+      input: nativeInput,
+      requiresNativeInput: true,
+    },
     fetch: (input, init) => {
       capturedUrl = String(input);
       capturedBody = JSON.parse(String(init?.body));
@@ -106,7 +270,8 @@ Deno.test("native Responses buffered adapter transforms the request and preserve
   assertEquals(capturedBody.metadata, { trace: "buffered" });
   assertEquals(capturedBody.user, "caller-123");
   assertEquals(capturedBody.text, { format: { type: "json_object" } });
-  assertEquals(Array.isArray(capturedBody.input), true);
+  assertEquals(capturedBody.input, nativeInput);
+  assertEquals("requiresNativeInput" in capturedBody, false);
   assertEquals(Array.isArray(capturedBody.tools), true);
   assertEquals(result.text, "hello");
   assertEquals(result.inputTokens, 9);
@@ -143,44 +308,111 @@ Deno.test("native Responses SSE adapter exposes Chat chunks, usage, and one DONE
     {
       type: "response.output_item.added",
       output_index: 0,
-      item: { type: "message", role: "assistant" },
+      item: { id: "rs_stream", type: "reasoning", status: "in_progress" },
     },
-    { type: "response.reasoning_summary_text.delta", delta: "summary" },
+    {
+      type: "response.reasoning_summary_part.added",
+      item_id: "rs_stream",
+      output_index: 0,
+      summary_index: 0,
+      part: { type: "summary_text", text: "" },
+    },
+    {
+      type: "response.reasoning_summary_text.delta",
+      item_id: "rs_stream",
+      output_index: 0,
+      summary_index: 0,
+      delta: "summary",
+    },
+    ...messageLifecycle(1, "msg_stream"),
     {
       type: "response.output_text.delta",
-      output_index: 0,
+      item_id: "msg_stream",
+      output_index: 1,
       content_index: 0,
       delta: "hello ",
     },
     {
       type: "response.output_text.delta",
-      output_index: 2,
+      item_id: "msg_stream",
+      output_index: 1,
       content_index: 0,
       delta: "world",
     },
     {
       type: "response.output_text.annotation.added",
-      output_index: 2,
+      item_id: "msg_stream",
+      output_index: 1,
       content_index: 0,
       annotation: {
         type: "url_citation",
-        start_index: 0,
-        end_index: 5,
+        start_index: 6,
+        end_index: 11,
         title: "Source",
         url: "https://example.test/source",
       },
     },
-    { type: "response.refusal.done", refusal: "" },
     {
       type: "response.output_item.added",
-      output_index: 3,
-      item: { type: "function_call", id: "item", call_id: "call", name: "lookup" },
+      output_index: 2,
+      item: {
+        type: "function_call",
+        id: "item",
+        status: "in_progress",
+        call_id: "call",
+        name: "lookup",
+      },
     },
     {
       type: "response.function_call_arguments.delta",
-      output_index: 3,
+      output_index: 2,
       item_id: "item",
       delta: "{}",
+    },
+    {
+      type: "response.reasoning_summary_text.done",
+      item_id: "rs_stream",
+      output_index: 0,
+      summary_index: 0,
+      text: "summary",
+    },
+    {
+      type: "response.reasoning_summary_part.done",
+      item_id: "rs_stream",
+      output_index: 0,
+      summary_index: 0,
+      part: { type: "summary_text", text: "summary" },
+    },
+    {
+      type: "response.output_item.done",
+      output_index: 0,
+      item: {
+        id: "rs_stream",
+        type: "reasoning",
+        status: "completed",
+        summary: [{ type: "summary_text", text: "summary" }],
+        content: [],
+      },
+    },
+    ...messageDone(1, "msg_stream", "hello world"),
+    {
+      type: "response.function_call_arguments.done",
+      output_index: 2,
+      item_id: "item",
+      name: "lookup",
+      arguments: "{}",
+    },
+    {
+      type: "response.output_item.done",
+      output_index: 2,
+      item: {
+        type: "function_call",
+        id: "item",
+        status: "completed",
+        call_id: "call",
+        name: "lookup",
+        arguments: "{}",
+      },
     },
     {
       type: "response.completed",
@@ -375,7 +607,15 @@ Deno.test("Responses output byte bounds allow long tokens and retain hard ceilin
           new Response(
             [
               { type: "response.created", response: { id: "resp_bound", model: "upstream-model" } },
-              { type: "response.output_text.delta", delta: " ".repeat(1_024) },
+              ...messageLifecycle(0, "msg_bound"),
+              {
+                type: "response.output_text.delta",
+                item_id: "msg_bound",
+                output_index: 0,
+                content_index: 0,
+                delta: " ".repeat(1_024),
+              },
+              ...messageDone(0, "msg_bound", " ".repeat(1_024)),
               {
                 type: "response.completed",
                 response: {
@@ -415,8 +655,12 @@ Deno.test("Responses output byte bounds allow long tokens and retain hard ceilin
                     type: "response.created",
                     response: { id: "resp_bound_rejected", model: "upstream-model" },
                   },
+                  ...messageLifecycle(0, "msg_bound_rejected"),
                   {
                     type: "response.output_text.delta",
+                    item_id: "msg_bound_rejected",
+                    output_index: 0,
+                    content_index: 0,
                     delta: " ".repeat(64 * 256 + 1),
                   },
                 ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
@@ -431,10 +675,18 @@ Deno.test("Responses output byte bounds allow long tokens and retain hard ceilin
   );
 });
 
-Deno.test("Responses streams reject duplicate DONE and non-marker post-terminal data", async () => {
+Deno.test("Responses streams terminate on official lifecycle events and reject bare DONE", async () => {
   const terminal = [
     { type: "response.created", response: { id: "resp_terminal", model: "upstream-model" } },
-    { type: "response.output_text.delta", delta: "ok" },
+    ...messageLifecycle(0, "msg_terminal"),
+    {
+      type: "response.output_text.delta",
+      item_id: "msg_terminal",
+      output_index: 0,
+      content_index: 0,
+      delta: "ok",
+    },
+    ...messageDone(0, "msg_terminal", "ok"),
     {
       type: "response.completed",
       response: {
@@ -452,30 +704,233 @@ Deno.test("Responses streams reject duplicate DONE and non-marker post-terminal 
       },
     },
   ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
-  for (
-    const suffix of [
-      "data: [DONE]\n\ndata: [DONE]\n\n",
-      'data: {"type":"response.in_progress","response":{}}\n\n',
-    ]
-  ) {
-    await assertRejects(
+  let cancelled = false;
+  const frames: string[] = [];
+  await Promise.race([
+    (async () => {
+      for await (
+        const frame of streamResponsesChat(request, new AbortController().signal, {
+          baseUrl: "https://provider.example/v1",
+          apiKey: "secret",
+          upstreamModel: "upstream-model",
+          fetch: () =>
+            Promise.resolve(
+              new Response(
+                new ReadableStream<Uint8Array>({
+                  start(controller) {
+                    controller.enqueue(new TextEncoder().encode(terminal));
+                    // Deliberately remain open. The official terminal event must finish parsing
+                    // without waiting for transport EOF or a non-standard [DONE] marker.
+                  },
+                  cancel() {
+                    cancelled = true;
+                  },
+                }),
+                { headers: { "content-type": "text/event-stream" } },
+              ),
+            ),
+        })
+      ) frames.push(frame);
+    })(),
+    new Promise<never>((_resolve, reject) =>
+      setTimeout(() => reject(new Error("official terminal waited for EOF")), 250)
+    ),
+  ]);
+  assertEquals(frames.at(-1), "[DONE]");
+  assertEquals(cancelled, true);
+
+  await assertRejects(
+    async () => {
+      for await (
+        const _ of streamResponsesChat(request, new AbortController().signal, {
+          baseUrl: "https://provider.example/v1",
+          apiKey: "secret",
+          upstreamModel: "upstream-model",
+          fetch: () =>
+            Promise.resolve(
+              new Response("data: [DONE]\n\n", {
+                headers: { "content-type": "text/event-stream" },
+              }),
+            ),
+        })
+      ) { /* consume */ }
+    },
+    ProviderAttemptError,
+    "before an official terminal",
+  );
+});
+
+Deno.test("native Responses streams reject invalid lifecycle prefixes before text is exposed", async () => {
+  const created = {
+    type: "response.created",
+    response: { id: "resp_lifecycle", model: "upstream-model", status: "in_progress" },
+  };
+  const message = messageLifecycle(0, "msg_lifecycle");
+  const invalidCases: Array<{ name: string; events: unknown[]; message: string }> = [{
+    name: "duplicate created",
+    events: [created, created],
+    message: "duplicate response.created",
+  }, {
+    name: "changed response id",
+    events: [created, {
+      type: "response.in_progress",
+      response: { id: "resp_changed", model: "upstream-model", status: "in_progress" },
+    }],
+    message: "changed response id",
+  }, {
+    name: "changed terminal model",
+    events: [created, {
+      type: "response.completed",
+      response: {
+        id: "resp_lifecycle",
+        model: "different-model",
+        status: "completed",
+        output: [],
+      },
+    }],
+    message: "changed response model",
+  }, {
+    name: "delta before item",
+    events: [created, {
+      type: "response.output_text.delta",
+      item_id: "msg_lifecycle",
+      output_index: 0,
+      content_index: 0,
+      delta: "must remain buffered",
+    }],
+    message: "preceded output_item.added",
+  }, {
+    name: "delta before content part",
+    events: [created, message[0], {
+      type: "response.output_text.delta",
+      item_id: "msg_lifecycle",
+      output_index: 0,
+      content_index: 0,
+      delta: "must remain buffered",
+    }],
+    message: "preceded content_part.added",
+  }, {
+    name: "changed item id",
+    events: [created, ...message, {
+      type: "response.output_text.delta",
+      item_id: "msg_changed",
+      output_index: 0,
+      content_index: 0,
+      delta: "must remain buffered",
+    }],
+    message: "item identity changed",
+  }, {
+    name: "content part not closed",
+    events: [created, ...message, {
+      type: "response.output_text.done",
+      item_id: "msg_lifecycle",
+      output_index: 0,
+      content_index: 0,
+      text: "",
+    }, {
+      type: "response.output_item.done",
+      output_index: 0,
+      item: {
+        id: "msg_lifecycle",
+        type: "message",
+        status: "completed",
+        role: "assistant",
+        content: [{ type: "output_text", text: "" }],
+      },
+    }],
+    message: "preceded content_part.done",
+  }, {
+    name: "output item not closed",
+    events: [created, ...message, {
+      type: "response.completed",
+      response: {
+        id: "resp_lifecycle",
+        model: "upstream-model",
+        status: "completed",
+        output: [{
+          id: "msg_lifecycle",
+          type: "message",
+          status: "completed",
+          role: "assistant",
+          content: [{ type: "output_text", text: "" }],
+        }],
+      },
+    }],
+    message: "preceded output_item.done",
+  }, {
+    name: "function arguments not closed",
+    events: [created, {
+      type: "response.output_item.added",
+      output_index: 0,
+      item: {
+        id: "fc_lifecycle",
+        type: "function_call",
+        status: "in_progress",
+        call_id: "call_lifecycle",
+        name: "lookup",
+        arguments: "",
+      },
+    }, {
+      type: "response.output_item.done",
+      output_index: 0,
+      item: {
+        id: "fc_lifecycle",
+        type: "function_call",
+        status: "completed",
+        call_id: "call_lifecycle",
+        name: "lookup",
+        arguments: "{}",
+      },
+    }],
+    message: "preceded function_call_arguments.done",
+  }, {
+    name: "terminal item identity changed",
+    events: [created, ...message, ...messageDone(0, "msg_lifecycle", ""), {
+      type: "response.completed",
+      response: {
+        id: "resp_lifecycle",
+        model: "upstream-model",
+        status: "completed",
+        output: [{
+          id: "msg_changed_at_terminal",
+          type: "message",
+          status: "completed",
+          role: "assistant",
+          content: [{ type: "output_text", text: "" }],
+        }],
+      },
+    }],
+    message: "conflicts with its streamed identity",
+  }];
+
+  for (const invalid of invalidCases) {
+    const exposed: string[] = [];
+    const error = await assertRejects(
       async () => {
         for await (
-          const _ of streamResponsesChat(request, new AbortController().signal, {
+          const frame of streamResponsesChat(request, new AbortController().signal, {
             baseUrl: "https://provider.example/v1",
             apiKey: "secret",
-            upstreamModel: "upstream-model",
             fetch: () =>
               Promise.resolve(
-                new Response(terminal + suffix, {
-                  headers: { "content-type": "text/event-stream" },
-                }),
+                new Response(
+                  invalid.events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
+                  { headers: { "content-type": "text/event-stream" } },
+                ),
               ),
           })
-        ) { /* consume */ }
+        ) exposed.push(frame);
       },
       ProviderAttemptError,
-      "after its terminal",
+      invalid.message,
+      invalid.name,
+    );
+    assertEquals(error.options.category, "invalid_response", invalid.name);
+    assertEquals(error.options.transient, true, invalid.name);
+    assertEquals(
+      exposed.some((frame) => frame.includes("must remain buffered")),
+      false,
+      invalid.name,
     );
   }
 });
@@ -483,7 +938,15 @@ Deno.test("Responses streams reject duplicate DONE and non-marker post-terminal 
 Deno.test("native Responses SSE adapter maps incomplete terminals to Chat length", async () => {
   const events = [
     { type: "response.created", response: { id: "resp_incomplete", model: "upstream-model" } },
-    { type: "response.output_text.delta", delta: "partial" },
+    ...messageLifecycle(0, "msg_incomplete"),
+    {
+      type: "response.output_text.delta",
+      item_id: "msg_incomplete",
+      output_index: 0,
+      content_index: 0,
+      delta: "partial",
+    },
+    ...messageDone(0, "msg_incomplete", "partial", "incomplete"),
     {
       type: "response.incomplete",
       response: {
@@ -610,7 +1073,13 @@ Deno.test("Responses body and stream errors distinguish permanent from transient
                   }\n\ndata: ${
                     JSON.stringify({
                       type: "response.failed",
-                      response: { error: { code, message: "failed" } },
+                      response: {
+                        id: `resp_${code}`,
+                        model: "upstream-model",
+                        status: "failed",
+                        output: [],
+                        error: { code, message: "failed" },
+                      },
                     })
                   }\n\n`,
                   { headers: { "content-type": "text/event-stream" } },
@@ -649,6 +1118,46 @@ Deno.test("native Responses streaming propagates caller cancellation to transpor
   assertEquals(transportAborted, true);
 });
 
+Deno.test("native Responses provider timeouts retain retry and public error classification", async () => {
+  const timedOut = () => Promise.reject(new DOMException("deadline exceeded", "TimeoutError"));
+  const buffered = await assertRejects(
+    () =>
+      completeResponsesChat(request, new AbortController().signal, {
+        baseUrl: "https://provider.example/v1",
+        apiKey: "secret",
+        fetch: timedOut,
+      }),
+    ProviderAttemptError,
+    "timed out",
+  );
+  assertEquals(buffered.options, {
+    category: "timeout",
+    status: 504,
+    transient: true,
+    code: "timeout",
+  });
+
+  const streamed = await assertRejects(
+    async () => {
+      for await (
+        const _ of streamResponsesChat(request, new AbortController().signal, {
+          baseUrl: "https://provider.example/v1",
+          apiKey: "secret",
+          fetch: timedOut,
+        })
+      ) { /* consume */ }
+    },
+    ProviderAttemptError,
+    "timed out",
+  );
+  assertEquals(streamed.options, {
+    category: "timeout",
+    status: 504,
+    transient: true,
+    code: "timeout",
+  });
+});
+
 Deno.test("lossy Chat to Responses options fail before transport without fallback eligibility", async () => {
   let dispatched = false;
   const error = await assertRejects(
@@ -674,14 +1183,17 @@ Deno.test("Responses streaming rejects authoritative done values that conflict w
       type: "response.created",
       response: { id: "resp_mismatch", status: "in_progress", model: "upstream" },
     },
+    ...messageLifecycle(0, "msg_mismatch"),
     {
       type: "response.output_text.delta",
+      item_id: "msg_mismatch",
       output_index: 0,
       content_index: 0,
       delta: "exposed text",
     },
     {
       type: "response.output_text.done",
+      item_id: "msg_mismatch",
       output_index: 0,
       content_index: 0,
       text: "different terminal text",
@@ -708,6 +1220,95 @@ Deno.test("Responses streaming rejects authoritative done values that conflict w
   );
 });
 
+Deno.test("Responses streaming rejects terminal citations that conflict with live annotations", async () => {
+  const citation = (url: string) => ({
+    type: "url_citation",
+    start_index: 0,
+    end_index: 1,
+    title: "source",
+    url,
+  });
+  const live = citation("https://example.test/live");
+  const terminal = citation("https://example.test/terminal");
+  const item = (annotations: unknown[]) => ({
+    id: "msg_citation_mismatch",
+    type: "message",
+    status: "completed",
+    role: "assistant",
+    content: [{ type: "output_text", text: "x", annotations }],
+  });
+  const events = [
+    {
+      type: "response.created",
+      response: { id: "resp_citation_mismatch", status: "in_progress", model: "upstream" },
+    },
+    ...messageLifecycle(0, "msg_citation_mismatch"),
+    {
+      type: "response.output_text.delta",
+      item_id: "msg_citation_mismatch",
+      output_index: 0,
+      content_index: 0,
+      delta: "x",
+    },
+    {
+      type: "response.output_text.annotation.added",
+      item_id: "msg_citation_mismatch",
+      output_index: 0,
+      content_index: 0,
+      annotation_index: 0,
+      annotation: live,
+    },
+    {
+      type: "response.output_text.done",
+      item_id: "msg_citation_mismatch",
+      output_index: 0,
+      content_index: 0,
+      text: "x",
+    },
+    {
+      type: "response.content_part.done",
+      item_id: "msg_citation_mismatch",
+      output_index: 0,
+      content_index: 0,
+      part: { type: "output_text", text: "x", annotations: [live] },
+    },
+    {
+      type: "response.output_item.done",
+      output_index: 0,
+      item: item([live]),
+    },
+    {
+      type: "response.completed",
+      response: {
+        id: "resp_citation_mismatch",
+        object: "response",
+        status: "completed",
+        model: "upstream",
+        output: [item([terminal])],
+      },
+    },
+  ];
+  await assertRejects(
+    async () => {
+      for await (
+        const _event of streamResponsesChat(request, new AbortController().signal, {
+          baseUrl: "https://provider.example/v1",
+          apiKey: "secret",
+          fetch: () =>
+            Promise.resolve(
+              new Response(
+                events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
+                { headers: { "content-type": "text/event-stream" } },
+              ),
+            ),
+        })
+      ) { /* consume */ }
+    },
+    ProviderAttemptError,
+    "terminal citations conflict",
+  );
+});
+
 Deno.test("Responses SSE parsing remains linear across many small transport chunks", async () => {
   const text = "x".repeat(32_768);
   const payload = new TextEncoder().encode([
@@ -717,14 +1318,17 @@ Deno.test("Responses SSE parsing remains linear across many small transport chun
         response: { id: "resp_chunked", status: "in_progress", model: "upstream" },
       })
     }\n\n`,
+    ...messageLifecycle(0, "msg_chunked").map((event) => `data: ${JSON.stringify(event)}\n\n`),
     `data: ${
       JSON.stringify({
         type: "response.output_text.delta",
+        item_id: "msg_chunked",
         output_index: 0,
         content_index: 0,
         delta: text,
       })
     }\n\n`,
+    ...messageDone(0, "msg_chunked", text).map((event) => `data: ${JSON.stringify(event)}\n\n`),
     `data: ${
       JSON.stringify({
         type: "response.completed",

@@ -55,9 +55,81 @@ Deno.test("public Chat and Responses routes execute a native Responses registry 
         },
       }, { status: 401 }));
     }
+    if (JSON.stringify(body.input).includes("force provider timeout")) {
+      return Promise.reject(new DOMException("native deadline exceeded", "TimeoutError"));
+    }
     const id = `resp_${upstreamBodies.length}`;
     if (body.stream === true) {
+      if (JSON.stringify(body.input).includes("long token without usage")) {
+        const text = " ".repeat(256);
+        const messageId = `msg_long_${upstreamBodies.length}`;
+        const events = [{
+          type: "response.created",
+          response: { id, status: "in_progress", model: "native-upstream" },
+        }, {
+          type: "response.output_item.added",
+          output_index: 0,
+          item: { id: messageId, type: "message", status: "in_progress", role: "assistant" },
+        }, {
+          type: "response.content_part.added",
+          item_id: messageId,
+          output_index: 0,
+          content_index: 0,
+          part: { type: "output_text", text: "", annotations: [] },
+        }, {
+          type: "response.output_text.delta",
+          item_id: messageId,
+          output_index: 0,
+          content_index: 0,
+          delta: text,
+        }, {
+          type: "response.output_text.done",
+          item_id: messageId,
+          output_index: 0,
+          content_index: 0,
+          text,
+        }, {
+          type: "response.content_part.done",
+          item_id: messageId,
+          output_index: 0,
+          content_index: 0,
+          part: { type: "output_text", text, annotations: [] },
+        }, {
+          type: "response.output_item.done",
+          output_index: 0,
+          item: {
+            id: messageId,
+            type: "message",
+            role: "assistant",
+            status: "completed",
+            content: [{ type: "output_text", text, annotations: [] }],
+          },
+        }, {
+          type: "response.completed",
+          response: {
+            id,
+            status: "completed",
+            model: "native-upstream",
+            output: [{
+              id: messageId,
+              type: "message",
+              role: "assistant",
+              status: "completed",
+              content: [{ type: "output_text", text, annotations: [] }],
+            }],
+          },
+        }];
+        return Promise.resolve(
+          new Response(
+            events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(
+              "",
+            ),
+            { headers: { "content-type": "text/event-stream" } },
+          ),
+        );
+      }
       if (JSON.stringify(body.input).includes("cancel public response")) {
+        const messageId = `msg_cancel_${upstreamBodies.length}`;
         const encode = (event: Record<string, unknown>) =>
           new TextEncoder().encode(
             `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`,
@@ -69,7 +141,20 @@ Deno.test("public Chat and Responses routes execute a native Responses registry 
               response: { id, status: "in_progress", model: "native-upstream" },
             }));
             controller.enqueue(encode({
+              type: "response.output_item.added",
+              output_index: 0,
+              item: { id: messageId, type: "message", status: "in_progress", role: "assistant" },
+            }));
+            controller.enqueue(encode({
+              type: "response.content_part.added",
+              item_id: messageId,
+              output_index: 0,
+              content_index: 0,
+              part: { type: "output_text", text: "", annotations: [] },
+            }));
+            controller.enqueue(encode({
               type: "response.output_text.delta",
+              item_id: messageId,
               output_index: 0,
               content_index: 0,
               delta: "bill this visible cancellation",
@@ -90,6 +175,16 @@ Deno.test("public Chat and Responses routes execute a native Responses registry 
         const events = [{
           type: "response.created",
           response: { id, status: "in_progress", model: "native-upstream" },
+        }, {
+          type: "response.output_item.added",
+          output_index: 0,
+          item: { id: "rs_summary", type: "reasoning", status: "in_progress" },
+        }, {
+          type: "response.reasoning_summary_part.added",
+          item_id: "rs_summary",
+          output_index: 0,
+          summary_index: 0,
+          part: { type: "summary_text", text: "" },
         }, {
           type: "response.reasoning_summary_text.delta",
           item_id: "rs_summary",
@@ -114,23 +209,60 @@ Deno.test("public Chat and Responses routes execute a native Responses registry 
           ),
         );
       }
+      const messageId = `msg_stream_${upstreamBodies.length}`;
       const events = [
-        { type: "response.queued", response: { id, status: "queued", model: "native-upstream" } },
         {
           type: "response.created",
           response: { id, status: "in_progress", model: "native-upstream" },
         },
+        { type: "response.queued", response: { id, status: "queued", model: "native-upstream" } },
+        {
+          type: "response.output_item.added",
+          output_index: 0,
+          item: { id: messageId, type: "message", status: "in_progress", role: "assistant" },
+        },
+        {
+          type: "response.content_part.added",
+          item_id: messageId,
+          output_index: 0,
+          content_index: 0,
+          part: { type: "output_text", text: "", annotations: [] },
+        },
         {
           type: "response.output_text.delta",
+          item_id: messageId,
           output_index: 0,
           content_index: 0,
           delta: "native streamed result",
         },
         {
           type: "response.output_text.done",
+          item_id: messageId,
           output_index: 0,
           content_index: 0,
           text: "native streamed result",
+        },
+        {
+          type: "response.content_part.done",
+          item_id: messageId,
+          output_index: 0,
+          content_index: 0,
+          part: { type: "output_text", text: "native streamed result", annotations: [] },
+        },
+        {
+          type: "response.output_item.done",
+          output_index: 0,
+          item: {
+            id: messageId,
+            type: "message",
+            role: "assistant",
+            status: "completed",
+            content: [{
+              type: "output_text",
+              text: "native streamed result",
+              annotations: [],
+            }],
+          },
         },
         {
           type: "response.completed",
@@ -139,7 +271,7 @@ Deno.test("public Chat and Responses routes execute a native Responses registry 
             status: "completed",
             model: "native-upstream",
             output: [{
-              id: `msg_stream_${upstreamBodies.length}`,
+              id: messageId,
               type: "message",
               role: "assistant",
               status: "completed",
@@ -160,10 +292,13 @@ Deno.test("public Chat and Responses routes execute a native Responses registry 
           );
         const controlled = new ReadableStream<Uint8Array>({
           start(controller) {
-            for (const event of events.slice(0, 3)) controller.enqueue(encode(event));
+            const terminalStart = events.findIndex((event) =>
+              event.type === "response.output_text.done"
+            );
+            for (const event of events.slice(0, terminalStart)) controller.enqueue(encode(event));
             releasePublicResponsesStream = () => {
               publicResponsesTerminalReleased = true;
-              for (const event of events.slice(3)) controller.enqueue(encode(event));
+              for (const event of events.slice(terminalStart)) controller.enqueue(encode(event));
               controller.close();
             };
           },
@@ -326,12 +461,42 @@ Deno.test("public Chat and Responses routes execute a native Responses registry 
   assertEquals(chatStreamText.trimEnd().endsWith("data: [DONE]"), true);
   assertEquals(chatStreamText.includes('"usage"'), false);
 
+  const statelessInput = [
+    {
+      type: "reasoning",
+      id: "rs_previous",
+      summary: [{ type: "summary_text", text: "Use the prior output" }],
+      encrypted_content: "opaque-provider-state",
+      status: "completed",
+    },
+    {
+      type: "message",
+      id: "msg_previous",
+      status: "completed",
+      role: "assistant",
+      content: [{ type: "output_text", text: "Prior native answer", annotations: [] }],
+    },
+    {
+      type: "function_call",
+      id: "fc_previous",
+      call_id: "call_previous",
+      name: "lookup",
+      arguments: '{"query":"prior"}',
+      status: "completed",
+    },
+    {
+      type: "function_call_output",
+      call_id: "call_previous",
+      output: "prior tool result",
+    },
+    { type: "message", role: "user", content: "buffered response" },
+  ];
   const response = await app.request("/v1/responses", {
     method: "POST",
     headers: { ...openAIHeaders, "idempotency-key": "native-response-buffered" },
     body: JSON.stringify({
       model: "native-responses/model",
-      input: "buffered response",
+      input: statelessInput,
       store: false,
       metadata: { request: "buffered" },
       user: "public-buffered-user",
@@ -342,6 +507,7 @@ Deno.test("public Chat and Responses routes execute a native Responses registry 
   assertEquals(upstreamBodies[2].store, false);
   assertEquals(upstreamBodies[2].metadata, { request: "buffered" });
   assertEquals(upstreamBodies[2].user, "public-buffered-user");
+  assertEquals(upstreamBodies[2].input, statelessInput);
 
   const responseStream = await app.request("/v1/responses", {
     method: "POST",
@@ -388,7 +554,7 @@ Deno.test("public Chat and Responses routes execute a native Responses registry 
       stream: true,
     }),
   });
-  assertEquals(summaryFailure.status, 200);
+  assertEquals(summaryFailure.status, 200, await summaryFailure.clone().text());
   const summaryFailureText = await summaryFailure.text();
   assertStringIncludes(summaryFailureText, "visible summary");
   assertStringIncludes(summaryFailureText, "provider_error");
@@ -422,6 +588,8 @@ Deno.test("public Chat and Responses routes execute a native Responses registry 
   assertEquals(incompleteResponse.status, 200, JSON.stringify(incompleteBody));
   assertEquals(incompleteBody.status, "incomplete");
   assertEquals(incompleteBody.incomplete_details, { reason: "max_output_tokens" });
+  assertEquals(incompleteBody.store, false);
+  assertEquals(upstreamBodies.at(-1)?.store, false);
   assertEquals(upstreamUrls.length, 7);
 
   const usageStream = await app.request("/v1/chat/completions", {
@@ -520,6 +688,7 @@ Deno.test("public Chat and Responses routes execute a native Responses registry 
   assertEquals(rateLimited.status, 429, JSON.stringify(rateLimitedBody));
   assertEquals(rateLimited.headers.get("retry-after"), "2");
   assertEquals(rateLimitedBody.error.code, "rate_limit_exceeded");
+  assertEquals(rateLimitedBody.error.type, "rate_limit_error");
   assertStringIncludes(rateLimitedBody.error.message, "Native provider rate limit");
 
   const authenticationFailure = await app.request("/v1/responses", {
@@ -533,6 +702,7 @@ Deno.test("public Chat and Responses routes execute a native Responses registry 
   const authenticationFailureBody = await json(authenticationFailure);
   assertEquals(authenticationFailure.status, 502, JSON.stringify(authenticationFailureBody));
   assertEquals(authenticationFailureBody.error.code, "provider_authentication_error");
+  assertEquals(authenticationFailureBody.error.type, "server_error");
   assertEquals(
     authenticationFailureBody.error.message,
     "The configured provider rejected its credentials",
@@ -541,4 +711,52 @@ Deno.test("public Chat and Responses routes execute a native Responses registry 
     JSON.stringify(authenticationFailureBody).includes("sk-provider-fingerprint"),
     false,
   );
+
+  const boundedEstimate = await app.request("/v1/responses", {
+    method: "POST",
+    headers: { ...openAIHeaders, "idempotency-key": "native-response-bounded-estimate" },
+    body: JSON.stringify({
+      model: "native-responses/model",
+      input: "long token without usage",
+      max_output_tokens: 1,
+      stream: true,
+    }),
+  });
+  const boundedEstimateBody = await boundedEstimate.text();
+  assertStringIncludes(boundedEstimateBody, "response.completed");
+  const boundedReplay = [...memory.apiIdempotencyRequests.values()].find((item) =>
+    item.idempotencyKey === "native-response-bounded-estimate"
+  );
+  assertExists(boundedReplay);
+  assertEquals(memory.usageRuns.get(boundedReplay.usageRunId)?.outputTokens, 1);
+
+  const timeout = await app.request("/v1/responses", {
+    method: "POST",
+    headers: { ...openAIHeaders, "idempotency-key": "native-response-timeout" },
+    body: JSON.stringify({
+      model: "native-responses/model",
+      input: "force provider timeout",
+    }),
+  });
+  const timeoutBody = await json(timeout);
+  assertEquals(timeout.status, 504, JSON.stringify(timeoutBody));
+  assertEquals(timeoutBody.error.code, "timeout");
+  assertEquals(timeoutBody.error.type, "server_error");
+
+  const dispatchesBeforeUnsupportedStore = upstreamBodies.length;
+  const usageBeforeUnsupportedStore = memory.usageRuns.size;
+  const unsupportedStore = await app.request("/v1/responses", {
+    method: "POST",
+    headers: { ...openAIHeaders, "idempotency-key": "native-response-store-true" },
+    body: JSON.stringify({
+      model: "native-responses/model",
+      input: "do not dispatch stored response",
+      store: true,
+    }),
+  });
+  const unsupportedStoreBody = await json(unsupportedStore);
+  assertEquals(unsupportedStore.status, 400, JSON.stringify(unsupportedStoreBody));
+  assertEquals(unsupportedStoreBody.error.code, "unsupported_parameter");
+  assertEquals(upstreamBodies.length, dispatchesBeforeUnsupportedStore);
+  assertEquals(memory.usageRuns.size, usageBeforeUnsupportedStore);
 });

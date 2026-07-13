@@ -74,6 +74,33 @@ test("canceling an immutable edit restores the existing draft", async ({ page })
   await expect(composer).toHaveValue("Unsent draft that must survive");
 });
 
+test("edit mode locks generation and branch actions without losing draft", async ({ page }) => {
+  const composer = page.getByRole("textbox", { name: /message/i });
+  await composer.fill("Branch action lock seed");
+  await composer.press("Enter");
+
+  const regenerate = page.getByRole("button", { name: "Regenerate response in a new branch" });
+  await expect(regenerate).toBeEnabled();
+  await regenerate.click();
+  await expect(page.getByLabel("Branch 2 of 2")).toBeVisible();
+  await expect(regenerate).toBeEnabled();
+
+  await composer.fill("Unsent draft protected from special actions");
+  const prompt = page.getByText("Branch action lock seed", { exact: true });
+  await prompt.locator("xpath=ancestor::article[1]").getByRole("button", { name: /edit/i }).click();
+  await expect(composer).toHaveValue("Branch action lock seed");
+
+  await expect(regenerate).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Continue response" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Previous branch" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "View conversation tree" })).toBeDisabled();
+
+  await page.getByRole("button", { name: "Cancel edit" }).click();
+  await expect(composer).toHaveValue("Unsent draft protected from special actions");
+  await expect(regenerate).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Previous branch" })).toBeEnabled();
+});
+
 test("editing preserves the original Markdown source exactly", async ({ page }) => {
   const markdown = "**Bold** and `code` with _emphasis_";
   const composer = page.getByRole("textbox", { name: /message/i });

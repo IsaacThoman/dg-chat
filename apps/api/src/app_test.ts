@@ -58,6 +58,325 @@ Deno.test("OpenAI endpoint registrations are unique", () => {
   ) assertEquals(counts.has(expected), true, `Missing OpenAI route registration: ${expected}`);
 });
 
+Deno.test("Chat stream replay fragment overflow terminalizes durably", async () => {
+  const repository = new MemoryRepository();
+  let providerCalls = 0;
+  const providerStream = async function* () {
+    providerCalls++;
+    for (let index = 0; index < 4; index++) {
+      yield JSON.stringify({
+        id: "chatcmpl-upstream",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "upstream",
+        choices: [{ index: 0, delta: {}, finish_reason: null }],
+      });
+    }
+    yield JSON.stringify({
+      id: "chatcmpl-upstream",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "upstream",
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+    });
+    yield "[DONE]";
+  };
+  const { app } = createApp({
+    repository,
+    setupToken: "chat-fragment-setup",
+    providerStream,
+    replayQuota: { maxRequests: 10, maxBytes: 64 * 1024 * 1024, maxEvents: 4 },
+  });
+  await app.request("/api/setup/bootstrap", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-setup-token": "chat-fragment-setup" },
+    body: JSON.stringify({
+      email: "chat-fragments@example.com",
+      password: "correct horse battery",
+      name: "Fragment Admin",
+    }),
+  });
+  const login = await app.request("/api/auth/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email: "chat-fragments@example.com",
+      password: "correct horse battery",
+    }),
+  });
+  const cookie = sessionCookie(login);
+  const tokenResponse = await app.request("/api/tokens", {
+    method: "POST",
+    headers: {
+      cookie,
+      origin: "http://localhost:5173",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ name: "Fragment test", scopes: ["chat:write"] }),
+  });
+  const token = (await json(tokenResponse)).token;
+  const headers = {
+    authorization: `Bearer ${token}`,
+    "content-type": "application/json",
+    "idempotency-key": "chat-fragment-overflow",
+  };
+  const body = JSON.stringify({
+    model: "openai/default",
+    messages: [{ role: "user", content: "produce too many empty chunks" }],
+    stream: true,
+  });
+  const response = await app.request("/v1/chat/completions", { method: "POST", headers, body });
+  const responseText = await response.text();
+  assertEquals(response.status, 200);
+  assertStringIncludes(responseText, "provider_error");
+  const admin = (await repository.listUsers())[0];
+  const stored = await repository.getApiRequest(
+    admin.id,
+    "chat.completions",
+    "chat-fragment-overflow",
+  );
+  assertEquals(stored?.state, "failed");
+  assertEquals(stored?.frames.length, 4);
+  const replay = await app.request("/v1/chat/completions", { method: "POST", headers, body });
+  assertEquals(replay.headers.get("x-idempotent-replay"), "true");
+  assertEquals(await replay.text(), responseText);
+  assertEquals(providerCalls, 1);
+});
+
+Deno.test("buffered Responses replay admits large output limits bounded by provider payloads", async () => {
+  let providerCalls = 0;
+  let providerStreamCalls = 0;
+  const { app } = createApp({
+    setupToken: "responses-buffered-bound",
+    replayQuota: { maxRequests: 256, maxBytes: 128 * 1024 * 1024, maxEvents: 20_000 },
+    providerComplete: () => {
+      providerCalls++;
+      return Promise.resolve({ text: "bounded result", inputTokens: 1, outputTokens: 2 });
+    },
+    providerStream: async function* () {
+      providerStreamCalls++;
+      yield JSON.stringify({
+        id: "chatcmpl-high-output-bound",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "upstream",
+        choices: [{ index: 0, delta: { content: "bounded stream" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 },
+      });
+      yield "[DONE]";
+    },
+  });
+  await app.request("/api/setup/bootstrap", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-setup-token": "responses-buffered-bound",
+    },
+    body: JSON.stringify({
+      email: "responses-buffered@example.com",
+      password: "correct horse battery",
+      name: "Responses Buffered",
+    }),
+  });
+  const login = await app.request("/api/auth/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email: "responses-buffered@example.com",
+      password: "correct horse battery",
+    }),
+  });
+  const tokenResponse = await app.request("/api/tokens", {
+    method: "POST",
+    headers: {
+      cookie: sessionCookie(login),
+      origin: "http://localhost:5173",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ name: "Responses buffered", scopes: ["chat:write"] }),
+  });
+  const token = (await json(tokenResponse)).token;
+  const headers = {
+    authorization: `Bearer ${token}`,
+    "content-type": "application/json",
+    "idempotency-key": "responses-buffered-large-output",
+  };
+  const body = JSON.stringify({
+    model: "openai/default",
+    input: "The normalized provider payload is the real buffered boundary",
+    max_output_tokens: 8_192,
+  });
+  const response = await app.request("/v1/responses", { method: "POST", headers, body });
+  const responseBody = await response.text();
+  assertEquals(response.status, 200);
+  assertStringIncludes(responseBody, "bounded result");
+  const replay = await app.request("/v1/responses", { method: "POST", headers, body });
+  assertEquals(replay.status, 200);
+  assertEquals(replay.headers.get("x-idempotent-replay"), "true");
+  assertEquals(await replay.text(), responseBody);
+  assertEquals(providerCalls, 1);
+
+  const streamHeaders = {
+    ...headers,
+    "idempotency-key": "responses-stream-high-output",
+  };
+  const streamBody = JSON.stringify({
+    model: "openai/default",
+    input: "Provider transport caps the actual streaming terminal",
+    max_output_tokens: 131_072,
+    stream: true,
+  });
+  const stream = await app.request("/v1/responses", {
+    method: "POST",
+    headers: streamHeaders,
+    body: streamBody,
+  });
+  const streamText = await stream.text();
+  assertEquals(stream.status, 200);
+  assertStringIncludes(streamText, "response.completed");
+  const streamReplay = await app.request("/v1/responses", {
+    method: "POST",
+    headers: streamHeaders,
+    body: streamBody,
+  });
+  assertEquals(streamReplay.headers.get("x-idempotent-replay"), "true");
+  assertEquals(await streamReplay.text(), streamText);
+  assertEquals(providerStreamCalls, 1);
+});
+
+Deno.test("Responses citation streams replay completely and overflow terminalizes durably", async () => {
+  let providerCalls = 0;
+  const providerStream = async function* (request: ChatCompletionRequest) {
+    providerCalls++;
+    const messages = JSON.stringify(request.messages);
+    const overflow = messages.includes("overflow citations");
+    const invalidRange = messages.includes("invalid citation range");
+    const annotations = Array.from({ length: overflow ? 22 : 12 }, (_, index) => ({
+      type: "url_citation",
+      url_citation: {
+        start_index: 0,
+        end_index: invalidRange ? 2 : 1,
+        title: "\u0000".repeat(8_192),
+        url: `https://example.test/${index}/` + "a".repeat(16_000),
+      },
+    }));
+    yield JSON.stringify({
+      id: "chatcmpl-citations",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "upstream",
+      choices: [{
+        index: 0,
+        delta: { role: "assistant", content: "x", annotations },
+        finish_reason: null,
+      }],
+    });
+    yield JSON.stringify({
+      id: "chatcmpl-citations",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "upstream",
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    });
+    yield "[DONE]";
+  };
+  const repository = new MemoryRepository();
+  const { app } = createApp({
+    repository,
+    setupToken: "responses-citation-bound",
+    providerStream,
+  });
+  await app.request("/api/setup/bootstrap", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-setup-token": "responses-citation-bound",
+    },
+    body: JSON.stringify({
+      email: "responses-citations@example.com",
+      password: "correct horse battery",
+      name: "Responses Citations",
+    }),
+  });
+  const login = await app.request("/api/auth/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email: "responses-citations@example.com",
+      password: "correct horse battery",
+    }),
+  });
+  const tokenResponse = await app.request("/api/tokens", {
+    method: "POST",
+    headers: {
+      cookie: sessionCookie(login),
+      origin: "http://localhost:5173",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ name: "Responses citations", scopes: ["chat:write"] }),
+  });
+  const token = (await json(tokenResponse)).token;
+  const request = async (input: string, key: string) => {
+    const headers = {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+      "idempotency-key": key,
+    };
+    const body = JSON.stringify({
+      model: "openai/default",
+      input,
+      stream: true,
+      max_output_tokens: 1,
+    });
+    return await app.request("/v1/responses", { method: "POST", headers, body });
+  };
+
+  const success = await request("near-limit citations", "responses-citations-success");
+  const successBody = await success.text();
+  assertEquals(success.status, 200);
+  assertStringIncludes(successBody, "response.output_text.annotation.added");
+  assertStringIncludes(successBody, "response.content_part.done");
+  assertStringIncludes(successBody, "response.output_item.done");
+  assertStringIncludes(successBody, "response.completed");
+  const successReplay = await request("near-limit citations", "responses-citations-success");
+  assertEquals(successReplay.headers.get("x-idempotent-replay"), "true");
+  assertEquals(await successReplay.text(), successBody);
+  assertEquals(providerCalls, 1);
+
+  const overflow = await request("overflow citations", "responses-citations-overflow");
+  const overflowBody = await overflow.text();
+  assertEquals(overflow.status, 200);
+  assertStringIncludes(overflowBody, '"type":"error"');
+  assertEquals(overflowBody.includes("replay_persistence_error"), false);
+  const overflowReplay = await request("overflow citations", "responses-citations-overflow");
+  assertEquals(overflowReplay.headers.get("x-idempotent-replay"), "true");
+  assertEquals(await overflowReplay.text(), overflowBody);
+  assertEquals(providerCalls, 2);
+  const owner = (await repository.listUsers())[0];
+  assertEquals(
+    (await repository.getApiRequest(owner.id, "responses", "responses-citations-overflow"))
+      ?.state,
+    "failed",
+  );
+
+  const invalidRange = await request(
+    "invalid citation range",
+    "responses-citations-invalid-range",
+  );
+  const invalidRangeBody = await invalidRange.text();
+  assertEquals(invalidRange.status, 200);
+  assertStringIncludes(invalidRangeBody, '"type":"error"');
+  assertEquals(invalidRangeBody.includes("replay_persistence_error"), false);
+  const invalidRangeReplay = await request(
+    "invalid citation range",
+    "responses-citations-invalid-range",
+  );
+  assertEquals(invalidRangeReplay.headers.get("x-idempotent-replay"), "true");
+  assertEquals(await invalidRangeReplay.text(), invalidRangeBody);
+  assertEquals(providerCalls, 3);
+});
+
 Deno.test("preferences folders and tags are authenticated owner-scoped versioned APIs", async () => {
   let upstreamRequest: ChatCompletionRequest | undefined;
   const { app } = createApp({
@@ -684,6 +1003,73 @@ Deno.test("bootstrap, signup, approval, immutable chat, API token and OpenAI com
   assertEquals(await streamReplay.text(), streamEvents);
   assertEquals((await repository.usage(signed.user.id)).calls, 3);
 
+  const oversizedMetadata = await app.request("/v1/responses", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${apiToken.token}`,
+      "content-type": "application/json",
+      "idempotency-key": "responses-metadata-too-large",
+    },
+    body: JSON.stringify({
+      model: "simulated/dg-chat",
+      input: "must fail before dispatch",
+      stream: true,
+      metadata: { trace: "x".repeat(513) },
+    }),
+  });
+  assertEquals(oversizedMetadata.status, 422);
+  assertEquals((await repository.usage(signed.user.id)).calls, 3);
+  const oversizedProjectedTerminal = await app.request("/v1/responses", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${apiToken.token}`,
+      "content-type": "application/json",
+      "idempotency-key": "responses-terminal-too-large",
+    },
+    body: JSON.stringify({
+      model: "simulated/dg-chat",
+      input: "must fail before dispatch too",
+      stream: true,
+      max_output_tokens: 131_072,
+    }),
+  });
+  assertEquals(oversizedProjectedTerminal.status, 413);
+  assertEquals((await repository.usage(signed.user.id)).calls, 3);
+  const { app: constrainedReplayApp } = createApp({
+    repository,
+    replayQuota: { maxRequests: 256, maxBytes: 1_048_576, maxEvents: 20_000 },
+  });
+  const constrainedChatReplay = await constrainedReplayApp.request("/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${apiToken.token}`,
+      "content-type": "application/json",
+      "idempotency-key": "chat-constrained-replay",
+    },
+    body: JSON.stringify({
+      model: "simulated/dg-chat",
+      messages: [{ role: "user", content: "must fail before simulated provider work" }],
+      stream: true,
+    }),
+  });
+  assertEquals(constrainedChatReplay.status, 413);
+  assertEquals((await repository.usage(signed.user.id)).calls, 3);
+  const constrainedReplay = await constrainedReplayApp.request("/v1/responses", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${apiToken.token}`,
+      "content-type": "application/json",
+      "idempotency-key": "responses-constrained-replay",
+    },
+    body: JSON.stringify({
+      model: "simulated/dg-chat",
+      input: "default output limit cannot fit this configured replay quota",
+      stream: true,
+    }),
+  });
+  assertEquals(constrainedReplay.status, 413);
+  assertEquals((await repository.usage(signed.user.id)).calls, 3);
+
   let responseCompleteCalls = 0;
   let responseTerminalFrame: string | undefined;
   const completeApiStream = repository.completeApiStream.bind(repository);
@@ -704,7 +1090,7 @@ Deno.test("bootstrap, signup, approval, immutable chat, API token and OpenAI com
       model: "simulated/dg-chat",
       input: "stream a Responses API result",
       stream: true,
-      max_output_tokens: 100,
+      metadata: { trace: "responses-stream-metadata" },
     }),
   });
   assertEquals(responseStream.status, 200);
@@ -713,6 +1099,8 @@ Deno.test("bootstrap, signup, approval, immutable chat, API token and OpenAI com
   assertStringIncludes(responseEvents, "event: response.created");
   assertStringIncludes(responseEvents, "event: response.output_text.delta");
   assertStringIncludes(responseEvents, "event: response.completed");
+  assertStringIncludes(responseEvents, '"store":false');
+  assertStringIncludes(responseEvents, '"trace":"responses-stream-metadata"');
   assertEquals(responseEvents.includes("[DONE]"), false);
   assertEquals(responseCompleteCalls, 1);
   assertStringIncludes(responseTerminalFrame ?? "", "response.completed");
@@ -728,12 +1116,28 @@ Deno.test("bootstrap, signup, approval, immutable chat, API token and OpenAI com
       model: "simulated/dg-chat",
       input: "stream a Responses API result",
       stream: true,
-      max_output_tokens: 100,
+      metadata: { trace: "responses-stream-metadata" },
     }),
   });
   assertEquals(responseReplay.headers.get("x-idempotent-replay"), "true");
   assertEquals(responseReplay.headers.get("cache-control"), "no-cache");
   assertEquals(await responseReplay.text(), responseEvents);
+  assertEquals((await repository.usage(signed.user.id)).calls, 4);
+  const responseMetadataConflict = await app.request("/v1/responses", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${apiToken.token}`,
+      "content-type": "application/json",
+      "idempotency-key": "responses-stream-regression",
+    },
+    body: JSON.stringify({
+      model: "simulated/dg-chat",
+      input: "stream a Responses API result",
+      stream: true,
+      metadata: { trace: "different-metadata" },
+    }),
+  });
+  assertEquals(responseMetadataConflict.status, 409);
   assertEquals((await repository.usage(signed.user.id)).calls, 4);
 
   const completeApiJson = repository.completeApiJson.bind(repository);

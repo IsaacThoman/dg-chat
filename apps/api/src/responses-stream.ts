@@ -4,6 +4,8 @@ import {
   type CanonicalUrlCitation,
   type CanonicalUsage,
   normalizeChatStreamChunk,
+  ProviderProtocolError,
+  ResponseCitationBudget,
 } from "./provider-protocol.ts";
 import { type ResponseRequestEcho, responseRequestFields } from "./responses.ts";
 
@@ -68,6 +70,7 @@ export class ResponsesStreamProjector {
   #usage?: CanonicalUsage;
   #finishState: CanonicalResult["finishState"] = "unknown";
   #visibleBytes = 0;
+  readonly #citationBudget = new ResponseCitationBudget();
   #sawDone = false;
 
   constructor(input: {
@@ -177,6 +180,14 @@ export class ResponsesStreamProjector {
     if (event.type === "annotation") {
       const message = this.#ensureMessage(outward);
       this.#ensureTextPart(message, outward);
+      if (event.annotation.endIndex > message.text.length) {
+        throw new ProviderProtocolError(
+          "malformed_payload",
+          "Provider citation range exceeds accumulated output text",
+          "response.annotations",
+        );
+      }
+      this.#citationBudget.add(event.annotation);
       message.annotations.push({ ...event.annotation });
       outward.push({
         type: "response.output_text.annotation.added",

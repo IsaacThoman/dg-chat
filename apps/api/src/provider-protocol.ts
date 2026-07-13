@@ -1,10 +1,14 @@
-const MAX_PAYLOAD_BYTES = 4 * 1024 * 1024;
+export const MAX_PROVIDER_PROTOCOL_PAYLOAD_BYTES = 4 * 1024 * 1024;
+const MAX_PAYLOAD_BYTES = MAX_PROVIDER_PROTOCOL_PAYLOAD_BYTES;
 const MAX_MESSAGES = 256;
 const MAX_PARTS = 256;
 const MAX_TOOLS = 128;
 const MAX_TEXT_BYTES = 2_000_000;
 const MAX_ID_BYTES = 512;
 const encoder = new TextEncoder();
+
+export const MAX_RESPONSE_CITATIONS = 256;
+export const MAX_RESPONSE_CITATION_COLLECTION_BYTES = 1_048_576;
 
 export type CanonicalRole = "system" | "developer" | "user" | "assistant" | "tool";
 export type CanonicalContentPart =
@@ -16,6 +20,51 @@ export interface CanonicalUrlCitation {
   endIndex: number;
   title: string;
   url: string;
+}
+
+function publicCitationProjection(citation: CanonicalUrlCitation) {
+  return {
+    type: citation.type,
+    start_index: citation.startIndex,
+    end_index: citation.endIndex,
+    title: citation.title,
+    url: citation.url,
+  };
+}
+
+/** Bounds the exact citation array shape emitted by both Responses projectors. */
+export class ResponseCitationBudget {
+  #count = 0;
+  #bytes = 2; // JSON array brackets.
+
+  add(citation: CanonicalUrlCitation, path = "response.annotations"): void {
+    if (this.#count >= MAX_RESPONSE_CITATIONS) {
+      throw new ProviderProtocolError(
+        "payload_too_large",
+        `Provider response contains more than ${MAX_RESPONSE_CITATIONS} citations`,
+        path,
+      );
+    }
+    const bytes = this.#bytes + (this.#count > 0 ? 1 : 0) +
+      encoder.encode(JSON.stringify(publicCitationProjection(citation))).byteLength;
+    if (bytes > MAX_RESPONSE_CITATION_COLLECTION_BYTES) {
+      throw new ProviderProtocolError(
+        "payload_too_large",
+        "Provider response citations exceed the size limit",
+        path,
+      );
+    }
+    this.#count++;
+    this.#bytes = bytes;
+  }
+}
+
+export function assertResponseCitationBudget(
+  citations: readonly CanonicalUrlCitation[],
+  path = "response.annotations",
+): void {
+  const budget = new ResponseCitationBudget();
+  for (const citation of citations) budget.add(citation, path);
 }
 export interface CanonicalToolCall {
   id: string;
@@ -238,6 +287,16 @@ function reasoningSummary(value: unknown, path: string): string {
   }
   return summary;
 }
+function responseMetadata(value: unknown, path: string): Record<string, string> {
+  const metadata = object(value, path);
+  if (Object.keys(metadata).length > 16) fail(`${path} must contain at most 16 entries`, path);
+  return Object.fromEntries(
+    Object.entries(metadata).map(([key, entry]) => [
+      string(key, `${path} key`, 64, false),
+      string(entry, `${path}.${key}`, 512),
+    ]),
+  );
+}
 function allowedKeys(value: Record<string, unknown>, allowed: readonly string[], path: string) {
   const extra = Object.keys(value).find((key) => !allowed.includes(key));
   if (extra) unsupported(path, `${path} contains an unsupported field`);
@@ -294,6 +353,20 @@ function responseParts(value: unknown, path: string): CanonicalContentPart[] {
     if (part.type === "input_text" || part.type === "text") {
       allowedKeys(part, ["type", "text"], `${path}[${index}]`);
       return { type: "text", text: string(part.text, `${path}[${index}].text`) };
+    }
+    if (part.type === "output_text") {
+      allowedKeys(part, ["type", "text", "annotations", "logprobs"], `${path}[${index}]`);
+      if (part.annotations !== undefined) {
+        array(part.annotations, `${path}[${index}].annotations`, MAX_PARTS);
+      }
+      if (part.logprobs !== undefined && part.logprobs !== null) {
+        array(part.logprobs, `${path}[${index}].logprobs`, MAX_PARTS);
+      }
+      return { type: "text", text: string(part.text, `${path}[${index}].text`) };
+    }
+    if (part.type === "refusal") {
+      allowedKeys(part, ["type", "refusal"], `${path}[${index}]`);
+      return { type: "text", text: string(part.refusal, `${path}[${index}].refusal`) };
     }
     if (part.type === "input_image") {
       allowedKeys(part, ["type", "image_url", "detail"], `${path}[${index}]`);
@@ -673,6 +746,30 @@ const responsesRequestKeys = [
   "stream_options",
 ];
 
+/** Identifies Responses input items that cannot be represented losslessly for a Chat target. */
+export function responsesRequestRequiresNativeInput(input: unknown): boolean {
+  const body = object(input, "request");
+  if (!Array.isArray(body.input)) return false;
+  return body.input.some((raw) => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
+    const item = raw as Record<string, unknown>;
+    if (item.type === "reasoning") return true;
+    if (item.type === "function_call") {
+      // call_id is the semantic tool correlation key. The Responses item id is transport
+      // identity only, and a completed call maps losslessly to an assistant Chat tool call.
+      // Partial calls cannot be represented faithfully by Chat Completions.
+      return item.status === "in_progress" || item.status === "incomplete";
+    }
+    if (item.type !== "message") return false;
+    if (item.id !== undefined || item.status !== undefined) return true;
+    return Array.isArray(item.content) &&
+      item.content.some((part) =>
+        !!part && typeof part === "object" && !Array.isArray(part) &&
+        ["output_text", "refusal"].includes(String((part as Record<string, unknown>).type))
+      );
+  });
+}
+
 /** Converts a Responses request into a Chat Completions request without silent field loss. */
 export function responsesRequestToChatCompletions(input: unknown): Record<string, unknown> {
   const body = object(clonePayload(input), "request");
@@ -688,7 +785,7 @@ export function responsesRequestToChatCompletions(input: unknown): Record<string
     boolean(body.store, "request.store");
   }
   if (body.metadata !== undefined && body.metadata !== null) {
-    object(body.metadata, "request.metadata");
+    responseMetadata(body.metadata, "request.metadata");
   }
   if (body.background !== undefined && body.background !== null) {
     if (boolean(body.background, "request.background")) unsupported("request.background");
@@ -707,7 +804,6 @@ export function responsesRequestToChatCompletions(input: unknown): Record<string
       const item = object(raw, `request.input[${index}]`);
       if (item.type === "function_call") {
         const call = toolCall(item, `request.input[${index}]`);
-        if (call.status !== undefined) lossy(`request.input[${index}].status`);
         const serialized = {
           id: call.id,
           type: "function",
@@ -731,8 +827,87 @@ export function responsesRequestToChatCompletions(input: unknown): Record<string
           ),
           content: string(item.output, `request.input[${index}].output`),
         });
+      } else if (item.type === "reasoning") {
+        allowedKeys(
+          item,
+          ["type", "id", "summary", "content", "encrypted_content", "status"],
+          `request.input[${index}]`,
+        );
+        if (item.id !== undefined) {
+          string(item.id, `request.input[${index}].id`, MAX_ID_BYTES, false);
+        }
+        if (
+          item.status !== undefined &&
+          !["in_progress", "completed", "incomplete"].includes(String(item.status))
+        ) {
+          fail(`request.input[${index}].status is invalid`, `request.input[${index}].status`);
+        }
+        if (item.summary !== undefined) {
+          for (
+            const [partIndex, rawPart] of array(
+              item.summary,
+              `request.input[${index}].summary`,
+              MAX_PARTS,
+            ).entries()
+          ) {
+            const part = object(rawPart, `request.input[${index}].summary[${partIndex}]`);
+            allowedKeys(part, ["type", "text"], `request.input[${index}].summary[${partIndex}]`);
+            if (part.type !== "summary_text") {
+              fail(
+                "Reasoning summary part type is invalid",
+                `request.input[${index}].summary[${partIndex}].type`,
+              );
+            }
+            string(part.text, `request.input[${index}].summary[${partIndex}].text`);
+          }
+        }
+        if (item.content !== undefined) {
+          for (
+            const [partIndex, rawPart] of array(
+              item.content,
+              `request.input[${index}].content`,
+              MAX_PARTS,
+            ).entries()
+          ) {
+            const part = object(rawPart, `request.input[${index}].content[${partIndex}]`);
+            allowedKeys(part, ["type", "text"], `request.input[${index}].content[${partIndex}]`);
+            if (part.type !== "reasoning_text") {
+              fail(
+                "Reasoning content part type is invalid",
+                `request.input[${index}].content[${partIndex}].type`,
+              );
+            }
+            string(part.text, `request.input[${index}].content[${partIndex}].text`);
+          }
+        }
+        if (item.encrypted_content !== undefined) {
+          string(item.encrypted_content, `request.input[${index}].encrypted_content`);
+        }
+        // The native provider receives the original item. This bounded shadow retains its token
+        // weight for reservation/telemetry but is never dispatched to a Chat candidate.
+        messages.push({ role: "assistant", content: JSON.stringify(item) });
       } else {
-        allowedKeys(item, ["type", "role", "content"], `request.input[${index}]`);
+        const outputMessage = item.type === "message" &&
+          (item.id !== undefined || item.status !== undefined ||
+            (Array.isArray(item.content) &&
+              item.content.some((part) =>
+                !!part && typeof part === "object" && !Array.isArray(part) &&
+                ["output_text", "refusal"].includes(String((part as Record<string, unknown>).type))
+              )));
+        allowedKeys(
+          item,
+          outputMessage ? ["type", "id", "status", "role", "content"] : ["type", "role", "content"],
+          `request.input[${index}]`,
+        );
+        if (item.id !== undefined) {
+          string(item.id, `request.input[${index}].id`, MAX_ID_BYTES, false);
+        }
+        if (
+          item.status !== undefined &&
+          !["in_progress", "completed", "incomplete"].includes(String(item.status))
+        ) {
+          fail(`request.input[${index}].status is invalid`, `request.input[${index}].status`);
+        }
         messages.push({
           role: role(item.role, `request.input[${index}].role`),
           content: toChatContent(responseParts(item.content, `request.input[${index}].content`)),
@@ -903,6 +1078,7 @@ export function normalizeChatCompletionResult(input: unknown): CanonicalResult {
       (annotation, index) =>
         canonicalChatCitation(annotation, `response.choices[0].message.annotations[${index}]`),
     );
+  assertResponseCitationBudget(annotations, "response.choices[0].message.annotations");
   if (annotations.some((annotation) => annotation.endIndex > text.length)) {
     fail(
       "Citation range exceeds the assistant message content",
@@ -1058,6 +1234,7 @@ export function normalizeResponsesResult(input: unknown): CanonicalResult {
   const incompleteReason = body.incomplete_details === undefined
     ? undefined
     : object(body.incomplete_details, "response.incomplete_details").reason;
+  assertResponseCitationBudget(annotations, "response.output.annotations");
   return {
     id: string(body.id, "response.id", MAX_ID_BYTES, false),
     model: string(body.model, "response.model", 200, false),

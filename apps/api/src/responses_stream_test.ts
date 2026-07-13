@@ -1,4 +1,5 @@
 import { assertEquals, assertStringIncludes, assertThrows } from "jsr:@std/assert@1.0.14";
+import { ProviderProtocolError } from "./provider-protocol.ts";
 import { ResponsesStreamProjector } from "./responses-stream.ts";
 
 function chunk(input: Record<string, unknown>) {
@@ -10,6 +11,68 @@ function chunk(input: Record<string, unknown>) {
     ...input,
   });
 }
+
+Deno.test("Responses stream projection caps accumulated citation bytes before emission", () => {
+  const projector = new ResponsesStreamProjector({
+    responseId: "resp_citation_limit",
+    messageId: "msg_citation_limit",
+    model: "public/model",
+    createdAt: 10,
+  });
+  const annotations = Array.from({ length: 22 }, (_, index) => ({
+    type: "url_citation",
+    url_citation: {
+      start_index: 0,
+      end_index: 1,
+      title: "\u0000".repeat(8_192),
+      url: `https://example.test/${index}/` + "a".repeat(16_000),
+    },
+  }));
+  const error = assertThrows(
+    () =>
+      projector.push(chunk({
+        choices: [{
+          index: 0,
+          delta: { content: "x", annotations },
+          finish_reason: null,
+        }],
+      })),
+    ProviderProtocolError,
+  );
+  assertEquals(error.code, "payload_too_large");
+});
+
+Deno.test("Responses stream projection rejects citation ranges beyond accumulated text", () => {
+  const projector = new ResponsesStreamProjector({
+    responseId: "resp_citation_range",
+    messageId: "msg_citation_range",
+    model: "public/model",
+    createdAt: 10,
+  });
+  const error = assertThrows(
+    () =>
+      projector.push(chunk({
+        choices: [{
+          index: 0,
+          delta: {
+            content: "x",
+            annotations: [{
+              type: "url_citation",
+              url_citation: {
+                start_index: 0,
+                end_index: 2,
+                title: "outside",
+                url: "https://example.test/outside",
+              },
+            }],
+          },
+          finish_reason: null,
+        }],
+      })),
+    ProviderProtocolError,
+  );
+  assertEquals(error.code, "malformed_payload");
+});
 
 Deno.test("Responses stream projection preserves live reasoning, text, citations, tools, and usage", () => {
   const projector = new ResponsesStreamProjector({

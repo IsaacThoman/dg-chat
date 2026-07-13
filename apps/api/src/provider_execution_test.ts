@@ -327,6 +327,7 @@ Deno.test("provider execution retries through the breaker, falls back, and persi
             refusal: "declined",
             tool_calls: toolCalls,
           },
+          finish_reason: "stop",
         }],
       });
       yield "[DONE]";
@@ -383,7 +384,7 @@ Deno.test("provider execution retries through the breaker, falls back, and persi
     stream: async function* () {
       yield JSON.stringify({ choices: [{ delta: { content: "estimated first" } }] });
       yield JSON.stringify({
-        choices: [],
+        choices: [{ delta: {}, finish_reason: "stop" }],
         usage: {
           prompt_tokens: 17,
           completion_tokens: 9,
@@ -454,6 +455,7 @@ Deno.test("provider execution retries through the breaker, falls back, and persi
         usage: { prompt_tokens: 23, completion_tokens: 1 },
       });
       yield JSON.stringify({ choices: [{ delta: { content: "output after early usage" } }] });
+      yield JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] });
       yield "[DONE]";
     },
   });
@@ -721,6 +723,81 @@ async function singleProviderFixture(
   if (!run.runLeaseToken) throw new Error("execution lease missing");
   return { repo, user, keyring, provider, model, price, runId, run };
 }
+
+Deno.test("chat execution accepts only terminally valid empty streams and rejects bare DONE", async () => {
+  const valid = await singleProviderFixture("chat_completions");
+  const validEngine = new ProviderExecutionEngine({
+    repository: valid.repo,
+    keyring: valid.keyring,
+    circuitBreaker: new MemoryCircuitBreaker(),
+    breakerPolicy: {
+      failureThreshold: 3,
+      failureWindowSeconds: 60,
+      openSeconds: 30,
+      halfOpenLeaseSeconds: 5,
+    },
+    stream: async function* () {
+      yield JSON.stringify({
+        choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+      });
+      yield JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "content_filter" }] });
+      yield "[DONE]";
+    },
+  });
+  const validFrames: string[] = [];
+  for await (
+    const frame of validEngine.stream(
+      valid.model.id,
+      valid.runId,
+      valid.run.runLeaseToken!,
+      {
+        model: valid.model.publicModelId,
+        messages: [{ role: "user", content: "empty is valid" }],
+        stream: true,
+      },
+      new AbortController().signal,
+    )
+  ) validFrames.push(frame);
+  assertEquals(validFrames.at(-1), "[DONE]");
+  assertEquals(valid.repo.listProviderAttempts(valid.runId)[0].status, "succeeded");
+
+  const invalid = await singleProviderFixture("chat_completions");
+  const invalidEngine = new ProviderExecutionEngine({
+    repository: invalid.repo,
+    keyring: invalid.keyring,
+    circuitBreaker: new MemoryCircuitBreaker(),
+    breakerPolicy: {
+      failureThreshold: 3,
+      failureWindowSeconds: 60,
+      openSeconds: 30,
+      halfOpenLeaseSeconds: 5,
+    },
+    stream: async function* () {
+      yield JSON.stringify({ choices: [{ index: 0, delta: { content: "partial" } }] });
+      yield "[DONE]";
+    },
+  });
+  await assertRejects(
+    async () => {
+      for await (
+        const _frame of invalidEngine.stream(
+          invalid.model.id,
+          invalid.runId,
+          invalid.run.runLeaseToken!,
+          {
+            model: invalid.model.publicModelId,
+            messages: [{ role: "user", content: "reject bare done" }],
+            stream: true,
+          },
+          new AbortController().signal,
+        )
+      ) { /* consume */ }
+    },
+    ProviderAttemptError,
+    "before finish_reason",
+  );
+  assertEquals(invalid.repo.listProviderAttempts(invalid.runId)[0].status, "failed");
+});
 
 Deno.test("speech provider execution retries 429, preserves telemetry, and requires capability and fixed pricing", async () => {
   const fixture = await singleProviderFixture("chat_completions", ["speech"], true);
@@ -1187,7 +1264,7 @@ Deno.test("provider execution dispatches native Responses targets", async () => 
   assertEquals(fixture.repo.listProviderAttempts(fixture.runId)[0].status, "succeeded");
 });
 
-Deno.test("provider execution rejects unrepresentable Responses fields before a Chat dispatch", async () => {
+Deno.test("provider execution rejects store=true before a Chat dispatch", async () => {
   const fixture = await singleProviderFixture("chat_completions");
   let dispatched = false;
   const engine = new ProviderExecutionEngine({
@@ -1215,7 +1292,7 @@ Deno.test("provider execution rejects unrepresentable Responses fields before a 
         new AbortController().signal,
         undefined,
         undefined,
-        { metadata: { trace: "cannot-drop" } },
+        { store: true },
       ),
     ProviderAttemptError,
     "cannot preserve",
@@ -1225,6 +1302,90 @@ Deno.test("provider execution rejects unrepresentable Responses fields before a 
   const [attempt] = fixture.repo.listProviderAttempts(fixture.runId);
   assertEquals(attempt.costMicros, 0);
   assertEquals(attempt.inputTokens, 0);
+});
+
+Deno.test("provider execution skips Chat transport for native-only stateless input", async () => {
+  const fixture = await singleProviderFixture("chat_completions");
+  let dispatched = false;
+  const engine = new ProviderExecutionEngine({
+    repository: fixture.repo,
+    keyring: fixture.keyring,
+    circuitBreaker: new MemoryCircuitBreaker(),
+    breakerPolicy: {
+      failureThreshold: 1,
+      failureWindowSeconds: 60,
+      openSeconds: 30,
+      halfOpenLeaseSeconds: 5,
+    },
+    complete: () => {
+      dispatched = true;
+      return Promise.reject(new Error("must not dispatch"));
+    },
+  });
+  const error = await assertRejects(
+    () =>
+      engine.complete(
+        fixture.model.id,
+        fixture.runId,
+        fixture.run.runLeaseToken!,
+        { model: fixture.model.publicModelId, messages: [{ role: "user", content: "shadow" }] },
+        new AbortController().signal,
+        undefined,
+        undefined,
+        {
+          store: false,
+          input: [{ type: "reasoning", encrypted_content: "opaque" }],
+          requiresNativeInput: true,
+        },
+      ),
+    ProviderAttemptError,
+    "cannot preserve",
+  );
+  assertEquals(error.options.candidateLocal, true);
+  assertEquals(dispatched, false);
+  const [attempt] = fixture.repo.listProviderAttempts(fixture.runId);
+  assertEquals(attempt.costMicros, 0);
+  assertEquals(attempt.inputTokens, 0);
+});
+
+Deno.test("provider execution keeps gateway-owned Responses metadata across a Chat dispatch", async () => {
+  const fixture = await singleProviderFixture("chat_completions");
+  let dispatched = false;
+  const engine = new ProviderExecutionEngine({
+    repository: fixture.repo,
+    keyring: fixture.keyring,
+    circuitBreaker: new MemoryCircuitBreaker(),
+    breakerPolicy: {
+      failureThreshold: 1,
+      failureWindowSeconds: 60,
+      openSeconds: 30,
+      halfOpenLeaseSeconds: 5,
+    },
+    complete: () => {
+      dispatched = true;
+      return Promise.resolve({
+        text: "metadata remains in the public response",
+        inputTokens: 3,
+        outputTokens: 2,
+        upstream: {
+          id: "chatcmpl_metadata",
+          choices: [{ message: { role: "assistant", content: "metadata remains" } }],
+          usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+        },
+      });
+    },
+  });
+  await engine.complete(
+    fixture.model.id,
+    fixture.runId,
+    fixture.run.runLeaseToken!,
+    { model: fixture.model.publicModelId, messages: [{ role: "user", content: "hello" }] },
+    new AbortController().signal,
+    undefined,
+    undefined,
+    { store: false, metadata: { trace: "gateway-owned" } },
+  );
+  assertEquals(dispatched, true);
 });
 
 Deno.test("provider execution falls back across Chat Completions and Responses protocols", async () => {

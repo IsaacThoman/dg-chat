@@ -2,23 +2,116 @@ import type { ChatCompletionRequest } from "@dg-chat/contracts";
 import {
   type CanonicalResult,
   type CanonicalStreamEvent,
+  type CanonicalUrlCitation,
   chatCompletionsRequestToResponses,
+  MAX_PROVIDER_PROTOCOL_PAYLOAD_BYTES,
+  MAX_RESPONSE_CITATION_COLLECTION_BYTES,
   normalizeResponsesResult,
   normalizeResponsesStreamEvent,
   ProviderProtocolError,
 } from "./provider-protocol.ts";
 import { type UpstreamStreamOptions } from "./models.ts";
+import { providerResponseByteLimit } from "./provider-limits.ts";
 import { isSpecialUseIp, pinnedProviderFetch } from "./provider_transport.ts";
 import { ProviderAttemptError } from "./provider-resilience.ts";
 
-const DEFAULT_MAX_RESPONSE_BYTES = 16_777_216;
-const MAX_RESPONSE_BYTES = 67_108_864;
 const MAX_SSE_LINE_BYTES = 1_048_576;
 const MAX_ERROR_BODY_BYTES = 65_536;
 // Large whitespace/code tokens can decode to far more than four bytes. Keep a bounded
 // per-token ceiling while the transport-wide response limit remains the hard outer bound.
-const MAX_VISIBLE_BYTES_PER_OUTPUT_TOKEN = 256;
+export const MAX_VISIBLE_BYTES_PER_OUTPUT_TOKEN = 256;
+const MAX_JSON_BYTES_PER_VISIBLE_BYTE = 6;
+const RESPONSES_TERMINAL_TEXT_PROJECTIONS = 2;
+// The provider transport contains the first visible projection. Before the terminal response, the
+// projector can repeat that accumulated value in value-done, part-done, and item-done events.
+const RESPONSES_STREAM_REPEATED_TEXT_PROJECTIONS = 3;
+// Citations are emitted once when added, then repeated in content-part done, output-item done,
+// and the terminal response. The canonical protocol boundary caps their accumulated public JSON.
+const RESPONSES_STREAM_REPEATED_CITATION_PROJECTIONS = 2;
+const RESPONSES_TERMINAL_ENVELOPE_BYTES = 65_536;
+const RESPONSES_BUFFERED_PROVIDER_PROJECTIONS = 3;
+const RESPONSES_STREAM_EVENT_ENVELOPE_BYTES = 512;
 const encoder = new TextEncoder();
+
+/**
+ * Bounds a projected terminal Responses object before provider work begins. Completed assistant
+ * text appears in both `output_text` and the message output item, and a one-byte control character
+ * can require a six-byte JSON escape in each projection.
+ */
+export function responsesTerminalReplayUpperBound(
+  maxOutputTokens: number,
+  echoedRequestBytes: number,
+  providerResponseBytes = providerResponseByteLimit(),
+): number {
+  if (
+    !Number.isSafeInteger(maxOutputTokens) || maxOutputTokens < 0 ||
+    !Number.isSafeInteger(echoedRequestBytes) || echoedRequestBytes < 0 ||
+    !Number.isSafeInteger(providerResponseBytes) || providerResponseBytes < 0
+  ) throw new TypeError("Responses replay bounds must be non-negative safe integers");
+  const escapedVisibleBytes = BigInt(maxOutputTokens) *
+    BigInt(MAX_VISIBLE_BYTES_PER_OUTPUT_TOKEN) * BigInt(MAX_JSON_BYTES_PER_VISIBLE_BYTE);
+  const providerBytes = BigInt(providerResponseBytes);
+  const boundedEscapedVisibleBytes = escapedVisibleBytes < providerBytes
+    ? escapedVisibleBytes
+    : providerBytes;
+  const total = BigInt(echoedRequestBytes) +
+    boundedEscapedVisibleBytes * BigInt(RESPONSES_TERMINAL_TEXT_PROJECTIONS) +
+    BigInt(MAX_RESPONSE_CITATION_COLLECTION_BYTES) +
+    BigInt(RESPONSES_TERMINAL_ENVELOPE_BYTES);
+  return total > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(total);
+}
+
+/**
+ * Buffered provider payloads cross the protocol's whole-JSON clone boundary before projection.
+ * Three copies cover the normalized output, the extra top-level output_text projection, and
+ * structural/key expansion; the request echo and public envelope are budgeted separately.
+ */
+export function responsesBufferedReplayUpperBound(echoedRequestBytes: number): number {
+  if (!Number.isSafeInteger(echoedRequestBytes) || echoedRequestBytes < 0) {
+    throw new TypeError("Responses replay bounds must be non-negative safe integers");
+  }
+  const total = BigInt(echoedRequestBytes) +
+    BigInt(MAX_PROVIDER_PROTOCOL_PAYLOAD_BYTES) *
+      BigInt(RESPONSES_BUFFERED_PROVIDER_PROJECTIONS) +
+    BigInt(RESPONSES_TERMINAL_ENVELOPE_BYTES);
+  return total > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(total);
+}
+
+/**
+ * Includes every accumulated-value projection emitted before the final terminal response. The
+ * final response itself is covered by `responsesTerminalReplayUpperBound`; this additional bound
+ * covers deltas plus the value-, part-, and item-done lifecycle events.
+ */
+export function responsesStreamReplayUpperBound(
+  maxOutputTokens: number,
+  echoedRequestBytes: number,
+  maxEvents: number,
+  providerResponseBytes = providerResponseByteLimit(),
+): number {
+  if (
+    !Number.isSafeInteger(maxEvents) || maxEvents < 0 ||
+    !Number.isSafeInteger(providerResponseBytes) || providerResponseBytes < 0
+  ) {
+    throw new TypeError("Responses replay event and provider bounds must be non-negative integers");
+  }
+  const visibleBytes = BigInt(maxOutputTokens) * BigInt(MAX_VISIBLE_BYTES_PER_OUTPUT_TOKEN);
+  const escapedVisibleBytes = visibleBytes * BigInt(MAX_JSON_BYTES_PER_VISIBLE_BYTE);
+  const providerBytes = BigInt(providerResponseBytes);
+  const repeatedVisibleBytes = escapedVisibleBytes < providerBytes
+    ? escapedVisibleBytes
+    : providerBytes;
+  const projectedLifecycleBytes = providerBytes +
+    repeatedVisibleBytes * BigInt(RESPONSES_STREAM_REPEATED_TEXT_PROJECTIONS) +
+    BigInt(MAX_RESPONSE_CITATION_COLLECTION_BYTES) *
+      BigInt(RESPONSES_STREAM_REPEATED_CITATION_PROJECTIONS) +
+    BigInt(maxEvents) * BigInt(RESPONSES_STREAM_EVENT_ENVELOPE_BYTES);
+  const total = BigInt(responsesTerminalReplayUpperBound(
+    maxOutputTokens,
+    echoedRequestBytes,
+    providerResponseBytes,
+  )) + projectedLifecycleBytes + BigInt(echoedRequestBytes) * 2n;
+  return total > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(total);
+}
 
 class ResponsesStreamConsistency {
   readonly #text = new Map<string, string>();
@@ -26,6 +119,7 @@ class ResponsesStreamConsistency {
   #refusal = "";
   #reasoning = "";
   #summary = "";
+  readonly #annotations: CanonicalUrlCitation[] = [];
 
   observe(events: CanonicalStreamEvent[]) {
     for (const event of events) {
@@ -43,6 +137,8 @@ class ResponsesStreamConsistency {
           name: event.name ?? current.name,
           arguments: current.arguments + (event.arguments ?? ""),
         });
+      } else if (event.type === "annotation") {
+        this.#annotations.push({ ...event.annotation });
       }
     }
   }
@@ -92,6 +188,9 @@ class ResponsesStreamConsistency {
         this.#equal(result.refusal ?? "", this.#refusal, "terminal response refusal");
         this.#equal(result.reasoning?.summary ?? "", this.#summary, "terminal reasoning summary");
         this.#equal(result.reasoning?.content ?? "", this.#reasoning, "terminal reasoning content");
+        if (JSON.stringify(result.annotations ?? []) !== JSON.stringify(this.#annotations)) {
+          throw new Error("Responses terminal citations conflict with streamed annotations");
+        }
         const terminalTools = result.toolCalls.map(({ id, name, arguments: value }) => ({
           id,
           name,
@@ -113,6 +212,329 @@ class ResponsesStreamConsistency {
   }
 }
 
+type ResponsesLifecycleItem = {
+  id: string;
+  type: string;
+  done: boolean;
+  valueDone: boolean;
+};
+type ResponsesLifecyclePart = { type: string; valueDone: boolean; done: boolean };
+type ResponsesLifecycleSummaryPart = { valueDone: boolean; done: boolean };
+
+/**
+ * Enforces the ordering and identity invariants promised by the Responses SSE protocol before
+ * canonical events become visible to the caller. In particular, a malformed prefix must fail
+ * while the resilience layer can still retry or select a fallback provider.
+ */
+class ResponsesStreamLifecycle {
+  readonly #items = new Map<number, ResponsesLifecycleItem>();
+  readonly #contentParts = new Map<string, ResponsesLifecyclePart>();
+  readonly #summaryParts = new Map<string, ResponsesLifecycleSummaryPart>();
+  #created = false;
+  #terminal = false;
+  #responseId?: string;
+  #model?: string;
+
+  observe(input: unknown): void {
+    if (!input || typeof input !== "object" || Array.isArray(input)) return;
+    const event = input as Record<string, unknown>;
+    if (typeof event.type !== "string") return;
+    const type = event.type;
+    if (this.#terminal) throw new Error("Responses stream sent data after its terminal event");
+    if (type !== "response.created" && !this.#created) {
+      throw new Error("Responses stream must begin with response.created");
+    }
+    if (type === "response.created") {
+      if (this.#created) throw new Error("Responses stream sent duplicate response.created");
+      this.#created = true;
+      this.#observeResponseIdentity(event.response, type, true);
+      return;
+    }
+    if (["response.queued", "response.in_progress"].includes(type)) {
+      this.#observeResponseIdentity(event.response, type, false);
+      return;
+    }
+    if (
+      ["response.completed", "response.incomplete", "response.failed"].includes(type)
+    ) {
+      this.#observeResponseIdentity(event.response, type, false);
+      if (type !== "response.failed") this.#validateTerminalOutput(event.response, type);
+      this.#terminal = true;
+      return;
+    }
+    if (type === "error") {
+      this.#terminal = true;
+      return;
+    }
+    if (type === "response.output_item.added") {
+      const outputIndex = this.#index(event.output_index, "output_index");
+      if (this.#items.has(outputIndex)) {
+        throw new Error("Responses stream added the same output item twice");
+      }
+      const item = this.#record(event.item, "item");
+      const id = this.#string(item.id, "item.id");
+      const itemType = this.#string(item.type, "item.type");
+      this.#items.set(outputIndex, { id, type: itemType, done: false, valueDone: false });
+      return;
+    }
+    if (type === "response.output_item.done") {
+      const outputIndex = this.#index(event.output_index, "output_index");
+      const item = this.#requireItem(outputIndex, event.item_id);
+      if (item.done) throw new Error("Responses stream completed the same output item twice");
+      this.#requireItemPartsDone(outputIndex, item);
+      const doneItem = this.#record(event.item, "item");
+      if (doneItem.id !== item.id || doneItem.type !== item.type) {
+        throw new Error("Responses output_item.done conflicts with its added item");
+      }
+      item.done = true;
+      return;
+    }
+    if (type === "response.content_part.added") {
+      const outputIndex = this.#index(event.output_index, "output_index");
+      const contentIndex = this.#index(event.content_index, "content_index");
+      this.#requireItem(outputIndex, event.item_id);
+      const part = this.#record(event.part, "part");
+      const partType = this.#string(part.type, "part.type");
+      const key = this.#contentKey(outputIndex, contentIndex);
+      if (this.#contentParts.has(key)) {
+        throw new Error("Responses stream added the same content part twice");
+      }
+      this.#contentParts.set(key, { type: partType, valueDone: false, done: false });
+      return;
+    }
+    if (type === "response.content_part.done") {
+      const outputIndex = this.#index(event.output_index, "output_index");
+      const contentIndex = this.#index(event.content_index, "content_index");
+      const part = this.#requireContentPart(outputIndex, contentIndex, event.item_id);
+      if (part.done) throw new Error("Responses stream completed the same content part twice");
+      if (!part.valueDone) {
+        throw new Error("Responses content_part.done preceded its content done event");
+      }
+      const donePart = event.part === undefined ? undefined : this.#record(event.part, "part");
+      if (donePart && donePart.type !== part.type) {
+        throw new Error("Responses content_part.done conflicts with its added content part");
+      }
+      part.done = true;
+      return;
+    }
+    if (type === "response.reasoning_summary_part.added") {
+      const outputIndex = this.#index(event.output_index, "output_index");
+      const summaryIndex = this.#index(event.summary_index, "summary_index");
+      const item = this.#requireItem(outputIndex, event.item_id);
+      if (item.type !== "reasoning") {
+        throw new Error("Responses reasoning summary belongs to a non-reasoning item");
+      }
+      const key = this.#summaryKey(outputIndex, summaryIndex);
+      if (this.#summaryParts.has(key)) {
+        throw new Error("Responses stream added the same reasoning summary part twice");
+      }
+      this.#summaryParts.set(key, { valueDone: false, done: false });
+      return;
+    }
+    if (type === "response.reasoning_summary_part.done") {
+      const outputIndex = this.#index(event.output_index, "output_index");
+      const summaryIndex = this.#index(event.summary_index, "summary_index");
+      const part = this.#requireSummaryPart(outputIndex, summaryIndex, event.item_id);
+      if (part.done) {
+        throw new Error("Responses stream completed the same reasoning summary part twice");
+      }
+      if (!part.valueDone) {
+        throw new Error("Responses reasoning_summary_part.done preceded its text done event");
+      }
+      part.done = true;
+      return;
+    }
+    if (
+      type === "response.output_text.delta" || type === "response.output_text.done" ||
+      type === "response.output_text.annotation.added"
+    ) {
+      const part = this.#requireTypedContentPart(event, "output_text");
+      this.#observeContentValueEvent(part, type);
+      return;
+    }
+    if (type === "response.refusal.delta" || type === "response.refusal.done") {
+      const part = this.#requireTypedContentPart(event, "refusal");
+      this.#observeContentValueEvent(part, type);
+      return;
+    }
+    if (type === "response.reasoning_text.delta" || type === "response.reasoning_text.done") {
+      const part = this.#requireTypedContentPart(event, "reasoning_text");
+      this.#observeContentValueEvent(part, type);
+      return;
+    }
+    if (
+      type === "response.reasoning_summary_text.delta" ||
+      type === "response.reasoning_summary_text.done"
+    ) {
+      const outputIndex = this.#index(event.output_index, "output_index");
+      const summaryIndex = this.#index(event.summary_index, "summary_index");
+      const part = this.#requireSummaryPart(outputIndex, summaryIndex, event.item_id);
+      if (part.valueDone) {
+        throw new Error("Responses reasoning summary sent data after its text done event");
+      }
+      if (type.endsWith(".done")) part.valueDone = true;
+      return;
+    }
+    if (
+      type === "response.function_call_arguments.delta" ||
+      type === "response.function_call_arguments.done"
+    ) {
+      const item = this.#requireItem(
+        this.#index(event.output_index, "output_index"),
+        event.item_id,
+      );
+      if (item.type !== "function_call") {
+        throw new Error("Responses function-call arguments belong to a non-function item");
+      }
+      if (item.valueDone) {
+        throw new Error("Responses function call sent data after its arguments done event");
+      }
+      if (type.endsWith(".done")) item.valueDone = true;
+    }
+  }
+
+  #validateTerminalOutput(value: unknown, eventType: string): void {
+    const response = this.#record(value, `${eventType}.response`);
+    if (!Array.isArray(response.output)) {
+      throw new Error(`Responses ${eventType}.response.output is invalid`);
+    }
+    if (response.output.length !== this.#items.size) {
+      throw new Error("Responses terminal output does not match its streamed output items");
+    }
+    for (const [outputIndex, rawItem] of response.output.entries()) {
+      const streamed = this.#items.get(outputIndex);
+      if (!streamed || !streamed.done) {
+        throw new Error("Responses terminal event preceded output_item.done");
+      }
+      const terminal = this.#record(rawItem, `${eventType}.response.output[${outputIndex}]`);
+      if (terminal.id !== streamed.id || terminal.type !== streamed.type) {
+        throw new Error("Responses terminal output item conflicts with its streamed identity");
+      }
+    }
+  }
+
+  #requireItemPartsDone(outputIndex: number, item: ResponsesLifecycleItem): void {
+    for (const [key, part] of this.#contentParts) {
+      if (key.startsWith(`${outputIndex}:`) && !part.done) {
+        throw new Error("Responses output_item.done preceded content_part.done");
+      }
+    }
+    for (const [key, part] of this.#summaryParts) {
+      if (key.startsWith(`${outputIndex}:`) && !part.done) {
+        throw new Error("Responses output_item.done preceded reasoning_summary_part.done");
+      }
+    }
+    if (item.type === "function_call" && !item.valueDone) {
+      throw new Error("Responses output_item.done preceded function_call_arguments.done");
+    }
+  }
+
+  #observeContentValueEvent(part: ResponsesLifecyclePart, type: string): void {
+    if (part.valueDone) throw new Error(`Responses ${type} followed its content done event`);
+    if (type.endsWith(".done")) part.valueDone = true;
+  }
+
+  #observeResponseIdentity(
+    value: unknown,
+    eventType: string,
+    initialize: boolean,
+  ): void {
+    const response = this.#record(value, `${eventType}.response`);
+    const id = this.#string(response.id, `${eventType}.response.id`);
+    const model = response.model === undefined
+      ? undefined
+      : this.#string(response.model, `${eventType}.response.model`);
+    if (initialize) {
+      this.#responseId = id;
+      this.#model = model;
+      return;
+    }
+    if (id !== this.#responseId) throw new Error("Responses stream changed response id");
+    if (model !== undefined && this.#model !== undefined && model !== this.#model) {
+      throw new Error("Responses stream changed response model");
+    }
+    if (this.#model === undefined) this.#model = model;
+  }
+
+  #requireTypedContentPart(
+    event: Record<string, unknown>,
+    expectedType: string,
+  ): ResponsesLifecyclePart {
+    const outputIndex = this.#index(event.output_index, "output_index");
+    const contentIndex = this.#index(event.content_index, "content_index");
+    const part = this.#requireContentPart(outputIndex, contentIndex, event.item_id);
+    if (part.type !== expectedType) {
+      throw new Error(`Responses ${event.type} conflicts with its added content part`);
+    }
+    return part;
+  }
+
+  #requireContentPart(
+    outputIndex: number,
+    contentIndex: number,
+    itemId: unknown,
+  ): ResponsesLifecyclePart {
+    this.#requireItem(outputIndex, itemId);
+    const part = this.#contentParts.get(this.#contentKey(outputIndex, contentIndex));
+    if (!part) throw new Error("Responses content event preceded content_part.added");
+    return part;
+  }
+
+  #requireSummaryPart(
+    outputIndex: number,
+    summaryIndex: number,
+    itemId: unknown,
+  ): ResponsesLifecycleSummaryPart {
+    const item = this.#requireItem(outputIndex, itemId);
+    if (item.type !== "reasoning") {
+      throw new Error("Responses reasoning summary belongs to a non-reasoning item");
+    }
+    const part = this.#summaryParts.get(this.#summaryKey(outputIndex, summaryIndex));
+    if (!part) {
+      throw new Error("Responses reasoning event preceded reasoning_summary_part.added");
+    }
+    return part;
+  }
+
+  #requireItem(outputIndex: number, itemId: unknown): ResponsesLifecycleItem {
+    const item = this.#items.get(outputIndex);
+    if (!item) throw new Error("Responses item event preceded output_item.added");
+    if (itemId !== undefined && this.#string(itemId, "item_id") !== item.id) {
+      throw new Error("Responses item identity changed during the stream");
+    }
+    return item;
+  }
+
+  #record(value: unknown, field: string): Record<string, unknown> {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error(`Responses ${field} is invalid`);
+    }
+    return value as Record<string, unknown>;
+  }
+
+  #string(value: unknown, field: string): string {
+    if (typeof value !== "string" || value.length === 0) {
+      throw new Error(`Responses ${field} is invalid`);
+    }
+    return value;
+  }
+
+  #index(value: unknown, field: string): number {
+    if (!Number.isSafeInteger(value) || Number(value) < 0) {
+      throw new Error(`Responses ${field} is invalid`);
+    }
+    return Number(value);
+  }
+
+  #contentKey(outputIndex: number, contentIndex: number): string {
+    return `${outputIndex}:${contentIndex}`;
+  }
+
+  #summaryKey(outputIndex: number, summaryIndex: number): string {
+    return `${outputIndex}:${summaryIndex}`;
+  }
+}
+
 export interface ResponsesUpstreamOptions extends UpstreamStreamOptions {
   protocol?: "responses";
   /** Responses-only fields preserved by the public Responses compatibility route. */
@@ -122,6 +544,10 @@ export interface ResponsesUpstreamOptions extends UpstreamStreamOptions {
 export interface NativeResponsesRequestFields {
   store?: boolean;
   metadata?: Record<string, unknown>;
+  /** Validated stateless Responses input items preserved for a native Responses provider. */
+  input?: unknown;
+  /** The original request contains Responses items that cannot pass through Chat Completions. */
+  requiresNativeInput?: boolean;
 }
 
 export interface ResponsesChatCompletion {
@@ -137,16 +563,6 @@ function providerTimeoutMs(override?: number): number {
   const value = override ?? Number(Deno.env.get("OPENAI_TIMEOUT_MS") ?? 120_000);
   if (!Number.isSafeInteger(value) || value < 100 || value > 600_000) {
     throw new Error("OPENAI_TIMEOUT_MS must be an integer between 100 and 600000");
-  }
-  return value;
-}
-
-function responseByteLimit(override?: number): number {
-  const value = override ?? Number(
-    Deno.env.get("OPENAI_MAX_RESPONSE_BYTES") ?? DEFAULT_MAX_RESPONSE_BYTES,
-  );
-  if (!Number.isSafeInteger(value) || value < 1_024 || value > MAX_RESPONSE_BYTES) {
-    throw new Error("OPENAI_MAX_RESPONSE_BYTES must be between 1024 and 67108864");
   }
   return value;
 }
@@ -430,6 +846,7 @@ function responseRequest(
     };
     return {
       ...translated,
+      ...(requestFields.input === undefined ? {} : { input: structuredClone(requestFields.input) }),
       ...(requestFields.store === undefined ? {} : { store: requestFields.store }),
       ...(requestFields.metadata === undefined
         ? {}
@@ -490,7 +907,7 @@ export async function completeResponsesChat(
     const body = await requireSuccessfulResponse(
       response,
       "application/json",
-      responseByteLimit(options.maxResponseBytes),
+      providerResponseByteLimit(options.maxResponseBytes),
     );
     let payload: unknown;
     try {
@@ -499,7 +916,7 @@ export async function completeResponsesChat(
       throw new Error("Provider returned malformed JSON");
     }
     const result = normalizeResponsesResult(payload);
-    const maxResponseBytes = responseByteLimit(options.maxResponseBytes);
+    const maxResponseBytes = providerResponseByteLimit(options.maxResponseBytes);
     validateUsageBounds(result, request, maxResponseBytes);
     const upstream = responsesResultToChatCompletion(result);
     const fallbackInput = Math.max(1, Math.ceil(JSON.stringify(request.messages).length / 4));
@@ -517,9 +934,19 @@ export async function completeResponsesChat(
     };
   } catch (error) {
     if (
+      !signal.aborted && error instanceof DOMException &&
+      ["AbortError", "TimeoutError"].includes(error.name)
+    ) {
+      throw new ProviderAttemptError("Provider request timed out", {
+        category: "timeout",
+        status: 504,
+        transient: true,
+        code: "timeout",
+      });
+    }
+    if (
       signal.aborted || error instanceof ProviderAttemptError ||
-      (error instanceof TypeError && !(error instanceof ProviderProtocolError)) ||
-      (error instanceof DOMException && ["AbortError", "TimeoutError"].includes(error.name))
+      (error instanceof TypeError && !(error instanceof ProviderProtocolError))
     ) throw error;
     throw new ProviderAttemptError(
       error instanceof Error ? error.message : "Provider returned an invalid Responses result",
@@ -542,6 +969,7 @@ async function* parseResponsesEvents(
   let received = 0;
   let terminal = false;
   const consistency = new ResponsesStreamConsistency();
+  const lifecycle = new ResponsesStreamLifecycle();
   const abortReader = () => void reader.cancel(signal.reason).catch(() => undefined);
   signal.addEventListener("abort", abortReader, { once: true });
   const dispatch = () => {
@@ -557,26 +985,20 @@ async function* parseResponsesEvents(
         throw new Error("Upstream sent malformed JSON in its Responses event stream");
       }
     }
+    lifecycle.observe(value);
     const events = normalizeResponsesStreamEvent(value);
     consistency.validate(value);
     consistency.observe(events);
     return { events, doneMarker: data === "[DONE]" };
   };
-  let terminalKind: "official" | "marker" | undefined;
-  let trailingDone = false;
   const processLine = (line: string): CanonicalStreamEvent[] | undefined => {
     if (line === "") {
       const frame = dispatch();
       if (!frame) return;
-      if (terminal) {
-        if (terminalKind === "official" && frame.doneMarker && !trailingDone) {
-          trailingDone = true;
-          return;
-        }
-        throw new Error("Responses stream sent data after its terminal event");
+      if (frame.doneMarker) {
+        throw new Error("Responses stream sent [DONE] before an official terminal event");
       }
       terminal = frame.events.some((event) => event.type === "done");
-      if (terminal) terminalKind = frame.doneMarker ? "marker" : "official";
       return frame.events;
     }
     if (line.startsWith(":")) return;
@@ -608,6 +1030,7 @@ async function* parseResponsesEvents(
         if (pendingCarriageReturn) {
           const events = completeLine();
           if (events) yield events;
+          if (terminal) return;
           pendingCarriageReturn = false;
           if (byte === 10) continue;
         }
@@ -616,6 +1039,7 @@ async function* parseResponsesEvents(
         } else if (byte === 10) {
           const events = completeLine();
           if (events) yield events;
+          if (terminal) return;
         } else {
           lineBytes.push(byte);
           if (lineBytes.length > MAX_SSE_LINE_BYTES) {
@@ -627,16 +1051,19 @@ async function* parseResponsesEvents(
       if (pendingCarriageReturn) {
         const events = completeLine();
         if (events) yield events;
+        if (terminal) return;
         pendingCarriageReturn = false;
       } else if (lineBytes.length) {
         const events = completeLine();
         if (events) yield events;
+        if (terminal) return;
       }
       // Dispatch a complete pending event at EOF even if the producer omitted the customary
       // trailing blank line. The normal JSON parser still rejects a genuinely truncated payload.
       if (dataLines.length) {
         const events = processLine("");
         if (events) yield events;
+        if (terminal) return;
       }
       break;
     }
@@ -797,7 +1224,7 @@ export async function* streamResponsesChat(
     await requireSuccessfulResponse(
       response,
       "text/event-stream",
-      responseByteLimit(options.maxResponseBytes),
+      providerResponseByteLimit(options.maxResponseBytes),
     );
     const state = {
       id: "",
@@ -814,7 +1241,7 @@ export async function* streamResponsesChat(
       const events of parseResponsesEvents(
         response.body!,
         combinedSignal,
-        responseByteLimit(options.maxResponseBytes),
+        providerResponseByteLimit(options.maxResponseBytes),
       )
     ) {
       for (const event of events) {
@@ -836,7 +1263,7 @@ export async function* streamResponsesChat(
         if (
           visibleBytes > visibleOutputByteLimit(
             request,
-            responseByteLimit(options.maxResponseBytes),
+            providerResponseByteLimit(options.maxResponseBytes),
           )
         ) {
           throw new Error("Provider output exceeds the requested output bound");
@@ -847,9 +1274,19 @@ export async function* streamResponsesChat(
     }
   } catch (error) {
     if (
+      !signal.aborted && error instanceof DOMException &&
+      ["AbortError", "TimeoutError"].includes(error.name)
+    ) {
+      throw new ProviderAttemptError("Provider request timed out", {
+        category: "timeout",
+        status: 504,
+        transient: true,
+        code: "timeout",
+      });
+    }
+    if (
       signal.aborted || error instanceof ProviderAttemptError ||
-      (error instanceof TypeError && !(error instanceof ProviderProtocolError)) ||
-      (error instanceof DOMException && ["AbortError", "TimeoutError"].includes(error.name))
+      (error instanceof TypeError && !(error instanceof ProviderProtocolError))
     ) throw error;
     throw new ProviderAttemptError(
       error instanceof Error ? error.message : "Provider returned an invalid Responses stream",

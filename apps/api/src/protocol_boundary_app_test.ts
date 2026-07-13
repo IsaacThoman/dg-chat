@@ -313,6 +313,7 @@ Deno.test("OpenAI gateway preserves public identity, visible stream billing, and
       tools: [{ type: "function", name: "lookup", parameters: { type: "object" } }],
       tool_choice: { type: "function", name: "lookup" },
       reasoning: { effort: "medium", summary: "none" },
+      metadata: { trace: "chat-provider" },
     }),
   });
   assertEquals(supported.status, 200);
@@ -330,6 +331,8 @@ Deno.test("OpenAI gateway preserves public identity, visible stream billing, and
   }]);
   assertEquals(converted.reasoning_effort, "medium");
   const supportedBody = await json(supported);
+  assertEquals(supportedBody.store, false);
+  assertEquals(supportedBody.metadata, { trace: "chat-provider" });
   const citedText = supportedBody.output.flatMap(
     (item: { content?: Array<Record<string, unknown>> }) => item.content ?? [],
   ).find((part: { type?: string }) => part.type === "output_text");
@@ -383,6 +386,7 @@ Deno.test("OpenAI gateway preserves public identity, visible stream billing, and
   assertEquals(richResponse.status, 200);
   const richBody = await json(richResponse);
   assertEquals(JSON.stringify(richBody).includes("must-not-leak"), false);
+  assertEquals(richBody.store, false);
   assertEquals(
     richBody.output.some((item: { type: string }) => item.type === "function_call"),
     true,
@@ -444,6 +448,19 @@ Deno.test("OpenAI gateway preserves public identity, visible stream billing, and
 
   const callsBeforeUnsupported = completedRequests.length;
   const usageBeforeUnsupported = await repository.usage(me.user.id);
+  const stored = await app.request("/v1/responses", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model: "openai/default",
+      input: "do not claim unsupported storage",
+      store: true,
+    }),
+  });
+  assertEquals(stored.status, 400);
+  assertEquals((await json(stored)).error.code, "unsupported_parameter");
+  assertEquals(completedRequests.length, callsBeforeUnsupported);
+  assertEquals(await repository.usage(me.user.id), usageBeforeUnsupported);
   const unsupported = await app.request("/v1/responses", {
     method: "POST",
     headers,

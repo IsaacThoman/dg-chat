@@ -1088,6 +1088,155 @@ Deno.test({
         latencyMs: 8,
       });
       assertEquals(terminal.frames.length, 3);
+      const largeTerminal = `event: response.completed\ndata: ${
+        JSON.stringify({ text: `${"\u0000".repeat(200_000)}${"🦖".repeat(80_000)}` })
+      }\n\n`;
+      const chunkedReplay = await repo.beginApiRequest({
+        ...replayInput,
+        idempotencyKey: "postgres-replay-chunked",
+        requestHash: "9".repeat(64),
+        runId: "postgres-replay-chunked-run",
+      });
+      if (chunkedReplay.kind !== "started") throw new Error("missing chunked replay request");
+      const chunkedTerminal = await repo.completeApiStream({
+        id: chunkedReplay.request.id,
+        leaseToken: chunkedReplay.leaseToken,
+        responseStatus: 200,
+        terminalFrame: largeTerminal,
+        costMicros: 20_000,
+        inputTokens: 4,
+        outputTokens: 2,
+        latencyMs: 8,
+      });
+      assertEquals(chunkedTerminal.frames.length > 1, true);
+      assertEquals(chunkedTerminal.frames.map((frame) => frame.frame).join(""), largeTerminal);
+      assertEquals(
+        chunkedTerminal.frames.every((frame) =>
+          new TextEncoder().encode(frame.frame).length <= 1_048_576
+        ),
+        true,
+      );
+      const replayReservationUser = await repo.createUser({
+        email: "replay-reservation@database.test",
+        name: "Replay reservation",
+        passwordHash: "hash",
+        emailVerified: true,
+      });
+      await repo.approveUser(replayReservationUser.id, "approved", 1_000_000);
+      const reservationQuota = { maxRequests: 10, maxEvents: 20_000, maxBytes: 67_108_864 };
+      await assertRejects(
+        () =>
+          repo.beginApiRequest({
+            userId: replayReservationUser.id,
+            endpoint: "responses",
+            idempotencyKey: "postgres-invalid-replay-reservation",
+            requestHash: "e".repeat(64),
+            stream: true,
+            model: "test/model",
+            runId: "postgres-invalid-replay-reservation-run",
+            reserveMicros: 1,
+            provider: "test",
+            quota: reservationQuota,
+            replayReservedBytes: 0,
+            replayReservedEvents: 1,
+          }),
+        DomainError,
+        "Invalid idempotent request parameters",
+      );
+      const reservationStarts = await Promise.allSettled(
+        ["a", "b"].map((suffix) =>
+          repo.beginApiRequest({
+            userId: replayReservationUser.id,
+            endpoint: "responses",
+            idempotencyKey: `postgres-replay-reservation-${suffix}`,
+            requestHash: suffix.repeat(64),
+            stream: true,
+            model: "test/model",
+            runId: `postgres-replay-reservation-run-${suffix}`,
+            reserveMicros: 1,
+            provider: "test",
+            quota: reservationQuota,
+            replayReservedBytes: 40_000_000,
+            replayReservedEvents: 9_000,
+          })
+        ),
+      );
+      assertEquals(
+        reservationStarts.map((result) => result.status).sort(),
+        ["fulfilled", "rejected"],
+      );
+      const failureReservation = await repo.beginApiRequest({
+        userId: replayReservationUser.id,
+        endpoint: "responses",
+        idempotencyKey: "postgres-failure-reservation",
+        requestHash: "f".repeat(64),
+        stream: true,
+        model: "test/model",
+        runId: "postgres-failure-reservation-run",
+        reserveMicros: 1,
+        provider: "test",
+        quota: reservationQuota,
+        replayReservedBytes: 16,
+        replayReservedEvents: 1,
+      });
+      if (failureReservation.kind !== "started") {
+        throw new Error("missing failure reservation request");
+      }
+      await assertRejects(
+        () =>
+          repo.failApiRequest({
+            id: failureReservation.request.id,
+            leaseToken: failureReservation.leaseToken,
+            responseStatus: 500,
+            responseBody: '{"error":"provider failed"}',
+            terminalFrame: "event: response.failed\ndata: {}\n\n",
+            billing: { mode: "refund" },
+          }),
+        DomainError,
+        "Reserved replay capacity",
+      );
+      const failureReservationState = await repo.getApiRequest(
+        replayReservationUser.id,
+        "responses",
+        "postgres-failure-reservation",
+      );
+      assertEquals(failureReservationState?.state, "in_progress");
+      assertEquals(failureReservationState?.frames, []);
+      const failureQuotaUser = await repo.createUser({
+        email: "failure-quota@database.test",
+        name: "Failure quota",
+        passwordHash: "hash",
+        emailVerified: true,
+      });
+      await repo.approveUser(failureQuotaUser.id, "approved", 1_000_000);
+      const failureQuotaRequest = await repo.beginApiRequest({
+        userId: failureQuotaUser.id,
+        endpoint: "chat.completions",
+        idempotencyKey: "postgres-failure-custom-quota",
+        requestHash: "a".repeat(64),
+        stream: false,
+        model: "test/model",
+        runId: "postgres-failure-custom-quota-run",
+        reserveMicros: 1,
+        provider: "test",
+        quota: { maxRequests: 10, maxEvents: 10, maxBytes: 100 },
+      });
+      if (failureQuotaRequest.kind !== "started") {
+        throw new Error("missing custom failure quota request");
+      }
+      await assertRejects(
+        () =>
+          repo.failApiRequest({
+            id: failureQuotaRequest.request.id,
+            leaseToken: failureQuotaRequest.leaseToken,
+            responseStatus: 500,
+            responseBody: "x".repeat(101),
+            quota: { maxRequests: 10, maxEvents: 10, maxBytes: 100 },
+            billing: { mode: "refund" },
+          }),
+        DomainError,
+        "User replay storage quota exceeded",
+      );
       const mutate = postgres(databaseUrl!, { max: 1 });
 
       const atomicRejected = await repo.beginApiRequest({
@@ -1144,7 +1293,7 @@ Deno.test({
       });
       const replayed = await repo.beginApiRequest(replayInput);
       assertEquals(replayed.kind, "completed");
-      assertEquals((await repo.usage(applicant.id)).balanceMicros, 945_000);
+      assertEquals((await repo.usage(applicant.id)).balanceMicros, 925_000);
       await assertRejects(
         () => repo.beginApiRequest({ ...replayInput, requestHash: "d".repeat(64) }),
         DomainError,

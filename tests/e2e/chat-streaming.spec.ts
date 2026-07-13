@@ -15,9 +15,13 @@ async function selectSlowStream(page: import("@playwright/test").Page) {
 }
 
 test("renders real incremental SSE and runs queued prompts in FIFO order", async ({ page }) => {
+  test.setTimeout(60_000);
   await selectSlowStream(page);
   const composer = page.getByRole("textbox", { name: "Message" });
-  const first = "first prompt stays live long enough for queue validation";
+  const first = Array.from(
+    { length: 30 },
+    (_, index) => `queue-window-${index + 1}`,
+  ).join(" ");
   await composer.fill(first);
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.getByRole("button", { name: "Stop generating" })).toBeVisible();
@@ -39,7 +43,7 @@ test("renders real incremental SSE and runs queued prompts in FIFO order", async
   await page.getByRole("button", { name: "Queue message" }).click();
   await expect(page.getByText("2 queued", { exact: true })).toBeVisible();
   await expect(page.getByText(`This is a simulated response to: ${first}`, { exact: true }))
-    .toBeVisible();
+    .toBeVisible({ timeout: 30_000 });
   await expect(page.getByText(`This is a simulated response to: ${second}`, { exact: true }))
     .toBeVisible();
   await expect(page.getByText(`This is a simulated response to: ${third}`, { exact: true }))

@@ -1180,6 +1180,46 @@ export interface ApiReplayQuota {
   maxBytes: number;
   maxEvents: number;
 }
+export const API_SSE_REPLAY_FRAGMENT_MAX_BYTES = 1_048_576;
+export const API_SSE_REPLAY_REQUEST_MAX_BYTES = 268_435_456;
+export const API_SSE_REPLAY_REQUEST_MAX_EVENTS = 20_000;
+
+/** Splits replay records without changing their exact string concatenation. */
+export function splitApiSseReplayFrame(
+  frame: string,
+  maximumBytes = API_SSE_REPLAY_FRAGMENT_MAX_BYTES,
+): string[] {
+  if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 4) {
+    throw new TypeError("SSE replay fragment size must be an integer of at least four bytes");
+  }
+  if (frame.length === 0) return [""];
+  const chunks: string[] = [];
+  let start = 0;
+  let bytes = 0;
+  for (let index = 0; index < frame.length;) {
+    const first = frame.charCodeAt(index);
+    const paired = first >= 0xd800 && first <= 0xdbff && index + 1 < frame.length &&
+      frame.charCodeAt(index + 1) >= 0xdc00 && frame.charCodeAt(index + 1) <= 0xdfff;
+    const width = paired ? 2 : 1;
+    const codePoint = paired ? frame.codePointAt(index)! : first;
+    const encodedBytes = codePoint <= 0x7f
+      ? 1
+      : codePoint <= 0x7ff
+      ? 2
+      : codePoint <= 0xffff
+      ? 3
+      : 4;
+    if (bytes + encodedBytes > maximumBytes) {
+      chunks.push(frame.slice(start, index));
+      start = index;
+      bytes = 0;
+    }
+    bytes += encodedBytes;
+    index += width;
+  }
+  chunks.push(frame.slice(start));
+  return chunks;
+}
 export interface ApiSseFrameInput {
   sequence: number;
   frame: string;
@@ -1196,6 +1236,8 @@ export interface ApiIdempotencyRequest {
   leaseToken: string | null;
   leaseExpiresAt: string | null;
   usageRunId: string;
+  replayReservedBytes: number;
+  replayReservedEvents: number;
   responseStatus: number | null;
   responseHeaders: Record<string, string>;
   responseBody: string | null;
@@ -1226,6 +1268,8 @@ export interface BeginApiRequestInput {
   leaseSeconds?: number;
   retentionSeconds?: number;
   quota?: ApiReplayQuota;
+  replayReservedBytes?: number;
+  replayReservedEvents?: number;
 }
 export type BeginApiRequestResult =
   | { kind: "started"; request: ApiIdempotencyRequest; leaseToken: string; usageRun: UsageRun }
@@ -1253,6 +1297,7 @@ export interface FailApiRequestInput {
   responseHeaders?: Record<string, string>;
   responseBody: string;
   terminalFrame?: string;
+  quota?: ApiReplayQuota;
   billing: { mode: "refund" } | {
     mode: "settle";
     costMicros: number;

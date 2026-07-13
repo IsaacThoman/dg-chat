@@ -21,7 +21,7 @@ Deno.test("Responses payloads use the official response and output item shapes",
   assertEquals(pending.parallel_tool_calls, true);
   assertEquals(pending.previous_response_id, null);
   assertEquals(pending.reasoning, { effort: null, summary: null });
-  assertEquals(pending.store, true);
+  assertEquals(pending.store, false);
   assertEquals(pending.temperature, 1);
   assertEquals(pending.text, { format: { type: "text" } });
   assertEquals(pending.tool_choice, "auto");

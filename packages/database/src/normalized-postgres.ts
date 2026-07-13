@@ -30,6 +30,9 @@ import {
   providerOcrTargetProviderViolation,
 } from "./provider-model-invariants.ts";
 import {
+  API_SSE_REPLAY_FRAGMENT_MAX_BYTES,
+  API_SSE_REPLAY_REQUEST_MAX_BYTES,
+  API_SSE_REPLAY_REQUEST_MAX_EVENTS,
   apiResponseBodyByteLength,
   canonicalWorkspaceName,
   KNOWLEDGE_EMBEDDING_DIMENSIONS,
@@ -38,6 +41,7 @@ import {
   MAX_CONVERSATION_SHARE_CONTENT_CHARS,
   MAX_CONVERSATION_SHARE_MESSAGES,
   normalizeKnowledgeSearchLimit,
+  splitApiSseReplayFrame,
   validateChunkEmbeddings,
   validateDocumentChunkInputs,
 } from "./repository.ts";
@@ -965,6 +969,8 @@ function apiRequest(row: Row, frames: ApiIdempotencyFrame[] = []): ApiIdempotenc
     leaseToken: row.lease_token == null ? null : String(row.lease_token),
     leaseExpiresAt: nullableIso(row.lease_expires_at),
     usageRunId: String(row.usage_run_id),
+    replayReservedBytes: number(row.replay_reserved_bytes ?? 0),
+    replayReservedEvents: number(row.replay_reserved_events ?? 0),
     responseStatus: row.response_status == null ? null : number(row.response_status),
     responseHeaders: (row.response_headers ?? {}) as Record<string, string>,
     responseBody: row.response_body == null ? null : String(row.response_body),
@@ -6546,7 +6552,12 @@ export class PostgresRepository implements DomainRepository {
     }
     if (
       input.reserveMicros < 0 || leaseSeconds < 1 || retentionSeconds < 60 ||
-      retentionSeconds > 2_592_000
+      retentionSeconds > 2_592_000 ||
+      !Number.isSafeInteger(input.replayReservedBytes ?? 0) ||
+      (input.replayReservedBytes ?? 0) < 0 ||
+      !Number.isSafeInteger(input.replayReservedEvents ?? 0) ||
+      (input.replayReservedEvents ?? 0) < 0 ||
+      ((input.replayReservedBytes ?? 0) === 0 && (input.replayReservedEvents ?? 0) > 0)
     ) throw new DomainError("validation_error", "Invalid idempotent request parameters", 422);
     if (input.pricingSnapshot !== undefined && !isUsagePricingSnapshot(input.pricingSnapshot)) {
       throw new DomainError("validation_error", "Usage pricing snapshot is invalid", 422);
@@ -6561,7 +6572,11 @@ export class PostgresRepository implements DomainRepository {
       const id = crypto.randomUUID();
       const inserted = await tx<
         Row[]
-      >`INSERT INTO api_idempotency_requests(id,user_id,endpoint,idempotency_key,request_hash,stream,model,state,lease_token,lease_expires_at,usage_run_id,retention_seconds,expires_at) VALUES(${id},${input.userId},${input.endpoint},${input.idempotencyKey},${input.requestHash},${input.stream},${input.model},'in_progress',${leaseToken},now()+${leaseSeconds}*interval '1 second',${input.runId},${retentionSeconds},now()+${retentionSeconds}*interval '1 second') ON CONFLICT(user_id,endpoint,idempotency_key) DO NOTHING RETURNING *`;
+      >`INSERT INTO api_idempotency_requests(id,user_id,endpoint,idempotency_key,request_hash,stream,model,state,lease_token,lease_expires_at,usage_run_id,replay_reserved_bytes,replay_reserved_events,retention_seconds,expires_at) VALUES(${id},${input.userId},${input.endpoint},${input.idempotencyKey},${input.requestHash},${input.stream},${input.model},'in_progress',${leaseToken},now()+${leaseSeconds}*interval '1 second',${input.runId},${
+        input.replayReservedBytes ?? 0
+      },${
+        input.replayReservedEvents ?? 0
+      },${retentionSeconds},now()+${retentionSeconds}*interval '1 second') ON CONFLICT(user_id,endpoint,idempotency_key) DO NOTHING RETURNING *`;
       if (!inserted[0]) {
         const rows = await tx<
           Row[]
@@ -6590,10 +6605,24 @@ export class PostgresRepository implements DomainRepository {
       }
       const quota = replayQuota(input.quota);
       const live = await tx<
-        { count: number }[]
-      >`SELECT count(*)::int count FROM api_idempotency_requests WHERE user_id=${input.userId} AND expires_at>now()`;
+        { count: number; bytes: number; events: number }[]
+      >`SELECT count(*)::int count,
+        COALESCE(sum(CASE WHEN state='in_progress' AND replay_reserved_bytes>0
+          THEN replay_reserved_bytes
+          ELSE COALESCE(CASE response_body_encoding WHEN 'base64'
+            THEN octet_length(decode(response_body,'base64')) ELSE octet_length(response_body) END,0) +
+            COALESCE((SELECT sum(octet_length(frame)) FROM api_idempotency_events e WHERE e.request_id=r.id),0)
+        END),0)::bigint bytes,
+        COALESCE(sum(CASE WHEN state='in_progress' AND replay_reserved_events>0
+          THEN replay_reserved_events
+          ELSE (SELECT count(*) FROM api_idempotency_events e WHERE e.request_id=r.id)
+        END),0)::bigint events
+        FROM api_idempotency_requests r WHERE user_id=${input.userId} AND expires_at>now()`;
       if (live[0].count > quota.maxRequests) {
         throw new DomainError("replay_quota_exceeded", "Replay request quota exceeded", 429);
+      }
+      if (number(live[0].bytes) > quota.maxBytes || number(live[0].events) > quota.maxEvents) {
+        throw new DomainError("replay_quota_exceeded", "Replay storage quota exceeded", 429);
       }
       const balance = number(users[0].balance_micros);
       if (balance < input.reserveMicros) {
@@ -6669,7 +6698,7 @@ export class PostgresRepository implements DomainRepository {
     }
     const encoder = new TextEncoder();
     const frameBytes = frames.map(({ frame }) => encoder.encode(frame).length);
-    if (frameBytes.some((bytes) => bytes > 1_048_576)) {
+    if (frameBytes.some((bytes) => bytes > API_SSE_REPLAY_FRAGMENT_MAX_BYTES)) {
       throw new DomainError("response_too_large", "SSE frame exceeds replay limit", 413);
     }
     return await this.#sql.begin(async (tx) => {
@@ -6711,26 +6740,41 @@ export class PostgresRepository implements DomainRepository {
         (sum, item) => sum + encoder.encode(item.frame).length,
         0,
       );
-      if (stats[0].count + pending.length > 10_000 || stats[0].bytes + pendingBytes > 16_777_216) {
+      if (
+        stats[0].count + pending.length > API_SSE_REPLAY_REQUEST_MAX_EVENTS ||
+        stats[0].bytes + pendingBytes > API_SSE_REPLAY_REQUEST_MAX_BYTES
+      ) {
         throw new DomainError("response_too_large", "SSE replay exceeds storage limit", 413);
       }
       const quota = replayQuota(quotaInput);
+      const reservedBytes = number(rows[0].replay_reserved_bytes ?? 0);
+      const reservedEvents = number(rows[0].replay_reserved_events ?? 0);
+      if (
+        (reservedBytes > 0 || reservedEvents > 0) &&
+        (stats[0].count + pending.length > reservedEvents ||
+          stats[0].bytes + pendingBytes > reservedBytes)
+      ) throw new DomainError("replay_quota_exceeded", "Reserved replay capacity exceeded", 429);
       const aggregate = await tx<
         { events: number; bytes: number }[]
       >`SELECT
-        (SELECT count(*)::int FROM api_idempotency_events e JOIN api_idempotency_requests r ON r.id=e.request_id WHERE r.user_id=${
+        COALESCE(sum(CASE WHEN state='in_progress' AND replay_reserved_events>0
+          THEN replay_reserved_events
+          ELSE (SELECT count(*) FROM api_idempotency_events e WHERE e.request_id=r.id)
+        END),0)::bigint events,
+        COALESCE(sum(CASE WHEN state='in_progress' AND replay_reserved_bytes>0
+          THEN replay_reserved_bytes
+          ELSE COALESCE(CASE response_body_encoding WHEN 'base64'
+            THEN octet_length(decode(response_body,'base64')) ELSE octet_length(response_body) END,0) +
+            COALESCE((SELECT sum(octet_length(frame)) FROM api_idempotency_events e WHERE e.request_id=r.id),0)
+        END),0)::bigint bytes
+        FROM api_idempotency_requests r WHERE user_id=${
         String(rows[0].user_id)
-      } AND r.expires_at>now()) events,
-        ((SELECT COALESCE(sum(octet_length(e.frame)),0)::bigint FROM api_idempotency_events e JOIN api_idempotency_requests r ON r.id=e.request_id WHERE r.user_id=${
-        String(rows[0].user_id)
-      } AND r.expires_at>now()) +
-         (SELECT COALESCE(sum(CASE response_body_encoding WHEN 'base64'
-           THEN octet_length(decode(response_body,'base64')) ELSE octet_length(response_body) END),0)::bigint FROM api_idempotency_requests WHERE user_id=${
-        String(rows[0].user_id)
-      } AND expires_at>now())) bytes`;
+      } AND expires_at>now()`;
       if (
-        number(aggregate[0].events) + pending.length > quota.maxEvents ||
-        number(aggregate[0].bytes) + pendingBytes > quota.maxBytes
+        reservedBytes === 0 && reservedEvents === 0 && (
+          number(aggregate[0].events) + pending.length > quota.maxEvents ||
+          number(aggregate[0].bytes) + pendingBytes > quota.maxBytes
+        )
       ) throw new DomainError("replay_quota_exceeded", "User replay storage quota exceeded", 429);
       if (pending.length > 0) {
         await tx`INSERT INTO api_idempotency_events ${
@@ -6801,7 +6845,7 @@ export class PostgresRepository implements DomainRepository {
     const decodedResponseBytes = input.responseBody
       ? apiResponseBodyByteLength(input.responseBody, responseBodyEncoding)
       : 0;
-    if (decodedResponseBytes > 16_777_216) {
+    if (decodedResponseBytes > API_SSE_REPLAY_REQUEST_MAX_BYTES) {
       throw new DomainError("response_too_large", "Replay response exceeds storage limit", 413);
     }
     return await this.#sql.begin(async (tx) => {
@@ -6835,7 +6879,11 @@ export class PostgresRepository implements DomainRepository {
         { count: number; bytes: number }[]
       >`SELECT count(*)::int count,COALESCE(sum(octet_length(frame)),0)::int bytes FROM api_idempotency_events WHERE request_id=${input.id}`;
       const frameInputs = input.frames ?? [];
-      if (frameInputs.some(({ frame }) => encoder.encode(frame).length > 1_048_576)) {
+      if (
+        frameInputs.some(({ frame }) =>
+          encoder.encode(frame).length > API_SSE_REPLAY_FRAGMENT_MAX_BYTES
+        )
+      ) {
         throw new DomainError("response_too_large", "SSE frame exceeds replay limit", 413);
       }
       const existingBySequence = new Map<number, Row>();
@@ -6865,41 +6913,57 @@ export class PostgresRepository implements DomainRepository {
         (sum, item) => sum + encoder.encode(item.frame).length,
         0,
       );
-      const terminalBytes = input.terminalFrame ? encoder.encode(input.terminalFrame).length : 0;
-      if (terminalBytes > 1_048_576) {
-        throw new DomainError("response_too_large", "Terminal SSE frame exceeds replay limit", 413);
-      }
+      const terminalFragments = stream && input.terminalFrame !== undefined
+        ? splitApiSseReplayFrame(input.terminalFrame)
+        : [];
+      const terminalBytes = terminalFragments.reduce(
+        (sum, frame) => sum + encoder.encode(frame).length,
+        0,
+      );
       if (
-        stats[0].count + pending.length + (input.terminalFrame ? 1 : 0) > 10_000 ||
-        stats[0].bytes + pendingBytes + terminalBytes > 16_777_216
+        stats[0].count + pending.length + terminalFragments.length >
+          API_SSE_REPLAY_REQUEST_MAX_EVENTS ||
+        stats[0].bytes + pendingBytes + terminalBytes > API_SSE_REPLAY_REQUEST_MAX_BYTES
       ) throw new DomainError("response_too_large", "SSE replay exceeds storage limit", 413);
       const quota = replayQuota(input.quota);
+      const responseBytes = decodedResponseBytes;
+      const reservedBytes = number(row.replay_reserved_bytes ?? 0);
+      const reservedEvents = number(row.replay_reserved_events ?? 0);
+      if (
+        (reservedBytes > 0 || reservedEvents > 0) &&
+        (stats[0].count + pending.length + terminalFragments.length > reservedEvents ||
+          stats[0].bytes + responseBytes + pendingBytes + terminalBytes > reservedBytes)
+      ) throw new DomainError("replay_quota_exceeded", "Reserved replay capacity exceeded", 429);
       await tx`SELECT id FROM users WHERE id=${String(row.user_id)} FOR UPDATE`;
       const aggregate = await tx<
         { events: number; bytes: number }[]
       >`SELECT
-        (SELECT count(*)::int FROM api_idempotency_events e JOIN api_idempotency_requests r ON r.id=e.request_id WHERE r.user_id=${
-        String(row.user_id)
-      } AND r.expires_at>now()) events,
-        ((SELECT COALESCE(sum(octet_length(e.frame)),0)::bigint FROM api_idempotency_events e JOIN api_idempotency_requests r ON r.id=e.request_id WHERE r.user_id=${
-        String(row.user_id)
-      } AND r.expires_at>now()) +
-         (SELECT COALESCE(sum(CASE response_body_encoding WHEN 'base64'
-           THEN octet_length(decode(response_body,'base64')) ELSE octet_length(response_body) END),0)::bigint FROM api_idempotency_requests WHERE user_id=${
-        String(row.user_id)
-      } AND expires_at>now())) bytes`;
-      const responseBytes = decodedResponseBytes;
+        COALESCE(sum(CASE WHEN state='in_progress' AND replay_reserved_events>0
+          THEN replay_reserved_events
+          ELSE (SELECT count(*) FROM api_idempotency_events e WHERE e.request_id=r.id)
+        END),0)::bigint events,
+        COALESCE(sum(CASE WHEN state='in_progress' AND replay_reserved_bytes>0
+          THEN replay_reserved_bytes
+          ELSE COALESCE(CASE response_body_encoding WHEN 'base64'
+            THEN octet_length(decode(response_body,'base64')) ELSE octet_length(response_body) END,0) +
+            COALESCE((SELECT sum(octet_length(frame)) FROM api_idempotency_events e WHERE e.request_id=r.id),0)
+        END),0)::bigint bytes
+        FROM api_idempotency_requests r WHERE user_id=${String(row.user_id)} AND expires_at>now()`;
       if (
-        number(aggregate[0].events) + pending.length + (input.terminalFrame ? 1 : 0) >
-          quota.maxEvents ||
-        number(aggregate[0].bytes) + responseBytes + pendingBytes + terminalBytes > quota.maxBytes
+        reservedBytes === 0 && reservedEvents === 0 && (
+          number(aggregate[0].events) + pending.length + terminalFragments.length >
+            quota.maxEvents ||
+          number(aggregate[0].bytes) + responseBytes + pendingBytes + terminalBytes > quota.maxBytes
+        )
       ) throw new DomainError("replay_quota_exceeded", "User replay storage quota exceeded", 429);
       const completingFrames = [...pending];
-      if (stream && input.terminalFrame !== undefined) {
-        completingFrames.push({
-          sequence: stats[0].count + pending.length,
-          frame: input.terminalFrame,
-        });
+      if (stream) {
+        for (const frame of terminalFragments) {
+          completingFrames.push({
+            sequence: stats[0].count + completingFrames.length,
+            frame,
+          });
+        }
       }
       if (completingFrames.length > 0) {
         await tx`INSERT INTO api_idempotency_events ${
@@ -6972,7 +7036,8 @@ export class PostgresRepository implements DomainRepository {
     return this.#completeApi(input, true);
   }
   async failApiRequest(input: FailApiRequestInput) {
-    if (new TextEncoder().encode(input.responseBody).length > 16_777_216) {
+    const responseBytes = new TextEncoder().encode(input.responseBody).length;
+    if (responseBytes > API_SSE_REPLAY_REQUEST_MAX_BYTES) {
       throw new DomainError("response_too_large", "Replay response exceeds storage limit", 413);
     }
     return await this.#sql.begin(async (tx) => {
@@ -6999,17 +7064,79 @@ export class PostgresRepository implements DomainRepository {
       >`SELECT count(*)::int count,COALESCE(sum(octet_length(frame)),0)::int bytes FROM api_idempotency_events WHERE request_id=${input.id}`;
       eventCount = stats[0].count;
       const failureStartedStream = eventCount > 0 || input.terminalFrame !== undefined;
-      if (input.terminalFrame !== undefined) {
-        const terminalBytes = new TextEncoder().encode(input.terminalFrame).length;
-        if (terminalBytes > 1_048_576 || stats[0].bytes + terminalBytes > 16_777_216) {
+      const terminalFragments = input.terminalFrame === undefined
+        ? []
+        : splitApiSseReplayFrame(input.terminalFrame);
+      const terminalBytes = input.terminalFrame === undefined
+        ? 0
+        : new TextEncoder().encode(input.terminalFrame).length;
+      if (
+        eventCount + terminalFragments.length > API_SSE_REPLAY_REQUEST_MAX_EVENTS ||
+        stats[0].bytes + terminalBytes > API_SSE_REPLAY_REQUEST_MAX_BYTES
+      ) {
+        throw new DomainError(
+          "response_too_large",
+          "SSE replay exceeds storage limit",
+          413,
+        );
+      }
+      const reservedBytes = number(row.replay_reserved_bytes ?? 0);
+      const reservedEvents = number(row.replay_reserved_events ?? 0);
+      if (
+        (reservedBytes > 0 || reservedEvents > 0) &&
+        (eventCount + terminalFragments.length > reservedEvents ||
+          stats[0].bytes + responseBytes + terminalBytes > reservedBytes)
+      ) {
+        throw new DomainError(
+          "replay_quota_exceeded",
+          "Reserved replay capacity exceeded",
+          429,
+        );
+      }
+      await tx`SELECT id FROM users WHERE id=${String(row.user_id)} FOR UPDATE`;
+      if (reservedBytes === 0 && reservedEvents === 0) {
+        const quota = replayQuota(input.quota);
+        const aggregate = await tx<
+          { events: number; bytes: number }[]
+        >`SELECT
+          COALESCE(sum(CASE WHEN state='in_progress' AND replay_reserved_events>0
+            THEN replay_reserved_events
+            ELSE (SELECT count(*) FROM api_idempotency_events e WHERE e.request_id=r.id)
+          END),0)::bigint events,
+          COALESCE(sum(CASE WHEN state='in_progress' AND replay_reserved_bytes>0
+            THEN replay_reserved_bytes
+            ELSE COALESCE(CASE response_body_encoding WHEN 'base64'
+              THEN octet_length(decode(response_body,'base64')) ELSE octet_length(response_body) END,0) +
+              COALESCE((SELECT sum(octet_length(frame)) FROM api_idempotency_events e WHERE e.request_id=r.id),0)
+          END),0)::bigint bytes
+          FROM api_idempotency_requests r WHERE user_id=${
+          String(row.user_id)
+        } AND expires_at>now()`;
+        if (
+          number(aggregate[0].events) + terminalFragments.length > quota.maxEvents ||
+          number(aggregate[0].bytes) + responseBytes + terminalBytes > quota.maxBytes
+        ) {
           throw new DomainError(
-            "response_too_large",
-            "Terminal SSE frame exceeds replay limit",
-            413,
+            "replay_quota_exceeded",
+            "User replay storage quota exceeded",
+            429,
           );
         }
-        await tx`INSERT INTO api_idempotency_events(request_id,sequence,frame) VALUES(${input.id},${eventCount},${input.terminalFrame})`;
-        eventCount++;
+      }
+      if (input.terminalFrame !== undefined) {
+        await tx`INSERT INTO api_idempotency_events ${
+          tx(
+            terminalFragments.map((frame, index) => ({
+              request_id: input.id,
+              sequence: eventCount + index,
+              frame,
+            })),
+            "request_id",
+            "sequence",
+            "frame",
+          )
+        }`;
+        eventCount += terminalFragments.length;
       }
       const runs = await tx<Row[]>`SELECT *,EXISTS(SELECT 1 FROM provider_attempts
         WHERE usage_run_id=usage_runs.id AND status='running') AS provider_accounting_uncertain

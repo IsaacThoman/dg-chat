@@ -13,8 +13,57 @@ import {
   ProviderProtocolError,
   publicChatCompletion,
   publicChatStreamChunk,
+  responsesRequestRequiresNativeInput,
   responsesRequestToChatCompletions,
 } from "./provider-protocol.ts";
+
+const oversizedCitationSet = () =>
+  Array.from({ length: 22 }, (_, index) => ({
+    type: "url_citation",
+    start_index: 0,
+    end_index: 1,
+    title: "\u0000".repeat(8_192),
+    url: `https://example.test/${index}/` + "a".repeat(16_000),
+  }));
+
+Deno.test("canonical buffered results cap accumulated public citation bytes", () => {
+  for (const protocol of ["chat", "responses"] as const) {
+    const error = assertThrows(
+      () =>
+        protocol === "chat"
+          ? normalizeChatCompletionResult({
+            id: "chatcmpl-citations",
+            model: "provider/model",
+            choices: [{
+              message: {
+                role: "assistant",
+                content: "x",
+                annotations: oversizedCitationSet().map(({ type, ...url_citation }) => ({
+                  type,
+                  url_citation,
+                })),
+              },
+              finish_reason: "stop",
+            }],
+          })
+          : normalizeResponsesResult({
+            id: "resp_citations",
+            object: "response",
+            model: "provider/model",
+            status: "completed",
+            output: [{
+              id: "msg_citations",
+              type: "message",
+              status: "completed",
+              role: "assistant",
+              content: [{ type: "output_text", text: "x", annotations: oversizedCitationSet() }],
+            }],
+          }),
+      ProviderProtocolError,
+    );
+    assertEquals(error.code, "payload_too_large");
+  }
+});
 
 Deno.test("chat request converts multimodal messages, tools, calls, results, and reasoning effort", () => {
   const output = chatCompletionsRequestToResponses({
@@ -206,6 +255,98 @@ Deno.test("responses request converts instructions, multimodal input, calls, res
     reasoning_summary: "none",
     user: "caller-456",
   });
+});
+
+Deno.test("stateless Responses continuation validates a bounded shadow without losing native items", () => {
+  const input = [
+    {
+      type: "reasoning",
+      id: "rs_1",
+      summary: [{ type: "summary_text", text: "Consider the tool result" }],
+      encrypted_content: "opaque-provider-state",
+      status: "completed",
+    },
+    {
+      type: "message",
+      id: "msg_1",
+      status: "completed",
+      role: "assistant",
+      content: [{
+        type: "output_text",
+        text: "I will call the tool",
+        annotations: [],
+        logprobs: [],
+      }],
+    },
+    {
+      type: "function_call",
+      id: "fc_1",
+      call_id: "call_1",
+      name: "lookup",
+      arguments: "{}",
+      status: "completed",
+    },
+    { type: "function_call_output", call_id: "call_1", output: "result" },
+    { type: "message", role: "user", content: [{ type: "input_text", text: "Continue" }] },
+  ];
+  const request = { model: "provider/model", input };
+  assertEquals(responsesRequestRequiresNativeInput(request), true);
+  const converted = responsesRequestToChatCompletions(request);
+  assertEquals((converted.messages as Array<Record<string, unknown>>).slice(1), [
+    { role: "assistant", content: "I will call the tool" },
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [{
+        id: "call_1",
+        type: "function",
+        function: { name: "lookup", arguments: "{}" },
+      }],
+    },
+    { role: "tool", tool_call_id: "call_1", content: "result" },
+    { role: "user", content: "Continue" },
+  ]);
+  assertEquals(
+    String((converted.messages as Array<Record<string, unknown>>)[0].content).includes(
+      "opaque-provider-state",
+    ),
+    true,
+  );
+  assertEquals(
+    responsesRequestRequiresNativeInput({
+      model: "provider/model",
+      input: [{
+        type: "function_call",
+        id: "fc_2",
+        call_id: "call_2",
+        name: "lookup",
+        arguments: "{}",
+        status: "completed",
+      }],
+    }),
+    false,
+  );
+  assertEquals(
+    responsesRequestRequiresNativeInput({
+      model: "provider/model",
+      input: [{
+        type: "function_call",
+        id: "fc_3",
+        call_id: "call_3",
+        name: "lookup",
+        arguments: "{}",
+        status: "incomplete",
+      }],
+    }),
+    true,
+  );
+  assertEquals(
+    responsesRequestRequiresNativeInput({
+      model: "provider/model",
+      input: [{ type: "message", role: "user", content: "ordinary" }],
+    }),
+    false,
+  );
 });
 
 Deno.test("protocol adapters treat explicit nullable SDK options as omitted", () => {

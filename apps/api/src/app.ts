@@ -72,6 +72,9 @@ import type {
   WebGenerationEvent,
 } from "@dg-chat/contracts";
 import {
+  API_SSE_REPLAY_FRAGMENT_MAX_BYTES,
+  API_SSE_REPLAY_REQUEST_MAX_BYTES,
+  API_SSE_REPLAY_REQUEST_MAX_EVENTS,
   type ApiIdempotencyEndpoint,
   type ApiIdempotencyRequest,
   type ApiReplayQuota,
@@ -81,6 +84,7 @@ import {
   decodeApiResponseBody,
   DomainError,
   type DomainRepository,
+  type FailApiRequestInput,
   type KnowledgeCollection,
   type KnowledgeConversationBinding,
   MemoryRepository,
@@ -92,13 +96,29 @@ import {
   type ProviderExecutionPlan,
   type ProviderModelRecord,
   type ProviderRecord,
+  splitApiSseReplayFrame,
   type TokenAccessSubject,
   type UsagePricingSnapshot,
   usagePricingSnapshotsEqual,
 } from "@dg-chat/database";
 import { hashPassword, randomToken, sha256, sha256Hex, verifyPassword } from "./crypto.ts";
-import { createEmbeddings, EmbeddingsProviderError, type ProviderFetch } from "./embeddings.ts";
-import { AudioProviderError, type AudioRequest, estimateAudioInputTokens } from "./audio.ts";
+import {
+  maximumBufferedChatReplayBytes,
+  maximumChatStreamReplayBytes,
+  maximumLiveChatStreamReplayBytes,
+} from "./chat-replay.ts";
+import {
+  createEmbeddings,
+  EmbeddingsProviderError,
+  maximumEmbeddingsReplayBytes,
+  type ProviderFetch,
+} from "./embeddings.ts";
+import {
+  AUDIO_MAX_RESPONSE_BYTES,
+  AudioProviderError,
+  type AudioRequest,
+  estimateAudioInputTokens,
+} from "./audio.ts";
 import {
   assertImageAggregateBytes,
   assertImageUsagePricing,
@@ -113,7 +133,9 @@ import {
   type ImageOutput,
   ImageProviderError,
   imageTerminalOutput,
+  maximumImageJsonReplayBytes,
   maximumImageStreamReplayBytes,
+  maximumImageStreamReplayEvents,
   parseImageEditJson,
   parseImageGenerationRequest,
 } from "./images.ts";
@@ -122,6 +144,7 @@ import {
   assertSpeechFixedPricing,
   estimateSpeechInputTokens,
   parseSpeechRequest,
+  SPEECH_MAX_RESPONSE_BYTES,
   speechFrameDecodedBytes,
   SpeechProviderError,
   type SpeechRequest,
@@ -142,9 +165,15 @@ import {
   streamChatCompletion,
   type UpstreamStreamOptions,
 } from "./models.ts";
+import { providerResponseByteLimit } from "./provider-limits.ts";
 import { estimateInputTokens, priceUsage, reservationPrice } from "./pricing.ts";
-import { responseObject } from "./responses.ts";
+import { responseObject, responseRequestFields } from "./responses.ts";
 import { ResponsesStreamProjector } from "./responses-stream.ts";
+import {
+  responsesBufferedReplayUpperBound,
+  responsesStreamReplayUpperBound,
+  responsesTerminalReplayUpperBound,
+} from "./responses-provider.ts";
 import { type IdentityMailer, smtpIdentityMailer } from "./mail.ts";
 import {
   boundedIdentityDelivery,
@@ -201,6 +230,7 @@ import {
   ProviderProtocolError,
   publicChatCompletion,
   publicChatStreamChunk,
+  responsesRequestRequiresNativeInput,
   responsesRequestToChatCompletions,
 } from "./provider-protocol.ts";
 import {
@@ -471,12 +501,54 @@ const openAIFile = (attachment: AttachmentRecord, purpose = "assistants") => ({
   status_details: attachment.inspectionError,
 });
 
-const openAIError = (message: string, code: string | null = null) => ({
-  error: { message, type: "invalid_request_error", param: null, code },
+type OpenAIErrorType =
+  | "invalid_request_error"
+  | "authentication_error"
+  | "permission_error"
+  | "rate_limit_error"
+  | "server_error";
+
+const defaultOpenAIErrorType = (code: string | null): OpenAIErrorType => {
+  if (code === "unauthorized") return "authentication_error";
+  if (code === "insufficient_scope") return "permission_error";
+  if (code === "rate_limit_exceeded") return "rate_limit_error";
+  if (
+    code === "service_unavailable" || code === "provider_authentication_error" ||
+    code === "provider_error" || code === "timeout" || code === "stream_error" ||
+    code === "replay_persistence_error" || code === "storage_not_configured" ||
+    code === "internal_error"
+  ) return "server_error";
+  return "invalid_request_error";
+};
+
+const statusOpenAIErrorType = (status: number): OpenAIErrorType => {
+  if (status === 401) return "authentication_error";
+  if (status === 403) return "permission_error";
+  if (status === 429) return "rate_limit_error";
+  if (status >= 500) return "server_error";
+  return "invalid_request_error";
+};
+
+const openAIError = (
+  message: string,
+  code: string | null = null,
+  typeOrStatus: OpenAIErrorType | number = defaultOpenAIErrorType(code),
+) => ({
+  error: {
+    message,
+    type: typeof typeOrStatus === "number" ? statusOpenAIErrorType(typeOrStatus) : typeOrStatus,
+    param: null,
+    code,
+  },
 });
 const publicProviderFailure = (error: unknown, cancelled = false) => {
   if (cancelled) {
-    return { status: 499, code: "request_cancelled", message: "Request cancelled" };
+    return {
+      status: 499,
+      code: "request_cancelled",
+      message: "Request cancelled",
+      type: "server_error" as const,
+    };
   }
   const candidate = error instanceof ResilienceExhaustedError ? error.lastError : error;
   if (candidate instanceof ProviderAttemptError) {
@@ -486,6 +558,7 @@ const publicProviderFailure = (error: unknown, cancelled = false) => {
         status: 502,
         code: "provider_authentication_error",
         message: "The configured provider rejected its credentials",
+        type: "server_error" as const,
       };
     }
     const status = candidate.options.status && candidate.options.status >= 400 &&
@@ -511,9 +584,19 @@ const publicProviderFailure = (error: unknown, cancelled = false) => {
       code,
       message: candidate.message,
       retryAfterMs: candidate.options.retryAfterMs,
+      type: category === "rate_limited"
+        ? "rate_limit_error" as const
+        : category === "invalid_request"
+        ? "invalid_request_error" as const
+        : "server_error" as const,
     };
   }
-  return { status: 502, code: "provider_error", message: "Provider request failed" };
+  return {
+    status: 502,
+    code: "provider_error",
+    message: "Provider request failed",
+    type: "server_error" as const,
+  };
 };
 const auditIdentifier = /^[a-z0-9][a-z0-9._:-]*$/i;
 const auditUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -1348,6 +1431,57 @@ export function createApp(options: AppOptions = {}) {
     maxBytes: positiveInteger("REPLAY_MAX_BYTES_PER_USER", 67_108_864),
     maxEvents: positiveInteger("REPLAY_MAX_EVENTS_PER_USER", 20_000),
   };
+  const boundedReplayBytes = Math.min(replayQuota.maxBytes, API_SSE_REPLAY_REQUEST_MAX_BYTES);
+  const boundedReplayEvents = Math.min(replayQuota.maxEvents, API_SSE_REPLAY_REQUEST_MAX_EVENTS);
+  const standardStreamReplayEvents = Math.min(8_192, boundedReplayEvents);
+  const idempotentReplayReservation = (
+    c: Context<{ Variables: Variables }>,
+    bytes: number,
+    events = 0,
+  ) => {
+    if (!c.req.header("idempotency-key")) return undefined;
+    if (
+      !Number.isSafeInteger(bytes) || bytes < 1 || bytes > boundedReplayBytes ||
+      !Number.isSafeInteger(events) || events < 0 || events > boundedReplayEvents
+    ) {
+      throw new DomainError(
+        "response_too_large",
+        "Requested response cannot fit in idempotent replay storage",
+        413,
+      );
+    }
+    return { bytes, events };
+  };
+  const failOpenAIUsage = (input: FailApiRequestInput) =>
+    repo.failApiRequest({ ...input, quota: replayQuota });
+  const appendReplaySseFrame = async (
+    id: string,
+    leaseToken: string,
+    sequence: number,
+    frame: string,
+    observation?: {
+      inputTokens: number;
+      outputTokens: number;
+      costMicros: number;
+      latencyMs: number;
+    },
+    maximumLiveFragments = standardStreamReplayEvents - 1,
+  ) => {
+    const fragments = splitApiSseReplayFrame(frame);
+    // Every streaming reservation retains at least one fragment for a durable terminal or error.
+    if (sequence + fragments.length > maximumLiveFragments) {
+      throw new DomainError("response_too_large", "SSE replay event limit reached", 413);
+    }
+    await repo.appendApiSseFrames(
+      id,
+      leaseToken,
+      fragments.map((fragment, index) => ({ sequence: sequence + index, frame: fragment })),
+      undefined,
+      observation,
+      replayQuota,
+    );
+    return fragments.length;
+  };
   const trustProxyHeaders = options.trustProxyHeaders ??
     Deno.env.get("TRUST_PROXY_HEADERS") === "true";
   const legacyHarnessEnabled = legacyModelHarnessAllowed(Deno.env.get("DENO_ENV"));
@@ -1785,7 +1919,7 @@ export function createApp(options: AppOptions = {}) {
     const unavailable = (code: string, message: string, retryAfter: number) => {
       c.header("Retry-After", String(retryAfter));
       return openAiSurface
-        ? c.json(openAIError(message, code), 503)
+        ? c.json(openAIError(message, code, 503), 503)
         : c.json({ error: { code, message } }, 503);
     };
     let state: Awaited<ReturnType<BackupAdminService["maintenanceState"]>>;
@@ -6576,6 +6710,7 @@ export function createApp(options: AppOptions = {}) {
     model: ModelInfo,
     reserveMicros: number,
     price?: ModelPriceVersion,
+    replayReservation?: { bytes: number; events: number },
   ) => {
     const idempotencyKey = c.req.header("idempotency-key");
     const runId = `${c.get("user").id}:${endpoint}:${crypto.randomUUID()}`;
@@ -6628,6 +6763,8 @@ export function createApp(options: AppOptions = {}) {
       tokenId: c.get("tokenId"),
       leaseSeconds: idempotencyLeaseSeconds,
       quota: replayQuota,
+      replayReservedBytes: replayReservation?.bytes,
+      replayReservedEvents: replayReservation?.events,
     });
     if (result.kind === "in_progress") {
       return {
@@ -6995,7 +7132,10 @@ export function createApp(options: AppOptions = {}) {
       }
     } catch (error) {
       if (!(error instanceof ImageProviderError)) throw error;
-      return c.json(openAIError(error.message, error.code), error.status as 400);
+      return c.json(
+        openAIError(error.message, error.code, error.status),
+        error.status as 400,
+      );
     }
     const imageEndpoint = operation === "edit" ? "images.edits" : "images.generations";
     const requestIdentity = editRequest
@@ -7088,7 +7228,10 @@ export function createApp(options: AppOptions = {}) {
         }
       } catch (error) {
         if (!(error instanceof ImageProviderError)) throw error;
-        return c.json(openAIError(error.message, error.code), error.status as 400);
+        return c.json(
+          openAIError(error.message, error.code, error.status),
+          error.status as 400,
+        );
       }
     }
     if (
@@ -7184,6 +7327,13 @@ export function createApp(options: AppOptions = {}) {
         runLease: false,
       };
     } else {
+      const replayReservation = request.stream
+        ? idempotentReplayReservation(
+          c,
+          maximumImageStreamReplayBytes(request),
+          maximumImageStreamReplayEvents(request) + 1,
+        )
+        : idempotentReplayReservation(c, maximumImageJsonReplayBytes(request, richApi));
       usage = await beginOpenAIUsage(
         c,
         imageEndpoint,
@@ -7191,6 +7341,7 @@ export function createApp(options: AppOptions = {}) {
         model,
         reserveMicros,
         resolved!.price,
+        replayReservation,
       );
     }
     if (usage.kind === "replay") return usage.response;
@@ -7478,14 +7629,11 @@ export function createApp(options: AppOptions = {}) {
               }
               const frame = new TextDecoder("utf-8", { fatal: true }).decode(frameBytes);
               if (idempotency) {
-                await repo.appendApiSseFrame(
+                sequence += await appendReplaySseFrame(
                   idempotency.id,
                   idempotency.leaseToken,
-                  sequence++,
+                  sequence,
                   frame,
-                  undefined,
-                  undefined,
-                  replayQuota,
                 );
               }
               exposedPartial = true;
@@ -7597,7 +7745,7 @@ export function createApp(options: AppOptions = {}) {
               const inputTokens = providerCompleted ? observedInputTokens : model.contextWindow;
               const outputTokens = providerCompleted ? observedOutputTokens : maximumOutputTokens;
               if (idempotency) {
-                await repo.failApiRequest({
+                await failOpenAIUsage({
                   id: idempotency.id,
                   leaseToken: idempotency.leaseToken,
                   responseStatus: 200,
@@ -7784,7 +7932,7 @@ export function createApp(options: AppOptions = {}) {
         const responseBody = JSON.stringify(openAIError(message, code));
         try {
           if (idempotency) {
-            await repo.failApiRequest({
+            await failOpenAIUsage({
               id: idempotency.id,
               leaseToken: idempotency.leaseToken,
               responseStatus: status,
@@ -7908,6 +8056,7 @@ export function createApp(options: AppOptions = {}) {
       model,
       reserveMicros,
       resolved.price,
+      idempotentReplayReservation(c, maximumEmbeddingsReplayBytes(request)),
     );
     if (usage.kind === "replay") return usage.response;
     const { runId, idempotency, executionLeaseToken, runLease } = usage;
@@ -7959,7 +8108,7 @@ export function createApp(options: AppOptions = {}) {
           });
           terminalAccounting = true;
         } catch (persistenceError) {
-          await repo.failApiRequest({
+          await failOpenAIUsage({
             id: idempotency.id,
             leaseToken: idempotency.leaseToken,
             responseStatus: 500,
@@ -7988,7 +8137,7 @@ export function createApp(options: AppOptions = {}) {
         ),
       );
       if (idempotency) {
-        await repo.failApiRequest({
+        await failOpenAIUsage({
           id: idempotency.id,
           leaseToken: idempotency.leaseToken,
           responseStatus: c.req.raw.signal.aborted ? 499 : responseStatus,
@@ -8023,6 +8172,35 @@ export function createApp(options: AppOptions = {}) {
         maxOutput,
       )
       : reservationPrice(model, request, maxOutput).costMicros;
+    const maximumLiveChatReplayFragments = standardStreamReplayEvents - 1;
+    let maximumLiveChatReplayBytes = 0;
+    let chatReplayReservation: { bytes: number; events: number } | undefined;
+    if (c.req.header("idempotency-key")) {
+      if (request.stream) {
+        if (maximumLiveChatReplayFragments < 1) {
+          throw new DomainError(
+            "response_too_large",
+            "Requested response cannot fit in idempotent replay storage",
+            413,
+          );
+        }
+        const responseBytes = providerResponseByteLimit();
+        maximumLiveChatReplayBytes = maximumLiveChatStreamReplayBytes(
+          responseBytes,
+          maximumLiveChatReplayFragments,
+        );
+        chatReplayReservation = idempotentReplayReservation(
+          c,
+          maximumChatStreamReplayBytes(responseBytes, maximumLiveChatReplayFragments),
+          standardStreamReplayEvents,
+        );
+      } else {
+        chatReplayReservation = idempotentReplayReservation(
+          c,
+          maximumBufferedChatReplayBytes(),
+        );
+      }
+    }
     const usage = await beginOpenAIUsage(
       c,
       "chat.completions",
@@ -8030,6 +8208,7 @@ export function createApp(options: AppOptions = {}) {
       model,
       reserveMicros,
       resolvedModel.price,
+      chatReplayReservation,
     );
     if (usage.kind === "replay") return usage.response;
     const { runId, idempotency, executionLeaseToken, runLease } = usage;
@@ -8049,6 +8228,7 @@ export function createApp(options: AppOptions = {}) {
         let deliveredText = "";
         let settled = false;
         let sequence = 0;
+        let replayBytes = 0;
         try {
           for (const word of words) {
             if (stream.aborted || c.req.raw.signal.aborted) {
@@ -8063,23 +8243,30 @@ export function createApp(options: AppOptions = {}) {
             });
             const frame = sseData(data);
             if (idempotency) {
+              const nextReplayBytes = replayBytes + new TextEncoder().encode(frame).byteLength;
+              if (nextReplayBytes > maximumLiveChatReplayBytes) {
+                throw new DomainError(
+                  "response_too_large",
+                  "Provider stream exceeded the replay byte limit",
+                  413,
+                );
+              }
               const observedText = deliveredText + word;
               const observedOutput = Math.ceil(observedText.length / 4);
               const observedInput = estimateInputTokens(request);
-              await repo.appendApiSseFrame(
+              sequence += await appendReplaySseFrame(
                 idempotency.id,
                 idempotency.leaseToken,
-                sequence++,
+                sequence,
                 frame,
-                undefined,
                 {
                   inputTokens: observedInput,
                   outputTokens: observedOutput,
                   costMicros: priceUsage(model, observedInput, observedOutput).costMicros,
                   latencyMs: Math.round(performance.now() - started),
                 },
-                replayQuota,
               );
+              replayBytes = nextReplayBytes;
             }
             deliveredText += word;
             await stream.writeSSE({ data });
@@ -8103,14 +8290,11 @@ export function createApp(options: AppOptions = {}) {
             choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
           });
           if (idempotency) {
-            await repo.appendApiSseFrame(
+            sequence += await appendReplaySseFrame(
               idempotency.id,
               idempotency.leaseToken,
-              sequence++,
+              sequence,
               sseData(finishData),
-              undefined,
-              undefined,
-              replayQuota,
             );
             await repo.completeApiStream({
               id: idempotency.id,
@@ -8146,7 +8330,7 @@ export function createApp(options: AppOptions = {}) {
             const output = Math.ceil(deliveredText.length / 4);
             const latencyMs = Math.round(performance.now() - started);
             if (idempotency) {
-              await repo.failApiRequest({
+              await failOpenAIUsage({
                 id: idempotency.id,
                 leaseToken: idempotency.leaseToken,
                 responseStatus: 200,
@@ -8203,6 +8387,7 @@ export function createApp(options: AppOptions = {}) {
         let settled = false;
         let sawDone = false;
         let sequence = 0;
+        let replayBytes = 0;
         const upstreamRequest: ChatCompletionRequest = {
           ...request,
           stream_options: {
@@ -8284,15 +8469,24 @@ export function createApp(options: AppOptions = {}) {
               throw upstreamSignal.reason ?? new DOMException("Client disconnected", "AbortError");
             }
             if (idempotency) {
+              const outwardFrame = sseData(outwardData);
+              const nextReplayBytes = replayBytes +
+                new TextEncoder().encode(outwardFrame).byteLength;
+              if (nextReplayBytes > maximumLiveChatReplayBytes) {
+                throw new DomainError(
+                  "response_too_large",
+                  "Provider stream exceeded the replay byte limit",
+                  413,
+                );
+              }
               const observedOutput = sawProviderOutputUsage
                 ? outputTokens
                 : Math.max(outputTokens, Math.ceil(nextVisibleOutputBytes / 4));
-              await repo.appendApiSseFrame(
+              sequence += await appendReplaySseFrame(
                 idempotency.id,
                 idempotency.leaseToken,
-                sequence++,
-                sseData(outwardData),
-                undefined,
+                sequence,
+                outwardFrame,
                 {
                   inputTokens,
                   outputTokens: observedOutput,
@@ -8302,8 +8496,8 @@ export function createApp(options: AppOptions = {}) {
                   }).costMicros,
                   latencyMs: Math.round(performance.now() - started),
                 },
-                replayQuota,
               );
+              replayBytes = nextReplayBytes;
             }
             visibleOutputBytes = nextVisibleOutputBytes;
             await stream.writeSSE({ data: outwardData });
@@ -8376,7 +8570,7 @@ export function createApp(options: AppOptions = {}) {
               ? outputTokens
               : Math.max(outputTokens, Math.ceil(visibleOutputBytes / 4));
             const latencyMs = Math.round(performance.now() - started);
-            await repo.failApiRequest({
+            await failOpenAIUsage({
               id: idempotency.id,
               leaseToken: idempotency.leaseToken,
               responseStatus: 200,
@@ -8487,7 +8681,7 @@ export function createApp(options: AppOptions = {}) {
           });
         } catch (persistenceError) {
           const status = persistenceError instanceof DomainError ? persistenceError.status : 500;
-          await repo.failApiRequest({
+          await failOpenAIUsage({
             id: idempotency.id,
             leaseToken: idempotency.leaseToken,
             responseStatus: status,
@@ -8522,7 +8716,7 @@ export function createApp(options: AppOptions = {}) {
       }
       if (!providerCompleted && idempotency) {
         const body = JSON.stringify(openAIError("Provider request failed", "provider_error"));
-        await repo.failApiRequest({
+        await failOpenAIUsage({
           id: idempotency.id,
           leaseToken: idempotency.leaseToken,
           responseStatus: 502,
@@ -8541,6 +8735,13 @@ export function createApp(options: AppOptions = {}) {
   app.post("/v1/chat/completions", requireScope("chat:write"), chatHandler);
   app.post("/v1/responses", requireScope("chat:write"), async (c) => {
     const body = await parseJson(c, responsesSchema);
+    if (body.store === true) {
+      throw new DomainError(
+        "unsupported_parameter",
+        "store=true is not supported until stored Responses can be retrieved by public response ID",
+        400,
+      );
+    }
     const responseIdempotencyKey = c.req.header("idempotency-key");
     if (responseIdempotencyKey) {
       if (responseIdempotencyKey.length < 8 || responseIdempotencyKey.length > 200) {
@@ -8580,16 +8781,20 @@ export function createApp(options: AppOptions = {}) {
       }
     }
     let request: ChatCompletionRequest;
+    let nativeResponseInput: unknown;
+    let requiresNativeInput = false;
     try {
       const resolvedBody = await resolveResponseInputFiles(
         body as Record<string, unknown>,
         c.get("user").id,
       );
+      nativeResponseInput = structuredClone(resolvedBody.input);
+      requiresNativeInput = responsesRequestRequiresNativeInput(resolvedBody);
       request = responsesRequestToChatCompletions(resolvedBody) as unknown as ChatCompletionRequest;
     } catch (error) {
       if (error instanceof ProviderProtocolError) {
         const status = error.code === "payload_too_large" ? 413 : 400;
-        return c.json(openAIError(error.message, error.code), status);
+        return c.json(openAIError(error.message, error.code, status), status);
       }
       throw error;
     }
@@ -8598,11 +8803,79 @@ export function createApp(options: AppOptions = {}) {
     if (!model) {
       return c.json(openAIError("The requested model is unavailable", "model_not_found"), 404);
     }
+    if (requiresNativeInput && (!resolvedModel.registryModel || !providerExecution)) {
+      return c.json(
+        openAIError(
+          "This Responses input requires a native Responses provider",
+          "unsupported_feature",
+        ),
+        400,
+      );
+    }
     const maxResponseOutput = body.max_output_tokens ?? 4096;
-    // Responses replay repeats the final text in several terminal events. Reject requests whose
-    // declared output ceiling cannot fit before spending provider credits.
-    if (maxResponseOutput * 16 * 5 + 1_048_576 > 16_777_216) {
-      throw new DomainError("response_too_large", "Requested output exceeds replay storage", 413);
+    let responseReplayReservation:
+      | { bytes: number; events: number; terminalEvents: number }
+      | undefined;
+    if (responseIdempotencyKey) {
+      const echoedRequestBytes = new TextEncoder().encode(JSON.stringify(responseRequestFields({
+        background: body.background === false ? false : undefined,
+        instructions: body.instructions,
+        maxOutputTokens: body.max_output_tokens,
+        metadata: body.metadata,
+        parallelToolCalls: body.parallel_tool_calls,
+        store: false,
+        reasoning: body.reasoning,
+        temperature: body.temperature,
+        text: body.text,
+        toolChoice: body.tool_choice,
+        tools: Array.isArray(body.tools) ? body.tools : undefined,
+        topP: body.top_p,
+        user: typeof body.user === "string" ? body.user : undefined,
+      }))).byteLength;
+      // The terminal response repeats visible text in output_text and output items. Conservatively
+      // budget JSON escaping and token expansion so persistence can never fail after dispatch.
+      const terminalReplayUpperBound = responsesTerminalReplayUpperBound(
+        maxResponseOutput,
+        echoedRequestBytes,
+        providerResponseByteLimit(),
+      );
+      const boundedReplayEvents = Math.min(
+        replayQuota.maxEvents,
+        API_SSE_REPLAY_REQUEST_MAX_EVENTS,
+      );
+      const terminalFragments = Math.ceil(
+        terminalReplayUpperBound / API_SSE_REPLAY_FRAGMENT_MAX_BYTES,
+      );
+      const reservedReplayEvents = body.stream
+        ? Math.min(boundedReplayEvents, 8_192 + terminalFragments)
+        : 0;
+      const fullReplayUpperBound = body.stream
+        ? responsesStreamReplayUpperBound(
+          maxResponseOutput,
+          echoedRequestBytes,
+          reservedReplayEvents,
+          providerResponseByteLimit(),
+        )
+        : responsesBufferedReplayUpperBound(echoedRequestBytes);
+      const replayResponseLimit = Math.min(
+        replayQuota.maxBytes,
+        API_SSE_REPLAY_REQUEST_MAX_BYTES,
+      );
+      if (
+        fullReplayUpperBound > replayResponseLimit ||
+        (body.stream && terminalFragments + 2 > boundedReplayEvents)
+      ) {
+        throw new DomainError(
+          "response_too_large",
+          "Requested response cannot fit in idempotent replay storage",
+          413,
+        );
+      }
+      responseReplayReservation = {
+        bytes: fullReplayUpperBound,
+        events: reservedReplayEvents,
+        terminalEvents: body.stream ? terminalFragments : 0,
+      };
     }
     const providerPlan = resolvedModel.registryModel && providerExecution
       ? await resolveEntitledPlan(accessSubject(c), resolvedModel.registryModel.id)
@@ -8621,6 +8894,7 @@ export function createApp(options: AppOptions = {}) {
       model,
       responseReservation,
       resolvedModel.price,
+      responseReplayReservation,
     );
     if (usage.kind === "replay") return usage.response;
     const { runId, idempotency, executionLeaseToken, runLease } = usage;
@@ -8643,7 +8917,9 @@ export function createApp(options: AppOptions = {}) {
         : {}),
     };
     const nativeResponseRequestFields = {
-      ...(typeof body.store === "boolean" ? { store: body.store } : {}),
+      store: false,
+      input: nativeResponseInput,
+      requiresNativeInput,
       ...(body.metadata && typeof body.metadata === "object" && !Array.isArray(body.metadata)
         ? { metadata: body.metadata as Record<string, unknown> }
         : {}),
@@ -8674,7 +8950,7 @@ export function createApp(options: AppOptions = {}) {
             parallelToolCalls: typeof body.parallel_tool_calls === "boolean"
               ? body.parallel_tool_calls
               : undefined,
-            store: typeof body.store === "boolean" ? body.store : undefined,
+            store: false,
             reasoning: body.reasoning,
             temperature: typeof body.temperature === "number" ? body.temperature : undefined,
             text: body.text,
@@ -8698,7 +8974,7 @@ export function createApp(options: AppOptions = {}) {
           const providerUsage = projector.usage;
           const inputTokens = providerUsage?.inputTokens ?? estimateInputTokens(request);
           const outputTokens = providerUsage?.outputTokens ??
-            Math.ceil(projector.visibleBytes / 4);
+            Math.min(maxResponseOutput, Math.ceil(projector.visibleBytes / 4));
           const cachedInputTokens = providerUsage?.cachedInputTokens ?? 0;
           const reasoningTokens = providerUsage?.reasoningTokens ?? 0;
           return {
@@ -8719,16 +8995,24 @@ export function createApp(options: AppOptions = {}) {
             throw upstreamSignal.reason ?? new DOMException("Client disconnected", "AbortError");
           }
           if (idempotency) {
-            await repo.appendApiSseFrame(
+            const fragmentCount = splitApiSseReplayFrame(frame).length;
+            const liveEventLimit = responseReplayReservation!.events -
+              responseReplayReservation!.terminalEvents;
+            if (persistenceSequence + fragmentCount > liveEventLimit) {
+              throw new DomainError(
+                "response_too_large",
+                "Provider stream contains too many replay events",
+                413,
+              );
+            }
+            persistenceSequence += await appendReplaySseFrame(
               idempotency.id,
               idempotency.leaseToken,
               persistenceSequence,
               frame,
-              undefined,
               observedAccounting(),
-              replayQuota,
+              liveEventLimit,
             );
-            persistenceSequence++;
             eventSequence++;
           }
           await stream.write(frame);
@@ -8834,7 +9118,7 @@ export function createApp(options: AppOptions = {}) {
             };
             const terminalFrame = eventFrame(failure);
             if (idempotency) {
-              await repo.failApiRequest({
+              await failOpenAIUsage({
                 id: idempotency.id,
                 leaseToken: idempotency.leaseToken,
                 responseStatus: 200,
@@ -8842,7 +9126,9 @@ export function createApp(options: AppOptions = {}) {
                   "content-type": "text/event-stream",
                   "cache-control": "no-cache",
                 },
-                responseBody: JSON.stringify(openAIError(failure.message, failure.code)),
+                responseBody: JSON.stringify(
+                  openAIError(failure.message, failure.code, publicFailure.type),
+                ),
                 terminalFrame,
                 billing: hasBillableWork
                   ? {
@@ -8895,7 +9181,7 @@ export function createApp(options: AppOptions = {}) {
       if (!providerCompleted && idempotency) {
         const failure = publicProviderFailure(error, c.req.raw.signal.aborted);
         const failureBody = JSON.stringify(
-          openAIError(failure.message, failure.code),
+          openAIError(failure.message, failure.code, failure.type),
         );
         const responseHeaders = {
           "content-type": "application/json",
@@ -8903,7 +9189,7 @@ export function createApp(options: AppOptions = {}) {
             ? { "retry-after": String(Math.max(1, Math.ceil(failure.retryAfterMs / 1_000))) }
             : {}),
         };
-        await repo.failApiRequest({
+        await failOpenAIUsage({
           id: idempotency.id,
           leaseToken: idempotency.leaseToken,
           responseStatus: failure.status,
@@ -8920,11 +9206,15 @@ export function createApp(options: AppOptions = {}) {
       if (!providerCompleted) {
         await repo.refund(runId);
         const failure = publicProviderFailure(error, c.req.raw.signal.aborted);
-        return c.json(openAIError(failure.message, failure.code), failure.status as 400, {
-          ...(failure.retryAfterMs !== undefined
-            ? { "retry-after": String(Math.max(1, Math.ceil(failure.retryAfterMs / 1_000))) }
-            : {}),
-        });
+        return c.json(
+          openAIError(failure.message, failure.code, failure.type),
+          failure.status as 400,
+          {
+            ...(failure.retryAfterMs !== undefined
+              ? { "retry-after": String(Math.max(1, Math.ceil(failure.retryAfterMs / 1_000))) }
+              : {}),
+          },
+        );
       }
       await lease.stop();
       throw error;
@@ -8981,7 +9271,7 @@ export function createApp(options: AppOptions = {}) {
             ? body.parallel_tool_calls
             : undefined,
           reasoning: body.reasoning,
-          store: typeof body.store === "boolean" ? body.store : undefined,
+          store: false,
           temperature: typeof body.temperature === "number" ? body.temperature : undefined,
           text: body.text,
           toolChoice: body.tool_choice,
@@ -9012,7 +9302,7 @@ export function createApp(options: AppOptions = {}) {
           status,
         );
         const failureBody = JSON.stringify(openAIError(failure.message, failure.code));
-        await repo.failApiRequest({
+        await failOpenAIUsage({
           id: idempotency.id,
           leaseToken: idempotency.leaseToken,
           responseStatus: status,
@@ -9179,6 +9469,13 @@ export function createApp(options: AppOptions = {}) {
         model,
         reserveMicros,
         resolved.price,
+        request.stream
+          ? idempotentReplayReservation(
+            c,
+            AUDIO_MAX_RESPONSE_BYTES + API_SSE_REPLAY_FRAGMENT_MAX_BYTES,
+            standardStreamReplayEvents,
+          )
+          : idempotentReplayReservation(c, AUDIO_MAX_RESPONSE_BYTES),
       );
       if (usage.kind === "replay") return usage.response;
       const { runId, idempotency, executionLeaseToken, runLease } = usage;
@@ -9195,7 +9492,7 @@ export function createApp(options: AppOptions = {}) {
           : "Audio admission is temporarily unavailable";
         const responseBody = JSON.stringify(openAIError(message, code));
         if (idempotency) {
-          await repo.failApiRequest({
+          await failOpenAIUsage({
             id: idempotency.id,
             leaseToken: idempotency.leaseToken,
             responseStatus: status,
@@ -9219,7 +9516,7 @@ export function createApp(options: AppOptions = {}) {
           ),
         );
         if (idempotency) {
-          await repo.failApiRequest({
+          await failOpenAIUsage({
             id: idempotency.id,
             leaseToken: idempotency.leaseToken,
             responseStatus: 503,
@@ -9270,14 +9567,11 @@ export function createApp(options: AppOptions = {}) {
                 visibleCharacters = observeAudioTranscriptFrame(frame, transcriptVisibility)
                   .totalCharacters;
                 if (idempotency) {
-                  await repo.appendApiSseFrame(
+                  sequence += await appendReplaySseFrame(
                     idempotency.id,
                     idempotency.leaseToken,
-                    sequence++,
+                    sequence,
                     frame,
-                    undefined,
-                    undefined,
-                    replayQuota,
                   );
                 }
                 await stream.write(frame);
@@ -9351,7 +9645,7 @@ export function createApp(options: AppOptions = {}) {
                   ))
                 }\n\n`;
                 if (idempotency) {
-                  await repo.failApiRequest({
+                  await failOpenAIUsage({
                     id: idempotency.id,
                     leaseToken: idempotency.leaseToken,
                     // Hono has committed the SSE response before this callback begins. Persist
@@ -9431,7 +9725,7 @@ export function createApp(options: AppOptions = {}) {
             });
             terminalAccounting = true;
           } catch (persistenceError) {
-            await repo.failApiRequest({
+            await failOpenAIUsage({
               id: idempotency.id,
               leaseToken: idempotency.leaseToken,
               responseStatus: 500,
@@ -9491,7 +9785,7 @@ export function createApp(options: AppOptions = {}) {
           code,
         ));
         if (idempotency) {
-          await repo.failApiRequest({
+          await failOpenAIUsage({
             id: idempotency.id,
             leaseToken: idempotency.leaseToken,
             responseStatus: status,
@@ -9549,7 +9843,10 @@ export function createApp(options: AppOptions = {}) {
       request = parseSpeechRequest(value);
     } catch (error) {
       if (!(error instanceof SpeechProviderError)) throw error;
-      return c.json(openAIError(error.message, error.code), error.status as 400);
+      return c.json(
+        openAIError(error.message, error.code, error.status),
+        error.status as 400,
+      );
     }
 
     const endpointKey = "audio.speech" as const;
@@ -9611,7 +9908,10 @@ export function createApp(options: AppOptions = {}) {
       assertSpeechFixedPricing(sourcePricing);
     } catch (error) {
       if (!(error instanceof SpeechProviderError)) throw error;
-      return c.json(openAIError(error.message, error.code), error.status as 500);
+      return c.json(
+        openAIError(error.message, error.code, error.status),
+        error.status as 500,
+      );
     }
     const providerPlan = await resolveEntitledPlan(accessSubject(c), resolved.registryModel.id);
     const estimatedInputTokens = estimateSpeechInputTokens(request);
@@ -9623,6 +9923,13 @@ export function createApp(options: AppOptions = {}) {
       model,
       reserveMicros,
       resolved.price,
+      request.streamFormat === "sse"
+        ? idempotentReplayReservation(
+          c,
+          SPEECH_MAX_RESPONSE_BYTES + API_SSE_REPLAY_FRAGMENT_MAX_BYTES,
+          standardStreamReplayEvents,
+        )
+        : idempotentReplayReservation(c, SPEECH_MAX_RESPONSE_BYTES),
     );
     if (usage.kind === "replay") return usage.response;
     const { runId, idempotency, executionLeaseToken, runLease } = usage;
@@ -9642,7 +9949,7 @@ export function createApp(options: AppOptions = {}) {
           : "Audio admission is temporarily unavailable";
         const responseBody = JSON.stringify(openAIError(message, code));
         if (idempotency) {
-          await repo.failApiRequest({
+          await failOpenAIUsage({
             id: idempotency.id,
             leaseToken: idempotency.leaseToken,
             responseStatus: status,
@@ -9669,7 +9976,7 @@ export function createApp(options: AppOptions = {}) {
           "service_unavailable",
         ));
         if (idempotency) {
-          await repo.failApiRequest({
+          await failOpenAIUsage({
             id: idempotency.id,
             leaseToken: idempotency.leaseToken,
             responseStatus: 503,
@@ -9726,14 +10033,11 @@ export function createApp(options: AppOptions = {}) {
                 visibleAudioBytes += speechFrameDecodedBytes(frameBytes);
                 const frame = new TextDecoder("utf-8", { fatal: true }).decode(frameBytes);
                 if (idempotency) {
-                  await repo.appendApiSseFrame(
+                  sequence += await appendReplaySseFrame(
                     idempotency.id,
                     idempotency.leaseToken,
-                    sequence++,
+                    sequence,
                     frame,
-                    undefined,
-                    undefined,
-                    replayQuota,
                   );
                 }
                 await stream.write(frame);
@@ -9803,7 +10107,7 @@ export function createApp(options: AppOptions = {}) {
                 );
                 const errorFrame = `data: ${JSON.stringify(errorBody)}\n\n`;
                 if (idempotency) {
-                  await repo.failApiRequest({
+                  await failOpenAIUsage({
                     id: idempotency.id,
                     leaseToken: idempotency.leaseToken,
                     responseStatus: 200,
@@ -9873,7 +10177,7 @@ export function createApp(options: AppOptions = {}) {
             const failureBody = JSON.stringify(
               openAIError("Response replay persistence failed", "replay_persistence_error"),
             );
-            await repo.failApiRequest({
+            await failOpenAIUsage({
               id: idempotency.id,
               leaseToken: idempotency.leaseToken,
               responseStatus: status,
@@ -9951,7 +10255,7 @@ export function createApp(options: AppOptions = {}) {
           }
           : { mode: "refund" as const };
         if (idempotency) {
-          await repo.failApiRequest({
+          await failOpenAIUsage({
             id: idempotency.id,
             leaseToken: idempotency.leaseToken,
             responseStatus: status,
@@ -10063,7 +10367,7 @@ export function createApp(options: AppOptions = {}) {
     if (error instanceof HTTPException) {
       if (c.req.path.startsWith("/v1/")) {
         const code = error.status === 413 ? "request_too_large" : "request_error";
-        return c.json(openAIError(error.message, code), error.status as 400);
+        return c.json(openAIError(error.message, code, error.status), error.status as 400);
       }
       if (error.status === 413) {
         return c.json({
@@ -10083,7 +10387,7 @@ export function createApp(options: AppOptions = {}) {
     }
     if (error instanceof UploadSecurityError) {
       return c.req.path.startsWith("/v1/")
-        ? c.json(openAIError(error.message, error.code), error.status as 400)
+        ? c.json(openAIError(error.message, error.code, error.status), error.status as 400)
         : c.json({ error: { code: error.code, message: error.message } }, error.status as 400);
     }
     if (error instanceof BackupServiceError) {
@@ -10098,7 +10402,10 @@ export function createApp(options: AppOptions = {}) {
     }
     if (error instanceof DomainError) {
       if (c.req.path.startsWith("/v1/")) {
-        return c.json(openAIError(error.message, error.code), error.status as 400);
+        return c.json(
+          openAIError(error.message, error.code, error.status),
+          error.status as 400,
+        );
       }
       return c.json({ error: { code: error.code, message: error.message } }, error.status as 400);
     }
@@ -10115,9 +10422,12 @@ export function createApp(options: AppOptions = {}) {
     console.error(
       JSON.stringify({ level: "error", message: "Unhandled request error", correlationId }),
     );
-    return c.json(openAIError(`Internal server error (${correlationId})`, "internal_error"), 500);
+    return c.json(
+      openAIError(`Internal server error (${correlationId})`, "internal_error", 500),
+      500,
+    );
   });
-  app.notFound((c) => c.json(openAIError("Route not found", "not_found"), 404));
+  app.notFound((c) => c.json(openAIError("Route not found", "not_found", 404), 404));
   return {
     app,
     repository: repo,

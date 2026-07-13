@@ -38,6 +38,7 @@ Deno.test("upstream streaming preserves split SSE chunks and terminal DONE", asy
           '\ndata: {"id":"one","choices":[{"delta":{"content":"Hel"}}]}\r\n\r',
           '\ndata: {"id":"two",\n',
           'data: "choices":[]}\n\n',
+          'data: {"id":"three","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
           "data: [DO",
           "NE]\n\n",
         ]),
@@ -56,6 +57,7 @@ Deno.test("upstream streaming preserves split SSE chunks and terminal DONE", asy
   assertEquals(chunks, [
     '{"id":"one","choices":[{"delta":{"content":"Hel"}}]}',
     '{"id":"two",\n"choices":[]}',
+    '{"id":"three","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
     "[DONE]",
   ]);
   assertEquals(acceptHeader, "text/event-stream");
@@ -83,9 +85,13 @@ Deno.test("Chat upstream defaults apply to buffered and streaming requests witho
   const streamingFetch = ((_input: string | URL | Request, init?: RequestInit) => {
     bodies.push(JSON.parse(String(init?.body)));
     return Promise.resolve(
-      new Response("data: [DONE]\n\n", {
-        headers: { "content-type": "text/event-stream" },
-      }),
+      new Response(
+        'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n' +
+          "data: [DONE]\n\n",
+        {
+          headers: { "content-type": "text/event-stream" },
+        },
+      ),
     );
   }) as typeof fetch;
   await collect(streamChatCompletion(
@@ -199,6 +205,91 @@ Deno.test("SSE parser rejects malformed JSON and streams without DONE", async ()
       )),
     Error,
     "mid-frame",
+  );
+});
+
+Deno.test("SSE parser requires finish_reason before DONE and accepts empty content filters", async () => {
+  await assertRejects(
+    () =>
+      collect(parseOpenAIEventStream(
+        byteStream(["data: [DONE]\n\n"]),
+        new AbortController().signal,
+      )),
+    ProviderAttemptError,
+    "before finish_reason",
+  );
+  assertEquals(
+    await collect(parseOpenAIEventStream(
+      byteStream([
+        'data: {"choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]}\n\n',
+        "data: [DONE]\n\n",
+      ]),
+      new AbortController().signal,
+    )),
+    [
+      '{"choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]}',
+      "[DONE]",
+    ],
+  );
+  assertEquals(
+    await collect(parseOpenAIEventStream(
+      byteStream([
+        'data: {"choices":[{"index":0,"delta":{"function_call":{"name":"lookup","arguments":"{}"}},"finish_reason":"function_call"}]}\n\n',
+        "data: [DONE]\n\n",
+      ]),
+      new AbortController().signal,
+    )),
+    [
+      '{"choices":[{"index":0,"delta":{"function_call":{"name":"lookup","arguments":"{}"}},"finish_reason":"function_call"}]}',
+      "[DONE]",
+    ],
+  );
+});
+
+Deno.test("SSE parser treats finish_reason as unique and terminal", async () => {
+  const invalidStreams = [
+    [
+      '{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+      '{"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}',
+    ],
+    [
+      '{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+      '{"choices":[{"index":0,"delta":{"content":"late"},"finish_reason":null}]}',
+    ],
+    [
+      '{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+      '{"choices":[],"not_usage":true}',
+    ],
+    [
+      '{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+      '{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":0}}',
+    ],
+  ];
+  for (const events of invalidStreams) {
+    await assertRejects(
+      () =>
+        collect(parseOpenAIEventStream(
+          byteStream([events.map((event) => `data: ${event}\n\n`).join("") + "data: [DONE]\n\n"]),
+          new AbortController().signal,
+        )),
+      ProviderAttemptError,
+    );
+  }
+
+  assertEquals(
+    await collect(parseOpenAIEventStream(
+      byteStream([
+        'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n' +
+        'data: {"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":0,"total_tokens":1}}\n\n' +
+        "data: [DONE]\n\n",
+      ]),
+      new AbortController().signal,
+    )),
+    [
+      '{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+      '{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":0,"total_tokens":1}}',
+      "[DONE]",
+    ],
   );
 });
 

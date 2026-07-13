@@ -2,17 +2,41 @@ import { expect, test } from "@playwright/test";
 import { env } from "./env.ts";
 import { bootstrap, createChat, login } from "./helpers.ts";
 
+function contrastRatio(foreground: string, background: string): number {
+  const luminance = (color: string) => {
+    const channels = color.match(/[\d.]+/g)?.slice(0, 3).map(Number);
+    if (!channels || channels.length !== 3) throw new Error(`Unsupported color: ${color}`);
+    const [red, green, blue] = channels.map((channel) => {
+      const normalized = channel / 255;
+      return normalized <= 0.04045 ? normalized / 12.92 : ((normalized + 0.055) / 1.055) ** 2.4;
+    });
+    return red * 0.2126 + green * 0.7152 + blue * 0.0722;
+  };
+  const light = Math.max(luminance(foreground), luminance(background));
+  const dark = Math.min(luminance(foreground), luminance(background));
+  return (light + 0.05) / (dark + 0.05);
+}
+
 test(
   "primary chat controls remain usable at the project viewport",
   async ({ page, request }, testInfo) => {
     await bootstrap(request);
     await login(page);
     await createChat(page);
+    const mobile = testInfo.project.name.includes("mobile");
     const composer = page.getByRole("textbox", { name: /message/i });
     await expect(composer).toBeVisible();
     await composer.focus();
     await expect(composer).toBeFocused();
-    await expect(page.getByRole("button", { name: "New chat ⌘ K", exact: true })).toBeVisible();
+    if (mobile) {
+      await expect(page.getByRole("button", { name: "Open menu", exact: true })).toBeVisible();
+      await expect(page.getByRole("button", { name: "New chat ⌘ K", exact: true }))
+        .toHaveCount(0);
+    } else {
+      await expect(page.getByRole("button", { name: "New chat ⌘ K", exact: true })).toBeVisible();
+      await expect(page.getByRole("button", { name: "Open menu", exact: true })).toBeHidden();
+      await expect(page.getByRole("button", { name: "Close sidebar", exact: true })).toBeHidden();
+    }
     await expect(page.getByRole("button", { name: "Attach files" })).toBeEnabled();
     await expect(page.getByRole("button", { name: "Open web search" })).toBeEnabled();
     await expect(page.getByRole("button", { name: "Tools (not available yet)" })).toBeDisabled();
@@ -20,7 +44,47 @@ test(
       name: /^(Start voice input|Voice input unavailable:)/,
     })).toBeVisible();
 
-    if (testInfo.project.name.includes("mobile")) {
+    await page.evaluate(() => document.documentElement.setAttribute("data-theme", "dark"));
+    const composerGradient = await page.locator(".composer-wrap").evaluate((element) =>
+      getComputedStyle(element).backgroundImage
+    );
+    expect(composerGradient).toContain("rgb(23, 23, 21)");
+    expect(composerGradient).not.toContain("rgb(255, 255, 255)");
+    const darkSidebarColors = await page.evaluate(() => {
+      const newChat = document.querySelector<HTMLElement>(".new-chat")!;
+      const search = document.querySelector<HTMLElement>(".search")!;
+      const searchInput = search.querySelector<HTMLElement>("input")!;
+      return {
+        newChat: {
+          foreground: getComputedStyle(newChat).color,
+          background: getComputedStyle(newChat).backgroundColor,
+        },
+        search: {
+          foreground: getComputedStyle(searchInput).color,
+          background: getComputedStyle(search).backgroundColor,
+        },
+      };
+    });
+    expect(contrastRatio(
+      darkSidebarColors.newChat.foreground,
+      darkSidebarColors.newChat.background,
+    )).toBeGreaterThanOrEqual(4.5);
+    expect(contrastRatio(
+      darkSidebarColors.search.foreground,
+      darkSidebarColors.search.background,
+    )).toBeGreaterThanOrEqual(4.5);
+    const attachButton = page.getByRole("button", { name: "Attach files" });
+    await attachButton.hover();
+    const iconHoverColors = await attachButton.evaluate((element) => ({
+      foreground: getComputedStyle(element).color,
+      background: getComputedStyle(element).backgroundColor,
+    }));
+    expect(contrastRatio(
+      iconHoverColors.foreground,
+      iconHoverColors.background,
+    )).toBeGreaterThanOrEqual(3);
+
+    if (mobile) {
       await page.setViewportSize({ width: 320, height: 800 });
       await expect(page.locator("body")).not.toHaveCSS("overflow-x", "scroll");
       expect(
@@ -37,6 +101,75 @@ test(
     }
   },
 );
+
+test("mobile drawer is inert while closed and sheds modal state at the desktop breakpoint", async ({
+  page,
+  request,
+}, testInfo) => {
+  test.skip(!testInfo.project.name.includes("mobile"), "mobile drawer regression");
+  await bootstrap(request);
+  await login(page);
+  await createChat(page);
+  await page.setViewportSize({ width: 320, height: 800 });
+
+  const sidebar = page.locator("aside.sidebar");
+  await expect(sidebar).toHaveAttribute("aria-hidden", "true");
+  await expect(sidebar).toHaveAttribute("inert", "");
+  await expect(page.getByRole("dialog", { name: "Workspace navigation", exact: true }))
+    .toHaveCount(0);
+  await expect(page.getByRole("button", { name: "New chat ⌘ K", exact: true })).toHaveCount(0);
+
+  const open = page.getByRole("button", { name: "Open menu", exact: true });
+  await open.click();
+  const drawer = page.getByRole("dialog", { name: "Workspace navigation", exact: true });
+  await expect(drawer).toBeVisible();
+  await expect(sidebar).not.toHaveAttribute("aria-hidden", "true");
+  await expect(sidebar).not.toHaveAttribute("inert", "");
+  await expect(page.getByRole("button", { name: "Close sidebar", exact: true })).toBeFocused();
+
+  const actions = drawer.locator("[data-conversation-actions]").first();
+  await actions.click();
+  const rename = page.getByRole("menuitem", { name: "Rename", exact: true });
+  await expect(rename).toBeFocused();
+  await rename.press("Shift+Tab");
+  expect(await sidebar.evaluate((element) => element.contains(document.activeElement))).toBe(true);
+  await rename.focus();
+  await rename.press("End");
+  const lastMenuItem = page.getByRole("menuitem").last();
+  await expect(lastMenuItem).toBeFocused();
+  await lastMenuItem.press("Tab");
+  expect(await sidebar.evaluate((element) => element.contains(document.activeElement))).toBe(true);
+  await actions.click();
+  await expect(page.getByRole("menu")).toHaveCount(0);
+
+  await page.setViewportSize({ width: 1200, height: 800 });
+  await expect(sidebar).not.toHaveClass(/mobile-open/);
+  await expect(sidebar).not.toHaveAttribute("role", "dialog");
+  await expect(sidebar).not.toHaveAttribute("aria-modal", "true");
+  await expect(sidebar).not.toHaveAttribute("aria-hidden", "true");
+  await expect(sidebar).not.toHaveAttribute("inert", "");
+  await expect(page.getByRole("button", { name: "Open menu", exact: true })).toBeHidden();
+  await expect(page.getByRole("button", { name: "Close sidebar", exact: true })).toBeHidden();
+  await expect(page.getByRole("textbox", { name: "Message", exact: true })).toBeFocused();
+});
+
+test("mobile top-level navigation restores focus", async ({ page, request }, testInfo) => {
+  test.skip(!testInfo.project.name.includes("mobile"), "mobile focus restoration regression");
+  await bootstrap(request);
+  await login(page);
+  await createChat(page);
+
+  const destinations = ["Admin console", "Settings", "Knowledge"];
+  for (const destination of destinations) {
+    const openMenu = page.getByRole("button", { name: "Open menu", exact: true });
+    await openMenu.click();
+    await page.getByRole("dialog", { name: "Workspace navigation", exact: true }).getByRole(
+      "button",
+      { name: destination, exact: true },
+    ).click();
+    await expect(page.getByRole("button", { name: "Open menu", exact: true })).toBeFocused();
+  }
+});
 
 test("every admin section is reachable across desktop and mobile", async ({
   page,

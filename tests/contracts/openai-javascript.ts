@@ -357,6 +357,9 @@ const response = await client.responses.create({
 if (!response.output_text.includes("JavaScript Responses contract")) {
   throw new Error("JavaScript Responses result did not contain the expected content");
 }
+if ((response as unknown as { store?: boolean }).store !== false) {
+  throw new Error("JavaScript Responses result claimed unsupported persistent storage");
+}
 
 const responseStream = await client.responses.create({
   model,
@@ -472,6 +475,40 @@ const nativeResponse = await client.responses.create({
 if (!nativeResponse.output_text.includes("native Responses public contract")) {
   throw new Error("JavaScript Responses API did not use a native Responses upstream");
 }
+const statelessNativeResponse = await client.responses.create({
+  model: responsesModel,
+  input: [
+    {
+      id: "rs_javascript_previous",
+      type: "reasoning",
+      summary: [{ type: "summary_text", text: "Preserve this prior reasoning item" }],
+      encrypted_content: "opaque-javascript-reasoning-state",
+      status: "completed",
+    },
+    ...nativeResponse.output,
+    {
+      id: "fc_javascript_previous",
+      type: "function_call",
+      call_id: "call_javascript_previous",
+      name: "lookup_previous",
+      arguments: '{"query":"javascript"}',
+      status: "completed",
+    },
+    {
+      type: "function_call_output",
+      call_id: "call_javascript_previous",
+      output: "prior JavaScript tool result",
+    },
+    {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "JavaScript stateless continuation" }],
+    },
+  ],
+});
+if (!statelessNativeResponse.output_text.includes("JavaScript stateless continuation")) {
+  throw new Error("JavaScript Responses stateless output/reasoning continuation was not preserved");
+}
 const nativeResponseStream = await client.responses.create({
   model: responsesModel,
   input: "JavaScript native Responses public stream",
@@ -493,6 +530,22 @@ if (
   nativeResponseEvents.some((event, index) => event.sequence_number !== index)
 ) {
   throw new Error("JavaScript Responses stream lifecycle or sequence numbers were invalid");
+}
+const emptyIncompleteStream = await client.responses.create({
+  model: responsesModel,
+  input: "JavaScript empty incomplete stream",
+  max_output_tokens: 1,
+  stream: true,
+});
+const emptyIncompleteEvents: Array<Record<string, unknown>> = [];
+for await (const event of emptyIncompleteStream) {
+  emptyIncompleteEvents.push(event as unknown as Record<string, unknown>);
+}
+if (
+  emptyIncompleteEvents.at(-1)?.type !== "response.incomplete" ||
+  emptyIncompleteEvents.some((event) => event.type === "error")
+) {
+  throw new Error("JavaScript valid empty incomplete Responses stream was rejected");
 }
 const nativeTerminal = nativeResponseEvents.at(-1)?.response as Record<string, unknown> | undefined;
 if (
@@ -575,6 +628,7 @@ async function expectApiError(
   request: Promise<unknown>,
   status: number,
   code?: string,
+  type?: string,
 ) {
   try {
     await request;
@@ -583,7 +637,8 @@ async function expectApiError(
     if (error instanceof Error && error.message === `${label} was accepted`) throw error;
     if (
       !(error instanceof OpenAI.APIError) || error.status !== status ||
-      (code !== undefined && error.code !== code)
+      (code !== undefined && error.code !== code) ||
+      (type !== undefined && error.type !== type)
     ) {
       throw new Error(`${label} did not return the expected OpenAI error`, { cause: error });
     }
@@ -594,11 +649,22 @@ await expectApiError(
   "JavaScript malformed Chat Completions request",
   client.chat.completions.create({ model, messages: [] }),
   422,
+  undefined,
+  "invalid_request_error",
 );
 await expectApiError(
   "JavaScript malformed Responses request",
   client.responses.create({ model, input: [], max_output_tokens: -1 }),
   422,
+  undefined,
+  "invalid_request_error",
+);
+await expectApiError(
+  "JavaScript unsupported stored Response",
+  client.responses.create({ model, input: "must not store", store: true }),
+  400,
+  "unsupported_parameter",
+  "invalid_request_error",
 );
 
 const rateApiKey = Deno.env.get("CONTRACT_JS_RATE_API_KEY");
@@ -613,6 +679,7 @@ await expectApiError(
   rateClient.models.list(),
   429,
   "rate_limit_exceeded",
+  "rate_limit_error",
 );
 const emptyCreditClient = new OpenAI({ apiKey: emptyCreditApiKey, baseURL, maxRetries: 0 });
 await expectApiError(

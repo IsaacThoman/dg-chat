@@ -616,6 +616,11 @@ export async function* streamProviderRequest<T>(
     visibleUnits?: (chunk: T) => number;
     /** Accept a validated stream whose buffered events contain no user-visible units. */
     allowNoVisibleOutput?: boolean;
+    /**
+     * Accept a no-visible stream only after a protocol-specific validator proves its terminal
+     * lifecycle. This is preferable to allowNoVisibleOutput for structured text protocols.
+     */
+    validateNoVisibleOutput?: (buffered: readonly T[]) => void | Promise<void>;
   },
 ): AsyncGenerator<T> {
   const policy = validateResiliencePolicy(options.policy);
@@ -661,7 +666,9 @@ export async function* streamProviderRequest<T>(
         );
         if (item.done) {
           if (!visible) {
-            if (!options.allowNoVisibleOutput) {
+            if (options.validateNoVisibleOutput) {
+              await options.validateNoVisibleOutput(buffered);
+            } else if (!options.allowNoVisibleOutput) {
               throw new ProviderAttemptError("Provider stream ended before visible output", {
                 category: "invalid_response",
                 transient: true,

@@ -91,6 +91,15 @@ function count(request: EmbeddingsRequest): number {
     : 1;
 }
 
+/** Conservative normalized JSON replay bound for a validated embeddings request. */
+export function maximumEmbeddingsReplayBytes(request: EmbeddingsRequest): number {
+  const dimensions = request.dimensions ?? MAX_DIMENSIONS;
+  const bytesPerEmbedding = request.encoding_format === "base64"
+    ? Math.ceil((dimensions * 4) / 3) * 4 + 256
+    : dimensions * 32 + 256;
+  return Math.min(MAX_RESPONSE_BYTES, 65_536 + count(request) * bytesPerEmbedding);
+}
+
 function nonnegativeInteger(value: unknown, field: string): number {
   if (!Number.isSafeInteger(value) || Number(value) < 0) {
     throw new EmbeddingsProviderError(`Provider returned invalid ${field}`);
