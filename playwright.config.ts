@@ -12,7 +12,11 @@ export default defineConfig({
   fullyParallel: false,
   forbidOnly: Boolean(env("CI")),
   retries: env("CI") ? 2 : 0,
-  workers: env("CI") ? 1 : undefined,
+  // Managed journeys share one self-hosted installation and intentionally exercise global limits,
+  // bootstrap state, retention, and account lifecycle. Parallel workers would race that state and
+  // exhaust the administrator's real authentication quota, so keep managed runs isolated locally
+  // as well as in CI. Externally provisioned test stacks may still opt into Playwright's default.
+  workers: env("CI") || env("E2E_MANAGED_SERVER") === "true" ? 1 : undefined,
   timeout: 45_000,
   expect: { timeout: 8_000 },
   reporter: env("CI")
