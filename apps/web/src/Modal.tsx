@@ -2,6 +2,7 @@ import { type ReactNode, useEffect, useId, useRef } from "react";
 import { createPortal } from "react-dom";
 import { X } from "lucide-react";
 import {
+  consumeModalEscape,
   modalFocusableElements,
   modalInitialFocus,
   modalShouldRestoreFocus,
@@ -37,11 +38,7 @@ export function Modal(
     const dialog = dialogRef.current;
     if (dialog) modalInitialFocus(dialog).focus();
     const keydown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && dismissibleRef.current) {
-        event.preventDefault();
-        closeRef.current();
-        return;
-      }
+      if (consumeModalEscape(event, dismissibleRef.current, closeRef.current)) return;
       if (event.key !== "Tab" || !dialog) return;
       const items = modalFocusableElements(dialog);
       if (!items.length) return;

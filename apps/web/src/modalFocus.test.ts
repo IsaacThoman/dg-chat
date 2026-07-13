@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  consumeModalEscape,
+  drawerShouldHandleEscape,
   MODAL_FOCUSABLE_SELECTOR,
   modalFocusableElements,
   modalInitialFocus,
@@ -48,6 +50,32 @@ describe("modal focus targets", () => {
       .toBe(true);
     expect(modalOverlayPresent({ querySelector: () => null } as Pick<Document, "querySelector">))
       .toBe(false);
+  });
+
+  it("consumes exactly one layer regardless of document listener order", () => {
+    const event = {
+      key: "Escape",
+      defaultPrevented: false,
+      immediateStopped: false,
+      preventDefault() {
+        this.defaultPrevented = true;
+      },
+      stopImmediatePropagation() {
+        this.immediateStopped = true;
+      },
+    };
+    let modalClosed = 0;
+    let drawerClosed = 0;
+
+    // Modal listener first: native propagation is consumed and defaultPrevented is durable.
+    expect(consumeModalEscape(event, true, () => modalClosed++)).toBe(true);
+    if (drawerShouldHandleEscape(event, false)) drawerClosed++;
+    expect(event.immediateStopped).toBe(true);
+    expect({ modalClosed, drawerClosed }).toEqual({ modalClosed: 1, drawerClosed: 0 });
+
+    // Drawer listener first: the still-open modal layer makes it defer.
+    const earlierDrawerEvent = { key: "Escape", defaultPrevented: false };
+    expect(drawerShouldHandleEscape(earlierDrawerEvent, true)).toBe(false);
   });
 
   it("filters disabled, hidden, inert, and negative-tab-index matches", () => {
