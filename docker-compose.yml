@@ -92,7 +92,7 @@ services:
       - app-search
       - egress
     healthcheck:
-      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8000/ready"]
+      test: ["CMD", "busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8000/ready"]
       interval: 10s
       timeout: 5s
       retries: 12
