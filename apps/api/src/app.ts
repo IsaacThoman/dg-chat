@@ -29,6 +29,7 @@ import {
   embeddingsSchema,
   generateMessageSchema,
   identityTokenSchema,
+  keepTemporaryConversationSchema,
   knowledgeBindingSchema,
   knowledgeExpectedVersionSchema,
   loginSchema,
@@ -83,6 +84,7 @@ import {
   ObjectAlreadyExistsError,
   type ObjectStore,
   parseEmbeddingBillingConfig,
+  parseTemporaryLifecycleConfig,
   type ProviderExecutionPlan,
   type ProviderModelRecord,
   type ProviderRecord,
@@ -255,6 +257,7 @@ export interface AppOptions {
   generationHeartbeatMs?: number;
   generationLeaseSeconds?: number;
   generationStopPollMs?: number;
+  temporaryRetentionDays?: number;
   webComplete?: typeof complete;
   objectStore?: ObjectStore;
   attachmentContextMaxRawBytes?: number;
@@ -1148,6 +1151,13 @@ export function createApp(options: AppOptions = {}) {
     !Number.isSafeInteger(generationStopPollMs) || generationStopPollMs < 100 ||
     generationStopPollMs > 5_000
   ) throw new Error("GENERATION_STOP_POLL_MS must be an integer between 100 and 5000");
+  const temporaryRetentionDays = options.temporaryRetentionDays ?? parseTemporaryLifecycleConfig({
+    TEMPORARY_CHAT_RETENTION_DAYS: Deno.env.get("TEMPORARY_CHAT_RETENTION_DAYS"),
+  }).retentionDays;
+  if (
+    !Number.isSafeInteger(temporaryRetentionDays) || temporaryRetentionDays < 1 ||
+    temporaryRetentionDays > 3650
+  ) throw new Error("Temporary chat retention must be an integer between 1 and 3650 days");
   const webComplete = options.webComplete ?? complete;
   const activeWebGenerations = new Map<string, AbortController>();
   const setupToken = options.setupToken ?? Deno.env.get("SETUP_TOKEN") ?? "";
@@ -3354,9 +3364,28 @@ export function createApp(options: AppOptions = {}) {
         body.title,
         body.temporary,
         c.req.header("idempotency-key"),
+        temporaryRetentionDays,
       ),
       201,
     );
+  });
+  app.post("/api/conversations/:id/keep", async (c) => {
+    const ownerId = c.get("user").id;
+    const conversationId = requireUuid(c.req.param("id"), "conversationId");
+    const body = await parseJson(c, keepTemporaryConversationSchema);
+    const conversation = await repo.promoteTemporaryConversation(
+      ownerId,
+      conversationId,
+      body.expectedVersion,
+    );
+    await repo.recordAudit({
+      actorId: ownerId,
+      action: "conversation.temporary_kept",
+      targetType: "conversation",
+      targetId: conversationId,
+      metadata: { previousVersion: body.expectedVersion, version: conversation.version },
+    });
+    return c.json(conversation);
   });
   app.get(
     "/api/conversations/:id",

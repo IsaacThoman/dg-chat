@@ -4,6 +4,7 @@ import {
   type ObjectStore,
   objectStoreFromEnv,
   parseDocumentProcessingConfig,
+  parseTemporaryLifecycleConfig,
   PostgresRepository,
   validateDocumentChunkInputs,
 } from "@dg-chat/database";
@@ -35,6 +36,7 @@ import {
 } from "./knowledge-embedding.ts";
 import { runAccountedEmbeddingCall } from "../../api/src/embedding-accounting.ts";
 import { parseRetentionScrubPayload, processRetentionScrub } from "./retention-scrub.ts";
+import { purgeTemporaryConversationBatch } from "./temporary-lifecycle.ts";
 
 const databaseUrl = Deno.env.get("DATABASE_URL");
 const workerId = Deno.env.get("WORKER_ID") ?? `worker-${crypto.randomUUID().slice(0, 8)}`;
@@ -84,6 +86,11 @@ const documentExtractionLimits: DocumentExtractionLimits = {
 const jobDeadlineMarginMs = positiveInteger("WORKER_JOB_DEADLINE_MARGIN_MS", 5_000);
 const generatedCleanupGraceSeconds = positiveInteger("GENERATED_OBJECT_CLEANUP_GRACE_SECONDS", 600);
 const generatedCleanupSweepMs = positiveInteger("GENERATED_OBJECT_CLEANUP_SWEEP_MS", 60_000);
+const temporaryLifecycle = parseTemporaryLifecycleConfig({
+  TEMPORARY_CHAT_RETENTION_DAYS: Deno.env.get("TEMPORARY_CHAT_RETENTION_DAYS"),
+  TEMPORARY_CHAT_PURGE_INTERVAL_SECONDS: Deno.env.get("TEMPORARY_CHAT_PURGE_INTERVAL_SECONDS"),
+  TEMPORARY_CHAT_PURGE_BATCH_SIZE: Deno.env.get("TEMPORARY_CHAT_PURGE_BATCH_SIZE"),
+});
 if (!Number.isSafeInteger(pollMs) || pollMs < 10) {
   throw new Error("WORKER_POLL_MS must be an integer of at least 10 milliseconds");
 }
@@ -467,10 +474,34 @@ async function processJob(
 }
 
 let nextGeneratedCleanupSweep = Date.now() + generatedCleanupSweepMs;
+let nextTemporaryChatPurge = Date.now();
 while (!stopping) {
   if (Date.now() >= nextGeneratedCleanupSweep) {
     await enqueueStaleGeneratedObjectCleanup();
     nextGeneratedCleanupSweep = Date.now() + generatedCleanupSweepMs;
+  }
+  if (Date.now() >= nextTemporaryChatPurge) {
+    try {
+      const purge = await purgeTemporaryConversationBatch(
+        repository,
+        temporaryLifecycle.purgeBatchSize,
+      );
+      console.log(JSON.stringify({
+        level: "info",
+        message: "Temporary conversation purge completed",
+        purged: purge.conversationIds.length,
+        hasMore: purge.hasMore,
+      }));
+      nextTemporaryChatPurge = Date.now() +
+        (purge.hasMore ? pollMs : temporaryLifecycle.purgeIntervalMs);
+    } catch (error) {
+      console.error(JSON.stringify({
+        level: "error",
+        message: "Temporary conversation purge failed",
+        error: error instanceof Error ? error.message : String(error),
+      }));
+      nextTemporaryChatPurge = Date.now() + temporaryLifecycle.purgeIntervalMs;
+    }
   }
   const job = await claimJob(sql, workerId, jobLeaseSeconds);
   if (!job) {
