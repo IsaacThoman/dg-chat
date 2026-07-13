@@ -2857,7 +2857,13 @@ function SettingsView(
                   <strong>{user.name}</strong>
                   <small>{user.email}</small>
                 </div>
-                <button className="secondary push">Change avatar</button>
+                <button
+                  className="secondary push"
+                  disabled
+                  title="Avatar editing is not available yet"
+                >
+                  Change avatar
+                </button>
               </div>
               <Field label="Display name" value={user.name} />
               <Field label="Email address" value={user.email} />
@@ -2866,7 +2872,13 @@ function SettingsView(
                   <strong>Password</strong>
                   <small>Last changed 3 months ago</small>
                 </span>
-                <button className="secondary">Change password</button>
+                <button
+                  className="secondary"
+                  disabled
+                  title="Password changes are not available in the app yet"
+                >
+                  Change password
+                </button>
               </div>
               <div className="danger-zone">
                 <h3>Danger zone</h3>
@@ -2875,7 +2887,13 @@ function SettingsView(
                     <strong>Delete account</strong>
                     <small>Schedule your account and data for deletion.</small>
                   </span>
-                  <button className="danger-button">Delete account</button>
+                  <button
+                    className="danger-button"
+                    disabled
+                    title="Self-service account deletion is not available yet"
+                  >
+                    Delete account
+                  </button>
                 </div>
               </div>
             </>
@@ -2901,10 +2919,13 @@ function SettingsView(
                 title="Data & privacy"
                 subtitle="Control storage, exports, and retention"
               />
-              <ToggleRow
-                title="Store provider payloads"
-                subtitle="Off by default; intended for debugging only"
-              />
+              <div className="setting-row">
+                <span>
+                  <strong>Provider payload storage</strong>
+                  <small>Managed by your administrator and off by default.</small>
+                </span>
+                <span className="status muted">Administrator controlled</span>
+              </div>
               <div className="setting-row">
                 <span>
                   <strong>Export your data</strong>
@@ -2935,31 +2956,10 @@ function Field({ label, value }: { label: string; value: string }) {
   return (
     <label className="field">
       <span>{label}</span>
-      <input defaultValue={value} />
+      <input value={value} readOnly aria-readonly="true" />
     </label>
   );
 }
-function ToggleRow(
-  { title, subtitle, on = false }: { title: string; subtitle: string; on?: boolean },
-) {
-  const [enabled, setEnabled] = useState(on);
-  return (
-    <div className="setting-row">
-      <span>
-        <strong>{title}</strong>
-        <small>{subtitle}</small>
-      </span>
-      <button
-        aria-label={title}
-        className={cn("toggle", enabled && "on")}
-        onClick={() => setEnabled(!enabled)}
-      >
-        <i />
-      </button>
-    </div>
-  );
-}
-
 function UsageSettings() {
   const usage = useQuery({ queryKey: ["usage"], queryFn: api.usage });
   const data = usage.data;
