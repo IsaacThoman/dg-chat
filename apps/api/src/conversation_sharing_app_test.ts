@@ -12,7 +12,10 @@ import { sha256 } from "./crypto.ts";
 import { TestObjectStore } from "./test-object-store.ts";
 import type { RateLimiter, RateLimitResult } from "./rate-limit.ts";
 
-const capability = (fill: number) => Buffer.alloc(32, fill).toString("base64url");
+const capability = (seed: number) =>
+  Buffer.from(Array.from({ length: 32 }, (_, index) => (seed * 17 + index * 29) % 256)).toString(
+    "base64url",
+  );
 
 async function ownerFixture(repository: MemoryRepository, email: string, name = "Share Owner") {
   const user = repository.createUser({
