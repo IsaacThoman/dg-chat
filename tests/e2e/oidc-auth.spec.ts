@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { adminEmail, adminPassword, apiURL, bootstrap, login } from "./helpers.ts";
+import { lightweightManagedStack } from "./env.ts";
 
 const mockControlUrl = "http://localhost:4020";
 const mockControlHeaders = { authorization: "Bearer ci-mock-oidc-control-token" };
@@ -18,6 +19,7 @@ test("OIDC creates a pending applicant and approval enables a fresh SSO session"
   page,
   request,
 }, testInfo) => {
+  test.skip(lightweightManagedStack, "requires the durable OIDC-enabled stack");
   const viewport = testInfo.project.name === "mobile-chromium" ? "mobile" : "desktop";
   const retry = Math.min(testInfo.retry, 2);
   const personaName = `OIDC ${viewport === "mobile" ? "Mobile" : "Desktop"} Applicant ${retry}`;
