@@ -41,7 +41,12 @@ export function parseKnowledgeEmbeddingConfig(
     !Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > 256
   ) throw new Error("Knowledge embedding configuration is incomplete or invalid");
   const url = new URL(baseUrl);
-  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) {
+  const testHttpAllowed = env.DENO_ENV === "test" && url.protocol === "http:" &&
+    env.OPENAI_TEST_ALLOW_HTTP_HOST?.trim().toLowerCase() === url.hostname.toLowerCase();
+  if (
+    (url.protocol !== "https:" && !testHttpAllowed) || url.username || url.password ||
+    url.search || url.hash
+  ) {
     throw new Error("KNOWLEDGE_EMBEDDING_BASE_URL must be a credential-free HTTPS URL");
   }
   const version = knowledgeEmbeddingIdentityVersion({ baseVersion, baseUrl, model, upstreamModel });

@@ -1,47 +1,135 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-worker_id="$(docker compose "$@" ps -q worker)"
-if [[ -z "$worker_id" ]]; then
-  echo "worker container was not created" >&2
-  exit 1
-fi
+compose=(docker compose "$@")
 
-health=""
-for _ in {1..30}; do
-  state="$(docker inspect --format '{{.State.Status}}' "$worker_id")"
-  health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' "$worker_id")"
-  if [[ "$state" == "running" && "$health" == "healthy" ]]; then
-    break
-  fi
-  if [[ "$state" == "exited" || "$state" == "dead" ]]; then
-    echo "worker entered terminal state: $state" >&2
-    docker logs "$worker_id" >&2
+container_id() {
+  local service="$1"
+  local id
+  id="$("${compose[@]}" ps -q "$service")"
+  if [[ -z "$id" ]]; then
+    echo "$service container was not created" >&2
     exit 1
   fi
-  sleep 2
+  printf '%s' "$id"
+}
+
+dump_failure() {
+  local service="$1"
+  local id="$2"
+  docker inspect "$id" >&2 || true
+  "${compose[@]}" logs --no-color "$service" >&2 || true
+}
+
+wait_healthy() {
+  local service="$1"
+  local id state health
+  id="$(container_id "$service")"
+  health=""
+  for _ in {1..90}; do
+    state="$(docker inspect --format '{{.State.Status}}' "$id")"
+    health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' "$id")"
+    if [[ "$state" == "running" && "$health" == "healthy" ]]; then
+      break
+    fi
+    if [[ "$state" == "exited" || "$state" == "dead" ]]; then
+      echo "$service entered terminal state: $state" >&2
+      dump_failure "$service" "$id"
+      exit 1
+    fi
+    sleep 2
+  done
+  if [[ "$health" != "healthy" ]]; then
+    echo "$service did not become healthy (health=$health)" >&2
+    dump_failure "$service" "$id"
+    exit 1
+  fi
+  assert_no_restarts "$service" "$id"
+}
+
+wait_running() {
+  local service="$1"
+  local id state
+  id="$(container_id "$service")"
+  for _ in {1..60}; do
+    state="$(docker inspect --format '{{.State.Status}}' "$id")"
+    if [[ "$state" == "running" ]]; then
+      assert_no_restarts "$service" "$id"
+      return
+    fi
+    if [[ "$state" == "exited" || "$state" == "dead" ]]; then
+      echo "$service entered terminal state: $state" >&2
+      dump_failure "$service" "$id"
+      exit 1
+    fi
+    sleep 2
+  done
+  echo "$service did not enter the running state" >&2
+  dump_failure "$service" "$id"
+  exit 1
+}
+
+wait_completed() {
+  local service="$1"
+  local id state exit_code
+  id="$(container_id "$service")"
+  for _ in {1..90}; do
+    state="$(docker inspect --format '{{.State.Status}}' "$id")"
+    if [[ "$state" == "exited" ]]; then
+      exit_code="$(docker inspect --format '{{.State.ExitCode}}' "$id")"
+      if [[ "$exit_code" == "0" ]]; then
+        return
+      fi
+      echo "$service exited unsuccessfully (exit_code=$exit_code)" >&2
+      dump_failure "$service" "$id"
+      exit 1
+    fi
+    if [[ "$state" == "dead" ]]; then
+      echo "$service entered terminal state: $state" >&2
+      dump_failure "$service" "$id"
+      exit 1
+    fi
+    sleep 2
+  done
+  echo "$service did not complete successfully" >&2
+  dump_failure "$service" "$id"
+  exit 1
+}
+
+assert_no_restarts() {
+  local service="$1"
+  local id="$2"
+  local restart_count
+  restart_count="$(docker inspect --format '{{.RestartCount}}' "$id")"
+  if [[ "$restart_count" != "0" ]]; then
+    echo "$service restarted during startup (restart_count=$restart_count)" >&2
+    dump_failure "$service" "$id"
+    exit 1
+  fi
+}
+
+for service in postgres redis minio searxng app worker; do
+  wait_healthy "$service"
+done
+for service in migrate minio-init; do
+  wait_completed "$service"
+done
+for service in search-proxy web; do
+  wait_running "$service"
 done
 
-if [[ "$health" != "healthy" ]]; then
-  echo "worker did not become healthy (health=$health)" >&2
-  docker inspect "$worker_id" >&2
-  docker logs "$worker_id" >&2
-  exit 1
-fi
-
-restart_count="$(docker inspect --format '{{.RestartCount}}' "$worker_id")"
-if [[ "$restart_count" != "0" ]]; then
-  echo "worker restarted during startup (restart_count=$restart_count)" >&2
-  docker logs "$worker_id" >&2
-  exit 1
-fi
-
+worker_id="$(container_id worker)"
 worker_env="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$worker_id")"
-for name in S3_ENDPOINT S3_REGION S3_BUCKET S3_ACCESS_KEY S3_SECRET_KEY S3_FORCE_PATH_STYLE; do
+for name in S3_ENDPOINT S3_ALLOW_INSECURE S3_REGION S3_BUCKET S3_ACCESS_KEY S3_SECRET_KEY S3_FORCE_PATH_STYLE; do
   if ! grep -q "^${name}=." <<<"$worker_env"; then
     echo "worker is missing required object-storage environment: $name" >&2
     exit 1
   fi
 done
 
-echo "worker is healthy and started without restarts"
+web_url="${COMPOSE_HEALTH_URL:-http://127.0.0.1:${PORT:-8000}}"
+curl --fail --silent --show-error "$web_url/health" >/dev/null
+curl --fail --silent --show-error "$web_url/ready" >/dev/null
+curl --fail --silent --show-error "$web_url/api/setup/status" >/dev/null
+
+echo "full Compose stack is healthy, initialized, reachable, and started without restarts"

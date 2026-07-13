@@ -1,6 +1,6 @@
 import os
 import io
-import io
+import json
 import uuid
 import base64
 
@@ -14,6 +14,7 @@ if not api_key:
 
 client = OpenAI(api_key=api_key, base_url=base_url, max_retries=0)
 model = "openai/mock-fast"
+responses_model = "contracts-responses/mock-responses"
 embedding_model = "contracts/mock-embedding"
 audio_model = "contracts/mock-transcribe"
 image_model = "contracts/mock-image"
@@ -40,6 +41,8 @@ if not any(candidate.id == audio_model for candidate in models.data):
     raise RuntimeError("Official Python client did not receive the transcription model")
 if not any(candidate.id == image_model for candidate in models.data):
     raise RuntimeError("Official Python client did not receive the image generation model")
+if not any(candidate.id == responses_model for candidate in models.data):
+    raise RuntimeError("Official Python client did not receive the native Responses model")
 
 image_replay_key = f"python-image-{uuid.uuid4()}"
 def create_image():
@@ -232,6 +235,16 @@ streamed_text = "".join((chunk.choices[0].delta.content or "") for chunk in stre
 if "Python streaming contract" not in streamed_text:
     raise RuntimeError("Python streaming completion did not contain the expected content")
 
+nullable_completion = client.chat.completions.create(
+    model=model,
+    messages=[{"role": "user", "content": "Python nullable Chat contract"}],
+    temperature=None,
+    max_completion_tokens=None,
+    stop=None,
+)
+if "nullable Chat contract" not in (nullable_completion.choices[0].message.content or ""):
+    raise RuntimeError("Python Chat Completions rejected nullable SDK parameters")
+
 response = client.responses.create(model=model, input="Python Responses contract")
 if "Python Responses contract" not in response.output_text:
     raise RuntimeError("Python Responses result did not contain the expected content")
@@ -246,6 +259,157 @@ response_stream_text = "".join(
 )
 if "Python Responses streaming contract" not in response_stream_text:
     raise RuntimeError("Python Responses stream did not contain the expected content")
+
+nullable_response_stream = client.responses.create(
+    model=model,
+    input="Python nullable Responses contract",
+    instructions=None,
+    stream=True,
+    stream_options={"include_obfuscation": False},
+    temperature=None,
+    top_p=None,
+    parallel_tool_calls=None,
+    max_output_tokens=None,
+    reasoning=None,
+)
+nullable_response_text = "".join(
+    event.delta
+    for event in nullable_response_stream
+    if event.type == "response.output_text.delta"
+)
+if "nullable Responses contract" not in nullable_response_text:
+    raise RuntimeError("Python Responses rejected nullable SDK or disabled obfuscation options")
+
+native_completion = client.chat.completions.create(
+    model=responses_model,
+    messages=[{"role": "user", "content": "Python native Responses chat contract"}],
+)
+if "native Responses chat contract" not in (native_completion.choices[0].message.content or ""):
+    raise RuntimeError("Python Chat Completions did not translate through a Responses upstream")
+
+native_tool_completion = client.chat.completions.create(
+    model=responses_model,
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Inspect this image and look up the weather"},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZQmcAAAAASUVORK5CYII=",
+                        "detail": "low",
+                    },
+                },
+            ],
+        }
+    ],
+    tools=[
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup_weather",
+                "description": "Look up weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": False,
+                },
+                "strict": True,
+            },
+        }
+    ],
+    tool_choice={"type": "function", "function": {"name": "lookup_weather"}},
+)
+native_tool_call = native_tool_completion.choices[0].message.tool_calls[0]
+if (
+    native_tool_completion.choices[0].finish_reason != "tool_calls"
+    or native_tool_call.type != "function"
+    or native_tool_call.function.name != "lookup_weather"
+    or json.loads(native_tool_call.function.arguments)["city"] != "New York"
+):
+    raise RuntimeError("Python native Responses tool or multimodal translation was invalid")
+
+native_tool_result = client.chat.completions.create(
+    model=responses_model,
+    messages=[
+        {"role": "user", "content": "Use the weather tool"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [native_tool_call.model_dump()],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": native_tool_call.id,
+            "content": '{"temperature":72}',
+        },
+    ],
+)
+if "Mock response" not in (native_tool_result.choices[0].message.content or ""):
+    raise RuntimeError("Python native Responses tool-result history was not translated")
+
+native_completion_stream = client.chat.completions.create(
+    model=responses_model,
+    stream=True,
+    messages=[{"role": "user", "content": "Python native Responses chat stream"}],
+)
+native_completion_text = "".join(
+    chunk.choices[0].delta.content or ""
+    for chunk in native_completion_stream
+    if chunk.choices
+)
+if "native Responses chat stream" not in native_completion_text:
+    raise RuntimeError("Python streaming Chat Completions did not use a Responses upstream")
+
+native_response = client.responses.create(
+    model=responses_model,
+    input="Python native Responses public contract",
+)
+if "native Responses public contract" not in native_response.output_text:
+    raise RuntimeError("Python Responses API did not use a native Responses upstream")
+
+native_response_stream = client.responses.create(
+    model=responses_model,
+    input="Python native Responses public stream",
+    stream=True,
+)
+native_response_events = list(native_response_stream)
+native_response_text = "".join(
+    event.delta
+    for event in native_response_events
+    if event.type == "response.output_text.delta"
+)
+if "native Responses public stream" not in native_response_text:
+    raise RuntimeError("Python streaming Responses API did not use a native Responses upstream")
+if (
+    native_response_events[0].type != "response.created"
+    or native_response_events[1].type != "response.in_progress"
+    or native_response_events[-1].type != "response.completed"
+    or any(event.sequence_number != index for index, event in enumerate(native_response_events))
+):
+    raise RuntimeError("Python Responses stream lifecycle or sequence numbers were invalid")
+native_terminal = native_response_events[-1].response
+if (
+    native_terminal.status != "completed"
+    or not native_terminal.output
+    or native_terminal.usage is None
+):
+    raise RuntimeError("Python Responses stream terminal snapshot was incomplete")
+
+with client.responses.stream(
+    model=responses_model,
+    input="Python managed Responses stream contract",
+) as managed_stream:
+    managed_response = managed_stream.get_final_response()
+if (
+    managed_response.status != "completed"
+    or "managed Responses stream contract" not in managed_response.output_text
+    or managed_response.usage is None
+    or managed_response.usage.total_tokens <= 0
+):
+    raise RuntimeError("Python responses.stream().get_final_response() contract failed")
 
 file_text = f"Python files contract {uuid.uuid4()}\n"
 file_bytes = file_text.encode("utf-8")
@@ -300,5 +464,56 @@ finally:
             client.files.delete(uploaded.id)
         except Exception:
             pass
+
+
+def expect_api_error(label, call, status, code=None):
+    try:
+        call()
+    except Exception as error:
+        if getattr(error, "status_code", None) != status:
+            raise RuntimeError(f"{label} did not return HTTP {status}") from error
+        if code is not None and getattr(error, "code", None) != code:
+            raise RuntimeError(f"{label} did not return error code {code}") from error
+    else:
+        raise RuntimeError(f"{label} was accepted")
+
+
+expect_api_error(
+    "Python malformed Chat Completions request",
+    lambda: client.chat.completions.create(model=model, messages=[]),
+    422,
+)
+expect_api_error(
+    "Python malformed Responses request",
+    lambda: client.responses.create(model=model, input=[], max_output_tokens=-1),
+    422,
+)
+
+rate_api_key = os.environ.get("CONTRACT_PYTHON_RATE_API_KEY")
+empty_credit_api_key = os.environ.get("CONTRACT_EMPTY_CREDIT_API_KEY")
+if not rate_api_key or not empty_credit_api_key:
+    raise RuntimeError("Python governance contract API keys are required")
+rate_client = OpenAI(api_key=rate_api_key, base_url=base_url, max_retries=0)
+rate_client.models.list()
+expect_api_error(
+    "Python token rate limit",
+    lambda: rate_client.models.list(),
+    429,
+    "rate_limit_exceeded",
+)
+empty_credit_client = OpenAI(
+    api_key=empty_credit_api_key,
+    base_url=base_url,
+    max_retries=0,
+)
+expect_api_error(
+    "Python insufficient credit request",
+    lambda: empty_credit_client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": "Must not dispatch without credit"}],
+    ),
+    402,
+    "insufficient_credit",
+)
 
 print("Official OpenAI Python client contracts passed")

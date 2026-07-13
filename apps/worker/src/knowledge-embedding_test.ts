@@ -15,6 +15,25 @@ Deno.test("knowledge embedding configuration is disabled cleanly and validates c
       KNOWLEDGE_EMBEDDING_MODEL: "embed",
     })
   );
+  assertThrows(() =>
+    parseKnowledgeEmbeddingConfig({
+      DENO_ENV: "test",
+      OPENAI_TEST_ALLOW_HTTP_HOST: "different.example",
+      KNOWLEDGE_EMBEDDING_BASE_URL: "http://provider.example/v1",
+      KNOWLEDGE_EMBEDDING_API_KEY: "secret",
+      KNOWLEDGE_EMBEDDING_MODEL: "embed",
+    })
+  );
+  assertEquals(
+    parseKnowledgeEmbeddingConfig({
+      DENO_ENV: "test",
+      OPENAI_TEST_ALLOW_HTTP_HOST: "provider.example",
+      KNOWLEDGE_EMBEDDING_BASE_URL: "http://provider.example/v1",
+      KNOWLEDGE_EMBEDDING_API_KEY: "secret",
+      KNOWLEDGE_EMBEDDING_MODEL: "embed",
+    })?.baseUrl,
+    "http://provider.example/v1",
+  );
   const config = parseKnowledgeEmbeddingConfig({
     KNOWLEDGE_EMBEDDING_BASE_URL: "https://provider.example/v1",
     KNOWLEDGE_EMBEDDING_API_KEY: "secret",

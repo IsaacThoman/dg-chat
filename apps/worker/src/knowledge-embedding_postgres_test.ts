@@ -48,7 +48,7 @@ Deno.test({
     const port = (server.addr as Deno.NetAddr).port;
     const effectiveVersion = knowledgeEmbeddingIdentityVersion({
       baseVersion: "mock-v1",
-      baseUrl: `https://127.0.0.1:${port}/v1`,
+      baseUrl: `http://127.0.0.1:${port}/v1`,
       model: "mock-embedding",
       upstreamModel: "mock-embedding",
     });
@@ -57,7 +57,7 @@ Deno.test({
       DATABASE_URL: databaseUrl!,
       DENO_ENV: "test",
       OPENAI_TEST_ALLOW_HTTP_HOST: "127.0.0.1",
-      KNOWLEDGE_EMBEDDING_BASE_URL: `https://127.0.0.1:${port}/v1`,
+      KNOWLEDGE_EMBEDDING_BASE_URL: `http://127.0.0.1:${port}/v1`,
       KNOWLEDGE_EMBEDDING_API_KEY: "test-secret",
       KNOWLEDGE_EMBEDDING_MODEL: "mock-embedding",
       KNOWLEDGE_EMBEDDING_VERSION: "mock-v1",
@@ -69,6 +69,7 @@ Deno.test({
       WORKER_JOB_DEADLINE_MARGIN_MS: "1000",
       S3_BUCKET: "embedding-test",
       S3_ENDPOINT: "http://127.0.0.1:1",
+      S3_ALLOW_INSECURE: "true",
       S3_ACCESS_KEY: "test",
       S3_SECRET_KEY: "test-secret",
     };

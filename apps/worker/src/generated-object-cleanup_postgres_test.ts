@@ -84,6 +84,7 @@ Deno.test({
         GENERATED_OBJECT_CLEANUP_SWEEP_MS: "1000",
         S3_BUCKET: "cleanup-test",
         S3_ENDPOINT: `http://127.0.0.1:${port}`,
+        S3_ALLOW_INSECURE: "true",
         S3_REGION: "us-east-1",
         S3_ACCESS_KEY: "cleanup-test-access",
         S3_SECRET_KEY: "cleanup-test-secret",

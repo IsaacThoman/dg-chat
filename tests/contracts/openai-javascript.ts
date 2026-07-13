@@ -6,6 +6,7 @@ if (!apiKey) throw new Error("OPENAI_API_KEY is required");
 
 const client = new OpenAI({ apiKey, baseURL, maxRetries: 0 });
 const model = "openai/mock-fast";
+const responsesModel = "contracts-responses/mock-responses";
 const embeddingModel = "contracts/mock-embedding";
 const audioModel = "contracts/mock-transcribe";
 const imageModel = "contracts/mock-image";
@@ -56,6 +57,9 @@ if (!models.data.some((candidate) => candidate.id === audioModel)) {
 }
 if (!models.data.some((candidate) => candidate.id === imageModel)) {
   throw new Error("Official JavaScript client did not receive the image generation model");
+}
+if (!models.data.some((candidate) => candidate.id === responsesModel)) {
+  throw new Error("Official JavaScript client did not receive the native Responses model");
 }
 
 const imageReplayKey = `javascript-image-${crypto.randomUUID()}`;
@@ -335,6 +339,17 @@ if (!streamedText.includes("JavaScript streaming contract")) {
   throw new Error("JavaScript streaming completion did not contain the expected content");
 }
 
+const nullableCompletion = await client.chat.completions.create({
+  model,
+  messages: [{ role: "user", content: "JavaScript nullable Chat contract" }],
+  temperature: null,
+  max_completion_tokens: null,
+  stop: null,
+});
+if (!nullableCompletion.choices[0]?.message.content?.includes("nullable Chat contract")) {
+  throw new Error("JavaScript Chat Completions rejected nullable SDK parameters");
+}
+
 const response = await client.responses.create({
   model,
   input: "JavaScript Responses contract",
@@ -355,6 +370,146 @@ for await (const event of responseStream) {
 if (!responseStreamText.includes("JavaScript Responses streaming contract")) {
   throw new Error("JavaScript Responses stream did not contain the expected content");
 }
+
+const nullableResponseStream = await client.responses.create({
+  model,
+  input: "JavaScript nullable Responses contract",
+  instructions: null,
+  stream: true,
+  stream_options: { include_obfuscation: false },
+  temperature: null,
+  top_p: null,
+  parallel_tool_calls: null,
+  max_output_tokens: null,
+  reasoning: null,
+});
+let nullableResponseText = "";
+for await (const event of nullableResponseStream) {
+  if (event.type === "response.output_text.delta") nullableResponseText += event.delta;
+}
+if (!nullableResponseText.includes("nullable Responses contract")) {
+  throw new Error("JavaScript Responses rejected nullable SDK or disabled obfuscation options");
+}
+
+const nativeCompletion = await client.chat.completions.create({
+  model: responsesModel,
+  messages: [{ role: "user", content: "JavaScript native Responses chat contract" }],
+});
+if (!nativeCompletion.choices[0]?.message.content?.includes("native Responses chat contract")) {
+  throw new Error("JavaScript Chat Completions did not translate through a Responses upstream");
+}
+const nativeToolCompletion = await client.chat.completions.create({
+  model: responsesModel,
+  messages: [{
+    role: "user",
+    content: [
+      { type: "text", text: "Inspect this image and look up the weather" },
+      {
+        type: "image_url",
+        image_url: {
+          url:
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZQmcAAAAASUVORK5CYII=",
+          detail: "low",
+        },
+      },
+    ],
+  }],
+  tools: [{
+    type: "function",
+    function: {
+      name: "lookup_weather",
+      description: "Look up weather",
+      parameters: {
+        type: "object",
+        properties: { city: { type: "string" } },
+        required: ["city"],
+        additionalProperties: false,
+      },
+      strict: true,
+    },
+  }],
+  tool_choice: { type: "function", function: { name: "lookup_weather" } },
+});
+const nativeToolCall = nativeToolCompletion.choices[0]?.message.tool_calls?.[0];
+if (
+  nativeToolCompletion.choices[0]?.finish_reason !== "tool_calls" ||
+  nativeToolCall?.type !== "function" || nativeToolCall.function.name !== "lookup_weather" ||
+  JSON.parse(nativeToolCall.function.arguments).city !== "New York"
+) {
+  throw new Error("JavaScript native Responses tool or multimodal translation was invalid");
+}
+const nativeToolResult = await client.chat.completions.create({
+  model: responsesModel,
+  messages: [
+    { role: "user", content: "Use the weather tool" },
+    { role: "assistant", content: null, tool_calls: [nativeToolCall] },
+    {
+      role: "tool",
+      tool_call_id: nativeToolCall.id,
+      content: '{"temperature":72}',
+    },
+  ],
+});
+if (!nativeToolResult.choices[0]?.message.content?.includes("Mock response")) {
+  throw new Error("JavaScript native Responses tool-result history was not translated");
+}
+const nativeCompletionStream = await client.chat.completions.create({
+  model: responsesModel,
+  stream: true,
+  messages: [{ role: "user", content: "JavaScript native Responses chat stream" }],
+});
+let nativeCompletionText = "";
+for await (const chunk of nativeCompletionStream) {
+  nativeCompletionText += chunk.choices[0]?.delta.content ?? "";
+}
+if (!nativeCompletionText.includes("native Responses chat stream")) {
+  throw new Error("JavaScript streaming Chat Completions did not use a Responses upstream");
+}
+const nativeResponse = await client.responses.create({
+  model: responsesModel,
+  input: "JavaScript native Responses public contract",
+});
+if (!nativeResponse.output_text.includes("native Responses public contract")) {
+  throw new Error("JavaScript Responses API did not use a native Responses upstream");
+}
+const nativeResponseStream = await client.responses.create({
+  model: responsesModel,
+  input: "JavaScript native Responses public stream",
+  stream: true,
+});
+let nativeResponseText = "";
+const nativeResponseEvents: Array<Record<string, unknown>> = [];
+for await (const event of nativeResponseStream) {
+  nativeResponseEvents.push(event as unknown as Record<string, unknown>);
+  if (event.type === "response.output_text.delta") nativeResponseText += event.delta;
+}
+if (!nativeResponseText.includes("native Responses public stream")) {
+  throw new Error("JavaScript streaming Responses API did not use a native Responses upstream");
+}
+if (
+  nativeResponseEvents[0]?.type !== "response.created" ||
+  nativeResponseEvents[1]?.type !== "response.in_progress" ||
+  nativeResponseEvents.at(-1)?.type !== "response.completed" ||
+  nativeResponseEvents.some((event, index) => event.sequence_number !== index)
+) {
+  throw new Error("JavaScript Responses stream lifecycle or sequence numbers were invalid");
+}
+const nativeTerminal = nativeResponseEvents.at(-1)?.response as Record<string, unknown> | undefined;
+if (
+  nativeTerminal?.status !== "completed" || !Array.isArray(nativeTerminal.output) ||
+  !(nativeTerminal.usage && typeof nativeTerminal.usage === "object")
+) throw new Error("JavaScript Responses stream terminal snapshot was incomplete");
+
+const managedResponseStream = client.responses.stream({
+  model: responsesModel,
+  input: "JavaScript managed Responses stream contract",
+});
+const managedResponse = await managedResponseStream.finalResponse();
+if (
+  managedResponse.status !== "completed" ||
+  !managedResponse.output_text.includes("managed Responses stream contract") ||
+  !managedResponse.usage || managedResponse.usage.total_tokens <= 0
+) throw new Error("JavaScript responses.stream().finalResponse() contract failed");
 
 const fileText = `JavaScript files contract ${crypto.randomUUID()}\n`;
 const fileName = `javascript-contract-${crypto.randomUUID()}.txt`;
@@ -414,5 +569,60 @@ try {
 } finally {
   if (!deleted) await client.files.delete(uploaded.id).catch(() => undefined);
 }
+
+async function expectApiError(
+  label: string,
+  request: Promise<unknown>,
+  status: number,
+  code?: string,
+) {
+  try {
+    await request;
+    throw new Error(`${label} was accepted`);
+  } catch (error) {
+    if (error instanceof Error && error.message === `${label} was accepted`) throw error;
+    if (
+      !(error instanceof OpenAI.APIError) || error.status !== status ||
+      (code !== undefined && error.code !== code)
+    ) {
+      throw new Error(`${label} did not return the expected OpenAI error`, { cause: error });
+    }
+  }
+}
+
+await expectApiError(
+  "JavaScript malformed Chat Completions request",
+  client.chat.completions.create({ model, messages: [] }),
+  422,
+);
+await expectApiError(
+  "JavaScript malformed Responses request",
+  client.responses.create({ model, input: [], max_output_tokens: -1 }),
+  422,
+);
+
+const rateApiKey = Deno.env.get("CONTRACT_JS_RATE_API_KEY");
+const emptyCreditApiKey = Deno.env.get("CONTRACT_EMPTY_CREDIT_API_KEY");
+if (!rateApiKey || !emptyCreditApiKey) {
+  throw new Error("JavaScript governance contract API keys are required");
+}
+const rateClient = new OpenAI({ apiKey: rateApiKey, baseURL, maxRetries: 0 });
+await rateClient.models.list();
+await expectApiError(
+  "JavaScript token rate limit",
+  rateClient.models.list(),
+  429,
+  "rate_limit_exceeded",
+);
+const emptyCreditClient = new OpenAI({ apiKey: emptyCreditApiKey, baseURL, maxRetries: 0 });
+await expectApiError(
+  "JavaScript insufficient credit request",
+  emptyCreditClient.chat.completions.create({
+    model,
+    messages: [{ role: "user", content: "Must not dispatch without credit" }],
+  }),
+  402,
+  "insufficient_credit",
+);
 
 console.log("Official OpenAI JavaScript client contracts passed");

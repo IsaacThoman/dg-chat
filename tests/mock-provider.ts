@@ -58,6 +58,16 @@ interface ScenarioState {
   lastAccept: string | null;
   lastAuthorized: boolean;
   lastStream: boolean;
+  lastPath: string | null;
+  lastHasInput: boolean;
+  lastHasMessages: boolean;
+  responsesPathViolations: number;
+  responsesMissingInput: number;
+  responsesMessagesViolations: number;
+  authorizationViolations: number;
+  sawResponsesTools: boolean;
+  sawResponsesImage: boolean;
+  sawResponsesToolResult: boolean;
 }
 
 const scenarios = new Map<string, ScenarioState>();
@@ -100,6 +110,19 @@ function textFrom(body: Record<string, unknown>): string {
     }).join(" ");
   }
   if (typeof body.input === "string") return body.input;
+  if (Array.isArray(body.input)) {
+    for (const raw of [...body.input].reverse()) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+      const item = raw as Record<string, unknown>;
+      if (!Array.isArray(item.content)) continue;
+      const text = item.content.map((part) => {
+        if (!part || typeof part !== "object" || Array.isArray(part)) return "";
+        const value = part as Record<string, unknown>;
+        return value.type === "text" || value.type === "input_text" ? String(value.text ?? "") : "";
+      }).filter(Boolean).join(" ");
+      if (text) return text;
+    }
+  }
   return "Hello";
 }
 
@@ -128,6 +151,16 @@ function stateFor(model: string): ScenarioState {
     lastAccept: null,
     lastAuthorized: false,
     lastStream: false,
+    lastPath: null,
+    lastHasInput: false,
+    lastHasMessages: false,
+    responsesPathViolations: 0,
+    responsesMissingInput: 0,
+    responsesMessagesViolations: 0,
+    authorizationViolations: 0,
+    sawResponsesTools: false,
+    sawResponsesImage: false,
+    sawResponsesToolResult: false,
   };
   scenarios.set(model, state);
   return state;
@@ -139,6 +172,22 @@ function observe(request: Request, model: string, body: Record<string, unknown>)
   state.lastAccept = request.headers.get("accept");
   state.lastAuthorized = authorized(request, apiKey);
   state.lastStream = body.stream === true;
+  state.lastPath = new URL(request.url).pathname;
+  state.lastHasInput = Object.hasOwn(body, "input");
+  state.lastHasMessages = Object.hasOwn(body, "messages");
+  if (!state.lastAuthorized) state.authorizationViolations++;
+  if (model === "mock-responses") {
+    if (state.lastPath !== "/v1/responses") state.responsesPathViolations++;
+    if (!state.lastHasInput) state.responsesMissingInput++;
+    if (state.lastHasMessages) state.responsesMessagesViolations++;
+    state.sawResponsesTools ||= Array.isArray(body.tools) && body.tools.length > 0;
+    const input = Array.isArray(body.input) ? body.input as Record<string, unknown>[] : [];
+    state.sawResponsesImage ||= input.some((item) =>
+      Array.isArray(item.content) &&
+      (item.content as Record<string, unknown>[]).some((part) => part.type === "input_image")
+    );
+    state.sawResponsesToolResult ||= input.some((item) => item.type === "function_call_output");
+  }
   return state;
 }
 
@@ -300,10 +349,31 @@ async function handleResponses(request: Request): Promise<Response> {
   if (!authorized(request, apiKey)) return error("Invalid mock provider key", 401, "unauthorized");
   const body = await request.json() as Record<string, unknown>;
   const model = modelFrom(body);
+  const state = observe(request, model, body);
   const failure = maybeFail(model);
   if (failure) return failure;
   const id = `resp_${crypto.randomUUID().replaceAll("-", "")}`;
   const content = completionText(model, textFrom(body));
+  const tools = Array.isArray(body.tools) ? body.tools as Record<string, unknown>[] : [];
+  const requestedTool = tools[0];
+  if (requestedTool) {
+    state.completed++;
+    return json({
+      id,
+      object: "response",
+      status: "completed",
+      model,
+      output: [{
+        id: "fc_mock",
+        type: "function_call",
+        status: "completed",
+        call_id: "call_mock_weather",
+        name: String(requestedTool.name ?? "lookup_weather"),
+        arguments: '{"city":"New York"}',
+      }],
+      usage: { input_tokens: 9, output_tokens: 4, total_tokens: 13 },
+    });
+  }
   if (body.stream === true) {
     const events = [
       {
@@ -326,14 +396,29 @@ async function handleResponses(request: Request): Promise<Response> {
       },
       {
         type: "response.completed",
-        response: { id, object: "response", status: "completed", model },
+        response: {
+          id,
+          object: "response",
+          status: "completed",
+          model,
+          output: [{
+            id: "msg_mock",
+            type: "message",
+            role: "assistant",
+            status: "completed",
+            content: [{ type: "output_text", text: content, annotations: [] }],
+          }],
+          usage: { input_tokens: 8, output_tokens: 12, total_tokens: 20 },
+        },
       },
     ];
+    state.completed++;
     return new Response(
       events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""),
       { headers: { ...headers, "content-type": "text/event-stream" } },
     );
   }
+  state.completed++;
   return json({
     id,
     object: "response",
