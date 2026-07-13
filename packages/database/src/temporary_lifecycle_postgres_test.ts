@@ -113,6 +113,7 @@ Deno.test({
       );
     } finally {
       await sql`DELETE FROM attachments WHERE owner_id IN (${owner.id},${other.id})`;
+      await sql`DELETE FROM audit_events WHERE actor_id IN (${owner.id},${other.id})`;
       await sql`DELETE FROM users WHERE id IN (${owner.id},${other.id})`;
       await sql.end();
       await repo.close();

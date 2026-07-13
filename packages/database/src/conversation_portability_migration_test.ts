@@ -28,14 +28,19 @@ Deno.test({
           attachment_id uuid NOT NULL REFERENCES attachments(id),
           PRIMARY KEY(message_id,attachment_id)
         );
+        CREATE FUNCTION dg_chat_enforce_restore_maintenance() RETURNS trigger LANGUAGE plpgsql AS
+          $$ BEGIN RETURN NULL; END $$;
       `);
       const migration = await Deno.readTextFile(
         new URL("../migrations/0033_conversation_portability.sql", import.meta.url),
       );
       await sql.unsafe(migration);
       const roles = await sql<{ enumlabel: string }[]>`
-        SELECT enumlabel FROM pg_enum e JOIN pg_type t ON t.oid=e.enumtypid
-        WHERE t.typname='message_role' ORDER BY enumsortorder`;
+        SELECT enumlabel FROM pg_enum e
+        JOIN pg_type t ON t.oid=e.enumtypid
+        JOIN pg_namespace n ON n.oid=t.typnamespace
+        WHERE t.typname='message_role' AND n.nspname=${schema}
+        ORDER BY enumsortorder`;
       assertEquals(roles.map((row) => row.enumlabel), [
         "system",
         "user",

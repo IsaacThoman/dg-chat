@@ -37,6 +37,10 @@ CREATE TABLE conversation_portability_imports (
 CREATE INDEX conversation_portability_imports_owner_created_idx
   ON conversation_portability_imports(owner_id,created_at DESC);
 
+CREATE TRIGGER dg_chat_restore_maintenance_fence
+  BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON conversation_portability_imports
+  FOR EACH STATEMENT EXECUTE FUNCTION dg_chat_enforce_restore_maintenance();
+
 -- Trusted global maintenance cannot use the owner-leading lifecycle index.
 CREATE INDEX conversations_temporary_expiry_global_idx
   ON conversations(temporary_expires_at,id) WHERE temporary=true;
