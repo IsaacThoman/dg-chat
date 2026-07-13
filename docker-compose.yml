@@ -147,6 +147,10 @@ services:
       # Docker Desktop does not publish ports for containers attached only to an internal
       # network. Keep proxy-to-app traffic private while exposing nginx through this bridge.
       - egress
+    labels:
+      # The web container joins multiple networks. Pin Traefik to Coolify's injected
+      # resource network so it does not select an unreachable internal bridge.
+      - "traefik.docker.network=${COOLIFY_RESOURCE_UUID:-coolify}"
     read_only: true
     tmpfs:
       - /tmp:size=32m,mode=1777
