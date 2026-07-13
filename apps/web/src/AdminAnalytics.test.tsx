@@ -37,6 +37,34 @@ describe("AdminAnalytics", () => {
     expect(markup).toContain("exact values follow in the table");
     expect(markup).toContain("Exact usage values");
     expect(markup).toContain("91.7%");
+    expect(markup).toContain("Average latency");
+    expect(markup).toContain("500 ms");
+  });
+
+  it("does not describe an empty or in-progress-only sample as a zero percent success rate", () => {
+    const markup = renderToStaticMarkup(
+      <AdminAnalytics
+        filters={filters}
+        onApply={() => {}}
+        onRetry={() => {}}
+        data={analyticsData([], { calls: 1, completed: 0, failed: 0, successRate: 0 })}
+      />,
+    );
+    expect(markup).toContain("Success rate");
+    expect(markup).toContain("Unavailable");
+    expect(markup).not.toContain("0.0%");
+  });
+
+  it("excludes in-progress requests from the terminal success-rate percentage", () => {
+    const markup = renderToStaticMarkup(
+      <AdminAnalytics
+        filters={filters}
+        onApply={() => {}}
+        onRetry={() => {}}
+        data={analyticsData([], { calls: 3, completed: 1, failed: 1, successRate: 0.5 })}
+      />,
+    );
+    expect(markup).toContain("50.0%");
   });
 
   it("distinguishes blocking, stale, and empty states", () => {
@@ -69,7 +97,10 @@ describe("AdminAnalytics", () => {
   });
 });
 
-function analyticsData(points: import("./types.ts").AdminAnalyticsPoint[]) {
+function analyticsData(
+  points: import("./types.ts").AdminAnalyticsPoint[],
+  summary: Partial<import("./types.ts").AdminAnalyticsSummary> = {},
+) {
   return {
     query: {
       from: "2026-07-01T00:00:00.000Z",
@@ -86,10 +117,11 @@ function analyticsData(points: import("./types.ts").AdminAnalyticsPoint[]) {
       outputTokens: 50,
       customerCostMicros: 123000,
       providerCostMicros: 100000,
-      successRate: 91.7,
+      successRate: 11 / 12,
       avgLatencyMs: 500,
       p95LatencyMs: 850,
       avgTtftMs: 100,
+      ...summary,
     },
     points,
     models: [],

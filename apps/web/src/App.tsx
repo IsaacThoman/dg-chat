@@ -2997,7 +2997,7 @@ function Field({ label, value }: { label: string; value: string }) {
     </label>
   );
 }
-function UsageSettings() {
+export function UsageSettings() {
   const usage = useQuery({ queryKey: ["usage"], queryFn: api.usage });
   const data = usage.data;
   const balance = (data?.balanceMicros ?? 0) / 1_000_000;
@@ -3028,7 +3028,7 @@ function UsageSettings() {
       <div className="setting-row">
         <span>
           <strong>All-time usage</strong>
-          <small>{data?.calls ?? 0} requests · {tokens.toLocaleString()} tokens</small>
+          <small>{data?.calls ?? 0} completed requests · {tokens.toLocaleString()} tokens</small>
         </span>
         <strong>${spent.toFixed(4)}</strong>
       </div>
