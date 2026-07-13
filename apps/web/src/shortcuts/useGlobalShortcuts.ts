@@ -1,5 +1,26 @@
 import { useEffect } from "react";
 
+export function mobileSidebarLayout(
+  match: Pick<typeof globalThis, "matchMedia"> = globalThis,
+): boolean {
+  return match.matchMedia?.("(max-width: 760px)").matches ?? false;
+}
+
+export function focusConversationSearch({
+  openDrawer,
+  focus,
+  schedule = (callback: () => void) => requestAnimationFrame(callback),
+  mobile = mobileSidebarLayout(),
+}: {
+  openDrawer: () => void;
+  focus: () => void;
+  schedule?: (callback: () => void) => unknown;
+  mobile?: boolean;
+}) {
+  if (mobile) openDrawer();
+  schedule(focus);
+}
+
 function isEditable(target: EventTarget | null) {
   const element = target instanceof HTMLElement ? target : null;
   return Boolean(

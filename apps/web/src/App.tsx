@@ -125,7 +125,7 @@ import {
   useImageGeneration,
 } from "./images/index.ts";
 import { ModelPicker } from "./models/ModelPicker.tsx";
-import { useGlobalShortcuts } from "./shortcuts/useGlobalShortcuts.ts";
+import { focusConversationSearch, useGlobalShortcuts } from "./shortcuts/useGlobalShortcuts.ts";
 import {
   AppearancePreferences,
   PersonalizationPreferences,
@@ -1969,6 +1969,7 @@ function ChatView({
   onUpdateConversation,
   readOnly: readOnlyProp = false,
   saveHistory = true,
+  modelPreferenceError = "",
 }: {
   conversations: Conversation[];
   activeId: string;
@@ -1985,6 +1986,7 @@ function ChatView({
   ) => Promise<void>;
   readOnly?: boolean;
   saveHistory?: boolean;
+  modelPreferenceError?: string;
 }) {
   const queryClient = useQueryClient();
   const chatModels = useMemo(
@@ -2449,6 +2451,9 @@ function ChatView({
           <Menu size={20} />
         </IconButton>
         <ModelPicker models={chatModels} selected={selectedModel} setSelected={setSelectedModel} />
+        {modelPreferenceError && (
+          <span className="model-preference-error" role="alert">{modelPreferenceError}</span>
+        )}
         <div className="header-actions">
           {speechModels.length > 0 && (
             <div className="speech-preferences" aria-label="Read aloud settings">
@@ -3483,6 +3488,7 @@ export function App(
   const modelQuery = useQuery({ queryKey: ["models"], queryFn: api.models });
   const preferencesQuery = usePreferences();
   const preferenceMutation = usePreferenceMutation();
+  const [modelPreferenceError, setModelPreferenceError] = useState("");
   const demoMode = import.meta.env.VITE_DEMO_MODE === "true";
   const user = userQuery.data ?? (demoMode ? demoUser : undefined);
   const conversations = conversationQuery.data ?? (demoMode ? demoConversations : []);
@@ -3600,10 +3606,11 @@ export function App(
   };
   useGlobalShortcuts({
     newChat: () => void open("new"),
-    focusSearch: () => {
-      setMobile(true);
-      requestAnimationFrame(() => conversationSearchRef.current?.focus());
-    },
+    focusSearch: () =>
+      focusConversationSearch({
+        openDrawer: () => setMobile(true),
+        focus: () => conversationSearchRef.current?.focus(),
+      }),
   });
   const conversationCreated = async (id: string) => {
     await conversationQuery.refetch();
@@ -3702,10 +3709,18 @@ export function App(
           selectedModel={selectedModel}
           setSelectedModel={(modelId) => {
             setSelectedModel(modelId);
+            setModelPreferenceError("");
             if (preferencesQuery.data) {
               preferenceMutation.mutate({
                 current: preferencesQuery.data,
                 patch: { preferredModelId: modelId },
+              }, {
+                onError: () => {
+                  setModelPreferenceError(
+                    "Model selected for this chat, but the default could not be saved.",
+                  );
+                  void queryClient.invalidateQueries({ queryKey: ["preferences"] });
+                },
               });
             }
           }}
@@ -3715,6 +3730,7 @@ export function App(
           onUpdateConversation={updateConversation}
           readOnly={view !== "chat"}
           saveHistory={preferencesQuery.data?.saveHistory ?? true}
+          modelPreferenceError={modelPreferenceError}
         />
       )}
       {(view === "chat" || view === "archived" || view === "trash") && !creatingConversation &&

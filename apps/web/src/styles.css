@@ -797,6 +797,12 @@ kbd {
 .model-picker {
   position: relative;
 }
+.model-preference-error {
+  max-width: 250px;
+  color: var(--danger);
+  font-size: 11px;
+  line-height: 1.25;
+}
 .model-trigger {
   border: 0;
   background: transparent;
