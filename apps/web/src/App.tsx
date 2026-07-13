@@ -235,6 +235,7 @@ function Sidebar({
   const previousFocus = useRef<HTMLElement | null>(null);
   const closeMobileRef = useRef(closeMobile);
   closeMobileRef.current = closeMobile;
+  const searchId = useId();
   const [query, setQuery] = useState("");
   const [selectedFolder, setSelectedFolder] = useState<string | null>(null);
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
@@ -311,10 +312,11 @@ function Sidebar({
       >
         <Plus size={18} /> New chat <kbd>⌘ K</kbd>
       </button>
-      <label className="search">
-        <span className="sr-only">Search conversations</span>
+      <div className="search" role="search">
+        <label className="sr-only" htmlFor={searchId}>Search conversations</label>
         <Search size={16} aria-hidden="true" />
         <input
+          id={searchId}
           ref={searchInputRef}
           value={query}
           onChange={(e) => setQuery(e.target.value)}
@@ -341,7 +343,7 @@ function Sidebar({
             </button>
           )
           : <kbd>⌘F</kbd>}
-      </label>
+      </div>
       <span className="sr-only" role="status" aria-live="polite">
         {query ? `${filtered.length} conversation${filtered.length === 1 ? "" : "s"} found` : ""}
       </span>
