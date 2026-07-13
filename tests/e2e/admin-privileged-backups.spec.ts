@@ -29,6 +29,15 @@ async function mockAdminSession(page: import("@playwright/test").Page) {
 }
 
 test("admin creates and downloads a separately encrypted provider-secret backup", async ({ page }) => {
+  // Chromium exposes the native save picker in some CI environments. Disable it in this case so
+  // Playwright deterministically exercises the bounded compatibility download and receives a
+  // browser download event; the streaming picker path is covered by the API unit tests.
+  await page.addInitScript(() => {
+    Object.defineProperty(window, "showSaveFilePicker", {
+      configurable: true,
+      value: undefined,
+    });
+  });
   await mockAdminSession(page);
   const id = "00000000-0000-4000-8000-0000000000b1";
   const createdAt = "2026-07-12T18:00:00.000Z";

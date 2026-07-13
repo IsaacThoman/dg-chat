@@ -8,13 +8,32 @@ import {
   isRecentAuthenticationRequired,
   mergeBackupExport,
   monitorBackupRestore,
+  persistSessionRestoreId,
   PRIVILEGED_BACKUP_CONFIRMATION,
+  safeSessionRestoreId,
 } from "./AdminBackups.tsx";
 import { ApiError } from "./api.ts";
 
 const base = { exports: [], restoreEnabled: true, onRetry: () => {}, onCreate: async () => {} };
 
 describe("AdminBackups", () => {
+  it("keeps recovery usable when browser session storage is blocked", () => {
+    const blocked = {
+      getItem: () => {
+        throw new DOMException("blocked", "SecurityError");
+      },
+      setItem: () => {
+        throw new DOMException("blocked", "SecurityError");
+      },
+      removeItem: () => {
+        throw new DOMException("blocked", "SecurityError");
+      },
+    };
+    expect(safeSessionRestoreId(blocked)).toBeUndefined();
+    expect(() => persistSessionRestoreId(blocked, "restore-id")).not.toThrow();
+    expect(() => persistSessionRestoreId(blocked, undefined)).not.toThrow();
+  });
+
   it("warns that standard archives are sensitive and renders useful empty and upload states", () => {
     const html = renderToStaticMarkup(<AdminBackups {...base} />);
     expect(html).toContain(

@@ -42,6 +42,27 @@ export const mergeBackupExport = (
 export const isRecentAuthenticationRequired = (error: unknown) =>
   error instanceof ApiError && error.status === 403 &&
   error.code === "recent_authentication_required";
+const PROVIDER_SECRET_RESTORE_KEY = "dg.provider-secret-restore-id";
+export function safeSessionRestoreId(storage: Pick<Storage, "getItem"> | undefined) {
+  try {
+    return (storage ?? globalThis.sessionStorage)?.getItem(PROVIDER_SECRET_RESTORE_KEY) ??
+      undefined;
+  } catch {
+    return undefined;
+  }
+}
+export function persistSessionRestoreId(
+  storage: Pick<Storage, "setItem" | "removeItem"> | undefined,
+  restoreId: string | undefined,
+) {
+  try {
+    const target = storage ?? globalThis.sessionStorage;
+    if (restoreId) target?.setItem(PROVIDER_SECRET_RESTORE_KEY, restoreId);
+    else target?.removeItem(PROVIDER_SECRET_RESTORE_KEY);
+  } catch {
+    // Session persistence is an enhancement; in-memory recovery state remains authoritative.
+  }
+}
 export const canApplyBackupRestore = (
   preview: BackupRestorePreview | undefined,
   confirmation: string,
@@ -230,9 +251,7 @@ export async function monitorBackupRestore(
 export function AdminBackupsView() {
   const client = useQueryClient();
   const exportKey = useRef(crypto.randomUUID());
-  const [recentRestoreId, setRecentRestoreId] = useState(() =>
-    globalThis.sessionStorage?.getItem("dg.provider-secret-restore-id") ?? undefined
-  );
+  const [recentRestoreId, setRecentRestoreId] = useState(() => safeSessionRestoreId(undefined));
   const backups = useQuery({
     queryKey: ["admin-backups"],
     queryFn: api.adminBackups,
@@ -316,12 +335,12 @@ export function AdminBackupsView() {
         privilegedCreate.mutateAsync(confirmation).then(() => undefined)}
       onDownloadSecrets={downloadSecrets}
       onBaseRestoreCompleted={(restoreId) => {
-        globalThis.sessionStorage?.setItem("dg.provider-secret-restore-id", restoreId);
         setRecentRestoreId(restoreId);
+        persistSessionRestoreId(undefined, restoreId);
       }}
       onProviderSecretsApplied={() => {
-        globalThis.sessionStorage?.removeItem("dg.provider-secret-restore-id");
         setRecentRestoreId(undefined);
+        persistSessionRestoreId(undefined, undefined);
       }}
       onReauthenticate={() => globalThis.location.assign("/login")}
     />
