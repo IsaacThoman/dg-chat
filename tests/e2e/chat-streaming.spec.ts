@@ -8,7 +8,7 @@ test.beforeEach(async ({ page, request }) => {
 });
 
 async function selectSlowStream(page: import("@playwright/test").Page) {
-  await page.getByRole("button", { name: /DG Chat Simulated/ }).click();
+  await page.locator('button.model-trigger[aria-haspopup="listbox"]').click();
   await page.getByRole("listbox", { name: "Chat model" })
     .getByRole("option", { name: /DG Chat Slow Stream/ }).click();
   await expect(page.getByRole("button", { name: /DG Chat Slow Stream/ })).toBeVisible();

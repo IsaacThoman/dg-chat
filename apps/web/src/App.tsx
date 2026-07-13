@@ -4,6 +4,7 @@ import {
   Fragment,
   type ReactNode,
   type RefObject,
+  useCallback,
   useEffect,
   useId,
   useMemo,
@@ -220,6 +221,7 @@ function Sidebar({
   staleWarning,
   retryList,
   searchInputRef,
+  busyConversationId,
 }: {
   conversations: Conversation[];
   active: string;
@@ -238,6 +240,7 @@ function Sidebar({
   staleWarning: boolean;
   retryList: () => void;
   searchInputRef: RefObject<HTMLInputElement | null>;
+  busyConversationId: string;
 }) {
   const sidebarRef = useRef<HTMLElement>(null);
   const previousFocus = useRef<HTMLElement | null>(null);
@@ -432,6 +435,7 @@ function Sidebar({
                 onUpdate={onUpdate}
                 folders={workspace.folders.data}
                 tags={workspace.tags.data}
+                mutationLocked={busyConversationId === c.id}
               />
             ))}
             <p className="section-label">RECENT</p>
@@ -446,6 +450,7 @@ function Sidebar({
                 onUpdate={onUpdate}
                 folders={workspace.folders.data}
                 tags={workspace.tags.data}
+                mutationLocked={busyConversationId === c.id}
               />
             ))}
             {!filtered.length && (
@@ -492,7 +497,7 @@ function Sidebar({
 }
 
 function ConversationRow(
-  { c, active, onOpen, listView, onUpdate, folders, tags }: {
+  { c, active, onOpen, listView, onUpdate, folders, tags, mutationLocked }: {
     c: Conversation;
     active: boolean;
     onOpen: (id: string) => void;
@@ -503,6 +508,7 @@ function ConversationRow(
     ) => Promise<void>;
     folders?: import("./workspace/WorkspaceNavigation.tsx").FolderData;
     tags?: import("./workspace/WorkspaceNavigation.tsx").TagData;
+    mutationLocked: boolean;
   },
 ) {
   const [menu, setMenu] = useState(false);
@@ -592,11 +598,14 @@ function ConversationRow(
         ref={actionRef}
         className="icon-button"
         type="button"
-        title={`Actions for ${c.title}`}
+        title={mutationLocked
+          ? "Conversation actions are available after the current response finishes"
+          : `Actions for ${c.title}`}
         aria-label={`Actions for ${c.title}`}
         aria-haspopup="menu"
         aria-expanded={menu}
         data-conversation-actions={c.id}
+        disabled={mutationLocked}
         onClick={() => {
           if (!menu) {
             const trigger = actionRef.current?.getBoundingClientRect();
@@ -938,6 +947,7 @@ function MessageItem(
             {!readOnly && (
               <IconButton
                 label="Edit without overwriting"
+                disabled={generationBusy || branchBusy}
                 onClick={() => onEdit(message)}
               >
                 <Pencil size={15} />
@@ -2020,6 +2030,7 @@ function ChatView({
   saveHistory = true,
   modelPreferenceError = "",
   historyPreferenceWarning = "",
+  onGenerationBusyChange,
 }: {
   conversations: Conversation[];
   activeId: string;
@@ -2038,6 +2049,7 @@ function ChatView({
   saveHistory?: boolean;
   modelPreferenceError?: string;
   historyPreferenceWarning?: string;
+  onGenerationBusyChange: (conversationId: string, busy: boolean) => void;
 }) {
   const queryClient = useQueryClient();
   const chatModels = useMemo(
@@ -2174,6 +2186,11 @@ function ChatView({
     [localMessages, conversation?.activeLeafId],
   );
   const streaming = Boolean(activeStream);
+  const generationBusy = streaming || queue.length > 0;
+  useEffect(() => {
+    onGenerationBusyChange(activeId, generationBusy);
+    return () => onGenerationBusyChange(activeId, false);
+  }, [activeId, generationBusy, onGenerationBusyChange]);
   const speechContentFingerprint = useMemo(
     () => localMessages.map((message) => `${message.id}:${message.content}`).join("\u0000"),
     [localMessages],
@@ -3570,6 +3587,12 @@ export function App(
       return "";
     }
   });
+  const [busyConversationId, setBusyConversationId] = useState("");
+  const updateGenerationBusy = useCallback((conversationId: string, busy: boolean) => {
+    setBusyConversationId((current) =>
+      busy ? conversationId : current === conversationId ? "" : current
+    );
+  }, []);
   const [view, setViewState] = useState<View>(initialView);
   const [adminSection, setAdminSectionState] = useState<AdminSection>(initialAdminSection);
   useEffect(() => setViewState(initialView), [initialView]);
@@ -3750,6 +3773,7 @@ export function App(
             : conversationQuery.refetch());
         }}
         searchInputRef={conversationSearchRef}
+        busyConversationId={busyConversationId}
       />
       {mobile && <div className="sidebar-scrim" onClick={() => setMobile(false)} />}
       {(view === "chat" || view === "archived" || view === "trash") && creatingConversation && (
@@ -3795,6 +3819,7 @@ export function App(
           saveHistory={!temporaryChatUntilPreferencesResolve(demoMode, preferencesQuery.data)}
           modelPreferenceError={modelPreferenceError}
           historyPreferenceWarning={historyPreferenceWarning(demoMode, preferencesQuery.isError)}
+          onGenerationBusyChange={updateGenerationBusy}
         />
       )}
       {(view === "chat" || view === "archived" || view === "trash") && !creatingConversation &&
