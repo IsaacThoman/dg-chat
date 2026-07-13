@@ -326,9 +326,7 @@ export const conversationTagBindings = pgTable("conversation_tag_bindings", {
 
 export const messages = pgTable("messages", {
   id: uuid("id").primaryKey().defaultRandom(),
-  conversationId: uuid("conversation_id").notNull().references(() => conversations.id, {
-    onDelete: "cascade",
-  }),
+  conversationId: uuid("conversation_id").notNull(),
   parentId: uuid("parent_id"),
   supersedesId: uuid("supersedes_id"),
   generationId: uuid("generation_id"),
@@ -347,6 +345,93 @@ export const messages = pgTable("messages", {
   ),
   uniqueIndex("messages_sibling_uq").on(table.conversationId, table.parentId, table.siblingIndex),
   index("messages_parent_idx").on(table.parentId),
+]);
+
+export const conversationShareSnapshots = pgTable("conversation_share_snapshots", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  ownerId: uuid("owner_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  conversationId: uuid("conversation_id").notNull().references(() => conversations.id, {
+    onDelete: "cascade",
+  }),
+  leafId: uuid("leaf_id").notNull(),
+  conversationVersion: integer("conversation_version").notNull(),
+  title: text("title").notNull(),
+  identityVisibility: text("identity_visibility").notNull(),
+  attachmentPolicy: text("attachment_policy").notNull(),
+  ownerNameSnapshot: text("owner_name_snapshot"),
+  publicSnapshot: jsonb("public_snapshot").notNull(),
+  sourceAttachments: jsonb("source_attachments").notNull().default({}),
+  secretHash: text("secret_hash").notNull(),
+  idempotencyKey: text("idempotency_key").notNull(),
+  payloadHash: text("payload_hash").notNull(),
+  version: integer("version").notNull().default(1),
+  expiresAt: timestamp("expires_at", { withTimezone: true }),
+  revokedAt: timestamp("revoked_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("conversation_share_snapshots_secret_uq").on(table.secretHash),
+  uniqueIndex("conversation_share_snapshots_owner_idempotency_uq").on(
+    table.ownerId,
+    table.idempotencyKey,
+  ),
+  foreignKey({
+    columns: [table.conversationId, table.ownerId],
+    foreignColumns: [conversations.id, conversations.ownerId],
+    name: "conversation_share_snapshots_conversation_owner_fk",
+  }).onDelete("cascade"),
+  index("conversation_share_snapshots_owner_created_idx").on(
+    table.ownerId,
+    table.createdAt,
+    table.id,
+  ),
+  index("conversation_share_snapshots_public_expiry_idx").on(table.expiresAt, table.id).where(
+    sql`${table.revokedAt} IS NULL`,
+  ),
+  check("conversation_share_snapshots_version_check", sql`${table.version} >= 1`),
+  check(
+    "conversation_share_snapshots_conversation_version_check",
+    sql`${table.conversationVersion} >= 0`,
+  ),
+  check(
+    "conversation_share_snapshots_title_check",
+    sql`char_length(${table.title}) BETWEEN 1 AND 500`,
+  ),
+  check(
+    "conversation_share_snapshots_identity_check",
+    sql`${table.identityVisibility} IN ('owner','anonymous')`,
+  ),
+  check(
+    "conversation_share_snapshots_attachment_policy_check",
+    sql`${table.attachmentPolicy} IN ('include','redact','selected')`,
+  ),
+  check(
+    "conversation_share_snapshots_owner_name_check",
+    sql`(${table.identityVisibility}='owner' AND ${table.ownerNameSnapshot} IS NOT NULL AND char_length(${table.ownerNameSnapshot}) BETWEEN 1 AND 200) OR (${table.identityVisibility}='anonymous' AND ${table.ownerNameSnapshot} IS NULL)`,
+  ),
+  check(
+    "conversation_share_snapshots_secret_hash_check",
+    sql`${table.secretHash} ~ '^[0-9a-f]{64}$'`,
+  ),
+  check(
+    "conversation_share_snapshots_payload_hash_check",
+    sql`${table.payloadHash} ~ '^[0-9a-f]{64}$'`,
+  ),
+  check(
+    "conversation_share_snapshots_idempotency_check",
+    sql`char_length(${table.idempotencyKey}) BETWEEN 1 AND 200`,
+  ),
+  check(
+    "conversation_share_snapshots_public_snapshot_check",
+    sql`jsonb_typeof(${table.publicSnapshot})='object' AND ${table.publicSnapshot}->>'id'=${table.id}::text AND ${table.publicSnapshot}->>'title'=${table.title} AND ${table.publicSnapshot}->>'conversationVersion'=${table.conversationVersion}::text AND ${table.publicSnapshot}#>>'{identity,visibility}'=${table.identityVisibility} AND (${table.publicSnapshot}#>>'{identity,displayName}') IS NOT DISTINCT FROM ${table.ownerNameSnapshot} AND ${table.publicSnapshot}->>'attachmentPolicy'=${table.attachmentPolicy} AND jsonb_typeof(${table.publicSnapshot}->'messages')='array' AND jsonb_typeof(${table.publicSnapshot}->'attachments')='array'`,
+  ),
+  check(
+    "conversation_share_snapshots_source_attachments_check",
+    sql`jsonb_typeof(${table.sourceAttachments})='object'`,
+  ),
+  check(
+    "conversation_share_snapshots_expiry_check",
+    sql`${table.expiresAt} IS NULL OR ${table.expiresAt} > ${table.createdAt}`,
+  ),
 ]);
 
 export const attachments = pgTable("attachments", {
