@@ -272,6 +272,8 @@ function ImportDialog({ close }: { close: () => void }) {
                   className="visually-hidden"
                   type="file"
                   accept="application/json,.dgchat,.json"
+                  aria-hidden="true"
+                  tabIndex={-1}
                   onClick={(event) => {
                     event.currentTarget.value = "";
                   }}
