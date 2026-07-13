@@ -150,7 +150,7 @@ services:
     labels:
       # The web container joins multiple networks. Pin Traefik to Coolify's injected
       # resource network so it does not select an unreachable internal bridge.
-      - "traefik.docker.network=${COOLIFY_RESOURCE_UUID:-coolify}"
+      - "traefik.docker.network=kvrktwghpyzt1dled95jc23x"
     read_only: true
     tmpfs:
       - /tmp:size=32m,mode=1777
