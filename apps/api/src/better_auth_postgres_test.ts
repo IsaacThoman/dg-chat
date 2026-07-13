@@ -147,6 +147,11 @@ Deno.test({
       await adminSql.unsafe(migration);
 
       repository = await PostgresRepository.connect(schemaDatabaseUrl(databaseUrl!, schema));
+      const bootstrap = await repository.bootstrapAdmin({
+        email: "admin@example.com",
+        name: "Bootstrap Admin",
+        passwordHash: await hashPassword("bootstrap password remains valid"),
+      }, 5_000_000);
       const mockOidc = await createMockOidcProvider({
         publicIssuer: "http://localhost:4020",
         internalBaseUrl: "http://mock-oidc:4020",
@@ -267,16 +272,28 @@ Deno.test({
         (await oidcState.json() as { counters: { userinfo: number } }).counters.userinfo,
         0,
       );
-      const firstOidcApproval = await repository.approveUser(
-        oidcIdentity.user.id,
-        "approved",
-        5_000_000,
-      );
-      const repeatedOidcApproval = await repository.approveUser(
-        oidcIdentity.user.id,
-        "approved",
-        5_000_000,
-      );
+      const firstOidcApproval = await repository.decideUserApproval({
+        actorId: bootstrap.id,
+        targetUserId: oidcIdentity.user.id,
+        expectedVersion: 1,
+        status: "approved",
+        startingCreditMicros: 5_000_000,
+      });
+      const rejectedOidcIdentity = await repository.decideUserApproval({
+        actorId: bootstrap.id,
+        targetUserId: oidcIdentity.user.id,
+        expectedVersion: firstOidcApproval.version,
+        status: "rejected",
+        startingCreditMicros: 5_000_000,
+        reason: "Exercise idempotent reapproval grant",
+      });
+      const repeatedOidcApproval = await repository.decideUserApproval({
+        actorId: bootstrap.id,
+        targetUserId: oidcIdentity.user.id,
+        expectedVersion: rejectedOidcIdentity.version,
+        status: "approved",
+        startingCreditMicros: 5_000_000,
+      });
       assertEquals(firstOidcApproval.balanceMicros, 5_000_000);
       assertEquals(repeatedOidcApproval.balanceMicros, 5_000_000);
       const approvedOidcStatus = await app.request("/api/auth/status", {
@@ -316,11 +333,6 @@ Deno.test({
         { userId: legacyId, limited: false },
       );
       assertMatch(legacySession.authenticatedAt, /^\d{4}-\d{2}-\d{2}T/u);
-      const bootstrap = await repository.bootstrapAdmin({
-        email: "admin@example.com",
-        name: "Bootstrap Admin",
-        passwordHash: await hashPassword("bootstrap password remains valid"),
-      }, 5_000_000);
       assertEquals(bootstrap.passwordHash, null);
       assertEquals(bootstrap.balanceMicros, 5_000_000);
       const bootstrapSignin = await service.handler(
@@ -748,7 +760,14 @@ Deno.test({
         },
       );
 
-      await repository.approveUser(body.user.id, "approved", 5_000_000, true);
+      await repository.decideUserApproval({
+        actorId: bootstrap.id,
+        targetUserId: body.user.id,
+        expectedVersion: domainUser!.version,
+        status: "approved",
+        startingCreditMicros: 5_000_000,
+        requireEmailVerification: true,
+      });
       assertEquals(
         await (await app.request("/api/auth/status", { headers: { cookie } })).json(),
         {
@@ -889,7 +908,14 @@ Deno.test({
       await adminSql`UPDATE users SET deleted_at=NULL WHERE id=${body.user.id}`;
       assert(await service.getSession(new Headers({ cookie: approvedCookie })));
 
-      await repository.setUserState(body.user.id, "suspended");
+      const bridgeUser = await repository.getAdminUser(body.user.id);
+      await repository.setAdminUserState({
+        actorId: bootstrap.id,
+        targetUserId: body.user.id,
+        expectedVersion: bridgeUser.version,
+        state: "suspended",
+        reason: "Exercise suspended Better Auth session behavior",
+      });
       assertEquals(await service.getSession(new Headers({ cookie: approvedCookie })), null);
 
       assertEquals(
@@ -906,7 +932,7 @@ Deno.test({
           SELECT limited FROM auth_sessions WHERE user_id=${body.user.id}
         `,
         ],
-        [],
+        [{ limited: true }],
       );
       assertEquals(
         [

@@ -68,6 +68,7 @@ Deno.test({
             targetUserId: targetId,
             expectedVersion: 1,
             role: "admin",
+            reason: "Exercise stale-version rejection",
           }),
         "version_conflict",
       );
@@ -76,6 +77,7 @@ Deno.test({
         targetUserId: targetId,
         expectedVersion: 2,
         role: "admin",
+        reason: "Promote lifecycle administrator",
       });
       assertEquals(promoted.effectiveAdmin, true);
       assertEquals(promoted.version, 3);
@@ -148,6 +150,7 @@ Deno.test({
         targetUserId: targetId,
         expectedVersion: 4,
         deleted: true,
+        reason: "Exercise account deletion",
       });
       assertExists(deleted.deletedAt);
       assertEquals(deleted.state, "suspended");
@@ -156,6 +159,7 @@ Deno.test({
         targetUserId: targetId,
         expectedVersion: 5,
         deleted: false,
+        reason: "Exercise account restoration",
       });
       assertEquals(restored.deletedAt, null);
       assertEquals(restored.state, "suspended");
@@ -233,12 +237,14 @@ Deno.test({
           targetUserId: secondId,
           expectedVersion: 1,
           deleted: true,
+          reason: "Concurrent final-admin coverage",
         }),
         second.setAdminUserRole({
           actorId: secondId,
           targetUserId: firstId,
           expectedVersion: 1,
           role: "user",
+          reason: "Concurrent final-admin coverage",
         }),
       ]);
       assertEquals(outcomes.filter((outcome) => outcome.status === "fulfilled").length, 1);

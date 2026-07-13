@@ -5,7 +5,6 @@ import {
   parsePublicConversationShare,
 } from "@dg-chat/contracts";
 import type {
-  AccountState,
   AdminUser,
   AdminUserPage,
   AdminUserQuery,
@@ -200,13 +199,15 @@ function adminUser(row: Row): AdminUser {
 function validateAdminCommand(input: {
   expectedVersion: number;
   reason?: string;
-}): string | undefined {
+}, reasonRequired = false): string | undefined {
   if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) {
     throw new DomainError("validation_error", "Expected version must be a positive integer", 422);
   }
   const reason = input.reason?.trim();
-  if (reason && reason.length > 500) {
-    throw new DomainError("validation_error", "Administrative reason is too long", 422);
+  if (
+    (reasonRequired && !reason) || (input.reason !== undefined && (!reason || reason.length > 500))
+  ) {
+    throw new DomainError("validation_error", "Administrative reason is invalid", 422);
   }
   return reason || undefined;
 }
@@ -1501,7 +1502,7 @@ export class PostgresRepository implements DomainRepository {
   }
 
   async decideUserApproval(input: AdminApprovalCommand): Promise<AdminUser> {
-    const reason = validateAdminCommand(input);
+    const reason = validateAdminCommand(input, input.status === "rejected");
     if (
       !Number.isSafeInteger(input.startingCreditMicros) || input.startingCreditMicros < 0 ||
       input.startingCreditMicros > 1_000_000_000
@@ -1576,7 +1577,7 @@ export class PostgresRepository implements DomainRepository {
   }
 
   async setAdminUserRole(input: AdminRoleCommand): Promise<AdminUser> {
-    const reason = validateAdminCommand(input);
+    const reason = validateAdminCommand(input, true);
     return await this.#sql.begin(async (tx) => {
       await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-final-admin'))`;
       await assertEffectiveAdminActor(tx, input.actorId);
@@ -1629,7 +1630,7 @@ export class PostgresRepository implements DomainRepository {
   }
 
   async setAdminUserState(input: AdminStateCommand): Promise<AdminUser> {
-    const reason = validateAdminCommand(input);
+    const reason = validateAdminCommand(input, input.state === "suspended");
     return await this.#sql.begin(async (tx) => {
       await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-final-admin'))`;
       await assertEffectiveAdminActor(tx, input.actorId);
@@ -1675,7 +1676,7 @@ export class PostgresRepository implements DomainRepository {
   }
 
   async setAdminUserDeleted(input: AdminDeletionCommand): Promise<AdminUser> {
-    const reason = validateAdminCommand(input);
+    const reason = validateAdminCommand(input, true);
     return await this.#sql.begin(async (tx) => {
       await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-final-admin'))`;
       await assertEffectiveAdminActor(tx, input.actorId);
@@ -1719,85 +1720,6 @@ export class PostgresRepository implements DomainRepository {
           ${input.targetUserId},
           ${tx.json(adminMutationMetadata(before, result, reason) as postgres.JSONValue)})`;
       return adminUser(result);
-    });
-  }
-
-  async approveUser(
-    id: string,
-    status: "approved" | "rejected",
-    credit: number,
-    requireEmailVerification = false,
-  ) {
-    return await this.#sql.begin(async (tx) => {
-      await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-final-admin'))`;
-      const rows = await tx<Row[]>`SELECT * FROM users WHERE id=${id} FOR UPDATE`;
-      if (!rows[0]) throw new DomainError("not_found", "User not found", 404);
-      if (status === "approved" && requireEmailVerification && !rows[0].email_verified_at) {
-        throw new DomainError("email_not_verified", "Email must be verified before approval", 409);
-      }
-      if (rows[0].role === "admin" && status === "rejected") {
-        const count = await tx<
-          { count: number }[]
-        >`SELECT count(*)::int AS count FROM users WHERE role='admin' AND state='active'
-          AND approval_status='approved' AND deleted_at IS NULL`;
-        if (count[0].count <= 1) {
-          throw new DomainError(
-            "final_admin",
-            "The final approved administrator is protected",
-            409,
-          );
-        }
-      }
-      let balance = number(rows[0].balance_micros);
-      if (status === "approved" && credit > 0) {
-        const approvalRunId = `approval:${id}`;
-        const priorGrant = await tx`SELECT id FROM ledger_entries
-          WHERE usage_run_id=${approvalRunId} AND kind='grant' LIMIT 1`;
-        if (!priorGrant.length) {
-          const balanceAfterGrant = balance + credit;
-          await tx`INSERT INTO ledger_entries
-            (user_id,usage_run_id,kind,amount_micros,balance_after_micros)
-            VALUES (${id},${approvalRunId},'grant',${credit},${balanceAfterGrant})`;
-          balance = balanceAfterGrant;
-        }
-      }
-      const updated = await tx<
-        Row[]
-      >`UPDATE users SET approval_status=${status},balance_micros=${balance},
-        version=version+1,updated_at=now() WHERE id=${id} RETURNING *`;
-      if (status === "rejected") {
-        await tx`UPDATE sessions SET invalidated_at=now()
-          WHERE user_id=${id} AND limited=false AND invalidated_at IS NULL`;
-        await tx`DELETE FROM auth_sessions WHERE user_id=${id} AND limited=false`;
-        await tx`UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,now()) WHERE user_id=${id}`;
-      }
-      return user(updated[0]);
-    });
-  }
-  async setUserState(id: string, state: AccountState) {
-    return await this.#sql.begin(async (tx) => {
-      await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-final-admin'))`;
-      const rows = await tx<Row[]>`SELECT * FROM users WHERE id=${id} FOR UPDATE`;
-      if (!rows[0]) throw new DomainError("not_found", "User not found", 404);
-      if (rows[0].role === "admin" && state !== "active") {
-        const count = await tx<
-          { count: number }[]
-        >`SELECT count(*)::int AS count FROM users WHERE role='admin' AND state='active'
-          AND approval_status='approved' AND deleted_at IS NULL`;
-        if (count[0].count <= 1) {
-          throw new DomainError("final_admin", "The final active administrator is protected", 409);
-        }
-      }
-      const updated = await tx<
-        Row[]
-      >`UPDATE users SET state=${state},version=version+1,updated_at=now()
-        WHERE id=${id} RETURNING *`;
-      if (state !== "active") {
-        await tx`UPDATE sessions SET invalidated_at=now() WHERE user_id=${id}`;
-        await tx`DELETE FROM auth_sessions WHERE user_id=${id}`;
-        await tx`UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,now()) WHERE user_id=${id}`;
-      }
-      return user(updated[0]);
     });
   }
 

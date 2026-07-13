@@ -225,6 +225,11 @@ Deno.test("owner portability rejects unauthorized, malformed, ambiguous, and ove
 
 Deno.test("owner portability mutations enforce CSRF, session-only auth, and active approval", async () => {
   const repository = new MemoryRepository();
+  const actor = repository.bootstrapAdmin({
+    email: "portability-admin@example.test",
+    name: "Portability Administrator",
+    passwordHash: "test-only-hash",
+  }, 0);
   const { app } = createApp({ repository });
   const owner = await ownerSession(repository, "security-portability@example.test");
   const initialAudits = repository.auditEvents.length;
@@ -279,9 +284,15 @@ Deno.test("owner portability mutations enforce CSRF, session-only auth, and acti
   assertEquals(pendingResponse.status, 403);
   assertEquals((await pendingResponse.json()).error.code, "approval_required");
 
-  repository.setUserState(owner.user.id, "suspended");
+  repository.setAdminUserState({
+    actorId: actor.id,
+    targetUserId: owner.user.id,
+    expectedVersion: owner.user.version,
+    state: "suspended",
+    reason: "Exercise suspended-account authorization",
+  });
   const suspended = await post({ ...owner.headers, "idempotency-key": "suspended-account" });
   assertEquals(suspended.status, 401);
   assertEquals(repository.listConversations(owner.user.id).length, 0);
-  assertEquals(repository.auditEvents.length, initialAudits);
+  assertEquals(repository.auditEvents.length, initialAudits + 1);
 });

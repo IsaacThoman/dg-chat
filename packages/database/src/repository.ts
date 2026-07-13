@@ -111,6 +111,7 @@ export interface AdminApprovalCommand extends AdminUserCommand {
 
 export interface AdminRoleCommand extends AdminUserCommand {
   role: UserRole;
+  reason: string;
 }
 
 export interface AdminStateCommand extends AdminUserCommand {
@@ -119,6 +120,7 @@ export interface AdminStateCommand extends AdminUserCommand {
 
 export interface AdminDeletionCommand extends AdminUserCommand {
   deleted: boolean;
+  reason: string;
 }
 
 const ADMIN_USER_CURSOR_VERSION = 1;
@@ -1812,13 +1814,6 @@ export interface DomainRepository {
   secureAfterPasswordReset(userId: string, token: string): MaybePromise<void>;
   recordAudit(input: AuditEventInput): MaybePromise<AuditEvent>;
   listAudit(query?: AuditQuery): MaybePromise<AuditPage>;
-  approveUser(
-    id: string,
-    status: "approved" | "rejected",
-    creditMicros: number,
-    requireEmailVerification?: boolean,
-  ): MaybePromise<StoredUser>;
-  setUserState(id: string, state: AccountState): MaybePromise<StoredUser>;
   decideUserApproval(input: AdminApprovalCommand): MaybePromise<AdminUser>;
   setAdminUserRole(input: AdminRoleCommand): MaybePromise<AdminUser>;
   setAdminUserState(input: AdminStateCommand): MaybePromise<AdminUser>;

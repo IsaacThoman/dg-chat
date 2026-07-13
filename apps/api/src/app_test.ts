@@ -1398,6 +1398,11 @@ Deno.test("auth status keeps limited sessions pollable through approval and veri
     mailer,
     requireEmailVerification: true,
   });
+  const actor = await repository.bootstrapAdmin({
+    email: "status-admin@example.com",
+    name: "Status Administrator",
+    passwordHash: "test-only-hash",
+  }, 0);
   const signup = await app.request("/api/auth/sign-up/email", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -1423,7 +1428,14 @@ Deno.test("auth status keeps limited sessions pollable through approval and veri
 
   // Approved-but-unverified is a valid imported/configuration-transition state. Approval must
   // not elevate or destroy the status-only session.
-  await repository.approveUser(signed.user.id, "approved", 0, false);
+  await repository.decideUserApproval({
+    actorId: actor.id,
+    targetUserId: signed.user.id,
+    expectedVersion: signed.user.version,
+    status: "approved",
+    startingCreditMicros: 0,
+    requireEmailVerification: false,
+  });
   assertEquals(await json(await app.request("/api/auth/status", { headers: limitedAuth })), {
     approvalStatus: "approved",
     state: "active",
@@ -1490,6 +1502,11 @@ Deno.test("auth status keeps limited sessions pollable through approval and veri
 
 Deno.test("rejected applicants retain only a status session", async () => {
   const { app, repository } = createApp();
+  const actor = await repository.bootstrapAdmin({
+    email: "rejection-admin@example.com",
+    name: "Rejection Administrator",
+    passwordHash: "test-only-hash",
+  }, 0);
   const signup = await app.request("/api/auth/sign-up/email", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -1501,7 +1518,14 @@ Deno.test("rejected applicants retain only a status session", async () => {
   });
   const signed = await json(signup);
   const headers = { cookie: sessionCookie(signup) };
-  await repository.approveUser(signed.user.id, "rejected", 0);
+  await repository.decideUserApproval({
+    actorId: actor.id,
+    targetUserId: signed.user.id,
+    expectedVersion: signed.user.version,
+    status: "rejected",
+    startingCreditMicros: 0,
+    reason: "Exercise rejected status-session behavior",
+  });
   assertEquals(await json(await app.request("/api/auth/status", { headers })), {
     approvalStatus: "rejected",
     state: "active",

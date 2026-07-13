@@ -2565,6 +2565,11 @@ Deno.test("replays authorize and reject payload mismatch; active leaf must be te
 
 Deno.test("approval grant is minted once and rejection revokes sessions and tokens", () => {
   const repo = new MemoryRepository();
+  const actor = repo.bootstrapAdmin({
+    email: "approval-admin@example.com",
+    name: "Approval Administrator",
+    passwordHash: "test-only-hash",
+  }, 0);
   const user = repo.createUser({
     email: "approval@example.com",
     name: "Approval",
@@ -2572,13 +2577,32 @@ Deno.test("approval grant is minted once and rejection revokes sessions and toke
     emailVerified: true,
   });
   repo.createSession(user.id, "limited-session", true);
-  repo.approveUser(user.id, "approved", 100);
+  let managed = repo.decideUserApproval({
+    actorId: actor.id,
+    targetUserId: user.id,
+    expectedVersion: user.version,
+    status: "approved",
+    startingCreditMicros: 100,
+  });
   assertEquals(repo.getSession("limited-session")?.limited, true);
   repo.reserve(user.id, "spend", "model", 100);
   repo.settle("spend", 100, 1, 1, 1);
-  repo.approveUser(user.id, "rejected", 100);
+  managed = repo.decideUserApproval({
+    actorId: actor.id,
+    targetUserId: user.id,
+    expectedVersion: managed.version,
+    status: "rejected",
+    startingCreditMicros: 100,
+    reason: "Exercise credential invalidation",
+  });
   assertEquals(repo.getSession("limited-session")?.limited, true);
-  repo.approveUser(user.id, "approved", 100);
+  managed = repo.decideUserApproval({
+    actorId: actor.id,
+    targetUserId: user.id,
+    expectedVersion: managed.version,
+    status: "approved",
+    startingCreditMicros: 100,
+  });
   assertEquals(user.balanceMicros, 0);
   repo.createSession(user.id, "session", false);
   const token = repo.createApiToken(user.id, {
@@ -2587,7 +2611,14 @@ Deno.test("approval grant is minted once and rejection revokes sessions and toke
     tokenHash: "hash",
     preview: "hash",
   });
-  repo.approveUser(user.id, "rejected", 100);
+  repo.decideUserApproval({
+    actorId: actor.id,
+    targetUserId: user.id,
+    expectedVersion: managed.version,
+    status: "rejected",
+    startingCreditMicros: 100,
+    reason: "Exercise full-session revocation",
+  });
   assertEquals(repo.getSession("session"), undefined);
   assertEquals(repo.getSession("limited-session")?.limited, true);
   assertEquals(Boolean(token.revokedAt), true);
@@ -2595,12 +2626,29 @@ Deno.test("approval grant is minted once and rejection revokes sessions and toke
 
 Deno.test("identity tokens are one-time and password reset invalidates credentials", () => {
   const repo = new MemoryRepository();
+  const actor = repo.bootstrapAdmin({
+    email: "identity-admin@example.com",
+    name: "Identity Administrator",
+    passwordHash: "test-only-hash",
+  }, 0);
   const user = repo.createUser({
     email: "identity@example.com",
     name: "Identity",
     passwordHash: "old",
   });
-  assertThrows(() => repo.approveUser(user.id, "approved", 10, true), DomainError, "verified");
+  assertThrows(
+    () =>
+      repo.decideUserApproval({
+        actorId: actor.id,
+        targetUserId: user.id,
+        expectedVersion: user.version,
+        status: "approved",
+        startingCreditMicros: 10,
+        requireEmailVerification: true,
+      }),
+    DomainError,
+    "verified",
+  );
   repo.createIdentityToken(
     user.id,
     "email_verification",

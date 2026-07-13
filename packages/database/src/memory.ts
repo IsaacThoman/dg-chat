@@ -720,11 +720,20 @@ export class MemoryRepository {
     }
   }
 
-  #adminTarget(targetUserId: string, expectedVersion: number, reason?: string): StoredUser {
+  #adminTarget(
+    targetUserId: string,
+    expectedVersion: number,
+    reason?: string,
+    reasonRequired = false,
+  ): StoredUser {
     if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 1) {
       throw new DomainError("validation_error", "Expected version must be a positive integer", 422);
     }
-    if (reason !== undefined && (reason.trim().length < 1 || reason.trim().length > 500)) {
+    const normalizedReason = reason?.trim();
+    if (
+      (reasonRequired && !normalizedReason) ||
+      (reason !== undefined && (!normalizedReason || normalizedReason.length > 500))
+    ) {
       throw new DomainError("validation_error", "Administrative reason is invalid", 422);
     }
     const user = this.users.get(targetUserId);
@@ -758,6 +767,58 @@ export class MemoryRepository {
     }
     for (const token of this.identityTokens.values()) {
       if (token.userId === userId && !token.consumedAt) token.consumedAt = now;
+    }
+  }
+
+  #withAtomicAdminMutation<T>(targetUserId: string, operation: () => T): T {
+    const userBefore = this.users.get(targetUserId)
+      ? structuredClone(this.users.get(targetUserId)!)
+      : undefined;
+    const sessionsBefore = [...this.sessions].filter(([, value]) => value.userId === targetUserId)
+      .map(([key, value]) => [key, structuredClone(value)] as const);
+    const tokensBefore = new Map(
+      [...this.tokens].filter(([, value]) => value.userId === targetUserId)
+        .map(([key, value]) => [key, structuredClone(value)]),
+    );
+    const identityTokensBefore = new Map(
+      [...this.identityTokens].filter(([, value]) => value.userId === targetUserId)
+        .map(([key, value]) => [key, structuredClone(value)]),
+    );
+    const ledgerLength = this.ledger.length;
+    const auditLength = this.auditEvents.length;
+    try {
+      return operation();
+    } catch (error) {
+      if (userBefore) {
+        const current = this.users.get(targetUserId);
+        if (current) Object.assign(current, userBefore);
+        else this.users.set(targetUserId, userBefore);
+      }
+      for (const [key, value] of this.sessions) {
+        if (value.userId === targetUserId) this.sessions.delete(key);
+      }
+      for (const [key, value] of sessionsBefore) this.sessions.set(key, value);
+      for (const [key, value] of this.tokens) {
+        if (value.userId !== targetUserId) continue;
+        const previous = tokensBefore.get(key);
+        if (previous) Object.assign(value, previous);
+        else this.tokens.delete(key);
+      }
+      for (const [key, value] of tokensBefore) {
+        if (!this.tokens.has(key)) this.tokens.set(key, value);
+      }
+      for (const [key, value] of this.identityTokens) {
+        if (value.userId !== targetUserId) continue;
+        const previous = identityTokensBefore.get(key);
+        if (previous) Object.assign(value, previous);
+        else this.identityTokens.delete(key);
+      }
+      for (const [key, value] of identityTokensBefore) {
+        if (!this.identityTokens.has(key)) this.identityTokens.set(key, value);
+      }
+      this.ledger.length = ledgerLength;
+      this.auditEvents.length = auditLength;
+      throw error;
     }
   }
 
@@ -831,130 +892,148 @@ export class MemoryRepository {
 
   decideUserApproval(input: AdminApprovalCommand): AdminUser {
     this.#assertEffectiveAdminActor(input.actorId);
-    const user = this.#adminTarget(input.targetUserId, input.expectedVersion, input.reason);
-    if (user.approvalStatus === input.status) {
-      throw new DomainError("no_state_change", "Approval status is unchanged", 409);
-    }
-    if (input.actorId === user.id && input.status === "rejected") {
-      throw new DomainError("self_action_forbidden", "You cannot reject your own account", 403);
-    }
-    if (
-      input.status === "approved" && input.requireEmailVerification && !user.emailVerifiedAt
-    ) throw new DomainError("email_not_verified", "Email must be verified before approval", 409);
-    const remainsEffective = user.role === "admin" && input.status === "approved" &&
-      user.state === "active" && user.deletedAt === null;
-    this.#assertAdminCanLoseAuthority(user, remainsEffective);
-    if (
-      !Number.isSafeInteger(input.startingCreditMicros) || input.startingCreditMicros < 0 ||
-      input.startingCreditMicros > 1_000_000_000
-    ) throw new DomainError("validation_error", "Starting credit is invalid", 422);
-    const before = {
-      role: user.role,
-      approvalStatus: user.approvalStatus,
-      state: user.state,
-      deleted: user.deletedAt !== null,
-      version: user.version,
-    };
-    const alreadyGranted = this.ledger.some((entry) =>
-      entry.usageRunId === `approval:${user.id}` && entry.kind === "grant"
-    );
-    if (input.status === "approved" && input.startingCreditMicros > 0 && !alreadyGranted) {
-      this.credit(user.id, `approval:${user.id}`, "grant", input.startingCreditMicros);
-    }
-    user.approvalStatus = input.status;
-    if (input.status === "rejected") this.#invalidateFullAuthority(user.id);
-    return this.#finishAdminMutation(
-      input,
-      user,
-      `user.approval.${input.status}`,
-      before,
-    );
+    return this.#withAtomicAdminMutation(input.targetUserId, () => {
+      const user = this.#adminTarget(
+        input.targetUserId,
+        input.expectedVersion,
+        input.reason,
+        input.status === "rejected",
+      );
+      if (user.approvalStatus === input.status) {
+        throw new DomainError("no_state_change", "Approval status is unchanged", 409);
+      }
+      if (input.actorId === user.id && input.status === "rejected") {
+        throw new DomainError("self_action_forbidden", "You cannot reject your own account", 403);
+      }
+      if (
+        input.status === "approved" && input.requireEmailVerification && !user.emailVerifiedAt
+      ) throw new DomainError("email_not_verified", "Email must be verified before approval", 409);
+      const remainsEffective = user.role === "admin" && input.status === "approved" &&
+        user.state === "active" && user.deletedAt === null;
+      this.#assertAdminCanLoseAuthority(user, remainsEffective);
+      if (
+        !Number.isSafeInteger(input.startingCreditMicros) || input.startingCreditMicros < 0 ||
+        input.startingCreditMicros > 1_000_000_000
+      ) throw new DomainError("validation_error", "Starting credit is invalid", 422);
+      const before = {
+        role: user.role,
+        approvalStatus: user.approvalStatus,
+        state: user.state,
+        deleted: user.deletedAt !== null,
+        version: user.version,
+      };
+      const alreadyGranted = this.ledger.some((entry) =>
+        entry.usageRunId === `approval:${user.id}` && entry.kind === "grant"
+      );
+      if (input.status === "approved" && input.startingCreditMicros > 0 && !alreadyGranted) {
+        this.credit(user.id, `approval:${user.id}`, "grant", input.startingCreditMicros);
+      }
+      user.approvalStatus = input.status;
+      if (input.status === "rejected") this.#invalidateFullAuthority(user.id);
+      return this.#finishAdminMutation(
+        input,
+        user,
+        `user.approval.${input.status}`,
+        before,
+      );
+    });
   }
 
   setAdminUserRole(input: AdminRoleCommand): AdminUser {
     this.#assertEffectiveAdminActor(input.actorId);
-    const user = this.#adminTarget(input.targetUserId, input.expectedVersion, input.reason);
-    if (user.role === input.role) {
-      throw new DomainError("no_state_change", "Role is unchanged", 409);
-    }
-    if (input.actorId === user.id && input.role !== "admin") {
-      throw new DomainError("self_action_forbidden", "You cannot demote your own account", 403);
-    }
-    if (
-      input.role === "admin" &&
-      (user.approvalStatus !== "approved" || user.state !== "active" || user.deletedAt !== null)
-    ) {
-      throw new DomainError(
-        "invalid_transition",
-        "Only available approved users can be promoted",
-        409,
-      );
-    }
-    const remainsEffective = input.role === "admin" && user.approvalStatus === "approved" &&
-      user.state === "active" && user.deletedAt === null;
-    this.#assertAdminCanLoseAuthority(user, remainsEffective);
-    const before = {
-      role: user.role,
-      approvalStatus: user.approvalStatus,
-      state: user.state,
-      deleted: user.deletedAt !== null,
-      version: user.version,
-    };
-    user.role = input.role;
-    return this.#finishAdminMutation(input, user, `user.role.${input.role}`, before);
+    return this.#withAtomicAdminMutation(input.targetUserId, () => {
+      const user = this.#adminTarget(input.targetUserId, input.expectedVersion, input.reason, true);
+      if (user.role === input.role) {
+        throw new DomainError("no_state_change", "Role is unchanged", 409);
+      }
+      if (input.actorId === user.id && input.role !== "admin") {
+        throw new DomainError("self_action_forbidden", "You cannot demote your own account", 403);
+      }
+      if (
+        input.role === "admin" &&
+        (user.approvalStatus !== "approved" || user.state !== "active" || user.deletedAt !== null)
+      ) {
+        throw new DomainError(
+          "invalid_transition",
+          "Only available approved users can be promoted",
+          409,
+        );
+      }
+      const remainsEffective = input.role === "admin" && user.approvalStatus === "approved" &&
+        user.state === "active" && user.deletedAt === null;
+      this.#assertAdminCanLoseAuthority(user, remainsEffective);
+      const before = {
+        role: user.role,
+        approvalStatus: user.approvalStatus,
+        state: user.state,
+        deleted: user.deletedAt !== null,
+        version: user.version,
+      };
+      user.role = input.role;
+      return this.#finishAdminMutation(input, user, `user.role.${input.role}`, before);
+    });
   }
 
   setAdminUserState(input: AdminStateCommand): AdminUser {
     this.#assertEffectiveAdminActor(input.actorId);
-    const user = this.#adminTarget(input.targetUserId, input.expectedVersion, input.reason);
-    if (user.state === input.state) {
-      throw new DomainError("no_state_change", "Account state is unchanged", 409);
-    }
-    if (input.actorId === user.id && input.state === "suspended") {
-      throw new DomainError("self_action_forbidden", "You cannot suspend your own account", 403);
-    }
-    const remainsEffective = user.role === "admin" && user.approvalStatus === "approved" &&
-      input.state === "active" && user.deletedAt === null;
-    this.#assertAdminCanLoseAuthority(user, remainsEffective);
-    const before = {
-      role: user.role,
-      approvalStatus: user.approvalStatus,
-      state: user.state,
-      deleted: user.deletedAt !== null,
-      version: user.version,
-    };
-    user.state = input.state;
-    if (input.state === "suspended") this.#invalidateFullAuthority(user.id);
-    return this.#finishAdminMutation(input, user, `user.state.${input.state}`, before);
+    return this.#withAtomicAdminMutation(input.targetUserId, () => {
+      const user = this.#adminTarget(
+        input.targetUserId,
+        input.expectedVersion,
+        input.reason,
+        input.state === "suspended",
+      );
+      if (user.state === input.state) {
+        throw new DomainError("no_state_change", "Account state is unchanged", 409);
+      }
+      if (input.actorId === user.id && input.state === "suspended") {
+        throw new DomainError("self_action_forbidden", "You cannot suspend your own account", 403);
+      }
+      const remainsEffective = user.role === "admin" && user.approvalStatus === "approved" &&
+        input.state === "active" && user.deletedAt === null;
+      this.#assertAdminCanLoseAuthority(user, remainsEffective);
+      const before = {
+        role: user.role,
+        approvalStatus: user.approvalStatus,
+        state: user.state,
+        deleted: user.deletedAt !== null,
+        version: user.version,
+      };
+      user.state = input.state;
+      if (input.state === "suspended") this.#invalidateFullAuthority(user.id);
+      return this.#finishAdminMutation(input, user, `user.state.${input.state}`, before);
+    });
   }
 
   setAdminUserDeleted(input: AdminDeletionCommand): AdminUser {
     this.#assertEffectiveAdminActor(input.actorId);
-    const user = this.#adminTarget(input.targetUserId, input.expectedVersion, input.reason);
-    if ((user.deletedAt !== null) === input.deleted) {
-      throw new DomainError("no_state_change", "Deletion status is unchanged", 409);
-    }
-    if (input.actorId === user.id && input.deleted) {
-      throw new DomainError("self_action_forbidden", "You cannot delete your own account", 403);
-    }
-    const remainsEffective = user.role === "admin" && user.approvalStatus === "approved" &&
-      user.state === "active" && !input.deleted;
-    this.#assertAdminCanLoseAuthority(user, remainsEffective);
-    const before = {
-      role: user.role,
-      approvalStatus: user.approvalStatus,
-      state: user.state,
-      deleted: user.deletedAt !== null,
-      version: user.version,
-    };
-    user.deletedAt = input.deleted ? new Date().toISOString() : null;
-    if (input.deleted) this.#invalidateFullAuthority(user.id);
-    return this.#finishAdminMutation(
-      input,
-      user,
-      input.deleted ? "user.deleted" : "user.restored",
-      before,
-    );
+    return this.#withAtomicAdminMutation(input.targetUserId, () => {
+      const user = this.#adminTarget(input.targetUserId, input.expectedVersion, input.reason, true);
+      if ((user.deletedAt !== null) === input.deleted) {
+        throw new DomainError("no_state_change", "Deletion status is unchanged", 409);
+      }
+      if (input.actorId === user.id && input.deleted) {
+        throw new DomainError("self_action_forbidden", "You cannot delete your own account", 403);
+      }
+      const remainsEffective = user.role === "admin" && user.approvalStatus === "approved" &&
+        user.state === "active" && !input.deleted;
+      this.#assertAdminCanLoseAuthority(user, remainsEffective);
+      const before = {
+        role: user.role,
+        approvalStatus: user.approvalStatus,
+        state: user.state,
+        deleted: user.deletedAt !== null,
+        version: user.version,
+      };
+      user.deletedAt = input.deleted ? new Date().toISOString() : null;
+      if (input.deleted) this.#invalidateFullAuthority(user.id);
+      return this.#finishAdminMutation(
+        input,
+        user,
+        input.deleted ? "user.deleted" : "user.restored",
+        before,
+      );
+    });
   }
 
   createSession(userId: string, tokenHash: string, limited: boolean): StoredSession {
@@ -1156,70 +1235,6 @@ export class MemoryRepository {
       data,
       nextCursor: matches.length > limit ? encodeAuditCursor(data[data.length - 1]) : null,
     };
-  }
-
-  approveUser(
-    id: string,
-    status: "approved" | "rejected",
-    creditMicros: number,
-    requireEmailVerification = false,
-  ): StoredUser {
-    const user = this.users.get(id);
-    if (!user) throw new DomainError("not_found", "User not found", 404);
-    if (status === "approved" && requireEmailVerification && !user.emailVerifiedAt) {
-      throw new DomainError("email_not_verified", "Email must be verified before approval", 409);
-    }
-    if (user.role === "admin" && status === "rejected") {
-      const availableAdmins = [...this.users.values()].filter((candidate) =>
-        candidate.role === "admin" && candidate.state === "active" &&
-        candidate.approvalStatus === "approved" && candidate.deletedAt === null
-      );
-      if (availableAdmins.length === 1 && availableAdmins[0].id === id) {
-        throw new DomainError("final_admin", "The final approved administrator is protected", 409);
-      }
-    }
-    user.approvalStatus = status;
-    const alreadyGranted = this.ledger.some((entry) =>
-      entry.usageRunId === `approval:${id}` && entry.kind === "grant"
-    );
-    if (status === "approved" && creditMicros > 0 && !alreadyGranted) {
-      this.credit(id, `approval:${id}`, "grant", creditMicros);
-    }
-    if (status === "rejected") {
-      for (const [hash, session] of this.sessions) {
-        if (session.userId === id && !session.limited) this.sessions.delete(hash);
-      }
-      for (const token of this.tokens.values()) {
-        if (token.userId === id && !token.revokedAt) token.revokedAt = new Date().toISOString();
-      }
-    }
-    user.version++;
-    user.updatedAt = new Date().toISOString();
-    return user;
-  }
-
-  setUserState(id: string, state: AccountState) {
-    const user = this.users.get(id);
-    if (!user) throw new DomainError("not_found", "User not found", 404);
-    if (user.role === "admin" && state !== "active") {
-      const activeAdmins = [...this.users.values()].filter((u) =>
-        u.role === "admin" && u.state === "active" && u.approvalStatus === "approved" &&
-        u.deletedAt === null
-      );
-      if (activeAdmins.length === 1) {
-        throw new DomainError("final_admin", "The final active administrator is protected", 409);
-      }
-    }
-    user.state = state;
-    if (state !== "active") {
-      this.invalidateUserSessions(id);
-      for (const token of this.tokens.values()) {
-        if (token.userId === id && !token.revokedAt) token.revokedAt = new Date().toISOString();
-      }
-    }
-    user.version++;
-    user.updatedAt = new Date().toISOString();
-    return user;
   }
 
   createConversation(

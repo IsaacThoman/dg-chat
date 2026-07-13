@@ -8,6 +8,11 @@ import type { CreateConversationShareInput } from "./repository.ts";
 
 function setup() {
   const repo = new MemoryRepository();
+  const actor = repo.bootstrapAdmin({
+    email: "share-admin@example.com",
+    name: "Share Administrator",
+    passwordHash: "test-only-hash",
+  }, 0);
   const owner = repo.createUser({
     email: "share-owner@example.com",
     name: "Snapshot Owner",
@@ -69,7 +74,7 @@ function setup() {
     idempotencyKey: "share-create-1",
     secretHash: "b".repeat(64),
   };
-  return { repo, owner, other, conversation, root, leaf, attachmentId, input };
+  return { repo, actor, owner, other, conversation, root, leaf, attachmentId, input };
 }
 
 Deno.test("memory share materializes an immutable private-ID-free path and attachment access", async () => {
@@ -155,11 +160,22 @@ Deno.test("memory share excludes tombstoned and hidden-instruction nodes and re-
 });
 
 Deno.test("memory share revocation, expiry, owner suspension/deletion, and attachment deletion fail closed", async () => {
-  const { repo, owner, attachmentId, input } = setup();
+  const { repo, actor, owner, attachmentId, input } = setup();
   const created = await repo.createConversationShare(owner.id, input);
-  repo.setUserState(owner.id, "suspended");
+  const suspended = repo.setAdminUserState({
+    actorId: actor.id,
+    targetUserId: owner.id,
+    expectedVersion: owner.version,
+    state: "suspended",
+    reason: "Exercise unavailable-owner behavior",
+  });
   assertEquals(repo.resolvePublicConversationShare(input.secretHash), undefined);
-  repo.setUserState(owner.id, "active");
+  repo.setAdminUserState({
+    actorId: actor.id,
+    targetUserId: owner.id,
+    expectedVersion: suspended.version,
+    state: "active",
+  });
   repo.users.get(owner.id)!.deletedAt = new Date().toISOString();
   assertEquals(repo.resolvePublicConversationShare(input.secretHash), undefined);
   assertRejects(

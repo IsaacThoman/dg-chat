@@ -121,7 +121,13 @@ Deno.test("knowledge API lifecycle, versions, deleted parents, and owner isolati
     }),
   });
   const other = (await json(signup)).user;
-  await repository.approveUser(other.id, "approved", 5_000_000);
+  await repository.decideUserApproval({
+    actorId: admin.id,
+    targetUserId: other.id,
+    expectedVersion: other.version,
+    status: "approved",
+    startingCreditMicros: 5_000_000,
+  });
   const otherLogin = await app.request("/api/auth/sign-in/email", {
     method: "POST",
     headers: { "content-type": "application/json" },
