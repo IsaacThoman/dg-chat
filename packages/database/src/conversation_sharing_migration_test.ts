@@ -39,7 +39,17 @@ Deno.test({
         SELECT count(*)::int count FROM information_schema.triggers
         WHERE event_object_schema=${schema} AND event_object_table='conversation_share_snapshots'
           AND trigger_name='dg_chat_restore_maintenance_fence'`;
-      assertEquals(triggers[0].count, 4);
+      // information_schema exposes INSERT/UPDATE/DELETE event rows but omits TRUNCATE. Inspect the
+      // authoritative PostgreSQL trigger definition separately so the restore fence proves all
+      // four events without relying on a view that intentionally hides one of them.
+      assertEquals(triggers[0].count, 3);
+      const definitions = await sql<{ definition: string }[]>`
+        SELECT pg_get_triggerdef(t.oid) definition FROM pg_trigger t
+        JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+        WHERE n.nspname=${schema} AND c.relname='conversation_share_snapshots'
+          AND t.tgname='dg_chat_restore_maintenance_fence' AND NOT t.tgisinternal`;
+      assertEquals(definitions.length, 1);
+      assertEquals(definitions[0].definition.includes("TRUNCATE"), true);
 
       const owner = crypto.randomUUID();
       const conversation = crypto.randomUUID();
