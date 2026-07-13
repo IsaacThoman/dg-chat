@@ -1859,6 +1859,14 @@ export class PostgresRepository implements DomainRepository {
       ) VALUES(${ownerId},${idempotencyKey},${payloadHash},${
         tx.json(result as unknown as postgres.JSONValue)
       })`;
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${ownerId},'conversation.portability_imported','user',${ownerId},${
+        tx.json({
+          conversations: result.conversations,
+          messages: result.messages,
+          attachments: result.attachments,
+        })
+      })`;
       return result;
     });
   }

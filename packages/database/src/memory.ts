@@ -1406,6 +1406,17 @@ export class MemoryRepository {
       payloadHash,
       result: structuredClone(result),
     });
+    this.recordAudit({
+      action: "conversation.portability_imported",
+      actorId: ownerId,
+      targetType: "user",
+      targetId: ownerId,
+      metadata: {
+        conversations: result.conversations,
+        messages: result.messages,
+        attachments: result.attachments,
+      },
+    });
     return result;
   }
 
