@@ -225,6 +225,58 @@ Deno.test("non-transient failures do not retry or fall back and fallback cycles 
   );
 });
 
+Deno.test("candidate-local protocol incompatibilities skip only that fallback target", async () => {
+  const calls: string[] = [];
+  const result = await executeProviderRequest({
+    initialCandidateId: "chat-primary",
+    resolveCandidate: (id) => ({
+      id,
+      fallbackId: id === "chat-primary"
+        ? "responses-incompatible"
+        : id === "responses-incompatible"
+        ? "chat-compatible"
+        : null,
+    }),
+    policy: { ...policy, maxRetries: 0 },
+    signal: new AbortController().signal,
+    attempt: (candidate) => {
+      calls.push(candidate.id);
+      if (candidate.id === "chat-primary") {
+        throw new ProviderAttemptError("unavailable", { status: 503 });
+      }
+      if (candidate.id === "responses-incompatible") {
+        throw new ProviderAttemptError("stop cannot be represented by Responses", {
+          category: "invalid_request",
+          transient: false,
+          candidateLocal: true,
+        });
+      }
+      return Promise.resolve("later Chat fallback won");
+    },
+  });
+  assertEquals(result, "later Chat fallback won");
+  assertEquals(calls, ["chat-primary", "responses-incompatible", "chat-compatible"]);
+
+  await assertRejects(
+    () =>
+      executeProviderRequest({
+        initialCandidateId: "responses-only",
+        resolveCandidate: (id) => ({ id }),
+        policy: { ...policy, maxRetries: 0 },
+        signal: new AbortController().signal,
+        attempt: () => {
+          throw new ProviderAttemptError("unsupported stop", {
+            category: "invalid_request",
+            transient: false,
+            candidateLocal: true,
+          });
+        },
+      }),
+    ProviderAttemptError,
+    "unsupported stop",
+  );
+});
+
 Deno.test("stream buffers role and keepalive chunks, retries before visibility, then publishes", async () => {
   let calls = 0;
   const chunks: unknown[] = [];
@@ -438,6 +490,10 @@ Deno.test("refusal and reasoning deltas count as visible output", () => {
   assertEquals(
     openAIVisibleUnits({ choices: [{ delta: { reasoning_content: "private thought" } }] }),
     15,
+  );
+  assertEquals(
+    openAIVisibleUnits({ choices: [{ delta: { reasoning_summary: "short summary" } }] }),
+    13,
   );
 });
 

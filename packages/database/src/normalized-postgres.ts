@@ -24,6 +24,12 @@ import { DomainError } from "./memory.ts";
 import { INGESTIBLE_DOCUMENT_MIME_TYPES, isIngestibleDocumentMime } from "./attachment-policy.ts";
 import { canonicalJson, sha256Hex } from "./backup-format.ts";
 import {
+  providerCustomParamsViolation,
+  providerDefaultsViolation,
+  providerModelOcrGraphViolation,
+  providerOcrTargetProviderViolation,
+} from "./provider-model-invariants.ts";
+import {
   apiResponseBodyByteLength,
   canonicalWorkspaceName,
   KNOWLEDGE_EMBEDDING_DIMENSIONS,
@@ -710,8 +716,11 @@ function normalizeProviderBaseUrl(value: string): string {
   }
   try {
     const url = new URL(value);
+    const testHttp = Deno.env.get("DENO_ENV") === "test" && url.protocol === "http:" &&
+      Deno.env.get("OPENAI_TEST_ALLOW_HTTP_HOST")?.toLowerCase() === url.hostname.toLowerCase();
     if (
-      url.protocol !== "https:" || url.username || url.password || url.search || url.hash ||
+      (!testHttp && url.protocol !== "https:") || url.username || url.password || url.search ||
+      url.hash ||
       url.port === "0"
     ) {
       throw new Error();
@@ -778,10 +787,10 @@ function validateProviderModelInput(
       new Set(input.capabilities).size !== input.capabilities.length ||
       input.capabilities.some((value) => !isModelCapability(value)))
   ) throw new DomainError("validation_error", "Model capabilities are invalid", 422);
-  if (
-    input.customParams !== undefined &&
-    (input.customParams === null || Array.isArray(input.customParams))
-  ) throw new DomainError("validation_error", "Model custom parameters are invalid", 422);
+  if (input.customParams !== undefined) {
+    const violation = providerCustomParamsViolation(input.customParams, input.publicModelId);
+    if (violation) throw new DomainError(violation.code, violation.message, 422);
+  }
 }
 function validatePriceInput(input: CreateModelPriceVersionInput) {
   if (!Number.isFinite(Date.parse(input.effectiveAt))) {
@@ -2271,7 +2280,7 @@ export class PostgresRepository implements DomainRepository {
     }
     const attachmentId = (source as Record<string, unknown>).attachmentId;
     if (typeof attachmentId !== "string") return undefined;
-    const attachments = await this.#sql<Row[]>`SELECT object_key FROM attachments
+    const attachments = await this.#sql<Row[]>`SELECT object_key,sha256 FROM attachments
       WHERE id=${attachmentId} AND owner_id=${String(rows[0].owner_id)}
         AND state='ready' AND deleted_at IS NULL`;
     if (!attachments[0]) return undefined;
@@ -2280,6 +2289,7 @@ export class PostgresRepository implements DomainRepository {
       ownerId: String(rows[0].owner_id),
       attachment: publicAttachment,
       objectKey: String(attachments[0].object_key),
+      sha256: String(attachments[0].sha256),
     };
   }
 
@@ -4575,10 +4585,28 @@ export class PostgresRepository implements DomainRepository {
     validateProviderInput(input);
     try {
       return await this.#sql.begin(async (tx) => {
+        await tx`SELECT pg_advisory_xact_lock(hashtext('provider-model-invariants'))`;
         const currentRows = await tx<Row[]>`SELECT * FROM providers WHERE id=${id} FOR UPDATE`;
         if (!currentRows[0]) throw new DomainError("not_found", "Provider not found", 404);
         const current = provider(currentRows[0]);
         if (current.version !== expectedVersion) throw registryConflict();
+        if (input.enabled === false && current.enabled) {
+          const models = (await tx<Row[]>`SELECT * FROM provider_models`).map(providerModel);
+          const providers = (await tx<Row[]>`SELECT id,enabled FROM providers`).map((row) => ({
+            id: String(row.id),
+            enabled: String(row.id) === id ? false : Boolean(row.enabled),
+          }));
+          const violation = providerOcrTargetProviderViolation(models, providers);
+          if (violation) throw new DomainError(violation.code, violation.message, 422);
+        }
+        if (input.protocol !== undefined && input.protocol !== current.protocol) {
+          const models = (await tx<Row[]>`SELECT * FROM provider_models WHERE provider_id=${id}`)
+            .map(providerModel);
+          const violation = models.map((model) =>
+            providerDefaultsViolation(input.protocol!, model.customParams, model.publicModelId)
+          ).find(Boolean);
+          if (violation) throw new DomainError(violation.code, violation.message, 422);
+        }
         const enabled = input.enabled ?? current.enabled;
         let healthStatus = input.healthStatus ?? current.healthStatus;
         if (!enabled) healthStatus = "disabled";
@@ -4681,8 +4709,11 @@ export class PostgresRepository implements DomainRepository {
     validateProviderModelInput(input);
     try {
       return await this.#sql.begin(async (tx) => {
+        await tx`SELECT pg_advisory_xact_lock(hashtext('provider-model-invariants'))`;
         await tx`SELECT pg_advisory_xact_lock(hashtext('model-public-id-namespace'))`;
-        const providerRows = await tx`SELECT id FROM providers WHERE id=${input.providerId}`;
+        const providerRows = await tx<
+          Row[]
+        >`SELECT id,protocol FROM providers WHERE id=${input.providerId}`;
         if ((await tx`SELECT 1 FROM model_aliases WHERE alias=${input.publicModelId}`).length) {
           throw new DomainError(
             "model_id_taken",
@@ -4691,6 +4722,14 @@ export class PostgresRepository implements DomainRepository {
           );
         }
         if (!providerRows.length) throw new DomainError("not_found", "Provider not found", 404);
+        const defaultsViolation = providerDefaultsViolation(
+          providerRows[0].protocol as "chat_completions" | "responses",
+          input.customParams ?? {},
+          input.publicModelId,
+        );
+        if (defaultsViolation) {
+          throw new DomainError(defaultsViolation.code, defaultsViolation.message, 422);
+        }
         const rows = await tx<Row[]>`
           INSERT INTO provider_models(provider_id,public_model_id,upstream_model_id,display_name,
             capabilities,context_window,enabled,custom_params)
@@ -4698,6 +4737,10 @@ export class PostgresRepository implements DomainRepository {
             ${input.displayName.trim()},${tx.json(input.capabilities)},${input.contextWindow},
             ${input.enabled ?? true},${tx.json((input.customParams ?? {}) as never)}) RETURNING *`;
         const value = providerModel(rows[0]);
+        const graphViolation = providerModelOcrGraphViolation(
+          (await tx<Row[]>`SELECT * FROM provider_models`).map(providerModel),
+        );
+        if (graphViolation) throw new DomainError(graphViolation.code, graphViolation.message, 422);
         await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
           VALUES(${mutation.actorId ?? null},${mutation.action},'provider_model',${value.id},${
           tx.json({ ...mutation.metadata, providerId: value.providerId, version: value.version })
@@ -4722,6 +4765,7 @@ export class PostgresRepository implements DomainRepository {
     validateProviderModelInput(input);
     try {
       return await this.#sql.begin(async (tx) => {
+        await tx`SELECT pg_advisory_xact_lock(hashtext('provider-model-invariants'))`;
         await tx`SELECT pg_advisory_xact_lock(hashtext('model-public-id-namespace'))`;
         const currentRows = await tx<
           Row[]
@@ -4729,6 +4773,31 @@ export class PostgresRepository implements DomainRepository {
         if (!currentRows[0]) throw new DomainError("not_found", "Provider model not found", 404);
         const current = providerModel(currentRows[0]);
         if (current.version !== expectedVersion) throw registryConflict();
+        const candidate: ProviderModelRecord = {
+          ...current,
+          ...(input.publicModelId === undefined ? {} : { publicModelId: input.publicModelId }),
+          ...(input.upstreamModelId === undefined
+            ? {}
+            : { upstreamModelId: input.upstreamModelId.trim() }),
+          ...(input.displayName === undefined ? {} : { displayName: input.displayName.trim() }),
+          ...(input.capabilities === undefined ? {} : { capabilities: [...input.capabilities] }),
+          ...(input.contextWindow === undefined ? {} : { contextWindow: input.contextWindow }),
+          ...(input.enabled === undefined ? {} : { enabled: input.enabled }),
+          ...(input.customParams === undefined
+            ? {}
+            : { customParams: structuredClone(input.customParams) }),
+        };
+        const providerRows = await tx<
+          Row[]
+        >`SELECT protocol FROM providers WHERE id=${current.providerId}`;
+        const defaultsViolation = providerDefaultsViolation(
+          providerRows[0].protocol as "chat_completions" | "responses",
+          candidate.customParams,
+          candidate.publicModelId,
+        );
+        if (defaultsViolation) {
+          throw new DomainError(defaultsViolation.code, defaultsViolation.message, 422);
+        }
         if (
           input.publicModelId &&
           (await tx`SELECT 1 FROM model_aliases WHERE alias=${input.publicModelId}`).length
@@ -4751,6 +4820,10 @@ export class PostgresRepository implements DomainRepository {
             custom_params=${tx.json((input.customParams ?? current.customParams) as never)},
             version=version+1,updated_at=now() WHERE id=${id} RETURNING *`;
         const value = providerModel(rows[0]);
+        const graphViolation = providerModelOcrGraphViolation(
+          (await tx<Row[]>`SELECT * FROM provider_models`).map(providerModel),
+        );
+        if (graphViolation) throw new DomainError(graphViolation.code, graphViolation.message, 422);
         await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
           VALUES(${mutation.actorId ?? null},${mutation.action},'provider_model',${value.id},${
           tx.json({ ...mutation.metadata, providerId: value.providerId, version: value.version })
@@ -4978,7 +5051,7 @@ export class PostgresRepository implements DomainRepository {
       if (
         targets.some((target) =>
           !target.enabled || !target.provider_enabled || target.credential_envelope == null ||
-          !target.priced || target.protocol !== sourceRow.protocol ||
+          !target.priced ||
           number(target.context_window) < number(sourceRow.context_window) ||
           sourceCapabilities.some((capability) =>
             !(target.capabilities as string[]).includes(capability)
@@ -5114,7 +5187,7 @@ export class PostgresRepository implements DomainRepository {
         WHERE m.id=${id}`;
       const row = rows[0];
       if (id === sourceModelId) sourceRow = row;
-      const compatible = row && sourceRow && row.protocol === sourceRow.protocol &&
+      const compatible = row && sourceRow &&
         number(row.context_window) >= number(sourceRow.context_window) &&
         (sourceRow.capabilities as string[]).every((capability) =>
           (row.capabilities as string[]).includes(capability)

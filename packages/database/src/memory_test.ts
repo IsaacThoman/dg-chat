@@ -1,4 +1,4 @@
-import { assertEquals, assertThrows } from "jsr:@std/assert@1.0.14";
+import { assertEquals, assertStringIncludes, assertThrows } from "jsr:@std/assert@1.0.14";
 import { DomainError, MemoryRepository } from "./memory.ts";
 import { decodeApiResponseBody, InvalidApiResponseBodyError } from "./repository.ts";
 
@@ -583,6 +583,165 @@ Deno.test("provider registry hides credentials, versions mutations, and preserve
       }, { actorId: actor.id, action: "provider.create" }),
     DomainError,
     "URL",
+  );
+});
+
+Deno.test("provider registry HTTP exception is exact-host and test-only", () => {
+  const previousEnvironment = Deno.env.get("DENO_ENV");
+  const previousHost = Deno.env.get("OPENAI_TEST_ALLOW_HTTP_HOST");
+  try {
+    Deno.env.set("DENO_ENV", "test");
+    Deno.env.set("OPENAI_TEST_ALLOW_HTTP_HOST", "127.0.0.1");
+    const repo = new MemoryRepository();
+    const actor = repo.createUser({
+      email: "contract-local@example.com",
+      name: "Contract local",
+      passwordHash: "hash",
+      role: "admin",
+      approvalStatus: "approved",
+    });
+    const mutation = { actorId: actor.id, action: "provider.create" };
+    const provider = repo.createProvider({
+      slug: "contract-local",
+      displayName: "Contract local",
+      baseUrl: "http://127.0.0.1:4010/v1/",
+      protocol: "responses",
+    }, mutation);
+    assertEquals(provider.baseUrl, "http://127.0.0.1:4010/v1");
+    assertThrows(
+      () =>
+        repo.createProvider({
+          slug: "contract-wrong-host",
+          displayName: "Wrong host",
+          baseUrl: "http://localhost:4010/v1",
+          protocol: "responses",
+        }, mutation),
+      DomainError,
+      "Provider base URL is invalid",
+    );
+  } finally {
+    if (previousEnvironment === undefined) Deno.env.delete("DENO_ENV");
+    else Deno.env.set("DENO_ENV", previousEnvironment);
+    if (previousHost === undefined) Deno.env.delete("OPENAI_TEST_ALLOW_HTTP_HOST");
+    else Deno.env.set("OPENAI_TEST_ALLOW_HTTP_HOST", previousHost);
+  }
+});
+
+Deno.test("provider model defaults and OCR graphs remain valid across edit order", () => {
+  const repo = new MemoryRepository();
+  const actor = repo.bootstrapAdmin({
+    email: "model-invariants@example.com",
+    name: "Model invariants",
+    passwordHash: "hash",
+  }, 1);
+  const mutation = { actorId: actor.id, action: "model.invariant" };
+  const provider = repo.createProvider({
+    slug: "invariants",
+    displayName: "Invariants",
+    baseUrl: "https://invariants.example/v1",
+    protocol: "chat_completions",
+  }, mutation);
+  const model = (name: string) =>
+    repo.createProviderModel({
+      providerId: provider.id,
+      publicModelId: `invariants/${name}`,
+      upstreamModelId: name,
+      displayName: name,
+      capabilities: ["chat", "vision"],
+      contextWindow: 8_192,
+    }, mutation);
+  const first = model("first");
+  const second = model("second");
+  const ocr = (target: string) => ({
+    ocr: {
+      enabled: true,
+      providerId: provider.id,
+      model: target,
+      prompt: "Extract text",
+    },
+  });
+  const firstUpdated = repo.updateProviderModel(first.id, first.version, {
+    customParams: ocr(second.id),
+  }, mutation);
+  assertThrows(
+    () => repo.updateProvider(provider.id, provider.version, { enabled: false }, mutation),
+    DomainError,
+    "must remain enabled",
+  );
+  assertThrows(
+    () =>
+      repo.updateProviderModel(
+        second.id,
+        second.version,
+        { customParams: ocr(first.id) },
+        mutation,
+      ),
+    DomainError,
+    "cannot intercept OCR itself",
+  );
+  assertThrows(
+    () =>
+      repo.updateProviderModel(second.id, second.version, { capabilities: ["vision"] }, mutation),
+    DomainError,
+    "both chat and vision",
+  );
+  assertThrows(
+    () =>
+      repo.updateProviderModel(
+        second.id,
+        second.version,
+        { customParams: ocr(second.id) },
+        mutation,
+      ),
+    DomainError,
+    "cannot intercept OCR itself",
+  );
+  const stoppedFirst = repo.updateProviderModel(first.id, firstUpdated.version, {
+    customParams: { stop: "END" },
+  }, mutation);
+  const protocolError = assertThrows(
+    () => repo.updateProvider(provider.id, provider.version, { protocol: "responses" }, mutation),
+    DomainError,
+    "not supported by Responses providers",
+  );
+  assertStringIncludes(protocolError.message, "invariants/first");
+
+  const disabledSource = repo.updateProviderModel(first.id, stoppedFirst.version, {
+    enabled: false,
+    customParams: ocr(second.id),
+  }, mutation);
+  repo.updateProviderModel(second.id, second.version, { enabled: false }, mutation);
+  const currentProvider = repo.findProvider(provider.id)!;
+  repo.updateProvider(currentProvider.id, currentProvider.version, { enabled: false }, mutation);
+  assertEquals(repo.findProviderModel(disabledSource.id)?.enabled, false);
+  assertThrows(
+    () =>
+      repo.updateProviderModel(disabledSource.id, disabledSource.version, {
+        enabled: true,
+      }, mutation),
+    DomainError,
+    "must remain enabled",
+  );
+
+  const responses = repo.createProvider({
+    slug: "responses-invariants",
+    displayName: "Responses invariants",
+    baseUrl: "https://responses.example/v1",
+    protocol: "responses",
+  }, mutation);
+  assertThrows(
+    () =>
+      repo.createProviderModel({
+        providerId: responses.id,
+        publicModelId: "responses-invariants/invalid",
+        upstreamModelId: "invalid",
+        displayName: "Invalid",
+        capabilities: ["chat"],
+        contextWindow: 8_192,
+        customParams: { stop: "END" },
+      }, mutation),
+    DomainError,
+    "not supported by Responses providers",
   );
 });
 

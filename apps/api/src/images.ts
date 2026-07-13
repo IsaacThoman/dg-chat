@@ -551,12 +551,14 @@ function usage(value: unknown, request: ImageGenerationRequest): ImageProviderUs
 
 function endpoint(baseUrl: string, operation: "generations" | "edits" = "generations"): URL {
   const url = new URL(baseUrl);
-  const test = Deno.env.get("DENO_ENV") === "test" &&
+  const testHttp = Deno.env.get("DENO_ENV") === "test" && url.protocol === "http:" &&
     Deno.env.get("OPENAI_TEST_ALLOW_HTTP_HOST")?.toLowerCase() === url.hostname.toLowerCase();
-  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) {
+  if (
+    (!testHttp && url.protocol !== "https:") || url.username || url.password || url.search ||
+    url.hash
+  ) {
     throw new ImageProviderError("Provider base URL is invalid", 500, "provider_config_error");
   }
-  if (test) url.protocol = "http:";
   url.pathname = `${url.pathname.replace(/\/$/, "")}/images/${operation}`;
   return url;
 }

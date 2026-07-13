@@ -78,6 +78,8 @@ export interface ConversationShareAttachmentAccess {
   ownerId: string;
   attachment: PublicConversationShareAttachment;
   objectKey: string;
+  /** Internal immutable digest used to validate the object before public streaming. */
+  sha256: string;
 }
 
 export interface CreateUserInput {

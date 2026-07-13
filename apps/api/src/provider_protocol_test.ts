@@ -52,6 +52,7 @@ Deno.test("chat request converts multimodal messages, tools, calls, results, and
     reasoning_effort: "high",
     max_completion_tokens: 500,
     stream: true,
+    user: "caller-123",
   });
   assertEquals(output, {
     model: "provider/model",
@@ -79,7 +80,79 @@ Deno.test("chat request converts multimodal messages, tools, calls, results, and
     }],
     tool_choice: { type: "function", name: "lookup" },
     reasoning: { effort: "high" },
+    user: "caller-123",
   });
+});
+
+Deno.test("parameterless and nullable Chat tools become valid Responses function tools", () => {
+  const translated = chatCompletionsRequestToResponses({
+    model: "public/model",
+    messages: [{ role: "user", content: "Ping" }],
+    tools: [
+      { type: "function", function: { name: "ping" } },
+      { type: "function", function: { name: "pong", strict: null } },
+    ],
+  });
+  assertEquals(translated.tools, [
+    { type: "function", name: "ping", parameters: null, strict: null },
+    { type: "function", name: "pong", parameters: null, strict: null },
+  ]);
+});
+
+Deno.test("Chat to Responses rejects role-specific tool fields instead of dropping them", () => {
+  for (
+    const messages of [
+      [{
+        role: "tool",
+        tool_call_id: "call_1",
+        content: "result",
+        tool_calls: [{
+          id: "call_2",
+          type: "function",
+          function: { name: "ignored", arguments: "{}" },
+        }],
+      }],
+      [{ role: "user", tool_call_id: "call_1", content: "not a tool result" }],
+    ]
+  ) {
+    const error = assertThrows(
+      () => chatCompletionsRequestToResponses({ model: "provider/model", messages }),
+      ProviderProtocolError,
+    );
+    assertEquals(error.code, "malformed_payload");
+  }
+});
+
+Deno.test("protocol adapters translate json_schema response formats bidirectionally", () => {
+  const schema = { type: "object", properties: { answer: { type: "string" } } };
+  const responses = chatCompletionsRequestToResponses({
+    model: "m",
+    messages: [{ role: "user", content: "structured" }],
+    response_format: {
+      type: "json_schema",
+      json_schema: { name: "answer", description: "An answer", schema, strict: true },
+    },
+  });
+  assertEquals(responses.text, {
+    format: {
+      type: "json_schema",
+      name: "answer",
+      description: "An answer",
+      schema,
+      strict: true,
+    },
+  });
+  assertEquals(
+    responsesRequestToChatCompletions({
+      model: "m",
+      input: "structured",
+      text: responses.text,
+    }).response_format,
+    {
+      type: "json_schema",
+      json_schema: { name: "answer", description: "An answer", schema, strict: true },
+    },
+  );
 });
 
 Deno.test("responses request converts instructions, multimodal input, calls, results, and tools", () => {
@@ -102,6 +175,7 @@ Deno.test("responses request converts instructions, multimodal input, calls, res
     tool_choice: { type: "function", name: "search" },
     reasoning: { effort: "medium", summary: "none" },
     text: { format: { type: "json_object" } },
+    user: "caller-456",
   });
   assertEquals(output, {
     model: "provider/model",
@@ -129,7 +203,87 @@ Deno.test("responses request converts instructions, multimodal input, calls, res
     tool_choice: { type: "function", function: { name: "search" } },
     response_format: { type: "json_object" },
     reasoning_effort: "medium",
+    reasoning_summary: "none",
+    user: "caller-456",
   });
+});
+
+Deno.test("protocol adapters treat explicit nullable SDK options as omitted", () => {
+  assertEquals(
+    responsesRequestToChatCompletions({
+      model: "provider/model",
+      input: "hello",
+      instructions: null,
+      stream: null,
+      stream_options: null,
+      temperature: null,
+      top_p: null,
+      parallel_tool_calls: null,
+      max_output_tokens: null,
+      reasoning: null,
+    }),
+    {
+      model: "provider/model",
+      messages: [{ role: "user", content: "hello" }],
+    },
+  );
+
+  assertEquals(
+    chatCompletionsRequestToResponses({
+      model: "provider/model",
+      messages: [{ role: "user", content: "hello" }],
+      temperature: null,
+      max_tokens: 123,
+      max_completion_tokens: null,
+      stop: null,
+    }),
+    {
+      model: "provider/model",
+      input: [{ role: "user", content: [{ type: "input_text", text: "hello" }] }],
+      max_output_tokens: 123,
+    },
+  );
+
+  assertEquals(
+    responsesRequestToChatCompletions({
+      model: "provider/model",
+      input: "hello",
+      reasoning: { effort: null, summary: null },
+    }),
+    {
+      model: "provider/model",
+      messages: [{ role: "user", content: "hello" }],
+    },
+  );
+});
+
+Deno.test("Responses stream obfuscation is accepted only when disabled", () => {
+  assertEquals(
+    responsesRequestToChatCompletions({
+      model: "provider/model",
+      input: "hello",
+      stream: true,
+      stream_options: { include_obfuscation: false },
+    }),
+    {
+      model: "provider/model",
+      messages: [{ role: "user", content: "hello" }],
+      stream: true,
+    },
+  );
+  const enabled = assertThrows(
+    () =>
+      responsesRequestToChatCompletions({
+        model: "provider/model",
+        input: "hello",
+        stream: true,
+        stream_options: { include_obfuscation: true },
+      }),
+    ProviderProtocolError,
+    "not implemented",
+  );
+  assertEquals(enabled.code, "unsupported_feature");
+  assertEquals(enabled.path, "request.stream_options.include_obfuscation");
 });
 
 Deno.test("lossy and unsupported request features fail before transport", () => {
@@ -155,9 +309,23 @@ Deno.test("lossy and unsupported request features fail before transport", () => 
     () =>
       responsesRequestToChatCompletions({ model: "m", input: "x", previous_response_id: "resp" }),
     () =>
-      responsesRequestToChatCompletions({ model: "m", input: "x", reasoning: { summary: "auto" } }),
+      responsesRequestToChatCompletions({
+        model: "m",
+        input: "x",
+        reasoning: { summary: "brief" },
+      }),
   ];
   for (const transform of cases) assertThrows(transform, ProviderProtocolError);
+  assertEquals(
+    chatCompletionsRequestToResponses(
+      responsesRequestToChatCompletions({
+        model: "m",
+        input: "x",
+        reasoning: { effort: "high", summary: "auto" },
+      }),
+    ).reasoning,
+    { effort: "high", summary: "auto" },
+  );
 });
 
 Deno.test("chat nonstream normalization preserves reasoning, tools, finish, and detailed usage", () => {
@@ -309,6 +477,42 @@ Deno.test("public Chat reconstruction allowlists citations, audio, and nested lo
     expires_at: 42,
     transcript: "hello",
   });
+  const streamChunk = publicChatStreamChunk(
+    {
+      choices: [{
+        delta: {
+          reasoning_summary: "summary",
+          annotations: [{
+            type: "url_citation",
+            url_citation: {
+              start_index: 0,
+              end_index: 5,
+              title: "Source",
+              url: "https://example.com/source",
+            },
+          }],
+        },
+        finish_reason: null,
+      }],
+    },
+    "chatcmpl_public",
+    "public/model",
+  );
+  assertEquals(
+    (streamChunk.choices as Array<Record<string, unknown>>)[0].delta as Record<string, unknown>,
+    {
+      reasoning_summary: "summary",
+      annotations: [{
+        type: "url_citation",
+        url_citation: {
+          start_index: 0,
+          end_index: 5,
+          title: "Source",
+          url: "https://example.com/source",
+        },
+      }],
+    },
+  );
   assertThrows(
     () =>
       publicChatStreamChunk(
@@ -330,19 +534,19 @@ Deno.test("responses nonstream normalization preserves output, reasoning, refusa
     status: "completed",
     output: [
       {
+        id: "rs_1",
         type: "reasoning",
+        status: "completed",
         summary: [{ type: "summary_text", text: "sum" }],
         content: [{ type: "reasoning_text", text: "why" }],
       },
       {
+        id: "msg_1",
         type: "message",
+        status: "completed",
+        role: "assistant",
         content: [
           { type: "output_text", text: "hello" },
-          {
-            type: "output_image",
-            image_url: "https://example.test/result.png",
-            detail: "high",
-          },
           { type: "refusal", refusal: "cannot" },
         ],
       },
@@ -367,7 +571,6 @@ Deno.test("responses nonstream normalization preserves output, reasoning, refusa
   assertEquals(result.text, "hello");
   assertEquals(result.content, [
     { type: "text", text: "hello" },
-    { type: "image", url: "https://example.test/result.png", detail: "high" },
   ]);
   assertEquals(result.refusal, "cannot");
   assertEquals(result.toolCalls, [{
@@ -380,6 +583,30 @@ Deno.test("responses nonstream normalization preserves output, reasoning, refusa
   assertEquals(result.usage?.reasoningTokens, 3);
 });
 
+Deno.test("Responses output images fail explicitly at the Chat compatibility boundary", () => {
+  assertThrows(
+    () =>
+      normalizeResponsesResult({
+        id: "resp_image",
+        model: "m",
+        status: "completed",
+        output: [{
+          id: "msg_image",
+          type: "message",
+          status: "completed",
+          role: "assistant",
+          content: [{
+            type: "output_image",
+            image_url: "https://example.test/result.png",
+            detail: "high",
+          }],
+        }],
+      }),
+    ProviderProtocolError,
+    "cannot represent",
+  );
+});
+
 Deno.test("chat streaming normalization emits visible, tool, usage, finish, and done events", () => {
   assertEquals(
     normalizeChatStreamChunk({
@@ -390,6 +617,16 @@ Deno.test("chat streaming normalization emits visible, tool, usage, finish, and 
           role: "assistant",
           content: "hi",
           reasoning_content: "why",
+          reasoning_summary: "sum",
+          annotations: [{
+            type: "url_citation",
+            url_citation: {
+              start_index: 0,
+              end_index: 2,
+              title: "Source",
+              url: "https://example.test/source",
+            },
+          }],
           tool_calls: [{ index: 0, id: "call", function: { name: "lookup", arguments: "{" } }],
         },
         finish_reason: "tool_calls",
@@ -406,7 +643,18 @@ Deno.test("chat streaming normalization emits visible, tool, usage, finish, and 
       { type: "started", id: "chunk", model: "m" },
       { type: "role", role: "assistant" },
       { type: "text_delta", text: "hi" },
+      { type: "reasoning_delta", text: "sum", summary: true },
       { type: "reasoning_delta", text: "why", summary: false },
+      {
+        type: "annotation",
+        annotation: {
+          type: "url_citation",
+          startIndex: 0,
+          endIndex: 2,
+          title: "Source",
+          url: "https://example.test/source",
+        },
+      },
       { type: "tool_call_delta", index: 0, id: "call", name: "lookup", arguments: "{" },
       { type: "finish", state: "tool_calls" },
       {
@@ -441,6 +689,32 @@ Deno.test("responses streaming normalization covers text, reasoning, tools, comp
   );
   assertEquals(
     normalizeResponsesStreamEvent({
+      type: "response.output_text.annotation.added",
+      annotation: {
+        type: "url_citation",
+        start_index: 0,
+        end_index: 2,
+        title: "Source",
+        url: "https://example.test/source",
+      },
+    }),
+    [{
+      type: "annotation",
+      annotation: {
+        type: "url_citation",
+        startIndex: 0,
+        endIndex: 2,
+        title: "Source",
+        url: "https://example.test/source",
+      },
+    }],
+  );
+  assertEquals(
+    normalizeResponsesStreamEvent({ type: "response.refusal.done", refusal: "cannot" }),
+    [],
+  );
+  assertEquals(
+    normalizeResponsesStreamEvent({
       type: "response.reasoning_summary_part.added",
       item_id: "reasoning",
       output_index: 0,
@@ -453,16 +727,19 @@ Deno.test("responses streaming normalization covers text, reasoning, tools, comp
     normalizeResponsesStreamEvent({
       type: "response.function_call_arguments.delta",
       output_index: 1,
-      item_id: "call",
+      item_id: "item",
       delta: "{}",
     }),
-    [{ type: "tool_call_delta", index: 1, id: "call", arguments: "{}" }],
+    [{ type: "tool_call_delta", index: 1, arguments: "{}" }],
   );
   assertEquals(
     normalizeResponsesStreamEvent({
       type: "response.completed",
       response: {
+        id: "resp_stream",
+        model: "m",
         status: "completed",
+        output: [],
         usage: { input_tokens: 1, output_tokens: 2, total_tokens: 3 },
       },
     }),
@@ -484,6 +761,63 @@ Deno.test("responses streaming normalization covers text, reasoning, tools, comp
   assertEquals(
     normalizeResponsesStreamEvent({ type: "error", error: { code: "bad", message: "safe" } }),
     [{ type: "error", code: "bad", message: "safe" }],
+  );
+  assertEquals(
+    normalizeResponsesStreamEvent({
+      type: "response.failed",
+      response: {
+        status: "failed",
+        usage: { input_tokens: 4, output_tokens: 2, total_tokens: 6 },
+        error: { code: "failed", message: "safe failure" },
+      },
+    }),
+    [{
+      type: "usage",
+      usage: {
+        inputTokens: 4,
+        cachedInputTokens: 0,
+        outputTokens: 2,
+        reasoningTokens: 0,
+        totalTokens: 6,
+      },
+    }, { type: "error", code: "failed", message: "safe failure" }],
+  );
+  assertEquals(
+    normalizeResponsesStreamEvent({
+      type: "response.incomplete",
+      response: {
+        id: "resp_incomplete",
+        model: "m",
+        status: "incomplete",
+        output: [],
+        incomplete_details: { reason: "max_output_tokens" },
+        usage: { input_tokens: 1, output_tokens: 2, total_tokens: 3 },
+      },
+    }),
+    [
+      {
+        type: "usage",
+        usage: {
+          inputTokens: 1,
+          cachedInputTokens: 0,
+          outputTokens: 2,
+          reasoningTokens: 0,
+          totalTokens: 3,
+        },
+      },
+      { type: "finish", state: "length" },
+      { type: "done" },
+    ],
+  );
+});
+
+Deno.test("Responses streaming accepts queued lifecycle events", () => {
+  assertEquals(
+    normalizeResponsesStreamEvent({
+      type: "response.queued",
+      response: { id: "resp_queued", object: "response", status: "queued" },
+    }),
+    [],
   );
 });
 

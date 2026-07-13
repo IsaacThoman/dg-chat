@@ -16,6 +16,12 @@ import { Buffer } from "node:buffer";
 import { type ProviderSecretEnvelope, ProviderSecretKeyring } from "./provider-secrets.ts";
 import { complete, streamChatCompletion, type UpstreamStreamOptions } from "./models.ts";
 import {
+  completeResponsesChat,
+  type NativeResponsesRequestFields,
+  streamResponsesChat,
+} from "./responses-provider.ts";
+import { providerUpstreamDefaults, ProviderValidationError } from "./provider-validation.ts";
+import {
   type AttemptContext,
   type AttemptEvent,
   type CircuitPermit,
@@ -96,6 +102,22 @@ interface RuntimeCandidate extends ProviderCandidate {
   credentialEnvelope: Record<string, unknown>;
 }
 
+function assertResponseFieldsCompatible(
+  protocol: UpstreamStreamOptions["protocol"],
+  fields?: NativeResponsesRequestFields,
+): void {
+  if (
+    protocol !== "responses" &&
+    (fields?.store === true ||
+      (fields?.metadata !== undefined && Object.keys(fields.metadata).length > 0))
+  ) {
+    throw new ProviderAttemptError(
+      "This Responses request contains fields that a Chat Completions provider cannot preserve",
+      { category: "invalid_request", transient: false, candidateLocal: true },
+    );
+  }
+}
+
 interface AttemptMetrics {
   dispatched: boolean;
   estimatedInputTokens: number;
@@ -121,6 +143,7 @@ export interface ProviderExecutionOptions {
   breakerPolicy: BreakerPolicy;
   complete?: typeof complete;
   stream?: typeof streamChatCompletion;
+  responsesFetch?: typeof fetch;
   embeddingsFetch?: ProviderFetch;
   audioFetch?: typeof fetch;
   speechFetch?: typeof fetch;
@@ -266,17 +289,15 @@ function reconcileObservedTokens(metrics: AttemptMetrics) {
   const estimatedOutput = Math.ceil(metrics.visibleCharacters / 4);
   const estimatedReasoning = Math.ceil(metrics.reasoningCharacters / 4);
   metrics.inputTokens = metrics.providerInputTokens ?? metrics.estimatedInputTokens;
-  metrics.outputTokens = Math.max(metrics.providerOutputTokens ?? 0, estimatedOutput);
+  metrics.outputTokens = metrics.providerOutputTokens ?? estimatedOutput;
   metrics.reasoningTokens = Math.min(
     metrics.outputTokens,
-    Math.max(metrics.providerReasoningTokens ?? 0, estimatedReasoning),
+    metrics.providerReasoningTokens ?? estimatedReasoning,
   );
   metrics.cachedInputTokens = Math.min(metrics.cachedInputTokens, metrics.inputTokens);
   const providerCoversObservedOutput = metrics.providerOutputTokens !== null &&
-    metrics.providerOutputTokens >= estimatedOutput &&
     (estimatedReasoning === 0 ||
-      (metrics.providerReasoningTokens !== null &&
-        metrics.providerReasoningTokens >= estimatedReasoning));
+      metrics.providerReasoningTokens !== null);
   metrics.tokenSource = metrics.providerInputTokens !== null && providerCoversObservedOutput
     ? "provider"
     : metrics.inputTokens > 0 || metrics.outputTokens > 0
@@ -325,7 +346,7 @@ function observeChunk(metrics: AttemptMetrics, data: string, now: number) {
     for (const name of ["content", "refusal"]) {
       if (typeof fields[name] === "string") characters += fields[name].length;
     }
-    for (const name of ["reasoning_content", "reasoning"]) {
+    for (const name of ["reasoning_content", "reasoning", "reasoning_summary"]) {
       if (typeof fields[name] === "string") {
         characters += fields[name].length;
         metrics.reasoningCharacters = Math.min(
@@ -424,6 +445,7 @@ export class ProviderExecutionEngine {
   readonly #breakerPolicy: BreakerPolicy;
   readonly #complete: typeof complete;
   readonly #stream: typeof streamChatCompletion;
+  readonly #responsesFetch?: typeof fetch;
   readonly #embeddingsFetch?: ProviderFetch;
   readonly #audioFetch?: typeof fetch;
   readonly #speechFetch?: typeof fetch;
@@ -441,6 +463,7 @@ export class ProviderExecutionEngine {
     this.#breakerPolicy = options.breakerPolicy;
     this.#complete = options.complete ?? complete;
     this.#stream = options.stream ?? streamChatCompletion;
+    this.#responsesFetch = options.responsesFetch;
     this.#embeddingsFetch = options.embeddingsFetch;
     this.#audioFetch = options.audioFetch;
     this.#speechFetch = options.speechFetch;
@@ -472,12 +495,26 @@ export class ProviderExecutionEngine {
     request: ChatCompletionRequest,
     signal: AbortSignal,
     plan: ProviderExecutionPlan,
+    userId = "internal",
   ): Promise<ChatCompletionRequest> {
     const source = await this.#repository.findProviderModel(sourceModelId);
     const config = parseOcrInterceptionConfig(source?.customParams);
     if (!config) return request;
+    const cacheProvider = await this.#repository.findProvider(config.providerId);
+    const cacheModel = await this.#repository.findProviderModel(config.model);
     const rewritten = await interceptOcrImages(request, config, {
       cache: this.#ocrCache,
+      ...(cacheProvider && cacheModel
+        ? {
+          cacheScope: {
+            userId,
+            providerVersion: cacheProvider.version,
+            credentialUpdatedAt: cacheProvider.credentialUpdatedAt,
+            modelVersion: cacheModel.version,
+            upstreamModelId: cacheModel.upstreamModelId,
+          },
+        }
+        : {}),
       ...(this.#ocrFetch ? { fetch: this.#ocrFetch } : {}),
       recognize: async (input) => {
         if (this.#ocrRecognize) {
@@ -641,12 +678,6 @@ export class ProviderExecutionEngine {
     }
     const candidates = new Map<string, RuntimeCandidate>();
     for (const target of plan.targets) {
-      if (capability === "chat" && target.protocol !== "chat_completions") {
-        throw new ProviderAttemptError(
-          "Native Responses provider execution is not enabled in this runtime",
-          { category: "invalid_request", transient: false },
-        );
-      }
       const providerBefore = await this.#repository.findProvider(target.providerId);
       const modelBefore = await this.#repository.findProviderModel(target.providerModelId);
       const credential = await this.#repository.getProviderCredential(target.providerId);
@@ -786,11 +817,77 @@ export class ProviderExecutionEngine {
         transient: false,
       });
     }
+    let customParams: Record<string, unknown>;
+    try {
+      customParams = providerUpstreamDefaults(modelAfter.customParams, target.protocol);
+    } catch (error) {
+      if (error instanceof ProviderValidationError) {
+        throw new ProviderAttemptError(error.message, {
+          category: "invalid_request",
+          transient: false,
+        });
+      }
+      throw error;
+    }
     return {
       baseUrl: providerAfter.baseUrl,
       apiKey,
       upstreamModel: target.upstreamModelId,
+      protocol: target.protocol,
+      customParams,
     };
+  }
+
+  #completeChat(
+    request: ChatCompletionRequest,
+    signal: AbortSignal,
+    options: UpstreamStreamOptions,
+    responseFields?: NativeResponsesRequestFields,
+  ): Promise<Completion> {
+    if (
+      options.protocol !== "responses" && request.reasoning_summary !== undefined &&
+      request.reasoning_summary !== "none"
+    ) {
+      throw new ProviderAttemptError(
+        "Reasoning summaries require a native Responses provider",
+        { category: "invalid_request", transient: false, candidateLocal: true },
+      );
+    }
+    assertResponseFieldsCompatible(options.protocol, responseFields);
+    return options.protocol === "responses"
+      ? completeResponsesChat(request, signal, {
+        ...options,
+        protocol: "responses",
+        fetch: this.#responsesFetch,
+        requestFields: responseFields,
+      })
+      : this.#complete(request, signal, options);
+  }
+
+  #streamChat(
+    request: ChatCompletionRequest,
+    signal: AbortSignal,
+    options: UpstreamStreamOptions,
+    responseFields?: NativeResponsesRequestFields,
+  ): AsyncGenerator<string> {
+    if (
+      options.protocol !== "responses" && request.reasoning_summary !== undefined &&
+      request.reasoning_summary !== "none"
+    ) {
+      throw new ProviderAttemptError(
+        "Reasoning summaries require a native Responses provider",
+        { category: "invalid_request", transient: false, candidateLocal: true },
+      );
+    }
+    assertResponseFieldsCompatible(options.protocol, responseFields);
+    return options.protocol === "responses"
+      ? streamResponsesChat(request, signal, {
+        ...options,
+        protocol: "responses",
+        fetch: this.#responsesFetch,
+        requestFields: responseFields,
+      })
+      : this.#stream(request, signal, options);
   }
 
   #telemetry(
@@ -991,6 +1088,8 @@ export class ProviderExecutionEngine {
     request: ChatCompletionRequest,
     signal: AbortSignal,
     frozenPlan?: ProviderExecutionPlan,
+    ocrUserId?: string,
+    responseFields?: NativeResponsesRequestFields,
   ): Promise<Completion> {
     const { plan, candidates } = await this.#prepare(sourceModelId, frozenPlan);
     request = await this.#interceptOcr(
@@ -1000,6 +1099,7 @@ export class ProviderExecutionEngine {
       request,
       signal,
       plan,
+      ocrUserId,
     );
     const claim = await this.#repository.claimProviderExecution(usageRunId, ownerLeaseToken);
     const remainingAttempts = policyFor(plan, undefined, this.#slowStream).maxAttempts -
@@ -1037,7 +1137,12 @@ export class ProviderExecutionEngine {
             if (!upstream) throw new Error("Provider dispatch options are missing");
             const observed = metrics.get(key(candidate.id, context));
             if (observed) observed.dispatched = true;
-            const result = await this.#complete(request, attemptSignal, upstream);
+            const result = await this.#completeChat(
+              request,
+              attemptSignal,
+              upstream,
+              responseFields,
+            );
             metrics.set(key(candidate.id, context), completionMetrics(result));
             const providerAttemptId = attemptIds.get(key(candidate.id, context));
             if (providerAttemptId) {
@@ -1051,6 +1156,12 @@ export class ProviderExecutionEngine {
             return result;
           } catch (error) {
             const eventKey = key(candidate.id, context);
+            if (
+              error instanceof ProviderAttemptError && error.options.candidateLocal === true
+            ) {
+              const observed = metrics.get(eventKey);
+              if (observed) observed.dispatched = false;
+            }
             if (metrics.get(eventKey)?.dispatched) {
               const providerAttemptId = attemptIds.get(eventKey);
               if (providerAttemptId) {
@@ -1802,6 +1913,9 @@ export class ProviderExecutionEngine {
         yield data;
       }
     } catch (error) {
+      if (error instanceof ProviderAttemptError && error.options.candidateLocal === true) {
+        observed.dispatched = false;
+      }
       this.#normalizeError(error, plan);
     }
   }
@@ -1813,6 +1927,8 @@ export class ProviderExecutionEngine {
     request: ChatCompletionRequest,
     signal: AbortSignal,
     frozenPlan?: ProviderExecutionPlan,
+    ocrUserId?: string,
+    responseFields?: NativeResponsesRequestFields,
   ): AsyncGenerator<string> {
     const { plan, candidates } = await this.#prepare(sourceModelId, frozenPlan);
     request = await this.#interceptOcr(
@@ -1822,6 +1938,7 @@ export class ProviderExecutionEngine {
       request,
       signal,
       plan,
+      ocrUserId,
     );
     const claim = await this.#repository.claimProviderExecution(usageRunId, ownerLeaseToken);
     const remainingAttempts = policyFor(plan, undefined, this.#slowStream).maxAttempts -
@@ -1860,7 +1977,12 @@ export class ProviderExecutionEngine {
           const observed = metrics.get(key(candidate.id, context)) ??
             emptyMetrics(estimateInputTokens(request));
           observed.dispatched = true;
-          const upstream = this.#stream(request, attemptSignal, upstreamOptions);
+          const upstream = this.#streamChat(
+            request,
+            attemptSignal,
+            upstreamOptions,
+            responseFields,
+          );
           metrics.set(key(candidate.id, context), observed);
           const providerAttemptId = attemptIds.get(key(candidate.id, context));
           const diagnostic = new ProviderStreamDiagnostic();

@@ -63,6 +63,61 @@ Deno.test("upstream streaming preserves split SSE chunks and terminal DONE", asy
   assertEquals(postedBody?.stream, true);
 });
 
+Deno.test("Chat upstream defaults apply to buffered and streaming requests without overriding callers", async () => {
+  const bodies: Record<string, unknown>[] = [];
+  const bufferedFetch = ((_input: string | URL | Request, init?: RequestInit) => {
+    bodies.push(JSON.parse(String(init?.body)));
+    return Promise.resolve(Response.json({
+      choices: [{ message: { content: "ok" } }],
+      usage: { prompt_tokens: 1, completion_tokens: 1 },
+    }));
+  }) as typeof fetch;
+  await complete({ ...request, temperature: 0.7 }, new AbortController().signal, {
+    baseUrl: "https://provider.example/v1",
+    apiKey: "secret",
+    upstreamModel: "provider-model",
+    customParams: { temperature: 0.2, top_p: 0.8, model: "forbidden", stream: true },
+    fetch: bufferedFetch,
+  });
+
+  const streamingFetch = ((_input: string | URL | Request, init?: RequestInit) => {
+    bodies.push(JSON.parse(String(init?.body)));
+    return Promise.resolve(
+      new Response("data: [DONE]\n\n", {
+        headers: { "content-type": "text/event-stream" },
+      }),
+    );
+  }) as typeof fetch;
+  await collect(streamChatCompletion(
+    { ...request, stream: true, temperature: 0.6 },
+    new AbortController().signal,
+    {
+      baseUrl: "https://provider.example/v1",
+      apiKey: "secret",
+      upstreamModel: "provider-model",
+      customParams: { temperature: 0.1, top_p: 0.9, model: "forbidden", stream: false },
+      fetch: streamingFetch,
+    },
+  ));
+
+  assertEquals(bodies, [
+    {
+      temperature: 0.7,
+      top_p: 0.8,
+      model: "provider-model",
+      stream: false,
+      messages: request.messages,
+    },
+    {
+      temperature: 0.6,
+      top_p: 0.9,
+      model: "provider-model",
+      stream: true,
+      messages: request.messages,
+    },
+  ]);
+});
+
 Deno.test("upstream streaming propagates caller abort to fetch", async () => {
   const controller = new AbortController();
   let upstreamSignal: AbortSignal | undefined;

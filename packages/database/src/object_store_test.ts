@@ -16,19 +16,59 @@ Deno.test("object store environment configuration is explicit and validates cred
     objectStoreConfigFromEnv({
       S3_BUCKET: "dg-chat-files",
       S3_REGION: "us-east-1",
-      S3_ENDPOINT: "http://minio:9000",
+      S3_ENDPOINT: "https://objects.example.test",
       S3_ACCESS_KEY: "scoped-user",
       S3_SECRET_KEY: "scoped-secret",
     }),
     {
       bucket: "dg-chat-files",
       region: "us-east-1",
-      endpoint: "http://minio:9000",
+      endpoint: "https://objects.example.test",
       accessKey: "scoped-user",
       secretKey: "scoped-secret",
       forcePathStyle: true,
     },
   );
+});
+
+Deno.test("object store requires HTTPS unless private insecure storage is explicitly enabled", () => {
+  const base = { S3_BUCKET: "dg-chat-files" };
+  assertThrows(
+    () => objectStoreConfigFromEnv({ ...base, S3_ENDPOINT: "http://minio:9000" }),
+    Error,
+    "S3_ALLOW_INSECURE=true",
+  );
+  assertThrows(
+    () =>
+      objectStoreConfigFromEnv({
+        ...base,
+        S3_ENDPOINT: "http://objects.example.com",
+        S3_ALLOW_INSECURE: "true",
+      }),
+    Error,
+    "restricted to loopback, private-network, or container hosts",
+  );
+  for (
+    const endpoint of [
+      "http://minio:9000",
+      "http://localhost:9000",
+      "http://127.0.0.1:9000",
+      "http://10.20.30.40:9000",
+      "http://172.31.0.2:9000",
+      "http://192.168.1.2:9000",
+      "http://[::1]:9000",
+      "http://[fd00::1]:9000",
+    ]
+  ) {
+    assertEquals(
+      objectStoreConfigFromEnv({
+        ...base,
+        S3_ENDPOINT: endpoint,
+        S3_ALLOW_INSECURE: "true",
+      })?.endpoint,
+      endpoint,
+    );
+  }
 });
 
 Deno.test("S3 object store streams put/get and supports delete/readiness", async () => {

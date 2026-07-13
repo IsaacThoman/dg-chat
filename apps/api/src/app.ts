@@ -144,6 +144,7 @@ import {
 } from "./models.ts";
 import { estimateInputTokens, priceUsage, reservationPrice } from "./pricing.ts";
 import { responseObject } from "./responses.ts";
+import { ResponsesStreamProjector } from "./responses-stream.ts";
 import { type IdentityMailer, smtpIdentityMailer } from "./mail.ts";
 import {
   boundedIdentityDelivery,
@@ -176,6 +177,7 @@ import {
   ProviderExecutionEngine,
   TerminalAccountingPersistenceError,
 } from "./provider-execution.ts";
+import { parseOcrInterceptionConfig } from "./ocr-interception.ts";
 import {
   modelPriceCreate,
   providerCreate,
@@ -192,6 +194,7 @@ import {
   providerRetryPolicyCreate,
   providerRetryPolicyPatch,
 } from "./provider-resilience-validation.ts";
+import { ProviderAttemptError, ResilienceExhaustedError } from "./provider-resilience.ts";
 import {
   normalizeChatCompletionResult,
   normalizeChatStreamChunk,
@@ -285,6 +288,7 @@ export interface AppOptions {
   knowledgeQueryEmbedder?: KnowledgeQueryEmbedder;
   providerKeyring?: ProviderSecretKeyring;
   providerDiscoveryFetch?: typeof fetch;
+  responsesFetch?: typeof fetch;
   embeddingsFetch?: ProviderFetch;
   audioFetch?: typeof fetch;
   speechFetch?: typeof fetch;
@@ -470,6 +474,47 @@ const openAIFile = (attachment: AttachmentRecord, purpose = "assistants") => ({
 const openAIError = (message: string, code: string | null = null) => ({
   error: { message, type: "invalid_request_error", param: null, code },
 });
+const publicProviderFailure = (error: unknown, cancelled = false) => {
+  if (cancelled) {
+    return { status: 499, code: "request_cancelled", message: "Request cancelled" };
+  }
+  const candidate = error instanceof ResilienceExhaustedError ? error.lastError : error;
+  if (candidate instanceof ProviderAttemptError) {
+    const category = candidate.options.category;
+    if (category === "authentication") {
+      return {
+        status: 502,
+        code: "provider_authentication_error",
+        message: "The configured provider rejected its credentials",
+      };
+    }
+    const status = candidate.options.status && candidate.options.status >= 400 &&
+        candidate.options.status <= 599
+      ? candidate.options.status
+      : category === "rate_limited"
+      ? 429
+      : category === "invalid_request"
+      ? 400
+      : category === "timeout"
+      ? 504
+      : 502;
+    const code = candidate.options.code ??
+      (category === "rate_limited"
+        ? "rate_limit_exceeded"
+        : category === "invalid_request"
+        ? "invalid_request_error"
+        : category === "timeout"
+        ? "timeout"
+        : "provider_error");
+    return {
+      status,
+      code,
+      message: candidate.message,
+      retryAfterMs: candidate.options.retryAfterMs,
+    };
+  }
+  return { status: 502, code: "provider_error", message: "Provider request failed" };
+};
 const auditIdentifier = /^[a-z0-9][a-z0-9._:-]*$/i;
 const auditUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const parseAuditQuery = (c: Context): AuditQuery => {
@@ -793,167 +838,6 @@ const assertPublicAudioUsagePricing = (
     );
   }
 };
-const chunkUtf8 = (value: string, maxBytes = 16 * 1024, maxChunks = 512): string[] => {
-  const bytes = new TextEncoder().encode(value);
-  if (bytes.length === 0) return [];
-  if (bytes.length > maxBytes * maxChunks) {
-    throw new DomainError("response_too_large", "Response exceeds replay storage limit", 413);
-  }
-  const decoder = new TextDecoder();
-  const chunks: string[] = [];
-  for (let offset = 0; offset < bytes.length; offset += maxBytes) {
-    const end = Math.min(offset + maxBytes, bytes.length);
-    const chunk = decoder.decode(bytes.subarray(offset, end), { stream: end < bytes.length });
-    if (chunk) chunks.push(chunk);
-  }
-  return chunks;
-};
-const bufferedResponseOutputEvents = (
-  output: Array<Record<string, unknown>>,
-  eventFrame: (event: Record<string, unknown>) => string,
-) =>
-  output.flatMap((item, outputIndex) => {
-    const itemId = String(item.id);
-    const addedItem = item.type === "message"
-      ? { ...item, status: "in_progress", content: [] }
-      : item.type === "function_call"
-      ? { ...item, status: "in_progress", arguments: "" }
-      : item.type === "reasoning"
-      ? { ...item, status: "in_progress", summary: [], content: [] }
-      : { ...item, status: "in_progress" };
-    const frames = [eventFrame({
-      type: "response.output_item.added",
-      output_index: outputIndex,
-      item: addedItem,
-    })];
-    if (item.type === "message") {
-      const content = Array.isArray(item.content)
-        ? item.content as Array<Record<string, unknown>>
-        : [];
-      for (const [contentIndex, part] of content.entries()) {
-        frames.push(eventFrame({
-          type: "response.content_part.added",
-          item_id: itemId,
-          output_index: outputIndex,
-          content_index: contentIndex,
-          part: part.type === "output_text"
-            ? { type: "output_text", text: "", annotations: [] }
-            : { type: "refusal", refusal: "" },
-        }));
-        const value = String(part.type === "refusal" ? part.refusal ?? "" : part.text ?? "");
-        const prefix = part.type === "refusal" ? "response.refusal" : "response.output_text";
-        for (const delta of chunkUtf8(value)) {
-          frames.push(eventFrame({
-            type: `${prefix}.delta`,
-            item_id: itemId,
-            output_index: outputIndex,
-            content_index: contentIndex,
-            delta,
-            ...(part.type === "output_text" ? { logprobs: [] } : {}),
-          }));
-        }
-        frames.push(eventFrame({
-          type: `${prefix}.done`,
-          item_id: itemId,
-          output_index: outputIndex,
-          content_index: contentIndex,
-          ...(part.type === "refusal" ? { refusal: value } : { text: value, logprobs: [] }),
-        }));
-        frames.push(eventFrame({
-          type: "response.content_part.done",
-          item_id: itemId,
-          output_index: outputIndex,
-          content_index: contentIndex,
-          part,
-        }));
-      }
-    } else if (item.type === "function_call") {
-      const argumentsText = String(item.arguments ?? "");
-      for (const delta of chunkUtf8(argumentsText)) {
-        frames.push(eventFrame({
-          type: "response.function_call_arguments.delta",
-          item_id: itemId,
-          output_index: outputIndex,
-          delta,
-        }));
-      }
-      frames.push(eventFrame({
-        type: "response.function_call_arguments.done",
-        item_id: itemId,
-        output_index: outputIndex,
-        name: String(item.name ?? ""),
-        arguments: argumentsText,
-      }));
-    } else if (item.type === "reasoning") {
-      for (
-        const [kind, parts] of [["reasoning_summary_text", item.summary], [
-          "reasoning_text",
-          item.content,
-        ]] as const
-      ) {
-        if (!Array.isArray(parts)) continue;
-        for (const [contentIndex, part] of (parts as Array<Record<string, unknown>>).entries()) {
-          const value = String(part.text ?? "");
-          const summary = kind === "reasoning_summary_text";
-          const indexField = summary
-            ? { summary_index: contentIndex }
-            : { content_index: contentIndex };
-          frames.push(eventFrame(
-            summary
-              ? {
-                type: "response.reasoning_summary_part.added",
-                item_id: itemId,
-                output_index: outputIndex,
-                summary_index: contentIndex,
-                part: { type: "summary_text", text: "" },
-              }
-              : {
-                type: "response.content_part.added",
-                item_id: itemId,
-                output_index: outputIndex,
-                content_index: contentIndex,
-                part: { type: "reasoning_text", text: "" },
-              },
-          ));
-          for (const delta of chunkUtf8(value)) {
-            frames.push(eventFrame({
-              type: `response.${kind}.delta`,
-              item_id: itemId,
-              output_index: outputIndex,
-              ...indexField,
-              delta,
-            }));
-          }
-          frames.push(eventFrame({
-            type: `response.${kind}.done`,
-            item_id: itemId,
-            output_index: outputIndex,
-            ...indexField,
-            text: value,
-          }));
-          frames.push(eventFrame(
-            summary
-              ? {
-                type: "response.reasoning_summary_part.done",
-                item_id: itemId,
-                output_index: outputIndex,
-                summary_index: contentIndex,
-                part: { type: "summary_text", text: value },
-              }
-              : {
-                type: "response.content_part.done",
-                item_id: itemId,
-                output_index: outputIndex,
-                content_index: contentIndex,
-                part: { type: "reasoning_text", text: value },
-              },
-          ));
-        }
-      }
-    }
-    frames.push(eventFrame({ type: "response.output_item.done", output_index: outputIndex, item }));
-    return frames;
-  });
 const sameOrigin = (candidate: string, allowed: string): boolean => {
   try {
     return new URL(candidate).origin === allowed;
@@ -1520,6 +1404,7 @@ export function createApp(options: AppOptions = {}) {
       breakerPolicy,
       complete: providerComplete,
       stream: providerStream,
+      responsesFetch: options.responsesFetch,
       embeddingsFetch: options.embeddingsFetch,
       audioFetch: options.audioFetch,
       speechFetch: options.speechFetch,
@@ -1725,10 +1610,7 @@ export function createApp(options: AppOptions = {}) {
     const model = (await repo.resolveEntitledProviderModel(subject, id))?.model;
     if (!model?.enabled || !model.capabilities.includes("chat")) return undefined;
     const provider = await repo.findProvider(model.providerId);
-    if (
-      !provider?.enabled || !provider.hasCredential || provider.protocol !== "chat_completions" ||
-      !providerKeyring
-    ) return undefined;
+    if (!provider?.enabled || !provider.hasCredential || !providerKeyring) return undefined;
     const credential = await repo.getProviderCredential(provider.id);
     if (!credential) return undefined;
     let apiKey: string;
@@ -2407,6 +2289,60 @@ export function createApp(options: AppOptions = {}) {
     }
   };
 
+  const readExactObjectBody = async (
+    body: ReadableStream<Uint8Array>,
+    expectedBytes: number,
+    maximumBytes: number,
+    failure: () => Error,
+  ): Promise<Uint8Array> => {
+    if (
+      !Number.isSafeInteger(expectedBytes) || expectedBytes < 0 ||
+      !Number.isSafeInteger(maximumBytes) || maximumBytes < expectedBytes
+    ) throw failure();
+    const reader = body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > expectedBytes || total > maximumBytes) throw failure();
+        chunks.push(value);
+      }
+    } finally {
+      await reader.cancel().catch(() => undefined);
+      reader.releaseLock();
+    }
+    if (total !== expectedBytes) throw failure();
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return bytes;
+  };
+
+  const verifiedAttachmentObject = async (
+    objectKey: string,
+    attachment: Pick<AttachmentRecord, "sizeBytes" | "mimeType" | "sha256">,
+    ownerId: string,
+    failure: () => Error,
+  ) => {
+    if (!objectStore) throw failure();
+    const object = await objectStore.get(objectKey);
+    if (
+      !object || object.contentLength !== attachment.sizeBytes ||
+      object.contentType !== attachment.mimeType ||
+      object.metadata.sha256 !== attachment.sha256 || object.metadata.owner !== ownerId
+    ) {
+      await object?.body.cancel().catch(() => undefined);
+      throw failure();
+    }
+    return object;
+  };
+
   const attachmentContent = async (attachment: AttachmentRecord, allowDeleted = false) => {
     if (!objectStore) {
       throw new DomainError("storage_not_configured", "Object storage is not configured", 503);
@@ -2416,6 +2352,18 @@ export function createApp(options: AppOptions = {}) {
     }
     const object = await objectStore.get(attachment.objectKey);
     if (!object) throw new DomainError("object_missing", "Stored file is unavailable", 503);
+    if (
+      object.contentLength !== attachment.sizeBytes || object.contentType !== attachment.mimeType ||
+      object.metadata.sha256 !== attachment.sha256 ||
+      (object.metadata.owner !== undefined && object.metadata.owner !== attachment.ownerId)
+    ) {
+      await object.body.cancel().catch(() => undefined);
+      throw new DomainError(
+        "attachment_corrupt",
+        "Stored attachment metadata does not match its immutable record",
+        503,
+      );
+    }
     return new Response(object.body, {
       headers: {
         "Content-Type": attachment.mimeType,
@@ -2427,6 +2375,178 @@ export function createApp(options: AppOptions = {}) {
         "X-Content-Type-Options": "nosniff",
       },
     });
+  };
+  const responseFileBytes = async (
+    fileId: string,
+    ownerId: string,
+    maximumBytes: number,
+  ) => {
+    if (!objectStore) {
+      throw new DomainError("storage_not_configured", "Object storage is not configured", 503);
+    }
+    const attachment = await repo.getAttachment(fileId, ownerId);
+    if (attachment.state !== "ready") {
+      throw new DomainError("attachment_not_ready", "Response input file is not ready", 409);
+    }
+    if (attachment.sizeBytes < 1 || attachment.sizeBytes > maximumBytes) {
+      throw new DomainError("file_too_large", "Response input file is too large", 413);
+    }
+    const object = await objectStore.get(attachment.objectKey);
+    if (
+      !object || object.contentLength !== attachment.sizeBytes ||
+      object.contentType !== attachment.mimeType || object.metadata.sha256 !== attachment.sha256 ||
+      object.metadata.owner !== ownerId
+    ) {
+      await object?.body.cancel().catch(() => undefined);
+      throw new DomainError("attachment_corrupt", "Response input file failed validation", 503);
+    }
+    const bytes = await readExactObjectBody(
+      object.body,
+      attachment.sizeBytes,
+      maximumBytes,
+      () => new DomainError("attachment_corrupt", "Response input file failed validation", 503),
+    );
+    if (
+      await imageBytesSha256(bytes) !== attachment.sha256
+    ) throw new DomainError("attachment_corrupt", "Response input file failed validation", 503);
+    return { attachment, bytes };
+  };
+  const resolveResponseInputFiles = async (
+    body: Record<string, unknown>,
+    ownerId: string,
+  ): Promise<Record<string, unknown>> => {
+    if (!Array.isArray(body.input)) return body;
+    const referenceLimit = 16;
+    const expandedByteLimit = 4 * 1024 * 1024;
+    let referenceCount = 0;
+    for (const raw of body.input) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+      const item = raw as Record<string, unknown>;
+      if (!Array.isArray(item.content)) continue;
+      for (const rawPart of item.content) {
+        if (!rawPart || typeof rawPart !== "object" || Array.isArray(rawPart)) continue;
+        const part = rawPart as Record<string, unknown>;
+        if (part.type === "input_image" && part.file_id !== undefined) {
+          if (typeof part.file_id !== "string" || part.image_url !== undefined) {
+            throw new DomainError("validation_error", "input_image file_id is invalid", 422);
+          }
+          referenceCount++;
+        } else if (part.type === "input_file") {
+          if (typeof part.file_id !== "string") {
+            throw new DomainError(
+              "unsupported_feature",
+              "input_file currently requires an uploaded file_id",
+              400,
+            );
+          }
+          referenceCount++;
+        }
+        if (referenceCount > referenceLimit) {
+          throw new DomainError(
+            "response_input_files_too_large",
+            `Responses input supports at most ${referenceLimit} uploaded file references`,
+            413,
+          );
+        }
+      }
+    }
+    type LoadedResponseFile = Awaited<ReturnType<typeof responseFileBytes>>;
+    const loadedFiles = new Map<string, LoadedResponseFile>();
+    const loadOnce = async (
+      kind: "file" | "image",
+      fileId: string,
+      maximumBytes: number,
+    ) => {
+      const key = `${kind}:${fileId}`;
+      const cached = loadedFiles.get(key);
+      if (cached) return cached;
+      const loaded = await responseFileBytes(fileId, ownerId, maximumBytes);
+      loadedFiles.set(key, loaded);
+      return loaded;
+    };
+    let expandedBytes = 0;
+    const accountExpandedBytes = (bytes: number) => {
+      expandedBytes += bytes;
+      if (expandedBytes > expandedByteLimit) {
+        throw new DomainError(
+          "response_input_files_too_large",
+          "Expanded Responses input files exceed the 4 MiB limit",
+          413,
+        );
+      }
+    };
+    const input: unknown[] = [];
+    for (const raw of body.input) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+        input.push(raw);
+        continue;
+      }
+      const item = raw as Record<string, unknown>;
+      if (!Array.isArray(item.content)) {
+        input.push(raw);
+        continue;
+      }
+      const content: unknown[] = [];
+      for (const rawPart of item.content) {
+        if (!rawPart || typeof rawPart !== "object" || Array.isArray(rawPart)) {
+          content.push(rawPart);
+          continue;
+        }
+        const part = rawPart as Record<string, unknown>;
+        if (part.type === "input_image" && part.file_id !== undefined) {
+          const { attachment, bytes } = await loadOnce(
+            "image",
+            part.file_id as string,
+            1_400_000,
+          );
+          if (!attachment.mimeType.startsWith("image/")) {
+            throw new DomainError("validation_error", "input_image file is not an image", 422);
+          }
+          accountExpandedBytes(
+            new TextEncoder().encode(`data:${attachment.mimeType};base64,`).byteLength +
+              4 * Math.ceil(bytes.byteLength / 3),
+          );
+          content.push({
+            type: "input_image",
+            image_url: `data:${attachment.mimeType};base64,${
+              Buffer.from(bytes).toString("base64")
+            }`,
+            ...(part.detail === undefined ? {} : { detail: part.detail }),
+          });
+          continue;
+        }
+        if (part.type === "input_file") {
+          const { attachment, bytes } = await loadOnce(
+            "file",
+            part.file_id as string,
+            1_900_000,
+          );
+          if (
+            !attachment.mimeType.startsWith("text/") &&
+            !["application/json", "application/xml"].includes(attachment.mimeType)
+          ) {
+            throw new DomainError(
+              "unsupported_feature",
+              "This uploaded file type cannot be included directly in a Response",
+              400,
+            );
+          }
+          let text: string;
+          try {
+            text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+          } catch {
+            throw new DomainError("invalid_file", "Response input file is not valid UTF-8", 422);
+          }
+          const expanded = `[File: ${attachment.filename}]\n${text}`;
+          accountExpandedBytes(new TextEncoder().encode(expanded).byteLength);
+          content.push({ type: "input_text", text: expanded });
+          continue;
+        }
+        content.push(rawPart);
+      }
+      input.push({ ...item, content });
+    }
+    return { ...body, input };
   };
   const verifiedGeneratedImage = async (
     asset: Awaited<ReturnType<DomainRepository["getGeneratedAsset"]>>,
@@ -2646,30 +2766,26 @@ export function createApp(options: AppOptions = {}) {
           );
         }
         budget.rawBytes += attachment.sizeBytes;
-        const object = await objectStore.get(attachment.objectKey);
-        if (!object) throw new DomainError("object_missing", "Stored file is unavailable", 503);
-        const reader = object.body.getReader();
-        const chunks: Uint8Array[] = [];
-        let bytes = 0;
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            bytes += value.byteLength;
-            if (bytes > 10 * 1024 * 1024) {
-              throw new DomainError(
-                "attachment_context_too_large",
-                "Image attachment exceeds the inline limit",
-                413,
-              );
-            }
-            chunks.push(value);
-          }
-        } finally {
-          await reader.cancel().catch(() => undefined);
-          reader.releaseLock();
-        }
-        const encoded = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("base64");
+        const corrupt = () =>
+          new DomainError(
+            "attachment_corrupt",
+            "Stored attachment failed integrity validation",
+            503,
+          );
+        const object = await verifiedAttachmentObject(
+          attachment.objectKey,
+          attachment,
+          ownerId,
+          corrupt,
+        );
+        const bytes = await readExactObjectBody(
+          object.body,
+          attachment.sizeBytes,
+          10 * 1024 * 1024,
+          corrupt,
+        );
+        if (await imageBytesSha256(bytes) !== attachment.sha256) throw corrupt();
+        const encoded = Buffer.from(bytes).toString("base64");
         parts.push({ type: "text", text: `[Attached image: ${attachment.filename}]` });
         parts.push({
           type: "image_url",
@@ -2691,27 +2807,28 @@ export function createApp(options: AppOptions = {}) {
           );
         }
         budget.rawBytes += attachment.sizeBytes;
-        const object = await objectStore.get(attachment.objectKey);
-        if (!object) throw new DomainError("object_missing", "Stored file is unavailable", 503);
-        const reader = object.body.getReader();
+        const corrupt = () =>
+          new DomainError(
+            "attachment_corrupt",
+            "Stored attachment failed integrity validation",
+            503,
+          );
+        const object = await verifiedAttachmentObject(
+          attachment.objectKey,
+          attachment,
+          ownerId,
+          corrupt,
+        );
+        const bytes = await readExactObjectBody(
+          object.body,
+          attachment.sizeBytes,
+          1_048_576,
+          corrupt,
+        );
         const decoder = new TextDecoder("utf-8", { fatal: true });
         let text = "";
-        let bytes = 0;
         try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            bytes += value.byteLength;
-            if (bytes > 1_048_576) {
-              throw new DomainError(
-                "attachment_context_too_large",
-                "Attachment context exceeds the inline limit",
-                413,
-              );
-            }
-            text += decoder.decode(value, { stream: true });
-          }
-          text += decoder.decode();
+          text = decoder.decode(bytes);
         } catch (error) {
           if (error instanceof DomainError) throw error;
           throw new DomainError(
@@ -2719,10 +2836,8 @@ export function createApp(options: AppOptions = {}) {
             "Attachment is not valid UTF-8 text",
             422,
           );
-        } finally {
-          await reader.cancel().catch(() => undefined);
-          reader.releaseLock();
         }
+        if (await imageBytesSha256(bytes) !== attachment.sha256) throw corrupt();
         parts.push({
           type: "text",
           text:
@@ -3551,15 +3666,12 @@ export function createApp(options: AppOptions = {}) {
     if (!access) {
       throw new DomainError("share_unavailable", "Shared attachment is unavailable", 404);
     }
-    if (!objectStore) {
-      throw new DomainError("storage_not_configured", "Stored file is unavailable", 503);
-    }
-    const object = await objectStore.get(access.objectKey);
-    if (
-      !object || object.contentLength !== access.attachment.sizeBytes ||
-      object.contentType !== access.attachment.mimeType ||
-      (object.metadata.owner !== undefined && object.metadata.owner !== access.ownerId)
-    ) throw new DomainError("object_missing", "Stored file is unavailable", 503);
+    const object = await verifiedAttachmentObject(
+      access.objectKey,
+      { ...access.attachment, sha256: access.sha256 },
+      access.ownerId,
+      () => new DomainError("object_missing", "Stored file is unavailable", 503),
+    );
     return new Response(object.body, {
       headers: {
         "Content-Type": access.attachment.mimeType,
@@ -4140,6 +4252,7 @@ export function createApp(options: AppOptions = {}) {
           providerRequest,
           c.req.raw.signal,
           providerPlan,
+          ownerId,
         )
         : await webComplete(providerRequest, c.req.raw.signal, resolvedModel.upstream);
       providerCompleted = true;
@@ -4404,6 +4517,17 @@ export function createApp(options: AppOptions = {}) {
       let cachedInputTokens = 0;
       let outputTokens = 0;
       let reasoningTokens = 0;
+      let sawProviderUsage = false;
+      const estimatedVisibleTokens = () =>
+        Math.ceil(
+          (text.length + reasoning.length + refusal.length + JSON.stringify(toolCalls).length) / 4,
+        );
+      const accountedOutputTokens = () =>
+        sawProviderUsage ? outputTokens : Math.max(outputTokens, estimatedVisibleTokens());
+      const accountedReasoningTokens = () =>
+        sawProviderUsage
+          ? reasoningTokens
+          : Math.max(reasoningTokens, Math.ceil(reasoning.length / 4));
       let knowledgeContext: Awaited<ReturnType<typeof buildKnowledgeContext>> = {
         sources: [],
         includedCharacters: 0,
@@ -4533,6 +4657,7 @@ export function createApp(options: AppOptions = {}) {
             request,
             signal,
             providerPlan,
+            ownerId,
           )
           : body.model.startsWith("simulated/") && !options.providerStream
           ? (async function* () {
@@ -4600,6 +4725,7 @@ export function createApp(options: AppOptions = {}) {
                 ...(event.arguments ? { arguments: event.arguments } : {}),
               });
             } else if (event.type === "usage") {
+              sawProviderUsage = true;
               inputTokens = event.usage.inputTokens;
               cachedInputTokens = event.usage.cachedInputTokens;
               outputTokens = event.usage.outputTokens;
@@ -4619,11 +4745,8 @@ export function createApp(options: AppOptions = {}) {
         }
         await pollStop();
         if (controller.signal.aborted) throw controller.signal.reason;
-        outputTokens = Math.max(
-          outputTokens,
-          Math.ceil((text.length + reasoning.length + refusal.length) / 4),
-        );
-        reasoningTokens = Math.max(reasoningTokens, Math.ceil(reasoning.length / 4));
+        outputTokens = accountedOutputTokens();
+        reasoningTokens = accountedReasoningTokens();
         const content = body.mode === "continue"
           ? appendContinuation(source!.content, visibleText)
           : visibleText;
@@ -4686,13 +4809,10 @@ export function createApp(options: AppOptions = {}) {
             ? priceUsage(
               model,
               inputTokens,
-              Math.max(
-                outputTokens,
-                Math.ceil((text.length + reasoning.length + refusal.length) / 4),
-              ),
+              accountedOutputTokens(),
               {
                 cachedInputTokens,
-                reasoningTokens: Math.max(reasoningTokens, Math.ceil(reasoning.length / 4)),
+                reasoningTokens: accountedReasoningTokens(),
               },
             ).costMicros
             : 0;
@@ -4707,10 +4827,7 @@ export function createApp(options: AppOptions = {}) {
             model: body.model,
             costMicros: cost,
             inputTokens,
-            outputTokens: Math.max(
-              outputTokens,
-              Math.ceil((text.length + reasoning.length + refusal.length) / 4),
-            ),
+            outputTokens: accountedOutputTokens(),
             latencyMs: Math.round(performance.now() - started),
             status: "stopped",
             supersedesId: source?.id ?? null,
@@ -4722,11 +4839,8 @@ export function createApp(options: AppOptions = {}) {
               toolCalls: toolCalls.filter(Boolean),
               inputTokens,
               cachedInputTokens,
-              outputTokens: Math.max(
-                outputTokens,
-                Math.ceil((text.length + reasoning.length + refusal.length) / 4),
-              ),
-              reasoningTokens: Math.max(reasoningTokens, Math.ceil(reasoning.length / 4)),
+              outputTokens: accountedOutputTokens(),
+              reasoningTokens: accountedReasoningTokens(),
               knowledgeSources: knowledgeContext.sources,
               localCitations: knowledgeContext.sources,
               knowledgeContextCharacters: knowledgeContext.includedCharacters,
@@ -5953,6 +6067,66 @@ export function createApp(options: AppOptions = {}) {
     if (!provider) throw new DomainError("not_found", "Provider not found", 404);
     return provider;
   };
+  const validateOcrTarget = async (
+    sourceModelId: string | undefined,
+    customParams: Record<string, unknown> | undefined,
+  ) => {
+    const config = parseOcrInterceptionConfig(customParams);
+    if (!config) return;
+    const [provider, model] = await Promise.all([
+      repo.findProvider(config.providerId),
+      repo.findProviderModel(config.model),
+    ]);
+    if (!provider || !model || model.providerId !== provider.id) {
+      throw new DomainError(
+        "ocr_target_invalid",
+        "OCR provider and model must reference the same configured target",
+        422,
+      );
+    }
+    if (sourceModelId && model.id === sourceModelId) {
+      throw new DomainError("ocr_target_recursive", "A model cannot use itself for OCR", 422);
+    }
+    if (parseOcrInterceptionConfig(model.customParams)) {
+      throw new DomainError(
+        "ocr_target_recursive",
+        "An OCR target cannot enable OCR interception itself",
+        422,
+      );
+    }
+    if (!model.capabilities.includes("vision") || !model.capabilities.includes("chat")) {
+      throw new DomainError(
+        "ocr_target_invalid",
+        "OCR target model must support both chat and vision",
+        422,
+      );
+    }
+    const hasEffectivePrice = (await repo.listModelPriceVersions(model.id)).some((price) =>
+      Date.parse(price.effectiveAt) <= (options.now ?? Date.now)()
+    );
+    if (!provider.enabled || !provider.hasCredential || !model.enabled || !hasEffectivePrice) {
+      throw new DomainError(
+        "ocr_target_unavailable",
+        "OCR target must be enabled, credentialed, and have effective pricing",
+        409,
+      );
+    }
+  };
+  const assertProviderNotRequiredByOcr = async (providerId: string) => {
+    const models = await repo.listProviderModels();
+    const dependent = models.find((model) => {
+      if (!model.enabled) return false;
+      const config = parseOcrInterceptionConfig(model.customParams);
+      return config?.providerId === providerId;
+    });
+    if (dependent) {
+      throw new DomainError(
+        "ocr_target_unavailable",
+        `Provider cannot be disabled while ${dependent.publicModelId} uses it for OCR`,
+        409,
+      );
+    }
+  };
   const providerApiKey = async (provider: ProviderRecord) => {
     const stored = await repo.getProviderCredential(provider.id);
     if (!stored) {
@@ -6043,6 +6217,12 @@ export function createApp(options: AppOptions = {}) {
     providerNoStore(c);
     const { expectedVersion, patch } = await parseProviderAdminBody(c, providerPatch);
     const current = await providerForAdmin(c.req.param("id"));
+    if (current.version !== expectedVersion) {
+      throw new DomainError("version_conflict", "Provider changed in another session", 409);
+    }
+    if (current.enabled && patch.enabled === false) {
+      await assertProviderNotRequiredByOcr(current.id);
+    }
     if (
       (patch.baseUrl !== undefined && patch.baseUrl !== current.baseUrl) ||
       (patch.protocol !== undefined && patch.protocol !== current.protocol)
@@ -6106,6 +6286,7 @@ export function createApp(options: AppOptions = {}) {
         422,
       );
     }
+    await validateOcrTarget(undefined, input.customParams);
     return c.json(
       await repo.createProviderModel(input, registryMutation(c, "provider_model.created")),
       201,
@@ -6114,6 +6295,9 @@ export function createApp(options: AppOptions = {}) {
   app.patch("/api/admin/models/:id", async (c) => {
     providerNoStore(c);
     const { expectedVersion, patch } = await parseProviderAdminBody(c, providerModelPatch);
+    const current = await repo.findProviderModel(c.req.param("id"));
+    if (!current) throw new DomainError("not_found", "Provider model not found", 404);
+    await validateOcrTarget(current.id, patch.customParams);
     return c.json(
       await repo.updateProviderModel(
         c.req.param("id"),
@@ -6544,11 +6728,15 @@ export function createApp(options: AppOptions = {}) {
         existing.contentType !== mimeType || existing.metadata.sha256 !== digest ||
         existing.metadata.owner !== ownerId
       ) throw new DomainError("object_key_conflict", "Generated object collision", 409);
-      const existingBytes = new Uint8Array(await new Response(existing.body).arrayBuffer());
-      if (
-        existingBytes.byteLength !== output.bytes.byteLength ||
-        await imageBytesSha256(existingBytes) !== digest
-      ) throw new DomainError("object_key_conflict", "Generated object collision", 409);
+      const existingBytes = await readExactObjectBody(
+        existing.body,
+        output.bytes.byteLength,
+        output.bytes.byteLength,
+        () => new DomainError("object_key_conflict", "Generated object collision", 409),
+      );
+      if (await imageBytesSha256(existingBytes) !== digest) {
+        throw new DomainError("object_key_conflict", "Generated object collision", 409);
+      }
     }
     await repo.markGeneratedObjectStored(stage.id, ownerId);
     try {
@@ -6587,11 +6775,18 @@ export function createApp(options: AppOptions = {}) {
     if (!object || object.contentLength !== attachment.sizeBytes) {
       throw new DomainError("object_missing", "Edit input is unavailable", 503);
     }
-    const bytes = new Uint8Array(await new Response(object.body).arrayBuffer());
-    if (
-      bytes.byteLength !== attachment.sizeBytes ||
-      await imageBytesSha256(bytes) !== attachment.sha256
-    ) {
+    const bytes = await readExactObjectBody(
+      object.body,
+      attachment.sizeBytes,
+      IMAGE_MAX_BYTES,
+      () =>
+        new DomainError(
+          "generated_asset_corrupt",
+          "Edit input failed integrity validation",
+          503,
+        ),
+    );
+    if (await imageBytesSha256(bytes) !== attachment.sha256) {
       throw new DomainError(
         "generated_asset_corrupt",
         "Edit input failed integrity validation",
@@ -6658,11 +6853,15 @@ export function createApp(options: AppOptions = {}) {
       ) {
         throw new DomainError("object_key_conflict", "Edit input object collision", 409);
       }
-      const priorBytes = new Uint8Array(await new Response(prior.body).arrayBuffer());
-      if (
-        priorBytes.byteLength !== input.bytes.byteLength ||
-        await imageBytesSha256(priorBytes) !== input.sha256
-      ) throw new DomainError("object_key_conflict", "Edit input object collision", 409);
+      const priorBytes = await readExactObjectBody(
+        prior.body,
+        input.bytes.byteLength,
+        input.bytes.byteLength,
+        () => new DomainError("object_key_conflict", "Edit input object collision", 409),
+      );
+      if (await imageBytesSha256(priorBytes) !== input.sha256) {
+        throw new DomainError("object_key_conflict", "Edit input object collision", 409);
+      }
     }
     await repo.markGeneratedObjectStored(stage.id, ownerId);
     try {
@@ -7820,10 +8019,7 @@ export function createApp(options: AppOptions = {}) {
     const reserveMicros = providerPlan && providerExecution
       ? providerExecution.reservationMicros(
         providerPlan,
-        Math.max(
-          estimateInputTokens(request),
-          model.contextWindow - Math.min(maxOutput, model.contextWindow),
-        ),
+        estimateInputTokens(request),
         maxOutput,
       )
       : reservationPrice(model, request, maxOutput).costMicros;
@@ -8003,20 +8199,29 @@ export function createApp(options: AppOptions = {}) {
         let outputTokens = 0;
         let cachedInputTokens = 0;
         let reasoningTokens = 0;
+        let sawProviderOutputUsage = false;
         let settled = false;
         let sawDone = false;
         let sequence = 0;
+        const upstreamRequest: ChatCompletionRequest = {
+          ...request,
+          stream_options: {
+            ...request.stream_options,
+            include_usage: true,
+          },
+        };
         try {
           const providerEvents = resolvedModel.registryModel && providerExecution
             ? providerExecution.stream(
               resolvedModel.registryModel.id,
               runId,
               executionLeaseToken,
-              request,
+              upstreamRequest,
               upstreamSignal,
               providerPlan,
+              c.get("user").id,
             )
-            : providerStream(request, upstreamSignal, resolvedModel.upstream);
+            : providerStream(upstreamRequest, upstreamSignal, resolvedModel.upstream);
           for await (const data of providerEvents) {
             if (data === "[DONE]") {
               sawDone = true;
@@ -8032,6 +8237,7 @@ export function createApp(options: AppOptions = {}) {
                   content?: string;
                   reasoning_content?: string;
                   reasoning?: string;
+                  reasoning_summary?: string;
                   refusal?: string;
                   tool_calls?: unknown;
                 };
@@ -8045,6 +8251,9 @@ export function createApp(options: AppOptions = {}) {
               error?: { message?: string };
             };
             if (chunk.error) throw new Error(chunk.error.message ?? "Provider stream failed");
+            if (chunk.usage?.completion_tokens !== undefined) {
+              sawProviderOutputUsage = true;
+            }
             inputTokens = chunk.usage?.prompt_tokens ?? inputTokens;
             outputTokens = chunk.usage?.completion_tokens ?? outputTokens;
             cachedInputTokens = chunk.usage?.prompt_tokens_details?.cached_tokens ??
@@ -8055,7 +8264,8 @@ export function createApp(options: AppOptions = {}) {
               choice.delta?.content ?? ""
             ).join("") ?? "";
             const chunkReasoning = chunk.choices?.map((choice) =>
-              (choice.delta?.reasoning_content ?? "") + (choice.delta?.reasoning ?? "")
+              (choice.delta?.reasoning_content ?? "") + (choice.delta?.reasoning ?? "") +
+              (choice.delta?.reasoning_summary ?? "")
             ).join("") ?? "";
             const chunkRefusal = chunk.choices?.map((choice) => choice.delta?.refusal ?? "").join(
               "",
@@ -8063,7 +8273,10 @@ export function createApp(options: AppOptions = {}) {
             const chunkTools = chunk.choices?.map((choice) => choice.delta?.tool_calls)
               .filter((value) => value !== undefined)
               .map((value) => JSON.stringify(value)).join("") ?? "";
-            const outwardData = JSON.stringify(chunk);
+            const outwardChunk = request.stream_options?.include_usage === true
+              ? chunk
+              : Object.fromEntries(Object.entries(chunk).filter(([key]) => key !== "usage"));
+            const outwardData = JSON.stringify(outwardChunk);
             const nextVisibleOutputBytes = visibleOutputBytes + new TextEncoder().encode(
               chunkText + chunkReasoning + chunkRefusal + chunkTools,
             ).byteLength;
@@ -8071,7 +8284,9 @@ export function createApp(options: AppOptions = {}) {
               throw upstreamSignal.reason ?? new DOMException("Client disconnected", "AbortError");
             }
             if (idempotency) {
-              const observedOutput = Math.max(outputTokens, Math.ceil(nextVisibleOutputBytes / 4));
+              const observedOutput = sawProviderOutputUsage
+                ? outputTokens
+                : Math.max(outputTokens, Math.ceil(nextVisibleOutputBytes / 4));
               await repo.appendApiSseFrame(
                 idempotency.id,
                 idempotency.leaseToken,
@@ -8097,7 +8312,9 @@ export function createApp(options: AppOptions = {}) {
             }
           }
           if (sawDone) {
-            const finalOutput = Math.max(outputTokens, Math.ceil(visibleOutputBytes / 4));
+            const finalOutput = sawProviderOutputUsage
+              ? outputTokens
+              : Math.max(outputTokens, Math.ceil(visibleOutputBytes / 4));
             const cost = priceUsage(model, inputTokens, finalOutput, {
               cachedInputTokens,
               reasoningTokens,
@@ -8132,7 +8349,9 @@ export function createApp(options: AppOptions = {}) {
               await stream.writeSSE({ data: "[DONE]" });
             }
           } else if (!settled && !idempotency) {
-            const finalOutput = Math.max(outputTokens, Math.ceil(visibleOutputBytes / 4));
+            const finalOutput = sawProviderOutputUsage
+              ? outputTokens
+              : Math.max(outputTokens, Math.ceil(visibleOutputBytes / 4));
             if (finalOutput > 0) {
               await repo.settle(
                 runId,
@@ -8153,7 +8372,9 @@ export function createApp(options: AppOptions = {}) {
         } catch (error) {
           if (error instanceof TerminalAccountingPersistenceError) throw error;
           if (!settled && idempotency) {
-            const finalOutput = Math.max(outputTokens, Math.ceil(visibleOutputBytes / 4));
+            const finalOutput = sawProviderOutputUsage
+              ? outputTokens
+              : Math.max(outputTokens, Math.ceil(visibleOutputBytes / 4));
             const latencyMs = Math.round(performance.now() - started);
             await repo.failApiRequest({
               id: idempotency.id,
@@ -8181,7 +8402,9 @@ export function createApp(options: AppOptions = {}) {
                 : { mode: "refund" },
             });
           } else if (!settled && visibleOutputBytes > 0) {
-            const finalOutput = Math.max(outputTokens, Math.ceil(visibleOutputBytes / 4));
+            const finalOutput = sawProviderOutputUsage
+              ? outputTokens
+              : Math.max(outputTokens, Math.ceil(visibleOutputBytes / 4));
             await repo.settle(
               runId,
               priceUsage(model, inputTokens, finalOutput, {
@@ -8214,6 +8437,7 @@ export function createApp(options: AppOptions = {}) {
           request,
           c.req.raw.signal,
           providerPlan,
+          c.get("user").id,
         )
         : await providerComplete(request, c.req.raw.signal, resolvedModel.upstream);
       providerCompleted = true;
@@ -8317,9 +8541,51 @@ export function createApp(options: AppOptions = {}) {
   app.post("/v1/chat/completions", requireScope("chat:write"), chatHandler);
   app.post("/v1/responses", requireScope("chat:write"), async (c) => {
     const body = await parseJson(c, responsesSchema);
+    const responseIdempotencyKey = c.req.header("idempotency-key");
+    if (responseIdempotencyKey) {
+      if (responseIdempotencyKey.length < 8 || responseIdempotencyKey.length > 200) {
+        throw new DomainError(
+          "invalid_idempotency_key",
+          "Idempotency-Key must contain between 8 and 200 characters",
+          400,
+        );
+      }
+      const existing = await repo.getApiRequest(
+        c.get("user").id,
+        "responses",
+        responseIdempotencyKey,
+      );
+      if (existing) {
+        // A terminal replay is already immutable. Validate its raw request identity and current
+        // entitlement before touching referenced objects, which may have since been deleted.
+        const requestHash = await sha256Hex(
+          canonicalJson({ endpoint: "responses", request: body }),
+        );
+        if (existing.requestHash !== requestHash || existing.stream !== Boolean(body.stream)) {
+          throw new DomainError(
+            "idempotency_conflict",
+            "Idempotency key payload differs",
+            409,
+          );
+        }
+        if (existing.state !== "in_progress") {
+          if (!await replayModelIsEntitled(c, existing.model, "chat")) {
+            return c.json(
+              openAIError("The requested model is unavailable", "model_not_found"),
+              404,
+            );
+          }
+          return replayResponse(existing);
+        }
+      }
+    }
     let request: ChatCompletionRequest;
     try {
-      request = responsesRequestToChatCompletions(body) as unknown as ChatCompletionRequest;
+      const resolvedBody = await resolveResponseInputFiles(
+        body as Record<string, unknown>,
+        c.get("user").id,
+      );
+      request = responsesRequestToChatCompletions(resolvedBody) as unknown as ChatCompletionRequest;
     } catch (error) {
       if (error instanceof ProviderProtocolError) {
         const status = error.code === "payload_too_large" ? 413 : 400;
@@ -8344,10 +8610,7 @@ export function createApp(options: AppOptions = {}) {
     const responseReservation = providerPlan && providerExecution
       ? providerExecution.reservationMicros(
         providerPlan,
-        Math.max(
-          estimateInputTokens(request),
-          model.contextWindow - Math.min(maxResponseOutput, model.contextWindow),
-        ),
+        estimateInputTokens(request),
         maxResponseOutput,
       )
       : reservationPrice(model, request, maxResponseOutput).costMicros;
@@ -8366,16 +8629,251 @@ export function createApp(options: AppOptions = {}) {
       runLease ? { runId, leaseToken: executionLeaseToken } : undefined,
     );
     const started = performance.now();
+    const providerRequest = {
+      ...request,
+      stream: Boolean(body.stream),
+      max_completion_tokens: maxResponseOutput,
+      ...(body.stream
+        ? {
+          stream_options: {
+            ...request.stream_options,
+            include_usage: true,
+          },
+        }
+        : {}),
+    };
+    const nativeResponseRequestFields = {
+      ...(typeof body.store === "boolean" ? { store: body.store } : {}),
+      ...(body.metadata && typeof body.metadata === "object" && !Array.isArray(body.metadata)
+        ? { metadata: body.metadata as Record<string, unknown> }
+        : {}),
+    };
+    if (body.stream) {
+      const responseId = `resp_${crypto.randomUUID()}`;
+      const messageId = `msg_${crypto.randomUUID()}`;
+      const createdAt = Math.floor(Date.now() / 1000);
+      return streamSSE(c, async (stream) => {
+        const downstreamAbort = new AbortController();
+        stream.onAbort(() =>
+          downstreamAbort.abort(new DOMException("Client disconnected", "AbortError"))
+        );
+        const upstreamSignal = AbortSignal.any([c.req.raw.signal, downstreamAbort.signal]);
+        const projector = new ResponsesStreamProjector({
+          responseId,
+          messageId,
+          model: body.model,
+          createdAt,
+          request: {
+            background: body.background === false ? false : undefined,
+            instructions: body.instructions,
+            maxOutputTokens: body.max_output_tokens,
+            metadata: body.metadata && typeof body.metadata === "object" &&
+                !Array.isArray(body.metadata)
+              ? body.metadata as Record<string, unknown>
+              : undefined,
+            parallelToolCalls: typeof body.parallel_tool_calls === "boolean"
+              ? body.parallel_tool_calls
+              : undefined,
+            store: typeof body.store === "boolean" ? body.store : undefined,
+            reasoning: body.reasoning,
+            temperature: typeof body.temperature === "number" ? body.temperature : undefined,
+            text: body.text,
+            toolChoice: body.tool_choice,
+            tools: Array.isArray(body.tools) ? body.tools : undefined,
+            topP: typeof body.top_p === "number" ? body.top_p : undefined,
+            user: typeof body.user === "string" ? body.user : undefined,
+          },
+        });
+        let eventSequence = 0;
+        let persistenceSequence = 0;
+        let settled = false;
+        const eventFrame = (event: Record<string, unknown>) => {
+          const payload: Record<string, unknown> = {
+            ...event,
+            sequence_number: eventSequence,
+          };
+          return sseData(JSON.stringify(payload), String(payload.type));
+        };
+        const observedAccounting = () => {
+          const providerUsage = projector.usage;
+          const inputTokens = providerUsage?.inputTokens ?? estimateInputTokens(request);
+          const outputTokens = providerUsage?.outputTokens ??
+            Math.ceil(projector.visibleBytes / 4);
+          const cachedInputTokens = providerUsage?.cachedInputTokens ?? 0;
+          const reasoningTokens = providerUsage?.reasoningTokens ?? 0;
+          return {
+            inputTokens,
+            outputTokens,
+            cachedInputTokens,
+            reasoningTokens,
+            costMicros: priceUsage(model, inputTokens, outputTokens, {
+              cachedInputTokens,
+              reasoningTokens,
+            }).costMicros,
+            latencyMs: Math.round(performance.now() - started),
+          };
+        };
+        const persistAndWrite = async (event: Record<string, unknown>) => {
+          const frame = eventFrame(event);
+          if (stream.aborted || upstreamSignal.aborted) {
+            throw upstreamSignal.reason ?? new DOMException("Client disconnected", "AbortError");
+          }
+          if (idempotency) {
+            await repo.appendApiSseFrame(
+              idempotency.id,
+              idempotency.leaseToken,
+              persistenceSequence,
+              frame,
+              undefined,
+              observedAccounting(),
+              replayQuota,
+            );
+            persistenceSequence++;
+            eventSequence++;
+          }
+          await stream.write(frame);
+          if (!idempotency) eventSequence++;
+        };
+        try {
+          await persistAndWrite(projector.createdEvent());
+          await persistAndWrite(projector.inProgressEvent());
+          const providerEvents = body.model.startsWith("simulated/")
+            ? (async function* () {
+              const text = simulate(providerRequest);
+              const inputTokens = estimateInputTokens(providerRequest);
+              const outputTokens = Math.ceil(text.length / 4);
+              yield JSON.stringify({
+                id: `chatcmpl-${crypto.randomUUID()}`,
+                object: "chat.completion.chunk",
+                created: Math.floor(Date.now() / 1_000),
+                model: body.model,
+                choices: [{
+                  index: 0,
+                  delta: { role: "assistant", content: text },
+                  finish_reason: "stop",
+                }],
+                usage: {
+                  prompt_tokens: inputTokens,
+                  completion_tokens: outputTokens,
+                  total_tokens: inputTokens + outputTokens,
+                },
+              });
+              yield "[DONE]";
+            })()
+            : resolvedModel.registryModel && providerExecution
+            ? providerExecution.stream(
+              resolvedModel.registryModel.id,
+              runId,
+              executionLeaseToken,
+              providerRequest,
+              upstreamSignal,
+              providerPlan,
+              c.get("user").id,
+              nativeResponseRequestFields,
+            )
+            : providerStream(providerRequest, upstreamSignal, resolvedModel.upstream);
+          for await (const data of providerEvents) {
+            for (const event of projector.push(data)) await persistAndWrite(event);
+          }
+          const finalBeforeTerminal = observedAccounting();
+          const snapshot = projector.finish({
+            inputTokens: finalBeforeTerminal.inputTokens,
+            cachedInputTokens: finalBeforeTerminal.cachedInputTokens,
+            outputTokens: finalBeforeTerminal.outputTokens,
+            reasoningTokens: finalBeforeTerminal.reasoningTokens,
+            totalTokens: finalBeforeTerminal.inputTokens + finalBeforeTerminal.outputTokens,
+          });
+          const terminal = snapshot.terminalEvents.at(-1)!;
+          for (const event of snapshot.terminalEvents.slice(0, -1)) {
+            await persistAndWrite(event);
+          }
+          const final = observedAccounting();
+          await lease.checkpoint(final);
+          const terminalFrame = eventFrame(terminal);
+          if (idempotency) {
+            await repo.completeApiStream({
+              id: idempotency.id,
+              leaseToken: idempotency.leaseToken,
+              responseStatus: 200,
+              responseHeaders: {
+                "content-type": "text/event-stream",
+                "cache-control": "no-cache",
+              },
+              terminalFrame,
+              costMicros: final.costMicros,
+              inputTokens: final.inputTokens,
+              outputTokens: final.outputTokens,
+              latencyMs: final.latencyMs,
+              quota: replayQuota,
+            });
+          } else {
+            await repo.settle(
+              runId,
+              final.costMicros,
+              final.inputTokens,
+              final.outputTokens,
+              final.latencyMs,
+            );
+          }
+          eventSequence++;
+          settled = true;
+          if (!stream.aborted && !upstreamSignal.aborted) await stream.write(terminalFrame);
+        } catch (error) {
+          if (error instanceof TerminalAccountingPersistenceError) throw error;
+          if (!settled) {
+            const partial = observedAccounting();
+            const hasVisibleOutput = projector.visibleBytes > 0;
+            const hasAuthoritativeUsage = projector.usage !== undefined;
+            const hasBillableWork = hasVisibleOutput || hasAuthoritativeUsage;
+            const publicFailure = publicProviderFailure(error, upstreamSignal.aborted);
+            const failure = {
+              type: "error",
+              code: publicFailure.code,
+              message: publicFailure.message,
+              param: null,
+            };
+            const terminalFrame = eventFrame(failure);
+            if (idempotency) {
+              await repo.failApiRequest({
+                id: idempotency.id,
+                leaseToken: idempotency.leaseToken,
+                responseStatus: 200,
+                responseHeaders: {
+                  "content-type": "text/event-stream",
+                  "cache-control": "no-cache",
+                },
+                responseBody: JSON.stringify(openAIError(failure.message, failure.code)),
+                terminalFrame,
+                billing: hasBillableWork
+                  ? {
+                    mode: "settle",
+                    costMicros: partial.costMicros,
+                    inputTokens: partial.inputTokens,
+                    outputTokens: partial.outputTokens,
+                    latencyMs: partial.latencyMs,
+                  }
+                  : { mode: "refund" },
+              });
+            } else if (hasBillableWork) {
+              await repo.settle(
+                runId,
+                partial.costMicros,
+                partial.inputTokens,
+                partial.outputTokens,
+                partial.latencyMs,
+              );
+            } else await repo.refund(runId);
+            settled = true;
+            if (!stream.aborted && !upstreamSignal.aborted) await stream.write(terminalFrame);
+          }
+        } finally {
+          await lease.stop();
+        }
+      });
+    }
     let result;
     let providerCompleted = false;
     try {
-      // Responses streaming is currently synthesized from one bounded completion so replay can be
-      // committed atomically. Keep the converted request fields, but request a non-stream result.
-      const providerRequest = {
-        ...request,
-        stream: false,
-        max_completion_tokens: maxResponseOutput,
-      };
       result = resolvedModel.registryModel && providerExecution
         ? await providerExecution.complete(
           resolvedModel.registryModel.id,
@@ -8384,6 +8882,8 @@ export function createApp(options: AppOptions = {}) {
           providerRequest,
           c.req.raw.signal,
           providerPlan,
+          c.get("user").id,
+          nativeResponseRequestFields,
         )
         : await providerComplete(providerRequest, c.req.raw.signal, resolvedModel.upstream);
       providerCompleted = true;
@@ -8393,24 +8893,39 @@ export function createApp(options: AppOptions = {}) {
         throw error;
       }
       if (!providerCompleted && idempotency) {
+        const failure = publicProviderFailure(error, c.req.raw.signal.aborted);
         const failureBody = JSON.stringify(
-          openAIError("Provider request failed", "provider_error"),
+          openAIError(failure.message, failure.code),
         );
+        const responseHeaders = {
+          "content-type": "application/json",
+          ...(failure.retryAfterMs !== undefined
+            ? { "retry-after": String(Math.max(1, Math.ceil(failure.retryAfterMs / 1_000))) }
+            : {}),
+        };
         await repo.failApiRequest({
           id: idempotency.id,
           leaseToken: idempotency.leaseToken,
-          responseStatus: 502,
-          responseHeaders: { "content-type": "application/json" },
+          responseStatus: failure.status,
+          responseHeaders,
           responseBody: failureBody,
           billing: { mode: "refund" },
         });
         await lease.stop();
         return new Response(failureBody, {
-          status: 502,
-          headers: { "content-type": "application/json" },
+          status: failure.status,
+          headers: responseHeaders,
         });
       }
-      if (!providerCompleted) await repo.refund(runId);
+      if (!providerCompleted) {
+        await repo.refund(runId);
+        const failure = publicProviderFailure(error, c.req.raw.signal.aborted);
+        return c.json(openAIError(failure.message, failure.code), failure.status as 400, {
+          ...(failure.retryAfterMs !== undefined
+            ? { "retry-after": String(Math.max(1, Math.ceil(failure.retryAfterMs / 1_000))) }
+            : {}),
+        });
+      }
       await lease.stop();
       throw error;
     }
@@ -8443,13 +8958,36 @@ export function createApp(options: AppOptions = {}) {
         messageId,
         model: body.model,
         createdAt,
-        status: "completed",
+        status: canonicalResult.finishState === "stop" ||
+            canonicalResult.finishState === "tool_calls"
+          ? "completed"
+          : "incomplete",
         result: canonicalResult,
         usage: {
           inputTokens: result.inputTokens,
           outputTokens: result.outputTokens,
           cachedInputTokens: result.cachedInputTokens,
           reasoningTokens: result.reasoningTokens,
+        },
+        request: {
+          background: body.background === false ? false : undefined,
+          instructions: body.instructions,
+          maxOutputTokens: body.max_output_tokens,
+          metadata: body.metadata && typeof body.metadata === "object" &&
+              !Array.isArray(body.metadata)
+            ? body.metadata as Record<string, unknown>
+            : undefined,
+          parallelToolCalls: typeof body.parallel_tool_calls === "boolean"
+            ? body.parallel_tool_calls
+            : undefined,
+          reasoning: body.reasoning,
+          store: typeof body.store === "boolean" ? body.store : undefined,
+          temperature: typeof body.temperature === "number" ? body.temperature : undefined,
+          text: body.text,
+          toolChoice: body.tool_choice,
+          tools: Array.isArray(body.tools) ? body.tools : undefined,
+          topP: typeof body.top_p === "number" ? body.top_p : undefined,
+          user: typeof body.user === "string" ? body.user : undefined,
         },
       });
       const responseCost = priceUsage(model, result.inputTokens, result.outputTokens, {
@@ -8490,67 +9028,15 @@ export function createApp(options: AppOptions = {}) {
         });
         throw failure;
       };
-      if (!body.stream) {
-        const responseBody = JSON.stringify(completedResponse);
-        if (idempotency) {
-          try {
-            await repo.completeApiJson({
-              id: idempotency.id,
-              leaseToken: idempotency.leaseToken,
-              responseStatus: 200,
-              responseHeaders: { "content-type": "application/json" },
-              responseBody,
-              costMicros: responseCost,
-              inputTokens: result.inputTokens,
-              outputTokens: result.outputTokens,
-              latencyMs,
-              quota: replayQuota,
-            });
-          } catch (error) {
-            await terminalizePersistenceFailure(error);
-          }
-        } else {
-          await repo.settle(
-            runId,
-            responseCost,
-            result.inputTokens,
-            result.outputTokens,
-            latencyMs,
-          );
-        }
-        return new Response(responseBody, { headers: { "content-type": "application/json" } });
-      }
-
-      const pendingResponse = responseObject({
-        id: responseId,
-        messageId,
-        model: body.model,
-        createdAt,
-        status: "in_progress",
-      });
-      let eventSequence = 0;
-      const eventFrame = (event: Record<string, unknown>) => {
-        const payload: Record<string, unknown> = { ...event, sequence_number: ++eventSequence };
-        return sseData(JSON.stringify(payload), String(payload.type));
-      };
-      const completedOutput = completedResponse.output as Array<Record<string, unknown>>;
-      const responseFrames = [
-        eventFrame({ type: "response.created", response: pendingResponse }),
-        ...bufferedResponseOutputEvents(completedOutput, eventFrame),
-        eventFrame({ type: "response.completed", response: completedResponse }),
-      ];
+      const responseBody = JSON.stringify(completedResponse);
       if (idempotency) {
         try {
-          await repo.completeApiStream({
+          await repo.completeApiJson({
             id: idempotency.id,
             leaseToken: idempotency.leaseToken,
             responseStatus: 200,
-            responseHeaders: {
-              "content-type": "text/event-stream",
-              "cache-control": "no-cache",
-            },
-            frames: responseFrames.slice(0, -1).map((frame, sequence) => ({ sequence, frame })),
-            terminalFrame: responseFrames.at(-1),
+            responseHeaders: { "content-type": "application/json" },
+            responseBody,
             costMicros: responseCost,
             inputTokens: result.inputTokens,
             outputTokens: result.outputTokens,
@@ -8569,12 +9055,7 @@ export function createApp(options: AppOptions = {}) {
           latencyMs,
         );
       }
-      return streamSSE(c, async (stream) => {
-        for (const frame of responseFrames) {
-          if (stream.aborted || c.req.raw.signal.aborted) return;
-          await stream.write(frame);
-        }
-      });
+      return new Response(responseBody, { headers: { "content-type": "application/json" } });
     } finally {
       await lease.stop();
     }

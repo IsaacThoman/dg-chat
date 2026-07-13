@@ -82,6 +82,10 @@ export interface UpstreamStreamOptions {
   baseUrl?: string;
   apiKey?: string;
   upstreamModel?: string;
+  /** Protocol selected by the frozen execution-plan target. */
+  protocol?: "chat_completions" | "responses";
+  /** Validated model defaults. Dispatch adapters intentionally decide which keys they support. */
+  customParams?: Readonly<Record<string, unknown>>;
   timeoutMs?: number;
   maxResponseBytes?: number;
   fetch?: typeof fetch;
@@ -460,7 +464,12 @@ export async function* streamChatCompletion(
       authorization: `Bearer ${apiKey}`,
       "content-type": "application/json",
     },
-    body: JSON.stringify({ ...request, model: upstreamModel, stream: true }),
+    body: JSON.stringify({
+      ...options.customParams,
+      ...request,
+      model: upstreamModel,
+      stream: true,
+    }),
   });
   if (!response.ok) {
     const payload = await readBoundedBody(response, maxResponseBytes(options.maxResponseBytes));
@@ -565,7 +574,12 @@ async function completeAttempt(
     signal: AbortSignal.any([signal, timeout]),
     redirect: "error",
     headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
-    body: JSON.stringify({ ...request, model: upstreamModel, stream: false }),
+    body: JSON.stringify({
+      ...options.customParams,
+      ...request,
+      model: upstreamModel,
+      stream: false,
+    }),
   });
   const body = await readBoundedBody(response, maxResponseBytes(options.maxResponseBytes));
   if (!response.ok) {

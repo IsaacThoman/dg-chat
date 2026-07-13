@@ -27,6 +27,12 @@ import type {
 import { isIngestibleDocumentMime } from "./attachment-policy.ts";
 import { canonicalJson, sha256Hex } from "./backup-format.ts";
 import {
+  providerCustomParamsViolation,
+  providerDefaultsViolation,
+  providerModelOcrGraphViolation,
+  providerOcrTargetProviderViolation,
+} from "./provider-model-invariants.ts";
+import {
   apiResponseBodyByteLength,
   canonicalWorkspaceName,
   MAX_ACTIVE_CONVERSATION_SHARES,
@@ -292,8 +298,11 @@ function normalizeProviderBaseUrl(value: string): string {
   }
   try {
     const url = new URL(value);
+    const testHttp = Deno.env.get("DENO_ENV") === "test" && url.protocol === "http:" &&
+      Deno.env.get("OPENAI_TEST_ALLOW_HTTP_HOST")?.toLowerCase() === url.hostname.toLowerCase();
     if (
-      url.protocol !== "https:" || url.username || url.password || url.search || url.hash ||
+      (!testHttp && url.protocol !== "https:") || url.username || url.password || url.search ||
+      url.hash ||
       url.port === "0"
     ) {
       throw new Error();
@@ -361,10 +370,10 @@ function validateProviderModelInput(
       new Set(input.capabilities).size !== input.capabilities.length ||
       input.capabilities.some((value) => !isModelCapability(value)))
   ) throw new DomainError("validation_error", "Model capabilities are invalid", 422);
-  if (
-    input.customParams !== undefined &&
-    (input.customParams === null || Array.isArray(input.customParams))
-  ) throw new DomainError("validation_error", "Model custom parameters are invalid", 422);
+  if (input.customParams !== undefined) {
+    const violation = providerCustomParamsViolation(input.customParams, input.publicModelId);
+    if (violation) throw new DomainError(violation.code, violation.message, 422);
+  }
 }
 
 function validatePriceInput(input: CreateModelPriceVersionInput) {
@@ -1790,7 +1799,13 @@ export class MemoryRepository {
     if (!source || !attachment || !current || current.state !== "ready" || current.deletedAt) {
       return undefined;
     }
-    return { shareId, ownerId: stored.ownerId, attachment, objectKey: source.objectKey };
+    return {
+      shareId,
+      ownerId: stored.ownerId,
+      attachment,
+      objectKey: source.objectKey,
+      sha256: current.sha256,
+    };
   }
 
   updateUserPreferences(ownerId: string, patch: import("./repository.ts").UserPreferencesPatch) {
@@ -3793,6 +3808,25 @@ export class MemoryRepository {
     const stored = this.providers.get(id);
     if (!stored) throw new DomainError("not_found", "Provider not found", 404);
     if (stored.version !== expectedVersion) throw registryConflict();
+    if (input.enabled === false && stored.enabled) {
+      const violation = providerOcrTargetProviderViolation(
+        [...this.providerModels.values()],
+        [...this.providers.values()].map((provider) => ({
+          id: provider.id,
+          enabled: provider.id === id ? false : provider.enabled,
+        })),
+      );
+      if (violation) throw new DomainError(violation.code, violation.message, 422);
+    }
+    if (input.protocol !== undefined && input.protocol !== stored.protocol) {
+      const violation = [...this.providerModels.values()]
+        .filter((model) => model.providerId === id)
+        .map((model) =>
+          providerDefaultsViolation(input.protocol!, model.customParams, model.publicModelId)
+        )
+        .find(Boolean);
+      if (violation) throw new DomainError(violation.code, violation.message, 422);
+    }
     if (
       input.slug !== undefined &&
       [...this.providers.values()].some((provider) =>
@@ -3908,6 +3942,16 @@ export class MemoryRepository {
       createdAt: now,
       updatedAt: now,
     };
+    const defaultsViolation = providerDefaultsViolation(
+      this.providers.get(input.providerId)!.protocol,
+      model.customParams,
+      model.publicModelId,
+    );
+    if (defaultsViolation) {
+      throw new DomainError(defaultsViolation.code, defaultsViolation.message, 422);
+    }
+    const graphViolation = providerModelOcrGraphViolation([...this.providerModels.values(), model]);
+    if (graphViolation) throw new DomainError(graphViolation.code, graphViolation.message, 422);
     this.providerModels.set(model.id, model);
     this.registryAudit(mutation, "provider_model", model.id, {
       providerId: model.providerId,
@@ -3933,6 +3977,30 @@ export class MemoryRepository {
           candidate.id !== id && candidate.publicModelId === input.publicModelId
         ) || [...this.modelAliases.values()].some((alias) => alias.alias === input.publicModelId)
     ) throw new DomainError("model_id_taken", "Public model ID already exists", 409);
+    const candidate = structuredClone(model);
+    if (input.publicModelId !== undefined) candidate.publicModelId = input.publicModelId;
+    if (input.upstreamModelId !== undefined) {
+      candidate.upstreamModelId = input.upstreamModelId.trim();
+    }
+    if (input.displayName !== undefined) candidate.displayName = input.displayName.trim();
+    if (input.capabilities !== undefined) candidate.capabilities = [...input.capabilities];
+    if (input.contextWindow !== undefined) candidate.contextWindow = input.contextWindow;
+    if (input.enabled !== undefined) candidate.enabled = input.enabled;
+    if (input.customParams !== undefined) {
+      candidate.customParams = structuredClone(input.customParams);
+    }
+    const defaultsViolation = providerDefaultsViolation(
+      this.providers.get(candidate.providerId)!.protocol,
+      candidate.customParams,
+      candidate.publicModelId,
+    );
+    if (defaultsViolation) {
+      throw new DomainError(defaultsViolation.code, defaultsViolation.message, 422);
+    }
+    const graphViolation = providerModelOcrGraphViolation(
+      [...this.providerModels.values()].map((item) => item.id === id ? candidate : item),
+    );
+    if (graphViolation) throw new DomainError(graphViolation.code, graphViolation.message, 422);
     if (input.publicModelId !== undefined) model.publicModelId = input.publicModelId;
     if (input.upstreamModelId !== undefined) model.upstreamModelId = input.upstreamModelId.trim();
     if (input.displayName !== undefined) model.displayName = input.displayName.trim();
@@ -4147,13 +4215,11 @@ export class MemoryRepository {
     if (input.retryPolicyId != null && !this.providerRetryPolicies.has(input.retryPolicyId)) {
       throw new DomainError("not_found", "Retry policy not found", 404);
     }
-    const sourceProvider = this.providers.get(source.providerId);
     const compatible = input.fallbackModelIds.every((id) => {
       const target = this.providerModels.get(id)!;
       const provider = this.providers.get(target.providerId);
       return target.enabled && provider?.enabled && provider.hasCredential &&
-        this.effectiveModelPrice(target.id) !== undefined && sourceProvider &&
-        provider.protocol === sourceProvider.protocol &&
+        this.effectiveModelPrice(target.id) !== undefined &&
         target.contextWindow >= source.contextWindow &&
         source.capabilities.every((capability) => target.capabilities.includes(capability));
     });
@@ -4209,14 +4275,12 @@ export class MemoryRepository {
     };
     flatten(sourceModelId);
     const source = this.providerModels.get(sourceModelId);
-    const sourceProvider = source ? this.providers.get(source.providerId) : undefined;
     const targets: ProviderExecutionPlan["targets"] = [];
     for (const id of ids) {
       const model = this.providerModels.get(id);
       const provider = model ? this.providers.get(model.providerId) : undefined;
       const price = model ? this.effectiveModelPrice(model.id, at) : undefined;
-      const compatible = source && sourceProvider && model && provider &&
-        provider.protocol === sourceProvider.protocol &&
+      const compatible = source && model && provider &&
         model.contextWindow >= source.contextWindow &&
         source.capabilities.every((capability) => model.capabilities.includes(capability));
       const unavailable = !model || !provider || !model.enabled || !provider.enabled ||

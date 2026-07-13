@@ -379,6 +379,10 @@ export const setTokenAccessModeSchema = z.object({
   accessMode: z.enum(["inherit", "restricted"]),
 }).strict();
 
+function omitUndefined<T extends Record<string, unknown>>(value: T): T {
+  return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined)) as T;
+}
+
 export const chatCompletionSchema = z.object({
   model: z.string().min(1),
   messages: z.array(
@@ -391,21 +395,27 @@ export const chatCompletionSchema = z.object({
     }).passthrough(),
   ).min(1).max(256),
   stream: z.boolean().optional(),
-  temperature: z.number().min(0).max(2).optional(),
+  temperature: z.number().min(0).max(2).nullable().optional().transform((value) =>
+    value ?? undefined
+  ),
   max_tokens: z.number().int().positive().max(131072).optional(),
-  max_completion_tokens: z.number().int().positive().max(131072).optional(),
+  max_completion_tokens: z.number().int().positive().max(131072).nullable().optional().transform(
+    (value) => value ?? undefined,
+  ),
   stream_options: z.object({ include_usage: z.boolean().optional() }).passthrough().optional(),
   tools: z.array(z.unknown()).optional(),
   tool_choice: z.unknown().optional(),
   response_format: z.unknown().optional(),
   parallel_tool_calls: z.boolean().optional(),
-  stop: z.union([z.string(), z.array(z.string()).max(16)]).optional(),
+  stop: z.union([z.string(), z.array(z.string()).max(16)]).nullable().optional().transform((
+    value,
+  ) => value ?? undefined),
   frequency_penalty: z.number().min(-2).max(2).optional(),
   presence_penalty: z.number().min(-2).max(2).optional(),
   seed: z.number().int().optional(),
   n: z.literal(1).optional(),
   user: z.string().optional(),
-}).passthrough();
+}).passthrough().transform(omitUndefined);
 
 export const responsesSchema = z.object({
   model: z.string().min(1).max(200),
@@ -437,9 +447,22 @@ export const responsesSchema = z.object({
       ]),
     ).min(1).max(256),
   ]),
-  stream: z.boolean().optional(),
-  max_output_tokens: z.number().int().positive().max(131_072).optional(),
-}).passthrough();
+  instructions: z.string().max(2_000_000).nullable().optional().transform((value) =>
+    value ?? undefined
+  ),
+  stream: z.boolean().nullable().optional().transform((value) => value ?? undefined),
+  stream_options: z.object({ include_obfuscation: z.boolean().optional() }).strict().nullable()
+    .optional().transform((value) => value ?? undefined),
+  temperature: z.number().min(0).max(2).nullable().optional().transform((value) =>
+    value ?? undefined
+  ),
+  top_p: z.number().min(0).max(1).nullable().optional().transform((value) => value ?? undefined),
+  parallel_tool_calls: z.boolean().nullable().optional().transform((value) => value ?? undefined),
+  max_output_tokens: z.number().int().positive().max(131_072).nullable().optional().transform(
+    (value) => value ?? undefined,
+  ),
+  reasoning: z.unknown().nullable().optional().transform((value) => value ?? undefined),
+}).passthrough().transform(omitUndefined);
 
 const embeddingTokenArraySchema = z.array(z.number().int().min(0).max(4_294_967_295))
   .min(1).max(131_072);

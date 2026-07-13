@@ -1296,9 +1296,32 @@ Deno.test({
           ciphertext: "Y2lwaGVy",
         },
       }, { actorId: actor.id, action: "provider.credential" });
-      const makeModel = async (name: string) => {
+      const responsesProvider = await repo.createProvider({
+        slug: "resilience-responses",
+        displayName: "Resilience Responses",
+        baseUrl: "https://responses-resilience.database.test/v1",
+        protocol: "responses",
+      }, { actorId: actor.id, action: "provider.create" });
+      const credentialedResponses = await repo.setProviderCredential(
+        responsesProvider.id,
+        responsesProvider.version,
+        {
+          envelope: {
+            version: 1,
+            algorithm: "AES-256-GCM",
+            keyId: "test",
+            credentialVersion: 1,
+            wrappedKeyNonce: "bm9uY2U=",
+            wrappedKey: "d3JhcA==",
+            contentNonce: "bm9uY2U=",
+            ciphertext: "Y2lwaGVy",
+          },
+        },
+        { actorId: actor.id, action: "provider.credential" },
+      );
+      const makeModel = async (name: string, targetProvider = credentialed) => {
         const model = await repo.createProviderModel({
-          providerId: provider.id,
+          providerId: targetProvider.id,
           publicModelId: `resilience/${name}`,
           upstreamModelId: name,
           displayName: name,
@@ -1318,7 +1341,9 @@ Deno.test({
         }, { actorId: actor.id, action: "price.create" });
         return { model: (await repo.findProviderModel(model.id))!, price };
       };
-      const a = await makeModel("a"), b = await makeModel("b"), c = await makeModel("c");
+      const a = await makeModel("a"),
+        b = await makeModel("b"),
+        c = await makeModel("c", credentialedResponses);
       const routeA = await repo.setProviderModelRoute({
         sourceModelId: a.model.id,
         expectedVersion: 0,
@@ -1642,6 +1667,148 @@ Deno.test({
       assertEquals((await repo.findProvider(disabled.id))?.displayName, "Database Provider");
     } finally {
       await repo.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "Postgres serializes OCR graph edits and protocol default invariants",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 1 });
+    await sql`TRUNCATE model_price_versions, provider_models, providers, audit_events,
+      ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users
+      RESTART IDENTITY CASCADE`;
+    await sql.end();
+    const firstRepo = await PostgresRepository.connect(databaseUrl!);
+    const secondRepo = await PostgresRepository.connect(databaseUrl!);
+    try {
+      const actor = await firstRepo.bootstrapAdmin({
+        email: "model-invariants@database.test",
+        name: "Model invariants",
+        passwordHash: "hash",
+      }, 1);
+      const mutation = { actorId: actor.id, action: "model.invariant" };
+      const provider = await firstRepo.createProvider({
+        slug: "model-invariants",
+        displayName: "Model invariants",
+        baseUrl: "https://invariants.database.test/v1",
+        protocol: "chat_completions",
+      }, mutation);
+      const model = (name: string) =>
+        firstRepo.createProviderModel({
+          providerId: provider.id,
+          publicModelId: `model-invariants/${name}`,
+          upstreamModelId: name,
+          displayName: name,
+          capabilities: ["chat", "vision"],
+          contextWindow: 8_192,
+        }, mutation);
+      const a = await model("a");
+      const b = await model("b");
+      const ocr = (target: string) => ({
+        ocr: { enabled: true, providerId: provider.id, model: target, prompt: "Extract text" },
+      });
+      const edits = await Promise.allSettled([
+        firstRepo.updateProviderModel(a.id, a.version, { customParams: ocr(b.id) }, mutation),
+        secondRepo.updateProviderModel(b.id, b.version, { customParams: ocr(a.id) }, mutation),
+      ]);
+      assertEquals(edits.filter((result) => result.status === "fulfilled").length, 1);
+      assertEquals(edits.filter((result) => result.status === "rejected").length, 1);
+      const rejected = edits.find((result): result is PromiseRejectedResult =>
+        result.status === "rejected"
+      );
+      assertEquals(rejected?.reason instanceof DomainError, true);
+      const persisted = await firstRepo.listProviderModels(provider.id);
+      const ocrSource = persisted.find((model) =>
+        model.customParams.ocr && typeof model.customParams.ocr === "object"
+      )!;
+      const targetId = String((ocrSource.customParams.ocr as Record<string, unknown>).model);
+      const ocrTarget = (await firstRepo.findProviderModel(targetId))!;
+      await assertRejects(
+        () =>
+          firstRepo.updateProvider(
+            provider.id,
+            provider.version,
+            { enabled: false },
+            mutation,
+          ),
+        DomainError,
+        "must remain enabled",
+      );
+      await assertRejects(
+        () =>
+          firstRepo.updateProviderModel(ocrTarget.id, ocrTarget.version, {
+            capabilities: ["vision"],
+          }, mutation),
+        DomainError,
+        "both chat and vision",
+      );
+
+      const stopModel = await model("stop");
+      await firstRepo.updateProviderModel(stopModel.id, stopModel.version, {
+        customParams: { stop: "END" },
+      }, mutation);
+      await assertRejects(
+        () =>
+          firstRepo.updateProvider(
+            provider.id,
+            provider.version,
+            { protocol: "responses" },
+            mutation,
+          ),
+        DomainError,
+        "not supported by Responses providers",
+      );
+      const currentSource = (await firstRepo.findProviderModel(ocrSource.id))!;
+      await firstRepo.updateProviderModel(currentSource.id, currentSource.version, {
+        enabled: false,
+      }, mutation);
+      const currentTarget = (await firstRepo.findProviderModel(ocrTarget.id))!;
+      await firstRepo.updateProviderModel(currentTarget.id, currentTarget.version, {
+        enabled: false,
+      }, mutation);
+      const currentProvider = (await firstRepo.findProvider(provider.id))!;
+      await firstRepo.updateProvider(
+        currentProvider.id,
+        currentProvider.version,
+        { enabled: false },
+        mutation,
+      );
+      const disabledSource = (await firstRepo.findProviderModel(currentSource.id))!;
+      await assertRejects(
+        () =>
+          firstRepo.updateProviderModel(disabledSource.id, disabledSource.version, {
+            enabled: true,
+          }, mutation),
+        DomainError,
+        "must remain enabled",
+      );
+      const responses = await firstRepo.createProvider({
+        slug: "responses-invariants",
+        displayName: "Responses invariants",
+        baseUrl: "https://responses.database.test/v1",
+        protocol: "responses",
+      }, mutation);
+      await assertRejects(
+        () =>
+          firstRepo.createProviderModel({
+            providerId: responses.id,
+            publicModelId: "responses-invariants/invalid",
+            upstreamModelId: "invalid",
+            displayName: "Invalid",
+            capabilities: ["chat"],
+            contextWindow: 8_192,
+            customParams: { seed: 7 },
+          }, mutation),
+        DomainError,
+        "not supported by Responses providers",
+      );
+    } finally {
+      await firstRepo.close();
+      await secondRepo.close();
     }
   },
 });

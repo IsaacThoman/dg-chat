@@ -323,6 +323,9 @@ export interface ChatCompletionRequest {
   n?: number;
   tools?: unknown[];
   user?: string;
+  reasoning_effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+  /** Internal canonical bridge for Responses reasoning summaries. */
+  reasoning_summary?: "none" | "auto" | "concise" | "detailed";
 }
 
 export interface ApiErrorBody {

@@ -35,8 +35,12 @@ export function normalizeProviderBaseUrl(value: string): string {
   } catch {
     throw new TypeError("Provider base URL is invalid");
   }
+  const testHttpHost = Deno.env.get("OPENAI_TEST_ALLOW_HTTP_HOST")?.toLowerCase();
+  const testHttp = Deno.env.get("DENO_ENV") === "test" && url.protocol === "http:" &&
+    testHttpHost === url.hostname.toLowerCase();
   if (
-    url.protocol !== "https:" || url.username || url.password || url.search || url.hash ||
+    (!testHttp && url.protocol !== "https:") || url.username || url.password || url.search ||
+    url.hash ||
     !url.hostname || url.port === "0"
   ) {
     throw new TypeError(
