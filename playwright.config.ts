@@ -42,6 +42,13 @@ export default defineConfig({
         url: `${env("E2E_API_URL") ?? "http://localhost:8000"}/health`,
         reuseExistingServer: !env("CI"),
         timeout: 120_000,
+        // Browser journeys repeatedly authenticate the same fixture administrator. Dedicated
+        // rate-limit tests cover the production defaults; a high managed-stack quota prevents
+        // unrelated journeys from becoming order- and wall-clock-dependent.
+        env: {
+          AUTH_RATE_LIMIT: env("E2E_AUTH_RATE_LIMIT") ?? "1000",
+          AUTH_CLIENT_RATE_LIMIT: env("E2E_AUTH_CLIENT_RATE_LIMIT") ?? "1000",
+        },
       },
       {
         command: "deno task dev:web --host 0.0.0.0",
