@@ -3373,19 +3373,11 @@ export function createApp(options: AppOptions = {}) {
     const ownerId = c.get("user").id;
     const conversationId = requireUuid(c.req.param("id"), "conversationId");
     const body = await parseJson(c, keepTemporaryConversationSchema);
-    const conversation = await repo.promoteTemporaryConversation(
+    return c.json(await repo.promoteTemporaryConversation(
       ownerId,
       conversationId,
       body.expectedVersion,
-    );
-    await repo.recordAudit({
-      actorId: ownerId,
-      action: "conversation.temporary_kept",
-      targetType: "conversation",
-      targetId: conversationId,
-      metadata: { previousVersion: body.expectedVersion, version: conversation.version },
-    });
-    return c.json(conversation);
+    ));
   });
   app.get(
     "/api/conversations/:id",
