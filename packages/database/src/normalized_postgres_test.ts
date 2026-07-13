@@ -1848,13 +1848,13 @@ Deno.test({
 
       await repo.updateConversation(owner.id, conversation.id, {
         archived: true,
-        expectedVersion: conversation.version,
+        expectedVersion: conversation.version + 1,
       });
       await assertReadOnly();
       await repo.updateConversation(owner.id, conversation.id, {
         archived: false,
         deleted: true,
-        expectedVersion: conversation.version + 1,
+        expectedVersion: conversation.version + 2,
       });
       await assertReadOnly();
     } finally {
