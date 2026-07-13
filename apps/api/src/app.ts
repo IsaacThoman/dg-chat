@@ -268,6 +268,7 @@ export interface AppOptions {
   temporaryRetentionDays?: number;
   publicShareRateLimit?: number;
   publicShareClientRateLimit?: number;
+  shareMutationRateLimit?: number;
   webComplete?: typeof complete;
   objectStore?: ObjectStore;
   attachmentContextMaxRawBytes?: number;
@@ -1306,10 +1307,14 @@ export function createApp(options: AppOptions = {}) {
     positiveInteger("PUBLIC_SHARE_RATE_LIMIT", 120);
   const configuredPublicShareClientLimit = options.publicShareClientRateLimit ??
     positiveInteger("PUBLIC_SHARE_CLIENT_RATE_LIMIT", 240);
+  const configuredShareMutationLimit = options.shareMutationRateLimit ??
+    positiveInteger("SHARE_MUTATION_RATE_LIMIT", 20);
   if (
     !Number.isSafeInteger(configuredPublicShareLimit) || configuredPublicShareLimit < 1 ||
-    !Number.isSafeInteger(configuredPublicShareClientLimit) || configuredPublicShareClientLimit < 1
-  ) throw new Error("Public share rate limits must be positive safe integers");
+    !Number.isSafeInteger(configuredPublicShareClientLimit) ||
+    configuredPublicShareClientLimit < 1 ||
+    !Number.isSafeInteger(configuredShareMutationLimit) || configuredShareMutationLimit < 1
+  ) throw new Error("Share rate limits must be positive safe integers");
   const configuredRateWindow = positiveInteger("RATE_LIMIT_WINDOW_SECONDS", 60);
   const effectiveTokenRpmLimit = Math.ceil(
     configuredOpenAILimit * 60 / configuredRateWindow,
@@ -3420,12 +3425,36 @@ export function createApp(options: AppOptions = {}) {
   app.use("/api/conversations", authenticate, approved, sessionOnly);
   app.use("/api/shares/*", authenticate, approved, sessionOnly);
   app.use("/api/shares", authenticate, approved, sessionOnly);
+  const protectShareMutation = async (c: Context<{ Variables: Variables }>) => {
+    let rate;
+    try {
+      rate = await rateLimiter.consume(
+        `conversation-share:owner:${c.get("user").id}`,
+        configuredShareMutationLimit,
+        configuredRateWindow,
+      );
+    } catch {
+      c.header("Retry-After", "5");
+      throw new DomainError(
+        "service_unavailable",
+        "Share protection is temporarily unavailable",
+        503,
+      );
+    }
+    c.header("X-RateLimit-Limit", String(rate.limit));
+    c.header("X-RateLimit-Remaining", String(rate.remaining));
+    if (!rate.allowed) {
+      c.header("Retry-After", String(rate.retryAfterSeconds));
+      throw new DomainError("rate_limit_exceeded", "Too many share changes", 429);
+    }
+  };
   app.get("/api/shares", async (c) => {
     privateNoStore(c);
     return c.json({ data: await repo.listConversationShares(c.get("user").id) });
   });
   app.post("/api/shares/:id/revoke", async (c) => {
     privateNoStore(c);
+    await protectShareMutation(c);
     const body = await parseJson(c, revokeConversationShareSchema);
     const share = await repo.revokeConversationShare(
       c.get("user").id,
@@ -3619,6 +3648,7 @@ export function createApp(options: AppOptions = {}) {
   });
   app.post("/api/conversations/:id/shares", async (c) => {
     privateNoStore(c);
+    await protectShareMutation(c);
     const body = await parseJson(c, createConversationShareSchema);
     if (!isCanonicalShareCapability(body.capability)) {
       throw new DomainError(

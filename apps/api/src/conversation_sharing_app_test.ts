@@ -371,8 +371,33 @@ Deno.test("public shares enforce per-capability/client limits and fail closed", 
   assertEquals(denied.status, 429);
   assertExists(denied.headers.get("retry-after"));
 
+  const mutationLimited = createApp({ repository, shareMutationRateLimit: 1 });
+  const mutation = (seed: number, key: string) =>
+    mutationLimited.app.request(`/api/conversations/${owner.conversation.id}/shares`, {
+      method: "POST",
+      headers: { ...owner.headers, "idempotency-key": key },
+      body: JSON.stringify(
+        createBody(owner.leaf.id, owner.conversation.version, capability(seed)),
+      ),
+    });
+  assertEquals((await mutation(21, "owner-mutation-one")).status, 201);
+  const mutationDenied = await mutation(22, "owner-mutation-two");
+  assertEquals(mutationDenied.status, 429);
+  assertExists(mutationDenied.headers.get("retry-after"));
+
   const unavailable = createApp({ repository, rateLimiter: new ThrowingRateLimiter() });
   const failedClosed = await unavailable.app.request(`/api/public/shares/${secret}`);
   assertEquals(failedClosed.status, 503);
   assertEquals((await failedClosed.json()).error.code, "service_unavailable");
+  const mutationFailedClosed = await unavailable.app.request(
+    `/api/conversations/${owner.conversation.id}/shares`,
+    {
+      method: "POST",
+      headers: { ...owner.headers, "idempotency-key": "owner-rate-failure" },
+      body: JSON.stringify(
+        createBody(owner.leaf.id, owner.conversation.version, capability(23)),
+      ),
+    },
+  );
+  assertEquals(mutationFailedClosed.status, 503);
 });
