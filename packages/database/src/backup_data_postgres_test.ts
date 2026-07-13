@@ -104,7 +104,7 @@ Deno.test({
       )`;
       await sql`INSERT INTO conversation_folders(
         id,owner_id,name,normalized_name,position,membership_version
-      ) VALUES(${folderId},${userId},'Portable project','portable project',0,1)`;
+      ) VALUES(${folderId},${userId},'İstanbul Project','İstanbul project',0,1)`;
       await sql`INSERT INTO conversation_folder_memberships(
         folder_id,conversation_id,owner_id,position
       ) VALUES(${folderId},${conversationId},${userId},0)`;
@@ -295,7 +295,7 @@ Deno.test({
             ON m.folder_id=f.id AND m.owner_id=f.owner_id
           WHERE f.id=${folderId} AND m.conversation_id=${conversationId}`,
         ],
-        [{ name: "Portable project", membership_version: 1, position: 0 }],
+        [{ name: "İstanbul Project", membership_version: 1, position: 0 }],
       );
       assertEquals(
         [

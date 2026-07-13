@@ -68,6 +68,10 @@ export const replaceFolderMembershipsSchema = z.object({
   ),
   expectedMembershipVersions: z.record(z.string().uuid(), z.number().int().nonnegative()),
 }).strict();
+export const deleteConversationFolderSchema = z.object({
+  expectedVersion: expectedWorkspaceVersionSchema,
+  expectedMembershipVersion: z.number().int().nonnegative(),
+}).strict();
 export const workspaceDeleteSchema = z.object({
   expectedVersion: expectedWorkspaceVersionSchema,
 }).strict();

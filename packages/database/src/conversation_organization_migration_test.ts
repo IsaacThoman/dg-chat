@@ -57,7 +57,7 @@ Deno.test({
       );
       const triggers = await sql<
         { table_name: string }[]
-      >`SELECT event_object_table table_name FROM information_schema.triggers WHERE trigger_name='dg_chat_restore_maintenance_fence' ORDER BY event_object_table`;
+      >`SELECT event_object_table table_name FROM information_schema.triggers WHERE trigger_schema=${schema} AND trigger_name='dg_chat_restore_maintenance_fence' ORDER BY event_object_table`;
       assertEquals(
         new Set(triggers.map((row) => row.table_name)),
         new Set([

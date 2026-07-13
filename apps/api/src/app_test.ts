@@ -122,14 +122,27 @@ Deno.test("preferences folders and tags are authenticated owner-scoped versioned
   const first = await json(
     await app.request("/api/folders", {
       method: "POST",
-      headers,
+      headers: { ...headers, "idempotency-key": "folder-first-route" },
       body: JSON.stringify({ name: "First" }),
     }),
   );
+  const firstReplay = await app.request("/api/folders", {
+    method: "POST",
+    headers: { ...headers, "idempotency-key": "folder-first-route" },
+    body: JSON.stringify({ name: "First" }),
+  });
+  assertEquals(firstReplay.status, 201);
+  assertEquals((await json(firstReplay)).id, first.id);
+  const folderDrift = await app.request("/api/folders", {
+    method: "POST",
+    headers: { ...headers, "idempotency-key": "folder-first-route" },
+    body: JSON.stringify({ name: "Different" }),
+  });
+  assertEquals(folderDrift.status, 409);
   const second = await json(
     await app.request("/api/folders", {
       method: "POST",
-      headers,
+      headers: { ...headers, "idempotency-key": "folder-second-route" },
       body: JSON.stringify({ name: "Second" }),
     }),
   );
@@ -154,10 +167,23 @@ Deno.test("preferences folders and tags are authenticated owner-scoped versioned
   const tag = await json(
     await app.request("/api/tags", {
       method: "POST",
-      headers,
+      headers: { ...headers, "idempotency-key": "tag-important-route" },
       body: JSON.stringify({ name: "Important", color: "#ff0000" }),
     }),
   );
+  const tagReplay = await app.request("/api/tags", {
+    method: "POST",
+    headers: { ...headers, "idempotency-key": "tag-important-route" },
+    body: JSON.stringify({ name: "Important", color: "#ff0000" }),
+  });
+  assertEquals(tagReplay.status, 201);
+  assertEquals((await json(tagReplay)).id, tag.id);
+  const tagDrift = await app.request("/api/tags", {
+    method: "POST",
+    headers: { ...headers, "idempotency-key": "tag-important-route" },
+    body: JSON.stringify({ name: "Important", color: "#00ff00" }),
+  });
+  assertEquals(tagDrift.status, 409);
   const tagged = await app.request(`/api/conversations/${chat.id}/tags`, {
     method: "PUT",
     headers,

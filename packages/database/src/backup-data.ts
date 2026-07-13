@@ -1281,6 +1281,25 @@ async function validateStagedDatabase(
   if (!admins || admins.count < 1) {
     throw new BackupDataError("invariant", "Restore must contain an active approved administrator");
   }
+  for (const table of ["conversation_folders", "conversation_tags"] as const) {
+    const invalid = await tx.unsafe(
+      `SELECT 1 FROM ${
+        staged(table)
+      } WHERE normalized_name<>translate(name,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz') LIMIT 1`,
+    );
+    if (invalid.length) {
+      throw new BackupDataError(
+        "invariant",
+        `Backup ${table} contains a nonportable name identity`,
+      );
+    }
+    const duplicate = await tx.unsafe(
+      `SELECT 1 FROM ${staged(table)} GROUP BY owner_id,normalized_name HAVING count(*)>1 LIMIT 1`,
+    );
+    if (duplicate.length) {
+      throw new BackupDataError("invariant", `Backup ${table} contains duplicate name identities`);
+    }
+  }
   const cycles = await tx.unsafe(
     `WITH RECURSIVE walk AS (
       SELECT id,conversation_id,parent_id,ARRAY[id] path,false cycle FROM ${staged("messages")}

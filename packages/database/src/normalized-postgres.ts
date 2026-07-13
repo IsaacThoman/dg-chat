@@ -17,6 +17,7 @@ import { DomainError } from "./memory.ts";
 import { INGESTIBLE_DOCUMENT_MIME_TYPES, isIngestibleDocumentMime } from "./attachment-policy.ts";
 import {
   apiResponseBodyByteLength,
+  canonicalWorkspaceName,
   KNOWLEDGE_EMBEDDING_DIMENSIONS,
   normalizeKnowledgeSearchLimit,
   validateChunkEmbeddings,
@@ -1391,6 +1392,9 @@ export class PostgresRepository implements DomainRepository {
   }
   async updateConversation(ownerId: string, id: string, patch: ConversationPatch) {
     return await this.#sql.begin(async (tx) => {
+      if (patch.deleted === true) {
+        await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-workspace'),hashtext(${ownerId}))`;
+      }
       const affectedFolders = patch.deleted === true
         ? await tx<
           Row[]
@@ -1418,6 +1422,7 @@ export class PostgresRepository implements DomainRepository {
       }
       if (patch.deleted === true) {
         await tx`DELETE FROM conversation_folder_memberships WHERE conversation_id=${id} AND owner_id=${ownerId}`;
+        await tx`DELETE FROM conversation_tag_bindings WHERE conversation_id=${id} AND owner_id=${ownerId}`;
         await tx`DELETE FROM conversation_tag_sets WHERE conversation_id=${id} AND owner_id=${ownerId}`;
         if (affectedFolders.length) {
           await tx`UPDATE conversation_folders SET membership_version=membership_version+1,updated_at=now() WHERE id=ANY(${
@@ -1485,14 +1490,39 @@ export class PostgresRepository implements DomainRepository {
     ]);
     return { folders: folders.map(folder), memberships: memberships.map(folderMembership) };
   }
-  async createConversationFolder(ownerId: string, inputName: string) {
+  async createConversationFolder(ownerId: string, inputName: string, idempotencyKey: string) {
     const name = inputName.trim();
+    const fingerprint = JSON.stringify({ name });
     try {
       return await this.#sql.begin(async (tx) => {
         await tx`SELECT id FROM users WHERE id=${ownerId} FOR UPDATE`;
+        const prior = await tx<
+          Row[]
+        >`SELECT payload_hash,result_id FROM operation_idempotency WHERE owner_id=${ownerId} AND operation='folder.create' AND idempotency_key=${idempotencyKey}`;
+        if (prior[0]) {
+          if (String(prior[0].payload_hash) !== fingerprint) {
+            throw new DomainError("idempotency_conflict", "Folder replay payload differs", 409);
+          }
+          const replay = await tx<Row[]>`SELECT * FROM conversation_folders WHERE id=${
+            String(prior[0].result_id)
+          } AND owner_id=${ownerId}`;
+          if (!replay[0]) {
+            throw new DomainError(
+              "idempotency_conflict",
+              "Folder replay target is unavailable",
+              409,
+            );
+          }
+          return folder(replay[0]);
+        }
         const rows = await tx<
           Row[]
-        >`INSERT INTO conversation_folders(owner_id,name,normalized_name,position) VALUES(${ownerId},${name},lower(${name}),COALESCE((SELECT max(position)+1 FROM conversation_folders WHERE owner_id=${ownerId}),0)) RETURNING *`;
+        >`INSERT INTO conversation_folders(owner_id,name,normalized_name,position) VALUES(${ownerId},${name},${
+          canonicalWorkspaceName(name)
+        },COALESCE((SELECT max(position)+1 FROM conversation_folders WHERE owner_id=${ownerId}),0)) RETURNING *`;
+        await tx`INSERT INTO operation_idempotency(owner_id,operation,idempotency_key,payload_hash,result_id) VALUES(${ownerId},'folder.create',${idempotencyKey},${fingerprint},${
+          String(rows[0].id)
+        })`;
         return folder(rows[0]);
       });
     } catch (error) {
@@ -1512,7 +1542,9 @@ export class PostgresRepository implements DomainRepository {
     try {
       const rows = await this.#sql<
         Row[]
-      >`UPDATE conversation_folders SET name=${name},normalized_name=lower(${name}),version=version+1,updated_at=now() WHERE id=${id} AND owner_id=${ownerId} AND version=${expectedVersion} RETURNING *`;
+      >`UPDATE conversation_folders SET name=${name},normalized_name=${
+        canonicalWorkspaceName(name)
+      },version=version+1,updated_at=now() WHERE id=${id} AND owner_id=${ownerId} AND version=${expectedVersion} RETURNING *`;
       if (!rows[0]) {
         const exists = await this.#sql<
           Row[]
@@ -1531,20 +1563,28 @@ export class PostgresRepository implements DomainRepository {
       throw error;
     }
   }
-  async deleteConversationFolder(ownerId: string, id: string, expectedVersion: number) {
-    const rows = await this.#sql<
-      Row[]
-    >`DELETE FROM conversation_folders WHERE id=${id} AND owner_id=${ownerId} AND version=${expectedVersion} RETURNING id`;
-    if (!rows[0]) {
-      const exists = await this.#sql<
+  async deleteConversationFolder(
+    ownerId: string,
+    id: string,
+    expectedVersion: number,
+    expectedMembershipVersion: number,
+  ) {
+    return await this.#sql.begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-workspace'),hashtext(${ownerId}))`;
+      const rows = await tx<
         Row[]
-      >`SELECT 1 FROM conversation_folders WHERE id=${id} AND owner_id=${ownerId}`;
-      throw new DomainError(
-        exists[0] ? "version_conflict" : "not_found",
-        exists[0] ? "Folder changed in another request" : "Folder not found",
-        exists[0] ? 409 : 404,
-      );
-    }
+      >`DELETE FROM conversation_folders WHERE id=${id} AND owner_id=${ownerId} AND version=${expectedVersion} AND membership_version=${expectedMembershipVersion} RETURNING id`;
+      if (!rows[0]) {
+        const exists = await tx<
+          Row[]
+        >`SELECT 1 FROM conversation_folders WHERE id=${id} AND owner_id=${ownerId}`;
+        throw new DomainError(
+          exists[0] ? "version_conflict" : "not_found",
+          exists[0] ? "Folder changed in another request" : "Folder not found",
+          exists[0] ? 409 : 404,
+        );
+      }
+    });
   }
   async reorderConversationFolders(
     ownerId: string,
@@ -1552,6 +1592,7 @@ export class PostgresRepository implements DomainRepository {
     versions: Record<string, number>,
   ) {
     return await this.#sql.begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-workspace'),hashtext(${ownerId}))`;
       await tx`SET CONSTRAINTS conversation_folders_owner_position_uq DEFERRED`;
       const rows = await tx<
         Row[]
@@ -1584,6 +1625,7 @@ export class PostgresRepository implements DomainRepository {
     expected: Record<string, number>,
   ) {
     return await this.#sql.begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-workspace'),hashtext(${ownerId}))`;
       await tx`SET CONSTRAINTS conversation_folder_memberships_position_uq DEFERRED`;
       const target = await tx<
         Row[]
@@ -1664,13 +1706,42 @@ export class PostgresRepository implements DomainRepository {
       tagSets: sets.map(tagSet),
     };
   }
-  async createConversationTag(ownerId: string, inputName: string, color: string) {
+  async createConversationTag(
+    ownerId: string,
+    inputName: string,
+    color: string,
+    idempotencyKey: string,
+  ) {
     const name = inputName.trim();
+    const fingerprint = JSON.stringify({ name, color });
     try {
-      const rows = await this.#sql<
-        Row[]
-      >`INSERT INTO conversation_tags(owner_id,name,normalized_name,color) VALUES(${ownerId},${name},lower(${name}),${color}) RETURNING *`;
-      return conversationTag(rows[0]);
+      return await this.#sql.begin(async (tx) => {
+        await tx`SELECT id FROM users WHERE id=${ownerId} FOR UPDATE`;
+        const prior = await tx<
+          Row[]
+        >`SELECT payload_hash,result_id FROM operation_idempotency WHERE owner_id=${ownerId} AND operation='tag.create' AND idempotency_key=${idempotencyKey}`;
+        if (prior[0]) {
+          if (String(prior[0].payload_hash) !== fingerprint) {
+            throw new DomainError("idempotency_conflict", "Tag replay payload differs", 409);
+          }
+          const replay = await tx<Row[]>`SELECT * FROM conversation_tags WHERE id=${
+            String(prior[0].result_id)
+          } AND owner_id=${ownerId}`;
+          if (!replay[0]) {
+            throw new DomainError("idempotency_conflict", "Tag replay target is unavailable", 409);
+          }
+          return conversationTag(replay[0]);
+        }
+        const rows = await tx<
+          Row[]
+        >`INSERT INTO conversation_tags(owner_id,name,normalized_name,color) VALUES(${ownerId},${name},${
+          canonicalWorkspaceName(name)
+        },${color}) RETURNING *`;
+        await tx`INSERT INTO operation_idempotency(owner_id,operation,idempotency_key,payload_hash,result_id) VALUES(${ownerId},'tag.create',${idempotencyKey},${fingerprint},${
+          String(rows[0].id)
+        })`;
+        return conversationTag(rows[0]);
+      });
     } catch (error) {
       if ((error as { code?: string }).code === "23505") {
         throw new DomainError("name_conflict", "A tag with that name already exists", 409);
@@ -1687,9 +1758,9 @@ export class PostgresRepository implements DomainRepository {
     try {
       const rows = await this.#sql<Row[]>`UPDATE conversation_tags SET name=COALESCE(${
         name ?? null
-      },name),normalized_name=CASE WHEN ${
-        name ?? null
-      }::text IS NULL THEN normalized_name ELSE lower(${name ?? ""}) END,color=COALESCE(${
+      },name),normalized_name=CASE WHEN ${name ?? null}::text IS NULL THEN normalized_name ELSE ${
+        canonicalWorkspaceName(name ?? "")
+      } END,color=COALESCE(${
         patch.color ?? null
       },color),version=version+1,updated_at=now() WHERE id=${id} AND owner_id=${ownerId} AND version=${patch.expectedVersion} RETURNING *`;
       if (!rows[0]) {
@@ -1712,6 +1783,7 @@ export class PostgresRepository implements DomainRepository {
   }
   async deleteConversationTag(ownerId: string, id: string, expectedVersion: number) {
     return await this.#sql.begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-workspace'),hashtext(${ownerId}))`;
       const tag = await tx<
         Row[]
       >`SELECT * FROM conversation_tags WHERE id=${id} AND owner_id=${ownerId} FOR UPDATE`;
@@ -1741,6 +1813,7 @@ export class PostgresRepository implements DomainRepository {
     expected: number,
   ) {
     return await this.#sql.begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-workspace'),hashtext(${ownerId}))`;
       const chats = await tx<
         Row[]
       >`SELECT id,temporary,deleted_at FROM conversations WHERE id=${conversationId} AND owner_id=${ownerId} FOR UPDATE`;

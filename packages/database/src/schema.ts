@@ -201,6 +201,10 @@ export const conversationFolders = pgTable("conversation_folders", {
   check("conversation_folders_position_check", sql`${table.position} >= 0`),
   check("conversation_folders_version_check", sql`${table.version} >= 1`),
   check("conversation_folders_membership_version_check", sql`${table.membershipVersion} >= 0`),
+  check(
+    "conversation_folders_normalized_check",
+    sql`${table.normalizedName} = translate(${table.name},'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')`,
+  ),
 ]);
 
 export const conversationFolderMemberships = pgTable("conversation_folder_memberships", {
@@ -242,6 +246,10 @@ export const conversationTags = pgTable("conversation_tags", {
   check("conversation_tags_name_check", sql`char_length(${table.name}) BETWEEN 1 AND 64`),
   check("conversation_tags_color_check", sql`${table.color} ~ '^#[0-9A-Fa-f]{6}$'`),
   check("conversation_tags_version_check", sql`${table.version} >= 1`),
+  check(
+    "conversation_tags_normalized_check",
+    sql`${table.normalizedName} = translate(${table.name},'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')`,
+  ),
 ]);
 
 export const conversationTagSets = pgTable("conversation_tag_sets", {

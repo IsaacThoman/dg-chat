@@ -22,7 +22,7 @@ CREATE TABLE conversation_folders (
   version integer NOT NULL DEFAULT 1 CHECK(version >= 1),
   membership_version integer NOT NULL DEFAULT 0 CHECK(membership_version >= 0),
   created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(),
-  CONSTRAINT conversation_folders_normalized_check CHECK(normalized_name=lower(name)),
+  CONSTRAINT conversation_folders_normalized_check CHECK(normalized_name=translate(name,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')),
   CONSTRAINT conversation_folders_id_owner_uq UNIQUE(id,owner_id),
   CONSTRAINT conversation_folders_owner_name_uq UNIQUE(owner_id,normalized_name),
   CONSTRAINT conversation_folders_owner_position_uq UNIQUE(owner_id,position) DEFERRABLE INITIALLY IMMEDIATE
@@ -46,7 +46,7 @@ CREATE TABLE conversation_tags (
   name text NOT NULL CHECK(char_length(name) BETWEEN 1 AND 64 AND name=btrim(name)), normalized_name text NOT NULL,
   color text NOT NULL CHECK(color ~ '^#[0-9A-Fa-f]{6}$'), version integer NOT NULL DEFAULT 1 CHECK(version >= 1),
   created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(),
-  CONSTRAINT conversation_tags_normalized_check CHECK(normalized_name=lower(name)),
+  CONSTRAINT conversation_tags_normalized_check CHECK(normalized_name=translate(name,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')),
   CONSTRAINT conversation_tags_id_owner_uq UNIQUE(id,owner_id),
   CONSTRAINT conversation_tags_owner_name_uq UNIQUE(owner_id,normalized_name)
 );

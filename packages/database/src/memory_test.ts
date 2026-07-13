@@ -2793,8 +2793,19 @@ Deno.test("workspace organization versions moves and preferences are atomic", ()
     "changed",
   );
 
-  const first = repo.createConversationFolder(owner.id, "First");
-  const second = repo.createConversationFolder(owner.id, "Second");
+  const first = repo.createConversationFolder(owner.id, "First", "folder-first");
+  const second = repo.createConversationFolder(owner.id, "Second", "folder-second");
+  assertEquals(repo.createConversationFolder(owner.id, "First", "folder-first").id, first.id);
+  assertThrows(
+    () => repo.createConversationFolder(owner.id, "Drift", "folder-first"),
+    DomainError,
+    "replay payload differs",
+  );
+  const unicode = repo.createConversationFolder(owner.id, "İstanbul", "folder-unicode");
+  assertEquals(
+    repo.createConversationFolder(owner.id, "İstanbul", "folder-unicode").id,
+    unicode.id,
+  );
   const chat = repo.createConversation(owner.id, "Organize");
   repo.replaceFolderMemberships(owner.id, first.id, [chat.id], { [first.id]: 0 });
   const afterFirst = repo.listConversationFolders(owner.id).folders;
@@ -2825,7 +2836,16 @@ Deno.test("workspace organization versions moves and preferences are atomic", ()
   );
   assertEquals(repo.listConversationFolders(owner.id).folders, beforeOrder);
 
-  const tag = repo.createConversationTag(owner.id, "Important", "#ff0000");
+  const tag = repo.createConversationTag(owner.id, "Important", "#ff0000", "tag-important");
+  assertEquals(
+    repo.createConversationTag(owner.id, "Important", "#ff0000", "tag-important").id,
+    tag.id,
+  );
+  assertThrows(
+    () => repo.createConversationTag(owner.id, "Important", "#00ff00", "tag-important"),
+    DomainError,
+    "replay payload differs",
+  );
   const assignment = repo.replaceConversationTags(owner.id, chat.id, [tag.id], 0);
   repo.deleteConversationTag(owner.id, tag.id, tag.version);
   assertEquals(
@@ -2839,4 +2859,10 @@ Deno.test("workspace organization versions moves and preferences are atomic", ()
     DomainError,
     "cannot be organized",
   );
+  assertThrows(
+    () => repo.deleteConversationFolder(owner.id, second.id, second.version, 0),
+    DomainError,
+    "membership changed",
+  );
+  repo.deleteConversationFolder(owner.id, second.id, second.version, 1);
 });

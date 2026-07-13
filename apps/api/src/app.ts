@@ -25,6 +25,7 @@ import {
   createModelAliasSchema,
   createTokenSchema,
   deleteAccessGroupSchema,
+  deleteConversationFolderSchema,
   embeddingsSchema,
   generateMessageSchema,
   identityTokenSchema,
@@ -940,6 +941,22 @@ const requireUuid = (value: string, field: string): string => {
     throw new DomainError("validation_error", `${field} must be a valid UUID`, 422);
   }
   return value;
+};
+const requireIdempotencyKey = (value: string | undefined): string => {
+  const key = value?.trim();
+  if (
+    !key || key.length < 8 || key.length > 200 || [...key].some((character) => {
+      const code = character.charCodeAt(0);
+      return code <= 31 || code === 127;
+    })
+  ) {
+    throw new DomainError(
+      "idempotency_key_required",
+      "A valid Idempotency-Key header is required",
+      422,
+    );
+  }
+  return key;
 };
 
 async function stageMultipartUpload(
@@ -3231,7 +3248,14 @@ export function createApp(options: AppOptions = {}) {
   });
   app.post("/api/folders", async (c) => {
     const body = await parseJson(c, createConversationFolderSchema);
-    return c.json(await repo.createConversationFolder(c.get("user").id, body.name), 201);
+    return c.json(
+      await repo.createConversationFolder(
+        c.get("user").id,
+        body.name,
+        requireIdempotencyKey(c.req.header("idempotency-key")),
+      ),
+      201,
+    );
   });
   app.put("/api/folders/order", async (c) => {
     const body = await parseJson(c, reorderConversationFoldersSchema);
@@ -3255,11 +3279,12 @@ export function createApp(options: AppOptions = {}) {
     );
   });
   app.delete("/api/folders/:id", async (c) => {
-    const body = await parseJson(c, workspaceDeleteSchema);
+    const body = await parseJson(c, deleteConversationFolderSchema);
     await repo.deleteConversationFolder(
       c.get("user").id,
       requireUuid(c.req.param("id"), "folderId"),
       body.expectedVersion,
+      body.expectedMembershipVersion,
     );
     return c.body(null, 204);
   });
@@ -3282,7 +3307,15 @@ export function createApp(options: AppOptions = {}) {
   });
   app.post("/api/tags", async (c) => {
     const body = await parseJson(c, createConversationTagSchema);
-    return c.json(await repo.createConversationTag(c.get("user").id, body.name, body.color), 201);
+    return c.json(
+      await repo.createConversationTag(
+        c.get("user").id,
+        body.name,
+        body.color,
+        requireIdempotencyKey(c.req.header("idempotency-key")),
+      ),
+      201,
+    );
   });
   app.patch("/api/tags/:id", async (c) => {
     const body = await parseJson(c, updateConversationTagSchema);
@@ -9068,6 +9101,15 @@ export function createApp(options: AppOptions = {}) {
         return c.json(openAIError(error.message, error.code), error.status as 400);
       }
       return c.json({ error: { code: error.code, message: error.message } }, error.status as 400);
+    }
+    const databaseCode = (error as { code?: unknown })?.code;
+    if (databaseCode === "40P01" || databaseCode === "40001" || databaseCode === "55P03") {
+      return c.json({
+        error: {
+          code: "version_conflict",
+          message: "The request conflicted with another update. Reload and try again.",
+        },
+      }, 409);
     }
     const correlationId = crypto.randomUUID();
     console.error(

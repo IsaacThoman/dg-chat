@@ -20,6 +20,7 @@ import type {
 import { isIngestibleDocumentMime } from "./attachment-policy.ts";
 import {
   apiResponseBodyByteLength,
+  canonicalWorkspaceName,
   normalizeKnowledgeSearchLimit,
   validateChunkEmbeddings,
   validateDocumentChunkInputs,
@@ -916,10 +917,10 @@ export class MemoryRepository {
             folder.updatedAt = new Date().toISOString();
           }
         }
-        this.conversationTagSets.delete(id);
         for (const [key, binding] of this.conversationTagBindings) {
           if (binding.conversationId === id) this.conversationTagBindings.delete(key);
         }
+        this.conversationTagSets.delete(id);
       }
     }
     value.version++;
@@ -990,12 +991,21 @@ export class MemoryRepository {
       ).sort((a, b) => a.position - b.position || a.conversationId.localeCompare(b.conversationId)),
     };
   }
-  createConversationFolder(ownerId: string, inputName: string) {
+  createConversationFolder(ownerId: string, inputName: string, idempotencyKey: string) {
     const name = inputName.trim();
-    const normalized = name.toLowerCase();
+    const replayKey = `folder:${ownerId}:${idempotencyKey}`;
+    const priorId = this.idempotency.get(replayKey);
+    if (priorId) {
+      const prior = this.conversationFolders.get(priorId)!;
+      if (prior.name !== name) {
+        throw new DomainError("idempotency_conflict", "Folder replay payload differs", 409);
+      }
+      return { ...prior };
+    }
+    const normalized = canonicalWorkspaceName(name);
     if (
       [...this.conversationFolders.values()].some((x) =>
-        x.ownerId === ownerId && x.name.toLowerCase() === normalized
+        x.ownerId === ownerId && canonicalWorkspaceName(x.name) === normalized
       )
     ) throw new DomainError("name_conflict", "A folder with that name already exists", 409);
     const now = new Date().toISOString();
@@ -1015,6 +1025,7 @@ export class MemoryRepository {
       updatedAt: now,
     };
     this.conversationFolders.set(value.id, value);
+    this.idempotency.set(replayKey, value.id);
     return { ...value };
   }
   updateConversationFolder(
@@ -1031,22 +1042,30 @@ export class MemoryRepository {
       throw new DomainError("version_conflict", "Folder changed in another request", 409);
     }
     const name = nameInput.trim();
-    const normalized = name.toLowerCase();
+    const normalized = canonicalWorkspaceName(name);
     if (
       [...this.conversationFolders.values()].some((x) =>
-        x.id !== id && x.ownerId === ownerId && x.name.toLowerCase() === normalized
+        x.id !== id && x.ownerId === ownerId && canonicalWorkspaceName(x.name) === normalized
       )
     ) throw new DomainError("name_conflict", "A folder with that name already exists", 409);
     Object.assign(value, { name, version: value.version + 1, updatedAt: new Date().toISOString() });
     return { ...value };
   }
-  deleteConversationFolder(ownerId: string, id: string, expectedVersion: number) {
+  deleteConversationFolder(
+    ownerId: string,
+    id: string,
+    expectedVersion: number,
+    expectedMembershipVersion: number,
+  ) {
     const value = this.conversationFolders.get(id);
     if (!value || value.ownerId !== ownerId) {
       throw new DomainError("not_found", "Folder not found", 404);
     }
     if (value.version !== expectedVersion) {
       throw new DomainError("version_conflict", "Folder changed in another request", 409);
+    }
+    if (value.membershipVersion !== expectedMembershipVersion) {
+      throw new DomainError("version_conflict", "Folder membership changed", 409);
     }
     this.conversationFolders.delete(id);
     for (const [key, m] of this.conversationFolderMemberships) {
@@ -1138,12 +1157,21 @@ export class MemoryRepository {
       tagSets: [...this.conversationTagSets.values()].filter((x) => x.ownerId === ownerId),
     };
   }
-  createConversationTag(ownerId: string, inputName: string, color: string) {
+  createConversationTag(ownerId: string, inputName: string, color: string, idempotencyKey: string) {
     const name = inputName.trim();
-    const normalized = name.toLowerCase();
+    const replayKey = `tag:${ownerId}:${idempotencyKey}`;
+    const priorId = this.idempotency.get(replayKey);
+    if (priorId) {
+      const prior = this.conversationTags.get(priorId)!;
+      if (prior.name !== name || prior.color !== color) {
+        throw new DomainError("idempotency_conflict", "Tag replay payload differs", 409);
+      }
+      return { ...prior };
+    }
+    const normalized = canonicalWorkspaceName(name);
     if (
       [...this.conversationTags.values()].some((x) =>
-        x.ownerId === ownerId && x.name.toLowerCase() === normalized
+        x.ownerId === ownerId && canonicalWorkspaceName(x.name) === normalized
       )
     ) throw new DomainError("name_conflict", "A tag with that name already exists", 409);
     const now = new Date().toISOString();
@@ -1157,6 +1185,7 @@ export class MemoryRepository {
       updatedAt: now,
     };
     this.conversationTags.set(value.id, value);
+    this.idempotency.set(replayKey, value.id);
     return { ...value };
   }
   updateConversationTag(
@@ -1173,7 +1202,8 @@ export class MemoryRepository {
       const name = patch.name.trim();
       if (
         [...this.conversationTags.values()].some((y) =>
-          y.id !== id && y.ownerId === ownerId && y.name.toLowerCase() === name.toLowerCase()
+          y.id !== id && y.ownerId === ownerId &&
+          canonicalWorkspaceName(y.name) === canonicalWorkspaceName(name)
         )
       ) throw new DomainError("name_conflict", "A tag with that name already exists", 409);
       x.name = name;

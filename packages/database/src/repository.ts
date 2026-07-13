@@ -850,6 +850,10 @@ export interface ConversationPatch {
   archived?: boolean;
   deleted?: boolean;
 }
+/** Locale-independent workspace identity: display Unicode is preserved; ASCII case is folded. */
+export function canonicalWorkspaceName(value: string): string {
+  return value.replace(/[A-Z]/g, (character) => character.toLowerCase());
+}
 export type UserPreferencesPatch =
   & Partial<
     Pick<
@@ -1564,7 +1568,11 @@ export interface DomainRepository {
     patch: UserPreferencesPatch,
   ): MaybePromise<UserPreferences>;
   listConversationFolders(ownerId: string): MaybePromise<WorkspaceList>;
-  createConversationFolder(ownerId: string, name: string): MaybePromise<ConversationFolder>;
+  createConversationFolder(
+    ownerId: string,
+    name: string,
+    idempotencyKey: string,
+  ): MaybePromise<ConversationFolder>;
   updateConversationFolder(
     ownerId: string,
     id: string,
@@ -1575,6 +1583,7 @@ export interface DomainRepository {
     ownerId: string,
     id: string,
     expectedVersion: number,
+    expectedMembershipVersion: number,
   ): MaybePromise<void>;
   reorderConversationFolders(
     ownerId: string,
@@ -1592,6 +1601,7 @@ export interface DomainRepository {
     ownerId: string,
     name: string,
     color: string,
+    idempotencyKey: string,
   ): MaybePromise<ConversationTag>;
   updateConversationTag(
     ownerId: string,
