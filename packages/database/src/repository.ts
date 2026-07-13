@@ -123,7 +123,20 @@ export interface AdminDeletionCommand extends AdminUserCommand {
   reason: string;
 }
 
-const ADMIN_USER_CURSOR_VERSION = 1;
+const ADMIN_USER_CURSOR_VERSION = 2;
+const LEGACY_ADMIN_USER_CURSOR_VERSION = 1;
+const MAX_ADMIN_USER_CURSOR_MICROS = 253_402_300_799_999_999n;
+
+function validAdminUserCursorMicros(value: unknown, createdAt: string): value is string {
+  if (typeof value !== "string" || !/^\d{1,18}$/.test(value)) return false;
+  try {
+    const micros = BigInt(value);
+    return micros <= MAX_ADMIN_USER_CURSOR_MICROS &&
+      micros / 1_000n === BigInt(Date.parse(createdAt));
+  } catch {
+    return false;
+  }
+}
 
 /** Bind pagination cursors to the normalized filters that produced them. */
 export function adminUserQueryFingerprint(query: AdminUserQuery): string {
@@ -140,31 +153,57 @@ export function adminUserQueryFingerprint(query: AdminUserQuery): string {
 export function encodeAdminUserCursor(
   value: Pick<PublicUser, "createdAt" | "id">,
   query: AdminUserQuery,
+  createdAtMicros?: string,
 ): string {
-  return btoa(JSON.stringify([
+  if (
+    createdAtMicros !== undefined && !validAdminUserCursorMicros(createdAtMicros, value.createdAt)
+  ) {
+    throw new TypeError("Admin user cursor microseconds must match its timestamp");
+  }
+  const bytes = new TextEncoder().encode(JSON.stringify([
     ADMIN_USER_CURSOR_VERSION,
     value.createdAt,
     value.id,
     adminUserQueryFingerprint(query),
-  ])).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+    createdAtMicros ?? null,
+  ]));
+  return btoa(String.fromCharCode(...bytes)).replaceAll("+", "-").replaceAll("/", "_").replace(
+    /=+$/,
+    "",
+  );
 }
 
 export function decodeAdminUserCursor(
   cursor: string,
   query: AdminUserQuery,
-): { createdAt: string; id: string } | undefined {
+): { createdAt: string; id: string; createdAtMicros?: string } | undefined {
   try {
     const base64 = cursor.replaceAll("-", "+").replaceAll("_", "/");
-    const value = JSON.parse(atob(base64.padEnd(Math.ceil(base64.length / 4) * 4, "=")));
+    const binary = atob(base64.padEnd(Math.ceil(base64.length / 4) * 4, "="));
+    const value = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(
+        Uint8Array.from(binary, (character) => character.charCodeAt(0)),
+      ),
+    );
+    if (!Array.isArray(value)) return undefined;
+    const legacy = value[0] === LEGACY_ADMIN_USER_CURSOR_VERSION && value.length === 4;
+    const current = value[0] === ADMIN_USER_CURSOR_VERSION && value.length === 5;
+    const parsedCreatedAt = typeof value[1] === "string" ? Date.parse(value[1]) : Number.NaN;
     if (
-      !Array.isArray(value) || value.length !== 4 || value[0] !== ADMIN_USER_CURSOR_VERSION ||
-      typeof value[1] !== "string" || !Number.isFinite(Date.parse(value[1])) ||
+      (!legacy && !current) ||
+      typeof value[1] !== "string" || !Number.isFinite(parsedCreatedAt) ||
+      new Date(parsedCreatedAt).toISOString() !== value[1] ||
       typeof value[2] !== "string" ||
       !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
         .test(value[2]) ||
-      value[3] !== adminUserQueryFingerprint(query)
+      value[3] !== adminUserQueryFingerprint(query) ||
+      (current && value[4] !== null && !validAdminUserCursorMicros(value[4], value[1]))
     ) return undefined;
-    return { createdAt: new Date(value[1]).toISOString(), id: value[2] };
+    return {
+      createdAt: value[1],
+      id: value[2],
+      ...(current && value[4] !== null ? { createdAtMicros: value[4] } : {}),
+    };
   } catch {
     return undefined;
   }

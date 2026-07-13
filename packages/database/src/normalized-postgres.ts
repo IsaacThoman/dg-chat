@@ -1194,7 +1194,8 @@ export class PostgresRepository implements DomainRepository {
     }
     const deletion = query.deletion ?? "present";
     const rows = await this.#sql<Row[]>`
-      SELECT * FROM users
+      SELECT *,floor(extract(epoch FROM created_at)*1000000)::bigint::text AS cursor_created_at_micros
+      FROM users
       WHERE (${search ?? null}::text IS NULL OR
           strpos(lower(email),lower(${search ?? null}))>0 OR
           strpos(lower(name),lower(${search ?? null}))>0)
@@ -1205,15 +1206,36 @@ export class PostgresRepository implements DomainRepository {
         AND (${query.emailVerified ?? null}::boolean IS NULL OR
           (email_verified_at IS NOT NULL)=${query.emailVerified ?? null})
         AND (${deletion}='all' OR (${deletion}='deleted')=(deleted_at IS NOT NULL))
-        AND (${cursor?.createdAt ?? null}::timestamptz IS NULL OR
-          (date_trunc('milliseconds',created_at),id)<
-            (${cursor?.createdAt ?? null}::timestamptz,${cursor?.id ?? null}::uuid))
-      ORDER BY date_trunc('milliseconds',created_at) DESC,id DESC
+        AND (
+          ${cursor?.createdAt ?? null}::timestamptz IS NULL OR
+          (${cursor?.createdAtMicros ?? null}::bigint IS NOT NULL AND
+            (created_at,id)<(
+              timestamptz 'epoch' + ${
+      cursor?.createdAtMicros ?? null
+    }::bigint * interval '1 microsecond',
+              ${cursor?.id ?? null}::uuid
+            )) OR
+          (${cursor?.createdAtMicros ?? null}::bigint IS NULL AND
+            (date_trunc('milliseconds',created_at),id)<(
+              ${cursor?.createdAt ?? null}::timestamptz,
+              ${cursor?.id ?? null}::uuid
+            ))
+        )
+      ORDER BY created_at DESC,id DESC
       LIMIT ${limit + 1}`;
     const data = rows.slice(0, limit).map(adminUser);
     return {
       data,
-      nextCursor: rows.length > limit ? encodeAdminUserCursor(data[data.length - 1], query) : null,
+      nextCursor: rows.length > limit
+        ? encodeAdminUserCursor(
+          {
+            createdAt: data[data.length - 1].createdAt,
+            id: String(rows[limit - 1].id),
+          },
+          query,
+          String(rows[limit - 1].cursor_created_at_micros),
+        )
+        : null,
     };
   }
   async getAdminUser(id: string): Promise<AdminUser> {

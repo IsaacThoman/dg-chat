@@ -1,5 +1,6 @@
-import { assertEquals, assertThrows } from "jsr:@std/assert@1.0.14";
+import { assertEquals, assertExists, assertThrows } from "jsr:@std/assert@1.0.14";
 import { DomainError, MemoryRepository } from "./memory.ts";
+import { encodeAdminUserCursor } from "./repository.ts";
 
 function adminRepository() {
   const repo = new MemoryRepository();
@@ -192,6 +193,35 @@ Deno.test("admin user directory has stable filter-bound cursor pagination", () =
       limit: 2,
       cursor: first.nextCursor!,
     }), "validation_error");
+});
+
+Deno.test("admin user directory cursors support non-Latin filter text", () => {
+  const repo = new MemoryRepository();
+  const actor = repo.createUser({
+    email: "unicode-admin@example.com",
+    name: "Unicode admin",
+    role: "admin",
+    approvalStatus: "approved",
+  });
+  for (let index = 0; index < 3; index++) {
+    repo.createUser({
+      email: `unicode-${index}@example.com`,
+      name: `漢字 ${index}`,
+      approvalStatus: "approved",
+    });
+  }
+
+  const first = repo.listAdminUsers({ search: "漢字", limit: 1 });
+  assertEquals(first.data.length, 1);
+  assertExists(first.nextCursor);
+  const second = repo.listAdminUsers({ search: "漢字", limit: 1, cursor: first.nextCursor });
+  assertEquals(second.data.length, 1);
+  assertEquals(second.data[0].id === first.data[0].id, false);
+  assertEquals(repo.getAdminUser(actor.id).role, "admin");
+  assertThrows(
+    () => encodeAdminUserCursor(first.data[0], { search: "漢字" }, "999999999999999999"),
+    TypeError,
+  );
 });
 
 Deno.test("approval grant is append-only and never repeated on reapproval", () => {
