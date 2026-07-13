@@ -1096,6 +1096,19 @@ export const backupOperations = pgTable("backup_operations", {
   artifactCleanupLeaseExpiresAt: timestamp("artifact_cleanup_lease_expires_at", {
     withTimezone: true,
   }),
+  providerSecretsRequested: boolean("provider_secrets_requested").notNull().default(false),
+  secretArtifactObjectKey: text("secret_artifact_object_key"),
+  secretArchiveSha256: text("secret_archive_sha256"),
+  secretArchiveBytes: bigint("secret_archive_bytes", { mode: "number" }),
+  secretProviderCount: integer("secret_provider_count"),
+  secretRecoveryKeyId: text("secret_recovery_key_id"),
+  secretArtifactCleanupCheckedAt: timestamp("secret_artifact_cleanup_checked_at", {
+    withTimezone: true,
+  }),
+  secretArtifactCleanupLeaseToken: uuid("secret_artifact_cleanup_lease_token"),
+  secretArtifactCleanupLeaseExpiresAt: timestamp("secret_artifact_cleanup_lease_expires_at", {
+    withTimezone: true,
+  }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   startedAt: timestamp("started_at", { withTimezone: true }),
   validatedAt: timestamp("validated_at", { withTimezone: true }),
@@ -1112,6 +1125,13 @@ export const backupOperations = pgTable("backup_operations", {
     table.kind,
     table.createdAt.desc(),
     table.id.desc(),
+  ),
+  index("backup_operations_secret_cleanup_idx").on(
+    table.secretArtifactCleanupCheckedAt,
+    table.createdAt,
+    table.id,
+  ).where(
+    sql`${table.kind}='export' AND ${table.status} IN ('failed','cancelled') AND ${table.secretArtifactObjectKey} IS NOT NULL AND ${table.secretArchiveSha256} IS NOT NULL`,
   ),
   check("backup_operations_kind_check", sql`${table.kind} IN ('export','restore')`),
   check(
@@ -1161,12 +1181,134 @@ export const backupOperations = pgTable("backup_operations", {
     sql`(${table.artifactCleanupLeaseToken} IS NULL AND ${table.artifactCleanupLeaseExpiresAt} IS NULL) OR (${table.kind}='export' AND ${table.status} IN ('failed','cancelled') AND ${table.artifactObjectKey} IS NOT NULL AND ${table.archiveSha256} IS NOT NULL AND ${table.artifactCleanupLeaseToken} IS NOT NULL AND ${table.artifactCleanupLeaseExpiresAt} IS NOT NULL)`,
   ),
   check(
+    "backup_operations_provider_secrets_kind_check",
+    sql`NOT ${table.providerSecretsRequested} OR ${table.kind}='export'`,
+  ),
+  check(
+    "backup_operations_secret_object_key_check",
+    sql`${table.secretArtifactObjectKey} IS NULL OR (char_length(${table.secretArtifactObjectKey}) BETWEEN 1 AND 1024 AND left(${table.secretArtifactObjectKey},1) <> '/')`,
+  ),
+  check(
+    "backup_operations_secret_digest_check",
+    sql`${table.secretArchiveSha256} IS NULL OR ${table.secretArchiveSha256} ~ '^[0-9a-f]{64}$'`,
+  ),
+  check(
+    "backup_operations_secret_metadata_check",
+    sql`(${table.secretArtifactObjectKey} IS NULL AND ${table.secretArchiveSha256} IS NULL AND ${table.secretArchiveBytes} IS NULL AND ${table.secretProviderCount} IS NULL AND ${table.secretRecoveryKeyId} IS NULL) OR (${table.providerSecretsRequested} AND ${table.kind}='export' AND ${table.secretArtifactObjectKey} IS NOT NULL AND ${table.secretArchiveSha256} IS NOT NULL AND ${table.secretArchiveBytes} > 0 AND ${table.secretProviderCount} >= 0 AND char_length(${table.secretRecoveryKeyId}) BETWEEN 1 AND 128)`,
+  ),
+  check(
+    "backup_operations_secret_completion_check",
+    sql`${table.status} <> 'completed' OR NOT ${table.providerSecretsRequested} OR (${table.secretArtifactObjectKey} IS NOT NULL AND ${table.secretArchiveSha256} IS NOT NULL AND ${table.secretArchiveBytes} IS NOT NULL AND ${table.secretProviderCount} IS NOT NULL AND ${table.secretRecoveryKeyId} IS NOT NULL)`,
+  ),
+  check(
+    "backup_operations_secret_cleanup_lease_check",
+    sql`(${table.secretArtifactCleanupLeaseToken} IS NULL AND ${table.secretArtifactCleanupLeaseExpiresAt} IS NULL) OR (${table.kind}='export' AND ${table.status} IN ('failed','cancelled') AND ${table.secretArtifactObjectKey} IS NOT NULL AND ${table.secretArchiveSha256} IS NOT NULL AND ${table.secretArtifactCleanupLeaseToken} IS NOT NULL AND ${table.secretArtifactCleanupLeaseExpiresAt} IS NOT NULL)`,
+  ),
+  check(
     "backup_operations_time_check",
     sql`${table.updatedAt} >= ${table.createdAt} AND (${table.startedAt} IS NULL OR ${table.startedAt} >= ${table.createdAt}) AND (${table.validatedAt} IS NULL OR ${table.validatedAt} >= ${table.createdAt}) AND (${table.completedAt} IS NULL OR ${table.completedAt} >= ${table.createdAt})`,
   ),
   check(
     "backup_operations_lifecycle_check",
     sql`(${table.status}='queued' AND ${table.startedAt} IS NULL AND ${table.completedAt} IS NULL AND ${table.error} IS NULL) OR (${table.status}='running' AND ${table.startedAt} IS NOT NULL AND ${table.completedAt} IS NULL AND ${table.error} IS NULL) OR (${table.status}='validated' AND ${table.kind}='restore' AND ${table.startedAt} IS NOT NULL AND ${table.validatedAt} IS NOT NULL AND ${table.completedAt} IS NULL AND ${table.error} IS NULL AND ${table.archiveSha256} IS NOT NULL AND ${table.impact} IS NOT NULL AND ${table.confirmationFingerprint} IS NOT NULL) OR (${table.status}='completed' AND ${table.startedAt} IS NOT NULL AND ${table.completedAt} IS NOT NULL AND ${table.error} IS NULL AND ${table.archiveSha256} IS NOT NULL) OR (${table.status}='failed' AND ${table.startedAt} IS NOT NULL AND ${table.completedAt} IS NOT NULL AND ${table.error} IS NOT NULL) OR (${table.status}='cancelled' AND ${table.completedAt} IS NOT NULL AND ${table.error} IS NULL)`,
+  ),
+]);
+
+export const backupRestoreSecretSidecars = pgTable("backup_restore_secret_sidecars", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  restoreOperationId: uuid("restore_operation_id").notNull().references(() => backupOperations.id, {
+    onDelete: "restrict",
+  }),
+  status: text("status").$type<
+    "staging" | "uploaded" | "validated" | "applied" | "failed" | "cancelled"
+  >().notNull().default("staging"),
+  version: integer("version").notNull().default(1),
+  idempotencyKey: text("idempotency_key").notNull(),
+  // Control-plane actor evidence intentionally has no users FK so a later full restore cannot
+  // cascade-truncate sidecar history while replacing portable user data.
+  requestedBy: uuid("requested_by"),
+  appliedBy: uuid("applied_by"),
+  sourceObjectKey: text("source_object_key").notNull(),
+  archiveSha256: text("archive_sha256").notNull(),
+  archiveBytes: bigint("archive_bytes", { mode: "number" }).notNull(),
+  sidecarId: uuid("sidecar_id").notNull(),
+  recoveryKeyId: text("recovery_key_id").notNull(),
+  baseBackupId: uuid("base_backup_id").notNull(),
+  baseArchiveSha256: text("base_archive_sha256").notNull(),
+  baseContentRootSha256: text("base_content_root_sha256").notNull(),
+  sourceInstallationId: uuid("source_installation_id").notNull(),
+  baseRestoreEpoch: bigint("base_restore_epoch", { mode: "number" }).notNull(),
+  recordCount: integer("record_count"),
+  recordsSha256: text("records_sha256"),
+  providerStateSha256: text("provider_state_sha256"),
+  providerPlan: jsonb("provider_plan"),
+  impact: jsonb("impact"),
+  error: text("error"),
+  cleanupCheckedAt: timestamp("cleanup_checked_at", { withTimezone: true }),
+  cleanupLeaseToken: uuid("cleanup_lease_token"),
+  cleanupLeaseExpiresAt: timestamp("cleanup_lease_expires_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  validatedAt: timestamp("validated_at", { withTimezone: true }),
+  appliedAt: timestamp("applied_at", { withTimezone: true }),
+  completedAt: timestamp("completed_at", { withTimezone: true }),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("backup_restore_secret_sidecars_active_restore_uq").on(table.restoreOperationId)
+    .where(sql`${table.status} IN ('staging','uploaded','validated','applied')`),
+  uniqueIndex("backup_restore_secret_sidecars_idempotency_uq").on(
+    table.restoreOperationId,
+    table.idempotencyKey,
+  ),
+  index("backup_restore_secret_sidecars_cleanup_idx").on(
+    table.cleanupCheckedAt,
+    table.completedAt,
+    table.id,
+  ).where(sql`${table.status} IN ('applied','failed','cancelled')`),
+  check(
+    "backup_restore_secret_sidecars_status_check",
+    sql`${table.status} IN ('staging','uploaded','validated','applied','failed','cancelled')`,
+  ),
+  check("backup_restore_secret_sidecars_version_check", sql`${table.version} >= 1`),
+  check(
+    "backup_restore_secret_sidecars_idempotency_check",
+    sql`char_length(${table.idempotencyKey}) BETWEEN 8 AND 200`,
+  ),
+  check(
+    "backup_restore_secret_sidecars_object_key_check",
+    sql`char_length(${table.sourceObjectKey}) BETWEEN 1 AND 1024 AND left(${table.sourceObjectKey},1) <> '/' AND ${table.sourceObjectKey} !~ '(^|/)\.\.(/|$)' AND ${table.sourceObjectKey} !~ '//' AND ${table.sourceObjectKey} !~ '[[:cntrl:]]'`,
+  ),
+  check(
+    "backup_restore_secret_sidecars_digest_check",
+    sql`${table.archiveSha256} ~ '^[0-9a-f]{64}$' AND ${table.baseArchiveSha256} ~ '^[0-9a-f]{64}$' AND ${table.baseContentRootSha256} ~ '^[0-9a-f]{64}$' AND (${table.recordsSha256} IS NULL OR ${table.recordsSha256} ~ '^[0-9a-f]{64}$') AND (${table.providerStateSha256} IS NULL OR ${table.providerStateSha256} ~ '^[0-9a-f]{64}$')`,
+  ),
+  check("backup_restore_secret_sidecars_size_check", sql`${table.archiveBytes} > 0`),
+  check(
+    "backup_restore_secret_sidecars_restore_epoch_check",
+    sql`${table.baseRestoreEpoch} > 0`,
+  ),
+  check(
+    "backup_restore_secret_sidecars_key_check",
+    sql`${table.recoveryKeyId} ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'`,
+  ),
+  check(
+    "backup_restore_secret_sidecars_validation_check",
+    sql`(${table.recordCount} IS NULL AND ${table.recordsSha256} IS NULL AND ${table.providerStateSha256} IS NULL AND ${table.providerPlan} IS NULL AND ${table.impact} IS NULL AND ${table.validatedAt} IS NULL) OR (${table.recordCount} >= 0 AND ${table.recordsSha256} IS NOT NULL AND ${table.providerStateSha256} IS NOT NULL AND jsonb_typeof(${table.providerPlan})='array' AND jsonb_array_length(${table.providerPlan})=${table.recordCount} AND jsonb_typeof(${table.impact})='object' AND ${table.validatedAt} IS NOT NULL)`,
+  ),
+  check(
+    "backup_restore_secret_sidecars_error_check",
+    sql`${table.error} IS NULL OR char_length(${table.error}) BETWEEN 1 AND 1000`,
+  ),
+  check(
+    "backup_restore_secret_sidecars_cleanup_lease_check",
+    sql`(${table.cleanupLeaseToken} IS NULL AND ${table.cleanupLeaseExpiresAt} IS NULL) OR (${table.status} IN ('applied','failed','cancelled') AND ${table.cleanupLeaseToken} IS NOT NULL AND ${table.cleanupLeaseExpiresAt} IS NOT NULL)`,
+  ),
+  check(
+    "backup_restore_secret_sidecars_time_check",
+    sql`${table.updatedAt} >= ${table.createdAt} AND (${table.validatedAt} IS NULL OR ${table.validatedAt} >= ${table.createdAt}) AND (${table.appliedAt} IS NULL OR ${table.appliedAt} >= ${table.createdAt}) AND (${table.completedAt} IS NULL OR ${table.completedAt} >= ${table.createdAt})`,
+  ),
+  check(
+    "backup_restore_secret_sidecars_lifecycle_check",
+    sql`(${table.status} IN ('staging','uploaded') AND ${table.validatedAt} IS NULL AND ${table.appliedAt} IS NULL AND ${table.completedAt} IS NULL AND ${table.error} IS NULL) OR (${table.status}='validated' AND ${table.validatedAt} IS NOT NULL AND ${table.appliedAt} IS NULL AND ${table.completedAt} IS NULL AND ${table.error} IS NULL) OR (${table.status}='applied' AND ${table.validatedAt} IS NOT NULL AND ${table.appliedAt} IS NOT NULL AND ${table.completedAt} IS NOT NULL AND ${table.error} IS NULL AND ${table.appliedBy} IS NOT NULL) OR (${table.status}='failed' AND ${table.appliedAt} IS NULL AND ${table.completedAt} IS NOT NULL AND ${table.error} IS NOT NULL) OR (${table.status}='cancelled' AND ${table.appliedAt} IS NULL AND ${table.completedAt} IS NOT NULL AND ${table.error} IS NULL)`,
   ),
 ]);
 

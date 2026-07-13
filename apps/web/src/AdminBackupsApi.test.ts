@@ -45,6 +45,235 @@ describe("backup administration API", () => {
     );
   });
 
+  it("requires the exact privileged confirmation and downloads the sidecar separately", async () => {
+    const paired = {
+      id: "paired/1",
+      status: "queued",
+      providerSecrets: { status: "queued", encrypted: true },
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json(paired, { status: 202 }))
+      .mockResolvedValueOnce(new Response(new Uint8Array([1, 2, 3]), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.createAdminPrivilegedBackupExport(
+      "privileged-attempt",
+      "EXPORT PROVIDER SECRETS",
+    );
+    const blob = await api.downloadAdminProviderSecrets("paired/1");
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "/api/admin/backups/privileged-exports",
+      expect.objectContaining({
+        method: "POST",
+        credentials: "include",
+        headers: expect.objectContaining({ "Idempotency-Key": "privileged-attempt" }),
+        body: JSON.stringify({
+          includeDiagnostics: false,
+          confirmation: "EXPORT PROVIDER SECRETS",
+        }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/admin/backups/paired%2F1/provider-secrets/content",
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(blob?.size).toBe(3);
+    expect(api.adminProviderSecretsContentUrl("paired/1")).toBe(
+      "/api/admin/backups/paired%2F1/provider-secrets/content",
+    );
+  });
+
+  it("preserves the dedicated recent-auth error while downloading provider secrets", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(Response.json({
+        error: { code: "recent_authentication_required", message: "Sign in again" },
+      }, { status: 403 })),
+    );
+    await expect(api.downloadAdminProviderSecrets("paired")).rejects.toMatchObject({
+      status: 403,
+      code: "recent_authentication_required",
+      message: "Sign in again",
+    });
+  });
+
+  it("streams provider secrets directly into a supplied file destination", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response(new Uint8Array([1, 2, 3]), { status: 200 })),
+    );
+    const chunks: number[] = [];
+    const destination = new WritableStream<Uint8Array>({
+      write(chunk) {
+        chunks.push(...chunk);
+      },
+    });
+    await expect(api.downloadAdminProviderSecrets("paired", destination)).resolves.toBeUndefined();
+    expect(chunks).toEqual([1, 2, 3]);
+  });
+
+  it("aborts a picker-created destination when authorization fails before streaming", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(Response.json({
+        error: { code: "recent_authentication_required", message: "Sign in again" },
+      }, { status: 403 })),
+    );
+    const abort = vi.fn();
+    const destination = new WritableStream<Uint8Array>({ abort });
+    await expect(api.downloadAdminProviderSecrets("paired", destination)).rejects.toMatchObject({
+      code: "recent_authentication_required",
+    });
+    expect(abort).toHaveBeenCalledOnce();
+    expect(abort.mock.calls[0][0]).toMatchObject({ code: "recent_authentication_required" });
+  });
+
+  it("rejects oversized compatibility downloads before buffering response bytes", async () => {
+    const cancel = vi.fn().mockResolvedValue(undefined);
+    const body = new ReadableStream<Uint8Array>({ cancel });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(body, {
+          status: 200,
+          headers: { "Content-Length": String(32 * 1024 * 1024 + 1) },
+        }),
+      ),
+    );
+    await expect(api.downloadAdminProviderSecrets("oversized")).rejects.toMatchObject({
+      status: 413,
+      code: "download_too_large_for_browser",
+    });
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("uploads a sidecar with stable identity and binds preview/apply to both fingerprints", async () => {
+    let xhr: RestoreSidecarXhr | undefined;
+    class RestoreSidecarXhr {
+      status = 201;
+      responseText = JSON.stringify({ id: "sidecar", restoreId: "restore" });
+      withCredentials = false;
+      upload: { onprogress?: (event: ProgressEvent) => void } = {};
+      onerror?: () => void;
+      onabort?: () => void;
+      onload?: () => void;
+      headers = new Map<string, string>();
+      url = "";
+      constructor() {
+        xhr = this;
+      }
+      open(_method: string, url: string) {
+        this.url = url;
+      }
+      setRequestHeader(name: string, value: string) {
+        this.headers.set(name, value);
+      }
+      send() {
+        this.onload?.();
+      }
+      abort() {
+        this.onabort?.();
+      }
+    }
+    vi.stubGlobal("XMLHttpRequest", RestoreSidecarXhr);
+    await api.uploadAdminProviderSecretRestore(
+      "restore/one",
+      new File(["encrypted"], "paired.dgsecrets"),
+      "stable-sidecar-upload",
+    );
+    expect(xhr?.url).toBe(
+      "/api/admin/backups/restores/restore%2Fone/provider-secrets/uploads",
+    );
+    expect(xhr?.withCredentials).toBe(true);
+    expect(xhr?.headers.get("Idempotency-Key")).toBe("stable-sidecar-upload");
+
+    const preview = {
+      id: "sidecar/one",
+      restoreId: "restore/one",
+      status: "validated" as const,
+      version: 2,
+      baseFingerprint: "a".repeat(64),
+      sidecarFingerprint: "b".repeat(64),
+      recoveryKeyId: "recovery-2026",
+      recordCount: 1,
+      providers: [],
+      warnings: [],
+      blockingErrors: [],
+      providersRemainDisabled: true as const,
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json(preview))
+      .mockResolvedValueOnce(Response.json({ status: "applied" }));
+    vi.stubGlobal("fetch", fetchMock);
+    await api.previewAdminProviderSecretRestore(preview.restoreId, preview.id);
+    await api.applyAdminProviderSecretRestore(preview, "RESTORE PROVIDER SECRETS");
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "/api/admin/backups/restores/restore%2Fone/provider-secrets/sidecar%2Fone/dry-run",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/admin/backups/restores/restore%2Fone/provider-secrets/sidecar%2Fone/apply",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          confirmation: "RESTORE PROVIDER SECRETS",
+          expectedVersion: 2,
+          baseFingerprint: "a".repeat(64),
+          sidecarFingerprint: "b".repeat(64),
+        }),
+      }),
+    );
+  });
+
+  it("loads resumable provider-secret state and cancels it with optimistic version binding", async () => {
+    const state = {
+      id: "sidecar/one",
+      restoreId: "restore/one",
+      status: "uploaded" as const,
+      version: 4,
+      filename: "provider-secrets.dgsecrets" as const,
+      bytes: 128,
+      baseFingerprint: "a".repeat(64),
+      sidecarFingerprint: "b".repeat(64),
+      recoveryKeyId: "recovery-2026",
+      recordCount: null,
+      providers: [],
+      warnings: [],
+      blockingErrors: [],
+      providersRemainDisabled: true as const,
+      error: null,
+      createdAt: "2026-07-12T00:00:00Z",
+      updatedAt: "2026-07-12T00:00:00Z",
+      appliedAt: null,
+      expiresAt: "2026-07-19T00:00:00Z",
+      canCancel: true,
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json({ item: state }))
+      .mockResolvedValueOnce(Response.json({ ...state, status: "cancelled", version: 5 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await api.adminProviderSecretRestore(state.restoreId);
+    await api.cancelAdminProviderSecretRestore(state);
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "/api/admin/backups/restores/restore%2Fone/provider-secrets",
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/admin/backups/restores/restore%2Fone/provider-secrets/sidecar%2Fone",
+      expect.objectContaining({
+        method: "DELETE",
+        body: JSON.stringify({ expectedVersion: 4 }),
+      }),
+    );
+  });
+
   it("wires cancellation to the active XHR while retaining its idempotency header", async () => {
     let xhr: FakeXhr | undefined;
     class FakeXhr {

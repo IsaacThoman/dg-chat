@@ -204,6 +204,20 @@
       "when": 1783656028000,
       "tag": "0028_backup_restore",
       "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1783656029000,
+      "tag": "0029_provider_secret_sidecars",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "7",
+      "when": 1783656030000,
+      "tag": "0030_restore_provider_secret_sidecars",
+      "breakpoints": true
     }
   ]
 }

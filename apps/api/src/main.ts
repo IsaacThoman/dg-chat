@@ -5,6 +5,7 @@ import {
   objectStoreFromEnv,
   PostgresBackupStore,
   PostgresRepository,
+  PostgresRestoreProviderSecretsStore,
   PostgresToolExecutionStore,
   reconcileBetterAuthIdentities,
   verifyBackupDataCatalog,
@@ -20,6 +21,7 @@ import {
 import { createBetterAuthService } from "./better-auth.ts";
 import { smtpIdentityMailer } from "./mail.ts";
 import { backupRuntimeConfig } from "./backup-config.ts";
+import { privilegedBackupSecretConfig } from "./backup-secret-keyring.ts";
 import { DefaultBackupAdminService } from "./backup-service.ts";
 import { createPostgresBackupDataPort } from "./postgres-backup-data.ts";
 import { shutdownApi } from "./shutdown.ts";
@@ -34,6 +36,9 @@ if (Deno.env.get("DENO_ENV") === "production" && !providerKeyring) {
 const databaseUrl = Deno.env.get("DATABASE_URL");
 const production = Deno.env.get("DENO_ENV") === "production";
 if (production && !databaseUrl) throw new Error("Production requires DATABASE_URL");
+// Parse before constructing services: an explicit opt-in must never start with an incomplete,
+// reused, or malformed recovery key domain.
+const privilegedBackupSecrets = privilegedBackupSecretConfig(Deno.env.toObject());
 const objectStore = objectStoreFromEnv();
 const backupConfig = await backupRuntimeConfig(Deno.env.toObject(), {
   dependenciesAvailable: Boolean(databaseUrl && objectStore),
@@ -53,6 +58,16 @@ const backupAdmin = backupConfig.enabled && databaseUrl && objectStore && backup
     authenticator: backupConfig.authenticator,
     restoreEnabled: backupConfig.restoreEnabled,
     maxUploadBytes: backupConfig.maxUploadBytes,
+    privilegedProviderSecrets: privilegedBackupSecrets.enabled && privilegedBackupSecrets.keyring &&
+        providerKeyring
+      ? {
+        recoveryKeyring: privilegedBackupSecrets.keyring,
+        providerKeyring,
+      }
+      : undefined,
+    providerSecretRestoreStore: privilegedBackupSecrets.enabled && backupConfig.restoreEnabled
+      ? await PostgresRestoreProviderSecretsStore.connect(databaseUrl)
+      : undefined,
   })
   : undefined;
 if (backupAdmin) {

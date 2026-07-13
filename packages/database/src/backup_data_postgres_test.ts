@@ -7,9 +7,11 @@ import {
   type BackupDataBatch,
   BackupDataError,
   type BackupDataSource,
+  type BackupProviderCredential,
   dryRunBackupData,
   restoreBackupData,
   verifyBackupDataCatalog,
+  withPrivilegedRepeatableReadBackupSnapshot,
   withRepeatableReadBackupSnapshot,
 } from "./backup-data.ts";
 import { PostgresBackupStore } from "./backup-postgres.ts";
@@ -136,6 +138,7 @@ Deno.test({
       await withRepeatableReadBackupSnapshot(
         databaseUrl!,
         async (source) => {
+          assertEquals("providerCredentials" in source, false);
           assertEquals(source.tables.length, BACKUP_DATA_TABLES.length);
           for (const definition of source.tables) {
             if (definition.name === "conversations") {
@@ -158,6 +161,45 @@ Deno.test({
       assertEquals("credential_envelope" in capturedProvider, false);
       const capturedAccount = captured.get("auth_accounts")!.flat()[0];
       assertEquals("access_token" in capturedAccount, false);
+
+      const concurrentProviderId = crypto.randomUUID();
+      const privilegedCredentials: BackupProviderCredential[] = [];
+      await withPrivilegedRepeatableReadBackupSnapshot(
+        databaseUrl!,
+        async (source) => {
+          // The installation-state read has established this transaction's snapshot. This insert
+          // must be absent from both the portable provider rows and credential envelope stream.
+          await sql`INSERT INTO providers(
+            id,slug,display_name,base_url,protocol,enabled,version,
+            credential_envelope,credential_updated_at
+          ) VALUES(
+            ${concurrentProviderId},'after-snapshot','After snapshot',
+            'https://after-snapshot.example/v1','chat_completions',true,1,
+            ${
+            sql.json({
+              version: 1,
+              algorithm: "AES-256-GCM",
+              keyId: "default",
+              credentialVersion: 2,
+              wrappedKeyNonce: "later-nonce",
+              wrappedKey: "later-key",
+              contentNonce: "later-nonce",
+              ciphertext: "later-secret",
+            })
+          },now()
+          )`;
+          const providerRows = [];
+          for await (const batch of source.rows("providers")) providerRows.push(...batch);
+          assertEquals(providerRows.some((row) => row.id === concurrentProviderId), false);
+          for await (const batch of source.providerCredentials()) {
+            privilegedCredentials.push(...structuredClone(batch));
+          }
+        },
+        { batchSize: 1 },
+      );
+      assertEquals(privilegedCredentials.length, 1);
+      assertEquals(privilegedCredentials[0].providerId, providerId);
+      assertEquals(privilegedCredentials[0].envelope.credentialVersion, 1);
 
       const source = replaySource(captured);
       const preview = await dryRunBackupData(databaseUrl!, source);

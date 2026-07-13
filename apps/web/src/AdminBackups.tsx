@@ -5,13 +5,17 @@ import {
   CheckCircle2,
   Download,
   FileArchive,
+  KeyRound,
+  LockKeyhole,
   RefreshCw,
   ShieldCheck,
   Upload,
 } from "lucide-react";
 import { api, ApiError } from "./api.ts";
+import { ProviderSecretRestore } from "./ProviderSecretRestore.tsx";
 import type {
   BackupExport,
+  BackupExportPage,
   BackupRestorePreview,
   BackupRestoreStatus,
   BackupRestoreStatusCapability,
@@ -25,9 +29,40 @@ const size = (bytes: number | null) =>
     : new Intl.NumberFormat(undefined, { style: "unit", unit: "byte", notation: "compact" })
       .format(bytes);
 const terminal = (item: BackupExport) => item.status === "completed" || item.status === "failed";
+export const PRIVILEGED_BACKUP_CONFIRMATION = "EXPORT PROVIDER SECRETS";
+export const mergeBackupExport = (
+  current: BackupExportPage | undefined,
+  item: BackupExport,
+): BackupExportPage => ({
+  items: [item, ...(current?.items ?? []).filter((existing) => existing.id !== item.id)],
+  restoreEnabled: current?.restoreEnabled ?? false,
+  privilegedSecretBackupsEnabled: current?.privilegedSecretBackupsEnabled ?? false,
+  providerSecretRestoreEnabled: current?.providerSecretRestoreEnabled ?? false,
+});
 export const isRecentAuthenticationRequired = (error: unknown) =>
   error instanceof ApiError && error.status === 403 &&
   error.code === "recent_authentication_required";
+const PROVIDER_SECRET_RESTORE_KEY = "dg.provider-secret-restore-id";
+export function safeSessionRestoreId(storage: Pick<Storage, "getItem"> | undefined) {
+  try {
+    return (storage ?? globalThis.sessionStorage)?.getItem(PROVIDER_SECRET_RESTORE_KEY) ??
+      undefined;
+  } catch {
+    return undefined;
+  }
+}
+export function persistSessionRestoreId(
+  storage: Pick<Storage, "setItem" | "removeItem"> | undefined,
+  restoreId: string | undefined,
+) {
+  try {
+    const target = storage ?? globalThis.sessionStorage;
+    if (restoreId) target?.setItem(PROVIDER_SECRET_RESTORE_KEY, restoreId);
+    else target?.removeItem(PROVIDER_SECRET_RESTORE_KEY);
+  } catch {
+    // Session persistence is an enhancement; in-memory recovery state remains authoritative.
+  }
+}
 export const canApplyBackupRestore = (
   preview: BackupRestorePreview | undefined,
   confirmation: string,
@@ -216,6 +251,7 @@ export async function monitorBackupRestore(
 export function AdminBackupsView() {
   const client = useQueryClient();
   const exportKey = useRef(crypto.randomUUID());
+  const [recentRestoreId, setRecentRestoreId] = useState(() => safeSessionRestoreId(undefined));
   const backups = useQuery({
     queryKey: ["admin-backups"],
     queryFn: api.adminBackups,
@@ -226,23 +262,86 @@ export function AdminBackupsView() {
     mutationFn: () => api.createAdminBackupExport(exportKey.current),
     onSuccess: (item) => {
       exportKey.current = crypto.randomUUID();
-      client.setQueryData(["admin-backups"], (current: typeof backups.data) => ({
-        items: [item, ...(current?.items ?? []).filter((existing) => existing.id !== item.id)],
-        restoreEnabled: current?.restoreEnabled ?? false,
-      }));
+      client.setQueryData(
+        ["admin-backups"],
+        (current: typeof backups.data) => mergeBackupExport(current, item),
+      );
     },
   });
+  const privilegedKey = useRef(crypto.randomUUID());
+  const privilegedCreate = useMutation({
+    mutationFn: (confirmation: string) =>
+      api.createAdminPrivilegedBackupExport(privilegedKey.current, confirmation),
+    onSuccess: (item) => {
+      privilegedKey.current = crypto.randomUUID();
+      client.setQueryData(
+        ["admin-backups"],
+        (current: typeof backups.data) => mergeBackupExport(current, item),
+      );
+    },
+  });
+  const downloadSecrets = async (item: BackupExport) => {
+    const filename = `dg-chat-provider-secrets-${item.id}.dgsecrets`;
+    const picker = (globalThis as unknown as {
+      showSaveFilePicker?: (options: {
+        suggestedName: string;
+        types: Array<{ description: string; accept: Record<string, string[]> }>;
+      }) => Promise<{ createWritable(): Promise<WritableStream<Uint8Array>> }>;
+    }).showSaveFilePicker;
+    if (picker) {
+      // Open the picker before any network await so the browser still recognizes the click's user
+      // activation. The response then pipes directly to disk instead of entering JS heap memory.
+      const handle = await picker({
+        suggestedName: filename,
+        types: [{
+          description: "DG Chat encrypted provider secrets",
+          accept: { "application/vnd.dg-chat.provider-secrets": [".dgsecrets"] },
+        }],
+      });
+      const writable = await handle.createWritable();
+      await api.downloadAdminProviderSecrets(item.id, writable);
+      return;
+    }
+    const blob = await api.downloadAdminProviderSecrets(item.id);
+    if (!blob) return;
+    const url = URL.createObjectURL(blob);
+    try {
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = filename;
+      anchor.rel = "noopener";
+      anchor.click();
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  };
   return (
     <AdminBackups
       exports={backups.data?.items ?? []}
       restoreEnabled={backups.data?.restoreEnabled}
+      privilegedSecretBackupsEnabled={backups.data?.privilegedSecretBackupsEnabled}
+      providerSecretRestoreEnabled={backups.data?.providerSecretRestoreEnabled}
+      recentRestoreId={recentRestoreId}
       loading={backups.isLoading}
       stale={backups.isError && backups.data !== undefined}
       loadError={backups.isError ? message(backups.error) : undefined}
       creating={create.isPending}
       createError={create.isError ? message(create.error) : undefined}
+      creatingPrivileged={privilegedCreate.isPending}
+      privilegedCreateError={privilegedCreate.isError ? privilegedCreate.error : undefined}
       onRetry={() => void backups.refetch()}
       onCreate={() => create.mutateAsync().then(() => undefined)}
+      onCreatePrivileged={(confirmation) =>
+        privilegedCreate.mutateAsync(confirmation).then(() => undefined)}
+      onDownloadSecrets={downloadSecrets}
+      onBaseRestoreCompleted={(restoreId) => {
+        setRecentRestoreId(restoreId);
+        persistSessionRestoreId(undefined, restoreId);
+      }}
+      onProviderSecretsApplied={() => {
+        setRecentRestoreId(undefined);
+        persistSessionRestoreId(undefined, undefined);
+      }}
       onReauthenticate={() => globalThis.location.assign("/login")}
     />
   );
@@ -251,13 +350,22 @@ export function AdminBackupsView() {
 export interface AdminBackupsProps {
   exports: BackupExport[];
   restoreEnabled?: boolean;
+  privilegedSecretBackupsEnabled?: boolean;
+  providerSecretRestoreEnabled?: boolean;
+  recentRestoreId?: string;
   loading?: boolean;
   stale?: boolean;
   loadError?: string;
   creating?: boolean;
   createError?: string;
+  creatingPrivileged?: boolean;
+  privilegedCreateError?: unknown;
   onRetry(): void;
   onCreate(): Promise<void>;
+  onCreatePrivileged?(confirmation: string): Promise<void>;
+  onDownloadSecrets?(item: BackupExport): Promise<void>;
+  onBaseRestoreCompleted?(restoreId: string): void;
+  onProviderSecretsApplied?(): void;
   onReauthenticate?(): void;
 }
 
@@ -286,6 +394,50 @@ export function AdminBackups(props: AdminBackupsProps) {
   const [completed, setCompleted] = useState(false);
   const [restoreStage, setRestoreStage] = useState<string>();
   const [announcement, setAnnouncement] = useState("");
+  const [privilegedConfirmation, setPrivilegedConfirmation] = useState("");
+  const [privilegedError, setPrivilegedError] = useState<string>();
+  const [secretDownloadId, setSecretDownloadId] = useState<string>();
+
+  const createPrivileged = async (event: FormEvent) => {
+    event.preventDefault();
+    if (
+      privilegedConfirmation !== PRIVILEGED_BACKUP_CONFIRMATION ||
+      !props.onCreatePrivileged || props.creatingPrivileged
+    ) return;
+    setPrivilegedError(undefined);
+    try {
+      await props.onCreatePrivileged(privilegedConfirmation);
+      setPrivilegedConfirmation("");
+      setAnnouncement(
+        "Encrypted provider-secret export started. Download both files when validation completes.",
+      );
+    } catch (error) {
+      setPrivilegedConfirmation("");
+      if (isRecentAuthenticationRequired(error)) {
+        setPrivilegedError("Your sign-in is no longer recent enough. Redirecting to sign in.");
+        globalThis.setTimeout(() => props.onReauthenticate?.(), 900);
+      } else setPrivilegedError(message(error));
+    }
+  };
+  const downloadSecrets = async (item: BackupExport) => {
+    if (!props.onDownloadSecrets || secretDownloadId) return;
+    setSecretDownloadId(item.id);
+    setPrivilegedError(undefined);
+    try {
+      await props.onDownloadSecrets(item);
+      setAnnouncement("Encrypted provider-secret sidecar downloaded.");
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        // Closing the native save picker is an intentional cancellation, not a failed backup.
+        return;
+      } else if (isRecentAuthenticationRequired(error)) {
+        setPrivilegedError("Sign in again before downloading provider secrets. Redirecting…");
+        globalThis.setTimeout(() => props.onReauthenticate?.(), 900);
+      } else setPrivilegedError(message(error));
+    } finally {
+      setSecretDownloadId(undefined);
+    }
+  };
 
   useEffect(() => {
     if (preview) restoreHeading.current?.focus();
@@ -412,6 +564,7 @@ export function AdminBackups(props: AdminBackupsProps) {
         throw new Error("The restore failed. Check server logs before retrying.");
       }
       setCompleted(true);
+      props.onBaseRestoreCompleted?.(preview.restoreId);
       setAnnouncement("Restore completed. All sessions were invalidated; redirecting to sign in.");
       globalThis.setTimeout(() => props.onReauthenticate?.(), 900);
     } catch (error) {
@@ -487,6 +640,81 @@ export function AdminBackups(props: AdminBackupsProps) {
       </aside>
       {props.createError && <p className="backup-alert" role="alert">{props.createError}</p>}
 
+      <section className="backup-card backup-privileged" aria-labelledby="privileged-export-title">
+        <div className="backup-section-heading">
+          <div>
+            <h2 id="privileged-export-title">
+              <KeyRound size={18} /> Provider-secret recovery
+            </h2>
+            <p>Create a separately encrypted credential sidecar for installation recovery.</p>
+          </div>
+          <span className="ops-status ops-status-failed">highly sensitive</span>
+        </div>
+        {props.privilegedSecretBackupsEnabled === false
+          ? (
+            <aside className="backup-warning" role="status">
+              <LockKeyhole size={18} aria-hidden="true" />
+              <div>
+                <strong>Privileged secret backups are disabled</strong>
+                <p>
+                  An operator must configure the independent recovery keyring and explicitly enable
+                  privileged backups. Standard exports remain available and always redact provider
+                  credentials.
+                </p>
+              </div>
+            </aside>
+          )
+          : props.privilegedSecretBackupsEnabled === true
+          ? (
+            <form className="backup-privileged-form" onSubmit={createPrivileged}>
+              <aside className="backup-alert" role="note">
+                <AlertTriangle size={18} aria-hidden="true" />
+                <div>
+                  <strong>The recovery key is not stored in either download</strong>
+                  <p>
+                    Keep the configured recovery keyring in a separate, encrypted location. A
+                    <code>.dgsecrets</code> file is unusable without its exact{" "}
+                    <code>.dgbackup</code>
+                    partner and recovery key; losing the key permanently loses these credentials.
+                    Anyone holding all three can recover provider credentials.
+                  </p>
+                </div>
+              </aside>
+              <label htmlFor={`${titleId}-privileged-confirmation`}>
+                <strong>Type {PRIVILEGED_BACKUP_CONFIRMATION} to continue</strong>
+                <small>
+                  Recent authentication is required. The resulting provider-secret file is
+                  downloaded separately from the redacted base archive.
+                </small>
+              </label>
+              <div className="backup-privileged-action">
+                <input
+                  id={`${titleId}-privileged-confirmation`}
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={privilegedConfirmation}
+                  onChange={(event) => setPrivilegedConfirmation(event.target.value)}
+                  disabled={props.creatingPrivileged}
+                />
+                <button
+                  className="danger"
+                  disabled={props.creatingPrivileged ||
+                    privilegedConfirmation !== PRIVILEGED_BACKUP_CONFIRMATION}
+                >
+                  <KeyRound size={15} />
+                  {props.creatingPrivileged ? "Starting encrypted export…" : "Create paired export"}
+                </button>
+              </div>
+            </form>
+          )
+          : <div className="backup-empty" role="status">Checking privileged backup policy…</div>}
+        {(privilegedError !== undefined || props.privilegedCreateError !== undefined) && (
+          <p className="backup-alert" role="alert">
+            {privilegedError ?? message(props.privilegedCreateError)}
+          </p>
+        )}
+      </section>
+
       <section className="backup-card" aria-labelledby="export-history-title">
         <div className="backup-section-heading">
           <div>
@@ -525,17 +753,39 @@ export function AdminBackups(props: AdminBackupsProps) {
                     <small>
                       Format v{item.formatVersion} · {size(item.bytes)} · secrets redacted
                     </small>
+                    {item.providerSecrets && (
+                      <small className="backup-secret-summary">
+                        <LockKeyhole size={13} aria-hidden="true" /> Encrypted sidecar: {size(
+                          item.providerSecrets.bytes,
+                        )} · {item.providerSecrets.providerCount ?? "—"} providers · recovery key
+                        {" "}
+                        {item.providerSecrets.recoveryKeyId ?? "pending"}
+                      </small>
+                    )}
                     {item.error && <span className="backup-error" role="alert">{item.error}</span>}
                   </div>
                   {item.status === "completed"
                     ? (
-                      <a
-                        className="secondary button-link"
-                        href={api.adminBackupContentUrl(item.id)}
-                        download
-                      >
-                        <Download size={15} /> Download
-                      </a>
+                      <div className="backup-downloads">
+                        <a
+                          className="secondary button-link"
+                          href={api.adminBackupContentUrl(item.id)}
+                          download
+                        >
+                          <Download size={15} /> .dgbackup
+                        </a>
+                        {item.providerSecrets?.status === "completed" && (
+                          <button
+                            type="button"
+                            className="secondary"
+                            disabled={secretDownloadId === item.id}
+                            onClick={() => void downloadSecrets(item)}
+                          >
+                            <KeyRound size={15} />
+                            {secretDownloadId === item.id ? "Preparing…" : ".dgsecrets"}
+                          </button>
+                        )}
+                      </div>
                     )
                     : item.status === "failed"
                     ? <small>Download unavailable</small>
@@ -747,6 +997,12 @@ export function AdminBackups(props: AdminBackupsProps) {
           </form>
         )}
       </section>
+      <ProviderSecretRestore
+        enabled={props.providerSecretRestoreEnabled}
+        initialRestoreId={props.recentRestoreId}
+        onReauthenticate={props.onReauthenticate}
+        onApplied={props.onProviderSecretsApplied}
+      />
     </section>
   );
 }

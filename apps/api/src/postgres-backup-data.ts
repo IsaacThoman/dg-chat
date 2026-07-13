@@ -9,6 +9,8 @@ import type {
   BackupManifestV1,
   BackupRestoreImpact,
   ObjectStore,
+  PrivilegedBackupExportSource,
+  ProviderCredentialEnvelope,
 } from "@dg-chat/database";
 import {
   BACKUP_DATA_BATCH_SIZE,
@@ -22,6 +24,7 @@ import {
   restoreBackupData,
   signBackupManifest,
   verifyBackupDataCatalog,
+  withPrivilegedRepeatableReadBackupSnapshot,
   withRepeatableReadBackupSnapshot,
 } from "@dg-chat/database";
 import type {
@@ -33,6 +36,8 @@ import type {
 const encoder = new TextEncoder();
 const MAX_ENTRIES = 10_000;
 const MAX_LINE_BYTES = 8 * 1024 * 1024;
+const MAX_PROVIDER_CREDENTIALS = 10_000;
+const MAX_PROVIDER_CREDENTIAL_LINE_BYTES = 64 * 1024;
 const OBJECT_INDEX = "objects/index.ndjson";
 const TABLE_PREFIX = "tables/";
 const SHA256 = /^[0-9a-f]{64}$/u;
@@ -43,6 +48,11 @@ type DatabaseAdapter = {
   snapshot<T>(
     databaseUrl: string,
     consumer: (source: BackupExportSource) => Promise<T>,
+    options: { diagnosticPolicy: "excluded" | "included" },
+  ): Promise<T>;
+  privilegedSnapshot<T>(
+    databaseUrl: string,
+    consumer: (source: PrivilegedBackupExportSource) => Promise<T>,
     options: { diagnosticPolicy: "excluded" | "included" },
   ): Promise<T>;
   dryRun(databaseUrl: string, source: BackupDataSource): Promise<BackupRestoreImpact>;
@@ -84,9 +94,26 @@ interface TempPayload {
 const defaultDatabase: DatabaseAdapter = {
   verifyCatalog: verifyBackupDataCatalog,
   snapshot: withRepeatableReadBackupSnapshot,
+  privilegedSnapshot: withPrivilegedRepeatableReadBackupSnapshot,
   dryRun: dryRunBackupData,
   restore: restoreBackupData,
 };
+
+export interface SourceEncryptedProviderCredential {
+  readonly providerId: string;
+  readonly envelope: ProviderCredentialEnvelope;
+}
+
+export interface PrivilegedPostgresBackupExportSnapshot extends BackupExportSnapshot {
+  /** Re-readable, sequential access to source-key-encrypted credential envelopes. */
+  providerCredentials(): AsyncIterable<SourceEncryptedProviderCredential>;
+}
+
+export interface PostgresBackupDataPort extends BackupDataPort {
+  exportPrivilegedSnapshot(
+    input: { includeDiagnostics: boolean; installationId: string; signal?: AbortSignal },
+  ): Promise<PrivilegedPostgresBackupExportSnapshot>;
+}
 
 async function writeAll(file: Deno.FsFile, bytes: Uint8Array) {
   let offset = 0;
@@ -115,9 +142,9 @@ class HashedFileWriter {
   constructor(readonly path: string) {
     this.#file = Deno.openSync(path, { create: true, write: true, truncate: true });
   }
-  async line(value: unknown) {
+  async line(value: unknown, maxBytes = MAX_LINE_BYTES) {
     const bytes = encoder.encode(`${canonicalJson(value)}\n`);
-    if (bytes.length - 1 > MAX_LINE_BYTES) throw new TypeError("NDJSON line is too large");
+    if (bytes.length - 1 > maxBytes) throw new TypeError("NDJSON line is too large");
     this.#hash.update(bytes);
     this.bytes += bytes.length;
     this.records += 1;
@@ -137,6 +164,34 @@ class HashedFileWriter {
       this.#file.close();
     } catch { /* already closed */ }
   }
+}
+
+function exactProviderCredential(value: unknown): SourceEncryptedProviderCredential {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("Provider credential spool record is invalid");
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    Object.keys(record).sort().join() !== "envelope,providerId" ||
+    typeof record.providerId !== "string" || !UUID.test(record.providerId) ||
+    !record.envelope || typeof record.envelope !== "object" || Array.isArray(record.envelope)
+  ) throw new TypeError("Provider credential spool record is invalid");
+  const envelope = record.envelope as Record<string, unknown>;
+  if (
+    Object.keys(envelope).sort().join() !==
+      "algorithm,ciphertext,contentNonce,credentialVersion,keyId,version,wrappedKey,wrappedKeyNonce" ||
+    envelope.version !== 1 || envelope.algorithm !== "AES-256-GCM" ||
+    typeof envelope.keyId !== "string" || !/^[A-Za-z0-9._-]{1,64}$/u.test(envelope.keyId) ||
+    !Number.isSafeInteger(envelope.credentialVersion) || Number(envelope.credentialVersion) < 1 ||
+    ["wrappedKeyNonce", "wrappedKey", "contentNonce", "ciphertext"].some((field) => {
+      const fieldValue = envelope[field];
+      return typeof fieldValue !== "string" || fieldValue.length < 1 || fieldValue.length > 48_000;
+    })
+  ) throw new TypeError("Provider credential spool record is invalid");
+  return Object.freeze({
+    providerId: record.providerId,
+    envelope: Object.freeze(structuredClone(envelope)) as unknown as ProviderCredentialEnvelope,
+  });
 }
 
 function exactObjectReference(value: unknown): ObjectReference {
@@ -294,153 +349,227 @@ function impactCounts(impact: BackupRestoreImpact) {
   }));
 }
 
-export function createPostgresBackupDataPort(options: PostgresBackupDataOptions): BackupDataPort {
+export function createPostgresBackupDataPort(
+  options: PostgresBackupDataOptions,
+): PostgresBackupDataPort {
   if (!options.databaseUrl) throw new TypeError("Backup database URL is required");
   const database = options.database ?? defaultDatabase;
   const appVersion = options.appVersion ?? "0.1.0";
-  return {
-    async exportSnapshot(input): Promise<BackupExportSnapshot> {
+  const exportSnapshot = async (
+    input: { includeDiagnostics: boolean; installationId: string; signal?: AbortSignal },
+    privileged: boolean,
+  ): Promise<PrivilegedPostgresBackupExportSnapshot> => {
+    input.signal?.throwIfAborted();
+    await database.verifyCatalog?.(options.databaseUrl);
+    input.signal?.throwIfAborted();
+    const root = await Deno.makeTempDir({ prefix: "dg-backup-data-" });
+    try {
       input.signal?.throwIfAborted();
-      await database.verifyCatalog?.(options.databaseUrl);
-      input.signal?.throwIfAborted();
-      const root = await Deno.makeTempDir({ prefix: "dg-backup-data-" });
-      try {
+      const takeSnapshot = privileged ? database.privilegedSnapshot : database.snapshot;
+      const relational = await takeSnapshot(options.databaseUrl, async (source) => {
         input.signal?.throwIfAborted();
-        const relational = await database.snapshot(options.databaseUrl, async (source) => {
-          input.signal?.throwIfAborted();
-          if (source.installationId !== input.installationId) {
-            throw new TypeError("Backup installation changed during export");
-          }
-          const expectedTables = BACKUP_DATA_TABLES.filter((table) =>
-            input.includeDiagnostics || table.name !== "provider_payload_captures"
-          ).map((table) => table.name);
-          if (source.tables.map((table) => table.name).join() !== expectedTables.join()) {
-            throw new TypeError("Backup database table catalog is incomplete");
-          }
-          const payloads = new Map<string, Uint8Array | AsyncIterable<Uint8Array>>();
-          const entries: BackupManifestEntryV1[] = [];
-          const referencesPath = `${root}/object-references.ndjson`;
-          const references = new HashedFileWriter(referencesPath);
-          try {
-            for (const table of source.tables) {
-              input.signal?.throwIfAborted();
-              const name = `${TABLE_PREFIX}${table.name}.ndjson`;
-              const path = `${root}/table-${table.name}.ndjson`;
-              const writer = new HashedFileWriter(path);
-              try {
-                for await (const batch of source.rows(table.name)) {
+        if (source.installationId !== input.installationId) {
+          throw new TypeError("Backup installation changed during export");
+        }
+        const expectedTables = BACKUP_DATA_TABLES.filter((table) =>
+          input.includeDiagnostics || table.name !== "provider_payload_captures"
+        ).map((table) => table.name);
+        if (source.tables.map((table) => table.name).join() !== expectedTables.join()) {
+          throw new TypeError("Backup database table catalog is incomplete");
+        }
+        const payloads = new Map<string, Uint8Array | AsyncIterable<Uint8Array>>();
+        const entries: BackupManifestEntryV1[] = [];
+        const referencesPath = `${root}/object-references.ndjson`;
+        const references = new HashedFileWriter(referencesPath);
+        try {
+          for (const table of source.tables) {
+            input.signal?.throwIfAborted();
+            const name = `${TABLE_PREFIX}${table.name}.ndjson`;
+            const path = `${root}/table-${table.name}.ndjson`;
+            const writer = new HashedFileWriter(path);
+            try {
+              for await (const batch of source.rows(table.name)) {
+                input.signal?.throwIfAborted();
+                for (const row of batch) {
                   input.signal?.throwIfAborted();
-                  for (const row of batch) {
-                    input.signal?.throwIfAborted();
-                    await writer.line(row);
-                    if (table.name === "attachments") {
-                      const reference = attachmentReference(row);
-                      if (reference) await references.line(reference);
-                    }
+                  await writer.line(row);
+                  if (table.name === "attachments") {
+                    const reference = attachmentReference(row);
+                    if (reference) await references.line(reference);
                   }
                 }
-                const digest = writer.finish();
-                entries.push({
-                  name,
-                  kind: "ndjson",
-                  bytes: writer.bytes,
-                  sha256: digest,
-                  records: writer.records,
-                });
-                payloads.set(name, filePayload(path));
-              } catch (error) {
-                writer.close();
-                throw error;
               }
+              const digest = writer.finish();
+              entries.push({
+                name,
+                kind: "ndjson",
+                bytes: writer.bytes,
+                sha256: digest,
+                records: writer.records,
+              });
+              payloads.set(name, filePayload(path));
+            } catch (error) {
+              writer.close();
+              throw error;
             }
-          } finally {
-            references.finish();
           }
-          input.signal?.throwIfAborted();
-          return {
-            payloads,
-            entries,
-            referencesPath,
-            schemaVersion: source.schemaVersion,
-            installationId: source.installationId,
-          };
-        }, { diagnosticPolicy: input.includeDiagnostics ? "included" : "excluded" });
-        input.signal?.throwIfAborted();
-
-        // Attachment objects are immutable. Fetch them only after releasing the repeatable-read
-        // database snapshot so slow multi-gigabyte object storage cannot hold back PostgreSQL VACUUM.
-        const objectIndexPath = `${root}/objects-index.ndjson`;
-        const objectIndex = new HashedFileWriter(objectIndexPath);
-        let objectCount = 0;
-        let objectBytes = 0;
-        try {
-          for await (const raw of ndjson(relational.referencesPath)) {
-            input.signal?.throwIfAborted();
-            const reference = exactObjectReference(raw);
-            const { payload, created } = await spoolObject(
-              root,
-              options.objects,
-              reference,
-              input.signal,
-            );
-            input.signal?.throwIfAborted();
-            if (created) {
-              if (relational.entries.length >= MAX_ENTRIES - 1) {
-                throw new TypeError("Backup has too many entries");
-              }
-              relational.entries.push(payload.entry);
-              relational.payloads.set(payload.entry.name, filePayload(payload.path));
-              objectCount += 1;
-              objectBytes += payload.entry.bytes;
-            }
-            await objectIndex.line(
-              { ...reference, entry: payload.entry.name } satisfies ObjectIndexRecord,
-            );
-          }
-          input.signal?.throwIfAborted();
-          const indexDigest = objectIndex.finish();
-          const indexEntry: BackupManifestEntryV1 = {
-            name: OBJECT_INDEX,
-            kind: "ndjson",
-            bytes: objectIndex.bytes,
-            sha256: indexDigest,
-            records: objectIndex.records,
-          };
-          relational.entries.push(indexEntry);
-          relational.payloads.set(OBJECT_INDEX, filePayload(objectIndexPath));
-          input.signal?.throwIfAborted();
-          const manifest = await signBackupManifest({
-            format: "dg-chat-backup",
-            version: 1,
-            backupId: crypto.randomUUID(),
-            createdAt: new Date().toISOString(),
-            appVersion,
-            schemaVersion: relational.schemaVersion,
-            mode: "system",
-            secretPolicy: "redacted",
-            diagnosticPayloadPolicy: input.includeDiagnostics ? "included" : "excluded",
-            source: { installationId: relational.installationId },
-            objects: { count: objectCount, bytes: objectBytes, indexSha256: indexDigest },
-            requiredProviderKeyIds: [],
-            contentRootSha256: await backupContentRoot(relational.entries),
-            entries: relational.entries,
-          }, options.authenticator);
-          input.signal?.throwIfAborted();
-          return {
-            manifest,
-            payloads: relational.payloads,
-            objectsTotal: objectCount,
-            bytesTotal: relational.entries.reduce((sum, entry) => sum + entry.bytes, 0),
-            cleanup: () => Deno.remove(root, { recursive: true }).catch(() => undefined),
-          };
-        } catch (error) {
-          objectIndex.close();
-          throw error;
+        } finally {
+          references.finish();
         }
+        input.signal?.throwIfAborted();
+        let providerCredentialsPath: string | undefined;
+        if (privileged) {
+          if (!("providerCredentials" in source)) {
+            throw new TypeError("Privileged backup credential source is unavailable");
+          }
+          const privilegedSource = source as PrivilegedBackupExportSource;
+          providerCredentialsPath = `${root}/provider-credentials.ndjson`;
+          const credentialWriter = new HashedFileWriter(providerCredentialsPath);
+          try {
+            for await (const batch of privilegedSource.providerCredentials()) {
+              for (const credential of batch) {
+                input.signal?.throwIfAborted();
+                if (credentialWriter.records >= MAX_PROVIDER_CREDENTIALS) {
+                  throw new TypeError("Backup has too many provider credentials");
+                }
+                await credentialWriter.line(
+                  exactProviderCredential(credential),
+                  MAX_PROVIDER_CREDENTIAL_LINE_BYTES,
+                );
+              }
+            }
+            credentialWriter.finish();
+          } catch (error) {
+            credentialWriter.close();
+            throw error;
+          }
+        }
+        return {
+          payloads,
+          entries,
+          referencesPath,
+          providerCredentialsPath,
+          schemaVersion: source.schemaVersion,
+          installationId: source.installationId,
+        };
+      }, { diagnosticPolicy: input.includeDiagnostics ? "included" : "excluded" });
+      input.signal?.throwIfAborted();
+
+      // Attachment objects are immutable. Fetch them only after releasing the repeatable-read
+      // database snapshot so slow multi-gigabyte object storage cannot hold back PostgreSQL VACUUM.
+      const objectIndexPath = `${root}/objects-index.ndjson`;
+      const objectIndex = new HashedFileWriter(objectIndexPath);
+      let objectCount = 0;
+      let objectBytes = 0;
+      try {
+        for await (const raw of ndjson(relational.referencesPath)) {
+          input.signal?.throwIfAborted();
+          const reference = exactObjectReference(raw);
+          const { payload, created } = await spoolObject(
+            root,
+            options.objects,
+            reference,
+            input.signal,
+          );
+          input.signal?.throwIfAborted();
+          if (created) {
+            if (relational.entries.length >= MAX_ENTRIES - 1) {
+              throw new TypeError("Backup has too many entries");
+            }
+            relational.entries.push(payload.entry);
+            relational.payloads.set(payload.entry.name, filePayload(payload.path));
+            objectCount += 1;
+            objectBytes += payload.entry.bytes;
+          }
+          await objectIndex.line(
+            { ...reference, entry: payload.entry.name } satisfies ObjectIndexRecord,
+          );
+        }
+        input.signal?.throwIfAborted();
+        const indexDigest = objectIndex.finish();
+        const indexEntry: BackupManifestEntryV1 = {
+          name: OBJECT_INDEX,
+          kind: "ndjson",
+          bytes: objectIndex.bytes,
+          sha256: indexDigest,
+          records: objectIndex.records,
+        };
+        relational.entries.push(indexEntry);
+        relational.payloads.set(OBJECT_INDEX, filePayload(objectIndexPath));
+        input.signal?.throwIfAborted();
+        const manifest = await signBackupManifest({
+          format: "dg-chat-backup",
+          version: 1,
+          backupId: crypto.randomUUID(),
+          createdAt: new Date().toISOString(),
+          appVersion,
+          schemaVersion: relational.schemaVersion,
+          mode: "system",
+          secretPolicy: "redacted",
+          diagnosticPayloadPolicy: input.includeDiagnostics ? "included" : "excluded",
+          source: { installationId: relational.installationId },
+          objects: { count: objectCount, bytes: objectBytes, indexSha256: indexDigest },
+          requiredProviderKeyIds: [],
+          contentRootSha256: await backupContentRoot(relational.entries),
+          entries: relational.entries,
+        }, options.authenticator);
+        input.signal?.throwIfAborted();
+        let credentialsActive = false;
+        let cleaned = false;
+        const result: BackupExportSnapshot = {
+          manifest,
+          payloads: relational.payloads,
+          objectsTotal: objectCount,
+          bytesTotal: relational.entries.reduce((sum, entry) => sum + entry.bytes, 0),
+          cleanup: async () => {
+            cleaned = true;
+            await Deno.remove(root, { recursive: true }).catch(() => undefined);
+          },
+        };
+        if (!privileged) return result as PrivilegedPostgresBackupExportSnapshot;
+        return Object.assign(result, {
+          providerCredentials(): AsyncIterable<SourceEncryptedProviderCredential> {
+            if (!relational.providerCredentialsPath) {
+              throw new TypeError("Provider credentials were not captured for this backup");
+            }
+            return (async function* () {
+              if (cleaned) throw new TypeError("Provider credential spool has been cleaned up");
+              if (credentialsActive) {
+                throw new TypeError("Provider credentials are already being read");
+              }
+              credentialsActive = true;
+              let records = 0;
+              try {
+                for await (const raw of ndjson(relational.providerCredentialsPath!)) {
+                  input.signal?.throwIfAborted();
+                  records += 1;
+                  if (records > MAX_PROVIDER_CREDENTIALS) {
+                    throw new TypeError("Backup has too many provider credentials");
+                  }
+                  yield exactProviderCredential(raw);
+                }
+              } finally {
+                credentialsActive = false;
+              }
+            })();
+          },
+        });
       } catch (error) {
-        await Deno.remove(root, { recursive: true }).catch(() => undefined);
+        objectIndex.close();
         throw error;
       }
+    } catch (error) {
+      await Deno.remove(root, { recursive: true }).catch(() => undefined);
+      throw error;
+    }
+  };
+
+  return {
+    exportSnapshot(input) {
+      return exportSnapshot(input, false);
+    },
+    exportPrivilegedSnapshot(input) {
+      return exportSnapshot(input, true);
     },
 
     async restoreSession(mode, sessionContext): Promise<BackupRestoreSession> {

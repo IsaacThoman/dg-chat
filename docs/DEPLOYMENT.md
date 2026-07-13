@@ -14,6 +14,7 @@ APP_SECRET=... # at least 32 random bytes
 ENCRYPTION_KEY=... # exactly 32 random bytes encoded as base64
 BACKUP_SIGNING_KEY=... # independent, exactly 32 random bytes encoded as base64
 BACKUP_SIGNING_KEY_ID=installation-v1 # stable identifier recorded in every archive
+ENABLE_PRIVILEGED_SECRET_BACKUPS=false # privileged provider-secret recovery is a separate opt-in
 SETUP_TOKEN=... # one-time bootstrap secret
 APP_URL=https://chat.example.com
 WEB_URL=https://chat.example.com
@@ -26,6 +27,14 @@ not reuse either key for the other purpose. For rolling provider-secret rotation
 each provider credential has been explicitly replaced through the admin console under the new
 primary key; an online bulk rewrap command is not yet shipped. `ENCRYPTION_KEY` remains the
 supported single-key form.
+
+Privileged provider-secret recovery artifacts are disabled by default. To prepare their independent
+key domain, set `BACKUP_SECRET_KEYRING` to a JSON object of stable key IDs and canonical base64
+32-byte keys, set `BACKUP_SECRET_PRIMARY_KEY_ID` to the key used for new artifacts, and explicitly
+set `ENABLE_PRIVILEGED_SECRET_BACKUPS=true`. Generate these keys independently: startup rejects any
+recovery key that equals a configured provider-encryption or backup-signing key. Rotation changes
+the primary ID while retaining prior keys until every recovery artifact encrypted with them has
+expired. Never publish or include this keyring in an ordinary `.dgbackup` archive.
 
 The bundled `minio-init` service creates the private bucket and provisions this application identity
 with only list, location, read, write, and delete permissions for that bucket. Never set
@@ -141,8 +150,14 @@ Keep encrypted backups outside the deployment host and test restoration regularl
    branched conversation, token authentication, attachments, and ledger totals.
 
 Never discard an encryption key while provider credentials or privileged exports still depend on it.
-Provider-secret-bearing privileged export is not currently shipped. Do not assume a normal portable
-export can restore providers without manual credential re-entry.
+Normal portable exports always redact provider credentials. When privileged secret backups are
+explicitly enabled, an administrator can create a separate recovery-key-encrypted `.dgsecrets`
+sidecar bound to the exact `.dgbackup` digest and content root. Store and transfer the two files as
+a pair, retain every referenced recovery key, and require recent authentication for export,
+download, upload, dry-run, and apply. On restore, apply the normal archive first, sign in again as
+an administrator from the restored installation, then dry-run and apply its matching sidecar.
+Secrets are re-encrypted under the destination provider keyring and every restored provider remains
+disabled until it is tested and deliberately enabled.
 
 ## Upgrades and rollback
 

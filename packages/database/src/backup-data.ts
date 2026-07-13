@@ -1,4 +1,5 @@
 import postgres from "npm:postgres@3.4.7";
+import type { ProviderCredentialEnvelope } from "./repository.ts";
 
 export const BACKUP_DATA_SCHEMA_VERSION = "0028" as const;
 export const BACKUP_DATA_BATCH_SIZE = 100;
@@ -502,6 +503,7 @@ export async function verifyBackupDataCatalog(databaseUrl: string): Promise<void
     const control = new Set([
       ...BACKUP_EPHEMERAL_TABLES,
       "backup_operations",
+      "backup_restore_secret_sidecars",
       "installation_state",
       "repository_migrations",
     ]);
@@ -549,7 +551,14 @@ export async function verifyBackupDataCatalog(databaseUrl: string): Promise<void
         );
       }
     }
-    for (const name of ["backup_operations", "installation_state", "repository_migrations"]) {
+    for (
+      const name of [
+        "backup_operations",
+        "backup_restore_secret_sidecars",
+        "installation_state",
+        "repository_migrations",
+      ]
+    ) {
       if (fenced.has(name)) {
         throw new BackupDataError(
           "invariant",
@@ -567,6 +576,23 @@ export interface BackupExportSource {
   readonly installationId: string;
   readonly tables: readonly BackupDataTable[];
   rows(tableName: string): AsyncIterable<BackupDataBatch>;
+}
+
+/**
+ * Persistence-only provider credential captured alongside a portable backup.
+ * The envelope is still encrypted with the source installation's provider key.
+ * It must never be written into the ordinary backup archive or returned to a client.
+ */
+export interface BackupProviderCredential {
+  readonly providerId: string;
+  readonly envelope: ProviderCredentialEnvelope;
+}
+
+export type BackupProviderCredentialBatch = readonly BackupProviderCredential[];
+
+/** Available only through the explicitly privileged snapshot entry point. */
+export interface PrivilegedBackupExportSource extends BackupExportSource {
+  providerCredentials(): AsyncIterable<BackupProviderCredentialBatch>;
 }
 
 export interface BackupDataSource {
@@ -655,10 +681,16 @@ function portableValue(value: unknown, kind: ColumnKind): unknown {
   return structuredClone(value);
 }
 
-export async function withRepeatableReadBackupSnapshot<T>(
+interface BackupSnapshotOptions {
+  diagnosticPolicy?: BackupDiagnosticPolicy;
+  batchSize?: number;
+}
+
+async function withBackupSnapshot<T>(
   databaseUrl: string,
-  consumer: (source: BackupExportSource) => Promise<T>,
-  options: { diagnosticPolicy?: BackupDiagnosticPolicy; batchSize?: number } = {},
+  privileged: boolean,
+  consumer: (source: PrivilegedBackupExportSource) => Promise<T>,
+  options: BackupSnapshotOptions = {},
 ): Promise<T> {
   const batchSize = options.batchSize ?? BACKUP_DATA_BATCH_SIZE;
   if (!Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > BACKUP_DATA_MAX_BATCH_SIZE) {
@@ -676,7 +708,7 @@ export async function withRepeatableReadBackupSnapshot<T>(
         ? BACKUP_DATA_TABLES.filter((entry) => entry.name !== "provider_payload_captures")
         : BACKUP_DATA_TABLES;
       let active: string | null = null;
-      const source: BackupExportSource = {
+      const source: BackupExportSource & Partial<PrivilegedBackupExportSource> = {
         schemaVersion: BACKUP_DATA_SCHEMA_VERSION,
         installationId: state.installation_id,
         tables,
@@ -711,11 +743,65 @@ export async function withRepeatableReadBackupSnapshot<T>(
           })();
         },
       };
-      return await consumer(source);
+      if (privileged) {
+        source.providerCredentials = function (): AsyncIterable<BackupProviderCredentialBatch> {
+          if (active !== null) {
+            throw new BackupDataError(
+              "conflict",
+              "Backup data streams must be consumed sequentially",
+            );
+          }
+          active = "provider_credentials";
+          return (async function* () {
+            try {
+              for await (
+                const rows of tx<{
+                  id: string;
+                  credential_envelope: ProviderCredentialEnvelope;
+                }[]>`
+                  SELECT id,credential_envelope FROM providers
+                  WHERE credential_envelope IS NOT NULL ORDER BY id
+                `.cursor(batchSize)
+              ) {
+                yield rows.map((row) =>
+                  Object.freeze({
+                    providerId: row.id,
+                    envelope: Object.freeze(structuredClone(row.credential_envelope)),
+                  })
+                );
+              }
+            } finally {
+              active = null;
+            }
+          })();
+        };
+      }
+      return await consumer(source as PrivilegedBackupExportSource);
     }) as unknown as T;
   } finally {
     await sql.end({ timeout: 5 });
   }
+}
+
+/** Streams only the redacted, portable data surface from one repeatable-read snapshot. */
+export function withRepeatableReadBackupSnapshot<T>(
+  databaseUrl: string,
+  consumer: (source: BackupExportSource) => Promise<T>,
+  options: BackupSnapshotOptions = {},
+): Promise<T> {
+  return withBackupSnapshot(databaseUrl, false, consumer, options);
+}
+
+/**
+ * Streams portable data and source-encrypted provider envelopes from the exact same snapshot.
+ * Callers must keep the credential stream separate from the ordinary backup artifact.
+ */
+export function withPrivilegedRepeatableReadBackupSnapshot<T>(
+  databaseUrl: string,
+  consumer: (source: PrivilegedBackupExportSource) => Promise<T>,
+  options: BackupSnapshotOptions = {},
+): Promise<T> {
+  return withBackupSnapshot(databaseUrl, true, consumer, options);
 }
 
 function exactRow(definition: BackupDataTable, value: unknown): Record<string, unknown> {

@@ -6,13 +6,34 @@ import {
   canApplyBackupRestore,
   createBackupUploadAttempt,
   isRecentAuthenticationRequired,
+  mergeBackupExport,
   monitorBackupRestore,
+  persistSessionRestoreId,
+  PRIVILEGED_BACKUP_CONFIRMATION,
+  safeSessionRestoreId,
 } from "./AdminBackups.tsx";
 import { ApiError } from "./api.ts";
 
 const base = { exports: [], restoreEnabled: true, onRetry: () => {}, onCreate: async () => {} };
 
 describe("AdminBackups", () => {
+  it("keeps recovery usable when browser session storage is blocked", () => {
+    const blocked = {
+      getItem: () => {
+        throw new DOMException("blocked", "SecurityError");
+      },
+      setItem: () => {
+        throw new DOMException("blocked", "SecurityError");
+      },
+      removeItem: () => {
+        throw new DOMException("blocked", "SecurityError");
+      },
+    };
+    expect(safeSessionRestoreId(blocked)).toBeUndefined();
+    expect(() => persistSessionRestoreId(blocked, "restore-id")).not.toThrow();
+    expect(() => persistSessionRestoreId(blocked, undefined)).not.toThrow();
+  });
+
   it("warns that standard archives are sensitive and renders useful empty and upload states", () => {
     const html = renderToStaticMarkup(<AdminBackups {...base} />);
     expect(html).toContain(
@@ -81,6 +102,89 @@ describe("AdminBackups", () => {
     expect(html).toContain("Export and download remain safe to");
     expect(html).toContain('class="primary"');
     expect(html).toContain('class="backup-dropzone " disabled=""');
+  });
+
+  it("keeps privileged recovery visibly separate and fail-closed", () => {
+    const disabled = renderToStaticMarkup(
+      <AdminBackups {...base} privilegedSecretBackupsEnabled={false} />,
+    );
+    expect(disabled).toContain("Privileged secret backups are disabled");
+    expect(disabled).toContain("independent recovery keyring");
+    expect(disabled).not.toContain("Create paired export");
+
+    const enabled = renderToStaticMarkup(
+      <AdminBackups
+        {...base}
+        privilegedSecretBackupsEnabled
+        onCreatePrivileged={async () => {}}
+      />,
+    );
+    expect(enabled).toContain("Provider-secret recovery");
+    expect(enabled).toContain("recovery key is not stored in either download");
+    expect(enabled).toContain(PRIVILEGED_BACKUP_CONFIRMATION);
+    expect(enabled).toContain("Anyone holding all three can recover provider credentials");
+    expect(enabled).toContain('disabled=""');
+  });
+
+  it("shows both independently downloadable artifacts for a completed paired export", () => {
+    const html = renderToStaticMarkup(
+      <AdminBackups
+        {...base}
+        privilegedSecretBackupsEnabled
+        onCreatePrivileged={async () => {}}
+        onDownloadSecrets={async () => {}}
+        exports={[{
+          id: "paired",
+          status: "completed",
+          formatVersion: 1,
+          includesDiagnostics: false,
+          secretsRedacted: true,
+          bytes: 4096,
+          fingerprint: "a".repeat(64),
+          createdAt: "2026-07-12T00:00:00Z",
+          completedAt: "2026-07-12T00:01:00Z",
+          error: null,
+          providerSecrets: {
+            status: "completed",
+            encrypted: true,
+            providerCount: 3,
+            bytes: 512,
+            fingerprint: "b".repeat(64),
+            recoveryKeyId: "recovery-2026",
+          },
+        }]}
+      />,
+    );
+    expect(html).toContain("Encrypted sidecar");
+    expect(html).toContain("3 providers");
+    expect(html).toContain("recovery-2026");
+    expect(html).toContain(".dgbackup");
+    expect(html).toContain(".dgsecrets");
+  });
+
+  it("preserves privileged capability during optimistic ordinary-export updates", () => {
+    const item = {
+      id: "ordinary",
+      status: "queued" as const,
+      formatVersion: 1,
+      includesDiagnostics: false,
+      secretsRedacted: true as const,
+      bytes: null,
+      fingerprint: null,
+      createdAt: "2026-07-12T00:00:00Z",
+      completedAt: null,
+      error: null,
+    };
+    const updated = mergeBackupExport({
+      items: [],
+      restoreEnabled: true,
+      privilegedSecretBackupsEnabled: true,
+      providerSecretRestoreEnabled: true,
+    }, item);
+    expect(updated.items).toEqual([item]);
+    expect(updated.restoreEnabled).toBe(true);
+    expect(updated.privilegedSecretBackupsEnabled).toBe(true);
+    expect(updated.providerSecretRestoreEnabled).toBe(true);
   });
 
   it("requires an exact fingerprint and a blocker-free fresh preview", () => {

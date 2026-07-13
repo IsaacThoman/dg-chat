@@ -20,6 +20,9 @@ x-app-environment: &app-environment
   ENCRYPTION_PRIMARY_KEY_ID: ${ENCRYPTION_PRIMARY_KEY_ID:-}
   BACKUP_SIGNING_KEY: ${BACKUP_SIGNING_KEY:?BACKUP_SIGNING_KEY is required}
   BACKUP_SIGNING_KEY_ID: ${BACKUP_SIGNING_KEY_ID:-installation-v1}
+  ENABLE_PRIVILEGED_SECRET_BACKUPS: ${ENABLE_PRIVILEGED_SECRET_BACKUPS:-false}
+  BACKUP_SECRET_KEYRING: ${BACKUP_SECRET_KEYRING:-}
+  BACKUP_SECRET_PRIMARY_KEY_ID: ${BACKUP_SECRET_PRIMARY_KEY_ID:-}
   ALLOW_IN_APP_RESTORE: ${ALLOW_IN_APP_RESTORE:-false}
   BACKUP_MAX_UPLOAD_BYTES: ${BACKUP_MAX_UPLOAD_BYTES:-1073741824}
   SETUP_TOKEN: ${SETUP_TOKEN:?SETUP_TOKEN is required}
@@ -89,7 +92,7 @@ services:
       - app-search
       - egress
     healthcheck:
-      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8000/ready"]
+      test: ["CMD", "busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8000/ready"]
       interval: 10s
       timeout: 5s
       retries: 12

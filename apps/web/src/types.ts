@@ -357,10 +357,82 @@ export interface BackupExport {
   createdAt: string;
   completedAt: string | null;
   error: string | null;
+  providerSecrets?: {
+    status: BackupExportStatus;
+    encrypted: true;
+    providerCount: number | null;
+    bytes: number | null;
+    fingerprint: string | null;
+    recoveryKeyId: string | null;
+  };
 }
 export interface BackupExportPage {
   items: BackupExport[];
   restoreEnabled: boolean;
+  privilegedSecretBackupsEnabled: boolean;
+  providerSecretRestoreEnabled: boolean;
+}
+export interface ProviderSecretRestoreUpload {
+  id: string;
+  restoreId: string;
+  status: "uploaded";
+  version: number;
+  filename: string;
+  bytes: number;
+  baseFingerprint: string;
+  sidecarFingerprint: string;
+  recoveryKeyId: string;
+  createdAt: string;
+}
+export interface ProviderSecretRestoreImpact {
+  providerId: string;
+  displayName: string;
+  action: "restore" | "skip" | "blocked";
+  reason: string | null;
+}
+export interface ProviderSecretRestorePreview {
+  id: string;
+  restoreId: string;
+  status: "validated";
+  version: number;
+  baseFingerprint: string;
+  sidecarFingerprint: string;
+  recoveryKeyId: string;
+  recordCount: number;
+  providers: ProviderSecretRestoreImpact[];
+  warnings: string[];
+  blockingErrors: string[];
+  providersRemainDisabled: true;
+}
+export interface ProviderSecretRestoreResult {
+  id: string;
+  restoreId: string;
+  status: "applied";
+  providerCount: number;
+  providersRemainDisabled: true;
+  appliedAt: string;
+}
+export interface ProviderSecretRestoreState {
+  id: string;
+  restoreId: string;
+  status: "staging" | "uploaded" | "validated" | "applied" | "failed" | "cancelled";
+  version: number;
+  filename: "provider-secrets.dgsecrets";
+  bytes: number;
+  baseFingerprint: string;
+  sidecarFingerprint: string;
+  recoveryKeyId: string;
+  recordCount: number | null;
+  providers: ProviderSecretRestoreImpact[];
+  warnings: string[];
+  blockingErrors: string[];
+  providersRemainDisabled: true;
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
+  appliedAt: string | null;
+  expiresAt: string | null;
+  canCancel: boolean;
 }
 export interface BackupRestoreUpload {
   id: string;

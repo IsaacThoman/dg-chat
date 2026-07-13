@@ -54,6 +54,72 @@ Deno.test("provider credential envelopes are bound to provider, version, and cip
     Error,
     "could not be decrypted",
   );
+  await assertRejects(
+    () => ring.decryptBytes(providerId, { ...envelope, keyId: "x".repeat(65) }),
+    Error,
+    "envelope is invalid",
+  );
+  await assertRejects(
+    () => ring.rewrap(providerId, { ...envelope, keyId: "invalid/key" }),
+    Error,
+    "envelope is invalid",
+  );
+});
+
+Deno.test("provider credential byte APIs round trip binary data without mutating the caller", async () => {
+  const ring = new ProviderSecretKeyring({
+    primaryKeyId: "primary",
+    keys: new Map([["primary", key(4)]]),
+  });
+  const secret = new Uint8Array([0, 255, 1, 128, 42]);
+  const original = secret.slice();
+  const envelope = await ring.encryptBytes(providerId, 3, secret);
+  assertEquals(secret, original);
+  assertEquals(await ring.decryptBytes(providerId, envelope), original);
+});
+
+Deno.test("provider credential byte APIs decrypt old keys after rotation", async () => {
+  const oldRing = new ProviderSecretKeyring({
+    primaryKeyId: "old",
+    keys: new Map([["old", key(5)]]),
+  });
+  const envelope = await oldRing.encryptBytes(providerId, 1, new Uint8Array([1, 2, 3]));
+  const rollingRing = new ProviderSecretKeyring({
+    primaryKeyId: "new",
+    keys: new Map([["old", key(5)], ["new", key(6)]]),
+  });
+  assertEquals(await rollingRing.decryptBytes(providerId, envelope), new Uint8Array([1, 2, 3]));
+});
+
+Deno.test("provider credential string wrapper rejects invalid UTF-8", async () => {
+  const ring = new ProviderSecretKeyring({
+    primaryKeyId: "primary",
+    keys: new Map([["primary", key(7)]]),
+  });
+  const envelope = await ring.encryptBytes(providerId, 1, new Uint8Array([0xc3, 0x28]));
+  assertEquals(await ring.decryptBytes(providerId, envelope), new Uint8Array([0xc3, 0x28]));
+  await assertRejects(
+    () => ring.decrypt(providerId, envelope),
+    Error,
+    "could not be decrypted",
+  );
+});
+
+Deno.test("provider credential byte APIs enforce plaintext bounds", async () => {
+  const ring = new ProviderSecretKeyring({
+    primaryKeyId: "primary",
+    keys: new Map([["primary", key(8)]]),
+  });
+  await assertRejects(
+    () => ring.encryptBytes(providerId, 1, new Uint8Array()),
+    TypeError,
+    "invalid",
+  );
+  await assertRejects(
+    () => ring.encryptBytes(providerId, 1, new Uint8Array(32_769)),
+    TypeError,
+    "invalid",
+  );
 });
 
 Deno.test("provider keyring rejects invalid and missing primary keys", () => {

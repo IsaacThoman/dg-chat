@@ -1719,6 +1719,11 @@ export function createApp(options: AppOptions = {}) {
     (c, next) =>
       c.req.path.startsWith("/api/attachments") ||
         c.req.path === "/api/admin/backups/restore-uploads" ||
+        (c.req.method === "POST" &&
+          /^\/api\/admin\/backups\/restores\/[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/provider-secrets\/uploads$/i
+            .test(
+              c.req.path,
+            )) ||
         c.req.path === "/api/audio/transcriptions"
         ? next()
         : apiBodyLimit(c, next),
@@ -4312,6 +4317,87 @@ export function createApp(options: AppOptions = {}) {
     }
     return options.backupAdmin;
   };
+  const requirePrivilegedBackupAdmin = ():
+    & BackupAdminService
+    & Required<
+      Pick<
+        BackupAdminService,
+        "requestPrivilegedExport" | "providerSecretExportContent"
+      >
+    > => {
+    const service = requireBackupAdmin();
+    if (
+      service.privilegedSecretBackupsEnabled !== true ||
+      typeof service.requestPrivilegedExport !== "function" ||
+      typeof service.providerSecretExportContent !== "function"
+    ) {
+      throw new DomainError(
+        "privileged_backup_unavailable",
+        "Encrypted provider-secret backups are not enabled for this installation",
+        503,
+      );
+    }
+    return service as
+      & BackupAdminService
+      & Required<
+        Pick<
+          BackupAdminService,
+          "requestPrivilegedExport" | "providerSecretExportContent"
+        >
+      >;
+  };
+  const requireRecentBackupAuthentication = (
+    c: Context<{ Variables: Variables }>,
+    action: string,
+  ) => {
+    if (!hasRecentAuthentication(c.get("sessionAuthenticatedAt"), (options.now ?? Date.now)())) {
+      throw new DomainError(
+        "recent_authentication_required",
+        `Sign in again before ${action}`,
+        403,
+      );
+    }
+  };
+  const requireProviderSecretRestoreAdmin = ():
+    & BackupAdminService
+    & Required<
+      Pick<
+        BackupAdminService,
+        | "uploadProviderSecretRestore"
+        | "previewProviderSecretRestore"
+        | "applyProviderSecretRestore"
+        | "getProviderSecretRestore"
+        | "cancelProviderSecretRestore"
+      >
+    > => {
+    const service = requireBackupAdmin();
+    if (
+      service.providerSecretRestoreEnabled !== true ||
+      typeof service.uploadProviderSecretRestore !== "function" ||
+      typeof service.previewProviderSecretRestore !== "function" ||
+      typeof service.applyProviderSecretRestore !== "function" ||
+      typeof service.getProviderSecretRestore !== "function" ||
+      typeof service.cancelProviderSecretRestore !== "function"
+    ) {
+      throw new DomainError(
+        "provider_secret_restore_unavailable",
+        "Provider-secret restore is not enabled for this installation",
+        503,
+      );
+    }
+    return service as
+      & BackupAdminService
+      & Required<
+        Pick<
+          BackupAdminService,
+          | "uploadProviderSecretRestore"
+          | "previewProviderSecretRestore"
+          | "applyProviderSecretRestore"
+          | "getProviderSecretRestore"
+          | "cancelProviderSecretRestore"
+        >
+      >;
+  };
   const backupIdempotencyKey = (c: Context<{ Variables: Variables }>): string => {
     const value = c.req.header("idempotency-key")?.trim();
     if (
@@ -4356,6 +4442,8 @@ export function createApp(options: AppOptions = {}) {
     return c.json({
       items: await service.listExports(c.get("user").id),
       restoreEnabled: service.restoreEnabled,
+      privilegedSecretBackupsEnabled: service.privilegedSecretBackupsEnabled === true,
+      providerSecretRestoreEnabled: service.providerSecretRestoreEnabled === true,
     });
   });
   app.post("/api/admin/backups/exports", async (c) => {
@@ -4385,6 +4473,46 @@ export function createApp(options: AppOptions = {}) {
     });
     return c.json(backup, 202);
   });
+  app.post("/api/admin/backups/privileged-exports", async (c) => {
+    noStoreBackupResponse(c);
+    requireRecentBackupAuthentication(c, "exporting provider secrets");
+    const service = requirePrivilegedBackupAdmin();
+    let raw: unknown;
+    try {
+      raw = await c.req.json();
+    } catch {
+      throw new DomainError("invalid_json", "Request body must be valid JSON", 400);
+    }
+    if (
+      !raw || typeof raw !== "object" || Array.isArray(raw) ||
+      Object.keys(raw).length !== 2 ||
+      typeof (raw as { includeDiagnostics?: unknown }).includeDiagnostics !== "boolean" ||
+      (raw as { confirmation?: unknown }).confirmation !== "EXPORT PROVIDER SECRETS"
+    ) {
+      throw new DomainError(
+        "validation_error",
+        "Privileged backup confirmation and options are invalid",
+        422,
+      );
+    }
+    const backup = await service.requestPrivilegedExport({
+      actorId: c.get("user").id,
+      includeDiagnostics: (raw as { includeDiagnostics: boolean }).includeDiagnostics,
+      idempotencyKey: backupIdempotencyKey(c),
+    });
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: "backup.provider_secrets_export_requested",
+      targetType: "backup_operation",
+      targetId: backup.id,
+      metadata: {
+        includeDiagnostics: backup.includesDiagnostics,
+        secretsEncrypted: true,
+        recoveryKeyId: backup.providerSecrets.recoveryKeyId,
+      },
+    });
+    return c.json(backup, 202);
+  });
   app.get("/api/admin/backups/:id/content", async (c) => {
     noStoreBackupResponse(c);
     const id = requireUuid(c.req.param("id"), "backupId");
@@ -4402,6 +4530,164 @@ export function createApp(options: AppOptions = {}) {
     headers.set("Content-Disposition", `attachment; filename="dg-chat-backup-${id}.dgbackup"`);
     return new Response(response.body, { status: response.status, headers });
   });
+  app.get("/api/admin/backups/:id/provider-secrets/content", async (c) => {
+    noStoreBackupResponse(c);
+    c.header("Referrer-Policy", "no-referrer");
+    requireRecentBackupAuthentication(c, "downloading provider secrets");
+    const id = requireUuid(c.req.param("id"), "backupId");
+    const response = await requirePrivilegedBackupAdmin().providerSecretExportContent(
+      c.get("user").id,
+      id,
+    );
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: "backup.provider_secrets_download_requested",
+      targetType: "backup_operation",
+      targetId: id,
+      metadata: { secretsEncrypted: true },
+    });
+    const headers = new Headers(response.headers);
+    headers.set("Cache-Control", "private, no-store");
+    headers.set("Pragma", "no-cache");
+    headers.set("X-Content-Type-Options", "nosniff");
+    headers.set("Referrer-Policy", "no-referrer");
+    headers.set(
+      "Content-Disposition",
+      `attachment; filename="dg-chat-provider-secrets-${id}.dgsecrets"`,
+    );
+    return new Response(response.body, { status: response.status, headers });
+  });
+  app.post("/api/admin/backups/restores/:restoreId/provider-secrets/uploads", async (c) => {
+    noStoreBackupResponse(c);
+    requireRecentBackupAuthentication(c, "uploading provider secrets");
+    const restoreId = requireUuid(c.req.param("restoreId"), "restoreId");
+    const upload = await requireProviderSecretRestoreAdmin().uploadProviderSecretRestore({
+      actorId: c.get("user").id,
+      restoreId,
+      request: c.req.raw,
+      idempotencyKey: backupIdempotencyKey(c),
+    });
+    await repo.recordAudit({
+      actorId: c.get("user").id,
+      action: "backup.provider_secrets_restore_uploaded",
+      targetType: "backup_operation",
+      targetId: restoreId,
+      metadata: { sidecarId: upload.id, bytes: upload.bytes, recoveryKeyId: upload.recoveryKeyId },
+    });
+    return c.json(upload, 201);
+  });
+  app.get("/api/admin/backups/restores/:restoreId/provider-secrets", async (c) => {
+    noStoreBackupResponse(c);
+    const restoreId = requireUuid(c.req.param("restoreId"), "restoreId");
+    return c.json({
+      item: await requireProviderSecretRestoreAdmin().getProviderSecretRestore(
+        c.get("user").id,
+        restoreId,
+      ),
+    });
+  });
+  app.delete(
+    "/api/admin/backups/restores/:restoreId/provider-secrets/:sidecarId",
+    async (c) => {
+      noStoreBackupResponse(c);
+      requireRecentBackupAuthentication(c, "starting provider-secret recovery over");
+      let raw: unknown;
+      try {
+        raw = await c.req.json();
+      } catch {
+        throw new DomainError("invalid_json", "Request body must be valid JSON", 400);
+      }
+      if (
+        !raw || typeof raw !== "object" || Array.isArray(raw) ||
+        Object.keys(raw).length !== 1 ||
+        !Number.isSafeInteger((raw as { expectedVersion?: unknown }).expectedVersion) ||
+        Number((raw as { expectedVersion: number }).expectedVersion) < 1
+      ) {
+        throw new DomainError("validation_error", "Sidecar version is invalid", 422);
+      }
+      const restoreId = requireUuid(c.req.param("restoreId"), "restoreId");
+      const state = await requireProviderSecretRestoreAdmin().cancelProviderSecretRestore({
+        actorId: c.get("user").id,
+        restoreId,
+        sidecarId: requireUuid(c.req.param("sidecarId"), "sidecarId"),
+        expectedVersion: Number((raw as { expectedVersion: number }).expectedVersion),
+      });
+      await repo.recordAudit({
+        actorId: c.get("user").id,
+        action: "backup.provider_secrets_restore_cancelled",
+        targetType: "backup_operation",
+        targetId: restoreId,
+        metadata: { sidecarId: state.id },
+      });
+      return c.json(state);
+    },
+  );
+  app.post(
+    "/api/admin/backups/restores/:restoreId/provider-secrets/:sidecarId/dry-run",
+    async (c) => {
+      noStoreBackupResponse(c);
+      requireRecentBackupAuthentication(c, "previewing provider-secret recovery");
+      const restoreId = requireUuid(c.req.param("restoreId"), "restoreId");
+      const preview = await requireProviderSecretRestoreAdmin().previewProviderSecretRestore(
+        c.get("user").id,
+        restoreId,
+        requireUuid(c.req.param("sidecarId"), "sidecarId"),
+      );
+      await repo.recordAudit({
+        actorId: c.get("user").id,
+        action: "backup.provider_secrets_restore_previewed",
+        targetType: "backup_operation",
+        targetId: restoreId,
+        metadata: {
+          sidecarId: preview.id,
+          providerCount: preview.recordCount,
+          blockingErrorCount: preview.blockingErrors.length,
+        },
+      });
+      return c.json(preview);
+    },
+  );
+  app.post(
+    "/api/admin/backups/restores/:restoreId/provider-secrets/:sidecarId/apply",
+    async (c) => {
+      noStoreBackupResponse(c);
+      requireRecentBackupAuthentication(c, "restoring provider secrets");
+      const service = requireProviderSecretRestoreAdmin();
+      let raw: unknown;
+      try {
+        raw = await c.req.json();
+      } catch {
+        throw new DomainError("invalid_json", "Request body must be valid JSON", 400);
+      }
+      if (
+        !raw || typeof raw !== "object" || Array.isArray(raw) ||
+        Object.keys(raw).length !== 4 ||
+        (raw as { confirmation?: unknown }).confirmation !== "RESTORE PROVIDER SECRETS" ||
+        !Number.isSafeInteger((raw as { expectedVersion?: unknown }).expectedVersion) ||
+        Number((raw as { expectedVersion?: unknown }).expectedVersion) < 1 ||
+        typeof (raw as { baseFingerprint?: unknown }).baseFingerprint !== "string" ||
+        !/^[0-9a-f]{64}$/u.test((raw as { baseFingerprint: string }).baseFingerprint) ||
+        typeof (raw as { sidecarFingerprint?: unknown }).sidecarFingerprint !== "string" ||
+        !/^[0-9a-f]{64}$/u.test((raw as { sidecarFingerprint: string }).sidecarFingerprint)
+      ) {
+        throw new DomainError(
+          "validation_error",
+          "Provider-secret restore confirmation is invalid",
+          422,
+        );
+      }
+      const restoreId = requireUuid(c.req.param("restoreId"), "restoreId");
+      const result = await service.applyProviderSecretRestore({
+        actorId: c.get("user").id,
+        restoreId,
+        sidecarId: requireUuid(c.req.param("sidecarId"), "sidecarId"),
+        expectedVersion: Number((raw as { expectedVersion: number }).expectedVersion),
+        baseFingerprint: (raw as { baseFingerprint: string }).baseFingerprint,
+        sidecarFingerprint: (raw as { sidecarFingerprint: string }).sidecarFingerprint,
+      });
+      return c.json(result);
+    },
+  );
   app.post("/api/admin/backups/restore-uploads", async (c) => {
     noStoreBackupResponse(c);
     const upload = await requireBackupAdmin().uploadRestore({

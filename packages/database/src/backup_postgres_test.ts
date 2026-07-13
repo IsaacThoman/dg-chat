@@ -168,6 +168,143 @@ Deno.test({
       assertEquals(durableTombstone.archiveSha256, "c".repeat(64));
       assertEquals(durableTombstone.artifactCleanupCheckedAt !== null, true);
 
+      const privilegedPlan = await first.create({
+        kind: "export",
+        actorId,
+        idempotencyKey: "privileged-export-paired-artifacts",
+        providerSecretsRequested: true,
+      });
+      assertEquals(privilegedPlan.providerSecretsRequested, true);
+      const privilegedLease = crypto.randomUUID();
+      let privilegedOwner = await first.claimExport(
+        privilegedPlan.id,
+        privilegedPlan.version,
+        privilegedLease,
+        60,
+      );
+      const privilegedBaseKey = `backups/exports/${privilegedOwner.id}/${privilegedLease}-${
+        "e".repeat(64)
+      }.dgbackup`;
+      const privilegedSecretKey = `backups/secrets/${privilegedOwner.id}/${privilegedLease}-${
+        "f".repeat(64)
+      }.dgsecrets`;
+      await assertRejects(
+        () =>
+          first.planExportArtifact(
+            privilegedOwner.id,
+            privilegedOwner.version,
+            privilegedLease,
+            privilegedBaseKey,
+            "e".repeat(64),
+          ),
+        BackupOperationError,
+      );
+      privilegedOwner = await first.planPrivilegedExportArtifacts(
+        privilegedOwner.id,
+        privilegedOwner.version,
+        privilegedLease,
+        privilegedBaseKey,
+        "e".repeat(64),
+        {
+          artifactObjectKey: privilegedSecretKey,
+          archiveSha256: "f".repeat(64),
+          archiveBytes: 4096,
+          providerCount: 2,
+          recoveryKeyId: "recovery-2026-01",
+        },
+      );
+      assertEquals(privilegedOwner.secretArtifactObjectKey, privilegedSecretKey);
+      assertEquals(privilegedOwner.secretProviderCount, 2);
+      await assertRejects(
+        () =>
+          first.complete(privilegedOwner.id, privilegedOwner.version, {
+            artifactObjectKey: privilegedBaseKey,
+            archiveSha256: "e".repeat(64),
+          }),
+        BackupOperationError,
+      );
+      await sql`UPDATE backup_operations SET export_lease_expires_at=now()-interval '1 second'
+        WHERE id=${privilegedOwner.id}`;
+      assertEquals(await first.expireExportLeases(), 1);
+      const baseCleanupLease = crypto.randomUUID();
+      const secretCleanupLease = crypto.randomUUID();
+      assertEquals(
+        (await first.claimRecoverableExportArtifacts(baseCleanupLease, 60, 60_000, 4_000))
+          .some((operation) => operation.id === privilegedOwner.id),
+        true,
+      );
+      assertEquals(
+        (await first.claimRecoverableProviderSecretArtifacts(
+          secretCleanupLease,
+          60,
+          60_000,
+          4_000,
+        )).some((operation) => operation.id === privilegedOwner.id),
+        true,
+      );
+      assertEquals(
+        await first.recordProviderSecretArtifactCleanup(
+          privilegedOwner.id,
+          privilegedSecretKey,
+          "f".repeat(64),
+          secretCleanupLease,
+        ),
+        true,
+      );
+      const privilegedTombstone = await first.get(privilegedOwner.id);
+      assertEquals(privilegedTombstone.secretArtifactObjectKey, privilegedSecretKey);
+      assertEquals(privilegedTombstone.secretArtifactCleanupCheckedAt !== null, true);
+
+      const pairedCompletion = await first.create({
+        kind: "export",
+        actorId,
+        idempotencyKey: "privileged-export-completes-pair",
+        providerSecretsRequested: true,
+      });
+      const pairedLease = crypto.randomUUID();
+      let pairedOwner = await first.claimExport(
+        pairedCompletion.id,
+        pairedCompletion.version,
+        pairedLease,
+        60,
+      );
+      const pairedBaseKey = `backups/exports/${pairedOwner.id}/${pairedLease}.dgbackup`;
+      const pairedSecretKey = `backups/secrets/${pairedOwner.id}/${pairedLease}.dgsecrets`;
+      pairedOwner = await first.planPrivilegedExportArtifacts(
+        pairedOwner.id,
+        pairedOwner.version,
+        pairedLease,
+        pairedBaseKey,
+        "1".repeat(64),
+        {
+          artifactObjectKey: pairedSecretKey,
+          archiveSha256: "2".repeat(64),
+          archiveBytes: 1024,
+          providerCount: 0,
+          recoveryKeyId: "recovery-empty",
+        },
+      );
+      pairedOwner = await first.complete(pairedOwner.id, pairedOwner.version, {
+        artifactObjectKey: pairedBaseKey,
+        archiveSha256: "1".repeat(64),
+        secretArtifactObjectKey: pairedSecretKey,
+        secretArchiveSha256: "2".repeat(64),
+        secretArchiveBytes: 1024,
+        secretProviderCount: 0,
+        secretRecoveryKeyId: "recovery-empty",
+      });
+      assertEquals(pairedOwner.status, "completed");
+      assertEquals(pairedOwner.secretArchiveBytes, 1024);
+      assertEquals(
+        await first.recordProviderSecretArtifactCleanup(
+          pairedOwner.id,
+          pairedSecretKey,
+          "2".repeat(64),
+          crypto.randomUUID(),
+        ),
+        false,
+      );
+
       const completedPlan = await first.create({
         kind: "export",
         actorId,

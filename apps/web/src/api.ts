@@ -28,6 +28,10 @@ import type {
   ModelAlias,
   ModelPriceVersion,
   ProviderProtocol,
+  ProviderSecretRestorePreview,
+  ProviderSecretRestoreResult,
+  ProviderSecretRestoreState,
+  ProviderSecretRestoreUpload,
   RetentionPolicy,
   RetentionPreview,
   RetentionScrubRun,
@@ -838,7 +842,192 @@ export const api = {
       headers: { "Idempotency-Key": idempotencyKey },
       body: JSON.stringify({ includeDiagnostics: false }),
     }),
+  createAdminPrivilegedBackupExport: (idempotencyKey: string, confirmation: string) =>
+    request<BackupExport>("/admin/backups/privileged-exports", {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+      body: JSON.stringify({ includeDiagnostics: false, confirmation }),
+    }),
   adminBackupContentUrl: (id: string) => `/api/admin/backups/${encodeURIComponent(id)}/content`,
+  adminProviderSecretsContentUrl: (id: string) =>
+    `/api/admin/backups/${encodeURIComponent(id)}/provider-secrets/content`,
+  downloadAdminProviderSecrets: async (
+    id: string,
+    destination?: WritableStream<Uint8Array>,
+  ): Promise<Blob | undefined> => {
+    let pipingStarted = false;
+    try {
+      const response = await fetch(
+        `/api/admin/backups/${encodeURIComponent(id)}/provider-secrets/content`,
+        { credentials: "include", headers: { Accept: "application/octet-stream" } },
+      );
+      if (!response.ok) {
+        let body: { error?: { code?: string; message?: string } } = {};
+        try {
+          body = await response.json();
+        } catch {
+          // Preserve a useful status-based error when an intermediary returned a non-JSON body.
+        }
+        throw new ApiError(
+          response.status,
+          body.error?.code ?? "request_failed",
+          body.error?.message ?? `Request failed (${response.status})`,
+        );
+      }
+      if (destination) {
+        if (!response.body) {
+          throw new ApiError(502, "empty_download", "The provider-secret download was empty");
+        }
+        pipingStarted = true;
+        await response.body.pipeTo(destination);
+        return;
+      }
+
+      // Browsers without the File System Access API cannot stream a download to a chosen file while
+      // retaining structured recent-auth errors. Keep that compatibility path strictly bounded.
+      const maxFallbackBytes = 32 * 1024 * 1024;
+      const declaredLength = Number(response.headers.get("content-length"));
+      if (Number.isFinite(declaredLength) && declaredLength > maxFallbackBytes) {
+        await response.body?.cancel();
+        throw new ApiError(
+          413,
+          "download_too_large_for_browser",
+          "This encrypted sidecar is too large for this browser's safe download fallback. Use a Chromium-based browser with direct file saving enabled.",
+        );
+      }
+      if (!response.body) return new Blob();
+      const reader = response.body.getReader();
+      const chunks: ArrayBuffer[] = [];
+      let total = 0;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          total += value.byteLength;
+          if (total > maxFallbackBytes) {
+            await reader.cancel();
+            throw new ApiError(
+              413,
+              "download_too_large_for_browser",
+              "This encrypted sidecar is too large for this browser's safe download fallback. Use a Chromium-based browser with direct file saving enabled.",
+            );
+          }
+          const copy = new Uint8Array(value.byteLength);
+          copy.set(value);
+          chunks.push(copy.buffer);
+        }
+        return new Blob(chunks, { type: "application/vnd.dg-chat.provider-secrets" });
+      } finally {
+        reader.releaseLock();
+      }
+    } catch (error) {
+      // A picker-created destination exists before fetch begins. Close it on authentication,
+      // transport, or response-validation failure; pipeTo owns aborting once piping has started.
+      if (destination && !pipingStarted) {
+        try {
+          await destination.abort(error);
+        } catch {
+          // Never replace the authoritative network/API error with cleanup failure.
+        }
+      }
+      throw error;
+    }
+  },
+  uploadAdminProviderSecretRestore: (
+    restoreId: string,
+    file: File,
+    idempotencyKey: string,
+    onProgress?: (percent: number) => void,
+    signal?: AbortSignal,
+  ): Promise<ProviderSecretRestoreUpload> =>
+    new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      const form = new FormData();
+      form.append("file", file);
+      xhr.open(
+        "POST",
+        `/api/admin/backups/restores/${encodeURIComponent(restoreId)}/provider-secrets/uploads`,
+      );
+      xhr.withCredentials = true;
+      xhr.setRequestHeader("Idempotency-Key", idempotencyKey);
+      const abort = () => xhr.abort();
+      const cleanup = () => signal?.removeEventListener("abort", abort);
+      if (signal?.aborted) {
+        reject(signal.reason ?? new DOMException("Upload cancelled", "AbortError"));
+        return;
+      }
+      signal?.addEventListener("abort", abort, { once: true });
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) onProgress?.(Math.round(event.loaded / event.total * 100));
+      };
+      xhr.onerror = () => {
+        cleanup();
+        reject(new Error("Provider-secret upload failed. Check your connection and retry."));
+      };
+      xhr.onabort = () => {
+        cleanup();
+        reject(new DOMException("Upload cancelled", "AbortError"));
+      };
+      xhr.onload = () => {
+        cleanup();
+        let body: unknown;
+        try {
+          body = JSON.parse(xhr.responseText);
+        } catch {
+          reject(new Error(`Upload failed (${xhr.status})`));
+          return;
+        }
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve(body as ProviderSecretRestoreUpload);
+          return;
+        }
+        const failure = body as { error?: { code?: string; message?: string } };
+        reject(
+          new ApiError(
+            xhr.status,
+            failure.error?.code ?? "upload_failed",
+            failure.error?.message ?? `Upload failed (${xhr.status})`,
+          ),
+        );
+      };
+      xhr.send(form);
+    }),
+  previewAdminProviderSecretRestore: (restoreId: string, sidecarId: string) =>
+    request<ProviderSecretRestorePreview>(
+      `/admin/backups/restores/${encodeURIComponent(restoreId)}/provider-secrets/${
+        encodeURIComponent(sidecarId)
+      }/dry-run`,
+      { method: "POST" },
+    ),
+  applyAdminProviderSecretRestore: (
+    preview: ProviderSecretRestorePreview,
+    confirmation: string,
+  ) =>
+    request<ProviderSecretRestoreResult>(
+      `/admin/backups/restores/${encodeURIComponent(preview.restoreId)}/provider-secrets/${
+        encodeURIComponent(preview.id)
+      }/apply`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          confirmation,
+          expectedVersion: preview.version,
+          baseFingerprint: preview.baseFingerprint,
+          sidecarFingerprint: preview.sidecarFingerprint,
+        }),
+      },
+    ),
+  adminProviderSecretRestore: (restoreId: string) =>
+    request<{ item: ProviderSecretRestoreState | null }>(
+      `/admin/backups/restores/${encodeURIComponent(restoreId)}/provider-secrets`,
+    ),
+  cancelAdminProviderSecretRestore: (state: ProviderSecretRestoreState) =>
+    request<ProviderSecretRestoreState>(
+      `/admin/backups/restores/${encodeURIComponent(state.restoreId)}/provider-secrets/${
+        encodeURIComponent(state.id)
+      }`,
+      { method: "DELETE", body: JSON.stringify({ expectedVersion: state.version }) },
+    ),
   uploadAdminBackupRestore: (
     file: File,
     idempotencyKey: string,
