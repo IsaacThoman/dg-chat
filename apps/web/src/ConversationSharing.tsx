@@ -97,6 +97,7 @@ function ShareDialog({
       fingerprint: string;
       capability: string;
       idempotencyKey: string;
+      expiresAt: string | null;
     } | null
   >(null);
   const [identityVisibility, setIdentityVisibility] = useState<ShareIdentityVisibility>(
@@ -110,6 +111,7 @@ function ShareDialog({
   const [error, setError] = useState("");
   const [createdUrl, setCreatedUrl] = useState("");
   const [copied, setCopied] = useState(false);
+  const [linkStored, setLinkStored] = useState(false);
   const attachments = useMemo(
     () => messages.flatMap((message) => message.attachments ?? []),
     [messages],
@@ -120,7 +122,6 @@ function ShareDialog({
 
   const create = async () => {
     if (!conversation.activeLeafId || conversation.version === undefined) return;
-    const expiresAt = expirationValue(expiry);
     const effectiveAttachmentIds = attachmentPolicy === "selected" ? selectedAttachmentIds : [];
     const fingerprint = JSON.stringify({
       leafId: conversation.activeLeafId,
@@ -128,13 +129,14 @@ function ShareDialog({
       identityVisibility,
       attachmentPolicy,
       selectedAttachmentIds: [...effectiveAttachmentIds].sort(),
-      expiresAt,
+      expiry,
     });
     if (createOperation.current?.fingerprint !== fingerprint) {
       createOperation.current = {
         fingerprint,
         capability: createShareCapability(),
         idempotencyKey: crypto.randomUUID(),
+        expiresAt: expirationValue(expiry),
       };
     }
     const operation = createOperation.current;
@@ -148,12 +150,16 @@ function ShareDialog({
         identityVisibility,
         attachmentPolicy,
         selectedAttachmentIds: effectiveAttachmentIds,
-        expiresAt,
+        expiresAt: operation.expiresAt,
         capability: operation.capability,
         idempotencyKey: operation.idempotencyKey,
       });
       const url = new URL(result.path, globalThis.location.origin);
-      if (url.origin !== globalThis.location.origin || !url.pathname.startsWith("/share/")) {
+      if (
+        url.origin !== globalThis.location.origin ||
+        url.pathname !== `/share/${operation.capability}` ||
+        url.search || url.hash
+      ) {
         throw new Error("The server returned an invalid share link.");
       }
       setCreatedUrl(url.toString());
@@ -173,11 +179,20 @@ function ShareDialog({
   const copy = async () => {
     try {
       await navigator.clipboard.writeText(createdUrl);
+      setLinkStored(true);
       setCopied(true);
       setTimeout(() => setCopied(false), 1_500);
     } catch {
       setError("Copy failed. Select and copy the link manually.");
     }
+  };
+
+  const requestClose = () => {
+    if (
+      createdUrl && !linkStored &&
+      !globalThis.confirm("Close without copying the link? This snapshot link cannot be recovered.")
+    ) return;
+    close();
   };
 
   const revoke = async (share: ConversationShareSummary) => {
@@ -202,7 +217,7 @@ function ShareDialog({
   };
 
   return (
-    <Modal title="Share conversation" close={close} dismissible={!creating && !revokingId}>
+    <Modal title="Share conversation" close={requestClose} dismissible={!creating && !revokingId}>
       <div className="modal-body share-dialog">
         <div className="share-immutable-note">
           <Shield size={18} />
@@ -224,7 +239,12 @@ function ShareDialog({
                   readOnly
                   onFocus={(event) => event.currentTarget.select()}
                 />
-                <button type="button" className="secondary" onClick={() => void copy()}>
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() =>
+                    void copy()}
+                >
                   {copied ? <Check size={15} /> : <Copy size={15} />}
                   {copied ? "Copied" : "Copy"}
                 </button>
@@ -255,7 +275,8 @@ function ShareDialog({
                     type="radio"
                     name="share-identity"
                     checked={identityVisibility === "owner"}
-                    onChange={() => setIdentityVisibility("owner")}
+                    onChange={() =>
+                      setIdentityVisibility("owner")}
                   />
                   <span>
                     <strong>Show my name</strong>
@@ -270,7 +291,8 @@ function ShareDialog({
                     type="radio"
                     name="share-attachments"
                     checked={attachmentPolicy === "redact"}
-                    onChange={() => setAttachmentPolicy("redact")}
+                    onChange={() =>
+                      setAttachmentPolicy("redact")}
                   />
                   <span>
                     <strong>Redact all</strong>
@@ -398,7 +420,7 @@ function ShareDialog({
           type="button"
           className="secondary"
           disabled={creating || Boolean(revokingId)}
-          onClick={close}
+          onClick={requestClose}
         >
           Close
         </button>

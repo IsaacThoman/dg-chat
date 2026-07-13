@@ -147,6 +147,11 @@ export function PublicConversationShareView({ capability }: { capability: string
                     a: ({ node: _node, ...props }) => (
                       <a {...props} target="_blank" rel="noopener noreferrer" />
                     ),
+                    img: ({ node: _node, alt }) => (
+                      <span className="public-share-remote-image">
+                        Remote image blocked{alt ? `: ${alt}` : ""}
+                      </span>
+                    ),
                   }}
                 >
                   {message.content}

@@ -47,19 +47,28 @@ test("creates and revokes an immutable snapshot with conservative defaults", asy
         body: JSON.stringify({ data: storedSummary ? [storedSummary] : [] }),
       }),
   );
-  let createBody: Record<string, unknown> | undefined;
-  let idempotencyKey = "";
+  const createBodies: Record<string, unknown>[] = [];
+  const idempotencyKeys: string[] = [];
   await page.route(`**/api/conversations/${conversationId}/shares`, async (route) => {
-    createBody = route.request().postDataJSON();
-    idempotencyKey = await route.request().headerValue("idempotency-key") ?? "";
+    createBodies.push(route.request().postDataJSON());
+    idempotencyKeys.push(await route.request().headerValue("idempotency-key") ?? "");
+    if (createBodies.length === 1) {
+      await route.fulfill({
+        status: 503,
+        contentType: "application/json",
+        body: JSON.stringify({ error: { code: "service_unavailable", message: "Try again" } }),
+      });
+      return;
+    }
     storedSummary = ownerSummary;
+    const createdCapability = String(createBodies.at(-1)?.capability);
     await route.fulfill({
       status: 201,
       contentType: "application/json",
       body: JSON.stringify({
         share: ownerSummary,
-        capability,
-        path: `/share/${capability}`,
+        capability: createdCapability,
+        path: `/share/${createdCapability}`,
         replayed: false,
       }),
     });
@@ -82,18 +91,25 @@ test("creates and revokes an immutable snapshot with conservative defaults", asy
   await expect(dialog).toContainText("Future edits and branches will never change it");
   await expect(dialog.getByRole("radio", { name: "Anonymous" })).toBeChecked();
   await expect(dialog.getByRole("radio", { name: "Redact all" })).toBeChecked();
+  await dialog.getByLabel("Link expiry").selectOption("week");
+  await dialog.getByRole("button", { name: "Create snapshot" }).click();
+  await expect(dialog.getByRole("alert")).toContainText("Try again");
   await dialog.getByRole("button", { name: "Create snapshot" }).click();
   await expect(dialog.getByRole("heading", { name: "Snapshot ready" })).toBeVisible();
+  const createdCapability = String(createBodies[1]?.capability);
   await expect(dialog.getByLabel("Share link")).toHaveValue(
-    `http://localhost:5173/share/${capability}`,
+    `http://localhost:5173/share/${createdCapability}`,
   );
-  expect(createBody).toMatchObject({
+  expect(createBodies[1]).toMatchObject({
     identityVisibility: "anonymous",
     attachmentPolicy: "redact",
     selectedAttachmentIds: [],
   });
-  expect(String(createBody?.capability)).toMatch(/^[A-Za-z0-9_-]{43}$/);
-  expect(idempotencyKey.length).toBeGreaterThanOrEqual(8);
+  expect(String(createBodies[1]?.capability)).toMatch(/^[A-Za-z0-9_-]{43}$/);
+  expect(createBodies[1]?.capability).toBe(createBodies[0]?.capability);
+  expect(createBodies[1]?.expiresAt).toBe(createBodies[0]?.expiresAt);
+  expect(idempotencyKeys[1]).toBe(idempotencyKeys[0]);
+  expect(idempotencyKeys[1].length).toBeGreaterThanOrEqual(8);
 
   page.once("dialog", (prompt) => prompt.accept());
   await dialog.getByRole("button", { name: "Revoke" }).click();
@@ -127,7 +143,8 @@ test("renders a redacted public snapshot safely without workspace chrome", async
               id: "public-message-2",
               parentId: "public-message-1",
               role: "assistant",
-              content: "Read [the guide](https://example.com).",
+              content:
+                "Read [the guide](https://example.com). ![tracking pixel](https://tracker.invalid/pixel.png)",
               model: "simulator/fast",
               status: "complete",
               attachmentIds: [],
@@ -146,6 +163,7 @@ test("renders a redacted public snapshot safely without workspace chrome", async
   await expect(page.getByText("Read-only snapshot")).toBeVisible();
   await expect(page.getByRole("complementary", { name: "Workspace navigation" })).toHaveCount(0);
   await expect(page.locator(".public-share-message img")).toHaveCount(0);
+  await expect(page.getByText("Remote image blocked: tracking pixel")).toBeVisible();
   const external = page.getByRole("link", { name: "the guide" });
   await expect(external).toHaveAttribute("rel", "noopener noreferrer");
   await expect(page.locator('meta[name="referrer"]')).toHaveAttribute("content", "no-referrer");

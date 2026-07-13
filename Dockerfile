@@ -31,11 +31,23 @@ FROM nginxinc/nginx-unprivileged:1.27-alpine AS web
 COPY --from=web-build /workspace/apps/web/dist /usr/share/nginx/html
 RUN <<'EOF'
 cat > /etc/nginx/conf.d/default.conf <<'NGINX'
+map $request_uri $dgchat_safe_request_uri {
+  ~^/share/ /share/[REDACTED];
+  ~^/api/public/shares/ /api/public/shares/[REDACTED];
+  default $uri;
+}
+
+log_format dgchat_privacy '$remote_addr - $remote_user [$time_local] '
+                          '"$request_method $dgchat_safe_request_uri $server_protocol" $status $body_bytes_sent '
+                          '"-" "$http_user_agent"';
+
 server {
   listen 8080;
   server_name _;
   root /usr/share/nginx/html;
   client_max_body_size 100m;
+  access_log /dev/stdout dgchat_privacy;
+  add_header Referrer-Policy "no-referrer" always;
 
   location ~ ^/(api|v1)/ {
     proxy_pass http://app:8000;
