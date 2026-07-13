@@ -27,13 +27,32 @@ async function ownerFixture(repository: MemoryRepository, email: string, name = 
   const token = `session-${crypto.randomUUID()}`;
   repository.createSession(user.id, await sha256(token), false);
   const conversation = repository.createConversation(user.id, "Immutable snapshot");
-  const first = repository.appendMessage({
+  const internal = repository.appendMessage({
     conversationId: conversation.id,
     ownerId: user.id,
     parentId: null,
+    role: "system",
+    content: "PRIVATE CUSTOM INSTRUCTIONS MUST NEVER BE SHARED",
+    expectedVersion: 0,
+    idempotencyKey: `message-${crypto.randomUUID()}`,
+  });
+  const removed = repository.appendMessage({
+    conversationId: conversation.id,
+    ownerId: user.id,
+    parentId: internal.id,
+    role: "user",
+    content: "EXPLICITLY TOMBSTONED CONTENT MUST NEVER BE SHARED",
+    expectedVersion: 1,
+    idempotencyKey: `message-${crypto.randomUUID()}`,
+  });
+  repository.messages.get(removed.id)!.status = "tombstoned";
+  const first = repository.appendMessage({
+    conversationId: conversation.id,
+    ownerId: user.id,
+    parentId: removed.id,
     role: "user",
     content: "Owner-only source question",
-    expectedVersion: 0,
+    expectedVersion: 2,
     idempotencyKey: `message-${crypto.randomUUID()}`,
   });
   const leaf = repository.appendMessage({
@@ -43,13 +62,15 @@ async function ownerFixture(repository: MemoryRepository, email: string, name = 
     role: "assistant",
     content: "A safe public answer",
     model: "private/internal-model",
-    expectedVersion: 1,
+    expectedVersion: 3,
     idempotencyKey: `message-${crypto.randomUUID()}`,
     metadata: { costMicros: 99_000, hiddenReasoning: "never public" },
   });
   return {
     user,
     conversation: repository.detail(conversation.id, user.id),
+    internal,
+    removed,
     first,
     leaf,
     headers: {
@@ -137,11 +158,16 @@ Deno.test("sharing routes create one immutable redacted snapshot, stream authori
   const serialized = JSON.stringify(publicBody);
   assertEquals(publicBody.share.identity, { visibility: "anonymous", displayName: null });
   assertEquals(publicBody.share.messages.length, 2);
+  assertEquals(publicBody.share.messages[0].parentId, null);
   assertEquals(publicBody.share.attachments.length, 1);
   assertFalse(serialized.includes(owner.user.id));
   assertFalse(serialized.includes(owner.user.email));
   assertFalse(serialized.includes(owner.first.id));
   assertFalse(serialized.includes(owner.leaf.id));
+  assertFalse(serialized.includes(owner.internal.id));
+  assertFalse(serialized.includes(owner.removed.id));
+  assertFalse(serialized.includes("PRIVATE CUSTOM INSTRUCTIONS"));
+  assertFalse(serialized.includes("EXPLICITLY TOMBSTONED CONTENT"));
   assertFalse(serialized.includes(attachment.id));
   assertFalse(serialized.includes(objectKey));
   assertFalse(serialized.includes("costMicros"));
