@@ -1976,6 +1976,34 @@ kbd {
   background: var(--panel);
   font-size: 12px;
 }
+.temporary-chat-banner {
+  margin: 8px auto 18px;
+  width: min(780px, calc(100% - 32px));
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--line));
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--accent) 7%, var(--panel));
+}
+.temporary-chat-banner > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+.temporary-chat-banner strong {
+  font-size: 12px;
+}
+.temporary-chat-banner span {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.temporary-chat-banner [role="alert"] {
+  color: var(--danger);
+}
 .composer-note span {
   margin-left: 10px;
 }

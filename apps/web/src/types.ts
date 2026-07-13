@@ -36,6 +36,7 @@ export interface Conversation {
   archived?: boolean;
   deleted?: boolean;
   temporary?: boolean;
+  temporaryExpiresAt?: string | null;
   project?: string;
   activeLeafId?: string | null;
   version?: number;

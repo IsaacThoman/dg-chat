@@ -71,6 +71,7 @@ type RawConversation = {
   version: number;
   pinned: boolean;
   temporary?: boolean;
+  temporaryExpiresAt?: string | null;
   archivedAt: string | null;
   deletedAt: string | null;
   updatedAt: string;
@@ -147,6 +148,7 @@ export function mapConversation(value: RawConversation): Conversation {
     updatedAt: new Date(value.updatedAt).toLocaleString(),
     pinned: value.pinned,
     temporary: value.temporary ?? false,
+    temporaryExpiresAt: value.temporaryExpiresAt ?? null,
     archived: Boolean(value.archivedAt),
     deleted: Boolean(value.deletedAt),
     activeLeafId: value.activeLeafId,
@@ -451,6 +453,13 @@ export const api = {
       await request<RawConversation>(`/conversations/${conversation.id}`, {
         method: "PATCH",
         body: JSON.stringify({ expectedVersion: conversation.version, ...patch }),
+      }),
+    ),
+  keepConversation: async (conversation: Pick<Conversation, "id" | "version">) =>
+    mapConversation(
+      await request<RawConversation>(`/conversations/${conversation.id}/keep`, {
+        method: "POST",
+        body: JSON.stringify({ expectedVersion: conversation.version }),
       }),
     ),
   preferences: () => request<UserPreferences>("/preferences"),

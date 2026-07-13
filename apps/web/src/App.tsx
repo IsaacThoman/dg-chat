@@ -2026,6 +2026,7 @@ function ChatView({
   balance,
   onConversationCreated,
   onUpdateConversation,
+  onKeepConversation,
   readOnly: readOnlyProp = false,
   saveHistory = true,
   modelPreferenceError = "",
@@ -2045,6 +2046,7 @@ function ChatView({
     conversation: Conversation,
     patch: { title?: string; pinned?: boolean; archived?: boolean; deleted?: boolean },
   ) => Promise<void>;
+  onKeepConversation: (conversation: Conversation) => Promise<Conversation>;
   readOnly?: boolean;
   saveHistory?: boolean;
   modelPreferenceError?: string;
@@ -2167,6 +2169,8 @@ function ChatView({
   const [branchBusy, setBranchBusy] = useState(false);
   const [sendError, setSendError] = useState("");
   const [renaming, setRenaming] = useState(false);
+  const [keepingTemporary, setKeepingTemporary] = useState(false);
+  const [keepTemporaryError, setKeepTemporaryError] = useState("");
   const initialConversation = conversations.find((c) => c.id === activeId);
   const [conversation, setConversation] = useState(initialConversation);
   const syncConversation = (next: Conversation) => {
@@ -2596,6 +2600,42 @@ function ChatView({
             <Pencil size={14} /> Rename
           </button>
         </div>
+        {conversation?.temporary && (
+          <div className="temporary-chat-banner" role="status">
+            <div>
+              <strong>Temporary chat</strong>
+              <span>
+                This chat is excluded from organization and user exports and will be deleted
+                {conversation.temporaryExpiresAt
+                  ? ` after ${new Date(conversation.temporaryExpiresAt).toLocaleString()}`
+                  : " automatically"}.
+              </span>
+              {keepTemporaryError && <span role="alert">{keepTemporaryError}</span>}
+            </div>
+            {!readOnly && (
+              <button
+                type="button"
+                className="secondary"
+                disabled={keepingTemporary || generationBusy}
+                onClick={async () => {
+                  setKeepingTemporary(true);
+                  setKeepTemporaryError("");
+                  try {
+                    syncConversation(await onKeepConversation(conversation));
+                  } catch (error) {
+                    setKeepTemporaryError(
+                      error instanceof Error ? error.message : "This chat could not be kept.",
+                    );
+                  } finally {
+                    setKeepingTemporary(false);
+                  }
+                }}
+              >
+                {keepingTemporary ? "Keeping…" : "Keep chat"}
+              </button>
+            )}
+          </div>
+        )}
         {activePath.map((m) => (
           <MessageItem
             key={m.id}
@@ -3749,6 +3789,15 @@ export function App(
       });
     }
   };
+  const keepConversation = async (conversation: Conversation) => {
+    const updated = await api.keepConversation(conversation);
+    queryClient.setQueryData<Conversation[]>(
+      ["conversations"],
+      (current) => mergeConversationSnapshot(current, updated),
+    );
+    await conversationQuery.refetch();
+    return updated;
+  };
   if (!user) {
     return <DiscoveryLoading unavailable={setupQuery.isError && userQuery.isError} />;
   }
@@ -3815,6 +3864,7 @@ export function App(
           balance={user.balance}
           onConversationCreated={conversationCreated}
           onUpdateConversation={updateConversation}
+          onKeepConversation={keepConversation}
           readOnly={view !== "chat"}
           saveHistory={!temporaryChatUntilPreferencesResolve(demoMode, preferencesQuery.data)}
           modelPreferenceError={modelPreferenceError}
