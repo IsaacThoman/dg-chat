@@ -38,11 +38,13 @@ import {
   API_SSE_REPLAY_REQUEST_MAX_EVENTS,
   apiResponseBodyByteLength,
   canonicalWorkspaceName,
+  DEFAULT_API_REPLAY_QUOTA,
   MAX_ACTIVE_CONVERSATION_SHARES,
   MAX_CONVERSATION_SHARE_ATTACHMENTS,
   MAX_CONVERSATION_SHARE_CONTENT_CHARS,
   MAX_CONVERSATION_SHARE_MESSAGES,
   normalizeKnowledgeSearchLimit,
+  planAbandonedApiReplay,
   splitApiSseReplayFrame,
   validateChunkEmbeddings,
   validateDocumentChunkInputs,
@@ -5543,7 +5545,7 @@ export class MemoryRepository {
     return request;
   }
   #replayQuota(quota?: ApiReplayQuota): ApiReplayQuota {
-    const value = quota ?? { maxRequests: 256, maxBytes: 67_108_864, maxEvents: 20_000 };
+    const value = quota ?? DEFAULT_API_REPLAY_QUOTA;
     if (
       !Number.isSafeInteger(value.maxRequests) || value.maxRequests < 1 ||
       !Number.isSafeInteger(value.maxBytes) || value.maxBytes < 1 ||
@@ -6013,7 +6015,8 @@ export class MemoryRepository {
     request.expiresAt = new Date(Date.now() + request.retentionSeconds * 1000).toISOString();
     return structuredClone(request);
   }
-  reapStaleApiRequests(limit = 100) {
+  reapStaleApiRequests(limit = 100, quotaInput?: ApiReplayQuota) {
+    const quota = this.#replayQuota(quotaInput);
     let count = 0;
     for (const request of this.apiIdempotencyRequests.values()) {
       if (count >= limit) break;
@@ -6025,15 +6028,6 @@ export class MemoryRepository {
         request.endpoint === "images.generations" &&
         [...this.generatedAssets.values()].some((asset) => asset.usageRunId === request.usageRunId)
       ) continue;
-      if (request.observedCostMicros > 0) {
-        this.settle(
-          request.usageRunId,
-          request.observedCostMicros,
-          request.observedInputTokens,
-          request.observedOutputTokens,
-          request.observedLatencyMs,
-        );
-      } else this.refund(request.usageRunId);
       for (const attempt of this.providerAttempts.values()) {
         if (attempt.usageRunId !== request.usageRunId || attempt.status !== "running") continue;
         attempt.status = "cancelled";
@@ -6044,24 +6038,45 @@ export class MemoryRepository {
         attempt.latencyMs = Math.max(0, Date.now() - Date.parse(attempt.startedAt));
         attempt.completedAt = new Date().toISOString();
       }
+      if (request.observedCostMicros > 0) {
+        this.settle(
+          request.usageRunId,
+          request.observedCostMicros,
+          request.observedInputTokens,
+          request.observedOutputTokens,
+          request.observedLatencyMs,
+        );
+        this.usageRuns.get(request.usageRunId)!.status = "failed";
+      } else this.refund(request.usageRunId);
       request.state = "failed";
-      request.responseStatus = 500;
-      request.responseBody = JSON.stringify({
-        error: {
-          message: "Request interrupted before completion",
-          type: "server_error",
-          code: "request_abandoned",
-        },
+      const encoder = new TextEncoder();
+      const aggregate = this.#replayTotals(request.userId);
+      const eventBytes = request.frames.reduce(
+        (sum, frame) => sum + encoder.encode(frame.frame).length,
+        0,
+      );
+      const recovery = planAbandonedApiReplay({
+        endpoint: request.endpoint,
+        eventCount: request.frames.length,
+        eventBytes,
+        replayReservedBytes: request.replayReservedBytes,
+        replayReservedEvents: request.replayReservedEvents,
+        aggregateBytes: aggregate.bytes,
+        aggregateEvents: aggregate.events,
+        quota,
       });
+      request.responseBody = recovery.responseBody;
       request.responseBodyEncoding = "utf8";
       request.failureStartedStream = request.frames.length > 0;
-      if (request.failureStartedStream) {
-        const frame = request.endpoint === "responses"
-          ? `event: error\ndata: ${request.responseBody}\n\n`
-          : `data: ${request.responseBody}\n\n`;
+      request.responseHeaders = {
+        "content-type": request.failureStartedStream ? "text/event-stream" : "application/json",
+        ...(request.failureStartedStream ? { "cache-control": "no-cache" } : {}),
+      };
+      request.responseStatus = request.failureStartedStream ? 200 : 500;
+      if (recovery.terminalFrame !== null) {
         request.frames.push({
           sequence: request.frames.length,
-          frame,
+          frame: recovery.terminalFrame,
           createdAt: new Date().toISOString(),
         });
       }
@@ -6121,7 +6136,7 @@ export class MemoryRepository {
     const user = this.users.get(userId);
     if (!user) throw new DomainError("not_found", "User not found", 404);
     const runs = [...this.usageRuns.values()].filter((r) =>
-      r.userId === userId && r.status === "completed"
+      r.userId === userId && (r.status === "completed" || r.costMicros > 0)
     );
     return {
       balanceMicros: user.balanceMicros,

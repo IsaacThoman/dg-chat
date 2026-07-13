@@ -9,13 +9,22 @@ import {
 } from "./modalFocus.ts";
 
 export function Modal(
-  { title, close, children, dismissible = true, variant = "default", restoreFocus = true }: {
+  {
+    title,
+    close,
+    children,
+    dismissible = true,
+    variant = "default",
+    restoreFocus = true,
+    restoreFocusTarget,
+  }: {
     title: string;
     close: () => void;
     children: ReactNode;
     dismissible?: boolean;
     variant?: "default" | "medium" | "wide";
     restoreFocus?: boolean | (() => boolean);
+    restoreFocusTarget?: () => HTMLElement | null;
   },
 ) {
   const titleId = useId();
@@ -27,9 +36,11 @@ export function Modal(
   const dismissibleRef = useRef(dismissible);
   const restoreFrame = useRef<number | null>(null);
   const restoreFocusRef = useRef(restoreFocus);
+  const restoreFocusTargetRef = useRef(restoreFocusTarget);
   closeRef.current = close;
   dismissibleRef.current = dismissible;
   restoreFocusRef.current = restoreFocus;
+  restoreFocusTargetRef.current = restoreFocusTarget;
   useEffect(() => {
     if (restoreFrame.current !== null) {
       cancelAnimationFrame(restoreFrame.current);
@@ -57,10 +68,25 @@ export function Modal(
       document.removeEventListener("keydown", keydown);
       const shouldRestore = modalShouldRestoreFocus(restoreFocusRef.current);
       if (!shouldRestore) return;
-      restoreFrame.current = requestAnimationFrame(() => {
+      const focusWhenAvailable = (attempt = 0) => {
         restoreFrame.current = null;
-        previousFocus.current?.focus();
-      });
+        const candidates = [restoreFocusTargetRef.current?.() ?? null, previousFocus.current];
+        const target = candidates.find((candidate) =>
+          candidate?.isConnected && candidate.getClientRects().length > 0 &&
+          !candidate.closest("[inert]")
+        );
+        if (target) {
+          target.focus();
+          return;
+        }
+        // A successful mutation can unmount the modal's owning row before React
+        // commits the parent drawer's inert-state update. Give that commit a
+        // bounded opportunity to expose the fallback target before giving up.
+        if (attempt < 2 && restoreFocusTargetRef.current) {
+          restoreFrame.current = requestAnimationFrame(() => focusWhenAvailable(attempt + 1));
+        }
+      };
+      restoreFrame.current = requestAnimationFrame(() => focusWhenAvailable());
     };
   }, []);
   return createPortal(

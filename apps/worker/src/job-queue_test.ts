@@ -49,6 +49,8 @@ Deno.test({
     const jobId = crypto.randomUUID();
     const sentinel = "super-secret-parser-detail";
     try {
+      await sql`TRUNCATE jobs,retention_scrub_runs,retention_policy_state,
+        retention_policy_versions,users RESTART IDENTITY CASCADE`;
       await sql`INSERT INTO users(id,email,name,role,approval_status,state)
         VALUES(${userId},${`${userId}@retention-worker.test`},'Retention worker','admin','approved','active')`;
       await sql`INSERT INTO retention_policy_versions(version,capture_enabled,request_body_days,

@@ -2800,6 +2800,152 @@ Deno.test("durable API idempotency lifecycle reserves once, replays frames, and 
   assertEquals(repo.pruneExpiredApiRequests(), 1);
 });
 
+Deno.test("stale API reaping never exceeds an exact replay reservation", () => {
+  const repo = new MemoryRepository();
+  const user = repo.createUser({
+    email: "api-reaper-bound@example.com",
+    name: "Reaper bound",
+    passwordHash: "x",
+  });
+  repo.credit(user.id, "api-reaper-bound-grant", "grant", 1_000_000);
+  const prefix = 'data: {"delta":"bounded"}\n\n';
+  const prefixBytes = new TextEncoder().encode(prefix).length;
+  const begun = repo.beginApiRequest({
+    userId: user.id,
+    endpoint: "chat.completions",
+    idempotencyKey: "reaper-exact-bound",
+    requestHash: "f".repeat(64),
+    stream: true,
+    model: "test/model",
+    runId: "reaper-exact-bound-run",
+    reserveMicros: 100,
+    provider: "test",
+    replayReservedBytes: prefixBytes,
+    replayReservedEvents: 1,
+  });
+  if (begun.kind !== "started") throw new Error("expected started request");
+  repo.appendApiSseFrame(begun.request.id, begun.leaseToken, 0, prefix);
+  repo.apiIdempotencyRequests.get(begun.request.id)!.leaseExpiresAt = new Date(0).toISOString();
+
+  assertEquals(repo.reapStaleApiRequests(), 1);
+  const failed = repo.getApiRequest(
+    user.id,
+    "chat.completions",
+    "reaper-exact-bound",
+  )!;
+  assertEquals(failed.state, "failed");
+  assertEquals(failed.frames.map(({ frame }) => frame), [prefix]);
+  assertEquals(failed.responseBody, null);
+  assertEquals(failed.failureStartedStream, true);
+  assertEquals(failed.responseStatus, 200);
+  assertEquals(failed.responseHeaders["content-type"], "text/event-stream");
+  assertEquals(failed.responseHeaders["cache-control"], "no-cache");
+
+  repo.apiIdempotencyRequests.get(begun.request.id)!.expiresAt = new Date(0).toISOString();
+  assertEquals(repo.pruneExpiredApiRequests(), 1);
+  const legacy = repo.beginApiRequest({
+    userId: user.id,
+    endpoint: "responses",
+    idempotencyKey: "reaper-custom-quota-bound",
+    requestHash: "e".repeat(64),
+    stream: true,
+    model: "test/model",
+    runId: "reaper-custom-quota-bound-run",
+    reserveMicros: 100,
+    provider: "test",
+    quota: { maxRequests: 1, maxBytes: prefixBytes, maxEvents: 1 },
+  });
+  if (legacy.kind !== "started") throw new Error("expected legacy request to start");
+  repo.appendApiSseFrame(
+    legacy.request.id,
+    legacy.leaseToken,
+    0,
+    prefix,
+    120,
+    undefined,
+    { maxRequests: 1, maxBytes: prefixBytes, maxEvents: 1 },
+  );
+  repo.apiIdempotencyRequests.get(legacy.request.id)!.leaseExpiresAt = new Date(0).toISOString();
+  assertEquals(
+    repo.reapStaleApiRequests(100, {
+      maxRequests: 1,
+      maxBytes: prefixBytes,
+      maxEvents: 1,
+    }),
+    1,
+  );
+  const legacyFailed = repo.getApiRequest(
+    user.id,
+    "responses",
+    "reaper-custom-quota-bound",
+  )!;
+  assertEquals(legacyFailed.frames.map(({ frame }) => frame), [prefix]);
+  assertEquals(legacyFailed.responseBody, null);
+  assertEquals(legacyFailed.responseStatus, 200);
+});
+
+Deno.test("stale API reaping preserves partial spend and its explicit attempt cause", () => {
+  const repo = new MemoryRepository();
+  const user = repo.createUser({
+    email: "api-reaper-partial@example.com",
+    name: "Partial reaper",
+    passwordHash: "x",
+  });
+  repo.credit(user.id, "api-reaper-partial-grant", "grant", 1_000);
+  const begun = repo.beginApiRequest({
+    userId: user.id,
+    endpoint: "chat.completions",
+    idempotencyKey: "reaper-partial-accounting",
+    requestHash: "d".repeat(64),
+    stream: true,
+    model: "test/model",
+    runId: "reaper-partial-accounting-run",
+    reserveMicros: 100,
+    provider: "test",
+  });
+  if (begun.kind !== "started") throw new Error("expected started request");
+  const run = repo.usageRuns.get(begun.usageRun.id)!;
+  run.executionEpoch = 1;
+  repo.providerAttempts.set("reaper-partial-attempt", {
+    usageRunId: run.id,
+    status: "running",
+    startedAt: new Date(Date.now() - 1_000).toISOString(),
+  } as never);
+  repo.appendApiSseFrame(
+    begun.request.id,
+    begun.leaseToken,
+    0,
+    'data: {"delta":"partial"}\n\n',
+    120,
+    { inputTokens: 5, outputTokens: 2, costMicros: 25, latencyMs: 10 },
+  );
+  repo.apiIdempotencyRequests.get(begun.request.id)!.leaseExpiresAt = new Date(0).toISOString();
+
+  assertEquals(repo.reapStaleApiRequests(), 1);
+  assertEquals(run.status, "failed");
+  assertEquals(repo.usage(user.id), {
+    balanceMicros: 975,
+    calls: 1,
+    inputTokens: 5,
+    outputTokens: 2,
+    spentMicros: 25,
+  });
+  const attempt = repo.providerAttempts.get("reaper-partial-attempt")!;
+  assertEquals(
+    { status: attempt.status, errorCode: attempt.errorCode, retryable: attempt.retryable },
+    { status: "cancelled", errorCode: "api_lease_expired", retryable: true },
+  );
+  const analytics = repo.adminAnalytics({
+    from: new Date(Date.now() - 60_000).toISOString(),
+    to: new Date(Date.now() + 60_000).toISOString(),
+    bucket: "hour",
+  });
+  assertEquals(
+    { completed: analytics.summary.completed, failed: analytics.summary.failed },
+    { completed: 0, failed: 1 },
+  );
+});
+
 Deno.test("durable API SSE batches validate atomically and preserve contiguous order", () => {
   const repo = new MemoryRepository();
   const user = repo.createUser({

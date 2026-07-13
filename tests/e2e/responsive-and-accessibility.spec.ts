@@ -110,6 +110,7 @@ test("mobile drawer is inert while closed and sheds modal state at the desktop b
   await bootstrap(request);
   await login(page);
   await createChat(page);
+  await createChat(page);
   await page.setViewportSize({ width: 320, height: 800 });
 
   const sidebar = page.locator("aside.sidebar");
@@ -127,7 +128,12 @@ test("mobile drawer is inert while closed and sheds modal state at the desktop b
   await expect(sidebar).not.toHaveAttribute("inert", "");
   await expect(page.getByRole("button", { name: "Close sidebar", exact: true })).toBeFocused();
 
-  const actions = drawer.locator("[data-conversation-actions]").first();
+  const actions = drawer.locator(".conversation-row.active [data-conversation-actions]");
+  await expect(actions).toHaveCount(1);
+  const actionLabel = await actions.getAttribute("aria-label");
+  const actionId = await actions.getAttribute("data-conversation-actions");
+  expect(actionLabel).toBeTruthy();
+  expect(actionId).toBeTruthy();
   await actions.click();
   const rename = page.getByRole("menuitem", { name: "Rename", exact: true });
   await expect(rename).toBeFocused();
@@ -139,8 +145,86 @@ test("mobile drawer is inert while closed and sheds modal state at the desktop b
   await expect(lastMenuItem).toBeFocused();
   await lastMenuItem.press("Tab");
   expect(await sidebar.evaluate((element) => element.contains(document.activeElement))).toBe(true);
+
+  await rename.click();
+  const renameDialog = page.getByRole("dialog", { name: "Rename conversation", exact: true });
+  await expect(renameDialog).toBeVisible();
+  await expect(page.locator('[role="dialog"][aria-modal="true"]')).toHaveCount(1);
+  await expect(sidebar).toHaveAttribute("aria-hidden", "true");
+  await expect(sidebar).toHaveAttribute("inert", "");
+  await expect(sidebar).not.toHaveAttribute("role", "dialog");
+  const renameClose = renameDialog.getByRole("button", { name: "Close", exact: true });
+  const renameSave = renameDialog.getByRole("button", { name: "Save", exact: true });
+  await renameClose.focus();
+  await renameClose.press("Shift+Tab");
+  await expect(renameSave).toBeFocused();
+  await renameSave.press("Tab");
+  await expect(renameClose).toBeFocused();
+  await renameDialog.press("Escape");
+  await expect(renameDialog).toHaveCount(0);
+  await expect(drawer).toBeVisible();
+  await expect(page.locator('[role="dialog"][aria-modal="true"]')).toHaveCount(1);
+  await expect(actions).toBeFocused();
+
   await actions.click();
-  await expect(page.getByRole("menu")).toHaveCount(0);
+  await rename.click();
+  await page.setViewportSize({ width: 1200, height: 800 });
+  await expect(renameDialog).toBeVisible();
+  await expect(sidebar).not.toHaveAttribute("inert", "");
+  await page.setViewportSize({ width: 320, height: 800 });
+  await expect(sidebar).toHaveAttribute("aria-hidden", "true");
+  await expect(sidebar).toHaveAttribute("inert", "");
+  await renameDialog.press("Escape");
+  await expect(renameDialog).toHaveCount(0);
+  await expect(open).toBeFocused();
+  await open.click();
+  await expect(drawer).toBeVisible();
+
+  await actions.click();
+  await page.getByRole("menuitem", { name: "Move to trash", exact: true }).click();
+  const trashDialog = page.getByRole("dialog", {
+    name: "Move conversation to trash?",
+    exact: true,
+  });
+  await expect(page.locator('[role="dialog"][aria-modal="true"]')).toHaveCount(1);
+  await trashDialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(trashDialog).toHaveCount(0);
+  await expect(actions).toBeFocused();
+
+  await actions.click();
+  await page.getByRole("menuitem", { name: "Move to trash", exact: true }).click();
+  await page.route("**/api/conversations/*", async (route) => {
+    if (route.request().method() === "PATCH") {
+      await route.fulfill({
+        status: 500,
+        contentType: "application/json",
+        body: JSON.stringify({ error: { message: "Injected failure" } }),
+      });
+      return;
+    }
+    await route.fallback();
+  });
+  const confirmTrash = trashDialog.getByRole("button", { name: "Move to trash", exact: true });
+  await confirmTrash.click();
+  await expect(trashDialog.getByRole("alert")).toHaveText("Action failed. Try again.");
+  await expect(trashDialog).toBeVisible();
+  await page.unroute("**/api/conversations/*");
+  await trashDialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(trashDialog).toHaveCount(0);
+  await actions.click();
+  await page.getByRole("menuitem", { name: "Move to trash", exact: true }).click();
+  await expect(trashDialog.getByRole("alert")).toHaveCount(0);
+  await confirmTrash.click();
+  await expect(trashDialog).toHaveCount(0);
+  await expect(
+    drawer.locator(`[data-conversation-actions="${actionId!}"]`),
+  ).toHaveCount(0);
+  await expect(drawer).toBeVisible();
+  await expect(page.locator('[role="dialog"][aria-modal="true"]')).toHaveCount(1);
+  await expect(page.getByRole("button", { name: "Close sidebar", exact: true })).toBeFocused();
+  const fallbackAction = drawer.locator(".conversation-row.active [data-conversation-actions]");
+  await expect(fallbackAction).toHaveCount(1);
+  await expect(fallbackAction).not.toHaveAttribute("data-conversation-actions", actionId!);
 
   await page.setViewportSize({ width: 1200, height: 800 });
   await expect(sidebar).not.toHaveClass(/mobile-open/);

@@ -10434,5 +10434,6 @@ export function createApp(options: AppOptions = {}) {
     circuitBreaker,
     toolExecutionService: toolExecution,
     drainIdentityDeliveries,
+    replayQuota,
   };
 }

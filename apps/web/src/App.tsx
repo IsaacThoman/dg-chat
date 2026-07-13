@@ -229,6 +229,22 @@ function Avatar({ user, small = false }: { user: User; small?: boolean }) {
   );
 }
 
+function conversationDialogFocusTarget(conversationId: string): HTMLButtonElement | null {
+  const candidates = [
+    document.querySelector<HTMLButtonElement>(
+      `[data-conversation-actions="${CSS.escape(conversationId)}"]`,
+    ),
+    document.querySelector<HTMLButtonElement>('aside.sidebar [aria-label="Close sidebar"]'),
+    ...document.querySelectorAll<HTMLButtonElement>('[aria-label="Open menu"]'),
+    ...document.querySelectorAll<HTMLButtonElement>("[data-conversation-actions]"),
+    ...document.querySelectorAll<HTMLButtonElement>(".lifecycle-empty button, .new-chat"),
+  ];
+  return candidates.find((candidate) =>
+    candidate?.isConnected && candidate.getClientRects().length > 0 &&
+    !candidate.closest("[inert]") && !candidate.disabled
+  ) ?? null;
+}
+
 function Sidebar({
   conversations,
   active,
@@ -259,6 +275,7 @@ function Sidebar({
   onUpdate: (
     conversation: Conversation,
     patch: { title?: string; pinned?: boolean; archived?: boolean; deleted?: boolean },
+    options?: { restoreLifecycleFocus?: boolean },
   ) => Promise<void>;
   listError: boolean;
   listLoading: boolean;
@@ -276,6 +293,25 @@ function Sidebar({
   const [query, setQuery] = useState("");
   const [selectedFolder, setSelectedFolder] = useState<string | null>(null);
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
+  const [activeRowDialogId, setActiveRowDialogId] = useState<string | null>(null);
+  const previousRowDialogId = useRef<string | null>(null);
+  const setRowDialogOpen = useCallback((id: string, open: boolean) => {
+    setActiveRowDialogId((current) => open ? id : current === id ? null : current);
+  }, []);
+  useEffect(() => {
+    const previous = previousRowDialogId.current;
+    previousRowDialogId.current = activeRowDialogId;
+    if (previous === null || activeRowDialogId !== null) return;
+    const frame = requestAnimationFrame(() => {
+      const activeElement = document.activeElement as HTMLElement | null;
+      if (
+        activeElement && activeElement !== document.body && activeElement.isConnected &&
+        !activeElement.closest("[inert]")
+      ) return;
+      conversationDialogFocusTarget(previous)?.focus();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [activeRowDialogId]);
   const workspace = useWorkspace();
   const listView: ConversationListView = view === "archived" || view === "trash" ? view : "chat";
   const visible = conversationsForView(conversations, listView);
@@ -351,15 +387,16 @@ function Sidebar({
   }, [drawerMode, mobileOpen]);
   const closedDrawer = drawerMode && !mobileOpen;
   const openDrawer = drawerMode && mobileOpen;
+  const nestedDrawerDialog = openDrawer && activeRowDialogId !== null;
   return (
     <aside
       ref={sidebarRef}
       className={cn("sidebar", mobileOpen && "mobile-open")}
       aria-label="Workspace navigation"
-      aria-hidden={closedDrawer || undefined}
-      aria-modal={openDrawer || undefined}
-      inert={closedDrawer || undefined}
-      role={openDrawer ? "dialog" : undefined}
+      aria-hidden={closedDrawer || nestedDrawerDialog || undefined}
+      aria-modal={openDrawer && !nestedDrawerDialog || undefined}
+      inert={closedDrawer || nestedDrawerDialog || undefined}
+      role={openDrawer && !nestedDrawerDialog ? "dialog" : undefined}
     >
       <div className="sidebar-head">
         <Brand />
@@ -490,6 +527,7 @@ function Sidebar({
                 tags={workspace.tags.data}
                 mutationLocked={busyConversationId === c.id}
                 menuPortalRef={menuPortalRef}
+                onDialogChange={setRowDialogOpen}
               />
             ))}
             <p className="section-label">RECENT</p>
@@ -506,6 +544,7 @@ function Sidebar({
                 tags={workspace.tags.data}
                 mutationLocked={busyConversationId === c.id}
                 menuPortalRef={menuPortalRef}
+                onDialogChange={setRowDialogOpen}
               />
             ))}
             {!filtered.length && (
@@ -553,7 +592,18 @@ function Sidebar({
 }
 
 function ConversationRow(
-  { c, active, onOpen, listView, onUpdate, folders, tags, mutationLocked, menuPortalRef }: {
+  {
+    c,
+    active,
+    onOpen,
+    listView,
+    onUpdate,
+    folders,
+    tags,
+    mutationLocked,
+    menuPortalRef,
+    onDialogChange,
+  }: {
     c: Conversation;
     active: boolean;
     onOpen: (id: string) => void;
@@ -561,11 +611,13 @@ function ConversationRow(
     onUpdate: (
       conversation: Conversation,
       patch: { title?: string; pinned?: boolean; archived?: boolean; deleted?: boolean },
+      options?: { restoreLifecycleFocus?: boolean },
     ) => Promise<void>;
     folders?: import("./workspace/WorkspaceNavigation.tsx").FolderData;
     tags?: import("./workspace/WorkspaceNavigation.tsx").TagData;
     mutationLocked: boolean;
     menuPortalRef: RefObject<HTMLDivElement | null>;
+    onDialogChange: (id: string, open: boolean) => void;
   },
 ) {
   const [menu, setMenu] = useState(false);
@@ -578,6 +630,22 @@ function ConversationRow(
   const rowRef = useRef<HTMLDivElement>(null);
   const actionRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+  useEffect(() => () => onDialogChange(c.id, false), [c.id, onDialogChange]);
+  const restoreDialogFocus = useCallback(
+    () => conversationDialogFocusTarget(c.id),
+    [c.id],
+  );
+  const openRowDialog = (open: () => void) => {
+    setError("");
+    actionRef.current?.focus();
+    onDialogChange(c.id, true);
+    setMenu(false);
+    open();
+  };
+  const closeRowDialog = (close: () => void) => {
+    close();
+    onDialogChange(c.id, false);
+  };
   useEffect(() => {
     if (!menu) return;
     const dismiss = (event: PointerEvent) => {
@@ -612,11 +680,14 @@ function ConversationRow(
     setMenu(false);
     requestAnimationFrame(() => actionRef.current?.focus());
   };
-  const update = async (patch: Parameters<typeof onUpdate>[1]) => {
+  const update = async (
+    patch: Parameters<typeof onUpdate>[1],
+    options?: Parameters<typeof onUpdate>[2],
+  ) => {
     setBusy(true);
     setError("");
     try {
-      await onUpdate(c, patch);
+      await onUpdate(c, patch, options);
       if (patch.pinned !== undefined) {
         setMenu(false);
         requestAnimationFrame(() => {
@@ -714,11 +785,7 @@ function ConversationRow(
             <button
               autoFocus
               role="menuitem"
-              onClick={() => {
-                actionRef.current?.focus();
-                setRename(true);
-                setMenu(false);
-              }}
+              onClick={() => openRowDialog(() => setRename(true))}
             >
               <Pencil size={14} /> Rename
             </button>
@@ -726,11 +793,7 @@ function ConversationRow(
           {listView === "chat" && folders && tags && (
             <button
               role="menuitem"
-              onClick={() => {
-                actionRef.current?.focus();
-                setOrganize(true);
-                setMenu(false);
-              }}
+              onClick={() => openRowDialog(() => setOrganize(true))}
             >
               <Folder size={14} /> Organize
             </button>
@@ -777,11 +840,7 @@ function ConversationRow(
             <button
               className="menu-danger"
               role="menuitem"
-              onClick={() => {
-                actionRef.current?.focus();
-                setConfirmDelete(true);
-                setMenu(false);
-              }}
+              onClick={() => openRowDialog(() => setConfirmDelete(true))}
             >
               <Trash2 size={14} /> Move to trash
             </button>
@@ -793,10 +852,11 @@ function ConversationRow(
       {rename && (
         <RenameConversationDialog
           conversation={c}
-          close={() => setRename(false)}
+          close={() => closeRowDialog(() => setRename(false))}
+          restoreFocusTarget={restoreDialogFocus}
           save={async (title) => {
             const saved = await update({ title });
-            if (saved) setRename(false);
+            if (saved) closeRowDialog(() => setRename(false));
             return saved;
           }}
         />
@@ -804,19 +864,27 @@ function ConversationRow(
       {confirmDelete && (
         <Modal
           title="Move conversation to trash?"
-          close={() => setConfirmDelete(false)}
+          close={() => closeRowDialog(() => setConfirmDelete(false))}
           dismissible={!busy}
+          restoreFocusTarget={restoreDialogFocus}
         >
           <p className="muted">“{c.title}” can be restored later from Trash.</p>
+          {error && <p className="form-error" role="alert">{error}</p>}
           <div className="modal-actions">
-            <button className="secondary" disabled={busy} onClick={() => setConfirmDelete(false)}>
+            <button
+              className="secondary"
+              disabled={busy}
+              onClick={() => closeRowDialog(() => setConfirmDelete(false))}
+            >
               Cancel
             </button>
             <button
               className="danger-button"
               disabled={busy}
               onClick={async () => {
-                if (await update({ deleted: true })) setConfirmDelete(false);
+                if (await update({ deleted: true }, { restoreLifecycleFocus: false })) {
+                  closeRowDialog(() => setConfirmDelete(false));
+                }
               }}
             >
               Move to trash
@@ -829,7 +897,8 @@ function ConversationRow(
           conversation={c}
           folders={folders}
           tags={tags}
-          close={() => setOrganize(false)}
+          close={() => closeRowDialog(() => setOrganize(false))}
+          restoreFocusTarget={restoreDialogFocus}
         />
       )}
     </div>
@@ -837,10 +906,11 @@ function ConversationRow(
 }
 
 function RenameConversationDialog(
-  { conversation, close, save }: {
+  { conversation, close, save, restoreFocusTarget }: {
     conversation: Conversation;
     close: () => void;
     save: (title: string) => Promise<boolean>;
+    restoreFocusTarget?: () => HTMLElement | null;
   },
 ) {
   const [title, setTitle] = useState(conversation.title);
@@ -861,7 +931,12 @@ function RenameConversationDialog(
     }
   };
   return (
-    <Modal title="Rename conversation" close={close} dismissible={!busy}>
+    <Modal
+      title="Rename conversation"
+      close={close}
+      dismissible={!busy}
+      restoreFocusTarget={restoreFocusTarget}
+    >
       <form onSubmit={submit}>
         <label className="field">
           <span>Conversation title</span>
@@ -3937,6 +4012,7 @@ export function App(
   const updateConversation = async (
     conversation: Conversation,
     patch: { title?: string; pinned?: boolean; archived?: boolean; deleted?: boolean },
+    options: { restoreLifecycleFocus?: boolean } = {},
   ) => {
     const updated = await api.updateConversation(conversation, patch);
     const replace = (current: Conversation[] = []) =>
@@ -3968,6 +4044,7 @@ export function App(
     if (!conversationsForView(refreshed, listView).some((item) => item.id === activeId)) {
       const nextId = fallbackConversationId(refreshed, listView, conversation.id);
       setActiveId(nextId);
+      if (options.restoreLifecycleFocus === false) return;
       requestAnimationFrame(() => {
         const nextAction = nextId
           ? document.querySelector<HTMLButtonElement>(

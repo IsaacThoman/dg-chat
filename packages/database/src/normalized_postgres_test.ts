@@ -644,7 +644,9 @@ Deno.test({
       });
       if (api.kind !== "started") throw new Error("API request did not start");
       await sql`UPDATE usage_runs SET execution_epoch=1 WHERE id=${api.usageRun.id}`;
-      await sql`UPDATE api_idempotency_requests SET lease_expires_at=now()-interval '1 second'
+      await sql`UPDATE api_idempotency_requests SET lease_expires_at=now()-interval '1 second',
+        observed_cost_micros=25,observed_input_tokens=5,observed_output_tokens=2,
+        observed_latency_ms=10
         WHERE id=${api.request.id}`;
       await insertUncertainAttempt(api.usageRun.id);
       const apiBalanceBefore = await sql<
@@ -658,11 +660,31 @@ Deno.test({
         { balance: string }[]
       >`SELECT balance_micros::text balance FROM users WHERE id=${user.id}`;
       const apiAttempts = await sql<
-        { status: string; error_code: string | null }[]
-      >`SELECT status,error_code FROM provider_attempts WHERE usage_run_id=${api.usageRun.id}`;
-      assertEquals([...apiRun], [{ status: "failed", cost: "0" }]);
-      assertEquals(Number(apiBalanceAfter[0].balance), Number(apiBalanceBefore[0].balance) + 100);
-      assertEquals([...apiAttempts], [{ status: "cancelled", error_code: "api_lease_expired" }]);
+        { status: string; error_code: string | null; retryable: boolean }[]
+      >`SELECT status,error_code,retryable FROM provider_attempts
+        WHERE usage_run_id=${api.usageRun.id}`;
+      assertEquals([...apiRun], [{ status: "failed", cost: "25" }]);
+      assertEquals(Number(apiBalanceAfter[0].balance), Number(apiBalanceBefore[0].balance) + 75);
+      assertEquals([...apiAttempts], [{
+        status: "cancelled",
+        error_code: "api_lease_expired",
+        retryable: true,
+      }]);
+      assertEquals(await repo.usage(user.id), {
+        balanceMicros: Number(apiBalanceAfter[0].balance),
+        calls: 3,
+        inputTokens: 104,
+        outputTokens: 11,
+        spentMicros: 126,
+      });
+      const analytics = await repo.adminAnalytics({
+        from: new Date(Date.now() - 60_000).toISOString(),
+        to: new Date(Date.now() + 60_000).toISOString(),
+        bucket: "hour",
+        userId: user.id,
+      });
+      assertEquals(analytics.summary.completed, 2);
+      assertEquals(analytics.summary.failed, 3);
 
       const conversation = await repo.createConversation(user.id, "Uncertain generation");
       const generation = await repo.beginGeneration({
@@ -1876,6 +1898,104 @@ Deno.test({
       else Deno.env.set("DENO_ENV", previousEnvironment);
       if (previousHost === undefined) Deno.env.delete("OPENAI_TEST_ALLOW_HTTP_HOST");
       else Deno.env.set("OPENAI_TEST_ALLOW_HTTP_HOST", previousHost);
+    }
+  },
+});
+
+Deno.test({
+  name: "Postgres stale API reaping never exceeds an exact replay reservation",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 1 });
+    await sql`TRUNCATE api_idempotency_requests, usage_runs, ledger_entries, users
+      RESTART IDENTITY CASCADE`;
+    await sql.end();
+    const repo = await PostgresRepository.connect(databaseUrl!);
+    const mutate = postgres(databaseUrl!, { max: 1 });
+    try {
+      const user = await repo.bootstrapAdmin({
+        email: "api-reaper-bound@database.test",
+        name: "API reaper bound",
+        passwordHash: "hash",
+      }, 1_000_000);
+      const prefix = 'data: {"delta":"bounded"}\n\n';
+      const prefixBytes = new TextEncoder().encode(prefix).length;
+      const begun = await repo.beginApiRequest({
+        userId: user.id,
+        endpoint: "chat.completions",
+        idempotencyKey: "postgres-reaper-exact-bound",
+        requestHash: "f".repeat(64),
+        stream: true,
+        model: "test/model",
+        runId: "postgres-reaper-exact-bound-run",
+        reserveMicros: 100,
+        provider: "test",
+        replayReservedBytes: prefixBytes,
+        replayReservedEvents: 1,
+      });
+      if (begun.kind !== "started") throw new Error("expected started request");
+      await repo.appendApiSseFrame(begun.request.id, begun.leaseToken, 0, prefix);
+      await mutate`UPDATE api_idempotency_requests
+        SET lease_expires_at=now()-interval '1 second' WHERE id=${begun.request.id}`;
+
+      assertEquals(await repo.reapStaleApiRequests(), 1);
+      const failed = (await repo.getApiRequest(
+        user.id,
+        "chat.completions",
+        "postgres-reaper-exact-bound",
+      ))!;
+      assertEquals(failed.state, "failed");
+      assertEquals(failed.frames.map(({ frame }) => frame), [prefix]);
+      assertEquals(failed.responseBody, null);
+      assertEquals(failed.failureStartedStream, true);
+      assertEquals(failed.responseStatus, 200);
+      assertEquals(failed.responseHeaders["content-type"], "text/event-stream");
+      assertEquals(failed.responseHeaders["cache-control"], "no-cache");
+      const usage = await repo.usage(user.id);
+      assertEquals(usage.balanceMicros, 1_000_000);
+
+      await mutate`UPDATE api_idempotency_requests SET expires_at=now()-interval '1 second'
+        WHERE id=${begun.request.id}`;
+      assertEquals(await repo.pruneExpiredApiRequests(), 1);
+      const quota = { maxRequests: 1, maxBytes: prefixBytes, maxEvents: 1 };
+      const legacy = await repo.beginApiRequest({
+        userId: user.id,
+        endpoint: "responses",
+        idempotencyKey: "postgres-reaper-custom-quota",
+        requestHash: "e".repeat(64),
+        stream: true,
+        model: "test/model",
+        runId: "postgres-reaper-custom-quota-run",
+        reserveMicros: 100,
+        provider: "test",
+        quota,
+      });
+      if (legacy.kind !== "started") throw new Error("expected legacy request to start");
+      await repo.appendApiSseFrame(
+        legacy.request.id,
+        legacy.leaseToken,
+        0,
+        prefix,
+        120,
+        undefined,
+        quota,
+      );
+      await mutate`UPDATE api_idempotency_requests
+        SET lease_expires_at=now()-interval '1 second' WHERE id=${legacy.request.id}`;
+      assertEquals(await repo.reapStaleApiRequests(100, quota), 1);
+      const legacyFailed = (await repo.getApiRequest(
+        user.id,
+        "responses",
+        "postgres-reaper-custom-quota",
+      ))!;
+      assertEquals(legacyFailed.frames.map(({ frame }) => frame), [prefix]);
+      assertEquals(legacyFailed.responseBody, null);
+      assertEquals(legacyFailed.responseStatus, 200);
+    } finally {
+      await mutate.end();
+      await repo.close();
     }
   },
 });

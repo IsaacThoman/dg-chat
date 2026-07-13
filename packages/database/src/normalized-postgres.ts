@@ -35,12 +35,14 @@ import {
   API_SSE_REPLAY_REQUEST_MAX_EVENTS,
   apiResponseBodyByteLength,
   canonicalWorkspaceName,
+  DEFAULT_API_REPLAY_QUOTA,
   KNOWLEDGE_EMBEDDING_DIMENSIONS,
   MAX_ACTIVE_CONVERSATION_SHARES,
   MAX_CONVERSATION_SHARE_ATTACHMENTS,
   MAX_CONVERSATION_SHARE_CONTENT_CHARS,
   MAX_CONVERSATION_SHARE_MESSAGES,
   normalizeKnowledgeSearchLimit,
+  planAbandonedApiReplay,
   splitApiSseReplayFrame,
   validateChunkEmbeddings,
   validateDocumentChunkInputs,
@@ -244,7 +246,7 @@ const knowledgeBinding = (row: Row): KnowledgeConversationBinding => ({
   updatedAt: iso(row.updated_at),
 });
 const replayQuota = (quota?: ApiReplayQuota): ApiReplayQuota => {
-  const value = quota ?? { maxRequests: 256, maxBytes: 67_108_864, maxEvents: 20_000 };
+  const value = quota ?? DEFAULT_API_REPLAY_QUOTA;
   if (
     !Number.isSafeInteger(value.maxRequests) || value.maxRequests < 1 ||
     !Number.isSafeInteger(value.maxBytes) || value.maxBytes < 1 ||
@@ -7210,7 +7212,8 @@ export class PostgresRepository implements DomainRepository {
       return apiRequest(updated[0], events.map(apiFrame));
     });
   }
-  async reapStaleApiRequests(limit = 100) {
+  async reapStaleApiRequests(limit = 100, quotaInput?: ApiReplayQuota) {
+    const quota = replayQuota(quotaInput);
     return await this.#sql.begin(async (tx) => {
       const rows = await tx<
         Row[]
@@ -7260,26 +7263,52 @@ export class PostgresRepository implements DomainRepository {
               : "request lease expired"
           },completed_at=now() WHERE id=${String(row.usage_run_id)}`;
         }
+        await tx`SELECT id FROM users WHERE id=${String(row.user_id)} FOR UPDATE`;
         const stats = await tx<
-          { count: number }[]
-        >`SELECT count(*)::int count FROM api_idempotency_events WHERE request_id=${id}`;
-        const errorBody = JSON.stringify({
-          error: {
-            message: "Request interrupted before completion",
-            type: "server_error",
-            param: null,
-            code: "request_abandoned",
-          },
+          { count: number; bytes: number }[]
+        >`SELECT count(*)::int count,COALESCE(sum(octet_length(frame)),0)::int bytes
+          FROM api_idempotency_events WHERE request_id=${id}`;
+        const aggregate = await tx<
+          { events: number; bytes: number }[]
+        >`SELECT
+          COALESCE(sum(CASE WHEN state='in_progress' AND replay_reserved_events>0
+            THEN replay_reserved_events
+            ELSE (SELECT count(*) FROM api_idempotency_events e WHERE e.request_id=r.id)
+          END),0)::bigint events,
+          COALESCE(sum(CASE WHEN state='in_progress' AND replay_reserved_bytes>0
+            THEN replay_reserved_bytes
+            ELSE COALESCE(CASE response_body_encoding WHEN 'base64'
+              THEN octet_length(decode(response_body,'base64')) ELSE octet_length(response_body) END,0) +
+              COALESCE((SELECT sum(octet_length(frame)) FROM api_idempotency_events e
+                WHERE e.request_id=r.id),0)
+          END),0)::bigint bytes
+          FROM api_idempotency_requests r WHERE user_id=${
+          String(row.user_id)
+        } AND expires_at>now()`;
+        const recovery = planAbandonedApiReplay({
+          endpoint: row.endpoint as ApiIdempotencyEndpoint,
+          eventCount: stats[0].count,
+          eventBytes: stats[0].bytes,
+          replayReservedBytes: number(row.replay_reserved_bytes ?? 0),
+          replayReservedEvents: number(row.replay_reserved_events ?? 0),
+          aggregateBytes: number(aggregate[0].bytes),
+          aggregateEvents: number(aggregate[0].events),
+          quota,
         });
-        if (stats[0].count > 0) {
-          const frame = row.endpoint === "responses"
-            ? `event: error\ndata: ${errorBody}\n\n`
-            : `data: ${errorBody}\n\n`;
+        if (recovery.terminalFrame !== null) {
           await tx`INSERT INTO api_idempotency_events(request_id,sequence,frame) VALUES(${id},${
             stats[0].count
-          },${frame})`;
+          },${recovery.terminalFrame})`;
         }
-        await tx`UPDATE api_idempotency_requests SET state='failed',lease_token=NULL,lease_expires_at=NULL,response_status=500,response_headers='{"content-type":"application/json"}'::jsonb,response_body=${errorBody},failure_started_stream=${
+        const responseHeaders = {
+          "content-type": stats[0].count > 0 ? "text/event-stream" : "application/json",
+          ...(stats[0].count > 0 ? { "cache-control": "no-cache" } : {}),
+        };
+        await tx`UPDATE api_idempotency_requests SET state='failed',lease_token=NULL,lease_expires_at=NULL,response_status=${
+          stats[0].count > 0 ? 200 : 500
+        },response_headers=${
+          tx.json(responseHeaders)
+        },response_body=${recovery.responseBody},failure_started_stream=${
           stats[0].count > 0
         },completed_at=now(),updated_at=now(),expires_at=now()+retention_seconds*interval '1 second' WHERE id=${id}`;
       }
@@ -7294,7 +7323,12 @@ export class PostgresRepository implements DomainRepository {
   async usage(userId: string) {
     const rows = await this.#sql<
       Row[]
-    >`SELECT u.balance_micros,count(r.id) FILTER(WHERE r.status='completed')::int calls,COALESCE(sum(r.input_tokens) FILTER(WHERE r.status='completed'),0)::bigint input_tokens,COALESCE(sum(r.output_tokens) FILTER(WHERE r.status='completed'),0)::bigint output_tokens,COALESCE(sum(r.cost_micros) FILTER(WHERE r.status='completed'),0)::bigint spent_micros FROM users u LEFT JOIN usage_runs r ON r.user_id=u.id WHERE u.id=${userId} GROUP BY u.id`;
+    >`SELECT u.balance_micros,
+      count(r.id) FILTER(WHERE r.status='completed' OR r.cost_micros>0)::int calls,
+      COALESCE(sum(r.input_tokens) FILTER(WHERE r.status='completed' OR r.cost_micros>0),0)::bigint input_tokens,
+      COALESCE(sum(r.output_tokens) FILTER(WHERE r.status='completed' OR r.cost_micros>0),0)::bigint output_tokens,
+      COALESCE(sum(r.cost_micros) FILTER(WHERE r.status='completed' OR r.cost_micros>0),0)::bigint spent_micros
+      FROM users u LEFT JOIN usage_runs r ON r.user_id=u.id WHERE u.id=${userId} GROUP BY u.id`;
     if (!rows[0]) throw new DomainError("not_found", "User not found", 404);
     return {
       balanceMicros: number(rows[0].balance_micros),
