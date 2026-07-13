@@ -5,10 +5,16 @@ import type {
   ApprovalStatus,
   Conversation,
   ConversationDetail,
+  ConversationFolder,
+  ConversationFolderMembership,
+  ConversationTag,
+  ConversationTagBinding,
+  ConversationTagSet,
   MessageNode,
   MessageRole,
   PublicUser,
   UsageSummary,
+  UserPreferences,
   UserRole,
 } from "@dg-chat/contracts";
 import { isIngestibleDocumentMime } from "./attachment-policy.ts";
@@ -489,6 +495,12 @@ export class MemoryRepository {
   readonly providerPayloadCaptures = new Map<string, ProviderPayloadCapture>();
   readonly retentionScrubRuns = new Map<string, RetentionScrubRun>();
   readonly conversations = new Map<string, Conversation>();
+  readonly userPreferences = new Map<string, UserPreferences>();
+  readonly conversationFolders = new Map<string, ConversationFolder>();
+  readonly conversationFolderMemberships = new Map<string, ConversationFolderMembership>();
+  readonly conversationTags = new Map<string, ConversationTag>();
+  readonly conversationTagSets = new Map<string, ConversationTagSet>();
+  readonly conversationTagBindings = new Map<string, ConversationTagBinding>();
   readonly messages = new Map<string, MessageNode>();
   readonly idempotency = new Map<string, string>();
   readonly ledger: LedgerEntry[] = [];
@@ -884,6 +896,9 @@ export class MemoryRepository {
     if (!value || value.ownerId !== ownerId) {
       throw new DomainError("not_found", "Conversation not found", 404);
     }
+    if (value.version !== patch.expectedVersion) {
+      throw new DomainError("version_conflict", "Conversation changed in another request", 409);
+    }
     if (patch.title !== undefined) value.title = patch.title.trim().slice(0, 200);
     if (patch.pinned !== undefined) value.pinned = patch.pinned;
     if (patch.archived !== undefined) {
@@ -891,6 +906,21 @@ export class MemoryRepository {
     }
     if (patch.deleted !== undefined) {
       value.deletedAt = patch.deleted ? new Date().toISOString() : null;
+      if (patch.deleted) {
+        const membership = this.conversationFolderMemberships.get(id);
+        this.conversationFolderMemberships.delete(id);
+        if (membership) {
+          const folder = this.conversationFolders.get(membership.folderId);
+          if (folder) {
+            folder.membershipVersion++;
+            folder.updatedAt = new Date().toISOString();
+          }
+        }
+        this.conversationTagSets.delete(id);
+        for (const [key, binding] of this.conversationTagBindings) {
+          if (binding.conversationId === id) this.conversationTagBindings.delete(key);
+        }
+      }
     }
     value.version++;
     value.updatedAt = new Date().toISOString();
@@ -907,6 +937,325 @@ export class MemoryRepository {
       b,
     ) => a.createdAt.localeCompare(b.createdAt));
     return { ...conversation, messages };
+  }
+
+  getUserPreferences(ownerId: string): UserPreferences {
+    if (!this.users.has(ownerId)) throw new DomainError("not_found", "User not found", 404);
+    let value = this.userPreferences.get(ownerId);
+    if (!value) {
+      const now = new Date().toISOString();
+      value = {
+        userId: ownerId,
+        version: 1,
+        theme: "system",
+        compactConversations: false,
+        reduceMotion: false,
+        customInstructions: "",
+        useMemory: false,
+        saveHistory: true,
+        preferredModelId: null,
+        createdAt: now,
+        updatedAt: now,
+      };
+      this.userPreferences.set(ownerId, value);
+    }
+    return { ...value };
+  }
+
+  updateUserPreferences(ownerId: string, patch: import("./repository.ts").UserPreferencesPatch) {
+    const value = this.getUserPreferences(ownerId);
+    if (value.version !== patch.expectedVersion) {
+      throw new DomainError("version_conflict", "Preferences changed in another request", 409);
+    }
+    const { expectedVersion: _expectedVersion, ...changes } = patch;
+    const next = {
+      ...value,
+      ...changes,
+      userId: ownerId,
+      version: value.version + 1,
+      updatedAt: new Date().toISOString(),
+    } as UserPreferences;
+    this.userPreferences.set(ownerId, next);
+    return { ...next };
+  }
+
+  listConversationFolders(ownerId: string) {
+    return {
+      folders: [...this.conversationFolders.values()].filter((x) => x.ownerId === ownerId).sort((
+        a,
+        b,
+      ) => a.position - b.position || a.id.localeCompare(b.id)),
+      memberships: [...this.conversationFolderMemberships.values()].filter((x) =>
+        x.ownerId === ownerId
+      ).sort((a, b) => a.position - b.position || a.conversationId.localeCompare(b.conversationId)),
+    };
+  }
+  createConversationFolder(ownerId: string, inputName: string) {
+    const name = inputName.trim();
+    const normalized = name.toLowerCase();
+    if (
+      [...this.conversationFolders.values()].some((x) =>
+        x.ownerId === ownerId && x.name.toLowerCase() === normalized
+      )
+    ) throw new DomainError("name_conflict", "A folder with that name already exists", 409);
+    const now = new Date().toISOString();
+    const value: ConversationFolder = {
+      id: crypto.randomUUID(),
+      ownerId,
+      name,
+      position: Math.max(
+        -1,
+        ...[...this.conversationFolders.values()].filter((x) => x.ownerId === ownerId).map((x) =>
+          x.position
+        ),
+      ) + 1,
+      version: 1,
+      membershipVersion: 0,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.conversationFolders.set(value.id, value);
+    return { ...value };
+  }
+  updateConversationFolder(
+    ownerId: string,
+    id: string,
+    nameInput: string,
+    expectedVersion: number,
+  ) {
+    const value = this.conversationFolders.get(id);
+    if (!value || value.ownerId !== ownerId) {
+      throw new DomainError("not_found", "Folder not found", 404);
+    }
+    if (value.version !== expectedVersion) {
+      throw new DomainError("version_conflict", "Folder changed in another request", 409);
+    }
+    const name = nameInput.trim();
+    const normalized = name.toLowerCase();
+    if (
+      [...this.conversationFolders.values()].some((x) =>
+        x.id !== id && x.ownerId === ownerId && x.name.toLowerCase() === normalized
+      )
+    ) throw new DomainError("name_conflict", "A folder with that name already exists", 409);
+    Object.assign(value, { name, version: value.version + 1, updatedAt: new Date().toISOString() });
+    return { ...value };
+  }
+  deleteConversationFolder(ownerId: string, id: string, expectedVersion: number) {
+    const value = this.conversationFolders.get(id);
+    if (!value || value.ownerId !== ownerId) {
+      throw new DomainError("not_found", "Folder not found", 404);
+    }
+    if (value.version !== expectedVersion) {
+      throw new DomainError("version_conflict", "Folder changed in another request", 409);
+    }
+    this.conversationFolders.delete(id);
+    for (const [key, m] of this.conversationFolderMemberships) {
+      if (m.folderId === id) this.conversationFolderMemberships.delete(key);
+    }
+  }
+  reorderConversationFolders(ownerId: string, ids: string[], versions: Record<string, number>) {
+    const current = this.listConversationFolders(ownerId).folders;
+    if (
+      ids.length !== current.length || new Set(ids).size !== ids.length ||
+      current.some((x) => !ids.includes(x.id))
+    ) throw new DomainError("folder_set_conflict", "Folder set changed", 409);
+    for (const id of ids) {
+      if (versions[id] !== this.conversationFolders.get(id)!.version) {
+        throw new DomainError("version_conflict", "Folder changed in another request", 409);
+      }
+    }
+    const now = new Date().toISOString();
+    ids.forEach((id, position) => {
+      const x = this.conversationFolders.get(id)!;
+      Object.assign(x, { position, version: x.version + 1, updatedAt: now });
+    });
+    return this.listConversationFolders(ownerId).folders;
+  }
+  replaceFolderMemberships(
+    ownerId: string,
+    folderId: string,
+    ids: string[],
+    expected: Record<string, number>,
+  ) {
+    const folder = this.conversationFolders.get(folderId);
+    if (!folder || folder.ownerId !== ownerId) {
+      throw new DomainError("not_found", "Folder not found", 404);
+    }
+    for (const id of ids) {
+      const c = this.conversations.get(id);
+      if (!c || c.ownerId !== ownerId) {
+        throw new DomainError("not_found", "Conversation not found", 404);
+      }
+      if (c.temporary || c.deletedAt) {
+        throw new DomainError(
+          "conversation_not_organizable",
+          "Temporary or deleted conversations cannot be organized",
+          409,
+        );
+      }
+    }
+    const affectedIds = new Set([
+      folderId,
+      ...ids.map((id) => this.conversationFolderMemberships.get(id)?.folderId).filter((
+        x,
+      ): x is string => Boolean(x)),
+    ]);
+    if (
+      Object.keys(expected).length !== affectedIds.size ||
+      [...affectedIds].some((id) =>
+        expected[id] !== this.conversationFolders.get(id)?.membershipVersion
+      )
+    ) throw new DomainError("version_conflict", "Folder membership changed", 409);
+    for (const [id, m] of this.conversationFolderMemberships) {
+      if (m.folderId === folderId || ids.includes(id)) {
+        this.conversationFolderMemberships.delete(id);
+      }
+    }
+    const now = new Date().toISOString();
+    ids.forEach((id, position) =>
+      this.conversationFolderMemberships.set(id, {
+        folderId,
+        conversationId: id,
+        ownerId,
+        position,
+        createdAt: now,
+        updatedAt: now,
+      })
+    );
+    for (const id of affectedIds) {
+      const x = this.conversationFolders.get(id)!;
+      x.membershipVersion++;
+      x.updatedAt = now;
+    }
+    return this.listConversationFolders(ownerId);
+  }
+  listConversationTags(ownerId: string) {
+    return {
+      tags: [...this.conversationTags.values()].filter((x) => x.ownerId === ownerId).sort((a, b) =>
+        a.name.localeCompare(b.name)
+      ),
+      bindings: [...this.conversationTagBindings.values()].filter((x) => x.ownerId === ownerId),
+      tagSets: [...this.conversationTagSets.values()].filter((x) => x.ownerId === ownerId),
+    };
+  }
+  createConversationTag(ownerId: string, inputName: string, color: string) {
+    const name = inputName.trim();
+    const normalized = name.toLowerCase();
+    if (
+      [...this.conversationTags.values()].some((x) =>
+        x.ownerId === ownerId && x.name.toLowerCase() === normalized
+      )
+    ) throw new DomainError("name_conflict", "A tag with that name already exists", 409);
+    const now = new Date().toISOString();
+    const value: ConversationTag = {
+      id: crypto.randomUUID(),
+      ownerId,
+      name,
+      color,
+      version: 1,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.conversationTags.set(value.id, value);
+    return { ...value };
+  }
+  updateConversationTag(
+    ownerId: string,
+    id: string,
+    patch: { name?: string; color?: string; expectedVersion: number },
+  ) {
+    const x = this.conversationTags.get(id);
+    if (!x || x.ownerId !== ownerId) throw new DomainError("not_found", "Tag not found", 404);
+    if (x.version !== patch.expectedVersion) {
+      throw new DomainError("version_conflict", "Tag changed in another request", 409);
+    }
+    if (patch.name !== undefined) {
+      const name = patch.name.trim();
+      if (
+        [...this.conversationTags.values()].some((y) =>
+          y.id !== id && y.ownerId === ownerId && y.name.toLowerCase() === name.toLowerCase()
+        )
+      ) throw new DomainError("name_conflict", "A tag with that name already exists", 409);
+      x.name = name;
+    }
+    if (patch.color !== undefined) x.color = patch.color;
+    x.version++;
+    x.updatedAt = new Date().toISOString();
+    return { ...x };
+  }
+  deleteConversationTag(ownerId: string, id: string, expectedVersion: number) {
+    const x = this.conversationTags.get(id);
+    if (!x || x.ownerId !== ownerId) throw new DomainError("not_found", "Tag not found", 404);
+    if (x.version !== expectedVersion) {
+      throw new DomainError("version_conflict", "Tag changed in another request", 409);
+    }
+    const now = new Date().toISOString();
+    const affected = new Set<string>();
+    for (const [k, b] of this.conversationTagBindings) {
+      if (b.tagId === id) {
+        affected.add(b.conversationId);
+        this.conversationTagBindings.delete(k);
+      }
+    }
+    for (const conversationId of affected) {
+      const set = this.conversationTagSets.get(conversationId);
+      if (set) {
+        set.version++;
+        set.updatedAt = now;
+      }
+    }
+    this.conversationTags.delete(id);
+  }
+  replaceConversationTags(
+    ownerId: string,
+    conversationId: string,
+    tagIds: string[],
+    expectedVersion: number,
+  ) {
+    const c = this.conversations.get(conversationId);
+    if (!c || c.ownerId !== ownerId) {
+      throw new DomainError("not_found", "Conversation not found", 404);
+    }
+    if (c.temporary || c.deletedAt) {
+      throw new DomainError(
+        "conversation_not_organizable",
+        "Temporary or deleted conversations cannot be organized",
+        409,
+      );
+    }
+    const current = this.conversationTagSets.get(conversationId);
+    if ((current?.version ?? 0) !== expectedVersion) {
+      throw new DomainError("version_conflict", "Conversation tags changed", 409);
+    }
+    for (const id of tagIds) {
+      const t = this.conversationTags.get(id);
+      if (!t || t.ownerId !== ownerId) throw new DomainError("not_found", "Tag not found", 404);
+    }
+    for (const [k, b] of this.conversationTagBindings) {
+      if (b.conversationId === conversationId) this.conversationTagBindings.delete(k);
+    }
+    const now = new Date().toISOString();
+    for (const tagId of tagIds) {
+      this.conversationTagBindings.set(`${conversationId}:${tagId}`, {
+        conversationId,
+        tagId,
+        ownerId,
+        createdAt: now,
+      });
+    }
+    const tagSet = {
+      conversationId,
+      ownerId,
+      version: (current?.version ?? 0) + 1,
+      updatedAt: now,
+    };
+    this.conversationTagSets.set(conversationId, tagSet);
+    return {
+      tagSet: { ...tagSet },
+      bindings: this.listConversationTags(ownerId).bindings.filter((x) =>
+        x.conversationId === conversationId
+      ),
+    };
   }
 
   appendMessage(

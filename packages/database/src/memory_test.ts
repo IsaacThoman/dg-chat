@@ -1414,9 +1414,16 @@ Deno.test("archived and deleted conversations reject new graph mutations", () =>
     );
   };
 
-  repo.updateConversation(user.id, conversation.id, { archived: true });
+  const archived = repo.updateConversation(user.id, conversation.id, {
+    archived: true,
+    expectedVersion: conversation.version,
+  });
   assertReadOnly();
-  repo.updateConversation(user.id, conversation.id, { archived: false, deleted: true });
+  repo.updateConversation(user.id, conversation.id, {
+    archived: false,
+    deleted: true,
+    expectedVersion: archived.version,
+  });
   assertReadOnly();
 });
 
@@ -2762,5 +2769,74 @@ Deno.test("per-user replay quotas bound live requests, events, and bytes", () =>
       }),
     DomainError,
     "storage quota",
+  );
+});
+
+Deno.test("workspace organization versions moves and preferences are atomic", () => {
+  const repo = new MemoryRepository();
+  const owner = repo.createUser({ email: "workspace@example.com", name: "Workspace" });
+  const preferences = repo.getUserPreferences(owner.id);
+  const updated = repo.updateUserPreferences(owner.id, {
+    expectedVersion: preferences.version,
+    theme: "dark",
+    customInstructions: "Prefer concise answers.",
+  });
+  assertEquals(updated.theme, "dark");
+  assertEquals("expectedVersion" in updated, false);
+  assertThrows(
+    () =>
+      repo.updateUserPreferences(owner.id, {
+        expectedVersion: preferences.version,
+        theme: "light",
+      }),
+    DomainError,
+    "changed",
+  );
+
+  const first = repo.createConversationFolder(owner.id, "First");
+  const second = repo.createConversationFolder(owner.id, "Second");
+  const chat = repo.createConversation(owner.id, "Organize");
+  repo.replaceFolderMemberships(owner.id, first.id, [chat.id], { [first.id]: 0 });
+  const afterFirst = repo.listConversationFolders(owner.id).folders;
+  assertEquals(afterFirst.find((folder) => folder.id === first.id)?.membershipVersion, 1);
+  assertThrows(
+    () => repo.replaceFolderMemberships(owner.id, second.id, [chat.id], { [second.id]: 0 }),
+    DomainError,
+    "changed",
+  );
+  repo.replaceFolderMemberships(owner.id, second.id, [chat.id], {
+    [first.id]: 1,
+    [second.id]: 0,
+  });
+  const moved = repo.listConversationFolders(owner.id);
+  assertEquals(moved.memberships[0].folderId, second.id);
+  assertEquals(moved.folders.find((folder) => folder.id === first.id)?.membershipVersion, 2);
+  assertEquals(moved.folders.find((folder) => folder.id === second.id)?.membershipVersion, 1);
+
+  const beforeOrder = moved.folders.map((folder) => ({ ...folder }));
+  assertThrows(
+    () =>
+      repo.reorderConversationFolders(owner.id, [second.id, first.id], {
+        [second.id]: second.version,
+        [first.id]: first.version + 99,
+      }),
+    DomainError,
+    "changed",
+  );
+  assertEquals(repo.listConversationFolders(owner.id).folders, beforeOrder);
+
+  const tag = repo.createConversationTag(owner.id, "Important", "#ff0000");
+  const assignment = repo.replaceConversationTags(owner.id, chat.id, [tag.id], 0);
+  repo.deleteConversationTag(owner.id, tag.id, tag.version);
+  assertEquals(
+    repo.listConversationTags(owner.id).tagSets.find((set) => set.conversationId === chat.id)
+      ?.version,
+    assignment.tagSet.version + 1,
+  );
+  const temporary = repo.createConversation(owner.id, "Temporary", true);
+  assertThrows(
+    () => repo.replaceConversationTags(owner.id, temporary.id, [], 0),
+    DomainError,
+    "cannot be organized",
   );
 });

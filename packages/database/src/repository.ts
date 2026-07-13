@@ -4,11 +4,17 @@ import type {
   ApprovalStatus,
   Conversation,
   ConversationDetail,
+  ConversationFolder,
+  ConversationFolderMembership,
+  ConversationTag,
+  ConversationTagBinding,
+  ConversationTagSet,
   MessageNode,
   MessageRole,
   ModelCapability,
   PublicUser,
   UsageSummary,
+  UserPreferences,
   UserRole,
 } from "@dg-chat/contracts";
 import type { LedgerEntry, StoredApiToken, StoredSession, StoredUser, UsageRun } from "./memory.ts";
@@ -838,10 +844,34 @@ export type BeginGenerationResult =
   | (GenerationResult & { kind: "completed" })
   | (GenerationResult & { kind: "in_progress"; retryAfterSeconds: number });
 export interface ConversationPatch {
+  expectedVersion: number;
   title?: string;
   pinned?: boolean;
   archived?: boolean;
   deleted?: boolean;
+}
+export type UserPreferencesPatch =
+  & Partial<
+    Pick<
+      UserPreferences,
+      | "theme"
+      | "compactConversations"
+      | "reduceMotion"
+      | "customInstructions"
+      | "useMemory"
+      | "saveHistory"
+      | "preferredModelId"
+    >
+  >
+  & { expectedVersion: number };
+export interface WorkspaceList {
+  folders: ConversationFolder[];
+  memberships: ConversationFolderMembership[];
+}
+export interface TagList {
+  tags: ConversationTag[];
+  bindings: ConversationTagBinding[];
+  tagSets: ConversationTagSet[];
 }
 export interface AdminSummary {
   calls: number;
@@ -1528,6 +1558,53 @@ export interface DomainRepository {
     patch: ConversationPatch,
   ): MaybePromise<Conversation>;
   detail(id: string, ownerId: string): MaybePromise<ConversationDetail>;
+  getUserPreferences(ownerId: string): MaybePromise<UserPreferences>;
+  updateUserPreferences(
+    ownerId: string,
+    patch: UserPreferencesPatch,
+  ): MaybePromise<UserPreferences>;
+  listConversationFolders(ownerId: string): MaybePromise<WorkspaceList>;
+  createConversationFolder(ownerId: string, name: string): MaybePromise<ConversationFolder>;
+  updateConversationFolder(
+    ownerId: string,
+    id: string,
+    name: string,
+    expectedVersion: number,
+  ): MaybePromise<ConversationFolder>;
+  deleteConversationFolder(
+    ownerId: string,
+    id: string,
+    expectedVersion: number,
+  ): MaybePromise<void>;
+  reorderConversationFolders(
+    ownerId: string,
+    folderIds: string[],
+    expectedVersions: Record<string, number>,
+  ): MaybePromise<ConversationFolder[]>;
+  replaceFolderMemberships(
+    ownerId: string,
+    folderId: string,
+    conversationIds: string[],
+    expectedMembershipVersions: Record<string, number>,
+  ): MaybePromise<WorkspaceList>;
+  listConversationTags(ownerId: string): MaybePromise<TagList>;
+  createConversationTag(
+    ownerId: string,
+    name: string,
+    color: string,
+  ): MaybePromise<ConversationTag>;
+  updateConversationTag(
+    ownerId: string,
+    id: string,
+    patch: { name?: string; color?: string; expectedVersion: number },
+  ): MaybePromise<ConversationTag>;
+  deleteConversationTag(ownerId: string, id: string, expectedVersion: number): MaybePromise<void>;
+  replaceConversationTags(
+    ownerId: string,
+    conversationId: string,
+    tagIds: string[],
+    expectedVersion: number,
+  ): MaybePromise<{ tagSet: ConversationTagSet; bindings: ConversationTagBinding[] }>;
   appendMessage(input: AppendMessageInput): MaybePromise<MessageNode>;
   beginGeneration(input: BeginGenerationInput): MaybePromise<BeginGenerationResult>;
   beginAssistantGeneration(

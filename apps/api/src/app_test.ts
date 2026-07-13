@@ -49,6 +49,124 @@ Deno.test("OpenAI endpoint registrations are unique", () => {
   ) assertEquals(counts.has(expected), true, `Missing OpenAI route registration: ${expected}`);
 });
 
+Deno.test("preferences folders and tags are authenticated owner-scoped versioned APIs", async () => {
+  let upstreamRequest: ChatCompletionRequest | undefined;
+  const { app } = createApp({
+    setupToken: "workspace-route",
+    webComplete: (request) => {
+      upstreamRequest = request;
+      return Promise.resolve({ text: "done", inputTokens: 4, outputTokens: 1 });
+    },
+  });
+  await app.request("/api/setup/bootstrap", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-setup-token": "workspace-route" },
+    body: JSON.stringify({
+      email: "workspace-route@example.com",
+      password: "correct horse battery",
+      name: "Workspace",
+    }),
+  });
+  const login = await app.request("/api/auth/sign-in/email", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email: "workspace-route@example.com",
+      password: "correct horse battery",
+    }),
+  });
+  const headers = {
+    cookie: sessionCookie(login),
+    origin: "http://localhost:5173",
+    "content-type": "application/json",
+  };
+  const preferencesResponse = await app.request("/api/preferences", { headers });
+  assertEquals(preferencesResponse.status, 200);
+  const preferences = await json(preferencesResponse);
+  const updated = await app.request("/api/preferences", {
+    method: "PATCH",
+    headers,
+    body: JSON.stringify({
+      expectedVersion: preferences.version,
+      theme: "dark",
+      customInstructions: "Be exact.",
+    }),
+  });
+  assertEquals(updated.status, 200, await updated.clone().text());
+  const stale = await app.request("/api/preferences", {
+    method: "PATCH",
+    headers,
+    body: JSON.stringify({ expectedVersion: preferences.version, theme: "light" }),
+  });
+  assertEquals(stale.status, 409);
+  const chatResponse = await app.request("/api/conversations", {
+    method: "POST",
+    headers: { ...headers, "idempotency-key": crypto.randomUUID() },
+    body: JSON.stringify({ title: "Filed" }),
+  });
+  const chat = await json(chatResponse);
+  const generated = await app.request(`/api/conversations/${chat.id}/generate`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      content: "hello",
+      model: "simulated/dg-chat",
+      parentId: null,
+      supersedesId: null,
+      expectedVersion: chat.version,
+      idempotencyKey: crypto.randomUUID(),
+    }),
+  });
+  assertEquals(generated.status, 201, await generated.clone().text());
+  assertEquals(upstreamRequest?.messages[0], { role: "system", content: "Be exact." });
+  const first = await json(
+    await app.request("/api/folders", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ name: "First" }),
+    }),
+  );
+  const second = await json(
+    await app.request("/api/folders", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ name: "Second" }),
+    }),
+  );
+  const filed = await app.request(`/api/folders/${first.id}/conversations`, {
+    method: "PUT",
+    headers,
+    body: JSON.stringify({
+      conversationIds: [chat.id],
+      expectedMembershipVersions: { [first.id]: 0 },
+    }),
+  });
+  assertEquals(filed.status, 200, await filed.clone().text());
+  const unsafeMove = await app.request(`/api/folders/${second.id}/conversations`, {
+    method: "PUT",
+    headers,
+    body: JSON.stringify({
+      conversationIds: [chat.id],
+      expectedMembershipVersions: { [second.id]: 0 },
+    }),
+  });
+  assertEquals(unsafeMove.status, 409);
+  const tag = await json(
+    await app.request("/api/tags", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ name: "Important", color: "#ff0000" }),
+    }),
+  );
+  const tagged = await app.request(`/api/conversations/${chat.id}/tags`, {
+    method: "PUT",
+    headers,
+    body: JSON.stringify({ tagIds: [tag.id], expectedVersion: 0 }),
+  });
+  assertEquals(tagged.status, 200, await tagged.clone().text());
+  assertEquals((await json(tagged)).tagSet.version, 1);
+});
+
 Deno.test("production disables all legacy and built-in model harnesses", () => {
   assertEquals(legacyModelHarnessAllowed("production"), false);
   assertEquals(legacyModelHarnessAllowed("test"), true);
@@ -417,14 +535,20 @@ Deno.test("bootstrap, signup, approval, immutable chat, API token and OpenAI com
   const renamedConversation = await app.request(`/api/conversations/${conversation.id}`, {
     method: "PATCH",
     headers: userAuth,
-    body: JSON.stringify({ title: "  Renamed chat  " }),
+    body: JSON.stringify({
+      title: "  Renamed chat  ",
+      expectedVersion: generation.conversation.version,
+    }),
   });
   assertEquals(renamedConversation.status, 200);
   assertEquals((await json(renamedConversation)).title, "Renamed chat");
   const oversizedTitle = await app.request(`/api/conversations/${conversation.id}`, {
     method: "PATCH",
     headers: userAuth,
-    body: JSON.stringify({ title: "x".repeat(201) }),
+    body: JSON.stringify({
+      title: "x".repeat(201),
+      expectedVersion: generation.conversation.version + 1,
+    }),
   });
   assertEquals(oversizedTitle.status, 422);
   const unknownConversationPatch = await app.request(`/api/conversations/${conversation.id}`, {

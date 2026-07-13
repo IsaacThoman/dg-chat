@@ -157,7 +157,127 @@ export const conversations = pgTable("conversations", {
   deletedAt: timestamp("deleted_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-}, (table) => [index("conversations_owner_updated_idx").on(table.ownerId, table.updatedAt)]);
+}, (table) => [
+  index("conversations_owner_updated_idx").on(table.ownerId, table.updatedAt),
+  unique("conversations_id_owner_uq").on(table.id, table.ownerId),
+]);
+
+export const userPreferences = pgTable("user_preferences", {
+  userId: uuid("user_id").primaryKey().references(() => users.id, { onDelete: "cascade" }),
+  version: integer("version").notNull().default(1),
+  theme: text("theme").notNull().default("system"),
+  compactConversations: boolean("compact_conversations").notNull().default(false),
+  reduceMotion: boolean("reduce_motion").notNull().default(false),
+  customInstructions: text("custom_instructions").notNull().default(""),
+  useMemory: boolean("use_memory").notNull().default(false),
+  saveHistory: boolean("save_history").notNull().default(true),
+  preferredModelId: text("preferred_model_id"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  check("user_preferences_version_check", sql`${table.version} >= 1`),
+  check("user_preferences_theme_check", sql`${table.theme} IN ('light','dark','system')`),
+  check(
+    "user_preferences_instructions_check",
+    sql`char_length(${table.customInstructions}) <= 20000`,
+  ),
+]);
+
+export const conversationFolders = pgTable("conversation_folders", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  ownerId: uuid("owner_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  name: text("name").notNull(),
+  normalizedName: text("normalized_name").notNull(),
+  position: integer("position").notNull(),
+  version: integer("version").notNull().default(1),
+  membershipVersion: integer("membership_version").notNull().default(0),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("conversation_folders_owner_name_uq").on(table.ownerId, table.normalizedName),
+  uniqueIndex("conversation_folders_owner_position_uq").on(table.ownerId, table.position),
+  unique("conversation_folders_id_owner_uq").on(table.id, table.ownerId),
+  check("conversation_folders_name_check", sql`char_length(${table.name}) BETWEEN 1 AND 120`),
+  check("conversation_folders_position_check", sql`${table.position} >= 0`),
+  check("conversation_folders_version_check", sql`${table.version} >= 1`),
+  check("conversation_folders_membership_version_check", sql`${table.membershipVersion} >= 0`),
+]);
+
+export const conversationFolderMemberships = pgTable("conversation_folder_memberships", {
+  folderId: uuid("folder_id").notNull(),
+  conversationId: uuid("conversation_id").primaryKey(),
+  ownerId: uuid("owner_id").notNull(),
+  position: integer("position").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("conversation_folder_memberships_position_uq").on(table.folderId, table.position),
+  index("conversation_folder_memberships_owner_idx").on(table.ownerId, table.folderId),
+  check("conversation_folder_memberships_position_check", sql`${table.position} >= 0`),
+  foreignKey({
+    columns: [table.folderId, table.ownerId],
+    foreignColumns: [conversationFolders.id, conversationFolders.ownerId],
+    name: "conversation_folder_memberships_folder_owner_fk",
+  }).onDelete("cascade"),
+  foreignKey({
+    columns: [table.conversationId, table.ownerId],
+    foreignColumns: [conversations.id, conversations.ownerId],
+    name: "conversation_folder_memberships_conversation_owner_fk",
+  }).onDelete("cascade"),
+]);
+
+export const conversationTags = pgTable("conversation_tags", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  ownerId: uuid("owner_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  name: text("name").notNull(),
+  normalizedName: text("normalized_name").notNull(),
+  color: text("color").notNull(),
+  version: integer("version").notNull().default(1),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("conversation_tags_owner_name_uq").on(table.ownerId, table.normalizedName),
+  unique("conversation_tags_id_owner_uq").on(table.id, table.ownerId),
+  index("conversation_tags_owner_name_idx").on(table.ownerId, table.normalizedName),
+  check("conversation_tags_name_check", sql`char_length(${table.name}) BETWEEN 1 AND 64`),
+  check("conversation_tags_color_check", sql`${table.color} ~ '^#[0-9A-Fa-f]{6}$'`),
+  check("conversation_tags_version_check", sql`${table.version} >= 1`),
+]);
+
+export const conversationTagSets = pgTable("conversation_tag_sets", {
+  conversationId: uuid("conversation_id").primaryKey(),
+  ownerId: uuid("owner_id").notNull(),
+  version: integer("version").notNull().default(0),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  check("conversation_tag_sets_version_check", sql`${table.version} >= 0`),
+  unique("conversation_tag_sets_conversation_owner_uq").on(table.conversationId, table.ownerId),
+  foreignKey({
+    columns: [table.conversationId, table.ownerId],
+    foreignColumns: [conversations.id, conversations.ownerId],
+    name: "conversation_tag_sets_conversation_owner_fk",
+  }).onDelete("cascade"),
+]);
+
+export const conversationTagBindings = pgTable("conversation_tag_bindings", {
+  conversationId: uuid("conversation_id").notNull(),
+  tagId: uuid("tag_id").notNull(),
+  ownerId: uuid("owner_id").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  primaryKey({ columns: [table.conversationId, table.tagId] }),
+  index("conversation_tag_bindings_owner_idx").on(table.ownerId, table.conversationId),
+  foreignKey({
+    columns: [table.conversationId, table.ownerId],
+    foreignColumns: [conversationTagSets.conversationId, conversationTagSets.ownerId],
+    name: "conversation_tag_bindings_conversation_owner_fk",
+  }).onDelete("cascade"),
+  foreignKey({
+    columns: [table.tagId, table.ownerId],
+    foreignColumns: [conversationTags.id, conversationTags.ownerId],
+    name: "conversation_tag_bindings_tag_owner_fk",
+  }).onDelete("cascade"),
+]);
 
 export const messages = pgTable("messages", {
   id: uuid("id").primaryKey().defaultRandom(),

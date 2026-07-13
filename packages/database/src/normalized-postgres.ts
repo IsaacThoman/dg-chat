@@ -3,9 +3,15 @@ import { isModelCapability } from "@dg-chat/contracts";
 import type {
   AccountState,
   Conversation,
+  ConversationFolder,
+  ConversationFolderMembership,
+  ConversationTag,
+  ConversationTagBinding,
+  ConversationTagSet,
   MessageNode,
   ModelCapability,
   PublicUser,
+  UserPreferences,
 } from "@dg-chat/contracts";
 import { DomainError } from "./memory.ts";
 import { INGESTIBLE_DOCUMENT_MIME_TYPES, isIngestibleDocumentMime } from "./attachment-policy.ts";
@@ -248,6 +254,70 @@ function conversation(row: Row): Conversation {
     archivedAt: nullableIso(row.archived_at),
     deletedAt: nullableIso(row.deleted_at),
     createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+  };
+}
+function preferences(row: Row): UserPreferences {
+  return {
+    userId: String(row.user_id),
+    version: number(row.version),
+    theme: String(row.theme) as UserPreferences["theme"],
+    compactConversations: Boolean(row.compact_conversations),
+    reduceMotion: Boolean(row.reduce_motion),
+    customInstructions: String(row.custom_instructions),
+    useMemory: Boolean(row.use_memory),
+    saveHistory: Boolean(row.save_history),
+    preferredModelId: row.preferred_model_id == null ? null : String(row.preferred_model_id),
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+  };
+}
+function folder(row: Row): ConversationFolder {
+  return {
+    id: String(row.id),
+    ownerId: String(row.owner_id),
+    name: String(row.name),
+    position: number(row.position),
+    version: number(row.version),
+    membershipVersion: number(row.membership_version),
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+  };
+}
+function folderMembership(row: Row): ConversationFolderMembership {
+  return {
+    folderId: String(row.folder_id),
+    conversationId: String(row.conversation_id),
+    ownerId: String(row.owner_id),
+    position: number(row.position),
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+  };
+}
+function conversationTag(row: Row): ConversationTag {
+  return {
+    id: String(row.id),
+    ownerId: String(row.owner_id),
+    name: String(row.name),
+    color: String(row.color),
+    version: number(row.version),
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+  };
+}
+function tagBinding(row: Row): ConversationTagBinding {
+  return {
+    conversationId: String(row.conversation_id),
+    tagId: String(row.tag_id),
+    ownerId: String(row.owner_id),
+    createdAt: iso(row.created_at),
+  };
+}
+function tagSet(row: Row): ConversationTagSet {
+  return {
+    conversationId: String(row.conversation_id),
+    ownerId: String(row.owner_id),
+    version: number(row.version),
     updatedAt: iso(row.updated_at),
   };
 }
@@ -1320,19 +1390,43 @@ export class PostgresRepository implements DomainRepository {
     return rows.map(conversation);
   }
   async updateConversation(ownerId: string, id: string, patch: ConversationPatch) {
-    const rows = await this.#sql<Row[]>`UPDATE conversations SET title=COALESCE(${
-      patch.title ?? null
-    },title),pinned=COALESCE(${patch.pinned ?? null},pinned),archived_at=CASE WHEN ${
-      patch.archived ?? null
-    }::boolean IS NULL THEN archived_at WHEN ${
-      patch.archived ?? false
-    } THEN now() ELSE NULL END,deleted_at=CASE WHEN ${
-      patch.deleted ?? null
-    }::boolean IS NULL THEN deleted_at WHEN ${
-      patch.deleted ?? false
-    } THEN now() ELSE NULL END,version=version+1,updated_at=now() WHERE id=${id} AND owner_id=${ownerId} RETURNING *`;
-    if (!rows[0]) throw new DomainError("not_found", "Conversation not found", 404);
-    return conversation(rows[0]);
+    return await this.#sql.begin(async (tx) => {
+      const affectedFolders = patch.deleted === true
+        ? await tx<
+          Row[]
+        >`SELECT f.id FROM conversation_folder_memberships m JOIN conversation_folders f ON f.id=m.folder_id WHERE m.conversation_id=${id} AND m.owner_id=${ownerId} FOR UPDATE OF f`
+        : [];
+      const rows = await tx<Row[]>`UPDATE conversations SET title=COALESCE(${
+        patch.title ?? null
+      },title),pinned=COALESCE(${patch.pinned ?? null},pinned),archived_at=CASE WHEN ${
+        patch.archived ?? null
+      }::boolean IS NULL THEN archived_at WHEN ${
+        patch.archived ?? false
+      } THEN now() ELSE NULL END,deleted_at=CASE WHEN ${
+        patch.deleted ?? null
+      }::boolean IS NULL THEN deleted_at WHEN ${
+        patch.deleted ?? false
+      } THEN now() ELSE NULL END,version=version+1,updated_at=now() WHERE id=${id} AND owner_id=${ownerId} AND version=${patch.expectedVersion} RETURNING *`;
+      if (!rows[0]) {
+        const exists = await tx<
+          Row[]
+        >`SELECT 1 FROM conversations WHERE id=${id} AND owner_id=${ownerId}`;
+        if (exists[0]) {
+          throw new DomainError("version_conflict", "Conversation changed in another request", 409);
+        }
+        throw new DomainError("not_found", "Conversation not found", 404);
+      }
+      if (patch.deleted === true) {
+        await tx`DELETE FROM conversation_folder_memberships WHERE conversation_id=${id} AND owner_id=${ownerId}`;
+        await tx`DELETE FROM conversation_tag_sets WHERE conversation_id=${id} AND owner_id=${ownerId}`;
+        if (affectedFolders.length) {
+          await tx`UPDATE conversation_folders SET membership_version=membership_version+1,updated_at=now() WHERE id=ANY(${
+            tx.array(affectedFolders.map((row) => String(row.id)))
+          }::uuid[])`;
+        }
+      }
+      return conversation(rows[0]);
+    });
   }
   async detail(id: string, ownerId: string) {
     const rows = await this.#sql<
@@ -1343,6 +1437,351 @@ export class PostgresRepository implements DomainRepository {
       Row[]
     >`SELECT * FROM messages WHERE conversation_id=${id} ORDER BY created_at,id`;
     return { ...conversation(rows[0]), messages: nodes.map(message) };
+  }
+  async getUserPreferences(ownerId: string) {
+    let rows = await this.#sql<Row[]>`SELECT * FROM user_preferences WHERE user_id=${ownerId}`;
+    if (!rows[0]) {
+      await this
+        .#sql`INSERT INTO user_preferences(user_id) VALUES(${ownerId}) ON CONFLICT(user_id) DO NOTHING`;
+      rows = await this.#sql<Row[]>`SELECT * FROM user_preferences WHERE user_id=${ownerId}`;
+    }
+    return preferences(rows[0]);
+  }
+  async updateUserPreferences(
+    ownerId: string,
+    patch: import("./repository.ts").UserPreferencesPatch,
+  ) {
+    const rows = await this.#sql<Row[]>`UPDATE user_preferences SET theme=COALESCE(${
+      patch.theme ?? null
+    },theme),compact_conversations=COALESCE(${
+      patch.compactConversations ?? null
+    },compact_conversations),reduce_motion=COALESCE(${
+      patch.reduceMotion ?? null
+    },reduce_motion),custom_instructions=COALESCE(${
+      patch.customInstructions ?? null
+    },custom_instructions),use_memory=COALESCE(${
+      patch.useMemory ?? null
+    },use_memory),save_history=COALESCE(${
+      patch.saveHistory ?? null
+    },save_history),preferred_model_id=CASE WHEN ${
+      patch.preferredModelId === undefined
+    } THEN preferred_model_id ELSE ${
+      patch.preferredModelId ?? null
+    } END,version=version+1,updated_at=now() WHERE user_id=${ownerId} AND version=${patch.expectedVersion} RETURNING *`;
+    if (!rows[0]) {
+      await this.getUserPreferences(ownerId);
+      throw new DomainError("version_conflict", "Preferences changed in another request", 409);
+    }
+    return preferences(rows[0]);
+  }
+  async listConversationFolders(ownerId: string) {
+    const [folders, memberships] = await Promise.all([
+      this.#sql<
+        Row[]
+      >`SELECT * FROM conversation_folders WHERE owner_id=${ownerId} ORDER BY position,id`,
+      this.#sql<
+        Row[]
+      >`SELECT * FROM conversation_folder_memberships WHERE owner_id=${ownerId} ORDER BY folder_id,position,conversation_id`,
+    ]);
+    return { folders: folders.map(folder), memberships: memberships.map(folderMembership) };
+  }
+  async createConversationFolder(ownerId: string, inputName: string) {
+    const name = inputName.trim();
+    try {
+      return await this.#sql.begin(async (tx) => {
+        await tx`SELECT id FROM users WHERE id=${ownerId} FOR UPDATE`;
+        const rows = await tx<
+          Row[]
+        >`INSERT INTO conversation_folders(owner_id,name,normalized_name,position) VALUES(${ownerId},${name},lower(${name}),COALESCE((SELECT max(position)+1 FROM conversation_folders WHERE owner_id=${ownerId}),0)) RETURNING *`;
+        return folder(rows[0]);
+      });
+    } catch (error) {
+      if ((error as { code?: string }).code === "23505") {
+        throw new DomainError("name_conflict", "A folder with that name already exists", 409);
+      }
+      throw error;
+    }
+  }
+  async updateConversationFolder(
+    ownerId: string,
+    id: string,
+    inputName: string,
+    expectedVersion: number,
+  ) {
+    const name = inputName.trim();
+    try {
+      const rows = await this.#sql<
+        Row[]
+      >`UPDATE conversation_folders SET name=${name},normalized_name=lower(${name}),version=version+1,updated_at=now() WHERE id=${id} AND owner_id=${ownerId} AND version=${expectedVersion} RETURNING *`;
+      if (!rows[0]) {
+        const exists = await this.#sql<
+          Row[]
+        >`SELECT 1 FROM conversation_folders WHERE id=${id} AND owner_id=${ownerId}`;
+        throw new DomainError(
+          exists[0] ? "version_conflict" : "not_found",
+          exists[0] ? "Folder changed in another request" : "Folder not found",
+          exists[0] ? 409 : 404,
+        );
+      }
+      return folder(rows[0]);
+    } catch (error) {
+      if ((error as { code?: string }).code === "23505") {
+        throw new DomainError("name_conflict", "A folder with that name already exists", 409);
+      }
+      throw error;
+    }
+  }
+  async deleteConversationFolder(ownerId: string, id: string, expectedVersion: number) {
+    const rows = await this.#sql<
+      Row[]
+    >`DELETE FROM conversation_folders WHERE id=${id} AND owner_id=${ownerId} AND version=${expectedVersion} RETURNING id`;
+    if (!rows[0]) {
+      const exists = await this.#sql<
+        Row[]
+      >`SELECT 1 FROM conversation_folders WHERE id=${id} AND owner_id=${ownerId}`;
+      throw new DomainError(
+        exists[0] ? "version_conflict" : "not_found",
+        exists[0] ? "Folder changed in another request" : "Folder not found",
+        exists[0] ? 409 : 404,
+      );
+    }
+  }
+  async reorderConversationFolders(
+    ownerId: string,
+    ids: string[],
+    versions: Record<string, number>,
+  ) {
+    return await this.#sql.begin(async (tx) => {
+      await tx`SET CONSTRAINTS conversation_folders_owner_position_uq DEFERRED`;
+      const rows = await tx<
+        Row[]
+      >`SELECT * FROM conversation_folders WHERE owner_id=${ownerId} ORDER BY position,id FOR UPDATE`;
+      if (
+        rows.length !== ids.length || rows.some((x) => !ids.includes(String(x.id))) ||
+        Object.keys(versions).length !== ids.length
+      ) throw new DomainError("folder_set_conflict", "Folder set changed", 409);
+      for (const row of rows) {
+        if (versions[String(row.id)] !== number(row.version)) {
+          throw new DomainError("version_conflict", "Folder changed in another request", 409);
+        }
+      }
+      for (let position = 0; position < ids.length; position++) {
+        await tx`UPDATE conversation_folders SET position=${position},version=version+1,updated_at=now() WHERE id=${
+          ids[position]
+        } AND owner_id=${ownerId}`;
+      }
+      return (await tx<
+        Row[]
+      >`SELECT * FROM conversation_folders WHERE owner_id=${ownerId} ORDER BY position,id`).map(
+        folder,
+      );
+    });
+  }
+  async replaceFolderMemberships(
+    ownerId: string,
+    folderId: string,
+    ids: string[],
+    expected: Record<string, number>,
+  ) {
+    return await this.#sql.begin(async (tx) => {
+      await tx`SET CONSTRAINTS conversation_folder_memberships_position_uq DEFERRED`;
+      const target = await tx<
+        Row[]
+      >`SELECT * FROM conversation_folders WHERE id=${folderId} AND owner_id=${ownerId}`;
+      if (!target[0]) throw new DomainError("not_found", "Folder not found", 404);
+      const chats = ids.length
+        ? await tx<
+          Row[]
+        >`SELECT id,temporary,deleted_at FROM conversations WHERE owner_id=${ownerId} AND id=ANY(${
+          tx.array(ids)
+        }::uuid[]) FOR UPDATE`
+        : [];
+      if (chats.length !== ids.length) {
+        throw new DomainError("not_found", "Conversation not found", 404);
+      }
+      if (chats.some((x) => x.temporary || x.deleted_at)) {
+        throw new DomainError(
+          "conversation_not_organizable",
+          "Temporary or deleted conversations cannot be organized",
+          409,
+        );
+      }
+      const sources = ids.length
+        ? await tx<
+          Row[]
+        >`SELECT DISTINCT folder_id FROM conversation_folder_memberships WHERE owner_id=${ownerId} AND conversation_id=ANY(${
+          tx.array(ids)
+        }::uuid[])`
+        : [];
+      const affected = [...new Set([folderId, ...sources.map((x) => String(x.folder_id))])].sort();
+      const folders = await tx<
+        Row[]
+      >`SELECT * FROM conversation_folders WHERE owner_id=${ownerId} AND id=ANY(${
+        tx.array(affected)
+      }::uuid[]) ORDER BY id FOR UPDATE`;
+      if (
+        folders.length !== affected.length || Object.keys(expected).length !== affected.length ||
+        folders.some((x) => expected[String(x.id)] !== number(x.membership_version))
+      ) throw new DomainError("version_conflict", "Folder membership changed", 409);
+      await tx`DELETE FROM conversation_folder_memberships WHERE folder_id=${folderId} OR (owner_id=${ownerId} AND conversation_id=ANY(${
+        tx.array(ids)
+      }::uuid[]))`;
+      for (let position = 0; position < ids.length; position++) {
+        await tx`INSERT INTO conversation_folder_memberships(folder_id,conversation_id,owner_id,position) VALUES(${folderId},${
+          ids[position]
+        },${ownerId},${position})`;
+      }
+      await tx`UPDATE conversation_folders SET membership_version=membership_version+1,updated_at=now() WHERE id=ANY(${
+        tx.array(affected)
+      }::uuid[])`;
+      const foldersOut = (await tx<
+        Row[]
+      >`SELECT * FROM conversation_folders WHERE owner_id=${ownerId} ORDER BY position,id`).map(
+        folder,
+      );
+      const memberships = (await tx<
+        Row[]
+      >`SELECT * FROM conversation_folder_memberships WHERE owner_id=${ownerId} ORDER BY folder_id,position`)
+        .map(folderMembership);
+      return { folders: foldersOut, memberships };
+    });
+  }
+  async listConversationTags(ownerId: string) {
+    const [tags, bindings, sets] = await Promise.all([
+      this.#sql<
+        Row[]
+      >`SELECT * FROM conversation_tags WHERE owner_id=${ownerId} ORDER BY normalized_name,id`,
+      this.#sql<
+        Row[]
+      >`SELECT * FROM conversation_tag_bindings WHERE owner_id=${ownerId} ORDER BY conversation_id,tag_id`,
+      this.#sql<
+        Row[]
+      >`SELECT * FROM conversation_tag_sets WHERE owner_id=${ownerId} ORDER BY conversation_id`,
+    ]);
+    return {
+      tags: tags.map(conversationTag),
+      bindings: bindings.map(tagBinding),
+      tagSets: sets.map(tagSet),
+    };
+  }
+  async createConversationTag(ownerId: string, inputName: string, color: string) {
+    const name = inputName.trim();
+    try {
+      const rows = await this.#sql<
+        Row[]
+      >`INSERT INTO conversation_tags(owner_id,name,normalized_name,color) VALUES(${ownerId},${name},lower(${name}),${color}) RETURNING *`;
+      return conversationTag(rows[0]);
+    } catch (error) {
+      if ((error as { code?: string }).code === "23505") {
+        throw new DomainError("name_conflict", "A tag with that name already exists", 409);
+      }
+      throw error;
+    }
+  }
+  async updateConversationTag(
+    ownerId: string,
+    id: string,
+    patch: { name?: string; color?: string; expectedVersion: number },
+  ) {
+    const name = patch.name?.trim();
+    try {
+      const rows = await this.#sql<Row[]>`UPDATE conversation_tags SET name=COALESCE(${
+        name ?? null
+      },name),normalized_name=CASE WHEN ${
+        name ?? null
+      }::text IS NULL THEN normalized_name ELSE lower(${name ?? ""}) END,color=COALESCE(${
+        patch.color ?? null
+      },color),version=version+1,updated_at=now() WHERE id=${id} AND owner_id=${ownerId} AND version=${patch.expectedVersion} RETURNING *`;
+      if (!rows[0]) {
+        const exists = await this.#sql<
+          Row[]
+        >`SELECT 1 FROM conversation_tags WHERE id=${id} AND owner_id=${ownerId}`;
+        throw new DomainError(
+          exists[0] ? "version_conflict" : "not_found",
+          exists[0] ? "Tag changed in another request" : "Tag not found",
+          exists[0] ? 409 : 404,
+        );
+      }
+      return conversationTag(rows[0]);
+    } catch (error) {
+      if ((error as { code?: string }).code === "23505") {
+        throw new DomainError("name_conflict", "A tag with that name already exists", 409);
+      }
+      throw error;
+    }
+  }
+  async deleteConversationTag(ownerId: string, id: string, expectedVersion: number) {
+    return await this.#sql.begin(async (tx) => {
+      const tag = await tx<
+        Row[]
+      >`SELECT * FROM conversation_tags WHERE id=${id} AND owner_id=${ownerId} FOR UPDATE`;
+      if (!tag[0]) throw new DomainError("not_found", "Tag not found", 404);
+      if (number(tag[0].version) !== expectedVersion) {
+        throw new DomainError("version_conflict", "Tag changed in another request", 409);
+      }
+      const affected = await tx<
+        Row[]
+      >`SELECT DISTINCT conversation_id FROM conversation_tag_bindings WHERE tag_id=${id} ORDER BY conversation_id`;
+      if (affected.length) {
+        const ids = affected.map((x) => String(x.conversation_id));
+        await tx`SELECT 1 FROM conversation_tag_sets WHERE conversation_id=ANY(${
+          tx.array(ids)
+        }::uuid[]) ORDER BY conversation_id FOR UPDATE`;
+        await tx`UPDATE conversation_tag_sets SET version=version+1,updated_at=now() WHERE conversation_id=ANY(${
+          tx.array(ids)
+        }::uuid[])`;
+      }
+      await tx`DELETE FROM conversation_tags WHERE id=${id}`;
+    });
+  }
+  async replaceConversationTags(
+    ownerId: string,
+    conversationId: string,
+    ids: string[],
+    expected: number,
+  ) {
+    return await this.#sql.begin(async (tx) => {
+      const chats = await tx<
+        Row[]
+      >`SELECT id,temporary,deleted_at FROM conversations WHERE id=${conversationId} AND owner_id=${ownerId} FOR UPDATE`;
+      if (!chats[0]) throw new DomainError("not_found", "Conversation not found", 404);
+      if (chats[0].temporary || chats[0].deleted_at) {
+        throw new DomainError(
+          "conversation_not_organizable",
+          "Temporary or deleted conversations cannot be organized",
+          409,
+        );
+      }
+      await tx`INSERT INTO conversation_tag_sets(conversation_id,owner_id) VALUES(${conversationId},${ownerId}) ON CONFLICT DO NOTHING`;
+      const sets = await tx<
+        Row[]
+      >`SELECT * FROM conversation_tag_sets WHERE conversation_id=${conversationId} AND owner_id=${ownerId} FOR UPDATE`;
+      if (number(sets[0].version) !== expected) {
+        throw new DomainError("version_conflict", "Conversation tags changed", 409);
+      }
+      const tags = ids.length
+        ? await tx<Row[]>`SELECT id FROM conversation_tags WHERE owner_id=${ownerId} AND id=ANY(${
+          tx.array(ids)
+        }::uuid[])`
+        : [];
+      if (tags.length !== ids.length) throw new DomainError("not_found", "Tag not found", 404);
+      await tx`DELETE FROM conversation_tag_bindings WHERE conversation_id=${conversationId}`;
+      for (const id of ids) {
+        await tx`INSERT INTO conversation_tag_bindings(conversation_id,tag_id,owner_id) VALUES(${conversationId},${id},${ownerId})`;
+      }
+      const updated = (await tx<
+        Row[]
+      >`UPDATE conversation_tag_sets SET version=version+1,updated_at=now() WHERE conversation_id=${conversationId} RETURNING *`)[
+        0
+      ];
+      return {
+        tagSet: tagSet(updated),
+        bindings: (await tx<
+          Row[]
+        >`SELECT * FROM conversation_tag_bindings WHERE conversation_id=${conversationId} ORDER BY tag_id`)
+          .map(tagBinding),
+      };
+    });
   }
   async appendMessage(input: AppendMessageInput) {
     return await this.#sql.begin(async (tx) => {

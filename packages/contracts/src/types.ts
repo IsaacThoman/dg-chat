@@ -73,6 +73,65 @@ export interface ConversationDetail extends Conversation {
   messages: MessageNode[];
 }
 
+export type ThemePreference = "light" | "dark" | "system";
+export interface UserPreferences {
+  userId: string;
+  version: number;
+  theme: ThemePreference;
+  compactConversations: boolean;
+  reduceMotion: boolean;
+  customInstructions: string;
+  useMemory: boolean;
+  saveHistory: boolean;
+  preferredModelId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ConversationFolder {
+  id: string;
+  ownerId: string;
+  name: string;
+  position: number;
+  version: number;
+  membershipVersion: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ConversationFolderMembership {
+  folderId: string;
+  conversationId: string;
+  ownerId: string;
+  position: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ConversationTag {
+  id: string;
+  ownerId: string;
+  name: string;
+  color: string;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ConversationTagBinding {
+  conversationId: string;
+  tagId: string;
+  ownerId: string;
+  createdAt: string;
+}
+
+export interface ConversationTagSet {
+  conversationId: string;
+  ownerId: string;
+  version: number;
+  updatedAt: string;
+}
+
 export type WebGenerationEvent =
   | {
     type: "generation.started";

@@ -1846,9 +1846,16 @@ Deno.test({
         );
       };
 
-      await repo.updateConversation(owner.id, conversation.id, { archived: true });
+      await repo.updateConversation(owner.id, conversation.id, {
+        archived: true,
+        expectedVersion: conversation.version,
+      });
       await assertReadOnly();
-      await repo.updateConversation(owner.id, conversation.id, { archived: false, deleted: true });
+      await repo.updateConversation(owner.id, conversation.id, {
+        archived: false,
+        deleted: true,
+        expectedVersion: conversation.version + 1,
+      });
       await assertReadOnly();
     } finally {
       await repo.close();
