@@ -2,7 +2,6 @@ import postgres from "npm:postgres@3.4.7";
 import { isModelCapability } from "@dg-chat/contracts";
 import type {
   AccountState,
-  Conversation,
   ConversationFolder,
   ConversationFolderMembership,
   ConversationTag,
@@ -91,6 +90,7 @@ import type {
   KnowledgeConversationBinding,
   KnowledgeRetrievalMode,
   KnowledgeSearchHit,
+  LifecycleConversation,
   ModelAlias,
   ModelPriceVersion,
   ProviderAttempt,
@@ -104,6 +104,7 @@ import type {
   ProviderPayloadCaptureInput,
   ProviderRecord,
   ProviderRetryPolicy,
+  PurgeTemporaryConversationsInput,
   RegistryMutationContext,
   ReplaceAccessGroupPolicyInput,
   ReplaceConversationKnowledgeInput,
@@ -243,7 +244,7 @@ function publicUser(value: StoredUser): PublicUser {
   const { passwordHash: _passwordHash, ...safe } = value;
   return safe;
 }
-function conversation(row: Row): Conversation {
+function conversation(row: Row): LifecycleConversation {
   return {
     id: String(row.id),
     ownerId: String(row.owner_id),
@@ -252,6 +253,7 @@ function conversation(row: Row): Conversation {
     version: number(row.version),
     pinned: Boolean(row.pinned),
     temporary: Boolean(row.temporary),
+    temporaryExpiresAt: nullableIso(row.temporary_expires_at),
     archivedAt: nullableIso(row.archived_at),
     deletedAt: nullableIso(row.deleted_at),
     createdAt: iso(row.created_at),
@@ -1348,9 +1350,25 @@ export class PostgresRepository implements DomainRepository {
     title: string,
     temporary = false,
     idempotencyKey?: string,
+    temporaryRetentionDays = 30,
   ) {
+    if (
+      temporary &&
+      (!Number.isInteger(temporaryRetentionDays) || temporaryRetentionDays < 1 ||
+        temporaryRetentionDays > 3650)
+    ) {
+      throw new DomainError(
+        "validation_error",
+        "Temporary retention days must be between 1 and 3650",
+        422,
+      );
+    }
     return await this.#sql.begin(async (tx) => {
-      const fingerprint = JSON.stringify({ title, temporary });
+      const fingerprint = JSON.stringify(
+        temporary && temporaryRetentionDays !== 30
+          ? { title, temporary, temporaryRetentionDays }
+          : { title, temporary },
+      );
       if (idempotencyKey) {
         const prior = await tx<
           Row[]
@@ -1371,13 +1389,51 @@ export class PostgresRepository implements DomainRepository {
       }
       const rows = await tx<
         Row[]
-      >`INSERT INTO conversations(owner_id,title,temporary) VALUES(${ownerId},${title},${temporary}) RETURNING *`;
+      >`INSERT INTO conversations(owner_id,title,temporary,temporary_expires_at) VALUES(
+        ${ownerId},${title},${temporary},
+        CASE WHEN ${temporary} THEN now()+${temporaryRetentionDays}*interval '1 day' ELSE NULL END
+      ) RETURNING *`;
       if (idempotencyKey) {
         await tx`INSERT INTO operation_idempotency(owner_id,operation,idempotency_key,payload_hash,result_id) VALUES(${ownerId},'conversation.create',${idempotencyKey},${fingerprint},${
           String(rows[0].id)
         })`;
       }
       return conversation(rows[0]);
+    });
+  }
+  async promoteTemporaryConversation(ownerId: string, id: string, expectedVersion: number) {
+    const rows = await this.#sql<Row[]>`UPDATE conversations
+      SET temporary=false,temporary_expires_at=NULL,version=version+1,updated_at=now()
+      WHERE id=${id} AND owner_id=${ownerId} AND version=${expectedVersion} AND temporary=true
+      RETURNING *`;
+    if (rows[0]) return conversation(rows[0]);
+    const existing = await this.#sql<Row[]>`SELECT version,temporary FROM conversations
+      WHERE id=${id} AND owner_id=${ownerId}`;
+    if (!existing[0]) throw new DomainError("not_found", "Conversation not found", 404);
+    if (number(existing[0].version) !== expectedVersion) {
+      throw new DomainError("version_conflict", "Conversation changed in another request", 409);
+    }
+    throw new DomainError("not_temporary", "Conversation is already saved", 409);
+  }
+  async purgeExpiredTemporaryConversations(input: PurgeTemporaryConversationsInput) {
+    const limit = input.limit ?? 100;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
+      throw new DomainError("validation_error", "Purge limit must be between 1 and 1000", 422);
+    }
+    const cutoff = input.now ?? new Date().toISOString();
+    if (!Number.isFinite(Date.parse(cutoff))) {
+      throw new DomainError("validation_error", "Invalid purge cutoff", 422);
+    }
+    return await this.#sql.begin(async (tx) => {
+      const selected = await tx<Row[]>`SELECT id FROM conversations
+        WHERE owner_id=${input.ownerId} AND temporary=true AND temporary_expires_at<=${cutoff}
+        ORDER BY temporary_expires_at,id FOR UPDATE SKIP LOCKED LIMIT ${limit}`;
+      const conversationIds = selected.map((row) => String(row.id));
+      if (conversationIds.length) {
+        await tx`DELETE FROM conversations WHERE owner_id=${input.ownerId}
+          AND id=ANY(${conversationIds}::uuid[]) AND temporary=true AND temporary_expires_at<=${cutoff}`;
+      }
+      return { conversationIds };
     });
   }
   async listConversations(ownerId: string, includeDeleted = false) {

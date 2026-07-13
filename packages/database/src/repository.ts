@@ -850,6 +850,19 @@ export interface ConversationPatch {
   archived?: boolean;
   deleted?: boolean;
 }
+export type LifecycleConversation = Conversation & { temporaryExpiresAt: string | null };
+export type LifecycleConversationDetail = ConversationDetail & {
+  temporaryExpiresAt: string | null;
+};
+export interface PurgeTemporaryConversationsInput {
+  ownerId: string;
+  limit?: number;
+  /** Injectable cutoff for deterministic maintenance jobs and tests. */
+  now?: string;
+}
+export interface PurgeTemporaryConversationsResult {
+  conversationIds: string[];
+}
 /** Locale-independent workspace identity: display Unicode is preserved; ASCII case is folded. */
 export function canonicalWorkspaceName(value: string): string {
   return value.replace(/[A-Z]/g, (character) => character.toLowerCase());
@@ -1554,14 +1567,26 @@ export interface DomainRepository {
     title: string,
     temporary?: boolean,
     idempotencyKey?: string,
-  ): MaybePromise<Conversation>;
-  listConversations(ownerId: string, includeDeleted?: boolean): MaybePromise<Conversation[]>;
+    temporaryRetentionDays?: number,
+  ): MaybePromise<LifecycleConversation>;
+  listConversations(
+    ownerId: string,
+    includeDeleted?: boolean,
+  ): MaybePromise<LifecycleConversation[]>;
   updateConversation(
     ownerId: string,
     id: string,
     patch: ConversationPatch,
-  ): MaybePromise<Conversation>;
-  detail(id: string, ownerId: string): MaybePromise<ConversationDetail>;
+  ): MaybePromise<LifecycleConversation>;
+  detail(id: string, ownerId: string): MaybePromise<LifecycleConversationDetail>;
+  promoteTemporaryConversation(
+    ownerId: string,
+    id: string,
+    expectedVersion: number,
+  ): MaybePromise<LifecycleConversation>;
+  purgeExpiredTemporaryConversations(
+    input: PurgeTemporaryConversationsInput,
+  ): MaybePromise<PurgeTemporaryConversationsResult>;
   getUserPreferences(ownerId: string): MaybePromise<UserPreferences>;
   updateUserPreferences(
     ownerId: string,

@@ -1,7 +1,21 @@
 import postgres from "npm:postgres@3.4.7";
 import type { ProviderCredentialEnvelope } from "./repository.ts";
 
-export const BACKUP_DATA_SCHEMA_VERSION = "0028" as const;
+export const BACKUP_DATA_SCHEMA_VERSION = "0032" as const;
+const LEGACY_BACKUP_DATA_SCHEMA_VERSION = "0028" as const;
+export const LEGACY_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
+  new Set([
+    "user_preferences",
+    "conversation_folders",
+    "conversation_folder_memberships",
+    "conversation_tags",
+    "conversation_tag_sets",
+    "conversation_tag_bindings",
+  ]),
+);
+export function isSupportedBackupDataSchemaVersion(value: string): boolean {
+  return value === BACKUP_DATA_SCHEMA_VERSION || value === LEGACY_BACKUP_DATA_SCHEMA_VERSION;
+}
 export const BACKUP_DATA_BATCH_SIZE = 100;
 export const BACKUP_DATA_MAX_BATCH_SIZE = 500;
 export const BACKUP_DATA_MAX_ROWS_PER_TABLE = 10_000_000;
@@ -225,7 +239,7 @@ export const BACKUP_DATA_TABLES: readonly BackupDataTable[] = Object.freeze([
   ),
   T(
     "conversations",
-    "id owner_id title active_leaf_id version pinned temporary archived_at deleted_at created_at updated_at",
+    "id owner_id title active_leaf_id version pinned temporary temporary_expires_at archived_at deleted_at created_at updated_at",
     "id",
     {
       version: "integer",
@@ -861,6 +875,31 @@ function exactRow(definition: BackupDataTable, value: unknown): Record<string, u
   return row;
 }
 
+function exactSourceRow(
+  definition: BackupDataTable,
+  value: unknown,
+  schemaVersion: string,
+): Record<string, unknown> {
+  if (
+    schemaVersion === LEGACY_BACKUP_DATA_SCHEMA_VERSION && definition.name === "conversations" &&
+    value && typeof value === "object" && !Array.isArray(value) &&
+    !("temporary_expires_at" in value)
+  ) {
+    const legacy = value as Record<string, unknown>;
+    const createdAt = legacy.created_at;
+    const temporary = legacy.temporary;
+    const upgraded = {
+      ...legacy,
+      temporary_expires_at: temporary === true && typeof createdAt === "string" &&
+          Number.isFinite(Date.parse(createdAt))
+        ? new Date(Date.parse(createdAt) + 30 * 86_400_000).toISOString()
+        : null,
+    };
+    return exactRow(definition, upgraded);
+  }
+  return exactRow(definition, value);
+}
+
 function validateValue(definition: BackupDataTable, column: string, value: unknown): void {
   if (value === null) return;
   const kind = definition.kinds[column];
@@ -914,7 +953,7 @@ async function stageSource(
   suffix: string,
   objectKeyMap: ReadonlyMap<string, string>,
 ): Promise<{ stage: Map<string, string>; counts: Record<string, number> }> {
-  if (source.schemaVersion !== BACKUP_DATA_SCHEMA_VERSION) {
+  if (!isSupportedBackupDataSchemaVersion(source.schemaVersion)) {
     throw new BackupDataError("invalid_source", "Backup data schema version is unsupported");
   }
   const stage = new Map<string, string>();
@@ -943,7 +982,7 @@ async function stageSource(
       if (!batch.length) continue;
       const values: unknown[] = [];
       const tuples = batch.map((raw, rowIndex) => {
-        const row = exactRow(definition, raw);
+        const row = exactSourceRow(definition, raw, source.schemaVersion);
         const placeholders = definition.columns.map((column) => {
           let value = row[column];
           if (

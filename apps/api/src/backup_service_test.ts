@@ -7,6 +7,7 @@ import type {
   StoredObject,
 } from "@dg-chat/database";
 import {
+  BACKUP_DATA_SCHEMA_VERSION,
   backupContentRoot,
   BackupOperationError,
   createHmacBackupAuthenticator,
@@ -888,7 +889,7 @@ async function setup(
     backupId: BACKUP_ID,
     createdAt: "2026-07-12T00:00:00.000Z",
     appVersion: "1.0.0",
-    schemaVersion: "0028",
+    schemaVersion: BACKUP_DATA_SCHEMA_VERSION,
     mode: "system",
     secretPolicy: "redacted",
     diagnosticPayloadPolicy: "excluded",

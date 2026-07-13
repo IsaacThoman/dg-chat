@@ -153,13 +153,23 @@ export const conversations = pgTable("conversations", {
   version: integer("version").notNull().default(0),
   pinned: boolean("pinned").notNull().default(false),
   temporary: boolean("temporary").notNull().default(false),
+  temporaryExpiresAt: timestamp("temporary_expires_at", { withTimezone: true }),
   archivedAt: timestamp("archived_at", { withTimezone: true }),
   deletedAt: timestamp("deleted_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [
   index("conversations_owner_updated_idx").on(table.ownerId, table.updatedAt),
+  index("conversations_owner_temporary_expiry_idx").on(
+    table.ownerId,
+    table.temporaryExpiresAt,
+    table.id,
+  ).where(sql`${table.temporary} = true`),
   unique("conversations_id_owner_uq").on(table.id, table.ownerId),
+  check(
+    "conversations_temporary_expiry_check",
+    sql`(${table.temporary} = true AND ${table.temporaryExpiresAt} IS NOT NULL) OR (${table.temporary} = false AND ${table.temporaryExpiresAt} IS NULL)`,
+  ),
 ]);
 
 export const userPreferences = pgTable("user_preferences", {

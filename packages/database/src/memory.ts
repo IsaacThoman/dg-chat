@@ -4,7 +4,6 @@ import type {
   ApiTokenSummary,
   ApprovalStatus,
   Conversation,
-  ConversationDetail,
   ConversationFolder,
   ConversationFolderMembership,
   ConversationTag,
@@ -90,6 +89,7 @@ import type {
   KnowledgeConversationBinding,
   KnowledgeRetrievalMode,
   KnowledgeSearchHit,
+  LifecycleConversationDetail,
   ModelAlias,
   ModelPriceVersion,
   ProviderAttempt,
@@ -103,6 +103,8 @@ import type {
   ProviderPayloadCaptureInput,
   ProviderRecord,
   ProviderRetryPolicy,
+  PurgeTemporaryConversationsInput,
+  PurgeTemporaryConversationsResult,
   RegistryMutationContext,
   ReplaceAccessGroupPolicyInput,
   ReplaceConversationKnowledgeInput,
@@ -495,7 +497,10 @@ export class MemoryRepository {
   };
   readonly providerPayloadCaptures = new Map<string, ProviderPayloadCapture>();
   readonly retentionScrubRuns = new Map<string, RetentionScrubRun>();
-  readonly conversations = new Map<string, Conversation>();
+  readonly conversations = new Map<
+    string,
+    Conversation & { temporaryExpiresAt: string | null }
+  >();
   readonly userPreferences = new Map<string, UserPreferences>();
   readonly conversationFolders = new Map<string, ConversationFolder>();
   readonly conversationFolderMemberships = new Map<string, ConversationFolderMembership>();
@@ -851,19 +856,36 @@ export class MemoryRepository {
     title: string,
     temporary = false,
     idempotencyKey?: string,
-  ): Conversation {
+    temporaryRetentionDays = 30,
+  ): Conversation & { temporaryExpiresAt: string | null } {
+    if (
+      temporary &&
+      (!Number.isInteger(temporaryRetentionDays) || temporaryRetentionDays < 1 ||
+        temporaryRetentionDays > 3650)
+    ) {
+      throw new DomainError(
+        "validation_error",
+        "Temporary retention days must be between 1 and 3650",
+        422,
+      );
+    }
     if (idempotencyKey) {
       const priorId = this.idempotency.get(`conversation:${ownerId}:${idempotencyKey}`);
       if (priorId) {
         const prior = this.conversations.get(priorId)!;
-        if (prior.title !== title || prior.temporary !== temporary) {
+        if (
+          prior.title !== title || prior.temporary !== temporary ||
+          (temporary &&
+            Date.parse(prior.temporaryExpiresAt!) - Date.parse(prior.createdAt) !==
+              temporaryRetentionDays * 86_400_000)
+        ) {
           throw new DomainError("idempotency_conflict", "Conversation replay payload differs", 409);
         }
         return prior;
       }
     }
     const now = new Date().toISOString();
-    const conversation: Conversation = {
+    const conversation: Conversation & { temporaryExpiresAt: string | null } = {
       id: crypto.randomUUID(),
       ownerId,
       title,
@@ -871,6 +893,9 @@ export class MemoryRepository {
       version: 0,
       pinned: false,
       temporary,
+      temporaryExpiresAt: temporary
+        ? new Date(Date.parse(now) + temporaryRetentionDays * 86_400_000).toISOString()
+        : null,
       archivedAt: null,
       deletedAt: null,
       createdAt: now,
@@ -881,6 +906,75 @@ export class MemoryRepository {
       this.idempotency.set(`conversation:${ownerId}:${idempotencyKey}`, conversation.id);
     }
     return conversation;
+  }
+
+  promoteTemporaryConversation(ownerId: string, id: string, expectedVersion: number) {
+    const value = this.conversations.get(id);
+    if (!value || value.ownerId !== ownerId) {
+      throw new DomainError("not_found", "Conversation not found", 404);
+    }
+    if (value.version !== expectedVersion) {
+      throw new DomainError("version_conflict", "Conversation changed in another request", 409);
+    }
+    if (!value.temporary) {
+      throw new DomainError("not_temporary", "Conversation is already saved", 409);
+    }
+    value.temporary = false;
+    value.temporaryExpiresAt = null;
+    value.version++;
+    value.updatedAt = new Date().toISOString();
+    return value;
+  }
+
+  purgeExpiredTemporaryConversations(
+    input: PurgeTemporaryConversationsInput,
+  ): PurgeTemporaryConversationsResult {
+    const limit = input.limit ?? 100;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
+      throw new DomainError("validation_error", "Purge limit must be between 1 and 1000", 422);
+    }
+    const cutoff = Date.parse(input.now ?? new Date().toISOString());
+    if (!Number.isFinite(cutoff)) {
+      throw new DomainError("validation_error", "Invalid purge cutoff", 422);
+    }
+    const conversationIds = [...this.conversations.values()]
+      .filter((value) =>
+        value.ownerId === input.ownerId && value.temporary && value.temporaryExpiresAt !== null &&
+        Date.parse(value.temporaryExpiresAt) <= cutoff
+      )
+      .sort((a, b) =>
+        a.temporaryExpiresAt!.localeCompare(b.temporaryExpiresAt!) || a.id.localeCompare(b.id)
+      )
+      .slice(0, limit)
+      .map((value) => value.id);
+    const purged = new Set(conversationIds);
+    const messageIds = new Set(
+      [...this.messages.values()].filter((value) => purged.has(value.conversationId)).map((value) =>
+        value.id
+      ),
+    );
+    for (const id of conversationIds) this.conversations.delete(id);
+    for (const id of conversationIds) {
+      this.conversationFolderMemberships.delete(id);
+      this.conversationTagSets.delete(id);
+      for (const [key, binding] of this.conversationTagBindings) {
+        if (binding.conversationId === id) this.conversationTagBindings.delete(key);
+      }
+      for (const [key, binding] of this.knowledgeBindings) {
+        if (binding.conversationId === id) this.knowledgeBindings.delete(key);
+      }
+    }
+    for (const id of messageIds) {
+      this.messages.delete(id);
+      this.messageAttachments.delete(id);
+    }
+    for (const [runId, control] of this.generationControls) {
+      if (purged.has(control.conversationId)) this.generationControls.delete(runId);
+    }
+    for (const [key, resultId] of this.idempotency) {
+      if (purged.has(resultId) || messageIds.has(resultId)) this.idempotency.delete(key);
+    }
+    return { conversationIds };
   }
 
   listConversations(ownerId: string, includeDeleted = false) {
@@ -928,7 +1022,7 @@ export class MemoryRepository {
     return value;
   }
 
-  detail(id: string, ownerId: string): ConversationDetail {
+  detail(id: string, ownerId: string): LifecycleConversationDetail {
     const conversation = this.conversations.get(id);
     if (!conversation || conversation.ownerId !== ownerId) {
       throw new DomainError("not_found", "Conversation not found", 404);
