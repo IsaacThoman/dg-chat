@@ -48,6 +48,7 @@ test("previews and explicitly confirms a portable import", async ({ page }) => {
   await expect(page.getByLabel("Include temporary conversations")).not.toBeChecked();
   await page.getByRole("button", { name: "Choose archive" }).click();
   const dialog = page.getByRole("dialog", { name: "Import chat data" });
+  expect(await dialog.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
   await dialog.locator('input[type="file"]').setInputFiles({
     name: "dg-chat-export.dgchat",
     mimeType: "application/json",

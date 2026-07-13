@@ -219,7 +219,12 @@ function ShareDialog({
   };
 
   return (
-    <Modal title="Share conversation" close={requestClose} dismissible={!creating && !revokingId}>
+    <Modal
+      title="Share conversation"
+      close={requestClose}
+      dismissible={!creating && !revokingId}
+      variant="medium"
+    >
       <div className="modal-body share-dialog">
         <div className="share-immutable-note">
           <Shield size={18} />
@@ -244,8 +249,7 @@ function ShareDialog({
                 <button
                   type="button"
                   className="secondary"
-                  onClick={() =>
-                    void copy()}
+                  onClick={() => void copy()}
                 >
                   {copied ? <Check size={15} /> : <Copy size={15} />}
                   {copied ? "Copied" : "Copy"}
@@ -284,8 +288,7 @@ function ShareDialog({
                       type="radio"
                       name="share-identity"
                       checked={identityVisibility === "owner"}
-                      onChange={() =>
-                        setIdentityVisibility("owner")}
+                      onChange={() => setIdentityVisibility("owner")}
                     />
                     <span>
                       <strong>Show my name</strong>
@@ -314,8 +317,7 @@ function ShareDialog({
                       type="radio"
                       name="share-attachments"
                       checked={attachmentPolicy === "include"}
-                      onChange={() =>
-                        setAttachmentPolicy("include")}
+                      onChange={() => setAttachmentPolicy("include")}
                       disabled={attachments.length === 0}
                     />
                     <span>

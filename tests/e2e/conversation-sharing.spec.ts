@@ -97,6 +97,7 @@ test("creates and revokes an immutable snapshot with conservative defaults", asy
 
   await page.getByRole("button", { name: "Share an immutable snapshot" }).click();
   const dialog = page.getByRole("dialog", { name: "Share conversation" });
+  expect(await dialog.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
   await expect(dialog).toContainText("Future edits and branches will never change it");
   await expect(dialog.getByRole("radio", { name: "Anonymous" })).toBeChecked();
   await expect(dialog.getByRole("radio", { name: "Redact all" })).toBeChecked();

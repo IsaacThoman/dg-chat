@@ -2437,7 +2437,7 @@ kbd {
   font-size: 13px;
 }
 .portability-dialog {
-  min-width: min(520px, 78vw);
+  min-width: 0;
 }
 .portability-drop {
   display: grid;
@@ -2508,7 +2508,7 @@ kbd {
   color: var(--danger) !important;
 }
 .share-dialog {
-  width: min(620px, 82vw);
+  width: 100%;
 }
 .share-immutable-note {
   display: flex;
@@ -4688,6 +4688,9 @@ kbd {
 }
 .modal-wide {
   width: min(980px, 100%);
+}
+.modal-medium {
+  width: min(660px, 100%);
 }
 .modal-head {
   display: flex;

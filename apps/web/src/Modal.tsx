@@ -14,7 +14,7 @@ export function Modal(
     close: () => void;
     children: ReactNode;
     dismissible?: boolean;
-    variant?: "default" | "wide";
+    variant?: "default" | "medium" | "wide";
     restoreFocus?: boolean | (() => boolean);
   },
 ) {
@@ -70,7 +70,9 @@ export function Modal(
     >
       <div
         ref={dialogRef}
-        className={`modal${variant === "wide" ? " modal-wide" : ""}`}
+        className={`modal${variant === "medium" ? " modal-medium" : ""}${
+          variant === "wide" ? " modal-wide" : ""
+        }`}
         role="dialog"
         tabIndex={-1}
         aria-modal="true"

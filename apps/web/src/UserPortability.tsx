@@ -222,6 +222,7 @@ function ImportDialog({ close }: { close: () => void }) {
       title={result ? "Import complete" : "Import chat data"}
       close={close}
       dismissible={status === "idle"}
+      variant="medium"
     >
       <div className="modal-body portability-dialog">
         {result
