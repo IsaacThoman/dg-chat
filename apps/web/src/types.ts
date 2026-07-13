@@ -41,6 +41,59 @@ export interface Conversation {
   activeLeafId?: string | null;
   version?: number;
 }
+export type ShareIdentityVisibility = "owner" | "anonymous";
+export type ShareAttachmentPolicy = "include" | "redact" | "selected";
+export interface ConversationShareSummary {
+  id: string;
+  conversationId: string;
+  leafId: string;
+  conversationVersion: number;
+  title: string;
+  identityVisibility: ShareIdentityVisibility;
+  attachmentPolicy: ShareAttachmentPolicy;
+  attachmentCount: number;
+  messageCount: number;
+  expiresAt: string | null;
+  revokedAt: string | null;
+  createdAt: string;
+  version: number;
+}
+export interface PublicShareAttachment {
+  id: string;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+  width: number | null;
+  height: number | null;
+  createdAt: string;
+}
+export interface PublicShareMessage {
+  id: string;
+  role: "user" | "assistant" | "tool";
+  content: string;
+  model: string | null;
+  status: "complete" | "stopped" | "error";
+  parentId: string | null;
+  createdAt: string;
+  attachmentIds: string[];
+}
+export interface PublicConversationShare {
+  id: string;
+  title: string;
+  conversationVersion: number;
+  identity: { visibility: ShareIdentityVisibility; displayName: string | null };
+  attachmentPolicy: ShareAttachmentPolicy;
+  attachments: PublicShareAttachment[];
+  createdAt: string;
+  expiresAt: string | null;
+  messages: PublicShareMessage[];
+}
+export interface ConversationShareCreated {
+  share: ConversationShareSummary;
+  capability: string;
+  path: string;
+  replayed: boolean;
+}
 export interface Branch {
   index: number;
   total: number;

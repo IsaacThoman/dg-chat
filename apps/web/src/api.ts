@@ -23,6 +23,8 @@ import type {
   ConversationKnowledge,
   ConversationPortabilityDownload,
   ConversationPortabilityImportResult,
+  ConversationShareCreated,
+  ConversationShareSummary,
   ConversationTag,
   ConversationTagBinding,
   ConversationTagSet,
@@ -39,11 +41,14 @@ import type {
   ProviderSecretRestoreResult,
   ProviderSecretRestoreState,
   ProviderSecretRestoreUpload,
+  PublicConversationShare,
   RetentionPolicy,
   RetentionPreview,
   RetentionScrubRun,
   RetentionScrubRunPage,
   RetriedAdminJob,
+  ShareAttachmentPolicy,
+  ShareIdentityVisibility,
   Token,
   TokenRotation,
   TokenSecret,
@@ -295,6 +300,66 @@ export async function importConversationPortability(
   return await response.json() as ConversationPortabilityImportResult;
 }
 
+export async function createConversationShare(input: {
+  conversationId: string;
+  leafId: string;
+  expectedConversationVersion: number;
+  identityVisibility: ShareIdentityVisibility;
+  attachmentPolicy: ShareAttachmentPolicy;
+  selectedAttachmentIds: string[];
+  expiresAt: string | null;
+  capability: string;
+  idempotencyKey: string;
+}): Promise<ConversationShareCreated> {
+  const response = await fetch(`/api/conversations/${input.conversationId}/shares`, {
+    method: "POST",
+    credentials: "include",
+    headers: { ...json, "Idempotency-Key": input.idempotencyKey },
+    body: JSON.stringify({
+      leafId: input.leafId,
+      expectedConversationVersion: input.expectedConversationVersion,
+      identityVisibility: input.identityVisibility,
+      attachmentPolicy: input.attachmentPolicy,
+      selectedAttachmentIds: input.selectedAttachmentIds,
+      expiresAt: input.expiresAt,
+      capability: input.capability,
+    }),
+  });
+  if (!response.ok) throw await responseError(response);
+  return await response.json() as ConversationShareCreated;
+}
+
+export async function listConversationShares(): Promise<ConversationShareSummary[]> {
+  const response = await fetch("/api/shares", { credentials: "include" });
+  if (!response.ok) throw await responseError(response);
+  return ((await response.json()) as { data: ConversationShareSummary[] }).data;
+}
+
+export async function revokeConversationShare(
+  shareId: string,
+  expectedVersion: number,
+): Promise<ConversationShareSummary> {
+  const response = await fetch(`/api/shares/${shareId}/revoke`, {
+    method: "POST",
+    credentials: "include",
+    headers: json,
+    body: JSON.stringify({ expectedVersion }),
+  });
+  if (!response.ok) throw await responseError(response);
+  return ((await response.json()) as { share: ConversationShareSummary }).share;
+}
+
+export async function getPublicConversationShare(
+  capability: string,
+): Promise<PublicConversationShare> {
+  const response = await fetch(`/api/public/shares/${encodeURIComponent(capability)}`, {
+    credentials: "omit",
+    headers: { Accept: "application/json" },
+  });
+  if (!response.ok) throw await responseError(response);
+  return ((await response.json()) as { share: PublicConversationShare }).share;
+}
+
 async function request<T>(path: string, init?: RequestInit, fallback?: T): Promise<T> {
   try {
     const response = await fetch(`/api${path}`, {
@@ -511,6 +576,10 @@ export const api = {
   preferences: () => request<UserPreferences>("/preferences"),
   downloadConversationPortability,
   importConversationPortability,
+  createConversationShare,
+  listConversationShares,
+  revokeConversationShare,
+  getPublicConversationShare,
   updatePreferences: (
     preferences: UserPreferences,
     patch: Partial<
