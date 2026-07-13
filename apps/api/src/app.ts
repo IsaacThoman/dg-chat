@@ -18,11 +18,14 @@ import {
   approvalSchema,
   chatCompletionSchema,
   createAccessGroupSchema,
+  createConversationFolderSchema,
   createConversationSchema,
+  createConversationTagSchema,
   createKnowledgeCollectionSchema,
   createModelAliasSchema,
   createTokenSchema,
   deleteAccessGroupSchema,
+  deleteConversationFolderSchema,
   embeddingsSchema,
   generateMessageSchema,
   identityTokenSchema,
@@ -33,10 +36,13 @@ import {
   passwordResetSchema,
   previewAccessGroupPolicySchema,
   registerSchema,
+  reorderConversationFoldersSchema,
   replaceAccessGroupIdsSchema,
   replaceAccessGroupModelsSchema,
   replaceAccessGroupPolicySchema,
   replaceConversationKnowledgeSchema,
+  replaceConversationTagsSchema,
+  replaceFolderMembershipsSchema,
   responsesSchema,
   revokeTokenSchema,
   rotateTokenSchema,
@@ -45,10 +51,14 @@ import {
   setTokenAccessModeSchema,
   streamGenerationSchema,
   updateAccessGroupSchema,
+  updateConversationFolderSchema,
   updateConversationSchema,
+  updateConversationTagSchema,
   updateKnowledgeCollectionSchema,
   updateModelAliasSchema,
+  updatePreferencesSchema,
   updateTokenSchema,
+  workspaceDeleteSchema,
 } from "@dg-chat/contracts";
 import type {
   ChatCompletionRequest,
@@ -931,6 +941,22 @@ const requireUuid = (value: string, field: string): string => {
     throw new DomainError("validation_error", `${field} must be a valid UUID`, 422);
   }
   return value;
+};
+const requireIdempotencyKey = (value: string | undefined): string => {
+  const key = value?.trim();
+  if (
+    !key || key.length < 8 || key.length > 200 || [...key].some((character) => {
+      const code = character.charCodeAt(0);
+      return code <= 31 || code === 127;
+    })
+  ) {
+    throw new DomainError(
+      "idempotency_key_required",
+      "A valid Idempotency-Key header is required",
+      422,
+    );
+  }
+  return key;
 };
 
 async function stageMultipartUpload(
@@ -3199,6 +3225,117 @@ export function createApp(options: AppOptions = {}) {
 
   app.use("/api/conversations/*", authenticate, approved, sessionOnly);
   app.use("/api/conversations", authenticate, approved, sessionOnly);
+  app.use("/api/preferences", authenticate, approved, sessionOnly);
+  app.get("/api/preferences", async (c) => {
+    c.header("Cache-Control", "private, no-store");
+    return c.json(await repo.getUserPreferences(c.get("user").id));
+  });
+  app.patch("/api/preferences", async (c) => {
+    c.header("Cache-Control", "private, no-store");
+    return c.json(
+      await repo.updateUserPreferences(
+        c.get("user").id,
+        await parseJson(c, updatePreferencesSchema),
+      ),
+    );
+  });
+  app.use("/api/folders/*", authenticate, approved, sessionOnly);
+  app.use("/api/folders", authenticate, approved, sessionOnly);
+  app.get("/api/folders", async (c) => {
+    c.header("Cache-Control", "private, no-store");
+    const value = await repo.listConversationFolders(c.get("user").id);
+    return c.json({ data: value.folders, memberships: value.memberships });
+  });
+  app.post("/api/folders", async (c) => {
+    const body = await parseJson(c, createConversationFolderSchema);
+    return c.json(
+      await repo.createConversationFolder(
+        c.get("user").id,
+        body.name,
+        requireIdempotencyKey(c.req.header("idempotency-key")),
+      ),
+      201,
+    );
+  });
+  app.put("/api/folders/order", async (c) => {
+    const body = await parseJson(c, reorderConversationFoldersSchema);
+    return c.json({
+      data: await repo.reorderConversationFolders(
+        c.get("user").id,
+        body.folderIds,
+        body.expectedVersions,
+      ),
+    });
+  });
+  app.patch("/api/folders/:id", async (c) => {
+    const body = await parseJson(c, updateConversationFolderSchema);
+    return c.json(
+      await repo.updateConversationFolder(
+        c.get("user").id,
+        requireUuid(c.req.param("id"), "folderId"),
+        body.name!,
+        body.expectedVersion,
+      ),
+    );
+  });
+  app.delete("/api/folders/:id", async (c) => {
+    const body = await parseJson(c, deleteConversationFolderSchema);
+    await repo.deleteConversationFolder(
+      c.get("user").id,
+      requireUuid(c.req.param("id"), "folderId"),
+      body.expectedVersion,
+      body.expectedMembershipVersion,
+    );
+    return c.body(null, 204);
+  });
+  app.put("/api/folders/:id/conversations", async (c) => {
+    const body = await parseJson(c, replaceFolderMembershipsSchema);
+    const value = await repo.replaceFolderMemberships(
+      c.get("user").id,
+      requireUuid(c.req.param("id"), "folderId"),
+      body.conversationIds,
+      body.expectedMembershipVersions,
+    );
+    return c.json({ data: value.folders, memberships: value.memberships });
+  });
+  app.use("/api/tags/*", authenticate, approved, sessionOnly);
+  app.use("/api/tags", authenticate, approved, sessionOnly);
+  app.get("/api/tags", async (c) => {
+    c.header("Cache-Control", "private, no-store");
+    const value = await repo.listConversationTags(c.get("user").id);
+    return c.json({ data: value.tags, bindings: value.bindings, tagSets: value.tagSets });
+  });
+  app.post("/api/tags", async (c) => {
+    const body = await parseJson(c, createConversationTagSchema);
+    return c.json(
+      await repo.createConversationTag(
+        c.get("user").id,
+        body.name,
+        body.color,
+        requireIdempotencyKey(c.req.header("idempotency-key")),
+      ),
+      201,
+    );
+  });
+  app.patch("/api/tags/:id", async (c) => {
+    const body = await parseJson(c, updateConversationTagSchema);
+    return c.json(
+      await repo.updateConversationTag(
+        c.get("user").id,
+        requireUuid(c.req.param("id"), "tagId"),
+        body,
+      ),
+    );
+  });
+  app.delete("/api/tags/:id", async (c) => {
+    const body = await parseJson(c, workspaceDeleteSchema);
+    await repo.deleteConversationTag(
+      c.get("user").id,
+      requireUuid(c.req.param("id"), "tagId"),
+      body.expectedVersion,
+    );
+    return c.body(null, 204);
+  });
   app.get(
     "/api/conversations",
     async (c) =>
@@ -3468,6 +3605,8 @@ export function createApp(options: AppOptions = {}) {
         embeddingVersion: queryEmbedding?.version,
       });
       if (knowledgeContext.message) history.unshift(knowledgeContext.message);
+      const customInstructions = (await repo.getUserPreferences(ownerId)).customInstructions.trim();
+      if (customInstructions) history.unshift({ role: "system", content: customInstructions });
       const estimatedInputTokens = estimateWebContextTokens(history);
       if (estimatedInputTokens >= model.contextWindow) {
         throw new DomainError(
@@ -3856,6 +3995,9 @@ export function createApp(options: AppOptions = {}) {
           },
         );
         if (knowledgeContext.message) history.unshift(knowledgeContext.message);
+        const customInstructions = (await repo.getUserPreferences(ownerId)).customInstructions
+          .trim();
+        if (customInstructions) history.unshift({ role: "system", content: customInstructions });
         inputTokens = estimateWebContextTokens(history);
         if (inputTokens >= model.contextWindow) {
           throw new DomainError(
@@ -4164,6 +4306,17 @@ export function createApp(options: AppOptions = {}) {
     const body = await parseJson(c, updateConversationSchema);
     return c.json(
       await repo.updateConversation(c.get("user").id, c.req.param("id"), body),
+    );
+  });
+  app.put("/api/conversations/:id/tags", async (c) => {
+    const body = await parseJson(c, replaceConversationTagsSchema);
+    return c.json(
+      await repo.replaceConversationTags(
+        c.get("user").id,
+        requireUuid(c.req.param("id"), "conversationId"),
+        body.tagIds,
+        body.expectedVersion,
+      ),
     );
   });
 
@@ -8948,6 +9101,15 @@ export function createApp(options: AppOptions = {}) {
         return c.json(openAIError(error.message, error.code), error.status as 400);
       }
       return c.json({ error: { code: error.code, message: error.message } }, error.status as 400);
+    }
+    const databaseCode = (error as { code?: unknown })?.code;
+    if (databaseCode === "40P01" || databaseCode === "40001" || databaseCode === "55P03") {
+      return c.json({
+        error: {
+          code: "version_conflict",
+          message: "The request conflicted with another update. Reload and try again.",
+        },
+      }, 409);
     }
     const correlationId = crypto.randomUUID();
     console.error(

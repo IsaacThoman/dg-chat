@@ -218,6 +218,13 @@
       "when": 1783656030000,
       "tag": "0030_restore_provider_secret_sidecars",
       "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1783656031000,
+      "tag": "0031_conversation_organization",
+      "breakpoints": true
     }
   ]
 }

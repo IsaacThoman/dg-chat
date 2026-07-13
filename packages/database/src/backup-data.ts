@@ -234,6 +234,44 @@ export const BACKUP_DATA_TABLES: readonly BackupDataTable[] = Object.freeze([
     },
   ),
   T(
+    "user_preferences",
+    "user_id version theme compact_conversations reduce_motion custom_instructions use_memory save_history preferred_model_id created_at updated_at",
+    "user_id",
+    {
+      version: "integer",
+      compact_conversations: "boolean",
+      reduce_motion: "boolean",
+      use_memory: "boolean",
+      save_history: "boolean",
+    },
+  ),
+  T(
+    "conversation_folders",
+    "id owner_id name normalized_name position version membership_version created_at updated_at",
+    "id",
+    { position: "integer", version: "integer", membership_version: "integer" },
+  ),
+  T(
+    "conversation_folder_memberships",
+    "folder_id conversation_id owner_id position created_at updated_at",
+    "folder_id,position,conversation_id",
+    { position: "integer" },
+  ),
+  T(
+    "conversation_tags",
+    "id owner_id name normalized_name color version created_at updated_at",
+    "id",
+    { version: "integer" },
+  ),
+  T("conversation_tag_sets", "conversation_id owner_id version updated_at", "conversation_id", {
+    version: "integer",
+  }),
+  T(
+    "conversation_tag_bindings",
+    "conversation_id tag_id owner_id created_at",
+    "conversation_id,tag_id",
+  ),
+  T(
     "messages",
     "id conversation_id parent_id supersedes_id generation_id sibling_index role content model status metadata idempotency_key created_at",
     "conversation_id,sibling_index,id",
@@ -1021,6 +1059,39 @@ const RELATIONS: readonly BackupRelation[] = Object.freeze([
   },
   { from: "attachments", columns: ["owner_id"], to: "users", target: ["id"] },
   { from: "conversations", columns: ["owner_id"], to: "users", target: ["id"] },
+  { from: "user_preferences", columns: ["user_id"], to: "users", target: ["id"] },
+  { from: "conversation_folders", columns: ["owner_id"], to: "users", target: ["id"] },
+  {
+    from: "conversation_folder_memberships",
+    columns: ["folder_id", "owner_id"],
+    to: "conversation_folders",
+    target: ["id", "owner_id"],
+  },
+  {
+    from: "conversation_folder_memberships",
+    columns: ["conversation_id", "owner_id"],
+    to: "conversations",
+    target: ["id", "owner_id"],
+  },
+  { from: "conversation_tags", columns: ["owner_id"], to: "users", target: ["id"] },
+  {
+    from: "conversation_tag_sets",
+    columns: ["conversation_id", "owner_id"],
+    to: "conversations",
+    target: ["id", "owner_id"],
+  },
+  {
+    from: "conversation_tag_bindings",
+    columns: ["conversation_id", "owner_id"],
+    to: "conversation_tag_sets",
+    target: ["conversation_id", "owner_id"],
+  },
+  {
+    from: "conversation_tag_bindings",
+    columns: ["tag_id", "owner_id"],
+    to: "conversation_tags",
+    target: ["id", "owner_id"],
+  },
   {
     from: "conversations",
     columns: ["active_leaf_id", "id"],
@@ -1209,6 +1280,25 @@ async function validateStagedDatabase(
   );
   if (!admins || admins.count < 1) {
     throw new BackupDataError("invariant", "Restore must contain an active approved administrator");
+  }
+  for (const table of ["conversation_folders", "conversation_tags"] as const) {
+    const invalid = await tx.unsafe(
+      `SELECT 1 FROM ${
+        staged(table)
+      } WHERE normalized_name<>translate(name,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz') LIMIT 1`,
+    );
+    if (invalid.length) {
+      throw new BackupDataError(
+        "invariant",
+        `Backup ${table} contains a nonportable name identity`,
+      );
+    }
+    const duplicate = await tx.unsafe(
+      `SELECT 1 FROM ${staged(table)} GROUP BY owner_id,normalized_name HAVING count(*)>1 LIMIT 1`,
+    );
+    if (duplicate.length) {
+      throw new BackupDataError("invariant", `Backup ${table} contains duplicate name identities`);
+    }
   }
   const cycles = await tx.unsafe(
     `WITH RECURSIVE walk AS (

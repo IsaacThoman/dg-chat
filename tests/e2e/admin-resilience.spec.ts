@@ -146,9 +146,9 @@ test("an administrator creates and orders a resilient route accessibly", async (
 
   await editRoute.click();
   await page.getByRole("button", { name: `Move ${fallbackTwo.displayName} up` }).click();
-  await expect(page.locator('.sr-only[aria-live="polite"]')).toContainText(
-    `${fallbackTwo.displayName} moved to position 1 of 2`,
-  );
+  await expect(
+    page.getByRole("dialog").locator('.sr-only[aria-live="polite"]'),
+  ).toContainText(`${fallbackTwo.displayName} moved to position 1 of 2`);
   const orderedItems = page.getByRole("list", {
     name: `Fallback order for ${primary.displayName}`,
   }).getByRole("listitem");

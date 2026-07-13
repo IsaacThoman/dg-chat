@@ -18,7 +18,12 @@ import type {
   BackupRestoreStatusCapability,
   BackupRestoreUpload,
   Conversation,
+  ConversationFolder,
+  ConversationFolderMembership,
   ConversationKnowledge,
+  ConversationTag,
+  ConversationTagBinding,
+  ConversationTagSet,
   DiscoveredProviderModel,
   KnowledgeCollection,
   KnowledgeMode,
@@ -41,6 +46,7 @@ import type {
   TokenRotation,
   TokenSecret,
   User,
+  UserPreferences,
 } from "./types.ts";
 import { demoConversations, demoMessages, demoModels, demoTokens, demoUser } from "./demo.ts";
 import type { SetupStatus } from "./setupDiscovery.ts";
@@ -64,6 +70,7 @@ type RawConversation = {
   activeLeafId: string | null;
   version: number;
   pinned: boolean;
+  temporary?: boolean;
   archivedAt: string | null;
   deletedAt: string | null;
   updatedAt: string;
@@ -139,6 +146,7 @@ export function mapConversation(value: RawConversation): Conversation {
     preview: "",
     updatedAt: new Date(value.updatedAt).toLocaleString(),
     pinned: value.pinned,
+    temporary: value.temporary ?? false,
     archived: Boolean(value.archivedAt),
     deleted: Boolean(value.deletedAt),
     activeLeafId: value.activeLeafId,
@@ -436,14 +444,112 @@ export const api = {
       { method: "POST" },
     ).then((result) => result.attachment),
   updateConversation: async (
-    id: string,
+    conversation: Pick<Conversation, "id" | "version">,
     patch: { title?: string; pinned?: boolean; archived?: boolean; deleted?: boolean },
   ) =>
     mapConversation(
-      await request<RawConversation>(`/conversations/${id}`, {
+      await request<RawConversation>(`/conversations/${conversation.id}`, {
         method: "PATCH",
-        body: JSON.stringify(patch),
+        body: JSON.stringify({ expectedVersion: conversation.version, ...patch }),
       }),
+    ),
+  preferences: () => request<UserPreferences>("/preferences"),
+  updatePreferences: (
+    preferences: UserPreferences,
+    patch: Partial<
+      Pick<
+        UserPreferences,
+        | "theme"
+        | "compactConversations"
+        | "reduceMotion"
+        | "customInstructions"
+        | "useMemory"
+        | "saveHistory"
+        | "preferredModelId"
+      >
+    >,
+  ) =>
+    request<UserPreferences>("/preferences", {
+      method: "PATCH",
+      body: JSON.stringify({ expectedVersion: preferences.version, ...patch }),
+    }),
+  folders: () =>
+    request<{ data: ConversationFolder[]; memberships: ConversationFolderMembership[] }>(
+      "/folders",
+    ),
+  createFolder: (name: string, idempotencyKey: string) =>
+    request<ConversationFolder>("/folders", {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+      body: JSON.stringify({ name }),
+    }),
+  updateFolder: (folder: ConversationFolder, name: string) =>
+    request<ConversationFolder>(`/folders/${encodeURIComponent(folder.id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ name, expectedVersion: folder.version }),
+    }),
+  deleteFolder: (folder: ConversationFolder) =>
+    request<void>(`/folders/${encodeURIComponent(folder.id)}`, {
+      method: "DELETE",
+      body: JSON.stringify({
+        expectedVersion: folder.version,
+        expectedMembershipVersion: folder.membershipVersion,
+      }),
+    }),
+  reorderFolders: async (folders: ConversationFolder[]) =>
+    (await request<{ data: ConversationFolder[] }>(
+      "/folders/order",
+      {
+        method: "PUT",
+        body: JSON.stringify({
+          folderIds: folders.map((folder) => folder.id),
+          expectedVersions: Object.fromEntries(
+            folders.map((folder) => [folder.id, folder.version]),
+          ),
+        }),
+      },
+    )).data,
+  setFolderConversations: (
+    folder: ConversationFolder,
+    conversationIds: string[],
+    expectedMembershipVersions: Record<string, number>,
+  ) =>
+    request<{ data: ConversationFolder[]; memberships: ConversationFolderMembership[] }>(
+      `/folders/${encodeURIComponent(folder.id)}/conversations`,
+      {
+        method: "PUT",
+        body: JSON.stringify({
+          conversationIds,
+          expectedMembershipVersions,
+        }),
+      },
+    ),
+  tags: () =>
+    request<{
+      data: ConversationTag[];
+      bindings: ConversationTagBinding[];
+      tagSets: ConversationTagSet[];
+    }>("/tags"),
+  createTag: (name: string, color: string, idempotencyKey: string) =>
+    request<ConversationTag>("/tags", {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+      body: JSON.stringify({ name, color }),
+    }),
+  updateTag: (tag: ConversationTag, patch: { name?: string; color?: string }) =>
+    request<ConversationTag>(`/tags/${encodeURIComponent(tag.id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ expectedVersion: tag.version, ...patch }),
+    }),
+  deleteTag: (tag: ConversationTag) =>
+    request<void>(`/tags/${encodeURIComponent(tag.id)}`, {
+      method: "DELETE",
+      body: JSON.stringify({ expectedVersion: tag.version }),
+    }),
+  setConversationTags: (conversationId: string, tagIds: string[], expectedVersion: number) =>
+    request<{ tagSet: ConversationTagSet; bindings: ConversationTagBinding[] }>(
+      `/conversations/${encodeURIComponent(conversationId)}/tags`,
+      { method: "PUT", body: JSON.stringify({ tagIds, expectedVersion }) },
     ),
   conversation: async (id: string) =>
     mapConversation(await request<RawConversation>(`/conversations/${id}`)),
@@ -513,12 +619,16 @@ export const api = {
       headers: { "x-setup-token": setupToken },
       body: JSON.stringify({ name, email, password }),
     }),
-  createConversation: async (title = "New chat", idempotencyKey: string = crypto.randomUUID()) =>
+  createConversation: async (
+    title = "New chat",
+    idempotencyKey: string = crypto.randomUUID(),
+    temporary = false,
+  ) =>
     mapConversation(
       await request<RawConversation>("/conversations", {
         method: "POST",
         headers: { "Idempotency-Key": idempotencyKey },
-        body: JSON.stringify({ title, idempotencyKey }),
+        body: JSON.stringify({ title, idempotencyKey, temporary }),
       }),
     ),
   createToken: (input: {

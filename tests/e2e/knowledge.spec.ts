@@ -51,9 +51,13 @@ test.beforeEach(async ({ page, request }) => {
 
 async function openSidebar(page: import("@playwright/test").Page) {
   if ((page.viewportSize()?.width ?? 1280) <= 800) {
+    if (await page.getByRole("dialog", { name: "Workspace navigation" }).isVisible()) return;
     await page.getByRole("button", { name: "Open menu", exact: true }).click();
   }
 }
+
+const workspaceNavigation = (page: import("@playwright/test").Page) =>
+  page.getByLabel("Workspace navigation", { exact: true });
 
 test("manages a collection and persists conversation knowledge", async ({ page }, testInfo) => {
   const suffix = `${Date.now()}-${testInfo.project.name}`;
@@ -79,7 +83,7 @@ test("manages a collection and persists conversation knowledge", async ({ page }
   }, { timeout: 30_000 }).toBe("ready");
 
   await openSidebar(page);
-  await page.getByRole("complementary").getByRole("button", {
+  await workspaceNavigation(page).getByRole("button", {
     name: "Knowledge",
     exact: true,
   }).click();
@@ -108,7 +112,7 @@ test("manages a collection and persists conversation knowledge", async ({ page }
   );
 
   await openSidebar(page);
-  await page.getByRole("complementary").getByRole("button", { name: "Chats", exact: true })
+  await workspaceNavigation(page).getByRole("button", { name: "Chats", exact: true })
     .click();
   const knowledgeTrigger = page.getByRole("main").getByRole("button", { name: /^Knowledge/ });
   await knowledgeTrigger.click();
@@ -130,7 +134,7 @@ test("manages a collection and persists conversation knowledge", async ({ page }
   await expect(knowledgeTrigger).not.toContainText("1");
 
   await openSidebar(page);
-  await page.getByRole("complementary").getByRole("button", {
+  await workspaceNavigation(page).getByRole("button", {
     name: "Knowledge",
     exact: true,
   }).click();
@@ -198,7 +202,7 @@ test("recovers failed extraction from the file picker and polls until selectable
   });
 
   await openSidebar(page);
-  await page.getByRole("complementary").getByRole("button", { name: "Knowledge", exact: true })
+  await workspaceNavigation(page).getByRole("button", { name: "Knowledge", exact: true })
     .click();
   await page.getByRole("button", { name: "Create collection" }).click();
   const createDialog = page.getByRole("dialog", { name: "New collection" });
@@ -232,7 +236,7 @@ test("persists library selection and repairs it after the selected collection is
   const storageKey = "dg-chat.active-knowledge-collection";
 
   await openSidebar(page);
-  await page.getByRole("complementary").getByRole("button", { name: "Knowledge", exact: true })
+  await workspaceNavigation(page).getByRole("button", { name: "Knowledge", exact: true })
     .click();
   const createCollection = async (name: string) => {
     await page.getByRole("button", { name: "Create collection" }).click();
@@ -261,11 +265,11 @@ test("persists library selection and repairs it after the selected collection is
   );
 
   await openSidebar(page);
-  await page.getByRole("complementary").getByRole("button", { name: "Chats", exact: true })
+  await workspaceNavigation(page).getByRole("button", { name: "Chats", exact: true })
     .click();
   await page.reload();
   await openSidebar(page);
-  await page.getByRole("complementary").getByRole("button", { name: "Knowledge", exact: true })
+  await workspaceNavigation(page).getByRole("button", { name: "Knowledge", exact: true })
     .click();
   await expect(page.getByRole("heading", { name: firstName, exact: true })).toBeVisible();
   expect(await page.evaluate((key) => sessionStorage.getItem(key), storageKey)).toBe(first!.id);

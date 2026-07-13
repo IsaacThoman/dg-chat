@@ -20,3 +20,37 @@ export function modalFocusableElements(dialog: HTMLElement): HTMLElement[] {
 export function modalShouldRestoreFocus(value: boolean | (() => boolean)): boolean {
   return typeof value === "function" ? value() : value;
 }
+
+export function modalOverlayPresent(
+  root: Pick<Document, "querySelector"> = document,
+): boolean {
+  return Boolean(root.querySelector(".modal-overlay"));
+}
+
+export function consumeModalEscape(
+  event: Pick<KeyboardEvent, "key" | "preventDefault" | "stopImmediatePropagation">,
+  dismissible: boolean,
+  close: () => void,
+): boolean {
+  if (event.key !== "Escape" || !dismissible) return false;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  close();
+  return true;
+}
+
+export function drawerShouldHandleEscape(
+  event: Pick<KeyboardEvent, "key" | "defaultPrevented">,
+  modalOpen: boolean,
+): boolean {
+  return event.key === "Escape" && !event.defaultPrevented && !modalOpen;
+}
+
+export function modalInitialFocus(
+  dialog: HTMLElement,
+  focusable = modalFocusableElements(dialog),
+): HTMLElement {
+  return focusable.find((element) =>
+    element.hasAttribute("data-autofocus") || element.hasAttribute("autofocus")
+  ) ?? focusable[0] ?? dialog;
+}

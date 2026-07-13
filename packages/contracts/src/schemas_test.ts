@@ -1,13 +1,22 @@
 import { assertEquals } from "jsr:@std/assert@1.0.14";
 import {
   chatCompletionSchema,
+  createConversationFolderSchema,
+  createConversationTagSchema,
   createTokenSchema,
   generateMessageSchema,
+  reorderConversationFoldersSchema,
+  replaceConversationTagsSchema,
+  replaceFolderMembershipsSchema,
   responsesSchema,
   setActiveLeafSchema,
   streamGenerationSchema,
+  updateConversationFolderSchema,
   updateConversationSchema,
+  updateConversationTagSchema,
+  updatePreferencesSchema,
   updateTokenSchema,
+  workspaceDeleteSchema,
 } from "./schemas.ts";
 import { isModelCapability, MODEL_CAPABILITIES } from "./types.ts";
 
@@ -122,14 +131,28 @@ Deno.test("Responses accepts bounded developer and function-call history items",
 });
 
 Deno.test("conversation patches are strict, bounded, and normalized", () => {
-  assertEquals(updateConversationSchema.parse({ title: "  Renamed  " }), { title: "Renamed" });
-  assertEquals(updateConversationSchema.safeParse({}).success, false);
-  assertEquals(updateConversationSchema.safeParse({ title: "x".repeat(201) }).success, false);
+  assertEquals(updateConversationSchema.parse({ title: "  Renamed  ", expectedVersion: 2 }), {
+    title: "Renamed",
+    expectedVersion: 2,
+  });
+  assertEquals(updateConversationSchema.safeParse({ expectedVersion: 2 }).success, false);
   assertEquals(
-    updateConversationSchema.safeParse({ title: "ok", ownerId: "other" }).success,
+    updateConversationSchema.safeParse({ title: "x".repeat(201), expectedVersion: 2 }).success,
     false,
   );
-  assertEquals(updateConversationSchema.safeParse({ pinned: "yes" }).success, false);
+  assertEquals(
+    updateConversationSchema.safeParse({ title: "ok", expectedVersion: 2, ownerId: "other" })
+      .success,
+    false,
+  );
+  assertEquals(
+    updateConversationSchema.safeParse({ pinned: "yes", expectedVersion: 2 }).success,
+    false,
+  );
+  assertEquals(
+    updateConversationSchema.safeParse({ pinned: true, expectedVersion: -1 }).success,
+    false,
+  );
 });
 
 Deno.test("active leaf changes require a strict UUID and optimistic version", () => {
@@ -148,6 +171,120 @@ Deno.test("active leaf changes require a strict UUID and optimistic version", ()
   assertEquals(
     setActiveLeafSchema.safeParse({ leafId: crypto.randomUUID(), expectedVersion: 0, ownerId: "x" })
       .success,
+    false,
+  );
+});
+
+Deno.test("workspace preferences are strict, bounded, and require an optimistic mutation", () => {
+  assertEquals(
+    updatePreferencesSchema.parse({
+      expectedVersion: 1,
+      theme: "dark",
+      preferredModelId: "  provider/model  ",
+    }),
+    { expectedVersion: 1, theme: "dark", preferredModelId: "provider/model" },
+  );
+  assertEquals(updatePreferencesSchema.safeParse({ expectedVersion: 1 }).success, false);
+  assertEquals(
+    updatePreferencesSchema.safeParse({ expectedVersion: 0, theme: "system" }).success,
+    false,
+  );
+  assertEquals(
+    updatePreferencesSchema.safeParse({
+      expectedVersion: 1,
+      customInstructions: "x".repeat(20_001),
+    })
+      .success,
+    false,
+  );
+  assertEquals(
+    updatePreferencesSchema.safeParse({ expectedVersion: 1, theme: "dark", userId: "other" })
+      .success,
+    false,
+  );
+  assertEquals(
+    updatePreferencesSchema.safeParse({ expectedVersion: 1, preferredModelId: null }).success,
+    true,
+  );
+});
+
+Deno.test("folder contracts reject ambiguous reorder and membership mutations", () => {
+  const first = crypto.randomUUID();
+  const second = crypto.randomUUID();
+  assertEquals(createConversationFolderSchema.parse({ name: "  Research  " }), {
+    name: "Research",
+  });
+  assertEquals(createConversationFolderSchema.safeParse({ name: " " }).success, false);
+  assertEquals(
+    updateConversationFolderSchema.safeParse({ expectedVersion: 1 }).success,
+    false,
+  );
+  assertEquals(
+    updateConversationFolderSchema.safeParse({ expectedVersion: 0, name: "Renamed" }).success,
+    false,
+  );
+  assertEquals(
+    reorderConversationFoldersSchema.safeParse({
+      folderIds: [first, second],
+      expectedVersions: { [first]: 1, [second]: 3 },
+    }).success,
+    true,
+  );
+  assertEquals(
+    reorderConversationFoldersSchema.safeParse({
+      folderIds: [first, first],
+      expectedVersions: { [first]: 1 },
+    }).success,
+    false,
+  );
+  assertEquals(
+    reorderConversationFoldersSchema.safeParse({
+      folderIds: [first, second],
+      expectedVersions: { [first]: 1 },
+    }).success,
+    false,
+  );
+  assertEquals(
+    replaceFolderMembershipsSchema.safeParse({
+      conversationIds: [first, first],
+      expectedMembershipVersions: { [second]: 0 },
+    }).success,
+    false,
+  );
+  assertEquals(workspaceDeleteSchema.safeParse({ expectedVersion: 0 }).success, false);
+  assertEquals(
+    workspaceDeleteSchema.safeParse({ expectedVersion: 1, deleteConversations: true }).success,
+    false,
+  );
+});
+
+Deno.test("tag contracts normalize names and bound colors and assignment sets", () => {
+  const tagId = crypto.randomUUID();
+  assertEquals(createConversationTagSchema.parse({ name: "  Review  ", color: "#aBc123" }), {
+    name: "Review",
+    color: "#aBc123",
+  });
+  assertEquals(
+    createConversationTagSchema.safeParse({ name: "Review", color: "red" }).success,
+    false,
+  );
+  assertEquals(
+    updateConversationTagSchema.safeParse({ expectedVersion: 1 }).success,
+    false,
+  );
+  assertEquals(
+    updateConversationTagSchema.safeParse({ expectedVersion: 0, color: "#000000" }).success,
+    false,
+  );
+  assertEquals(
+    replaceConversationTagsSchema.safeParse({ tagIds: [tagId, tagId], expectedVersion: 0 }).success,
+    false,
+  );
+  assertEquals(
+    replaceConversationTagsSchema.safeParse({
+      tagIds: Array.from({ length: 21 }, () => crypto.randomUUID()),
+      expectedVersion: 0,
+    }).success,
     false,
   );
 });

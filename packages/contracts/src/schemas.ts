@@ -26,13 +26,70 @@ export const createConversationSchema = z.object({
 });
 
 export const updateConversationSchema = z.object({
+  expectedVersion: z.number().int().nonnegative(),
   title: z.string().trim().min(1).max(200).optional(),
   pinned: z.boolean().optional(),
   archived: z.boolean().optional(),
   deleted: z.boolean().optional(),
-}).strict().refine((value) => Object.keys(value).length > 0, {
+}).strict().refine((value) => Object.keys(value).some((key) => key !== "expectedVersion"), {
   message: "At least one conversation field is required",
 });
+
+export const updatePreferencesSchema = z.object({
+  expectedVersion: z.number().int().positive(),
+  theme: z.enum(["light", "dark", "system"]).optional(),
+  compactConversations: z.boolean().optional(),
+  reduceMotion: z.boolean().optional(),
+  customInstructions: z.string().max(20_000).optional(),
+  useMemory: z.boolean().optional(),
+  saveHistory: z.boolean().optional(),
+  preferredModelId: z.string().trim().min(1).max(200).nullable().optional(),
+}).strict().refine((value) => Object.keys(value).some((key) => key !== "expectedVersion"), {
+  message: "At least one preference is required",
+});
+
+const workspaceNameSchema = z.string().trim().min(1).max(120);
+const expectedWorkspaceVersionSchema = z.number().int().positive();
+export const createConversationFolderSchema = z.object({ name: workspaceNameSchema }).strict();
+export const updateConversationFolderSchema = z.object({
+  name: workspaceNameSchema.optional(),
+  expectedVersion: expectedWorkspaceVersionSchema,
+}).strict().refine((value) => value.name !== undefined, { message: "A folder field is required" });
+export const reorderConversationFoldersSchema = z.object({
+  folderIds: z.array(z.string().uuid()).max(500).refine((ids) => new Set(ids).size === ids.length),
+  expectedVersions: z.record(z.string().uuid(), expectedWorkspaceVersionSchema),
+}).strict().refine((value) => {
+  const keys = Object.keys(value.expectedVersions);
+  return keys.length === value.folderIds.length && keys.every((id) => value.folderIds.includes(id));
+}, { message: "Expected versions must exactly match folder identifiers" });
+export const replaceFolderMembershipsSchema = z.object({
+  conversationIds: z.array(z.string().uuid()).max(5000).refine((ids) =>
+    new Set(ids).size === ids.length
+  ),
+  expectedMembershipVersions: z.record(z.string().uuid(), z.number().int().nonnegative()),
+}).strict();
+export const deleteConversationFolderSchema = z.object({
+  expectedVersion: expectedWorkspaceVersionSchema,
+  expectedMembershipVersion: z.number().int().nonnegative(),
+}).strict();
+export const workspaceDeleteSchema = z.object({
+  expectedVersion: expectedWorkspaceVersionSchema,
+}).strict();
+export const createConversationTagSchema = z.object({
+  name: workspaceNameSchema.max(64),
+  color: z.string().regex(/^#[0-9a-fA-F]{6}$/),
+}).strict();
+export const updateConversationTagSchema = z.object({
+  name: workspaceNameSchema.max(64).optional(),
+  color: z.string().regex(/^#[0-9a-fA-F]{6}$/).optional(),
+  expectedVersion: expectedWorkspaceVersionSchema,
+}).strict().refine((value) => value.name !== undefined || value.color !== undefined, {
+  message: "A tag field is required",
+});
+export const replaceConversationTagsSchema = z.object({
+  tagIds: z.array(z.string().uuid()).max(20).refine((ids) => new Set(ids).size === ids.length),
+  expectedVersion: z.number().int().nonnegative(),
+}).strict();
 
 const knowledgeIdempotencyKeySchema = z.string().min(8).max(160).regex(
   /^[A-Za-z0-9._:-]+$/,
