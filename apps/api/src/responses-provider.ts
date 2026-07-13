@@ -119,7 +119,7 @@ class ResponsesStreamConsistency {
   #refusal = "";
   #reasoning = "";
   #summary = "";
-  readonly #annotations: CanonicalUrlCitation[] = [];
+  readonly #annotations: Array<{ key: string; annotation: CanonicalUrlCitation }> = [];
 
   observe(events: CanonicalStreamEvent[]) {
     for (const event of events) {
@@ -138,7 +138,9 @@ class ResponsesStreamConsistency {
           arguments: current.arguments + (event.arguments ?? ""),
         });
       } else if (event.type === "annotation") {
-        this.#annotations.push({ ...event.annotation });
+        const key = `${event.outputIndex ?? 0}:${event.contentIndex ?? 0}`;
+        if (!this.#text.has(key)) this.#text.set(key, "");
+        this.#annotations.push({ key, annotation: { ...event.annotation } });
       }
     }
   }
@@ -181,14 +183,26 @@ class ResponsesStreamConsistency {
       const response = event.response;
       {
         const result = normalizeResponsesResult(response);
-        const streamedText = [...this.#text.entries()].sort(([left], [right]) =>
+        const textParts = [...this.#text.entries()].sort(([left], [right]) =>
           left.localeCompare(right, undefined, { numeric: true })
-        ).map(([, value]) => value).join("");
+        );
+        const streamedText = textParts.map(([, value]) => value).join("");
         this.#equal(result.text, streamedText, "terminal response text");
         this.#equal(result.refusal ?? "", this.#refusal, "terminal response refusal");
         this.#equal(result.reasoning?.summary ?? "", this.#summary, "terminal reasoning summary");
         this.#equal(result.reasoning?.content ?? "", this.#reasoning, "terminal reasoning content");
-        if (JSON.stringify(result.annotations ?? []) !== JSON.stringify(this.#annotations)) {
+        let textOffset = 0;
+        const textPartOffsets = new Map<string, number>();
+        for (const [key, value] of textParts) {
+          textPartOffsets.set(key, textOffset);
+          textOffset += value.length;
+        }
+        const streamedAnnotations = this.#annotations.map(({ key, annotation }) => ({
+          ...annotation,
+          startIndex: annotation.startIndex + (textPartOffsets.get(key) ?? 0),
+          endIndex: annotation.endIndex + (textPartOffsets.get(key) ?? 0),
+        }));
+        if (JSON.stringify(result.annotations ?? []) !== JSON.stringify(streamedAnnotations)) {
           throw new Error("Responses terminal citations conflict with streamed annotations");
         }
         const terminalTools = result.toolCalls.map(({ id, name, arguments: value }) => ({

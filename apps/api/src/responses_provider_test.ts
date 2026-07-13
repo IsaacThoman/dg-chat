@@ -1309,6 +1309,116 @@ Deno.test("Responses streaming rejects terminal citations that conflict with liv
   );
 });
 
+Deno.test("Responses streaming globalizes citations from later output text parts", async () => {
+  const citation = {
+    type: "url_citation",
+    start_index: 0,
+    end_index: 1,
+    title: "second part",
+    url: "https://example.test/second",
+  };
+  const content = [
+    { type: "output_text", text: "a", annotations: [] },
+    { type: "output_text", text: "b", annotations: [citation] },
+  ];
+  const partLifecycle = (contentIndex: number, text: string, annotations: unknown[]) => [
+    {
+      type: "response.content_part.added",
+      item_id: "msg_multi_part",
+      output_index: 0,
+      content_index: contentIndex,
+      part: { type: "output_text", text: "", annotations: [] },
+    },
+    {
+      type: "response.output_text.delta",
+      item_id: "msg_multi_part",
+      output_index: 0,
+      content_index: contentIndex,
+      delta: text,
+    },
+    ...(annotations.length
+      ? [{
+        type: "response.output_text.annotation.added",
+        item_id: "msg_multi_part",
+        output_index: 0,
+        content_index: contentIndex,
+        annotation_index: 0,
+        annotation: annotations[0],
+      }]
+      : []),
+    {
+      type: "response.output_text.done",
+      item_id: "msg_multi_part",
+      output_index: 0,
+      content_index: contentIndex,
+      text,
+    },
+    {
+      type: "response.content_part.done",
+      item_id: "msg_multi_part",
+      output_index: 0,
+      content_index: contentIndex,
+      part: { type: "output_text", text, annotations },
+    },
+  ];
+  const messageItem = {
+    id: "msg_multi_part",
+    type: "message",
+    status: "completed",
+    role: "assistant",
+    content,
+  };
+  const events = [
+    {
+      type: "response.created",
+      response: { id: "resp_multi_part", status: "in_progress", model: "upstream" },
+    },
+    {
+      type: "response.output_item.added",
+      output_index: 0,
+      item: {
+        id: "msg_multi_part",
+        type: "message",
+        status: "in_progress",
+        role: "assistant",
+      },
+    },
+    ...partLifecycle(0, "a", []),
+    ...partLifecycle(1, "b", [citation]),
+    {
+      type: "response.output_item.done",
+      output_index: 0,
+      item: messageItem,
+    },
+    {
+      type: "response.completed",
+      response: {
+        id: "resp_multi_part",
+        object: "response",
+        status: "completed",
+        model: "upstream",
+        output: [messageItem],
+      },
+    },
+  ];
+  const frames: string[] = [];
+  for await (
+    const frame of streamResponsesChat(request, new AbortController().signal, {
+      baseUrl: "https://provider.example/v1",
+      apiKey: "secret",
+      fetch: () =>
+        Promise.resolve(
+          new Response(
+            events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
+            { headers: { "content-type": "text/event-stream" } },
+          ),
+        ),
+    })
+  ) frames.push(frame);
+  assertEquals(frames.some((frame) => frame.includes('"start_index":1')), true);
+  assertEquals(frames.some((frame) => frame.includes('"end_index":2')), true);
+});
+
 Deno.test("Responses SSE parsing remains linear across many small transport chunks", async () => {
   const text = "x".repeat(32_768);
   const payload = new TextEncoder().encode([
