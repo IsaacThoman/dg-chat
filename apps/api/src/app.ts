@@ -627,11 +627,15 @@ const analyticsCsv = (
     "calls",
     "completed",
     "failed",
+    "success_rate",
     "input_tokens",
+    "cached_input_tokens",
+    "reasoning_tokens",
     "output_tokens",
     "customer_cost_micros",
     "provider_cost_micros",
     "avg_latency_ms",
+    "p95_latency_ms",
     "avg_ttft_ms",
   ]];
   rows.push([
@@ -641,11 +645,15 @@ const analyticsCsv = (
     analytics.summary.calls,
     analytics.summary.completed,
     analytics.summary.failed,
+    analytics.summary.successRate,
     analytics.summary.inputTokens,
+    analytics.summary.cachedInputTokens,
+    analytics.summary.reasoningTokens,
     analytics.summary.outputTokens,
     analytics.summary.customerCostMicros,
     analytics.summary.providerCostMicros,
     analytics.summary.avgLatencyMs,
+    analytics.summary.p95LatencyMs,
     analytics.summary.avgTtftMs,
   ]);
   for (const point of analytics.points) {
@@ -656,11 +664,15 @@ const analyticsCsv = (
       point.calls,
       point.completed,
       point.failed,
+      "",
       point.inputTokens,
+      "",
+      "",
       point.outputTokens,
       point.customerCostMicros,
       "",
       point.avgLatencyMs,
+      "",
       point.avgTtftMs,
     ]);
   }
@@ -672,7 +684,24 @@ const analyticsCsv = (
     ] as const
   ) {
     for (const value of values) {
-      rows.push([section, value.key, "", value.calls, "", "", "", "", value.customerCostMicros]);
+      rows.push([
+        section,
+        value.key,
+        "",
+        value.calls,
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        value.customerCostMicros,
+        "",
+        "",
+        "",
+        "",
+      ]);
     }
   }
   return rows.map((row) => row.map(csvCell).join(",")).join("\r\n") + "\r\n";

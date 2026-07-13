@@ -94,6 +94,7 @@ export function AdminAnalytics(props: AdminAnalyticsProps) {
   );
   const maxCalls = Math.max(1, ...(props.data?.points.map((point) => point.calls) ?? [1]));
   const points = props.data?.points ?? [];
+  const terminalCalls = props.data ? props.data.summary.completed + props.data.summary.failed : 0;
   return (
     <section className="ops-page" aria-labelledby={titleId}>
       <div className="ops-heading">
@@ -237,7 +238,12 @@ export function AdminAnalytics(props: AdminAnalyticsProps) {
             <Metric label="Calls" value={props.data.summary.calls.toLocaleString()} />
             <Metric label="Completed" value={props.data.summary.completed.toLocaleString()} />
             <Metric label="Failed" value={props.data.summary.failed.toLocaleString()} />
-            <Metric label="Success rate" value={`${props.data.summary.successRate.toFixed(1)}%`} />
+            <Metric
+              label="Success rate"
+              value={terminalCalls === 0
+                ? "Unavailable"
+                : `${(props.data.summary.successRate * 100).toFixed(1)}%`}
+            />
             <Metric label="Input tokens" value={props.data.summary.inputTokens.toLocaleString()} />
             <Metric
               label="Output tokens"
@@ -253,6 +259,12 @@ export function AdminAnalytics(props: AdminAnalyticsProps) {
             />
             <Metric label="Customer cost" value={money(props.data.summary.customerCostMicros)} />
             <Metric label="Provider cost" value={money(props.data.summary.providerCostMicros)} />
+            <Metric
+              label="Average latency"
+              value={props.data.summary.avgLatencyMs === null
+                ? "Unavailable"
+                : `${props.data.summary.avgLatencyMs.toLocaleString()} ms`}
+            />
             <Metric
               label="P95 latency"
               value={props.data.summary.p95LatencyMs === null

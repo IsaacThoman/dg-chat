@@ -1,4 +1,4 @@
-import { type ChangeEvent, type DragEvent, useRef, useState } from "react";
+import { type ChangeEvent, type DragEvent, useEffect, useRef, useState } from "react";
 import { Check, Download, FileJson, RefreshCw, Upload } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { api, ApiError } from "./api.ts";
@@ -6,6 +6,42 @@ import { Modal } from "./Modal.tsx";
 import type { ConversationPortabilityImportResult } from "./types.ts";
 
 export const PORTABILITY_MAX_BYTES = 16 * 1024 * 1024;
+
+export class PortabilitySelectionCoordinator {
+  #generation = 0;
+  #idempotencyKey: string;
+
+  constructor(private readonly createKey: () => string = () => crypto.randomUUID()) {
+    this.#idempotencyKey = createKey();
+  }
+
+  beginSelection(valid: boolean): number {
+    this.#generation += 1;
+    if (valid) this.#idempotencyKey = this.createKey();
+    return this.#generation;
+  }
+
+  cancel(): void {
+    this.#generation += 1;
+  }
+
+  isCurrent(generation: number): boolean {
+    return generation === this.#generation;
+  }
+
+  currentIdempotencyKey(): string {
+    return this.#idempotencyKey;
+  }
+
+  async latest<T>(generation: number, operation: () => Promise<T>): Promise<T | undefined> {
+    const result = await operation();
+    return this.isCurrent(generation) ? result : undefined;
+  }
+}
+
+export function resetPortabilityFileInput(input: Pick<HTMLInputElement, "value">): void {
+  input.value = "";
+}
 
 export function validatePortabilityFile(file: Pick<File, "name" | "size" | "type">): string | null {
   if (!/\.(dgchat|json)$/i.test(file.name)) {
@@ -153,7 +189,7 @@ export function UserPortability() {
 function ImportDialog({ close }: { close: () => void }) {
   const queryClient = useQueryClient();
   const input = useRef<HTMLInputElement>(null);
-  const idempotencyKey = useRef(crypto.randomUUID());
+  const [selection] = useState(() => new PortabilitySelectionCoordinator());
   const [dragging, setDragging] = useState(false);
   const [file, setFile] = useState<File | null>(null);
   const [archive, setArchive] = useState("");
@@ -162,36 +198,49 @@ function ImportDialog({ close }: { close: () => void }) {
   const [status, setStatus] = useState<"idle" | "reading" | "previewing" | "applying">("idle");
   const [error, setError] = useState("");
 
+  useEffect(() => () => selection.cancel(), [selection]);
+
   const choose = async (next: File | undefined) => {
     if (!next) return;
     const validation = validatePortabilityFile(next);
+    const generation = selection.beginSelection(validation === null);
     setError(validation ?? "");
     setFile(null);
     setArchive("");
     setPreview(null);
     setResult(null);
-    if (validation) return;
-    idempotencyKey.current = crypto.randomUUID();
+    if (validation) {
+      setStatus("idle");
+      return;
+    }
     setFile(next);
     setStatus("reading");
     try {
-      const text = await next.text();
+      const text = await selection.latest(generation, () => next.text());
+      if (text === undefined) return;
       JSON.parse(text);
       setArchive(text);
       setStatus("previewing");
-      setPreview(await api.importConversationPortability(text, true));
+      const nextPreview = await selection.latest(
+        generation,
+        () => api.importConversationPortability(text, true),
+      );
+      if (nextPreview === undefined) return;
+      setPreview(nextPreview);
     } catch (caught) {
+      if (!selection.isCurrent(generation)) return;
       setError(
         caught instanceof SyntaxError ? "This file is not valid JSON." : errorMessage(caught),
       );
     } finally {
-      setStatus("idle");
+      if (selection.isCurrent(generation)) setStatus("idle");
     }
   };
   const onInput = (event: ChangeEvent<HTMLInputElement>) => void choose(event.target.files?.[0]);
   const onDrop = (event: DragEvent<HTMLDivElement>) => {
     event.preventDefault();
     setDragging(false);
+    if (status !== "idle") return;
     void choose(event.dataTransfer.files[0]);
   };
   const apply = async () => {
@@ -201,7 +250,7 @@ function ImportDialog({ close }: { close: () => void }) {
       const imported = await api.importConversationPortability(
         archive,
         false,
-        idempotencyKey.current,
+        selection.currentIdempotencyKey(),
       );
       setResult(imported);
       await Promise.all([
@@ -245,9 +294,10 @@ function ImportDialog({ close }: { close: () => void }) {
               </p>
               <div
                 className={`portability-drop${dragging ? " dragging" : ""}`}
+                aria-disabled={status !== "idle"}
                 onDragEnter={(event) => {
                   event.preventDefault();
-                  setDragging(true);
+                  if (status === "idle") setDragging(true);
                 }}
                 onDragOver={(event) => event.preventDefault()}
                 onDragLeave={() => setDragging(false)}
@@ -276,9 +326,7 @@ function ImportDialog({ close }: { close: () => void }) {
                   accept="application/json,.dgchat,.json"
                   aria-hidden="true"
                   tabIndex={-1}
-                  onClick={(event) => {
-                    event.currentTarget.value = "";
-                  }}
+                  onClick={(event) => resetPortabilityFileInput(event.currentTarget)}
                   onChange={onInput}
                 />
               </div>

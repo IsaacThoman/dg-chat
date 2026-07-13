@@ -9,6 +9,7 @@
   --card: #fff;
   --ink: #242321;
   --muted: #77746e;
+  --supporting-ink: #6f6c66;
   --line: #e6e5e0;
   --purple: #7660bf;
   --purple-soft: #eeeafd;
@@ -23,6 +24,7 @@
   --card: #292927;
   --ink: #f2f1ed;
   --muted: #aaa79f;
+  --supporting-ink: #aaa79f;
   --line: #3b3a36;
   --purple: #a892ee;
   --purple-soft: #332d49;
@@ -2278,8 +2280,8 @@ kbd {
 }
 .section-title p {
   margin: 0;
-  font-size: 10px;
-  color: var(--muted);
+  font-size: 12px;
+  color: var(--supporting-ink);
 }
 .profile-row {
   display: flex;
@@ -2375,11 +2377,11 @@ kbd {
   gap: 3px;
 }
 .setting-row strong {
-  font-size: 10px;
+  font-size: 12px;
 }
 .setting-row small {
-  font-size: 9px;
-  color: var(--muted);
+  font-size: 12px;
+  color: var(--supporting-ink);
   line-height: 1.4;
 }
 .portability-card {
@@ -2404,7 +2406,7 @@ kbd {
 .portability-card-head small,
 .portability-card p,
 .portability-options small {
-  color: var(--muted);
+  color: var(--supporting-ink);
   font-size: 12px;
   line-height: 1.55;
 }
@@ -2461,7 +2463,7 @@ kbd {
 .portability-drop small,
 .portability-preview p,
 .portability-success p {
-  color: var(--muted);
+  color: var(--supporting-ink);
   font-size: 12px;
 }
 .portability-progress {
@@ -2492,8 +2494,8 @@ kbd {
   text-align: center;
 }
 .portability-summary dt {
-  color: var(--muted);
-  font-size: 11px;
+  color: var(--supporting-ink);
+  font-size: 12px;
 }
 .portability-summary dd {
   margin: 3px 0 0;
@@ -2508,6 +2510,11 @@ kbd {
 }
 .portability-success .portability-summary {
   width: 100%;
+}
+.portability-card .inline-error,
+.portability-dialog .inline-error {
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 .inline-error {
   color: var(--danger) !important;

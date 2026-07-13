@@ -127,6 +127,18 @@ Deno.test("admin analytics validates bounded filters and exports formula-safe no
   assertEquals(csv.headers.get("cache-control"), "private, no-store");
   assertEquals(csv.headers.get("x-content-type-options"), "nosniff");
   const body = await csv.text();
+  const rows = body.trimEnd().split("\r\n");
+  assertEquals(
+    rows[0],
+    '"section","key","start","calls","completed","failed","success_rate","input_tokens",' +
+      '"cached_input_tokens","reasoning_tokens","output_tokens","customer_cost_micros",' +
+      '"provider_cost_micros","avg_latency_ms","p95_latency_ms","avg_ttft_ms"',
+  );
+  assertEquals(
+    rows[1],
+    '"summary","total","2026-07-01T00:00:00.000Z","3","2","1",' +
+      '"0.6666666666666666","12","2","3","8","99","70","40","55","10"',
+  );
   assertStringIncludes(body, '"\'=unsafe-model"');
   assertStringIncludes(body, '"\'+unsafe-provider"');
 });

@@ -3,6 +3,8 @@ import { renderToString } from "react-dom/server";
 import { downloadConversationPortability, importConversationPortability } from "./api.ts";
 import {
   PORTABILITY_MAX_BYTES,
+  PortabilitySelectionCoordinator,
+  resetPortabilityFileInput,
   UserPortability,
   validatePortabilityFile,
 } from "./UserPortability.tsx";
@@ -10,6 +12,49 @@ import {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("user portability", () => {
+  it("ignores preview results from an older file selection", async () => {
+    const coordinator = new PortabilitySelectionCoordinator(() => crypto.randomUUID());
+    let resolveFirst!: (value: string) => void;
+    let resolveSecond!: (value: string) => void;
+    const firstResult = new Promise<string>((resolve) => resolveFirst = resolve);
+    const secondResult = new Promise<string>((resolve) => resolveSecond = resolve);
+
+    const firstGeneration = coordinator.beginSelection(true);
+    const first = coordinator.latest(firstGeneration, () => firstResult);
+    const secondGeneration = coordinator.beginSelection(true);
+    const second = coordinator.latest(secondGeneration, () => secondResult);
+
+    resolveSecond("second preview");
+    await expect(second).resolves.toBe("second preview");
+    resolveFirst("stale first preview");
+    await expect(first).resolves.toBeUndefined();
+  });
+
+  it("rotates apply keys for valid selections and keeps one stable across retries", () => {
+    const keys = ["initial", "first-selection", "second-selection"];
+    const coordinator = new PortabilitySelectionCoordinator(() => keys.shift()!);
+
+    coordinator.beginSelection(true);
+    const firstAttempt = coordinator.currentIdempotencyKey();
+    const retryAttempt = coordinator.currentIdempotencyKey();
+    expect(firstAttempt).toBe("first-selection");
+    expect(retryAttempt).toBe(firstAttempt);
+
+    coordinator.beginSelection(false);
+    expect(coordinator.currentIdempotencyKey()).toBe(firstAttempt);
+    coordinator.beginSelection(true);
+    expect(coordinator.currentIdempotencyKey()).toBe("second-selection");
+  });
+
+  it("clears the native input before every chooser opening so the same file can be selected again", () => {
+    const input = { value: "/fake/path/archive.dgchat" };
+    resetPortabilityFileInput(input);
+    expect(input.value).toBe("");
+    input.value = "/fake/path/archive.dgchat";
+    resetPortabilityFileInput(input);
+    expect(input.value).toBe("");
+  });
+
   it("rejects unsafe local files before upload", () => {
     expect(validatePortabilityFile({ name: "archive.txt", size: 10, type: "text/plain" })).toMatch(
       /\.dgchat/,
