@@ -239,6 +239,13 @@
       "when": 1783656033000,
       "tag": "0033_conversation_portability",
       "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1783915200000,
+      "tag": "0034_immutable_sharing_snapshots",
+      "breakpoints": true
     }
   ]
 }

@@ -10,6 +10,7 @@ import {
 } from "@tanstack/react-router";
 import { App, AuthScreen, PendingScreen, SetupScreen } from "./App.tsx";
 import { isAdminSection, parseAdminSearch } from "./adminRouting.ts";
+import { PublicConversationShareView } from "./PublicConversationShare.tsx";
 import "./styles.css";
 
 const rootRoute = createRootRoute({ component: () => <Outlet /> });
@@ -28,6 +29,14 @@ const pendingRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/pending",
   component: PendingScreen,
+});
+const publicShareRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/share/$capability",
+  component: () => {
+    const { capability } = publicShareRoute.useParams();
+    return <PublicConversationShareView capability={capability} />;
+  },
 });
 const adminRoute = createRoute({
   getParentRoute: () => rootRoute,
@@ -50,6 +59,7 @@ const routeTree = rootRoute.addChildren([
   loginRoute,
   setupRoute,
   pendingRoute,
+  publicShareRoute,
   adminRoute,
 ]);
 const router = createRouter({ routeTree });

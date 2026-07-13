@@ -1,4 +1,8 @@
-import { isModelCapability, parseConversationPortabilityV1 } from "@dg-chat/contracts";
+import {
+  isModelCapability,
+  parseConversationPortabilityV1,
+  parsePublicConversationShare,
+} from "@dg-chat/contracts";
 import type {
   AccountState,
   ApiTokenSummary,
@@ -7,11 +11,14 @@ import type {
   ConversationFolder,
   ConversationFolderMembership,
   ConversationPortabilityV1,
+  ConversationShareSummary,
   ConversationTag,
   ConversationTagBinding,
   ConversationTagSet,
   MessageNode,
   MessageRole,
+  PublicConversationShare,
+  PublicConversationShareAttachment,
   PublicUser,
   UsageSummary,
   UserPreferences,
@@ -22,6 +29,10 @@ import { canonicalJson, sha256Hex } from "./backup-format.ts";
 import {
   apiResponseBodyByteLength,
   canonicalWorkspaceName,
+  MAX_ACTIVE_CONVERSATION_SHARES,
+  MAX_CONVERSATION_SHARE_ATTACHMENTS,
+  MAX_CONVERSATION_SHARE_CONTENT_CHARS,
+  MAX_CONVERSATION_SHARE_MESSAGES,
   normalizeKnowledgeSearchLimit,
   validateChunkEmbeddings,
   validateDocumentChunkInputs,
@@ -56,10 +67,13 @@ import type {
   CompleteApiRequestInput,
   CompleteGenerationInput,
   ConversationPortabilityImportResult,
+  ConversationShareAttachmentAccess,
   CreateAccessGroupInput,
   CreateApiTokenInput,
   CreateAttachmentInput,
   CreateAttachmentResult,
+  CreateConversationShareInput,
+  CreateConversationShareResult,
   CreateKnowledgeCollectionInput,
   CreateModelAliasInput,
   CreateModelPriceVersionInput,
@@ -163,6 +177,14 @@ export interface StoredApiToken extends ApiTokenSummary {
   userId: string;
   tokenHash: string;
 }
+interface StoredConversationShare {
+  summary: ConversationShareSummary;
+  ownerId: string;
+  secretHash: string;
+  payloadHash: string;
+  publicSnapshot: PublicConversationShare;
+  sourceAttachments: Record<string, { attachmentId: string; objectKey: string }>;
+}
 export interface LedgerEntry {
   id: string;
   userId: string;
@@ -203,6 +225,20 @@ export class DomainError extends Error {
     super(message);
   }
 }
+
+function materializePublicConversationShare(value: unknown): PublicConversationShare {
+  try {
+    return parsePublicConversationShare(value);
+  } catch {
+    throw new DomainError(
+      "conversation_not_shareable",
+      "Conversation contains unsupported public data",
+      422,
+    );
+  }
+}
+const CONVERSATION_SHARE_UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function validateDocumentChunks(
   chunks: DocumentChunkInput[],
@@ -517,6 +553,9 @@ export class MemoryRepository {
     payloadHash: string;
     result: ConversationPortabilityImportResult;
   }>();
+  readonly conversationShares = new Map<string, StoredConversationShare>();
+  readonly conversationShareIdempotency = new Map<string, string>();
+  readonly conversationShareSecrets = new Map<string, string>();
   readonly ledger: LedgerEntry[] = [];
   readonly usageRuns = new Map<string, UsageRun>();
   readonly generationControls = new Map<string, GenerationControl>();
@@ -1418,6 +1457,332 @@ export class MemoryRepository {
       },
     });
     return result;
+  }
+
+  async createConversationShare(
+    ownerId: string,
+    input: CreateConversationShareInput,
+  ): Promise<CreateConversationShareResult> {
+    const user = this.users.get(ownerId);
+    if (
+      !user || user.approvalStatus !== "approved" || user.state !== "active"
+    ) throw new DomainError("account_unavailable", "Account cannot create shares", 403);
+    if (
+      !input.idempotencyKey || input.idempotencyKey.length > 200 ||
+      !CONVERSATION_SHARE_UUID_PATTERN.test(input.conversationId) ||
+      !CONVERSATION_SHARE_UUID_PATTERN.test(input.leafId) ||
+      !/^[0-9a-f]{64}$/.test(input.secretHash) ||
+      !Number.isSafeInteger(input.expectedConversationVersion) ||
+      input.expectedConversationVersion < 0 ||
+      !["owner", "anonymous"].includes(input.identityVisibility) ||
+      !["include", "redact", "selected"].includes(input.attachmentPolicy) ||
+      !Array.isArray(input.selectedAttachmentIds) ||
+      input.selectedAttachmentIds.length > 100 ||
+      input.selectedAttachmentIds.some((id) => !CONVERSATION_SHARE_UUID_PATTERN.test(id)) ||
+      new Set(input.selectedAttachmentIds).size !== input.selectedAttachmentIds.length ||
+      (input.attachmentPolicy === "selected") !== (input.selectedAttachmentIds.length > 0)
+    ) throw new DomainError("validation_error", "Share request is invalid", 422);
+    const expiryInstant = input.expiresAt === null ? null : Date.parse(input.expiresAt);
+    if (
+      input.expiresAt !== null &&
+      (!Number.isFinite(expiryInstant) || Number(expiryInstant) <= Date.now())
+    ) throw new DomainError("validation_error", "Share expiry must be in the future", 422);
+    const expiresAt = expiryInstant === null ? null : new Date(expiryInstant).toISOString();
+    const payloadHash = await sha256Hex(new TextEncoder().encode(canonicalJson({
+      conversationId: input.conversationId,
+      leafId: input.leafId,
+      expectedConversationVersion: input.expectedConversationVersion,
+      identityVisibility: input.identityVisibility,
+      attachmentPolicy: input.attachmentPolicy,
+      selectedAttachmentIds: [...input.selectedAttachmentIds].sort(),
+      expiresAt,
+      secretHash: input.secretHash,
+    })));
+    const replayKey = `${ownerId}:${input.idempotencyKey}`;
+    const replayId = this.conversationShareIdempotency.get(replayKey);
+    if (replayId) {
+      const prior = this.conversationShares.get(replayId)!;
+      if (prior.payloadHash !== payloadHash) {
+        throw new DomainError("idempotency_conflict", "Share replay payload differs", 409);
+      }
+      return { share: structuredClone(prior.summary), replayed: true };
+    }
+    if (this.conversationShareSecrets.has(input.secretHash)) {
+      throw new DomainError("secret_conflict", "Share capability already exists", 409);
+    }
+    const activeShareCount =
+      [...this.conversationShares.values()].filter((value) =>
+        value.ownerId === ownerId && !value.summary.revokedAt &&
+        (value.summary.expiresAt === null || Date.parse(value.summary.expiresAt) > Date.now())
+      ).length;
+    if (activeShareCount >= MAX_ACTIVE_CONVERSATION_SHARES) {
+      throw new DomainError(
+        "share_limit_exceeded",
+        "Revoke an existing share before creating another",
+        409,
+      );
+    }
+    const conversation = this.conversations.get(input.conversationId);
+    if (
+      !conversation || conversation.ownerId !== ownerId || conversation.deletedAt ||
+      conversation.version !== input.expectedConversationVersion
+    ) {
+      if (conversation?.ownerId === ownerId && !conversation.deletedAt) {
+        throw new DomainError("version_conflict", "Conversation changed before sharing", 409);
+      }
+      throw new DomainError("not_found", "Conversation not found", 404);
+    }
+    if (conversation.temporary) {
+      throw new DomainError(
+        "temporary_conversation_not_shareable",
+        "Save this temporary chat before sharing",
+        409,
+      );
+    }
+    const conversationNodes = [...this.messages.values()].filter((node) =>
+      node.conversationId === conversation.id
+    );
+    if (conversationNodes.length > MAX_CONVERSATION_SHARE_MESSAGES) {
+      throw new DomainError("share_too_large", "Conversation is too large to share", 413);
+    }
+    if (conversationNodes.some((node) => node.status === "streaming")) {
+      throw new DomainError(
+        "generation_in_progress",
+        "Stop the active generation before sharing",
+        409,
+      );
+    }
+    const byId = new Map(conversationNodes.map((node) => [node.id, node]));
+    const reversePath: MessageNode[] = [];
+    const seen = new Set<string>();
+    let cursor: string | null = input.leafId;
+    while (cursor !== null) {
+      if (seen.has(cursor)) {
+        throw new DomainError("invalid_graph", "Conversation graph contains a cycle", 409);
+      }
+      seen.add(cursor);
+      const node = byId.get(cursor);
+      if (!node) {
+        throw new DomainError("invalid_leaf", "Share leaf is not in this conversation", 422);
+      }
+      reversePath.push(node);
+      cursor = node.parentId;
+    }
+    const path = reversePath.reverse();
+    const leaf = path[path.length - 1];
+    if (
+      leaf.status === "tombstoned" || leaf.role === "system" || leaf.role === "developer"
+    ) throw new DomainError("leaf_not_shareable", "Share leaf is not publicly shareable", 422);
+    const publicPath = path.filter((node) =>
+      node.status !== "tombstoned" && node.role !== "system" && node.role !== "developer"
+    );
+    if (
+      publicPath.length > MAX_CONVERSATION_SHARE_MESSAGES ||
+      publicPath.reduce((total, node) => total + node.content.length, 0) >
+        MAX_CONVERSATION_SHARE_CONTENT_CHARS
+    ) throw new DomainError("share_too_large", "Conversation is too large to share", 413);
+    const pathAttachmentIds: string[] = [];
+    if (input.attachmentPolicy !== "redact") {
+      for (const node of publicPath) {
+        const nodeAttachments = [...(this.messageAttachments.get(node.id) ?? [])].filter((id) =>
+          input.attachmentPolicy === "include" || input.selectedAttachmentIds.includes(id)
+        );
+        if (nodeAttachments.length > 100) {
+          throw new DomainError(
+            "share_too_large",
+            "Conversation has too many shared attachments",
+            413,
+          );
+        }
+        for (const attachmentId of nodeAttachments) {
+          if (!pathAttachmentIds.includes(attachmentId)) pathAttachmentIds.push(attachmentId);
+          if (pathAttachmentIds.length > MAX_CONVERSATION_SHARE_ATTACHMENTS) {
+            throw new DomainError(
+              "share_too_large",
+              "Conversation has too many shared attachments",
+              413,
+            );
+          }
+        }
+      }
+    }
+    const selected = input.attachmentPolicy === "include"
+      ? pathAttachmentIds
+      : input.attachmentPolicy === "selected"
+      ? input.selectedAttachmentIds
+      : [];
+    if (selected.some((id) => !pathAttachmentIds.includes(id))) {
+      throw new DomainError(
+        "invalid_attachment",
+        "Selected attachment is not on the shared path",
+        422,
+      );
+    }
+    const attachmentPublicIds = new Map<string, string>();
+    const publicAttachments: PublicConversationShareAttachment[] = [];
+    const sourceAttachments: StoredConversationShare["sourceAttachments"] = {};
+    for (const attachmentId of selected) {
+      const value = this.attachments.get(attachmentId);
+      if (!value || value.ownerId !== ownerId || value.state !== "ready" || value.deletedAt) {
+        throw new DomainError("invalid_attachment", "Shared attachment is unavailable", 409);
+      }
+      const publicId = crypto.randomUUID();
+      attachmentPublicIds.set(attachmentId, publicId);
+      const dimensions = this.attachmentDimensions.get(attachmentId);
+      publicAttachments.push({
+        id: publicId,
+        filename: value.filename,
+        mimeType: value.mimeType,
+        sizeBytes: value.sizeBytes,
+        width: dimensions?.width ?? null,
+        height: dimensions?.height ?? null,
+        createdAt: value.createdAt,
+      });
+      sourceAttachments[publicId] = { attachmentId, objectKey: value.objectKey };
+    }
+    const messagePublicIds = new Map(publicPath.map((node) => [node.id, crypto.randomUUID()]));
+    const id = crypto.randomUUID();
+    const createdAt = new Date().toISOString();
+    if (expiresAt !== null && Date.parse(expiresAt) <= Date.parse(createdAt)) {
+      throw new DomainError("validation_error", "Share expiry must be in the future", 422);
+    }
+    const publicSnapshot = materializePublicConversationShare({
+      id,
+      title: conversation.title,
+      conversationVersion: conversation.version,
+      identity: {
+        visibility: input.identityVisibility,
+        displayName: input.identityVisibility === "owner" ? user.name : null,
+      },
+      attachmentPolicy: input.attachmentPolicy,
+      messages: publicPath.map((node, index) => ({
+        id: messagePublicIds.get(node.id)!,
+        parentId: index === 0 ? null : messagePublicIds.get(publicPath[index - 1].id)!,
+        role: node.role as "user" | "assistant" | "tool",
+        content: node.content,
+        status: node.status as "complete" | "stopped" | "error",
+        attachmentIds: [...(this.messageAttachments.get(node.id) ?? [])]
+          .map((attachmentId) => attachmentPublicIds.get(attachmentId))
+          .filter((value): value is string => value !== undefined),
+        createdAt: node.createdAt,
+      })),
+      attachments: publicAttachments,
+      createdAt,
+      expiresAt,
+    });
+    const summary: ConversationShareSummary = {
+      id,
+      conversationId: conversation.id,
+      leafId: input.leafId,
+      conversationVersion: conversation.version,
+      title: conversation.title,
+      identityVisibility: input.identityVisibility,
+      attachmentPolicy: input.attachmentPolicy,
+      attachmentCount: publicAttachments.length,
+      messageCount: publicPath.length,
+      version: 1,
+      createdAt,
+      expiresAt,
+      revokedAt: null,
+    };
+    const stored: StoredConversationShare = {
+      summary,
+      ownerId,
+      secretHash: input.secretHash,
+      payloadHash,
+      publicSnapshot,
+      sourceAttachments,
+    };
+    this.conversationShares.set(id, stored);
+    this.conversationShareIdempotency.set(replayKey, id);
+    this.conversationShareSecrets.set(input.secretHash, id);
+    this.recordAudit({
+      actorId: ownerId,
+      action: "conversation.share_created",
+      targetType: "conversation_share",
+      targetId: id,
+      metadata: { conversationId: conversation.id, attachmentCount: publicAttachments.length },
+    });
+    return { share: structuredClone(summary), replayed: false };
+  }
+
+  listConversationShares(ownerId: string): ConversationShareSummary[] {
+    if (!this.users.has(ownerId)) throw new DomainError("not_found", "User not found", 404);
+    return [...this.conversationShares.values()].filter((value) => value.ownerId === ownerId)
+      .sort((a, b) =>
+        b.summary.createdAt.localeCompare(a.summary.createdAt) ||
+        b.summary.id.localeCompare(a.summary.id)
+      )
+      .map((value) => structuredClone(value.summary));
+  }
+
+  getConversationShare(ownerId: string, shareId: string): ConversationShareSummary {
+    const value = this.conversationShares.get(shareId);
+    if (!value || value.ownerId !== ownerId) {
+      throw new DomainError("not_found", "Share not found", 404);
+    }
+    return structuredClone(value.summary);
+  }
+
+  revokeConversationShare(
+    ownerId: string,
+    shareId: string,
+    expectedVersion: number,
+  ): ConversationShareSummary {
+    const value = this.conversationShares.get(shareId);
+    if (!value || value.ownerId !== ownerId) {
+      throw new DomainError("not_found", "Share not found", 404);
+    }
+    if (value.summary.version !== expectedVersion) {
+      throw new DomainError("version_conflict", "Share changed in another request", 409);
+    }
+    if (value.summary.revokedAt) return structuredClone(value.summary);
+    value.summary.revokedAt = new Date().toISOString();
+    value.summary.version++;
+    this.recordAudit({
+      actorId: ownerId,
+      action: "conversation.share_revoked",
+      targetType: "conversation_share",
+      targetId: shareId,
+      metadata: { conversationId: value.summary.conversationId },
+    });
+    return structuredClone(value.summary);
+  }
+
+  resolvePublicConversationShare(
+    secretHash: string,
+    now = new Date().toISOString(),
+  ): PublicConversationShare | undefined {
+    const shareId = /^[0-9a-f]{64}$/.test(secretHash)
+      ? this.conversationShareSecrets.get(secretHash)
+      : undefined;
+    const value = shareId ? this.conversationShares.get(shareId) : undefined;
+    const user = value ? this.users.get(value.ownerId) : undefined;
+    const instant = Date.parse(now);
+    if (
+      !value || !user || !Number.isFinite(instant) || value.summary.revokedAt ||
+      (value.summary.expiresAt !== null && Date.parse(value.summary.expiresAt) <= instant) ||
+      user.approvalStatus !== "approved" || user.state !== "active"
+    ) return undefined;
+    return structuredClone(value.publicSnapshot);
+  }
+
+  resolvePublicShareAttachment(
+    secretHash: string,
+    publicAttachmentId: string,
+    now = new Date().toISOString(),
+  ): ConversationShareAttachmentAccess | undefined {
+    const snapshot = this.resolvePublicConversationShare(secretHash, now);
+    if (!snapshot) return undefined;
+    const shareId = this.conversationShareSecrets.get(secretHash)!;
+    const stored = this.conversationShares.get(shareId)!;
+    const source = stored.sourceAttachments[publicAttachmentId];
+    const attachment = snapshot.attachments.find((value) => value.id === publicAttachmentId);
+    const current = source ? this.attachments.get(source.attachmentId) : undefined;
+    if (!source || !attachment || !current || current.state !== "ready" || current.deletedAt) {
+      return undefined;
+    }
+    return { shareId, ownerId: stored.ownerId, attachment, objectKey: source.objectKey };
   }
 
   updateUserPreferences(ownerId: string, patch: import("./repository.ts").UserPreferencesPatch) {

@@ -29,6 +29,40 @@ export const keepTemporaryConversationSchema = z.object({
   expectedVersion: z.number().int().nonnegative(),
 }).strict();
 
+/** Owner-controlled policy for one immutable, revocable conversation snapshot. */
+export const createConversationShareSchema = z.object({
+  // A Web Crypto generated 32-byte capability. It is hashed before persistence.
+  capability: z.string().length(43).regex(/^[A-Za-z0-9_-]{43}$/),
+  leafId: z.string().uuid(),
+  expectedConversationVersion: z.number().int().nonnegative(),
+  identityVisibility: z.enum(["owner", "anonymous"]),
+  attachmentPolicy: z.enum(["include", "redact", "selected"]),
+  selectedAttachmentIds: z.array(z.string().uuid()).max(100).refine(
+    (ids) => new Set(ids).size === ids.length,
+    "Attachment identifiers must be unique",
+  ).default([]),
+  expiresAt: z.string().datetime({ offset: true }).nullable().default(null),
+}).strict().superRefine((value, context) => {
+  if (value.attachmentPolicy === "selected" && value.selectedAttachmentIds.length === 0) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["selectedAttachmentIds"],
+      message: "Select at least one attachment",
+    });
+  }
+  if (value.attachmentPolicy !== "selected" && value.selectedAttachmentIds.length !== 0) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["selectedAttachmentIds"],
+      message: "Attachment selections require the selected policy",
+    });
+  }
+});
+
+export const revokeConversationShareSchema = z.object({
+  expectedVersion: z.number().int().positive(),
+}).strict();
+
 export const updateConversationSchema = z.object({
   expectedVersion: z.number().int().nonnegative(),
   title: z.string().trim().min(1).max(200).optional(),

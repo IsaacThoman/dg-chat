@@ -21,6 +21,7 @@ import {
   createAccessGroupSchema,
   createConversationFolderSchema,
   createConversationSchema,
+  createConversationShareSchema,
   createConversationTagSchema,
   createKnowledgeCollectionSchema,
   createModelAliasSchema,
@@ -46,6 +47,7 @@ import {
   replaceConversationTagsSchema,
   replaceFolderMembershipsSchema,
   responsesSchema,
+  revokeConversationShareSchema,
   revokeTokenSchema,
   rotateTokenSchema,
   setActiveLeafSchema,
@@ -233,6 +235,11 @@ type WebGenerationEventInput = WebGenerationEvent extends infer Event
 
 export function redactRequestLog(message: string): string {
   return message
+    // Public share capabilities are bearer credentials. Never emit them into request logs.
+    .replace(
+      /(\/api\/public\/shares\/)[^/?\s]+/g,
+      "$1[REDACTED]",
+    )
     // URL parsers accept percent-encoded key names, so suppress the entire capability query.
     .replace(
       /(\/v1\/images\/assets\/[^?\s]+\/content)\?[^\s]*/g,
@@ -259,6 +266,9 @@ export interface AppOptions {
   generationLeaseSeconds?: number;
   generationStopPollMs?: number;
   temporaryRetentionDays?: number;
+  publicShareRateLimit?: number;
+  publicShareClientRateLimit?: number;
+  shareMutationRateLimit?: number;
   webComplete?: typeof complete;
   objectStore?: ObjectStore;
   attachmentContextMaxRawBytes?: number;
@@ -1014,6 +1024,27 @@ const privateNoStore = (c: Context) => {
   c.header("X-Content-Type-Options", "nosniff");
 };
 
+const isCanonicalShareCapability = (value: string): boolean => {
+  if (!/^[A-Za-z0-9_-]{43}$/.test(value)) return false;
+  try {
+    const decoded = Buffer.from(value, "base64url");
+    return decoded.byteLength === 32 && decoded.toString("base64url") === value;
+  } catch {
+    return false;
+  }
+};
+
+const publicShareNoStore = (c: Context) => {
+  c.header("Cache-Control", "no-store, max-age=0");
+  c.header("Pragma", "no-cache");
+  c.header("X-Content-Type-Options", "nosniff");
+  c.header("X-Robots-Tag", "noindex, nofollow, noarchive");
+  c.header("Referrer-Policy", "no-referrer");
+};
+
+const rfc5987Filename = (value: string) =>
+  encodeURIComponent(value).replaceAll("'", "%27").replaceAll("*", "%2A");
+
 async function stageMultipartUpload(
   request: Request,
   maxBytes: number,
@@ -1272,6 +1303,18 @@ export function createApp(options: AppOptions = {}) {
   const configuredGenerationLimit = positiveInteger("GENERATION_RATE_LIMIT", 30);
   const configuredOpenAILimit = positiveInteger("OPENAI_RATE_LIMIT", 120);
   const configuredProviderAdminLimit = positiveInteger("PROVIDER_ADMIN_RATE_LIMIT", 30);
+  const configuredPublicShareLimit = options.publicShareRateLimit ??
+    positiveInteger("PUBLIC_SHARE_RATE_LIMIT", 120);
+  const configuredPublicShareClientLimit = options.publicShareClientRateLimit ??
+    positiveInteger("PUBLIC_SHARE_CLIENT_RATE_LIMIT", 240);
+  const configuredShareMutationLimit = options.shareMutationRateLimit ??
+    positiveInteger("SHARE_MUTATION_RATE_LIMIT", 20);
+  if (
+    !Number.isSafeInteger(configuredPublicShareLimit) || configuredPublicShareLimit < 1 ||
+    !Number.isSafeInteger(configuredPublicShareClientLimit) ||
+    configuredPublicShareClientLimit < 1 ||
+    !Number.isSafeInteger(configuredShareMutationLimit) || configuredShareMutationLimit < 1
+  ) throw new Error("Share rate limits must be positive safe integers");
   const configuredRateWindow = positiveInteger("RATE_LIMIT_WINDOW_SECONDS", 60);
   const effectiveTokenRpmLimit = Math.ceil(
     configuredOpenAILimit * 60 / configuredRateWindow,
@@ -3288,8 +3331,138 @@ export function createApp(options: AppOptions = {}) {
     });
   });
 
+  const resolvePublicShareCapability = async (c: Context) => {
+    publicShareNoStore(c);
+    const capability = c.req.param("capability") ?? "";
+    // Malformed and unknown capabilities are deliberately indistinguishable.
+    if (!isCanonicalShareCapability(capability)) {
+      throw new DomainError("share_unavailable", "Shared conversation is unavailable", 404);
+    }
+    const secretHash = await sha256Hex(capability);
+    let rates;
+    try {
+      rates = await Promise.all([
+        rateLimiter.consume(
+          `public-share:capability:${secretHash}`,
+          configuredPublicShareLimit,
+          configuredRateWindow,
+        ),
+        rateLimiter.consume(
+          `public-share:client:${requestClientKey(c.req.raw.headers, trustProxyHeaders)}`,
+          configuredPublicShareClientLimit,
+          configuredRateWindow,
+        ),
+      ]);
+    } catch {
+      c.header("Retry-After", "5");
+      throw new DomainError(
+        "service_unavailable",
+        "Shared conversations are temporarily unavailable",
+        503,
+      );
+    }
+    const denied = rates.find((rate) => !rate.allowed);
+    c.header("X-RateLimit-Limit", String(Math.min(...rates.map((rate) => rate.limit))));
+    c.header("X-RateLimit-Remaining", String(Math.min(...rates.map((rate) => rate.remaining))));
+    if (denied) {
+      c.header("Retry-After", String(denied.retryAfterSeconds));
+      throw new DomainError("rate_limit_exceeded", "Too many requests", 429);
+    }
+    return secretHash;
+  };
+
+  app.get("/api/public/shares/:capability", async (c) => {
+    const share = await repo.resolvePublicConversationShare(
+      await resolvePublicShareCapability(c),
+      new Date(options.now?.() ?? Date.now()).toISOString(),
+    );
+    if (!share) {
+      throw new DomainError("share_unavailable", "Shared conversation is unavailable", 404);
+    }
+    return c.json({ share });
+  });
+  app.get("/api/public/shares/:capability/attachments/:attachmentId", async (c) => {
+    const secretHash = await resolvePublicShareCapability(c);
+    const publicAttachmentId = c.req.param("attachmentId");
+    if (!auditUuid.test(publicAttachmentId)) {
+      throw new DomainError("share_unavailable", "Shared attachment is unavailable", 404);
+    }
+    const access = await repo.resolvePublicShareAttachment(
+      secretHash,
+      publicAttachmentId,
+      new Date(options.now?.() ?? Date.now()).toISOString(),
+    );
+    if (!access) {
+      throw new DomainError("share_unavailable", "Shared attachment is unavailable", 404);
+    }
+    if (!objectStore) {
+      throw new DomainError("storage_not_configured", "Stored file is unavailable", 503);
+    }
+    const object = await objectStore.get(access.objectKey);
+    if (
+      !object || object.contentLength !== access.attachment.sizeBytes ||
+      object.contentType !== access.attachment.mimeType ||
+      (object.metadata.owner !== undefined && object.metadata.owner !== access.ownerId)
+    ) throw new DomainError("object_missing", "Stored file is unavailable", 503);
+    return new Response(object.body, {
+      headers: {
+        "Content-Type": access.attachment.mimeType,
+        "Content-Length": String(access.attachment.sizeBytes),
+        "Content-Disposition": `attachment; filename*=UTF-8''${
+          rfc5987Filename(access.attachment.filename)
+        }`,
+        "Cache-Control": "no-store, max-age=0",
+        "Pragma": "no-cache",
+        "X-Content-Type-Options": "nosniff",
+        "X-Robots-Tag": "noindex, nofollow, noarchive",
+        "Referrer-Policy": "no-referrer",
+        "Content-Security-Policy": "default-src 'none'; sandbox",
+      },
+    });
+  });
+
   app.use("/api/conversations/*", authenticate, approved, sessionOnly);
   app.use("/api/conversations", authenticate, approved, sessionOnly);
+  app.use("/api/shares/*", authenticate, approved, sessionOnly);
+  app.use("/api/shares", authenticate, approved, sessionOnly);
+  const protectShareMutation = async (c: Context<{ Variables: Variables }>) => {
+    let rate;
+    try {
+      rate = await rateLimiter.consume(
+        `conversation-share:owner:${c.get("user").id}`,
+        configuredShareMutationLimit,
+        configuredRateWindow,
+      );
+    } catch {
+      c.header("Retry-After", "5");
+      throw new DomainError(
+        "service_unavailable",
+        "Share protection is temporarily unavailable",
+        503,
+      );
+    }
+    c.header("X-RateLimit-Limit", String(rate.limit));
+    c.header("X-RateLimit-Remaining", String(rate.remaining));
+    if (!rate.allowed) {
+      c.header("Retry-After", String(rate.retryAfterSeconds));
+      throw new DomainError("rate_limit_exceeded", "Too many share changes", 429);
+    }
+  };
+  app.get("/api/shares", async (c) => {
+    privateNoStore(c);
+    return c.json({ data: await repo.listConversationShares(c.get("user").id) });
+  });
+  app.post("/api/shares/:id/revoke", async (c) => {
+    privateNoStore(c);
+    await protectShareMutation(c);
+    const body = await parseJson(c, revokeConversationShareSchema);
+    const share = await repo.revokeConversationShare(
+      c.get("user").id,
+      requireUuid(c.req.param("id"), "shareId"),
+      body.expectedVersion,
+    );
+    return c.json({ share });
+  });
   app.use("/api/portability/*", authenticate, approved, sessionOnly);
   app.get("/api/portability/export", async (c) => {
     privateNoStore(c);
@@ -3472,6 +3645,38 @@ export function createApp(options: AppOptions = {}) {
       body.expectedVersion,
     );
     return c.body(null, 204);
+  });
+  app.post("/api/conversations/:id/shares", async (c) => {
+    privateNoStore(c);
+    await protectShareMutation(c);
+    const body = await parseJson(c, createConversationShareSchema);
+    if (!isCanonicalShareCapability(body.capability)) {
+      throw new DomainError(
+        "validation_error",
+        "capability must be a canonical 32-byte base64url value",
+        422,
+      );
+    }
+    const idempotencyKey = requirePortabilityIdempotencyKey(
+      c.req.header("idempotency-key"),
+    );
+    const result = await repo.createConversationShare(c.get("user").id, {
+      conversationId: requireUuid(c.req.param("id"), "conversationId"),
+      leafId: body.leafId,
+      expectedConversationVersion: body.expectedConversationVersion,
+      identityVisibility: body.identityVisibility,
+      attachmentPolicy: body.attachmentPolicy,
+      selectedAttachmentIds: body.selectedAttachmentIds,
+      expiresAt: body.expiresAt === null ? null : new Date(body.expiresAt).toISOString(),
+      idempotencyKey,
+      secretHash: await sha256Hex(body.capability),
+    });
+    return c.json({
+      share: result.share,
+      capability: body.capability,
+      path: `/share/${body.capability}`,
+      replayed: result.replayed,
+    }, result.replayed ? 200 : 201);
   });
   app.get(
     "/api/conversations",

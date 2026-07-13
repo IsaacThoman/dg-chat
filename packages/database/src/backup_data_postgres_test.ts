@@ -72,6 +72,9 @@ Deno.test({
       const temporaryConversationId = crypto.randomUUID();
       const messageId = crypto.randomUUID();
       const attachmentId = crypto.randomUUID();
+      const activeShareId = crypto.randomUUID();
+      const revokedShareId = crypto.randomUUID();
+      const expiredShareId = crypto.randomUUID();
       const providerId = crypto.randomUUID();
       const folderId = crypto.randomUUID();
       const tagId = crypto.randomUUID();
@@ -126,6 +129,41 @@ Deno.test({
       await sql`UPDATE conversations SET active_leaf_id=${messageId} WHERE id=${conversationId}`;
       await sql`INSERT INTO message_attachments(message_id,attachment_id)
         VALUES(${messageId},${attachmentId})`;
+      for (
+        const [shareId, secretHash, expiresAt, revokedAt, key] of [
+          [activeShareId, "c".repeat(64), null, null, "backup-share-active"],
+          [revokedShareId, "d".repeat(64), null, "2026-03-01T00:00:00Z", "backup-share-revoked"],
+          [expiredShareId, "e".repeat(64), "2026-02-01T00:00:00Z", null, "backup-share-expired"],
+        ] as const
+      ) {
+        const publicSnapshot = {
+          id: shareId,
+          title: "Portable conversation",
+          conversationVersion: 1,
+          identity: { visibility: "anonymous", displayName: null },
+          attachmentPolicy: "redact",
+          messages: [{
+            id: crypto.randomUUID(),
+            parentId: null,
+            role: "user",
+            content: "hello",
+            status: "complete",
+            attachmentIds: [],
+            createdAt: "2026-01-01T00:00:00.000Z",
+          }],
+          attachments: [],
+          createdAt: "2026-01-01T00:00:00.000Z",
+          expiresAt: expiresAt ? new Date(expiresAt).toISOString() : null,
+        };
+        await sql`INSERT INTO conversation_share_snapshots(
+          id,owner_id,conversation_id,leaf_id,conversation_version,title,identity_visibility,
+          attachment_policy,owner_name_snapshot,public_snapshot,source_attachments,secret_hash,
+          idempotency_key,payload_hash,expires_at,revoked_at,created_at
+        ) VALUES(${shareId},${userId},${conversationId},${messageId},1,
+          'Portable conversation','anonymous','redact',NULL,${sql.json(publicSnapshot)},
+          ${sql.json({})},${secretHash},${key},${"f".repeat(64)},${expiresAt},${revokedAt},
+          '2026-01-01T00:00:00Z')`;
+      }
       await sql`INSERT INTO providers(
         id,slug,display_name,base_url,protocol,enabled,version,
         credential_envelope,credential_updated_at
@@ -185,6 +223,7 @@ Deno.test({
       assertEquals("credential_envelope" in capturedProvider, false);
       const capturedAccount = captured.get("auth_accounts")!.flat()[0];
       assertEquals("access_token" in capturedAccount, false);
+      assertEquals(captured.get("conversation_share_snapshots")!.flat().length, 3);
 
       const concurrentProviderId = crypto.randomUUID();
       const privilegedCredentials: BackupProviderCredential[] = [];
@@ -293,6 +332,17 @@ Deno.test({
       );
 
       assertEquals(Number((await sql`SELECT count(*) count FROM conversations`)[0].count), 2);
+      assertEquals(
+        [
+          ...await sql`SELECT id,secret_hash,expires_at IS NOT NULL expired,revoked_at IS NOT NULL revoked
+          FROM conversation_share_snapshots ORDER BY id`,
+        ],
+        [
+          { id: activeShareId, secret_hash: "c".repeat(64), expired: false, revoked: false },
+          { id: expiredShareId, secret_hash: "e".repeat(64), expired: true, revoked: false },
+          { id: revokedShareId, secret_hash: "d".repeat(64), expired: false, revoked: true },
+        ].sort((a, b) => a.id.localeCompare(b.id)),
+      );
       const restoredTemporary = await sql<{ temporary_expires_at: Date }[]>`
         SELECT temporary_expires_at FROM conversations WHERE id=${temporaryConversationId}`;
       assertEquals(

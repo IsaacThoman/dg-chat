@@ -75,6 +75,68 @@ export interface ConversationDetail extends Conversation {
   messages: MessageNode[];
 }
 
+/** Visibility of the conversation owner's identity on an immutable public share. */
+export type ConversationShareIdentityVisibility = "owner" | "anonymous";
+/** Attachment materialization policy selected when a share is created. */
+export type ConversationShareAttachmentPolicy = "include" | "redact" | "selected";
+
+/** Immutable attachment metadata exposed by a public share. Object-store keys are never public. */
+export interface PublicConversationShareAttachment {
+  /** Share-local identifier; never the private attachment identifier. */
+  id: string;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+  width: number | null;
+  height: number | null;
+  createdAt: string;
+}
+
+/** One share-local node on the exact root-to-leaf path captured at share creation. */
+export interface PublicConversationShareMessage {
+  /** Share-local identifier; never the private message identifier. */
+  id: string;
+  parentId: string | null;
+  role: "user" | "assistant" | "tool";
+  content: string;
+  status: "complete" | "stopped" | "error";
+  attachmentIds: string[];
+  createdAt: string;
+}
+
+/** Read-only materialized public snapshot. It never follows later conversation edits. */
+export interface PublicConversationShare {
+  id: string;
+  title: string;
+  conversationVersion: number;
+  identity: {
+    visibility: ConversationShareIdentityVisibility;
+    displayName: string | null;
+  };
+  attachmentPolicy: ConversationShareAttachmentPolicy;
+  messages: PublicConversationShareMessage[];
+  attachments: PublicConversationShareAttachment[];
+  createdAt: string;
+  expiresAt: string | null;
+}
+
+/** Owner-only lifecycle metadata. Private graph identifiers never enter the public contract. */
+export interface ConversationShareSummary {
+  id: string;
+  conversationId: string;
+  leafId: string;
+  conversationVersion: number;
+  title: string;
+  identityVisibility: ConversationShareIdentityVisibility;
+  attachmentPolicy: ConversationShareAttachmentPolicy;
+  attachmentCount: number;
+  messageCount: number;
+  version: number;
+  createdAt: string;
+  expiresAt: string | null;
+  revokedAt: string | null;
+}
+
 export type ThemePreference = "light" | "dark" | "system";
 export interface UserPreferences {
   userId: string;

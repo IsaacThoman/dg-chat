@@ -1,15 +1,22 @@
 import postgres from "npm:postgres@3.4.7";
-import { isModelCapability, parseConversationPortabilityV1 } from "@dg-chat/contracts";
+import {
+  isModelCapability,
+  parseConversationPortabilityV1,
+  parsePublicConversationShare,
+} from "@dg-chat/contracts";
 import type {
   AccountState,
   ConversationFolder,
   ConversationFolderMembership,
   ConversationPortabilityV1,
+  ConversationShareSummary,
   ConversationTag,
   ConversationTagBinding,
   ConversationTagSet,
   MessageNode,
   ModelCapability,
+  PublicConversationShare,
+  PublicConversationShareAttachment,
   PublicUser,
   UserPreferences,
 } from "@dg-chat/contracts";
@@ -20,6 +27,10 @@ import {
   apiResponseBodyByteLength,
   canonicalWorkspaceName,
   KNOWLEDGE_EMBEDDING_DIMENSIONS,
+  MAX_ACTIVE_CONVERSATION_SHARES,
+  MAX_CONVERSATION_SHARE_ATTACHMENTS,
+  MAX_CONVERSATION_SHARE_CONTENT_CHARS,
+  MAX_CONVERSATION_SHARE_MESSAGES,
   normalizeKnowledgeSearchLimit,
   validateChunkEmbeddings,
   validateDocumentChunkInputs,
@@ -59,10 +70,13 @@ import type {
   ConversationPatch,
   ConversationPortabilityExportOptions,
   ConversationPortabilityImportResult,
+  ConversationShareAttachmentAccess,
   CreateAccessGroupInput,
   CreateApiTokenInput,
   CreateAttachmentInput,
   CreateAttachmentResult,
+  CreateConversationShareInput,
+  CreateConversationShareResult,
   CreateKnowledgeCollectionInput,
   CreateModelAliasInput,
   CreateModelPriceVersionInput,
@@ -344,6 +358,39 @@ function message(row: Row): MessageNode {
     createdAt: iso(row.created_at),
   };
 }
+function conversationShareSummary(row: Row): ConversationShareSummary {
+  const snapshot = parsePublicConversationShare(row.public_snapshot);
+  return {
+    id: String(row.id),
+    conversationId: String(row.conversation_id),
+    leafId: String(row.leaf_id),
+    conversationVersion: number(row.conversation_version),
+    title: String(row.title),
+    identityVisibility: String(
+      row.identity_visibility,
+    ) as ConversationShareSummary["identityVisibility"],
+    attachmentPolicy: String(row.attachment_policy) as ConversationShareSummary["attachmentPolicy"],
+    attachmentCount: snapshot.attachments.length,
+    messageCount: snapshot.messages.length,
+    version: number(row.version),
+    createdAt: iso(row.created_at),
+    expiresAt: nullableIso(row.expires_at),
+    revokedAt: nullableIso(row.revoked_at),
+  };
+}
+function materializePublicConversationShare(value: unknown): PublicConversationShare {
+  try {
+    return parsePublicConversationShare(value);
+  } catch {
+    throw new DomainError(
+      "conversation_not_shareable",
+      "Conversation contains unsupported public data",
+      422,
+    );
+  }
+}
+const CONVERSATION_SHARE_UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 function token(row: Row): StoredApiToken {
   return {
     id: String(row.id),
@@ -1870,6 +1917,363 @@ export class PostgresRepository implements DomainRepository {
       return result;
     });
   }
+  async createConversationShare(
+    ownerId: string,
+    input: CreateConversationShareInput,
+  ): Promise<CreateConversationShareResult> {
+    if (
+      !input.idempotencyKey || input.idempotencyKey.length > 200 ||
+      !CONVERSATION_SHARE_UUID_PATTERN.test(input.conversationId) ||
+      !CONVERSATION_SHARE_UUID_PATTERN.test(input.leafId) ||
+      !/^[0-9a-f]{64}$/.test(input.secretHash) ||
+      !Number.isSafeInteger(input.expectedConversationVersion) ||
+      input.expectedConversationVersion < 0 ||
+      !["owner", "anonymous"].includes(input.identityVisibility) ||
+      !["include", "redact", "selected"].includes(input.attachmentPolicy) ||
+      !Array.isArray(input.selectedAttachmentIds) ||
+      input.selectedAttachmentIds.length > 100 ||
+      input.selectedAttachmentIds.some((id) => !CONVERSATION_SHARE_UUID_PATTERN.test(id)) ||
+      new Set(input.selectedAttachmentIds).size !== input.selectedAttachmentIds.length ||
+      (input.attachmentPolicy === "selected") !== (input.selectedAttachmentIds.length > 0)
+    ) throw new DomainError("validation_error", "Share request is invalid", 422);
+    const expiryInstant = input.expiresAt === null ? null : Date.parse(input.expiresAt);
+    if (
+      input.expiresAt !== null &&
+      (!Number.isFinite(expiryInstant) || Number(expiryInstant) <= Date.now())
+    ) throw new DomainError("validation_error", "Share expiry must be in the future", 422);
+    const expiresAt = expiryInstant === null ? null : new Date(expiryInstant).toISOString();
+    const payloadHash = await sha256Hex(new TextEncoder().encode(canonicalJson({
+      conversationId: input.conversationId,
+      leafId: input.leafId,
+      expectedConversationVersion: input.expectedConversationVersion,
+      identityVisibility: input.identityVisibility,
+      attachmentPolicy: input.attachmentPolicy,
+      selectedAttachmentIds: [...input.selectedAttachmentIds].sort(),
+      expiresAt,
+      secretHash: input.secretHash,
+    })));
+    return await this.#sql.begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-share-idempotency'),hashtext(${`${ownerId}:${input.idempotencyKey}`}))`;
+      const prior = await tx<Row[]>`SELECT * FROM conversation_share_snapshots
+        WHERE owner_id=${ownerId} AND idempotency_key=${input.idempotencyKey}`;
+      if (prior[0]) {
+        if (String(prior[0].payload_hash) !== payloadHash) {
+          throw new DomainError("idempotency_conflict", "Share replay payload differs", 409);
+        }
+        return { share: conversationShareSummary(prior[0]), replayed: true };
+      }
+      await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-share-owner'),hashtext(${ownerId}))`;
+      const activeShares = await tx<{ count: number }[]>`SELECT count(*)::int count
+        FROM conversation_share_snapshots WHERE owner_id=${ownerId} AND revoked_at IS NULL
+          AND (expires_at IS NULL OR expires_at>now())`;
+      if (activeShares[0].count >= MAX_ACTIVE_CONVERSATION_SHARES) {
+        throw new DomainError(
+          "share_limit_exceeded",
+          "Revoke an existing share before creating another",
+          409,
+        );
+      }
+      await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-share-secret'),hashtext(${input.secretHash}))`;
+      if (
+        (await tx`SELECT 1 FROM conversation_share_snapshots WHERE secret_hash=${input.secretHash}`)
+          .length
+      ) {
+        throw new DomainError("secret_conflict", "Share capability already exists", 409);
+      }
+      const rows = await tx<Row[]>`SELECT c.*,u.name owner_name,u.approval_status,u.state
+        FROM conversations c JOIN users u ON u.id=c.owner_id
+        WHERE c.id=${input.conversationId} AND c.owner_id=${ownerId} FOR UPDATE OF c`;
+      const row = rows[0];
+      if (!row || row.deleted_at) throw new DomainError("not_found", "Conversation not found", 404);
+      if (row.approval_status !== "approved" || row.state !== "active") {
+        throw new DomainError("account_unavailable", "Account cannot create shares", 403);
+      }
+      if (row.temporary) {
+        throw new DomainError(
+          "temporary_conversation_not_shareable",
+          "Save this temporary chat before sharing",
+          409,
+        );
+      }
+      if (number(row.version) !== input.expectedConversationVersion) {
+        throw new DomainError("version_conflict", "Conversation changed before sharing", 409);
+      }
+      const messageRows = await tx<
+        Row[]
+      >`SELECT * FROM messages WHERE conversation_id=${input.conversationId}
+        ORDER BY created_at,id LIMIT ${MAX_CONVERSATION_SHARE_MESSAGES + 1}`;
+      if (messageRows.length > MAX_CONVERSATION_SHARE_MESSAGES) {
+        throw new DomainError("share_too_large", "Conversation is too large to share", 413);
+      }
+      if (messageRows.some((value) => value.status === "streaming")) {
+        throw new DomainError(
+          "generation_in_progress",
+          "Stop the active generation before sharing",
+          409,
+        );
+      }
+      const byId = new Map(messageRows.map((value) => [String(value.id), value]));
+      const reversePath: Row[] = [];
+      const seen = new Set<string>();
+      let cursor: string | null = input.leafId;
+      while (cursor !== null) {
+        if (seen.has(cursor)) {
+          throw new DomainError("invalid_graph", "Conversation graph contains a cycle", 409);
+        }
+        seen.add(cursor);
+        const node = byId.get(cursor);
+        if (!node) {
+          throw new DomainError("invalid_leaf", "Share leaf is not in this conversation", 422);
+        }
+        reversePath.push(node);
+        cursor = node.parent_id == null ? null : String(node.parent_id);
+      }
+      const path = reversePath.reverse();
+      const leaf = path[path.length - 1];
+      if (
+        leaf.status === "tombstoned" || leaf.role === "system" || leaf.role === "developer"
+      ) throw new DomainError("leaf_not_shareable", "Share leaf is not publicly shareable", 422);
+      const publicPath = path.filter((value) =>
+        value.status !== "tombstoned" && value.role !== "system" && value.role !== "developer"
+      );
+      if (
+        publicPath.length > MAX_CONVERSATION_SHARE_MESSAGES ||
+        publicPath.reduce((total, value) => total + String(value.content).length, 0) >
+          MAX_CONVERSATION_SHARE_CONTENT_CHARS
+      ) throw new DomainError("share_too_large", "Conversation is too large to share", 413);
+      const pathIds = publicPath.map((value) => String(value.id));
+      const links = input.attachmentPolicy === "redact" || !pathIds.length
+        ? []
+        : input.attachmentPolicy === "selected"
+        ? await tx<Row[]>`SELECT message_id,attachment_id,position FROM message_attachments
+          WHERE message_id=ANY(${pathIds}::uuid[])
+            AND attachment_id=ANY(${input.selectedAttachmentIds}::uuid[])
+          ORDER BY message_id,position LIMIT ${MAX_CONVERSATION_SHARE_ATTACHMENTS + 1}`
+        : await tx<Row[]>`SELECT message_id,attachment_id,position FROM message_attachments
+          WHERE message_id=ANY(${pathIds}::uuid[]) ORDER BY message_id,position
+          LIMIT ${MAX_CONVERSATION_SHARE_ATTACHMENTS + 1}`;
+      if (links.length > MAX_CONVERSATION_SHARE_ATTACHMENTS) {
+        throw new DomainError(
+          "share_too_large",
+          "Conversation has too many shared attachments",
+          413,
+        );
+      }
+      const byMessage = new Map<string, Row[]>();
+      const pathAttachmentIds: string[] = [];
+      for (const link of links) {
+        const messageId = String(link.message_id);
+        const values = byMessage.get(messageId) ?? [];
+        values.push(link);
+        if (values.length > 100) {
+          throw new DomainError(
+            "share_too_large",
+            "Conversation has too many shared attachments",
+            413,
+          );
+        }
+        byMessage.set(messageId, values);
+        const attachmentId = String(link.attachment_id);
+        if (!pathAttachmentIds.includes(attachmentId)) pathAttachmentIds.push(attachmentId);
+      }
+      const selected = input.attachmentPolicy === "include"
+        ? pathAttachmentIds
+        : input.attachmentPolicy === "selected"
+        ? input.selectedAttachmentIds
+        : [];
+      if (selected.length > MAX_CONVERSATION_SHARE_ATTACHMENTS) {
+        throw new DomainError(
+          "share_too_large",
+          "Conversation has too many shared attachments",
+          413,
+        );
+      }
+      if (selected.some((id) => !pathAttachmentIds.includes(id))) {
+        throw new DomainError(
+          "invalid_attachment",
+          "Selected attachment is not on the shared path",
+          422,
+        );
+      }
+      const attachmentRows = selected.length
+        ? await tx<Row[]>`SELECT * FROM attachments WHERE id=ANY(${selected}::uuid[])
+          AND owner_id=${ownerId} AND state='ready' AND deleted_at IS NULL`
+        : [];
+      if (attachmentRows.length !== selected.length) {
+        throw new DomainError("invalid_attachment", "Shared attachment is unavailable", 409);
+      }
+      const attachmentById = new Map(attachmentRows.map((value) => [String(value.id), value]));
+      const attachmentPublicIds = new Map(selected.map((id) => [id, crypto.randomUUID()]));
+      const publicAttachments: PublicConversationShareAttachment[] = selected.map(
+        (attachmentId) => {
+          const value = attachmentById.get(attachmentId)!;
+          return {
+            id: attachmentPublicIds.get(attachmentId)!,
+            filename: String(value.filename),
+            mimeType: String(value.mime_type),
+            sizeBytes: number(value.size_bytes),
+            width: value.width == null ? null : number(value.width),
+            height: value.height == null ? null : number(value.height),
+            createdAt: iso(value.created_at),
+          };
+        },
+      );
+      const sourceAttachments = Object.fromEntries(selected.map((attachmentId) => {
+        const value = attachmentById.get(attachmentId)!;
+        return [attachmentPublicIds.get(attachmentId)!, {
+          attachmentId,
+          objectKey: String(value.object_key),
+        }];
+      }));
+      const messagePublicIds = new Map(
+        publicPath.map((value) => [String(value.id), crypto.randomUUID()]),
+      );
+      const id = crypto.randomUUID();
+      const createdAt = new Date().toISOString();
+      if (expiresAt !== null && Date.parse(expiresAt) <= Date.parse(createdAt)) {
+        throw new DomainError("validation_error", "Share expiry must be in the future", 422);
+      }
+      const publicSnapshot = materializePublicConversationShare({
+        id,
+        title: String(row.title),
+        conversationVersion: number(row.version),
+        identity: {
+          visibility: input.identityVisibility,
+          displayName: input.identityVisibility === "owner" ? String(row.owner_name) : null,
+        },
+        attachmentPolicy: input.attachmentPolicy,
+        messages: publicPath.map((value, index) => {
+          const messageId = String(value.id);
+          return {
+            id: messagePublicIds.get(messageId)!,
+            parentId: index === 0 ? null : messagePublicIds.get(String(publicPath[index - 1].id))!,
+            role: String(value.role),
+            content: String(value.content),
+            status: String(value.status),
+            attachmentIds: (byMessage.get(messageId) ?? []).map((link) =>
+              attachmentPublicIds.get(String(link.attachment_id))
+            ).filter((value) => value !== undefined),
+            createdAt: iso(value.created_at),
+          };
+        }),
+        attachments: publicAttachments,
+        createdAt,
+        expiresAt,
+      });
+      const inserted = await tx<Row[]>`INSERT INTO conversation_share_snapshots(
+        id,owner_id,conversation_id,leaf_id,conversation_version,title,identity_visibility,
+        attachment_policy,owner_name_snapshot,public_snapshot,source_attachments,secret_hash,
+        idempotency_key,payload_hash,version,expires_at,created_at
+      ) VALUES(${id},${ownerId},${input.conversationId},${input.leafId},${number(row.version)},
+        ${String(row.title)},${input.identityVisibility},${input.attachmentPolicy},
+        ${input.identityVisibility === "owner" ? String(row.owner_name) : null},
+        ${tx.json(publicSnapshot as unknown as postgres.JSONValue)},
+        ${tx.json(sourceAttachments as postgres.JSONValue)},${input.secretHash},
+        ${input.idempotencyKey},${payloadHash},1,${expiresAt},${createdAt}) RETURNING *`;
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${ownerId},'conversation.share_created','conversation_share',${id},
+          ${
+        tx.json({ conversationId: input.conversationId, attachmentCount: publicAttachments.length })
+      })`;
+      return { share: conversationShareSummary(inserted[0]), replayed: false };
+    });
+  }
+
+  async listConversationShares(ownerId: string): Promise<ConversationShareSummary[]> {
+    if (!(await this.#sql`SELECT 1 FROM users WHERE id=${ownerId}`).length) {
+      throw new DomainError("not_found", "User not found", 404);
+    }
+    const rows = await this.#sql<Row[]>`SELECT * FROM conversation_share_snapshots
+      WHERE owner_id=${ownerId} ORDER BY created_at DESC,id DESC`;
+    return rows.map(conversationShareSummary);
+  }
+
+  async getConversationShare(ownerId: string, shareId: string): Promise<ConversationShareSummary> {
+    const rows = await this.#sql<Row[]>`SELECT * FROM conversation_share_snapshots
+      WHERE id=${shareId} AND owner_id=${ownerId}`;
+    if (!rows[0]) throw new DomainError("not_found", "Share not found", 404);
+    return conversationShareSummary(rows[0]);
+  }
+
+  async revokeConversationShare(
+    ownerId: string,
+    shareId: string,
+    expectedVersion: number,
+  ): Promise<ConversationShareSummary> {
+    return await this.#sql.begin(async (tx) => {
+      const rows = await tx<Row[]>`UPDATE conversation_share_snapshots
+        SET revoked_at=now(),version=version+1
+        WHERE id=${shareId} AND owner_id=${ownerId} AND version=${expectedVersion}
+          AND revoked_at IS NULL RETURNING *`;
+      if (rows[0]) {
+        await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+          VALUES(${ownerId},'conversation.share_revoked','conversation_share',${shareId},
+            ${tx.json({ conversationId: String(rows[0].conversation_id) })})`;
+        return conversationShareSummary(rows[0]);
+      }
+      const current = await tx<Row[]>`SELECT * FROM conversation_share_snapshots
+        WHERE id=${shareId} AND owner_id=${ownerId}`;
+      if (!current[0]) throw new DomainError("not_found", "Share not found", 404);
+      if (number(current[0].version) !== expectedVersion) {
+        throw new DomainError("version_conflict", "Share changed in another request", 409);
+      }
+      return conversationShareSummary(current[0]);
+    });
+  }
+
+  async resolvePublicConversationShare(
+    secretHash: string,
+    now = new Date().toISOString(),
+  ): Promise<PublicConversationShare | undefined> {
+    if (!/^[0-9a-f]{64}$/.test(secretHash) || !Number.isFinite(Date.parse(now))) return undefined;
+    const rows = await this.#sql<Row[]>`SELECT s.public_snapshot FROM conversation_share_snapshots s
+      JOIN users u ON u.id=s.owner_id WHERE s.secret_hash=${secretHash}
+        AND s.revoked_at IS NULL AND (s.expires_at IS NULL OR s.expires_at>${now})
+        AND u.approval_status='approved' AND u.state='active'`;
+    return rows[0] ? parsePublicConversationShare(rows[0].public_snapshot) : undefined;
+  }
+
+  async resolvePublicShareAttachment(
+    secretHash: string,
+    publicAttachmentId: string,
+    now = new Date().toISOString(),
+  ): Promise<ConversationShareAttachmentAccess | undefined> {
+    if (
+      !/^[0-9a-f]{64}$/.test(secretHash) ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+        publicAttachmentId,
+      ) ||
+      !Number.isFinite(Date.parse(now))
+    ) return undefined;
+    const rows = await this.#sql<Row[]>`SELECT s.*,u.approval_status,u.state
+      FROM conversation_share_snapshots s JOIN users u ON u.id=s.owner_id
+      WHERE s.secret_hash=${secretHash} AND s.revoked_at IS NULL
+        AND (s.expires_at IS NULL OR s.expires_at>${now})
+        AND u.approval_status='approved' AND u.state='active'`;
+    if (!rows[0]) return undefined;
+    const snapshot = parsePublicConversationShare(rows[0].public_snapshot);
+    const publicAttachment = snapshot.attachments.find((value) => value.id === publicAttachmentId);
+    const sources = rows[0].source_attachments;
+    const source = sources && typeof sources === "object" && !Array.isArray(sources)
+      ? (sources as Record<string, unknown>)[publicAttachmentId]
+      : undefined;
+    if (!publicAttachment || !source || typeof source !== "object" || Array.isArray(source)) {
+      return undefined;
+    }
+    const attachmentId = (source as Record<string, unknown>).attachmentId;
+    if (typeof attachmentId !== "string") return undefined;
+    const attachments = await this.#sql<Row[]>`SELECT object_key FROM attachments
+      WHERE id=${attachmentId} AND owner_id=${String(rows[0].owner_id)}
+        AND state='ready' AND deleted_at IS NULL`;
+    if (!attachments[0]) return undefined;
+    return {
+      shareId: String(rows[0].id),
+      ownerId: String(rows[0].owner_id),
+      attachment: publicAttachment,
+      objectKey: String(attachments[0].object_key),
+    };
+  }
+
   async updateUserPreferences(
     ownerId: string,
     patch: import("./repository.ts").UserPreferencesPatch,

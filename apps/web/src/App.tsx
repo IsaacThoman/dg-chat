@@ -65,7 +65,6 @@ import {
   Square,
   Sun,
   Trash2,
-  Upload,
   UserCheck,
   Users,
   Volume2,
@@ -78,6 +77,7 @@ import { AdminRetentionView } from "./AdminRetention.tsx";
 import { AdminBackupsView } from "./AdminBackups.tsx";
 import { PersonalTokenSettings } from "./TokenGovernance.tsx";
 import { UserPortability } from "./UserPortability.tsx";
+import { ConversationShareButton } from "./ConversationSharing.tsx";
 import {
   conversationForFirstSend,
   mergeAttachmentIds,
@@ -2577,9 +2577,13 @@ function ChatView({
           <span className="balance-pill">
             <CircleDollarSign size={15} /> ${balance.toFixed(2)}
           </span>
-          <IconButton label="Share conversation (not available yet)" disabled>
-            <Upload size={18} />
-          </IconButton>
+          {conversation && (
+            <ConversationShareButton
+              conversation={conversation}
+              messages={activePath}
+              disabled={generationBusy || activePath.length === 0}
+            />
+          )}
           <IconButton label="Conversation options (not available yet)" disabled>
             <MoreHorizontal size={19} />
           </IconButton>

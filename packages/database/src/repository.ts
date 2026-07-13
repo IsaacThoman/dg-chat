@@ -7,12 +7,17 @@ import type {
   ConversationFolder,
   ConversationFolderMembership,
   ConversationPortabilityV1,
+  ConversationShareAttachmentPolicy,
+  ConversationShareIdentityVisibility,
+  ConversationShareSummary,
   ConversationTag,
   ConversationTagBinding,
   ConversationTagSet,
   MessageNode,
   MessageRole,
   ModelCapability,
+  PublicConversationShare,
+  PublicConversationShareAttachment,
   PublicUser,
   UsageSummary,
   UserPreferences,
@@ -42,6 +47,37 @@ export interface ConversationPortabilityImportResult {
   tags: number;
   /** Old archive identifiers mapped to newly allocated owner-scoped identifiers. */
   idMap: Record<string, string>;
+}
+
+export interface CreateConversationShareInput {
+  conversationId: string;
+  leafId: string;
+  expectedConversationVersion: number;
+  identityVisibility: ConversationShareIdentityVisibility;
+  attachmentPolicy: ConversationShareAttachmentPolicy;
+  /** Required and non-empty only for the selected policy. Private attachment identifiers. */
+  selectedAttachmentIds: string[];
+  expiresAt: string | null;
+  idempotencyKey: string;
+  /** SHA-256 of the caller-held 32-byte capability. The plaintext is never persisted. */
+  secretHash: string;
+}
+
+export interface CreateConversationShareResult {
+  share: ConversationShareSummary;
+  replayed: boolean;
+}
+export const MAX_ACTIVE_CONVERSATION_SHARES = 100;
+export const MAX_CONVERSATION_SHARE_MESSAGES = 20_000;
+export const MAX_CONVERSATION_SHARE_ATTACHMENTS = 2_000;
+export const MAX_CONVERSATION_SHARE_CONTENT_CHARS = 16_000_000;
+
+/** Internal object access returned only after a valid capability has resolved. */
+export interface ConversationShareAttachmentAccess {
+  shareId: string;
+  ownerId: string;
+  attachment: PublicConversationShareAttachment;
+  objectKey: string;
 }
 
 export interface CreateUserInput {
@@ -1615,6 +1651,29 @@ export interface DomainRepository {
     idempotencyKey: string,
     dryRun?: boolean,
   ): MaybePromise<ConversationPortabilityImportResult>;
+  createConversationShare(
+    ownerId: string,
+    input: CreateConversationShareInput,
+  ): MaybePromise<CreateConversationShareResult>;
+  listConversationShares(ownerId: string): MaybePromise<ConversationShareSummary[]>;
+  getConversationShare(
+    ownerId: string,
+    shareId: string,
+  ): MaybePromise<ConversationShareSummary>;
+  revokeConversationShare(
+    ownerId: string,
+    shareId: string,
+    expectedVersion: number,
+  ): MaybePromise<ConversationShareSummary>;
+  resolvePublicConversationShare(
+    secretHash: string,
+    now?: string,
+  ): MaybePromise<PublicConversationShare | undefined>;
+  resolvePublicShareAttachment(
+    secretHash: string,
+    publicAttachmentId: string,
+    now?: string,
+  ): MaybePromise<ConversationShareAttachmentAccess | undefined>;
   updateUserPreferences(
     ownerId: string,
     patch: UserPreferencesPatch,

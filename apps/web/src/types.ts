@@ -1,10 +1,16 @@
 import type {
   ConversationFolder,
   ConversationFolderMembership,
+  ConversationShareAttachmentPolicy,
+  ConversationShareIdentityVisibility,
+  ConversationShareSummary,
   ConversationTag,
   ConversationTagBinding,
   ConversationTagSet,
   ModelCapability,
+  PublicConversationShare,
+  PublicConversationShareAttachment,
+  PublicConversationShareMessage,
   UserPreferences,
 } from "../../../packages/contracts/src/types.ts";
 export type {
@@ -15,6 +21,7 @@ export type {
   ConversationTagSet,
   UserPreferences,
 };
+export type { ConversationShareSummary, PublicConversationShare };
 
 export type Role = "user" | "admin";
 export type UserStatus = "pending" | "approved" | "suspended" | "rejected" | "deleted";
@@ -40,6 +47,16 @@ export interface Conversation {
   project?: string;
   activeLeafId?: string | null;
   version?: number;
+}
+export type ShareIdentityVisibility = ConversationShareIdentityVisibility;
+export type ShareAttachmentPolicy = ConversationShareAttachmentPolicy;
+export type PublicShareAttachment = PublicConversationShareAttachment;
+export type PublicShareMessage = PublicConversationShareMessage;
+export interface ConversationShareCreated {
+  share: ConversationShareSummary;
+  capability: string;
+  path: string;
+  replayed: boolean;
 }
 export interface Branch {
   index: number;

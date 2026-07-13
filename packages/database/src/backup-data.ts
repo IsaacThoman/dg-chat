@@ -1,8 +1,10 @@
 import postgres from "npm:postgres@3.4.7";
+import { parsePublicConversationShare } from "@dg-chat/contracts";
 import type { ProviderCredentialEnvelope } from "./repository.ts";
 
-export const BACKUP_DATA_SCHEMA_VERSION = "0033" as const;
-const PREVIOUS_BACKUP_DATA_SCHEMA_VERSION = "0032" as const;
+export const BACKUP_DATA_SCHEMA_VERSION = "0034" as const;
+const PREVIOUS_BACKUP_DATA_SCHEMA_VERSION = "0033" as const;
+const SECOND_PREVIOUS_BACKUP_DATA_SCHEMA_VERSION = "0032" as const;
 const LEGACY_BACKUP_DATA_SCHEMA_VERSION = "0028" as const;
 export const LEGACY_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
   new Set([
@@ -12,10 +14,12 @@ export const LEGACY_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
     "conversation_tags",
     "conversation_tag_sets",
     "conversation_tag_bindings",
+    "conversation_share_snapshots",
   ]),
 );
 export function isSupportedBackupDataSchemaVersion(value: string): boolean {
   return value === BACKUP_DATA_SCHEMA_VERSION || value === PREVIOUS_BACKUP_DATA_SCHEMA_VERSION ||
+    value === SECOND_PREVIOUS_BACKUP_DATA_SCHEMA_VERSION ||
     value === LEGACY_BACKUP_DATA_SCHEMA_VERSION;
 }
 export const BACKUP_DATA_BATCH_SIZE = 100;
@@ -100,6 +104,7 @@ const UUID_COLUMNS = new Set([
   "supersedes_id",
   "generation_id",
   "active_leaf_id",
+  "leaf_id",
 ]);
 const TIMESTAMP_SUFFIX = /(?:_at|_expires_at)$/u;
 const inferKinds = (columns: readonly string[], explicit: ColumnKinds): ColumnKinds =>
@@ -249,6 +254,17 @@ export const BACKUP_DATA_TABLES: readonly BackupDataTable[] = Object.freeze([
       version: "integer",
       pinned: "boolean",
       temporary: "boolean",
+    },
+  ),
+  T(
+    "conversation_share_snapshots",
+    "id owner_id conversation_id leaf_id conversation_version title identity_visibility attachment_policy owner_name_snapshot public_snapshot source_attachments secret_hash idempotency_key payload_hash version expires_at revoked_at created_at",
+    "id",
+    {
+      conversation_version: "integer",
+      public_snapshot: "json",
+      source_attachments: "json",
+      version: "integer",
     },
   ),
   T(
@@ -1125,6 +1141,18 @@ const RELATIONS: readonly BackupRelation[] = Object.freeze([
   },
   { from: "attachments", columns: ["owner_id"], to: "users", target: ["id"] },
   { from: "conversations", columns: ["owner_id"], to: "users", target: ["id"] },
+  {
+    from: "conversation_share_snapshots",
+    columns: ["owner_id"],
+    to: "users",
+    target: ["id"],
+  },
+  {
+    from: "conversation_share_snapshots",
+    columns: ["conversation_id", "owner_id"],
+    to: "conversations",
+    target: ["id", "owner_id"],
+  },
   { from: "user_preferences", columns: ["user_id"], to: "users", target: ["id"] },
   { from: "conversation_folders", columns: ["owner_id"], to: "users", target: ["id"] },
   {
@@ -1346,6 +1374,49 @@ async function validateStagedDatabase(
   );
   if (!admins || admins.count < 1) {
     throw new BackupDataError("invariant", "Restore must contain an active approved administrator");
+  }
+  for await (
+    const rows of tx.unsafe(`SELECT id,title,conversation_version,identity_visibility,
+      attachment_policy,owner_name_snapshot,public_snapshot,source_attachments,expires_at
+      FROM ${staged("conversation_share_snapshots")} ORDER BY id`).cursor(100)
+  ) {
+    for (const row of rows as Record<string, unknown>[]) {
+      try {
+        const snapshot = parsePublicConversationShare(row.public_snapshot);
+        const sources = row.source_attachments;
+        if (!sources || typeof sources !== "object" || Array.isArray(sources)) throw new Error();
+        const sourceEntries = Object.entries(sources as Record<string, unknown>);
+        const publicAttachmentIds = new Set(snapshot.attachments.map((value) => value.id));
+        if (
+          snapshot.id !== row.id || snapshot.title !== row.title ||
+          snapshot.conversationVersion !== row.conversation_version ||
+          snapshot.identity.visibility !== row.identity_visibility ||
+          snapshot.identity.displayName !== row.owner_name_snapshot ||
+          snapshot.attachmentPolicy !== row.attachment_policy ||
+          (snapshot.expiresAt === null) !== (row.expires_at === null) ||
+          sourceEntries.length !== publicAttachmentIds.size ||
+          sourceEntries.some(([publicId, source]) => {
+            if (
+              !publicAttachmentIds.has(publicId) || !source || typeof source !== "object" ||
+              Array.isArray(source)
+            ) return true;
+            const keys = Object.keys(source);
+            const value = source as Record<string, unknown>;
+            return keys.length !== 2 || !keys.includes("attachmentId") ||
+              !keys.includes("objectKey") || typeof value.attachmentId !== "string" ||
+              !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+                value.attachmentId,
+              ) || typeof value.objectKey !== "string" || !value.objectKey;
+          })
+        ) throw new Error();
+        if (
+          snapshot.expiresAt !== null &&
+          new Date(snapshot.expiresAt).getTime() !== new Date(String(row.expires_at)).getTime()
+        ) throw new Error();
+      } catch {
+        throw new BackupDataError("invariant", "Backup contains an invalid conversation share");
+      }
+    }
   }
   for (const table of ["conversation_folders", "conversation_tags"] as const) {
     const invalid = await tx.unsafe(
