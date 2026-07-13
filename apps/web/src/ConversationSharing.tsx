@@ -92,8 +92,13 @@ function ShareDialog({
     queryKey: ["conversation-shares"],
     queryFn: api.listConversationShares,
   });
-  const capability = useRef(createShareCapability());
-  const idempotencyKey = useRef(crypto.randomUUID());
+  const createOperation = useRef<
+    {
+      fingerprint: string;
+      capability: string;
+      idempotencyKey: string;
+    } | null
+  >(null);
   const [identityVisibility, setIdentityVisibility] = useState<ShareIdentityVisibility>(
     "anonymous",
   );
@@ -115,6 +120,24 @@ function ShareDialog({
 
   const create = async () => {
     if (!conversation.activeLeafId || conversation.version === undefined) return;
+    const expiresAt = expirationValue(expiry);
+    const effectiveAttachmentIds = attachmentPolicy === "selected" ? selectedAttachmentIds : [];
+    const fingerprint = JSON.stringify({
+      leafId: conversation.activeLeafId,
+      expectedConversationVersion: conversation.version,
+      identityVisibility,
+      attachmentPolicy,
+      selectedAttachmentIds: [...effectiveAttachmentIds].sort(),
+      expiresAt,
+    });
+    if (createOperation.current?.fingerprint !== fingerprint) {
+      createOperation.current = {
+        fingerprint,
+        capability: createShareCapability(),
+        idempotencyKey: crypto.randomUUID(),
+      };
+    }
+    const operation = createOperation.current;
     setCreating(true);
     setError("");
     try {
@@ -124,20 +147,22 @@ function ShareDialog({
         expectedConversationVersion: conversation.version,
         identityVisibility,
         attachmentPolicy,
-        selectedAttachmentIds: attachmentPolicy === "selected" ? selectedAttachmentIds : [],
-        expiresAt: expirationValue(expiry),
-        capability: capability.current,
-        idempotencyKey: idempotencyKey.current,
+        selectedAttachmentIds: effectiveAttachmentIds,
+        expiresAt,
+        capability: operation.capability,
+        idempotencyKey: operation.idempotencyKey,
       });
       const url = new URL(result.path, globalThis.location.origin);
       if (url.origin !== globalThis.location.origin || !url.pathname.startsWith("/share/")) {
         throw new Error("The server returned an invalid share link.");
       }
       setCreatedUrl(url.toString());
+      await queryClient.cancelQueries({ queryKey: ["conversation-shares"] });
       queryClient.setQueryData<ConversationShareSummary[]>(
         ["conversation-shares"],
         (current = []) => [result.share, ...current.filter((item) => item.id !== result.share.id)],
       );
+      void queryClient.invalidateQueries({ queryKey: ["conversation-shares"] });
     } catch (caught) {
       setError(errorMessage(caught));
     } finally {

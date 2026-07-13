@@ -37,13 +37,14 @@ test("creates and revokes an immutable snapshot with conservative defaults", asy
   ).getAttribute("data-conversation-actions");
   expect(conversationId).toBeTruthy();
   const ownerSummary = { ...summary, conversationId };
+  let storedSummary: typeof ownerSummary | undefined;
   await page.route(
     "**/api/shares",
     (route) =>
       route.fulfill({
         status: 200,
         contentType: "application/json",
-        body: JSON.stringify({ data: [] }),
+        body: JSON.stringify({ data: storedSummary ? [storedSummary] : [] }),
       }),
   );
   let createBody: Record<string, unknown> | undefined;
@@ -51,6 +52,7 @@ test("creates and revokes an immutable snapshot with conservative defaults", asy
   await page.route(`**/api/conversations/${conversationId}/shares`, async (route) => {
     createBody = route.request().postDataJSON();
     idempotencyKey = await route.request().headerValue("idempotency-key") ?? "";
+    storedSummary = ownerSummary;
     await route.fulfill({
       status: 201,
       contentType: "application/json",
@@ -62,14 +64,18 @@ test("creates and revokes an immutable snapshot with conservative defaults", asy
       }),
     });
   });
-  await page.route("**/api/shares/share-1/revoke", (route) =>
-    route.fulfill({
+  await page.route("**/api/shares/share-1/revoke", (route) => {
+    storedSummary = {
+      ...ownerSummary,
+      version: 2,
+      revokedAt: "2026-07-13T05:00:00.000Z",
+    };
+    return route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({
-        share: { ...ownerSummary, version: 2, revokedAt: "2026-07-13T05:00:00.000Z" },
-      }),
-    }));
+      body: JSON.stringify({ share: storedSummary }),
+    });
+  });
 
   await page.getByRole("button", { name: "Share an immutable snapshot" }).click();
   const dialog = page.getByRole("dialog", { name: "Share conversation" });
