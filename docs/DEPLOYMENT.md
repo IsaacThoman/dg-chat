@@ -197,9 +197,9 @@ encrypted credential, the model is enabled, and an effective price revision exis
 
 Public conversation capabilities are protected independently per capability and per client by
 `PUBLIC_SHARE_RATE_LIMIT` (120) and `PUBLIC_SHARE_CLIENT_RATE_LIMIT` (240) in the common
-`RATE_LIMIT_WINDOW_SECONDS` window. Owner create/revoke operations use
-`SHARE_MUTATION_RATE_LIMIT` (20). Public access fails closed when Redis is unavailable. If the API
-is behind a reverse proxy, enable `TRUST_PROXY_HEADERS` only after that proxy strips inbound
-forwarding headers and supplies the direct client address; without that trust boundary, the client
-ceiling intentionally becomes installation-wide. Public capability paths must be redacted from
-proxy/access logs, and the web `/share/*` route must retain `Referrer-Policy: no-referrer`.
+`RATE_LIMIT_WINDOW_SECONDS` window. Owner create/revoke operations use `SHARE_MUTATION_RATE_LIMIT`
+(20). Public access fails closed when Redis is unavailable. If the API is behind a reverse proxy,
+enable `TRUST_PROXY_HEADERS` only after that proxy strips inbound forwarding headers and supplies
+the direct client address; without that trust boundary, the client ceiling intentionally becomes
+installation-wide. Public capability paths must be redacted from proxy/access logs, and the web
+`/share/*` route must retain `Referrer-Policy: no-referrer`.
