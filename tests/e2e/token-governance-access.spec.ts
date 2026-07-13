@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 import type { Token } from "../../apps/web/src/types.ts";
-import { bootstrap, login } from "./helpers.ts";
+import { bootstrap, login, openSidebar } from "./helpers.ts";
 
 const token: Token = {
   id: "00000000-0000-4000-8000-000000000301",
@@ -101,9 +101,7 @@ test("personal token governance and admin entitlements are explicit and responsi
     throw new Error(`Unexpected token request: ${method} ${url.pathname}${url.search}`);
   });
 
-  if ((page.viewportSize()?.width ?? 1280) <= 800) {
-    await page.getByRole("button", { name: "Open menu", exact: true }).click();
-  }
+  await openSidebar(page);
   await page.getByRole("button", { name: "Settings", exact: true }).click();
   await page.getByRole("button", { name: "API tokens", exact: true }).click();
   await expect(page.getByText("Installation default", { exact: true })).toBeVisible();
@@ -469,8 +467,9 @@ test("token settings expose loading, fetch failure, retry, and empty states", as
     }
     return route.fulfill({ json: { data: [] } });
   });
-  if ((page.viewportSize()?.width ?? 1280) <= 800) {
-    await page.getByRole("button", { name: "Open menu", exact: true }).focus();
+  const openMenu = page.getByRole("button", { name: "Open menu", exact: true });
+  if (await openMenu.isVisible()) {
+    await openMenu.focus();
     await page.keyboard.press("Enter");
   }
   await page.getByRole("button", { name: "Settings", exact: true }).focus();

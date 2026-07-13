@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { bootstrap, login } from "./helpers.ts";
+import { bootstrap, login, openSidebar } from "./helpers.ts";
 
 const approvedUser = {
   id: "00000000-0000-4000-8000-000000000099",
@@ -346,9 +346,7 @@ test("account settings distinguish sessions and tolerate a transient current-ses
       body: JSON.stringify({ error: { code: "service_unavailable", message: "Try again" } }),
     });
   });
-  if ((page.viewportSize()?.width ?? 1280) <= 800) {
-    await page.getByRole("button", { name: "Open menu", exact: true }).click();
-  }
+  await openSidebar(page);
   await page.getByRole("button", { name: "Settings", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Signed-in sessions", exact: true }))
     .toBeVisible();
@@ -395,9 +393,7 @@ test("revoking the current session returns to sign in", async ({ page, request }
       body: JSON.stringify({ error: { code: "unauthorized", message: "Signed out" } }),
     });
   });
-  if ((page.viewportSize()?.width ?? 1280) <= 800) {
-    await page.getByRole("button", { name: "Open menu", exact: true }).click();
-  }
+  await openSidebar(page);
   await page.getByRole("button", { name: "Settings", exact: true }).click();
   await page.getByRole("button", { name: /Sign out workspace session created/ }).click();
   await expect(page).toHaveURL(/\/login$/);

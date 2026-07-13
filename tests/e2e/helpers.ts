@@ -42,15 +42,59 @@ export async function login(
   await expect(page).toHaveURL(/\/$/, { timeout: 30_000 });
 }
 
+export function workspaceSidebar(page: Page) {
+  return page.locator('aside.sidebar[aria-label="Workspace navigation"]');
+}
+
+async function sidebarIsExposed(page: Page): Promise<boolean> {
+  const sidebar = workspaceSidebar(page);
+  if (await sidebar.count() !== 1) return false;
+  return await sidebar.evaluate((element) =>
+    element.getAttribute("aria-hidden") !== "true" &&
+    !element.hasAttribute("inert")
+  );
+}
+
+/**
+ * Exposes the responsive workspace sidebar without assuming a viewport breakpoint or ARIA role.
+ * The same aside is a complementary landmark on desktop, an inert off-canvas element while a
+ * mobile drawer is closed, and a modal dialog while that drawer is open.
+ */
+export async function openSidebar(page: Page) {
+  const sidebar = workspaceSidebar(page);
+  await expect(sidebar).toHaveCount(1);
+  if (await sidebarIsExposed(page)) return sidebar;
+
+  // A nested row dialog temporarily makes an already-open drawer inert. Wait for that dialog's
+  // cleanup instead of trying to click the Open menu control behind the physical drawer.
+  if (await sidebar.evaluate((element) => element.classList.contains("mobile-open"))) {
+    await expect.poll(() => sidebarIsExposed(page), {
+      message: "the open workspace drawer to become interactive again",
+    }).toBe(true);
+    return sidebar;
+  }
+
+  const menu = page.getByRole("button", { name: "Open menu", exact: true });
+  await expect(menu).toBeVisible();
+  await menu.click();
+  await expect.poll(() => sidebarIsExposed(page), {
+    message: "the workspace sidebar to become interactive",
+  }).toBe(true);
+  await expect(sidebar).toBeVisible();
+  await expect(sidebar).toHaveAttribute("role", "dialog");
+  await expect(
+    sidebar.getByRole("button", { name: "Close sidebar", exact: true }),
+  ).toBeFocused();
+  return sidebar;
+}
+
 export async function createChat(page: Page): Promise<void> {
   const activeActions = page.locator(".conversation-row.active [data-conversation-actions]");
   const previousId = await activeActions.count() === 1
     ? await activeActions.getAttribute("data-conversation-actions")
     : null;
   const button = page.getByRole("button", { name: "New chat ⌘ K", exact: true });
-  if ((page.viewportSize()?.width ?? 1280) <= 800) {
-    await page.getByRole("button", { name: "Open menu", exact: true }).click();
-  }
+  await openSidebar(page);
   await button.click();
   await expect.poll(
     () => activeActions.getAttribute("data-conversation-actions"),

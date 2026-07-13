@@ -111,16 +111,24 @@ test("mobile drawer is inert while closed and sheds modal state at the desktop b
   await login(page);
   await createChat(page);
   await createChat(page);
-  await page.setViewportSize({ width: 320, height: 800 });
 
   const sidebar = page.locator("aside.sidebar");
+  const open = page.getByRole("button", { name: "Open menu", exact: true });
+  await page.setViewportSize({ width: 760, height: 800 });
+  await expect(sidebar).toHaveAttribute("aria-hidden", "true");
+  await expect(sidebar).toHaveAttribute("inert", "");
+  await expect(open).toBeVisible();
+  await page.setViewportSize({ width: 761, height: 800 });
+  await expect(sidebar).not.toHaveAttribute("aria-hidden", "true");
+  await expect(sidebar).not.toHaveAttribute("inert", "");
+  await expect(open).toBeHidden();
+  await page.setViewportSize({ width: 320, height: 800 });
   await expect(sidebar).toHaveAttribute("aria-hidden", "true");
   await expect(sidebar).toHaveAttribute("inert", "");
   await expect(page.getByRole("dialog", { name: "Workspace navigation", exact: true }))
     .toHaveCount(0);
   await expect(page.getByRole("button", { name: "New chat ⌘ K", exact: true })).toHaveCount(0);
 
-  const open = page.getByRole("button", { name: "Open menu", exact: true });
   await open.click();
   const drawer = page.getByRole("dialog", { name: "Workspace navigation", exact: true });
   await expect(drawer).toBeVisible();

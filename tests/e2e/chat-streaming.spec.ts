@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { apiURL, bootstrap, createChat, login } from "./helpers.ts";
+import { apiURL, bootstrap, createChat, login, openSidebar } from "./helpers.ts";
 
 test.beforeEach(async ({ page, request }) => {
   await bootstrap(request);
@@ -87,9 +87,7 @@ test("stop persists exactly one partial assistant node across reload", async ({ 
   expect(persisted).not.toContain("final-sentinel");
 
   await page.reload();
-  if ((page.viewportSize()?.width ?? 1280) <= 800) {
-    await page.getByRole("button", { name: "Open menu", exact: true }).click();
-  }
+  await openSidebar(page);
   await page.locator(
     `.conversation-row:has([data-conversation-actions="${conversationId}"]) button.conversation-open`,
   ).click();
@@ -160,9 +158,7 @@ test("regenerating an earlier turn selects and keeps the new branch", async ({ p
   ).getAttribute("data-conversation-actions");
   expect(conversationId).toBeTruthy();
   await page.reload();
-  if ((page.viewportSize()?.width ?? 1280) <= 800) {
-    await page.getByRole("button", { name: "Open menu", exact: true }).click();
-  }
+  await openSidebar(page);
   await page.locator(
     `.conversation-row:has([data-conversation-actions="${conversationId}"]) button.conversation-open`,
   ).click();

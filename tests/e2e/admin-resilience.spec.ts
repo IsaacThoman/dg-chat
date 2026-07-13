@@ -1,5 +1,5 @@
 import { expect, type Page, test } from "@playwright/test";
-import { apiURL, bootstrap, login } from "./helpers.ts";
+import { apiURL, bootstrap, login, openSidebar } from "./helpers.ts";
 
 interface ProviderModelFixture {
   id: string;
@@ -74,7 +74,7 @@ async function createModelFixture(
 }
 
 async function openResilience(page: Page, mobile: boolean) {
-  if (mobile) await page.getByRole("button", { name: "Open menu", exact: true }).click();
+  await openSidebar(page);
   await page.getByRole("button", { name: "Admin console", exact: true }).click();
   if (mobile) {
     await page.getByRole("combobox", { name: "Admin section" }).selectOption("resilience");

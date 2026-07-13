@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { bootstrap, login } from "./helpers.ts";
+import { bootstrap, login, openSidebar } from "./helpers.ts";
 
 const preview = {
   dryRun: true,
@@ -18,9 +18,7 @@ test.beforeEach(async ({ page, request }) => {
 });
 
 async function openSettings(page: import("@playwright/test").Page) {
-  if ((page.viewportSize()?.width ?? 1280) <= 800) {
-    await page.getByRole("button", { name: "Open menu", exact: true }).click();
-  }
+  await openSidebar(page);
   await page.getByRole("button", { name: "Settings", exact: true }).click();
   await page.getByRole("button", { name: "Data & privacy", exact: true }).click();
 }
