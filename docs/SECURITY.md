@@ -75,10 +75,14 @@ timestamps only. A scrub run is fenced to those reviewed cutoffs and permanently
 diagnostic bodies while preserving chats, attachments, usage, costs, attempts, and audit history.
 Worker failures persist fixed public codes and messages rather than exception text.
 
-Public chat snapshots are not implemented in the current release. Conversations remain private to
-their owner. A future sharing implementation must be revocable, read-only, pinned to an immutable
-leaf, independently control identity and attachment exposure, and invalidate cached access on
-revocation.
+Conversations remain private unless their owner explicitly creates a read-only snapshot pinned to an
+exact immutable leaf. Share capabilities are generated in the browser, revealed once, and stored
+only as SHA-256 hashes. Public snapshots use share-local message and attachment identifiers, omit
+system/developer and tombstoned content, hide provider routing, default to anonymous identity with
+attachments redacted, and never follow later edits. Public responses are `no-store`/`no-referrer`,
+and access fails closed after revocation, expiry, owner suspension, or owner deletion. The public
+attachment route revalidates the live share, object ownership, MIME type, and byte length on every
+read.
 
 ## Reporting vulnerabilities
 
