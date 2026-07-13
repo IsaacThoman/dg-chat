@@ -709,6 +709,17 @@ export class MemoryRepository {
     return { ...this.publicUser(user), effectiveAdmin: this.#isEffectiveAdmin(user) };
   }
 
+  #assertEffectiveAdminActor(actorId: string): void {
+    const actor = this.users.get(actorId);
+    if (!actor || !this.#isEffectiveAdmin(actor)) {
+      throw new DomainError(
+        "admin_authority_required",
+        "Administrator authority changed before the request completed",
+        403,
+      );
+    }
+  }
+
   #adminTarget(targetUserId: string, expectedVersion: number, reason?: string): StoredUser {
     if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 1) {
       throw new DomainError("validation_error", "Expected version must be a positive integer", 422);
@@ -744,6 +755,9 @@ export class MemoryRepository {
         token.revokedAt = now;
         token.version++;
       }
+    }
+    for (const token of this.identityTokens.values()) {
+      if (token.userId === userId && !token.consumedAt) token.consumedAt = now;
     }
   }
 
@@ -816,6 +830,7 @@ export class MemoryRepository {
   }
 
   decideUserApproval(input: AdminApprovalCommand): AdminUser {
+    this.#assertEffectiveAdminActor(input.actorId);
     const user = this.#adminTarget(input.targetUserId, input.expectedVersion, input.reason);
     if (user.approvalStatus === input.status) {
       throw new DomainError("no_state_change", "Approval status is unchanged", 409);
@@ -857,6 +872,7 @@ export class MemoryRepository {
   }
 
   setAdminUserRole(input: AdminRoleCommand): AdminUser {
+    this.#assertEffectiveAdminActor(input.actorId);
     const user = this.#adminTarget(input.targetUserId, input.expectedVersion, input.reason);
     if (user.role === input.role) {
       throw new DomainError("no_state_change", "Role is unchanged", 409);
@@ -889,6 +905,7 @@ export class MemoryRepository {
   }
 
   setAdminUserState(input: AdminStateCommand): AdminUser {
+    this.#assertEffectiveAdminActor(input.actorId);
     const user = this.#adminTarget(input.targetUserId, input.expectedVersion, input.reason);
     if (user.state === input.state) {
       throw new DomainError("no_state_change", "Account state is unchanged", 409);
@@ -912,6 +929,7 @@ export class MemoryRepository {
   }
 
   setAdminUserDeleted(input: AdminDeletionCommand): AdminUser {
+    this.#assertEffectiveAdminActor(input.actorId);
     const user = this.#adminTarget(input.targetUserId, input.expectedVersion, input.reason);
     if ((user.deletedAt !== null) === input.deleted) {
       throw new DomainError("no_state_change", "Deletion status is unchanged", 409);

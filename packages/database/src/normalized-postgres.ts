@@ -238,6 +238,35 @@ function adminMutationMetadata(
     ...(reason ? { reason } : {}),
   };
 }
+
+async function assertEffectiveAdminActor(
+  tx: postgres.TransactionSql,
+  actorId: string,
+): Promise<void> {
+  const actors = await tx<Row[]>`SELECT * FROM users WHERE id=${actorId} FOR UPDATE`;
+  if (!actors[0] || !isEffectiveAdminRow(actors[0])) {
+    throw new DomainError(
+      "admin_authority_required",
+      "Administrator authority changed before the request completed",
+      403,
+    );
+  }
+}
+
+async function invalidateFullUserAuthority(
+  tx: postgres.TransactionSql,
+  userId: string,
+): Promise<void> {
+  await tx`UPDATE sessions SET invalidated_at=now()
+    WHERE user_id=${userId} AND limited=false AND invalidated_at IS NULL`;
+  await tx`DELETE FROM auth_sessions WHERE user_id=${userId} AND limited=false`;
+  await tx`UPDATE api_tokens SET revoked_at=now(),version=version+1
+    WHERE user_id=${userId} AND revoked_at IS NULL`;
+  await tx`UPDATE identity_tokens SET consumed_at=now()
+    WHERE user_id=${userId} AND consumed_at IS NULL`;
+  await tx`DELETE FROM auth_verifications
+    WHERE value=${userId} AND identifier LIKE 'reset-password:%'`;
+}
 const adminJob = (row: Row): AdminJobSummary => ({
   id: String(row.id),
   type: String(row.type),
@@ -1479,6 +1508,7 @@ export class PostgresRepository implements DomainRepository {
     ) throw new DomainError("validation_error", "Starting credit is invalid", 422);
     return await this.#sql.begin(async (tx) => {
       await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-final-admin'))`;
+      await assertEffectiveAdminActor(tx, input.actorId);
       const rows = await tx<Row[]>`SELECT * FROM users WHERE id=${input.targetUserId} FOR UPDATE`;
       const row = rows[0];
       if (!row) throw new DomainError("not_found", "User not found", 404);
@@ -1535,11 +1565,7 @@ export class PostgresRepository implements DomainRepository {
         balance_micros=${balance},version=version+1,updated_at=now()
         WHERE id=${input.targetUserId} RETURNING *`;
       if (input.status === "rejected") {
-        await tx`UPDATE sessions SET invalidated_at=now()
-          WHERE user_id=${input.targetUserId} AND limited=false AND invalidated_at IS NULL`;
-        await tx`DELETE FROM auth_sessions WHERE user_id=${input.targetUserId} AND limited=false`;
-        await tx`UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,now())
-          WHERE user_id=${input.targetUserId}`;
+        await invalidateFullUserAuthority(tx, input.targetUserId);
       }
       const result = updated[0];
       await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
@@ -1553,6 +1579,7 @@ export class PostgresRepository implements DomainRepository {
     const reason = validateAdminCommand(input);
     return await this.#sql.begin(async (tx) => {
       await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-final-admin'))`;
+      await assertEffectiveAdminActor(tx, input.actorId);
       const rows = await tx<Row[]>`SELECT * FROM users WHERE id=${input.targetUserId} FOR UPDATE`;
       const row = rows[0];
       if (!row) throw new DomainError("not_found", "User not found", 404);
@@ -1605,6 +1632,7 @@ export class PostgresRepository implements DomainRepository {
     const reason = validateAdminCommand(input);
     return await this.#sql.begin(async (tx) => {
       await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-final-admin'))`;
+      await assertEffectiveAdminActor(tx, input.actorId);
       const rows = await tx<Row[]>`SELECT * FROM users WHERE id=${input.targetUserId} FOR UPDATE`;
       const row = rows[0];
       if (!row) throw new DomainError("not_found", "User not found", 404);
@@ -1636,11 +1664,7 @@ export class PostgresRepository implements DomainRepository {
       const updated = await tx<Row[]>`UPDATE users SET state=${input.state},version=version+1,
         updated_at=now() WHERE id=${input.targetUserId} RETURNING *`;
       if (input.state === "suspended") {
-        await tx`UPDATE sessions SET invalidated_at=now()
-          WHERE user_id=${input.targetUserId} AND limited=false AND invalidated_at IS NULL`;
-        await tx`DELETE FROM auth_sessions WHERE user_id=${input.targetUserId} AND limited=false`;
-        await tx`UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,now())
-          WHERE user_id=${input.targetUserId}`;
+        await invalidateFullUserAuthority(tx, input.targetUserId);
       }
       const result = updated[0];
       await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
@@ -1654,6 +1678,7 @@ export class PostgresRepository implements DomainRepository {
     const reason = validateAdminCommand(input);
     return await this.#sql.begin(async (tx) => {
       await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-final-admin'))`;
+      await assertEffectiveAdminActor(tx, input.actorId);
       const rows = await tx<Row[]>`SELECT * FROM users WHERE id=${input.targetUserId} FOR UPDATE`;
       const row = rows[0];
       if (!row) throw new DomainError("not_found", "User not found", 404);
@@ -1686,11 +1711,7 @@ export class PostgresRepository implements DomainRepository {
         input.deleted ? new Date() : null
       },version=version+1,updated_at=now() WHERE id=${input.targetUserId} RETURNING *`;
       if (input.deleted) {
-        await tx`UPDATE sessions SET invalidated_at=now()
-          WHERE user_id=${input.targetUserId} AND limited=false AND invalidated_at IS NULL`;
-        await tx`DELETE FROM auth_sessions WHERE user_id=${input.targetUserId} AND limited=false`;
-        await tx`UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,now())
-          WHERE user_id=${input.targetUserId}`;
+        await invalidateFullUserAuthority(tx, input.targetUserId);
       }
       const result = updated[0];
       await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)

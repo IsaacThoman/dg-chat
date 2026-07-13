@@ -20,8 +20,8 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 2 });
-    await sql`TRUNCATE audit_events,ledger_entries,api_tokens,auth_sessions,auth_accounts,
-      auth_users,sessions,users RESTART IDENTITY CASCADE`;
+    await sql`TRUNCATE audit_events,ledger_entries,identity_tokens,api_tokens,auth_verifications,
+      auth_sessions,auth_accounts,auth_users,sessions,users RESTART IDENTITY CASCADE`;
     const actorId = crypto.randomUUID();
     const targetId = crypto.randomUUID();
     const secondId = crypto.randomUUID();
@@ -91,6 +91,11 @@ Deno.test({
       const tokenId = crypto.randomUUID();
       await sql`INSERT INTO api_tokens(id,user_id,name,token_hash,preview,scopes,rotation_family_id)
         VALUES(${tokenId},${targetId},'test','token-hash','dg_test','["chat"]',${tokenId})`;
+      await sql`INSERT INTO identity_tokens(user_id,purpose,token_hash,expires_at)
+        VALUES(${targetId},'password_reset','pending-reset',now()+interval '1 hour')`;
+      await sql`INSERT INTO auth_verifications(id,identifier,value,expires_at)
+        VALUES(${crypto.randomUUID()},'reset-password:pending-better-auth',${targetId},
+          now()+interval '1 hour')`;
       const suspended = await repo.setAdminUserState({
         actorId,
         targetUserId: targetId,
@@ -120,6 +125,23 @@ Deno.test({
         await sql`SELECT id FROM api_tokens WHERE revoked_at IS NULL`.then((rows) => rows.length),
         0,
       );
+      assertEquals(
+        await sql`SELECT version FROM api_tokens WHERE id=${tokenId}`.then((rows) =>
+          Number(rows[0].version)
+        ),
+        2,
+      );
+      assertEquals(
+        await sql`SELECT id FROM identity_tokens WHERE user_id=${targetId}
+          AND consumed_at IS NULL`.then((rows) => rows.length),
+        0,
+      );
+      assertEquals(
+        await sql`SELECT id FROM auth_verifications WHERE value=${targetId}`.then((rows) =>
+          rows.length
+        ),
+        0,
+      );
 
       const deleted = await repo.setAdminUserDeleted({
         actorId,
@@ -139,14 +161,16 @@ Deno.test({
       assertEquals(restored.state, "suspended");
 
       const beforeAuditFailure = await repo.getAdminUser(secondId);
-      await assertRejects(() =>
-        repo.decideUserApproval({
-          actorId: crypto.randomUUID(),
-          targetUserId: secondId,
-          expectedVersion: beforeAuditFailure.version,
-          status: "approved",
-          startingCreditMicros: 700,
-        })
+      await domainError(
+        () =>
+          repo.decideUserApproval({
+            actorId: crypto.randomUUID(),
+            targetUserId: secondId,
+            expectedVersion: beforeAuditFailure.version,
+            status: "approved",
+            startingCreditMicros: 700,
+          }),
+        "admin_authority_required",
       );
       const afterAuditFailure = await repo.getAdminUser(secondId);
       assertEquals(afterAuditFailure, beforeAuditFailure);
@@ -164,6 +188,20 @@ Deno.test({
         "user.role.admin",
         "user.approval.approved",
       ]);
+
+      await sql`UPDATE users SET role='user' WHERE id=${actorId}`;
+      await domainError(
+        () =>
+          repo.decideUserApproval({
+            actorId,
+            targetUserId: secondId,
+            expectedVersion: beforeAuditFailure.version,
+            status: "approved",
+            startingCreditMicros: 700,
+          }),
+        "admin_authority_required",
+      );
+      assertEquals((await repo.getAdminUser(secondId)).approvalStatus, "pending");
     } finally {
       await repo.close();
       await sql.end();
@@ -178,8 +216,8 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
-    await sql`TRUNCATE audit_events,ledger_entries,api_tokens,auth_sessions,auth_accounts,
-      auth_users,sessions,users RESTART IDENTITY CASCADE`;
+    await sql`TRUNCATE audit_events,ledger_entries,identity_tokens,api_tokens,auth_verifications,
+      auth_sessions,auth_accounts,auth_users,sessions,users RESTART IDENTITY CASCADE`;
     const firstId = crypto.randomUUID();
     const secondId = crypto.randomUUID();
     await sql`INSERT INTO users(id,email,name,role,approval_status,state,email_verified_at)
@@ -206,7 +244,10 @@ Deno.test({
       assertEquals(outcomes.filter((outcome) => outcome.status === "fulfilled").length, 1);
       const rejection = outcomes.find((outcome) => outcome.status === "rejected");
       assertExists(rejection);
-      assertEquals((rejection as PromiseRejectedResult).reason.code, "final_admin");
+      assertEquals(
+        (rejection as PromiseRejectedResult).reason.code,
+        "admin_authority_required",
+      );
       assertEquals(
         (await first.listAdminUsers({ deletion: "all" })).data.filter((user) => user.effectiveAdmin)
           .length,

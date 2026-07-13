@@ -40,7 +40,7 @@ Deno.test("admin lifecycle protects the exact final effective administrator", ()
       expectedVersion: admin.version,
       state: "suspended",
       reason: "test",
-    }), "final_admin");
+    }), "admin_authority_required");
 
   const second = repo.createUser({
     email: "second@example.com",
@@ -79,6 +79,18 @@ Deno.test("admin lifecycle uses optimistic versions and keeps deletion independe
   });
   const full = repo.createSession(user.id, "full", false);
   const limited = repo.createSession(user.id, "limited", true);
+  const apiToken = repo.createApiToken(user.id, {
+    name: "Lifecycle token",
+    scopes: ["chat:write"],
+    tokenHash: "lifecycle-token",
+    preview: "dg_life",
+  });
+  repo.createIdentityToken(
+    user.id,
+    "password_reset",
+    "pending-password-reset",
+    new Date(Date.now() + 60_000).toISOString(),
+  );
   const originalVersion = user.version;
 
   const deleted = repo.setAdminUserDeleted({
@@ -92,6 +104,9 @@ Deno.test("admin lifecycle uses optimistic versions and keeps deletion independe
   assertEquals(deleted.state, "active");
   assertEquals(repo.listSessions(user.id).map((session) => session.id), [limited.id]);
   assertEquals(repo.listSessions(user.id).some((session) => session.id === full.id), false);
+  assertEquals(apiToken.revokedAt !== null, true);
+  assertEquals(apiToken.version, 2);
+  assertEquals(repo.identityTokens.get("pending-password-reset")?.consumedAt !== null, true);
 
   assertDomainCode(() =>
     repo.setAdminUserState({
@@ -112,6 +127,44 @@ Deno.test("admin lifecycle uses optimistic versions and keeps deletion independe
   assertEquals(restored.deletedAt, null);
   assertEquals(restored.state, "active");
   assertEquals(restored.version, deleted.version + 1);
+});
+
+Deno.test("admin lifecycle fails closed after actor authority is revoked", () => {
+  const { repo, admin } = adminRepository();
+  const second = repo.createUser({
+    email: "security-admin@example.com",
+    name: "Security administrator",
+    approvalStatus: "approved",
+    emailVerified: true,
+  });
+  repo.setAdminUserRole({
+    actorId: admin.id,
+    targetUserId: second.id,
+    expectedVersion: second.version,
+    role: "admin",
+    reason: "Add independent administrator",
+  });
+  repo.setAdminUserRole({
+    actorId: second.id,
+    targetUserId: admin.id,
+    expectedVersion: admin.version,
+    role: "user",
+    reason: "Revoke stale administrator",
+  });
+  const applicant = repo.createUser({ email: "stale-target@example.com", name: "Applicant" });
+  const auditCount = repo.auditEvents.length;
+
+  assertDomainCode(() =>
+    repo.decideUserApproval({
+      actorId: admin.id,
+      targetUserId: applicant.id,
+      expectedVersion: applicant.version,
+      status: "approved",
+      startingCreditMicros: 500,
+    }), "admin_authority_required");
+  assertEquals(applicant.approvalStatus, "pending");
+  assertEquals(applicant.balanceMicros, 0);
+  assertEquals(repo.auditEvents.length, auditCount);
 });
 
 Deno.test("admin user directory has stable filter-bound cursor pagination", () => {
