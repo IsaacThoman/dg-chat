@@ -230,6 +230,42 @@ Deno.test("memory balance adjustment provides exact replay, payload conflict, CA
   assertEquals(repository.ledger.filter((entry) => entry.kind === "adjustment").length, 1);
 });
 
+Deno.test("memory ledger sequence is causal and cursor pagination ignores timestamps", () => {
+  const { repository, actor, target } = fixture();
+  let balance = 0;
+  for (const [index, amount] of [100, -25, 50].entries()) {
+    repository.adjustAdminUserBalance({
+      actorId: actor.id,
+      targetUserId: target.id,
+      amountMicros: amount,
+      expectedBalanceMicros: balance,
+      idempotencyKeyHash: String(index + 1).repeat(64),
+      requestHash: String(index + 4).repeat(64),
+      reason: `Causal adjustment ${index + 1}`,
+    });
+    balance += amount;
+  }
+  const entries = repository.ledger.filter((entry) => entry.userId === target.id);
+  assertEquals(entries.map((entry) => entry.sequence), [1, 2, 3]);
+  entries[0].createdAt = "2099-01-01T00:00:00.000Z";
+  entries[1].createdAt = "2000-01-01T00:00:00.000Z";
+  entries[2].createdAt = "1999-01-01T00:00:00.000Z";
+
+  const first = repository.listAdminUserLedger(actor.id, target.id, { limit: 2 });
+  assertEquals(first.data.map((entry) => entry.sequence), [3, 2]);
+  assertEquals(first.nextCursor !== null, true);
+  const second = repository.listAdminUserLedger(actor.id, target.id, {
+    limit: 2,
+    cursor: first.nextCursor!,
+  });
+  assertEquals(second.data.map((entry) => entry.sequence), [1]);
+  assertEquals(second.nextCursor, null);
+  assertEquals(
+    new Set([...first.data, ...second.data].map((entry) => entry.id)).size,
+    3,
+  );
+});
+
 Deno.test("memory rotation invalidates stale administrative versions across the token family", () => {
   const { repository, actor, target } = fixture();
   const first = repository.createApiToken(target.id, {

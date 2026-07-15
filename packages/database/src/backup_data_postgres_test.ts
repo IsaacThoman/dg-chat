@@ -309,7 +309,55 @@ Deno.test({
       assertEquals(Number((await sql`SELECT count(*) count FROM conversations`)[0].count), 3);
       assertEquals(Number((await sql`SELECT count(*) count FROM sessions`)[0].count), 1);
 
-      const legacyCaptured = structuredClone(captured);
+      const preSequenceCaptured = structuredClone(captured);
+      preSequenceCaptured.set(
+        "ledger_entries",
+        preSequenceCaptured.get("ledger_entries")!.map((batch) =>
+          batch.map(({ sequence: _sequence, ...row }) => ({
+            ...row,
+            // Deliberately reverse timestamp order. Causal reconstruction must still follow the
+            // balance transitions 0 -> 100 -> 125.
+            created_at: row.kind === "grant"
+              ? "2099-01-01T00:00:00.000Z"
+              : "2000-01-01T00:00:00.000Z",
+          }))
+        ),
+      );
+      const preSequencePreview = await dryRunBackupData(databaseUrl!, {
+        schemaVersion: "0038",
+        rows(name) {
+          return (async function* () {
+            for (const batch of preSequenceCaptured.get(name) ?? []) {
+              yield structuredClone(batch);
+            }
+          })();
+        },
+      });
+      assertEquals(preSequencePreview.users, preview.users);
+      const impossibleLedger = structuredClone(preSequenceCaptured);
+      impossibleLedger.set(
+        "ledger_entries",
+        impossibleLedger.get("ledger_entries")!.map((batch) =>
+          batch.map((row) => row.kind === "grant" ? { ...row, balance_after_micros: "101" } : row)
+        ),
+      );
+      await assertRejects(
+        () =>
+          dryRunBackupData(databaseUrl!, {
+            schemaVersion: "0038",
+            rows(name) {
+              return (async function* () {
+                for (const batch of impossibleLedger.get(name) ?? []) {
+                  yield structuredClone(batch);
+                }
+              })();
+            },
+          }),
+        BackupDataError,
+        "ledger history is inconsistent",
+      );
+
+      const legacyCaptured = structuredClone(preSequenceCaptured);
       legacyCaptured.set(
         "users",
         legacyCaptured.get("users")!.map((batch) =>

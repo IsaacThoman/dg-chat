@@ -1402,8 +1402,8 @@ export class PostgresRepository implements DomainRepository {
       ) SELECT * FROM all_sessions
       WHERE (${query.source ?? null}::text IS NULL OR source=${query.source ?? null})
         AND (${query.status ?? null}::text IS NULL OR status=${query.status ?? null})
-        AND (${cursor?.createdAt ?? null}::text IS NULL OR
-          (created_at,sort_id)<(${cursor?.createdAt ?? null}::timestamptz,${cursor?.id ?? null}))
+        AND (${cursor?.position ?? null}::text IS NULL OR
+          (created_at,sort_id)<(${cursor?.position ?? null}::timestamptz,${cursor?.id ?? null}))
       ORDER BY created_at DESC,sort_id DESC LIMIT ${limit + 1}`;
       const data = rows.slice(0, limit).map((row) => ({
         id: String(row.sort_id),
@@ -1461,8 +1461,8 @@ export class PostgresRepository implements DomainRepository {
         GROUP BY t.id
       ) SELECT * FROM token_page
       WHERE (${query.status ?? null}::text IS NULL OR status=${query.status ?? null})
-        AND (${cursor?.createdAt ?? null}::text IS NULL OR
-          (created_at,id)<(${cursor?.createdAt ?? null}::timestamptz,${cursor?.id ?? null}::uuid))
+        AND (${cursor?.position ?? null}::text IS NULL OR
+          (created_at,id)<(${cursor?.position ?? null}::timestamptz,${cursor?.id ?? null}::uuid))
       ORDER BY created_at DESC,id DESC LIMIT ${limit + 1}`;
       const data = rows.slice(0, limit).map((row) => ({
         ...tokenSummary(token(row)),
@@ -1498,21 +1498,18 @@ export class PostgresRepository implements DomainRepository {
         fingerprint,
       );
       const rows = await tx<Row[]>`
-      SELECT l.*,
-        to_char(l.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') cursor_created_at,
-        a.id adjustment_id,
+      SELECT l.*,a.id adjustment_id,
         a.actor_id adjustment_actor_id,a.reason adjustment_reason
       FROM ledger_entries l LEFT JOIN admin_balance_adjustments a ON a.ledger_entry_id=l.id
       WHERE l.user_id=${targetUserId}
         AND (${query.kind ?? null}::text IS NULL OR l.kind::text=${query.kind ?? null})
-        AND (${cursor?.createdAt ?? null}::text IS NULL OR
-          (l.created_at,l.id)<(${cursor?.createdAt ?? null}::timestamptz,${
-        cursor?.id ?? null
-      }::uuid))
-      ORDER BY l.created_at DESC,l.id DESC LIMIT ${limit + 1}`;
+        AND (${cursor?.position ?? null}::text IS NULL OR
+          (l.sequence,l.id)<(${cursor?.position ?? null}::bigint,${cursor?.id ?? null}::uuid))
+      ORDER BY l.sequence DESC,l.id DESC LIMIT ${limit + 1}`;
       const data = rows.slice(0, limit).map((row) => ({
         id: String(row.id),
         userId: String(row.user_id),
+        sequence: number(row.sequence),
         usageRunId: String(row.usage_run_id),
         kind: row.kind as "grant" | "reserve" | "settle" | "refund" | "adjustment",
         amountMicros: number(row.amount_micros),
@@ -1530,7 +1527,7 @@ export class PostgresRepository implements DomainRepository {
           ? encodeAdminResourceCursor(
             "ledger",
             targetUserId,
-            String(rows[limit - 1].cursor_created_at),
+            String(rows[limit - 1].sequence),
             String(rows[limit - 1].id),
             fingerprint,
           )
@@ -8046,9 +8043,10 @@ export class PostgresRepository implements DomainRepository {
   async listLedger(userId: string): Promise<LedgerEntry[]> {
     return (await this.#sql<
       Row[]
-    >`SELECT * FROM ledger_entries WHERE user_id=${userId} ORDER BY created_at,id`).map((row) => ({
+    >`SELECT * FROM ledger_entries WHERE user_id=${userId} ORDER BY sequence,id`).map((row) => ({
       id: String(row.id),
       userId: String(row.user_id),
+      sequence: number(row.sequence),
       usageRunId: String(row.usage_run_id),
       kind: row.kind as LedgerEntry["kind"],
       amountMicros: number(row.amount_micros),
@@ -8191,11 +8189,12 @@ export class PostgresRepository implements DomainRepository {
     });
   }
   private async listAllLedger(): Promise<LedgerEntry[]> {
-    return (await this.#sql<Row[]>`SELECT * FROM ledger_entries ORDER BY created_at,id`).map((
+    return (await this.#sql<Row[]>`SELECT * FROM ledger_entries ORDER BY user_id,sequence,id`).map((
       row,
     ) => ({
       id: String(row.id),
       userId: String(row.user_id),
+      sequence: number(row.sequence),
       usageRunId: String(row.usage_run_id),
       kind: row.kind as LedgerEntry["kind"],
       amountMicros: number(row.amount_micros),

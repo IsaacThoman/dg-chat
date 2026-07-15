@@ -4,6 +4,7 @@ import {
   BACKUP_DATA_SCHEMA_VERSION,
   BACKUP_DATA_TABLES,
   backupContentRoot,
+  canonicalJson,
   createHmacBackupAuthenticator,
   LEGACY_BACKUP_DATA_OMITTED_TABLES,
   ObjectAlreadyExistsError,
@@ -177,6 +178,7 @@ async function fixture(
     ingested_at: null,
   };
   let restoredMap: ReadonlyMap<string, string> | undefined;
+  let restoredLedgerRows: Record<string, unknown>[] = [];
   const impact = (count: number): BackupRestoreImpact => ({
     rowsByTable: { attachments: count },
     totalRows: count,
@@ -190,6 +192,10 @@ async function fixture(
   const countRows = async (source: BackupDataSource) => {
     let count = 0;
     for await (const batch of source.rows("attachments")) count += batch.length;
+    restoredLedgerRows = [];
+    for await (const batch of source.rows("ledger_entries")) {
+      restoredLedgerRows.push(...structuredClone(batch));
+    }
     return count;
   };
   const duplicateObjectKey = ["attachments", "duplicate"].join("/");
@@ -303,6 +309,7 @@ async function fixture(
     catalogChecks: () => catalogChecks,
     setCatalogFailure: (value: boolean) => catalogFailure = value,
     restoredMap: () => restoredMap,
+    restoredLedgerRows: () => restoredLedgerRows,
   };
 }
 
@@ -622,21 +629,45 @@ Deno.test("postgres backup data previews and applies a signed legacy 0028 table 
   }
 });
 
-Deno.test("postgres backup data accepts supported pre-0038 catalogs without adjustment commands", async () => {
-  for (const schemaVersion of ["0037", "0034", "0033", "0032"] as const) {
+Deno.test("postgres backup data accepts supported pre-0039 catalogs", async () => {
+  for (const schemaVersion of ["0038", "0037", "0034", "0033", "0032"] as const) {
     const fx = await fixture();
     const snapshot = await fx.adapter.exportSnapshot({
       includeDiagnostics: false,
       installationId: "installation-test",
     });
     try {
-      const omitted = ["0033", "0032"].includes(schemaVersion)
+      const omitted = schemaVersion === "0038"
+        ? []
+        : ["0033", "0032"].includes(schemaVersion)
         ? PRE_IMMUTABLE_SHARING_BACKUP_DATA_OMITTED_TABLES
         : ADMIN_LIFECYCLE_BACKUP_DATA_OMITTED_TABLES;
       const omittedNames = new Set(
         [...omitted].map((name) => `tables/${name}.ndjson`),
       );
-      const entries = snapshot.manifest.entries.filter((entry) => !omittedNames.has(entry.name));
+      let entries = snapshot.manifest.entries.filter((entry) => !omittedNames.has(entry.name));
+      const payloads = new Map(snapshot.payloads);
+      if (schemaVersion === "0038") {
+        const ledgerPayload = new TextEncoder().encode(`${
+          canonicalJson({
+            id: "30000000-0000-4000-8000-000000000001",
+            user_id: ownerId,
+            usage_run_id: "legacy-0038-run",
+            kind: "grant",
+            amount_micros: "5",
+            balance_after_micros: "5",
+            metadata: {},
+            created_at: "2026-01-01T00:00:00.000Z",
+          })
+        }\n`);
+        const digest = await sha256Hex(ledgerPayload);
+        entries = entries.map((entry) =>
+          entry.name === "tables/ledger_entries.ndjson"
+            ? { ...entry, bytes: ledgerPayload.length, records: 1, sha256: digest }
+            : entry
+        );
+        payloads.set("tables/ledger_entries.ndjson", ledgerPayload);
+      }
       const { signature: _signature, ...unsigned } = snapshot.manifest;
       const manifest = await signBackupManifest({
         ...unsigned,
@@ -644,7 +675,6 @@ Deno.test("postgres backup data accepts supported pre-0038 catalogs without adju
         entries,
         contentRootSha256: await backupContentRoot(entries),
       }, fx.authenticator);
-      const payloads = new Map(snapshot.payloads);
       for (const name of omittedNames) payloads.delete(name);
       const session = await fx.adapter.restoreSession("preview", { restoreOperationId });
       const parsed = await parseBackupArchiveStream(
@@ -654,6 +684,10 @@ Deno.test("postgres backup data accepts supported pre-0038 catalogs without adju
       );
       const preview = await session.summarize(parsed);
       assertEquals(preview.counts.find((row) => row.resource === "attachments")?.create, 1);
+      if (schemaVersion === "0038") {
+        assertEquals(fx.restoredLedgerRows().length, 1);
+        assertEquals("sequence" in fx.restoredLedgerRows()[0], false);
+      }
       await session.rollback();
     } finally {
       await snapshot.cleanup?.();

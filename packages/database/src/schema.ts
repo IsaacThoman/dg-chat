@@ -603,6 +603,7 @@ export const ledgerEntries = pgTable(
     userId: uuid("user_id").notNull().references(() => users.id),
     usageRunId: text("usage_run_id").notNull(),
     kind: ledgerKind("kind").notNull(),
+    sequence: bigint("sequence", { mode: "number" }).notNull(),
     amountMicros: bigint("amount_micros", { mode: "number" }).notNull(),
     balanceAfterMicros: bigint("balance_after_micros", { mode: "number" }).notNull(),
     metadata: jsonb("metadata").notNull().default({}),
@@ -614,6 +615,16 @@ export const ledgerEntries = pgTable(
     index("ledger_run_kind_idx").on(table.usageRunId, table.kind),
     index("ledger_user_idx").on(table.userId),
     index("ledger_user_page_idx").on(table.userId, table.createdAt.desc(), table.id.desc()),
+    uniqueIndex("ledger_user_sequence_uq").on(table.userId, table.sequence),
+    index("ledger_user_sequence_page_idx").on(
+      table.userId,
+      table.sequence.desc(),
+      table.id.desc(),
+    ),
+    check(
+      "ledger_sequence_safe_check",
+      sql`${table.sequence} BETWEEN 1 AND 9007199254740991`,
+    ),
     check(
       "ledger_amount_safe_check",
       sql`${table.amountMicros} BETWEEN -9007199254740991 AND 9007199254740991`,

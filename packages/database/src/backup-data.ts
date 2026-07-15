@@ -10,7 +10,8 @@ import {
   type ProviderProtocol,
 } from "./provider-model-invariants.ts";
 
-export const BACKUP_DATA_SCHEMA_VERSION = "0038" as const;
+export const BACKUP_DATA_SCHEMA_VERSION = "0039" as const;
+const ADMIN_SECURITY_BILLING_BACKUP_DATA_SCHEMA_VERSION = "0038" as const;
 const ADMIN_LIFECYCLE_BACKUP_DATA_SCHEMA_VERSION = "0037" as const;
 const IMMUTABLE_SHARING_BACKUP_DATA_SCHEMA_VERSION = "0034" as const;
 const CONVERSATION_PORTABILITY_BACKUP_DATA_SCHEMA_VERSION = "0033" as const;
@@ -36,6 +37,7 @@ export const PRE_IMMUTABLE_SHARING_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
 );
 export function isSupportedBackupDataSchemaVersion(value: string): boolean {
   return value === BACKUP_DATA_SCHEMA_VERSION ||
+    value === ADMIN_SECURITY_BILLING_BACKUP_DATA_SCHEMA_VERSION ||
     value === ADMIN_LIFECYCLE_BACKUP_DATA_SCHEMA_VERSION ||
     value === IMMUTABLE_SHARING_BACKUP_DATA_SCHEMA_VERSION ||
     value === CONVERSATION_PORTABILITY_BACKUP_DATA_SCHEMA_VERSION ||
@@ -388,11 +390,12 @@ export const BACKUP_DATA_TABLES: readonly BackupDataTable[] = Object.freeze([
   ),
   T(
     "ledger_entries",
-    "id user_id usage_run_id kind amount_micros balance_after_micros metadata created_at",
-    "user_id,created_at,id",
+    "id user_id usage_run_id kind sequence amount_micros balance_after_micros metadata created_at",
+    "user_id,sequence,id",
     {
       id: "uuid",
       usage_run_id: "text",
+      sequence: "bigint",
       amount_micros: "bigint",
       balance_after_micros: "bigint",
       metadata: "json",
@@ -944,6 +947,12 @@ function exactSourceRow(
   schemaVersion: string,
 ): Record<string, unknown> {
   if (
+    schemaVersion !== BACKUP_DATA_SCHEMA_VERSION && definition.name === "ledger_entries" && value &&
+    typeof value === "object" && !Array.isArray(value)
+  ) {
+    return exactRow(definition, { ...(value as Record<string, unknown>), sequence: null });
+  }
+  if (
     schemaVersion !== BACKUP_DATA_SCHEMA_VERSION && definition.name === "users" && value &&
     typeof value === "object" && !Array.isArray(value) && !("version" in value)
   ) {
@@ -1061,6 +1070,13 @@ async function stageSource(
         safeIdentifier(definition.name)
       } INCLUDING ALL) ON COMMIT DROP`,
     );
+    if (
+      source.schemaVersion !== BACKUP_DATA_SCHEMA_VERSION && definition.name === "ledger_entries"
+    ) {
+      await tx.unsafe(
+        `ALTER TABLE ${safeIdentifier(temporary)} ALTER COLUMN sequence DROP NOT NULL`,
+      );
+    }
     for (const [column, type] of Object.entries(definition.syntheticColumns ?? {})) {
       await tx.unsafe(
         `ALTER TABLE ${safeIdentifier(temporary)} ADD COLUMN ${safeIdentifier(column)} ${type}`,
@@ -1113,6 +1129,24 @@ async function stageSource(
       count += batch.length;
     }
     counts[definition.name] = count;
+  }
+  if (source.schemaVersion !== BACKUP_DATA_SCHEMA_VERSION) {
+    const ledgerName = stage.get("ledger_entries")!;
+    const usersName = stage.get("users")!;
+    try {
+      await tx`SELECT dg_chat_reconstruct_ledger_sequences(
+        ${ledgerName}::regclass,
+        ${usersName}::regclass
+      )`;
+    } catch (error) {
+      if ((error as { code?: unknown }).code === "23514") {
+        throw new BackupDataError("invariant", "Backup ledger history is inconsistent");
+      }
+      throw error;
+    }
+    await tx.unsafe(
+      `ALTER TABLE ${safeIdentifier(ledgerName)} ALTER COLUMN sequence SET NOT NULL`,
+    );
   }
   return { stage, counts };
 }
@@ -1618,10 +1652,12 @@ async function validateStagedDatabase(
   if (cycles.length) throw new BackupDataError("invariant", "Backup contains a conversation cycle");
   const ledgerMismatch = await tx.unsafe(
     `WITH balances AS (
-      SELECT id,user_id,balance_after_micros,
-        sum(amount_micros) OVER(PARTITION BY user_id ORDER BY created_at,id) expected
+      SELECT id,user_id,sequence,balance_after_micros,
+        row_number() OVER(PARTITION BY user_id ORDER BY sequence) ordinal,
+        sum(amount_micros) OVER(PARTITION BY user_id ORDER BY sequence) expected
       FROM ${staged("ledger_entries")}
-    ) SELECT 1 FROM balances WHERE balance_after_micros<>expected LIMIT 1`,
+    ) SELECT 1 FROM balances
+      WHERE sequence<>ordinal OR balance_after_micros<>expected LIMIT 1`,
   );
   if (ledgerMismatch.length) {
     throw new BackupDataError("invariant", "Backup ledger history is inconsistent");
@@ -1629,7 +1665,7 @@ async function validateStagedDatabase(
   const balanceMismatch = await tx.unsafe(
     `SELECT 1 FROM ${staged("users")} u LEFT JOIN LATERAL (
       SELECT balance_after_micros FROM ${staged("ledger_entries")} l WHERE l.user_id=u.id
-      ORDER BY created_at DESC,id DESC LIMIT 1
+      ORDER BY sequence DESC,id DESC LIMIT 1
     ) latest ON true WHERE u.balance_micros<>COALESCE(latest.balance_after_micros,0) LIMIT 1`,
   );
   if (balanceMismatch.length) {
@@ -1687,10 +1723,12 @@ async function validateRestoredDatabase(tx: postgres.TransactionSql): Promise<vo
   if (cycles.length) throw new BackupDataError("invariant", "Backup contains a conversation cycle");
   const ledgerMismatch = await tx`
     WITH balances AS (
-      SELECT id,user_id,balance_after_micros,
-        sum(amount_micros) OVER(PARTITION BY user_id ORDER BY created_at,id) expected
+      SELECT id,user_id,sequence,balance_after_micros,
+        row_number() OVER(PARTITION BY user_id ORDER BY sequence) ordinal,
+        sum(amount_micros) OVER(PARTITION BY user_id ORDER BY sequence) expected
       FROM ledger_entries
-    ) SELECT 1 FROM balances WHERE balance_after_micros<>expected LIMIT 1
+    ) SELECT 1 FROM balances
+      WHERE sequence<>ordinal OR balance_after_micros<>expected LIMIT 1
   `;
   if (ledgerMismatch.length) {
     throw new BackupDataError("invariant", "Backup ledger history is inconsistent");
@@ -1698,7 +1736,7 @@ async function validateRestoredDatabase(tx: postgres.TransactionSql): Promise<vo
   const userBalanceMismatch = await tx`
     SELECT 1 FROM users u LEFT JOIN LATERAL (
       SELECT balance_after_micros FROM ledger_entries l WHERE l.user_id=u.id
-      ORDER BY created_at DESC,id DESC LIMIT 1
+      ORDER BY sequence DESC,id DESC LIMIT 1
     ) latest ON true WHERE u.balance_micros<>COALESCE(latest.balance_after_micros,0) LIMIT 1
   `;
   if (userBalanceMismatch.length) {

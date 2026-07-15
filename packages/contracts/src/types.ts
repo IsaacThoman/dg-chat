@@ -392,6 +392,8 @@ export interface AdminLedgerAdjustmentDetail {
 export interface AdminLedgerEntry {
   id: string;
   userId: string;
+  /** Monotonic per-user causal position; timestamps are presentation-only. */
+  sequence: number;
   usageRunId: string;
   kind: AdminLedgerKind;
   amountMicros: number;

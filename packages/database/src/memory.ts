@@ -221,6 +221,7 @@ interface StoredConversationShare {
 export interface LedgerEntry {
   id: string;
   userId: string;
+  sequence: number;
   usageRunId: string;
   kind: "grant" | "reserve" | "settle" | "refund" | "adjustment";
   amountMicros: number;
@@ -1152,8 +1153,8 @@ export class MemoryRepository {
     const rows = [...this.sessions.values()].filter((session) =>
       session.userId === targetUserId && (!query.source || query.source === "legacy") &&
       (!query.status || status(session) === query.status) &&
-      (!cursor || session.createdAt < cursor.createdAt ||
-        (session.createdAt === cursor.createdAt && session.id < cursor.id))
+      (!cursor || session.createdAt < cursor.position ||
+        (session.createdAt === cursor.position && session.id < cursor.id))
     ).sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
     const page = rows.slice(0, limit);
     return {
@@ -1201,8 +1202,8 @@ export class MemoryRepository {
     };
     const rows = [...this.tokens.values()].filter((token) =>
       token.userId === targetUserId && (!query.status || status(token) === query.status) &&
-      (!cursor || token.createdAt < cursor.createdAt ||
-        (token.createdAt === cursor.createdAt && token.id < cursor.id))
+      (!cursor || token.createdAt < cursor.position ||
+        (token.createdAt === cursor.position && token.id < cursor.id))
     ).sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
     const page = rows.slice(0, limit);
     return {
@@ -1236,9 +1237,9 @@ export class MemoryRepository {
     const { limit, cursor } = this.#adminPageQuery(query, "ledger", targetUserId, fingerprint);
     const rows = this.ledger.filter((entry) =>
       entry.userId === targetUserId && (!query.kind || entry.kind === query.kind) &&
-      (!cursor || entry.createdAt < cursor.createdAt ||
-        (entry.createdAt === cursor.createdAt && entry.id < cursor.id))
-    ).sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
+      (!cursor || entry.sequence < Number(cursor.position) ||
+        (entry.sequence === Number(cursor.position) && entry.id < cursor.id))
+    ).sort((a, b) => b.sequence - a.sequence || b.id.localeCompare(a.id));
     const page = rows.slice(0, limit);
     return {
       data: page.map((entry) => {
@@ -1248,6 +1249,7 @@ export class MemoryRepository {
         return {
           id: entry.id,
           userId: entry.userId,
+          sequence: entry.sequence,
           usageRunId: entry.usageRunId,
           kind: entry.kind,
           amountMicros: entry.amountMicros,
@@ -1262,7 +1264,7 @@ export class MemoryRepository {
         ? encodeAdminResourceCursor(
           "ledger",
           targetUserId,
-          page[page.length - 1].createdAt,
+          String(page[page.length - 1].sequence),
           page[page.length - 1].id,
           fingerprint,
         )
@@ -1381,6 +1383,7 @@ export class MemoryRepository {
       const entry: LedgerEntry = {
         id: crypto.randomUUID(),
         userId: user.id,
+        sequence: this.#nextLedgerSequence(user.id),
         usageRunId,
         kind: "adjustment",
         amountMicros: input.amountMicros,
@@ -5489,6 +5492,7 @@ export class MemoryRepository {
     this.ledger.push({
       id: crypto.randomUUID(),
       userId: run.userId,
+      sequence: this.#nextLedgerSequence(run.userId),
       usageRunId: run.id,
       kind: "reserve",
       amountMicros: -delta,
@@ -6082,6 +6086,7 @@ export class MemoryRepository {
     const entry: LedgerEntry = {
       id: crypto.randomUUID(),
       userId,
+      sequence: this.#nextLedgerSequence(userId),
       usageRunId,
       kind,
       amountMicros,
@@ -6090,6 +6095,21 @@ export class MemoryRepository {
     };
     this.ledger.push(entry);
     return entry;
+  }
+  #nextLedgerSequence(userId: string): number {
+    const current = this.ledger.reduce(
+      (maximum, entry) => entry.userId === userId ? Math.max(maximum, entry.sequence) : maximum,
+      0,
+    );
+    const next = current + 1;
+    if (!Number.isSafeInteger(next)) {
+      throw new DomainError(
+        "accounting_overflow",
+        "Ledger sequence exceeds accounting bounds",
+        422,
+      );
+    }
+    return next;
   }
 
   reserve(

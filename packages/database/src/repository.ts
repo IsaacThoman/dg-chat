@@ -249,7 +249,7 @@ function validAdminResourceTimestamp(value: unknown): value is string {
 export function encodeAdminResourceCursor(
   resource: "sessions" | "tokens" | "ledger",
   targetUserId: string,
-  createdAt: string,
+  position: string,
   id: string,
   fingerprint = "",
 ): string {
@@ -258,7 +258,7 @@ export function encodeAdminResourceCursor(
       ADMIN_RESOURCE_CURSOR_VERSION,
       resource,
       targetUserId,
-      createdAt,
+      position,
       id,
       fingerprint,
     ]),
@@ -270,21 +270,23 @@ export function decodeAdminResourceCursor(
   resource: "sessions" | "tokens" | "ledger",
   targetUserId: string,
   fingerprint = "",
-): { createdAt: string; id: string } | undefined {
+): { position: string; id: string } | undefined {
   try {
     const base64 = cursor.replaceAll("-", "+").replaceAll("_", "/");
     const value = JSON.parse(atob(base64.padEnd(Math.ceil(base64.length / 4) * 4, "=")));
     if (
       !Array.isArray(value) || value.length !== 6 || value[0] !== ADMIN_RESOURCE_CURSOR_VERSION ||
-      value[1] !== resource || value[2] !== targetUserId ||
-      !validAdminResourceTimestamp(value[3]) ||
+      value[1] !== resource || value[2] !== targetUserId || typeof value[3] !== "string" ||
+      (resource === "ledger"
+        ? !/^[1-9]\d{0,15}$/.test(value[3]) || !Number.isSafeInteger(Number(value[3]))
+        : !validAdminResourceTimestamp(value[3])) ||
       typeof value[4] !== "string" || value[5] !== fingerprint ||
       (resource === "sessions"
         ? !/^(?:legacy|better_auth):[0-9a-f-]{36}$/i.test(value[4]) ||
           !ADMIN_RESOURCE_UUID_PATTERN.test(value[4].slice(value[4].indexOf(":") + 1))
         : !ADMIN_RESOURCE_UUID_PATTERN.test(value[4]))
     ) return undefined;
-    return { createdAt: value[3], id: value[4] };
+    return { position: value[3], id: value[4] };
   } catch {
     return undefined;
   }
