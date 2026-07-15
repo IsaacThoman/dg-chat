@@ -69,6 +69,10 @@ export const users = pgTable("users", {
   index("users_created_cursor_idx").on(table.createdAt.desc(), table.id.desc()),
   check("users_version_check", sql`${table.version} >= 1`),
   check("users_account_state_check", sql`${table.state} IN ('active','suspended')`),
+  check(
+    "users_balance_safe_check",
+    sql`${table.balanceMicros} BETWEEN 0 AND 9007199254740991`,
+  ),
 ]);
 
 // Better Auth owns credentials and browser sessions. These tables intentionally remain
@@ -98,6 +102,7 @@ export const authSessions = pgTable("auth_sessions", {
 }, (table) => [
   uniqueIndex("auth_sessions_token_uq").on(table.token),
   index("auth_sessions_user_idx").on(table.userId),
+  index("auth_sessions_user_page_idx").on(table.userId, table.createdAt.desc(), table.id.desc()),
 ]);
 
 export const authAccounts = pgTable("auth_accounts", {
@@ -144,6 +149,7 @@ export const sessions = pgTable(
   ) => [
     uniqueIndex("sessions_token_hash_uq").on(table.tokenHash),
     index("sessions_user_idx").on(table.userId),
+    index("sessions_user_page_idx").on(table.userId, table.createdAt.desc(), table.id.desc()),
   ],
 );
 
@@ -555,6 +561,7 @@ export const apiTokens = pgTable(
   ) => [
     uniqueIndex("api_tokens_hash_uq").on(table.tokenHash),
     index("api_tokens_user_idx").on(table.userId),
+    index("api_tokens_user_page_idx").on(table.userId, table.createdAt.desc(), table.id.desc()),
     uniqueIndex("api_tokens_family_generation_uq").on(
       table.rotationFamilyId,
       table.rotationGeneration,
@@ -606,6 +613,15 @@ export const ledgerEntries = pgTable(
   ) => [
     index("ledger_run_kind_idx").on(table.usageRunId, table.kind),
     index("ledger_user_idx").on(table.userId),
+    index("ledger_user_page_idx").on(table.userId, table.createdAt.desc(), table.id.desc()),
+    check(
+      "ledger_amount_safe_check",
+      sql`${table.amountMicros} BETWEEN -9007199254740991 AND 9007199254740991`,
+    ),
+    check(
+      "ledger_balance_safe_check",
+      sql`${table.balanceAfterMicros} BETWEEN 0 AND 9007199254740991`,
+    ),
   ],
 );
 
@@ -800,6 +816,65 @@ export const auditEvents = pgTable("audit_events", {
     table.targetId,
     table.createdAt.desc(),
     table.id.desc(),
+  ),
+]);
+
+/** Durable replay boundary for privileged balance mutations. Plaintext idempotency keys are never stored. */
+export const adminBalanceAdjustments = pgTable("admin_balance_adjustments", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  actorId: uuid("actor_id").notNull().references(() => users.id, { onDelete: "restrict" }),
+  targetUserId: uuid("target_user_id").notNull().references(() => users.id, {
+    onDelete: "restrict",
+  }),
+  idempotencyKeyHash: text("idempotency_key_hash").notNull(),
+  requestHash: text("request_hash").notNull(),
+  amountMicros: bigint("amount_micros", { mode: "number" }).notNull(),
+  balanceBeforeMicros: bigint("balance_before_micros", { mode: "number" }).notNull(),
+  balanceAfterMicros: bigint("balance_after_micros", { mode: "number" }).notNull(),
+  reason: text("reason").notNull(),
+  ledgerEntryId: uuid("ledger_entry_id").notNull().references(() => ledgerEntries.id, {
+    onDelete: "restrict",
+  }),
+  auditEventId: uuid("audit_event_id").notNull().references(() => auditEvents.id, {
+    onDelete: "restrict",
+  }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("admin_balance_adjustments_actor_key_uq").on(
+    table.actorId,
+    table.idempotencyKeyHash,
+  ),
+  uniqueIndex("admin_balance_adjustments_ledger_entry_uq").on(table.ledgerEntryId),
+  uniqueIndex("admin_balance_adjustments_audit_event_uq").on(table.auditEventId),
+  index("admin_balance_adjustments_target_page_idx").on(
+    table.targetUserId,
+    table.createdAt.desc(),
+    table.id.desc(),
+  ),
+  index("admin_balance_adjustments_actor_page_idx").on(
+    table.actorId,
+    table.createdAt.desc(),
+    table.id.desc(),
+  ),
+  check(
+    "admin_balance_adjustments_key_hash_check",
+    sql`${table.idempotencyKeyHash} ~ '^[0-9a-f]{64}$'`,
+  ),
+  check(
+    "admin_balance_adjustments_request_hash_check",
+    sql`${table.requestHash} ~ '^[0-9a-f]{64}$'`,
+  ),
+  check(
+    "admin_balance_adjustments_amount_check",
+    sql`${table.amountMicros} BETWEEN -9007199254740991 AND 9007199254740991 AND ${table.amountMicros} <> 0`,
+  ),
+  check(
+    "admin_balance_adjustments_balance_check",
+    sql`${table.balanceBeforeMicros} BETWEEN 0 AND 9007199254740991 AND ${table.balanceAfterMicros} BETWEEN 0 AND 9007199254740991 AND ${table.balanceAfterMicros} = ${table.balanceBeforeMicros} + ${table.amountMicros}`,
+  ),
+  check(
+    "admin_balance_adjustments_reason_check",
+    sql`${table.reason} = btrim(${table.reason}) AND char_length(${table.reason}) BETWEEN 1 AND 500`,
   ),
 ]);
 

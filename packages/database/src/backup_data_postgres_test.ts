@@ -80,11 +80,15 @@ Deno.test({
       const ocrSourceId = crypto.randomUUID();
       const folderId = crypto.randomUUID();
       const tagId = crypto.randomUUID();
+      const grantLedgerId = crypto.randomUUID();
+      const adjustmentLedgerId = crypto.randomUUID();
+      const adjustmentAuditId = crypto.randomUUID();
+      const adjustmentId = crypto.randomUUID();
       await sql`INSERT INTO users(
         id,email,name,password_hash,role,approval_status,state,balance_micros,email_verified_at
       ) VALUES(
         ${userId},'portable-admin@example.com','Portable Admin',NULL,
-        'admin','approved','active',100,now()
+        'admin','approved','active',125,now()
       )`;
       await sql`INSERT INTO auth_users(id,name,email,email_verified)
         VALUES(${userId},'Portable Admin','portable-admin@example.com',true)`;
@@ -92,8 +96,21 @@ Deno.test({
         id,account_id,provider_id,user_id,password,created_at,updated_at
       ) VALUES(${crypto.randomUUID()},${userId},'credential',${userId},'password-hash',now(),now())`;
       await sql`INSERT INTO ledger_entries(
-        user_id,usage_run_id,kind,amount_micros,balance_after_micros
-      ) VALUES(${userId},${`grant:${userId}`},'grant',100,100)`;
+        id,user_id,usage_run_id,kind,amount_micros,balance_after_micros,created_at
+      ) VALUES
+        (${grantLedgerId},${userId},${`grant:${userId}`},'grant',100,100,
+          '2026-07-01T00:00:00Z'),
+        (${adjustmentLedgerId},${userId},${`admin-adjustment:${adjustmentId}`},
+          'adjustment',25,125,'2026-07-01T00:00:01Z')`;
+      await sql`INSERT INTO audit_events(id,actor_id,action,target_type,target_id,metadata)
+        VALUES(${adjustmentAuditId},${userId},'user.balance.adjusted','user',${userId},
+          ${sql.json({ reason: "Portable support credit", ledgerEntryId: adjustmentLedgerId })})`;
+      await sql`INSERT INTO admin_balance_adjustments(
+        id,actor_id,target_user_id,idempotency_key_hash,request_hash,amount_micros,
+        balance_before_micros,balance_after_micros,reason,ledger_entry_id,audit_event_id,created_at)
+      VALUES(${adjustmentId},${userId},${userId},${"7".repeat(64)},${"8".repeat(64)},25,
+        100,125,'Portable support credit',${adjustmentLedgerId},${adjustmentAuditId},
+        '2026-07-01T00:00:01Z')`;
       await sql`INSERT INTO attachments(
         id,owner_id,object_key,filename,mime_type,size_bytes,sha256,state,ingestion_status
       ) VALUES(
@@ -486,6 +503,24 @@ Deno.test({
       assertEquals(Number((await sql`SELECT count(*) count FROM auth_sessions`)[0].count), 0);
       assertEquals(Number((await sql`SELECT count(*) count FROM auth_verifications`)[0].count), 0);
       assertEquals(Number((await sql`SELECT count(*) count FROM jobs`)[0].count), 0);
+      assertEquals(
+        [
+          ...await sql`SELECT id,actor_id,target_user_id,amount_micros,balance_before_micros,
+          balance_after_micros,reason,ledger_entry_id,audit_event_id
+          FROM admin_balance_adjustments`,
+        ],
+        [{
+          id: adjustmentId,
+          actor_id: userId,
+          target_user_id: userId,
+          amount_micros: "25",
+          balance_before_micros: "100",
+          balance_after_micros: "125",
+          reason: "Portable support credit",
+          ledger_entry_id: adjustmentLedgerId,
+          audit_event_id: adjustmentAuditId,
+        }],
+      );
       assertEquals(
         Number(
           (await sql`SELECT count(*) count FROM audit_events

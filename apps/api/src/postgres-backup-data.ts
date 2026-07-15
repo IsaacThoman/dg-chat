@@ -13,6 +13,7 @@ import type {
   ProviderCredentialEnvelope,
 } from "@dg-chat/database";
 import {
+  ADMIN_LIFECYCLE_BACKUP_DATA_OMITTED_TABLES,
   BACKUP_DATA_BATCH_SIZE,
   BACKUP_DATA_SCHEMA_VERSION,
   BACKUP_DATA_TABLES,
@@ -23,6 +24,7 @@ import {
   isSupportedBackupDataSchemaVersion,
   LEGACY_BACKUP_DATA_OMITTED_TABLES,
   ObjectAlreadyExistsError,
+  PRE_IMMUTABLE_SHARING_BACKUP_DATA_OMITTED_TABLES,
   restoreBackupData,
   signBackupManifest,
   verifyBackupDataCatalog,
@@ -647,8 +649,12 @@ export function createPostgresBackupDataPort(
           const path = paths.get(`${TABLE_PREFIX}${tableName}.ndjson`);
           if (!path) {
             if (
-              stagedSchemaVersion === "0028" &&
-              LEGACY_BACKUP_DATA_OMITTED_TABLES.has(tableName)
+              (stagedSchemaVersion === "0028" &&
+                LEGACY_BACKUP_DATA_OMITTED_TABLES.has(tableName)) ||
+              (["0037", "0034"].includes(stagedSchemaVersion) &&
+                ADMIN_LIFECYCLE_BACKUP_DATA_OMITTED_TABLES.has(tableName)) ||
+              (["0033", "0032"].includes(stagedSchemaVersion) &&
+                PRE_IMMUTABLE_SHARING_BACKUP_DATA_OMITTED_TABLES.has(tableName))
             ) return (async function* () {})();
             if (diagnosticsExcluded && tableName === "provider_payload_captures") {
               return (async function* () {})();
@@ -692,6 +698,16 @@ export function createPostgresBackupDataPort(
             name.slice(TABLE_PREFIX.length, -".ndjson".length),
           )
         );
+        const adminLifecycleExpectedTables = currentExpectedTables.filter((name) =>
+          !ADMIN_LIFECYCLE_BACKUP_DATA_OMITTED_TABLES.has(
+            name.slice(TABLE_PREFIX.length, -".ndjson".length),
+          )
+        );
+        const preImmutableSharingExpectedTables = currentExpectedTables.filter((name) =>
+          !PRE_IMMUTABLE_SHARING_BACKUP_DATA_OMITTED_TABLES.has(
+            name.slice(TABLE_PREFIX.length, -".ndjson".length),
+          )
+        );
         diagnosticsExcluded = manifest.diagnosticPayloadPolicy === "excluded";
         const actualTables = manifest.entries.filter((entry) =>
           entry.name.startsWith(TABLE_PREFIX)
@@ -703,6 +719,12 @@ export function createPostgresBackupDataPort(
           );
         const expectedTables = matches(currentExpectedTables)
           ? currentExpectedTables
+          : ["0037", "0034"].includes(manifest.schemaVersion) &&
+              matches(adminLifecycleExpectedTables)
+          ? adminLifecycleExpectedTables
+          : ["0033", "0032"].includes(manifest.schemaVersion) &&
+              matches(preImmutableSharingExpectedTables)
+          ? preImmutableSharingExpectedTables
           : manifest.schemaVersion === "0028" && matches(legacyExpectedTables)
           ? legacyExpectedTables
           : null;

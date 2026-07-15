@@ -15,10 +15,16 @@ import { Buffer } from "node:buffer";
 import { Readable } from "node:stream";
 import {
   adminAccountStateSchema,
+  adminApiTokenQuerySchema,
+  adminApiTokenRevocationSchema,
   adminApprovalSchema,
+  adminBalanceAdjustmentSchema,
   adminDeleteUserSchema,
+  adminLedgerQuerySchema,
   adminRestoreUserSchema,
   adminRoleSchema,
+  adminSessionQuerySchema,
+  adminSessionRevocationSchema,
   adminUserQuerySchema,
   appendMessageSchema,
   chatCompletionSchema,
@@ -70,6 +76,9 @@ import {
   workspaceDeleteSchema,
 } from "@dg-chat/contracts";
 import type {
+  AdminApiTokenQuery,
+  AdminLedgerQuery,
+  AdminSessionQuery,
   AdminUserQuery,
   AuthStatusResponse,
   ChatCompletionRequest,
@@ -268,6 +277,9 @@ import { BackupServiceError } from "./backup-service.ts";
 type Variables = {
   user: PublicUser;
   authType: "session" | "token";
+  /** Server-resolved durable session identity. Never accept this from request input. */
+  sessionId?: string;
+  sessionSource?: "better_auth" | "legacy";
   sessionAuthenticatedAt?: string;
   sessionLimited?: boolean;
   tokenId?: string;
@@ -1061,6 +1073,42 @@ const parseAdminUserQuery = (c: Context): AdminUserQuery => {
   }
   return parsed.data;
 };
+
+const parseAdminDetailQuery = <T>(
+  c: Context,
+  allowed: readonly string[],
+  schema: {
+    safeParse: (value: unknown) => { success: boolean; data?: T };
+  },
+  resource: string,
+): T => {
+  const url = new URL(c.req.url);
+  const allowedSet = new Set(allowed);
+  for (const key of url.searchParams.keys()) {
+    if (!allowedSet.has(key) || url.searchParams.getAll(key).length !== 1) {
+      throw new DomainError("validation_error", `${resource} query parameters are invalid`, 422);
+    }
+  }
+  const raw = Object.fromEntries(url.searchParams.entries()) as Record<string, unknown>;
+  if (typeof raw.limit === "string" && /^\d+$/.test(raw.limit)) raw.limit = Number(raw.limit);
+  const parsed = schema.safeParse(raw);
+  if (!parsed.success) {
+    throw new DomainError("validation_error", `${resource} query parameters are invalid`, 422);
+  }
+  return parsed.data!;
+};
+
+const parseAdminSessionQuery = (c: Context): AdminSessionQuery =>
+  parseAdminDetailQuery(
+    c,
+    ["source", "status", "cursor", "limit"],
+    adminSessionQuerySchema,
+    "Session",
+  );
+const parseAdminApiTokenQuery = (c: Context): AdminApiTokenQuery =>
+  parseAdminDetailQuery(c, ["status", "cursor", "limit"], adminApiTokenQuerySchema, "Token");
+const parseAdminLedgerQuery = (c: Context): AdminLedgerQuery =>
+  parseAdminDetailQuery(c, ["kind", "cursor", "limit"], adminLedgerQuerySchema, "Ledger");
 
 const isCanonicalShareCapability = (value: string): boolean => {
   if (!/^[A-Za-z0-9_-]{43}$/.test(value)) return false;
@@ -2225,6 +2273,8 @@ export function createApp(options: AppOptions = {}) {
         }
         c.set("user", publicUser(legacyUser)!);
         c.set("authType", "session");
+        c.set("sessionId", legacySession.id);
+        c.set("sessionSource", "legacy");
         c.set("sessionLimited", legacySession.limited);
         c.set("sessionAuthenticatedAt", legacySession.createdAt);
         return next();
@@ -2238,6 +2288,8 @@ export function createApp(options: AppOptions = {}) {
       }
       c.set("user", publicUser(user)!);
       c.set("authType", "session");
+      c.set("sessionId", session.id);
+      c.set("sessionSource", "better_auth");
       c.set("sessionLimited", session.limited);
       c.set("sessionAuthenticatedAt", session.authenticatedAt);
       return next();
@@ -2278,6 +2330,8 @@ export function createApp(options: AppOptions = {}) {
     }
     c.set("user", publicUser(user)!);
     c.set("authType", "session");
+    c.set("sessionId", session.id);
+    c.set("sessionSource", "legacy");
     c.set("sessionLimited", session.limited);
     c.set("sessionAuthenticatedAt", session.createdAt);
     if (legacySession && raw === legacySession) {
@@ -5267,6 +5321,14 @@ export function createApp(options: AppOptions = {}) {
   });
 
   app.use("/api/admin/*", authenticate, approved, sessionOnly, admin);
+  app.use("/api/admin/*", async (c, next) => {
+    // Administrative payloads and typed failures can contain user, security, or accounting
+    // state. Apply the confidentiality policy before route execution so error responses inherit
+    // it as well as successful responses.
+    privateNoStore(c);
+    c.header("Vary", "Cookie");
+    await next();
+  });
   app.get("/api/admin/settings", (c) => {
     privateNoStore(c);
     c.header("Vary", "Cookie");
@@ -5323,11 +5385,14 @@ export function createApp(options: AppOptions = {}) {
       );
     }
   };
-  const requireRecentAdminAuthentication = (c: Context<{ Variables: Variables }>) => {
+  const requireRecentAdminAuthentication = (
+    c: Context<{ Variables: Variables }>,
+    action = "changing account authority",
+  ) => {
     if (!hasRecentAuthentication(c.get("sessionAuthenticatedAt"), (options.now ?? Date.now)())) {
       throw new DomainError(
         "recent_authentication_required",
-        "Sign in again before changing account authority",
+        `Sign in again before ${action}`,
         403,
       );
     }
@@ -6034,6 +6099,103 @@ export function createApp(options: AppOptions = {}) {
     privateNoStore(c);
     c.header("Vary", "Cookie");
     return c.json(await repo.getAdminUser(requireUuid(c.req.param("id"), "User id")));
+  });
+  app.get("/api/admin/users/:id/sessions", async (c) => {
+    const targetUserId = requireUuid(c.req.param("id"), "User id");
+    const sessionId = c.get("sessionId");
+    const sessionSource = c.get("sessionSource");
+    privateNoStore(c);
+    c.header("Vary", "Cookie");
+    return c.json(
+      await repo.listAdminUserSessions(
+        c.get("user").id,
+        targetUserId,
+        parseAdminSessionQuery(c),
+        sessionId && sessionSource ? { id: sessionId, source: sessionSource } : null,
+      ),
+    );
+  });
+  app.post("/api/admin/users/:id/sessions/:source/:sessionId/revoke", async (c) => {
+    requireRecentAdminAuthentication(c, "revoking a user session");
+    const source = c.req.param("source");
+    if (source !== "better_auth" && source !== "legacy") {
+      throw new DomainError("validation_error", "Session source is invalid", 422);
+    }
+    const body = await parseJson(c, adminSessionRevocationSchema);
+    const currentId = c.get("sessionId");
+    const currentSource = c.get("sessionSource");
+    await repo.revokeAdminUserSession({
+      actorId: c.get("user").id,
+      targetUserId: requireUuid(c.req.param("id"), "User id"),
+      source,
+      sessionId: requireUuid(c.req.param("sessionId"), "Session id"),
+      currentSession: currentId && currentSource ? { id: currentId, source: currentSource } : null,
+      reason: body.reason,
+    });
+    privateNoStore(c);
+    c.header("Vary", "Cookie");
+    return c.body(null, 204);
+  });
+  app.get("/api/admin/users/:id/api-tokens", async (c) => {
+    privateNoStore(c);
+    c.header("Vary", "Cookie");
+    return c.json(
+      await repo.listAdminUserTokens(
+        c.get("user").id,
+        requireUuid(c.req.param("id"), "User id"),
+        parseAdminApiTokenQuery(c),
+      ),
+    );
+  });
+  app.post("/api/admin/users/:id/api-tokens/:tokenId/revoke", async (c) => {
+    requireRecentAdminAuthentication(c, "revoking a user API token");
+    const body = await parseJson(c, adminApiTokenRevocationSchema);
+    await repo.revokeAdminUserTokenFamily({
+      actorId: c.get("user").id,
+      targetUserId: requireUuid(c.req.param("id"), "User id"),
+      tokenId: requireUuid(c.req.param("tokenId"), "Token id"),
+      expectedVersion: body.expectedVersion,
+      reason: body.reason,
+    });
+    privateNoStore(c);
+    c.header("Vary", "Cookie");
+    return c.body(null, 204);
+  });
+  app.get("/api/admin/users/:id/ledger", async (c) => {
+    privateNoStore(c);
+    c.header("Vary", "Cookie");
+    return c.json(
+      await repo.listAdminUserLedger(
+        c.get("user").id,
+        requireUuid(c.req.param("id"), "User id"),
+        parseAdminLedgerQuery(c),
+      ),
+    );
+  });
+  app.post("/api/admin/users/:id/balance-adjustments", async (c) => {
+    requireRecentAdminAuthentication(c, "adjusting a user balance");
+    const targetUserId = requireUuid(c.req.param("id"), "User id");
+    const body = await parseJson(c, adminBalanceAdjustmentSchema);
+    const idempotencyKey = requireIdempotencyKey(c.req.header("idempotency-key"));
+    const canonicalRequest = {
+      version: 1,
+      targetUserId,
+      amountMicros: body.amountMicros,
+      expectedBalanceMicros: body.expectedBalanceMicros,
+      reason: body.reason,
+    };
+    const adjusted = await repo.adjustAdminUserBalance({
+      actorId: c.get("user").id,
+      targetUserId,
+      amountMicros: body.amountMicros,
+      expectedBalanceMicros: body.expectedBalanceMicros,
+      reason: body.reason,
+      idempotencyKeyHash: await sha256Hex(idempotencyKey),
+      requestHash: await sha256Hex(canonicalJson(canonicalRequest)),
+    });
+    privateNoStore(c);
+    c.header("Vary", "Cookie");
+    return c.json(adjusted);
   });
   app.patch("/api/admin/users/:id/approval", async (c) => {
     requireRecentAdminAuthentication(c);

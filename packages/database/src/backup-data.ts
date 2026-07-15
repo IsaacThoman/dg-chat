@@ -10,7 +10,8 @@ import {
   type ProviderProtocol,
 } from "./provider-model-invariants.ts";
 
-export const BACKUP_DATA_SCHEMA_VERSION = "0037" as const;
+export const BACKUP_DATA_SCHEMA_VERSION = "0038" as const;
+const ADMIN_LIFECYCLE_BACKUP_DATA_SCHEMA_VERSION = "0037" as const;
 const IMMUTABLE_SHARING_BACKUP_DATA_SCHEMA_VERSION = "0034" as const;
 const CONVERSATION_PORTABILITY_BACKUP_DATA_SCHEMA_VERSION = "0033" as const;
 const TEMPORARY_LIFECYCLE_BACKUP_DATA_SCHEMA_VERSION = "0032" as const;
@@ -24,10 +25,18 @@ export const LEGACY_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
     "conversation_tag_sets",
     "conversation_tag_bindings",
     "conversation_share_snapshots",
+    "admin_balance_adjustments",
   ]),
+);
+export const ADMIN_LIFECYCLE_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
+  new Set(["admin_balance_adjustments"]),
+);
+export const PRE_IMMUTABLE_SHARING_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
+  new Set(["admin_balance_adjustments", "conversation_share_snapshots"]),
 );
 export function isSupportedBackupDataSchemaVersion(value: string): boolean {
   return value === BACKUP_DATA_SCHEMA_VERSION ||
+    value === ADMIN_LIFECYCLE_BACKUP_DATA_SCHEMA_VERSION ||
     value === IMMUTABLE_SHARING_BACKUP_DATA_SCHEMA_VERSION ||
     value === CONVERSATION_PORTABILITY_BACKUP_DATA_SCHEMA_VERSION ||
     value === TEMPORARY_LIFECYCLE_BACKUP_DATA_SCHEMA_VERSION ||
@@ -116,6 +125,9 @@ const UUID_COLUMNS = new Set([
   "generation_id",
   "active_leaf_id",
   "leaf_id",
+  "target_user_id",
+  "ledger_entry_id",
+  "audit_event_id",
 ]);
 const TIMESTAMP_SUFFIX = /(?:_at|_expires_at)$/u;
 const inferKinds = (columns: readonly string[], explicit: ColumnKinds): ColumnKinds =>
@@ -506,6 +518,19 @@ export const BACKUP_DATA_TABLES: readonly BackupDataTable[] = Object.freeze([
     "created_at,id",
     {
       metadata: "json",
+    },
+  ),
+  T(
+    "admin_balance_adjustments",
+    "id actor_id target_user_id idempotency_key_hash request_hash amount_micros balance_before_micros balance_after_micros reason ledger_entry_id audit_event_id created_at",
+    "created_at,id",
+    {
+      idempotency_key_hash: "text",
+      request_hash: "text",
+      amount_micros: "bigint",
+      balance_before_micros: "bigint",
+      balance_after_micros: "bigint",
+      reason: "text",
     },
   ),
   T(
@@ -1379,6 +1404,25 @@ const RELATIONS: readonly BackupRelation[] = Object.freeze([
     target: ["id"],
   },
   { from: "audit_events", columns: ["actor_id"], to: "users", target: ["id"] },
+  { from: "admin_balance_adjustments", columns: ["actor_id"], to: "users", target: ["id"] },
+  {
+    from: "admin_balance_adjustments",
+    columns: ["target_user_id"],
+    to: "users",
+    target: ["id"],
+  },
+  {
+    from: "admin_balance_adjustments",
+    columns: ["ledger_entry_id"],
+    to: "ledger_entries",
+    target: ["id"],
+  },
+  {
+    from: "admin_balance_adjustments",
+    columns: ["audit_event_id"],
+    to: "audit_events",
+    target: ["id"],
+  },
   { from: "retention_policy_versions", columns: ["updated_by"], to: "users", target: ["id"] },
   {
     from: "retention_policy_state",
@@ -1591,6 +1635,20 @@ async function validateStagedDatabase(
   if (balanceMismatch.length) {
     throw new BackupDataError("invariant", "Backup user balances do not match the ledger");
   }
+  const invalidAdjustments = await tx.unsafe(
+    `SELECT 1 FROM ${staged("admin_balance_adjustments")} a
+      JOIN ${staged("ledger_entries")} l ON l.id=a.ledger_entry_id
+      JOIN ${staged("audit_events")} e ON e.id=a.audit_event_id
+      WHERE l.user_id<>a.target_user_id OR l.kind<>'adjustment'
+        OR l.amount_micros<>a.amount_micros
+        OR l.balance_after_micros<>a.balance_after_micros
+        OR e.actor_id<>a.actor_id OR e.action<>'user.balance.adjusted'
+        OR e.target_type<>'user' OR e.target_id<>a.target_user_id::text
+      LIMIT 1`,
+  );
+  if (invalidAdjustments.length) {
+    throw new BackupDataError("invariant", "Backup contains an inconsistent balance adjustment");
+  }
   const terminalChecks = [
     ["messages", "status='streaming'"],
     ["usage_runs", "status='reserved'"],
@@ -1645,6 +1703,20 @@ async function validateRestoredDatabase(tx: postgres.TransactionSql): Promise<vo
   `;
   if (userBalanceMismatch.length) {
     throw new BackupDataError("invariant", "Backup user balances do not match the ledger");
+  }
+  const invalidAdjustments = await tx`
+    SELECT 1 FROM admin_balance_adjustments a
+    JOIN ledger_entries l ON l.id=a.ledger_entry_id
+    JOIN audit_events e ON e.id=a.audit_event_id
+    WHERE l.user_id<>a.target_user_id OR l.kind<>'adjustment'
+      OR l.amount_micros<>a.amount_micros
+      OR l.balance_after_micros<>a.balance_after_micros
+      OR e.actor_id<>a.actor_id OR e.action<>'user.balance.adjusted'
+      OR e.target_type<>'user' OR e.target_id<>a.target_user_id::text
+    LIMIT 1
+  `;
+  if (invalidAdjustments.length) {
+    throw new BackupDataError("invariant", "Backup contains an inconsistent balance adjustment");
   }
 }
 

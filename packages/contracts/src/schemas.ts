@@ -572,3 +572,45 @@ export const adminRestoreUserSchema = z.object({
   expectedVersion: adminExpectedVersionSchema,
   reason: adminReasonSchema,
 }).strict();
+
+const adminPageSchema = {
+  cursor: z.string().min(1).max(2048).optional(),
+  limit: z.number().int().min(1).max(100).default(50),
+};
+
+export const adminSessionQuerySchema = z.object({
+  source: z.enum(["better_auth", "legacy"]).optional(),
+  status: z.enum(["active", "expired", "revoked"]).optional(),
+  ...adminPageSchema,
+}).strict();
+
+export const adminSessionRevocationSchema = z.object({
+  reason: adminReasonSchema,
+}).strict();
+
+export const adminApiTokenQuerySchema = z.object({
+  status: z.enum(["active", "overlap", "expired", "revoked", "replaced"]).optional(),
+  ...adminPageSchema,
+}).strict();
+
+export const adminApiTokenRevocationSchema = z.object({
+  expectedVersion: adminExpectedVersionSchema,
+  reason: adminReasonSchema,
+}).strict();
+
+export const adminLedgerQuerySchema = z.object({
+  kind: z.enum(["grant", "reserve", "settle", "refund", "adjustment"]).optional(),
+  ...adminPageSchema,
+}).strict();
+
+const safeAccountingInteger = z.number().int()
+  .min(-Number.MAX_SAFE_INTEGER)
+  .max(Number.MAX_SAFE_INTEGER);
+
+export const adminBalanceAdjustmentSchema = z.object({
+  amountMicros: safeAccountingInteger.refine((amount) => amount !== 0, {
+    message: "Adjustment amount cannot be zero",
+  }),
+  expectedBalanceMicros: safeAccountingInteger.nonnegative(),
+  reason: adminReasonSchema,
+}).strict();

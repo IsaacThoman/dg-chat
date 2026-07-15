@@ -5,6 +5,16 @@ import {
   parsePublicConversationShare,
 } from "@dg-chat/contracts";
 import type {
+  AdminApiTokenPage,
+  AdminApiTokenQuery,
+  AdminApiTokenRevocationCommand,
+  AdminBalanceAdjustment,
+  AdminBalanceAdjustmentCommand,
+  AdminLedgerPage,
+  AdminLedgerQuery,
+  AdminSessionPage,
+  AdminSessionQuery,
+  AdminSessionRevocationCommand,
   AdminUser,
   AdminUserPage,
   AdminUserQuery,
@@ -171,8 +181,10 @@ import type {
   UsagePricingSnapshot,
 } from "./repository.ts";
 import {
+  decodeAdminResourceCursor,
   decodeAdminUserCursor,
   decodeAuditCursor,
+  encodeAdminResourceCursor,
   encodeAdminUserCursor,
   encodeAuditPostgresCursor,
   isUsagePricingSnapshot,
@@ -536,6 +548,21 @@ function token(row: Row): StoredApiToken {
 function tokenSummary(value: StoredApiToken) {
   const { tokenHash: _hash, userId: _userId, ...summary } = value;
   return summary;
+}
+function adminBalanceAdjustment(row: Row, replayed: boolean): AdminBalanceAdjustment {
+  return {
+    id: String(row.id),
+    targetUserId: String(row.target_user_id),
+    actorId: String(row.actor_id),
+    amountMicros: number(row.amount_micros),
+    balanceBeforeMicros: number(row.balance_before_micros),
+    balanceAfterMicros: number(row.balance_after_micros),
+    reason: String(row.reason),
+    ledgerEntryId: String(row.ledger_entry_id),
+    auditEventId: String(row.audit_event_id),
+    createdAt: iso(row.created_at),
+    replayed,
+  };
 }
 function validateTokenRates(rpm: number | null, burst: number | null) {
   if (
@@ -1299,6 +1326,349 @@ export class PostgresRepository implements DomainRepository {
       : await this
         .#sql`UPDATE sessions SET invalidated_at=now() WHERE id=${id} AND invalidated_at IS NULL RETURNING id`;
     if (!rows.length) throw new DomainError("not_found", "Session not found", 404);
+  }
+  #adminResourceQuery(
+    query: { cursor?: string; limit?: number },
+    resource: "sessions" | "tokens" | "ledger",
+    targetUserId: string,
+    fingerprint: string,
+  ) {
+    const limit = query.limit ?? 50;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new DomainError("validation_error", "Page limit must be between 1 and 100", 422);
+    }
+    const cursor = query.cursor
+      ? decodeAdminResourceCursor(query.cursor, resource, targetUserId, fingerprint)
+      : undefined;
+    if (query.cursor && !cursor) {
+      throw new DomainError("validation_error", "Invalid page cursor", 422);
+    }
+    return { limit, cursor };
+  }
+  async #adminRead<T>(
+    actorId: string,
+    targetUserId: string,
+    read: (tx: postgres.TransactionSql) => Promise<T>,
+  ): Promise<T> {
+    const result = await this.#sql.begin(async (tx) => {
+      // The actor lock prevents lifecycle mutations from revoking authority between the
+      // authorization decision and the sensitive resource read.
+      const actors = await tx<Row[]>`SELECT * FROM users WHERE id=${actorId} FOR SHARE`;
+      if (!actors[0] || !isEffectiveAdminRow(actors[0])) {
+        throw new DomainError(
+          "admin_authority_required",
+          "Administrator authority changed before the request completed",
+          403,
+        );
+      }
+      const targets = await tx`SELECT id FROM users WHERE id=${targetUserId} FOR SHARE`;
+      if (!targets.length) throw new DomainError("not_found", "User not found", 404);
+      return await read(tx);
+    });
+    return result as T;
+  }
+  async listAdminUserSessions(
+    actorId: string,
+    targetUserId: string,
+    query: AdminSessionQuery = {},
+    currentSession: AdminSessionRevocationCommand["currentSession"] = null,
+  ): Promise<AdminSessionPage> {
+    return await this.#adminRead(actorId, targetUserId, async (tx) => {
+      const fingerprint = JSON.stringify({
+        source: query.source ?? null,
+        status: query.status ?? null,
+      });
+      const { limit, cursor } = this.#adminResourceQuery(
+        query,
+        "sessions",
+        targetUserId,
+        fingerprint,
+      );
+      const rows = await tx<Row[]>`
+      WITH all_sessions AS (
+        SELECT 'legacy'::text source,id,user_id,limited,created_at,expires_at,invalidated_at,
+          NULL::text ip_address,NULL::text user_agent,
+          CASE WHEN invalidated_at IS NOT NULL THEN 'revoked'
+            WHEN expires_at<=now() THEN 'expired' ELSE 'active' END status,
+          'legacy:'||id::text sort_id,
+          to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') cursor_created_at
+        FROM sessions WHERE user_id=${targetUserId}
+        UNION ALL
+        SELECT 'better_auth',id,user_id,limited,created_at,expires_at,NULL,
+          ip_address,user_agent,CASE WHEN expires_at<=now() THEN 'expired' ELSE 'active' END,
+          'better_auth:'||id::text,
+          to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+        FROM auth_sessions WHERE user_id=${targetUserId}
+      ) SELECT * FROM all_sessions
+      WHERE (${query.source ?? null}::text IS NULL OR source=${query.source ?? null})
+        AND (${query.status ?? null}::text IS NULL OR status=${query.status ?? null})
+        AND (${cursor?.createdAt ?? null}::text IS NULL OR
+          (created_at,sort_id)<(${cursor?.createdAt ?? null}::timestamptz,${cursor?.id ?? null}))
+      ORDER BY created_at DESC,sort_id DESC LIMIT ${limit + 1}`;
+      const data = rows.slice(0, limit).map((row) => ({
+        id: String(row.sort_id),
+        userId: String(row.user_id),
+        source: row.source as "legacy" | "better_auth",
+        current: currentSession !== null && currentSession.source === row.source &&
+          currentSession.id === String(row.id),
+        limited: Boolean(row.limited),
+        status: row.status as "active" | "expired" | "revoked",
+        ipAddress: row.ip_address == null ? null : String(row.ip_address),
+        userAgent: row.user_agent == null ? null : String(row.user_agent),
+        createdAt: iso(row.created_at),
+        expiresAt: iso(row.expires_at),
+        invalidatedAt: nullableIso(row.invalidated_at),
+      }));
+      return {
+        data,
+        nextCursor: rows.length > limit
+          ? encodeAdminResourceCursor(
+            "sessions",
+            targetUserId,
+            String(rows[limit - 1].cursor_created_at),
+            String(rows[limit - 1].sort_id),
+            fingerprint,
+          )
+          : null,
+      };
+    });
+  }
+  async listAdminUserTokens(
+    actorId: string,
+    targetUserId: string,
+    query: AdminApiTokenQuery = {},
+  ): Promise<AdminApiTokenPage> {
+    return await this.#adminRead(actorId, targetUserId, async (tx) => {
+      const fingerprint = JSON.stringify({ status: query.status ?? null });
+      const { limit, cursor } = this.#adminResourceQuery(
+        query,
+        "tokens",
+        targetUserId,
+        fingerprint,
+      );
+      const rows = await tx<Row[]>`
+      WITH token_page AS (
+        SELECT t.*,
+          to_char(t.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') cursor_created_at,
+          COALESCE(array_agg(g.group_id::text ORDER BY g.group_id)
+            FILTER(WHERE g.group_id IS NOT NULL),ARRAY[]::text[]) group_ids,
+          CASE WHEN t.revoked_at IS NOT NULL THEN 'revoked'
+            WHEN t.expires_at IS NOT NULL AND t.expires_at<=now() THEN 'expired'
+            WHEN t.replaced_by_token_id IS NOT NULL AND t.overlap_ends_at>now() THEN 'overlap'
+            WHEN t.replaced_by_token_id IS NOT NULL THEN 'replaced' ELSE 'active' END status
+        FROM api_tokens t LEFT JOIN access_group_tokens g ON g.token_id=t.id
+        WHERE t.user_id=${targetUserId}
+        GROUP BY t.id
+      ) SELECT * FROM token_page
+      WHERE (${query.status ?? null}::text IS NULL OR status=${query.status ?? null})
+        AND (${cursor?.createdAt ?? null}::text IS NULL OR
+          (created_at,id)<(${cursor?.createdAt ?? null}::timestamptz,${cursor?.id ?? null}::uuid))
+      ORDER BY created_at DESC,id DESC LIMIT ${limit + 1}`;
+      const data = rows.slice(0, limit).map((row) => ({
+        ...tokenSummary(token(row)),
+        ownerId: targetUserId,
+        groupIds: (row.group_ids as unknown[]).map(String),
+        status: row.status as "active" | "overlap" | "expired" | "revoked" | "replaced",
+      }));
+      return {
+        data,
+        nextCursor: rows.length > limit
+          ? encodeAdminResourceCursor(
+            "tokens",
+            targetUserId,
+            String(rows[limit - 1].cursor_created_at),
+            String(rows[limit - 1].id),
+            fingerprint,
+          )
+          : null,
+      };
+    });
+  }
+  async listAdminUserLedger(
+    actorId: string,
+    targetUserId: string,
+    query: AdminLedgerQuery = {},
+  ): Promise<AdminLedgerPage> {
+    return await this.#adminRead(actorId, targetUserId, async (tx) => {
+      const fingerprint = JSON.stringify({ kind: query.kind ?? null });
+      const { limit, cursor } = this.#adminResourceQuery(
+        query,
+        "ledger",
+        targetUserId,
+        fingerprint,
+      );
+      const rows = await tx<Row[]>`
+      SELECT l.*,
+        to_char(l.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') cursor_created_at,
+        a.id adjustment_id,
+        a.actor_id adjustment_actor_id,a.reason adjustment_reason
+      FROM ledger_entries l LEFT JOIN admin_balance_adjustments a ON a.ledger_entry_id=l.id
+      WHERE l.user_id=${targetUserId}
+        AND (${query.kind ?? null}::text IS NULL OR l.kind::text=${query.kind ?? null})
+        AND (${cursor?.createdAt ?? null}::text IS NULL OR
+          (l.created_at,l.id)<(${cursor?.createdAt ?? null}::timestamptz,${
+        cursor?.id ?? null
+      }::uuid))
+      ORDER BY l.created_at DESC,l.id DESC LIMIT ${limit + 1}`;
+      const data = rows.slice(0, limit).map((row) => ({
+        id: String(row.id),
+        userId: String(row.user_id),
+        usageRunId: String(row.usage_run_id),
+        kind: row.kind as "grant" | "reserve" | "settle" | "refund" | "adjustment",
+        amountMicros: number(row.amount_micros),
+        balanceAfterMicros: number(row.balance_after_micros),
+        adjustment: row.adjustment_id == null ? null : {
+          id: String(row.adjustment_id),
+          actorId: String(row.adjustment_actor_id),
+          reason: String(row.adjustment_reason),
+        },
+        createdAt: iso(row.created_at),
+      }));
+      return {
+        data,
+        nextCursor: rows.length > limit
+          ? encodeAdminResourceCursor(
+            "ledger",
+            targetUserId,
+            String(rows[limit - 1].cursor_created_at),
+            String(rows[limit - 1].id),
+            fingerprint,
+          )
+          : null,
+      };
+    });
+  }
+  async revokeAdminUserSession(input: AdminSessionRevocationCommand): Promise<void> {
+    const reason = input.reason.trim();
+    if (!reason || reason.length > 500) {
+      throw new DomainError("validation_error", "Administrative reason is invalid", 422);
+    }
+    await this.#sql.begin(async (tx) => {
+      await assertEffectiveAdminActor(tx, input.actorId);
+      const targets = await tx`SELECT id FROM users WHERE id=${input.targetUserId} FOR SHARE`;
+      if (!targets.length) throw new DomainError("not_found", "User not found", 404);
+      if (
+        input.currentSession?.source === input.source && input.currentSession.id === input.sessionId
+      ) {
+        throw new DomainError(
+          "current_session_protected",
+          "Current session cannot be revoked",
+          409,
+        );
+      }
+      let changed: Row[];
+      if (input.source === "legacy") {
+        changed = await tx<Row[]>`UPDATE sessions SET invalidated_at=now()
+          WHERE id=${input.sessionId} AND user_id=${input.targetUserId}
+            AND invalidated_at IS NULL RETURNING id`;
+      } else {
+        changed = await tx<Row[]>`DELETE FROM auth_sessions
+          WHERE id=${input.sessionId} AND user_id=${input.targetUserId} RETURNING id`;
+      }
+      if (!changed[0]) throw new DomainError("not_found", "Session not found", 404);
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${input.actorId},'user.session.revoked','session',${input.sessionId},${
+        tx.json({ targetUserId: input.targetUserId, source: input.source, reason })
+      })`;
+    });
+  }
+  async revokeAdminUserTokenFamily(input: AdminApiTokenRevocationCommand): Promise<void> {
+    const reason = input.reason.trim();
+    if (
+      !reason || reason.length > 500 || !Number.isSafeInteger(input.expectedVersion) ||
+      input.expectedVersion < 1
+    ) {
+      throw new DomainError("validation_error", "Token revocation is invalid", 422);
+    }
+    await this.#sql.begin(async (tx) => {
+      await assertEffectiveAdminActor(tx, input.actorId);
+      const family = await tx<Row[]>`SELECT rotation_family_id FROM api_tokens
+        WHERE id=${input.tokenId} AND user_id=${input.targetUserId}`;
+      if (!family[0]) throw new DomainError("not_found", "Token not found", 404);
+      const familyId = String(family[0].rotation_family_id);
+      await tx`SELECT pg_advisory_xact_lock(hashtext(${familyId}))`;
+      const selected = await tx<Row[]>`SELECT * FROM api_tokens
+        WHERE id=${input.tokenId} AND user_id=${input.targetUserId} FOR UPDATE`;
+      if (!selected[0]) throw new DomainError("not_found", "Token not found", 404);
+      if (number(selected[0].version) !== input.expectedVersion) {
+        throw new DomainError("version_conflict", "Token was modified", 409);
+      }
+      const changed = await tx`UPDATE api_tokens SET revoked_at=now(),version=version+1
+        WHERE rotation_family_id=${familyId} AND revoked_at IS NULL RETURNING id`;
+      if (!changed.length) {
+        throw new DomainError("no_state_change", "Token family is already revoked", 409);
+      }
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${input.actorId},'user.api_token_family.revoked','api_token',${input.tokenId},${
+        tx.json({ targetUserId: input.targetUserId, rotationFamilyId: familyId, reason })
+      })`;
+    });
+  }
+  async adjustAdminUserBalance(
+    input: AdminBalanceAdjustmentCommand,
+  ): Promise<AdminBalanceAdjustment> {
+    const reason = input.reason.trim();
+    if (
+      !reason || reason.length > 500 || !Number.isSafeInteger(input.amountMicros) ||
+      input.amountMicros === 0 || !Number.isSafeInteger(input.expectedBalanceMicros) ||
+      input.expectedBalanceMicros < 0 || !/^[0-9a-f]{64}$/.test(input.idempotencyKeyHash) ||
+      !/^[0-9a-f]{64}$/.test(input.requestHash)
+    ) {
+      throw new DomainError("validation_error", "Balance adjustment is invalid", 422);
+    }
+    return await this.#sql.begin(async (tx) => {
+      await assertEffectiveAdminActor(tx, input.actorId);
+      await tx`SELECT pg_advisory_xact_lock(hashtext(${`${input.actorId}:${input.idempotencyKeyHash}`}))`;
+      const prior = await tx<Row[]>`SELECT * FROM admin_balance_adjustments
+        WHERE actor_id=${input.actorId} AND idempotency_key_hash=${input.idempotencyKeyHash}`;
+      if (prior[0]) {
+        if (String(prior[0].request_hash) !== input.requestHash) {
+          throw new DomainError("idempotency_conflict", "Adjustment key was reused", 409);
+        }
+        return adminBalanceAdjustment(prior[0], true);
+      }
+      const users = await tx<Row[]>`SELECT * FROM users WHERE id=${input.targetUserId} FOR UPDATE`;
+      if (!users[0]) throw new DomainError("not_found", "User not found", 404);
+      const before = number(users[0].balance_micros);
+      if (before !== input.expectedBalanceMicros) {
+        throw new DomainError("balance_conflict", "User balance changed", 409);
+      }
+      const after = before + input.amountMicros;
+      if (!Number.isSafeInteger(after) || after < 0) {
+        throw new DomainError(
+          "validation_error",
+          "Adjustment would produce an invalid balance",
+          422,
+        );
+      }
+      const adjustmentId = crypto.randomUUID();
+      const ledgerId = crypto.randomUUID();
+      const usageRunId = `admin-adjustment:${adjustmentId}`;
+      await tx`UPDATE users SET balance_micros=${after},updated_at=now()
+        WHERE id=${input.targetUserId}`;
+      const ledger = await tx<Row[]>`INSERT INTO ledger_entries
+        (id,user_id,usage_run_id,kind,amount_micros,balance_after_micros,metadata)
+        VALUES(${ledgerId},${input.targetUserId},${usageRunId},'adjustment',${input.amountMicros},
+          ${after},${tx.json({ administrative: true })}) RETURNING created_at`;
+      const audits = await tx<Row[]>`INSERT INTO audit_events
+        (actor_id,action,target_type,target_id,metadata)
+        VALUES(${input.actorId},'user.balance.adjusted','user',${input.targetUserId},${
+        tx.json({
+          amountMicros: input.amountMicros,
+          balanceBeforeMicros: before,
+          balanceAfterMicros: after,
+          reason,
+          ledgerEntryId: ledgerId,
+        })
+      }) RETURNING id`;
+      const inserted = await tx<Row[]>`INSERT INTO admin_balance_adjustments
+        (id,actor_id,target_user_id,idempotency_key_hash,request_hash,amount_micros,
+          balance_before_micros,balance_after_micros,reason,ledger_entry_id,audit_event_id,created_at)
+        VALUES(${adjustmentId},${input.actorId},${input.targetUserId},${input.idempotencyKeyHash},
+          ${input.requestHash},${input.amountMicros},${before},${after},${reason},${ledgerId},
+          ${String(audits[0].id)},${iso(ledger[0].created_at)}) RETURNING *`;
+      return adminBalanceAdjustment(inserted[0], false);
+    });
   }
   async createIdentityToken(
     userId: string,
@@ -6255,9 +6625,11 @@ export class PostgresRepository implements DomainRepository {
         throw error;
       }
       await tx`INSERT INTO access_group_tokens(group_id,token_id,user_id) SELECT group_id,${nextId},user_id FROM access_group_tokens WHERE token_id=${old.id}`;
+      await tx`UPDATE api_tokens SET version=version+1
+        WHERE rotation_family_id=${old.rotationFamilyId} AND id<>${nextId}`;
       const previous = await tx<
         Row[]
-      >`UPDATE api_tokens SET replaced_by_token_id=${nextId},overlap_ends_at=now()+${input.overlapSeconds}*interval '1 second',version=version+1 WHERE id=${old.id} RETURNING *`;
+      >`UPDATE api_tokens SET replaced_by_token_id=${nextId},overlap_ends_at=now()+${input.overlapSeconds}*interval '1 second' WHERE id=${old.id} RETURNING *`;
       return {
         previous: tokenSummary(token(previous[0])),
         replacement: tokenSummary(token(inserted[0])),

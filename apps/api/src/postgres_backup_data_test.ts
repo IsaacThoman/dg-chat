@@ -1,5 +1,6 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.14";
 import {
+  ADMIN_LIFECYCLE_BACKUP_DATA_OMITTED_TABLES,
   BACKUP_DATA_SCHEMA_VERSION,
   BACKUP_DATA_TABLES,
   backupContentRoot,
@@ -7,6 +8,7 @@ import {
   LEGACY_BACKUP_DATA_OMITTED_TABLES,
   ObjectAlreadyExistsError,
   parseBackupArchiveStream,
+  PRE_IMMUTABLE_SHARING_BACKUP_DATA_OMITTED_TABLES,
   sha256Hex,
   signBackupManifest,
   writeBackupArchiveStream,
@@ -617,6 +619,45 @@ Deno.test("postgres backup data previews and applies a signed legacy 0028 table 
     assertEquals(committed.counts.find((row) => row.resource === "attachments")?.create, 1);
   } finally {
     await snapshot.cleanup?.();
+  }
+});
+
+Deno.test("postgres backup data accepts supported pre-0038 catalogs without adjustment commands", async () => {
+  for (const schemaVersion of ["0037", "0034", "0033", "0032"] as const) {
+    const fx = await fixture();
+    const snapshot = await fx.adapter.exportSnapshot({
+      includeDiagnostics: false,
+      installationId: "installation-test",
+    });
+    try {
+      const omitted = ["0033", "0032"].includes(schemaVersion)
+        ? PRE_IMMUTABLE_SHARING_BACKUP_DATA_OMITTED_TABLES
+        : ADMIN_LIFECYCLE_BACKUP_DATA_OMITTED_TABLES;
+      const omittedNames = new Set(
+        [...omitted].map((name) => `tables/${name}.ndjson`),
+      );
+      const entries = snapshot.manifest.entries.filter((entry) => !omittedNames.has(entry.name));
+      const { signature: _signature, ...unsigned } = snapshot.manifest;
+      const manifest = await signBackupManifest({
+        ...unsigned,
+        schemaVersion,
+        entries,
+        contentRootSha256: await backupContentRoot(entries),
+      }, fx.authenticator);
+      const payloads = new Map(snapshot.payloads);
+      for (const name of omittedNames) payloads.delete(name);
+      const session = await fx.adapter.restoreSession("preview", { restoreOperationId });
+      const parsed = await parseBackupArchiveStream(
+        writeBackupArchiveStream(manifest, payloads, fx.authenticator),
+        fx.authenticator,
+        session.sink,
+      );
+      const preview = await session.summarize(parsed);
+      assertEquals(preview.counts.find((row) => row.resource === "attachments")?.create, 1);
+      await session.rollback();
+    } finally {
+      await snapshot.cleanup?.();
+    }
   }
 });
 
