@@ -25,6 +25,12 @@ verification is opt-in with `REQUIRE_EMAIL_VERIFICATION=true`; leave it false fo
 registration without SMTP. When verification is required, configure SMTP before exposing
 registration. Generic OIDC is available only when its issuer, client credentials, callback origin,
 and scopes are configured explicitly; callback state, nonce, PKCE, and origin checks fail closed.
+HTTP request logs use registered route templates and server-generated UUID request IDs rather than
+raw URLs. Caller-supplied correlation IDs are ignored to prevent cross-request collision. Query
+strings, headers, path capabilities, user search values, OIDC codes/state, and exception details are
+never included; the request ID returned and CORS-exposed in `X-Request-Id` correlates sanitized
+failures. Better Auth warnings and errors are reduced to a fixed component/severity event; callback
+parameters, identity values, and adapter exception details are never forwarded to application logs.
 
 Markdown, citations, filenames, provider errors, and tool results are rendered as hostile content
 under a restrictive Content Security Policy. Raw HTML is disabled unless passed through a maintained

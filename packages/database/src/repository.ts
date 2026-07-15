@@ -2464,5 +2464,5 @@ export interface DomainRepository {
     runId: string,
     code: RetentionScrubFailureCode,
   ): MaybePromise<RetentionScrubRun>;
-  readiness(): MaybePromise<{ ready: boolean; storage: string }>;
+  readiness(signal?: AbortSignal): MaybePromise<{ ready: boolean; storage: string }>;
 }

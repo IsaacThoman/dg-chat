@@ -38,7 +38,7 @@ export interface ObjectStore {
   put(input: PutObjectInput): Promise<{ etag: string | null }>;
   get(key: string): Promise<StoredObject | undefined>;
   delete(key: string): Promise<void>;
-  readiness(): Promise<boolean>;
+  readiness(signal?: AbortSignal): Promise<boolean>;
   close(): void;
 }
 
@@ -245,9 +245,12 @@ export class S3ObjectStore implements ObjectStore {
     await this.#client.send(new DeleteObjectCommand({ Bucket: this.#bucket, Key: key }));
   }
 
-  async readiness() {
+  async readiness(signal?: AbortSignal) {
     try {
-      await this.#client.send(new HeadBucketCommand({ Bucket: this.#bucket }));
+      await this.#client.send(
+        new HeadBucketCommand({ Bucket: this.#bucket }),
+        signal ? { abortSignal: signal } : undefined,
+      );
       return true;
     } catch {
       return false;

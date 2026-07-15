@@ -34,6 +34,10 @@ cat > /etc/nginx/conf.d/default.conf <<'NGINX'
 map $request_uri $dgchat_safe_request_uri {
   ~^/share/ /share/[REDACTED];
   ~^/api/public/shares/ /api/public/shares/[REDACTED];
+  ~^/api/ /api/[ROUTE];
+  ~^/v1/ /v1/[ROUTE];
+  ~^/chat/ /chat/[ROUTE];
+  ~^/admin/ /admin/[ROUTE];
   default $uri;
 }
 

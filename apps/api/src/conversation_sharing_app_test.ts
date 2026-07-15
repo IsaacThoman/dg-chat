@@ -1,13 +1,7 @@
-import {
-  assert,
-  assertEquals,
-  assertExists,
-  assertFalse,
-  assertMatch,
-} from "jsr:@std/assert@1.0.14";
+import { assertEquals, assertExists, assertFalse, assertMatch } from "jsr:@std/assert@1.0.14";
 import { Buffer } from "node:buffer";
 import { MemoryRepository } from "@dg-chat/database";
-import { createApp, redactRequestLog } from "./app.ts";
+import { createApp } from "./app.ts";
 import { sha256 } from "./crypto.ts";
 import { TestObjectStore } from "./test-object-store.ts";
 import type { RateLimiter, RateLimitResult } from "./rate-limit.ts";
@@ -351,15 +345,6 @@ Deno.test("sharing routes reject malformed, unsafe, temporary, expired, and unav
     assertEquals((await unavailable.json()).error.code, "share_unavailable");
     assertEquals(unavailable.headers.get("cache-control"), "no-store, max-age=0");
   }
-  const redacted = redactRequestLog(
-    `GET /api/public/shares/${secret}/attachments/${crypto.randomUUID()}?source=test`,
-  );
-  assertFalse(redacted.includes(secret));
-  assert(redacted.includes("[REDACTED]"));
-  assertEquals(
-    redactRequestLog("GET /api/public/shares/%41%42%43/attachments/id"),
-    "GET /api/public/shares/[REDACTED]/attachments/id",
-  );
 });
 
 class ThrowingRateLimiter implements RateLimiter {

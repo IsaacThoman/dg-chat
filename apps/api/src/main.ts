@@ -24,7 +24,7 @@ import { backupRuntimeConfig } from "./backup-config.ts";
 import { privilegedBackupSecretConfig } from "./backup-secret-keyring.ts";
 import { DefaultBackupAdminService } from "./backup-service.ts";
 import { createPostgresBackupDataPort } from "./postgres-backup-data.ts";
-import { shutdownApi } from "./shutdown.ts";
+import { shutdownApi, shutdownLogLevel } from "./shutdown.ts";
 import { IDENTITY_SHUTDOWN_ABORT_MS } from "./identity-delivery.ts";
 import { closeIdentityAwareResources } from "./resource-shutdown.ts";
 
@@ -252,7 +252,7 @@ const shutdown = async (signal: string) => {
   stopping = true;
   clearInterval(replayMaintenance);
   console.log(JSON.stringify({ level: "info", message: "API shutting down", signal }));
-  await shutdownApi({
+  const outcome = await shutdownApi({
     // close() synchronously flips the coordinator to closing and aborts every export controller
     // before its first await. Start it before the graceful HTTP drain so backup streams cannot
     // deadlock server.shutdown().
@@ -278,8 +278,19 @@ const shutdown = async (signal: string) => {
       });
     },
     drainGraceMs: 10_000,
+    forceGraceMs: 2_000,
     resourceGraceMs: 5_000,
   });
+  const shutdownLevel = shutdownLogLevel(outcome);
+  const shutdownLog = JSON.stringify({
+    level: shutdownLevel,
+    message: shutdownLevel === "info" ? "API shutdown complete" : "API shutdown degraded",
+    signal,
+    ...outcome,
+  });
+  if (shutdownLevel === "error") console.error(shutdownLog);
+  else if (shutdownLevel === "warn") console.warn(shutdownLog);
+  else console.log(shutdownLog);
 };
 for (const signal of ["SIGTERM", "SIGINT"] as const) {
   Deno.addSignalListener(signal, () => void shutdown(signal));

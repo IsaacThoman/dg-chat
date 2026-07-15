@@ -196,6 +196,27 @@ Alert on readiness, HTTP error ratio, stream starts without first tokens, queue 
 credit settlement backlog, database saturation, Redis availability, object-store errors, and disk
 growth. Provider health is a degraded dependency and should not make `/health` fail.
 
+`/health` is process liveness. `/ready` applies a hard two-second deadline to each PostgreSQL,
+Redis, and object-storage probe by default; tune all probes with `READINESS_TIMEOUT_MS` or an
+individual `POSTGRES_READINESS_TIMEOUT_MS`, `REDIS_READINESS_TIMEOUT_MS`, or
+`S3_READINESS_TIMEOUT_MS` value between 1 and 30000 milliseconds. The API returns a sanitized 503
+when any configured required dependency misses its deadline. The bundled API container has a
+35-second healthcheck timeout and coalesces concurrent readiness checks behind a result cached for
+500 monotonic milliseconds, preventing probe amplification while still reacting quickly to
+dependency state changes. Readiness responses use `Cache-Control: no-store` so intermediaries cannot
+extend that TTL. It has a 30-second stop grace period, allowing its HTTP and resource-drain budgets
+to complete.
+
+Each HTTP response includes a server-generated `X-Request-Id`, exposed to allowed browser origins.
+Caller-supplied values are not reused as authoritative correlation IDs. Request logs are one JSON
+object per request and contain only that UUID, method, registered route template, status, and
+duration. They deliberately exclude raw paths, query strings, request headers, user identifiers, and
+exception messages. The bundled nginx access log coarsens API, OpenAI, chat, admin, and public-share
+paths so concrete identifiers and bearer capabilities are not emitted. Keep the same query/path
+redaction policy in any replacement reverse proxy. Prometheus metrics, OpenTelemetry export, and
+executable alert rules are not shipped yet; the alert list above is operator guidance, not evidence
+that an exporter is present.
+
 Provider connection tests and discovery are limited by `PROVIDER_ADMIN_RATE_LIMIT` (30 mutations per
 minute by default). Registry models are not published to users until the provider is enabled, has an
 encrypted credential, the model is enabled, and an effective price revision exists.

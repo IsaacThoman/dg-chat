@@ -8644,12 +8644,24 @@ export class PostgresRepository implements DomainRepository {
       return retentionRun({ ...rows[0], ...policy[0] });
     });
   }
-  async readiness() {
+  async readiness(signal?: AbortSignal) {
+    const query = this.#sql`SELECT 1`;
+    const abort = () => {
+      try {
+        query.cancel();
+      } catch {
+        // Cancellation is best effort; the readiness boundary has its own hard deadline.
+      }
+    };
     try {
-      await this.#sql`SELECT 1`;
+      if (signal?.aborted) return { ready: false, storage: this.storageKind };
+      signal?.addEventListener("abort", abort, { once: true });
+      await query;
       return { ready: true, storage: this.storageKind };
     } catch {
       return { ready: false, storage: this.storageKind };
+    } finally {
+      signal?.removeEventListener("abort", abort);
     }
   }
 }
