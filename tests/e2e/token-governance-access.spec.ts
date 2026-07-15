@@ -467,12 +467,14 @@ test("token settings expose loading, fetch failure, retry, and empty states", as
     }
     return route.fulfill({ json: { data: [] } });
   });
-  const openMenu = page.getByRole("button", { name: "Open menu", exact: true });
-  if (await openMenu.isVisible()) {
-    await openMenu.focus();
-    await page.keyboard.press("Enter");
-  }
-  await page.getByRole("button", { name: "Settings", exact: true }).focus();
+  // The authenticated workspace can still be reconciling its responsive shell immediately after
+  // login. `isVisible()` is an instantaneous probe, so using it here could miss the mobile menu,
+  // then wait for a Settings control that remained inside the inert drawer. Use the shared helper
+  // to wait until the same sidebar is exposed on both desktop and narrow screens.
+  const sidebar = await openSidebar(page);
+  const settings = sidebar.getByRole("button", { name: "Settings", exact: true });
+  await settings.focus();
+  await expect(settings).toBeFocused();
   await page.keyboard.press("Enter");
   await page.getByRole("button", { name: "API tokens", exact: true }).focus();
   await page.keyboard.press("Enter");

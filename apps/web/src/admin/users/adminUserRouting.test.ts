@@ -2,10 +2,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   adminUserDetailPath,
   adminUserTabForKey,
+  adminUserTabForTargetKey,
   adminUserTabId,
   adminUserTabLabels,
   adminUserTabPanelId,
   adminUserTabs,
+  authenticatedAdminDestination,
   consumeAdminUserReturnPath,
   isAdminUserRouteId,
   isAdminUserTab,
@@ -87,6 +89,14 @@ describe("admin user detail routing", () => {
     expect(adminUserTabForKey("sessions", "Enter")).toBeNull();
   });
 
+  it("advances rapid key presses from the focused tab while URL state catches up", () => {
+    const first = adminUserTabForTargetKey("account", "account", "ArrowRight");
+    expect(first).toBe("sessions");
+    const second = adminUserTabForTargetKey(first, "account", "ArrowRight");
+    expect(second).toBe("tokens");
+    expect(adminUserTabForTargetKey("invalid", "billing", "ArrowRight")).toBe("account");
+  });
+
   it("stores only validated same-origin reauthentication return paths and consumes once", () => {
     const values = new Map<string, string>();
     vi.stubGlobal("sessionStorage", {
@@ -104,5 +114,21 @@ describe("admin user detail routing", () => {
       .toThrow(TypeError);
     expect(() => storeAdminUserReturnPath("/admin/usage"))
       .toThrow(TypeError);
+  });
+
+  it("restores a validated admin route only for a full authenticated workspace", () => {
+    const values = new Map<string, string>();
+    vi.stubGlobal("sessionStorage", {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+      removeItem: (key: string) => values.delete(key),
+    });
+    const userId = "019f4a1f-4ea2-7492-a8fc-eb07d9be43f0";
+    storeAdminUserReturnPath(`/admin/users/${userId}/tokens?userSearch=security`);
+    expect(authenticatedAdminDestination("/pending")).toBe("/pending");
+    expect(authenticatedAdminDestination("/")).toBe(
+      `/admin/users/${userId}/tokens?userSearch=security`,
+    );
+    expect(authenticatedAdminDestination("/")).toBe("/");
   });
 });

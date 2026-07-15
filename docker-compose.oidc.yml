@@ -24,6 +24,8 @@ services:
       MOCK_OIDC_CLIENT_ID: dg-chat-e2e
       MOCK_OIDC_CLIENT_SECRET: dg-chat-e2e-secret
       MOCK_OIDC_REDIRECT_URI: http://localhost:8000/api/auth/oidc/callback
+      # Include the final browser origin because CSP form-action evaluates redirect chains too.
+      MOCK_OIDC_POST_AUTH_REDIRECT_ORIGIN: ${WEB_URL:-http://localhost:8000}
       MOCK_OIDC_CONTROL_TOKEN: ci-mock-oidc-control-token
     volumes:
       - ./apps/mock-oidc:/workspace/apps/mock-oidc:ro

@@ -9,6 +9,7 @@ const provider = await createMockOidcProvider({
   clientSecret: Deno.env.get("MOCK_OIDC_CLIENT_SECRET") ?? "dg-chat-e2e-secret",
   redirectUri: Deno.env.get("MOCK_OIDC_REDIRECT_URI") ??
     "http://localhost:8000/api/auth/oidc/callback",
+  postAuthRedirectOrigin: Deno.env.get("MOCK_OIDC_POST_AUTH_REDIRECT_ORIGIN"),
   controlToken: Deno.env.get("MOCK_OIDC_CONTROL_TOKEN") ?? "mock-oidc-control-token",
 });
 

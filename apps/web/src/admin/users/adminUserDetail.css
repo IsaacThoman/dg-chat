@@ -528,7 +528,9 @@
   .admin-user-detail-actions button,
   .admin-user-resource-list button,
   .admin-user-token-actions button,
-  .admin-user-detail-pagination button {
+  .admin-user-detail-pagination button,
+  .admin-user-reason-form .modal-actions button,
+  .admin-user-adjustment .modal-actions button {
     min-height: 44px;
   }
   .admin-user-tab-heading,

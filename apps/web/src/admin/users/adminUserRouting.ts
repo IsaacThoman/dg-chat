@@ -65,6 +65,11 @@ export function consumeAdminUserReturnPath(): string | null {
   }
 }
 
+/** Uses a validated one-time admin route only after authentication reaches a full workspace. */
+export function authenticatedAdminDestination(destination: "/" | "/pending"): string {
+  return destination === "/" ? consumeAdminUserReturnPath() ?? destination : destination;
+}
+
 export function parseAdminUserDetailParams(
   params: Readonly<{ userId?: unknown; tab?: unknown }>,
 ): { userId: string; tab: AdminUserTab } | null {
@@ -96,4 +101,14 @@ export function adminUserTabForKey(
   const forward = direction === "ltr" ? key === "ArrowRight" : key === "ArrowLeft";
   const offset = forward ? 1 : -1;
   return adminUserTabs[(currentIndex + offset + adminUserTabs.length) % adminUserTabs.length];
+}
+
+/** Resolves from the focused tab, not a potentially lagging URL selection during rapid presses. */
+export function adminUserTabForTargetKey(
+  target: unknown,
+  selected: AdminUserTab,
+  key: string,
+  direction: "ltr" | "rtl" = "ltr",
+): AdminUserTab | null {
+  return adminUserTabForKey(isAdminUserTab(target) ? target : selected, key, direction);
 }

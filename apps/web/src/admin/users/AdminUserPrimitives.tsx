@@ -12,6 +12,14 @@ export const errorMessage = (error: unknown, fallback: string) =>
 export const isConflict = (error: unknown) =>
   error instanceof ApiError && ["version_conflict", "balance_conflict"].includes(error.code);
 
+/**
+ * Security-resource mutations can race another administrator or resource expiry. In each case the
+ * selected row is no longer authoritative and must not remain retryable with its captured version.
+ */
+export const isStaleAdminResource = (error: unknown) =>
+  error instanceof ApiError &&
+  (error.status === 404 || error.code === "no_state_change" || isConflict(error));
+
 export const requiresRecentAuth = (error: unknown) =>
   error instanceof ApiError && error.code === "recent_authentication_required";
 

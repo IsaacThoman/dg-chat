@@ -128,7 +128,7 @@ import { ToolLauncher } from "./ToolLauncher.tsx";
 import { AdminUserDetail } from "./admin/users/AdminUserDetail.tsx";
 import type { AdminUserTab } from "./admin/users/adminUserRouting.ts";
 import {
-  consumeAdminUserReturnPath,
+  authenticatedAdminDestination,
   storeAdminUserReturnPath,
 } from "./admin/users/adminUserRouting.ts";
 import { ConversationKnowledgePicker, KnowledgeView } from "./Knowledge.tsx";
@@ -187,6 +187,40 @@ function useMediaQuery(query: string): boolean {
     return () => media.removeEventListener("change", update);
   }, [query]);
   return matches;
+}
+
+export function ConversationMessagesQueryState(
+  { kind, retry }: { kind: "loading" | "error"; retry?: () => void },
+) {
+  return (
+    <main
+      className="chat-main lifecycle-empty"
+      role={kind === "error" ? "alert" : "status"}
+      aria-busy={kind === "loading" || undefined}
+      aria-label={kind === "loading" ? "Loading conversation messages" : undefined}
+    >
+      {kind === "loading"
+        ? (
+          <>
+            <div className="typing" aria-hidden="true">
+              <span />
+              <span />
+              <span />
+            </div>
+            <p>Loading conversation messages…</p>
+          </>
+        )
+        : (
+          <>
+            <h1>Conversation messages unavailable</h1>
+            <p>The saved conversation could not be loaded. No messages were removed.</p>
+            <button type="button" className="primary" onClick={retry}>
+              <RefreshCw size={15} aria-hidden="true" /> Retry
+            </button>
+          </>
+        )}
+    </main>
+  );
 }
 
 function Brand({ compact = false }: { compact?: boolean }) {
@@ -2284,6 +2318,8 @@ function ChatView({
   saveHistory = true,
   modelPreferenceError = "",
   historyPreferenceWarning = "",
+  messagesStale = false,
+  retryMessages,
   onGenerationBusyChange,
 }: {
   conversations: Conversation[];
@@ -2304,6 +2340,8 @@ function ChatView({
   saveHistory?: boolean;
   modelPreferenceError?: string;
   historyPreferenceWarning?: string;
+  messagesStale?: boolean;
+  retryMessages: () => void;
   onGenerationBusyChange: (conversationId: string, busy: boolean) => void;
 }) {
   const queryClient = useQueryClient();
@@ -2873,6 +2911,12 @@ function ChatView({
             <Pencil size={14} /> Rename
           </button>
         </div>
+        {messagesStale && (
+          <div className="stale-warning" role="status">
+            <span>Showing saved messages. The latest refresh failed.</span>
+            <button type="button" onClick={retryMessages}>Retry</button>
+          </div>
+        )}
         {conversation?.temporary && (
           <div className="temporary-chat-banner" role="status">
             <div>
@@ -4502,6 +4546,12 @@ export function App(
     await conversationQuery.refetch();
     return updated;
   };
+  const messagesBlockingLoading = !demoMode && Boolean(
+    activeId && messagesQuery.isLoading && messagesQuery.data === undefined,
+  );
+  const messagesBlockingError = !demoMode && Boolean(
+    activeId && messagesQuery.isError && messagesQuery.data === undefined,
+  );
   if (!user || user.limited) {
     return <DiscoveryLoading unavailable={setupQuery.isError && userQuery.isError} />;
   }
@@ -4540,7 +4590,16 @@ export function App(
         </main>
       )}
       {(view === "chat" || view === "archived" || view === "trash") && !creatingConversation &&
-        activeId && (
+        activeId && messagesBlockingLoading && <ConversationMessagesQueryState kind="loading" />}
+      {(view === "chat" || view === "archived" || view === "trash") && !creatingConversation &&
+        activeId && messagesBlockingError && (
+        <ConversationMessagesQueryState
+          kind="error"
+          retry={() => void messagesQuery.refetch()}
+        />
+      )}
+      {(view === "chat" || view === "archived" || view === "trash") && !creatingConversation &&
+        activeId && !messagesBlockingLoading && !messagesBlockingError && (
         <ChatView
           key={activeId}
           conversations={allConversations}
@@ -4574,6 +4633,8 @@ export function App(
           saveHistory={!temporaryChatUntilPreferencesResolve(demoMode, preferencesQuery.data)}
           modelPreferenceError={modelPreferenceError}
           historyPreferenceWarning={historyPreferenceWarning(demoMode, preferencesQuery.isError)}
+          messagesStale={!demoMode && messagesQuery.isError && messagesQuery.data !== undefined}
+          retryMessages={() => void messagesQuery.refetch()}
           onGenerationBusyChange={updateGenerationBusy}
         />
       )}
@@ -4759,8 +4820,7 @@ export function AuthScreen() {
         ? await api.signUp(name, email, password)
         : await api.signIn(email, password);
       const destination = identityDestination(user);
-      const adminReturn = !signup && destination === "/" ? consumeAdminUserReturnPath() : null;
-      location.assign(adminReturn ?? destination);
+      location.assign(!signup ? authenticatedAdminDestination(destination) : destination);
     } catch {
       setError("We couldn't sign you in. Check your details and try again.");
     } finally {
@@ -5008,7 +5068,7 @@ export function PendingScreen() {
   const mode = pendingMode(status.data);
   useEffect(() => {
     if (mode === "ready") {
-      location.assign("/");
+      location.assign(authenticatedAdminDestination("/"));
     }
     if (status.error instanceof ApiError && status.error.status === 401) location.assign("/login");
   }, [mode, status.error]);

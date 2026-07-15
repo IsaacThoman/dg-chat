@@ -15,8 +15,11 @@ export default defineConfig({
   // Managed journeys share one self-hosted installation and intentionally exercise global limits,
   // bootstrap state, retention, and account lifecycle. Parallel workers would race that state and
   // exhaust the administrator's real authentication quota, so keep managed runs isolated locally
-  // as well as in CI. Externally provisioned test stacks may still opt into Playwright's default.
-  workers: env("CI") || env("E2E_MANAGED_SERVER") === "true" ? 1 : undefined,
+  // as well as in CI. Lightweight external stacks that do not opt into full-stack journeys may
+  // still use Playwright's default worker count.
+  workers: env("CI") || env("E2E_MANAGED_SERVER") === "true" || env("E2E_FULL_STACK") === "true"
+    ? 1
+    : undefined,
   timeout: 45_000,
   expect: { timeout: 8_000 },
   reporter: env("CI")
@@ -46,6 +49,9 @@ export default defineConfig({
         // rate-limit tests cover the production defaults; a high managed-stack quota prevents
         // unrelated journeys from becoming order- and wall-clock-dependent.
         env: {
+          // Keep the disposable managed stack self-contained. External stacks do not use this
+          // webServer block and still require an explicitly provisioned setup secret.
+          SETUP_TOKEN: env("SETUP_TOKEN") ?? "e2e-setup-token",
           AUTH_RATE_LIMIT: env("E2E_AUTH_RATE_LIMIT") ?? "1000",
           AUTH_CLIENT_RATE_LIMIT: env("E2E_AUTH_CLIENT_RATE_LIMIT") ?? "1000",
           // Exercise the configured approval default instead of accidentally validating the

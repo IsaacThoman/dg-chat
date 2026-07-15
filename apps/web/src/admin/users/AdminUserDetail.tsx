@@ -18,7 +18,7 @@ import { AdminUserSessionsTab, AdminUserTokensTab } from "./AdminUserSecurityTab
 import { adminUserKeys } from "./adminUserKeys.ts";
 import {
   type AdminUserTab,
-  adminUserTabForKey,
+  adminUserTabForTargetKey,
   adminUserTabId,
   adminUserTabLabels,
   adminUserTabPanelId,
@@ -60,6 +60,7 @@ export function AdminUserDetail(
 ) {
   const [announcement, setAnnouncement] = useState("");
   const headingRef = useRef<HTMLHeadingElement>(null);
+  const focusedUserIdRef = useRef<string | undefined>(undefined);
   const user = useQuery({
     queryKey: adminUserKeys.detail(userId),
     queryFn: ({ signal }) => api.adminUserDetail(userId, signal),
@@ -68,19 +69,24 @@ export function AdminUserDetail(
     if (user.data) document.title = `${user.data.name} · Users · DG Chat Admin`;
   }, [user.data]);
   useEffect(() => {
-    if (user.data) headingRef.current?.focus();
-  }, [userId]);
-  const changeTab = (next: AdminUserTab, focus = false) => {
-    onTabChange(next);
-    if (focus) {
-      requestAnimationFrame(() => document.getElementById(adminUserTabId(userId, next))?.focus());
-    }
-  };
+    if (user.data?.id !== userId || focusedUserIdRef.current === userId) return;
+    focusedUserIdRef.current = userId;
+    headingRef.current?.focus();
+  }, [userId, user.data?.id]);
+  const changeTab = (next: AdminUserTab) => onTabChange(next);
   const tabKey = (event: KeyboardEvent<HTMLButtonElement>) => {
-    const next = adminUserTabForKey(tab, event.key, document.dir === "rtl" ? "rtl" : "ltr");
+    const next = adminUserTabForTargetKey(
+      event.currentTarget.dataset.adminUserTab,
+      tab,
+      event.key,
+      document.dir === "rtl" ? "rtl" : "ltr",
+    );
     if (!next) return;
     event.preventDefault();
-    changeTab(next, true);
+    // Move focus synchronously while the current tab strip is still mounted. The URL transition
+    // can otherwise race a requestAnimationFrame callback after a mutation-driven refetch.
+    document.getElementById(adminUserTabId(userId, next))?.focus();
+    changeTab(next);
   };
   if (user.isLoading) {
     return <DetailState kind="loading" message="Loading user security and billing…" />;
@@ -170,6 +176,7 @@ export function AdminUserDetail(
             type="button"
             aria-selected={tab === item}
             aria-controls={adminUserTabPanelId(userId, item)}
+            data-admin-user-tab={item}
             tabIndex={tab === item ? 0 : -1}
             onClick={() => changeTab(item)}
             onKeyDown={tabKey}
