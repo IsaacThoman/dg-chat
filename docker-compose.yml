@@ -6,6 +6,10 @@ x-app-environment: &app-environment
   WEB_URL: ${WEB_URL:-http://localhost:8000}
   DATABASE_URL: postgresql://${POSTGRES_USER:-dgchat}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-dgchat}
   REDIS_URL: redis://redis:6379
+  READINESS_TIMEOUT_MS: ${READINESS_TIMEOUT_MS:-2000}
+  POSTGRES_READINESS_TIMEOUT_MS: ${POSTGRES_READINESS_TIMEOUT_MS:-}
+  REDIS_READINESS_TIMEOUT_MS: ${REDIS_READINESS_TIMEOUT_MS:-}
+  S3_READINESS_TIMEOUT_MS: ${S3_READINESS_TIMEOUT_MS:-}
   # The bundled nginx overwrites X-Real-IP with the connecting address.
   TRUST_PROXY_HEADERS: "true"
   S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
@@ -85,6 +89,7 @@ x-app-service: &app-service
 services:
   app:
     <<: *app-service
+    stop_grace_period: 30s
     build:
       context: .
       dockerfile: Dockerfile
@@ -96,7 +101,7 @@ services:
     healthcheck:
       test: ["CMD", "busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8000/ready"]
       interval: 10s
-      timeout: 5s
+      timeout: 35s
       retries: 12
       start_period: 20s
     depends_on:

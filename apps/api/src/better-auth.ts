@@ -28,6 +28,8 @@ export interface BetterAuthServiceOptions {
   oidc?: Omit<OidcConfig, "appUrl" | "webOrigin">;
   requireEmailVerification?: boolean;
   identityDeliveryTimeoutMs?: number;
+  /** Test/embedding seam. Authentication library details are never forwarded to this sink. */
+  authLogSink?: (line: string) => void;
   sendVerificationEmail?: (input: {
     email: string;
     url: string;
@@ -38,6 +40,75 @@ export interface BetterAuthServiceOptions {
     url: string;
     token: string;
   }, signal?: AbortSignal) => Promise<void>;
+}
+
+export function createSanitizedBetterAuthLogger(
+  sink: (line: string) => void = (line) => console.error(line),
+) {
+  return {
+    disableColors: true,
+    level: "warn" as const,
+    log(level: "debug" | "info" | "warn" | "error", _message: string, ..._details: unknown[]) {
+      // Better Auth includes callback parameters and adapter exceptions in its detail arguments.
+      // Preserve severity and component identity only; the HTTP request lifecycle is logged
+      // separately without forwarding these attacker-controlled details.
+      const safeLevel = level === "error" ? "error" : "warn";
+      try {
+        sink(JSON.stringify({
+          level: safeLevel,
+          component: "better_auth",
+          message: "Authentication subsystem event",
+        }));
+      } catch {
+        // Observability must not alter authentication behavior.
+      }
+    },
+  };
+}
+
+export function createSanitizedBetterAuthLogging(
+  sink?: (line: string) => void,
+) {
+  const logger = createSanitizedBetterAuthLogger(sink);
+  return {
+    logger,
+    onAPIError: {
+      // Better Auth otherwise sends APIError messages through its package-global logger for warn
+      // and error levels, bypassing the configured logger. Supplying this callback takes over that
+      // path before the library fallback can print callback or adapter details.
+      onError: () => logger.log("error", "Authentication API error"),
+    },
+  };
+}
+
+type AuthOperationalLogEntry = {
+  level: "error" | "warn";
+  message: string;
+  action?: string;
+};
+
+export function createSanitizedAuthOperationalEmitter(
+  sink: (line: string) => void = (line) => console.error(line),
+) {
+  return (entry: AuthOperationalLogEntry): void => {
+    try {
+      sink(JSON.stringify(entry));
+    } catch {
+      // A broken output stream or embedding sink must not change authentication control flow.
+    }
+  };
+}
+
+export async function recordAuthAuditWithSanitizedFailure(
+  record: () => Promise<unknown> | unknown,
+  emit: (entry: AuthOperationalLogEntry) => void,
+  failure: AuthOperationalLogEntry,
+): Promise<void> {
+  try {
+    await record();
+  } catch {
+    emit(failure);
+  }
 }
 
 export interface BetterAuthBrowserSession {
@@ -58,6 +129,8 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
   if (options.requireEmailVerification && !options.sendVerificationEmail) {
     throw new Error("Email verification requires a delivery callback");
   }
+  const authOperationalLog = createSanitizedAuthOperationalEmitter(options.authLogSink);
+  const authLogging = createSanitizedBetterAuthLogging(options.authLogSink);
   const sql = postgres(options.databaseUrl, { max: 10 });
   const database = drizzle(sql, {
     schema: { authUsers, authSessions, authAccounts, authVerifications },
@@ -134,22 +207,21 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
     actorId: string | null,
     action: string,
   ) => {
-    try {
-      await options.repository.recordAudit({
-        actorId,
-        action,
-        targetType: "user",
-        targetId: userId,
-      });
-    } catch (error) {
-      console.error(JSON.stringify({
+    await recordAuthAuditWithSanitizedFailure(
+      () =>
+        options.repository.recordAudit({
+          actorId,
+          action,
+          targetType: "user",
+          targetId: userId,
+        }),
+      authOperationalLog,
+      {
         level: "error",
         message: "Identity delivery audit persistence failed",
-        userId,
         action,
-        error: error instanceof Error ? error.message : String(error),
-      }));
-    }
+      },
+    );
   };
   const dispatchIdentityEmail = (
     userId: string,
@@ -186,6 +258,7 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
     basePath: "/api/auth",
     secret: options.secret,
     trustedOrigins: [options.webOrigin],
+    ...authLogging,
     database: drizzleAdapter(database, {
       provider: "pg",
       schema: {
@@ -253,19 +326,20 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
         const token = request?.headers.get("x-dg-password-reset-token");
         if (!token) throw new Error("Password reset guard token is missing");
         await options.repository.secureAfterPasswordReset(user.id, token);
-        await Promise.resolve(options.repository.recordAudit({
-          actorId: user.id,
-          action: "identity.password_reset_completed",
-          targetType: "user",
-          targetId: user.id,
-        })).catch((error) => {
-          console.error(JSON.stringify({
+        await recordAuthAuditWithSanitizedFailure(
+          () =>
+            options.repository.recordAudit({
+              actorId: user.id,
+              action: "identity.password_reset_completed",
+              targetType: "user",
+              targetId: user.id,
+            }),
+          authOperationalLog,
+          {
             level: "error",
             message: "Password reset audit persistence failed",
-            userId: user.id,
-            error: error instanceof Error ? error.message : String(error),
-          }));
-        });
+          },
+        );
       },
     },
     emailVerification: options.sendVerificationEmail

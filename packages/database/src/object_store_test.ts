@@ -186,3 +186,28 @@ Deno.test("S3 object store maps missing keys and readiness failures", async () =
   assertEquals(await missing.get("users/user/missing.txt"), undefined);
   assertEquals(await missing.readiness(), false);
 });
+
+Deno.test("S3 readiness forwards cancellation to the SDK request", async () => {
+  let observedSignal: AbortSignal | undefined;
+  const store = new S3ObjectStore({
+    bucket: "dg-chat-files",
+    region: "us-east-1",
+    forcePathStyle: true,
+  }, {
+    send(_command: unknown, options?: { abortSignal?: AbortSignal }) {
+      observedSignal = options?.abortSignal;
+      return new Promise((_resolve, reject) => {
+        options?.abortSignal?.addEventListener(
+          "abort",
+          () => reject(options.abortSignal?.reason),
+          { once: true },
+        );
+      });
+    },
+  });
+  const controller = new AbortController();
+  const readiness = store.readiness(controller.signal);
+  controller.abort(new DOMException("test deadline", "TimeoutError"));
+  assertEquals(await readiness, false);
+  assertEquals(observedSignal, controller.signal);
+});

@@ -9,7 +9,7 @@ export interface RateLimitResult {
 
 export interface RateLimiter {
   consume(key: string, limit: number, windowSeconds: number): Promise<RateLimitResult>;
-  health(): Promise<boolean>;
+  health(signal?: AbortSignal): Promise<boolean>;
   close(): Promise<void>;
 }
 
@@ -128,10 +128,25 @@ export class RedisRateLimiter implements RateLimiter {
     else this.#redis.disconnect();
   }
 
-  async health() {
+  async health(signal?: AbortSignal) {
     try {
-      await this.#ensureConnected();
-      return await this.#redis.ping() === "PONG";
+      if (signal?.aborted) return false;
+      const health = (async () => {
+        await this.#ensureConnected();
+        return await this.#redis.ping() === "PONG";
+      })();
+      if (!signal) return await health;
+      return await new Promise<boolean>((resolve) => {
+        // ioredis does not expose per-command cancellation. Resolve this health probe on abort,
+        // but do not disconnect the shared client: doing so would disrupt concurrent requests.
+        // The route-level readiness deadline remains the hard caller-visible bound, while the
+        // in-flight ping settles independently under ioredis' finite retry policy.
+        const aborted = () => resolve(false);
+        signal.addEventListener("abort", aborted, { once: true });
+        void health.then(resolve, () => resolve(false)).finally(() => {
+          signal.removeEventListener("abort", aborted);
+        });
+      });
     } catch {
       return false;
     }

@@ -1,6 +1,6 @@
 import { assertEquals, assertExists } from "jsr:@std/assert@1.0.14";
 import { MemoryRepository } from "@dg-chat/database";
-import { createApp, redactRequestLog } from "./app.ts";
+import { createApp } from "./app.ts";
 import { ProviderSecretKeyring } from "./provider-secrets.ts";
 import { TestObjectStore } from "./test-object-store.ts";
 import type { RateLimiter } from "./rate-limit.ts";
@@ -64,16 +64,6 @@ async function rgbaPng(width: number, red: number): Promise<Uint8Array> {
 }
 
 const onePixelPng = (red: number) => rgbaPng(1, red);
-
-Deno.test("signed image capability queries are always redacted from request logs", () => {
-  for (const query of ["token=secret", "%74oken=secret", "x=1&to%6ben=secret"]) {
-    const redacted = redactRequestLog(
-      `--> GET /v1/images/assets/00000000-0000-4000-8000-000000000001/content?${query} 200`,
-    );
-    assertEquals(redacted.includes("secret"), false);
-    assertEquals(redacted.includes("?[REDACTED]"), true);
-  }
-});
 
 async function fixture(options: {
   providerUsage?: { input_tokens: number; output_tokens: number; total_tokens: number };

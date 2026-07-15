@@ -3,7 +3,6 @@ import { Hono } from "npm:hono@4.12.28";
 import { cors } from "npm:hono@4.12.28/cors";
 import { bodyLimit } from "npm:hono@4.12.28/body-limit";
 import { deleteCookie, getCookie, setCookie } from "npm:hono@4.12.28/cookie";
-import { logger } from "npm:hono@4.12.28/logger";
 import { HTTPException } from "npm:hono@4.12.28/http-exception";
 import { secureHeaders } from "npm:hono@4.12.28/secure-headers";
 import { streamSSE } from "npm:hono@4.12.28/streaming";
@@ -117,6 +116,7 @@ import {
   usagePricingSnapshotsEqual,
 } from "@dg-chat/database";
 import { hashPassword, randomToken, sha256, sha256Hex, verifyPassword } from "./crypto.ts";
+import { boundedReadiness, type ReadinessTimeouts, readinessTimeoutsFromEnv } from "./readiness.ts";
 import {
   maximumBufferedChatReplayBytes,
   maximumChatStreamReplayBytes,
@@ -275,6 +275,7 @@ import type { BackupAdminService } from "./backup-admin.ts";
 import { BackupServiceError } from "./backup-service.ts";
 
 type Variables = {
+  requestId: string;
   user: PublicUser;
   authType: "session" | "token";
   /** Server-resolved durable session identity. Never accept this from request input. */
@@ -291,23 +292,20 @@ type WebGenerationEventInput = WebGenerationEvent extends infer Event
   ? Event extends { sequence: number } ? Omit<Event, "sequence"> : never
   : never;
 
-export function redactRequestLog(message: string): string {
-  return message
-    // Public share capabilities are bearer credentials. Never emit them into request logs.
-    .replace(
-      /(\/api\/public\/shares\/)[^/?\s]+/g,
-      "$1[REDACTED]",
-    )
-    // URL parsers accept percent-encoded key names, so suppress the entire capability query.
-    .replace(
-      /(\/v1\/images\/assets\/[^?\s]+\/content)\?[^\s]*/g,
-      "$1?[REDACTED]",
-    )
-    .replace(/([?&]token=)[^&\s]+/g, "$1[REDACTED]");
+function safeLoggedRoute(c: Context<{ Variables: Variables }>): string {
+  // Hono exposes the registered route template after downstream handlers run. It keeps bearer-like
+  // path parameters (share capabilities, signed asset identifiers, user IDs) out of logs and keeps
+  // route cardinality bounded. Never fall back to the caller-controlled raw URL or pathname.
+  const matched = c.req.routePath;
+  return matched.startsWith("/") ? matched : "/[unmatched]";
 }
 
 export interface AppOptions {
   repository?: DomainRepository;
+  /** Test/embedding seam. Production defaults to one JSON object per stdout line. */
+  requestLogSink?: (line: string) => void;
+  /** Test/embedding seam. Production defaults to one JSON object per stderr line. */
+  requestErrorLogSink?: (line: string) => void;
   setupToken?: string;
   startingCreditMicros?: number;
   rateLimiter?: RateLimiter;
@@ -358,6 +356,9 @@ export interface AppOptions {
   toolReserveMicros?: number;
   browserAuth?: BetterAuthService;
   backupAdmin?: BackupAdminService;
+  readinessTimeouts?: ReadinessTimeouts;
+  /** Short test seam for the public readiness single-flight cache. */
+  readinessCacheMs?: number;
   /** Testable wall clock for security decisions. */
   now?: () => number;
 }
@@ -1301,9 +1302,24 @@ async function stageMultipartUpload(
 
 export function createApp(options: AppOptions = {}) {
   const repo = options.repository ?? new MemoryRepository();
+  const requestLogSink = options.requestLogSink ?? ((line: string) => console.log(line));
+  const requestErrorLogSink = options.requestErrorLogSink ??
+    ((line: string) => console.error(line));
+  const emitOperationalLog = (entry: Record<string, string | number>) => {
+    try {
+      requestErrorLogSink(JSON.stringify(entry));
+    } catch {
+      // Logging is observational and must never alter request or background delivery behavior.
+    }
+  };
   const browserAuth = options.browserAuth;
   const objectStore = options.objectStore;
   const rateLimiter = options.rateLimiter ?? new MemoryRateLimiter();
+  const readinessTimeouts = options.readinessTimeouts ?? readinessTimeoutsFromEnv();
+  const readinessCacheMs = Math.max(0, options.readinessCacheMs ?? 500);
+  if (!Number.isSafeInteger(readinessCacheMs) || readinessCacheMs > 30_000) {
+    throw new Error("Readiness cache must be an integer between 0 and 30000 milliseconds");
+  }
   const audioConcurrencyLimiter = options.audioConcurrencyLimiter ??
     new MemoryAudioConcurrencyLimiter();
   const imageConcurrencyLimiter = options.imageConcurrencyLimiter ?? audioConcurrencyLimiter;
@@ -1391,14 +1407,12 @@ export function createApp(options: AppOptions = {}) {
           targetType: "user",
           targetId: userId,
         });
-      } catch (error) {
-        console.error(JSON.stringify({
+      } catch {
+        emitOperationalLog({
           level: "error",
           message: "Identity delivery audit persistence failed",
-          userId,
           action,
-          error: error instanceof Error ? error.message : String(error),
-        }));
+        });
       }
     };
     const controller = new AbortController();
@@ -1685,11 +1699,10 @@ export function createApp(options: AppOptions = {}) {
       return value;
     } catch (error) {
       if (error instanceof DomainError && error.code === "insufficient_credit") throw error;
-      console.warn(JSON.stringify({
+      emitOperationalLog({
         level: "warn",
         message: "Knowledge query embedding failed; using lexical retrieval",
-        error: error instanceof Error ? error.message : String(error),
-      }));
+      });
       return undefined;
     }
   };
@@ -1970,10 +1983,34 @@ export function createApp(options: AppOptions = {}) {
     }
     return plan;
   };
-  app.use(
-    "*",
-    logger((message, ...rest) => console.log(redactRequestLog(message), ...rest)),
-  );
+  app.use("*", async (c, next) => {
+    // Correlation IDs are server-owned. Even a syntactically valid caller UUID can be replayed to
+    // merge unrelated incidents, so incoming X-Request-Id values are deliberately ignored.
+    const requestId = crypto.randomUUID();
+    const startedAt = performance.now();
+    c.set("requestId", requestId);
+    // Set this both before and after downstream execution. Hono handlers may return a fresh
+    // Response whose headers replace prepared headers, so the second assignment is required.
+    c.header("X-Request-Id", requestId);
+    try {
+      await next();
+      c.header("X-Request-Id", requestId);
+    } finally {
+      // This intentionally contains no URL, query, headers, user identifiers, or error text.
+      try {
+        requestLogSink(JSON.stringify({
+          method: c.req.method,
+          path: safeLoggedRoute(c),
+          status: c.res.status,
+          durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
+          requestId,
+        }));
+      } catch {
+        // Logging is observational. A broken stdout consumer or embedding callback must never
+        // change the request result or recursively invoke the application's error handler.
+      }
+    }
+  });
   app.use(
     "*",
     secureHeaders({
@@ -2063,7 +2100,8 @@ export function createApp(options: AppOptions = {}) {
     cors({
       origin: webOrigin,
       credentials: true,
-      allowHeaders: ["Authorization", "Content-Type", "Idempotency-Key"],
+      allowHeaders: ["Authorization", "Content-Type", "Idempotency-Key", "X-Request-Id"],
+      exposeHeaders: ["X-Request-Id"],
     }),
   );
   app.use("*", async (c, next) => {
@@ -2423,20 +2461,60 @@ export function createApp(options: AppOptions = {}) {
     };
 
   app.get("/health", (c) => c.json({ status: "ok", service: "api" }));
-  app.get("/ready", async (c) => {
+  type ReadinessSnapshot = {
+    status: "ready" | "not_ready";
+    storage: { ready: boolean; storage: string };
+    redis: boolean;
+    objects: { configured: boolean; ready: boolean };
+  };
+  let readinessCache: { snapshot: ReadinessSnapshot; expiresAt: number } | undefined;
+  let readinessInFlight: Promise<ReadinessSnapshot> | undefined;
+  const probeReadiness = async (): Promise<ReadinessSnapshot> => {
     const [storage, redis, objects] = await Promise.all([
-      repo.readiness(),
-      rateLimiter.health(),
-      objectStore?.readiness() ?? Promise.resolve(false),
+      boundedReadiness(
+        readinessTimeouts.postgresMs,
+        { ready: false, storage: repo.storageKind },
+        (signal) => repo.readiness(signal),
+      ),
+      boundedReadiness(readinessTimeouts.redisMs, false, (signal) => rateLimiter.health(signal)),
+      objectStore
+        ? boundedReadiness(
+          readinessTimeouts.objectStoreMs,
+          false,
+          (signal) => objectStore.readiness(signal),
+        )
+        : Promise.resolve(false),
     ]);
     const ready = storage.ready && redis && (objectStore ? objects : true);
-    const body = {
+    return {
       status: ready ? "ready" : "not_ready",
       storage,
       redis,
       objects: { configured: Boolean(objectStore), ready: objects },
     };
-    return ready ? c.json(body, 200) : c.json(body, 503);
+  };
+  const readinessSnapshot = (): Promise<ReadinessSnapshot> => {
+    // Use a monotonic clock for this in-process TTL. A wall-clock correction must not keep a stale
+    // ready result alive past the configured cache window.
+    const now = performance.now();
+    if (readinessCache && now < readinessCache.expiresAt) {
+      return Promise.resolve(readinessCache.snapshot);
+    }
+    if (readinessInFlight) return readinessInFlight;
+    const probe = probeReadiness().then((snapshot) => {
+      readinessCache = { snapshot, expiresAt: performance.now() + readinessCacheMs };
+      return snapshot;
+    }).finally(() => {
+      if (readinessInFlight === probe) readinessInFlight = undefined;
+    });
+    readinessInFlight = probe;
+    return probe;
+  };
+  app.get("/ready", async (c) => {
+    // Intermediaries must not extend a readiness decision beyond the bounded in-process TTL.
+    c.header("Cache-Control", "no-store");
+    const snapshot = await readinessSnapshot();
+    return snapshot.status === "ready" ? c.json(snapshot, 200) : c.json(snapshot, 503);
   });
   app.get("/api/setup/status", async (c) => {
     const users = await repo.listUsers();
@@ -2486,12 +2564,11 @@ export function createApp(options: AppOptions = {}) {
           : staged.inspection.decision.reason,
       });
       if (created.deduplicated) {
-        await objectStore.delete(objectKey).catch((error) => {
-          console.error(JSON.stringify({
+        await objectStore.delete(objectKey).catch(() => {
+          emitOperationalLog({
             level: "error",
             message: "Duplicate upload object cleanup failed",
-            error: error instanceof Error ? error.message : String(error),
-          }));
+          });
         });
         stored = false;
         return created.attachment;
@@ -3312,11 +3389,11 @@ export function createApp(options: AppOptions = {}) {
       // Better Auth deliberately does not disclose whether the account exists. Normalize its
       // successful response too so local and durable auth have the same product contract.
       if (!response.ok) {
-        console.error(JSON.stringify({
+        emitOperationalLog({
           level: "error",
           message: "Password reset request could not be processed",
           status: response.status,
-        }));
+        });
       }
       return c.body(null, 202);
     }
@@ -10690,12 +10767,12 @@ export function createApp(options: AppOptions = {}) {
         },
       }, 409);
     }
-    const correlationId = crypto.randomUUID();
-    console.error(
-      JSON.stringify({ level: "error", message: "Unhandled request error", correlationId }),
-    );
+    const requestId = c.get("requestId");
+    // Keep the detail fixed: arbitrary exception messages can contain SQL values, upstream URLs,
+    // credentials, object keys, or user content. The request ID is sufficient for correlation.
+    emitOperationalLog({ level: "error", message: "Unhandled request error", requestId });
     return c.json(
-      openAIError(`Internal server error (${correlationId})`, "internal_error", 500),
+      openAIError(`Internal server error (${requestId})`, "internal_error", 500),
       500,
     );
   });
