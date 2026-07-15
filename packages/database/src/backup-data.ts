@@ -10,7 +10,9 @@ import {
   type ProviderProtocol,
 } from "./provider-model-invariants.ts";
 
-export const BACKUP_DATA_SCHEMA_VERSION = "0037" as const;
+export const BACKUP_DATA_SCHEMA_VERSION = "0039" as const;
+const ADMIN_SECURITY_BILLING_BACKUP_DATA_SCHEMA_VERSION = "0038" as const;
+const ADMIN_LIFECYCLE_BACKUP_DATA_SCHEMA_VERSION = "0037" as const;
 const IMMUTABLE_SHARING_BACKUP_DATA_SCHEMA_VERSION = "0034" as const;
 const CONVERSATION_PORTABILITY_BACKUP_DATA_SCHEMA_VERSION = "0033" as const;
 const TEMPORARY_LIFECYCLE_BACKUP_DATA_SCHEMA_VERSION = "0032" as const;
@@ -24,10 +26,19 @@ export const LEGACY_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
     "conversation_tag_sets",
     "conversation_tag_bindings",
     "conversation_share_snapshots",
+    "admin_balance_adjustments",
   ]),
+);
+export const ADMIN_LIFECYCLE_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
+  new Set(["admin_balance_adjustments"]),
+);
+export const PRE_IMMUTABLE_SHARING_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
+  new Set(["admin_balance_adjustments", "conversation_share_snapshots"]),
 );
 export function isSupportedBackupDataSchemaVersion(value: string): boolean {
   return value === BACKUP_DATA_SCHEMA_VERSION ||
+    value === ADMIN_SECURITY_BILLING_BACKUP_DATA_SCHEMA_VERSION ||
+    value === ADMIN_LIFECYCLE_BACKUP_DATA_SCHEMA_VERSION ||
     value === IMMUTABLE_SHARING_BACKUP_DATA_SCHEMA_VERSION ||
     value === CONVERSATION_PORTABILITY_BACKUP_DATA_SCHEMA_VERSION ||
     value === TEMPORARY_LIFECYCLE_BACKUP_DATA_SCHEMA_VERSION ||
@@ -116,6 +127,9 @@ const UUID_COLUMNS = new Set([
   "generation_id",
   "active_leaf_id",
   "leaf_id",
+  "target_user_id",
+  "ledger_entry_id",
+  "audit_event_id",
 ]);
 const TIMESTAMP_SUFFIX = /(?:_at|_expires_at)$/u;
 const inferKinds = (columns: readonly string[], explicit: ColumnKinds): ColumnKinds =>
@@ -376,11 +390,12 @@ export const BACKUP_DATA_TABLES: readonly BackupDataTable[] = Object.freeze([
   ),
   T(
     "ledger_entries",
-    "id user_id usage_run_id kind amount_micros balance_after_micros metadata created_at",
-    "user_id,created_at,id",
+    "id user_id usage_run_id kind sequence amount_micros balance_after_micros metadata created_at",
+    "user_id,sequence,id",
     {
       id: "uuid",
       usage_run_id: "text",
+      sequence: "bigint",
       amount_micros: "bigint",
       balance_after_micros: "bigint",
       metadata: "json",
@@ -506,6 +521,19 @@ export const BACKUP_DATA_TABLES: readonly BackupDataTable[] = Object.freeze([
     "created_at,id",
     {
       metadata: "json",
+    },
+  ),
+  T(
+    "admin_balance_adjustments",
+    "id actor_id target_user_id idempotency_key_hash request_hash amount_micros balance_before_micros balance_after_micros reason ledger_entry_id audit_event_id created_at",
+    "created_at,id",
+    {
+      idempotency_key_hash: "text",
+      request_hash: "text",
+      amount_micros: "bigint",
+      balance_before_micros: "bigint",
+      balance_after_micros: "bigint",
+      reason: "text",
     },
   ),
   T(
@@ -919,6 +947,12 @@ function exactSourceRow(
   schemaVersion: string,
 ): Record<string, unknown> {
   if (
+    schemaVersion !== BACKUP_DATA_SCHEMA_VERSION && definition.name === "ledger_entries" && value &&
+    typeof value === "object" && !Array.isArray(value)
+  ) {
+    return exactRow(definition, { ...(value as Record<string, unknown>), sequence: null });
+  }
+  if (
     schemaVersion !== BACKUP_DATA_SCHEMA_VERSION && definition.name === "users" && value &&
     typeof value === "object" && !Array.isArray(value) && !("version" in value)
   ) {
@@ -1036,6 +1070,13 @@ async function stageSource(
         safeIdentifier(definition.name)
       } INCLUDING ALL) ON COMMIT DROP`,
     );
+    if (
+      source.schemaVersion !== BACKUP_DATA_SCHEMA_VERSION && definition.name === "ledger_entries"
+    ) {
+      await tx.unsafe(
+        `ALTER TABLE ${safeIdentifier(temporary)} ALTER COLUMN sequence DROP NOT NULL`,
+      );
+    }
     for (const [column, type] of Object.entries(definition.syntheticColumns ?? {})) {
       await tx.unsafe(
         `ALTER TABLE ${safeIdentifier(temporary)} ADD COLUMN ${safeIdentifier(column)} ${type}`,
@@ -1088,6 +1129,24 @@ async function stageSource(
       count += batch.length;
     }
     counts[definition.name] = count;
+  }
+  if (source.schemaVersion !== BACKUP_DATA_SCHEMA_VERSION) {
+    const ledgerName = stage.get("ledger_entries")!;
+    const usersName = stage.get("users")!;
+    try {
+      await tx`SELECT dg_chat_reconstruct_ledger_sequences(
+        ${ledgerName}::regclass,
+        ${usersName}::regclass
+      )`;
+    } catch (error) {
+      if ((error as { code?: unknown }).code === "23514") {
+        throw new BackupDataError("invariant", "Backup ledger history is inconsistent");
+      }
+      throw error;
+    }
+    await tx.unsafe(
+      `ALTER TABLE ${safeIdentifier(ledgerName)} ALTER COLUMN sequence SET NOT NULL`,
+    );
   }
   return { stage, counts };
 }
@@ -1379,6 +1438,25 @@ const RELATIONS: readonly BackupRelation[] = Object.freeze([
     target: ["id"],
   },
   { from: "audit_events", columns: ["actor_id"], to: "users", target: ["id"] },
+  { from: "admin_balance_adjustments", columns: ["actor_id"], to: "users", target: ["id"] },
+  {
+    from: "admin_balance_adjustments",
+    columns: ["target_user_id"],
+    to: "users",
+    target: ["id"],
+  },
+  {
+    from: "admin_balance_adjustments",
+    columns: ["ledger_entry_id"],
+    to: "ledger_entries",
+    target: ["id"],
+  },
+  {
+    from: "admin_balance_adjustments",
+    columns: ["audit_event_id"],
+    to: "audit_events",
+    target: ["id"],
+  },
   { from: "retention_policy_versions", columns: ["updated_by"], to: "users", target: ["id"] },
   {
     from: "retention_policy_state",
@@ -1574,10 +1652,12 @@ async function validateStagedDatabase(
   if (cycles.length) throw new BackupDataError("invariant", "Backup contains a conversation cycle");
   const ledgerMismatch = await tx.unsafe(
     `WITH balances AS (
-      SELECT id,user_id,balance_after_micros,
-        sum(amount_micros) OVER(PARTITION BY user_id ORDER BY created_at,id) expected
+      SELECT id,user_id,sequence,balance_after_micros,
+        row_number() OVER(PARTITION BY user_id ORDER BY sequence) ordinal,
+        sum(amount_micros) OVER(PARTITION BY user_id ORDER BY sequence) expected
       FROM ${staged("ledger_entries")}
-    ) SELECT 1 FROM balances WHERE balance_after_micros<>expected LIMIT 1`,
+    ) SELECT 1 FROM balances
+      WHERE sequence<>ordinal OR balance_after_micros<>expected LIMIT 1`,
   );
   if (ledgerMismatch.length) {
     throw new BackupDataError("invariant", "Backup ledger history is inconsistent");
@@ -1585,11 +1665,25 @@ async function validateStagedDatabase(
   const balanceMismatch = await tx.unsafe(
     `SELECT 1 FROM ${staged("users")} u LEFT JOIN LATERAL (
       SELECT balance_after_micros FROM ${staged("ledger_entries")} l WHERE l.user_id=u.id
-      ORDER BY created_at DESC,id DESC LIMIT 1
+      ORDER BY sequence DESC,id DESC LIMIT 1
     ) latest ON true WHERE u.balance_micros<>COALESCE(latest.balance_after_micros,0) LIMIT 1`,
   );
   if (balanceMismatch.length) {
     throw new BackupDataError("invariant", "Backup user balances do not match the ledger");
+  }
+  const invalidAdjustments = await tx.unsafe(
+    `SELECT 1 FROM ${staged("admin_balance_adjustments")} a
+      JOIN ${staged("ledger_entries")} l ON l.id=a.ledger_entry_id
+      JOIN ${staged("audit_events")} e ON e.id=a.audit_event_id
+      WHERE l.user_id<>a.target_user_id OR l.kind<>'adjustment'
+        OR l.amount_micros<>a.amount_micros
+        OR l.balance_after_micros<>a.balance_after_micros
+        OR e.actor_id<>a.actor_id OR e.action<>'user.balance.adjusted'
+        OR e.target_type<>'user' OR e.target_id<>a.target_user_id::text
+      LIMIT 1`,
+  );
+  if (invalidAdjustments.length) {
+    throw new BackupDataError("invariant", "Backup contains an inconsistent balance adjustment");
   }
   const terminalChecks = [
     ["messages", "status='streaming'"],
@@ -1629,10 +1723,12 @@ async function validateRestoredDatabase(tx: postgres.TransactionSql): Promise<vo
   if (cycles.length) throw new BackupDataError("invariant", "Backup contains a conversation cycle");
   const ledgerMismatch = await tx`
     WITH balances AS (
-      SELECT id,user_id,balance_after_micros,
-        sum(amount_micros) OVER(PARTITION BY user_id ORDER BY created_at,id) expected
+      SELECT id,user_id,sequence,balance_after_micros,
+        row_number() OVER(PARTITION BY user_id ORDER BY sequence) ordinal,
+        sum(amount_micros) OVER(PARTITION BY user_id ORDER BY sequence) expected
       FROM ledger_entries
-    ) SELECT 1 FROM balances WHERE balance_after_micros<>expected LIMIT 1
+    ) SELECT 1 FROM balances
+      WHERE sequence<>ordinal OR balance_after_micros<>expected LIMIT 1
   `;
   if (ledgerMismatch.length) {
     throw new BackupDataError("invariant", "Backup ledger history is inconsistent");
@@ -1640,11 +1736,25 @@ async function validateRestoredDatabase(tx: postgres.TransactionSql): Promise<vo
   const userBalanceMismatch = await tx`
     SELECT 1 FROM users u LEFT JOIN LATERAL (
       SELECT balance_after_micros FROM ledger_entries l WHERE l.user_id=u.id
-      ORDER BY created_at DESC,id DESC LIMIT 1
+      ORDER BY sequence DESC,id DESC LIMIT 1
     ) latest ON true WHERE u.balance_micros<>COALESCE(latest.balance_after_micros,0) LIMIT 1
   `;
   if (userBalanceMismatch.length) {
     throw new BackupDataError("invariant", "Backup user balances do not match the ledger");
+  }
+  const invalidAdjustments = await tx`
+    SELECT 1 FROM admin_balance_adjustments a
+    JOIN ledger_entries l ON l.id=a.ledger_entry_id
+    JOIN audit_events e ON e.id=a.audit_event_id
+    WHERE l.user_id<>a.target_user_id OR l.kind<>'adjustment'
+      OR l.amount_micros<>a.amount_micros
+      OR l.balance_after_micros<>a.balance_after_micros
+      OR e.actor_id<>a.actor_id OR e.action<>'user.balance.adjusted'
+      OR e.target_type<>'user' OR e.target_id<>a.target_user_id::text
+    LIMIT 1
+  `;
+  if (invalidAdjustments.length) {
+    throw new BackupDataError("invariant", "Backup contains an inconsistent balance adjustment");
   }
 }
 

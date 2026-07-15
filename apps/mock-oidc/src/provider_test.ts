@@ -137,6 +137,37 @@ Deno.test("authorization requires state, nonce, exact redirect, scopes, and S256
   );
 });
 
+Deno.test("authorization permits a distinct post-callback browser origin", async () => {
+  const provider = await createMockOidcProvider({
+    ...options,
+    postAuthRedirectOrigin: "http://localhost:5173/pending",
+  });
+  const valid = await authorize(provider, "v".repeat(64));
+  assertEquals(
+    valid.contentSecurityPolicy,
+    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' http://localhost:8000 http://localhost:5173; frame-ancestors 'none'",
+  );
+});
+
+Deno.test("browser origins fail closed for opaque schemes and credentials", async () => {
+  for (
+    const postAuthRedirectOrigin of [
+      "data:text/plain,opaque",
+      "file:///tmp/pending",
+      "ftp://localhost/pending",
+      "https://user:secret@example.com/pending",
+    ]
+  ) {
+    let rejected = false;
+    try {
+      await createMockOidcProvider({ ...options, postAuthRedirectOrigin });
+    } catch (error) {
+      rejected = error instanceof TypeError;
+    }
+    assert(rejected, `expected ${postAuthRedirectOrigin} to be rejected`);
+  }
+});
+
 Deno.test("token exchange enforces PKCE, consumes codes, signs ID token, and serves UserInfo", async () => {
   const provider = await createMockOidcProvider(options);
   const verifier = "v".repeat(64);
@@ -213,6 +244,79 @@ Deno.test("token exchange enforces PKCE, consumes codes, signs ID token, and ser
     email_verified: true,
     name: "OIDC New Applicant",
   });
+});
+
+Deno.test("protected controls provision a bounded run-specific persona", async () => {
+  const provider = await createMockOidcProvider(options);
+  const headers = {
+    authorization: `Bearer ${options.controlToken}`,
+    "content-type": "application/json",
+  };
+  const unsafeName = await provider.fetch(
+    new Request("http://mock/control/persona", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        persona: "new_verified",
+        sub: "unsafe-name-subject",
+        email: "unsafe-name@e2e.invalid",
+        name: "Unsafe\u0000applicant",
+      }),
+    }),
+  );
+  assertEquals(unsafeName.status, 422);
+  const persona = await provider.fetch(
+    new Request("http://mock/control/persona", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        persona: "new_verified",
+        sub: "run-specific-subject",
+        email: "run-specific@e2e.invalid",
+        name: "Run-specific applicant",
+      }),
+    }),
+  );
+  assertEquals(persona.status, 200);
+  const overriddenAuthorization = await authorize(provider, "p".repeat(64));
+  const betweenAuthorizationAndToken = await provider.fetch(
+    new Request("http://mock/control/persona", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        persona: "new_verified",
+        sub: "between-subject",
+        email: "between@e2e.invalid",
+        name: "Between applicant",
+      }),
+    }),
+  );
+  assertEquals(betweenAuthorizationAndToken.status, 200);
+  const overriddenTokens = await (await exchange(
+    provider,
+    overriddenAuthorization.code,
+    "p".repeat(64),
+  )).json();
+  assertEquals(decodeJwtPayload(overriddenTokens.id_token).sub, "run-specific-subject");
+  const replacement = await provider.fetch(
+    new Request("http://mock/control/persona", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        persona: "new_verified",
+        sub: "later-subject",
+        email: "later@e2e.invalid",
+        name: "Later applicant",
+      }),
+    }),
+  );
+  assertEquals(replacement.status, 200);
+  const userinfo = await provider.fetch(
+    new Request("http://mock/userinfo", {
+      headers: { authorization: `Bearer ${overriddenTokens.access_token}` },
+    }),
+  );
+  assertEquals((await userinfo.json()).sub, "run-specific-subject");
 });
 
 Deno.test("protected controls select negative modes and expose sanitized counters", async () => {

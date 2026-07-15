@@ -1,11 +1,28 @@
-import { expect, test } from "@playwright/test";
-import { bootstrap, login, uniqueUser } from "./helpers.ts";
+import { expect, type Locator, test } from "@playwright/test";
+import { adminEmail, bootstrap, login, uniqueUser } from "./helpers.ts";
 import { apiURL } from "./helpers.ts";
+
+test.describe.configure({ timeout: 120_000 });
 
 test("administrators approve, search, and manage an immutable account lifecycle", async ({
   page,
   request,
 }, testInfo) => {
+  const mobile = testInfo.project.name.includes("mobile");
+  const assertMobileLayout = async (...targets: Locator[]) => {
+    if (!mobile) return;
+    const overflow = await page.evaluate<{ body: number; root: number }>(`({
+      body: document.body.scrollWidth - document.body.clientWidth,
+      root: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    })`);
+    expect(overflow.body).toBeLessThanOrEqual(1);
+    expect(overflow.root).toBeLessThanOrEqual(1);
+    for (const target of targets) {
+      const box = await target.boundingBox();
+      expect(box?.height ?? 0).toBeGreaterThanOrEqual(44);
+    }
+  };
+
   await bootstrap(request);
   const applicant = uniqueUser("admin-lifecycle");
 
@@ -64,6 +81,27 @@ test("administrators approve, search, and manage an immutable account lifecycle"
     balanceMicros: 6_750_000,
   });
 
+  // Seed real target security resources through the owner surface. Signing in again also creates
+  // a full workspace session beside the limited signup/status session.
+  await page.context().clearCookies();
+  await login(page, applicant.email, applicant.password);
+  const tokenResponse = await page.request.post(`${apiURL}/api/tokens`, {
+    // APIRequestContext reuses the browser cookies but does not synthesize a browser Origin.
+    // Supply the actual same-origin page value so this setup call exercises, rather than bypasses,
+    // the API's browser-CSRF boundary.
+    headers: { origin: new URL(page.url()).origin },
+    data: {
+      name: "Lifecycle automation",
+      scopes: ["chat:write"],
+      rpmLimit: 60,
+      burstLimit: 10,
+    },
+  });
+  expect(tokenResponse.status()).toBe(201);
+
+  await page.context().clearCookies();
+  await login(page);
+
   await page.goto("/admin/users");
   const filters = page.getByRole("search", { name: "Filter users" });
   await filters.getByRole("textbox", { name: "Search users" }).fill(applicant.email);
@@ -74,30 +112,119 @@ test("administrators approve, search, and manage an immutable account lifecycle"
   await expect(userRow).toBeVisible();
 
   await userRow.getByRole("button", { name: `Manage ${applicant.name}` }).click();
+  await expect(page).toHaveURL(/\/admin\/users\/[0-9a-f-]+\/account\?.*userSearch=/u);
+  const detailHeading = page.getByRole("heading", { name: applicant.name, exact: true });
+  await expect(detailHeading).toBeVisible();
+  await expect(detailHeading).toBeFocused();
+  const tabs = page.getByRole("tablist", { name: "User administration" });
+  await expect(tabs.getByRole("tab", { name: "Account" })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+
   await page.getByRole("button", { name: "Promote to admin" }).click();
   const promoteDialog = page.getByRole("dialog", { name: `Promote ${applicant.name}?` });
   await promoteDialog.getByLabel("Reason").fill("Add incident coverage");
   await promoteDialog.getByRole("button", { name: "Confirm promote" }).click();
   await expect(promoteDialog).toBeHidden();
-  await expect(userRow).toContainText("admin");
+  await expect(page.getByLabel("Account status")).toContainText("admin");
+  // Modal teardown restores focus to its opener. Wait for that accessibility contract before
+  // deliberately moving into the tab strip, otherwise the cleanup can reclaim focus mid-keypress.
+  await expect(page.getByRole("button", { name: "Demote to user" })).toBeFocused();
 
-  await userRow.getByRole("button", { name: `Manage ${applicant.name}` }).click();
+  // The ARIA tab strip is URL-backed and supports the standard arrow-key model.
+  const accountTab = tabs.getByRole("tab", { name: "Account" });
+  await accountTab.focus();
+  await expect(accountTab).toBeFocused();
+  await page.keyboard.press("ArrowRight");
+  await expect(page).toHaveURL(/\/sessions(?:\?|$)/u);
+  const sessionsTab = tabs.getByRole("tab", { name: "Sessions" });
+  await expect(sessionsTab).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+  await expect(sessionsTab).toBeFocused();
+  await expect(page.getByRole("heading", { name: "Signed-in sessions" })).toBeVisible();
+  const revokeSession = page.getByRole("button", { name: "Revoke", exact: true }).first();
+  await expect(revokeSession).toBeEnabled();
+  await assertMobileLayout(revokeSession);
+  await revokeSession.click();
+  const sessionDialog = page.getByRole("dialog", { name: "Revoke session?" });
+  await sessionDialog.getByLabel("Reason").fill("Lost browser during E2E drill");
+  await sessionDialog.getByRole("button", { name: "Revoke session" }).click();
+  await expect(sessionDialog).toBeHidden();
+
+  await tabs.getByRole("tab", { name: "API tokens" }).click();
+  await expect(page).toHaveURL(/\/tokens(?:\?|$)/u);
+  const tokenCard = page.locator(".admin-user-token-card").filter({
+    hasText: "Lifecycle automation",
+  });
+  await expect(tokenCard).toContainText("chat:write");
+  const revokeToken = tokenCard.getByRole("button", { name: "Revoke token family" });
+  await assertMobileLayout(revokeToken);
+  await revokeToken.click();
+  const tokenDialog = page.getByRole("dialog", { name: "Revoke Lifecycle automation?" });
+  await tokenDialog.getByLabel("Reason").fill("Credential exposure exercise");
+  await tokenDialog.getByRole("button", { name: "Revoke token family" }).click();
+  await expect(tokenDialog).toBeHidden();
+  await expect(tokenCard).toContainText("revoked");
+
+  await tabs.getByRole("tab", { name: "Billing" }).click();
+  await expect(page).toHaveURL(/\/billing(?:\?|$)/u);
+  await expect(page.getByText("$6.75", { exact: true }).first()).toBeVisible();
+  const adjustBalance = page.getByRole("button", { name: "Adjust balance" });
+  await assertMobileLayout(adjustBalance);
+  await adjustBalance.click();
+  const adjustmentDialog = page.getByRole("dialog", { name: "Adjust balance" });
+  await adjustmentDialog.getByLabel("Amount (USD)").fill("1.234567");
+  await adjustmentDialog.getByLabel("Reason").fill("Exact E2E support credit");
+  await expect(adjustmentDialog.getByText("$7.984567", { exact: true })).toBeVisible();
+  const addCredit = adjustmentDialog.getByRole("button", { name: "Add credit" });
+  await assertMobileLayout(addCredit);
+  await addCredit.click();
+  await expect(adjustmentDialog).toBeHidden();
+  await expect(page.getByText("$7.984567", { exact: true }).first()).toBeVisible();
+  const adjustmentRow = page.locator(".admin-user-ledger tbody tr").filter({
+    hasText: "Exact E2E support credit",
+  });
+  await expect(adjustmentRow).toContainText("+$1.234567");
+  if (mobile) {
+    const ledger = page.locator(".admin-user-ledger-wrap");
+    const dimensions = await ledger.evaluate((element) => ({
+      clientWidth: element.clientWidth,
+      scrollWidth: element.scrollWidth,
+    }));
+    expect(dimensions.scrollWidth).toBeGreaterThan(dimensions.clientWidth);
+    await assertMobileLayout();
+  }
+
+  await tabs.getByRole("tab", { name: "Account" }).click();
   await page.getByRole("button", { name: "Suspend account" }).click();
   const suspendDialog = page.getByRole("dialog", { name: `Suspend ${applicant.name}?` });
   await suspendDialog.getByLabel("Reason").fill("Credential compromise drill");
   await suspendDialog.getByRole("button", { name: "Confirm suspend" }).click();
   await expect(suspendDialog).toBeHidden();
-  await expect(userRow).toContainText("suspended");
+  await expect(page.getByLabel("Account status")).toContainText("suspended");
 
-  if (testInfo.project.name.includes("mobile")) {
-    const overflow = await page.evaluate<{ body: number; root: number }>(`({
-      body: document.body.scrollWidth - document.body.clientWidth,
-      root: document.documentElement.scrollWidth - document.documentElement.clientWidth,
-    })`);
-    expect(overflow.body).toBeLessThanOrEqual(1);
-    expect(overflow.root).toBeLessThanOrEqual(1);
-    const manageBox = await userRow.getByRole("button", { name: `Manage ${applicant.name}` })
-      .boundingBox();
-    expect(manageBox?.height ?? 0).toBeGreaterThanOrEqual(44);
+  if (mobile) {
+    await assertMobileLayout();
+    for (const tab of await tabs.getByRole("tab").all()) {
+      const box = await tab.boundingBox();
+      expect(box?.height ?? 0).toBeGreaterThanOrEqual(44);
+    }
   }
+
+  // The acting administrator's exact server-resolved session is visibly protected.
+  const adminLookup = await page.request.get(
+    `${apiURL}/api/admin/users?search=${encodeURIComponent(adminEmail)}&limit=1`,
+  );
+  expect(adminLookup.ok()).toBeTruthy();
+  const adminId = (await adminLookup.json() as { data: Array<{ id: string }> }).data[0].id;
+  await page.goto(`/admin/users/${adminId}/sessions`);
+  const currentSession = page.locator(".admin-user-resource-list li").filter({
+    hasText: "Current administrator session",
+  });
+  await expect(currentSession).toBeVisible();
+  await expect(currentSession.getByRole("button", { name: "Revoke" })).toBeDisabled();
+  await expect(currentSession).toContainText("protected");
 });

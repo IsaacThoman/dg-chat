@@ -29,6 +29,10 @@ export interface AdminSearch {
   type?: string;
   cursor?: string;
   run?: string;
+  userSearch?: string;
+  userRole?: "user" | "admin";
+  userState?: "active" | "suspended";
+  userDeletion?: "present" | "deleted" | "all";
 }
 
 const bounded = (value: unknown, length: number) =>
@@ -44,6 +48,15 @@ const dateOnly = (value: unknown) => {
 
 export function parseAdminSearch(value: Record<string, unknown>): AdminSearch {
   const bucket = value.bucket === "hour" || value.bucket === "day" ? value.bucket : undefined;
+  const userRole = value.userRole === "user" || value.userRole === "admin"
+    ? value.userRole
+    : undefined;
+  const userState = value.userState === "active" || value.userState === "suspended"
+    ? value.userState
+    : undefined;
+  const userDeletion = ["present", "deleted", "all"].includes(String(value.userDeletion))
+    ? value.userDeletion as AdminSearch["userDeletion"]
+    : undefined;
   return {
     from: dateOnly(value.from),
     to: dateOnly(value.to),
@@ -55,5 +68,9 @@ export function parseAdminSearch(value: Record<string, unknown>): AdminSearch {
     type: bounded(value.type, 120),
     cursor: bounded(value.cursor, 2048),
     run: bounded(value.run, 100),
+    userSearch: bounded(value.userSearch, 200),
+    userRole,
+    userState,
+    userDeletion,
   };
 }

@@ -1,5 +1,15 @@
 import type {
   AccountState,
+  AdminApiTokenPage,
+  AdminApiTokenQuery,
+  AdminApiTokenRevocationCommand,
+  AdminBalanceAdjustment,
+  AdminBalanceAdjustmentCommand,
+  AdminLedgerPage,
+  AdminLedgerQuery,
+  AdminSessionPage,
+  AdminSessionQuery,
+  AdminSessionRevocationCommand,
   AdminUser,
   AdminUserPage,
   AdminUserQuery,
@@ -216,6 +226,70 @@ export interface SessionSummary {
   expiresAt: string;
   createdAt: string;
   invalidatedAt: string | null;
+}
+const ADMIN_RESOURCE_CURSOR_VERSION = 1;
+const ADMIN_RESOURCE_UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const ADMIN_RESOURCE_TIMESTAMP_PATTERN =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?Z$/;
+function validAdminResourceTimestamp(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const match = ADMIN_RESOURCE_TIMESTAMP_PATTERN.exec(value);
+  if (!match) return false;
+  const [year, month, day, hour, minute, second] = match.slice(1, 7).map(Number);
+  if (year < 1 || month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59) {
+    return false;
+  }
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][
+    month - 1
+  ];
+  return day >= 1 && day <= daysInMonth && Number.isFinite(Date.parse(value));
+}
+export function encodeAdminResourceCursor(
+  resource: "sessions" | "tokens" | "ledger",
+  targetUserId: string,
+  position: string,
+  id: string,
+  fingerprint = "",
+): string {
+  return btoa(
+    JSON.stringify([
+      ADMIN_RESOURCE_CURSOR_VERSION,
+      resource,
+      targetUserId,
+      position,
+      id,
+      fingerprint,
+    ]),
+  )
+    .replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+export function decodeAdminResourceCursor(
+  cursor: string,
+  resource: "sessions" | "tokens" | "ledger",
+  targetUserId: string,
+  fingerprint = "",
+): { position: string; id: string } | undefined {
+  try {
+    const base64 = cursor.replaceAll("-", "+").replaceAll("_", "/");
+    const value = JSON.parse(atob(base64.padEnd(Math.ceil(base64.length / 4) * 4, "=")));
+    if (
+      !Array.isArray(value) || value.length !== 6 || value[0] !== ADMIN_RESOURCE_CURSOR_VERSION ||
+      value[1] !== resource || value[2] !== targetUserId || typeof value[3] !== "string" ||
+      (resource === "ledger"
+        ? !/^[1-9]\d{0,15}$/.test(value[3]) || !Number.isSafeInteger(Number(value[3]))
+        : !validAdminResourceTimestamp(value[3])) ||
+      typeof value[4] !== "string" || value[5] !== fingerprint ||
+      (resource === "sessions"
+        ? !/^(?:legacy|better_auth):[0-9a-f-]{36}$/i.test(value[4]) ||
+          !ADMIN_RESOURCE_UUID_PATTERN.test(value[4].slice(value[4].indexOf(":") + 1))
+        : !ADMIN_RESOURCE_UUID_PATTERN.test(value[4]))
+    ) return undefined;
+    return { position: value[3], id: value[4] };
+  } catch {
+    return undefined;
+  }
 }
 export interface AuditEventInput {
   actorId?: string | null;
@@ -1840,6 +1914,27 @@ export interface DomainRepository {
   deleteSession(tokenHash: string): MaybePromise<void>;
   listSessions(userId: string): MaybePromise<SessionSummary[]>;
   revokeSession(id: string, ownerId?: string): MaybePromise<void>;
+  listAdminUserSessions(
+    actorId: string,
+    targetUserId: string,
+    query?: AdminSessionQuery,
+    currentSession?: AdminSessionRevocationCommand["currentSession"],
+  ): MaybePromise<AdminSessionPage>;
+  listAdminUserTokens(
+    actorId: string,
+    targetUserId: string,
+    query?: AdminApiTokenQuery,
+  ): MaybePromise<AdminApiTokenPage>;
+  listAdminUserLedger(
+    actorId: string,
+    targetUserId: string,
+    query?: AdminLedgerQuery,
+  ): MaybePromise<AdminLedgerPage>;
+  revokeAdminUserSession(input: AdminSessionRevocationCommand): MaybePromise<void>;
+  revokeAdminUserTokenFamily(input: AdminApiTokenRevocationCommand): MaybePromise<void>;
+  adjustAdminUserBalance(
+    input: AdminBalanceAdjustmentCommand,
+  ): MaybePromise<AdminBalanceAdjustment>;
   createIdentityToken(
     userId: string,
     purpose: IdentityTokenPurpose,

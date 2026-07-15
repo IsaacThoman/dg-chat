@@ -648,10 +648,15 @@ Deno.test({
         { userId: session.userId, limited: session.limited },
         { userId: body.user.id, limited: true },
       );
+      assertMatch(
+        session.id,
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+      );
       assertMatch(session.authenticatedAt, /^\d{4}-\d{2}-\d{2}T/u);
       assertEquals((await app.request("/api/auth/me", { headers: { cookie } })).status, 200);
       const directSessions = await service.listUserSessions(body.user.id, new Headers({ cookie }));
       assertEquals(directSessions.length >= 1, true);
+      assertEquals(directSessions.find((candidate) => candidate.current)?.id, session.id);
       assertEquals((await repository.listSessions(body.user.id)).length, 0);
       const listedSessions = await (await app.request("/api/sessions", { headers: { cookie } }))
         .json() as { data: Array<{ id: string; current: boolean }> };

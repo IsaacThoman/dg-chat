@@ -5,6 +5,16 @@ import {
 } from "@dg-chat/contracts";
 import type {
   AccountState,
+  AdminApiTokenPage,
+  AdminApiTokenQuery,
+  AdminApiTokenRevocationCommand,
+  AdminBalanceAdjustment,
+  AdminBalanceAdjustmentCommand,
+  AdminLedgerPage,
+  AdminLedgerQuery,
+  AdminSessionPage,
+  AdminSessionQuery,
+  AdminSessionRevocationCommand,
   AdminUser,
   AdminUserPage,
   AdminUserQuery,
@@ -41,8 +51,10 @@ import {
   API_SSE_REPLAY_REQUEST_MAX_EVENTS,
   apiResponseBodyByteLength,
   canonicalWorkspaceName,
+  decodeAdminResourceCursor,
   decodeAdminUserCursor,
   DEFAULT_API_REPLAY_QUOTA,
+  encodeAdminResourceCursor,
   encodeAdminUserCursor,
   MAX_ACTIVE_CONVERSATION_SHARES,
   MAX_CONVERSATION_SHARE_ATTACHMENTS,
@@ -209,10 +221,12 @@ interface StoredConversationShare {
 export interface LedgerEntry {
   id: string;
   userId: string;
+  sequence: number;
   usageRunId: string;
   kind: "grant" | "reserve" | "settle" | "refund" | "adjustment";
   amountMicros: number;
   balanceAfterMicros: number;
+  metadata?: Record<string, unknown>;
   createdAt: string;
 }
 export interface UsageRun {
@@ -581,6 +595,10 @@ export class MemoryRepository {
   readonly conversationShareIdempotency = new Map<string, string>();
   readonly conversationShareSecrets = new Map<string, string>();
   readonly ledger: LedgerEntry[] = [];
+  readonly adminBalanceAdjustments = new Map<
+    string,
+    AdminBalanceAdjustment & { requestHash: string }
+  >();
   readonly usageRuns = new Map<string, UsageRun>();
   readonly generationControls = new Map<string, GenerationControl>();
   readonly apiIdempotencyRequests = new Map<string, ApiIdempotencyRequest>();
@@ -786,6 +804,7 @@ export class MemoryRepository {
     );
     const ledgerLength = this.ledger.length;
     const auditLength = this.auditEvents.length;
+    const adjustmentsBefore = new Map(this.adminBalanceAdjustments);
     try {
       return operation();
     } catch (error) {
@@ -818,6 +837,8 @@ export class MemoryRepository {
       }
       this.ledger.length = ledgerLength;
       this.auditEvents.length = auditLength;
+      this.adminBalanceAdjustments.clear();
+      for (const [key, value] of adjustmentsBefore) this.adminBalanceAdjustments.set(key, value);
       throw error;
     }
   }
@@ -1053,7 +1074,7 @@ export class MemoryRepository {
 
   getSession(tokenHash: string) {
     const session = this.sessions.get(tokenHash);
-    if (!session || session.expiresAt <= Date.now()) return undefined;
+    if (!session || session.invalidatedAt || session.expiresAt <= Date.now()) return undefined;
     return session;
   }
 
@@ -1083,6 +1104,325 @@ export class MemoryRepository {
     );
     if (!entry) throw new DomainError("not_found", "Session not found", 404);
     this.sessions.delete(entry[0]);
+  }
+  #adminPageQuery(
+    query: { cursor?: string; limit?: number },
+    resource: "sessions" | "tokens" | "ledger",
+    targetUserId: string,
+    fingerprint: string,
+  ) {
+    const limit = query.limit ?? 50;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new DomainError("validation_error", "Page limit must be between 1 and 100", 422);
+    }
+    const cursor = query.cursor
+      ? decodeAdminResourceCursor(query.cursor, resource, targetUserId, fingerprint)
+      : undefined;
+    if (query.cursor && !cursor) {
+      throw new DomainError("validation_error", "Invalid page cursor", 422);
+    }
+    return { limit, cursor };
+  }
+  #assertAdminRead(actorId: string, targetUserId: string): void {
+    this.#assertEffectiveAdminActor(actorId);
+    if (!this.users.has(targetUserId)) throw new DomainError("not_found", "User not found", 404);
+  }
+  listAdminUserSessions(
+    actorId: string,
+    targetUserId: string,
+    query: AdminSessionQuery = {},
+    currentSession: AdminSessionRevocationCommand["currentSession"] = null,
+  ): AdminSessionPage {
+    this.#assertAdminRead(actorId, targetUserId);
+    const fingerprint = JSON.stringify({
+      source: query.source ?? null,
+      status: query.status ?? null,
+    });
+    const { limit, cursor } = this.#adminPageQuery(
+      query,
+      "sessions",
+      targetUserId,
+      fingerprint,
+    );
+    const status = (session: StoredSession) =>
+      session.invalidatedAt
+        ? "revoked" as const
+        : session.expiresAt <= Date.now()
+        ? "expired" as const
+        : "active" as const;
+    const rows = [...this.sessions.values()].filter((session) =>
+      session.userId === targetUserId && (!query.source || query.source === "legacy") &&
+      (!query.status || status(session) === query.status) &&
+      (!cursor || session.createdAt < cursor.position ||
+        (session.createdAt === cursor.position && session.id < cursor.id))
+    ).sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
+    const page = rows.slice(0, limit);
+    return {
+      data: page.map((session) => ({
+        id: `legacy:${session.id}`,
+        userId: session.userId,
+        source: "legacy",
+        limited: session.limited,
+        status: status(session),
+        ipAddress: null,
+        userAgent: null,
+        expiresAt: new Date(session.expiresAt).toISOString(),
+        createdAt: session.createdAt,
+        invalidatedAt: session.invalidatedAt,
+        current: currentSession?.source === "legacy" && currentSession.id === session.id,
+      })),
+      nextCursor: rows.length > limit
+        ? encodeAdminResourceCursor(
+          "sessions",
+          targetUserId,
+          page[page.length - 1].createdAt,
+          page[page.length - 1].id,
+          fingerprint,
+        )
+        : null,
+    };
+  }
+  listAdminUserTokens(
+    actorId: string,
+    targetUserId: string,
+    query: AdminApiTokenQuery = {},
+  ): AdminApiTokenPage {
+    this.#assertAdminRead(actorId, targetUserId);
+    const fingerprint = JSON.stringify({ status: query.status ?? null });
+    const { limit, cursor } = this.#adminPageQuery(query, "tokens", targetUserId, fingerprint);
+    const status = (token: StoredApiToken) => {
+      if (token.revokedAt) return "revoked" as const;
+      if (token.expiresAt && Date.parse(token.expiresAt) <= Date.now()) return "expired" as const;
+      if (token.replacedByTokenId) {
+        return token.overlapEndsAt && Date.parse(token.overlapEndsAt) > Date.now()
+          ? "overlap" as const
+          : "replaced" as const;
+      }
+      return "active" as const;
+    };
+    const rows = [...this.tokens.values()].filter((token) =>
+      token.userId === targetUserId && (!query.status || status(token) === query.status) &&
+      (!cursor || token.createdAt < cursor.position ||
+        (token.createdAt === cursor.position && token.id < cursor.id))
+    ).sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
+    const page = rows.slice(0, limit);
+    return {
+      data: page.map((token) => ({
+        ...this.#tokenSummary(token),
+        ownerId: targetUserId,
+        groupIds: [...this.accessGroups.values()].filter((group) =>
+          group.tokenIds.includes(token.id)
+        )
+          .map((group) => group.id).sort(),
+        status: status(token),
+      })),
+      nextCursor: rows.length > limit
+        ? encodeAdminResourceCursor(
+          "tokens",
+          targetUserId,
+          page[page.length - 1].createdAt,
+          page[page.length - 1].id,
+          fingerprint,
+        )
+        : null,
+    };
+  }
+  listAdminUserLedger(
+    actorId: string,
+    targetUserId: string,
+    query: AdminLedgerQuery = {},
+  ): AdminLedgerPage {
+    this.#assertAdminRead(actorId, targetUserId);
+    const fingerprint = JSON.stringify({ kind: query.kind ?? null });
+    const { limit, cursor } = this.#adminPageQuery(query, "ledger", targetUserId, fingerprint);
+    const rows = this.ledger.filter((entry) =>
+      entry.userId === targetUserId && (!query.kind || entry.kind === query.kind) &&
+      (!cursor || entry.sequence < Number(cursor.position) ||
+        (entry.sequence === Number(cursor.position) && entry.id < cursor.id))
+    ).sort((a, b) => b.sequence - a.sequence || b.id.localeCompare(a.id));
+    const page = rows.slice(0, limit);
+    return {
+      data: page.map((entry) => {
+        const adjustment = [...this.adminBalanceAdjustments.values()].find((candidate) =>
+          candidate.ledgerEntryId === entry.id
+        );
+        return {
+          id: entry.id,
+          userId: entry.userId,
+          sequence: entry.sequence,
+          usageRunId: entry.usageRunId,
+          kind: entry.kind,
+          amountMicros: entry.amountMicros,
+          balanceAfterMicros: entry.balanceAfterMicros,
+          adjustment: adjustment
+            ? { id: adjustment.id, actorId: adjustment.actorId, reason: adjustment.reason }
+            : null,
+          createdAt: entry.createdAt,
+        };
+      }),
+      nextCursor: rows.length > limit
+        ? encodeAdminResourceCursor(
+          "ledger",
+          targetUserId,
+          String(page[page.length - 1].sequence),
+          page[page.length - 1].id,
+          fingerprint,
+        )
+        : null,
+    };
+  }
+  #adminSecurityReason(reason: string): string {
+    const normalized = reason.trim();
+    if (!normalized || normalized.length > 500) {
+      throw new DomainError("validation_error", "Administrative reason is invalid", 422);
+    }
+    return normalized;
+  }
+  revokeAdminUserSession(input: AdminSessionRevocationCommand): void {
+    const reason = this.#adminSecurityReason(input.reason);
+    this.#assertEffectiveAdminActor(input.actorId);
+    this.#withAtomicAdminMutation(input.targetUserId, () => {
+      this.#assertEffectiveAdminActor(input.actorId);
+      if (!this.users.has(input.targetUserId)) {
+        throw new DomainError("not_found", "User not found", 404);
+      }
+      const entry = [...this.sessions.values()].find((session) => session.id === input.sessionId);
+      if (!entry || entry.userId !== input.targetUserId) {
+        throw new DomainError("not_found", "Session not found", 404);
+      }
+      if (input.source !== "legacy") {
+        throw new DomainError("not_found", "Session not found", 404);
+      }
+      if (input.currentSession?.source === "legacy" && input.currentSession.id === entry.id) {
+        throw new DomainError(
+          "current_session_protected",
+          "Current session cannot be revoked",
+          409,
+        );
+      }
+      if (entry.invalidatedAt) {
+        throw new DomainError("no_state_change", "Session is already revoked", 409);
+      }
+      entry.invalidatedAt = new Date().toISOString();
+      this.recordAudit({
+        actorId: input.actorId,
+        action: "user.session.revoked",
+        targetType: "session",
+        targetId: entry.id,
+        metadata: { targetUserId: input.targetUserId, reason },
+      });
+    });
+  }
+  revokeAdminUserTokenFamily(input: AdminApiTokenRevocationCommand): void {
+    const reason = this.#adminSecurityReason(input.reason);
+    if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) {
+      throw new DomainError("validation_error", "Expected version must be positive", 422);
+    }
+    this.#assertEffectiveAdminActor(input.actorId);
+    this.#withAtomicAdminMutation(input.targetUserId, () => {
+      this.#assertEffectiveAdminActor(input.actorId);
+      const token = this.tokens.get(input.tokenId);
+      if (!token || token.userId !== input.targetUserId) {
+        throw new DomainError("not_found", "Token not found", 404);
+      }
+      if (token.version !== input.expectedVersion) {
+        throw new DomainError("version_conflict", "Token was modified", 409);
+      }
+      if (this.#familyTokens(token).every((candidate) => candidate.revokedAt !== null)) {
+        throw new DomainError("no_state_change", "Token family is already revoked", 409);
+      }
+      this.#revokeFamily(token.rotationFamilyId);
+      this.recordAudit({
+        actorId: input.actorId,
+        action: "user.api_token_family.revoked",
+        targetType: "api_token",
+        targetId: token.id,
+        metadata: {
+          targetUserId: input.targetUserId,
+          rotationFamilyId: token.rotationFamilyId,
+          reason,
+        },
+      });
+    });
+  }
+  adjustAdminUserBalance(input: AdminBalanceAdjustmentCommand): AdminBalanceAdjustment {
+    const reason = this.#adminSecurityReason(input.reason);
+    if (
+      !Number.isSafeInteger(input.amountMicros) || input.amountMicros === 0 ||
+      !Number.isSafeInteger(input.expectedBalanceMicros) || input.expectedBalanceMicros < 0 ||
+      !/^[0-9a-f]{64}$/.test(input.idempotencyKeyHash) || !/^[0-9a-f]{64}$/.test(input.requestHash)
+    ) throw new DomainError("validation_error", "Balance adjustment is invalid", 422);
+    this.#assertEffectiveAdminActor(input.actorId);
+    return this.#withAtomicAdminMutation(input.targetUserId, () => {
+      this.#assertEffectiveAdminActor(input.actorId);
+      const user = this.users.get(input.targetUserId);
+      if (!user) throw new DomainError("not_found", "User not found", 404);
+      const commandKey = `${input.actorId}:${input.idempotencyKeyHash}`;
+      const prior = this.adminBalanceAdjustments.get(commandKey);
+      if (prior) {
+        if (prior.requestHash !== input.requestHash) {
+          throw new DomainError("idempotency_conflict", "Adjustment key was reused", 409);
+        }
+        return { ...structuredClone(prior), replayed: true };
+      }
+      if (user.balanceMicros !== input.expectedBalanceMicros) {
+        throw new DomainError("balance_conflict", "User balance changed", 409);
+      }
+      const next = user.balanceMicros + input.amountMicros;
+      if (!Number.isSafeInteger(next) || next < 0) {
+        throw new DomainError(
+          "validation_error",
+          "Adjustment would produce an invalid balance",
+          422,
+        );
+      }
+      user.balanceMicros = next;
+      user.updatedAt = new Date().toISOString();
+      const adjustmentId = crypto.randomUUID();
+      const usageRunId = `admin-adjustment:${adjustmentId}`;
+      const entry: LedgerEntry = {
+        id: crypto.randomUUID(),
+        userId: user.id,
+        sequence: this.#nextLedgerSequence(user.id),
+        usageRunId,
+        kind: "adjustment",
+        amountMicros: input.amountMicros,
+        balanceAfterMicros: next,
+        createdAt: new Date().toISOString(),
+      };
+      this.ledger.push(entry);
+      const audit = this.recordAudit({
+        actorId: input.actorId,
+        action: "user.balance.adjusted",
+        targetType: "user",
+        targetId: user.id,
+        metadata: {
+          targetUserId: input.targetUserId,
+          amountMicros: input.amountMicros,
+          balanceBeforeMicros: input.expectedBalanceMicros,
+          balanceAfterMicros: next,
+          reason,
+          ledgerEntryId: entry.id,
+        },
+      });
+      const adjustment = {
+        id: adjustmentId,
+        targetUserId: input.targetUserId,
+        actorId: input.actorId,
+        amountMicros: input.amountMicros,
+        balanceBeforeMicros: input.expectedBalanceMicros,
+        balanceAfterMicros: next,
+        reason,
+        ledgerEntryId: entry.id,
+        auditEventId: audit.id,
+        createdAt: entry.createdAt,
+        replayed: false,
+        requestHash: input.requestHash,
+      };
+      this.adminBalanceAdjustments.set(commandKey, adjustment);
+      const { requestHash: _requestHash, ...result } = adjustment;
+      return structuredClone(result);
+    });
   }
   createIdentityToken(
     userId: string,
@@ -5152,6 +5492,7 @@ export class MemoryRepository {
     this.ledger.push({
       id: crypto.randomUUID(),
       userId: run.userId,
+      sequence: this.#nextLedgerSequence(run.userId),
       usageRunId: run.id,
       kind: "reserve",
       amountMicros: -delta,
@@ -5343,9 +5684,9 @@ export class MemoryRepository {
       lastUsedAt: null,
       createdAt: now.toISOString(),
     };
+    for (const generation of this.#familyTokens(old)) generation.version++;
     old.replacedByTokenId = replacementId;
     old.overlapEndsAt = new Date(now.getTime() + input.overlapSeconds * 1000).toISOString();
-    old.version++;
     this.tokens.set(replacementId, replacement);
     for (const group of this.accessGroups.values()) {
       if (group.tokenIds.includes(old.id)) {
@@ -5745,6 +6086,7 @@ export class MemoryRepository {
     const entry: LedgerEntry = {
       id: crypto.randomUUID(),
       userId,
+      sequence: this.#nextLedgerSequence(userId),
       usageRunId,
       kind,
       amountMicros,
@@ -5753,6 +6095,21 @@ export class MemoryRepository {
     };
     this.ledger.push(entry);
     return entry;
+  }
+  #nextLedgerSequence(userId: string): number {
+    const current = this.ledger.reduce(
+      (maximum, entry) => entry.userId === userId ? Math.max(maximum, entry.sequence) : maximum,
+      0,
+    );
+    const next = current + 1;
+    if (!Number.isSafeInteger(next)) {
+      throw new DomainError(
+        "accounting_overflow",
+        "Ledger sequence exceeds accounting bounds",
+        422,
+      );
+    }
+    return next;
   }
 
   reserve(

@@ -1,9 +1,15 @@
 import { assertEquals } from "jsr:@std/assert@1.0.14";
 import {
   adminAccountStateSchema,
+  adminApiTokenQuerySchema,
+  adminApiTokenRevocationSchema,
   adminApprovalSchema,
+  adminBalanceAdjustmentSchema,
   adminDeleteUserSchema,
+  adminLedgerQuerySchema,
   adminRoleSchema,
+  adminSessionQuerySchema,
+  adminSessionRevocationSchema,
   adminUserQuerySchema,
   chatCompletionSchema,
   createConversationFolderSchema,
@@ -48,6 +54,77 @@ Deno.test("identity password policy is shared by registration and recovery", () 
   assertEquals(passwordPolicyError(short), `Use at least ${PASSWORD_MIN_LENGTH} characters.`);
   assertEquals(passwordPolicyError(valid), null);
   assertEquals(passwordPolicyError(long), `Use no more than ${PASSWORD_MAX_LENGTH} characters.`);
+});
+
+Deno.test("admin security and billing command schemas are strict and bounded", () => {
+  assertEquals(adminSessionQuerySchema.parse({}).limit, 50);
+  assertEquals(
+    adminSessionQuerySchema.safeParse({ source: "better_auth", status: "active", limit: 100 })
+      .success,
+    true,
+  );
+  assertEquals(adminSessionQuerySchema.safeParse({ source: "unknown" }).success, false);
+  assertEquals(adminSessionQuerySchema.safeParse({ limit: 101 }).success, false);
+  assertEquals(adminSessionQuerySchema.safeParse({ unexpected: true }).success, false);
+  assertEquals(
+    adminSessionRevocationSchema.parse({ reason: "  Lost device  " }).reason,
+    "Lost device",
+  );
+  assertEquals(adminSessionRevocationSchema.safeParse({ reason: "" }).success, false);
+
+  assertEquals(adminApiTokenQuerySchema.parse({ status: "overlap" }).limit, 50);
+  assertEquals(adminApiTokenQuerySchema.safeParse({ status: "expired" }).success, true);
+  assertEquals(adminApiTokenQuerySchema.safeParse({ status: "disabled" }).success, false);
+  assertEquals(
+    adminApiTokenRevocationSchema.safeParse({ expectedVersion: 1, reason: "Exposed" }).success,
+    true,
+  );
+  assertEquals(
+    adminApiTokenRevocationSchema.safeParse({ expectedVersion: 0, reason: "Exposed" }).success,
+    false,
+  );
+
+  assertEquals(adminLedgerQuerySchema.parse({ kind: "adjustment" }).limit, 50);
+  assertEquals(adminLedgerQuerySchema.safeParse({ kind: "charge" }).success, false);
+  assertEquals(
+    adminBalanceAdjustmentSchema.parse({
+      amountMicros: -250_000,
+      expectedBalanceMicros: 5_000_000,
+      reason: "  Correct duplicate grant  ",
+    }),
+    {
+      amountMicros: -250_000,
+      expectedBalanceMicros: 5_000_000,
+      reason: "Correct duplicate grant",
+    },
+  );
+  for (const amountMicros of [0, 0.5, Number.MAX_SAFE_INTEGER + 1]) {
+    assertEquals(
+      adminBalanceAdjustmentSchema.safeParse({
+        amountMicros,
+        expectedBalanceMicros: 0,
+        reason: "Correction",
+      }).success,
+      false,
+    );
+  }
+  assertEquals(
+    adminBalanceAdjustmentSchema.safeParse({
+      amountMicros: 1,
+      expectedBalanceMicros: -1,
+      reason: "Correction",
+    }).success,
+    false,
+  );
+  assertEquals(
+    adminBalanceAdjustmentSchema.safeParse({
+      amountMicros: 1,
+      expectedBalanceMicros: 0,
+      reason: "Correction",
+      idempotencyKey: "must-not-be-in-json",
+    }).success,
+    false,
+  );
 });
 
 Deno.test("model capabilities are canonical and reject near-miss values", () => {

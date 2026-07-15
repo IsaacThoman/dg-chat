@@ -106,8 +106,29 @@ export interface MockOidcProviderOptions {
   clientId: string;
   clientSecret: string;
   redirectUri: string;
+  /** Final browser origin after the API callback, when it differs from the callback origin. */
+  postAuthRedirectOrigin?: string;
   controlToken: string;
   now?: () => number;
+}
+
+function httpOrigin(value: string, label: string): string {
+  const url = new URL(value);
+  if (
+    !["http:", "https:"].includes(url.protocol) || url.origin === "null" || url.username ||
+    url.password
+  ) {
+    throw new TypeError(`${label} must be an HTTP(S) URL without credentials`);
+  }
+  return url.origin;
+}
+
+function hasAsciiControlCharacter(value: string): boolean {
+  for (const character of value) {
+    const codePoint = character.codePointAt(0)!;
+    if (codePoint <= 0x1f || codePoint === 0x7f) return true;
+  }
+  return false;
 }
 
 interface AuthorizationTransaction {
@@ -122,12 +143,14 @@ interface AuthorizationTransaction {
 
 interface AuthorizationCode extends AuthorizationTransaction {
   persona: MockOidcPersona;
+  profile: Record<string, unknown>;
   mode: MockOidcMode;
   expiresAt: number;
 }
 
 interface AccessGrant {
   persona: MockOidcPersona;
+  profile: Record<string, unknown>;
   mode: MockOidcMode;
   expiresAt: number;
 }
@@ -256,12 +279,20 @@ function requiredAuthorizationParams(url: URL, options: MockOidcProviderOptions)
 }
 
 export async function createMockOidcProvider(options: MockOidcProviderOptions) {
+  const callbackOrigin = httpOrigin(options.redirectUri, "redirectUri");
+  const postAuthRedirectOrigin = options.postAuthRedirectOrigin
+    ? httpOrigin(options.postAuthRedirectOrigin, "postAuthRedirectOrigin")
+    : callbackOrigin;
+  const allowedFormActionOrigins = [...new Set([callbackOrigin, postAuthRedirectOrigin])];
   const now = options.now ?? Date.now;
   const primary = await generateSigningKey("mock-primary");
   const invalid = await generateSigningKey("mock-invalid");
   const pending = new Map<string, AuthorizationTransaction>();
   const codes = new Map<string, AuthorizationCode>();
   const grants = new Map<string, AccessGrant>();
+  const personaOverrides = new Map<MockOidcPersona, Record<string, unknown>>();
+  const profileFor = (persona: MockOidcPersona): Record<string, unknown> =>
+    personaOverrides.get(persona) ?? MOCK_OIDC_PERSONAS[persona] as Record<string, unknown>;
   let mode: MockOidcMode = "normal";
   let counters: Counters = {
     discovery: 0,
@@ -293,6 +324,7 @@ export async function createMockOidcProvider(options: MockOidcProviderOptions) {
       jwks: 0,
     };
     recent.length = 0;
+    personaOverrides.clear();
   };
 
   const fetch = async (request: Request): Promise<Response> => {
@@ -343,12 +375,14 @@ export async function createMockOidcProvider(options: MockOidcProviderOptions) {
         createdAt: now(),
       });
       observe({ type: "authorize", noncePresent: true, pkce: "S256" });
-      const callbackOrigin = new URL(options.redirectUri).origin;
-      const buttons = Object.entries(MOCK_OIDC_PERSONAS).map(([id, persona]) =>
-        `<button name="persona" value="${escapeHtml(id)}" type="submit">${
-          escapeHtml("name" in persona ? persona.name : id.replaceAll("_", " "))
-        }</button>`
-      ).join("\n");
+      const buttons = (Object.keys(MOCK_OIDC_PERSONAS) as MockOidcPersona[]).map((id) => {
+        const persona = profileFor(id);
+        return (
+          `<button name="persona" value="${escapeHtml(id)}" type="submit">${
+            escapeHtml(typeof persona.name === "string" ? persona.name : id.replaceAll("_", " "))
+          }</button>`
+        );
+      }).join("\n");
       return new Response(
         `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
@@ -363,7 +397,9 @@ main{background:#1b1d22;border:1px solid #343741;border-radius:16px;padding:24px
             "content-type": "text/html; charset=utf-8",
             "cache-control": "no-store",
             "content-security-policy":
-              `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${callbackOrigin}; frame-ancestors 'none'`,
+              `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${
+                allowedFormActionOrigins.join(" ")
+              }; frame-ancestors 'none'`,
             "x-frame-options": "DENY",
           },
         },
@@ -395,6 +431,7 @@ main{background:#1b1d22;border:1px solid #343741;border-radius:16px;padding:24px
       codes.set(code, {
         ...transaction,
         persona: selected as MockOidcPersona,
+        profile: { ...profileFor(selected as MockOidcPersona) },
         mode,
         expiresAt: now() + 60_000,
       });
@@ -431,7 +468,7 @@ main{background:#1b1d22;border:1px solid #343741;border-radius:16px;padding:24px
         return oauthError("invalid_grant", "PKCE verification failed");
       }
       const seconds = Math.floor(now() / 1000);
-      const profile = MOCK_OIDC_PERSONAS[grant.persona] as Record<string, unknown>;
+      const profile = grant.profile;
       const payload: Record<string, unknown> = {
         iss: grant.mode === "wrong_issuer" ? `${options.publicIssuer}/wrong` : options.publicIssuer,
         aud: grant.mode === "wrong_audience" ? "wrong-client" : options.clientId,
@@ -453,6 +490,7 @@ main{background:#1b1d22;border:1px solid #343741;border-radius:16px;padding:24px
       const accessToken = `mock-at-${randomValue(24)}`;
       grants.set(accessToken, {
         persona: grant.persona,
+        profile: { ...grant.profile },
         mode: grant.mode,
         expiresAt: now() + 5 * 60_000,
       });
@@ -481,7 +519,7 @@ main{background:#1b1d22;border:1px solid #343741;border-radius:16px;padding:24px
       if (grant.mode === "userinfo_http_500") {
         return oauthError("server_error", "Injected failure", 500);
       }
-      const profile = { ...MOCK_OIDC_PERSONAS[grant.persona] } as Record<string, unknown>;
+      const profile = { ...grant.profile };
       if (grant.mode === "userinfo_subject_mismatch") profile.sub = "mock-sub-mismatch";
       observe({ type: "userinfo", persona: grant.persona, mode: grant.mode });
       return json(profile, 200, { "cache-control": "no-store" });
@@ -501,6 +539,30 @@ main{background:#1b1d22;border:1px solid #343741;border-radius:16px;padding:24px
         }
         mode = value.mode as MockOidcMode;
         return json({ mode });
+      }
+      if (request.method === "POST" && url.pathname === "/control/persona") {
+        const value = await request.json().catch(() => null) as Record<string, unknown> | null;
+        const keys = value ? Object.keys(value).sort() : [];
+        if (
+          !value || keys.join(",") !== "email,name,persona,sub" ||
+          typeof value.persona !== "string" ||
+          !personas.has(value.persona as MockOidcPersona) ||
+          typeof value.sub !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/u.test(value.sub) ||
+          typeof value.email !== "string" || value.email.length > 254 ||
+          !/^[a-z0-9][a-z0-9._+-]*@[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/u.test(value.email) ||
+          typeof value.name !== "string" || value.name.trim() !== value.name ||
+          value.name.length < 1 || value.name.length > 100 ||
+          hasAsciiControlCharacter(value.name)
+        ) {
+          return json({ error: "invalid_persona" }, 422);
+        }
+        personaOverrides.set(value.persona as MockOidcPersona, {
+          sub: value.sub,
+          email: value.email,
+          email_verified: true,
+          name: value.name,
+        });
+        return json({ persona: value.persona });
       }
       if (request.method === "GET" && url.pathname === "/control/state") {
         return json({

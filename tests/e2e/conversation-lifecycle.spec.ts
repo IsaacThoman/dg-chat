@@ -6,6 +6,13 @@ test.beforeEach(async ({ page, request }) => {
   await login(page);
 });
 
+async function selectDeterministicChatModel(page: import("@playwright/test").Page) {
+  await page.locator('button.model-trigger[aria-haspopup="listbox"]').click();
+  await page.getByRole("listbox", { name: "Chat model" })
+    .getByRole("option", { name: /DG Chat Simulated/ }).click();
+  await expect(page.getByRole("button", { name: /DG Chat Simulated/ })).toBeVisible();
+}
+
 test("conversation rename, archive, trash, and restore remain recoverable", async ({ page }) => {
   const title = `Lifecycle ${Date.now()}`;
   await createChat(page);
@@ -151,6 +158,7 @@ test("lifecycle lists show loading before empty state", async ({ page }) => {
 
 test("archived chats keep immutable branches navigable without becoming editable", async ({ page }) => {
   await createChat(page);
+  await selectDeterministicChatModel(page);
   const conversationId = await page.locator(
     ".conversation-row.active [data-conversation-actions]",
   ).getAttribute("data-conversation-actions");
@@ -167,7 +175,11 @@ test("archived chats keep immutable branches navigable without becoming editable
     "This is a simulated response to: Edited lifecycle branch",
     { exact: true },
   )).toBeVisible();
+  // Visible streamed text can precede the terminal graph event. Prove that the immutable branch
+  // has been reconciled and that lifecycle mutations are unlocked before archiving it.
+  await expect(page.getByRole("button", { name: "Previous branch" }).first()).toBeEnabled();
   await openSidebar(page);
+  await expect(actions).toBeEnabled();
   await actions.click();
   const archive = page.getByRole("menuitem", { name: "Archive" });
   await archive.click();
@@ -178,6 +190,10 @@ test("archived chats keep immutable branches navigable without becoming editable
     `.conversation-row:has([data-conversation-actions="${conversationId}"]) > button`,
   )
     .first().click();
+  await expect(page.getByText(
+    "This is a simulated response to: Edited lifecycle branch",
+    { exact: true },
+  )).toBeVisible();
   const previousBranch = page.getByRole("button", { name: "Previous branch" }).first();
   await expect(previousBranch).toBeEnabled();
   await previousBranch.click();

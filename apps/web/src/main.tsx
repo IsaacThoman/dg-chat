@@ -6,10 +6,12 @@ import {
   createRoute,
   createRouter,
   Outlet,
+  redirect,
   RouterProvider,
 } from "@tanstack/react-router";
 import { App, AuthScreen, PendingScreen, SetupScreen } from "./App.tsx";
 import { isAdminSection, parseAdminSearch } from "./adminRouting.ts";
+import { isAdminUserRouteId, isAdminUserTab } from "./admin/users/adminUserRouting.ts";
 import { PublicConversationShareView } from "./PublicConversationShare.tsx";
 import {
   ForgotPasswordScreen,
@@ -74,6 +76,35 @@ const adminRoute = createRoute({
     );
   },
 });
+const adminUserDetailRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/admin/users/$userId/$tab",
+  validateSearch: parseAdminSearch,
+  beforeLoad: ({ params, search }) => {
+    if (!isAdminUserRouteId(params.userId) || !isAdminUserTab(params.tab)) {
+      throw redirect({
+        to: "/admin/$section",
+        params: { section: "users" },
+        search,
+        replace: true,
+      });
+    }
+  },
+  component: () => {
+    const { userId, tab } = adminUserDetailRoute.useParams();
+    const search = adminUserDetailRoute.useSearch();
+    return (
+      <App
+        initialView="admin"
+        initialAdminSection="users"
+        initialAdminSearch={search}
+        initialAdminUserDetail={isAdminUserRouteId(userId) && isAdminUserTab(tab)
+          ? { userId, tab }
+          : undefined}
+      />
+    );
+  },
+});
 const routeTree = rootRoute.addChildren([
   indexRoute,
   loginRoute,
@@ -83,6 +114,7 @@ const routeTree = rootRoute.addChildren([
   resetPasswordRoute,
   verifyEmailRoute,
   publicShareRoute,
+  adminUserDetailRoute,
   adminRoute,
 ]);
 const router = createRouter({ routeTree });

@@ -80,8 +80,6 @@ import { UserPortability } from "./UserPortability.tsx";
 import { ConversationShareButton } from "./ConversationSharing.tsx";
 import { identityDestination, pendingMode } from "./identityState.ts";
 import {
-  type AdminLifecycleAction,
-  adminLifecycleConsequence,
   adminLifecycleErrorMessage,
   formatStartingCreditMicros,
   parseStartingCreditMicros,
@@ -127,6 +125,12 @@ import { AdminModels, AdminProviders } from "./AdminRegistry.tsx";
 import { AdminResilience } from "./AdminResilience.tsx";
 import { AdminTools } from "./AdminTools.tsx";
 import { ToolLauncher } from "./ToolLauncher.tsx";
+import { AdminUserDetail } from "./admin/users/AdminUserDetail.tsx";
+import type { AdminUserTab } from "./admin/users/adminUserRouting.ts";
+import {
+  authenticatedAdminDestination,
+  storeAdminUserReturnPath,
+} from "./admin/users/adminUserRouting.ts";
 import { ConversationKnowledgePicker, KnowledgeView } from "./Knowledge.tsx";
 import { VoiceRecorder } from "./voice/VoiceRecorder.tsx";
 import { insertTranscript } from "./voice/voiceState.ts";
@@ -183,6 +187,40 @@ function useMediaQuery(query: string): boolean {
     return () => media.removeEventListener("change", update);
   }, [query]);
   return matches;
+}
+
+export function ConversationMessagesQueryState(
+  { kind, retry }: { kind: "loading" | "error"; retry?: () => void },
+) {
+  return (
+    <main
+      className="chat-main lifecycle-empty"
+      role={kind === "error" ? "alert" : "status"}
+      aria-busy={kind === "loading" || undefined}
+      aria-label={kind === "loading" ? "Loading conversation messages" : undefined}
+    >
+      {kind === "loading"
+        ? (
+          <>
+            <div className="typing" aria-hidden="true">
+              <span />
+              <span />
+              <span />
+            </div>
+            <p>Loading conversation messages…</p>
+          </>
+        )
+        : (
+          <>
+            <h1>Conversation messages unavailable</h1>
+            <p>The saved conversation could not be loaded. No messages were removed.</p>
+            <button type="button" className="primary" onClick={retry}>
+              <RefreshCw size={15} aria-hidden="true" /> Retry
+            </button>
+          </>
+        )}
+    </main>
+  );
 }
 
 function Brand({ compact = false }: { compact?: boolean }) {
@@ -2280,6 +2318,8 @@ function ChatView({
   saveHistory = true,
   modelPreferenceError = "",
   historyPreferenceWarning = "",
+  messagesStale = false,
+  retryMessages,
   onGenerationBusyChange,
 }: {
   conversations: Conversation[];
@@ -2300,6 +2340,8 @@ function ChatView({
   saveHistory?: boolean;
   modelPreferenceError?: string;
   historyPreferenceWarning?: string;
+  messagesStale?: boolean;
+  retryMessages: () => void;
   onGenerationBusyChange: (conversationId: string, busy: boolean) => void;
 }) {
   const queryClient = useQueryClient();
@@ -2869,6 +2911,12 @@ function ChatView({
             <Pencil size={14} /> Rename
           </button>
         </div>
+        {messagesStale && (
+          <div className="stale-warning" role="status">
+            <span>Showing saved messages. The latest refresh failed.</span>
+            <button type="button" onClick={retryMessages}>Retry</button>
+          </div>
+        )}
         {conversation?.temporary && (
           <div className="temporary-chat-banner" role="status">
             <div>
@@ -3337,12 +3385,26 @@ const adminNav: { id: AdminSection; label: string; icon: typeof Gauge }[] = [
   { id: "storage", label: "Storage & backups", icon: HardDrive },
 ];
 function AdminView(
-  { onMenu, section, setSection, search, setSearch }: {
+  {
+    onMenu,
+    section,
+    setSection,
+    search,
+    setSearch,
+    userDetail,
+    setUserDetail,
+    backFromUser,
+    reauthenticate,
+  }: {
     onMenu: () => void;
     section: AdminSection;
     setSection: (section: AdminSection) => void;
     search: AdminSearch;
     setSearch: (search: AdminSearch) => void;
+    userDetail?: { userId: string; tab: AdminUserTab };
+    setUserDetail: (userId: string, tab: AdminUserTab) => void;
+    backFromUser: () => void;
+    reauthenticate: () => void;
   },
 ) {
   const currentLabel = adminNav.find((item) => item.id === section)?.label ?? "Admin";
@@ -3390,6 +3452,10 @@ function AdminView(
             setSection={setSection}
             search={search}
             setSearch={setSearch}
+            userDetail={userDetail}
+            setUserDetail={setUserDetail}
+            backFromUser={backFromUser}
+            reauthenticate={reauthenticate}
           />
         </section>
       </div>
@@ -3398,11 +3464,24 @@ function AdminView(
 }
 
 function AdminSectionContent(
-  { section, setSection, search, setSearch }: {
+  {
+    section,
+    setSection,
+    search,
+    setSearch,
+    userDetail,
+    setUserDetail,
+    backFromUser,
+    reauthenticate,
+  }: {
     section: AdminSection;
     setSection: (s: AdminSection) => void;
     search: AdminSearch;
     setSearch: (search: AdminSearch) => void;
+    userDetail?: { userId: string; tab: AdminUserTab };
+    setUserDetail: (userId: string, tab: AdminUserTab) => void;
+    backFromUser: () => void;
+    reauthenticate: () => void;
   },
 ) {
   if (section === "overview") {
@@ -3431,7 +3510,18 @@ function AdminSectionContent(
     return <AdminTools />;
   }
   if (section === "users") {
-    return <UserManagement />;
+    if (userDetail) {
+      return (
+        <AdminUserDetail
+          userId={userDetail.userId}
+          tab={userDetail.tab}
+          onTabChange={(tab) => setUserDetail(userDetail.userId, tab)}
+          onBack={backFromUser}
+          onReauthenticate={reauthenticate}
+        />
+      );
+    }
+    return <UserManagement search={search} setSearch={setSearch} />;
   }
   if (section === "usage") {
     return <AdminAnalyticsView search={search} onSearch={setSearch} />;
@@ -3852,94 +3942,34 @@ function Applicants({ compact = false }: { compact?: boolean }) {
     </>
   );
 }
-function UserManagement() {
-  const [searchDraft, setSearchDraft] = useState("");
-  const client = useQueryClient();
-  const [filters, setFilters] = useState<AdminUserFilters>({ limit: 25 });
+function UserManagement(
+  { search, setSearch }: { search: AdminSearch; setSearch: (search: AdminSearch) => void },
+) {
+  const navigate = useNavigate();
+  const [searchDraft, setSearchDraft] = useState(search.userSearch ?? "");
+  const [filters, setFilters] = useState<AdminUserFilters>({
+    limit: 25,
+    search: search.userSearch,
+    role: search.userRole,
+    state: search.userState,
+    deletion: search.userDeletion,
+  });
   const [cursors, setCursors] = useState<string[]>([]);
-  const [managed, setManaged] = useState<User>();
-  const [action, setAction] = useState<AdminLifecycleAction>();
-  const [reason, setReason] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-  const [reauthRequired, setReauthRequired] = useState(false);
   const cursor = cursors.at(-1);
   const query = useMemo(() => ({ ...filters, cursor }), [filters, cursor]);
+  const updateFilters = (next: AdminUserFilters) => {
+    setFilters(next);
+    setSearch({
+      userSearch: next.search,
+      userRole: next.role,
+      userState: next.state,
+      userDeletion: next.deletion,
+    });
+  };
   const users = useQuery({
     queryKey: ["admin-users", query],
     queryFn: () => api.adminUsers(query),
   });
-  const close = () => {
-    if (busy) return;
-    setManaged(undefined);
-    setAction(undefined);
-    setReason("");
-    setError("");
-    setReauthRequired(false);
-  };
-  const choose = (next?: AdminLifecycleAction) => {
-    setAction(next);
-    setReason("");
-    setError("");
-    setReauthRequired(false);
-  };
-  const perform = async (event: FormEvent) => {
-    event.preventDefault();
-    if (!managed || !action || !reason.trim()) return;
-    setBusy(true);
-    setError("");
-    try {
-      let saved: User;
-      if (action === "promote" || action === "demote") {
-        saved = await api.setUserRole(
-          managed.id,
-          action === "promote" ? "admin" : "user",
-          managed.version,
-          reason,
-        );
-      } else if (action === "suspend" || action === "activate") {
-        saved = await api.setUserState(
-          managed.id,
-          action === "suspend" ? "suspended" : "active",
-          managed.version,
-          reason,
-        );
-      } else if (action === "delete") {
-        saved = await api.deleteUser(managed.id, managed.version, reason);
-      } else saved = await api.restoreUser(managed.id, managed.version, reason);
-      client.setQueryData(
-        ["admin-users", query],
-        (current: Awaited<ReturnType<typeof api.adminUsers>> | undefined) =>
-          current
-            ? { ...current, data: current.data.map((user) => user.id === saved.id ? saved : user) }
-            : current,
-      );
-      setBusy(false);
-      setManaged(undefined);
-      setAction(undefined);
-      setReason("");
-      void client.invalidateQueries({ queryKey: ["admin-users"] });
-    } catch (cause) {
-      const apiError = cause instanceof ApiError ? cause : undefined;
-      if (apiError?.code === "version_conflict") {
-        const latest = await api.adminUser(managed.id);
-        setManaged(latest);
-        setError(
-          "This account changed in another tab. We loaded the latest version; review it before retrying.",
-        );
-      } else if (apiError?.code === "recent_authentication_required") {
-        setReauthRequired(true);
-        setError("For security, sign out and sign in again before changing account access.");
-      } else {
-        const fallback = cause instanceof Error
-          ? cause.message
-          : "The account could not be updated.";
-        setError(adminLifecycleErrorMessage(apiError?.code ?? "", fallback));
-      }
-    } finally {
-      setBusy(false);
-    }
-  };
   return (
     <>
       <PageHeader title="Users" subtitle="Review access state, roles, and current balances" />
@@ -3950,10 +3980,7 @@ function UserManagement() {
         onSubmit={(event) => {
           event.preventDefault();
           setCursors([]);
-          setFilters((current) => ({
-            ...current,
-            search: searchDraft.trim() || undefined,
-          }));
+          updateFilters({ ...filters, search: searchDraft.trim() || undefined });
         }}
       >
         <label className="admin-user-search">
@@ -3975,10 +4002,10 @@ function UserManagement() {
             value={filters.role ?? ""}
             onChange={(event) => {
               setCursors([]);
-              setFilters((current) => ({
-                ...current,
+              updateFilters({
+                ...filters,
                 role: event.target.value as AdminUserFilters["role"] || undefined,
-              }));
+              });
             }}
           >
             <option value="">All roles</option>
@@ -3992,10 +4019,10 @@ function UserManagement() {
             value={filters.state ?? ""}
             onChange={(event) => {
               setCursors([]);
-              setFilters((current) => ({
-                ...current,
+              updateFilters({
+                ...filters,
                 state: event.target.value as AdminUserFilters["state"] || undefined,
-              }));
+              });
             }}
           >
             <option value="">Any state</option>
@@ -4009,10 +4036,10 @@ function UserManagement() {
             value={filters.deletion ?? "present"}
             onChange={(event) => {
               setCursors([]);
-              setFilters((current) => ({
-                ...current,
+              updateFilters({
+                ...filters,
                 deletion: event.target.value as AdminUserFilters["deletion"],
-              }));
+              });
             }}
           >
             <option value="present">Current</option>
@@ -4062,10 +4089,11 @@ function UserManagement() {
               className="secondary"
               aria-label={`Manage ${user.name}`}
               onClick={() => {
-                setManaged(user);
-                setAction(undefined);
-                setReason("");
-                setError("");
+                void navigate({
+                  to: "/admin/users/$userId/$tab",
+                  params: { userId: user.id, tab: "account" },
+                  search,
+                });
               }}
             >
               Manage
@@ -4095,116 +4123,6 @@ function UserManagement() {
       <span className="sr-only" role="status" aria-live="polite">
         {users.isFetching ? "Refreshing user directory" : ""}
       </span>
-      {managed && (
-        <Modal
-          title={action
-            ? `${action[0].toUpperCase()}${action.slice(1)} ${managed.name}?`
-            : `Manage ${managed.name}`}
-          close={close}
-          dismissible={!busy}
-          variant="medium"
-        >
-          <div className="admin-user-summary">
-            <Avatar user={managed} />
-            <span>
-              <strong>{managed.name}</strong>
-              <small>{managed.email}</small>
-            </span>
-            <span className="admin-lifecycle-chips">
-              <span className="status-chip">{managed.approvalStatus}</span>
-              <span className="status-chip">{managed.state}</span>
-              {managed.deletedAt && <span className="status-chip warning">deleted</span>}
-            </span>
-            <small>Role: {managed.role}</small>
-            <small>Email: {managed.emailVerifiedAt ? "verified" : "unverified"}</small>
-            <small>Balance: ${managed.balance.toFixed(2)}</small>
-          </div>
-          {!action && (
-            <div className="admin-user-actions" aria-label="Account actions">
-              {!managed.deletedAt && (
-                <button
-                  className="secondary"
-                  disabled={managed.role !== "admin" &&
-                    (managed.approvalStatus !== "approved" || managed.state !== "active")}
-                  title={managed.role !== "admin" &&
-                      (managed.approvalStatus !== "approved" || managed.state !== "active")
-                    ? "Approve and activate this account before promotion"
-                    : undefined}
-                  onClick={() => choose(managed.role === "admin" ? "demote" : "promote")}
-                >
-                  <ShieldCheck size={15} aria-hidden="true" />{" "}
-                  {managed.role === "admin" ? "Demote to user" : "Promote to admin"}
-                </button>
-              )}
-              {!managed.deletedAt && (
-                <button
-                  className="secondary"
-                  onClick={() => choose(managed.state === "suspended" ? "activate" : "suspend")}
-                >
-                  <UserCheck size={15} aria-hidden="true" />{" "}
-                  {managed.state === "suspended" ? "Reactivate account" : "Suspend account"}
-                </button>
-              )}
-              <button
-                className={managed.deletedAt ? "secondary" : "danger-button"}
-                onClick={() => choose(managed.deletedAt ? "restore" : "delete")}
-              >
-                {managed.deletedAt ? <RotateCcw size={15} /> : <Trash2 size={15} />}
-                {managed.deletedAt ? "Restore deleted account" : "Delete account"}
-              </button>
-            </div>
-          )}
-          {action && (
-            <form onSubmit={perform}>
-              <p className="muted">
-                {adminLifecycleConsequence(action)}
-              </p>
-              <label className="admin-user-reason">
-                <span>Reason</span>
-                <textarea
-                  autoFocus
-                  required
-                  maxLength={500}
-                  rows={3}
-                  value={reason}
-                  onChange={(event) => setReason(event.target.value)}
-                  placeholder="Record why this change is needed"
-                />
-                <small>{reason.length}/500</small>
-              </label>
-              {error && <p className="form-error" role="alert">{error}</p>}
-              {reauthRequired && (
-                <button
-                  type="button"
-                  className="secondary"
-                  onClick={() => location.assign("/login")}
-                >
-                  Sign in again
-                </button>
-              )}
-              <div className="modal-actions">
-                <button
-                  type="button"
-                  className="secondary"
-                  disabled={busy}
-                  onClick={() => choose()}
-                >
-                  Back
-                </button>
-                <button
-                  type="submit"
-                  className={action === "delete" || action === "suspend" || action === "demote"
-                    ? "danger-button"
-                    : "approve"}
-                  disabled={busy || !reason.trim()}
-                >
-                  {busy ? "Saving…" : `Confirm ${action}`}
-                </button>
-              </div>
-            </form>
-          )}
-        </Modal>
-      )}
     </>
   );
 }
@@ -4378,10 +4296,16 @@ function AuditLog() {
   );
 }
 export function App(
-  { initialView = "chat", initialAdminSection = "overview", initialAdminSearch = {} }: {
+  {
+    initialView = "chat",
+    initialAdminSection = "overview",
+    initialAdminSearch = {},
+    initialAdminUserDetail,
+  }: {
     initialView?: View;
     initialAdminSection?: AdminSection;
     initialAdminSearch?: AdminSearch;
+    initialAdminUserDetail?: { userId: string; tab: AdminUserTab };
   } = {},
 ) {
   const navigate = useNavigate();
@@ -4444,6 +4368,30 @@ export function App(
   };
   const setAdminSearch = (search: AdminSearch) => {
     void navigate({ to: "/admin/$section", params: { section: adminSection }, search });
+  };
+  const setAdminUserDetail = (userId: string, tab: AdminUserTab) => {
+    void navigate({
+      to: "/admin/users/$userId/$tab",
+      params: { userId, tab },
+      search: initialAdminSearch,
+    });
+  };
+  const backFromAdminUser = () => {
+    void navigate({
+      to: "/admin/$section",
+      params: { section: "users" },
+      search: initialAdminSearch,
+    });
+  };
+  const reauthenticateAdminUser = () => {
+    if (!initialAdminUserDetail) return;
+    try {
+      storeAdminUserReturnPath(`${location.pathname}${location.search}`);
+    } catch {
+      // Reauthentication still works when private browsing blocks session storage;
+      // only restoration of the exact detail route is unavailable.
+    }
+    location.assign("/login");
   };
   const lifecycleQuery = view === "trash" ? deletedConversationQuery : conversationQuery;
   const lifecycleLoading = lifecycleQuery.isLoading;
@@ -4598,6 +4546,12 @@ export function App(
     await conversationQuery.refetch();
     return updated;
   };
+  const messagesBlockingLoading = !demoMode && Boolean(
+    activeId && messagesQuery.isLoading && messagesQuery.data === undefined,
+  );
+  const messagesBlockingError = !demoMode && Boolean(
+    activeId && messagesQuery.isError && messagesQuery.data === undefined,
+  );
   if (!user || user.limited) {
     return <DiscoveryLoading unavailable={setupQuery.isError && userQuery.isError} />;
   }
@@ -4636,7 +4590,16 @@ export function App(
         </main>
       )}
       {(view === "chat" || view === "archived" || view === "trash") && !creatingConversation &&
-        activeId && (
+        activeId && messagesBlockingLoading && <ConversationMessagesQueryState kind="loading" />}
+      {(view === "chat" || view === "archived" || view === "trash") && !creatingConversation &&
+        activeId && messagesBlockingError && (
+        <ConversationMessagesQueryState
+          kind="error"
+          retry={() => void messagesQuery.refetch()}
+        />
+      )}
+      {(view === "chat" || view === "archived" || view === "trash") && !creatingConversation &&
+        activeId && !messagesBlockingLoading && !messagesBlockingError && (
         <ChatView
           key={activeId}
           conversations={allConversations}
@@ -4670,6 +4633,8 @@ export function App(
           saveHistory={!temporaryChatUntilPreferencesResolve(demoMode, preferencesQuery.data)}
           modelPreferenceError={modelPreferenceError}
           historyPreferenceWarning={historyPreferenceWarning(demoMode, preferencesQuery.isError)}
+          messagesStale={!demoMode && messagesQuery.isError && messagesQuery.data !== undefined}
+          retryMessages={() => void messagesQuery.refetch()}
           onGenerationBusyChange={updateGenerationBusy}
         />
       )}
@@ -4764,6 +4729,10 @@ export function App(
           setSection={setAdminSection}
           search={initialAdminSearch}
           setSearch={setAdminSearch}
+          userDetail={initialAdminUserDetail}
+          setUserDetail={setAdminUserDetail}
+          backFromUser={backFromAdminUser}
+          reauthenticate={reauthenticateAdminUser}
         />
       )}
       {view === "knowledge" && <KnowledgeView onMenu={() => setMobile(true)} />}
@@ -4850,7 +4819,8 @@ export function AuthScreen() {
       const user = signup
         ? await api.signUp(name, email, password)
         : await api.signIn(email, password);
-      location.assign(identityDestination(user));
+      const destination = identityDestination(user);
+      location.assign(!signup ? authenticatedAdminDestination(destination) : destination);
     } catch {
       setError("We couldn't sign you in. Check your details and try again.");
     } finally {
@@ -5098,7 +5068,7 @@ export function PendingScreen() {
   const mode = pendingMode(status.data);
   useEffect(() => {
     if (mode === "ready") {
-      location.assign("/");
+      location.assign(authenticatedAdminDestination("/"));
     }
     if (status.error instanceof ApiError && status.error.status === 401) location.assign("/login");
   }, [mode, status.error]);

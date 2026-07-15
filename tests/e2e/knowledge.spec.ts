@@ -2,7 +2,12 @@ import { expect, test } from "@playwright/test";
 import { strToU8, zipSync } from "fflate";
 import { Buffer } from "node:buffer";
 import { apiURL, bootstrap, createChat, login, openSidebar } from "./helpers.ts";
-import { lightweightManagedStack } from "./env.ts";
+import {
+  type AppReadiness,
+  lightweightManagedStack,
+  missingDurableCapabilities,
+  strictDurableCapabilities,
+} from "./env.ts";
 
 const DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 
@@ -53,11 +58,47 @@ test.beforeEach(async ({ page, request }) => {
 const workspaceNavigation = (page: import("@playwright/test").Page) =>
   page.getByLabel("Workspace navigation", { exact: true });
 
+async function requireKnowledgeStack(request: import("@playwright/test").APIRequestContext) {
+  const response = await request.get(`${apiURL}/ready`);
+  const readiness = await response.json().catch(() => null) as AppReadiness | null;
+  const missing = missingDurableCapabilities(readiness, ["postgres", "objects"]);
+  if (!missing.length) return;
+  const reason = `requires live ${
+    missing.join(" and ")
+  } readiness; /ready returned HTTP ${response.status()}`;
+  if (strictDurableCapabilities()) throw new Error(`Full-stack E2E configuration error: ${reason}`);
+  test.skip(true, reason);
+}
+
+async function expectComposerUploadReady(
+  page: import("@playwright/test").Page,
+  filename: string,
+) {
+  const chip = page.getByLabel("Selected attachments").locator(".upload-chip").filter({
+    has: page.getByText(filename, { exact: true }),
+  });
+  await expect(chip).toBeVisible();
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const classes = await chip.getAttribute("class") ?? "";
+    if (classes.split(/\s+/u).includes("upload-ready")) return;
+    if (!classes.split(/\s+/u).includes("upload-uploading")) {
+      throw new Error(
+        `Upload ${filename} failed: ${(await chip.innerText()).replaceAll("\n", " ")}`,
+      );
+    }
+    await page.waitForTimeout(100);
+  }
+  throw new Error(`Upload ${filename} did not finish within 30000ms`);
+}
+
 test("manages a collection and persists conversation knowledge", async ({ page }, testInfo) => {
+  test.setTimeout(120_000);
   test.skip(
     lightweightManagedStack,
     "requires the durable PostgreSQL, object-storage, and worker stack",
   );
+  await requireKnowledgeStack(page.request);
   const suffix = `${Date.now()}-${testInfo.project.name}`;
   const originalName = `Knowledge ${suffix}`;
   const renamedName = `Product docs ${suffix}`;
@@ -70,6 +111,7 @@ test("manages a collection and persists conversation knowledge", async ({ page }
     mimeType: "text/plain",
     buffer: Buffer.from(`DG Chat knowledge browser test document ${suffix}.`),
   });
+  await expectComposerUploadReady(page, filename);
   await expect.poll(async () => {
     const response = await page.request.get(`${apiURL}/api/attachments`);
     if (!response.ok()) return "unavailable";
@@ -89,7 +131,9 @@ test("manages a collection and persists conversation knowledge", async ({ page }
 
   const create = page.getByRole("button", { name: "Create collection" });
   await create.click();
-  await page.getByRole("dialog", { name: "New collection" }).getByLabel("Name").fill(originalName);
+  await page.getByRole("dialog", { name: "New collection" }).getByLabel("Name").fill(
+    originalName,
+  );
   await page.getByRole("dialog", { name: "New collection" })
     .getByRole("button", { name: "Save" }).click();
   await expect(page.getByRole("heading", { name: originalName })).toBeVisible();
@@ -288,10 +332,12 @@ test("persists library selection and repairs it after the selected collection is
 test("extracts uploaded PDF pages and DOCX sections with persisted provenance", async ({
   page,
 }, testInfo) => {
+  test.setTimeout(180_000);
   test.skip(
     lightweightManagedStack,
     "requires the durable PostgreSQL, object-storage, and worker stack",
   );
+  await requireKnowledgeStack(page.request);
   const suffix = `${Date.now()}-${testInfo.project.name}`;
   const pdfName = `manual-${suffix}.pdf`;
   const docxName = `handbook-${suffix}.docx`;
@@ -304,11 +350,13 @@ test("extracts uploaded PDF pages and DOCX sections with persisted provenance", 
     mimeType: "application/pdf",
     buffer: documentPdf(pdfText),
   });
+  await expectComposerUploadReady(page, pdfName);
   await input.setInputFiles({
     name: docxName,
     mimeType: DOCX_MIME,
     buffer: documentDocx(firstSection, secondSection),
   });
+  await expectComposerUploadReady(page, docxName);
 
   type Attachment = { id: string; filename: string; ingestionStatus?: string };
   const attachment = async (filename: string): Promise<Attachment | undefined> => {

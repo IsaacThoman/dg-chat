@@ -41,6 +41,8 @@ export interface BetterAuthServiceOptions {
 }
 
 export interface BetterAuthBrowserSession {
+  /** Durable auth_sessions identifier for current-session security decisions. */
+  id: string;
   userId: string;
   limited: boolean;
   /** Time the user proved their identity, not the session's rolling refresh time. */
@@ -364,6 +366,7 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
       // the session was minted. Never substitute updatedAt because rolling refresh is not proof.
       if (!authenticatedAt || !Number.isFinite(authenticatedAt.getTime())) return null;
       return {
+        id: result.session.id,
         userId: result.user.id,
         limited: domainLimited ||
           Boolean((result.session as typeof result.session & { limited?: boolean }).limited),

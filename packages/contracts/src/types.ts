@@ -62,6 +62,50 @@ export interface AdminUserPage {
   nextCursor: string | null;
 }
 
+export type AdminSessionSource = "better_auth" | "legacy";
+export type AdminSessionStatus = "active" | "expired" | "revoked";
+
+/** Credential-free administrative projection of one browser session. */
+export interface AdminSessionSummary {
+  /** Source-prefixed opaque identifier; never a cookie or session token. */
+  id: string;
+  userId: string;
+  source: AdminSessionSource;
+  current: boolean;
+  limited: boolean;
+  status: AdminSessionStatus;
+  ipAddress: string | null;
+  userAgent: string | null;
+  createdAt: string;
+  expiresAt: string;
+  invalidatedAt: string | null;
+}
+
+export interface AdminSessionQuery {
+  source?: AdminSessionSource;
+  status?: AdminSessionStatus;
+  cursor?: string;
+  limit?: number;
+}
+
+export interface AdminSessionPage {
+  data: AdminSessionSummary[];
+  nextCursor: string | null;
+}
+
+export interface AdminSessionRevocationRequest {
+  reason: string;
+}
+
+/** Persistence command for a target-bound, audited administrative session revocation. */
+export interface AdminSessionRevocationCommand extends AdminSessionRevocationRequest {
+  actorId: string;
+  targetUserId: string;
+  source: AdminSessionSource;
+  sessionId: string;
+  currentSession: Pick<AdminSessionSummary, "source" | "id"> | null;
+}
+
 export interface SessionResponse {
   user: PublicUser;
   limited: boolean;
@@ -302,6 +346,99 @@ export interface ApiTokenSummary {
   revokedAt: string | null;
   lastUsedAt: string | null;
   createdAt: string;
+}
+
+export type AdminApiTokenStatus = "active" | "overlap" | "expired" | "revoked" | "replaced";
+
+/** Complete non-secret administrative token projection, including rotation and access policy. */
+export interface AdminApiTokenSummary extends ApiTokenSummary {
+  ownerId: string;
+  groupIds: string[];
+  status: AdminApiTokenStatus;
+}
+
+export interface AdminApiTokenQuery {
+  status?: AdminApiTokenStatus;
+  cursor?: string;
+  limit?: number;
+}
+
+export interface AdminApiTokenPage {
+  data: AdminApiTokenSummary[];
+  nextCursor: string | null;
+}
+
+export interface AdminApiTokenRevocationRequest {
+  expectedVersion: number;
+  reason: string;
+}
+
+/** Persistence command for a target-bound, versioned token-family revocation. */
+export interface AdminApiTokenRevocationCommand extends AdminApiTokenRevocationRequest {
+  actorId: string;
+  targetUserId: string;
+  tokenId: string;
+}
+
+export type AdminLedgerKind = "grant" | "reserve" | "settle" | "refund" | "adjustment";
+
+export interface AdminLedgerAdjustmentDetail {
+  id: string;
+  actorId: string;
+  reason: string;
+}
+
+/** Administrative ledger projection that deliberately excludes arbitrary stored metadata. */
+export interface AdminLedgerEntry {
+  id: string;
+  userId: string;
+  /** Monotonic per-user causal position; timestamps are presentation-only. */
+  sequence: number;
+  usageRunId: string;
+  kind: AdminLedgerKind;
+  amountMicros: number;
+  balanceAfterMicros: number;
+  adjustment: AdminLedgerAdjustmentDetail | null;
+  createdAt: string;
+}
+
+export interface AdminLedgerQuery {
+  kind?: AdminLedgerKind;
+  cursor?: string;
+  limit?: number;
+}
+
+export interface AdminLedgerPage {
+  data: AdminLedgerEntry[];
+  nextCursor: string | null;
+}
+
+export interface AdminBalanceAdjustmentRequest {
+  amountMicros: number;
+  expectedBalanceMicros: number;
+  reason: string;
+}
+
+/** Internal durable-command input; only hashes of HTTP replay material may cross this boundary. */
+export interface AdminBalanceAdjustmentCommand extends AdminBalanceAdjustmentRequest {
+  actorId: string;
+  targetUserId: string;
+  idempotencyKeyHash: string;
+  requestHash: string;
+}
+
+export interface AdminBalanceAdjustment {
+  id: string;
+  targetUserId: string;
+  actorId: string;
+  amountMicros: number;
+  balanceBeforeMicros: number;
+  balanceAfterMicros: number;
+  reason: string;
+  ledgerEntryId: string;
+  auditEventId: string;
+  createdAt: string;
+  replayed: boolean;
 }
 
 export interface UsageSummary {

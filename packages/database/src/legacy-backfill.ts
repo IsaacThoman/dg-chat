@@ -27,7 +27,7 @@ type LegacySnapshot = {
   conversations?: Array<[string, Conversation]>;
   messages?: Array<[string, MessageNode]>;
   idempotency?: Array<[string, string]>;
-  ledger?: LedgerEntry[];
+  ledger?: Array<Omit<LedgerEntry, "sequence"> & { sequence?: number }>;
   usageRuns?: Array<[string, UsageRun]>;
   jobs?: Array<
     {
