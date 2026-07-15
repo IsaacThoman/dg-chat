@@ -1,4 +1,4 @@
-import { assertEquals, assertExists } from "jsr:@std/assert@1.0.14";
+import { assertEquals, assertExists, assertThrows } from "jsr:@std/assert@1.0.14";
 import { createApp } from "./app.ts";
 import { MemoryRepository } from "@dg-chat/database";
 
@@ -13,12 +13,13 @@ function sessionCookie(response: Response): string {
   return cookie;
 }
 
-async function fixture() {
+async function fixture(startingCreditMicros?: number) {
   const repository = new MemoryRepository();
   let now = Date.now();
   const { app } = createApp({
     repository,
     setupToken: "admin-lifecycle-setup",
+    startingCreditMicros,
     now: () => now,
   });
   const bootstrap = await app.request("/api/setup/bootstrap", {
@@ -63,6 +64,41 @@ async function fixture() {
     advance: (milliseconds: number) => now += milliseconds,
   };
 }
+
+Deno.test("admin settings expose and approval applies the configured default credit", async () => {
+  const { app, applicant, headers } = await fixture(6_750_001);
+  const settingsResponse = await app.request("/api/admin/settings", {
+    headers: { cookie: headers.cookie },
+  });
+  assertEquals(settingsResponse.status, 200);
+  assertEquals(settingsResponse.headers.get("cache-control"), "private, no-store");
+  assertEquals(
+    settingsResponse.headers.get("vary")?.split(",").map((value) => value.trim()).includes(
+      "Cookie",
+    ),
+    true,
+  );
+  assertEquals((await json(settingsResponse)).defaultApprovalCreditMicros, 6_750_001);
+
+  const approval = await app.request(`/api/admin/users/${applicant.id}/approval`, {
+    method: "PATCH",
+    headers,
+    body: JSON.stringify({
+      status: "approved",
+      expectedVersion: applicant.version,
+    }),
+  });
+  assertEquals(approval.status, 200);
+  assertEquals((await json(approval)).balanceMicros, 6_750_001);
+});
+
+Deno.test("starting credit configuration cannot exceed the approval contract", () => {
+  assertThrows(
+    () => createApp({ startingCreditMicros: 1_000_000_001 }),
+    Error,
+    "between 0 and 1,000,000,000",
+  );
+});
 
 Deno.test("admin lifecycle HTTP API is paginated, versioned, atomic, and no-store", async () => {
   const { app, repository, applicant, headers } = await fixture();

@@ -156,3 +156,59 @@ Deno.test("memory repository enforces lifecycle reasons at the domain boundary",
   });
   assertEquals(activated.state, "active");
 });
+
+Deno.test("memory credits reject unsafe integer accounting without mutation", () => {
+  const { repository } = fixture();
+  const user = repository.createUser({
+    email: "unsafe-credit@example.com",
+    name: "Unsafe Credit",
+  });
+  user.balanceMicros = Number.MAX_SAFE_INTEGER - 100;
+
+  assertDomainCode(
+    () => repository.credit(user.id, "unsafe-credit", "grant", 101),
+    "validation_error",
+  );
+  assertEquals(user.balanceMicros, Number.MAX_SAFE_INTEGER - 100);
+  assertEquals(repository.ledger.some((entry) => entry.usageRunId === "unsafe-credit"), false);
+
+  assertDomainCode(
+    () => repository.credit(user.id, "fractional-credit", "grant", 0.5),
+    "validation_error",
+  );
+  assertEquals(user.balanceMicros, Number.MAX_SAFE_INTEGER - 100);
+  assertEquals(
+    repository.ledger.some((entry) => entry.usageRunId === "fractional-credit"),
+    false,
+  );
+});
+
+Deno.test("memory approval rolls back when its grant would exceed safe integer accounting", () => {
+  const { repository, actor } = fixture();
+  const applicant = repository.createUser({
+    email: "unsafe-approval@example.com",
+    name: "Unsafe Approval",
+  });
+  const initialBalance = Number.MAX_SAFE_INTEGER - 100;
+  applicant.balanceMicros = initialBalance;
+  const auditCount = repository.auditEvents.length;
+
+  assertDomainCode(() =>
+    repository.decideUserApproval({
+      actorId: actor.id,
+      targetUserId: applicant.id,
+      expectedVersion: applicant.version,
+      status: "approved",
+      startingCreditMicros: 101,
+    }), "validation_error");
+
+  const unchanged = repository.getAdminUser(applicant.id);
+  assertEquals(unchanged.approvalStatus, "pending");
+  assertEquals(unchanged.balanceMicros, initialBalance);
+  assertEquals(unchanged.version, 1);
+  assertEquals(
+    repository.ledger.some((entry) => entry.usageRunId === `approval:${applicant.id}`),
+    false,
+  );
+  assertEquals(repository.auditEvents.length, auditCount);
+});

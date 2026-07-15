@@ -5726,10 +5726,22 @@ export class MemoryRepository {
     if (duplicate) return duplicate;
     const user = this.users.get(userId);
     if (!user) throw new DomainError("not_found", "User not found", 404);
-    if (user.balanceMicros + amountMicros < 0) {
+    const nextBalanceMicros = user.balanceMicros + amountMicros;
+    if (
+      !Number.isSafeInteger(user.balanceMicros) ||
+      !Number.isSafeInteger(amountMicros) ||
+      !Number.isSafeInteger(nextBalanceMicros)
+    ) {
+      throw new DomainError(
+        "validation_error",
+        "Credit amount and resulting balance must be safe integers",
+        422,
+      );
+    }
+    if (nextBalanceMicros < 0) {
       throw new DomainError("insufficient_credit", "Insufficient credit", 402);
     }
-    user.balanceMicros += amountMicros;
+    user.balanceMicros = nextBalanceMicros;
     const entry: LedgerEntry = {
       id: crypto.randomUUID(),
       userId,

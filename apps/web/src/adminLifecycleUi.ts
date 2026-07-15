@@ -9,10 +9,18 @@ export type AdminLifecycleAction =
 /** Parse the administrator-facing USD input without binary floating-point accounting. */
 export function parseStartingCreditMicros(value: string): number | null {
   const normalized = value.trim();
-  if (!/^(?:0|[1-9]\d{0,3})(?:\.\d{1,2})?$/.test(normalized)) return null;
+  if (!/^(?:0|[1-9]\d{0,3})(?:\.\d{1,6})?$/.test(normalized)) return null;
   const [whole, fraction = ""] = normalized.split(".");
-  const micros = Number(whole) * 1_000_000 + Number(fraction.padEnd(2, "0")) * 10_000;
+  const micros = Number(whole) * 1_000_000 + Number(fraction.padEnd(6, "0"));
   return Number.isSafeInteger(micros) && micros <= 1_000_000_000 ? micros : null;
+}
+
+/** Format exact USD micros for an editable administrator-facing input. */
+export function formatStartingCreditMicros(value: number): string {
+  if (!Number.isSafeInteger(value) || value < 0) return "—";
+  const whole = Math.floor(value / 1_000_000);
+  const fraction = String(value % 1_000_000).padStart(6, "0").replace(/0+$/, "");
+  return fraction ? `${whole}.${fraction}` : `${whole}.00`;
 }
 
 export function adminLifecycleErrorMessage(code: string, fallback: string): string {

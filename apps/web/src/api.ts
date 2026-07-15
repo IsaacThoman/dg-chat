@@ -942,6 +942,7 @@ export const api = {
     request<{ calls: number; users: number; balanceMicros: number; ledger: unknown[] }>(
       "/admin/usage",
     ),
+  adminSettings: () => request<{ defaultApprovalCreditMicros: number }>("/admin/settings"),
   adminAnalytics: (filters: AdminAnalyticsFilters) =>
     request<AdminAnalyticsData>(`/admin/analytics?${adminAnalyticsQuery(filters)}`),
   adminAnalyticsCsvUrl: (filters: AdminAnalyticsFilters) =>

@@ -83,6 +83,7 @@ import {
   type AdminLifecycleAction,
   adminLifecycleConsequence,
   adminLifecycleErrorMessage,
+  formatStartingCreditMicros,
   parseStartingCreditMicros,
 } from "./adminLifecycleUi.ts";
 import { SessionCenter } from "./SessionCenter.tsx";
@@ -3604,9 +3605,11 @@ function Applicants({ compact = false }: { compact?: boolean }) {
   const client = useQueryClient();
   const [cursors, setCursors] = useState<string[]>([]);
   const cursor = compact ? undefined : cursors.at(-1);
+  const limit = compact ? 5 : 25;
+  const settings = useQuery({ queryKey: ["admin-settings"], queryFn: api.adminSettings });
   const users = useQuery({
-    queryKey: ["admin-users", "pending", cursor],
-    queryFn: () => api.adminUsers({ approvalStatus: "pending", limit: compact ? 5 : 25, cursor }),
+    queryKey: ["admin-users", { approvalStatus: "pending", limit, cursor }],
+    queryFn: () => api.adminUsers({ approvalStatus: "pending", limit, cursor }),
   });
   const applicants = users.data?.data ?? [];
   const [decision, setDecision] = useState<{ user: User; status: "approved" | "rejected" }>();
@@ -3615,9 +3618,12 @@ function Applicants({ compact = false }: { compact?: boolean }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [reauthRequired, setReauthRequired] = useState(false);
+  const defaultGrantDollars = settings.data
+    ? formatStartingCreditMicros(settings.data.defaultApprovalCreditMicros)
+    : undefined;
   const openDecision = (user: User, status: "approved" | "rejected") => {
     setDecision({ user, status });
-    setGrantDollars("5.00");
+    setGrantDollars("");
     setReason("");
     setError("");
     setReauthRequired(false);
@@ -3628,7 +3634,17 @@ function Applicants({ compact = false }: { compact?: boolean }) {
   const decide = async (event: FormEvent) => {
     event.preventDefault();
     if (!decision || (decision.status === "rejected" && !reason.trim())) return;
-    const startingCreditMicros = parseStartingCreditMicros(grantDollars);
+    const startingCreditMicros = grantDollars.trim()
+      ? parseStartingCreditMicros(grantDollars)
+      : undefined;
+    if (
+      decision.status === "approved" && startingCreditMicros === undefined && !settings.data
+    ) {
+      setError(
+        "The server default is unavailable. Retry loading it or enter an explicit starting credit.",
+      );
+      return;
+    }
     if (decision.status === "approved" && startingCreditMicros === null) {
       setError("Starting credit must be between $0 and $1,000.");
       return;
@@ -3638,7 +3654,9 @@ function Applicants({ compact = false }: { compact?: boolean }) {
     setReauthRequired(false);
     try {
       await api.approveUser(decision.user.id, decision.status, decision.user.version, {
-        ...(decision.status === "approved" ? { startingCreditMicros: startingCreditMicros! } : {}),
+        ...(decision.status === "approved" && typeof startingCreditMicros === "number"
+          ? { startingCreditMicros }
+          : {}),
         ...(reason.trim() ? { reason: reason.trim() } : {}),
       });
       setDecision(undefined);
@@ -3747,18 +3765,45 @@ function Applicants({ compact = false }: { compact?: boolean }) {
                 : "Rejection revokes full sessions and personal API tokens. The applicant can still view their status."}
             </p>
             {decision.status === "approved" && (
-              <label className="admin-user-reason">
-                <span>Starting credit (USD)</span>
-                <input
-                  autoFocus
-                  type="number"
-                  min="0"
-                  max="1000"
-                  step="0.01"
-                  value={grantDollars}
-                  onChange={(event) => setGrantDollars(event.target.value)}
-                />
-              </label>
+              <>
+                <label className="admin-user-reason">
+                  <span>Starting credit override (USD, optional)</span>
+                  <input
+                    autoFocus
+                    type="number"
+                    min="0"
+                    max="1000"
+                    step="0.000001"
+                    value={grantDollars}
+                    placeholder={defaultGrantDollars
+                      ? `Server default: $${defaultGrantDollars}`
+                      : "Enter an explicit amount"}
+                    onChange={(event) => setGrantDollars(event.target.value)}
+                  />
+                  {defaultGrantDollars
+                    ? (
+                      <small>
+                        Leave blank to grant the server default of ${defaultGrantDollars}.
+                      </small>
+                    )
+                    : settings.isLoading
+                    ? <small role="status">Loading the server default…</small>
+                    : (
+                      <small role="alert">
+                        The server default is unavailable. Enter an explicit override.
+                      </small>
+                    )}
+                </label>
+                {settings.isError && (
+                  <button
+                    type="button"
+                    className="text-button"
+                    onClick={() => settings.refetch()}
+                  >
+                    Retry loading the server default
+                  </button>
+                )}
+              </>
             )}
             <label className="admin-user-reason">
               <span>
@@ -3791,7 +3836,8 @@ function Applicants({ compact = false }: { compact?: boolean }) {
               <button
                 type="submit"
                 className={decision.status === "rejected" ? "danger-button" : "approve"}
-                disabled={busy || (decision.status === "rejected" && !reason.trim())}
+                disabled={busy || (decision.status === "rejected" && !reason.trim()) ||
+                  (decision.status === "approved" && !grantDollars.trim() && !settings.data)}
               >
                 {busy
                   ? "Saving…"

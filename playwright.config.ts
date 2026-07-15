@@ -48,6 +48,9 @@ export default defineConfig({
         env: {
           AUTH_RATE_LIMIT: env("E2E_AUTH_RATE_LIMIT") ?? "1000",
           AUTH_CLIENT_RATE_LIMIT: env("E2E_AUTH_CLIENT_RATE_LIMIT") ?? "1000",
+          // Exercise the configured approval default instead of accidentally validating the
+          // product's built-in $5 fallback in every browser journey.
+          DEFAULT_APPROVAL_CREDIT_USD: env("DEFAULT_APPROVAL_CREDIT_USD") ?? "6.75",
         },
       },
       {

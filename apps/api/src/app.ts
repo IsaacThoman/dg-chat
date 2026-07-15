@@ -1290,8 +1290,12 @@ export function createApp(options: AppOptions = {}) {
       : configuredStartingUsd
       ? Math.round(Number(configuredStartingUsd) * 1_000_000)
       : 5_000_000);
-  if (!Number.isSafeInteger(startingCredit) || startingCredit < 0) {
-    throw new Error("Starting credit configuration must be a non-negative number of USD micros");
+  if (
+    !Number.isSafeInteger(startingCredit) || startingCredit < 0 || startingCredit > 1_000_000_000
+  ) {
+    throw new Error(
+      "Starting credit configuration must be an integer between 0 and 1,000,000,000 USD micros",
+    );
   }
   const webOrigin = new URL(
     Deno.env.get("WEB_ORIGIN") ?? Deno.env.get("WEB_URL") ?? "http://localhost:5173",
@@ -5263,6 +5267,11 @@ export function createApp(options: AppOptions = {}) {
   });
 
   app.use("/api/admin/*", authenticate, approved, sessionOnly, admin);
+  app.get("/api/admin/settings", (c) => {
+    privateNoStore(c);
+    c.header("Vary", "Cookie");
+    return c.json({ defaultApprovalCreditMicros: startingCredit });
+  });
   const requireBackupAdmin = (): BackupAdminService => {
     if (!options.backupAdmin) {
       throw new DomainError(

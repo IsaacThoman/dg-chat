@@ -19,15 +19,37 @@ test("administrators approve, search, and manage an immutable account lifecycle"
 
   await page.context().clearCookies();
   await login(page);
-  await page.goto("/admin/applicants");
+  const compactApplicants = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return url.pathname === "/api/admin/users" &&
+      url.searchParams.get("approvalStatus") === "pending" &&
+      url.searchParams.get("limit") === "5";
+  });
+  await page.goto("/admin/overview");
+  await compactApplicants;
+  const fullApplicants = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return url.pathname === "/api/admin/users" &&
+      url.searchParams.get("approvalStatus") === "pending" &&
+      url.searchParams.get("limit") === "25";
+  });
+  await page.getByRole("button", { name: "View all" }).first().click();
+  await fullApplicants;
   await expect(page.getByRole("heading", { name: "Applicants", exact: true })).toBeVisible();
   const applicantRow = page.locator(".applicant-row").filter({ hasText: applicant.email });
   await applicantRow.getByRole("button", { name: "Approve", exact: true }).click();
   const approvalDialog = page.getByRole("dialog", { name: `Approve ${applicant.name}?` });
   await expect(approvalDialog).toBeVisible();
-  await approvalDialog.getByLabel("Starting credit (USD)").fill("7.25");
+  const startingCredit = approvalDialog.getByLabel("Starting credit override (USD, optional)");
+  await expect(startingCredit).toHaveValue("");
+  await expect(startingCredit).toHaveAttribute("placeholder", "Server default: $6.75");
   await approvalDialog.getByLabel("Internal note (optional)").fill("Approved in E2E review");
+  const approvalRequest = page.waitForRequest((request) =>
+    request.method() === "PATCH" && new URL(request.url()).pathname.endsWith("/approval")
+  );
   await approvalDialog.getByRole("button", { name: "Approve applicant" }).click();
+  const submittedApproval = await approvalRequest;
+  expect(submittedApproval.postDataJSON()).not.toHaveProperty("startingCreditMicros");
   await expect(approvalDialog).toBeHidden();
 
   const approvedResponse = await page.request.get(
@@ -39,7 +61,7 @@ test("administrators approve, search, and manage an immutable account lifecycle"
   };
   expect(approvedPage.data[0]).toMatchObject({
     approvalStatus: "approved",
-    balanceMicros: 7_250_000,
+    balanceMicros: 6_750_000,
   });
 
   await page.goto("/admin/users");

@@ -100,10 +100,13 @@ if [[ -z "${CONTRACT_EMPTY_CREDIT_API_KEY:-}" ]]; then
       --arg password "$empty_password" \
       '{name:"Empty Credit Contract",email:$email,password:$password}')")"
   empty_user_id="$(jq --raw-output '.user.id' <<<"$empty_signup")"
+  empty_user_version="$(curl --fail --silent --show-error \
+    "$api_url/api/admin/users/$empty_user_id" --cookie "$CONTRACT_SESSION_COOKIE" |
+    jq --raw-output '.version')"
   curl --fail --silent --show-error --request PATCH \
     "$api_url/api/admin/users/$empty_user_id/approval" --header 'content-type: application/json' \
     --header "origin: $web_origin" --cookie "$CONTRACT_SESSION_COOKIE" \
-    --data '{"status":"approved","startingCreditMicros":0}' >/dev/null
+    --data "{\"expectedVersion\":$empty_user_version,\"status\":\"approved\",\"startingCreditMicros\":0}" >/dev/null
   curl --fail --silent --show-error --cookie-jar "$empty_cookie_jar" --request POST \
     "$api_url/api/auth/sign-in/email" --header 'content-type: application/json' \
     --header "origin: $web_origin" \
