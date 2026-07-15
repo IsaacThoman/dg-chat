@@ -58,7 +58,19 @@ import type {
 } from "./types.ts";
 import { demoConversations, demoMessages, demoModels, demoTokens, demoUser } from "./demo.ts";
 import type { SetupStatus } from "./setupDiscovery.ts";
-import type { ModelCapability } from "../../../packages/contracts/src/types.ts";
+import type {
+  AdminApiTokenPage,
+  AdminApiTokenQuery,
+  AdminBalanceAdjustment,
+  AdminBalanceAdjustmentRequest,
+  AdminLedgerPage,
+  AdminLedgerQuery,
+  AdminSessionPage,
+  AdminSessionQuery,
+  AdminSessionSource,
+  AdminUser,
+  ModelCapability,
+} from "../../../packages/contracts/src/types.ts";
 
 const json = { "Content-Type": "application/json" };
 const demoMode = import.meta.env.VITE_DEMO_MODE === "true";
@@ -453,6 +465,14 @@ export function adminJobsQuery(
   return query.toString();
 }
 
+function adminUserResourceQuery(filters: object): string {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    if (value !== undefined && value !== "") query.set(key, String(value));
+  }
+  return query.size ? `?${query}` : "";
+}
+
 export function uploadAttachment(
   file: File,
   onProgress: (percent: number) => void,
@@ -777,6 +797,63 @@ export const api = {
     return { data: page.data.map((user) => mapUser(user)), nextCursor: page.nextCursor };
   },
   adminUser: async (id: string) => mapUser(await request<RawUser>(`/admin/users/${id}`)),
+  adminUserDetail: (id: string, signal?: AbortSignal) =>
+    request<AdminUser>(`/admin/users/${encodeURIComponent(id)}`, { signal }),
+  adminUserSessions: (id: string, filters: AdminSessionQuery = {}, signal?: AbortSignal) =>
+    request<AdminSessionPage>(
+      `/admin/users/${encodeURIComponent(id)}/sessions${adminUserResourceQuery(filters)}`,
+      { signal },
+    ),
+  revokeAdminUserSession: (
+    userId: string,
+    source: AdminSessionSource,
+    sessionId: string,
+    reason: string,
+  ) => {
+    const prefix = `${source}:`;
+    if (!sessionId.startsWith(prefix) || sessionId.length === prefix.length) {
+      throw new TypeError("The session identifier does not match its source.");
+    }
+    return request<void>(
+      `/admin/users/${encodeURIComponent(userId)}/sessions/${source}/${
+        encodeURIComponent(sessionId.slice(prefix.length))
+      }/revoke`,
+      { method: "POST", body: JSON.stringify({ reason }) },
+    );
+  },
+  adminUserApiTokens: (id: string, filters: AdminApiTokenQuery = {}, signal?: AbortSignal) =>
+    request<AdminApiTokenPage>(
+      `/admin/users/${encodeURIComponent(id)}/api-tokens${adminUserResourceQuery(filters)}`,
+      { signal },
+    ),
+  revokeAdminUserApiToken: (
+    userId: string,
+    tokenId: string,
+    expectedVersion: number,
+    reason: string,
+  ) =>
+    request<void>(
+      `/admin/users/${encodeURIComponent(userId)}/api-tokens/${encodeURIComponent(tokenId)}/revoke`,
+      { method: "POST", body: JSON.stringify({ expectedVersion, reason }) },
+    ),
+  adminUserLedger: (id: string, filters: AdminLedgerQuery = {}, signal?: AbortSignal) =>
+    request<AdminLedgerPage>(
+      `/admin/users/${encodeURIComponent(id)}/ledger${adminUserResourceQuery(filters)}`,
+      { signal },
+    ),
+  adjustAdminUserBalance: (
+    userId: string,
+    input: AdminBalanceAdjustmentRequest,
+    idempotencyKey: string,
+  ) =>
+    request<AdminBalanceAdjustment>(
+      `/admin/users/${encodeURIComponent(userId)}/balance-adjustments`,
+      {
+        method: "POST",
+        headers: { "Idempotency-Key": idempotencyKey },
+        body: JSON.stringify(input),
+      },
+    ),
   approveUser: async (
     id: string,
     status: "approved" | "rejected",

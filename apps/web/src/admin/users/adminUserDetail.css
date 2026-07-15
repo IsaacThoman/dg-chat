@@ -1,0 +1,596 @@
+/* Administrator user security and billing detail */
+.admin-user-detail-page {
+  display: grid;
+  gap: 18px;
+  width: min(1120px, 100%);
+}
+.admin-user-back {
+  display: inline-flex;
+  width: fit-content;
+  min-height: 36px;
+  align-items: center;
+  gap: 7px;
+  padding: 0;
+  color: var(--supporting-ink);
+  background: transparent;
+  font-weight: 650;
+}
+.admin-user-back:hover {
+  color: var(--ink);
+}
+.admin-user-detail-header {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 16px;
+  padding: 20px;
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  background: var(--card);
+  box-shadow: 0 10px 32px color-mix(in srgb, var(--ink) 5%, transparent);
+}
+.admin-user-detail-avatar {
+  display: grid;
+  width: 54px;
+  height: 54px;
+  place-items: center;
+  border-radius: 15px;
+  color: #fff;
+  background: linear-gradient(135deg, #6f5aa8, #3f3566);
+  font-size: 17px;
+  font-weight: 750;
+}
+.admin-user-detail-header h1 {
+  margin: 0;
+  outline: 0;
+  font-size: clamp(21px, 3vw, 28px);
+  letter-spacing: -0.035em;
+}
+.admin-user-detail-header p {
+  margin: 4px 0 9px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.admin-user-detail-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.admin-user-detail-balance {
+  display: grid;
+  min-width: 170px;
+  justify-items: end;
+  gap: 3px;
+}
+.admin-user-detail-balance small,
+.admin-user-detail-balance span {
+  color: var(--muted);
+  font-size: 10px;
+}
+.admin-user-detail-balance strong {
+  font-size: 21px;
+}
+.admin-user-refreshing {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 16px;
+  margin: -10px 0;
+  color: var(--muted);
+  font-size: 10px;
+}
+.admin-user-stale-warning {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, #a76b22 35%, var(--line));
+  border-radius: 9px;
+  color: var(--supporting-ink);
+  background: color-mix(in srgb, #a76b22 8%, var(--card));
+  font-size: 11px;
+  line-height: 1.45;
+}
+.admin-user-tabs {
+  display: flex;
+  gap: 5px;
+  padding: 5px;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+  scrollbar-width: thin;
+}
+.admin-user-tabs button {
+  display: inline-flex;
+  min-width: max-content;
+  min-height: 40px;
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  color: var(--supporting-ink);
+  background: transparent;
+  font-size: 12px;
+  font-weight: 650;
+}
+.admin-user-tabs button[aria-selected="true"] {
+  color: var(--purple);
+  background: var(--card);
+  box-shadow: 0 1px 5px color-mix(in srgb, var(--ink) 9%, transparent);
+}
+.admin-user-tab-panel {
+  min-width: 0;
+  outline: none;
+}
+.admin-user-tab-panel:focus-visible {
+  border-radius: 12px;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--purple) 28%, transparent);
+}
+.admin-user-account-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+.admin-user-card,
+.admin-user-token-card {
+  min-width: 0;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: var(--card);
+}
+.admin-user-card-heading,
+.admin-user-tab-heading,
+.admin-user-token-card > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+.admin-user-card-heading h2,
+.admin-user-tab-heading h2 {
+  margin: 0;
+  font-size: 16px;
+}
+.admin-user-card-heading p,
+.admin-user-tab-heading p {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.admin-user-card-heading > svg {
+  color: var(--purple);
+}
+.admin-user-facts,
+.admin-user-resource-facts,
+.admin-user-adjustment-preview {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin: 16px 0 0;
+}
+.admin-user-facts div,
+.admin-user-resource-facts div,
+.admin-user-adjustment-preview div {
+  min-width: 0;
+  padding: 10px;
+  border-radius: 9px;
+  background: var(--panel);
+}
+.admin-user-facts dt,
+.admin-user-resource-facts dt,
+.admin-user-adjustment-preview dt {
+  color: var(--muted);
+  font-size: 10px;
+}
+.admin-user-facts dd,
+.admin-user-resource-facts dd,
+.admin-user-adjustment-preview dd {
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  font-weight: 650;
+}
+.admin-user-detail-actions {
+  display: grid;
+  gap: 8px;
+  margin-top: 16px;
+}
+.admin-user-detail-actions button {
+  display: inline-flex;
+  min-height: 42px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+}
+.admin-user-inline-note,
+.admin-user-resource-note {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.admin-user-reason-form,
+.admin-user-adjustment {
+  display: grid;
+  gap: 14px;
+}
+.admin-user-reason-form label,
+.admin-user-adjustment > label {
+  display: grid;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 650;
+}
+.admin-user-reason-form textarea,
+.admin-user-adjustment input,
+.admin-user-adjustment textarea,
+.admin-user-tab-heading select {
+  width: 100%;
+  min-height: 42px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 9px 10px;
+  color: var(--ink);
+  background: var(--card);
+  font: inherit;
+}
+.admin-user-reason-form textarea,
+.admin-user-adjustment textarea {
+  resize: vertical;
+  line-height: 1.45;
+}
+.admin-user-reason-form small,
+.admin-user-adjustment small {
+  color: var(--muted);
+  font-weight: 400;
+}
+.admin-user-consequence {
+  margin: 0;
+  padding: 11px 12px;
+  border-radius: 9px;
+  color: var(--supporting-ink);
+  background: var(--panel);
+  line-height: 1.5;
+}
+.admin-user-tab-stack {
+  display: grid;
+  gap: 14px;
+}
+.admin-user-tab-heading {
+  align-items: end;
+}
+.admin-user-tab-heading label {
+  display: grid;
+  min-width: 150px;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 650;
+}
+.admin-user-detail-state,
+.admin-user-detail-fatal {
+  display: grid;
+  min-height: 170px;
+  place-items: center;
+  align-content: center;
+  gap: 10px;
+  padding: 24px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  color: var(--muted);
+  background: var(--card);
+  text-align: center;
+}
+.admin-user-detail-state p,
+.admin-user-detail-fatal p,
+.admin-user-detail-fatal h1 {
+  margin: 0;
+}
+.admin-user-detail-state.error,
+.admin-user-detail-fatal > svg {
+  color: var(--danger);
+}
+.admin-user-detail-fatal > div {
+  display: flex;
+  gap: 8px;
+}
+.admin-user-resource-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.admin-user-resource-list li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 11px;
+  padding: 13px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--card);
+}
+.admin-user-resource-icon {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 10px;
+  color: var(--purple);
+  background: var(--purple-soft);
+}
+.admin-user-resource-main {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+.admin-user-resource-main span,
+.admin-user-resource-main small {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+  font-size: 10px;
+}
+.admin-user-resource-list .admin-user-resource-note {
+  grid-column: 2 / -1;
+  margin: -3px 0 0;
+}
+.admin-user-token-list {
+  display: grid;
+  gap: 10px;
+}
+.admin-user-token-card {
+  display: grid;
+  gap: 13px;
+}
+.admin-user-token-card > header {
+  align-items: center;
+}
+.admin-user-token-card > header > div {
+  display: grid;
+  min-width: 0;
+  flex: 1;
+  gap: 3px;
+}
+.admin-user-token-card code {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.admin-user-token-card .scope-list {
+  flex-wrap: wrap;
+}
+.admin-user-token-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+.admin-user-detail-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 9px;
+}
+.admin-user-detail-pagination button,
+.admin-user-billing-tools,
+.admin-user-billing-tools > a {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.admin-user-detail-pagination span {
+  color: var(--muted);
+  font-size: 11px;
+}
+.admin-user-balance-hero {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 22px;
+  border-radius: 15px;
+  color: #fff;
+  background: linear-gradient(120deg, #302848, #604c90);
+  box-shadow: 0 13px 32px #4a3c7028;
+}
+.admin-user-balance-hero > div {
+  display: grid;
+  gap: 4px;
+}
+.admin-user-balance-hero p {
+  margin: 0;
+  font: 9px "DM Mono", monospace;
+  letter-spacing: 0.1em;
+  opacity: 0.7;
+}
+.admin-user-balance-hero strong {
+  font-size: 30px;
+}
+.admin-user-balance-hero small {
+  opacity: 0.72;
+}
+.admin-user-billing-tools {
+  align-items: end;
+}
+.admin-user-billing-tools label {
+  display: grid;
+  gap: 4px;
+}
+.admin-user-ledger-wrap {
+  width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--card);
+}
+.admin-user-ledger {
+  width: 100%;
+  min-width: 760px;
+  border-collapse: collapse;
+  text-align: left;
+}
+.admin-user-ledger th,
+.admin-user-ledger td {
+  padding: 11px 12px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+  font-size: 11px;
+}
+.admin-user-ledger th {
+  color: var(--muted);
+  background: var(--panel);
+  font-size: 9px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+.admin-user-ledger tbody tr:last-child td {
+  border-bottom: 0;
+}
+.admin-user-ledger td.positive {
+  color: var(--green);
+  font-weight: 700;
+}
+.admin-user-ledger td.negative {
+  color: var(--danger);
+  font-weight: 700;
+}
+.admin-user-ledger td:last-child > span {
+  display: grid;
+  gap: 3px;
+}
+.admin-user-ledger td:last-child small,
+.admin-user-ledger code {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.admin-user-adjustment fieldset {
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.admin-user-adjustment legend {
+  margin-bottom: 6px;
+  font-size: 11px;
+  font-weight: 650;
+}
+.admin-user-segmented {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  padding: 4px;
+  border-radius: 10px;
+  background: var(--panel);
+}
+.admin-user-segmented label {
+  display: flex;
+  min-height: 40px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border-radius: 7px;
+  background: var(--card);
+  font-weight: 650;
+}
+.admin-user-adjustment-preview {
+  margin: 0;
+}
+
+@media (max-width: 900px) {
+  .admin-user-account-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 760px) {
+  .admin-user-detail-page {
+    gap: 14px;
+  }
+  .admin-user-detail-header {
+    grid-template-columns: auto minmax(0, 1fr);
+    padding: 15px;
+  }
+  .admin-user-detail-balance {
+    grid-column: 1 / -1;
+    justify-items: start;
+    padding-top: 13px;
+    border-top: 1px solid var(--line);
+  }
+  .admin-user-tabs {
+    margin: 0 -12px;
+    padding-right: 12px;
+    padding-left: 12px;
+    border-right: 0;
+    border-left: 0;
+    border-radius: 0;
+  }
+  .admin-user-tabs button,
+  .admin-user-detail-actions button,
+  .admin-user-resource-list button,
+  .admin-user-token-actions button,
+  .admin-user-detail-pagination button {
+    min-height: 44px;
+  }
+  .admin-user-tab-heading,
+  .admin-user-balance-hero {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .admin-user-tab-heading label {
+    width: 100%;
+  }
+  .admin-user-resource-list li {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+  }
+  .admin-user-resource-list li > button {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
+  .admin-user-resource-list .admin-user-resource-note {
+    grid-column: 1 / -1;
+  }
+  .admin-user-resource-facts,
+  .admin-user-facts {
+    grid-template-columns: 1fr;
+  }
+  .admin-user-token-actions button,
+  .admin-user-balance-hero > button {
+    width: 100%;
+    min-height: 44px;
+  }
+  .admin-user-billing-tools {
+    display: grid;
+    width: 100%;
+    grid-template-columns: 1fr;
+  }
+  .admin-user-billing-tools > a {
+    min-height: 44px;
+    justify-content: center;
+  }
+  .admin-user-detail-pagination {
+    justify-content: space-between;
+  }
+}
+
+@media (max-width: 420px) {
+  .admin-user-detail-avatar {
+    width: 44px;
+    height: 44px;
+    border-radius: 12px;
+  }
+  .admin-user-detail-header h1 {
+    font-size: 20px;
+  }
+  .admin-user-card,
+  .admin-user-token-card {
+    padding: 14px;
+  }
+  .admin-user-detail-fatal > div,
+  .admin-user-adjustment-preview {
+    grid-template-columns: 1fr;
+  }
+  .admin-user-detail-fatal > div {
+    display: grid;
+    width: 100%;
+  }
+}

@@ -64,6 +64,98 @@ describe("operational admin API", () => {
   });
 });
 
+describe("admin user security and billing API", () => {
+  const userId = "00000000-0000-4000-8000-000000000010";
+
+  it("uses target-bound paginated resource endpoints", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json({ data: [], nextCursor: null }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(Response.json({ data: [], nextCursor: null }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(Response.json({ data: [], nextCursor: null }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.adminUserSessions(userId, { source: "better_auth", status: "active", limit: 25 });
+    await api.revokeAdminUserSession(
+      userId,
+      "better_auth",
+      "better_auth:opaque/session",
+      "Compromised",
+    );
+    await api.adminUserApiTokens(userId, { status: "active", cursor: "token-cursor", limit: 25 });
+    await api.revokeAdminUserApiToken(userId, "token/id", 4, "No longer needed");
+    await api.adminUserLedger(userId, { kind: "adjustment", cursor: "ledger-cursor", limit: 25 });
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      `/api/admin/users/${userId}/sessions?source=better_auth&status=active&limit=25`,
+      `/api/admin/users/${userId}/sessions/better_auth/opaque%2Fsession/revoke`,
+      `/api/admin/users/${userId}/api-tokens?status=active&cursor=token-cursor&limit=25`,
+      `/api/admin/users/${userId}/api-tokens/token%2Fid/revoke`,
+      `/api/admin/users/${userId}/ledger?kind=adjustment&cursor=ledger-cursor&limit=25`,
+    ]);
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      expect.any(String),
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ reason: "Compromised" }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      4,
+      expect.any(String),
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ expectedVersion: 4, reason: "No longer needed" }),
+      }),
+    );
+  });
+
+  it("fails closed when a source-prefixed session identifier is inconsistent", () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    expect(() => api.revokeAdminUserSession(userId, "legacy", "better_auth:session", "reason"))
+      .toThrow("does not match its source");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("sends exact balance preconditions with a replay key", async () => {
+    const result = {
+      id: "adjustment-id",
+      targetUserId: userId,
+      actorId: "actor-id",
+      amountMicros: 1_234_567,
+      balanceBeforeMicros: 5_000_000,
+      balanceAfterMicros: 6_234_567,
+      reason: "Service recovery",
+      ledgerEntryId: "ledger-id",
+      auditEventId: "audit-id",
+      createdAt: "2026-07-14T00:00:00.000Z",
+      replayed: false,
+    };
+    const fetchMock = vi.fn().mockResolvedValue(Response.json(result));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(api.adjustAdminUserBalance(userId, {
+      amountMicros: 1_234_567,
+      expectedBalanceMicros: 5_000_000,
+      reason: "Service recovery",
+    }, "adjustment-key")).resolves.toEqual(result);
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/admin/users/${userId}/balance-adjustments`,
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({ "Idempotency-Key": "adjustment-key" }),
+        body: JSON.stringify({
+          amountMicros: 1_234_567,
+          expectedBalanceMicros: 5_000_000,
+          reason: "Service recovery",
+        }),
+      }),
+    );
+  });
+});
+
 describe("authentication errors", () => {
   it("normalizes Better Auth's top-level error envelope", async () => {
     const error = await responseError(

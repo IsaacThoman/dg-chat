@@ -1827,6 +1827,7 @@ kbd {
     flex: 1 1 auto;
   }
 }
+
 @media (max-width: 390px) {
   /* Keep the primary send action inside the composer while preserving 44px touch targets. */
   .composer-tools .tool-pill:disabled {

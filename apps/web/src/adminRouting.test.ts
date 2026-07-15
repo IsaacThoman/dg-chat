@@ -31,6 +31,10 @@ describe("admin routing", () => {
       provider: undefined,
       type: undefined,
       run: undefined,
+      userSearch: undefined,
+      userRole: undefined,
+      userState: undefined,
+      userDeletion: undefined,
     });
     expect(parseAdminSearch({ run: "run-123" }).run).toBe("run-123");
     expect(parseAdminSearch({ model: "x".repeat(161), bucket: "week" })).toMatchObject({
@@ -40,6 +44,31 @@ describe("admin routing", () => {
     expect(parseAdminSearch({ from: "2026-02-29", to: "bad" })).toMatchObject({
       from: undefined,
       to: undefined,
+    });
+  });
+
+  it("validates bookmarkable user-directory filters", () => {
+    expect(parseAdminSearch({
+      userSearch: "person@example.com",
+      userRole: "admin",
+      userState: "suspended",
+      userDeletion: "all",
+    })).toMatchObject({
+      userSearch: "person@example.com",
+      userRole: "admin",
+      userState: "suspended",
+      userDeletion: "all",
+    });
+    expect(parseAdminSearch({
+      userSearch: "x".repeat(201),
+      userRole: "owner",
+      userState: "disabled",
+      userDeletion: "forever",
+    })).toMatchObject({
+      userSearch: undefined,
+      userRole: undefined,
+      userState: undefined,
+      userDeletion: undefined,
     });
   });
 });
