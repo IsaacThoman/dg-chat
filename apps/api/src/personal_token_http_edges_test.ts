@@ -56,7 +56,7 @@ Deno.test("personal token HTTP ownership, CAS, lifecycle, policy, and secrecy ed
     (await app.request(`/api/admin/users/${otherUser.id}/approval`, {
       method: "PATCH",
       headers: adminHeaders,
-      body: JSON.stringify({ status: "approved" }),
+      body: JSON.stringify({ status: "approved", expectedVersion: otherUser.version }),
     })).status,
     200,
   );

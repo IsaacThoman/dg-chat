@@ -5,6 +5,9 @@ import {
 } from "@dg-chat/contracts";
 import type {
   AccountState,
+  AdminUser,
+  AdminUserPage,
+  AdminUserQuery,
   ApiTokenSummary,
   ApprovalStatus,
   Conversation,
@@ -38,7 +41,9 @@ import {
   API_SSE_REPLAY_REQUEST_MAX_EVENTS,
   apiResponseBodyByteLength,
   canonicalWorkspaceName,
+  decodeAdminUserCursor,
   DEFAULT_API_REPLAY_QUOTA,
+  encodeAdminUserCursor,
   MAX_ACTIVE_CONVERSATION_SHARES,
   MAX_CONVERSATION_SHARE_ATTACHMENTS,
   MAX_CONVERSATION_SHARE_CONTENT_CHARS,
@@ -56,10 +61,14 @@ import type {
   AdminAnalytics,
   AdminAnalyticsDistribution,
   AdminAnalyticsQuery,
+  AdminApprovalCommand,
+  AdminDeletionCommand,
   AdminJobPage,
   AdminJobQuery,
   AdminJobStatus,
   AdminJobSummary,
+  AdminRoleCommand,
+  AdminStateCommand,
   AdminTokenLookupPage,
   ApiIdempotencyEndpoint,
   ApiIdempotencyRequest,
@@ -643,6 +652,7 @@ export class MemoryRepository {
     if ([...this.users.values()].some((u) => u.email === input.email)) {
       throw new DomainError("email_taken", "An account with that email already exists", 409);
     }
+    const now = new Date().toISOString();
     const user: StoredUser = {
       id: input.id ?? crypto.randomUUID(),
       email: input.email,
@@ -652,18 +662,31 @@ export class MemoryRepository {
       approvalStatus: input.approvalStatus ?? "pending",
       state: input.state ?? "active",
       balanceMicros: 0,
-      emailVerifiedAt: input.emailVerified || input.approvalStatus === "approved"
-        ? new Date().toISOString()
-        : null,
-      createdAt: new Date().toISOString(),
+      emailVerifiedAt: input.emailVerified || input.approvalStatus === "approved" ? now : null,
+      deletedAt: null,
+      version: 1,
+      createdAt: now,
+      updatedAt: now,
     };
     this.users.set(user.id, user);
     return user;
   }
 
   publicUser(user: StoredUser): PublicUser {
-    const { passwordHash: _passwordHash, ...safe } = user;
-    return safe;
+    return {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      role: user.role,
+      approvalStatus: user.approvalStatus,
+      state: user.state,
+      balanceMicros: user.balanceMicros,
+      emailVerifiedAt: user.emailVerifiedAt,
+      deletedAt: user.deletedAt,
+      version: user.version,
+      createdAt: user.createdAt,
+      updatedAt: user.updatedAt,
+    };
   }
 
   findUserByEmail(email: string) {
@@ -675,6 +698,342 @@ export class MemoryRepository {
 
   listUsers(): PublicUser[] {
     return [...this.users.values()].map((user) => this.publicUser(user));
+  }
+
+  #isEffectiveAdmin(user: StoredUser): boolean {
+    return user.role === "admin" && user.approvalStatus === "approved" &&
+      user.state === "active" && user.deletedAt === null;
+  }
+
+  #adminUser(user: StoredUser): AdminUser {
+    return { ...this.publicUser(user), effectiveAdmin: this.#isEffectiveAdmin(user) };
+  }
+
+  #assertEffectiveAdminActor(actorId: string): void {
+    const actor = this.users.get(actorId);
+    if (!actor || !this.#isEffectiveAdmin(actor)) {
+      throw new DomainError(
+        "admin_authority_required",
+        "Administrator authority changed before the request completed",
+        403,
+      );
+    }
+  }
+
+  #adminTarget(
+    targetUserId: string,
+    expectedVersion: number,
+    reason?: string,
+    reasonRequired = false,
+  ): StoredUser {
+    if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 1) {
+      throw new DomainError("validation_error", "Expected version must be a positive integer", 422);
+    }
+    const normalizedReason = reason?.trim();
+    if (
+      (reasonRequired && !normalizedReason) ||
+      (reason !== undefined && (!normalizedReason || normalizedReason.length > 500))
+    ) {
+      throw new DomainError("validation_error", "Administrative reason is invalid", 422);
+    }
+    const user = this.users.get(targetUserId);
+    if (!user) throw new DomainError("not_found", "User not found", 404);
+    if (user.version !== expectedVersion) {
+      throw new DomainError("version_conflict", "User was modified by another administrator", 409);
+    }
+    return user;
+  }
+
+  #assertAdminCanLoseAuthority(user: StoredUser, remainsEffective: boolean): void {
+    if (!this.#isEffectiveAdmin(user) || remainsEffective) return;
+    const otherEffectiveAdmins = [...this.users.values()].filter((candidate) =>
+      candidate.id !== user.id && this.#isEffectiveAdmin(candidate)
+    );
+    if (otherEffectiveAdmins.length === 0) {
+      throw new DomainError("final_admin", "The final active administrator is protected", 409);
+    }
+  }
+
+  #invalidateFullAuthority(userId: string): void {
+    for (const [hash, session] of this.sessions) {
+      if (session.userId === userId && !session.limited) this.sessions.delete(hash);
+    }
+    const now = new Date().toISOString();
+    for (const token of this.tokens.values()) {
+      if (token.userId === userId && !token.revokedAt) {
+        token.revokedAt = now;
+        token.version++;
+      }
+    }
+    for (const token of this.identityTokens.values()) {
+      if (token.userId === userId && !token.consumedAt) token.consumedAt = now;
+    }
+  }
+
+  #withAtomicAdminMutation<T>(targetUserId: string, operation: () => T): T {
+    const userBefore = this.users.get(targetUserId)
+      ? structuredClone(this.users.get(targetUserId)!)
+      : undefined;
+    const sessionsBefore = [...this.sessions].filter(([, value]) => value.userId === targetUserId)
+      .map(([key, value]) => [key, structuredClone(value)] as const);
+    const tokensBefore = new Map(
+      [...this.tokens].filter(([, value]) => value.userId === targetUserId)
+        .map(([key, value]) => [key, structuredClone(value)]),
+    );
+    const identityTokensBefore = new Map(
+      [...this.identityTokens].filter(([, value]) => value.userId === targetUserId)
+        .map(([key, value]) => [key, structuredClone(value)]),
+    );
+    const ledgerLength = this.ledger.length;
+    const auditLength = this.auditEvents.length;
+    try {
+      return operation();
+    } catch (error) {
+      if (userBefore) {
+        const current = this.users.get(targetUserId);
+        if (current) Object.assign(current, userBefore);
+        else this.users.set(targetUserId, userBefore);
+      }
+      for (const [key, value] of this.sessions) {
+        if (value.userId === targetUserId) this.sessions.delete(key);
+      }
+      for (const [key, value] of sessionsBefore) this.sessions.set(key, value);
+      for (const [key, value] of this.tokens) {
+        if (value.userId !== targetUserId) continue;
+        const previous = tokensBefore.get(key);
+        if (previous) Object.assign(value, previous);
+        else this.tokens.delete(key);
+      }
+      for (const [key, value] of tokensBefore) {
+        if (!this.tokens.has(key)) this.tokens.set(key, value);
+      }
+      for (const [key, value] of this.identityTokens) {
+        if (value.userId !== targetUserId) continue;
+        const previous = identityTokensBefore.get(key);
+        if (previous) Object.assign(value, previous);
+        else this.identityTokens.delete(key);
+      }
+      for (const [key, value] of identityTokensBefore) {
+        if (!this.identityTokens.has(key)) this.identityTokens.set(key, value);
+      }
+      this.ledger.length = ledgerLength;
+      this.auditEvents.length = auditLength;
+      throw error;
+    }
+  }
+
+  #finishAdminMutation(
+    input: { actorId: string; targetUserId: string; reason?: string },
+    user: StoredUser,
+    action: string,
+    before: Record<string, unknown>,
+  ): AdminUser {
+    const reason = input.reason?.trim();
+    user.version++;
+    user.updatedAt = new Date().toISOString();
+    this.recordAudit({
+      actorId: input.actorId,
+      action,
+      targetType: "user",
+      targetId: user.id,
+      metadata: {
+        before,
+        after: {
+          role: user.role,
+          approvalStatus: user.approvalStatus,
+          state: user.state,
+          deleted: user.deletedAt !== null,
+          version: user.version,
+        },
+        ...(reason ? { reason } : {}),
+      },
+    });
+    return this.#adminUser(user);
+  }
+
+  listAdminUsers(query: AdminUserQuery = {}): AdminUserPage {
+    const limit = query.limit ?? 50;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new DomainError("validation_error", "User limit must be between 1 and 100", 422);
+    }
+    const search = query.search?.trim().toLocaleLowerCase();
+    if (search && search.length > 200) {
+      throw new DomainError("validation_error", "User search is too long", 422);
+    }
+    const cursor = query.cursor ? decodeAdminUserCursor(query.cursor, query) : undefined;
+    if (query.cursor && !cursor) {
+      throw new DomainError("validation_error", "Invalid user cursor", 422);
+    }
+    const deletion = query.deletion ?? "present";
+    const rows = [...this.users.values()].filter((user) =>
+      (!search || user.name.toLocaleLowerCase().includes(search) ||
+        user.email.toLocaleLowerCase().includes(search)) &&
+      (!query.role || user.role === query.role) &&
+      (!query.approvalStatus || user.approvalStatus === query.approvalStatus) &&
+      (!query.state || user.state === query.state) &&
+      (query.emailVerified === undefined ||
+        Boolean(user.emailVerifiedAt) === query.emailVerified) &&
+      (deletion === "all" || (deletion === "deleted") === (user.deletedAt !== null)) &&
+      (!cursor || user.createdAt < cursor.createdAt ||
+        (user.createdAt === cursor.createdAt && user.id < cursor.id))
+    ).sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
+    const page = rows.slice(0, limit);
+    return {
+      data: page.map((user) => this.#adminUser(user)),
+      nextCursor: rows.length > limit ? encodeAdminUserCursor(page[page.length - 1], query) : null,
+    };
+  }
+
+  getAdminUser(id: string): AdminUser {
+    const user = this.users.get(id);
+    if (!user) throw new DomainError("not_found", "User not found", 404);
+    return this.#adminUser(user);
+  }
+
+  decideUserApproval(input: AdminApprovalCommand): AdminUser {
+    this.#assertEffectiveAdminActor(input.actorId);
+    return this.#withAtomicAdminMutation(input.targetUserId, () => {
+      const user = this.#adminTarget(
+        input.targetUserId,
+        input.expectedVersion,
+        input.reason,
+        input.status === "rejected",
+      );
+      if (user.approvalStatus === input.status) {
+        throw new DomainError("no_state_change", "Approval status is unchanged", 409);
+      }
+      if (input.actorId === user.id && input.status === "rejected") {
+        throw new DomainError("self_action_forbidden", "You cannot reject your own account", 403);
+      }
+      if (
+        input.status === "approved" && input.requireEmailVerification && !user.emailVerifiedAt
+      ) throw new DomainError("email_not_verified", "Email must be verified before approval", 409);
+      const remainsEffective = user.role === "admin" && input.status === "approved" &&
+        user.state === "active" && user.deletedAt === null;
+      this.#assertAdminCanLoseAuthority(user, remainsEffective);
+      if (
+        !Number.isSafeInteger(input.startingCreditMicros) || input.startingCreditMicros < 0 ||
+        input.startingCreditMicros > 1_000_000_000
+      ) throw new DomainError("validation_error", "Starting credit is invalid", 422);
+      const before = {
+        role: user.role,
+        approvalStatus: user.approvalStatus,
+        state: user.state,
+        deleted: user.deletedAt !== null,
+        version: user.version,
+      };
+      const alreadyGranted = this.ledger.some((entry) =>
+        entry.usageRunId === `approval:${user.id}` && entry.kind === "grant"
+      );
+      if (input.status === "approved" && input.startingCreditMicros > 0 && !alreadyGranted) {
+        this.credit(user.id, `approval:${user.id}`, "grant", input.startingCreditMicros);
+      }
+      user.approvalStatus = input.status;
+      if (input.status === "rejected") this.#invalidateFullAuthority(user.id);
+      return this.#finishAdminMutation(
+        input,
+        user,
+        `user.approval.${input.status}`,
+        before,
+      );
+    });
+  }
+
+  setAdminUserRole(input: AdminRoleCommand): AdminUser {
+    this.#assertEffectiveAdminActor(input.actorId);
+    return this.#withAtomicAdminMutation(input.targetUserId, () => {
+      const user = this.#adminTarget(input.targetUserId, input.expectedVersion, input.reason, true);
+      if (user.role === input.role) {
+        throw new DomainError("no_state_change", "Role is unchanged", 409);
+      }
+      if (input.actorId === user.id && input.role !== "admin") {
+        throw new DomainError("self_action_forbidden", "You cannot demote your own account", 403);
+      }
+      if (
+        input.role === "admin" &&
+        (user.approvalStatus !== "approved" || user.state !== "active" || user.deletedAt !== null)
+      ) {
+        throw new DomainError(
+          "invalid_transition",
+          "Only available approved users can be promoted",
+          409,
+        );
+      }
+      const remainsEffective = input.role === "admin" && user.approvalStatus === "approved" &&
+        user.state === "active" && user.deletedAt === null;
+      this.#assertAdminCanLoseAuthority(user, remainsEffective);
+      const before = {
+        role: user.role,
+        approvalStatus: user.approvalStatus,
+        state: user.state,
+        deleted: user.deletedAt !== null,
+        version: user.version,
+      };
+      user.role = input.role;
+      return this.#finishAdminMutation(input, user, `user.role.${input.role}`, before);
+    });
+  }
+
+  setAdminUserState(input: AdminStateCommand): AdminUser {
+    this.#assertEffectiveAdminActor(input.actorId);
+    return this.#withAtomicAdminMutation(input.targetUserId, () => {
+      const user = this.#adminTarget(
+        input.targetUserId,
+        input.expectedVersion,
+        input.reason,
+        input.state === "suspended",
+      );
+      if (user.state === input.state) {
+        throw new DomainError("no_state_change", "Account state is unchanged", 409);
+      }
+      if (input.actorId === user.id && input.state === "suspended") {
+        throw new DomainError("self_action_forbidden", "You cannot suspend your own account", 403);
+      }
+      const remainsEffective = user.role === "admin" && user.approvalStatus === "approved" &&
+        input.state === "active" && user.deletedAt === null;
+      this.#assertAdminCanLoseAuthority(user, remainsEffective);
+      const before = {
+        role: user.role,
+        approvalStatus: user.approvalStatus,
+        state: user.state,
+        deleted: user.deletedAt !== null,
+        version: user.version,
+      };
+      user.state = input.state;
+      if (input.state === "suspended") this.#invalidateFullAuthority(user.id);
+      return this.#finishAdminMutation(input, user, `user.state.${input.state}`, before);
+    });
+  }
+
+  setAdminUserDeleted(input: AdminDeletionCommand): AdminUser {
+    this.#assertEffectiveAdminActor(input.actorId);
+    return this.#withAtomicAdminMutation(input.targetUserId, () => {
+      const user = this.#adminTarget(input.targetUserId, input.expectedVersion, input.reason, true);
+      if ((user.deletedAt !== null) === input.deleted) {
+        throw new DomainError("no_state_change", "Deletion status is unchanged", 409);
+      }
+      if (input.actorId === user.id && input.deleted) {
+        throw new DomainError("self_action_forbidden", "You cannot delete your own account", 403);
+      }
+      const remainsEffective = user.role === "admin" && user.approvalStatus === "approved" &&
+        user.state === "active" && !input.deleted;
+      this.#assertAdminCanLoseAuthority(user, remainsEffective);
+      const before = {
+        role: user.role,
+        approvalStatus: user.approvalStatus,
+        state: user.state,
+        deleted: user.deletedAt !== null,
+        version: user.version,
+      };
+      user.deletedAt = input.deleted ? new Date().toISOString() : null;
+      if (input.deleted) this.#invalidateFullAuthority(user.id);
+      return this.#finishAdminMutation(
+        input,
+        user,
+        input.deleted ? "user.deleted" : "user.restored",
+        before,
+      );
+    });
   }
 
   createSession(userId: string, tokenHash: string, limited: boolean): StoredSession {
@@ -758,14 +1117,24 @@ export class MemoryRepository {
         400,
       );
     }
-    token.consumedAt = new Date().toISOString();
     const user = this.users.get(token.userId)!;
+    if (user.state !== "active" || user.deletedAt !== null) {
+      throw new DomainError(
+        "invalid_identity_token",
+        "Verification token is invalid or expired",
+        400,
+      );
+    }
+    token.consumedAt = new Date().toISOString();
     user.emailVerifiedAt = new Date().toISOString();
     return user;
   }
   markUserEmailVerified(userId: string) {
     const user = this.users.get(userId);
     if (!user) throw new DomainError("not_found", "User not found", 404);
+    if (user.state !== "active" || user.deletedAt !== null) {
+      throw new DomainError("account_unavailable", "Account is unavailable", 403);
+    }
     user.emailVerifiedAt ??= new Date().toISOString();
     return user;
   }
@@ -775,8 +1144,11 @@ export class MemoryRepository {
       !token || token.purpose !== "password_reset" || token.consumedAt ||
       Date.parse(token.expiresAt) <= Date.now()
     ) throw new DomainError("invalid_identity_token", "Reset token is invalid or expired", 400);
-    token.consumedAt = new Date().toISOString();
     const user = this.users.get(token.userId)!;
+    if (user.state !== "active" || user.deletedAt !== null) {
+      throw new DomainError("invalid_identity_token", "Reset token is invalid or expired", 400);
+    }
+    token.consumedAt = new Date().toISOString();
     user.passwordHash = passwordHash;
     this.invalidateUserSessions(user.id);
     for (const apiToken of this.tokens.values()) {
@@ -802,6 +1174,9 @@ export class MemoryRepository {
   secureAfterPasswordReset(userId: string, _token: string) {
     const user = this.users.get(userId);
     if (!user) throw new DomainError("not_found", "User not found", 404);
+    if (user.state !== "active" || user.deletedAt !== null) {
+      throw new DomainError("account_unavailable", "Account is unavailable", 403);
+    }
     user.passwordHash = null;
     this.invalidateUserSessions(userId);
     for (const token of this.tokens.values()) {
@@ -860,65 +1235,6 @@ export class MemoryRepository {
       data,
       nextCursor: matches.length > limit ? encodeAuditCursor(data[data.length - 1]) : null,
     };
-  }
-
-  approveUser(
-    id: string,
-    status: "approved" | "rejected",
-    creditMicros: number,
-    requireEmailVerification = false,
-  ): StoredUser {
-    const user = this.users.get(id);
-    if (!user) throw new DomainError("not_found", "User not found", 404);
-    if (status === "approved" && requireEmailVerification && !user.emailVerifiedAt) {
-      throw new DomainError("email_not_verified", "Email must be verified before approval", 409);
-    }
-    if (user.role === "admin" && status === "rejected") {
-      const availableAdmins = [...this.users.values()].filter((candidate) =>
-        candidate.role === "admin" && candidate.state === "active" &&
-        candidate.approvalStatus === "approved"
-      );
-      if (availableAdmins.length === 1 && availableAdmins[0].id === id) {
-        throw new DomainError("final_admin", "The final approved administrator is protected", 409);
-      }
-    }
-    user.approvalStatus = status;
-    const alreadyGranted = this.ledger.some((entry) =>
-      entry.usageRunId === `approval:${id}` && entry.kind === "grant"
-    );
-    if (status === "approved" && creditMicros > 0 && !alreadyGranted) {
-      this.credit(id, `approval:${id}`, "grant", creditMicros);
-    }
-    if (status === "rejected") {
-      for (const [hash, session] of this.sessions) {
-        if (session.userId === id && !session.limited) this.sessions.delete(hash);
-      }
-      for (const token of this.tokens.values()) {
-        if (token.userId === id && !token.revokedAt) token.revokedAt = new Date().toISOString();
-      }
-    }
-    return user;
-  }
-
-  setUserState(id: string, state: AccountState) {
-    const user = this.users.get(id);
-    if (!user) throw new DomainError("not_found", "User not found", 404);
-    if (user.role === "admin" && state !== "active") {
-      const activeAdmins = [...this.users.values()].filter((u) =>
-        u.role === "admin" && u.state === "active"
-      );
-      if (activeAdmins.length === 1) {
-        throw new DomainError("final_admin", "The final active administrator is protected", 409);
-      }
-    }
-    user.state = state;
-    if (state !== "active") {
-      this.invalidateUserSessions(id);
-      for (const token of this.tokens.values()) {
-        if (token.userId === id && !token.revokedAt) token.revokedAt = new Date().toISOString();
-      }
-    }
-    return user;
   }
 
   createConversation(
@@ -1488,7 +1804,8 @@ export class MemoryRepository {
   ): Promise<CreateConversationShareResult> {
     const user = this.users.get(ownerId);
     if (
-      !user || user.approvalStatus !== "approved" || user.state !== "active"
+      !user || user.approvalStatus !== "approved" || user.state !== "active" ||
+      user.deletedAt !== null
     ) throw new DomainError("account_unavailable", "Account cannot create shares", 403);
     if (
       !input.idempotencyKey || input.idempotencyKey.length > 200 ||
@@ -1785,7 +2102,8 @@ export class MemoryRepository {
     if (
       !value || !user || !Number.isFinite(instant) || value.summary.revokedAt ||
       (value.summary.expiresAt !== null && Date.parse(value.summary.expiresAt) <= instant) ||
-      user.approvalStatus !== "approved" || user.state !== "active"
+      user.approvalStatus !== "approved" || user.state !== "active" ||
+      user.deletedAt !== null
     ) return undefined;
     return structuredClone(value.publicSnapshot);
   }
@@ -5408,10 +5726,22 @@ export class MemoryRepository {
     if (duplicate) return duplicate;
     const user = this.users.get(userId);
     if (!user) throw new DomainError("not_found", "User not found", 404);
-    if (user.balanceMicros + amountMicros < 0) {
+    const nextBalanceMicros = user.balanceMicros + amountMicros;
+    if (
+      !Number.isSafeInteger(user.balanceMicros) ||
+      !Number.isSafeInteger(amountMicros) ||
+      !Number.isSafeInteger(nextBalanceMicros)
+    ) {
+      throw new DomainError(
+        "validation_error",
+        "Credit amount and resulting balance must be safe integers",
+        422,
+      );
+    }
+    if (nextBalanceMicros < 0) {
       throw new DomainError("insufficient_credit", "Insufficient credit", 402);
     }
-    user.balanceMicros += amountMicros;
+    user.balanceMicros = nextBalanceMicros;
     const entry: LedgerEntry = {
       id: crypto.randomUUID(),
       userId,

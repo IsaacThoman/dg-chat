@@ -69,9 +69,30 @@ type RawUser = {
   email: string;
   role: "user" | "admin";
   approvalStatus: "pending" | "approved" | "rejected";
-  state: "active" | "suspended" | "deleted";
+  state: "active" | "suspended";
   balanceMicros: number;
   emailVerifiedAt?: string | null;
+  deletedAt: string | null;
+  version: number;
+  updatedAt: string;
+  createdAt: string;
+  effectiveAdmin?: boolean;
+};
+
+export type AdminUserFilters = {
+  search?: string;
+  role?: "user" | "admin";
+  approvalStatus?: "pending" | "approved" | "rejected";
+  state?: "active" | "suspended";
+  deletion?: "present" | "deleted" | "all";
+  emailVerified?: boolean;
+  cursor?: string;
+  limit?: number;
+};
+
+export type AdminUserPage = {
+  data: User[];
+  nextCursor: string | null;
 };
 type RawConversation = {
   id: string;
@@ -144,8 +165,10 @@ export type ToolExecution = {
 };
 
 function mapUser(user: RawUser, limited = false): User {
-  const status = user.state === "suspended" || user.state === "deleted"
-    ? user.state
+  const status = user.deletedAt
+    ? "deleted"
+    : user.state === "suspended"
+    ? "suspended"
     : user.approvalStatus;
   return {
     ...user,
@@ -742,20 +765,66 @@ export const api = {
       outputTokens: number;
       spentMicros: number;
     }>("/usage"),
-  adminUsers: async () =>
-    (await request<{ data: RawUser[] }>("/admin/users")).data.map((user) => mapUser(user)),
-  approveUser: async (id: string, status: "approved" | "rejected") =>
+  adminUsers: async (filters: AdminUserFilters = {}): Promise<AdminUserPage> => {
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(filters)) {
+      if (value !== undefined && value !== "") params.set(key, String(value));
+    }
+    const suffix = params.size ? `?${params}` : "";
+    const page = await request<{ data: RawUser[]; nextCursor: string | null }>(
+      `/admin/users${suffix}`,
+    );
+    return { data: page.data.map((user) => mapUser(user)), nextCursor: page.nextCursor };
+  },
+  adminUser: async (id: string) => mapUser(await request<RawUser>(`/admin/users/${id}`)),
+  approveUser: async (
+    id: string,
+    status: "approved" | "rejected",
+    expectedVersion: number,
+    options: { startingCreditMicros?: number; reason?: string } = {},
+  ) =>
     mapUser(
       await request<RawUser>(`/admin/users/${id}/approval`, {
         method: "PATCH",
-        body: JSON.stringify({ status }),
+        body: JSON.stringify({ status, expectedVersion, ...options }),
       }),
     ),
-  setUserState: async (id: string, state: "active" | "suspended" | "deleted") =>
+  setUserRole: async (
+    id: string,
+    role: "user" | "admin",
+    expectedVersion: number,
+    reason: string,
+  ) =>
+    mapUser(
+      await request<RawUser>(`/admin/users/${id}/role`, {
+        method: "PATCH",
+        body: JSON.stringify({ role, expectedVersion, reason }),
+      }),
+    ),
+  setUserState: async (
+    id: string,
+    state: "active" | "suspended",
+    expectedVersion: number,
+    reason?: string,
+  ) =>
     mapUser(
       await request<RawUser>(`/admin/users/${id}/state`, {
         method: "PATCH",
-        body: JSON.stringify({ state }),
+        body: JSON.stringify({ state, expectedVersion, ...(reason ? { reason } : {}) }),
+      }),
+    ),
+  deleteUser: async (id: string, expectedVersion: number, reason: string) =>
+    mapUser(
+      await request<RawUser>(`/admin/users/${id}/delete`, {
+        method: "POST",
+        body: JSON.stringify({ expectedVersion, reason }),
+      }),
+    ),
+  restoreUser: async (id: string, expectedVersion: number, reason: string) =>
+    mapUser(
+      await request<RawUser>(`/admin/users/${id}/restore`, {
+        method: "POST",
+        body: JSON.stringify({ expectedVersion, reason }),
       }),
     ),
   signIn: async (email: string, password: string) => {
@@ -873,6 +942,7 @@ export const api = {
     request<{ calls: number; users: number; balanceMicros: number; ledger: unknown[] }>(
       "/admin/usage",
     ),
+  adminSettings: () => request<{ defaultApprovalCreditMicros: number }>("/admin/settings"),
   adminAnalytics: (filters: AdminAnalyticsFilters) =>
     request<AdminAnalyticsData>(`/admin/analytics?${adminAnalyticsQuery(filters)}`),
   adminAnalyticsCsvUrl: (filters: AdminAnalyticsFilters) =>

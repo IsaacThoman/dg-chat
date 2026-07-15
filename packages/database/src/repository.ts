@@ -1,5 +1,8 @@
 import type {
   AccountState,
+  AdminUser,
+  AdminUserPage,
+  AdminUserQuery,
   ApiTokenSummary,
   ApprovalStatus,
   Conversation,
@@ -91,6 +94,119 @@ export interface CreateUserInput {
   approvalStatus?: ApprovalStatus;
   state?: AccountState;
   emailVerified?: boolean;
+}
+
+export interface AdminUserCommand {
+  actorId: string;
+  targetUserId: string;
+  expectedVersion: number;
+  reason?: string;
+}
+
+export interface AdminApprovalCommand extends AdminUserCommand {
+  status: "approved" | "rejected";
+  startingCreditMicros: number;
+  requireEmailVerification?: boolean;
+}
+
+export interface AdminRoleCommand extends AdminUserCommand {
+  role: UserRole;
+  reason: string;
+}
+
+export interface AdminStateCommand extends AdminUserCommand {
+  state: AccountState;
+}
+
+export interface AdminDeletionCommand extends AdminUserCommand {
+  deleted: boolean;
+  reason: string;
+}
+
+const ADMIN_USER_CURSOR_VERSION = 2;
+const LEGACY_ADMIN_USER_CURSOR_VERSION = 1;
+const MAX_ADMIN_USER_CURSOR_MICROS = 253_402_300_799_999_999n;
+
+function validAdminUserCursorMicros(value: unknown, createdAt: string): value is string {
+  if (typeof value !== "string" || !/^\d{1,18}$/.test(value)) return false;
+  try {
+    const micros = BigInt(value);
+    return micros <= MAX_ADMIN_USER_CURSOR_MICROS &&
+      micros / 1_000n === BigInt(Date.parse(createdAt));
+  } catch {
+    return false;
+  }
+}
+
+/** Bind pagination cursors to the normalized filters that produced them. */
+export function adminUserQueryFingerprint(query: AdminUserQuery): string {
+  return JSON.stringify({
+    search: query.search?.trim().toLocaleLowerCase() || null,
+    role: query.role ?? null,
+    approvalStatus: query.approvalStatus ?? null,
+    state: query.state ?? null,
+    deletion: query.deletion ?? "present",
+    emailVerified: query.emailVerified ?? null,
+  });
+}
+
+export function encodeAdminUserCursor(
+  value: Pick<PublicUser, "createdAt" | "id">,
+  query: AdminUserQuery,
+  createdAtMicros?: string,
+): string {
+  if (
+    createdAtMicros !== undefined && !validAdminUserCursorMicros(createdAtMicros, value.createdAt)
+  ) {
+    throw new TypeError("Admin user cursor microseconds must match its timestamp");
+  }
+  const bytes = new TextEncoder().encode(JSON.stringify([
+    ADMIN_USER_CURSOR_VERSION,
+    value.createdAt,
+    value.id,
+    adminUserQueryFingerprint(query),
+    createdAtMicros ?? null,
+  ]));
+  return btoa(String.fromCharCode(...bytes)).replaceAll("+", "-").replaceAll("/", "_").replace(
+    /=+$/,
+    "",
+  );
+}
+
+export function decodeAdminUserCursor(
+  cursor: string,
+  query: AdminUserQuery,
+): { createdAt: string; id: string; createdAtMicros?: string } | undefined {
+  try {
+    const base64 = cursor.replaceAll("-", "+").replaceAll("_", "/");
+    const binary = atob(base64.padEnd(Math.ceil(base64.length / 4) * 4, "="));
+    const value = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(
+        Uint8Array.from(binary, (character) => character.charCodeAt(0)),
+      ),
+    );
+    if (!Array.isArray(value)) return undefined;
+    const legacy = value[0] === LEGACY_ADMIN_USER_CURSOR_VERSION && value.length === 4;
+    const current = value[0] === ADMIN_USER_CURSOR_VERSION && value.length === 5;
+    const parsedCreatedAt = typeof value[1] === "string" ? Date.parse(value[1]) : Number.NaN;
+    if (
+      (!legacy && !current) ||
+      typeof value[1] !== "string" || !Number.isFinite(parsedCreatedAt) ||
+      new Date(parsedCreatedAt).toISOString() !== value[1] ||
+      typeof value[2] !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+        .test(value[2]) ||
+      value[3] !== adminUserQueryFingerprint(query) ||
+      (current && value[4] !== null && !validAdminUserCursorMicros(value[4], value[1]))
+    ) return undefined;
+    return {
+      createdAt: value[1],
+      id: value[2],
+      ...(current && value[4] !== null ? { createdAtMicros: value[4] } : {}),
+    };
+  } catch {
+    return undefined;
+  }
 }
 export type IdentityTokenPurpose = "email_verification" | "password_reset";
 export interface SessionSummary {
@@ -1716,6 +1832,8 @@ export interface DomainRepository {
   findUser(id: string): MaybePromise<StoredUser | undefined>;
   findUserByEmail(email: string): MaybePromise<StoredUser | undefined>;
   listUsers(): MaybePromise<PublicUser[]>;
+  listAdminUsers(query?: AdminUserQuery): MaybePromise<AdminUserPage>;
+  getAdminUser(id: string): MaybePromise<AdminUser>;
   createSession(userId: string, tokenHash: string, limited: boolean): MaybePromise<StoredSession>;
   getSession(tokenHash: string): MaybePromise<StoredSession | undefined>;
   invalidateUserSessions(userId: string): MaybePromise<void>;
@@ -1735,13 +1853,10 @@ export interface DomainRepository {
   secureAfterPasswordReset(userId: string, token: string): MaybePromise<void>;
   recordAudit(input: AuditEventInput): MaybePromise<AuditEvent>;
   listAudit(query?: AuditQuery): MaybePromise<AuditPage>;
-  approveUser(
-    id: string,
-    status: "approved" | "rejected",
-    creditMicros: number,
-    requireEmailVerification?: boolean,
-  ): MaybePromise<StoredUser>;
-  setUserState(id: string, state: AccountState): MaybePromise<StoredUser>;
+  decideUserApproval(input: AdminApprovalCommand): MaybePromise<AdminUser>;
+  setAdminUserRole(input: AdminRoleCommand): MaybePromise<AdminUser>;
+  setAdminUserState(input: AdminStateCommand): MaybePromise<AdminUser>;
+  setAdminUserDeleted(input: AdminDeletionCommand): MaybePromise<AdminUser>;
   createConversation(
     ownerId: string,
     title: string,

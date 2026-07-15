@@ -12,7 +12,11 @@ export default defineConfig({
   fullyParallel: false,
   forbidOnly: Boolean(env("CI")),
   retries: env("CI") ? 2 : 0,
-  workers: env("CI") ? 1 : undefined,
+  // Managed journeys share one self-hosted installation and intentionally exercise global limits,
+  // bootstrap state, retention, and account lifecycle. Parallel workers would race that state and
+  // exhaust the administrator's real authentication quota, so keep managed runs isolated locally
+  // as well as in CI. Externally provisioned test stacks may still opt into Playwright's default.
+  workers: env("CI") || env("E2E_MANAGED_SERVER") === "true" ? 1 : undefined,
   timeout: 45_000,
   expect: { timeout: 8_000 },
   reporter: env("CI")
@@ -38,6 +42,16 @@ export default defineConfig({
         url: `${env("E2E_API_URL") ?? "http://localhost:8000"}/health`,
         reuseExistingServer: !env("CI"),
         timeout: 120_000,
+        // Browser journeys repeatedly authenticate the same fixture administrator. Dedicated
+        // rate-limit tests cover the production defaults; a high managed-stack quota prevents
+        // unrelated journeys from becoming order- and wall-clock-dependent.
+        env: {
+          AUTH_RATE_LIMIT: env("E2E_AUTH_RATE_LIMIT") ?? "1000",
+          AUTH_CLIENT_RATE_LIMIT: env("E2E_AUTH_CLIENT_RATE_LIMIT") ?? "1000",
+          // Exercise the configured approval default instead of accidentally validating the
+          // product's built-in $5 fallback in every browser journey.
+          DEFAULT_APPROVAL_CREDIT_USD: env("DEFAULT_APPROVAL_CREDIT_USD") ?? "6.75",
+        },
       },
       {
         command: "deno task dev:web --host 0.0.0.0",

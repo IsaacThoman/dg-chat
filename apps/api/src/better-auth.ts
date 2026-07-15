@@ -233,7 +233,11 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
         verify: ({ hash, password }) => verifyPassword(password, hash),
       },
       sendResetPassword: options.sendPasswordResetEmail
-        ? ({ user, url, token }) => {
+        ? async ({ user, url, token }) => {
+          const domainUser = await options.repository.findUser(user.id);
+          if (
+            !domainUser || domainUser.state !== "active" || domainUser.deletedAt !== null
+          ) return;
           dispatchIdentityEmail(
             user.id,
             null,
@@ -241,7 +245,6 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
             "identity.password_reset_requested",
             "identity.password_reset_delivery_failed",
           );
-          return Promise.resolve();
         }
         : undefined,
       onPasswordReset: async ({ user }, request) => {
@@ -313,7 +316,10 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
             const authUser = await loadAuthUser(session.userId);
             if (authUser) domainUser = await provisionDomainUser(authUser);
             if (!domainUser) return { data: { ...session, limited: true } };
-            if (domainUser.state !== "active" || domainUser.passwordResetPending === true) {
+            if (
+              domainUser.state !== "active" || domainUser.deletedAt !== null ||
+              domainUser.passwordResetPending === true
+            ) {
               return false;
             }
             const limited = domainUser.approvalStatus !== "approved" ||
@@ -340,7 +346,8 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
         emailVerified: result.user.emailVerified,
       });
       if (
-        !domainUser || domainUser.state !== "active" || domainUser.passwordResetPending === true ||
+        !domainUser || domainUser.state !== "active" || domainUser.deletedAt !== null ||
+        domainUser.passwordResetPending === true ||
         normalizeEmail(domainUser.email) !== normalizeEmail(result.user.email)
       ) return null;
       const domainLimited = domainUser.approvalStatus !== "approved" ||

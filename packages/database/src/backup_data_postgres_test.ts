@@ -294,6 +294,12 @@ Deno.test({
 
       const legacyCaptured = structuredClone(captured);
       legacyCaptured.set(
+        "users",
+        legacyCaptured.get("users")!.map((batch) =>
+          batch.map(({ version: _version, ...row }) => row)
+        ),
+      );
+      legacyCaptured.set(
         "conversations",
         legacyCaptured.get("conversations")!.map((batch) =>
           batch.map(({ temporary_expires_at: _expiry, ...row }) => row)
@@ -308,6 +314,50 @@ Deno.test({
         },
       });
       assertEquals(legacyPreview.conversations, preview.conversations);
+
+      const deletedLegacyAdmin = structuredClone(captured);
+      deletedLegacyAdmin.set(
+        "users",
+        deletedLegacyAdmin.get("users")!.map((batch) =>
+          batch.map(({ version: _version, ...row }) => ({
+            ...row,
+            state: "deleted",
+            deleted_at: "2026-07-01T00:00:00.000Z",
+          }))
+        ),
+      );
+      await assertRejects(
+        () =>
+          dryRunBackupData(databaseUrl!, {
+            schemaVersion: "0034",
+            rows(name) {
+              return (async function* () {
+                for (const batch of deletedLegacyAdmin.get(name) ?? []) {
+                  yield structuredClone(batch);
+                }
+              })();
+            },
+          }),
+        BackupDataError,
+        "active approved administrator",
+      );
+
+      const independentlyDeletedAdmin = structuredClone(captured);
+      independentlyDeletedAdmin.set(
+        "users",
+        independentlyDeletedAdmin.get("users")!.map((batch) =>
+          batch.map((row) => ({
+            ...row,
+            state: "active",
+            deleted_at: "2026-07-01T00:00:00.000Z",
+          }))
+        ),
+      );
+      await assertRejects(
+        () => dryRunBackupData(databaseUrl!, replaySource(independentlyDeletedAdmin)),
+        BackupDataError,
+        "active approved administrator",
+      );
 
       let operation = await store.create({
         kind: "restore",

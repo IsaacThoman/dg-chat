@@ -70,7 +70,7 @@ import {
   Volume2,
   X,
 } from "lucide-react";
-import { api, ApiError } from "./api.ts";
+import { type AdminUserFilters, api, ApiError } from "./api.ts";
 import type { AdminSearch, AdminSection } from "./adminRouting.ts";
 import { AdminAnalyticsView, AdminJobsView } from "./AdminOperations.tsx";
 import { AdminRetentionView } from "./AdminRetention.tsx";
@@ -79,6 +79,13 @@ import { PersonalTokenSettings } from "./TokenGovernance.tsx";
 import { UserPortability } from "./UserPortability.tsx";
 import { ConversationShareButton } from "./ConversationSharing.tsx";
 import { identityDestination, pendingMode } from "./identityState.ts";
+import {
+  type AdminLifecycleAction,
+  adminLifecycleConsequence,
+  adminLifecycleErrorMessage,
+  formatStartingCreditMicros,
+  parseStartingCreditMicros,
+} from "./adminLifecycleUi.ts";
 import { SessionCenter } from "./SessionCenter.tsx";
 import {
   PASSWORD_MAX_LENGTH,
@@ -3441,15 +3448,14 @@ function AdminSectionContent(
   return <AdminBackupsView />;
 }
 function AdminOverview({ setSection }: { setSection: (section: AdminSection) => void }) {
-  const users = useQuery({ queryKey: ["admin-users"], queryFn: api.adminUsers });
+  const users = useQuery({ queryKey: ["admin-users"], queryFn: () => api.adminUsers() });
   const usage = useQuery({ queryKey: ["admin-usage"], queryFn: api.adminUsage });
   const providers = useQuery({ queryKey: ["admin-providers"], queryFn: api.adminProviders });
   const audit = useQuery({
     queryKey: ["admin-audit-overview"],
     queryFn: () => api.adminAudit({}, undefined, 3),
   });
-  const activeUsers = users.data?.filter((user) => user.status === "approved").length;
-  const pendingUsers = users.data?.filter((user) => user.status === "pending").length;
+  const pendingUsers = users.data?.data.filter((user) => user.status === "pending").length;
   const value = (number: number | undefined) =>
     number === undefined ? "—" : number.toLocaleString();
   return (
@@ -3461,9 +3467,9 @@ function AdminOverview({ setSection }: { setSection: (section: AdminSection) => 
       <div className="stats-grid">
         <Stat
           icon={Users}
-          label="Approved users"
-          value={value(activeUsers)}
-          trend="Current accounts"
+          label="Total users"
+          value={value(usage.data?.users)}
+          trend="All registered accounts"
         />
         <Stat
           icon={MessageSquare}
@@ -3474,8 +3480,12 @@ function AdminOverview({ setSection }: { setSection: (section: AdminSection) => 
         <Stat
           icon={UserCheck}
           label="Pending applicants"
-          value={value(pendingUsers)}
-          trend="Awaiting a decision"
+          value={pendingUsers === undefined
+            ? "—"
+            : `${pendingUsers}${users.data?.nextCursor ? "+" : ""}`}
+          trend={users.data?.nextCursor
+            ? "At least this many await a decision"
+            : "Awaiting a decision"}
         />
         <Stat
           icon={CircleDollarSign}
@@ -3592,88 +3602,609 @@ function Stat(
   );
 }
 function Applicants({ compact = false }: { compact?: boolean }) {
-  const users = useQuery({ queryKey: ["admin-users"], queryFn: api.adminUsers });
-  const applicants = users.data?.filter((user) => user.status === "pending") ?? [];
-  const decide = async (id: string, status: "approved" | "rejected") => {
-    await api.approveUser(id, status);
-    await users.refetch();
+  const client = useQueryClient();
+  const [cursors, setCursors] = useState<string[]>([]);
+  const cursor = compact ? undefined : cursors.at(-1);
+  const limit = compact ? 5 : 25;
+  const settings = useQuery({ queryKey: ["admin-settings"], queryFn: api.adminSettings });
+  const users = useQuery({
+    queryKey: ["admin-users", { approvalStatus: "pending", limit, cursor }],
+    queryFn: () => api.adminUsers({ approvalStatus: "pending", limit, cursor }),
+  });
+  const applicants = users.data?.data ?? [];
+  const [decision, setDecision] = useState<{ user: User; status: "approved" | "rejected" }>();
+  const [grantDollars, setGrantDollars] = useState("5.00");
+  const [reason, setReason] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [reauthRequired, setReauthRequired] = useState(false);
+  const defaultGrantDollars = settings.data
+    ? formatStartingCreditMicros(settings.data.defaultApprovalCreditMicros)
+    : undefined;
+  const openDecision = (user: User, status: "approved" | "rejected") => {
+    setDecision({ user, status });
+    setGrantDollars("");
+    setReason("");
+    setError("");
+    setReauthRequired(false);
+  };
+  const closeDecision = () => {
+    if (!busy) setDecision(undefined);
+  };
+  const decide = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!decision || (decision.status === "rejected" && !reason.trim())) return;
+    const startingCreditMicros = grantDollars.trim()
+      ? parseStartingCreditMicros(grantDollars)
+      : undefined;
+    if (
+      decision.status === "approved" && startingCreditMicros === undefined && !settings.data
+    ) {
+      setError(
+        "The server default is unavailable. Retry loading it or enter an explicit starting credit.",
+      );
+      return;
+    }
+    if (decision.status === "approved" && startingCreditMicros === null) {
+      setError("Starting credit must be between $0 and $1,000.");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    setReauthRequired(false);
+    try {
+      await api.approveUser(decision.user.id, decision.status, decision.user.version, {
+        ...(decision.status === "approved" && typeof startingCreditMicros === "number"
+          ? { startingCreditMicros }
+          : {}),
+        ...(reason.trim() ? { reason: reason.trim() } : {}),
+      });
+      setDecision(undefined);
+      void client.invalidateQueries({ queryKey: ["admin-users"] });
+    } catch (cause) {
+      const apiError = cause instanceof ApiError ? cause : undefined;
+      if (apiError?.code === "version_conflict") {
+        const latest = await api.adminUser(decision.user.id);
+        setDecision((current) => current ? { ...current, user: latest } : current);
+        setError(
+          "This application changed in another tab. Review the refreshed details and try again.",
+        );
+      } else if (apiError?.code === "recent_authentication_required") {
+        setReauthRequired(true);
+        setError("For security, sign out and sign in again before deciding applications.");
+      } else {
+        const fallback = cause instanceof Error
+          ? cause.message
+          : "The application could not be updated.";
+        setError(adminLifecycleErrorMessage(apiError?.code ?? "", fallback));
+      }
+    } finally {
+      setBusy(false);
+    }
   };
   return (
-    <div className="data-table">
-      {!compact && (
-        <div className="table-head">
-          <span>APPLICANT</span>
-          <span>DETAILS</span>
-          <span>REQUESTED</span>
-          <span>ACTIONS</span>
-        </div>
-      )}
-      {users.isError && <div className="empty-mini">Applicant data is unavailable</div>}
-      {!users.isLoading && !users.isError && !applicants.length && (
-        <div className="empty-mini">No pending applicants</div>
-      )}
-      {applicants.map((applicant) => (
-        <div className="applicant-row" key={applicant.id}>
-          <Avatar user={applicant} small />
-          <span>
-            <strong>{applicant.name}</strong>
-            <small>{applicant.email}</small>
-          </span>
-          {!compact && (
-            <span className="applicant-detail">
-              <small>Intended use</small>
-              <strong>Chat and API access</strong>
+    <>
+      <div className="data-table admin-applicant-table" aria-busy={users.isLoading}>
+        {!compact && (
+          <div className="table-head">
+            <span>APPLICANT</span>
+            <span>DETAILS</span>
+            <span>REQUESTED</span>
+            <span>ACTIONS</span>
+          </div>
+        )}
+        {users.isLoading && <div className="empty-mini">Loading applicants…</div>}
+        {users.isError && (
+          <div className="empty-mini" role="alert">
+            Applicant data is unavailable.{" "}
+            <button className="text-button" onClick={() => users.refetch()}>Retry</button>
+          </div>
+        )}
+        {!users.isLoading && !users.isError && !applicants.length && (
+          <div className="empty-mini">No pending applicants</div>
+        )}
+        {applicants.map((applicant) => (
+          <div className="applicant-row" key={applicant.id}>
+            <Avatar user={applicant} small />
+            <span>
+              <strong>{applicant.name}</strong>
+              <small>{applicant.email}</small>
             </span>
-          )}
-          <time>Pending</time>
-          <span className="applicant-actions">
-            <button className="approve" onClick={() => decide(applicant.id, "approved")}>
-              <Check size={15} /> Approve
-            </button>
-            <IconButton label="Reject" onClick={() => decide(applicant.id, "rejected")}>
-              <X size={16} />
-            </IconButton>
-          </span>
+            {!compact && (
+              <span className="applicant-detail">
+                <small>Email</small>
+                <strong>{applicant.emailVerifiedAt ? "Verified" : "Unverified"}</strong>
+              </span>
+            )}
+            <time
+              dateTime={applicant.createdAt}
+              title={new Date(applicant.createdAt).toLocaleString()}
+            >
+              {new Date(applicant.createdAt).toLocaleDateString()}
+            </time>
+            <span className="applicant-actions">
+              <button className="approve" onClick={() => openDecision(applicant, "approved")}>
+                <Check size={15} /> Approve
+              </button>
+              <IconButton label="Reject" onClick={() => openDecision(applicant, "rejected")}>
+                <X size={16} />
+              </IconButton>
+            </span>
+          </div>
+        ))}
+      </div>
+      {!compact && (
+        <div className="admin-user-pagination" aria-label="Applicant pages">
+          <button
+            className="secondary"
+            disabled={!cursors.length || users.isFetching}
+            onClick={() => setCursors((current) => current.slice(0, -1))}
+          >
+            <ChevronLeft size={14} aria-hidden="true" /> Previous
+          </button>
+          <span>Page {cursors.length + 1}</span>
+          <button
+            className="secondary"
+            disabled={!users.data?.nextCursor || users.isFetching}
+            onClick={() => setCursors((current) => [...current, users.data!.nextCursor!])}
+          >
+            Next <ChevronRight size={14} aria-hidden="true" />
+          </button>
         </div>
-      ))}
-    </div>
+      )}
+      {decision && (
+        <Modal
+          title={`${decision.status === "approved" ? "Approve" : "Reject"} ${decision.user.name}?`}
+          close={closeDecision}
+          dismissible={!busy}
+        >
+          <form onSubmit={decide}>
+            <p className="muted">
+              {decision.status === "approved"
+                ? "Approval grants workspace and API access. Existing limited sessions stay limited until the user signs in again."
+                : "Rejection revokes full sessions and personal API tokens. The applicant can still view their status."}
+            </p>
+            {decision.status === "approved" && (
+              <>
+                <label className="admin-user-reason">
+                  <span>Starting credit override (USD, optional)</span>
+                  <input
+                    autoFocus
+                    type="number"
+                    min="0"
+                    max="1000"
+                    step="0.000001"
+                    value={grantDollars}
+                    placeholder={defaultGrantDollars
+                      ? `Server default: $${defaultGrantDollars}`
+                      : "Enter an explicit amount"}
+                    onChange={(event) => setGrantDollars(event.target.value)}
+                  />
+                  {defaultGrantDollars
+                    ? (
+                      <small>
+                        Leave blank to grant the server default of ${defaultGrantDollars}.
+                      </small>
+                    )
+                    : settings.isLoading
+                    ? <small role="status">Loading the server default…</small>
+                    : (
+                      <small role="alert">
+                        The server default is unavailable. Enter an explicit override.
+                      </small>
+                    )}
+                </label>
+                {settings.isError && (
+                  <button
+                    type="button"
+                    className="text-button"
+                    onClick={() => settings.refetch()}
+                  >
+                    Retry loading the server default
+                  </button>
+                )}
+              </>
+            )}
+            <label className="admin-user-reason">
+              <span>
+                {decision.status === "rejected" ? "Reason (required)" : "Internal note (optional)"}
+              </span>
+              <textarea
+                autoFocus={decision.status === "rejected"}
+                required={decision.status === "rejected"}
+                rows={3}
+                maxLength={500}
+                value={reason}
+                onChange={(event) => setReason(event.target.value)}
+                placeholder="Add context for the audit history"
+              />
+            </label>
+            {error && <p className="form-error" role="alert">{error}</p>}
+            {reauthRequired && (
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => location.assign("/login")}
+              >
+                Sign in again
+              </button>
+            )}
+            <div className="modal-actions">
+              <button type="button" className="secondary" disabled={busy} onClick={closeDecision}>
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className={decision.status === "rejected" ? "danger-button" : "approve"}
+                disabled={busy || (decision.status === "rejected" && !reason.trim()) ||
+                  (decision.status === "approved" && !grantDollars.trim() && !settings.data)}
+              >
+                {busy
+                  ? "Saving…"
+                  : decision.status === "approved"
+                  ? "Approve applicant"
+                  : "Reject applicant"}
+              </button>
+            </div>
+          </form>
+        </Modal>
+      )}
+    </>
   );
 }
 function UserManagement() {
-  const users = useQuery({ queryKey: ["admin-users"], queryFn: api.adminUsers });
-  const updateState = async (user: User) => {
-    await api.setUserState(user.id, user.status === "suspended" ? "active" : "suspended");
-    await users.refetch();
+  const [searchDraft, setSearchDraft] = useState("");
+  const client = useQueryClient();
+  const [filters, setFilters] = useState<AdminUserFilters>({ limit: 25 });
+  const [cursors, setCursors] = useState<string[]>([]);
+  const [managed, setManaged] = useState<User>();
+  const [action, setAction] = useState<AdminLifecycleAction>();
+  const [reason, setReason] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [reauthRequired, setReauthRequired] = useState(false);
+  const cursor = cursors.at(-1);
+  const query = useMemo(() => ({ ...filters, cursor }), [filters, cursor]);
+  const users = useQuery({
+    queryKey: ["admin-users", query],
+    queryFn: () => api.adminUsers(query),
+  });
+  const close = () => {
+    if (busy) return;
+    setManaged(undefined);
+    setAction(undefined);
+    setReason("");
+    setError("");
+    setReauthRequired(false);
+  };
+  const choose = (next?: AdminLifecycleAction) => {
+    setAction(next);
+    setReason("");
+    setError("");
+    setReauthRequired(false);
+  };
+  const perform = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!managed || !action || !reason.trim()) return;
+    setBusy(true);
+    setError("");
+    try {
+      let saved: User;
+      if (action === "promote" || action === "demote") {
+        saved = await api.setUserRole(
+          managed.id,
+          action === "promote" ? "admin" : "user",
+          managed.version,
+          reason,
+        );
+      } else if (action === "suspend" || action === "activate") {
+        saved = await api.setUserState(
+          managed.id,
+          action === "suspend" ? "suspended" : "active",
+          managed.version,
+          reason,
+        );
+      } else if (action === "delete") {
+        saved = await api.deleteUser(managed.id, managed.version, reason);
+      } else saved = await api.restoreUser(managed.id, managed.version, reason);
+      client.setQueryData(
+        ["admin-users", query],
+        (current: Awaited<ReturnType<typeof api.adminUsers>> | undefined) =>
+          current
+            ? { ...current, data: current.data.map((user) => user.id === saved.id ? saved : user) }
+            : current,
+      );
+      setBusy(false);
+      setManaged(undefined);
+      setAction(undefined);
+      setReason("");
+      void client.invalidateQueries({ queryKey: ["admin-users"] });
+    } catch (cause) {
+      const apiError = cause instanceof ApiError ? cause : undefined;
+      if (apiError?.code === "version_conflict") {
+        const latest = await api.adminUser(managed.id);
+        setManaged(latest);
+        setError(
+          "This account changed in another tab. We loaded the latest version; review it before retrying.",
+        );
+      } else if (apiError?.code === "recent_authentication_required") {
+        setReauthRequired(true);
+        setError("For security, sign out and sign in again before changing account access.");
+      } else {
+        const fallback = cause instanceof Error
+          ? cause.message
+          : "The account could not be updated.";
+        setError(adminLifecycleErrorMessage(apiError?.code ?? "", fallback));
+      }
+    } finally {
+      setBusy(false);
+    }
   };
   return (
     <>
       <PageHeader title="Users" subtitle="Review access state, roles, and current balances" />
-      <div className="table-card full data-table">
+      <form
+        className="admin-user-filters"
+        role="search"
+        aria-label="Filter users"
+        onSubmit={(event) => {
+          event.preventDefault();
+          setCursors([]);
+          setFilters((current) => ({
+            ...current,
+            search: searchDraft.trim() || undefined,
+          }));
+        }}
+      >
+        <label className="admin-user-search">
+          <span>Search</span>
+          <span>
+            <Search size={15} aria-hidden="true" />
+            <input
+              aria-label="Search users"
+              value={searchDraft}
+              onChange={(event) => setSearchDraft(event.target.value)}
+              placeholder="Name or email"
+              maxLength={200}
+            />
+          </span>
+        </label>
+        <label>
+          <span>Role</span>
+          <select
+            value={filters.role ?? ""}
+            onChange={(event) => {
+              setCursors([]);
+              setFilters((current) => ({
+                ...current,
+                role: event.target.value as AdminUserFilters["role"] || undefined,
+              }));
+            }}
+          >
+            <option value="">All roles</option>
+            <option value="user">User</option>
+            <option value="admin">Admin</option>
+          </select>
+        </label>
+        <label>
+          <span>Access</span>
+          <select
+            value={filters.state ?? ""}
+            onChange={(event) => {
+              setCursors([]);
+              setFilters((current) => ({
+                ...current,
+                state: event.target.value as AdminUserFilters["state"] || undefined,
+              }));
+            }}
+          >
+            <option value="">Any state</option>
+            <option value="active">Active</option>
+            <option value="suspended">Suspended</option>
+          </select>
+        </label>
+        <label>
+          <span>Deletion</span>
+          <select
+            value={filters.deletion ?? "present"}
+            onChange={(event) => {
+              setCursors([]);
+              setFilters((current) => ({
+                ...current,
+                deletion: event.target.value as AdminUserFilters["deletion"],
+              }));
+            }}
+          >
+            <option value="present">Current</option>
+            <option value="deleted">Deleted</option>
+            <option value="all">All</option>
+          </select>
+        </label>
+        <button type="submit" className="secondary">Apply</button>
+      </form>
+      <div className="table-card full data-table admin-user-table" aria-busy={users.isLoading}>
         <div className="table-head">
           <span>USER</span>
           <span>STATUS</span>
           <span>BALANCE</span>
           <span>ACTIONS</span>
         </div>
-        {users.data?.map((user) => (
+        {users.isLoading && <div className="empty-mini">Loading users…</div>}
+        {users.isError && (
+          <div className="empty-mini" role="alert">
+            User data is unavailable.{" "}
+            <button className="text-button" onClick={() => users.refetch()}>Retry</button>
+          </div>
+        )}
+        {!users.isLoading && !users.isError && users.data?.data.length === 0 && (
+          <div className="empty-mini">No users match these filters.</div>
+        )}
+        {users.data?.data.map((user) => (
           <div className="applicant-row" key={user.id}>
             <Avatar user={user} small />
             <span>
               <strong>{user.name}</strong>
-              <small>{user.email} · {user.role}</small>
+              <small>
+                {user.email} · {user.role}
+                {user.effectiveAdmin ? " · effective admin" : ""}
+              </small>
             </span>
-            <span className="status-chip">{user.status}</span>
-            <strong>${user.balance.toFixed(2)}</strong>
+            <span className="admin-lifecycle-chips">
+              <span className="status-chip">{user.approvalStatus}</span>
+              <span className="status-chip">{user.state}</span>
+              {user.deletedAt && <span className="status-chip warning">deleted</span>}
+            </span>
+            <span className="admin-user-balance">
+              <small>Balance</small>
+              <strong>${user.balance.toFixed(2)}</strong>
+            </span>
             <button
               className="secondary"
-              disabled={user.role === "admin"}
-              onClick={() => updateState(user)}
+              aria-label={`Manage ${user.name}`}
+              onClick={() => {
+                setManaged(user);
+                setAction(undefined);
+                setReason("");
+                setError("");
+              }}
             >
-              {user.status === "suspended" ? "Restore" : "Suspend"}
+              Manage
             </button>
           </div>
         ))}
       </div>
+      <div className="admin-user-pagination" aria-label="User pages">
+        <button
+          className="secondary"
+          aria-label="Previous page"
+          disabled={!cursors.length || users.isFetching}
+          onClick={() => setCursors((current) => current.slice(0, -1))}
+        >
+          <ChevronLeft size={14} /> Previous
+        </button>
+        <span>Page {cursors.length + 1}</span>
+        <button
+          className="secondary"
+          aria-label="Next page"
+          disabled={!users.data?.nextCursor || users.isFetching}
+          onClick={() => setCursors((current) => [...current, users.data!.nextCursor!])}
+        >
+          Next <ChevronRight size={14} />
+        </button>
+      </div>
+      <span className="sr-only" role="status" aria-live="polite">
+        {users.isFetching ? "Refreshing user directory" : ""}
+      </span>
+      {managed && (
+        <Modal
+          title={action
+            ? `${action[0].toUpperCase()}${action.slice(1)} ${managed.name}?`
+            : `Manage ${managed.name}`}
+          close={close}
+          dismissible={!busy}
+          variant="medium"
+        >
+          <div className="admin-user-summary">
+            <Avatar user={managed} />
+            <span>
+              <strong>{managed.name}</strong>
+              <small>{managed.email}</small>
+            </span>
+            <span className="admin-lifecycle-chips">
+              <span className="status-chip">{managed.approvalStatus}</span>
+              <span className="status-chip">{managed.state}</span>
+              {managed.deletedAt && <span className="status-chip warning">deleted</span>}
+            </span>
+            <small>Role: {managed.role}</small>
+            <small>Email: {managed.emailVerifiedAt ? "verified" : "unverified"}</small>
+            <small>Balance: ${managed.balance.toFixed(2)}</small>
+          </div>
+          {!action && (
+            <div className="admin-user-actions" aria-label="Account actions">
+              {!managed.deletedAt && (
+                <button
+                  className="secondary"
+                  disabled={managed.role !== "admin" &&
+                    (managed.approvalStatus !== "approved" || managed.state !== "active")}
+                  title={managed.role !== "admin" &&
+                      (managed.approvalStatus !== "approved" || managed.state !== "active")
+                    ? "Approve and activate this account before promotion"
+                    : undefined}
+                  onClick={() => choose(managed.role === "admin" ? "demote" : "promote")}
+                >
+                  <ShieldCheck size={15} aria-hidden="true" />{" "}
+                  {managed.role === "admin" ? "Demote to user" : "Promote to admin"}
+                </button>
+              )}
+              {!managed.deletedAt && (
+                <button
+                  className="secondary"
+                  onClick={() => choose(managed.state === "suspended" ? "activate" : "suspend")}
+                >
+                  <UserCheck size={15} aria-hidden="true" />{" "}
+                  {managed.state === "suspended" ? "Reactivate account" : "Suspend account"}
+                </button>
+              )}
+              <button
+                className={managed.deletedAt ? "secondary" : "danger-button"}
+                onClick={() => choose(managed.deletedAt ? "restore" : "delete")}
+              >
+                {managed.deletedAt ? <RotateCcw size={15} /> : <Trash2 size={15} />}
+                {managed.deletedAt ? "Restore deleted account" : "Delete account"}
+              </button>
+            </div>
+          )}
+          {action && (
+            <form onSubmit={perform}>
+              <p className="muted">
+                {adminLifecycleConsequence(action)}
+              </p>
+              <label className="admin-user-reason">
+                <span>Reason</span>
+                <textarea
+                  autoFocus
+                  required
+                  maxLength={500}
+                  rows={3}
+                  value={reason}
+                  onChange={(event) => setReason(event.target.value)}
+                  placeholder="Record why this change is needed"
+                />
+                <small>{reason.length}/500</small>
+              </label>
+              {error && <p className="form-error" role="alert">{error}</p>}
+              {reauthRequired && (
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => location.assign("/login")}
+                >
+                  Sign in again
+                </button>
+              )}
+              <div className="modal-actions">
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={busy}
+                  onClick={() => choose()}
+                >
+                  Back
+                </button>
+                <button
+                  type="submit"
+                  className={action === "delete" || action === "suspend" || action === "demote"
+                    ? "danger-button"
+                    : "approve"}
+                  disabled={busy || !reason.trim()}
+                >
+                  {busy ? "Saving…" : `Confirm ${action}`}
+                </button>
+              </div>
+            </form>
+          )}
+        </Modal>
+      )}
     </>
   );
 }

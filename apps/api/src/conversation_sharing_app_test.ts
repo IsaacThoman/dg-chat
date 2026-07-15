@@ -258,6 +258,11 @@ Deno.test("sharing routes create one immutable redacted snapshot, stream authori
 
 Deno.test("sharing routes reject malformed, unsafe, temporary, expired, and unavailable-owner access", async () => {
   const repository = new MemoryRepository();
+  const actor = repository.bootstrapAdmin({
+    email: "share-admin@example.test",
+    name: "Share Administrator",
+    passwordHash: "test-only-hash",
+  }, 0);
   let now = Date.now();
   const { app } = createApp({ repository, now: () => now });
   const owner = await ownerFixture(repository, "share-edges@example.test");
@@ -323,9 +328,20 @@ Deno.test("sharing routes reject malformed, unsafe, temporary, expired, and unav
   });
   assertEquals(created.status, 201);
   assertEquals((await app.request(`/api/public/shares/${secret}`)).status, 200);
-  repository.setUserState(owner.user.id, "suspended");
+  const suspended = repository.setAdminUserState({
+    actorId: actor.id,
+    targetUserId: owner.user.id,
+    expectedVersion: owner.user.version,
+    state: "suspended",
+    reason: "Exercise unavailable-owner behavior",
+  });
   assertEquals((await app.request(`/api/public/shares/${secret}`)).status, 404);
-  repository.setUserState(owner.user.id, "active");
+  repository.setAdminUserState({
+    actorId: actor.id,
+    targetUserId: owner.user.id,
+    expectedVersion: suspended.version,
+    state: "active",
+  });
   now = Date.parse(expiresAt) + 1;
   assertEquals((await app.request(`/api/public/shares/${secret}`)).status, 404);
 

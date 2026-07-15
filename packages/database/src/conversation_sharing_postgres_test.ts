@@ -107,6 +107,24 @@ Deno.test({
       await sql`UPDATE users SET state='suspended' WHERE id=${owner.id}`;
       assertEquals(await repo.resolvePublicConversationShare(input.secretHash), undefined);
       await sql`UPDATE users SET state='active' WHERE id=${owner.id}`;
+      await sql`UPDATE users SET deleted_at=now() WHERE id=${owner.id}`;
+      assertEquals(await repo.resolvePublicConversationShare(input.secretHash), undefined);
+      await assertRejects(
+        () => repo.createConversationShare(owner.id, input),
+        DomainError,
+        "cannot create shares",
+      );
+      await assertRejects(
+        () =>
+          repo.createConversationShare(owner.id, {
+            ...input,
+            idempotencyKey: "pg-deleted-owner-share",
+            secretHash: "f".repeat(64),
+          }),
+        DomainError,
+        "cannot create shares",
+      );
+      await sql`UPDATE users SET deleted_at=NULL WHERE id=${owner.id}`;
       const revoked = await repo.revokeConversationShare(owner.id, first.share.id, 1);
       assertEquals(revoked.version, 2);
       assertNotEquals(revoked.revokedAt, null);

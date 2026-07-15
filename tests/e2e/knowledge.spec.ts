@@ -2,6 +2,7 @@ import { expect, test } from "@playwright/test";
 import { strToU8, zipSync } from "fflate";
 import { Buffer } from "node:buffer";
 import { apiURL, bootstrap, createChat, login, openSidebar } from "./helpers.ts";
+import { lightweightManagedStack } from "./env.ts";
 
 const DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 
@@ -53,6 +54,10 @@ const workspaceNavigation = (page: import("@playwright/test").Page) =>
   page.getByLabel("Workspace navigation", { exact: true });
 
 test("manages a collection and persists conversation knowledge", async ({ page }, testInfo) => {
+  test.skip(
+    lightweightManagedStack,
+    "requires the durable PostgreSQL, object-storage, and worker stack",
+  );
   const suffix = `${Date.now()}-${testInfo.project.name}`;
   const originalName = `Knowledge ${suffix}`;
   const renamedName = `Product docs ${suffix}`;
@@ -283,6 +288,10 @@ test("persists library selection and repairs it after the selected collection is
 test("extracts uploaded PDF pages and DOCX sections with persisted provenance", async ({
   page,
 }, testInfo) => {
+  test.skip(
+    lightweightManagedStack,
+    "requires the durable PostgreSQL, object-storage, and worker stack",
+  );
   const suffix = `${Date.now()}-${testInfo.project.name}`;
   const pdfName = `manual-${suffix}.pdf`;
   const docxName = `handbook-${suffix}.docx`;

@@ -30,6 +30,13 @@ export interface User {
   name: string;
   email: string;
   role: Role;
+  approvalStatus: "pending" | "approved" | "rejected";
+  state: "active" | "suspended";
+  deletedAt: string | null;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+  effectiveAdmin?: boolean;
   status: UserStatus;
   balance: number;
   limited: boolean;

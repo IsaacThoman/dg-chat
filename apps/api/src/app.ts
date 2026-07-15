@@ -14,8 +14,13 @@ import pngCodec from "imagescript/wasm/node/png.js";
 import { Buffer } from "node:buffer";
 import { Readable } from "node:stream";
 import {
+  adminAccountStateSchema,
+  adminApprovalSchema,
+  adminDeleteUserSchema,
+  adminRestoreUserSchema,
+  adminRoleSchema,
+  adminUserQuerySchema,
   appendMessageSchema,
-  approvalSchema,
   chatCompletionSchema,
   conversationPortabilityV1Schema,
   createAccessGroupSchema,
@@ -65,6 +70,7 @@ import {
   workspaceDeleteSchema,
 } from "@dg-chat/contracts";
 import type {
+  AdminUserQuery,
   AuthStatusResponse,
   ChatCompletionRequest,
   ModelInfo,
@@ -1028,6 +1034,34 @@ const privateNoStore = (c: Context) => {
   c.header("X-Content-Type-Options", "nosniff");
 };
 
+const parseAdminUserQuery = (c: Context): AdminUserQuery => {
+  const url = new URL(c.req.url);
+  const allowed = new Set([
+    "search",
+    "role",
+    "approvalStatus",
+    "state",
+    "deletion",
+    "emailVerified",
+    "cursor",
+    "limit",
+  ]);
+  for (const key of url.searchParams.keys()) {
+    if (!allowed.has(key) || url.searchParams.getAll(key).length !== 1) {
+      throw new DomainError("validation_error", "User query parameters are invalid", 422);
+    }
+  }
+  const raw = Object.fromEntries(url.searchParams.entries()) as Record<string, unknown>;
+  if (typeof raw.limit === "string" && /^\d+$/.test(raw.limit)) raw.limit = Number(raw.limit);
+  if (raw.emailVerified === "true") raw.emailVerified = true;
+  else if (raw.emailVerified === "false") raw.emailVerified = false;
+  const parsed = adminUserQuerySchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new DomainError("validation_error", "User query parameters are invalid", 422);
+  }
+  return parsed.data;
+};
+
 const isCanonicalShareCapability = (value: string): boolean => {
   if (!/^[A-Za-z0-9_-]{43}$/.test(value)) return false;
   try {
@@ -1256,8 +1290,12 @@ export function createApp(options: AppOptions = {}) {
       : configuredStartingUsd
       ? Math.round(Number(configuredStartingUsd) * 1_000_000)
       : 5_000_000);
-  if (!Number.isSafeInteger(startingCredit) || startingCredit < 0) {
-    throw new Error("Starting credit configuration must be a non-negative number of USD micros");
+  if (
+    !Number.isSafeInteger(startingCredit) || startingCredit < 0 || startingCredit > 1_000_000_000
+  ) {
+    throw new Error(
+      "Starting credit configuration must be an integer between 0 and 1,000,000,000 USD micros",
+    );
   }
   const webOrigin = new URL(
     Deno.env.get("WEB_ORIGIN") ?? Deno.env.get("WEB_URL") ?? "http://localhost:5173",
@@ -2180,6 +2218,7 @@ export function createApp(options: AppOptions = {}) {
         const legacyUser = legacySession ? await repo.findUser(legacySession.userId) : undefined;
         if (
           !legacySession || !legacyUser || legacyUser.state !== "active" ||
+          legacyUser.deletedAt !== null ||
           legacyUser.passwordResetPending === true
         ) {
           return c.json(openAIError("Invalid or expired session", "unauthorized"), 401);
@@ -2191,7 +2230,10 @@ export function createApp(options: AppOptions = {}) {
         return next();
       }
       const user = await repo.findUser(session.userId);
-      if (!user || user.state !== "active" || user.passwordResetPending === true) {
+      if (
+        !user || user.state !== "active" || user.deletedAt !== null ||
+        user.passwordResetPending === true
+      ) {
         return c.json(openAIError("Invalid or expired session", "unauthorized"), 401);
       }
       c.set("user", publicUser(user)!);
@@ -2209,7 +2251,8 @@ export function createApp(options: AppOptions = {}) {
     if (apiToken) {
       const user = await repo.findUser(apiToken.userId);
       if (
-        !user || user.state !== "active" || user.passwordResetPending === true ||
+        !user || user.state !== "active" || user.deletedAt !== null ||
+        user.passwordResetPending === true ||
         user.approvalStatus !== "approved" ||
         (requireEmailVerification && !user.emailVerifiedAt) ||
         apiToken.revokedAt || (apiToken.expiresAt && Date.parse(apiToken.expiresAt) <= Date.now())
@@ -2227,7 +2270,10 @@ export function createApp(options: AppOptions = {}) {
     }
     const session = await repo.getSession(hash);
     const user = session ? await repo.findUser(session.userId) : undefined;
-    if (!session || !user || user.state !== "active" || user.passwordResetPending === true) {
+    if (
+      !session || !user || user.state !== "active" || user.deletedAt !== null ||
+      user.passwordResetPending === true
+    ) {
       return c.json(openAIError("Invalid or expired session", "unauthorized"), 401);
     }
     c.set("user", publicUser(user)!);
@@ -2252,7 +2298,8 @@ export function createApp(options: AppOptions = {}) {
     const apiToken = await repo.authenticateApiToken(await sha256(raw));
     const user = apiToken ? await repo.findUser(apiToken.userId) : undefined;
     if (
-      !apiToken || !user || user.state !== "active" || user.passwordResetPending === true ||
+      !apiToken || !user || user.state !== "active" || user.deletedAt !== null ||
+      user.passwordResetPending === true ||
       user.approvalStatus !== "approved" ||
       (requireEmailVerification && !user.emailVerifiedAt) || apiToken.revokedAt ||
       (apiToken.expiresAt && Date.parse(apiToken.expiresAt) <= Date.now())
@@ -3221,7 +3268,7 @@ export function createApp(options: AppOptions = {}) {
     }
     const body = await parseJson(c, passwordResetRequestSchema);
     const user = await repo.findUserByEmail(body.email);
-    if (user && mailer) {
+    if (user && user.state === "active" && user.deletedAt === null && mailer) {
       const token = randomToken("reset_");
       await repo.createIdentityToken(
         user.id,
@@ -3289,7 +3336,7 @@ export function createApp(options: AppOptions = {}) {
       });
       throw new DomainError("invalid_credentials", "Email or password is incorrect", 401);
     }
-    if (user.state !== "active") {
+    if (user.state !== "active" || user.deletedAt !== null) {
       throw new DomainError("account_unavailable", "This account is unavailable", 403);
     }
     if (user.approvalStatus === "rejected") {
@@ -3387,6 +3434,7 @@ export function createApp(options: AppOptions = {}) {
       const emailVerified = Boolean(user.emailVerifiedAt);
       const sessionLimited = Boolean(c.get("sessionLimited"));
       const fullSessionEligible = user.state === "active" &&
+        user.deletedAt === null &&
         user.approvalStatus === "approved" &&
         (!requireEmailVerification || emailVerified);
       const status: AuthStatusResponse = {
@@ -5219,6 +5267,11 @@ export function createApp(options: AppOptions = {}) {
   });
 
   app.use("/api/admin/*", authenticate, approved, sessionOnly, admin);
+  app.get("/api/admin/settings", (c) => {
+    privateNoStore(c);
+    c.header("Vary", "Cookie");
+    return c.json({ defaultApprovalCreditMicros: startingCredit });
+  });
   const requireBackupAdmin = (): BackupAdminService => {
     if (!options.backupAdmin) {
       throw new DomainError(
@@ -5266,6 +5319,15 @@ export function createApp(options: AppOptions = {}) {
       throw new DomainError(
         "recent_authentication_required",
         `Sign in again before ${action}`,
+        403,
+      );
+    }
+  };
+  const requireRecentAdminAuthentication = (c: Context<{ Variables: Variables }>) => {
+    if (!hasRecentAuthentication(c.get("sessionAuthenticatedAt"), (options.now ?? Date.now)())) {
+      throw new DomainError(
+        "recent_authentication_required",
+        "Sign in again before changing account authority",
         403,
       );
     }
@@ -5963,39 +6025,87 @@ export function createApp(options: AppOptions = {}) {
     });
     return c.json(policy);
   });
-  app.get(
-    "/api/admin/users",
-    async (c) => c.json({ data: await repo.listUsers() }),
-  );
+  app.get("/api/admin/users", async (c) => {
+    privateNoStore(c);
+    c.header("Vary", "Cookie");
+    return c.json(await repo.listAdminUsers(parseAdminUserQuery(c)));
+  });
+  app.get("/api/admin/users/:id", async (c) => {
+    privateNoStore(c);
+    c.header("Vary", "Cookie");
+    return c.json(await repo.getAdminUser(requireUuid(c.req.param("id"), "User id")));
+  });
   app.patch("/api/admin/users/:id/approval", async (c) => {
-    const body = await parseJson(c, approvalSchema);
-    const updated = await repo.approveUser(
-      c.req.param("id"),
-      body.status,
-      body.startingCreditMicros ?? startingCredit,
-      requireEmailVerification,
-    );
-    await repo.recordAudit({
+    requireRecentAdminAuthentication(c);
+    const body = await parseJson(c, adminApprovalSchema);
+    const updated = await repo.decideUserApproval({
       actorId: c.get("user").id,
-      action: `user.approval.${body.status}`,
-      targetType: "user",
-      targetId: updated.id,
+      targetUserId: requireUuid(c.req.param("id"), "User id"),
+      expectedVersion: body.expectedVersion,
+      status: body.status,
+      startingCreditMicros: body.startingCreditMicros ?? startingCredit,
+      requireEmailVerification,
+      reason: body.reason,
     });
-    return c.json(publicUser(updated));
+    privateNoStore(c);
+    c.header("Vary", "Cookie");
+    return c.json(updated);
+  });
+  app.patch("/api/admin/users/:id/role", async (c) => {
+    requireRecentAdminAuthentication(c);
+    const body = await parseJson(c, adminRoleSchema);
+    const updated = await repo.setAdminUserRole({
+      actorId: c.get("user").id,
+      targetUserId: requireUuid(c.req.param("id"), "User id"),
+      expectedVersion: body.expectedVersion,
+      role: body.role,
+      reason: body.reason,
+    });
+    privateNoStore(c);
+    c.header("Vary", "Cookie");
+    return c.json(updated);
   });
   app.patch("/api/admin/users/:id/state", async (c) => {
-    const body = await c.req.json<{ state: "active" | "suspended" | "deleted" }>();
-    if (!["active", "suspended", "deleted"].includes(body.state)) {
-      throw new DomainError("validation_error", "Invalid state", 422);
-    }
-    const updated = await repo.setUserState(c.req.param("id"), body.state);
-    await repo.recordAudit({
+    requireRecentAdminAuthentication(c);
+    const body = await parseJson(c, adminAccountStateSchema);
+    const updated = await repo.setAdminUserState({
       actorId: c.get("user").id,
-      action: `user.state.${body.state}`,
-      targetType: "user",
-      targetId: updated.id,
+      targetUserId: requireUuid(c.req.param("id"), "User id"),
+      expectedVersion: body.expectedVersion,
+      state: body.state,
+      reason: body.reason,
     });
-    return c.json(publicUser(updated));
+    privateNoStore(c);
+    c.header("Vary", "Cookie");
+    return c.json(updated);
+  });
+  app.post("/api/admin/users/:id/delete", async (c) => {
+    requireRecentAdminAuthentication(c);
+    const body = await parseJson(c, adminDeleteUserSchema);
+    const updated = await repo.setAdminUserDeleted({
+      actorId: c.get("user").id,
+      targetUserId: requireUuid(c.req.param("id"), "User id"),
+      expectedVersion: body.expectedVersion,
+      deleted: true,
+      reason: body.reason,
+    });
+    privateNoStore(c);
+    c.header("Vary", "Cookie");
+    return c.json(updated);
+  });
+  app.post("/api/admin/users/:id/restore", async (c) => {
+    requireRecentAdminAuthentication(c);
+    const body = await parseJson(c, adminRestoreUserSchema);
+    const updated = await repo.setAdminUserDeleted({
+      actorId: c.get("user").id,
+      targetUserId: requireUuid(c.req.param("id"), "User id"),
+      expectedVersion: body.expectedVersion,
+      deleted: false,
+      reason: body.reason,
+    });
+    privateNoStore(c);
+    c.header("Vary", "Cookie");
+    return c.json(updated);
   });
   app.delete("/api/admin/sessions/:id", async (c) => {
     const requestedId = c.req.param("id");

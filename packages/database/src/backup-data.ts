@@ -10,9 +10,10 @@ import {
   type ProviderProtocol,
 } from "./provider-model-invariants.ts";
 
-export const BACKUP_DATA_SCHEMA_VERSION = "0034" as const;
-const PREVIOUS_BACKUP_DATA_SCHEMA_VERSION = "0033" as const;
-const SECOND_PREVIOUS_BACKUP_DATA_SCHEMA_VERSION = "0032" as const;
+export const BACKUP_DATA_SCHEMA_VERSION = "0037" as const;
+const IMMUTABLE_SHARING_BACKUP_DATA_SCHEMA_VERSION = "0034" as const;
+const CONVERSATION_PORTABILITY_BACKUP_DATA_SCHEMA_VERSION = "0033" as const;
+const TEMPORARY_LIFECYCLE_BACKUP_DATA_SCHEMA_VERSION = "0032" as const;
 const LEGACY_BACKUP_DATA_SCHEMA_VERSION = "0028" as const;
 export const LEGACY_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
   new Set([
@@ -26,8 +27,10 @@ export const LEGACY_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
   ]),
 );
 export function isSupportedBackupDataSchemaVersion(value: string): boolean {
-  return value === BACKUP_DATA_SCHEMA_VERSION || value === PREVIOUS_BACKUP_DATA_SCHEMA_VERSION ||
-    value === SECOND_PREVIOUS_BACKUP_DATA_SCHEMA_VERSION ||
+  return value === BACKUP_DATA_SCHEMA_VERSION ||
+    value === IMMUTABLE_SHARING_BACKUP_DATA_SCHEMA_VERSION ||
+    value === CONVERSATION_PORTABILITY_BACKUP_DATA_SCHEMA_VERSION ||
+    value === TEMPORARY_LIFECYCLE_BACKUP_DATA_SCHEMA_VERSION ||
     value === LEGACY_BACKUP_DATA_SCHEMA_VERSION;
 }
 export const BACKUP_DATA_BATCH_SIZE = 100;
@@ -140,9 +143,10 @@ const T = (
 export const BACKUP_DATA_TABLES: readonly BackupDataTable[] = Object.freeze([
   T(
     "users",
-    "id email name password_hash role approval_status state balance_micros created_at updated_at deleted_at email_verified_at",
+    "id email name password_hash role approval_status state version balance_micros created_at updated_at deleted_at email_verified_at",
     "id",
     {
+      version: "integer",
       balance_micros: "bigint",
     },
   ),
@@ -915,6 +919,21 @@ function exactSourceRow(
   schemaVersion: string,
 ): Record<string, unknown> {
   if (
+    schemaVersion !== BACKUP_DATA_SCHEMA_VERSION && definition.name === "users" && value &&
+    typeof value === "object" && !Array.isArray(value) && !("version" in value)
+  ) {
+    const legacy = value as Record<string, unknown>;
+    const wasDeleted = legacy.state === "deleted";
+    return exactRow(definition, {
+      ...legacy,
+      state: wasDeleted ? "suspended" : legacy.state,
+      version: 1,
+      deleted_at: wasDeleted
+        ? legacy.deleted_at ?? legacy.updated_at ?? legacy.created_at
+        : legacy.deleted_at,
+    });
+  }
+  if (
     schemaVersion !== BACKUP_DATA_SCHEMA_VERSION && definition.name === "attachments" && value &&
     typeof value === "object" && !Array.isArray(value) && !("width" in value) &&
     !("height" in value)
@@ -1473,7 +1492,8 @@ async function validateStagedDatabase(
   const [admins] = await tx.unsafe<{ count: number }[]>(
     `SELECT count(*)::int count FROM ${
       staged("users")
-    } WHERE role='admin' AND approval_status='approved' AND state='active'`,
+    } WHERE role='admin' AND approval_status='approved' AND state='active'
+      AND deleted_at IS NULL`,
   );
   if (!admins || admins.count < 1) {
     throw new BackupDataError("invariant", "Restore must contain an active approved administrator");
@@ -1590,6 +1610,7 @@ async function validateRestoredDatabase(tx: postgres.TransactionSql): Promise<vo
   const [admins] = await tx<{ count: number }[]>`
     SELECT count(*)::int count FROM users
     WHERE role='admin' AND approval_status='approved' AND state='active'
+      AND deleted_at IS NULL
   `;
   if (!admins || admins.count < 1) {
     throw new BackupDataError("invariant", "Restore must contain an active approved administrator");

@@ -4,7 +4,24 @@ import type { LedgerEntry, StoredApiToken, StoredSession, StoredUser, UsageRun }
 import { DomainError } from "./memory.ts";
 
 type LegacySnapshot = {
-  users?: Array<[string, StoredUser]>;
+  users?: Array<[
+    string,
+    Pick<
+      StoredUser,
+      | "id"
+      | "email"
+      | "name"
+      | "passwordHash"
+      | "role"
+      | "approvalStatus"
+      | "balanceMicros"
+      | "createdAt"
+    > & {
+      state: StoredUser["state"] | "deleted";
+      deletedAt?: string | null;
+      updatedAt?: string;
+    },
+  ]>;
   sessions?: Array<[string, StoredSession]>;
   tokens?: Array<[string, StoredApiToken]>;
   conversations?: Array<[string, Conversation]>;
@@ -66,9 +83,14 @@ export async function backfillLegacyRuntimeSnapshot(url: string): Promise<Legacy
       }
       await tx`SET CONSTRAINTS ALL DEFERRED`;
       for (const [, value] of snapshot.users ?? []) {
-        await tx`INSERT INTO users(id,email,name,password_hash,role,approval_status,state,balance_micros,email_verified_at,created_at,updated_at) VALUES(${value.id},${value.email},${value.name},${value.passwordHash},${value.role},${value.approvalStatus},${value.state},${value.balanceMicros},${
+        const wasDeleted = value.state === "deleted";
+        await tx`INSERT INTO users(id,email,name,password_hash,role,approval_status,state,version,balance_micros,email_verified_at,created_at,updated_at,deleted_at) VALUES(${value.id},${value.email},${value.name},${value.passwordHash},${value.role},${value.approvalStatus},${
+          wasDeleted ? "suspended" : value.state
+        },1,${value.balanceMicros},${
           value.approvalStatus === "approved" ? value.createdAt : null
-        },${value.createdAt},${value.createdAt})`;
+        },${value.createdAt},${value.updatedAt ?? value.createdAt},${
+          value.deletedAt ?? (wasDeleted ? value.updatedAt ?? value.createdAt : null)
+        })`;
       }
       for (const [hash, value] of snapshot.sessions ?? []) {
         await tx`INSERT INTO sessions(user_id,token_hash,limited,expires_at) VALUES(${value.userId},${hash},${value.limited},${new Date(

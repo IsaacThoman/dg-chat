@@ -22,7 +22,10 @@ import { sql } from "npm:drizzle-orm@0.45.2";
 
 export const approvalStatus = pgEnum("approval_status", ["pending", "approved", "rejected"]);
 export const userRole = pgEnum("user_role", ["user", "admin"]);
-export const accountState = pgEnum("account_state", ["active", "suspended", "deleted"]);
+// PostgreSQL installations retain the historical `deleted` enum label because PostgreSQL cannot
+// safely remove enum values in-place. Application state is intentionally narrower: soft deletion
+// is represented independently by users.deleted_at and migration 0037 prevents new legacy values.
+export const accountState = pgEnum("account_state", ["active", "suspended"]);
 export const messageRole = pgEnum("message_role", [
   "system",
   "developer",
@@ -55,12 +58,18 @@ export const users = pgTable("users", {
   role: userRole("role").notNull().default("user"),
   approvalStatus: approvalStatus("approval_status").notNull().default("pending"),
   state: accountState("state").notNull().default("active"),
+  version: integer("version").notNull().default(1),
   balanceMicros: bigint("balance_micros", { mode: "number" }).notNull().default(0),
   emailVerifiedAt: timestamp("email_verified_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   deletedAt: timestamp("deleted_at", { withTimezone: true }),
-}, (table) => [uniqueIndex("users_email_uq").on(table.email)]);
+}, (table) => [
+  uniqueIndex("users_email_uq").on(table.email),
+  index("users_created_cursor_idx").on(table.createdAt.desc(), table.id.desc()),
+  check("users_version_check", sql`${table.version} >= 1`),
+  check("users_account_state_check", sql`${table.state} IN ('active','suspended')`),
+]);
 
 // Better Auth owns credentials and browser sessions. These tables intentionally remain
 // separate from the domain users/sessions above: domain users are the sole authority for

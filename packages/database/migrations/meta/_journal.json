@@ -260,6 +260,13 @@
       "when": 1783998001000,
       "tag": "0036_provider_test_http",
       "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "7",
+      "when": 1783998002000,
+      "tag": "0037_admin_account_lifecycle",
+      "breakpoints": true
     }
   ]
 }

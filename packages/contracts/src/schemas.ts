@@ -512,3 +512,63 @@ export const approvalSchema = z.object({
   status: z.enum(["approved", "rejected"]),
   startingCreditMicros: z.number().int().nonnegative().max(1_000_000_000).optional(),
 });
+
+const adminExpectedVersionSchema = z.number().int().positive();
+const adminReasonSchema = z.string().trim().min(1).max(500);
+
+/** Stable, bounded query contract for the administrative user directory. */
+export const adminUserQuerySchema = z.object({
+  search: z.string().trim().min(1).max(200).optional(),
+  role: z.enum(["user", "admin"]).optional(),
+  approvalStatus: z.enum(["pending", "approved", "rejected"]).optional(),
+  state: z.enum(["active", "suspended"]).optional(),
+  deletion: z.enum(["present", "deleted", "all"]).optional(),
+  emailVerified: z.boolean().optional(),
+  cursor: z.string().min(1).max(2048).optional(),
+  limit: z.number().int().min(1).max(100).default(50),
+}).strict();
+
+export const adminApprovalSchema = z.object({
+  status: z.enum(["approved", "rejected"]),
+  expectedVersion: adminExpectedVersionSchema,
+  startingCreditMicros: z.number().int().nonnegative().max(1_000_000_000).optional(),
+  reason: adminReasonSchema.optional(),
+}).strict().superRefine((value, context) => {
+  if (value.status === "rejected" && !value.reason) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["reason"],
+      message: "A reason is required when rejecting an account",
+    });
+  }
+});
+
+export const adminRoleSchema = z.object({
+  role: z.enum(["user", "admin"]),
+  expectedVersion: adminExpectedVersionSchema,
+  reason: adminReasonSchema,
+}).strict();
+
+export const adminAccountStateSchema = z.object({
+  state: z.enum(["active", "suspended"]),
+  expectedVersion: adminExpectedVersionSchema,
+  reason: adminReasonSchema.optional(),
+}).strict().superRefine((value, context) => {
+  if (value.state === "suspended" && !value.reason) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["reason"],
+      message: "A reason is required when suspending an account",
+    });
+  }
+});
+
+export const adminDeleteUserSchema = z.object({
+  expectedVersion: adminExpectedVersionSchema,
+  reason: adminReasonSchema,
+}).strict();
+
+export const adminRestoreUserSchema = z.object({
+  expectedVersion: adminExpectedVersionSchema,
+  reason: adminReasonSchema,
+}).strict();

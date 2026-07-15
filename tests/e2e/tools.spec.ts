@@ -1,5 +1,6 @@
 import { expect, type Page, test } from "@playwright/test";
 import { bootstrap, login, openSidebar, uniqueUser } from "./helpers.ts";
+import { lightweightManagedStack } from "./env.ts";
 
 async function authenticatedRequest(
   page: Page,
@@ -27,6 +28,7 @@ test("admin enables web search and a user explicitly reviews and cancels a tool 
   page,
   request,
 }, testInfo) => {
+  test.skip(lightweightManagedStack, "requires the durable tool and search adapter stack");
   await bootstrap(request);
   await login(page);
   const mobile = testInfo.project.name.includes("mobile");
@@ -147,6 +149,7 @@ test("admin enables web search and a user explicitly reviews and cancels a tool 
 });
 
 test("a second approved user cannot inspect another user's tool execution", async ({ page, request }) => {
+  test.skip(lightweightManagedStack, "requires the durable tool and search adapter stack");
   await bootstrap(request);
   await login(page);
   const policies = await authenticatedRequest(page, "/api/admin/tools");
@@ -188,18 +191,22 @@ test("a second approved user cannot inspect another user's tool execution", asyn
   await expect(page).toHaveURL(/\/pending$/);
   await page.context().clearCookies();
   await login(page);
-  const usersResponse = await authenticatedRequest(page, "/api/admin/users");
+  const usersResponse = await authenticatedRequest(
+    page,
+    `/api/admin/users?search=${encodeURIComponent(applicant.email)}&limit=1`,
+  );
   expect(usersResponse.status).toBe(200);
   const users = (usersResponse.body as {
     data: Array<{
       id: string;
       email: string;
+      version: number;
     }>;
   }).data;
   const user = users.find((candidate) => candidate.email === applicant.email)!;
   const approval = await authenticatedRequest(page, `/api/admin/users/${user.id}/approval`, {
     method: "PATCH",
-    body: { status: "approved" },
+    body: { status: "approved", expectedVersion: user.version },
   });
   expect(approval.status).toBe(200);
   await page.context().clearCookies();

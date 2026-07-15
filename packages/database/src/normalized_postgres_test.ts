@@ -778,15 +778,34 @@ Deno.test({
       });
       assertEquals(oidcOnly.passwordHash, null);
       const limitedSession = await repo.createSession(applicant.id, "limited-session-hash", true);
-      await repo.approveUser(applicant.id, "approved", 1_000_000);
+      let managedApplicant = await repo.decideUserApproval({
+        actorId: admin.id,
+        targetUserId: applicant.id,
+        expectedVersion: applicant.version,
+        status: "approved",
+        startingCreditMicros: 1_000_000,
+      });
       assertEquals((await repo.getSession(limitedSession.tokenHash))?.limited, true);
       const session = await repo.createSession(applicant.id, "session-hash", false);
       assertEquals((await repo.getSession(session.tokenHash))?.userId, applicant.id);
       assertEquals((await repo.listSessions(applicant.id))[0].id, session.id);
-      await repo.approveUser(applicant.id, "rejected", 0);
+      managedApplicant = await repo.decideUserApproval({
+        actorId: admin.id,
+        targetUserId: applicant.id,
+        expectedVersion: managedApplicant.version,
+        status: "rejected",
+        startingCreditMicros: 0,
+        reason: "Exercise rejected credential invalidation",
+      });
       assertEquals(await repo.getSession(session.tokenHash), undefined);
       assertEquals((await repo.getSession(limitedSession.tokenHash))?.limited, true);
-      await repo.approveUser(applicant.id, "approved", 0);
+      await repo.decideUserApproval({
+        actorId: admin.id,
+        targetUserId: applicant.id,
+        expectedVersion: managedApplicant.version,
+        status: "approved",
+        startingCreditMicros: 0,
+      });
 
       const identityUser = await repo.createUser({
         email: "identity@database.test",
@@ -804,7 +823,15 @@ Deno.test({
       });
       await identitySql.end();
       await assertRejects(
-        () => repo.approveUser(identityUser.id, "approved", 10, true),
+        () =>
+          repo.decideUserApproval({
+            actorId: admin.id,
+            targetUserId: identityUser.id,
+            expectedVersion: identityUser.version,
+            status: "approved",
+            startingCreditMicros: 10,
+            requireEmailVerification: true,
+          }),
         DomainError,
         "verified",
       );
@@ -939,7 +966,13 @@ Deno.test({
         passwordHash: "hash",
         emailVerified: true,
       });
-      await repo.approveUser(quotaUser.id, "approved", 1_000_000);
+      await repo.decideUserApproval({
+        actorId: admin.id,
+        targetUserId: quotaUser.id,
+        expectedVersion: quotaUser.version,
+        status: "approved",
+        startingCreditMicros: 1_000_000,
+      });
       const requestQuota = { maxRequests: 1, maxEvents: 10, maxBytes: 10_000 };
       const quotaStarts = await Promise.allSettled(["a", "b"].map((suffix) =>
         repo.beginApiRequest({
@@ -963,7 +996,13 @@ Deno.test({
         passwordHash: "hash",
         emailVerified: true,
       });
-      await repo.approveUser(eventQuotaUser.id, "approved", 1_000_000);
+      await repo.decideUserApproval({
+        actorId: admin.id,
+        targetUserId: eventQuotaUser.id,
+        expectedVersion: eventQuotaUser.version,
+        status: "approved",
+        startingCreditMicros: 1_000_000,
+      });
       const eventQuota = { maxRequests: 2, maxEvents: 1, maxBytes: 10_000 };
       const eventStarts = [];
       for (const suffix of ["d", "e"]) {
@@ -1144,7 +1183,13 @@ Deno.test({
         passwordHash: "hash",
         emailVerified: true,
       });
-      await repo.approveUser(replayReservationUser.id, "approved", 1_000_000);
+      await repo.decideUserApproval({
+        actorId: admin.id,
+        targetUserId: replayReservationUser.id,
+        expectedVersion: replayReservationUser.version,
+        status: "approved",
+        startingCreditMicros: 1_000_000,
+      });
       const reservationQuota = { maxRequests: 10, maxEvents: 20_000, maxBytes: 67_108_864 };
       await assertRejects(
         () =>
@@ -1230,7 +1275,13 @@ Deno.test({
         passwordHash: "hash",
         emailVerified: true,
       });
-      await repo.approveUser(failureQuotaUser.id, "approved", 1_000_000);
+      await repo.decideUserApproval({
+        actorId: admin.id,
+        targetUserId: failureQuotaUser.id,
+        expectedVersion: failureQuotaUser.version,
+        status: "approved",
+        startingCreditMicros: 1_000_000,
+      });
       const failureQuotaRequest = await repo.beginApiRequest({
         userId: failureQuotaUser.id,
         endpoint: "chat.completions",
@@ -1407,8 +1458,20 @@ Deno.test({
         emailVerified: true,
       });
       const removals = await Promise.allSettled([
-        repo.setUserState(admin.id, "suspended"),
-        repo.setUserState(secondAdmin.id, "suspended"),
+        repo.setAdminUserState({
+          actorId: admin.id,
+          targetUserId: secondAdmin.id,
+          expectedVersion: secondAdmin.version,
+          state: "suspended",
+          reason: "Concurrent final-admin coverage",
+        }),
+        repo.setAdminUserState({
+          actorId: secondAdmin.id,
+          targetUserId: admin.id,
+          expectedVersion: admin.version,
+          state: "suspended",
+          reason: "Concurrent final-admin coverage",
+        }),
       ]);
       assertEquals(removals.filter((result) => result.status === "fulfilled").length, 1);
       assertEquals(removals.filter((result) => result.status === "rejected").length, 1);

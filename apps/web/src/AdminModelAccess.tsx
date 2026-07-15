@@ -54,7 +54,7 @@ export function AdminModelAccess({ models }: { models: AdminModel[] }) {
     queryFn: api.adminModelAccessGroups,
   });
   const aliases = useQuery({ queryKey: ["admin-model-aliases"], queryFn: api.adminModelAliases });
-  const users = useQuery({ queryKey: ["admin-users"], queryFn: api.adminUsers });
+  const users = useQuery({ queryKey: ["admin-users"], queryFn: () => api.adminUsers() });
   const [group, setGroup] = useState<ModelAccessGroup | "new">();
   const [alias, setAlias] = useState<ModelAlias | "new">();
   const [deletingGroup, setDeletingGroup] = useState<ModelAccessGroup>();
@@ -220,7 +220,7 @@ export function AdminModelAccess({ models }: { models: AdminModel[] }) {
         <GroupDialog
           group={group === "new" ? undefined : group}
           models={models}
-          users={users.data ?? []}
+          users={users.data?.data ?? []}
           close={() => setGroup(undefined)}
           saved={async () => {
             setGroup(undefined);

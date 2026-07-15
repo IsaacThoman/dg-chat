@@ -54,6 +54,7 @@ Deno.test({
           role user_role NOT NULL DEFAULT 'user',
           approval_status approval_status NOT NULL DEFAULT 'pending',
           state account_state NOT NULL DEFAULT 'active',
+          version integer NOT NULL DEFAULT 1,
           balance_micros bigint NOT NULL DEFAULT 0,
           email_verified_at timestamptz,
           created_at timestamptz NOT NULL DEFAULT now(),
@@ -146,6 +147,11 @@ Deno.test({
       await adminSql.unsafe(migration);
 
       repository = await PostgresRepository.connect(schemaDatabaseUrl(databaseUrl!, schema));
+      const bootstrap = await repository.bootstrapAdmin({
+        email: "admin@example.com",
+        name: "Bootstrap Admin",
+        passwordHash: await hashPassword("bootstrap password remains valid"),
+      }, 5_000_000);
       const mockOidc = await createMockOidcProvider({
         publicIssuer: "http://localhost:4020",
         internalBaseUrl: "http://mock-oidc:4020",
@@ -266,16 +272,28 @@ Deno.test({
         (await oidcState.json() as { counters: { userinfo: number } }).counters.userinfo,
         0,
       );
-      const firstOidcApproval = await repository.approveUser(
-        oidcIdentity.user.id,
-        "approved",
-        5_000_000,
-      );
-      const repeatedOidcApproval = await repository.approveUser(
-        oidcIdentity.user.id,
-        "approved",
-        5_000_000,
-      );
+      const firstOidcApproval = await repository.decideUserApproval({
+        actorId: bootstrap.id,
+        targetUserId: oidcIdentity.user.id,
+        expectedVersion: 1,
+        status: "approved",
+        startingCreditMicros: 5_000_000,
+      });
+      const rejectedOidcIdentity = await repository.decideUserApproval({
+        actorId: bootstrap.id,
+        targetUserId: oidcIdentity.user.id,
+        expectedVersion: firstOidcApproval.version,
+        status: "rejected",
+        startingCreditMicros: 5_000_000,
+        reason: "Exercise idempotent reapproval grant",
+      });
+      const repeatedOidcApproval = await repository.decideUserApproval({
+        actorId: bootstrap.id,
+        targetUserId: oidcIdentity.user.id,
+        expectedVersion: rejectedOidcIdentity.version,
+        status: "approved",
+        startingCreditMicros: 5_000_000,
+      });
       assertEquals(firstOidcApproval.balanceMicros, 5_000_000);
       assertEquals(repeatedOidcApproval.balanceMicros, 5_000_000);
       const approvedOidcStatus = await app.request("/api/auth/status", {
@@ -315,11 +333,6 @@ Deno.test({
         { userId: legacyId, limited: false },
       );
       assertMatch(legacySession.authenticatedAt, /^\d{4}-\d{2}-\d{2}T/u);
-      const bootstrap = await repository.bootstrapAdmin({
-        email: "admin@example.com",
-        name: "Bootstrap Admin",
-        passwordHash: await hashPassword("bootstrap password remains valid"),
-      }, 5_000_000);
       assertEquals(bootstrap.passwordHash, null);
       assertEquals(bootstrap.balanceMicros, 5_000_000);
       const bootstrapSignin = await service.handler(
@@ -747,7 +760,14 @@ Deno.test({
         },
       );
 
-      await repository.approveUser(body.user.id, "approved", 5_000_000, true);
+      await repository.decideUserApproval({
+        actorId: bootstrap.id,
+        targetUserId: body.user.id,
+        expectedVersion: domainUser!.version,
+        status: "approved",
+        startingCreditMicros: 5_000_000,
+        requireEmailVerification: true,
+      });
       assertEquals(
         await (await app.request("/api/auth/status", { headers: { cookie } })).json(),
         {
@@ -789,6 +809,17 @@ Deno.test({
         { userId: body.user.id, limited: false },
       );
       assertMatch(approvedSession.authenticatedAt, /^\d{4}-\d{2}-\d{2}T/u);
+      const approvedTokenResponse = await app.request("/api/tokens", {
+        method: "POST",
+        headers: {
+          cookie: approvedCookie,
+          origin: "http://localhost:5173",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ name: "Deleted account regression", scopes: ["models:read"] }),
+      });
+      assertEquals(approvedTokenResponse.status, 201);
+      const approvedToken = (await approvedTokenResponse.json() as { token: string }).token;
 
       rejectVerificationDelivery = true;
       const deliveryFailureSignup = await app.request("/api/auth/sign-up/email", {
@@ -840,7 +871,51 @@ Deno.test({
       );
       rejectVerificationDelivery = false;
 
-      await repository.setUserState(body.user.id, "suspended");
+      await adminSql`UPDATE users SET deleted_at=now() WHERE id=${body.user.id}`;
+      assertEquals(await service.getSession(new Headers({ cookie: approvedCookie })), null);
+      const passwordResetCount = passwordResetDeliveries.length;
+      assertEquals(
+        (await app.request("/api/auth/password-reset/request", {
+          method: "POST",
+          headers: {
+            origin: "http://localhost:5173",
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ email: "bridge@example.com" }),
+        })).status,
+        202,
+      );
+      assertEquals(passwordResetDeliveries.length, passwordResetCount);
+      assertEquals(
+        (await app.request("/v1/models", {
+          headers: { authorization: `Bearer ${approvedToken}` },
+        })).status,
+        401,
+      );
+      const deletedSignin = await app.request("/api/auth/sign-in/email", {
+        method: "POST",
+        headers: {
+          origin: "http://localhost:5173",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          email: "bridge@example.com",
+          password: "correct horse battery staple",
+        }),
+      });
+      assertEquals(deletedSignin.status, 401);
+      assertEquals(deletedSignin.headers.has("set-cookie"), false);
+      await adminSql`UPDATE users SET deleted_at=NULL WHERE id=${body.user.id}`;
+      assert(await service.getSession(new Headers({ cookie: approvedCookie })));
+
+      const bridgeUser = await repository.getAdminUser(body.user.id);
+      await repository.setAdminUserState({
+        actorId: bootstrap.id,
+        targetUserId: body.user.id,
+        expectedVersion: bridgeUser.version,
+        state: "suspended",
+        reason: "Exercise suspended Better Auth session behavior",
+      });
       assertEquals(await service.getSession(new Headers({ cookie: approvedCookie })), null);
 
       assertEquals(
@@ -857,7 +932,7 @@ Deno.test({
           SELECT limited FROM auth_sessions WHERE user_id=${body.user.id}
         `,
         ],
-        [],
+        [{ limited: true }],
       );
       assertEquals(
         [
