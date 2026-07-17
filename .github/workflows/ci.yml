@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
@@ -77,7 +77,7 @@ jobs:
       DATABASE_URL: postgresql://dgchat:integration-password@localhost:5432/dgchat_test
       TEST_DATABASE_URL: postgresql://dgchat:integration-password@localhost:5432/dgchat_test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
@@ -131,7 +131,7 @@ jobs:
       TEST_S3_ACCESS_KEY: backup-integration-user
       TEST_S3_SECRET_KEY: backup-integration-password-123
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
@@ -180,7 +180,7 @@ jobs:
         run: docker logs backup-integration-minio > backup-integration-minio.log 2>&1 || true
       - name: Upload MinIO logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: backup-integration-minio-log
           path: backup-integration-minio.log
@@ -198,9 +198,9 @@ jobs:
       matrix:
         target: [app, web, worker]
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
         with:
           context: .
           target: ${{ matrix.target }}
@@ -223,7 +223,7 @@ jobs:
       CONTRACT_API_URL: http://localhost:8000
       CI: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
@@ -245,7 +245,7 @@ jobs:
             > mock-provider-state.json || true
       - name: Upload service logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: compose-contract-logs
           path: |
@@ -275,7 +275,7 @@ jobs:
       DEFAULT_APPROVAL_CREDIT_USD: "6.75"
       CI: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
@@ -294,7 +294,7 @@ jobs:
         run: npx playwright test
       - name: Upload browser report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: playwright-report
           path: |
@@ -311,7 +311,7 @@ jobs:
             http://localhost:4020/control/state > mock-oidc-state.json || true
       - name: Upload service logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: compose-logs
           path: |
