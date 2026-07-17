@@ -12,6 +12,7 @@ import {
   adminSessionRevocationSchema,
   adminUserQuerySchema,
   chatCompletionSchema,
+  createAccessGroupSchema,
   createConversationFolderSchema,
   createConversationTagSchema,
   createTokenSchema,
@@ -25,6 +26,7 @@ import {
   responsesSchema,
   setActiveLeafSchema,
   streamGenerationSchema,
+  updateAccessGroupSchema,
   updateConversationFolderSchema,
   updateConversationSchema,
   updateConversationTagSchema,
@@ -546,6 +548,46 @@ Deno.test("personal token policies are strict and bounded", () => {
     true,
   );
   assertEquals(updateTokenSchema.safeParse({ expectedVersion: 0, name: "Nope" }).success, false);
+});
+
+Deno.test("access-group metadata updates require an actual change", () => {
+  assertEquals(updateAccessGroupSchema.safeParse({ expectedVersion: 1 }).success, false);
+  assertEquals(
+    updateAccessGroupSchema.safeParse({ expectedVersion: 1, name: "Operators" }).success,
+    true,
+  );
+  assertEquals(
+    updateAccessGroupSchema.safeParse({ expectedVersion: 1, description: "" }).success,
+    true,
+  );
+});
+
+Deno.test("access-group creation accepts a bounded initial policy and defaults to empty", () => {
+  assertEquals(createAccessGroupSchema.parse({ name: "Legacy" }), {
+    name: "Legacy",
+    userIds: [],
+    modelIds: [],
+    tokenIds: [],
+  });
+  const id = crypto.randomUUID();
+  assertEquals(
+    createAccessGroupSchema.parse({
+      name: "Restricted",
+      userIds: [id],
+      modelIds: [id],
+      tokenIds: [id],
+    }),
+    {
+      name: "Restricted",
+      userIds: [id],
+      modelIds: [id],
+      tokenIds: [id],
+    },
+  );
+  assertEquals(
+    createAccessGroupSchema.safeParse({ name: "Invalid", userIds: ["not-a-uuid"] }).success,
+    false,
+  );
 });
 
 Deno.test("admin account lifecycle contracts are strict, versioned, and bounded", () => {

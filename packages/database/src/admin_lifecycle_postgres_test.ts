@@ -56,6 +56,7 @@ Deno.test({
 
       const approved = await repo.decideUserApproval({
         actorId,
+        expectedAuthorityEpoch: 1,
         targetUserId: targetId,
         expectedVersion: 1,
         status: "approved",
@@ -69,6 +70,7 @@ Deno.test({
         () =>
           repo.setAdminUserRole({
             actorId,
+            expectedAuthorityEpoch: 1,
             targetUserId: targetId,
             expectedVersion: 1,
             role: "admin",
@@ -78,6 +80,7 @@ Deno.test({
       );
       const promoted = await repo.setAdminUserRole({
         actorId,
+        expectedAuthorityEpoch: 1,
         targetUserId: targetId,
         expectedVersion: 2,
         role: "admin",
@@ -111,6 +114,7 @@ Deno.test({
       )`;
       const suspended = await repo.setAdminUserState({
         actorId,
+        expectedAuthorityEpoch: 1,
         targetUserId: targetId,
         expectedVersion: 3,
         state: "suspended",
@@ -158,6 +162,7 @@ Deno.test({
 
       const deleted = await repo.setAdminUserDeleted({
         actorId,
+        expectedAuthorityEpoch: 1,
         targetUserId: targetId,
         expectedVersion: 4,
         deleted: true,
@@ -167,6 +172,7 @@ Deno.test({
       assertEquals(deleted.state, "suspended");
       const restored = await repo.setAdminUserDeleted({
         actorId,
+        expectedAuthorityEpoch: 1,
         targetUserId: targetId,
         expectedVersion: 5,
         deleted: false,
@@ -180,6 +186,7 @@ Deno.test({
         () =>
           repo.decideUserApproval({
             actorId: crypto.randomUUID(),
+            expectedAuthorityEpoch: 1,
             targetUserId: secondId,
             expectedVersion: beforeAuditFailure.version,
             status: "approved",
@@ -209,6 +216,7 @@ Deno.test({
         () =>
           repo.decideUserApproval({
             actorId,
+            expectedAuthorityEpoch: 1,
             targetUserId: secondId,
             expectedVersion: beforeAuditFailure.version,
             status: "approved",
@@ -269,6 +277,7 @@ Deno.test({
     try {
       await repo.setAdminUserRole({
         actorId,
+        expectedAuthorityEpoch: 1,
         targetUserId: targetId,
         expectedVersion: 1,
         role: "admin",
@@ -333,6 +342,7 @@ Deno.test({
       const outcomes = await Promise.allSettled([
         first.setAdminUserDeleted({
           actorId: firstId,
+          expectedAuthorityEpoch: 1,
           targetUserId: secondId,
           expectedVersion: 1,
           deleted: true,
@@ -340,6 +350,7 @@ Deno.test({
         }),
         second.setAdminUserRole({
           actorId: secondId,
+          expectedAuthorityEpoch: 1,
           targetUserId: firstId,
           expectedVersion: 1,
           role: "user",

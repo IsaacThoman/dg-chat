@@ -70,7 +70,9 @@ async function fixture(options: {
     }),
   });
   assertEquals(setup.status, 201);
-  const user = (await setup.json()).user;
+  const publicUser = (await setup.json()).user;
+  const user = repository.findUser(publicUser.id);
+  assertExists(user);
   const mutation = { actorId: user.id, action: "test.speech-route" };
   const created = repository.createProvider({
     slug: "speech-primary",
@@ -211,8 +213,21 @@ Deno.test("completed speech replay reauthorizes model access", async () => {
     voice: "alloy",
   }, key);
   assertEquals(completed.status, 200, await completed.clone().text());
-  const group = fx.repository.createAccessGroup({ name: "deny-speech-replay" });
-  fx.repository.replaceAccessGroupModels(group.id, [fx.model.id], group.version);
+  const group = fx.repository.createAccessGroup({ name: "deny-speech-replay" }, {
+    actorId: fx.user.id,
+    action: "test.model_access_group.created",
+    targetType: "model_access_group",
+    requireEmailVerification: false,
+    expectedAuthorityEpoch: fx.user.authorityEpoch,
+  });
+  fx.repository.replaceAccessGroupModels(group.id, [fx.model.id], group.version, [], {
+    actorId: fx.user.id,
+    action: "test.model_access_group.models_replaced",
+    targetType: "model_access_group",
+    targetId: group.id,
+    requireEmailVerification: false,
+    expectedAuthorityEpoch: fx.user.authorityEpoch,
+  });
   const denied = await fx.request({
     model: fx.model.publicModelId,
     input: "stored-sentinel-speech-body",

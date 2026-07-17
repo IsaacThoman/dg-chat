@@ -1,5 +1,34 @@
-import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.14";
-import { abortableDelay, consumeLiveSse, derivedTimeoutSignal, percentile } from "./runtime.ts";
+import { assertEquals, assertRejects, assertThrows } from "jsr:@std/assert@1.0.14";
+import {
+  abortableDelay,
+  consumeLiveSse,
+  derivedTimeoutSignal,
+  percentile,
+  retentionScrubRequest,
+} from "./runtime.ts";
+
+Deno.test("retention load requests preserve the exact server-issued preview fence", () => {
+  const preview = {
+    policyVersion: 4,
+    requestCutoffAt: "2026-06-17T12:34:56.789Z",
+    responseCutoffAt: "2026-04-18T12:34:56.789Z",
+  };
+  assertEquals(retentionScrubRequest(preview, "load-retention-1"), {
+    expectedPolicyVersion: 4,
+    idempotencyKey: "load-retention-1",
+    requestCutoffAt: preview.requestCutoffAt,
+    responseCutoffAt: preview.responseCutoffAt,
+  });
+  assertThrows(
+    () =>
+      retentionScrubRequest(
+        { ...preview, requestCutoffAt: "one day ago" },
+        "load-retention-2",
+      ),
+    TypeError,
+    "preview fence is invalid",
+  );
+});
 
 Deno.test("derived timeout propagates parent cancellation and disposes its timer", async () => {
   const parent = new AbortController();

@@ -5,6 +5,7 @@ import {
   consumeLiveSse,
   derivedTimeoutSignal,
   percentile,
+  retentionScrubRequest,
   type TimedSseFrame,
 } from "./runtime.ts";
 
@@ -1010,7 +1011,14 @@ async function accountingPhase(): Promise<Record<string, Json>> {
 
 async function queuePhase(): Promise<Record<string, Json>> {
   const policy = await jsonRequest<{ version: number }>("/api/admin/retention/policy");
-  const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1_000).toISOString();
+  const preview = await jsonRequest<{
+    policyVersion: number;
+    requestCutoffAt: string;
+    responseCutoffAt: string;
+  }>("/api/admin/retention/previews", {
+    method: "POST",
+    body: JSON.stringify({ expectedPolicyVersion: policy.version }),
+  });
   const queueBoundary = await sql<{ boundary: Date }[]>`SELECT clock_timestamp() boundary`;
   await sql`CREATE SEQUENCE load_crash_once_seq`;
   const runs = await Promise.all(
@@ -1019,12 +1027,12 @@ async function queuePhase(): Promise<Record<string, Json>> {
       (_, index) =>
         jsonRequest<{ id: string; status: string }>("/api/admin/retention/scrub-runs", {
           method: "POST",
-          body: JSON.stringify({
-            expectedPolicyVersion: policy.version,
-            idempotencyKey: `load-backlog-${index}-${crypto.randomUUID()}`,
-            requestCutoffAt: cutoff,
-            responseCutoffAt: cutoff,
-          }),
+          body: JSON.stringify(
+            retentionScrubRequest(
+              preview,
+              `load-backlog-${index}-${crypto.randomUUID()}`,
+            ),
+          ),
         }, [202]),
     ),
   );

@@ -2675,6 +2675,7 @@ Deno.test("approval grant is minted once and rejection revokes sessions and toke
   repo.createSession(user.id, "limited-session", true);
   let managed = repo.decideUserApproval({
     actorId: actor.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: user.id,
     expectedVersion: user.version,
     status: "approved",
@@ -2685,6 +2686,7 @@ Deno.test("approval grant is minted once and rejection revokes sessions and toke
   repo.settle("spend", 100, 1, 1, 1);
   managed = repo.decideUserApproval({
     actorId: actor.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: user.id,
     expectedVersion: managed.version,
     status: "rejected",
@@ -2694,6 +2696,7 @@ Deno.test("approval grant is minted once and rejection revokes sessions and toke
   assertEquals(repo.getSession("limited-session")?.limited, true);
   managed = repo.decideUserApproval({
     actorId: actor.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: user.id,
     expectedVersion: managed.version,
     status: "approved",
@@ -2709,6 +2712,7 @@ Deno.test("approval grant is minted once and rejection revokes sessions and toke
   }, user.authorityEpoch);
   repo.decideUserApproval({
     actorId: actor.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: user.id,
     expectedVersion: managed.version,
     status: "rejected",
@@ -2736,6 +2740,7 @@ Deno.test("identity tokens are one-time and password reset invalidates credentia
     () =>
       repo.decideUserApproval({
         actorId: actor.id,
+        expectedAuthorityEpoch: 1,
         targetUserId: user.id,
         expectedVersion: user.version,
         status: "approved",
@@ -2816,6 +2821,7 @@ Deno.test("identity tokens are one-time and password reset invalidates credentia
   assertThrows(() => repo.verifyEmail("verify-hash"), DomainError, "invalid or expired");
   repo.decideUserApproval({
     actorId: actor.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: user.id,
     expectedVersion: user.version,
     status: "approved",
@@ -2828,7 +2834,7 @@ Deno.test("identity tokens are one-time and password reset invalidates credentia
     scopes: ["chat:write"],
     tokenHash: "api-hash",
     preview: "api…hash",
-  });
+  }, repo.findUser(user.id)!.authorityEpoch);
   repo.createIdentityToken(
     user.id,
     "password_reset",

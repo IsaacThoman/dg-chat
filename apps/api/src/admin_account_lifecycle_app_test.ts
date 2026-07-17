@@ -90,6 +90,7 @@ Deno.test("required email verification rejects promotion of an unverified approv
   const { app, repository, applicant, headers } = await fixture(undefined, true);
   const approved = repository.decideUserApproval({
     actorId: repository.listUsers().find((user) => user.role === "admin")!.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: applicant.id,
     expectedVersion: applicant.version,
     status: "approved",

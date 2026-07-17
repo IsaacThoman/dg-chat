@@ -350,19 +350,25 @@ test("personal token governance and admin entitlements are explicit and responsi
     }
     if (path === `/api/admin/model-access/groups/${accessGroup.id}/policy` && method === "PUT") {
       policyAttempts++;
-      if (policyAttempts === 1) {
-        return route.fulfill({
-          status: 409,
-          json: { error: { code: "version_conflict", message: "Group changed" } },
-        });
-      }
       const body = route.request().postDataJSON();
       expect(body).toMatchObject({
         expectedVersion: 1,
         userIds: [owner.id],
         tokenIds: [token.id],
         modelIds: [],
+        acknowledgePublicModelIds: [model.id],
       });
+      if (policyAttempts === 1) {
+        return route.fulfill({
+          status: 409,
+          json: {
+            error: {
+              code: "model_access_widening_acknowledgement_required",
+              message: "Access impact changed",
+            },
+          },
+        });
+      }
       accessGroup = { ...accessGroup, ...body, version: 2 };
       return route.fulfill({ json: accessGroup });
     }
@@ -411,7 +417,7 @@ test("personal token governance and admin entitlements are explicit and responsi
   await expect(groupDialog.getByText(/model\(s\).*become public/)).toBeVisible();
   await groupDialog.getByRole("button", { name: "Confirm widening and save" }).focus();
   await page.keyboard.press("Enter");
-  await expect(groupDialog.getByText(/changed in another session/)).toBeVisible();
+  await expect(groupDialog.getByText(/Access changed while you were confirming/)).toBeVisible();
   await groupDialog.getByRole("button", { name: "Confirm widening and save" }).focus();
   await page.keyboard.press("Enter");
   await expect(page.getByText("Access group updated.")).toBeAttached();

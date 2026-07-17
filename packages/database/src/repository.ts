@@ -276,6 +276,7 @@ export interface CreateUserInput {
 
 export interface AdminUserCommand {
   actorId: string;
+  expectedAuthorityEpoch: number;
   targetUserId: string;
   expectedVersion: number;
   reason?: string;
@@ -468,6 +469,17 @@ export interface AuditEventInput {
   targetType: string;
   targetId?: string | null;
   metadata?: Record<string, unknown>;
+}
+export interface PrivilegedAuditEventInput extends AuditEventInput {
+  actorId: string;
+  requireEmailVerification: boolean;
+  expectedAuthorityEpoch: number;
+}
+/** Authority admitted by middleware and revalidated at the storage disclosure boundary. */
+export interface PrivilegedReadContext {
+  actorId: string;
+  requireEmailVerification: boolean;
+  expectedAuthorityEpoch: number;
 }
 export interface AuditEvent extends AuditEventInput {
   id: string;
@@ -1338,6 +1350,10 @@ export interface AccessGroup {
 export interface CreateAccessGroupInput {
   name: string;
   description?: string;
+  /** Initial policy subjects. Omitted arrays preserve the legacy empty-group behavior. */
+  userIds?: string[];
+  modelIds?: string[];
+  tokenIds?: string[];
 }
 export interface UpdateAccessGroupInput {
   expectedVersion: number;
@@ -1348,6 +1364,7 @@ export interface ReplaceAccessGroupPolicyInput extends UpdateAccessGroupInput {
   userIds: string[];
   modelIds: string[];
   tokenIds: string[];
+  acknowledgePublicModelIds: string[];
 }
 export interface AccessGroupPolicyProposal {
   userIds: string[];
@@ -1358,6 +1375,25 @@ export interface AccessGroupPolicyImpact {
   modelIdsBecomingPublic: string[];
   tokenIdsLosingGroupAccess: string[];
   tokenIdsRevertingToOwnerInheritance: string[];
+}
+
+/**
+ * Canonicalizes an acknowledgement as a mathematical set. Callers use the same representation
+ * for both the locked impact and the supplied acknowledgement so neither ordering nor duplicate
+ * JSON entries can create a false mismatch.
+ */
+export function normalizeModelAccessWideningAcknowledgement(ids: readonly string[]): string[] {
+  return [...new Set(ids)].sort();
+}
+
+export function modelAccessWideningAcknowledgementMatches(
+  actualModelIds: readonly string[],
+  acknowledgedModelIds: readonly string[],
+): boolean {
+  const actual = normalizeModelAccessWideningAcknowledgement(actualModelIds);
+  const acknowledged = normalizeModelAccessWideningAcknowledgement(acknowledgedModelIds);
+  return actual.length === acknowledged.length &&
+    actual.every((modelId, index) => modelId === acknowledged[index]);
 }
 export interface EntitledProviderModel {
   model: ProviderModelRecord;
@@ -2772,55 +2808,102 @@ export interface DomainRepository {
     ownerId: string,
     input: ReplaceConversationKnowledgeInput,
   ): MaybePromise<KnowledgeConversationBinding[]>;
+  /** Creates a personal token and its mandatory audit record as one atomic command. */
   createApiToken(
     userId: string,
     input: CreateApiTokenInput,
-    expectedAuthorityEpoch?: number,
+    expectedAuthorityEpoch: number,
   ): MaybePromise<StoredApiToken>;
   authenticateApiToken(hash: string): MaybePromise<StoredApiToken | undefined>;
   findApiTokenByHash(hash: string): MaybePromise<StoredApiToken | undefined>;
   listApiTokens(userId: string): MaybePromise<ApiTokenSummary[]>;
-  revokeApiToken(id: string, userId: string): MaybePromise<void>;
+  /** Revokes the token family and appends its mandatory audit in the same transaction. */
+  revokeApiToken(
+    id: string,
+    userId: string,
+    expectedAuthorityEpoch: number,
+  ): MaybePromise<void>;
+  /** Updates the token family and appends its mandatory audit in the same transaction. */
   updateApiToken(
     userId: string,
     id: string,
     input: UpdateApiTokenInput,
+    expectedAuthorityEpoch: number,
   ): MaybePromise<ApiTokenSummary>;
+  /** Rotates the token and appends its mandatory audit before the replacement secret is returned. */
   rotateApiToken(
     userId: string,
     id: string,
     input: RotateApiTokenInput,
-    expectedAuthorityEpoch?: number,
+    expectedAuthorityEpoch: number,
   ): MaybePromise<RotatedApiToken>;
-  revokeApiTokenFamily(id: string, userId: string, expectedVersion: number): MaybePromise<void>;
+  /** CAS-revokes the family and appends its mandatory audit in the same transaction. */
+  revokeApiTokenFamily(
+    id: string,
+    userId: string,
+    expectedVersion: number,
+    expectedAuthorityEpoch: number,
+  ): MaybePromise<void>;
   searchApiTokens(
+    context: PrivilegedReadContext,
     query?: string,
     limit?: number,
     cursor?: string,
   ): MaybePromise<AdminTokenLookupPage>;
   listModelAliases(): MaybePromise<ModelAlias[]>;
-  createModelAlias(input: CreateModelAliasInput): MaybePromise<ModelAlias>;
-  updateModelAlias(id: string, input: UpdateModelAliasInput): MaybePromise<ModelAlias>;
-  deleteModelAlias(id: string, expectedVersion: number): MaybePromise<void>;
-  listAccessGroups(): MaybePromise<AccessGroup[]>;
-  createAccessGroup(input: CreateAccessGroupInput): MaybePromise<AccessGroup>;
-  updateAccessGroup(id: string, input: UpdateAccessGroupInput): MaybePromise<AccessGroup>;
-  deleteAccessGroup(id: string, expectedVersion: number): MaybePromise<void>;
+  /** Creates a model alias and appends its mandatory privileged audit atomically. */
+  createModelAlias(
+    input: CreateModelAliasInput,
+    audit: PrivilegedAuditEventInput,
+  ): MaybePromise<ModelAlias>;
+  /** Updates a model alias and appends its mandatory privileged audit atomically. */
+  updateModelAlias(
+    id: string,
+    input: UpdateModelAliasInput,
+    audit: PrivilegedAuditEventInput,
+  ): MaybePromise<ModelAlias>;
+  /** Deletes a model alias and appends its mandatory privileged audit atomically. */
+  deleteModelAlias(
+    id: string,
+    expectedVersion: number,
+    audit: PrivilegedAuditEventInput,
+  ): MaybePromise<void>;
+  listAccessGroups(context: PrivilegedReadContext): MaybePromise<AccessGroup[]>;
+  createAccessGroup(
+    input: CreateAccessGroupInput,
+    audit: PrivilegedAuditEventInput,
+  ): MaybePromise<AccessGroup>;
+  updateAccessGroup(
+    id: string,
+    input: UpdateAccessGroupInput,
+    audit: PrivilegedAuditEventInput,
+  ): MaybePromise<AccessGroup>;
+  deleteAccessGroup(
+    id: string,
+    expectedVersion: number,
+    acknowledgePublicModelIds: string[],
+    audit: PrivilegedAuditEventInput,
+  ): MaybePromise<void>;
   replaceAccessGroupUsers(
     id: string,
     userIds: string[],
     expectedVersion: number,
+    audit: PrivilegedAuditEventInput,
   ): MaybePromise<AccessGroup>;
   replaceAccessGroupModels(
     id: string,
     modelIds: string[],
     expectedVersion: number,
+    acknowledgePublicModelIds: string[],
+    audit: PrivilegedAuditEventInput,
   ): MaybePromise<AccessGroup>;
   replaceAccessGroupPolicy(
     id: string,
     input: ReplaceAccessGroupPolicyInput,
+    audit: PrivilegedAuditEventInput,
   ): MaybePromise<AccessGroup>;
   previewAccessGroupPolicyImpact(
+    context: PrivilegedReadContext,
     id: string,
     proposal?: AccessGroupPolicyProposal | null,
   ): MaybePromise<AccessGroupPolicyImpact>;
@@ -2829,12 +2912,14 @@ export interface DomainRepository {
     tokenId: string,
     groupIds: string[],
     expectedVersion: number,
+    audit: PrivilegedAuditEventInput,
   ): MaybePromise<ApiTokenSummary>;
   setTokenAccessMode(
     userId: string,
     tokenId: string,
     mode: "inherit" | "restricted",
     expectedVersion: number,
+    audit: PrivilegedAuditEventInput,
   ): MaybePromise<ApiTokenSummary>;
   listEntitledProviderModels(subject: TokenAccessSubject): MaybePromise<ProviderModelRecord[]>;
   resolveEntitledProviderModel(

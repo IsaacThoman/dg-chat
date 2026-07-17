@@ -32,6 +32,7 @@ Deno.test({
       });
       await repository.decideUserApproval({
         actorId: first.id,
+        expectedAuthorityEpoch: 1,
         targetUserId: second.id,
         expectedVersion: second.version,
         status: "approved",

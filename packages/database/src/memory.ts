@@ -75,6 +75,7 @@ import {
   MAX_CONVERSATION_SHARE_ATTACHMENTS,
   MAX_CONVERSATION_SHARE_CONTENT_CHARS,
   MAX_CONVERSATION_SHARE_MESSAGES,
+  modelAccessWideningAcknowledgementMatches,
   normalizeKnowledgeSearchLimit,
   planAbandonedApiReplay,
   splitApiSseReplayFrame,
@@ -169,6 +170,8 @@ import type {
   LifecycleConversationDetail,
   ModelAlias,
   ModelPriceVersion,
+  PrivilegedAuditEventInput,
+  PrivilegedReadContext,
   ProviderAttempt,
   ProviderCredentialEnvelope,
   ProviderCredentialMutation,
@@ -824,7 +827,7 @@ export class MemoryRepository {
 
   #isEffectiveAdmin(user: StoredUser, requireEmailVerification = false): boolean {
     return user.role === "admin" && user.approvalStatus === "approved" &&
-      user.state === "active" && user.deletedAt === null &&
+      user.state === "active" && user.deletedAt === null && !user.passwordResetPending &&
       (!requireEmailVerification || user.emailVerifiedAt !== null);
   }
 
@@ -832,9 +835,37 @@ export class MemoryRepository {
     return { ...this.publicUser(user), effectiveAdmin: this.#isEffectiveAdmin(user) };
   }
 
-  #assertEffectiveAdminActor(actorId: string, requireEmailVerification = false): void {
+  #requireAuthorityEpoch(expectedAuthorityEpoch: number | undefined): number {
+    if (!Number.isSafeInteger(expectedAuthorityEpoch) || expectedAuthorityEpoch! < 1) {
+      throw new DomainError(
+        "validation_error",
+        "Expected authority epoch must be a positive integer",
+        422,
+      );
+    }
+    return expectedAuthorityEpoch!;
+  }
+
+  #assertEffectiveAdminActor(
+    actorId: string,
+    requireEmailVerification = false,
+    expectedAuthorityEpoch?: number,
+  ): void {
+    if (
+      expectedAuthorityEpoch !== undefined &&
+      (!Number.isSafeInteger(expectedAuthorityEpoch) || expectedAuthorityEpoch < 1)
+    ) {
+      throw new DomainError(
+        "validation_error",
+        "Expected authority epoch must be a positive integer",
+        422,
+      );
+    }
     const actor = this.users.get(actorId);
-    if (!actor || !this.#isEffectiveAdmin(actor, requireEmailVerification)) {
+    if (
+      !actor || !this.#isEffectiveAdmin(actor, requireEmailVerification) ||
+      expectedAuthorityEpoch !== undefined && actor.authorityEpoch !== expectedAuthorityEpoch
+    ) {
       throw new DomainError(
         "admin_authority_required",
         "Administrator authority changed before the request completed",
@@ -1023,7 +1054,12 @@ export class MemoryRepository {
   }
 
   decideUserApproval(input: AdminApprovalCommand): AdminUser {
-    this.#assertEffectiveAdminActor(input.actorId, input.requireEmailVerification);
+    this.#requireAuthorityEpoch(input.expectedAuthorityEpoch);
+    this.#assertEffectiveAdminActor(
+      input.actorId,
+      input.requireEmailVerification,
+      input.expectedAuthorityEpoch,
+    );
     return this.#withAtomicAdminMutation(input.targetUserId, () => {
       const user = this.#adminTarget(
         input.targetUserId,
@@ -1041,7 +1077,7 @@ export class MemoryRepository {
         input.status === "approved" && input.requireEmailVerification && !user.emailVerifiedAt
       ) throw new DomainError("email_not_verified", "Email must be verified before approval", 409);
       const remainsEffective = user.role === "admin" && input.status === "approved" &&
-        user.state === "active" && user.deletedAt === null &&
+        user.state === "active" && user.deletedAt === null && !user.passwordResetPending &&
         (!input.requireEmailVerification || user.emailVerifiedAt !== null);
       this.#assertAdminCanLoseAuthority(user, remainsEffective, input.requireEmailVerification);
       if (
@@ -1073,7 +1109,12 @@ export class MemoryRepository {
   }
 
   setAdminUserRole(input: AdminRoleCommand): AdminUser {
-    this.#assertEffectiveAdminActor(input.actorId, input.requireEmailVerification);
+    this.#requireAuthorityEpoch(input.expectedAuthorityEpoch);
+    this.#assertEffectiveAdminActor(
+      input.actorId,
+      input.requireEmailVerification,
+      input.expectedAuthorityEpoch,
+    );
     return this.#withAtomicAdminMutation(input.targetUserId, () => {
       const user = this.#adminTarget(input.targetUserId, input.expectedVersion, input.reason, true);
       if (user.role === input.role) {
@@ -1084,7 +1125,8 @@ export class MemoryRepository {
       }
       if (
         input.role === "admin" &&
-        (user.approvalStatus !== "approved" || user.state !== "active" || user.deletedAt !== null)
+        (user.approvalStatus !== "approved" || user.state !== "active" ||
+          user.deletedAt !== null || user.passwordResetPending)
       ) {
         throw new DomainError(
           "invalid_transition",
@@ -1096,7 +1138,7 @@ export class MemoryRepository {
         throw new DomainError("email_not_verified", "Email must be verified before promotion", 409);
       }
       const remainsEffective = input.role === "admin" && user.approvalStatus === "approved" &&
-        user.state === "active" && user.deletedAt === null &&
+        user.state === "active" && user.deletedAt === null && !user.passwordResetPending &&
         (!input.requireEmailVerification || user.emailVerifiedAt !== null);
       this.#assertAdminCanLoseAuthority(user, remainsEffective, input.requireEmailVerification);
       const before = {
@@ -1116,7 +1158,12 @@ export class MemoryRepository {
   }
 
   setAdminUserState(input: AdminStateCommand): AdminUser {
-    this.#assertEffectiveAdminActor(input.actorId, input.requireEmailVerification);
+    this.#requireAuthorityEpoch(input.expectedAuthorityEpoch);
+    this.#assertEffectiveAdminActor(
+      input.actorId,
+      input.requireEmailVerification,
+      input.expectedAuthorityEpoch,
+    );
     return this.#withAtomicAdminMutation(input.targetUserId, () => {
       const user = this.#adminTarget(
         input.targetUserId,
@@ -1131,7 +1178,7 @@ export class MemoryRepository {
         throw new DomainError("self_action_forbidden", "You cannot suspend your own account", 403);
       }
       const remainsEffective = user.role === "admin" && user.approvalStatus === "approved" &&
-        input.state === "active" && user.deletedAt === null &&
+        input.state === "active" && user.deletedAt === null && !user.passwordResetPending &&
         (!input.requireEmailVerification || user.emailVerifiedAt !== null);
       this.#assertAdminCanLoseAuthority(user, remainsEffective, input.requireEmailVerification);
       const before = {
@@ -1148,7 +1195,12 @@ export class MemoryRepository {
   }
 
   setAdminUserDeleted(input: AdminDeletionCommand): AdminUser {
-    this.#assertEffectiveAdminActor(input.actorId, input.requireEmailVerification);
+    this.#requireAuthorityEpoch(input.expectedAuthorityEpoch);
+    this.#assertEffectiveAdminActor(
+      input.actorId,
+      input.requireEmailVerification,
+      input.expectedAuthorityEpoch,
+    );
     return this.#withAtomicAdminMutation(input.targetUserId, () => {
       const user = this.#adminTarget(input.targetUserId, input.expectedVersion, input.reason, true);
       if ((user.deletedAt !== null) === input.deleted) {
@@ -1158,7 +1210,7 @@ export class MemoryRepository {
         throw new DomainError("self_action_forbidden", "You cannot delete your own account", 403);
       }
       const remainsEffective = user.role === "admin" && user.approvalStatus === "approved" &&
-        user.state === "active" && !input.deleted &&
+        user.state === "active" && !input.deleted && !user.passwordResetPending &&
         (!input.requireEmailVerification || user.emailVerifiedAt !== null);
       this.#assertAdminCanLoseAuthority(user, remainsEffective, input.requireEmailVerification);
       const before = {
@@ -6816,10 +6868,50 @@ export class MemoryRepository {
     return structuredClone(existing);
   }
 
+  #withAtomicApiTokenMutation<T>(userId: string, operation: () => T): T {
+    const tokensBefore = new Map(
+      [...this.tokens].filter(([, value]) => value.userId === userId)
+        .map(([key, value]) => [key, structuredClone(value)]),
+    );
+    const accessGroupsBefore = new Map(
+      [...this.accessGroups].map(([key, value]) => [key, structuredClone(value)]),
+    );
+    const auditLength = this.auditEvents.length;
+    try {
+      return operation();
+    } catch (error) {
+      for (const [key, value] of this.tokens) {
+        if (value.userId === userId) this.tokens.delete(key);
+      }
+      for (const [key, value] of tokensBefore) this.tokens.set(key, value);
+      this.accessGroups.clear();
+      for (const [key, value] of accessGroupsBefore) this.accessGroups.set(key, value);
+      this.auditEvents.length = auditLength;
+      throw error;
+    }
+  }
+
   createApiToken(
     userId: string,
     input: CreateApiTokenInput,
-    expectedAuthorityEpoch = 1,
+    expectedAuthorityEpoch: number,
+  ): StoredApiToken {
+    return this.#withAtomicApiTokenMutation(userId, () => {
+      const created = this.#createApiTokenMutation(userId, input, expectedAuthorityEpoch);
+      this.recordAudit({
+        actorId: userId,
+        action: "api_token.created",
+        targetType: "api_token",
+        targetId: created.id,
+      });
+      return created;
+    });
+  }
+
+  #createApiTokenMutation(
+    userId: string,
+    input: CreateApiTokenInput,
+    expectedAuthorityEpoch: number,
   ): StoredApiToken {
     this.#validateTokenRates(input.rpmLimit ?? null, input.burstLimit ?? null);
     const user = this.users.get(userId);
@@ -6882,14 +6974,58 @@ export class MemoryRepository {
       { userId: _u, tokenHash: _h, authorityEpoch: _epoch, ...t },
     ) => t);
   }
-  revokeApiToken(id: string, userId: string) {
-    const token = this.tokens.get(id);
-    if (!token || token.userId !== userId) {
-      throw new DomainError("not_found", "Token not found", 404);
+  #assertPersonalTokenOwner(
+    userId: string,
+    expectedAuthorityEpoch: number,
+    action: "update" | "revoke",
+  ) {
+    const user = this.users.get(userId);
+    if (
+      !user || user.approvalStatus !== "approved" || user.state !== "active" ||
+      user.deletedAt !== null || user.passwordResetPending === true ||
+      user.authorityEpoch !== expectedAuthorityEpoch
+    ) {
+      throw new DomainError(
+        "account_unavailable",
+        `Account cannot ${action} API tokens`,
+        403,
+      );
     }
-    this.#revokeFamily(token.rotationFamilyId);
   }
-  revokeApiTokenFamily(id: string, userId: string, expectedVersion: number) {
+  revokeApiToken(id: string, userId: string, expectedAuthorityEpoch: number) {
+    return this.#withAtomicApiTokenMutation(userId, () => {
+      this.#assertPersonalTokenOwner(userId, expectedAuthorityEpoch, "revoke");
+      const token = this.tokens.get(id);
+      if (!token || token.userId !== userId) {
+        throw new DomainError("not_found", "Token not found", 404);
+      }
+      this.#revokeApiTokenFamilyMutation(id, userId, token.version);
+      this.recordAudit({
+        actorId: userId,
+        action: "api_token.revoked",
+        targetType: "api_token",
+        targetId: id,
+      });
+    });
+  }
+  revokeApiTokenFamily(
+    id: string,
+    userId: string,
+    expectedVersion: number,
+    expectedAuthorityEpoch: number,
+  ) {
+    return this.#withAtomicApiTokenMutation(userId, () => {
+      this.#assertPersonalTokenOwner(userId, expectedAuthorityEpoch, "revoke");
+      this.#revokeApiTokenFamilyMutation(id, userId, expectedVersion);
+      this.recordAudit({
+        actorId: userId,
+        action: "api_token.revoked",
+        targetType: "api_token",
+        targetId: id,
+      });
+    });
+  }
+  #revokeApiTokenFamilyMutation(id: string, userId: string, expectedVersion: number) {
     const token = this.tokens.get(id);
     if (!token || token.userId !== userId) {
       throw new DomainError("not_found", "Token not found", 404);
@@ -6926,7 +7062,25 @@ export class MemoryRepository {
       candidate.rotationFamilyId === token.rotationFamilyId
     );
   }
-  updateApiToken(userId: string, id: string, input: UpdateApiTokenInput) {
+  updateApiToken(
+    userId: string,
+    id: string,
+    input: UpdateApiTokenInput,
+    expectedAuthorityEpoch: number,
+  ) {
+    return this.#withAtomicApiTokenMutation(userId, () => {
+      this.#assertPersonalTokenOwner(userId, expectedAuthorityEpoch, "update");
+      const updated = this.#updateApiTokenMutation(userId, id, input);
+      this.recordAudit({
+        actorId: userId,
+        action: "api_token.updated",
+        targetType: "api_token",
+        targetId: id,
+      });
+      return updated;
+    });
+  }
+  #updateApiTokenMutation(userId: string, id: string, input: UpdateApiTokenInput) {
     const token = this.tokens.get(id);
     if (!token || token.userId !== userId) {
       throw new DomainError("not_found", "Token not found", 404);
@@ -6951,7 +7105,33 @@ export class MemoryRepository {
     userId: string,
     id: string,
     input: RotateApiTokenInput,
-    expectedAuthorityEpoch = 1,
+    expectedAuthorityEpoch: number,
+  ): RotatedApiToken {
+    return this.#withAtomicApiTokenMutation(userId, () => {
+      const rotated = this.#rotateApiTokenMutation(
+        userId,
+        id,
+        input,
+        expectedAuthorityEpoch,
+      );
+      this.recordAudit({
+        actorId: userId,
+        action: "api_token.rotated",
+        targetType: "api_token",
+        targetId: rotated.replacement.id,
+        metadata: {
+          previousTokenId: rotated.previous.id,
+          overlapSeconds: input.overlapSeconds,
+        },
+      });
+      return rotated;
+    });
+  }
+  #rotateApiTokenMutation(
+    userId: string,
+    id: string,
+    input: RotateApiTokenInput,
+    expectedAuthorityEpoch: number,
   ): RotatedApiToken {
     if (
       !Number.isInteger(input.overlapSeconds) || input.overlapSeconds < 0 ||
@@ -7017,7 +7197,12 @@ export class MemoryRepository {
     }
     return { previous: this.#tokenSummary(old), replacement: this.#tokenSummary(replacement) };
   }
-  searchApiTokens(query = "", limit = 50, cursor?: string): AdminTokenLookupPage {
+  searchApiTokens(
+    context: PrivilegedReadContext,
+    query = "",
+    limit = 50,
+    cursor?: string,
+  ): AdminTokenLookupPage {
     if (
       cursor &&
       !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
@@ -7026,6 +7211,7 @@ export class MemoryRepository {
     ) {
       throw new DomainError("validation_error", "cursor must be a valid UUID", 422);
     }
+    this.#assertPrivilegedReadContext(context);
     const bounded = Math.min(100, Math.max(1, limit));
     const q = query.trim().toLowerCase();
     const all = [...this.tokens.values()].filter((t) =>
@@ -7055,189 +7241,533 @@ export class MemoryRepository {
   listModelAliases() {
     return structuredClone([...this.modelAliases.values()]);
   }
-  createModelAlias(input: CreateModelAliasInput) {
-    if (
-      !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$/.test(input.alias) ||
-      [...this.modelAliases.values()].some((a) => a.alias === input.alias) ||
-      [...this.providerModels.values()].some((m) => m.publicModelId === input.alias)
-    ) throw new DomainError("conflict", "Model alias is invalid or already used", 409);
-    if (!this.providerModels.has(input.targetModelId)) {
-      throw new DomainError("not_found", "Target model not found", 404);
+  #withAtomicModelAliasMutation<T>(
+    operation: () => T,
+    audit: PrivilegedAuditEventInput,
+  ): T {
+    this.#requirePrivilegedAuditContext(audit);
+    const aliasesBefore = new Map(
+      [...this.modelAliases].map(([key, value]) => [key, structuredClone(value)]),
+    );
+    const auditLength = this.auditEvents.length;
+    try {
+      this.#assertEffectiveAdminActor(
+        audit.actorId,
+        audit.requireEmailVerification,
+        audit.expectedAuthorityEpoch,
+      );
+      const result = operation();
+      const {
+        requireEmailVerification: _requireEmailVerification,
+        expectedAuthorityEpoch: _expectedAuthorityEpoch,
+        ...event
+      } = audit;
+      this.recordAudit(event);
+      return result;
+    } catch (error) {
+      this.modelAliases.clear();
+      for (const [key, value] of aliasesBefore) this.modelAliases.set(key, value);
+      this.auditEvents.length = auditLength;
+      throw error;
     }
-    const now = new Date().toISOString();
-    const value: ModelAlias = {
-      id: crypto.randomUUID(),
-      alias: input.alias,
-      targetModelId: input.targetModelId,
-      description: input.description ?? "",
-      version: 1,
-      createdAt: now,
-      updatedAt: now,
+  }
+  createModelAlias(
+    input: CreateModelAliasInput,
+    audit: PrivilegedAuditEventInput,
+  ) {
+    this.#requirePrivilegedAuditContext(audit);
+    const id = crypto.randomUUID();
+    const mutationAudit: PrivilegedAuditEventInput = {
+      ...audit,
+      targetId: id,
+      metadata: { ...audit.metadata },
     };
-    this.modelAliases.set(value.id, value);
-    return structuredClone(value);
+    return this.#withAtomicModelAliasMutation(() => {
+      if (
+        !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$/.test(input.alias) ||
+        [...this.modelAliases.values()].some((a) => a.alias === input.alias) ||
+        [...this.providerModels.values()].some((m) => m.publicModelId === input.alias)
+      ) throw new DomainError("conflict", "Model alias is invalid or already used", 409);
+      if (!this.providerModels.has(input.targetModelId)) {
+        throw new DomainError("not_found", "Target model not found", 404);
+      }
+      const now = new Date().toISOString();
+      const value: ModelAlias = {
+        id,
+        alias: input.alias,
+        targetModelId: input.targetModelId,
+        description: input.description ?? "",
+        version: 1,
+        createdAt: now,
+        updatedAt: now,
+      };
+      this.modelAliases.set(value.id, value);
+      mutationAudit.metadata = {
+        ...mutationAudit.metadata,
+        after: {
+          alias: value.alias,
+          targetModelId: value.targetModelId,
+          description: value.description,
+        },
+      };
+      return structuredClone(value);
+    }, mutationAudit);
   }
-  updateModelAlias(id: string, input: UpdateModelAliasInput) {
-    const value = this.modelAliases.get(id);
-    if (!value) throw new DomainError("not_found", "Model alias not found", 404);
-    if (value.version !== input.expectedVersion) {
-      throw new DomainError("version_conflict", "Model alias was modified", 409);
-    }
-    const alias = input.alias ?? value.alias;
-    if (
-      !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$/.test(alias) ||
-      [...this.modelAliases.values()].some((a) => a.id !== id && a.alias === alias) ||
-      [...this.providerModels.values()].some((m) => m.publicModelId === alias)
-    ) throw new DomainError("conflict", "Model alias is invalid or already used", 409);
-    if (input.targetModelId !== undefined && !this.providerModels.has(input.targetModelId)) {
-      throw new DomainError("not_found", "Target model not found", 404);
-    }
-    value.alias = alias;
-    value.targetModelId = input.targetModelId ?? value.targetModelId;
-    value.description = input.description ?? value.description;
-    value.version++;
-    value.updatedAt = new Date().toISOString();
-    return structuredClone(value);
+  updateModelAlias(
+    id: string,
+    input: UpdateModelAliasInput,
+    audit: PrivilegedAuditEventInput,
+  ) {
+    this.#requirePrivilegedAuditContext(audit);
+    const mutationAudit: PrivilegedAuditEventInput = {
+      ...audit,
+      targetId: id,
+      metadata: { ...audit.metadata },
+    };
+    return this.#withAtomicModelAliasMutation(() => {
+      const value = this.modelAliases.get(id);
+      if (!value) throw new DomainError("not_found", "Model alias not found", 404);
+      if (value.version !== input.expectedVersion) {
+        throw new DomainError("version_conflict", "Model alias was modified", 409);
+      }
+      const alias = input.alias ?? value.alias;
+      if (
+        !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$/.test(alias) ||
+        [...this.modelAliases.values()].some((a) => a.id !== id && a.alias === alias) ||
+        [...this.providerModels.values()].some((m) => m.publicModelId === alias)
+      ) throw new DomainError("conflict", "Model alias is invalid or already used", 409);
+      if (input.targetModelId !== undefined && !this.providerModels.has(input.targetModelId)) {
+        throw new DomainError("not_found", "Target model not found", 404);
+      }
+      const before = {
+        alias: value.alias,
+        targetModelId: value.targetModelId,
+        description: value.description,
+      };
+      value.alias = alias;
+      value.targetModelId = input.targetModelId ?? value.targetModelId;
+      value.description = input.description ?? value.description;
+      value.version++;
+      value.updatedAt = new Date().toISOString();
+      mutationAudit.metadata = {
+        ...mutationAudit.metadata,
+        before,
+        after: {
+          alias: value.alias,
+          targetModelId: value.targetModelId,
+          description: value.description,
+        },
+      };
+      return structuredClone(value);
+    }, mutationAudit);
   }
-  deleteModelAlias(id: string, expectedVersion: number) {
-    const value = this.modelAliases.get(id);
-    if (!value) throw new DomainError("not_found", "Model alias not found", 404);
-    if (value.version !== expectedVersion) {
-      throw new DomainError("version_conflict", "Model alias was modified", 409);
-    }
-    this.modelAliases.delete(id);
+  deleteModelAlias(
+    id: string,
+    expectedVersion: number,
+    audit: PrivilegedAuditEventInput,
+  ) {
+    this.#requirePrivilegedAuditContext(audit);
+    const mutationAudit: PrivilegedAuditEventInput = {
+      ...audit,
+      targetId: id,
+      metadata: { ...audit.metadata },
+    };
+    this.#withAtomicModelAliasMutation(() => {
+      const value = this.modelAliases.get(id);
+      if (!value) throw new DomainError("not_found", "Model alias not found", 404);
+      if (value.version !== expectedVersion) {
+        throw new DomainError("version_conflict", "Model alias was modified", 409);
+      }
+      mutationAudit.metadata = {
+        ...mutationAudit.metadata,
+        before: {
+          alias: value.alias,
+          targetModelId: value.targetModelId,
+          description: value.description,
+        },
+      };
+      this.modelAliases.delete(id);
+    }, mutationAudit);
   }
-  listAccessGroups() {
+  listAccessGroups(context: PrivilegedReadContext) {
+    this.#assertPrivilegedReadContext(context);
     return structuredClone([...this.accessGroups.values()]);
   }
-  createAccessGroup(input: CreateAccessGroupInput) {
+  #assertPrivilegedReadContext(context: PrivilegedReadContext | undefined): void {
     if (
-      !input.name.trim() ||
-      [...this.accessGroups.values()].some((g) =>
-        g.name.toLowerCase() === input.name.trim().toLowerCase()
-      )
-    ) throw new DomainError("conflict", "Access group name is already used", 409);
-    const now = new Date().toISOString();
-    const value: AccessGroup = {
-      id: crypto.randomUUID(),
-      name: input.name.trim(),
-      description: input.description ?? "",
-      version: 1,
-      userIds: [],
-      modelIds: [],
-      tokenIds: [],
-      tokenOwners: [],
-      createdAt: now,
-      updatedAt: now,
+      !context ||
+      typeof context.actorId !== "string" || context.actorId.trim() === "" ||
+      typeof context.requireEmailVerification !== "boolean" ||
+      !Number.isSafeInteger(context.expectedAuthorityEpoch) ||
+      context.expectedAuthorityEpoch < 1
+    ) {
+      throw new DomainError(
+        "admin_authority_required",
+        "Privileged read context is required",
+        403,
+      );
+    }
+    this.#assertEffectiveAdminActor(
+      context.actorId,
+      context.requireEmailVerification,
+      context.expectedAuthorityEpoch,
+    );
+  }
+  #requirePrivilegedAuditContext(
+    audit: PrivilegedAuditEventInput | undefined,
+  ): asserts audit is PrivilegedAuditEventInput {
+    if (
+      !audit ||
+      typeof audit.actorId !== "string" || audit.actorId.trim() === "" ||
+      typeof audit.action !== "string" || audit.action.trim() === "" ||
+      typeof audit.targetType !== "string" || audit.targetType.trim() === "" ||
+      typeof audit.requireEmailVerification !== "boolean" ||
+      !Number.isSafeInteger(audit.expectedAuthorityEpoch) ||
+      audit.expectedAuthorityEpoch < 1
+    ) {
+      throw new DomainError(
+        "admin_authority_required",
+        "Privileged mutation context is required",
+        403,
+      );
+    }
+  }
+  createAccessGroup(input: CreateAccessGroupInput, audit: PrivilegedAuditEventInput) {
+    this.#requirePrivilegedAuditContext(audit);
+    const id = crypto.randomUUID();
+    const name = input.name.trim();
+    const description = input.description ?? "";
+    const userIds = [...new Set(input.userIds ?? [])];
+    const modelIds = [...new Set(input.modelIds ?? [])];
+    const requestedTokenIds = [...new Set(input.tokenIds ?? [])];
+    const mutationAudit: PrivilegedAuditEventInput = {
+      ...audit,
+      targetId: id,
+      metadata: { ...audit.metadata },
     };
-    this.accessGroups.set(value.id, value);
-    return structuredClone(value);
-  }
-  updateAccessGroup(id: string, input: UpdateAccessGroupInput) {
-    const g = this.#group(id, input.expectedVersion);
-    if (
-      input.name !== undefined &&
-      [...this.accessGroups.values()].some((other) =>
-        other.id !== id && other.name.toLowerCase() === input.name!.trim().toLowerCase()
-      )
-    ) throw new DomainError("conflict", "Access group name is already used", 409);
-    if (input.name !== undefined) g.name = input.name.trim();
-    if (input.description !== undefined) g.description = input.description;
-    g.version++;
-    g.updatedAt = new Date().toISOString();
-    return structuredClone(g);
-  }
-  deleteAccessGroup(id: string, expectedVersion: number) {
-    this.#group(id, expectedVersion);
-    this.accessGroups.delete(id);
-  }
-  replaceAccessGroupUsers(id: string, userIds: string[], expectedVersion: number) {
-    const g = this.#group(id, expectedVersion);
-    for (const uid of userIds) {
-      if (!this.users.has(uid)) throw new DomainError("not_found", "User not found", 404);
-    }
-    g.userIds = [...new Set(userIds)];
-    g.tokenIds = g.tokenIds.filter((tid) => g.userIds.includes(this.tokens.get(tid)?.userId ?? ""));
-    g.tokenOwners = g.tokenIds.map((tokenId) => ({
-      tokenId,
-      ownerId: this.tokens.get(tokenId)!.userId,
-    }));
-    g.version++;
-    g.updatedAt = new Date().toISOString();
-    return structuredClone(g);
-  }
-  replaceAccessGroupModels(id: string, modelIds: string[], expectedVersion: number) {
-    const g = this.#group(id, expectedVersion);
-    for (const mid of modelIds) {
-      if (!this.providerModels.has(mid)) {
-        throw new DomainError("not_found", "Model not found", 404);
+    return this.#withAtomicAccessGroupMutation(() => {
+      if (
+        !name ||
+        [...this.accessGroups.values()].some((g) => g.name.toLowerCase() === name.toLowerCase())
+      ) throw new DomainError("conflict", "Access group name is already used", 409);
+      for (const userId of userIds) {
+        if (!this.users.has(userId)) throw new DomainError("not_found", "User not found", 404);
       }
-    }
-    g.modelIds = [...new Set(modelIds)];
-    g.version++;
-    g.updatedAt = new Date().toISOString();
-    return structuredClone(g);
-  }
-  replaceAccessGroupPolicy(id: string, input: ReplaceAccessGroupPolicyInput) {
-    const group = this.#group(id, input.expectedVersion);
-    if (
-      input.name !== undefined &&
-      [...this.accessGroups.values()].some((other) =>
-        other.id !== id && other.name.toLowerCase() === input.name!.trim().toLowerCase()
-      )
-    ) throw new DomainError("conflict", "Access group name is already used", 409);
-    const userIds = [...new Set(input.userIds)];
-    const modelIds = [...new Set(input.modelIds)];
-    const tokenIds = [
-      ...new Set(input.tokenIds.flatMap((tokenId) => {
-        const token = this.tokens.get(tokenId);
-        return token ? this.#familyTokens(token).map((generation) => generation.id) : [tokenId];
-      })),
-    ];
-    for (const userId of userIds) {
-      if (!this.users.has(userId)) throw new DomainError("not_found", "User not found", 404);
-    }
-    for (const modelId of modelIds) {
-      if (!this.providerModels.has(modelId)) {
-        throw new DomainError("not_found", "Model not found", 404);
+      for (const modelId of modelIds) {
+        if (!this.providerModels.has(modelId)) {
+          throw new DomainError("not_found", "Model not found", 404);
+        }
       }
-    }
-    for (const tokenId of tokenIds) {
-      const token = this.tokens.get(tokenId);
-      if (!token) throw new DomainError("not_found", "Token not found", 404);
-      if (!userIds.includes(token.userId)) {
-        throw new DomainError(
-          "validation_error",
-          "Every token owner must be included in the group",
-          422,
-        );
+      const tokenIds = [
+        ...new Set(requestedTokenIds.flatMap((tokenId) => {
+          const token = this.tokens.get(tokenId);
+          if (!token) throw new DomainError("not_found", "Token not found", 404);
+          return this.#familyTokens(token).map((generation) => generation.id);
+        })),
+      ];
+      for (const tokenId of tokenIds) {
+        const token = this.tokens.get(tokenId)!;
+        if (!userIds.includes(token.userId)) {
+          throw new DomainError(
+            "validation_error",
+            "Every token owner must be included in the group",
+            422,
+          );
+        }
       }
-    }
-    if (input.name !== undefined) group.name = input.name.trim();
-    if (input.description !== undefined) group.description = input.description;
-    const priorTokenIds = [...group.tokenIds];
-    group.userIds = userIds;
-    group.modelIds = modelIds;
-    group.tokenIds = tokenIds;
-    group.tokenOwners = tokenIds.map((tokenId) => ({
-      tokenId,
-      ownerId: this.tokens.get(tokenId)!.userId,
-    }));
-    for (const tokenId of new Set([...priorTokenIds, ...tokenIds])) {
-      if (priorTokenIds.includes(tokenId) !== tokenIds.includes(tokenId)) {
+      const now = new Date().toISOString();
+      const value: AccessGroup = {
+        id,
+        name,
+        description,
+        version: 1,
+        userIds,
+        modelIds,
+        tokenIds,
+        tokenOwners: tokenIds.map((tokenId) => ({
+          tokenId,
+          ownerId: this.tokens.get(tokenId)!.userId,
+        })),
+        createdAt: now,
+        updatedAt: now,
+      };
+      this.accessGroups.set(value.id, value);
+      for (const tokenId of tokenIds) {
         const token = this.tokens.get(tokenId)!;
         token.accessMode = "restricted";
         token.version++;
       }
+      mutationAudit.metadata = {
+        ...mutationAudit.metadata,
+        after: { name, description, userIds, modelIds, tokenIds },
+      };
+      return structuredClone(value);
+    }, mutationAudit);
+  }
+  updateAccessGroup(
+    id: string,
+    input: UpdateAccessGroupInput,
+    audit: PrivilegedAuditEventInput,
+  ) {
+    this.#requirePrivilegedAuditContext(audit);
+    if (input.name === undefined && input.description === undefined) {
+      throw new DomainError(
+        "validation_error",
+        "Provide a name or description to update",
+        422,
+      );
     }
-    group.version++;
-    group.updatedAt = new Date().toISOString();
-    return structuredClone(group);
+    const mutationAudit: PrivilegedAuditEventInput = {
+      ...audit,
+      targetId: id,
+      metadata: { ...audit.metadata },
+    };
+    return this.#withAtomicAccessGroupMutation(() => {
+      const g = this.#group(id, input.expectedVersion);
+      const before = { name: g.name, description: g.description };
+      const after = {
+        name: input.name?.trim() ?? before.name,
+        description: input.description ?? before.description,
+      };
+      if (
+        input.name !== undefined &&
+        [...this.accessGroups.values()].some((other) =>
+          other.id !== id && other.name.toLowerCase() === input.name!.trim().toLowerCase()
+        )
+      ) throw new DomainError("conflict", "Access group name is already used", 409);
+      g.name = after.name;
+      g.description = after.description;
+      g.version++;
+      g.updatedAt = new Date().toISOString();
+      mutationAudit.metadata = { ...mutationAudit.metadata, before, after };
+      return structuredClone(g);
+    }, mutationAudit);
+  }
+  #withAtomicAccessGroupMutation<T>(
+    operation: () => T,
+    audit: PrivilegedAuditEventInput,
+  ): T {
+    if (!audit) {
+      throw new DomainError(
+        "admin_authority_required",
+        "Privileged mutation context is required",
+        403,
+      );
+    }
+    const groupsBefore = new Map(
+      [...this.accessGroups].map(([key, value]) => [key, structuredClone(value)]),
+    );
+    const tokensBefore = new Map(
+      [...this.tokens].map(([key, value]) => [key, structuredClone(value)]),
+    );
+    const auditLength = this.auditEvents.length;
+    try {
+      this.#assertEffectiveAdminActor(
+        audit.actorId,
+        audit.requireEmailVerification,
+        audit.expectedAuthorityEpoch,
+      );
+      const result = operation();
+      const {
+        requireEmailVerification: _requireEmailVerification,
+        expectedAuthorityEpoch: _expectedAuthorityEpoch,
+        ...event
+      } = audit;
+      this.recordAudit(event);
+      return result;
+    } catch (error) {
+      this.accessGroups.clear();
+      for (const [key, value] of groupsBefore) this.accessGroups.set(key, value);
+      this.tokens.clear();
+      for (const [key, value] of tokensBefore) this.tokens.set(key, value);
+      this.auditEvents.length = auditLength;
+      throw error;
+    }
+  }
+  deleteAccessGroup(
+    id: string,
+    expectedVersion: number,
+    acknowledgePublicModelIds: string[],
+    audit: PrivilegedAuditEventInput,
+  ) {
+    this.#requirePrivilegedAuditContext(audit);
+    const mutationAudit = { ...audit, targetId: id, metadata: { ...audit.metadata } };
+    return this.#withAtomicAccessGroupMutation(
+      () => {
+        const group = this.#group(id, expectedVersion);
+        const modelIdsBecomingPublic = this.#modelIdsBecomingPublic(id, group.modelIds, []);
+        this.#requireModelAccessWideningAcknowledgement(
+          modelIdsBecomingPublic,
+          acknowledgePublicModelIds,
+        );
+        this.#restrictTokenFamiliesForMembershipChange(group.tokenIds);
+        this.accessGroups.delete(id);
+        mutationAudit.metadata = { ...mutationAudit.metadata, modelIdsBecomingPublic };
+      },
+      mutationAudit,
+    );
+  }
+  replaceAccessGroupUsers(
+    id: string,
+    userIds: string[],
+    expectedVersion: number,
+    audit: PrivilegedAuditEventInput,
+  ) {
+    this.#requirePrivilegedAuditContext(audit);
+    const mutationAudit = { ...audit, targetId: id };
+    return this.#withAtomicAccessGroupMutation(() => {
+      const g = this.#group(id, expectedVersion);
+      for (const uid of userIds) {
+        if (!this.users.has(uid)) throw new DomainError("not_found", "User not found", 404);
+      }
+      g.userIds = [...new Set(userIds)];
+      const tokenIdsLosingMembership = g.tokenIds.filter((tokenId) =>
+        !g.userIds.includes(this.tokens.get(tokenId)?.userId ?? "")
+      );
+      g.tokenIds = g.tokenIds.filter((tid) =>
+        g.userIds.includes(this.tokens.get(tid)?.userId ?? "")
+      );
+      g.tokenOwners = g.tokenIds.map((tokenId) => ({
+        tokenId,
+        ownerId: this.tokens.get(tokenId)!.userId,
+      }));
+      this.#restrictTokenFamiliesForMembershipChange(tokenIdsLosingMembership);
+      g.version++;
+      g.updatedAt = new Date().toISOString();
+      return structuredClone(g);
+    }, mutationAudit);
+  }
+  replaceAccessGroupModels(
+    id: string,
+    modelIds: string[],
+    expectedVersion: number,
+    acknowledgePublicModelIds: string[],
+    audit: PrivilegedAuditEventInput,
+  ) {
+    this.#requirePrivilegedAuditContext(audit);
+    const desiredModelIds = [...new Set(modelIds)];
+    const mutationAudit = { ...audit, targetId: id, metadata: { ...audit.metadata } };
+    return this.#withAtomicAccessGroupMutation(
+      () => {
+        const g = this.#group(id, expectedVersion);
+        const modelIdsBecomingPublic = this.#modelIdsBecomingPublic(
+          id,
+          g.modelIds,
+          desiredModelIds,
+        );
+        for (const mid of desiredModelIds) {
+          if (!this.providerModels.has(mid)) {
+            throw new DomainError("not_found", "Model not found", 404);
+          }
+        }
+        this.#requireModelAccessWideningAcknowledgement(
+          modelIdsBecomingPublic,
+          acknowledgePublicModelIds,
+        );
+        g.modelIds = desiredModelIds;
+        g.version++;
+        g.updatedAt = new Date().toISOString();
+        mutationAudit.metadata = { ...mutationAudit.metadata, modelIdsBecomingPublic };
+        return structuredClone(g);
+      },
+      mutationAudit,
+    );
+  }
+  replaceAccessGroupPolicy(
+    id: string,
+    input: ReplaceAccessGroupPolicyInput,
+    audit: PrivilegedAuditEventInput,
+  ) {
+    this.#requirePrivilegedAuditContext(audit);
+    const modelIds = [...new Set(input.modelIds)];
+    const mutationAudit = { ...audit, targetId: id, metadata: { ...audit.metadata } };
+    return this.#withAtomicAccessGroupMutation(
+      () => {
+        const group = this.#group(id, input.expectedVersion);
+        const modelIdsBecomingPublic = this.#modelIdsBecomingPublic(
+          id,
+          group.modelIds,
+          modelIds,
+        );
+        const before = { name: group.name, description: group.description };
+        const after = {
+          name: input.name?.trim() ?? before.name,
+          description: input.description ?? before.description,
+        };
+        if (
+          input.name !== undefined &&
+          [...this.accessGroups.values()].some((other) =>
+            other.id !== id && other.name.toLowerCase() === input.name!.trim().toLowerCase()
+          )
+        ) {
+          throw new DomainError("conflict", "Access group name is already used", 409);
+        }
+        const userIds = [...new Set(input.userIds)];
+        const tokenIds = [
+          ...new Set(input.tokenIds.flatMap((tokenId) => {
+            const token = this.tokens.get(tokenId);
+            return token ? this.#familyTokens(token).map((generation) => generation.id) : [tokenId];
+          })),
+        ];
+        for (const userId of userIds) {
+          if (!this.users.has(userId)) throw new DomainError("not_found", "User not found", 404);
+        }
+        for (const modelId of modelIds) {
+          if (!this.providerModels.has(modelId)) {
+            throw new DomainError("not_found", "Model not found", 404);
+          }
+        }
+        for (const tokenId of tokenIds) {
+          const token = this.tokens.get(tokenId);
+          if (!token) throw new DomainError("not_found", "Token not found", 404);
+          if (!userIds.includes(token.userId)) {
+            throw new DomainError(
+              "validation_error",
+              "Every token owner must be included in the group",
+              422,
+            );
+          }
+        }
+        this.#requireModelAccessWideningAcknowledgement(
+          modelIdsBecomingPublic,
+          input.acknowledgePublicModelIds,
+        );
+        group.name = after.name;
+        group.description = after.description;
+        const priorTokenIds = [...group.tokenIds];
+        group.userIds = userIds;
+        group.modelIds = modelIds;
+        group.tokenIds = tokenIds;
+        group.tokenOwners = tokenIds.map((tokenId) => ({
+          tokenId,
+          ownerId: this.tokens.get(tokenId)!.userId,
+        }));
+        for (const tokenId of new Set([...priorTokenIds, ...tokenIds])) {
+          if (priorTokenIds.includes(tokenId) !== tokenIds.includes(tokenId)) {
+            const token = this.tokens.get(tokenId)!;
+            token.accessMode = "restricted";
+            token.version++;
+          }
+        }
+        group.version++;
+        group.updatedAt = new Date().toISOString();
+        mutationAudit.metadata = {
+          ...mutationAudit.metadata,
+          before,
+          after,
+          modelIdsBecomingPublic,
+        };
+        return structuredClone(group);
+      },
+      mutationAudit,
+    );
   }
   previewAccessGroupPolicyImpact(
+    context: PrivilegedReadContext,
     id: string,
     proposal: AccessGroupPolicyProposal | null = null,
   ): AccessGroupPolicyImpact {
+    this.#assertPrivilegedReadContext(context);
     const group = this.accessGroups.get(id);
     if (!group) throw new DomainError("not_found", "Access group not found", 404);
     const nextModels = new Set(proposal?.modelIds ?? []);
@@ -7245,11 +7775,10 @@ export class MemoryRepository {
       const token = this.tokens.get(tokenId);
       return token ? this.#familyTokens(token).map((generation) => generation.id) : [tokenId];
     }));
-    const modelIdsBecomingPublic = group.modelIds.filter((modelId) =>
-      !nextModels.has(modelId) &&
-      ![...this.accessGroups.values()].some((other) =>
-        other.id !== id && other.modelIds.includes(modelId)
-      )
+    const modelIdsBecomingPublic = this.#modelIdsBecomingPublic(
+      id,
+      group.modelIds,
+      [...nextModels],
     );
     const tokenIdsLosingGroupAccess = group.tokenIds.filter((tokenId) => !nextTokens.has(tokenId));
     const tokenIdsRevertingToOwnerInheritance = tokenIdsLosingGroupAccess.filter((tokenId) =>
@@ -7261,6 +7790,35 @@ export class MemoryRepository {
       tokenIdsRevertingToOwnerInheritance,
     };
   }
+  #modelIdsBecomingPublic(
+    groupId: string,
+    currentModelIds: readonly string[],
+    nextModelIds: readonly string[],
+  ): string[] {
+    const nextModels = new Set(nextModelIds);
+    return currentModelIds.filter((modelId) =>
+      !nextModels.has(modelId) &&
+      ![...this.accessGroups.values()].some((other) =>
+        other.id !== groupId && other.modelIds.includes(modelId)
+      )
+    ).sort();
+  }
+  #requireModelAccessWideningAcknowledgement(
+    actualModelIds: readonly string[],
+    acknowledgedModelIds: readonly string[],
+  ) {
+    if (
+      !modelAccessWideningAcknowledgementMatches(actualModelIds, acknowledgedModelIds)
+    ) {
+      throw new DomainError(
+        "model_access_widening_acknowledgement_required",
+        `Acknowledge the exact models that will become public before applying this change: ${
+          actualModelIds.join(", ")
+        }`,
+        409,
+      );
+    }
+  }
   #group(id: string, version: number) {
     const g = this.accessGroups.get(id);
     if (!g) throw new DomainError("not_found", "Access group not found", 404);
@@ -7269,7 +7827,49 @@ export class MemoryRepository {
     }
     return g;
   }
+  #restrictTokenFamiliesForMembershipChange(tokenIds: readonly string[]) {
+    const familyIds = new Set(
+      tokenIds.flatMap((tokenId) => {
+        const token = this.tokens.get(tokenId);
+        return token ? [token.rotationFamilyId] : [];
+      }),
+    );
+    for (const token of this.tokens.values()) {
+      if (!familyIds.has(token.rotationFamilyId)) continue;
+      token.accessMode = "restricted";
+      token.version++;
+    }
+  }
   setTokenAccessGroups(
+    userId: string,
+    tokenId: string,
+    groupIds: string[],
+    expectedVersion: number,
+    audit: PrivilegedAuditEventInput,
+  ) {
+    this.#requirePrivilegedAuditContext(audit);
+    return this.#withAtomicApiTokenMutation(userId, () => {
+      this.#assertEffectiveAdminActor(
+        audit.actorId,
+        audit.requireEmailVerification,
+        audit.expectedAuthorityEpoch,
+      );
+      const updated = this.#setTokenAccessGroupsMutation(
+        userId,
+        tokenId,
+        groupIds,
+        expectedVersion,
+      );
+      const {
+        requireEmailVerification: _requireEmailVerification,
+        expectedAuthorityEpoch: _expectedAuthorityEpoch,
+        ...event
+      } = audit;
+      this.recordAudit({ ...event, targetId: tokenId });
+      return updated;
+    });
+  }
+  #setTokenAccessGroupsMutation(
     userId: string,
     tokenId: string,
     groupIds: string[],
@@ -7307,6 +7907,35 @@ export class MemoryRepository {
     return this.#tokenSummary(token);
   }
   setTokenAccessMode(
+    userId: string,
+    tokenId: string,
+    mode: "inherit" | "restricted",
+    expectedVersion: number,
+    audit: PrivilegedAuditEventInput,
+  ) {
+    this.#requirePrivilegedAuditContext(audit);
+    return this.#withAtomicApiTokenMutation(userId, () => {
+      this.#assertEffectiveAdminActor(
+        audit.actorId,
+        audit.requireEmailVerification,
+        audit.expectedAuthorityEpoch,
+      );
+      const updated = this.#setTokenAccessModeMutation(
+        userId,
+        tokenId,
+        mode,
+        expectedVersion,
+      );
+      const {
+        requireEmailVerification: _requireEmailVerification,
+        expectedAuthorityEpoch: _expectedAuthorityEpoch,
+        ...event
+      } = audit;
+      this.recordAudit({ ...event, targetId: tokenId });
+      return updated;
+    });
+  }
+  #setTokenAccessModeMutation(
     userId: string,
     tokenId: string,
     mode: "inherit" | "restricted",

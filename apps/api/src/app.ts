@@ -5991,23 +5991,16 @@ export function createApp(options: AppOptions = {}) {
       authorityEpoch: _authorityEpoch,
       ...summary
     } = record;
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "api_token.created",
-      targetType: "api_token",
-      targetId: record.id,
-    });
     return c.json({ token: secret, ...summary }, 201);
   });
   app.patch("/api/tokens/:id", async (c) => {
     const body = await parseJson(c, updateTokenSchema);
-    const summary = await repo.updateApiToken(c.get("user").id, c.req.param("id"), body);
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "api_token.updated",
-      targetType: "api_token",
-      targetId: c.req.param("id"),
-    });
+    const summary = await repo.updateApiToken(
+      c.get("user").id,
+      c.req.param("id"),
+      body,
+      c.get("authorityEpoch"),
+    );
     return c.json(summary);
   });
   app.post("/api/tokens/:id/rotate", async (c) => {
@@ -6018,24 +6011,16 @@ export function createApp(options: AppOptions = {}) {
       tokenHash: await sha256(secret),
       preview: `${secret.slice(0, 7)}…${secret.slice(-4)}`,
     }, c.get("authorityEpoch"));
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "api_token.rotated",
-      targetType: "api_token",
-      targetId: rotated.replacement.id,
-      metadata: { previousTokenId: rotated.previous.id, overlapSeconds: body.overlapSeconds },
-    });
     return c.json({ token: secret, ...rotated }, 201);
   });
   app.delete("/api/tokens/:id", async (c) => {
     const body = await parseJson(c, revokeTokenSchema);
-    await repo.revokeApiTokenFamily(c.req.param("id"), c.get("user").id, body.expectedVersion);
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "api_token.revoked",
-      targetType: "api_token",
-      targetId: c.req.param("id"),
-    });
+    await repo.revokeApiTokenFamily(
+      c.req.param("id"),
+      c.get("user").id,
+      body.expectedVersion,
+      c.get("authorityEpoch"),
+    );
     return c.body(null, 204);
   });
   app.get(
@@ -6701,105 +6686,112 @@ export function createApp(options: AppOptions = {}) {
     async (c) => c.json({ data: await repo.listModelAliases() }),
   );
   app.post("/api/admin/model-access/aliases", async (c) => {
-    const alias = await repo.createModelAlias(await parseJson(c, createModelAliasSchema));
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "model_alias.created",
-      targetType: "model_alias",
-      targetId: alias.id,
-    });
+    const alias = await repo.createModelAlias(
+      await parseJson(c, createModelAliasSchema),
+      {
+        actorId: c.get("user").id,
+        action: "model_alias.created",
+        targetType: "model_alias",
+        requireEmailVerification,
+        expectedAuthorityEpoch: c.get("authorityEpoch"),
+      },
+    );
     return c.json(alias, 201);
   });
   app.patch("/api/admin/model-access/aliases/:id", async (c) => {
     const alias = await repo.updateModelAlias(
       c.req.param("id"),
       await parseJson(c, updateModelAliasSchema),
+      {
+        actorId: c.get("user").id,
+        action: "model_alias.updated",
+        targetType: "model_alias",
+        targetId: c.req.param("id"),
+        requireEmailVerification,
+        expectedAuthorityEpoch: c.get("authorityEpoch"),
+      },
     );
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "model_alias.updated",
-      targetType: "model_alias",
-      targetId: alias.id,
-    });
     return c.json(alias);
   });
   app.delete("/api/admin/model-access/aliases/:id", async (c) => {
     const { expectedVersion } = await parseJson(c, revokeTokenSchema);
-    await repo.deleteModelAlias(c.req.param("id"), expectedVersion);
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "model_alias.deleted",
-      targetType: "model_alias",
-      targetId: c.req.param("id"),
-    });
+    await repo.deleteModelAlias(
+      c.req.param("id"),
+      expectedVersion,
+      {
+        actorId: c.get("user").id,
+        action: "model_alias.deleted",
+        targetType: "model_alias",
+        targetId: c.req.param("id"),
+        requireEmailVerification,
+        expectedAuthorityEpoch: c.get("authorityEpoch"),
+      },
+    );
     return c.body(null, 204);
   });
   app.get(
     "/api/admin/model-access/groups",
-    async (c) => c.json({ data: await repo.listAccessGroups() }),
+    async (c) =>
+      c.json({
+        data: await repo.listAccessGroups({
+          actorId: c.get("user").id,
+          requireEmailVerification,
+          expectedAuthorityEpoch: c.get("authorityEpoch"),
+        }),
+      }),
   );
   app.post("/api/admin/model-access/groups", async (c) => {
-    const group = await repo.createAccessGroup(await parseJson(c, createAccessGroupSchema));
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "model_access_group.created",
-      targetType: "model_access_group",
-      targetId: group.id,
-    });
+    const body = await parseJson(c, createAccessGroupSchema);
+    const group = await repo.createAccessGroup(
+      body,
+      {
+        actorId: c.get("user").id,
+        action: "model_access_group.created",
+        targetType: "model_access_group",
+        metadata: {
+          userCount: body.userIds.length,
+          modelCount: body.modelIds.length,
+          tokenCount: body.tokenIds.length,
+        },
+        requireEmailVerification,
+        expectedAuthorityEpoch: c.get("authorityEpoch"),
+      },
+    );
     return c.json(group, 201);
   });
   app.patch("/api/admin/model-access/groups/:id", async (c) => {
     const group = await repo.updateAccessGroup(
       c.req.param("id"),
       await parseJson(c, updateAccessGroupSchema),
+      {
+        actorId: c.get("user").id,
+        action: "model_access_group.updated",
+        targetType: "model_access_group",
+        targetId: c.req.param("id"),
+        requireEmailVerification,
+        expectedAuthorityEpoch: c.get("authorityEpoch"),
+      },
     );
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "model_access_group.updated",
-      targetType: "model_access_group",
-      targetId: group.id,
-    });
     return c.json(group);
   });
-  const requireModelWideningAcknowledgement = (
-    actual: string[],
-    acknowledged: string[],
-  ) => {
-    const expected = [...new Set(actual)].sort();
-    const supplied = [...new Set(acknowledged)].sort();
-    if (
-      expected.length !== supplied.length || expected.some((id, index) => id !== supplied[index])
-    ) {
-      throw new DomainError(
-        "model_access_widening_acknowledgement_required",
-        `Acknowledge the exact models that will become public before applying this change: ${
-          expected.join(", ")
-        }`,
-        409,
-      );
-    }
-  };
   app.delete("/api/admin/model-access/groups/:id", async (c) => {
     const { expectedVersion, acknowledgePublicModelIds } = await parseJson(
       c,
       deleteAccessGroupSchema,
     );
-    const impact = await repo.previewAccessGroupPolicyImpact(c.req.param("id"), {
-      userIds: [],
-      modelIds: [],
-      tokenIds: [],
-    });
-    requireModelWideningAcknowledgement(
-      impact.modelIdsBecomingPublic,
+    await repo.deleteAccessGroup(
+      c.req.param("id"),
+      expectedVersion,
       acknowledgePublicModelIds,
+      {
+        actorId: c.get("user").id,
+        action: "model_access_group.deleted",
+        targetType: "model_access_group",
+        targetId: c.req.param("id"),
+        requireEmailVerification,
+        expectedAuthorityEpoch: c.get("authorityEpoch"),
+      },
     );
-    await repo.deleteAccessGroup(c.req.param("id"), expectedVersion);
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "model_access_group.deleted",
-      targetType: "model_access_group",
-      targetId: c.req.param("id"),
-    });
     return c.body(null, 204);
   });
   app.put("/api/admin/model-access/groups/:id/users", async (c) => {
@@ -6808,62 +6800,71 @@ export function createApp(options: AppOptions = {}) {
       c.req.param("id"),
       body.ids,
       body.expectedVersion,
+      {
+        actorId: c.get("user").id,
+        action: "model_access_group.users_replaced",
+        targetType: "model_access_group",
+        targetId: c.req.param("id"),
+        metadata: { userCount: body.ids.length },
+        requireEmailVerification,
+        expectedAuthorityEpoch: c.get("authorityEpoch"),
+      },
     );
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "model_access_group.users_replaced",
-      targetType: "model_access_group",
-      targetId: group.id,
-      metadata: { userCount: body.ids.length },
-    });
     return c.json(group);
   });
   app.put("/api/admin/model-access/groups/:id/models", async (c) => {
     const body = await parseJson(c, replaceAccessGroupModelsSchema);
-    const current = (await repo.listAccessGroups()).find((group) => group.id === c.req.param("id"));
-    if (!current) throw new DomainError("not_found", "Access group not found", 404);
-    const impact = await repo.previewAccessGroupPolicyImpact(c.req.param("id"), {
-      userIds: current.userIds,
-      modelIds: body.ids,
-      tokenIds: current.tokenIds,
-    });
-    requireModelWideningAcknowledgement(
-      impact.modelIdsBecomingPublic,
-      body.acknowledgePublicModelIds,
-    );
     const group = await repo.replaceAccessGroupModels(
       c.req.param("id"),
       body.ids,
       body.expectedVersion,
+      body.acknowledgePublicModelIds,
+      {
+        actorId: c.get("user").id,
+        action: "model_access_group.models_replaced",
+        targetType: "model_access_group",
+        targetId: c.req.param("id"),
+        metadata: { modelCount: body.ids.length },
+        requireEmailVerification,
+        expectedAuthorityEpoch: c.get("authorityEpoch"),
+      },
     );
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "model_access_group.models_replaced",
-      targetType: "model_access_group",
-      targetId: group.id,
-      metadata: { modelCount: body.ids.length },
-    });
     return c.json(group);
   });
   app.put("/api/admin/model-access/groups/:id/policy", async (c) => {
     const body = await parseJson(c, replaceAccessGroupPolicySchema);
-    const group = await repo.replaceAccessGroupPolicy(c.req.param("id"), body);
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "model_access_group.policy_replaced",
-      targetType: "model_access_group",
-      targetId: group.id,
-      metadata: {
-        userCount: body.userIds.length,
-        modelCount: body.modelIds.length,
-        tokenCount: body.tokenIds.length,
+    const group = await repo.replaceAccessGroupPolicy(
+      c.req.param("id"),
+      body,
+      {
+        actorId: c.get("user").id,
+        action: "model_access_group.policy_replaced",
+        targetType: "model_access_group",
+        targetId: c.req.param("id"),
+        metadata: {
+          userCount: body.userIds.length,
+          modelCount: body.modelIds.length,
+          tokenCount: body.tokenIds.length,
+        },
+        requireEmailVerification,
+        expectedAuthorityEpoch: c.get("authorityEpoch"),
       },
-    });
+    );
     return c.json(group);
   });
   app.post("/api/admin/model-access/groups/:id/impact", async (c) => {
     const body = await parseJson(c, previewAccessGroupPolicySchema);
-    return c.json(await repo.previewAccessGroupPolicyImpact(c.req.param("id"), body.proposal));
+    return c.json(
+      await repo.previewAccessGroupPolicyImpact(
+        {
+          actorId: c.get("user").id,
+          requireEmailVerification,
+          expectedAuthorityEpoch: c.get("authorityEpoch"),
+        },
+        c.req.param("id"),
+        body.proposal,
+      ),
+    );
   });
   app.get("/api/admin/model-access/tokens", async (c) => {
     const query = c.req.query("query")?.trim();
@@ -6876,7 +6877,18 @@ export function createApp(options: AppOptions = {}) {
       throw new DomainError("invalid_request", "Token search parameters are invalid", 422);
     }
     if (cursor) requireUuid(cursor, "cursor");
-    return c.json(await repo.searchApiTokens(query, requestedLimit, cursor));
+    return c.json(
+      await repo.searchApiTokens(
+        {
+          actorId: c.get("user").id,
+          requireEmailVerification,
+          expectedAuthorityEpoch: c.get("authorityEpoch"),
+        },
+        query,
+        requestedLimit,
+        cursor,
+      ),
+    );
   });
   app.put("/api/admin/model-access/tokens/:id/groups", async (c) => {
     const body = await parseJson(c, setTokenAccessGroupsSchema);
@@ -6885,14 +6897,16 @@ export function createApp(options: AppOptions = {}) {
       c.req.param("id"),
       body.groupIds,
       body.expectedVersion,
+      {
+        actorId: c.get("user").id,
+        action: "api_token.access_groups_set",
+        targetType: "api_token",
+        targetId: c.req.param("id"),
+        metadata: { groupCount: body.groupIds.length },
+        requireEmailVerification,
+        expectedAuthorityEpoch: c.get("authorityEpoch"),
+      },
     );
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "api_token.access_groups_set",
-      targetType: "api_token",
-      targetId: token.id,
-      metadata: { groupCount: body.groupIds.length },
-    });
     return c.json(token);
   });
   app.put("/api/admin/model-access/tokens/:id/access-mode", async (c) => {
@@ -6902,14 +6916,16 @@ export function createApp(options: AppOptions = {}) {
       c.req.param("id"),
       body.accessMode,
       body.expectedVersion,
+      {
+        actorId: c.get("user").id,
+        action: "api_token.access_mode_set",
+        targetType: "api_token",
+        targetId: c.req.param("id"),
+        metadata: { accessMode: body.accessMode },
+        requireEmailVerification,
+        expectedAuthorityEpoch: c.get("authorityEpoch"),
+      },
     );
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "api_token.access_mode_set",
-      targetType: "api_token",
-      targetId: token.id,
-      metadata: { accessMode: body.accessMode },
-    });
     return c.json(token);
   });
   app.get("/api/admin/tools", async (c) => c.json({ data: await toolExecution.listPolicies() }));
@@ -7068,6 +7084,7 @@ export function createApp(options: AppOptions = {}) {
     const body = await parseJson(c, adminApprovalSchema);
     const updated = await repo.decideUserApproval({
       actorId: c.get("user").id,
+      expectedAuthorityEpoch: c.get("authorityEpoch"),
       targetUserId: requireUuid(c.req.param("id"), "User id"),
       expectedVersion: body.expectedVersion,
       status: body.status,
@@ -7084,6 +7101,7 @@ export function createApp(options: AppOptions = {}) {
     const body = await parseJson(c, adminRoleSchema);
     const updated = await repo.setAdminUserRole({
       actorId: c.get("user").id,
+      expectedAuthorityEpoch: c.get("authorityEpoch"),
       targetUserId: requireUuid(c.req.param("id"), "User id"),
       expectedVersion: body.expectedVersion,
       role: body.role,
@@ -7099,6 +7117,7 @@ export function createApp(options: AppOptions = {}) {
     const body = await parseJson(c, adminAccountStateSchema);
     const updated = await repo.setAdminUserState({
       actorId: c.get("user").id,
+      expectedAuthorityEpoch: c.get("authorityEpoch"),
       targetUserId: requireUuid(c.req.param("id"), "User id"),
       expectedVersion: body.expectedVersion,
       state: body.state,
@@ -7114,6 +7133,7 @@ export function createApp(options: AppOptions = {}) {
     const body = await parseJson(c, adminDeleteUserSchema);
     const updated = await repo.setAdminUserDeleted({
       actorId: c.get("user").id,
+      expectedAuthorityEpoch: c.get("authorityEpoch"),
       targetUserId: requireUuid(c.req.param("id"), "User id"),
       expectedVersion: body.expectedVersion,
       deleted: true,
@@ -7129,6 +7149,7 @@ export function createApp(options: AppOptions = {}) {
     const body = await parseJson(c, adminRestoreUserSchema);
     const updated = await repo.setAdminUserDeleted({
       actorId: c.get("user").id,
+      expectedAuthorityEpoch: c.get("authorityEpoch"),
       targetUserId: requireUuid(c.req.param("id"), "User id"),
       expectedVersion: body.expectedVersion,
       deleted: false,

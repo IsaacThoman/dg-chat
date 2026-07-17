@@ -43,7 +43,7 @@ Deno.test("memory admin lifecycle rolls back grants and authority revocation whe
     scopes: ["chat:write"],
     tokenHash: "atomic-token-hash",
     preview: "atomic",
-  });
+  }, approved.authorityEpoch);
   repository.createIdentityToken(
     approved.id,
     "password_reset",
@@ -58,6 +58,7 @@ Deno.test("memory admin lifecycle rolls back grants and authority revocation whe
     () =>
       repository.decideUserApproval({
         actorId: actor.id,
+        expectedAuthorityEpoch: 1,
         targetUserId: applicant.id,
         expectedVersion: applicant.version,
         status: "approved",
@@ -78,6 +79,7 @@ Deno.test("memory admin lifecycle rolls back grants and authority revocation whe
     () =>
       repository.decideUserApproval({
         actorId: actor.id,
+        expectedAuthorityEpoch: 1,
         targetUserId: approved.id,
         expectedVersion: approved.version,
         status: "rejected",
@@ -106,6 +108,7 @@ Deno.test("memory repository enforces lifecycle reasons at the domain boundary",
   assertDomainCode(() =>
     repository.decideUserApproval({
       actorId: actor.id,
+      expectedAuthorityEpoch: 1,
       targetUserId: user.id,
       expectedVersion: user.version,
       status: "rejected",
@@ -114,6 +117,7 @@ Deno.test("memory repository enforces lifecycle reasons at the domain boundary",
   assertDomainCode(() =>
     repository.setAdminUserState({
       actorId: actor.id,
+      expectedAuthorityEpoch: 1,
       targetUserId: user.id,
       expectedVersion: user.version,
       state: "suspended",
@@ -121,6 +125,7 @@ Deno.test("memory repository enforces lifecycle reasons at the domain boundary",
   assertDomainCode(() =>
     repository.setAdminUserRole({
       actorId: actor.id,
+      expectedAuthorityEpoch: 1,
       targetUserId: user.id,
       expectedVersion: user.version,
       role: "admin",
@@ -129,6 +134,7 @@ Deno.test("memory repository enforces lifecycle reasons at the domain boundary",
   assertDomainCode(() =>
     repository.setAdminUserDeleted({
       actorId: actor.id,
+      expectedAuthorityEpoch: 1,
       targetUserId: user.id,
       expectedVersion: user.version,
       deleted: true,
@@ -137,6 +143,7 @@ Deno.test("memory repository enforces lifecycle reasons at the domain boundary",
 
   const approved = repository.decideUserApproval({
     actorId: actor.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: user.id,
     expectedVersion: user.version,
     status: "approved",
@@ -144,6 +151,7 @@ Deno.test("memory repository enforces lifecycle reasons at the domain boundary",
   });
   const suspended = repository.setAdminUserState({
     actorId: actor.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: user.id,
     expectedVersion: approved.version,
     state: "suspended",
@@ -151,6 +159,7 @@ Deno.test("memory repository enforces lifecycle reasons at the domain boundary",
   });
   const activated = repository.setAdminUserState({
     actorId: actor.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: user.id,
     expectedVersion: suspended.version,
     state: "active",
@@ -197,6 +206,7 @@ Deno.test("memory approval rolls back when its grant would exceed safe integer a
   assertDomainCode(() =>
     repository.decideUserApproval({
       actorId: actor.id,
+      expectedAuthorityEpoch: 1,
       targetUserId: applicant.id,
       expectedVersion: applicant.version,
       status: "approved",

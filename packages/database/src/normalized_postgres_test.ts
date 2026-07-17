@@ -918,6 +918,7 @@ Deno.test({
       const limitedSession = await repo.createSession(applicant.id, "limited-session-hash", true);
       let managedApplicant = await repo.decideUserApproval({
         actorId: admin.id,
+        expectedAuthorityEpoch: 1,
         targetUserId: applicant.id,
         expectedVersion: applicant.version,
         status: "approved",
@@ -929,6 +930,7 @@ Deno.test({
       assertEquals((await repo.listSessions(applicant.id))[0].id, session.id);
       managedApplicant = await repo.decideUserApproval({
         actorId: admin.id,
+        expectedAuthorityEpoch: 1,
         targetUserId: applicant.id,
         expectedVersion: managedApplicant.version,
         status: "rejected",
@@ -939,6 +941,7 @@ Deno.test({
       assertEquals((await repo.getSession(limitedSession.tokenHash))?.limited, true);
       await repo.decideUserApproval({
         actorId: admin.id,
+        expectedAuthorityEpoch: 1,
         targetUserId: applicant.id,
         expectedVersion: managedApplicant.version,
         status: "approved",
@@ -964,6 +967,7 @@ Deno.test({
         () =>
           repo.decideUserApproval({
             actorId: admin.id,
+            expectedAuthorityEpoch: 1,
             targetUserId: identityUser.id,
             expectedVersion: identityUser.version,
             status: "approved",
@@ -998,6 +1002,7 @@ Deno.test({
       );
       await repo.decideUserApproval({
         actorId: admin.id,
+        expectedAuthorityEpoch: 1,
         targetUserId: identityUser.id,
         expectedVersion: identityUser.version,
         status: "approved",
@@ -1014,7 +1019,7 @@ Deno.test({
         scopes: ["chat:write"],
         tokenHash: "identity-api-hash",
         preview: "identity…hash",
-      });
+      }, identitySession.authorityEpoch);
       await Promise.all([
         repo.createIdentityToken(
           identityUser.id,
@@ -1120,6 +1125,7 @@ Deno.test({
       });
       await repo.decideUserApproval({
         actorId: admin.id,
+        expectedAuthorityEpoch: 1,
         targetUserId: quotaUser.id,
         expectedVersion: quotaUser.version,
         status: "approved",
@@ -1150,6 +1156,7 @@ Deno.test({
       });
       await repo.decideUserApproval({
         actorId: admin.id,
+        expectedAuthorityEpoch: 1,
         targetUserId: eventQuotaUser.id,
         expectedVersion: eventQuotaUser.version,
         status: "approved",
@@ -1337,6 +1344,7 @@ Deno.test({
       });
       await repo.decideUserApproval({
         actorId: admin.id,
+        expectedAuthorityEpoch: 1,
         targetUserId: replayReservationUser.id,
         expectedVersion: replayReservationUser.version,
         status: "approved",
@@ -1429,6 +1437,7 @@ Deno.test({
       });
       await repo.decideUserApproval({
         actorId: admin.id,
+        expectedAuthorityEpoch: 1,
         targetUserId: failureQuotaUser.id,
         expectedVersion: failureQuotaUser.version,
         status: "approved",
@@ -1612,6 +1621,7 @@ Deno.test({
       const removals = await Promise.allSettled([
         repo.setAdminUserState({
           actorId: admin.id,
+          expectedAuthorityEpoch: 1,
           targetUserId: secondAdmin.id,
           expectedVersion: secondAdmin.version,
           state: "suspended",
@@ -1619,6 +1629,7 @@ Deno.test({
         }),
         repo.setAdminUserState({
           actorId: secondAdmin.id,
+          expectedAuthorityEpoch: 1,
           targetUserId: admin.id,
           expectedVersion: admin.version,
           state: "suspended",

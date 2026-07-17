@@ -138,15 +138,18 @@ Deno.test({
       ]);
       assertEquals(JSON.stringify(audit).includes(input.secretHash), false);
     } finally {
-      await withAuditTestMaintenance(
-        sql,
-        (tx) => tx`DELETE FROM audit_events WHERE actor_id IN (${owner.id},${other.id})`,
-      );
       await sql`DELETE FROM conversation_share_snapshots WHERE owner_id IN (${owner.id},${other.id})`;
       await sql`DELETE FROM message_attachments WHERE attachment_id=${attachmentId}`;
       await sql`DELETE FROM attachments WHERE owner_id IN (${owner.id},${other.id})`;
       await sql`DELETE FROM conversations WHERE owner_id IN (${owner.id},${other.id})`;
-      await sql`DELETE FROM users WHERE id IN (${owner.id},${other.id})`;
+      await withAuditTestMaintenance(sql, async (tx) => {
+        await tx`DELETE FROM audit_events WHERE actor_id IN (${owner.id},${other.id})`;
+        await tx`DELETE FROM attachment_storage_usage
+          WHERE owner_id IN (${owner.id},${other.id})`;
+        await tx`DELETE FROM attachment_storage_blobs
+          WHERE owner_id IN (${owner.id},${other.id})`;
+        await tx`DELETE FROM users WHERE id IN (${owner.id},${other.id})`;
+      });
       await sql.end();
       await repo.close();
     }

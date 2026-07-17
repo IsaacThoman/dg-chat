@@ -35,7 +35,9 @@ async function fixture() {
     }),
   });
   assertEquals(bootstrap.status, 201);
-  const admin = (await json(bootstrap)).user;
+  const publicAdmin = (await json(bootstrap)).user;
+  const admin = repository.findUser(publicAdmin.id);
+  assertExists(admin);
   const login = await app.request("/api/auth/sign-in/email", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -71,11 +73,13 @@ async function fixture() {
     }),
   });
   assertEquals(approval.status, 200);
+  const user = repository.findUser(applicant.id);
+  assertExists(user);
   return {
     app,
     repository,
     admin,
-    user: await json(approval),
+    user,
     headers,
     advance: (milliseconds: number) => now += milliseconds,
   };
@@ -105,7 +109,7 @@ Deno.test("admin user detail lists and atomically revokes target sessions and to
     preview: "dg_…test",
     rpmLimit: 60,
     burstLimit: 10,
-  });
+  }, user.authorityEpoch);
 
   const sessions = await app.request(`/api/admin/users/${user.id}/sessions?limit=25`, {
     headers: { cookie: headers.cookie },
@@ -287,7 +291,7 @@ Deno.test("admin security and billing mutations enforce origin, session auth, an
     scopes: ["chat:write"],
     tokenHash: await sha256(bearer),
     preview: bearer.slice(-4),
-  });
+  }, admin.authorityEpoch);
   const tokenAuth = await app.request(`/api/admin/users/${user.id}/ledger`, {
     headers: { authorization: `Bearer ${bearer}` },
   });

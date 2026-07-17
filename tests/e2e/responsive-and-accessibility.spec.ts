@@ -368,7 +368,8 @@ test("every admin section is reachable across desktop and mobile", async ({
     ["jobs", "Background jobs", "Background jobs"],
     ["audit", "Audit log", "Audit log"],
     ["retention", "Retention", "Retention"],
-    ["storage", "Storage & backups", "Storage & backups"],
+    ["storage", "Attachment storage", "Attachment storage"],
+    ["backups", "Backups", "Storage & backups"],
   ] as const;
 
   if (mobile) {

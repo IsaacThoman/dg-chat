@@ -626,6 +626,20 @@ Deno.test("admin model-access group user route matches the web contract", async 
   });
   assertEquals(createdResponse.status, 201);
   const group = await json(createdResponse);
+  const modelAccessAdmin = repository.findUserByEmail("model-access@example.com")!;
+  const directModelAccessAudit = (action: string) => ({
+    actorId: modelAccessAdmin.id,
+    action,
+    targetType: "model_access_group",
+    targetId: group.id,
+    requireEmailVerification: false,
+    expectedAuthorityEpoch: modelAccessAdmin.authorityEpoch,
+  });
+  const directModelAccessRead = {
+    actorId: modelAccessAdmin.id,
+    requireEmailVerification: false,
+    expectedAuthorityEpoch: modelAccessAdmin.authorityEpoch,
+  };
   const replaced = await app.request(`/api/admin/model-access/groups/${group.id}/users`, {
     method: "PUT",
     headers,
@@ -680,24 +694,91 @@ Deno.test("admin model-access group user route matches the web contract", async 
   const restricted = repository.replaceAccessGroupModels(
     group.id,
     [restrictedModelId],
-    repository.listAccessGroups()[0].version,
+    repository.listAccessGroups(directModelAccessRead)[0].version,
+    [],
+    directModelAccessAudit("test.model_access_group.models_replaced"),
+  );
+  const policyWithoutAcknowledgement = await app.request(
+    `/api/admin/model-access/groups/${group.id}/policy`,
+    {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({
+        expectedVersion: restricted.version,
+        name: "Atomic restricted",
+        description: "All membership changes together",
+        userIds: [],
+        modelIds: [],
+        tokenIds: [],
+      }),
+    },
+  );
+  assertEquals(policyWithoutAcknowledgement.status, 409);
+  assertEquals(repository.listAccessGroups(directModelAccessRead)[0].modelIds, [
+    restrictedModelId,
+  ]);
+  const policyWithStaleExtraAcknowledgement = await app.request(
+    `/api/admin/model-access/groups/${group.id}/policy`,
+    {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({
+        expectedVersion: restricted.version,
+        name: "Atomic restricted",
+        description: "All membership changes together",
+        userIds: [],
+        modelIds: [restrictedModelId],
+        tokenIds: [],
+        acknowledgePublicModelIds: [restrictedModelId],
+      }),
+    },
+  );
+  assertEquals(policyWithStaleExtraAcknowledgement.status, 409);
+  assertEquals(repository.listAccessGroups(directModelAccessRead)[0].modelIds, [
+    restrictedModelId,
+  ]);
+  const policyAcknowledged = await app.request(
+    `/api/admin/model-access/groups/${group.id}/policy`,
+    {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({
+        expectedVersion: restricted.version,
+        name: "Atomic restricted",
+        description: "All membership changes together",
+        userIds: [],
+        modelIds: [],
+        tokenIds: [],
+        acknowledgePublicModelIds: [restrictedModelId],
+      }),
+    },
+  );
+  assertEquals(policyAcknowledged.status, 200, await policyAcknowledged.clone().text());
+  const restoredAfterPolicy = repository.replaceAccessGroupModels(
+    group.id,
+    [restrictedModelId],
+    repository.listAccessGroups(directModelAccessRead)[0].version,
+    [],
+    directModelAccessAudit("test.model_access_group.models_replaced"),
   );
   const unacknowledged = await app.request(`/api/admin/model-access/groups/${group.id}/models`, {
     method: "PUT",
     headers,
-    body: JSON.stringify({ expectedVersion: restricted.version, ids: [] }),
+    body: JSON.stringify({ expectedVersion: restoredAfterPolicy.version, ids: [] }),
   });
   assertEquals(unacknowledged.status, 409);
   assertEquals(
     (await json(unacknowledged)).error.code,
     "model_access_widening_acknowledgement_required",
   );
-  assertEquals(repository.listAccessGroups()[0].modelIds, [restrictedModelId]);
+  assertEquals(repository.listAccessGroups(directModelAccessRead)[0].modelIds, [
+    restrictedModelId,
+  ]);
   const acknowledged = await app.request(`/api/admin/model-access/groups/${group.id}/models`, {
     method: "PUT",
     headers,
     body: JSON.stringify({
-      expectedVersion: restricted.version,
+      expectedVersion: restoredAfterPolicy.version,
       ids: [],
       acknowledgePublicModelIds: [restrictedModelId],
     }),
@@ -706,7 +787,9 @@ Deno.test("admin model-access group user route matches the web contract", async 
   const restored = repository.replaceAccessGroupModels(
     group.id,
     [restrictedModelId],
-    repository.listAccessGroups()[0].version,
+    repository.listAccessGroups(directModelAccessRead)[0].version,
+    [],
+    directModelAccessAudit("test.model_access_group.models_replaced"),
   );
   const deleteWithoutAcknowledgement = await app.request(
     `/api/admin/model-access/groups/${group.id}`,
@@ -1430,6 +1513,7 @@ Deno.test("auth status keeps limited sessions pollable through approval and veri
   // not elevate or destroy the status-only session.
   await repository.decideUserApproval({
     actorId: actor.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: signed.user.id,
     expectedVersion: signed.user.version,
     status: "approved",
@@ -1520,6 +1604,7 @@ Deno.test("rejected applicants retain only a status session", async () => {
   const headers = { cookie: sessionCookie(signup) };
   await repository.decideUserApproval({
     actorId: actor.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: signed.user.id,
     expectedVersion: signed.user.version,
     status: "rejected",
@@ -1562,6 +1647,7 @@ Deno.test("a rejected unverified applicant can verify before reconsideration", a
   const statusCookie = sessionCookie(signup);
   const rejected = await repository.decideUserApproval({
     actorId: actor.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: signed.user.id,
     expectedVersion: signed.user.version,
     status: "rejected",
@@ -1591,6 +1677,7 @@ Deno.test("a rejected unverified applicant can verify before reconsideration", a
 
   const approved = await repository.decideUserApproval({
     actorId: actor.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: signed.user.id,
     expectedVersion: rejected.version,
     status: "approved",

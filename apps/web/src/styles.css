@@ -3877,6 +3877,25 @@ kbd {
 .policy-impact p {
   margin: 0;
 }
+.policy-impact-models {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding-left: 20px;
+}
+.policy-impact-models li {
+  padding-left: 2px;
+}
+.policy-impact-models strong,
+.policy-impact-models code {
+  overflow-wrap: anywhere;
+}
+.policy-impact-models code {
+  display: block;
+  margin-top: 1px;
+  color: var(--muted);
+  font-size: 11px;
+}
 .policy-impact .danger-button {
   justify-self: start;
   margin-top: 3px;

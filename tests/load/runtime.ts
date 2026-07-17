@@ -3,6 +3,45 @@ export interface DerivedSignal {
   dispose(): void;
 }
 
+export interface RetentionPreviewFence {
+  policyVersion: number;
+  requestCutoffAt: string;
+  responseCutoffAt: string;
+}
+
+export interface RetentionScrubRequest {
+  expectedPolicyVersion: number;
+  idempotencyKey: string;
+  requestCutoffAt: string;
+  responseCutoffAt: string;
+}
+
+/**
+ * Retention cutoffs are server-issued fences, not durations the load client may reconstruct.
+ * Keeping the preview timestamps byte-for-byte also avoids weakening a longer current policy.
+ */
+export function retentionScrubRequest(
+  preview: RetentionPreviewFence,
+  idempotencyKey: string,
+): RetentionScrubRequest {
+  if (
+    !Number.isSafeInteger(preview.policyVersion) || preview.policyVersion < 1 ||
+    !Number.isFinite(Date.parse(preview.requestCutoffAt)) ||
+    !Number.isFinite(Date.parse(preview.responseCutoffAt))
+  ) {
+    throw new TypeError("Retention preview fence is invalid");
+  }
+  if (idempotencyKey.length < 8 || idempotencyKey.length > 200) {
+    throw new TypeError("Retention scrub idempotency key is invalid");
+  }
+  return {
+    expectedPolicyVersion: preview.policyVersion,
+    idempotencyKey,
+    requestCutoffAt: preview.requestCutoffAt,
+    responseCutoffAt: preview.responseCutoffAt,
+  };
+}
+
 export function derivedTimeoutSignal(
   parent: AbortSignal,
   timeoutMs: number,

@@ -1197,10 +1197,20 @@ export const api = {
   adminModels: async () => (await request<{ data: AdminModel[] }>("/admin/models")).data,
   adminModelAccessGroups: async () =>
     (await request<{ data: ModelAccessGroup[] }>("/admin/model-access/groups")).data,
-  createAdminModelAccessGroup: (input: { name: string; description: string }) =>
+  createAdminModelAccessGroup: (
+    input: {
+      name: string;
+      description: string;
+      userIds: string[];
+      modelIds: string[];
+      tokenIds: string[];
+    },
+    signal?: AbortSignal,
+  ) =>
     request<ModelAccessGroup>("/admin/model-access/groups", {
       method: "POST",
       body: JSON.stringify(input),
+      signal,
     }),
   updateAdminModelAccessGroup: (
     group: ModelAccessGroup,
@@ -1218,21 +1228,30 @@ export const api = {
         body: JSON.stringify({ expectedVersion: group.version, ids: userIds }),
       },
     ),
-  replaceAdminModelAccessGroupModels: (group: ModelAccessGroup, modelIds: string[]) =>
+  replaceAdminModelAccessGroupModels: (
+    group: ModelAccessGroup,
+    modelIds: string[],
+    acknowledgePublicModelIds: string[] = [],
+  ) =>
     request<ModelAccessGroup>(
       `/admin/model-access/groups/${encodeURIComponent(group.id)}/models`,
       {
         method: "PUT",
-        body: JSON.stringify({ expectedVersion: group.version, ids: modelIds }),
+        body: JSON.stringify({
+          expectedVersion: group.version,
+          ids: modelIds,
+          acknowledgePublicModelIds,
+        }),
       },
     ),
   previewAdminModelAccessGroupPolicy: (
     group: ModelAccessGroup,
     proposal: { userIds: string[]; modelIds: string[]; tokenIds: string[] } | null,
+    signal?: AbortSignal,
   ) =>
     request<AccessGroupPolicyImpact>(
       `/admin/model-access/groups/${encodeURIComponent(group.id)}/impact`,
-      { method: "POST", body: JSON.stringify({ proposal }) },
+      { method: "POST", body: JSON.stringify({ proposal }), signal },
     ),
   replaceAdminModelAccessGroupPolicy: (
     group: ModelAccessGroup,
@@ -1242,19 +1261,31 @@ export const api = {
       userIds: string[];
       modelIds: string[];
       tokenIds: string[];
+      acknowledgePublicModelIds?: string[];
     },
+    signal?: AbortSignal,
   ) =>
     request<ModelAccessGroup>(
       `/admin/model-access/groups/${encodeURIComponent(group.id)}/policy`,
       {
         method: "PUT",
-        body: JSON.stringify({ expectedVersion: group.version, ...input }),
+        body: JSON.stringify({
+          expectedVersion: group.version,
+          ...input,
+          acknowledgePublicModelIds: input.acknowledgePublicModelIds ?? [],
+        }),
+        signal,
       },
     ),
-  deleteAdminModelAccessGroup: (group: ModelAccessGroup) =>
+  deleteAdminModelAccessGroup: (
+    group: ModelAccessGroup,
+    acknowledgePublicModelIds: string[] = [],
+    signal?: AbortSignal,
+  ) =>
     request<void>(`/admin/model-access/groups/${encodeURIComponent(group.id)}`, {
       method: "DELETE",
-      body: JSON.stringify({ expectedVersion: group.version }),
+      body: JSON.stringify({ expectedVersion: group.version, acknowledgePublicModelIds }),
+      signal,
     }),
   adminModelAccessTokens: (query = "", cursor?: string, limit = 100, signal?: AbortSignal) => {
     const params = new URLSearchParams({ query, limit: String(limit) });

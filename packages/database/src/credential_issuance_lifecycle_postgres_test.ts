@@ -73,7 +73,7 @@ Deno.test({
         scopes: ["chat:write"],
         tokenHash: "credential-race-rotation-seed",
         preview: "rotation-seed",
-      });
+      }, 1);
 
       const rowLocked = Promise.withResolvers<void>();
       const transition = transitionSql.begin(async (tx) => {
@@ -96,7 +96,7 @@ Deno.test({
         scopes: ["chat:write"],
         tokenHash: "credential-race-token",
         preview: "race…token",
-      }));
+      }, 1));
       const sessionAttempt = outcome(
         repository.createSession(targetId, "credential-race-session", false),
       );
@@ -105,7 +105,7 @@ Deno.test({
         overlapSeconds: 30,
         tokenHash: "credential-race-rotated",
         preview: "race-rotated",
-      }));
+      }, 1));
       await waitForCredentialIssuanceWaiters(3);
 
       releaseTransition.resolve();
@@ -162,6 +162,7 @@ Deno.test({
       const beforeSuspend = await repository.getAdminUser(targetId);
       await repository.setAdminUserState({
         actorId,
+        expectedAuthorityEpoch: 1,
         targetUserId: targetId,
         expectedVersion: beforeSuspend.version,
         state: "suspended",
@@ -175,6 +176,7 @@ Deno.test({
       const suspended = await repository.getAdminUser(targetId);
       await repository.setAdminUserState({
         actorId,
+        expectedAuthorityEpoch: 1,
         targetUserId: targetId,
         expectedVersion: suspended.version,
         state: "active",
@@ -253,6 +255,7 @@ Deno.test({
       const beforeResetRejection = await repository.getAdminUser(targetId);
       const resetRejected = await repository.decideUserApproval({
         actorId,
+        expectedAuthorityEpoch: 1,
         targetUserId: targetId,
         expectedVersion: beforeResetRejection.version,
         status: "rejected",
@@ -278,6 +281,7 @@ Deno.test({
       );
       await repository.decideUserApproval({
         actorId,
+        expectedAuthorityEpoch: 1,
         targetUserId: targetId,
         expectedVersion: resetRejected.version,
         status: "approved",

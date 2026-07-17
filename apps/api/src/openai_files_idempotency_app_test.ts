@@ -54,7 +54,7 @@ async function fixture(
     scopes: ["files:read", "files:write"],
     tokenHash: await sha256(rawToken),
     preview: "primary",
-  });
+  }, repository.findUser(user.id)!.authorityEpoch);
   return {
     app,
     repository,
@@ -662,7 +662,7 @@ Deno.test("OpenAI file idempotency is credential-bound, owner-isolated, and reje
     scopes: ["files:write"],
     tokenHash: await sha256(secondRawToken),
     preview: "secondary",
-  });
+  }, value.repository.findUser(value.user.id)!.authorityEpoch);
   const credentialConflict = await value.app.request("/v1/files", {
     method: "POST",
     headers: {
@@ -685,7 +685,7 @@ Deno.test("OpenAI file idempotency is credential-bound, owner-isolated, and reje
     scopes: ["files:write"],
     tokenHash: await sha256(otherRawToken),
     preview: "other",
-  });
+  }, other.authorityEpoch);
   const isolated = await value.app.request("/v1/files", {
     method: "POST",
     headers: {

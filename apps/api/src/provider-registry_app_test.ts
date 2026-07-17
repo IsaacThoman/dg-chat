@@ -762,11 +762,26 @@ Deno.test("OpenAI embeddings route enforces capability, billing, safe failures, 
   );
   const restrictedFallbackGroup = await repository.createAccessGroup({
     name: "restricted-embedding-fallback",
+  }, {
+    actorId: adminUser.id,
+    action: "test.model_access_group.created",
+    targetType: "model_access_group",
+    requireEmailVerification: false,
+    expectedAuthorityEpoch: adminUser.authorityEpoch,
   });
   const restrictedFallbackPolicy = await repository.replaceAccessGroupModels(
     restrictedFallbackGroup.id,
     [fallbackModel.id],
     restrictedFallbackGroup.version,
+    [],
+    {
+      actorId: adminUser.id,
+      action: "test.model_access_group.models_replaced",
+      targetType: "model_access_group",
+      targetId: restrictedFallbackGroup.id,
+      requireEmailVerification: false,
+      expectedAuthorityEpoch: adminUser.authorityEpoch,
+    },
   );
   const callsBeforeDeniedFallback = calls;
   const runsBeforeDeniedFallback = (repository as MemoryRepository).usageRuns.size;
@@ -781,7 +796,19 @@ Deno.test("OpenAI embeddings route enforces capability, billing, safe failures, 
   assertEquals(calls, callsBeforeDeniedFallback);
   assertEquals((repository as MemoryRepository).usageRuns.size, runsBeforeDeniedFallback);
   assertEquals(adminUser.balanceMicros, balanceBeforeDeniedFallback);
-  await repository.deleteAccessGroup(restrictedFallbackGroup.id, restrictedFallbackPolicy.version);
+  await repository.deleteAccessGroup(
+    restrictedFallbackGroup.id,
+    restrictedFallbackPolicy.version,
+    [fallbackModel.id],
+    {
+      actorId: adminUser.id,
+      action: "test.model_access_group.deleted",
+      targetType: "model_access_group",
+      targetId: restrictedFallbackGroup.id,
+      requireEmailVerification: false,
+      expectedAuthorityEpoch: adminUser.authorityEpoch,
+    },
+  );
   await repository.setProviderModelRoute({
     sourceModelId: embeddingModel.id,
     expectedVersion: fallbackRoute.version,

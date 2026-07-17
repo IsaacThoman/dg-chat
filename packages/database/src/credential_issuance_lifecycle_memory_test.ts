@@ -28,13 +28,14 @@ Deno.test("credential issuance requires current lifecycle authority while preser
         scopes: ["chat:write"],
         tokenHash: "pending-token",
         preview: "pending",
-      }),
+      }, applicant.authorityEpoch),
     DomainError,
     "cannot create API tokens",
   );
 
   let managed = repository.decideUserApproval({
     actorId: actor.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: applicant.id,
     expectedVersion: applicant.version,
     status: "approved",
@@ -46,9 +47,10 @@ Deno.test("credential issuance requires current lifecycle authority while preser
     scopes: ["chat:write"],
     tokenHash: "approved-token",
     preview: "approved",
-  });
+  }, repository.findUser(applicant.id)!.authorityEpoch);
   managed = repository.setAdminUserState({
     actorId: actor.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: applicant.id,
     expectedVersion: managed.version,
     state: "suspended",
@@ -69,7 +71,7 @@ Deno.test("credential issuance requires current lifecycle authority while preser
         scopes: ["chat:write"],
         tokenHash: "suspended-token",
         preview: "suspended",
-      }),
+      }, staleEpoch),
     DomainError,
     "cannot create API tokens",
   );
@@ -80,13 +82,14 @@ Deno.test("credential issuance requires current lifecycle authority while preser
         overlapSeconds: 0,
         tokenHash: "suspended-rotation",
         preview: "suspended",
-      }),
+      }, staleEpoch),
     DomainError,
     "cannot rotate API tokens",
   );
 
   managed = repository.setAdminUserState({
     actorId: actor.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: applicant.id,
     expectedVersion: managed.version,
     state: "active",
@@ -128,6 +131,7 @@ Deno.test("credential issuance requires current lifecycle authority while preser
 
   managed = repository.decideUserApproval({
     actorId: actor.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: applicant.id,
     expectedVersion: managed.version,
     status: "rejected",
@@ -160,12 +164,13 @@ Deno.test("credential issuance requires current lifecycle authority while preser
         overlapSeconds: 0,
         tokenHash: "rejected-rotation",
         preview: "rejected",
-      }),
+      }, repository.findUser(applicant.id)!.authorityEpoch),
     DomainError,
     "cannot rotate API tokens",
   );
   managed = repository.decideUserApproval({
     actorId: actor.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: applicant.id,
     expectedVersion: managed.version,
     status: "approved",
@@ -183,6 +188,7 @@ Deno.test("credential issuance requires current lifecycle authority while preser
   }, reapprovedEpoch);
   managed = repository.setAdminUserDeleted({
     actorId: actor.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: applicant.id,
     expectedVersion: managed.version,
     deleted: true,
@@ -195,12 +201,13 @@ Deno.test("credential issuance requires current lifecycle authority while preser
         overlapSeconds: 0,
         tokenHash: "deleted-rotation",
         preview: "deleted",
-      }),
+      }, repository.findUser(applicant.id)!.authorityEpoch),
     DomainError,
     "cannot rotate API tokens",
   );
   repository.setAdminUserDeleted({
     actorId: actor.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: applicant.id,
     expectedVersion: managed.version,
     deleted: false,
@@ -236,6 +243,7 @@ Deno.test("every administrator role transition advances authority and revokes fu
   }, 1);
   let managed = repository.setAdminUserRole({
     actorId: actor.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: target.id,
     expectedVersion: target.version,
     role: "admin",
@@ -253,6 +261,7 @@ Deno.test("every administrator role transition advances authority and revokes fu
   }, 2);
   managed = repository.setAdminUserRole({
     actorId: actor.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: target.id,
     expectedVersion: managed.version,
     role: "user",
@@ -263,6 +272,7 @@ Deno.test("every administrator role transition advances authority and revokes fu
   assertEquals(repository.authenticateApiToken(token.tokenHash), undefined);
   repository.setAdminUserRole({
     actorId: actor.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: target.id,
     expectedVersion: managed.version,
     role: "admin",
@@ -284,7 +294,7 @@ Deno.test("memory token authentication independently enforces owner eligibility"
     scopes: ["models:read"],
     tokenHash: "memory-token-eligibility",
     preview: "eligibility",
-  });
+  }, user.authorityEpoch);
   assertEquals(repository.authenticateApiToken(token.tokenHash)?.id, token.id);
 
   repository.users.get(user.id)!.passwordResetPending = true;

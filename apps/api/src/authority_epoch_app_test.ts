@@ -35,6 +35,7 @@ Deno.test("an admitted stale browser request cannot mint a token after authority
   repository.createApiToken = (userId, input, expectedAuthorityEpoch) => {
     managed = repository.setAdminUserState({
       actorId: actor.id,
+      expectedAuthorityEpoch: 1,
       targetUserId: target.id,
       expectedVersion: managed.version,
       state: "suspended",
@@ -42,6 +43,7 @@ Deno.test("an admitted stale browser request cannot mint a token after authority
     });
     managed = repository.setAdminUserState({
       actorId: actor.id,
+      expectedAuthorityEpoch: 1,
       targetUserId: target.id,
       expectedVersion: managed.version,
       state: "active",

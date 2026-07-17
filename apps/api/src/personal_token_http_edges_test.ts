@@ -4,7 +4,69 @@ import {
   assertStringIncludes,
   assertThrows,
 } from "jsr:@std/assert@1.0.14";
+import { MemoryRepository } from "@dg-chat/database";
+import type {
+  AuditEventInput,
+  CreateApiTokenInput,
+  RotateApiTokenInput,
+  UpdateApiTokenInput,
+} from "@dg-chat/database";
 import { createApp } from "./app.ts";
+
+class FailingPersonalTokenAuditRepository extends MemoryRepository {
+  failAction: string | null = null;
+
+  override recordAudit(input: AuditEventInput) {
+    if (input.action === this.failAction) throw new Error("injected token audit failure");
+    return super.recordAudit(input);
+  }
+}
+
+class EpochCapturingPersonalTokenRepository extends MemoryRepository {
+  createEpochs: number[] = [];
+  updateEpochs: number[] = [];
+  rotateEpochs: number[] = [];
+  revokeEpochs: number[] = [];
+
+  override createApiToken(
+    userId: string,
+    input: CreateApiTokenInput,
+    expectedAuthorityEpoch: number,
+  ) {
+    this.createEpochs.push(expectedAuthorityEpoch);
+    return super.createApiToken(userId, input, expectedAuthorityEpoch);
+  }
+
+  override updateApiToken(
+    userId: string,
+    id: string,
+    input: UpdateApiTokenInput,
+    expectedAuthorityEpoch: number,
+  ) {
+    this.updateEpochs.push(expectedAuthorityEpoch);
+    return super.updateApiToken(userId, id, input, expectedAuthorityEpoch);
+  }
+
+  override revokeApiTokenFamily(
+    id: string,
+    userId: string,
+    expectedVersion: number,
+    expectedAuthorityEpoch: number,
+  ) {
+    this.revokeEpochs.push(expectedAuthorityEpoch);
+    return super.revokeApiTokenFamily(id, userId, expectedVersion, expectedAuthorityEpoch);
+  }
+
+  override rotateApiToken(
+    userId: string,
+    id: string,
+    input: RotateApiTokenInput,
+    expectedAuthorityEpoch: number,
+  ) {
+    this.rotateEpochs.push(expectedAuthorityEpoch);
+    return super.rotateApiToken(userId, id, input, expectedAuthorityEpoch);
+  }
+}
 
 async function body(response: Response) {
   // deno-lint-ignore no-explicit-any
@@ -16,6 +78,209 @@ function cookie(response: Response) {
   assertExists(value);
   return value;
 }
+
+Deno.test("personal token and entitlement mutations roll back when mandatory audit fails", async () => {
+  const repository = new FailingPersonalTokenAuditRepository();
+  const { app } = createApp({
+    repository,
+    setupToken: "personal-token-audit-failure",
+    requestErrorLogSink: () => undefined,
+  });
+  await app.request("/api/setup/bootstrap", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-setup-token": "personal-token-audit-failure",
+    },
+    body: JSON.stringify({
+      email: "token-audit-failure@example.com",
+      password: "correct horse battery",
+      name: "Token audit failure",
+    }),
+  });
+  const login = await app.request("/api/auth/sign-in/email", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email: "token-audit-failure@example.com",
+      password: "correct horse battery",
+    }),
+  });
+  const headers = {
+    cookie: cookie(login),
+    origin: "http://localhost:5173",
+    "content-type": "application/json",
+  };
+  repository.failAction = "api_token.created";
+
+  const response = await app.request("/api/tokens", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ name: "Never revealed", scopes: ["models:read"] }),
+  });
+  const responseText = await response.text();
+  assertEquals(response.status, 500);
+  assertEquals(responseText.includes('"token"'), false);
+  assertEquals(responseText.includes("dg_"), false);
+  const owner = [...repository.users.values()].find((user) =>
+    user.email === "token-audit-failure@example.com"
+  )!;
+  const readContext = {
+    actorId: owner.id,
+    requireEmailVerification: false,
+    expectedAuthorityEpoch: owner.authorityEpoch,
+  };
+  assertEquals(repository.listApiTokens(owner.id), []);
+  assertEquals(
+    repository.auditEvents.some((event) => event.action === "api_token.created"),
+    false,
+  );
+
+  repository.failAction = null;
+  const createdResponse = await app.request("/api/tokens", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ name: "Atomic entitlement", scopes: ["models:read"] }),
+  });
+  assertEquals(createdResponse.status, 201);
+  const created = await body(createdResponse);
+  const groupResponse = await app.request("/api/admin/model-access/groups", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ name: "Atomic entitlement group" }),
+  });
+  const group = await body(groupResponse);
+  const membershipResponse = await app.request(
+    `/api/admin/model-access/groups/${group.id}/users`,
+    {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({ expectedVersion: group.version, ids: [owner.id] }),
+    },
+  );
+  assertEquals(membershipResponse.status, 200);
+
+  repository.failAction = "api_token.access_groups_set";
+  const accessGroupsFailure = await app.request(
+    `/api/admin/model-access/tokens/${created.id}/groups`,
+    {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({
+        ownerId: owner.id,
+        expectedVersion: created.version,
+        groupIds: [group.id],
+      }),
+    },
+  );
+  assertEquals(accessGroupsFailure.status, 500);
+  assertEquals(repository.listApiTokens(owner.id)[0].version, created.version);
+  assertEquals(repository.listApiTokens(owner.id)[0].accessMode, "inherit");
+  assertEquals(repository.listAccessGroups(readContext)[0].tokenIds, []);
+
+  repository.failAction = null;
+  const assignedResponse = await app.request(
+    `/api/admin/model-access/tokens/${created.id}/groups`,
+    {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({
+        ownerId: owner.id,
+        expectedVersion: created.version,
+        groupIds: [group.id],
+      }),
+    },
+  );
+  assertEquals(assignedResponse.status, 200);
+  const assigned = await body(assignedResponse);
+  repository.failAction = "api_token.access_mode_set";
+  const accessModeFailure = await app.request(
+    `/api/admin/model-access/tokens/${created.id}/access-mode`,
+    {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({
+        ownerId: owner.id,
+        expectedVersion: assigned.version,
+        accessMode: "inherit",
+      }),
+    },
+  );
+  assertEquals(accessModeFailure.status, 500);
+  assertEquals(repository.listApiTokens(owner.id)[0].version, assigned.version);
+  assertEquals(repository.listApiTokens(owner.id)[0].accessMode, "restricted");
+  assertEquals(repository.listAccessGroups(readContext)[0].tokenIds, [created.id]);
+});
+
+Deno.test("personal token HTTP commands forward the authenticated authority epoch", async () => {
+  const repository = new EpochCapturingPersonalTokenRepository();
+  const { app } = createApp({
+    repository,
+    setupToken: "personal-token-authority-forwarding",
+  });
+  await app.request("/api/setup/bootstrap", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-setup-token": "personal-token-authority-forwarding",
+    },
+    body: JSON.stringify({
+      email: "token-authority-http@example.com",
+      password: "correct horse battery",
+      name: "Token authority HTTP",
+    }),
+  });
+  const login = await app.request("/api/auth/sign-in/email", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email: "token-authority-http@example.com",
+      password: "correct horse battery",
+    }),
+  });
+  const headers = {
+    cookie: cookie(login),
+    origin: "http://localhost:5173",
+    "content-type": "application/json",
+  };
+  const created = await body(
+    await app.request("/api/tokens", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ name: "Authority fenced", scopes: ["models:read"] }),
+    }),
+  );
+  const owner = [...repository.users.values()].find((user) =>
+    user.email === "token-authority-http@example.com"
+  )!;
+  assertEquals(repository.createEpochs, [owner.authorityEpoch]);
+
+  const updatedResponse = await app.request(`/api/tokens/${created.id}`, {
+    method: "PATCH",
+    headers,
+    body: JSON.stringify({ expectedVersion: created.version, name: "Authority fenced update" }),
+  });
+  assertEquals(updatedResponse.status, 200);
+  const updated = await body(updatedResponse);
+  assertEquals(repository.updateEpochs, [owner.authorityEpoch]);
+
+  const rotateResponse = await app.request(`/api/tokens/${created.id}/rotate`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ expectedVersion: updated.version, overlapSeconds: 0 }),
+  });
+  assertEquals(rotateResponse.status, 201);
+  const rotated = await body(rotateResponse);
+  assertEquals(repository.rotateEpochs, [owner.authorityEpoch]);
+
+  const revokeResponse = await app.request(`/api/tokens/${rotated.replacement.id}`, {
+    method: "DELETE",
+    headers,
+    body: JSON.stringify({ expectedVersion: rotated.replacement.version }),
+  });
+  assertEquals(revokeResponse.status, 204);
+  assertEquals(repository.revokeEpochs, [owner.authorityEpoch]);
+});
 
 Deno.test("personal token HTTP ownership, CAS, lifecycle, policy, and secrecy edges", async () => {
   const { app, repository } = createApp({ setupToken: "personal-token-edges" });
@@ -271,11 +536,38 @@ Deno.test("personal token HTTP ownership, CAS, lifecycle, policy, and secrecy ed
     assertEquals(auditText.includes(value), false);
   }
   assertEquals(auditText.includes("tokenHash"), false);
+  const tokenAuditActions = new Set(
+    (JSON.parse(auditText).data as { action: string }[])
+      .filter((event) => event.action.startsWith("api_token."))
+      .map((event) => event.action),
+  );
+  assertEquals(
+    tokenAuditActions,
+    new Set([
+      "api_token.created",
+      "api_token.updated",
+      "api_token.rotated",
+      "api_token.revoked",
+    ]),
+  );
   assertEquals(
     (await app.request("/api/admin/model-access/tokens?cursor=not-a-uuid", {
       headers: adminHeaders,
     })).status,
     422,
   );
-  assertThrows(() => repository.searchApiTokens("", 50, "not-a-uuid"));
+  const admin = await repository.findUserByEmail("token-admin@example.com");
+  assertExists(admin);
+  assertThrows(() =>
+    repository.searchApiTokens(
+      {
+        actorId: admin.id,
+        requireEmailVerification: false,
+        expectedAuthorityEpoch: admin.authorityEpoch,
+      },
+      "",
+      50,
+      "not-a-uuid",
+    )
+  );
 });

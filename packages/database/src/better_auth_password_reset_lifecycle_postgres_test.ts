@@ -105,6 +105,7 @@ Deno.test({
       );
       const lifecycleAfterReset = repository.setAdminUserState({
         actorId,
+        expectedAuthorityEpoch: 1,
         targetUserId: resetWinsId,
         expectedVersion: 1,
         state: "suspended",
@@ -164,6 +165,7 @@ Deno.test({
 
       const lifecycleBeforeReset = repository.setAdminUserState({
         actorId,
+        expectedAuthorityEpoch: 1,
         targetUserId: lifecycleWinsId,
         expectedVersion: 1,
         state: "suspended",

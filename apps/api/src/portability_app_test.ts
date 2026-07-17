@@ -259,7 +259,7 @@ Deno.test("owner portability mutations enforce CSRF, session-only auth, and acti
     scopes: ["chat:write"],
     tokenHash: await sha256(bearer),
     preview: bearer.slice(-4),
-  });
+  }, repository.findUser(owner.user.id)!.authorityEpoch);
   const tokenResponse = await post({
     authorization: `Bearer ${bearer}`,
     origin: "http://localhost:5173",
@@ -286,6 +286,7 @@ Deno.test("owner portability mutations enforce CSRF, session-only auth, and acti
 
   repository.setAdminUserState({
     actorId: actor.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: owner.user.id,
     expectedVersion: owner.user.version,
     state: "suspended",
@@ -294,5 +295,7 @@ Deno.test("owner portability mutations enforce CSRF, session-only auth, and acti
   const suspended = await post({ ...owner.headers, "idempotency-key": "suspended-account" });
   assertEquals(suspended.status, 401);
   assertEquals(repository.listConversations(owner.user.id).length, 0);
-  assertEquals(repository.auditEvents.length, initialAudits + 1);
+  // Token creation and the later suspension are both mandatory audited mutations.
+  // None of the rejected portability requests may append an audit.
+  assertEquals(repository.auditEvents.length, initialAudits + 2);
 });

@@ -237,13 +237,13 @@ Deno.test({
         scopes: ["chat:write"],
         tokenHash: "rotation-one",
         preview: "one",
-      });
+      }, 1);
       const rotatedTwice = await repository.rotateApiToken(targetId, rotating.id, {
         expectedVersion: 1,
         tokenHash: "rotation-two",
         preview: "two",
         overlapSeconds: 3600,
-      });
+      }, 1);
       const staleFirstVersion = rotatedTwice.previous.version;
       const rotatedThrice = await repository.rotateApiToken(
         targetId,
@@ -254,6 +254,7 @@ Deno.test({
           preview: "three",
           overlapSeconds: 3600,
         },
+        1,
       );
       await code(() =>
         repository.revokeAdminUserTokenFamily({

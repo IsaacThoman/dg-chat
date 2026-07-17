@@ -51,7 +51,9 @@ async function fixture(
     }),
   });
   assertEquals(bootstrap.status, 201);
-  const admin = (await json(bootstrap)).user;
+  const publicAdmin = (await json(bootstrap)).user;
+  const admin = repository.findUser(publicAdmin.id);
+  assertExists(admin);
   const login = await app.request("/api/auth/sign-in/email", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -252,7 +254,7 @@ Deno.test("admin storage inventory is session-only, filter-bound, private, and c
     preview: "stor…oken",
     rpmLimit: 60,
     burstLimit: 10,
-  });
+  }, admin.authorityEpoch);
   assertExists(token);
   const tokenDenied = await app.request("/api/admin/storage/summary", {
     headers: { authorization: "Bearer storage-token" },

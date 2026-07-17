@@ -173,6 +173,7 @@ Deno.test("rejected legacy identities cannot request or consume password resets"
   );
   repository.decideUserApproval({
     actorId: administrator.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: applicant.id,
     expectedVersion: applicant.version,
     status: "rejected",

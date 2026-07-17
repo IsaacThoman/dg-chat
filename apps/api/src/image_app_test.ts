@@ -192,7 +192,8 @@ async function fixture(options: {
     }),
   });
   assertEquals(setup.status, 201);
-  const user = (await setup.json()).user;
+  const setupUser = (await setup.json()).user;
+  const user = repository.findUser(setupUser.id)!;
   const mutation = { actorId: user.id, action: "test.image-route" };
   const created = repository.createProvider({
     slug: "image-primary",
@@ -342,8 +343,21 @@ Deno.test("completed image generation and edit replays reauthorize model access"
     };
     const completed = await request();
     assertEquals(completed.status, 200, await completed.clone().text());
-    const group = fx.repository.createAccessGroup({ name: `deny-${editing}` });
-    fx.repository.replaceAccessGroupModels(group.id, [fx.model.id], group.version);
+    const group = fx.repository.createAccessGroup({ name: `deny-${editing}` }, {
+      actorId: fx.user.id,
+      action: "test.model_access_group.created",
+      targetType: "model_access_group",
+      requireEmailVerification: false,
+      expectedAuthorityEpoch: fx.user.authorityEpoch,
+    });
+    fx.repository.replaceAccessGroupModels(group.id, [fx.model.id], group.version, [], {
+      actorId: fx.user.id,
+      action: "test.model_access_group.models_replaced",
+      targetType: "model_access_group",
+      targetId: group.id,
+      requireEmailVerification: false,
+      expectedAuthorityEpoch: fx.user.authorityEpoch,
+    });
     const denied = await request();
     const deniedBody = await denied.text();
     assertEquals(denied.status, 404, deniedBody);
@@ -1452,8 +1466,17 @@ Deno.test("stale image finalization reauthorizes its stored canonical model befo
 });
 
 Deno.test("buffered image crash recovery accepts an alias for its canonical asset", async () => {
-  const { app, repository, cookie, calls, model } = await fixture();
-  repository.createModelAlias({ alias: "images/buffered-recovery-alias", targetModelId: model.id });
+  const { app, repository, cookie, calls, model, user } = await fixture();
+  repository.createModelAlias(
+    { alias: "images/buffered-recovery-alias", targetModelId: model.id },
+    {
+      actorId: user.id,
+      action: "test.model_alias.created",
+      targetType: "model_alias",
+      requireEmailVerification: false,
+      expectedAuthorityEpoch: user.authorityEpoch,
+    },
+  );
   const originalComplete = repository.completeApiJson.bind(repository);
   const originalFail = repository.failApiRequest.bind(repository);
   let crashComplete = true;
@@ -1498,7 +1521,7 @@ Deno.test("buffered image crash recovery accepts an alias for its canonical asse
 });
 
 Deno.test("stream crash recovery preserves exact partial SSE frames and provider timestamp", async () => {
-  const { app, repository, cookie, calls } = await fixture({
+  const { app, repository, cookie, calls, user } = await fixture({
     streaming: "success",
     replayMaxBytes: 80 * 1024 * 1024,
   });
@@ -1524,6 +1547,12 @@ Deno.test("stream crash recovery preserves exact partial SSE frames and provider
   repository.createModelAlias({
     alias: "images/stream-recovery-alias",
     targetModelId: canonical.id,
+  }, {
+    actorId: user.id,
+    action: "test.model_alias.created",
+    targetType: "model_alias",
+    requireEmailVerification: false,
+    expectedAuthorityEpoch: user.authorityEpoch,
   });
   const headers = {
     cookie,

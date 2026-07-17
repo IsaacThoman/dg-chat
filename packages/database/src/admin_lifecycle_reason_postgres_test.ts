@@ -34,6 +34,7 @@ Deno.test({
       await assertDomainCode(() =>
         repository.decideUserApproval({
           actorId,
+          expectedAuthorityEpoch: 1,
           targetUserId: targetId,
           expectedVersion: 1,
           status: "rejected",
@@ -42,6 +43,7 @@ Deno.test({
       await assertDomainCode(() =>
         repository.setAdminUserState({
           actorId,
+          expectedAuthorityEpoch: 1,
           targetUserId: targetId,
           expectedVersion: 1,
           state: "suspended",
@@ -49,6 +51,7 @@ Deno.test({
       await assertDomainCode(() =>
         repository.setAdminUserRole({
           actorId,
+          expectedAuthorityEpoch: 1,
           targetUserId: targetId,
           expectedVersion: 1,
           role: "admin",
@@ -57,6 +60,7 @@ Deno.test({
       await assertDomainCode(() =>
         repository.setAdminUserDeleted({
           actorId,
+          expectedAuthorityEpoch: 1,
           targetUserId: targetId,
           expectedVersion: 1,
           deleted: true,
@@ -65,6 +69,7 @@ Deno.test({
 
       const approved = await repository.decideUserApproval({
         actorId,
+        expectedAuthorityEpoch: 1,
         targetUserId: targetId,
         expectedVersion: 1,
         status: "approved",
@@ -72,6 +77,7 @@ Deno.test({
       });
       const suspended = await repository.setAdminUserState({
         actorId,
+        expectedAuthorityEpoch: 1,
         targetUserId: targetId,
         expectedVersion: approved.version,
         state: "suspended",
@@ -79,6 +85,7 @@ Deno.test({
       });
       const activated = await repository.setAdminUserState({
         actorId,
+        expectedAuthorityEpoch: 1,
         targetUserId: targetId,
         expectedVersion: suspended.version,
         state: "active",

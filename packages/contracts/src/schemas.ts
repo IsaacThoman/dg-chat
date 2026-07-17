@@ -350,12 +350,18 @@ export const updateModelAliasSchema = z.object({
 export const createAccessGroupSchema = z.object({
   name: modelAccessName,
   description: modelAccessDescription.optional(),
+  userIds: z.array(z.string().uuid()).max(10_000).default([]),
+  modelIds: z.array(z.string().uuid()).max(10_000).default([]),
+  tokenIds: z.array(z.string().uuid()).max(10_000).default([]),
 }).strict();
 export const updateAccessGroupSchema = z.object({
   expectedVersion: z.number().int().min(1),
   name: modelAccessName.optional(),
   description: modelAccessDescription.optional(),
-}).strict();
+}).strict().refine(
+  (input) => input.name !== undefined || input.description !== undefined,
+  { message: "Provide a name or description to update" },
+);
 export const replaceAccessGroupIdsSchema = z.object({
   expectedVersion: z.number().int().min(1),
   ids: z.array(z.string().uuid()).max(10_000),
@@ -381,6 +387,7 @@ export const replaceAccessGroupPolicySchema = z.object({
   userIds: z.array(z.string().uuid()).max(10_000),
   modelIds: z.array(z.string().uuid()).max(10_000),
   tokenIds: z.array(z.string().uuid()).max(10_000),
+  acknowledgePublicModelIds: z.array(z.string().uuid()).max(10_000).default([]),
 }).strict();
 export const previewAccessGroupPolicySchema = z.object({
   proposal: z.object({
