@@ -99,6 +99,8 @@ Deno.test("chaos markers prove live work and bind faults to real claim owners", 
   assertStringIncludes(runner, "onOpen:");
   assertStringIncludes(runner, "onClose:");
   assertStringIncludes(runner, "NEW.status IN ('running','completed')");
+  assertStringIncludes(runner, "PERFORM pg_sleep(3)");
+  assertStringIncludes(runner, "every non-target backlog job is held behind the crash target");
   assertStringIncludes(
     script,
     'dg_chat_http_requests_in_flight{job="dg-chat-api",method="POST",route="api"} > 0',
@@ -106,4 +108,9 @@ Deno.test("chaos markers prove live work and bind faults to real claim owners", 
   assertStringIncludes(script, "activeMetricInstance");
   assertStringIncludes(script, "cat /tmp/dg-chat-worker-instance");
   assertStringIncludes(script, "status='running'");
+  assertStringIncludes(script, "bounded_host_command 30");
+  assertStringIncludes(script, "bounded_host_command 75");
+  assertStringIncludes(script, "worker-chaos-diagnostics.log");
+  assertStringIncludes(script, ".worker-chaos-complete.$$.tmp");
+  assertStringIncludes(runner, 'waitForFile("worker-chaos-complete.json", 240_000)');
 });

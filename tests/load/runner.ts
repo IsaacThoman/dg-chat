@@ -1047,7 +1047,10 @@ async function queuePhase(): Promise<Record<string, Json>> {
       IF NEW.id='${crashRun.id}'::uuid AND OLD.status='queued'
          AND NEW.status IN ('running','completed')
          AND nextval('load_crash_once_seq')=1 THEN
-        PERFORM pg_sleep(20);
+        -- Stay below the worker's real statement_timeout. The host observes claims immediately
+        -- after process start, so this is long enough to kill the owner without turning the
+        -- intended process crash into a synthetic statement-timeout retry.
+        PERFORM pg_sleep(3);
       END IF;
       RETURN NEW;
     END $$;
@@ -1066,13 +1069,41 @@ async function queuePhase(): Promise<Record<string, Json>> {
         ${sql.json({ stageId: item.stageId, ownerId: userId })},'queued',now(),${item.key})
     `;
   }
+  const deferredBacklogKeys = [
+    ...runs.slice(1).map((run) => `retention.scrub:${run.id}`),
+    ...mixed.map((item) => item.key),
+  ];
+  const deferredBacklog = await sql<{ id: string }[]>`
+    UPDATE jobs SET available_at=clock_timestamp()+interval '15 seconds'
+    WHERE idempotency_key=ANY(${deferredBacklogKeys}::text[])
+    RETURNING id::text
+  `;
+  invariant(
+    deferredBacklog.length === runs.length - 1 + mixed.length,
+    "every non-target backlog job is held behind the crash target",
+  );
+  const prioritizedCrashTarget = await sql<{ id: string }[]>`
+    UPDATE jobs SET available_at=clock_timestamp()
+    WHERE id=${crashJob[0].id}::uuid AND status='queued'
+    RETURNING id::text
+  `;
+  invariant(
+    prioritizedCrashTarget.length === 1,
+    "the crash target is the unique immediately available backlog job",
+  );
   await writeJsonArtifact("queue-enqueued.json", {
     crashRunId: crashRun.id,
     crashJobId: crashJob[0].id,
     retentionJobs: runs.length,
     mixedJobs: mixed.length,
+    deferredBehindCrashTarget: deferredBacklog.length,
   });
-  const chaos = await waitForFile("worker-chaos-complete.json", 90_000);
+  // The host keeps the actual claim observation strict (45 seconds), while this envelope also
+  // covers a separately bounded Compose start, the post-kill health transition, container identity
+  // probes, and the kill. Keeping the runner's deadline above the sum prevents it from racing the
+  // host and hiding the specific failed operation, without giving workers any longer to claim the
+  // crash target.
+  const chaos = await waitForFile("worker-chaos-complete.json", 240_000);
   const oldClaimToken = String(chaos.oldClaimToken ?? "");
   invariant(oldClaimToken.length > 20, "host captured the killed worker's real claim token");
   const deadline = Date.now() + 180_000;

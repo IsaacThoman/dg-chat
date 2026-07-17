@@ -62,6 +62,8 @@ case "$LOAD_ARTIFACT_DIR/" in
   "$artifact_root/"*) ;;
   *) die "LOAD_ARTIFACT_DIR must be below $artifact_root." ;;
 esac
+# shellcheck source=tests/load/host-commands.sh
+source "$ROOT/tests/load/host-commands.sh"
 
 command -v openssl >/dev/null || die "OpenSSL is required."
 command -v deno >/dev/null || die "Deno is required."
@@ -280,40 +282,71 @@ done
 
 crash_job_id="$(jq -r '.crashJobId' "$LOAD_ARTIFACT_DIR/queue-enqueued.json")"
 [[ "$crash_job_id" =~ ^[0-9a-f-]{36}$ ]] || die "queue marker has an invalid crash job id."
-"${compose[@]}" up -d --scale worker=3 --wait worker
-claim_deadline=$((SECONDS + 90))
+# Do not wait for health before observing the deliberately short claim stall. The worker's real
+# five-second PostgreSQL statement timeout is part of the invariant, so the runner keeps the
+# injected database statement below that limit and makes the crash target first in the queue.
+bounded_host_command 30 "start worker replicas for crash claim" \
+  "${compose[@]}" up -d --scale worker=3 worker
+claim_deadline=$((SECONDS + 45))
 old_claim_token=""
 while [[ -z "$old_claim_token" ]]; do
-  old_claim_token="$("${compose[@]}" exec -T postgres \
-    psql -v ON_ERROR_STOP=1 -At -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  old_claim_token="$(bounded_host_command 5 "read crash target claim" \
+    "${compose[@]}" exec -T \
+    -e PGCONNECT_TIMEOUT=3 \
+    -e PGOPTIONS=-c\ statement_timeout=3000 \
+    postgres psql -v ON_ERROR_STOP=1 -At -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
     -c "select coalesce(locked_by,'') from jobs where id='$crash_job_id' and status='running'" |
     tr -d '\r')"
   if ! kill -0 "$runner_pid" 2>/dev/null; then
     wait "$runner_pid"
     die "load runner exited before a worker claimed the crash target."
   fi
-  (( SECONDS < claim_deadline )) || die "no worker claimed the crash target before timeout."
+  if ((SECONDS >= claim_deadline)); then
+    {
+      echo "Crash target was not observed running within 45 seconds."
+      bounded_host_command 8 "snapshot crash target state" \
+        "${compose[@]}" exec -T \
+        -e PGCONNECT_TIMEOUT=3 \
+        -e PGOPTIONS=-c\ statement_timeout=5000 \
+        postgres psql -v ON_ERROR_STOP=1 -At -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+        -c "select json_build_object(
+          'id',id,'status',status,'attempts',attempts,'lockedBy',locked_by,
+          'lockedAt',locked_at,'availableAt',available_at,'observedAt',clock_timestamp()
+        ) from jobs where id='$crash_job_id'" || true
+      bounded_host_command 8 "snapshot worker replica state" \
+        "${compose[@]}" ps worker || true
+      bounded_host_command 8 "snapshot worker logs" \
+        "${compose[@]}" logs --no-color --tail 120 worker || true
+    } >"$LOAD_ARTIFACT_DIR/worker-chaos-diagnostics.log" 2>&1
+    cat "$LOAD_ARTIFACT_DIR/worker-chaos-diagnostics.log" >&2
+    die "no worker claimed the crash target before the 45-second recovery bound."
+  fi
   [[ -n "$old_claim_token" ]] || sleep 0.1
 done
 claim_instance="$(cut -d: -f2 <<<"$old_claim_token")"
 [[ "$claim_instance" =~ ^[0-9a-f-]{36}$ ]] || die "worker claim token lacked an instance identity."
 killed_worker=""
 for container in $("${compose[@]}" ps -q worker); do
-  instance="$(docker exec "$container" sh -c 'cat /tmp/dg-chat-worker-instance' 2>/dev/null || true)"
+  instance="$(bounded_host_command 5 "read worker instance identity" \
+    docker exec "$container" sh -c 'cat /tmp/dg-chat-worker-instance' 2>/dev/null || true)"
   if [[ "$instance" == "$claim_instance" ]]; then
     killed_worker="$container"
     break
   fi
 done
 [[ -n "$killed_worker" ]] || die "could not map the real claim owner to a worker container."
-docker kill --signal KILL "$killed_worker" >/dev/null
-"${compose[@]}" up -d --scale worker=3 --wait worker
+bounded_host_command 15 "kill real crash target claim owner" \
+  docker kill --signal KILL "$killed_worker" >/dev/null
+bounded_host_command 75 "restore killed worker replica" \
+  "${compose[@]}" up -d --scale worker=3 --wait --wait-timeout 60 worker
+worker_marker_tmp="$LOAD_ARTIFACT_DIR/.worker-chaos-complete.$$.tmp"
 jq -n \
   --arg killedContainer "$killed_worker" \
   --arg killedInstance "$claim_instance" \
   --arg oldClaimToken "$old_claim_token" \
   '{killedContainer:$killedContainer,killedInstance:$killedInstance,oldClaimToken:$oldClaimToken}' \
-  >"$LOAD_ARTIFACT_DIR/worker-chaos-complete.json"
+  >"$worker_marker_tmp"
+mv "$worker_marker_tmp" "$LOAD_ARTIFACT_DIR/worker-chaos-complete.json"
 
 wait "$runner_pid"
 runner_pid=""

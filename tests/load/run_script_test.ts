@@ -60,3 +60,32 @@ Deno.test("load runner script rejects invalid profiles and privileged ports", as
   assertEquals(duplicatePort.code, 2);
   assertStringIncludes(duplicatePort.stderr, "ports must differ");
 });
+
+Deno.test("host orchestration commands terminate at their own wall-clock bound", async () => {
+  const artifactDirectory = await Deno.makeTempDir({ prefix: "dg-chat-host-command-" });
+  try {
+    const command = new Deno.Command("bash", {
+      args: [
+        "-c",
+        'source "$1"; export LOAD_ARTIFACT_DIR="$2"; bounded_host_command 1 "stalled probe" ' +
+        "bash -c 'while :; do :; done'",
+        "_",
+        `${root}/tests/load/host-commands.sh`,
+        artifactDirectory,
+      ],
+      stdout: "piped",
+      stderr: "piped",
+    });
+    const started = performance.now();
+    const output = await command.output();
+    const elapsedMs = performance.now() - started;
+    const stderr = new TextDecoder().decode(output.stderr);
+    assertEquals(output.code, 124, stderr);
+    assertEquals(elapsedMs < 4_000, true, `bounded command took ${Math.round(elapsedMs)}ms`);
+    assertStringIncludes(stderr, "Host operation timed out after 1s: stalled probe");
+    const operations = await Deno.readTextFile(`${artifactDirectory}/host-operations.log`);
+    assertStringIncludes(operations, "timeout stalled probe");
+  } finally {
+    await Deno.remove(artifactDirectory, { recursive: true });
+  }
+});
