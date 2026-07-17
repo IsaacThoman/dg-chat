@@ -1,4 +1,4 @@
-import { useCallback, useContext, useEffect, useRef, useState } from "react";
+import { useCallback, useContext, useEffect, useId, useRef, useState } from "react";
 import { Camera, Check, MonitorUp, RotateCcw } from "lucide-react";
 import { ChatSessionActivityContext } from "../chatSessionActivity.ts";
 import { Modal } from "../Modal.tsx";
@@ -41,6 +41,8 @@ export function ScreenCapture({
   const [error, setError] = useState("");
   const [result, setResult] = useState<ScreenCaptureResult>();
   const [previewUrl, setPreviewUrl] = useState("");
+  const [showUnavailableReason, setShowUnavailableReason] = useState(false);
+  const unavailableReasonId = useId();
   const previewUrlRef = useRef("");
   const streamRef = useRef<MediaStream | undefined>(undefined);
   const requestRef = useRef(0);
@@ -114,8 +116,9 @@ export function ScreenCapture({
         request !== requestRef.current ||
         !screenCaptureResultIsUsable(
           requestedTargetKey,
-          getCurrentTargetKey?.() ?? targetKeyRef.current,
+          targetKeyRef.current,
           eligibleRef.current,
+          getCurrentTargetKey?.(),
         )
       ) return;
       streamRef.current = stream;
@@ -124,8 +127,9 @@ export function ScreenCapture({
         request !== requestRef.current ||
         !screenCaptureResultIsUsable(
           requestedTargetKey,
-          getCurrentTargetKey?.() ?? targetKeyRef.current,
+          targetKeyRef.current,
           eligibleRef.current,
+          getCurrentTargetKey?.(),
         )
       ) return;
       const url = URL.createObjectURL(captured.file);
@@ -139,8 +143,9 @@ export function ScreenCapture({
         request !== requestRef.current ||
         !screenCaptureResultIsUsable(
           requestedTargetKey,
-          getCurrentTargetKey?.() ?? targetKeyRef.current,
+          targetKeyRef.current,
           eligibleRef.current,
+          getCurrentTargetKey?.(),
         )
       ) return;
       setError(screenCaptureErrorMessage(reason));
@@ -156,8 +161,9 @@ export function ScreenCapture({
       !result ||
       !screenCaptureResultIsUsable(
         resultTargetRef.current,
-        getCurrentTargetKey?.() ?? targetKeyRef.current,
+        targetKeyRef.current,
         eligibleRef.current,
+        getCurrentTargetKey?.(),
       )
     ) {
       cancel();
@@ -170,22 +176,40 @@ export function ScreenCapture({
 
   return (
     <>
-      <button
-        type="button"
-        className="tool-pill"
-        aria-label={unavailableReason
-          ? `Capture screen unavailable: ${unavailableReason}`
-          : "Capture screen"}
-        title={unavailableReason ? `Screen capture unavailable: ${unavailableReason}.` : undefined}
-        disabled={disabled || Boolean(unavailableReason)}
-        onClick={() => {
-          setError("");
-          setPhase("idle");
-          setOpen(true);
-        }}
-      >
-        <MonitorUp size={16} aria-hidden="true" /> Capture
-      </button>
+      <span className="screen-capture-tool">
+        <button
+          type="button"
+          className="tool-pill"
+          aria-label={unavailableReason
+            ? `Capture screen unavailable: ${unavailableReason}`
+            : "Capture screen"}
+          aria-disabled={unavailableReason ? true : undefined}
+          aria-describedby={unavailableReason ? unavailableReasonId : undefined}
+          disabled={disabled}
+          onFocus={() => unavailableReason && setShowUnavailableReason(true)}
+          onBlur={() => setShowUnavailableReason(false)}
+          onClick={() => {
+            if (unavailableReason) {
+              setShowUnavailableReason(true);
+              return;
+            }
+            setError("");
+            setPhase("idle");
+            setOpen(true);
+          }}
+        >
+          <MonitorUp size={16} aria-hidden="true" /> Capture
+        </button>
+        {unavailableReason && (
+          <span
+            id={unavailableReasonId}
+            className={`tool-pill-explanation${showUnavailableReason ? " visible" : ""}`}
+            role="status"
+          >
+            Screen capture unavailable: {unavailableReason}.
+          </span>
+        )}
+      </span>
       {open && (
         <Modal title="Capture your screen" close={cancel} variant="medium">
           <div className="screen-capture-dialog">

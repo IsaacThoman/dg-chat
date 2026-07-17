@@ -3901,7 +3901,12 @@ export class MemoryRepository {
     let created: CreateAttachmentResult | undefined;
     try {
       created = this.createAttachment(input, quota);
-      this.attachGeneratedObject(id, ownerId, created.attachment.id, !created.deduplicated);
+      this.attachGeneratedObject(
+        id,
+        ownerId,
+        created.attachment.id,
+        created.attachment.objectKey === stage.objectKey,
+      );
       return created;
     } catch (error) {
       this.jobs.splice(jobsBefore);
@@ -4398,7 +4403,9 @@ export class MemoryRepository {
     const reason = input.reason.trim();
     if (
       !reason || reason.length > 500 || !Number.isSafeInteger(input.expectedVersion) ||
-      input.expectedVersion < 1
+      input.expectedVersion < 1 ||
+      !["local", "external"].includes(input.requiredInspectionMode) ||
+      input.inspectionPolicyVersion !== ATTACHMENT_INSPECTION_POLICY_VERSION
     ) throw new DomainError("validation_error", "Reinspection request is invalid", 422);
     const attachment = this.attachments.get(input.attachmentId);
     if (!attachment) throw new DomainError("not_found", "Attachment not found", 404);
@@ -4426,6 +4433,8 @@ export class MemoryRepository {
       state: attachment.state,
       inspectionError: attachment.inspectionError,
       inspectionEpoch: attachment.inspectionEpoch,
+      requiredInspectionMode: attachment.requiredInspectionMode,
+      inspectionPolicyVersion: attachment.inspectionPolicyVersion,
       version: attachment.version,
       updatedAt: attachment.updatedAt,
     };
@@ -4435,6 +4444,8 @@ export class MemoryRepository {
       attachment.state = "pending";
       attachment.inspectionError = null;
       attachment.inspectionEpoch++;
+      attachment.requiredInspectionMode = input.requiredInspectionMode;
+      attachment.inspectionPolicyVersion = input.inspectionPolicyVersion;
       attachment.version++;
       attachment.updatedAt = new Date().toISOString();
       const inspectionJobId = this.enqueueAttachmentInspection(attachment);
@@ -4450,6 +4461,8 @@ export class MemoryRepository {
           after: {
             state: attachment.state,
             inspectionEpoch: attachment.inspectionEpoch,
+            requiredInspectionMode: attachment.requiredInspectionMode,
+            inspectionPolicyVersion: attachment.inspectionPolicyVersion,
             version: attachment.version,
           },
           inspectionJobId,
@@ -4460,6 +4473,8 @@ export class MemoryRepository {
       attachment.state = before.state;
       attachment.inspectionError = before.inspectionError;
       attachment.inspectionEpoch = before.inspectionEpoch;
+      attachment.requiredInspectionMode = before.requiredInspectionMode;
+      attachment.inspectionPolicyVersion = before.inspectionPolicyVersion;
       attachment.version = before.version;
       attachment.updatedAt = before.updatedAt;
       this.jobs.splice(jobsBefore);

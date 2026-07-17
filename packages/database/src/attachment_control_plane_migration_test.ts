@@ -131,6 +131,7 @@ Deno.test({
 
       await applyMigration(sql, "0050_attachment_control_plane.sql");
       await applyMigration(sql, "0051_attachment_release_compatibility.sql");
+      await applyMigration(sql, "0052_attachment_cleanup_ownership.sql");
       await sql`SELECT set_config('dg_chat.test_restore_authorized','off',false)`;
       assertEquals(
         [...await sql`SELECT physical_bytes,physical_objects FROM attachment_storage_installation`]
@@ -367,7 +368,7 @@ Deno.test({
 });
 
 Deno.test({
-  name: "0051 upgrades original 0050 data and authorizes only bound restore inserts",
+  name: "0051 and 0052 upgrade original 0050 data with release and ownership compatibility",
   ignore: !databaseUrl,
   sanitizeOps: false,
   sanitizeResources: false,
@@ -381,17 +382,26 @@ Deno.test({
       const owner = crypto.randomUUID();
       const attachment = crypto.randomUUID();
       const stage = crypto.randomUUID();
+      const recoveredAttachment = crypto.randomUUID();
+      const recoveredStage = crypto.randomUUID();
       await sql`INSERT INTO users(id) VALUES(${owner})`;
-      await sql`INSERT INTO usage_runs(id,user_id) VALUES('legacy-cleanup-run',${owner})`;
+      await sql`INSERT INTO usage_runs(id,user_id)
+        VALUES('legacy-cleanup-run',${owner}),('legacy-recovery-run',${owner})`;
       await sql`INSERT INTO attachments(
         id,owner_id,object_key,filename,mime_type,size_bytes,sha256,state,deleted_at)
-        VALUES(${attachment},${owner},'generated/legacy-cleaned','legacy.png','image/png',13,
-          ${"a".repeat(64)},'deleted',now())`;
+        VALUES
+          (${attachment},${owner},'generated/legacy-cleaned','legacy.png','image/png',13,
+            ${"a".repeat(64)},'deleted',now()),
+          (${recoveredAttachment},${owner},'generated/legacy-recovery','recovered.png',
+            'image/png',17,${"b".repeat(64)},'ready',NULL)`;
       await sql`INSERT INTO generated_object_staging(
         id,owner_id,usage_run_id,object_key,mime_type,size_bytes,sha256,attachment_id,state,
         cleanup_attachment,cleanup_error)
-        VALUES(${stage},${owner},'legacy-cleanup-run','generated/legacy-cleaned','image/png',13,
-          ${"a".repeat(64)},${attachment},'cleaned',true,NULL)`;
+        VALUES
+          (${stage},${owner},'legacy-cleanup-run','generated/legacy-cleaned','image/png',13,
+            ${"a".repeat(64)},${attachment},'cleaned',true,NULL),
+          (${recoveredStage},${owner},'legacy-recovery-run','generated/legacy-recovery',
+            'image/png',17,${"b".repeat(64)},${recoveredAttachment},'attached',false,NULL)`;
 
       await applyMigration(sql, "0050_attachment_control_plane.sql");
       assertEquals(
@@ -408,7 +418,7 @@ Deno.test({
           physical_bytes: Number(row.physical_bytes),
           physical_objects: Number(row.physical_objects),
         })),
-        [{ physical_bytes: 13, physical_objects: 1 }],
+        [{ physical_bytes: 30, physical_objects: 2 }],
       );
 
       await applyMigration(sql, "0051_attachment_release_compatibility.sql");
@@ -427,7 +437,30 @@ Deno.test({
           physical_bytes: Number(row.physical_bytes),
           physical_objects: Number(row.physical_objects),
         })),
-        [{ physical_bytes: 0, physical_objects: 0 }],
+        [{ physical_bytes: 17, physical_objects: 1 }],
+      );
+      await applyMigration(sql, "0052_attachment_cleanup_ownership.sql");
+      assertEquals(
+        [
+          ...await sql`SELECT cleanup_attachment FROM generated_object_staging
+            WHERE id=${recoveredStage}`,
+        ],
+        [{ cleanup_attachment: true }],
+      );
+      assertEquals(
+        Number(
+          (await sql`SELECT count(*) count FROM audit_events
+            WHERE action='attachment.generated_cleanup_ownership_reconciled'
+              AND target_id=${recoveredAttachment}`)[0].count,
+        ),
+        1,
+      );
+      assertEquals(
+        (
+          await sql`UPDATE attachments SET required_inspection_mode='external'
+            WHERE id=${recoveredAttachment} RETURNING required_inspection_mode`
+        )[0].required_inspection_mode,
+        "external",
       );
 
       await assertRejects(
@@ -496,6 +529,47 @@ Deno.test({
         () => applyMigration(sql, "0051_attachment_release_compatibility.sql"),
         Error,
         "historical cleaned generated object is fenced by ambiguous durable state",
+      );
+    } finally {
+      await sql.unsafe(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+      await sql.end();
+    }
+  },
+});
+
+Deno.test({
+  name: "0052 fails closed for already-cleaned same-key deduplication ownership",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 1 });
+    const schema = `attachment_same_key_cleaned_${crypto.randomUUID().replaceAll("-", "")}`;
+    try {
+      await sql.unsafe(`CREATE SCHEMA ${schema}`);
+      await sql.unsafe(`SET search_path TO ${schema},public`);
+      await createPre0050Fixture(sql);
+      const owner = crypto.randomUUID();
+      const attachment = crypto.randomUUID();
+      const stage = crypto.randomUUID();
+      await sql`INSERT INTO users(id) VALUES(${owner})`;
+      await sql`INSERT INTO usage_runs(id,user_id) VALUES('same-key-cleaned-run',${owner})`;
+      await sql`INSERT INTO attachments(
+        id,owner_id,object_key,filename,mime_type,size_bytes,sha256,state)
+        VALUES(${attachment},${owner},'generated/same-key-cleaned','ambiguous.png','image/png',19,
+          ${"f".repeat(64)},'ready')`;
+      await sql`INSERT INTO generated_object_staging(
+        id,owner_id,usage_run_id,object_key,mime_type,size_bytes,sha256,attachment_id,state,
+        cleanup_attachment,cleanup_error)
+        VALUES(${stage},${owner},'same-key-cleaned-run','generated/same-key-cleaned','image/png',19,
+          ${"f".repeat(64)},${attachment},'cleaned',false,NULL)`;
+
+      await applyMigration(sql, "0050_attachment_control_plane.sql");
+      await applyMigration(sql, "0051_attachment_release_compatibility.sql");
+      await assertRejects(
+        () => applyMigration(sql, "0052_attachment_cleanup_ownership.sql"),
+        Error,
+        "historical generated cleanup ownership is ambiguous after object deletion",
       );
     } finally {
       await sql.unsafe(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);

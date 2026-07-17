@@ -68,8 +68,18 @@ export function reconcileReinspectedAttachment(
   };
 }
 
+export function removeConflictedAttachment(
+  page: AdminAttachmentPage | undefined,
+  attachmentId: string,
+): AdminAttachmentPage | undefined {
+  if (!page || !page.data.some((item) => item.id === attachmentId)) return page;
+  return { ...page, data: page.data.filter((item) => item.id !== attachmentId) };
+}
+
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Storage information is temporarily unavailable.";
+export const isAttachmentVersionConflict = (error: unknown) =>
+  error instanceof ApiError && error.code === "version_conflict";
 const bytes = (value: number) =>
   new Intl.NumberFormat(undefined, {
     style: "unit",
@@ -122,8 +132,14 @@ export function AdminStorageView({ onReauthenticate }: { onReauthenticate?: () =
         client.invalidateQueries({ queryKey: ["admin-storage-attachments"] }),
       ]);
     },
-    onError: async (error) => {
-      if (error instanceof ApiError && error.status === 409) {
+    onError: async (error, variables) => {
+      if (isAttachmentVersionConflict(error)) {
+        // Never leave a known-stale administrative snapshot actionable. A successful refetch
+        // restores the authoritative row; a failed refetch keeps it absent and exposes retry UI.
+        client.setQueriesData<AdminAttachmentPage>(
+          { queryKey: ["admin-storage-attachments"] },
+          (page) => removeConflictedAttachment(page, variables.attachment.id),
+        );
         await client.invalidateQueries({ queryKey: ["admin-storage-attachments"] });
       }
     },
@@ -140,7 +156,7 @@ export function AdminStorageView({ onReauthenticate }: { onReauthenticate?: () =
       hasPrevious={history.length > 0}
       reinspectionId={reinspect.isPending ? reinspect.variables?.attachment.id : undefined}
       reinspectionError={reinspect.isError ? errorMessage(reinspect.error) : undefined}
-      reinspectionConflict={reinspect.error instanceof ApiError && reinspect.error.status === 409}
+      reinspectionConflict={isAttachmentVersionConflict(reinspect.error)}
       reinspectionRecentAuth={reinspect.error instanceof ApiError &&
         reinspect.error.code === "recent_authentication_required"}
       onApply={(next) => {
@@ -203,6 +219,13 @@ export function AdminStorage(props: AdminStorageProps) {
     props.filters.state,
     props.filters.deletion,
   ]);
+  useEffect(() => {
+    if (!props.reinspectionConflict) return;
+    setSelected(undefined);
+    setReason("");
+    const frame = requestAnimationFrame(() => actionRef.current?.focus());
+    return () => cancelAnimationFrame(frame);
+  }, [props.reinspectionConflict]);
   const apply = (event: FormEvent) => {
     event.preventDefault();
     const next = boundedStorageFilters(draft);
@@ -400,10 +423,16 @@ export function AdminStorage(props: AdminStorageProps) {
           ? props.page ? `Showing older results. ${props.inventoryError}` : props.inventoryError
           : ""}
       </div>
-      {props.inventoryError && !props.page && (
+      {props.inventoryError && (
         <button className="secondary ops-target" onClick={props.onRetryInventory}>
-          Retry loading attachments
+          {props.page ? "Refresh attachment inventory" : "Retry loading attachments"}
         </button>
+      )}
+      {props.reinspectionConflict && !selected && (
+        <p className="ops-error" role="alert">
+          This attachment changed while you were reviewing it. The stale row was removed. Reload the
+          inventory and review its current state before requesting reinspection again.
+        </p>
       )}
       {props.page?.data.length === 0 && (
         <p className="ops-empty" role="status">No attachments match these filters.</p>
@@ -517,13 +546,7 @@ export function AdminStorage(props: AdminStorageProps) {
           <small id="storage-reinspection-hint">
             Required for the audit record. Enter 8–500 characters.
           </small>
-          {props.reinspectionError && (
-            <p role="alert">
-              {props.reinspectionConflict
-                ? "This attachment changed. The inventory has been refreshed; review the latest state before trying again."
-                : props.reinspectionError}
-            </p>
-          )}
+          {props.reinspectionError && <p role="alert">{props.reinspectionError}</p>}
           {props.reinspectionRecentAuth && props.onReauthenticate && (
             <button
               type="button"

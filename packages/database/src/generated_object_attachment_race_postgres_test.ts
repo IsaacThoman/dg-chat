@@ -327,3 +327,119 @@ Deno.test({
     }
   },
 });
+
+Deno.test({
+  name: "generated attachment cleanup ownership follows PostgreSQL physical object identity",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const suffix = crypto.randomUUID();
+    const repo = await PostgresRepository.connect(databaseUrl!);
+    const control = postgres(databaseUrl!, { max: 1 });
+    const owner = await repo.createUser({
+      email: `generated-object-identity-${suffix}@example.com`,
+      name: "Generated object identity",
+      approvalStatus: "approved",
+    });
+    const usageRunId = `generated-object-identity-${suffix}`;
+    const sameKey = `generated/${owner.id}/same-${suffix}.png`;
+    const retainedKey = `generated/${owner.id}/retained-${suffix}.png`;
+    const stagedKey = `generated/${owner.id}/staged-${suffix}.png`;
+    try {
+      await control`INSERT INTO usage_runs(
+        id,user_id,model,provider,recovery_owner,status
+      ) VALUES(
+        ${usageRunId},${owner.id},'identity/image','identity','provider','completed'
+      )`;
+      const sameAttachment = await repo.createAttachment({
+        ownerId: owner.id,
+        objectKey: sameKey,
+        filename: "legacy-same-key.png",
+        mimeType: "image/png",
+        sizeBytes: 68,
+        sha256: "8".repeat(64),
+        state: "ready",
+        inspectionComplete: true,
+      });
+      const sameStage = await repo.stageGeneratedObject({
+        ownerId: owner.id,
+        usageRunId,
+        purpose: "output",
+        ordinal: 0,
+        objectKey: sameKey,
+        mimeType: "image/png",
+        sizeBytes: 68,
+        sha256: "8".repeat(64),
+      });
+      await repo.markGeneratedObjectStored(sameStage.id, owner.id);
+      const recovered = await repo.createAttachmentFromGeneratedObjectStage(
+        sameStage.id,
+        owner.id,
+        {
+          ownerId: owner.id,
+          objectKey: sameKey,
+          filename: "recovered.png",
+          mimeType: "image/png",
+          sizeBytes: 68,
+          sha256: "8".repeat(64),
+          state: "ready",
+          inspectionComplete: true,
+        },
+      );
+      assertEquals(recovered.deduplicated, true);
+      assertEquals(recovered.attachment.id, sameAttachment.attachment.id);
+      assertEquals(
+        (await control`SELECT cleanup_attachment FROM generated_object_staging
+          WHERE id=${sameStage.id}`)[0].cleanup_attachment,
+        true,
+      );
+
+      const retained = await repo.createAttachment({
+        ownerId: owner.id,
+        objectKey: retainedKey,
+        filename: "retained.png",
+        mimeType: "image/png",
+        sizeBytes: 68,
+        sha256: "9".repeat(64),
+        state: "ready",
+        inspectionComplete: true,
+      });
+      const deduplicatedStage = await repo.stageGeneratedObject({
+        ownerId: owner.id,
+        usageRunId,
+        purpose: "output",
+        ordinal: 1,
+        objectKey: stagedKey,
+        mimeType: "image/png",
+        sizeBytes: 68,
+        sha256: "9".repeat(64),
+      });
+      await repo.markGeneratedObjectStored(deduplicatedStage.id, owner.id);
+      const reused = await repo.createAttachmentFromGeneratedObjectStage(
+        deduplicatedStage.id,
+        owner.id,
+        {
+          ownerId: owner.id,
+          objectKey: stagedKey,
+          filename: "deduplicated.png",
+          mimeType: "image/png",
+          sizeBytes: 68,
+          sha256: "9".repeat(64),
+          state: "ready",
+          inspectionComplete: true,
+        },
+      );
+      assertEquals(reused.deduplicated, true);
+      assertEquals(reused.attachment.id, retained.attachment.id);
+      assertEquals(
+        (await control`SELECT cleanup_attachment FROM generated_object_staging
+          WHERE id=${deduplicatedStage.id}`)[0].cleanup_attachment,
+        false,
+      );
+    } finally {
+      await control.end();
+      await repo.close();
+    }
+  },
+});

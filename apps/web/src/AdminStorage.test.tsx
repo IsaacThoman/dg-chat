@@ -3,8 +3,11 @@ import { describe, expect, it } from "vitest";
 import {
   AdminStorage,
   boundedStorageFilters,
+  isAttachmentVersionConflict,
   reconcileReinspectedAttachment,
+  removeConflictedAttachment,
 } from "./AdminStorage.tsx";
+import { ApiError } from "./api.ts";
 
 const filters = { ownerId: "", state: "" as const, deletion: "present" as const };
 const base = {
@@ -36,6 +39,30 @@ const attachment = {
 };
 
 describe("AdminStorage", () => {
+  it("distinguishes stale versions from permanent 409 policy conflicts", () => {
+    expect(isAttachmentVersionConflict(new ApiError(409, "version_conflict", "changed"))).toBe(
+      true,
+    );
+    expect(
+      isAttachmentVersionConflict(
+        new ApiError(409, "attachment_state_conflict", "policy quarantine"),
+      ),
+    ).toBe(false);
+    expect(isAttachmentVersionConflict(new ApiError(409, "attachment_deleted", "deleted"))).toBe(
+      false,
+    );
+  });
+
+  it("removes a known-stale conflicted row until authoritative inventory reloads", () => {
+    const page = { data: [attachment], nextCursor: "next" };
+    expect(removeConflictedAttachment(page, attachment.id)).toEqual({
+      data: [],
+      nextCursor: "next",
+    });
+    expect(removeConflictedAttachment(page, "missing")).toBe(page);
+    expect(removeConflictedAttachment(undefined, attachment.id)).toBeUndefined();
+  });
+
   it("renders accessible summary, filters, safe inventory, and worker-only action language", () => {
     const markup = renderToStaticMarkup(
       <AdminStorage
@@ -152,6 +179,18 @@ describe("AdminStorage", () => {
     expect(empty).toContain("Loading storage summary");
     expect(empty).toContain("Loading attachment inventory");
     expect(empty).toContain("No attachments match");
+  });
+
+  it("keeps an inventory refresh action visible when a background refetch fails", () => {
+    const markup = renderToStaticMarkup(
+      <AdminStorage
+        {...base}
+        page={{ data: [], nextCursor: null }}
+        inventoryError="The authoritative refresh failed."
+      />,
+    );
+    expect(markup).toContain("Showing older results");
+    expect(markup).toContain("Refresh attachment inventory");
   });
 
   it("bounds filter text and restores unknown enum values to safe defaults", () => {

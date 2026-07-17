@@ -365,6 +365,13 @@
       "when": 1783998016000,
       "tag": "0051_attachment_release_compatibility",
       "breakpoints": true
+    },
+    {
+      "idx": 52,
+      "version": "7",
+      "when": 1783998017000,
+      "tag": "0052_attachment_cleanup_ownership",
+      "breakpoints": true
     }
   ]
 }

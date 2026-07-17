@@ -279,13 +279,30 @@ Deno.test("memory reinspection is versioned, audited, epoch-fenced, and filter c
     attachmentId: second.id,
     expectedVersion: priorVersion,
     reason: "  Policy definition 2026-07 changed  ",
+    requiredInspectionMode: "external",
+    inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
   });
   assertEquals(result.attachment.inspectionEpoch, priorEpoch + 1);
   assertEquals(result.attachment.version, priorVersion + 1);
   assertEquals(result.attachment.state, "pending");
+  assertEquals(result.attachment.requiredInspectionMode, "external");
+  assertEquals(
+    result.attachment.inspectionPolicyVersion,
+    ATTACHMENT_INSPECTION_POLICY_VERSION,
+  );
   assertEquals(
     repo.jobs.find((job) => job.id === result.inspectionJobId)?.idempotencyKey,
     `attachment.inspect:${second.id}:${priorEpoch + 1}`,
+  );
+  assertEquals(
+    repo.jobs.find((job) => job.id === result.inspectionJobId)?.payload,
+    {
+      attachmentId: second.id,
+      ownerId: owner.id,
+      inspectionEpoch: priorEpoch + 1,
+      requiredInspectionMode: "external",
+      inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
+    },
   );
   assertThrows(
     () =>
@@ -402,6 +419,8 @@ Deno.test("memory reinspection rolls back its mutation and job when the audit ap
         attachmentId: original.id,
         expectedVersion: original.version,
         reason: "Exercise transaction rollback",
+        requiredInspectionMode: "external",
+        inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
       }),
     Error,
     "injected audit failure",
@@ -437,6 +456,8 @@ Deno.test("reinspection eligibility admits only worker-owned quarantines", () =>
         attachmentId: synchronous.id,
         expectedVersion: synchronous.version,
         reason: "try bypassing synchronous policy",
+        requiredInspectionMode: "external",
+        inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
       }),
     DomainError,
   );
@@ -454,6 +475,8 @@ Deno.test("reinspection eligibility admits only worker-owned quarantines", () =>
       attachmentId: workerOwned.id,
       expectedVersion: workerOwned.version,
       reason: "scanner signatures were corrected",
+      requiredInspectionMode: "external",
+      inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
     }).attachment.state,
     "pending",
   );

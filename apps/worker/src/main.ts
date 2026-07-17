@@ -978,17 +978,27 @@ async function processJob(
             state: string;
             deleted_at: Date | null;
             object_key: string;
+            physical_object: boolean;
           } | undefined;
-          if (candidate?.attachment_id && candidate.cleanup_attachment) {
+          if (candidate?.attachment_id) {
             // Reference writers take the same attachment row lock and require ready/not-deleted.
             // Fencing the attachment before the external delete closes the check/delete race.
             const attachments = await tx<{
               state: string;
               deleted_at: Date | null;
               object_key: string;
-            }[]>`SELECT state,deleted_at,object_key FROM attachments
+              physical_object: boolean;
+            }[]>`SELECT state,deleted_at,object_key,physical_object FROM attachments
             WHERE id=${candidate.attachment_id} AND owner_id=${ownerId} FOR UPDATE`;
             attachmentFence = attachments[0];
+            if (
+              !candidate.cleanup_attachment && attachmentFence?.physical_object &&
+              attachmentFence.object_key === candidate.object_key
+            ) {
+              throw new Error(
+                "Generated object cleanup is fenced by ambiguous same-key attachment ownership",
+              );
+            }
           }
           const rows = await tx<{
             object_key: string;

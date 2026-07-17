@@ -74,10 +74,12 @@ export function boundedCaptureDimensions(
 
 export function screenCaptureResultIsUsable(
   capturedTargetKey: string,
-  currentTargetKey: string,
+  renderedTargetKey: string,
   eligible: boolean,
+  immediateTargetKey = renderedTargetKey,
 ): boolean {
-  return eligible && capturedTargetKey === currentTargetKey;
+  return eligible && capturedTargetKey === renderedTargetKey &&
+    capturedTargetKey === immediateTargetKey;
 }
 
 export function screenCaptureErrorMessage(error: unknown): string {

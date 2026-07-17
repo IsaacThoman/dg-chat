@@ -432,6 +432,86 @@ Deno.test("generated attachment admission rolls back when its stage cannot be at
   assertEquals(repo.generatedObjectStages.get(stage.id)?.attachmentId, null);
 });
 
+Deno.test("generated attachment cleanup ownership follows physical object identity", () => {
+  const { repo, owner } = fixture();
+  const sameKey = `generated/${owner.id}/${crypto.randomUUID()}.png`;
+  const sameHash = "9".repeat(64);
+  const sameAttachment = repo.createAttachment({
+    ownerId: owner.id,
+    objectKey: sameKey,
+    filename: "legacy-same-key.png",
+    mimeType: "image/png",
+    sizeBytes: 100,
+    sha256: sameHash,
+    state: "ready",
+    inspectionComplete: true,
+  }).attachment;
+  const sameStage = repo.stageGeneratedObject({
+    ownerId: owner.id,
+    usageRunId: "asset-run-0001",
+    ordinal: 0,
+    objectKey: sameKey,
+    mimeType: "image/png",
+    sizeBytes: 100,
+    sha256: sameHash,
+  });
+  repo.markGeneratedObjectStored(sameStage.id, owner.id);
+  const recovered = repo.createAttachmentFromGeneratedObjectStage(sameStage.id, owner.id, {
+    ownerId: owner.id,
+    objectKey: sameKey,
+    filename: "recovered.png",
+    mimeType: "image/png",
+    sizeBytes: 100,
+    sha256: sameHash,
+    state: "ready",
+    inspectionComplete: true,
+  });
+  assertEquals(recovered.deduplicated, true);
+  assertEquals(recovered.attachment.id, sameAttachment.id);
+  assertEquals(repo.generatedObjectStages.get(sameStage.id)?.cleanupAttachment, true);
+
+  const retainedKey = `generated/${owner.id}/${crypto.randomUUID()}.png`;
+  const stagedKey = `generated/${owner.id}/${crypto.randomUUID()}.png`;
+  const otherHash = "a".repeat(64);
+  const retained = repo.createAttachment({
+    ownerId: owner.id,
+    objectKey: retainedKey,
+    filename: "retained.png",
+    mimeType: "image/png",
+    sizeBytes: 100,
+    sha256: otherHash,
+    state: "ready",
+    inspectionComplete: true,
+  }).attachment;
+  const deduplicatedStage = repo.stageGeneratedObject({
+    ownerId: owner.id,
+    usageRunId: "asset-run-0001",
+    ordinal: 1,
+    objectKey: stagedKey,
+    mimeType: "image/png",
+    sizeBytes: 100,
+    sha256: otherHash,
+  });
+  repo.markGeneratedObjectStored(deduplicatedStage.id, owner.id);
+  const reused = repo.createAttachmentFromGeneratedObjectStage(
+    deduplicatedStage.id,
+    owner.id,
+    {
+      ownerId: owner.id,
+      objectKey: stagedKey,
+      filename: "deduplicated.png",
+      mimeType: "image/png",
+      sizeBytes: 100,
+      sha256: otherHash,
+      state: "ready",
+      inspectionComplete: true,
+    },
+  );
+  assertEquals(reused.deduplicated, true);
+  assertEquals(reused.attachment.id, retained.id);
+  assertEquals(repo.generatedObjectStages.get(deduplicatedStage.id)?.cleanupAttachment, false);
+});
+
 Deno.test("image edit lineage enforces ownership, image masks, dimensions, and staged outputs", () => {
   const { repo, owner, stranger, model, identitySnapshot, createAttachment } = fixture();
   const source = createAttachment("edit-source", "1");

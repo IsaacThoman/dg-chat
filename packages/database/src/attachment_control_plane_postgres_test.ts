@@ -81,6 +81,8 @@ Deno.test({
             attachmentId: created.id,
             expectedVersion: created.version,
             reason: "Scanner policy epoch changed",
+            requiredInspectionMode: "external",
+            inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
           })
         ),
       );
@@ -89,6 +91,16 @@ Deno.test({
           item.status === "fulfilled"
         ).length,
         1,
+        JSON.stringify(
+          requests.map((item) =>
+            item.status === "rejected"
+              ? {
+                code: item.reason instanceof DomainError ? item.reason.code : undefined,
+                message: item.reason instanceof Error ? item.reason.message : String(item.reason),
+              }
+              : { status: "fulfilled" }
+          ),
+        ),
       );
       const requested = (requests.find((item) =>
         item.status === "fulfilled"
@@ -96,12 +108,49 @@ Deno.test({
         Awaited<ReturnType<typeof repositories[0]["requestAttachmentReinspection"]>>
       >).value;
       assertEquals(requested.attachment.inspectionEpoch, 2);
+      assertEquals(requested.attachment.requiredInspectionMode, "external");
       assertEquals(
         String(
           (await sql`SELECT idempotency_key FROM jobs WHERE id=${requested.inspectionJobId}`)[0]
             .idempotency_key,
         ),
         `attachment.inspect:${created.id}:2`,
+      );
+      assertEquals(
+        (await sql<{ payload: Record<string, unknown> }[]>`
+          SELECT payload FROM jobs WHERE id=${requested.inspectionJobId}`)[0].payload,
+        {
+          attachmentId: created.id,
+          ownerId: owner.id,
+          inspectionEpoch: 2,
+          requiredInspectionMode: "external",
+          inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
+        },
+      );
+      assertEquals(
+        (await sql<{ metadata: Record<string, unknown> }[]>`
+          SELECT metadata FROM audit_events
+          WHERE action='attachment.reinspection_requested'
+            AND target_id=${created.id}`)[0].metadata,
+        {
+          ownerId: owner.id,
+          reason: "Scanner policy epoch changed",
+          before: {
+            state: "ready",
+            inspectionEpoch: 1,
+            requiredInspectionMode: "local",
+            inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
+            version: created.version,
+          },
+          after: {
+            state: "pending",
+            inspectionEpoch: 2,
+            requiredInspectionMode: "external",
+            inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
+            version: created.version + 1,
+          },
+          inspectionJobId: requested.inspectionJobId,
+        },
       );
       const stale = await Promise.allSettled([
         repositories[0].transitionAttachmentInspection({
@@ -201,6 +250,8 @@ Deno.test({
           attachmentId: synchronousQuarantine.id,
           expectedVersion: synchronousQuarantine.version,
           reason: "must not bypass upload policy",
+          requiredInspectionMode: "external",
+          inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
         }),
       ]);
       assertEquals(synchronousResult[0].status, "rejected");
@@ -219,6 +270,8 @@ Deno.test({
           attachmentId: workerQuarantine.id,
           expectedVersion: workerQuarantine.version,
           reason: "worker policy signature was corrected",
+          requiredInspectionMode: "external",
+          inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
         })).attachment.state,
         "pending",
       );

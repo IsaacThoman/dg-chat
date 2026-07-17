@@ -1795,6 +1795,37 @@ kbd {
 .tool-pill:hover {
   background: #f1f0ec;
 }
+.screen-capture-tool {
+  position: relative;
+  display: flex;
+}
+.tool-pill-explanation {
+  position: absolute;
+  z-index: 30;
+  left: 0;
+  bottom: calc(100% + 7px);
+  width: max-content;
+  max-width: min(280px, calc(100vw - 32px));
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--ink);
+  background: var(--panel);
+  box-shadow: var(--shadow);
+  font-size: 11px;
+  line-height: 1.35;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translateY(3px);
+  transition: opacity 120ms ease, transform 120ms ease, visibility 120ms ease;
+}
+.tool-pill-explanation.visible,
+.screen-capture-tool:focus-within .tool-pill-explanation {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(0);
+}
 .recording {
   color: #c14b4b;
   background: #f8e9e9;

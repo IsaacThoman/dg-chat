@@ -4927,7 +4927,8 @@ export class PostgresRepository implements DomainRepository {
         );
       }
       const attached = await tx`UPDATE generated_object_staging SET state='attached',
-        attachment_id=${created.attachment.id},cleanup_attachment=${!created.deduplicated},
+        attachment_id=${created.attachment.id},
+        cleanup_attachment=${created.attachment.objectKey === String(stage.object_key)},
         updated_at=now() WHERE id=${id} AND owner_id=${ownerId} AND state='stored'
         RETURNING id`;
       if (!attached.length) {
@@ -5530,6 +5531,10 @@ export class PostgresRepository implements DomainRepository {
     input: RequestAttachmentReinspectionInput,
   ): Promise<AttachmentReinspectionResult> {
     const reason = validateAdminCommand(input, true)!;
+    if (
+      !["local", "external"].includes(input.requiredInspectionMode) ||
+      input.inspectionPolicyVersion !== ATTACHMENT_INSPECTION_POLICY_VERSION
+    ) throw new DomainError("validation_error", "Reinspection request is invalid", 422);
     return await this.#sql.begin(async (tx) => {
       await assertEffectiveAdminActor(tx, input.actorId);
       const rows = await tx<Row[]>`
@@ -5562,7 +5567,10 @@ export class PostgresRepository implements DomainRepository {
       }
       const updated = await tx<Row[]>`
         UPDATE attachments SET state='pending',inspection_error=NULL,
-          inspection_epoch=inspection_epoch+1,version=version+1,updated_at=now()
+          inspection_epoch=inspection_epoch+1,
+          required_inspection_mode=${input.requiredInspectionMode},
+          inspection_policy_version=${input.inspectionPolicyVersion},
+          version=version+1,updated_at=now()
         WHERE id=${input.attachmentId} RETURNING *`;
       const record = updated[0];
       const epoch = number(record.inspection_epoch);
@@ -5589,9 +5597,17 @@ export class PostgresRepository implements DomainRepository {
           before: {
             state: String(prior.state),
             inspectionEpoch: number(prior.inspection_epoch),
+            requiredInspectionMode: String(prior.required_inspection_mode),
+            inspectionPolicyVersion: String(prior.inspection_policy_version),
             version: number(prior.version),
           },
-          after: { state: "pending", inspectionEpoch: epoch, version: number(record.version) },
+          after: {
+            state: "pending",
+            inspectionEpoch: epoch,
+            requiredInspectionMode: String(record.required_inspection_mode),
+            inspectionPolicyVersion: String(record.inspection_policy_version),
+            version: number(record.version),
+          },
           inspectionJobId: jobId,
         })
       })`;

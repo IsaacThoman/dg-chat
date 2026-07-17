@@ -289,9 +289,18 @@ test("cancels and fences a pending capture when the selected model loses vision"
   await session.locator('button.model-trigger[aria-haspopup="listbox"]').dispatchEvent("click");
   await page.getByRole("option", { name: /E2E text only/ }).dispatchEvent("click");
   await expect(dialog).toBeHidden();
-  await expect(session.getByRole("button", {
+  const unavailableCapture = session.getByRole("button", {
     name: "Capture screen unavailable: the selected model does not support images",
-  })).toBeDisabled();
+  });
+  await expect(unavailableCapture).toHaveAttribute("aria-disabled", "true");
+  await unavailableCapture.focus();
+  await expect(unavailableCapture).toBeFocused();
+  const explanationId = await unavailableCapture.getAttribute("aria-describedby");
+  expect(explanationId).toBeTruthy();
+  await expect(session.locator(`[id="${explanationId}"]`)).toBeVisible();
+  await expect(session.locator(`[id="${explanationId}"]`)).toContainText(
+    "selected model does not support images",
+  );
 
   await page.evaluate(() => {
     (globalThis as typeof globalThis & { __captureTest: CaptureTestState }).__captureTest
@@ -348,9 +357,17 @@ test("synchronously fences Use Screenshot on an immediate model capability downg
     })
   ).toEqual({ clicks: 1, connected: true });
   await expect(dialog).toBeHidden();
-  await expect(session.getByRole("button", {
+  const unavailableCapture = session.getByRole("button", {
     name: "Capture screen unavailable: the selected model does not support images",
-  })).toBeDisabled();
+  });
+  await expect(unavailableCapture).toHaveAttribute("aria-disabled", "true");
+  // aria-disabled remains intentionally focusable/click-explanatory, while Playwright correctly
+  // excludes it from ordinary actionable controls. Force the pointer event to exercise that
+  // explicit explanatory path without pretending the capture action itself is enabled.
+  await unavailableCapture.click({ force: true });
+  const explanationId = await unavailableCapture.getAttribute("aria-describedby");
+  expect(explanationId).toBeTruthy();
+  await expect(session.locator(`[id="${explanationId}"]`)).toBeVisible();
   await expect.poll(() =>
     page.evaluate(() =>
       (globalThis as typeof globalThis & { __captureTest: CaptureTestState }).__captureTest

@@ -888,6 +888,9 @@ export interface RequestAttachmentReinspectionInput {
   actorId: string;
   expectedVersion: number;
   reason: string;
+  /** Trusted server-side policy snapshot to apply to the new inspection epoch. */
+  requiredInspectionMode: RequiredAttachmentInspectionMode;
+  inspectionPolicyVersion: typeof ATTACHMENT_INSPECTION_POLICY_VERSION;
 }
 export interface AttachmentReinspectionResult {
   attachment: AttachmentRecord;

@@ -1,4 +1,4 @@
-import { assert, assertEquals, assertMatch } from "jsr:@std/assert@1.0.14";
+import { assert, assertEquals } from "jsr:@std/assert@1.0.14";
 import postgres from "npm:postgres@3.4.7";
 import {
   BACKUP_DATA_TABLES,
@@ -107,6 +107,7 @@ Deno.test({
         } RESTART IDENTITY CASCADE`,
       );
       await sql`INSERT INTO installation_state(singleton_id) VALUES(1)`;
+      await sql`INSERT INTO attachment_storage_installation(singleton_id) VALUES(1)`;
       await sql`INSERT INTO retention_schedule_state(
         singleton_id,interval_seconds,next_due_at,updated_at)
         VALUES(1,86400,now(),now())`;
@@ -284,7 +285,11 @@ Deno.test({
 
       const [restoredAttachment] = await sql<{ object_key: string }[]>`
         SELECT object_key FROM attachments WHERE id=${attachmentId}`;
-      assertMatch(restoredAttachment.object_key, /^restores\/[0-9a-f-]+\/[0-9a-f]{64}$/u);
+      const sourceObjectIdentity = await sha256Hex(bytes(originalObjectKey));
+      assertEquals(
+        restoredAttachment.object_key,
+        `restores/${restore.id}/users/${userId}/${sourceObjectIdentity}/${attachmentDigest}`,
+      );
       createdObjectKeys.push(restoredAttachment.object_key);
       const restoredObject = await objects.get(restoredAttachment.object_key);
       assert(restoredObject);
@@ -342,7 +347,8 @@ Deno.test({
         abandoned.sink,
       );
       await abandoned.summarize(abandonedManifest);
-      const abandonedObjectKey = `restores/${crashOperation.id}/${attachmentDigest}`;
+      const abandonedObjectKey =
+        `restores/${crashOperation.id}/users/${userId}/${sourceObjectIdentity}/${attachmentDigest}`;
       const abandonedObject = await objects.get(abandonedObjectKey);
       assert(abandonedObject);
       await abandonedObject.body.cancel();

@@ -6192,6 +6192,8 @@ export function createApp(options: AppOptions = {}) {
       actorId: c.get("user").id,
       expectedVersion: input.expectedVersion,
       reason: input.reason,
+      requiredInspectionMode: attachmentExternalInspectionRequired ? "external" : "local",
+      inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
     });
     return c.json({
       attachment: publicAdminAttachment(result.attachment),

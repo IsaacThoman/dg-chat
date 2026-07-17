@@ -46,6 +46,22 @@ describe("screen capture safety", () => {
     expect(screenCaptureResultIsUsable("chat:model-a", "chat:model-a", true)).toBe(true);
     expect(screenCaptureResultIsUsable("chat:model-a", "chat:model-b", true)).toBe(false);
     expect(screenCaptureResultIsUsable("chat:model-a", "chat:model-a", false)).toBe(false);
+    expect(
+      screenCaptureResultIsUsable(
+        "chat:leaf-a:model-a",
+        "chat:leaf-b:model-a",
+        true,
+        "chat:leaf-a:model-a",
+      ),
+    ).toBe(false);
+    expect(
+      screenCaptureResultIsUsable(
+        "chat:leaf-a:model-a",
+        "chat:leaf-a:model-a",
+        true,
+        "chat:leaf-a:model-b",
+      ),
+    ).toBe(false);
   });
 
   it("binds capture ownership to chat model and vision capability, not voice preferences", () => {

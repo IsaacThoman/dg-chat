@@ -15,7 +15,9 @@ describe("ScreenCapture capability controls", () => {
     expect(markup).toContain(
       "Capture screen unavailable: the selected model does not support images",
     );
-    expect(markup).toContain("disabled");
+    expect(markup).toContain('aria-disabled="true"');
+    expect(markup).toContain("tool-pill-explanation");
+    expect(markup).not.toMatch(/<button[^>]+disabled=""/u);
   });
 
   it("offers capture for a vision model in a supporting browser", () => {
@@ -39,7 +41,8 @@ describe("ScreenCapture capability controls", () => {
     expect(markup).toContain(
       "Capture screen unavailable: screen sharing is not supported by this browser",
     );
-    expect(markup).toContain("disabled");
+    expect(markup).toContain('aria-disabled="true"');
+    expect(markup).toContain("tool-pill-explanation");
   });
 
   it("does not allow a supporting vision capture while its composer is disabled", () => {

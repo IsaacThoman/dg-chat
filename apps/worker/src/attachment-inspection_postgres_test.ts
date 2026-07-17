@@ -390,6 +390,8 @@ Deno.test({
         attachmentId: second.attachment.id,
         expectedVersion: second.attachment.version,
         reason: "New scanner policy",
+        requiredInspectionMode: "external",
+        inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
       });
       const staleJobId = crypto.randomUUID();
       const staleClaimToken = `stale-inspection:${crypto.randomUUID()}`;

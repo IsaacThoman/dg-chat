@@ -1,5 +1,9 @@
 import { assertEquals, assertExists, assertStringIncludes } from "jsr:@std/assert@1.0.14";
-import { ATTACHMENT_INSPECTION_REASON, MemoryRepository } from "@dg-chat/database";
+import {
+  ATTACHMENT_INSPECTION_POLICY_VERSION,
+  ATTACHMENT_INSPECTION_REASON,
+  MemoryRepository,
+} from "@dg-chat/database";
 import type { PutObjectInput } from "@dg-chat/database";
 import { createApp } from "./app.ts";
 import { sha256 } from "./crypto.ts";
@@ -295,8 +299,8 @@ Deno.test("admin storage summary reports actual overage above configured limits"
   assertEquals(summary.installationObjectsOverage, 1);
 });
 
-Deno.test("admin reinspection validates CSRF, reason and version without exposing object keys", async () => {
-  const { app, repository, admin, cookie, mutationHeaders } = await fixture();
+Deno.test("admin reinspection applies current policy without exposing object keys", async () => {
+  const { app, repository, admin, cookie, mutationHeaders } = await fixture(undefined, true);
   const attachment = repository.createAttachment({
     ownerId: admin.id,
     objectKey: `users/${admin.id}/never-public`,
@@ -309,6 +313,7 @@ Deno.test("admin reinspection validates CSRF, reason and version without exposin
     inspectionComplete: true,
   }).attachment;
   const initialVersion = attachment.version;
+  const initialEpoch = attachment.inspectionEpoch;
   const path = `/api/admin/storage/attachments/${attachment.id}/reinspect`;
 
   const missingOrigin = await app.request(path, {
@@ -349,6 +354,19 @@ Deno.test("admin reinspection validates CSRF, reason and version without exposin
   assertEquals(body.attachment.state, "pending");
   assertEquals(body.attachment.version, initialVersion + 1);
   assertEquals(typeof body.inspectionJobId, "string");
+  const stored = repository.getAttachment(attachment.id, admin.id, true);
+  assertEquals(stored.requiredInspectionMode, "external");
+  assertEquals(stored.inspectionPolicyVersion, ATTACHMENT_INSPECTION_POLICY_VERSION);
+  assertEquals(
+    repository.jobs.find((job) => job.id === body.inspectionJobId)?.payload,
+    {
+      attachmentId: attachment.id,
+      ownerId: admin.id,
+      inspectionEpoch: initialEpoch + 1,
+      requiredInspectionMode: "external",
+      inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
+    },
+  );
   const serialized = JSON.stringify(body);
   assertEquals(serialized.includes("never-public"), false);
   assertEquals(serialized.includes("objectKey"), false);

@@ -635,6 +635,12 @@ async function editsPhase(): Promise<Record<string, Json>> {
 async function mockState(): Promise<{
   attempts: Record<string, number>;
   scenarios: Record<string, { opened: number; completed: number; aborted: number }>;
+  chatBarrier: {
+    model: string;
+    target: number;
+    opened: number;
+    released: boolean;
+  } | null;
 }> {
   const response = await fetchBounded(
     new URL("/__test/state", mockControlUrl),
@@ -747,6 +753,21 @@ async function accountingPhase(): Promise<Record<string, Json>> {
       reason: "Disposable scarce-credit contention boundary",
     }),
   });
+  const configuredBarrier = await fetchBounded(
+    new URL("/__test/chat-barrier", mockControlUrl),
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${env.MOCK_PROVIDER_CONTROL_TOKEN}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model: "mock-slow", target: profile.accountingSlots }),
+    },
+    10_000,
+    "mock provider chat barrier configuration",
+  );
+  invariant(configuredBarrier.ok, "mock provider scarce-credit barrier is configured");
+  await configuredBarrier.body?.cancel();
   const boundary = await sql<{ boundary: Date; sequence: string }[]>`
     SELECT clock_timestamp() boundary,
       COALESCE((SELECT max(sequence) FROM ledger_entries WHERE user_id=${userId}::uuid),0)::text
@@ -757,7 +778,14 @@ async function accountingPhase(): Promise<Record<string, Json>> {
     (_, index) => `load-scarce-${index}-${crypto.randomUUID()}`,
   );
   const started = performance.now();
-  const responses = await Promise.all(keys.map(async (key) => {
+  type ContentionResponse = {
+    key: string;
+    status: number;
+    body: string;
+    replay: string | null;
+  };
+  const observedResponses: ContentionResponse[] = [];
+  const responsePromises = keys.map(async (key): Promise<ContentionResponse> => {
     const response = await fetchBounded(
       new URL("/v1/chat/completions", baseUrl),
       {
@@ -773,13 +801,48 @@ async function accountingPhase(): Promise<Record<string, Json>> {
       "scarce-credit completion",
     );
     const body = await response.text();
-    return {
+    const result = {
       key,
       status: response.status,
       body,
       replay: response.headers.get("x-idempotent-replay"),
     };
-  }));
+    observedResponses.push(result);
+    return result;
+  });
+  const admissionDeadline = Date.now() + 30_000;
+  let admissionBoundaryObserved = false;
+  try {
+    while (Date.now() < admissionDeadline) {
+      const state = await mockState();
+      const deniedSoFar = observedResponses.filter((response) => response.status === 402).length;
+      if (
+        state.chatBarrier?.opened === profile.accountingSlots &&
+        deniedSoFar === profile.accountingAttempts - profile.accountingSlots
+      ) {
+        admissionBoundaryObserved = true;
+        break;
+      }
+      await abortableDelay(50, signal);
+    }
+  } finally {
+    const releasedBarrier = await fetchBounded(
+      new URL("/__test/chat-barrier/release", mockControlUrl),
+      {
+        method: "POST",
+        headers: { authorization: `Bearer ${env.MOCK_PROVIDER_CONTROL_TOKEN}` },
+      },
+      10_000,
+      "mock provider chat barrier release",
+    );
+    invariant(releasedBarrier.ok, "mock provider scarce-credit barrier is released");
+    await releasedBarrier.body?.cancel();
+  }
+  invariant(
+    admissionBoundaryObserved,
+    "every scarce-credit contender receives an admission decision before settlement",
+  );
+  const responses = await Promise.all(responsePromises);
   const accepted = responses.filter((response) => response.status === 200);
   const denied = responses.filter((response) => response.status === 402);
   const responseDistribution = Object.fromEntries(
