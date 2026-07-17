@@ -10,7 +10,7 @@ groups:
           summary: "DG Chat {{ $labels.job }} metrics target is down"
           description: "Prometheus has been unable to scrape the private metrics listener for two minutes."
       - alert: DgChatApiTargetsAbsent
-        expr: absent(up{job="dg-chat-api"} == 1)
+        expr: label_replace(absent(up{job="dg-chat-api"} == 1), "job", "dg-chat-api", "", "")
         for: 2m
         labels:
           severity: critical
@@ -18,7 +18,7 @@ groups:
           summary: DG Chat has no healthy API metrics targets
           description: "Prometheus has observed no healthy API scrape target for two minutes."
       - alert: DgChatWorkerTargetsAbsent
-        expr: absent(up{job="dg-chat-worker"} == 1)
+        expr: label_replace(absent(up{job="dg-chat-worker"} == 1), "job", "dg-chat-worker", "", "")
         for: 2m
         labels:
           severity: critical

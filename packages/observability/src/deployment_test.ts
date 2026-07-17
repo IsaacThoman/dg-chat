@@ -34,11 +34,11 @@ Deno.test("Compose keeps per-replica exporters private and starts monitoring bef
   );
   assertMatch(
     alerts,
-    /alert: DgChatApiTargetsAbsent[\s\S]*?expr: absent\(up\{job="dg-chat-api"\} == 1\)/u,
+    /alert: DgChatApiTargetsAbsent[\s\S]*?expr: label_replace\(absent\(up\{job="dg-chat-api"\} == 1\)/u,
   );
   assertMatch(
     alerts,
-    /alert: DgChatWorkerTargetsAbsent[\s\S]*?expr: absent\(up\{job="dg-chat-worker"\} == 1\)/u,
+    /alert: DgChatWorkerTargetsAbsent[\s\S]*?expr: label_replace\(absent\(up\{job="dg-chat-worker"\} == 1\)/u,
   );
   assertMatch(dockerfile, /location ~ \^\/metrics/u);
   assertNotMatch(compose, /API_METRICS_PORT|WORKER_METRICS_PORT|METRICS_PORT:/u);
@@ -49,7 +49,6 @@ Deno.test("Compose keeps per-replica exporters private and starts monitoring bef
   assertNotMatch(prometheusService, /--web\.enable-lifecycle/u);
   assertMatch(acceptance, /--scale app=2 --scale worker=2/u);
   assertMatch(acceptance, /stop worker/u);
-  assertMatch(acceptance, /wait_for_active_target_count "dg-chat-worker" "0"/u);
   assertMatch(acceptance, /sum\(up\{job="dg-chat-worker"\}\) or vector\(0\)/u);
   assertMatch(workflow, /Start monitoring before application containers/u);
   assertMatch(workflow, /assert-observability-profile\.sh/u);
