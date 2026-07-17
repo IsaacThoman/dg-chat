@@ -29,6 +29,9 @@ Deno.test({
       );
       await sql`INSERT INTO installation_state(singleton_id) VALUES(1)
         ON CONFLICT(singleton_id) DO NOTHING`;
+      await sql`INSERT INTO retention_schedule_state(
+        singleton_id,interval_seconds,next_due_at,updated_at)
+        VALUES(1,86400,now(),now())`;
       const actorId = crypto.randomUUID();
       const targetId = crypto.randomUUID();
       await sql`INSERT INTO users(

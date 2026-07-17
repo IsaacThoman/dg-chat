@@ -424,8 +424,8 @@ jobs:
       ENCRYPTION_KEY: cHJvZHVjdGlvbi1zbW9rZS1lbmNyeXB0aW9uLWtleSE=
       BACKUP_SIGNING_KEY: QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=
       SETUP_TOKEN: production-smoke-setup-token
-      S3_ACCESS_KEY: production-smoke-minio-user
-      S3_SECRET_KEY: production-smoke-minio-password
+      S3_ACCESS_KEY: production-smoke-app-user
+      S3_SECRET_KEY: production-smoke-app-password
       SEARXNG_SECRET: production-smoke-searxng-secret
       WEB_HOST_PORT: "8000"
     steps:

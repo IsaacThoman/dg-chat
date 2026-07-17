@@ -107,6 +107,9 @@ Deno.test({
         } RESTART IDENTITY CASCADE`,
       );
       await sql`INSERT INTO installation_state(singleton_id) VALUES(1)`;
+      await sql`INSERT INTO retention_schedule_state(
+        singleton_id,interval_seconds,next_due_at,updated_at)
+        VALUES(1,86400,now(),now())`;
 
       const userId = crypto.randomUUID();
       const conversationId = crypto.randomUUID();
