@@ -1,5 +1,6 @@
 import { assertEquals, assertNotEquals } from "jsr:@std/assert@1.0.14";
 import postgres from "npm:postgres@3.4.7";
+import { withAuditTestMaintenance } from "../../../packages/database/src/postgres-test-maintenance.ts";
 import { claimJob, completeJob } from "./job-queue.ts";
 import { operationSignal, raceAbort } from "./operation-signal.ts";
 import { runResilientLoop } from "./resilient-loop.ts";
@@ -178,9 +179,13 @@ Deno.test({
       }
       releaseLock?.();
       await lockTransaction?.catch(() => undefined);
-      await sql`DELETE FROM jobs WHERE id=${jobId}`;
-      await sql`DELETE FROM attachments WHERE id=${attachmentId}`;
-      await sql`DELETE FROM users WHERE id=${userId}`;
+      await withAuditTestMaintenance(sql, async (tx) => {
+        await tx`DELETE FROM jobs WHERE id=${jobId}`;
+        await tx`DELETE FROM attachments WHERE id=${attachmentId}`;
+        await tx`DELETE FROM attachment_storage_usage WHERE owner_id=${userId}`;
+        await tx`DELETE FROM attachment_storage_blobs WHERE owner_id=${userId}`;
+        await tx`DELETE FROM users WHERE id=${userId}`;
+      });
       await Promise.all([locker.end(), sql.end()]);
     }
   },
@@ -289,9 +294,13 @@ Deno.test({
       }
       releaseLock?.();
       await lockTransaction?.catch(() => undefined);
-      await sql`DELETE FROM jobs WHERE id IN (${blockedJobId},${healthyJobId})`;
-      await sql`DELETE FROM attachments WHERE id IN (${blockedAttachmentId},${healthyAttachmentId})`;
-      await sql`DELETE FROM users WHERE id=${userId}`;
+      await withAuditTestMaintenance(sql, async (tx) => {
+        await tx`DELETE FROM jobs WHERE id IN (${blockedJobId},${healthyJobId})`;
+        await tx`DELETE FROM attachments WHERE id IN (${blockedAttachmentId},${healthyAttachmentId})`;
+        await tx`DELETE FROM attachment_storage_usage WHERE owner_id=${userId}`;
+        await tx`DELETE FROM attachment_storage_blobs WHERE owner_id=${userId}`;
+        await tx`DELETE FROM users WHERE id=${userId}`;
+      });
       await Promise.all([locker.end(), sql.end()]);
     }
   },

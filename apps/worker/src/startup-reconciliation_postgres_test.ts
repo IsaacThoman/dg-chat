@@ -1,5 +1,6 @@
 import { assertEquals } from "jsr:@std/assert@1.0.14";
 import postgres from "npm:postgres@3.4.7";
+import { withAuditTestMaintenance } from "../../../packages/database/src/postgres-test-maintenance.ts";
 import { reconcileEmbeddingJobsBatch, reconcileStartupQueues } from "./startup-reconciliation.ts";
 
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
@@ -58,9 +59,13 @@ Deno.test({
         { cleanup: 0, embeddings: 0 },
       );
     } finally {
-      await sql`DELETE FROM jobs WHERE idempotency_key LIKE ${`document.embed:%:${version}`}`;
-      await sql`DELETE FROM attachments WHERE owner_id=${userId}`;
-      await sql`DELETE FROM users WHERE id=${userId}`;
+      await withAuditTestMaintenance(sql, async (tx) => {
+        await tx`DELETE FROM jobs WHERE idempotency_key LIKE ${`document.embed:%:${version}`}`;
+        await tx`DELETE FROM attachments WHERE owner_id=${userId}`;
+        await tx`DELETE FROM attachment_storage_usage WHERE owner_id=${userId}`;
+        await tx`DELETE FROM attachment_storage_blobs WHERE owner_id=${userId}`;
+        await tx`DELETE FROM users WHERE id=${userId}`;
+      });
       await sql.end();
     }
   },
