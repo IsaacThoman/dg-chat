@@ -5,6 +5,7 @@ import {
   PostgresRepository,
   withRepeatableReadBackupSnapshot,
 } from "@dg-chat/database";
+import { withAuditTestMaintenance } from "../../../packages/database/src/postgres-test-maintenance.ts";
 import { runAccountedEmbeddingCall } from "../../api/src/embedding-accounting.ts";
 import { claimJob } from "./job-queue.ts";
 import {
@@ -639,14 +640,18 @@ Deno.test({
       );
       await withRepeatableReadBackupSnapshot(databaseUrl!, () => Promise.resolve(undefined));
     } finally {
-      await sql`DELETE FROM jobs WHERE id IN
-        (${successJobId},${uncertainJobId},${retrySafeJobId},${noFetchJobId})`;
-      await sql`DELETE FROM embedding_provider_attempts WHERE usage_run_id IN
-        (SELECT id FROM usage_runs WHERE user_id=${userId})`;
-      await sql`DELETE FROM ledger_entries WHERE user_id=${userId}`;
-      await sql`DELETE FROM usage_runs WHERE user_id=${userId}`;
-      await sql`DELETE FROM attachments WHERE id=${attachmentId}`;
-      await sql`DELETE FROM users WHERE id=${userId}`;
+      await withAuditTestMaintenance(sql, async (tx) => {
+        await tx`DELETE FROM jobs WHERE id IN
+          (${successJobId},${uncertainJobId},${retrySafeJobId},${noFetchJobId})`;
+        await tx`DELETE FROM embedding_provider_attempts WHERE usage_run_id IN
+          (SELECT id FROM usage_runs WHERE user_id=${userId})`;
+        await tx`DELETE FROM ledger_entries WHERE user_id=${userId}`;
+        await tx`DELETE FROM usage_runs WHERE user_id=${userId}`;
+        await tx`DELETE FROM attachments WHERE id=${attachmentId}`;
+        await tx`DELETE FROM attachment_storage_usage WHERE owner_id=${userId}`;
+        await tx`DELETE FROM attachment_storage_blobs WHERE owner_id=${userId}`;
+        await tx`DELETE FROM users WHERE id=${userId}`;
+      });
       await repository.close();
       await sql.end();
     }
