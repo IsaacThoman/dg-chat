@@ -44,6 +44,31 @@ wait_for_query_value() {
   exit 1
 }
 
+wait_for_active_target_count() {
+  local job="$1"
+  local expected="$2"
+  local payload value
+  for _attempt in $(seq 1 60); do
+    payload="$(
+      curl --fail --silent --show-error \
+        "$prometheus_origin/api/v1/targets?state=active" 2>/dev/null || true
+    )"
+    value="$(
+      jq -r --arg job "$job" \
+        '[.data.activeTargets[]? | select(.labels.job == $job)] | length' \
+        <<<"$payload" 2>/dev/null || true
+    )"
+    if [[ "$value" == "$expected" ]]; then
+      return
+    fi
+    sleep 2
+  done
+  echo "Prometheus active target count for $job did not reach $expected" >&2
+  curl --fail --silent --show-error \
+    "$prometheus_origin/api/v1/targets?state=active" >&2 || true
+  exit 1
+}
+
 healthy_count() {
   local service="$1"
   local count=0
@@ -127,10 +152,12 @@ if curl --fail --silent --max-time 2 http://127.0.0.1:9091/metrics >/dev/null 2>
   exit 1
 fi
 
-# Removing every worker makes DNS discovery remove the target set entirely. This exercises the
-# absent-fleet expression that a per-target `up == 0` alert cannot cover.
+# Removing every worker makes DNS discovery remove the active target set entirely. Query the
+# target-discovery API because Prometheus deliberately retains the final `up=0` sample for its
+# lookback window; waiting on `absent(up{...})` would make this smoke test timing-dependent.
 "${compose[@]}" stop worker >/dev/null
-wait_for_query_value 'absent(up{job="dg-chat-worker"})' "1" \
-  "Prometheus zero-worker detection"
+wait_for_active_target_count "dg-chat-worker" "0"
+wait_for_query_value 'sum(up{job="dg-chat-worker"}) or vector(0)' "0" \
+  "Prometheus zero-healthy-worker detection"
 
 echo "observability profile acceptance passed"
