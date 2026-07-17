@@ -140,6 +140,25 @@ type AuthRequestObservation = {
   eligible: boolean;
 };
 
+type AuthRequestContext = {
+  observation?: AuthRequestObservation;
+  authenticatedUserId?: string;
+};
+
+type AuthenticationAuthority = {
+  approvalStatus: "pending" | "approved" | "rejected";
+  state: "active" | "suspended";
+  deletedAt: string | null;
+  passwordResetPending?: boolean;
+};
+
+export function canIssueFreshAuthentication(
+  user: AuthenticationAuthority,
+): boolean {
+  return user.approvalStatus !== "rejected" && user.state === "active" &&
+    user.deletedAt === null && user.passwordResetPending !== true;
+}
+
 export function matchesPasswordResetObservation(
   observation: AuthRequestObservation | undefined,
   userId: string,
@@ -175,7 +194,7 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
   const normalizeEmail = (email: string) => email.trim().toLowerCase();
   // Better Auth performs credential work before its database hooks. Capture domain authority at
   // the request boundary so sign-in and password-reset issuance cannot cross an authority loss.
-  const authRequestObservation = new AsyncLocalStorage<AuthRequestObservation | undefined>();
+  const authRequestContext = new AsyncLocalStorage<AuthRequestContext>();
   const provisionDomainUser = async (authUser: {
     id: string;
     email: string;
@@ -260,6 +279,67 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
         level: "error",
         message: "Identity delivery audit persistence failed",
         action,
+      },
+    );
+  };
+  const recordAuthenticationOutcome = async (
+    path: string,
+    method: string,
+    response: Response | undefined,
+    context: AuthRequestContext,
+    signOutSession: { session: { id: string }; user: { id: string } } | null,
+  ): Promise<void> => {
+    if (method !== "POST" && !path.endsWith("/oidc/callback")) return;
+    const ordinarySuccess = Boolean(response?.ok);
+    const oidcSuccess = path.endsWith("/oidc/callback") && response?.status === 302 &&
+      response.headers.get("location") === `${options.webOrigin}/pending`;
+    let event:
+      | {
+        actorId: string | null;
+        action: string;
+        targetType: "user" | "session";
+        targetId: string | null;
+      }
+      | undefined;
+    if (path.endsWith("/sign-up/email")) {
+      const success = ordinarySuccess && Boolean(context.authenticatedUserId);
+      event = {
+        actorId: success ? context.authenticatedUserId! : null,
+        action: success ? "identity.signup" : "identity.signup_failed",
+        targetType: "user",
+        targetId: context.authenticatedUserId ?? null,
+      };
+    } else if (path.endsWith("/sign-in/email")) {
+      const success = ordinarySuccess && Boolean(context.authenticatedUserId);
+      event = {
+        actorId: success ? context.authenticatedUserId! : null,
+        action: success ? "identity.login_succeeded" : "identity.login_failed",
+        targetType: "user",
+        targetId: context.authenticatedUserId ?? context.observation?.userId ?? null,
+      };
+    } else if (path.endsWith("/oidc/callback")) {
+      event = {
+        actorId: oidcSuccess ? context.authenticatedUserId ?? null : null,
+        action: oidcSuccess ? "identity.oidc_login_succeeded" : "identity.oidc_login_failed",
+        targetType: "user",
+        targetId: context.authenticatedUserId ?? null,
+      };
+    } else if (path.endsWith("/sign-out") && signOutSession) {
+      event = {
+        actorId: signOutSession.user.id,
+        action: ordinarySuccess ? "session.signed_out" : "session.sign_out_failed",
+        targetType: "session",
+        targetId: signOutSession.session.id,
+      };
+    }
+    if (!event) return;
+    await recordAuthAuditWithSanitizedFailure(
+      () => options.repository.recordAudit(event!),
+      authOperationalLog,
+      {
+        level: "error",
+        message: "Authentication outcome audit persistence failed",
+        action: event.action,
       },
     );
   };
@@ -367,7 +447,7 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
           ? async ({ user, url, token }) => {
             const domainUser = await options.repository.findUser(user.id);
             if (
-              !domainUser || domainUser.state !== "active" || domainUser.deletedAt !== null
+              !domainUser || !canIssueFreshAuthentication(domainUser)
             ) return;
             dispatchIdentityEmail(
               user.id,
@@ -410,7 +490,7 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
               if (!verification.identifier.startsWith("reset-password:")) {
                 return { data: { ...verification, authorityEpoch: null } };
               }
-              const observation = authRequestObservation.getStore();
+              const observation = authRequestContext.getStore()?.observation;
               if (!matchesPasswordResetObservation(observation, verification.value)) {
                 // Better Auth does not consistently treat a false hook result as a failed write.
                 // Throw so no reset link can be delivered without a fenced durable record.
@@ -460,7 +540,8 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
               // matching domain row exists.
               const authUser = await loadAuthUser(session.userId);
               if (authUser) domainUser = await provisionDomainUser(authUser);
-              const requestObservation = authRequestObservation.getStore();
+              const requestContext = authRequestContext.getStore();
+              const requestObservation = requestContext?.observation;
               const passwordObservation = requestObservation?.kind === "sign_in"
                 ? requestObservation
                 : undefined;
@@ -483,10 +564,12 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
               }
               if (
                 domainUser.state !== "active" || domainUser.deletedAt !== null ||
-                domainUser.passwordResetPending === true
+                domainUser.passwordResetPending === true ||
+                domainUser.approvalStatus === "rejected"
               ) {
                 return false;
               }
+              if (requestContext) requestContext.authenticatedUserId = domainUser.id;
               const limited = domainUser.approvalStatus !== "approved" ||
                 ((options.requireEmailVerification ?? false) && !domainUser.emailVerifiedAt);
               return { data: { ...session, limited, authorityEpoch } };
@@ -524,8 +607,7 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
                 kind: path.endsWith("/request-password-reset") ? "password_reset" : "sign_in",
                 userId: user.id,
                 authorityEpoch: user.authorityEpoch,
-                eligible: user.state === "active" && user.deletedAt === null &&
-                  user.passwordResetPending !== true,
+                eligible: canIssueFreshAuthentication(user),
               };
             }
           }
@@ -533,7 +615,35 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
           // Better Auth owns request validation and its public error contract.
         }
       }
-      return await authRequestObservation.run(observation, () => auth.handler(request));
+      let signOutSession:
+        | { session: { id: string }; user: { id: string } }
+        | null = null;
+      if (request.method === "POST" && path.endsWith("/sign-out")) {
+        try {
+          signOutSession = await auth.api.getSession({ headers: request.headers });
+        } catch {
+          // The auth handler owns the public response. Missing or malformed credentials must not
+          // leak through this best-effort audit subject lookup.
+        }
+      }
+      const context: AuthRequestContext = { observation };
+      return await authRequestContext.run(context, async () => {
+        let response: Response;
+        try {
+          response = await auth.handler(request);
+        } catch (error) {
+          await recordAuthenticationOutcome(
+            path,
+            request.method,
+            undefined,
+            context,
+            signOutSession,
+          );
+          throw error;
+        }
+        await recordAuthenticationOutcome(path, request.method, response, context, signOutSession);
+        return response;
+      });
     },
     presentedSessionToken,
     async getSession(headers: Headers): Promise<BetterAuthBrowserSession | null> {

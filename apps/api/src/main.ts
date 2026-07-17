@@ -41,6 +41,7 @@ import {
   startTelemetry,
   telemetryConfig,
 } from "@dg-chat/observability";
+import { validateAppSecret } from "./auth-config.ts";
 
 const startupResources = new StartupResourceOwner();
 try {
@@ -184,10 +185,7 @@ try {
     )
     : undefined;
   if (mailer?.close) startupResources.defer(() => mailer.close!());
-  const appSecret = Deno.env.get("APP_SECRET");
-  if (databaseUrl && (!appSecret || new TextEncoder().encode(appSecret).byteLength < 32)) {
-    throw new Error("PostgreSQL authentication requires APP_SECRET with at least 32 bytes");
-  }
+  const appSecret = validateAppSecret(Deno.env.get("APP_SECRET"), Boolean(databaseUrl));
   const webOrigin = new URL(
     Deno.env.get("WEB_ORIGIN") ?? Deno.env.get("WEB_URL") ??
       "http://localhost:5173",
@@ -253,7 +251,13 @@ try {
     })
     : undefined;
   if (browserAuth) startupResources.defer(() => browserAuth.close());
-  const { app, toolExecutionService, drainIdentityDeliveries, replayQuota } = createApp({
+  const {
+    app,
+    toolExecutionService,
+    drainIdentityDeliveries,
+    replayQuota,
+    recoverFileUploads,
+  } = createApp({
     repository,
     rateLimiter,
     objectStore,
@@ -279,15 +283,20 @@ try {
   if (metricsServer) startupResources.defer(() => metricsServer.close());
   const replayMaintenance = setInterval(async () => {
     try {
+      const recoveredFiles = await recoverFileUploads(100);
       const reaped = await repository.reapStaleApiRequests(100, replayQuota);
       const reapedGenerations = await repository.reapStaleGenerations(100);
       const reapedProviderRuns = await repository.reapStaleProviderExecutionLeases(100);
       const pruned = await repository.pruneExpiredApiRequests(100);
       const recoveredTools = await toolExecutionService.recover();
-      if (reaped || reapedGenerations || reapedProviderRuns || pruned || recoveredTools) {
+      if (
+        recoveredFiles || reaped || reapedGenerations || reapedProviderRuns || pruned ||
+        recoveredTools
+      ) {
         console.log(JSON.stringify({
           level: "info",
           message: "Replay maintenance",
+          recoveredFiles,
           reaped,
           reapedGenerations,
           reapedProviderRuns,

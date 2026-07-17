@@ -2,6 +2,7 @@ import { assertEquals } from "jsr:@std/assert@1.0.14";
 import postgres from "npm:postgres@3.4.7";
 import { DomainError } from "./memory.ts";
 import { PostgresRepository } from "./normalized-postgres.ts";
+import { runAuditTestMaintenanceSql } from "./postgres-test-maintenance.ts";
 
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
 
@@ -49,7 +50,10 @@ Deno.test({
     const releaseAccountLock = Promise.withResolvers<void>();
     const releaseSessionLock = Promise.withResolvers<void>();
     try {
-      await observer`TRUNCATE auth_verifications,auth_users,users RESTART IDENTITY CASCADE`;
+      await runAuditTestMaintenanceSql(
+        observer,
+        "TRUNCATE auth_verifications,auth_users,users RESTART IDENTITY CASCADE",
+      );
 
       const actorId = crypto.randomUUID();
       const resetWinsId = crypto.randomUUID();

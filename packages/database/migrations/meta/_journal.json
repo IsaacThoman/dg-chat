@@ -330,6 +330,27 @@
       "when": 1783998011000,
       "tag": "0046_worker_instances",
       "breakpoints": true
+    },
+    {
+      "idx": 47,
+      "version": "7",
+      "when": 1783998012000,
+      "tag": "0047_file_upload_idempotency",
+      "breakpoints": true
+    },
+    {
+      "idx": 48,
+      "version": "7",
+      "when": 1783998013000,
+      "tag": "0048_audit_event_immutability",
+      "breakpoints": true
+    },
+    {
+      "idx": 49,
+      "version": "7",
+      "when": 1783998014000,
+      "tag": "0049_automatic_retention_schedule",
+      "breakpoints": true
     }
   ]
 }

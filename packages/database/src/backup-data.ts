@@ -10,7 +10,8 @@ import {
   type ProviderProtocol,
 } from "./provider-model-invariants.ts";
 
-export const BACKUP_DATA_SCHEMA_VERSION = "0045" as const;
+export const BACKUP_DATA_SCHEMA_VERSION = "0049" as const;
+const PRE_AUTOMATIC_RETENTION_BACKUP_DATA_SCHEMA_VERSION = "0045" as const;
 const PRE_TOOL_ACCOUNTING_BACKUP_DATA_SCHEMA_VERSION = "0043" as const;
 const PRE_AUTHORITY_EPOCH_BACKUP_DATA_SCHEMA_VERSION = "0039" as const;
 const ADMIN_SECURITY_BILLING_BACKUP_DATA_SCHEMA_VERSION = "0038" as const;
@@ -19,6 +20,9 @@ const IMMUTABLE_SHARING_BACKUP_DATA_SCHEMA_VERSION = "0034" as const;
 const CONVERSATION_PORTABILITY_BACKUP_DATA_SCHEMA_VERSION = "0033" as const;
 const TEMPORARY_LIFECYCLE_BACKUP_DATA_SCHEMA_VERSION = "0032" as const;
 const LEGACY_BACKUP_DATA_SCHEMA_VERSION = "0028" as const;
+export const PRE_AUTOMATIC_RETENTION_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
+  new Set(["retention_schedule_state"]),
+);
 export const LEGACY_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
   new Set([
     "user_preferences",
@@ -29,6 +33,7 @@ export const LEGACY_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
     "conversation_tag_bindings",
     "conversation_share_snapshots",
     "admin_balance_adjustments",
+    "retention_schedule_state",
   ]),
 );
 export const ADMIN_LIFECYCLE_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
@@ -39,6 +44,7 @@ export const PRE_IMMUTABLE_SHARING_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
 );
 export function isSupportedBackupDataSchemaVersion(value: string): boolean {
   return value === BACKUP_DATA_SCHEMA_VERSION ||
+    value === PRE_AUTOMATIC_RETENTION_BACKUP_DATA_SCHEMA_VERSION ||
     value === PRE_TOOL_ACCOUNTING_BACKUP_DATA_SCHEMA_VERSION ||
     value === PRE_AUTHORITY_EPOCH_BACKUP_DATA_SCHEMA_VERSION ||
     value === ADMIN_SECURITY_BILLING_BACKUP_DATA_SCHEMA_VERSION ||
@@ -48,6 +54,10 @@ export function isSupportedBackupDataSchemaVersion(value: string): boolean {
     value === TEMPORARY_LIFECYCLE_BACKUP_DATA_SCHEMA_VERSION ||
     value === LEGACY_BACKUP_DATA_SCHEMA_VERSION;
 }
+const hasCurrentPortableRowShape = (version: string) =>
+  version === BACKUP_DATA_SCHEMA_VERSION ||
+  version === PRE_AUTOMATIC_RETENTION_BACKUP_DATA_SCHEMA_VERSION;
+const requiresLegacyPortableUpgrade = (version: string) => !hasCurrentPortableRowShape(version);
 export const BACKUP_DATA_BATCH_SIZE = 100;
 export const BACKUP_DATA_MAX_BATCH_SIZE = 500;
 export const BACKUP_DATA_MAX_ROWS_PER_TABLE = 10_000_000;
@@ -134,6 +144,7 @@ const UUID_COLUMNS = new Set([
   "target_user_id",
   "ledger_entry_id",
   "audit_event_id",
+  "last_run_id",
 ]);
 const TIMESTAMP_SUFFIX = /(?:_at|_expires_at)$/u;
 const inferKinds = (columns: readonly string[], explicit: ColumnKinds): ColumnKinds =>
@@ -574,6 +585,16 @@ export const BACKUP_DATA_TABLES: readonly BackupDataTable[] = Object.freeze([
     },
   ),
   T(
+    "retention_schedule_state",
+    "singleton_id interval_seconds next_due_at last_policy_version last_scheduled_at last_run_id updated_at",
+    "singleton_id",
+    {
+      singleton_id: "integer",
+      interval_seconds: "integer",
+      last_policy_version: "integer",
+    },
+  ),
+  T(
     "provider_payload_captures",
     "id usage_run_id provider_attempt_id request_body response_body request_bytes response_bytes captured_at scrubbed_at",
     "id",
@@ -690,6 +711,33 @@ export async function verifyBackupDataCatalog(databaseUrl: string): Promise<void
         );
       }
     }
+    const auditGuards = await sql<{
+      trigger_count: number;
+      trigger_type: number | null;
+      function_name: string | null;
+    }[]>`
+      SELECT count(*)::int trigger_count,
+        max(t.tgtype::int)::int trigger_type,
+        max(p.proname) function_name
+      FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid
+      JOIN pg_namespace n ON n.oid=c.relnamespace
+      JOIN pg_proc p ON p.oid=t.tgfoid
+      WHERE n.nspname='public' AND c.relname='audit_events'
+        AND t.tgname='dg_chat_audit_events_append_only' AND NOT t.tgisinternal
+    `;
+    const auditGuard = auditGuards[0];
+    if (
+      auditGuard?.trigger_count !== 1 ||
+      // pg_trigger bit flags: BEFORE=2, DELETE=8, UPDATE=16, TRUNCATE=32. The absence of
+      // ROW=1 proves this is a statement trigger, so even a zero-row mutation is rejected.
+      auditGuard.trigger_type !== 58 ||
+      auditGuard.function_name !== "dg_chat_enforce_audit_event_immutability"
+    ) {
+      throw new BackupDataError(
+        "invariant",
+        "Database audit history is missing its append-only guard",
+      );
+    }
   } finally {
     await sql.end({ timeout: 5 });
   }
@@ -754,6 +802,7 @@ export const BACKUP_EPHEMERAL_TABLES = Object.freeze(
     "conversation_portability_imports",
     "api_idempotency_events",
     "api_idempotency_requests",
+    "file_upload_staging",
     "generation_controls",
     "jobs",
     "document_embedding_batches",
@@ -971,7 +1020,7 @@ function exactSourceRow(
   schemaVersion: string,
 ): Record<string, unknown> {
   if (
-    schemaVersion === BACKUP_DATA_SCHEMA_VERSION && definition.name === "usage_runs" && value &&
+    hasCurrentPortableRowShape(schemaVersion) && definition.name === "usage_runs" && value &&
     typeof value === "object" && !Array.isArray(value) &&
     (value as Record<string, unknown>).status === "reserved"
   ) {
@@ -992,7 +1041,7 @@ function exactSourceRow(
     }
   }
   if (
-    schemaVersion !== BACKUP_DATA_SCHEMA_VERSION && definition.name === "usage_runs" && value &&
+    requiresLegacyPortableUpgrade(schemaVersion) && definition.name === "usage_runs" && value &&
     typeof value === "object" && !Array.isArray(value) && !("recovery_owner" in value)
   ) {
     return exactRow(definition, {
@@ -1003,7 +1052,7 @@ function exactSourceRow(
     });
   }
   if (
-    schemaVersion !== BACKUP_DATA_SCHEMA_VERSION && definition.name === "tool_executions" &&
+    requiresLegacyPortableUpgrade(schemaVersion) && definition.name === "tool_executions" &&
     value &&
     typeof value === "object" && !Array.isArray(value) && !("billing_snapshot" in value)
   ) {
@@ -1028,13 +1077,13 @@ function exactSourceRow(
     });
   }
   if (
-    schemaVersion !== BACKUP_DATA_SCHEMA_VERSION && definition.name === "ledger_entries" && value &&
+    requiresLegacyPortableUpgrade(schemaVersion) && definition.name === "ledger_entries" && value &&
     typeof value === "object" && !Array.isArray(value)
   ) {
     return exactRow(definition, { ...(value as Record<string, unknown>), sequence: null });
   }
   if (
-    schemaVersion !== BACKUP_DATA_SCHEMA_VERSION &&
+    requiresLegacyPortableUpgrade(schemaVersion) &&
     schemaVersion !== PRE_TOOL_ACCOUNTING_BACKUP_DATA_SCHEMA_VERSION &&
     definition.name === "users" && value &&
     typeof value === "object" && !Array.isArray(value)
@@ -1052,7 +1101,7 @@ function exactSourceRow(
     });
   }
   if (
-    schemaVersion !== BACKUP_DATA_SCHEMA_VERSION &&
+    requiresLegacyPortableUpgrade(schemaVersion) &&
     schemaVersion !== PRE_TOOL_ACCOUNTING_BACKUP_DATA_SCHEMA_VERSION &&
     definition.name === "api_tokens" && value &&
     typeof value === "object" && !Array.isArray(value)
@@ -1060,7 +1109,7 @@ function exactSourceRow(
     return exactRow(definition, { ...(value as Record<string, unknown>), authority_epoch: 1 });
   }
   if (
-    schemaVersion !== BACKUP_DATA_SCHEMA_VERSION && definition.name === "attachments" && value &&
+    requiresLegacyPortableUpgrade(schemaVersion) && definition.name === "attachments" && value &&
     typeof value === "object" && !Array.isArray(value) && !("width" in value) &&
     !("height" in value)
   ) {
@@ -1071,7 +1120,7 @@ function exactSourceRow(
     });
   }
   if (
-    schemaVersion !== BACKUP_DATA_SCHEMA_VERSION && definition.name === "message_attachments" &&
+    requiresLegacyPortableUpgrade(schemaVersion) && definition.name === "message_attachments" &&
     value && typeof value === "object" && !Array.isArray(value) && !("position" in value)
   ) {
     return exactRow(definition, { ...(value as Record<string, unknown>), position: null });
@@ -1163,7 +1212,7 @@ async function stageSource(
       } INCLUDING ALL) ON COMMIT DROP`,
     );
     if (
-      source.schemaVersion !== BACKUP_DATA_SCHEMA_VERSION && definition.name === "ledger_entries"
+      requiresLegacyPortableUpgrade(source.schemaVersion) && definition.name === "ledger_entries"
     ) {
       await tx.unsafe(
         `ALTER TABLE ${safeIdentifier(temporary)} ALTER COLUMN sequence DROP NOT NULL`,
@@ -1223,6 +1272,13 @@ async function stageSource(
     counts[definition.name] = count;
   }
   if (source.schemaVersion !== BACKUP_DATA_SCHEMA_VERSION) {
+    const schedule = safeIdentifier(stage.get("retention_schedule_state")!);
+    await tx.unsafe(
+      `INSERT INTO ${schedule}(singleton_id,interval_seconds,next_due_at,updated_at)
+       VALUES(1,86400,now(),now()) ON CONFLICT(singleton_id) DO NOTHING`,
+    );
+  }
+  if (requiresLegacyPortableUpgrade(source.schemaVersion)) {
     // Legacy wire formats predate explicit recovery ownership. Recover only the relationship that
     // is actually present in the portable catalog; API replay and document-batch controls are
     // intentionally ephemeral and therefore cannot appear in an archive.
@@ -1233,7 +1289,7 @@ async function stageSource(
          AND usage.token_id IS NULL`,
     );
   }
-  if (source.schemaVersion !== BACKUP_DATA_SCHEMA_VERSION) {
+  if (requiresLegacyPortableUpgrade(source.schemaVersion)) {
     const ledgerName = stage.get("ledger_entries")!;
     const usersName = stage.get("users")!;
     try {
@@ -1641,6 +1697,18 @@ const RELATIONS: readonly BackupRelation[] = Object.freeze([
   },
   { from: "retention_scrub_runs", columns: ["requested_by"], to: "users", target: ["id"] },
   {
+    from: "retention_schedule_state",
+    columns: ["last_policy_version"],
+    to: "retention_policy_versions",
+    target: ["version"],
+  },
+  {
+    from: "retention_schedule_state",
+    columns: ["last_run_id"],
+    to: "retention_scrub_runs",
+    target: ["id"],
+  },
+  {
     from: "provider_payload_captures",
     columns: ["usage_run_id", "provider_attempt_id"],
     to: "provider_attempts",
@@ -1718,6 +1786,15 @@ async function validateStagedDatabase(
   stage: ReadonlyMap<string, string>,
 ): Promise<void> {
   const staged = (name: string) => safeIdentifier(stage.get(name)!);
+  const [scheduleState] = await tx.unsafe<{ count: number }[]>(
+    `SELECT count(*)::int count FROM ${staged("retention_schedule_state")}`,
+  );
+  if (scheduleState?.count !== 1) {
+    throw new BackupDataError(
+      "invariant",
+      "Restore must contain exactly one retention schedule state",
+    );
+  }
   for (const relation of RELATIONS) {
     const present = relation.columns.map((column) => `f.${safeIdentifier(column)} IS NOT NULL`)
       .join(" AND ");
@@ -2039,7 +2116,7 @@ async function applyBackupData(
         options.objectKeyMap ?? new Map(),
       );
       await disableRedactedOcrSources(tx, stage);
-      if (source.schemaVersion !== BACKUP_DATA_SCHEMA_VERSION) {
+      if (requiresLegacyPortableUpgrade(source.schemaVersion)) {
         const legacyLinks = safeIdentifier(stage.get("message_attachments")!);
         await tx.unsafe(`WITH ranked AS (
           SELECT message_id,attachment_id,

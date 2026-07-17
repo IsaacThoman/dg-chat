@@ -9,6 +9,22 @@ groups:
         annotations:
           summary: "DG Chat {{ $labels.job }} metrics target is down"
           description: "Prometheus has been unable to scrape the private metrics listener for two minutes."
+      - alert: DgChatApiTargetsAbsent
+        expr: absent(up{job="dg-chat-api"})
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: DG Chat has no discoverable API metrics targets
+          description: "Docker DNS discovery has returned no API replica for two minutes."
+      - alert: DgChatWorkerTargetsAbsent
+        expr: absent(up{job="dg-chat-worker"})
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: DG Chat has no discoverable worker metrics targets
+          description: "Docker DNS discovery has returned no worker replica for two minutes."
       - alert: DgChatApiNotReady
         expr: dg_chat_process_ready{service="api"} == 0
         for: 2m
@@ -41,11 +57,21 @@ groups:
         annotations:
           summary: DG Chat API error ratio is high
           description: "More than five percent of requests have returned 5xx for ten minutes."
+      - alert: DgChatHttpResponseBodyFailures
+        expr: sum(increase(dg_chat_http_response_lifecycle_total{outcome="failed"}[5m])) > 2
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: DG Chat HTTP response streams are failing
+          description: "More than two HTTP response bodies failed after dispatch in the rolling five-minute window."
 
   - name: dg-chat-durable-work
     rules:
       - alert: DgChatQueueBacklog
-        expr: dg_chat_job_queue_depth{status="queued"} > 100
+        # Every worker observes the same durable PostgreSQL queue. Collapse per-replica copies
+        # before alerting so a scaled fleet produces one installation-level queue alert.
+        expr: max by (status) (dg_chat_job_queue_depth{status="queued"}) > 100
         for: 10m
         labels:
           severity: warning
@@ -53,7 +79,7 @@ groups:
           summary: DG Chat durable queue is backing up
           description: "More than 100 jobs have remained queued for ten minutes."
       - alert: DgChatQueueStalled
-        expr: dg_chat_job_queue_oldest_seconds{status="queued"} > 300 and dg_chat_job_queue_depth{status="queued"} > 0
+        expr: max by (status) (dg_chat_job_queue_oldest_seconds{status="queued"}) > 300 and max by (status) (dg_chat_job_queue_depth{status="queued"}) > 0
         for: 5m
         labels:
           severity: critical
@@ -61,7 +87,7 @@ groups:
           summary: DG Chat durable queue appears stalled
           description: "The oldest runnable queued job is more than five minutes old."
       - alert: DgChatRunningJobLeaseStalled
-        expr: dg_chat_job_queue_oldest_seconds{status="running"} > 240
+        expr: max by (status) (dg_chat_job_queue_oldest_seconds{status="running"}) > 240
         for: 5m
         labels:
           severity: warning

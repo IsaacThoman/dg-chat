@@ -3,6 +3,10 @@ import postgres from "npm:postgres@3.4.7";
 import { DomainError } from "./memory.ts";
 import { parseStoredModelCapabilities, PostgresRepository } from "./normalized-postgres.ts";
 import { backfillLegacyRuntimeSnapshot } from "./legacy-backfill.ts";
+import {
+  runAuditTestMaintenanceSql,
+  withAuditTestMaintenance,
+} from "./postgres-test-maintenance.ts";
 import { decodeApiResponseBody, InvalidApiResponseBodyError } from "./repository.ts";
 
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
@@ -15,9 +19,12 @@ Deno.test({
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
     const repo = await PostgresRepository.connect(databaseUrl!);
-    await sql`TRUNCATE audit_events,ledger_entries,usage_runs,api_tokens,sessions,messages,
-      conversations,auth_sessions,auth_accounts,auth_verifications,auth_users,users
-      RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      `TRUNCATE audit_events,ledger_entries,usage_runs,api_tokens,sessions,messages,
+        conversations,auth_sessions,auth_accounts,auth_verifications,auth_users,users
+        RESTART IDENTITY CASCADE`,
+    );
     try {
       const user = await repo.bootstrapAdmin({
         email: "postgres-recovery-owner-collision@example.com",
@@ -89,9 +96,12 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
-    await sql`TRUNCATE retention_scrub_runs,provider_payload_captures,audit_events,jobs,
-      provider_attempts,model_price_versions,provider_models,providers,ledger_entries,usage_runs,
-      api_tokens,sessions,messages,conversations,users RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      `TRUNCATE retention_scrub_runs,provider_payload_captures,audit_events,jobs,
+        provider_attempts,model_price_versions,provider_models,providers,ledger_entries,usage_runs,
+        api_tokens,sessions,messages,conversations,users RESTART IDENTITY CASCADE`,
+    );
     await sql`INSERT INTO retention_policy_versions(version,capture_enabled,request_body_days,
       response_body_days) VALUES(1,false,30,30) ON CONFLICT(version) DO UPDATE SET
       capture_enabled=false,request_body_days=30,response_body_days=30,updated_by=NULL`;
@@ -263,8 +273,11 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
-    await sql`TRUNCATE jobs, ledger_entries, usage_runs, api_tokens, sessions, messages,
-      conversations, users RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      `TRUNCATE jobs, ledger_entries, usage_runs, api_tokens, sessions, messages,
+        conversations, users RESTART IDENTITY CASCADE`,
+    );
     const repo = await PostgresRepository.connect(databaseUrl!);
     try {
       const user = await repo.bootstrapAdmin({
@@ -358,8 +371,11 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
-    await sql`TRUNCATE api_idempotency_events, api_idempotency_requests, ledger_entries,
-      usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      `TRUNCATE api_idempotency_events, api_idempotency_requests, ledger_entries,
+        usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`,
+    );
     const repo = await PostgresRepository.connect(databaseUrl!);
     try {
       const user = await repo.bootstrapAdmin({
@@ -450,10 +466,13 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
-    await sql`TRUNCATE provider_attempts, provider_model_route_targets, provider_model_routes,
-      provider_retry_policies, model_price_versions, provider_models, providers,
-      api_idempotency_events, api_idempotency_requests, ledger_entries, usage_runs,
-      api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      `TRUNCATE provider_attempts, provider_model_route_targets, provider_model_routes,
+        provider_retry_policies, model_price_versions, provider_models, providers,
+        api_idempotency_events, api_idempotency_requests, ledger_entries, usage_runs,
+        api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`,
+    );
     const repo = await PostgresRepository.connect(databaseUrl!);
     try {
       const user = await repo.bootstrapAdmin({
@@ -541,10 +560,13 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
-    await sql`TRUNCATE provider_attempts, provider_model_route_targets, provider_model_routes,
-      provider_retry_policies, model_price_versions, provider_models, providers,
-      api_idempotency_events, api_idempotency_requests, ledger_entries, usage_runs,
-      api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      `TRUNCATE provider_attempts, provider_model_route_targets, provider_model_routes,
+        provider_retry_policies, model_price_versions, provider_models, providers,
+        api_idempotency_events, api_idempotency_requests, ledger_entries, usage_runs,
+        api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`,
+    );
     const repo = await PostgresRepository.connect(databaseUrl!);
     try {
       const user = await repo.bootstrapAdmin({
@@ -855,7 +877,10 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
-    await sql`TRUNCATE auth_verifications, auth_sessions, auth_accounts, auth_users, audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      "TRUNCATE auth_verifications, auth_sessions, auth_accounts, auth_users, audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE",
+    );
     await sql.end();
 
     const repo = await PostgresRepository.connect(databaseUrl!);
@@ -1063,12 +1088,14 @@ Deno.test({
         repo.recordAudit({ action: "precision.audit", targetType: "test" }),
       ]);
       const precisionSql = postgres(databaseUrl!, { max: 1 });
-      await precisionSql`UPDATE audit_events SET created_at='2026-07-10 00:00:00.000100+00' WHERE id=${
-        precisionEvents[0].id
-      }`;
-      await precisionSql`UPDATE audit_events SET created_at='2026-07-10 00:00:00.000200+00' WHERE id IN (${
-        precisionEvents[1].id
-      },${precisionEvents[2].id})`;
+      await withAuditTestMaintenance(precisionSql, async (tx) => {
+        await tx`UPDATE audit_events SET created_at='2026-07-10 00:00:00.000100+00' WHERE id=${
+          precisionEvents[0].id
+        }`;
+        await tx`UPDATE audit_events SET created_at='2026-07-10 00:00:00.000200+00' WHERE id IN (${
+          precisionEvents[1].id
+        },${precisionEvents[2].id})`;
+      });
       await precisionSql.end();
       const sameTimestamp = [precisionEvents[1].id, precisionEvents[2].id].sort().reverse();
       const expectedPrecisionOrder = [...sameTimestamp, precisionEvents[0].id];
@@ -1613,9 +1640,13 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
-    await sql`TRUNCATE provider_attempts,provider_model_route_targets,provider_model_routes,
-      provider_retry_policies,model_price_versions,provider_models,providers,audit_events,
-      ledger_entries,usage_runs,api_tokens,sessions,messages,conversations,users RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      `TRUNCATE provider_attempts,provider_model_route_targets,provider_model_routes,
+        provider_retry_policies,model_price_versions,provider_models,providers,audit_events,
+        ledger_entries,usage_runs,api_tokens,sessions,messages,conversations,users
+        RESTART IDENTITY CASCADE`,
+    );
     await sql.end();
     const repo = await PostgresRepository.connect(databaseUrl!);
     try {
@@ -1869,9 +1900,12 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
-    await sql`TRUNCATE model_price_versions, provider_models, providers, audit_events,
-      document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs,
-      api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      `TRUNCATE model_price_versions, provider_models, providers, audit_events,
+        document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs,
+        api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`,
+    );
     await sql.end();
     const repo = await PostgresRepository.connect(databaseUrl!);
     try {
@@ -2039,7 +2073,10 @@ Deno.test({
     const previousEnvironment = Deno.env.get("DENO_ENV");
     const previousHost = Deno.env.get("OPENAI_TEST_ALLOW_HTTP_HOST");
     const sql = postgres(databaseUrl!, { max: 1 });
-    await sql`TRUNCATE providers, audit_events, users RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      "TRUNCATE providers, audit_events, users RESTART IDENTITY CASCADE",
+    );
     await sql.end();
     const repo = await PostgresRepository.connect(databaseUrl!);
     try {
@@ -2097,8 +2134,11 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
-    await sql`TRUNCATE api_idempotency_requests, usage_runs, ledger_entries, users
-      RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      `TRUNCATE api_idempotency_requests, usage_runs, ledger_entries, users
+        RESTART IDENTITY CASCADE`,
+    );
     await sql.end();
     const repo = await PostgresRepository.connect(databaseUrl!);
     const mutate = postgres(databaseUrl!, { max: 1 });
@@ -2195,9 +2235,12 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
-    await sql`TRUNCATE model_price_versions, provider_models, providers, audit_events,
-      ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users
-      RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      `TRUNCATE model_price_versions, provider_models, providers, audit_events,
+        ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users
+        RESTART IDENTITY CASCADE`,
+    );
     await sql.end();
     const firstRepo = await PostgresRepository.connect(databaseUrl!);
     const secondRepo = await PostgresRepository.connect(databaseUrl!);
@@ -2337,7 +2380,10 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
-    await sql`TRUNCATE auth_verifications, auth_sessions, auth_accounts, auth_users, repository_migrations, operation_idempotency, audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users, runtime_snapshots RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      "TRUNCATE auth_verifications, auth_sessions, auth_accounts, auth_users, repository_migrations, operation_idempotency, audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users, runtime_snapshots RESTART IDENTITY CASCADE",
+    );
     const userId = crypto.randomUUID(),
       conversationId = crypto.randomUUID(),
       messageId = crypto.randomUUID();
@@ -2533,7 +2579,10 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
-    await sql`TRUNCATE auth_verifications, auth_sessions, auth_accounts, auth_users, audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      "TRUNCATE auth_verifications, auth_sessions, auth_accounts, auth_users, audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE",
+    );
     await sql.end();
     const repo = await PostgresRepository.connect(databaseUrl!);
     try {
@@ -2618,8 +2667,11 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
-    await sql`TRUNCATE generation_controls, provider_attempts, ledger_entries, usage_runs,
-      messages, conversations, users RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      `TRUNCATE generation_controls, provider_attempts, ledger_entries, usage_runs,
+        messages, conversations, users RESTART IDENTITY CASCADE`,
+    );
     await sql.end();
     const repo = await PostgresRepository.connect(databaseUrl!);
     try {
@@ -2788,8 +2840,11 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
-    await sql`TRUNCATE generation_controls, provider_attempts, ledger_entries, usage_runs,
-      messages, conversations, users RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      `TRUNCATE generation_controls, provider_attempts, ledger_entries, usage_runs,
+        messages, conversations, users RESTART IDENTITY CASCADE`,
+    );
     await sql.end();
     const repo = await PostgresRepository.connect(databaseUrl!);
     const expirySql = postgres(databaseUrl!, { max: 1 });
@@ -2908,7 +2963,10 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 2 });
-    await sql`TRUNCATE auth_verifications, auth_sessions, auth_accounts, auth_users, audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      "TRUNCATE auth_verifications, auth_sessions, auth_accounts, auth_users, audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE",
+    );
     const repo = await PostgresRepository.connect(databaseUrl!);
     try {
       const owner = await repo.bootstrapAdmin({
@@ -3080,10 +3138,13 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
-    await sql`TRUNCATE conversation_knowledge_bindings, knowledge_collection_attachments,
-      knowledge_collections, audit_events, document_chunks, message_attachments, attachments,
-      jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users
-      RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      `TRUNCATE conversation_knowledge_bindings, knowledge_collection_attachments,
+        knowledge_collections, audit_events, document_chunks, message_attachments, attachments,
+        jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users
+        RESTART IDENTITY CASCADE`,
+    );
     const first = await PostgresRepository.connect(databaseUrl!);
     const second = await PostgresRepository.connect(databaseUrl!);
     try {
@@ -3165,7 +3226,10 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
-    await sql`TRUNCATE auth_verifications, auth_sessions, auth_accounts, auth_users, audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      "TRUNCATE auth_verifications, auth_sessions, auth_accounts, auth_users, audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE",
+    );
     await sql.end();
     const repo = await PostgresRepository.connect(databaseUrl!);
     try {
@@ -3244,10 +3308,13 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
-    await sql`TRUNCATE generated_asset_inputs,generated_assets,audit_events,document_chunks,
-      message_attachments,attachments,jobs,ledger_entries,usage_runs,model_price_versions,
-      provider_models,providers,api_tokens,sessions,messages,conversations,users
-      RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      `TRUNCATE generated_asset_inputs,generated_assets,audit_events,document_chunks,
+        message_attachments,attachments,jobs,ledger_entries,usage_runs,model_price_versions,
+        provider_models,providers,api_tokens,sessions,messages,conversations,users
+        RESTART IDENTITY CASCADE`,
+    );
     const first = await PostgresRepository.connect(databaseUrl!);
     const second = await PostgresRepository.connect(databaseUrl!);
     try {
@@ -3501,7 +3568,10 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
-    await sql`TRUNCATE auth_verifications, auth_sessions, auth_accounts, auth_users, audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      "TRUNCATE auth_verifications, auth_sessions, auth_accounts, auth_users, audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE",
+    );
     await sql.end();
     const repo = await PostgresRepository.connect(databaseUrl!);
     try {
@@ -3597,7 +3667,10 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
-    await sql`TRUNCATE auth_verifications, auth_sessions, auth_accounts, auth_users, audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      "TRUNCATE auth_verifications, auth_sessions, auth_accounts, auth_users, audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE",
+    );
     await sql.end();
     const repo = await PostgresRepository.connect(databaseUrl!);
     try {
@@ -3705,7 +3778,10 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
-    await sql`TRUNCATE auth_verifications, auth_sessions, auth_accounts, auth_users, audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      "TRUNCATE auth_verifications, auth_sessions, auth_accounts, auth_users, audit_events, document_chunks, message_attachments, attachments, jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users RESTART IDENTITY CASCADE",
+    );
     await sql.end();
     const repo = await PostgresRepository.connect(databaseUrl!);
     try {

@@ -10,9 +10,17 @@ rule_files:
 scrape_configs:
   - job_name: dg-chat-api
     metrics_path: /metrics
-    static_configs:
-      - targets: ["app:9090"]
+    # Docker's embedded DNS returns one A record per scaled Compose replica. DNS discovery expands
+    # those addresses into independent scrape targets instead of load-balancing one static target.
+    dns_sd_configs:
+      - names: ["api-metrics"]
+        type: A
+        port: 9090
+        refresh_interval: 15s
   - job_name: dg-chat-worker
     metrics_path: /metrics
-    static_configs:
-      - targets: ["worker:9091"]
+    dns_sd_configs:
+      - names: ["worker-metrics"]
+        type: A
+        port: 9091
+        refresh_interval: 15s

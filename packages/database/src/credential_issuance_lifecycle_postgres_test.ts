@@ -2,6 +2,7 @@ import { assertEquals } from "jsr:@std/assert@1.0.14";
 import postgres from "npm:postgres@3.4.7";
 import { DomainError } from "./memory.ts";
 import { PostgresRepository } from "./normalized-postgres.ts";
+import { runAuditTestMaintenanceSql } from "./postgres-test-maintenance.ts";
 
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
 
@@ -52,9 +53,12 @@ Deno.test({
         }
         throw new Error(`Expected at least ${minimum} credential issuance user-lock waiters`);
       };
-      await sql`TRUNCATE audit_events,ledger_entries,identity_tokens,api_tokens,
-        auth_verifications,auth_sessions,auth_accounts,auth_users,sessions,users
-        RESTART IDENTITY CASCADE`;
+      await runAuditTestMaintenanceSql(
+        sql,
+        `TRUNCATE audit_events,ledger_entries,identity_tokens,api_tokens,
+          auth_verifications,auth_sessions,auth_accounts,auth_users,sessions,users
+          RESTART IDENTITY CASCADE`,
+      );
       const actorId = crypto.randomUUID();
       const targetId = crypto.randomUUID();
       await sql`INSERT INTO users(
@@ -245,6 +249,40 @@ Deno.test({
 
       await raceRotationAgainstAuthorityLoss("rejected", "rejection");
       await raceRotationAgainstAuthorityLoss("deleted", "deletion");
+
+      const beforeResetRejection = await repository.getAdminUser(targetId);
+      const resetRejected = await repository.decideUserApproval({
+        actorId,
+        targetUserId: targetId,
+        expectedVersion: beforeResetRejection.version,
+        status: "rejected",
+        startingCreditMicros: 0,
+        reason: "Exercise rejected password-reset issuance",
+      });
+      const rejectedEpoch = await currentEpoch();
+      assertAccountUnavailable(
+        await outcome(repository.createIdentityToken(
+          targetId,
+          "password_reset",
+          "credential-rejected-password-reset",
+          new Date(Date.now() + 60_000).toISOString(),
+          rejectedEpoch,
+        )),
+      );
+      await repository.createIdentityToken(
+        targetId,
+        "email_verification",
+        "credential-rejected-email-verification",
+        new Date(Date.now() + 60_000).toISOString(),
+        rejectedEpoch,
+      );
+      await repository.decideUserApproval({
+        actorId,
+        targetUserId: targetId,
+        expectedVersion: resetRejected.version,
+        status: "approved",
+        startingCreditMicros: 0,
+      });
 
       const finalFresh = await repository.createApiToken(targetId, {
         name: "Fresh token after lifecycle restoration",

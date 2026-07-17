@@ -1,6 +1,7 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.14";
 import postgres from "npm:postgres@3.4.7";
 import { PostgresRepository, PostgresToolExecutionStore } from "@dg-chat/database";
+import { runAuditTestMaintenanceSql } from "../../../packages/database/src/postgres-test-maintenance.ts";
 import { type ToolAdapter, ToolExecutionService } from "./tool-execution.ts";
 
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
@@ -19,9 +20,12 @@ Deno.test({
     const sql = postgres(databaseUrl!, { max: 1 });
     const repo = await PostgresRepository.connect(databaseUrl!);
     const store = PostgresToolExecutionStore.connect(databaseUrl!);
-    await sql`TRUNCATE tool_executions, tool_policies, audit_events, ledger_entries, usage_runs,
-      api_tokens, sessions, messages, conversations, auth_sessions, auth_accounts,
-      auth_verifications, auth_users, users RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      `TRUNCATE tool_executions, tool_policies, audit_events, ledger_entries, usage_runs,
+        api_tokens, sessions, messages, conversations, auth_sessions, auth_accounts,
+        auth_verifications, auth_users, users RESTART IDENTITY CASCADE`,
+    );
     try {
       const user = await repo.bootstrapAdmin({
         email: "tool-lost-ack@example.com",
@@ -371,9 +375,12 @@ Deno.test({
     const sql = postgres(databaseUrl!, { max: 1 });
     const repo = await PostgresRepository.connect(databaseUrl!);
     const store = PostgresToolExecutionStore.connect(databaseUrl!);
-    await sql`TRUNCATE tool_executions, tool_policies, audit_events, ledger_entries, usage_runs,
-      api_tokens, sessions, messages, conversations, auth_sessions, auth_accounts,
-      auth_verifications, auth_users, users RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      `TRUNCATE tool_executions, tool_policies, audit_events, ledger_entries, usage_runs,
+        api_tokens, sessions, messages, conversations, auth_sessions, auth_accounts,
+        auth_verifications, auth_users, users RESTART IDENTITY CASCADE`,
+    );
     try {
       const reserveMicros = 1_000;
       const user = await repo.bootstrapAdmin({
@@ -491,9 +498,12 @@ Deno.test({
     const sql = postgres(databaseUrl!, { max: 1 });
     const repo = await PostgresRepository.connect(databaseUrl!);
     const store = PostgresToolExecutionStore.connect(databaseUrl!);
-    await sql`TRUNCATE tool_executions, tool_policies, audit_events, ledger_entries, usage_runs,
-      api_tokens, sessions, messages, conversations, auth_sessions, auth_accounts,
-      auth_verifications, auth_users, users RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      `TRUNCATE tool_executions, tool_policies, audit_events, ledger_entries, usage_runs,
+        api_tokens, sessions, messages, conversations, auth_sessions, auth_accounts,
+        auth_verifications, auth_users, users RESTART IDENTITY CASCADE`,
+    );
     try {
       const user = await repo.bootstrapAdmin({
         email: "tool-billing-snapshot@example.com",

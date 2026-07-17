@@ -213,6 +213,7 @@ import {
 } from "./rate-limit.ts";
 import { consumeTokenRateLimits, type TokenRatePolicy } from "./token-rate-limit.ts";
 import {
+  safeUploadBlobObjectKey,
   safeUploadObjectKey,
   secureUploadStream,
   type UploadInspection,
@@ -285,6 +286,7 @@ import { WebSearchToolAdapter } from "./search-tool.ts";
 import type { OcrCache } from "./ocr-interception.ts";
 import type { BetterAuthService } from "./better-auth.ts";
 import type { BackupAdminService } from "./backup-admin.ts";
+import { timingSafeTextEqual, validateSetupToken } from "./auth-config.ts";
 import { BackupServiceError } from "./backup-service.ts";
 
 type Variables = {
@@ -347,6 +349,10 @@ export interface AppOptions {
   conversationSearchMaxConcurrentPerUser?: number;
   webComplete?: typeof complete;
   objectStore?: ObjectStore;
+  /** Short test/deployment seam; production defaults to UPLOAD_MAX_BYTES. */
+  uploadMaxBytes?: number;
+  /** Maximum time an ambiguous durable upload remains recoverable before terminal cleanup. */
+  fileUploadRecoveryMaxAgeMs?: number;
   attachmentContextMaxRawBytes?: number;
   knowledgeContextMaxCharacters?: number;
   knowledgeRetrievalTopK?: number;
@@ -425,6 +431,11 @@ interface StagedUpload {
   inspection: UploadInspection;
   purpose: string;
 }
+
+// Multipart framing is bounded independently from file bytes. Three parts, twenty header pairs,
+// and 8 KiB header blocks fit comfortably inside this allowance without permitting an attacker to
+// stream an unbounded preamble or epilogue when Transfer-Encoding is chunked.
+const MULTIPART_WIRE_OVERHEAD_BYTES = 64 * 1024;
 
 async function finalizeImageInspection(
   path: string,
@@ -777,6 +788,18 @@ export const publicProviderFailure = (error: unknown, cancelled = false) => {
     type: "server_error" as const,
   };
 };
+
+const projectOpenAIProviderFailure = (error: unknown, cancelled = false) => {
+  const failure = publicProviderFailure(error, cancelled);
+  const responseBody = JSON.stringify(
+    openAIError(failure.message, failure.code, failure.type, failure.param),
+  );
+  const retryHeaders: Record<string, string> = failure.retryAfterMs === undefined
+    ? {}
+    : { "retry-after": String(Math.max(1, Math.ceil(failure.retryAfterMs / 1_000))) };
+  return { failure, responseBody, retryHeaders };
+};
+
 const auditIdentifier = /^[a-z0-9][a-z0-9._:-]*$/i;
 const auditUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const parseAuditQuery = (c: Context): AuditQuery => {
@@ -1340,7 +1363,7 @@ async function stageMultipartUpload(
   }
   const contentLength = Number(request.headers.get("content-length"));
   if (
-    Number.isFinite(contentLength) && contentLength > maxBytes + 1024 * 1024
+    Number.isFinite(contentLength) && contentLength > maxBytes + MULTIPART_WIRE_OVERHEAD_BYTES
   ) throw new UploadSecurityError("upload_too_large", "Upload exceeds the byte limit", 413);
   if (!request.body) throw new UploadSecurityError("empty_upload", "Upload is empty", 400);
 
@@ -1437,10 +1460,23 @@ async function stageMultipartUpload(
   });
   const pump = (async () => {
     const reader = request.body!.getReader();
+    let wireBytes = 0;
     try {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
+        wireBytes += value.byteLength;
+        if (wireBytes > maxBytes + MULTIPART_WIRE_OVERHEAD_BYTES) {
+          const exceeded = new UploadSecurityError(
+            "upload_too_large",
+            "Upload exceeds the byte limit",
+            413,
+          );
+          failure ??= exceeded;
+          await reader.cancel(exceeded).catch(() => undefined);
+          busboy.destroy(exceeded);
+          break;
+        }
         if (!busboy.write(value)) {
           await new Promise<void>((resolve, reject) => {
             const drained = () => {
@@ -1540,7 +1576,10 @@ export function createApp(options: AppOptions = {}) {
   ) throw new Error("Temporary chat retention must be an integer between 1 and 3650 days");
   const webComplete = options.webComplete ?? complete;
   const activeWebGenerations = new Map<string, AbortController>();
-  const setupToken = options.setupToken ?? Deno.env.get("SETUP_TOKEN") ?? "";
+  const setupToken = validateSetupToken(
+    options.setupToken ?? Deno.env.get("SETUP_TOKEN"),
+    Deno.env.get("DENO_ENV") === "production",
+  ) ?? "";
   const configuredStartingCredit = Deno.env.get("STARTING_CREDIT_MICROS");
   const configuredStartingUsd = Deno.env.get("DEFAULT_APPROVAL_CREDIT_USD");
   const startingCredit = options.startingCreditMicros ??
@@ -1587,6 +1626,20 @@ export function createApp(options: AppOptions = {}) {
   const identityDeliveryTimeoutMs = options.identityDeliveryTimeoutMs ??
     DEFAULT_IDENTITY_DELIVERY_TIMEOUT_MS;
   const pendingIdentityDeliveries = new Map<Promise<void>, AbortController>();
+  const recordIdentityAuditWithSanitizedFailure = async (
+    input: Parameters<DomainRepository["recordAudit"]>[0],
+    failureMessage = "Identity outcome audit persistence failed",
+  ): Promise<void> => {
+    try {
+      await repo.recordAudit(input);
+    } catch {
+      emitOperationalLog({
+        level: "error",
+        message: failureMessage,
+        action: input.action,
+      });
+    }
+  };
   const dispatchIdentityDelivery = (
     userId: string,
     actorId: string | null,
@@ -1594,22 +1647,13 @@ export function createApp(options: AppOptions = {}) {
     sentAction: string,
     failedAction: string,
   ) => {
-    const audit = async (action: string): Promise<void> => {
-      try {
-        await repo.recordAudit({
-          actorId,
-          action,
-          targetType: "user",
-          targetId: userId,
-        });
-      } catch {
-        emitOperationalLog({
-          level: "error",
-          message: "Identity delivery audit persistence failed",
-          action,
-        });
-      }
-    };
+    const audit = (action: string): Promise<void> =>
+      recordIdentityAuditWithSanitizedFailure({
+        actorId,
+        action,
+        targetType: "user",
+        targetId: userId,
+      }, "Identity delivery audit persistence failed");
     const controller = new AbortController();
     const pending = boundedIdentityDelivery(delivery, controller, identityDeliveryTimeoutMs)
       .then(
@@ -1687,7 +1731,17 @@ export function createApp(options: AppOptions = {}) {
   if (configuredTokenDefaultBurst > 1_000) {
     throw new Error("TOKEN_DEFAULT_BURST_LIMIT must be between 1 and 1000");
   }
-  const uploadMaxBytes = positiveInteger("UPLOAD_MAX_BYTES", 25 * 1024 * 1024);
+  const uploadMaxBytes = options.uploadMaxBytes ??
+    positiveInteger("UPLOAD_MAX_BYTES", 25 * 1024 * 1024);
+  if (!Number.isSafeInteger(uploadMaxBytes) || uploadMaxBytes < 1) {
+    throw new Error("uploadMaxBytes must be a positive safe integer");
+  }
+  const fileUploadRecoveryMaxAgeMs = options.fileUploadRecoveryMaxAgeMs ??
+    positiveInteger("FILE_UPLOAD_RECOVERY_MAX_AGE_SECONDS", 7 * 24 * 60 * 60) * 1_000;
+  if (
+    !Number.isSafeInteger(fileUploadRecoveryMaxAgeMs) ||
+    fileUploadRecoveryMaxAgeMs < 1
+  ) throw new Error("fileUploadRecoveryMaxAgeMs must be a positive safe integer");
   const uploadMaxConcurrent = positiveInteger("UPLOAD_MAX_CONCURRENT", 4);
   const uploadMaxConcurrentPerUser = positiveInteger("UPLOAD_MAX_CONCURRENT_PER_USER", 2);
   if (uploadMaxConcurrentPerUser > uploadMaxConcurrent) {
@@ -2209,6 +2263,16 @@ export function createApp(options: AppOptions = {}) {
   };
   let bootstrapInProgress = false;
   const app = new Hono<{ Variables: Variables }>();
+  const applyPrivateCredentialCachePolicy = (c: Context) => {
+    const path = c.req.path;
+    const cookieSurface = path === "/api/auth" || path.startsWith("/api/auth/") ||
+      path === "/api/sessions" || path.startsWith("/api/sessions/") ||
+      path === "/api/tokens" || path.startsWith("/api/tokens/");
+    const setupSurface = path === "/api/setup" || path.startsWith("/api/setup/");
+    if (!cookieSurface && !setupSurface) return;
+    privateNoStore(c);
+    if (cookieSurface) c.header("Vary", "Cookie", { append: true });
+  };
   const accessSubject = (c: Context<{ Variables: Variables }>): TokenAccessSubject => ({
     userId: c.get("user").id,
     tokenId: c.get("authType") === "token" ? c.get("tokenId") ?? null : null,
@@ -2257,6 +2321,17 @@ export function createApp(options: AppOptions = {}) {
       }
     }
   });
+  // Credential responses must remain private even when an earlier body, maintenance, CORS, or
+  // rate-limit gate returns before the route handler. Reapply after downstream execution because
+  // Hono handlers may replace the prepared Response and its headers.
+  app.use("*", async (c, next) => {
+    applyPrivateCredentialCachePolicy(c);
+    try {
+      await next();
+    } finally {
+      applyPrivateCredentialCachePolicy(c);
+    }
+  });
   app.use(
     "*",
     secureHeaders({
@@ -2277,7 +2352,28 @@ export function createApp(options: AppOptions = {}) {
     cors({
       origin: webOrigin,
       credentials: true,
-      allowHeaders: ["Authorization", "Content-Type", "Idempotency-Key", "X-Request-Id"],
+      // Keep this bounded to headers emitted by the supported OpenAI JavaScript client plus the
+      // gateway's own idempotency/request metadata. Arbitrary caller-selected headers stay denied.
+      allowHeaders: [
+        "Authorization",
+        "Content-Type",
+        "Idempotency-Key",
+        "OpenAI-Beta",
+        "OpenAI-Organization",
+        "OpenAI-Project",
+        "X-Request-Id",
+        "X-Stainless-Arch",
+        "X-Stainless-Custom-Poll-Interval",
+        "X-Stainless-Helper-Method",
+        "X-Stainless-Lang",
+        "X-Stainless-OS",
+        "X-Stainless-Package-Version",
+        "X-Stainless-Poll-Helper",
+        "X-Stainless-Retry-Count",
+        "X-Stainless-Runtime",
+        "X-Stainless-Runtime-Version",
+        "X-Stainless-Timeout",
+      ],
       exposeHeaders: [
         "X-Request-Id",
         "Retry-After",
@@ -2807,6 +2903,7 @@ export function createApp(options: AppOptions = {}) {
     return snapshot.status === "ready" ? c.json(snapshot, 200) : c.json(snapshot, 503);
   });
   app.get("/api/setup/status", async (c) => {
+    privateNoStore(c);
     const users = await repo.listUsers();
     return c.json({
       bootstrapRequired: !users.some((user) => user.role === "admin"),
@@ -2852,6 +2949,10 @@ export function createApp(options: AppOptions = {}) {
         inspectionError: staged.inspection.decision.state === "ready"
           ? null
           : staged.inspection.decision.reason,
+        // stageMultipartUpload has already completed the bounded synchronous inspection. Enqueuing
+        // the legacy acknowledgement-only inspection job would amplify the durable queue without
+        // adding another security decision.
+        inspectionComplete: true,
       });
       if (created.deduplicated) {
         await objectStore.delete(objectKey).catch(() => {
@@ -2871,7 +2972,12 @@ export function createApp(options: AppOptions = {}) {
     }
   };
 
-  const uploadFor = async (request: Request, ownerId: string, requirePurpose = false) => {
+  const withStagedUpload = async <T>(
+    request: Request,
+    ownerId: string,
+    requirePurpose: boolean,
+    use: (staged: StagedUpload) => Promise<T>,
+  ): Promise<T> => {
     const ownerUploads = activeUploadsByUser.get(ownerId) ?? 0;
     if (activeUploads >= uploadMaxConcurrent || ownerUploads >= uploadMaxConcurrentPerUser) {
       throw new DomainError("upload_capacity_exceeded", "Too many uploads are in progress", 429);
@@ -2881,7 +2987,7 @@ export function createApp(options: AppOptions = {}) {
     let staged: StagedUpload | undefined;
     try {
       staged = await stageMultipartUpload(request, uploadMaxBytes, requirePurpose);
-      return { attachment: await persistUpload(ownerId, staged), purpose: staged.purpose };
+      return await use(staged);
     } finally {
       if (staged) await Deno.remove(staged.path).catch(() => undefined);
       activeUploads--;
@@ -2890,6 +2996,11 @@ export function createApp(options: AppOptions = {}) {
       else activeUploadsByUser.delete(ownerId);
     }
   };
+  const uploadFor = async (request: Request, ownerId: string, requirePurpose = false) =>
+    await withStagedUpload(request, ownerId, requirePurpose, async (staged) => ({
+      attachment: await persistUpload(ownerId, staged),
+      purpose: staged.purpose,
+    }));
 
   const readExactObjectBody = async (
     body: ReadableStream<Uint8Array>,
@@ -3479,11 +3590,12 @@ export function createApp(options: AppOptions = {}) {
   };
 
   app.post("/api/setup/bootstrap", async (c) => {
+    privateNoStore(c);
     if (!setupToken) throw new DomainError("setup_disabled", "SETUP_TOKEN is not configured", 503);
     if (bootstrapInProgress) {
       throw new DomainError("already_bootstrapped", "An administrator already exists", 409);
     }
-    if (c.req.header("x-setup-token") !== setupToken) {
+    if (!timingSafeTextEqual(c.req.header("x-setup-token"), setupToken)) {
       throw new DomainError("invalid_setup_token", "Invalid setup token", 401);
     }
     bootstrapInProgress = true;
@@ -3493,12 +3605,6 @@ export function createApp(options: AppOptions = {}) {
         ...body,
         passwordHash: await hashPassword(body.password),
       }, startingCredit);
-      await repo.recordAudit({
-        actorId: user.id,
-        action: "identity.bootstrap_admin",
-        targetType: "user",
-        targetId: user.id,
-      });
       return c.json({ user: publicUser(user) }, 201);
     } catch (error) {
       bootstrapInProgress = false;
@@ -3513,7 +3619,11 @@ export function createApp(options: AppOptions = {}) {
       passwordHash: await hashPassword(body.password),
       emailVerified: false,
     });
-    await repo.recordAudit({ action: "identity.signup", targetType: "user", targetId: user.id });
+    await recordIdentityAuditWithSanitizedFailure({
+      action: "identity.signup",
+      targetType: "user",
+      targetId: user.id,
+    });
     if (mailer) {
       const verificationToken = randomToken("verify_");
       await repo.createIdentityToken(
@@ -3530,13 +3640,13 @@ export function createApp(options: AppOptions = {}) {
           token: verificationToken,
           url: `${webOrigin}/verify-email#token=${encodeURIComponent(verificationToken)}`,
         });
-        await repo.recordAudit({
+        await recordIdentityAuditWithSanitizedFailure({
           action: "identity.verification_sent",
           targetType: "user",
           targetId: user.id,
         });
       } catch {
-        await repo.recordAudit({
+        await recordIdentityAuditWithSanitizedFailure({
           action: "identity.verification_delivery_failed",
           targetType: "user",
           targetId: user.id,
@@ -3602,21 +3712,9 @@ export function createApp(options: AppOptions = {}) {
       // that record directly so auth_users and domain users change in one repository transaction;
       // forwarding through Better Auth first would create a cross-transaction authority race.
       const verified = await repo.verifyEmail(await sha256(body.token));
-      await repo.recordAudit({
-        actorId: verified.id,
-        action: "identity.email_verified",
-        targetType: "user",
-        targetId: verified.id,
-      });
       return c.json({ user: publicUser(verified) });
     }
     const user = await repo.verifyEmail(await sha256(body.token));
-    await repo.recordAudit({
-      actorId: user.id,
-      action: "identity.email_verified",
-      targetType: "user",
-      targetId: user.id,
-    });
     return c.json({ user: publicUser(user) });
   });
   app.post("/api/auth/verify-email/request", authenticate, async (c) => {
@@ -3659,7 +3757,7 @@ export function createApp(options: AppOptions = {}) {
       token,
       url: `${webOrigin}/verify-email#token=${encodeURIComponent(token)}`,
     });
-    await repo.recordAudit({
+    await recordIdentityAuditWithSanitizedFailure({
       actorId: user.id,
       action: "identity.verification_sent",
       targetType: "user",
@@ -3695,7 +3793,10 @@ export function createApp(options: AppOptions = {}) {
     const body = await parseJson(c, passwordResetRequestSchema);
     try {
       const user = await repo.findUserByEmail(body.email);
-      if (user && user.state === "active" && user.deletedAt === null && mailer) {
+      if (
+        user && user.state === "active" && user.deletedAt === null &&
+        user.approvalStatus !== "rejected" && user.passwordResetPending !== true && mailer
+      ) {
         const token = randomToken("reset_");
         await repo.createIdentityToken(
           user.id,
@@ -3729,28 +3830,16 @@ export function createApp(options: AppOptions = {}) {
   app.post("/api/auth/password-reset", async (c) => {
     const body = await parseJson(c, passwordResetSchema);
     if (browserAuth && !body.token.startsWith("reset_")) {
-      const user = await repo.resetBetterAuthPassword(
+      await repo.resetBetterAuthPassword(
         body.token,
         await hashPassword(body.password),
       );
-      await repo.recordAudit({
-        actorId: user.id,
-        action: "identity.password_reset_completed",
-        targetType: "user",
-        targetId: user.id,
-      });
       return c.body(null, 204);
     }
-    const user = await repo.resetPassword(
+    await repo.resetPassword(
       await sha256(body.token),
       await hashPassword(body.password),
     );
-    await repo.recordAudit({
-      actorId: user.id,
-      action: "identity.password_reset_completed",
-      targetType: "user",
-      targetId: user.id,
-    });
     return c.body(null, 204);
   });
   const signIn = async (c: Context) => {
@@ -3761,7 +3850,7 @@ export function createApp(options: AppOptions = {}) {
       user?.passwordHash ?? DUMMY_PASSWORD_HASH,
     );
     if (!user || !passwordValid) {
-      await repo.recordAudit({
+      await recordIdentityAuditWithSanitizedFailure({
         action: "identity.login_failed",
         targetType: "user",
         targetId: user?.id ?? null,
@@ -3778,7 +3867,7 @@ export function createApp(options: AppOptions = {}) {
       (requireEmailVerification && !user.emailVerifiedAt);
     const token = randomToken("sess_");
     await repo.createSession(user.id, await sha256(token), limited, user.authorityEpoch);
-    await repo.recordAudit({
+    await recordIdentityAuditWithSanitizedFailure({
       actorId: user.id,
       action: "identity.login_succeeded",
       targetType: "user",
@@ -3832,7 +3921,7 @@ export function createApp(options: AppOptions = {}) {
       const session = await repo.getSession(hash);
       await repo.deleteSession(hash);
       if (session) {
-        await repo.recordAudit({
+        await recordIdentityAuditWithSanitizedFailure({
           actorId: session.userId,
           action: "session.signed_out",
           targetType: "session",
@@ -9149,42 +9238,81 @@ export function createApp(options: AppOptions = {}) {
       });
     }
     if (request.stream) {
+      const downstreamAbort = new AbortController();
+      const upstreamSignal = AbortSignal.any([c.req.raw.signal, downstreamAbort.signal]);
+      const upstreamRequest: ChatCompletionRequest = {
+        ...request,
+        stream_options: {
+          ...request.stream_options,
+          include_usage: true,
+        },
+      };
+      const providerEvents = resolvedModel.registryModel && providerExecution
+        ? providerExecution.stream(
+          resolvedModel.registryModel.id,
+          runId,
+          executionLeaseToken,
+          upstreamRequest,
+          upstreamSignal,
+          providerPlan,
+          c.get("user").id,
+        )
+        : providerStream(upstreamRequest, upstreamSignal, resolvedModel.upstream);
+      let firstProviderEvent: IteratorResult<string>;
+      try {
+        // Pull once before committing the HTTP response. A provider rejection before its first SSE
+        // event can then expose Retry-After on both the live response and its durable replay.
+        firstProviderEvent = await providerEvents.next();
+      } catch (error) {
+        const projected = projectOpenAIProviderFailure(error, upstreamSignal.aborted);
+        const responseHeaders = {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache",
+          ...projected.retryHeaders,
+        };
+        try {
+          if (idempotency) {
+            await failOpenAIUsage({
+              id: idempotency.id,
+              leaseToken: idempotency.leaseToken,
+              responseStatus: 200,
+              responseHeaders,
+              responseBody: projected.responseBody,
+              terminalFrame: sseData(projected.responseBody),
+              billing: { mode: "refund" },
+            });
+          } else await repo.refund(runId);
+        } finally {
+          await lease.stop();
+        }
+        for (const [name, value] of Object.entries(projected.retryHeaders)) c.header(name, value);
+        return streamSSE(c, async (stream) => {
+          if (!stream.aborted && !c.req.raw.signal.aborted) {
+            await stream.writeSSE({ data: projected.responseBody });
+          }
+        });
+      }
       return streamSSE(c, async (stream) => {
-        const downstreamAbort = new AbortController();
         stream.onAbort(() =>
           downstreamAbort.abort(new DOMException("Client disconnected", "AbortError"))
         );
-        const upstreamSignal = AbortSignal.any([c.req.raw.signal, downstreamAbort.signal]);
         let visibleOutputBytes = 0;
         let inputTokens = estimateInputTokens(request);
         let outputTokens = 0;
         let cachedInputTokens = 0;
         let reasoningTokens = 0;
+        let sawProviderUsage = false;
         let sawProviderOutputUsage = false;
         let settled = false;
         let sawDone = false;
         let sequence = 0;
         let replayBytes = 0;
-        const upstreamRequest: ChatCompletionRequest = {
-          ...request,
-          stream_options: {
-            ...request.stream_options,
-            include_usage: true,
-          },
-        };
         try {
-          const providerEvents = resolvedModel.registryModel && providerExecution
-            ? providerExecution.stream(
-              resolvedModel.registryModel.id,
-              runId,
-              executionLeaseToken,
-              upstreamRequest,
-              upstreamSignal,
-              providerPlan,
-              c.get("user").id,
-            )
-            : providerStream(upstreamRequest, upstreamSignal, resolvedModel.upstream);
-          for await (const data of providerEvents) {
+          const remainingProviderEvents = async function* () {
+            if (!firstProviderEvent.done) yield firstProviderEvent.value;
+            for await (const data of providerEvents) yield data;
+          };
+          for await (const data of remainingProviderEvents()) {
             if (data === "[DONE]") {
               sawDone = true;
               continue;
@@ -9213,6 +9341,7 @@ export function createApp(options: AppOptions = {}) {
               error?: { message?: string };
             };
             if (chunk.error) throw new Error(chunk.error.message ?? "Provider stream failed");
+            if (chunk.usage !== undefined) sawProviderUsage = true;
             if (chunk.usage?.completion_tokens !== undefined) {
               sawProviderOutputUsage = true;
             }
@@ -9342,24 +9471,28 @@ export function createApp(options: AppOptions = {}) {
           }
         } catch (error) {
           if (error instanceof TerminalAccountingPersistenceError) throw error;
+          const projected = projectOpenAIProviderFailure(error, upstreamSignal.aborted);
+          // The response has already started, so retry metadata cannot be added to its headers.
+          // Persist only the headers the original caller actually received; the terminal SSE frame
+          // still carries the safely projected provider classification.
+          const responseHeaders = {
+            "content-type": "text/event-stream",
+            "cache-control": "no-cache",
+          };
           if (!settled && idempotency) {
             const finalOutput = sawProviderOutputUsage
               ? outputTokens
               : Math.max(outputTokens, Math.ceil(visibleOutputBytes / 4));
             const latencyMs = Math.round(performance.now() - started);
+            const hasBillableWork = visibleOutputBytes > 0 || sawProviderUsage;
             await failOpenAIUsage({
               id: idempotency.id,
               leaseToken: idempotency.leaseToken,
               responseStatus: 200,
-              responseHeaders: {
-                "content-type": "text/event-stream",
-                "cache-control": "no-cache",
-              },
-              responseBody: JSON.stringify(openAIError("Provider stream failed", "provider_error")),
-              terminalFrame: sseData(
-                JSON.stringify(openAIError("Provider stream failed", "provider_error")),
-              ),
-              billing: finalOutput > 0
+              responseHeaders,
+              responseBody: projected.responseBody,
+              terminalFrame: sseData(projected.responseBody),
+              billing: hasBillableWork
                 ? {
                   mode: "settle",
                   costMicros: priceUsage(model, inputTokens, finalOutput, {
@@ -9372,7 +9505,7 @@ export function createApp(options: AppOptions = {}) {
                 }
                 : { mode: "refund" },
             });
-          } else if (!settled && visibleOutputBytes > 0) {
+          } else if (!settled && (visibleOutputBytes > 0 || sawProviderUsage)) {
             const finalOutput = sawProviderOutputUsage
               ? outputTokens
               : Math.max(outputTokens, Math.ceil(visibleOutputBytes / 4));
@@ -9391,7 +9524,7 @@ export function createApp(options: AppOptions = {}) {
           }
           if (upstreamSignal.aborted) return;
           await stream.writeSSE({
-            data: JSON.stringify(openAIError("Provider stream failed", "provider_error")),
+            data: projected.responseBody,
           });
         } finally {
           await lease.stop();
@@ -9491,19 +9624,27 @@ export function createApp(options: AppOptions = {}) {
         await lease.stop();
         throw error;
       }
-      if (!providerCompleted && idempotency) {
-        const body = JSON.stringify(openAIError("Provider request failed", "provider_error"));
-        await failOpenAIUsage({
-          id: idempotency.id,
-          leaseToken: idempotency.leaseToken,
-          responseStatus: 502,
-          responseHeaders: { "content-type": "application/json" },
-          responseBody: body,
-          billing: { mode: "refund" },
+      if (!providerCompleted) {
+        const projected = projectOpenAIProviderFailure(error, c.req.raw.signal.aborted);
+        const responseHeaders = {
+          "content-type": "application/json",
+          ...projected.retryHeaders,
+        };
+        if (idempotency) {
+          await failOpenAIUsage({
+            id: idempotency.id,
+            leaseToken: idempotency.leaseToken,
+            responseStatus: projected.failure.status,
+            responseHeaders,
+            responseBody: projected.responseBody,
+            billing: { mode: "refund" },
+          });
+        } else await repo.refund(runId);
+        return new Response(projected.responseBody, {
+          status: projected.failure.status,
+          headers: responseHeaders,
         });
-        return new Response(body, { status: 502, headers: { "content-type": "application/json" } });
       }
-      if (!providerCompleted) await repo.refund(runId);
       throw error;
     } finally {
       await lease.stop();
@@ -11141,6 +11282,158 @@ export function createApp(options: AppOptions = {}) {
     sessionOnly,
     speechHandler,
   );
+  const recoverFileUploads = async (limit = 100) => {
+    if (!objectStore) return 0;
+    const candidates = await repo.listStaleFileUploads(limit);
+    let recovered = 0;
+    for (const { stage, request } of candidates) {
+      if (!request.leaseToken) continue;
+      let leaseToken: string;
+      try {
+        leaseToken = (await repo.reclaimApiRequest(
+          request.id,
+          request.leaseToken,
+          idempotencyLeaseSeconds,
+        )).leaseToken;
+      } catch {
+        continue;
+      }
+      const lease = keepApiLeaseAlive({ id: request.id, leaseToken });
+      let terminal = false;
+      try {
+        if (
+          (options.now ?? Date.now)() - Date.parse(request.createdAt) >
+            fileUploadRecoveryMaxAgeMs
+        ) {
+          await repo.enqueueJob(
+            "file_object.cleanup",
+            {
+              requestId: request.id,
+              ownerId: stage.ownerId,
+              objectKey: stage.objectKey,
+            },
+            new Date(Date.now() + 5 * 60_000).toISOString(),
+            `file_object.cleanup:${request.id}`,
+          );
+          await failOpenAIUsage({
+            id: request.id,
+            leaseToken,
+            responseStatus: 500,
+            responseHeaders: { "content-type": "application/json" },
+            responseBody: JSON.stringify(
+              openAIError(
+                "File upload recovery window expired",
+                "upload_recovery_expired",
+              ),
+            ),
+            billing: { mode: "refund" },
+          });
+          terminal = true;
+          recovered++;
+          continue;
+        }
+        const object = await objectStore.get(stage.objectKey);
+        if (!object) {
+          await failOpenAIUsage({
+            id: request.id,
+            leaseToken,
+            responseStatus: 500,
+            responseHeaders: { "content-type": "application/json" },
+            responseBody: JSON.stringify(
+              openAIError("Interrupted file upload did not store an object", "upload_interrupted"),
+            ),
+            billing: { mode: "refund" },
+          });
+          terminal = true;
+          recovered++;
+          continue;
+        }
+        let valid = object.contentLength === stage.sizeBytes &&
+          object.contentType === stage.mimeType &&
+          object.metadata.sha256 === stage.sha256 &&
+          object.metadata.owner === stage.ownerId;
+        if (valid) {
+          // A body-read error is storage ambiguity, not proof of corruption. Let the outer retry
+          // path release the lease so a later maintenance pass can verify again.
+          const bytes = await readExactObjectBody(
+            object.body,
+            stage.sizeBytes,
+            stage.sizeBytes,
+            () => new DomainError("attachment_corrupt", "Stored upload failed validation", 503),
+          );
+          valid = await imageBytesSha256(bytes) === stage.sha256;
+        } else await object.body.cancel().catch(() => undefined);
+        if (!valid) {
+          await repo.enqueueJob(
+            "file_object.cleanup",
+            {
+              requestId: request.id,
+              ownerId: stage.ownerId,
+              objectKey: stage.objectKey,
+            },
+            new Date(Date.now() + 5 * 60_000).toISOString(),
+            `file_object.cleanup:${request.id}`,
+          );
+          await failOpenAIUsage({
+            id: request.id,
+            leaseToken,
+            responseStatus: 409,
+            responseHeaders: { "content-type": "application/json" },
+            responseBody: JSON.stringify(
+              openAIError(
+                "Stored upload conflicts with its durable metadata",
+                "object_key_conflict",
+              ),
+            ),
+            billing: { mode: "refund" },
+          });
+          terminal = true;
+          recovered++;
+          continue;
+        }
+        await lease.checkpoint();
+        await repo.markFileUploadStored(request.id, leaseToken);
+        await repo.finalizeFileUpload({
+          attachment: {
+            ownerId: stage.ownerId,
+            objectKey: stage.objectKey,
+            filename: stage.filename,
+            mimeType: stage.mimeType,
+            sizeBytes: stage.sizeBytes,
+            sha256: stage.sha256,
+            state: stage.attachmentState,
+            inspectionError: stage.inspectionError,
+            inspectionComplete: true,
+          },
+          request: {
+            id: request.id,
+            leaseToken,
+            responseStatus: 201,
+            responseHeaders: { "content-type": "application/json" },
+            costMicros: 0,
+            inputTokens: 0,
+            outputTokens: 0,
+            latencyMs: Math.max(0, Date.now() - Date.parse(request.createdAt)),
+            quota: replayQuota,
+          },
+          responseBody: (attachment) => JSON.stringify(openAIFile(attachment, stage.purpose)),
+        });
+        terminal = true;
+        recovered++;
+      } catch {
+        // Storage ambiguity and transient database failures remain resumable until the explicit
+        // recovery-age policy above expires.
+      } finally {
+        await lease.stop();
+        if (!terminal) {
+          await Promise.resolve(repo.releaseApiRequestLease(request.id, leaseToken)).catch(() =>
+            undefined
+          );
+        }
+      }
+    }
+    return recovered;
+  };
   app.get(
     "/v1/files",
     requireScope("files:read"),
@@ -11176,8 +11469,238 @@ export function createApp(options: AppOptions = {}) {
     "/v1/files",
     requireScope("files:write"),
     async (c) => {
-      const uploaded = await uploadFor(c.req.raw, c.get("user").id, true);
-      return c.json(openAIFile(uploaded.attachment, uploaded.purpose), 201);
+      const ownerId = c.get("user").id;
+      const idempotencyHeader = c.req.header("idempotency-key");
+      if (!idempotencyHeader) {
+        const uploaded = await uploadFor(c.req.raw, ownerId, true);
+        return c.json(openAIFile(uploaded.attachment, uploaded.purpose), 201);
+      }
+      const idempotencyKey = requireIdempotencyKey(idempotencyHeader);
+      return await withStagedUpload(c.req.raw, ownerId, true, async (staged) => {
+        const requestHash = await sha256Hex(canonicalJson({
+          endpoint: "files",
+          credential: c.get("tokenId") ?? `session:${c.get("sessionId") ?? "legacy"}`,
+          file: {
+            filename: staged.inspection.filename,
+            mimeType: staged.inspection.mime,
+            sizeBytes: staged.inspection.size,
+            sha256: staged.inspection.sha256,
+            decision: staged.inspection.decision,
+            image: staged.inspection.image ?? null,
+          },
+          purpose: staged.purpose,
+        }));
+        const objectKey = safeUploadBlobObjectKey(
+          ownerId,
+          staged.inspection.sha256,
+          staged.inspection.mime,
+        );
+        const runId = `${ownerId}:files:${crypto.randomUUID()}`;
+        const begun = await repo.beginApiRequest({
+          userId: ownerId,
+          endpoint: "files",
+          idempotencyKey,
+          requestHash,
+          stream: false,
+          model: "files/upload",
+          runId,
+          reserveMicros: 0,
+          provider: "local",
+          tokenId: c.get("tokenId"),
+          leaseSeconds: idempotencyLeaseSeconds,
+          quota: replayQuota,
+          replayReservedBytes: 16 * 1024,
+        });
+        if (begun.request.model !== "files/upload") {
+          throw new DomainError("idempotency_conflict", "Idempotency key payload differs", 409);
+        }
+        let active: { request: ApiIdempotencyRequest; leaseToken: string };
+        if (begun.kind === "started") {
+          active = { request: begun.request, leaseToken: begun.leaseToken };
+        } else if (
+          begun.kind === "in_progress" && begun.request.leaseToken &&
+          begun.request.leaseExpiresAt &&
+          Date.parse(begun.request.leaseExpiresAt) <= Date.now()
+        ) {
+          active = await repo.reclaimApiRequest(
+            begun.request.id,
+            begun.request.leaseToken,
+            idempotencyLeaseSeconds,
+          );
+        } else if (begun.kind === "in_progress") {
+          return inProgressApiResponse(begun.retryAfterSeconds);
+        } else {
+          return replayResponse(begun.request);
+        }
+        const started = performance.now();
+        const lease = keepApiLeaseAlive({
+          id: active.request.id,
+          leaseToken: active.leaseToken,
+        });
+        let terminal = false;
+        let blobDurable = false;
+        let objectAttempted = false;
+        let provenCollision = false;
+        try {
+          if (!objectStore) {
+            throw new DomainError(
+              "storage_not_configured",
+              "Object storage is not configured",
+              503,
+            );
+          }
+          await repo.stageFileUpload({
+            requestId: active.request.id,
+            ownerId,
+            objectKey,
+            filename: staged.inspection.filename,
+            mimeType: staged.inspection.mime,
+            sizeBytes: staged.inspection.size,
+            sha256: staged.inspection.sha256,
+            purpose: staged.purpose,
+            attachmentState: staged.inspection.decision.state === "ready" ? "ready" : "quarantined",
+            inspectionError: staged.inspection.decision.state === "ready"
+              ? null
+              : staged.inspection.decision.reason,
+          });
+          const verifyStoredBlob = async () => {
+            const existing = await objectStore.get(objectKey);
+            if (
+              !existing || existing.contentLength !== staged.inspection.size ||
+              existing.contentType !== staged.inspection.mime ||
+              existing.metadata.sha256 !== staged.inspection.sha256 ||
+              existing.metadata.owner !== ownerId
+            ) {
+              await existing?.body.cancel().catch(() => undefined);
+              return false;
+            }
+            const bytes = await readExactObjectBody(
+              existing.body,
+              staged.inspection.size,
+              staged.inspection.size,
+              () => new DomainError("object_key_conflict", "Upload object collision", 409),
+            );
+            return await imageBytesSha256(bytes) === staged.inspection.sha256;
+          };
+          const file = await Deno.open(staged.path, { read: true });
+          try {
+            objectAttempted = true;
+            await objectStore.put({
+              key: objectKey,
+              body: file.readable,
+              contentLength: staged.inspection.size,
+              contentType: staged.inspection.mime,
+              metadata: { sha256: staged.inspection.sha256, owner: ownerId },
+            });
+          } catch (error) {
+            // ObjectAlreadyExists is the normal blob-dedup path. The same reconciliation also
+            // covers a lost ACK where the backend committed bytes before throwing.
+            if (!await verifyStoredBlob()) {
+              if (error instanceof ObjectAlreadyExistsError) {
+                provenCollision = true;
+                throw new DomainError("object_key_conflict", "Upload object collision", 409);
+              }
+              throw error;
+            }
+          } finally {
+            try {
+              file.close();
+            } catch {
+              // The readable stream closes the file after normal consumption.
+            }
+          }
+          blobDurable = true;
+          await repo.markFileUploadStored(active.request.id, active.leaseToken);
+          await lease.checkpoint();
+          const finalized = await repo.finalizeFileUpload({
+            attachment: {
+              ownerId,
+              objectKey,
+              filename: staged.inspection.filename,
+              mimeType: staged.inspection.mime,
+              sizeBytes: staged.inspection.size,
+              sha256: staged.inspection.sha256,
+              state: staged.inspection.decision.state === "ready" ? "ready" : "quarantined",
+              inspectionError: staged.inspection.decision.state === "ready"
+                ? null
+                : staged.inspection.decision.reason,
+              inspectionComplete: true,
+            },
+            request: {
+              id: begun.request.id,
+              leaseToken: active.leaseToken,
+              responseStatus: 201,
+              responseHeaders: { "content-type": "application/json" },
+              costMicros: 0,
+              inputTokens: 0,
+              outputTokens: 0,
+              latencyMs: Math.round(performance.now() - started),
+              quota: replayQuota,
+            },
+            responseBody: (attachment) => JSON.stringify(openAIFile(attachment, staged.purpose)),
+          });
+          terminal = true;
+          const body = finalized.request.responseBody!;
+          return new Response(body, {
+            status: 201,
+            headers: { "content-type": "application/json" },
+          });
+        } catch (error) {
+          if (terminal) throw error;
+          const reconciled = await Promise.resolve(
+            repo.getApiRequest(ownerId, "files", idempotencyKey),
+          ).catch(() => undefined);
+          if (reconciled?.state === "completed") {
+            terminal = true;
+            return replayResponse(reconciled);
+          }
+          if ((blobDurable || objectAttempted) && !provenCollision) {
+            // The exact blob is content-addressed and durably named by the replay row. Leave the
+            // reservation resumable; a retry reclaims this deliberately expired lease and
+            // atomically finalizes the one File record.
+            await repo.releaseApiRequestLease(active.request.id, active.leaseToken);
+            return new Response(
+              JSON.stringify(
+                openAIError(
+                  "File finalization is temporarily unavailable",
+                  "service_unavailable",
+                  503,
+                ),
+              ),
+              {
+                status: 503,
+                headers: { "content-type": "application/json", "retry-after": "1" },
+              },
+            );
+          }
+          const known = error instanceof UploadSecurityError || error instanceof DomainError;
+          const status = known ? error.status : 500;
+          const code = known ? error.code : "storage_error";
+          const message = known ? error.message : "File storage is temporarily unavailable";
+          const body = JSON.stringify(openAIError(message, code, status));
+          try {
+            await failOpenAIUsage({
+              id: active.request.id,
+              leaseToken: active.leaseToken,
+              responseStatus: status,
+              responseHeaders: { "content-type": "application/json" },
+              responseBody: body,
+              billing: { mode: "refund" },
+            });
+            terminal = true;
+            return new Response(body, {
+              status,
+              headers: { "content-type": "application/json" },
+            });
+          } catch {
+            // The completion may have committed immediately before a transport failure. Preserve
+            // its durable state for a later replay instead of exposing internal storage details.
+            throw error;
+          }
+        } finally {
+          await lease.stop();
+        }
+      });
     },
   );
   app.get(
@@ -11291,6 +11814,7 @@ export function createApp(options: AppOptions = {}) {
     repository: repo,
     circuitBreaker,
     toolExecutionService: toolExecution,
+    recoverFileUploads,
     drainIdentityDeliveries,
     replayQuota,
   };

@@ -136,6 +136,25 @@ Deno.test("credential issuance requires current lifecycle authority while preser
   });
   assertThrows(
     () =>
+      repository.createIdentityToken(
+        applicant.id,
+        "password_reset",
+        "rejected-password-reset",
+        new Date(Date.now() + 60_000).toISOString(),
+        repository.findUser(applicant.id)!.authorityEpoch,
+      ),
+    DomainError,
+    "Identity authority changed",
+  );
+  repository.createIdentityToken(
+    applicant.id,
+    "email_verification",
+    "rejected-email-verification",
+    new Date(Date.now() + 60_000).toISOString(),
+    repository.findUser(applicant.id)!.authorityEpoch,
+  );
+  assertThrows(
+    () =>
       repository.rotateApiToken(applicant.id, rotated.replacement.id, {
         expectedVersion: rotated.replacement.version,
         overlapSeconds: 0,

@@ -55,6 +55,10 @@ a public or externally routed endpoint. Terminate TLS at the object store for th
 Uploads default to 25 MiB with at most four concurrent uploads per application replica and two per
 user. Tune `UPLOAD_MAX_BYTES`, `UPLOAD_MAX_CONCURRENT`, and `UPLOAD_MAX_CONCURRENT_PER_USER` while
 keeping the application `/tmp` tmpfs large enough for the resulting worst-case staged bytes.
+Interrupted content-addressed uploads remain resumable for seven days by default. After
+`FILE_UPLOAD_RECOVERY_MAX_AGE_SECONDS`, the API refunds the reservation, records an explicit
+`upload_recovery_expired` terminal response, and schedules delayed reference-fenced object cleanup.
+This age policy bounds permanently ambiguous storage failures without labeling them as corruption.
 
 Audio transcription is independently bounded to 25 MiB per request and defaults to four active
 requests across all API replicas, with two per user. Tune `AUDIO_MAX_CONCURRENT` and
@@ -308,6 +312,17 @@ scrub-run tables; it does not rewrite existing provider-attempt rows. After depl
 Retention admin screen reports capture disabled, run a zero-result preview, and verify the worker
 can query the new durable job type before enabling capture.
 
+Migration `0049` makes retention scrub runs system-ownable and adds the singleton automatic
+retention schedule. Every worker may check the schedule: PostgreSQL serializes those checks on the
+singleton row and commits the snapshotted scrub run, durable job, schedule advance, and null-actor
+audit evidence in one transaction. The default interval is one day
+(`RETENTION_SCRUB_INTERVAL_SECONDS=86400`, bounded from 300 through 2592000 seconds), checked once a
+minute (`RETENTION_SCHEDULER_POLL_SECONDS=60`, bounded from 10 through 3600 seconds). Missed cadence
+slots coalesce into one run with current cutoffs, policy changes trigger a fresh run without waiting
+for the old deadline, and a shorter configured interval is rebased from the last durable schedule.
+Backups include the schedule state; restoring an older supported archive initializes it due
+immediately.
+
 ## Monitoring
 
 Alert on readiness, HTTP error ratio, stream starts without first tokens, queue age, failed jobs,
@@ -348,11 +363,20 @@ docker compose --profile observability up -d prometheus
 ```
 
 The Prometheus UI is published through `PROMETHEUS_HOST_PORT` on `PROMETHEUS_BIND_ADDRESS=127.0.0.1`
-by default; firewall it before choosing a non-loopback bind on a remote host.
+by default; firewall it before choosing a non-loopback bind on a remote host. Prometheus has no
+startup dependency on the API or worker, so it can boot with zero targets and report their absence.
+API and worker exporters use fixed private ports 9090 and 9091 respectively; these ports are
+deliberately not configurable because the bundled discovery contract must never drift. Run
+`bash tests/assert-observability-profile.sh` against a disposable healthy stack to exercise scaled
+DNS discovery, the private exporter boundary, loaded alert rules, and zero-target detection. For a
+rolling upgrade, an inherited `METRICS_PORT` equal to that service's fixed port is accepted as a
+deprecated no-op; remove it after the rollout. Any conflicting value fails startup.
 `deploy/prometheus/alerts.yml` covers target/readiness failures, dependency failures, API 5xx ratio,
-queue depth/age/stalls, worker database failures, provider failures, and observed open circuits.
-Queue gauges come from a bounded 15-second worker query; provider counters are emitted at the
-durable terminal-attempt boundary. They contain neither user nor model/provider labels.
+post-dispatch HTTP response-body failures, queue depth/age/stalls, worker database failures,
+provider failures, and observed open circuits. Queue gauges come from a bounded 15-second worker
+query; provider counters are emitted at the durable terminal-attempt boundary. HTTP lifecycle
+counters distinguish completed, cancelled, and failed delivery without exposing request content.
+They contain neither user nor model/provider labels.
 
 Native Deno OpenTelemetry must remain disabled with `OTEL_DENO=false`: native server and client
 spans retain raw full URLs, paths, and queries in their exported attribute list, even after user
@@ -360,12 +384,21 @@ code adds redacted replacements. Enable DG Chat's privacy-bounded manual SDK wit
 `DG_CHAT_OTEL_ENABLED=true`, an explicit credential-free `OTEL_EXPORTER_OTLP_ENDPOINT` (or the
 trace-specific endpoint), and optionally an `OTEL_EXPORTER_OTLP_HEADERS` deployment secret. The
 exporter owns that header value and DG Chat never logs or returns it. The supported protocol is
-`http/protobuf`. The default parent-based 10% sampler is configurable with
-`OTEL_TRACES_SAMPLER_ARG`; incoming W3C `traceparent` is honored without accepting baggage. API
-spans contain only bounded method and route-group attributes, while worker spans contain only
-bounded job types and categorical outcomes. No raw URL, query, header, user/model/provider identity,
-exception, prompt, or object key is attached. Shutdown closes both private metrics listeners and
-gives the bounded batch exporter 2.5 seconds to flush.
+`http/protobuf`. `DG_CHAT_OTEL_SAMPLER=local_random_ratio` is the required privacy-bounded
+algorithm, and its default 10% ratio is configurable with `OTEL_TRACES_SAMPLER_ARG`. Each remote or
+root request receives a fresh, locally random sampling decision. Incoming W3C `traceparent`
+identifiers are honored for correlation, but neither the remote sampled bit nor a caller-selected or
+reused trace ID can override the local ratio. Caller-controlled `tracestate` and baggage are
+ignored. API spans contain only bounded method and route-group attributes, while worker spans
+contain only bounded job types and categorical outcomes. No raw URL, query, header,
+user/model/provider identity, exception, prompt, or object key is attached. Shutdown closes both
+private metrics listeners and gives the bounded batch exporter 2.5 seconds to flush.
+
+During an upgrade, `OTEL_TRACES_SAMPLER` is ignored while DG Chat tracing is disabled. When tracing
+is enabled, the exact legacy value `parentbased_traceidratio` is accepted as a deprecated migration
+alias but is executed with DG Chat's safer local-random semantics; remove it and set
+`DG_CHAT_OTEL_SAMPLER=local_random_ratio`. Any other legacy sampler value fails startup rather than
+silently changing the privacy or telemetry-volume boundary.
 
 Provider connection tests and discovery are limited by `PROVIDER_ADMIN_RATE_LIMIT` (30 mutations per
 minute by default). Registry models are not published to users until the provider is enabled, has an

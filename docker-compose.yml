@@ -76,7 +76,6 @@ x-app-environment: &app-environment
   # Prometheus binds only inside the private backend network. Public nginx keeps /metrics denied.
   METRICS_ENABLED: ${METRICS_ENABLED:-true}
   METRICS_HOST: 0.0.0.0
-  METRICS_PORT: ${API_METRICS_PORT:-9090}
   # Native Deno auto-instrumentation includes raw URLs; keep it off and use the bounded SDK spans.
   OTEL_DENO: "false"
   DG_CHAT_OTEL_ENABLED: ${DG_CHAT_OTEL_ENABLED:-false}
@@ -84,7 +83,7 @@ x-app-environment: &app-environment
   OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
   OTEL_EXPORTER_OTLP_PROTOCOL: ${OTEL_EXPORTER_OTLP_PROTOCOL:-http/protobuf}
   OTEL_EXPORTER_OTLP_HEADERS: ${OTEL_EXPORTER_OTLP_HEADERS:-}
-  OTEL_TRACES_SAMPLER: ${OTEL_TRACES_SAMPLER:-parentbased_traceidratio}
+  DG_CHAT_OTEL_SAMPLER: ${DG_CHAT_OTEL_SAMPLER:-local_random_ratio}
   OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACES_SAMPLER_ARG:-0.1}
 
 x-app-service: &app-service
@@ -119,9 +118,12 @@ services:
       dockerfile: Dockerfile
       target: app
     networks:
-      - backend
-      - app-search
-      - egress
+      backend:
+        # This alias exists only on the scrape network, preventing duplicate targets through egress.
+        aliases:
+          - api-metrics
+      app-search:
+      egress:
     healthcheck:
       test: ["CMD", "busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8000/ready"]
       interval: 10s
@@ -223,6 +225,8 @@ services:
       TEMPORARY_CHAT_RETENTION_DAYS: ${TEMPORARY_CHAT_RETENTION_DAYS:-30}
       TEMPORARY_CHAT_PURGE_INTERVAL_SECONDS: ${TEMPORARY_CHAT_PURGE_INTERVAL_SECONDS:-300}
       TEMPORARY_CHAT_PURGE_BATCH_SIZE: ${TEMPORARY_CHAT_PURGE_BATCH_SIZE:-100}
+      RETENTION_SCRUB_INTERVAL_SECONDS: ${RETENTION_SCRUB_INTERVAL_SECONDS:-86400}
+      RETENTION_SCHEDULER_POLL_SECONDS: ${RETENTION_SCHEDULER_POLL_SECONDS:-60}
       DOCUMENT_CHUNK_SIZE_CHARS: ${DOCUMENT_CHUNK_SIZE_CHARS:-4000}
       DOCUMENT_CHUNK_OVERLAP_CHARS: ${DOCUMENT_CHUNK_OVERLAP_CHARS:-400}
       DOCUMENT_EXTRACTOR_VERSION: ${DOCUMENT_EXTRACTOR_VERSION:-builtin-document-v1}
@@ -252,14 +256,13 @@ services:
       S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
       METRICS_ENABLED: ${METRICS_ENABLED:-true}
       METRICS_HOST: 0.0.0.0
-      METRICS_PORT: ${WORKER_METRICS_PORT:-9091}
       OTEL_DENO: "false"
       DG_CHAT_OTEL_ENABLED: ${DG_CHAT_OTEL_ENABLED:-false}
       OTEL_SERVICE_NAME: ${OTEL_WORKER_SERVICE_NAME:-dg-chat-worker}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
       OTEL_EXPORTER_OTLP_PROTOCOL: ${OTEL_EXPORTER_OTLP_PROTOCOL:-http/protobuf}
       OTEL_EXPORTER_OTLP_HEADERS: ${OTEL_EXPORTER_OTLP_HEADERS:-}
-      OTEL_TRACES_SAMPLER: ${OTEL_TRACES_SAMPLER:-parentbased_traceidratio}
+      DG_CHAT_OTEL_SAMPLER: ${DG_CHAT_OTEL_SAMPLER:-local_random_ratio}
       OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACES_SAMPLER_ARG:-0.1}
     depends_on:
       migrate:
@@ -269,8 +272,10 @@ services:
       minio-init:
         condition: service_completed_successfully
     networks:
-      - backend
-      - egress
+      backend:
+        aliases:
+          - worker-metrics
+      egress:
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -457,7 +462,6 @@ services:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
       - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-15d}
-      - --web.enable-lifecycle
     volumes:
       - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./deploy/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
@@ -467,11 +471,6 @@ services:
     networks:
       - backend
       - egress
-    depends_on:
-      app:
-        condition: service_healthy
-      worker:
-        condition: service_healthy
     read_only: true
     tmpfs:
       - /tmp:size=32m,mode=1777

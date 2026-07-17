@@ -52,6 +52,11 @@ import {
 } from "./document-embedding-dispatch.ts";
 import { EmbeddingsProviderError } from "../../api/src/embeddings.ts";
 import { parseRetentionScrubPayload, processRetentionScrub } from "./retention-scrub.ts";
+import {
+  parseRetentionSchedulerConfig,
+  scheduleAutomaticRetention,
+} from "./retention-scheduler.ts";
+import { processFileObjectCleanup } from "./file-object-cleanup.ts";
 import { purgeTemporaryConversationBatch } from "./temporary-lifecycle.ts";
 import { retryClaimSettlement, settleClaimedJobFault } from "./claimed-job-recovery.ts";
 import { retryWorkerClaimedDatabaseOperation } from "./worker-database.ts";
@@ -202,6 +207,10 @@ const temporaryLifecycle = parseTemporaryLifecycleConfig({
   TEMPORARY_CHAT_RETENTION_DAYS: Deno.env.get("TEMPORARY_CHAT_RETENTION_DAYS"),
   TEMPORARY_CHAT_PURGE_INTERVAL_SECONDS: Deno.env.get("TEMPORARY_CHAT_PURGE_INTERVAL_SECONDS"),
   TEMPORARY_CHAT_PURGE_BATCH_SIZE: Deno.env.get("TEMPORARY_CHAT_PURGE_BATCH_SIZE"),
+});
+const retentionScheduler = parseRetentionSchedulerConfig({
+  RETENTION_SCRUB_INTERVAL_SECONDS: Deno.env.get("RETENTION_SCRUB_INTERVAL_SECONDS"),
+  RETENTION_SCHEDULER_POLL_SECONDS: Deno.env.get("RETENTION_SCHEDULER_POLL_SECONDS"),
 });
 if (!Number.isSafeInteger(pollMs) || pollMs < 10) {
   throw new Error("WORKER_POLL_MS must be an integer of at least 10 milliseconds");
@@ -1029,6 +1038,19 @@ async function processJob(
       if (!committed) throw new Error("Generated object cleanup claim was reclaimed");
       return "completed";
     }
+    case "file_object.cleanup": {
+      const deletion = operationSignal(
+        shutdownSignal,
+        Date.now() + Math.max(
+          0,
+          job.externalDeadlineMonotonicMs - performance.now() - jobDeadlineMarginMs,
+        ),
+      );
+      const outcome = await runDatabaseOperation(() =>
+        processFileObjectCleanup(sql, objectStore, job, deletion.signal)
+      ).finally(deletion.dispose);
+      return outcome === "deferred" ? "deferred" : "completed";
+    }
     case "retention.scrub": {
       const payload = parseRetentionScrubPayload(job.payload);
       const result = await runDatabaseOperation(() => processRetentionScrub(repository, payload));
@@ -1052,6 +1074,7 @@ async function processJob(
 
 let nextGeneratedCleanupSweep = Date.now() + generatedCleanupSweepMs;
 let nextTemporaryChatPurge = Date.now();
+let nextRetentionScheduleCheck = Date.now();
 
 const claimSettlementOptions = {
   signal: shutdownSignal,
@@ -1145,6 +1168,34 @@ try {
           if (error instanceof DatabaseOperationError) throw error;
           logOperationalFailure("worker_temporary_conversation_purge");
           nextTemporaryChatPurge = Date.now() + temporaryLifecycle.purgeIntervalMs;
+        }
+      }
+      if (Date.now() >= nextRetentionScheduleCheck) {
+        try {
+          const schedule = await runDatabaseOperation(() =>
+            scheduleAutomaticRetention(repository, retentionScheduler)
+          );
+          workerMetrics.setRetentionScheduleOverdue(schedule.overdueSeconds);
+          workerMetrics.recordRetentionScheduleOutcome(
+            schedule.scheduled ? "scheduled" : "not_due",
+          );
+          if (schedule.scheduled) {
+            console.log(JSON.stringify({
+              level: "info",
+              message: "Automatic retention scrub enqueued",
+              runId: schedule.run?.id,
+              reason: schedule.reason,
+              policyVersion: schedule.run?.policy.version,
+              overdueSeconds: schedule.overdueSeconds,
+              nextDueAt: schedule.nextDueAt,
+            }));
+          }
+          nextRetentionScheduleCheck = Date.now() + retentionScheduler.pollIntervalMs;
+        } catch (error) {
+          workerMetrics.recordRetentionScheduleOutcome("failed");
+          nextRetentionScheduleCheck = Date.now() + retentionScheduler.pollIntervalMs;
+          if (error instanceof DatabaseOperationError) throw error;
+          logOperationalFailure("worker_retention_scheduler");
         }
       }
       const job = await runDatabaseOperation(() => claimJob(sql, workerId, jobLeaseSeconds));

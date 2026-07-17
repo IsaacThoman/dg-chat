@@ -501,8 +501,8 @@ export const attachments = pgTable("attachments", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   deletedAt: timestamp("deleted_at", { withTimezone: true }),
 }, (table) => [
-  uniqueIndex("attachments_object_key_uq").on(table.objectKey),
-  uniqueIndex("attachments_owner_active_hash_uq").on(table.ownerId, table.sha256).where(
+  index("attachments_object_key_idx").on(table.objectKey),
+  index("attachments_owner_active_hash_idx").on(table.ownerId, table.sha256).where(
     sql`${table.deletedAt} IS NULL`,
   ),
   check(
@@ -1092,6 +1092,35 @@ export const apiIdempotencyEvents = pgTable("api_idempotency_events", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [primaryKey({ columns: [table.requestId, table.sequence] })]);
 
+export const fileUploadStaging = pgTable("file_upload_staging", {
+  requestId: uuid("request_id").primaryKey().references(() => apiIdempotencyRequests.id, {
+    onDelete: "cascade",
+  }),
+  ownerId: uuid("owner_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  objectKey: text("object_key").notNull(),
+  filename: text("filename").notNull(),
+  mimeType: text("mime_type").notNull(),
+  sizeBytes: bigint("size_bytes", { mode: "number" }).notNull(),
+  sha256: text("sha256").notNull(),
+  purpose: text("purpose").notNull(),
+  attachmentState: text("attachment_state").notNull(),
+  inspectionError: text("inspection_error"),
+  state: text("state").notNull().default("pending"),
+  attachmentId: uuid("attachment_id").references(() => attachments.id),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  index("file_upload_staging_state_idx").on(table.state, table.updatedAt),
+  check("file_upload_staging_state_check", sql`${table.state} IN ('pending','stored','finalized')`),
+  check("file_upload_staging_size_check", sql`${table.sizeBytes} >= 0`),
+  check("file_upload_staging_sha256_check", sql`${table.sha256} ~ '^[0-9a-f]{64}$'`),
+  check("file_upload_staging_purpose_check", sql`${table.purpose} = 'assistants'`),
+  check(
+    "file_upload_staging_attachment_state_check",
+    sql`${table.attachmentState} IN ('ready','quarantined')`,
+  ),
+]);
+
 export const providers = pgTable("providers", {
   id: uuid("id").primaryKey().defaultRandom(),
   slug: text("slug").notNull(),
@@ -1537,7 +1566,7 @@ export const retentionScrubRuns = pgTable("retention_scrub_runs", {
   responseBodyDays: integer("response_body_days").notNull(),
   requestCutoffAt: timestamp("request_cutoff_at", { withTimezone: true }).notNull(),
   responseCutoffAt: timestamp("response_cutoff_at", { withTimezone: true }).notNull(),
-  requestedBy: uuid("requested_by").notNull().references(() => users.id, { onDelete: "restrict" }),
+  requestedBy: uuid("requested_by").references(() => users.id, { onDelete: "restrict" }),
   capturesScrubbed: integer("captures_scrubbed").notNull().default(0),
   requestBodiesScrubbed: integer("request_bodies_scrubbed").notNull().default(0),
   responseBodiesScrubbed: integer("response_bodies_scrubbed").notNull().default(0),
@@ -1576,6 +1605,31 @@ export const retentionScrubRuns = pgTable("retention_scrub_runs", {
   check(
     "retention_scrub_runs_error_check",
     sql`${table.error} IS NULL OR char_length(${table.error}) <= 1000`,
+  ),
+]);
+
+export const retentionScheduleState = pgTable("retention_schedule_state", {
+  singletonId: integer("singleton_id").primaryKey().default(1),
+  intervalSeconds: integer("interval_seconds").notNull().default(86_400),
+  nextDueAt: timestamp("next_due_at", { withTimezone: true }).notNull().defaultNow(),
+  lastPolicyVersion: integer("last_policy_version").references(
+    () => retentionPolicyVersions.version,
+    { onDelete: "restrict" },
+  ),
+  lastScheduledAt: timestamp("last_scheduled_at", { withTimezone: true }),
+  lastRunId: uuid("last_run_id").references(() => retentionScrubRuns.id, {
+    onDelete: "set null",
+  }),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  check("retention_schedule_singleton_check", sql`${table.singletonId} = 1`),
+  check(
+    "retention_schedule_interval_check",
+    sql`${table.intervalSeconds} BETWEEN 300 AND 2592000`,
+  ),
+  check(
+    "retention_schedule_last_run_check",
+    sql`(${table.lastRunId} IS NULL AND ${table.lastScheduledAt} IS NULL) OR (${table.lastRunId} IS NOT NULL AND ${table.lastScheduledAt} IS NOT NULL)`,
   ),
 ]);
 

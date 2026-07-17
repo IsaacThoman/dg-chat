@@ -1,6 +1,7 @@
 import { assertEquals, assertRejects, assertStringIncludes } from "jsr:@std/assert@1.0.14";
 import postgres from "npm:postgres@3.4.7";
 import { DomainError, PostgresRepository } from "@dg-chat/database";
+import { runAuditTestMaintenanceSql } from "../../../packages/database/src/postgres-test-maintenance.ts";
 import { buildKnowledgeContext } from "./knowledge-context.ts";
 
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
@@ -12,10 +13,13 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
-    await sql`TRUNCATE conversation_knowledge_bindings, knowledge_collection_attachments,
-      knowledge_collections, audit_events, document_chunks, message_attachments, attachments,
-      jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users
-      RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      `TRUNCATE conversation_knowledge_bindings, knowledge_collection_attachments,
+        knowledge_collections, audit_events, document_chunks, message_attachments, attachments,
+        jobs, ledger_entries, usage_runs, api_tokens, sessions, messages, conversations, users
+        RESTART IDENTITY CASCADE`,
+    );
     await sql.end();
     const repo = await PostgresRepository.connect(databaseUrl!);
     try {

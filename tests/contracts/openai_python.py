@@ -525,10 +525,39 @@ if (
 file_text = f"Python files contract {uuid.uuid4()}\n"
 file_bytes = file_text.encode("utf-8")
 file_name = f"python-contract-{uuid.uuid4()}.txt"
-uploaded = client.files.create(
+file_idempotency_key = f"python-file-{uuid.uuid4()}"
+upload_result = client.files.with_raw_response.create(
     file=(file_name, io.BytesIO(file_bytes), "text/plain"),
     purpose="assistants",
+    extra_headers={"Idempotency-Key": file_idempotency_key},
 )
+uploaded = upload_result.parse()
+upload_replay = client.files.with_raw_response.create(
+    file=(file_name, io.BytesIO(file_bytes), "text/plain"),
+    purpose="assistants",
+    extra_headers={"Idempotency-Key": file_idempotency_key},
+)
+replayed_upload = upload_replay.parse()
+if (
+    replayed_upload.id != uploaded.id
+    or replayed_upload.model_dump() != uploaded.model_dump()
+    or upload_replay.headers.get("x-idempotent-replay") != "true"
+):
+    raise RuntimeError("Python files.create() idempotent replay contract failed")
+file_conflict = False
+try:
+    client.files.create(
+        file=(file_name, io.BytesIO(file_bytes + b"drift"), "text/plain"),
+        purpose="assistants",
+        extra_headers={"Idempotency-Key": file_idempotency_key},
+    )
+except Exception as error:
+    file_conflict = (
+        getattr(error, "status_code", None) == 409
+        and getattr(error, "code", None) == "idempotency_conflict"
+    )
+if not file_conflict:
+    raise RuntimeError("Python files.create() idempotency drift was not rejected")
 deleted = False
 pagination_uploads = [uploaded]
 try:

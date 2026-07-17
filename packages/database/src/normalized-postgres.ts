@@ -58,6 +58,7 @@ import {
   decodeConversationSearchCursor,
   DEFAULT_API_REPLAY_QUOTA,
   encodeConversationSearchCursor,
+  isCanonicalFileUploadObjectKey,
   KNOWLEDGE_EMBEDDING_DIMENSIONS,
   MAX_ACTIVE_CONVERSATION_SHARES,
   MAX_CONVERSATION_SHARE_ATTACHMENTS,
@@ -140,7 +141,10 @@ import type {
   EntitledProviderModel,
   FailApiRequestInput,
   FailGenerationInput,
+  FileUploadStage,
   FinalizeEmbeddingProviderUsageInput,
+  FinalizeFileUploadInput,
+  FinalizeFileUploadResult,
   FinalizeGeneratedAssetsInput,
   FinalizeProviderUsageInput,
   FinishEmbeddingProviderAttemptInput,
@@ -174,6 +178,7 @@ import type {
   ReserveChildProviderUsageInput,
   RetentionPolicy,
   RetentionPreview,
+  RetentionScheduleResult,
   RetentionScrubBatchResult,
   RetentionScrubFailureCode,
   RetentionScrubPage,
@@ -181,9 +186,11 @@ import type {
   RetentionScrubRun,
   RotateApiTokenInput,
   RotatedApiToken,
+  ScheduleRetentionScrubInput,
   SearchConversationKnowledgeInput,
   SessionSummary,
   SetProviderModelRouteInput,
+  StageFileUploadInput,
   StageGeneratedObjectInput,
   StartProviderAttemptInput,
   StoredProviderCredential,
@@ -659,6 +666,24 @@ function attachment(row: Row): AttachmentRecord {
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at ?? row.created_at),
     deletedAt: nullableIso(row.deleted_at),
+  };
+}
+function fileUploadStage(row: Row): FileUploadStage {
+  return {
+    requestId: String(row.request_id),
+    ownerId: String(row.owner_id),
+    objectKey: String(row.object_key),
+    filename: String(row.filename),
+    mimeType: String(row.mime_type),
+    sizeBytes: number(row.size_bytes),
+    sha256: String(row.sha256),
+    purpose: String(row.purpose),
+    attachmentState: row.attachment_state as FileUploadStage["attachmentState"],
+    inspectionError: row.inspection_error ? String(row.inspection_error) : null,
+    state: row.state as FileUploadStage["state"],
+    attachmentId: row.attachment_id ? String(row.attachment_id) : null,
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
   };
 }
 function generatedAsset(row: Row): GeneratedAssetRecord {
@@ -1355,6 +1380,8 @@ export class PostgresRepository implements DomainRepository {
         )
       `;
       await tx`INSERT INTO ledger_entries (user_id,usage_run_id,kind,amount_micros,balance_after_micros) VALUES (${userId},${`bootstrap:${userId}`},'grant',${credit},${credit})`;
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${userId},'identity.bootstrap_admin','user',${userId},'{}'::jsonb)`;
       return user(rows[0]);
     });
   }
@@ -1887,11 +1914,15 @@ export class PostgresRepository implements DomainRepository {
     expectedAuthorityEpoch: number,
   ) {
     const rows = await this.#sql.begin(async (tx) => {
-      const users = await tx<Row[]>`SELECT authority_epoch,state,deleted_at FROM users
+      const users = await tx<Row[]>`SELECT authority_epoch,state,deleted_at,approval_status,
+        password_reset_pending FROM users
         WHERE id=${userId} FOR UPDATE`;
       if (
         !users[0] || users[0].state !== "active" || users[0].deleted_at != null ||
-        number(users[0].authority_epoch) !== expectedAuthorityEpoch
+        number(users[0].authority_epoch) !== expectedAuthorityEpoch ||
+        (purpose === "password_reset" &&
+          (users[0].approval_status === "rejected" ||
+            users[0].password_reset_pending === true))
       ) throw new DomainError("account_unavailable", "Identity authority changed", 403);
       return await tx<{ user_id: string }[]>`
       INSERT INTO identity_tokens(user_id,purpose,token_hash,expires_at,authority_epoch)
@@ -1952,6 +1983,8 @@ export class PostgresRepository implements DomainRepository {
         UPDATE auth_users SET email_verified=true,updated_at=now()
         WHERE id=${userId}
       `;
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${userId},'identity.email_verified','user',${userId},'{}'::jsonb)`;
       return user(rows[0]);
     });
   }
@@ -1976,7 +2009,11 @@ export class PostgresRepository implements DomainRepository {
       }
       const userId = String(candidates[0].user_id);
       const users = await tx<Row[]>`SELECT * FROM users WHERE id=${userId} FOR UPDATE`;
-      if (!users[0] || users[0].state !== "active" || users[0].deleted_at !== null) {
+      if (
+        !users[0] || users[0].state !== "active" || users[0].deleted_at !== null ||
+        users[0].approval_status === "rejected" ||
+        users[0].password_reset_pending === true
+      ) {
         throw new DomainError("invalid_identity_token", "Reset token is invalid or expired", 400);
       }
       const tokens = await tx<Row[]>`SELECT id FROM identity_tokens
@@ -2003,6 +2040,8 @@ export class PostgresRepository implements DomainRepository {
       await tx`DELETE FROM auth_sessions WHERE user_id=${userId}`;
       await tx`UPDATE api_tokens SET revoked_at=now() WHERE user_id=${userId} AND revoked_at IS NULL`;
       await tx`UPDATE identity_tokens SET consumed_at=now() WHERE user_id=${userId} AND consumed_at IS NULL`;
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${userId},'identity.password_reset_completed','user',${userId},'{}'::jsonb)`;
       return user(rows[0]);
     });
   }
@@ -2020,7 +2059,11 @@ export class PostgresRepository implements DomainRepository {
       }
       const userId = candidates[0].value;
       const users = await tx<Row[]>`SELECT * FROM users WHERE id=${userId} FOR UPDATE`;
-      if (!users[0] || users[0].state !== "active" || users[0].deleted_at !== null) {
+      if (
+        !users[0] || users[0].state !== "active" || users[0].deleted_at !== null ||
+        users[0].approval_status === "rejected" ||
+        users[0].password_reset_pending === true
+      ) {
         throw new DomainError("invalid_identity_token", "Reset token is invalid or expired", 400);
       }
       const authorityEpoch = number(users[0].authority_epoch);
@@ -2055,6 +2098,8 @@ export class PostgresRepository implements DomainRepository {
         WHERE user_id=${userId}`;
       await tx`DELETE FROM auth_verifications
         WHERE value=${userId} AND identifier LIKE 'reset-password:%'`;
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${userId},'identity.password_reset_completed','user',${userId},'{}'::jsonb)`;
       return user(rows[0]);
     });
   }
@@ -4635,27 +4680,17 @@ export class PostgresRepository implements DomainRepository {
   async createAttachment(input: CreateAttachmentInput): Promise<CreateAttachmentResult> {
     validateAttachmentInput(input);
     return await this.#sql.begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtextextended(${`attachment-dedup:${input.ownerId}:${input.sha256}`},0))`;
+      await tx`SELECT pg_advisory_xact_lock(hashtextextended(${input.objectKey},0))`;
       const owner = await tx`SELECT id FROM users WHERE id=${input.ownerId} FOR UPDATE`;
       if (!owner.length) throw new DomainError("not_found", "User not found", 404);
-      const inserted = await tx<
+      const existing = await tx<
         Row[]
-      >`INSERT INTO attachments(owner_id,object_key,filename,mime_type,size_bytes,sha256,state,inspection_error,ingestion_status) VALUES(${input.ownerId},${input.objectKey},${input.filename},${input.mimeType},${input.sizeBytes},${input.sha256},${
-        input.state ?? "pending"
-      },${input.inspectionError ?? null},${
-        input.state === "ready" && isIngestibleDocumentMime(input.mimeType)
-          ? "queued"
-          : "not_applicable"
-      }) ON CONFLICT DO NOTHING RETURNING *`;
-      let record = inserted[0];
-      const deduplicated = !record;
-      if (!record) {
-        const existing = await tx<
-          Row[]
-        >`SELECT * FROM attachments WHERE owner_id=${input.ownerId} AND sha256=${input.sha256} AND deleted_at IS NULL FOR UPDATE`;
-        record = existing[0];
-        if (!record) {
-          throw new DomainError("object_key_taken", "Attachment object key already exists", 409);
-        }
+      >`SELECT * FROM attachments WHERE owner_id=${input.ownerId} AND sha256=${input.sha256}
+        AND deleted_at IS NULL ORDER BY created_at,id LIMIT 1 FOR UPDATE`;
+      let record = existing[0];
+      const deduplicated = Boolean(record);
+      if (record) {
         if (
           number(record.size_bytes) !== input.sizeBytes ||
           String(record.mime_type) !== input.mimeType
@@ -4666,6 +4701,22 @@ export class PostgresRepository implements DomainRepository {
             409,
           );
         }
+      } else {
+        const objectConflict = await tx`
+          SELECT id FROM attachments WHERE object_key=${input.objectKey} LIMIT 1`;
+        if (objectConflict.length) {
+          throw new DomainError("object_key_taken", "Attachment object key already exists", 409);
+        }
+        const inserted = await tx<
+          Row[]
+        >`INSERT INTO attachments(owner_id,object_key,filename,mime_type,size_bytes,sha256,state,inspection_error,ingestion_status) VALUES(${input.ownerId},${input.objectKey},${input.filename},${input.mimeType},${input.sizeBytes},${input.sha256},${
+          input.state ?? "pending"
+        },${input.inspectionError ?? null},${
+          input.state === "ready" && isIngestibleDocumentMime(input.mimeType)
+            ? "queued"
+            : "not_applicable"
+        }) RETURNING *`;
+        record = inserted[0];
       }
       const attachmentId = String(record.id);
       const idempotencyKey = `attachment.inspect:${attachmentId}`;
@@ -4684,6 +4735,204 @@ export class PostgresRepository implements DomainRepository {
         inspectionJobId: jobs[0] ? String(jobs[0].id) : null,
         deduplicated,
       };
+    });
+  }
+
+  async stageFileUpload(input: StageFileUploadInput) {
+    if (input.purpose !== "assistants") {
+      throw new DomainError("unsupported_purpose", "File purpose is not supported", 422);
+    }
+    validateAttachmentInput({
+      ownerId: input.ownerId,
+      objectKey: input.objectKey,
+      filename: input.filename,
+      mimeType: input.mimeType,
+      sizeBytes: input.sizeBytes,
+      sha256: input.sha256,
+      state: input.attachmentState,
+      inspectionError: input.inspectionError,
+    });
+    if (!isCanonicalFileUploadObjectKey(input.ownerId, input.sha256, input.objectKey)) {
+      throw new DomainError("validation_error", "File upload object key is invalid", 422);
+    }
+    return await this.#sql.begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtextextended(${input.objectKey},0))`;
+      const requests = await tx<Row[]>`
+        SELECT * FROM api_idempotency_requests WHERE id=${input.requestId} FOR UPDATE`;
+      if (
+        !requests[0] || String(requests[0].endpoint) !== "files" ||
+        String(requests[0].user_id) !== input.ownerId
+      ) throw new DomainError("idempotency_conflict", "File upload stage owner differs", 409);
+      const rows = await tx<Row[]>`
+        INSERT INTO file_upload_staging(request_id,owner_id,object_key,filename,mime_type,
+          size_bytes,sha256,purpose,attachment_state,inspection_error)
+        VALUES(${input.requestId},${input.ownerId},${input.objectKey},${input.filename},
+          ${input.mimeType},${input.sizeBytes},${input.sha256},${input.purpose},
+          ${input.attachmentState},${input.inspectionError})
+        ON CONFLICT(request_id) DO UPDATE SET request_id=EXCLUDED.request_id RETURNING *`;
+      const stage = fileUploadStage(rows[0]);
+      if (
+        stage.ownerId !== input.ownerId || stage.objectKey !== input.objectKey ||
+        stage.filename !== input.filename || stage.mimeType !== input.mimeType ||
+        stage.sizeBytes !== input.sizeBytes || stage.sha256 !== input.sha256 ||
+        stage.purpose !== input.purpose || stage.attachmentState !== input.attachmentState ||
+        stage.inspectionError !== input.inspectionError
+      ) throw new DomainError("idempotency_conflict", "File upload stage differs", 409);
+      return stage;
+    });
+  }
+  async markFileUploadStored(requestId: string, leaseToken: string) {
+    const rows = await this.#sql<Row[]>`
+      UPDATE file_upload_staging s SET state='stored',updated_at=now()
+      FROM api_idempotency_requests r WHERE s.request_id=${requestId}
+        AND r.id=s.request_id AND r.state='in_progress' AND r.lease_token=${leaseToken}
+        AND r.lease_expires_at>now() AND s.state IN ('pending','stored') RETURNING s.*`;
+    if (!rows[0]) throw new DomainError("stale_lease", "File upload lease is stale", 409);
+    return fileUploadStage(rows[0]);
+  }
+  async listStaleFileUploads(limit = 100) {
+    const rows = await this.#sql<Row[]>`
+      SELECT s.*,row_to_json(r.*) request FROM file_upload_staging s
+        JOIN api_idempotency_requests r
+        ON r.id=s.request_id WHERE s.state<>'finalized' AND r.state='in_progress'
+        AND r.lease_expires_at<=now() ORDER BY r.lease_expires_at LIMIT ${limit}`;
+    return rows.map((row) => ({
+      stage: fileUploadStage(row),
+      request: apiRequest(row.request as Row),
+    }));
+  }
+  async attachmentObjectReferenceCount(objectKey: string) {
+    const rows = await this.#sql<{ count: number }[]>`
+      SELECT count(*)::int count FROM attachments
+      WHERE object_key=${objectKey} AND deleted_at IS NULL`;
+    return rows[0]?.count ?? 0;
+  }
+
+  async finalizeFileUpload(
+    input: FinalizeFileUploadInput,
+  ): Promise<FinalizeFileUploadResult> {
+    validateAttachmentInput(input.attachment);
+    if (
+      input.request.responseStatus !== 201 || input.request.costMicros !== 0 ||
+      input.request.inputTokens !== 0 || input.request.outputTokens !== 0
+    ) throw new DomainError("validation_error", "File completion accounting is invalid", 422);
+    return await this.#sql.begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtextextended(${input.attachment.objectKey},0))`;
+      const requests = await tx<Row[]>`
+        SELECT *,lease_expires_at>now() AS lease_active
+        FROM api_idempotency_requests WHERE id=${input.request.id} FOR UPDATE`;
+      const request = requests[0];
+      if (!request) throw new DomainError("not_found", "Idempotent request not found", 404);
+      if (
+        String(request.user_id) !== input.attachment.ownerId ||
+        String(request.endpoint) !== "files" || String(request.model) !== "files/upload"
+      ) throw new DomainError("idempotency_conflict", "File completion owner differs", 409);
+      if (String(request.state) === "completed") {
+        let attachmentId: string | undefined;
+        try {
+          const parsed = JSON.parse(String(request.response_body ?? "{}"));
+          if (typeof parsed.id === "string") attachmentId = parsed.id;
+        } catch {
+          // Converted to a categorical corruption error below.
+        }
+        const prior = attachmentId
+          ? await tx<Row[]>`SELECT * FROM attachments WHERE id=${attachmentId}
+            AND owner_id=${input.attachment.ownerId}`
+          : [];
+        if (!prior[0]) {
+          throw new DomainError("idempotency_corrupt", "Stored file replay is invalid", 500);
+        }
+        return {
+          attachment: attachment(prior[0]),
+          request: apiRequest(request),
+        };
+      }
+      if (
+        String(request.state) !== "in_progress" ||
+        String(request.lease_token) !== input.request.leaseToken ||
+        request.lease_active !== true
+      ) throw new DomainError("stale_lease", "Idempotent request lease is no longer active", 409);
+      const owners = await tx`
+        SELECT id FROM users WHERE id=${input.attachment.ownerId} FOR UPDATE`;
+      if (!owners.length) throw new DomainError("not_found", "User not found", 404);
+      const stages = await tx<Row[]>`
+        SELECT * FROM file_upload_staging WHERE request_id=${input.request.id} FOR UPDATE`;
+      const stage = stages[0] ? fileUploadStage(stages[0]) : undefined;
+      if (
+        !stage || stage.state !== "stored" ||
+        stage.ownerId !== input.attachment.ownerId ||
+        stage.objectKey !== input.attachment.objectKey ||
+        stage.filename !== input.attachment.filename ||
+        stage.mimeType !== input.attachment.mimeType ||
+        stage.sizeBytes !== input.attachment.sizeBytes ||
+        stage.sha256 !== input.attachment.sha256 ||
+        stage.attachmentState !== (input.attachment.state ?? "pending") ||
+        stage.inspectionError !== (input.attachment.inspectionError ?? null)
+      ) throw new DomainError("file_upload_stage_conflict", "File upload stage differs", 409);
+      const peers = await tx<Row[]>`
+        SELECT * FROM attachments WHERE object_key=${input.attachment.objectKey}
+          AND deleted_at IS NULL FOR UPDATE`;
+      if (
+        peers.some((peer) =>
+          String(peer.owner_id) !== input.attachment.ownerId ||
+          String(peer.sha256) !== input.attachment.sha256 ||
+          number(peer.size_bytes) !== input.attachment.sizeBytes ||
+          String(peer.mime_type) !== input.attachment.mimeType
+        )
+      ) throw new DomainError("object_key_taken", "Attachment object key already exists", 409);
+      const inserted = await tx<Row[]>`
+        INSERT INTO attachments(owner_id,object_key,filename,mime_type,size_bytes,sha256,state,
+          inspection_error,ingestion_status)
+        VALUES(${input.attachment.ownerId},${input.attachment.objectKey},
+          ${input.attachment.filename},${input.attachment.mimeType},
+          ${input.attachment.sizeBytes},${input.attachment.sha256},
+          ${input.attachment.state ?? "pending"},${input.attachment.inspectionError ?? null},${
+        input.attachment.state === "ready" &&
+          isIngestibleDocumentMime(input.attachment.mimeType)
+          ? "queued"
+          : "not_applicable"
+      }) RETURNING *`;
+      const record = inserted[0];
+      const attachmentId = String(record.id);
+      if (!input.attachment.inspectionComplete) {
+        await tx`INSERT INTO jobs(type,payload,idempotency_key)
+          VALUES('attachment.inspect',${
+          tx.json({ attachmentId, ownerId: input.attachment.ownerId })
+        },${`attachment.inspect:${attachmentId}`})`;
+      }
+      if (String(record.ingestion_status) === "queued") {
+        await tx`INSERT INTO jobs(type,payload,idempotency_key)
+          VALUES('attachment.ingest',${
+          tx.json({ attachmentId, ownerId: input.attachment.ownerId })
+        },${`attachment.ingest:${attachmentId}`})`;
+      }
+      const materialized = attachment(record);
+      const responseBody = input.responseBody(materialized);
+      const responseBytes = new TextEncoder().encode(responseBody).length;
+      const reservedBytes = number(request.replay_reserved_bytes ?? 0);
+      if (
+        responseBytes > API_SSE_REPLAY_REQUEST_MAX_BYTES ||
+        (reservedBytes > 0 && responseBytes > reservedBytes)
+      ) throw new DomainError("replay_quota_exceeded", "Reserved replay capacity exceeded", 429);
+      const runs = await tx<Row[]>`
+        SELECT * FROM usage_runs WHERE id=${String(request.usage_run_id)} FOR UPDATE`;
+      if (!runs[0] || String(runs[0].status) !== "reserved") {
+        throw new DomainError("invalid_usage_state", "Usage run is not reserved", 409);
+      }
+      await tx`UPDATE usage_runs SET status='completed',cost_micros=0,input_tokens=0,
+        output_tokens=0,latency_ms=${input.request.latencyMs},run_lease_token=NULL,
+        run_lease_expires_at=NULL,completed_at=now()
+        WHERE id=${String(request.usage_run_id)}`;
+      const updated = await tx<Row[]>`
+        UPDATE api_idempotency_requests SET state='completed',lease_token=NULL,
+          lease_expires_at=NULL,response_status=201,response_headers=${
+        tx.json((input.request.responseHeaders ?? {}) as postgres.JSONValue)
+      },response_body=${responseBody},response_body_encoding='utf8',completed_at=now(),
+          updated_at=now(),expires_at=now()+retention_seconds*interval '1 second'
+        WHERE id=${input.request.id} RETURNING *`;
+      await tx`UPDATE file_upload_staging SET state='finalized',attachment_id=${attachmentId},
+        updated_at=now() WHERE request_id=${input.request.id}`;
+      return { attachment: materialized, request: apiRequest(updated[0]) };
     });
   }
 
@@ -7040,7 +7289,9 @@ export class PostgresRepository implements DomainRepository {
     return await this.#sql.begin(async (tx) => {
       const rows = await tx<Row[]>`SELECT r.* FROM usage_runs r
         WHERE r.status='reserved' AND r.run_lease_token IS NOT NULL
-          AND r.recovery_owner='provider'
+          -- Document embeddings share this conservative provider-attempt reaper once their owning
+          -- job is terminal. API replay and tool recovery remain fenced to their own state machines.
+          AND r.recovery_owner IN ('provider','document_embedding')
           AND r.run_lease_expires_at<=now() AND r.generation_lease_token IS NULL
           AND NOT EXISTS(SELECT 1 FROM api_idempotency_requests a WHERE a.usage_run_id=r.id)
           AND NOT EXISTS(
@@ -8204,6 +8455,16 @@ export class PostgresRepository implements DomainRepository {
       throw new DomainError("stale_lease", "Idempotent request lease is no longer active", 409);
     }
   }
+  async releaseApiRequestLease(id: string, leaseToken: string) {
+    const rows = await this.#sql<Row[]>`
+      UPDATE api_idempotency_requests SET lease_expires_at=now()-interval '1 millisecond',
+        updated_at=now() WHERE id=${id} AND state='in_progress' AND lease_token=${leaseToken}
+        AND lease_expires_at>now() RETURNING *`;
+    if (!rows[0]) throw new DomainError("stale_lease", "Idempotent request lease is stale", 409);
+    const events = await this.#sql<Row[]>`
+      SELECT * FROM api_idempotency_events WHERE request_id=${id} ORDER BY sequence`;
+    return apiRequest(rows[0], events.map(apiFrame));
+  }
   async reclaimApiRequest(id: string, expiredLeaseToken: string, leaseSeconds = 120) {
     if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1) {
       throw new DomainError("validation_error", "Lease duration is invalid", 422);
@@ -8600,6 +8861,9 @@ export class PostgresRepository implements DomainRepository {
         WHERE r.state='in_progress' AND r.lease_expires_at<=now()
           AND NOT (r.endpoint='images.generations' AND EXISTS(
             SELECT 1 FROM generated_assets ga WHERE ga.usage_run_id=r.usage_run_id))
+          AND NOT (r.endpoint='files' AND EXISTS(
+            SELECT 1 FROM file_upload_staging s
+            WHERE s.request_id=r.id AND s.state<>'finalized'))
         ORDER BY r.lease_expires_at FOR UPDATE OF r SKIP LOCKED LIMIT ${limit}`;
       for (const row of rows) {
         const id = String(row.id);
@@ -8731,23 +8995,64 @@ export class PostgresRepository implements DomainRepository {
       createdAt: iso(row.created_at),
     }));
   }
-  async enqueueJob(type: string, payload: unknown, availableAt?: string) {
-    const rows = await this.#sql<
-      Row[]
-    >`INSERT INTO jobs(type,payload,available_at) VALUES(${type},${
-      this.#sql.json(payload as postgres.JSONValue)
-    },${availableAt ?? new Date().toISOString()}) RETURNING id`;
-    return String(rows[0].id);
+  async enqueueJob(
+    type: string,
+    payload: unknown,
+    availableAt?: string,
+    idempotencyKey?: string,
+  ) {
+    if (idempotencyKey === undefined) {
+      const rows = await this.#sql<
+        Row[]
+      >`INSERT INTO jobs(type,payload,available_at) VALUES(${type},${
+        this.#sql.json(payload as postgres.JSONValue)
+      },${availableAt ?? new Date().toISOString()}) RETURNING id`;
+      return String(rows[0].id);
+    }
+    return await this.#sql.begin(async (tx) => {
+      const inserted = await tx<Row[]>`
+        INSERT INTO jobs(type,payload,available_at,idempotency_key)
+        VALUES(${type},${tx.json(payload as postgres.JSONValue)},
+          ${availableAt ?? new Date().toISOString()},${idempotencyKey})
+        ON CONFLICT(idempotency_key) DO NOTHING RETURNING id`;
+      if (inserted[0]) return String(inserted[0].id);
+      const existing = await tx<Row[]>`
+        SELECT id FROM jobs WHERE idempotency_key=${idempotencyKey}
+          AND type=${type} AND payload=${tx.json(payload as postgres.JSONValue)}`;
+      const prior = existing[0];
+      if (!prior) {
+        throw new DomainError(
+          "job_idempotency_conflict",
+          "Job idempotency key payload differs",
+          409,
+        );
+      }
+      return String(prior.id);
+    });
   }
   async adminSummary() {
     const totals = await this.#sql<
       Row[]
-    >`SELECT (SELECT count(*)::int FROM usage_runs) calls,(SELECT count(*)::int FROM users) users,COALESCE((SELECT sum(balance_micros) FROM users),0)::bigint balance_micros`;
+    >`SELECT (SELECT count(*)::numeric FROM usage_runs) calls,
+      (SELECT count(*)::numeric FROM users) users,
+      COALESCE((SELECT sum(balance_micros)::numeric FROM users),0::numeric) balance_micros`;
+    const calls = Number(totals[0].calls);
+    const users = Number(totals[0].users);
+    const balanceMicros = Number(totals[0].balance_micros);
+    if (
+      !Number.isSafeInteger(calls) || !Number.isSafeInteger(users) ||
+      !Number.isSafeInteger(balanceMicros)
+    ) {
+      throw new DomainError(
+        "accounting_overflow",
+        "Administrative usage summary exceeds safe integer bounds",
+        500,
+      );
+    }
     return {
-      calls: number(totals[0].calls),
-      users: number(totals[0].users),
-      balanceMicros: number(totals[0].balance_micros),
-      ledger: await this.listAllLedger(),
+      calls,
+      users,
+      balanceMicros,
     };
   }
   async adminAnalytics(query: AdminAnalyticsQuery): Promise<AdminAnalytics> {
@@ -8864,20 +9169,6 @@ export class PostgresRepository implements DomainRepository {
         statuses: await distribution("status"),
       };
     });
-  }
-  private async listAllLedger(): Promise<LedgerEntry[]> {
-    return (await this.#sql<Row[]>`SELECT * FROM ledger_entries ORDER BY user_id,sequence,id`).map((
-      row,
-    ) => ({
-      id: String(row.id),
-      userId: String(row.user_id),
-      sequence: number(row.sequence),
-      usageRunId: String(row.usage_run_id),
-      kind: row.kind as LedgerEntry["kind"],
-      amountMicros: number(row.amount_micros),
-      balanceAfterMicros: number(row.balance_after_micros),
-      createdAt: iso(row.created_at),
-    }));
   }
   async listJobs(query: AdminJobQuery = {}): Promise<AdminJobPage> {
     const limit = query.limit ?? 50;
@@ -9199,7 +9490,7 @@ export class PostgresRepository implements DomainRepository {
       responseBytes: number(row.response_bytes),
     };
   }
-  async enqueueRetentionScrub(input: EnqueueRetentionScrubInput, actorId: string) {
+  async enqueueRetentionScrub(input: EnqueueRetentionScrubInput, actorId: string | null) {
     if (
       !input.idempotencyKey || input.idempotencyKey.length < 8 ||
       input.idempotencyKey.length > 200 ||
@@ -9271,6 +9562,122 @@ export class PostgresRepository implements DomainRepository {
         policy_updated_at: current[0].updated_at,
         policy_updated_by: current[0].updated_by,
       });
+    });
+  }
+  async scheduleRetentionScrub(
+    input: ScheduleRetentionScrubInput,
+  ): Promise<RetentionScheduleResult> {
+    if (
+      !Number.isSafeInteger(input.intervalSeconds) || input.intervalSeconds < 300 ||
+      input.intervalSeconds > 2_592_000
+    ) {
+      throw new DomainError(
+        "validation_error",
+        "Retention schedule interval must be between 300 and 2592000 seconds",
+        422,
+      );
+    }
+    const now = new Date(input.now ?? new Date().toISOString());
+    if (!Number.isFinite(now.getTime())) {
+      throw new DomainError("validation_error", "Retention schedule time is invalid", 422);
+    }
+    const nowIso = now.toISOString();
+    return await this.#sql.begin(async (tx) => {
+      const rows = await tx<Row[]>`SELECT s.*,v.version current_policy_version,
+        v.capture_enabled,v.request_body_days,
+        v.response_body_days,v.updated_at policy_updated_at,v.updated_by policy_updated_by
+        FROM retention_schedule_state s
+        JOIN retention_policy_state ps ON ps.singleton_id=1
+        JOIN retention_policy_versions v ON v.version=ps.current_version
+        WHERE s.singleton_id=1 FOR UPDATE OF s`;
+      const state = rows[0];
+      if (!state) {
+        throw new DomainError("not_found", "Retention schedule is not initialized", 500);
+      }
+      let dueAt = new Date(String(state.next_due_at));
+      if (number(state.interval_seconds) !== input.intervalSeconds) {
+        const cadenceAnchor = state.last_scheduled_at === null
+          ? now.getTime()
+          : new Date(String(state.last_scheduled_at)).getTime();
+        dueAt = new Date(cadenceAnchor + input.intervalSeconds * 1_000);
+      }
+      const policyVersion = number(state.current_policy_version);
+      const lastPolicyVersion = state.last_policy_version === null
+        ? null
+        : number(state.last_policy_version);
+      const intervalDue = dueAt.getTime() <= now.getTime();
+      const policyChanged = lastPolicyVersion !== policyVersion;
+      const overdueSeconds = intervalDue
+        ? Math.max(0, Math.floor((now.getTime() - dueAt.getTime()) / 1_000))
+        : 0;
+      if (!intervalDue && !policyChanged) {
+        const unchanged = await tx<Row[]>`UPDATE retention_schedule_state
+          SET interval_seconds=${input.intervalSeconds},next_due_at=${dueAt.toISOString()},
+          updated_at=${nowIso}
+          WHERE singleton_id=1 RETURNING next_due_at`;
+        return {
+          scheduled: false,
+          reason: null,
+          run: null,
+          intervalSeconds: input.intervalSeconds,
+          nextDueAt: iso(unchanged[0].next_due_at),
+          overdueSeconds,
+        };
+      }
+      const reason = policyChanged ? "policy_changed" : "interval_due";
+      // The locked singleton state is the exactly-once fence. A unique key cannot collide with
+      // administrator-chosen idempotency keys created before automatic scheduling existed.
+      const idempotencyKey = `retention.auto:${crypto.randomUUID()}`;
+      const requestCutoffAt = new Date(
+        now.getTime() - number(state.request_body_days) * 86_400_000,
+      ).toISOString();
+      const responseCutoffAt = new Date(
+        now.getTime() - number(state.response_body_days) * 86_400_000,
+      ).toISOString();
+      const inserted = await tx<Row[]>`INSERT INTO retention_scrub_runs(idempotency_key,status,
+        policy_version,capture_enabled,request_body_days,response_body_days,request_cutoff_at,
+        response_cutoff_at,requested_by)
+        VALUES(${idempotencyKey},'queued',${policyVersion},${Boolean(state.capture_enabled)},
+          ${number(state.request_body_days)},${number(state.response_body_days)},${requestCutoffAt},
+          ${responseCutoffAt},NULL) RETURNING *`;
+      const runId = String(inserted[0].id);
+      await tx`INSERT INTO jobs(type,payload,idempotency_key) VALUES('retention.scrub',
+        ${tx.json({ runId })},${`retention.scrub:${runId}`})`;
+      const intervalMs = input.intervalSeconds * 1_000;
+      const nextDueMs = intervalDue
+        ? dueAt.getTime() +
+          (Math.floor((now.getTime() - dueAt.getTime()) / intervalMs) + 1) * intervalMs
+        : now.getTime() + intervalMs;
+      const nextDueAt = new Date(nextDueMs).toISOString();
+      await tx`UPDATE retention_schedule_state SET interval_seconds=${input.intervalSeconds},
+        next_due_at=${nextDueAt},last_policy_version=${policyVersion},last_scheduled_at=${nowIso},
+        last_run_id=${runId}::uuid,updated_at=${nowIso} WHERE singleton_id=1`;
+      await tx`INSERT INTO audit_events(action,target_type,target_id,metadata)
+        VALUES('retention.scrub.enqueued','retention_scrub_run',${runId},${
+        tx.json({ policyVersion, source: "automatic" } as postgres.JSONValue)
+      }),('retention.schedule.enqueued','retention_scrub_run',${runId},${
+        tx.json(
+          {
+            reason,
+            policyVersion,
+            intervalSeconds: input.intervalSeconds,
+            overdueSeconds,
+            nextDueAt,
+          } as postgres.JSONValue,
+        )
+      })`;
+      return {
+        scheduled: true,
+        reason,
+        run: retentionRun({
+          ...inserted[0],
+          policy_updated_at: state.policy_updated_at,
+          policy_updated_by: state.policy_updated_by,
+        }),
+        intervalSeconds: input.intervalSeconds,
+        nextDueAt,
+        overdueSeconds,
+      };
     });
   }
   async getRetentionScrubRun(id: string) {

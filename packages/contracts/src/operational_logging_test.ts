@@ -17,6 +17,12 @@ const expected = {
     code: "background_task_failed",
     message: "Temporary conversation purge failed",
   },
+  worker_retention_scheduler: {
+    component: "worker",
+    event: "worker.retention_scheduler.failed",
+    code: "background_task_failed",
+    message: "Automatic retention scheduling failed",
+  },
   database_repository_checkpoint: {
     component: "database",
     event: "database.repository_checkpoint.failed",

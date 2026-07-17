@@ -1,5 +1,35 @@
 import { assertEquals } from "jsr:@std/assert@1.0.14";
-import { matchesPasswordResetObservation } from "./better-auth.ts";
+import { canIssueFreshAuthentication, matchesPasswordResetObservation } from "./better-auth.ts";
+
+Deno.test("fresh authentication rejects terminal approval and lifecycle states", () => {
+  const available = {
+    approvalStatus: "pending" as const,
+    state: "active" as const,
+    deletedAt: null,
+    passwordResetPending: false,
+  };
+  assertEquals(canIssueFreshAuthentication(available), true);
+  assertEquals(
+    canIssueFreshAuthentication({ ...available, approvalStatus: "approved" }),
+    true,
+  );
+  assertEquals(
+    canIssueFreshAuthentication({ ...available, approvalStatus: "rejected" }),
+    false,
+  );
+  assertEquals(
+    canIssueFreshAuthentication({ ...available, state: "suspended" }),
+    false,
+  );
+  assertEquals(
+    canIssueFreshAuthentication({ ...available, deletedAt: new Date().toISOString() }),
+    false,
+  );
+  assertEquals(
+    canIssueFreshAuthentication({ ...available, passwordResetPending: true }),
+    false,
+  );
+});
 
 Deno.test("password-reset verification requires a reset-specific authority observation", () => {
   const base = {

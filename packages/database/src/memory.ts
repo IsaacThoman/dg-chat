@@ -65,6 +65,7 @@ import {
   encodeAdminResourceCursor,
   encodeAdminUserCursor,
   encodeConversationSearchCursor,
+  isCanonicalFileUploadObjectKey,
   MAX_ACTIVE_CONVERSATION_SHARES,
   MAX_CONVERSATION_SHARE_ATTACHMENTS,
   MAX_CONVERSATION_SHARE_CONTENT_CHARS,
@@ -139,7 +140,10 @@ import type {
   EntitledProviderModel,
   FailApiRequestInput,
   FailGenerationInput,
+  FileUploadStage,
   FinalizeEmbeddingProviderUsageInput,
+  FinalizeFileUploadInput,
+  FinalizeFileUploadResult,
   FinalizeGeneratedAssetsInput,
   FinalizeProviderUsageInput,
   FinishEmbeddingProviderAttemptInput,
@@ -176,6 +180,7 @@ import type {
   ReserveChildProviderUsageInput,
   RetentionPolicy,
   RetentionPreview,
+  RetentionScheduleResult,
   RetentionScrubBatchResult,
   RetentionScrubFailureCode,
   RetentionScrubPage,
@@ -183,9 +188,11 @@ import type {
   RetentionScrubRun,
   RotateApiTokenInput,
   RotatedApiToken,
+  ScheduleRetentionScrubInput,
   SearchConversationKnowledgeInput,
   SessionSummary,
   SetProviderModelRouteInput,
+  StageFileUploadInput,
   StageGeneratedObjectInput,
   StartProviderAttemptInput,
   StoredProviderCredential,
@@ -601,6 +608,21 @@ export class MemoryRepository {
   };
   readonly providerPayloadCaptures = new Map<string, ProviderPayloadCapture>();
   readonly retentionScrubRuns = new Map<string, RetentionScrubRun>();
+  retentionScheduleState: {
+    intervalSeconds: number;
+    nextDueAt: string;
+    lastPolicyVersion: number | null;
+    lastScheduledAt: string | null;
+    lastRunId: string | null;
+    updatedAt: string;
+  } = {
+    intervalSeconds: 86_400,
+    nextDueAt: new Date(0).toISOString(),
+    lastPolicyVersion: null,
+    lastScheduledAt: null,
+    lastRunId: null,
+    updatedAt: new Date(0).toISOString(),
+  };
   readonly conversations = new Map<string, Conversation>();
   readonly userPreferences = new Map<string, UserPreferences>();
   readonly conversationFolders = new Map<string, ConversationFolder>();
@@ -626,6 +648,7 @@ export class MemoryRepository {
   readonly generationControls = new Map<string, GenerationControl>();
   readonly apiIdempotencyRequests = new Map<string, ApiIdempotencyRequest>();
   readonly apiIdempotencyKeys = new Map<string, string>();
+  readonly fileUploadStages = new Map<string, FileUploadStage>();
   readonly jobs: Array<
     {
       id: string;
@@ -661,14 +684,30 @@ export class MemoryRepository {
     if ([...this.users.values()].some((user) => user.role === "admin")) {
       throw new DomainError("already_bootstrapped", "An administrator already exists", 409);
     }
-    const user = this.createUser({
-      ...input,
-      role: "admin",
-      approvalStatus: "approved",
-      emailVerified: true,
-    });
-    this.credit(user.id, `bootstrap:${user.id}`, "grant", startingCreditMicros);
-    return user;
+    const ledgerLength = this.ledger.length;
+    const auditLength = this.auditEvents.length;
+    let user: StoredUser | undefined;
+    try {
+      user = this.createUser({
+        ...input,
+        role: "admin",
+        approvalStatus: "approved",
+        emailVerified: true,
+      });
+      this.credit(user.id, `bootstrap:${user.id}`, "grant", startingCreditMicros);
+      this.recordAudit({
+        actorId: user.id,
+        action: "identity.bootstrap_admin",
+        targetType: "user",
+        targetId: user.id,
+      });
+      return user;
+    } catch (error) {
+      if (user) this.users.delete(user.id);
+      this.ledger.length = ledgerLength;
+      this.auditEvents.length = auditLength;
+      throw error;
+    }
   }
 
   createUser(
@@ -1494,7 +1533,9 @@ export class MemoryRepository {
     const user = this.users.get(userId);
     if (
       !user || user.state !== "active" || user.deletedAt !== null ||
-      user.authorityEpoch !== expectedAuthorityEpoch
+      user.authorityEpoch !== expectedAuthorityEpoch ||
+      (purpose === "password_reset" &&
+        (user.approvalStatus === "rejected" || user.passwordResetPending === true))
     ) throw new DomainError("account_unavailable", "Identity authority changed", 403);
     const existing = this.identityTokens.get(tokenHash);
     if (existing) {
@@ -1532,17 +1573,25 @@ export class MemoryRepository {
         400,
       );
     }
-    const user = this.users.get(token.userId)!;
-    if (user.state !== "active" || user.deletedAt !== null) {
-      throw new DomainError(
-        "invalid_identity_token",
-        "Verification token is invalid or expired",
-        400,
-      );
-    }
-    token.consumedAt = new Date().toISOString();
-    user.emailVerifiedAt = new Date().toISOString();
-    return user;
+    return this.#withAtomicAdminMutation(token.userId, () => {
+      const user = this.users.get(token.userId)!;
+      if (user.state !== "active" || user.deletedAt !== null) {
+        throw new DomainError(
+          "invalid_identity_token",
+          "Verification token is invalid or expired",
+          400,
+        );
+      }
+      token.consumedAt = new Date().toISOString();
+      user.emailVerifiedAt = new Date().toISOString();
+      this.recordAudit({
+        actorId: user.id,
+        action: "identity.email_verified",
+        targetType: "user",
+        targetId: user.id,
+      });
+      return user;
+    });
   }
   markUserEmailVerified(userId: string) {
     const user = this.users.get(userId);
@@ -1560,26 +1609,37 @@ export class MemoryRepository {
       Date.parse(token.expiresAt) <= Date.now() ||
       token.authorityEpoch !== this.users.get(token.userId)?.authorityEpoch
     ) throw new DomainError("invalid_identity_token", "Reset token is invalid or expired", 400);
-    const user = this.users.get(token.userId)!;
-    if (user.state !== "active" || user.deletedAt !== null) {
-      throw new DomainError("invalid_identity_token", "Reset token is invalid or expired", 400);
-    }
-    token.consumedAt = new Date().toISOString();
-    user.authorityEpoch++;
-    user.passwordHash = passwordHash;
-    this.invalidateUserSessions(user.id);
-    for (const apiToken of this.tokens.values()) {
-      if (apiToken.userId === user.id && !apiToken.revokedAt) {
-        apiToken.revokedAt = new Date().toISOString();
+    return this.#withAtomicAdminMutation(token.userId, () => {
+      const user = this.users.get(token.userId)!;
+      if (
+        user.state !== "active" || user.deletedAt !== null ||
+        user.approvalStatus === "rejected" || user.passwordResetPending === true
+      ) {
+        throw new DomainError("invalid_identity_token", "Reset token is invalid or expired", 400);
       }
-    }
-    const consumedAt = new Date().toISOString();
-    for (const identityToken of this.identityTokens.values()) {
-      if (identityToken.userId === user.id && !identityToken.consumedAt) {
-        identityToken.consumedAt = consumedAt;
+      token.consumedAt = new Date().toISOString();
+      user.authorityEpoch++;
+      user.passwordHash = passwordHash;
+      this.invalidateUserSessions(user.id);
+      for (const apiToken of this.tokens.values()) {
+        if (apiToken.userId === user.id && !apiToken.revokedAt) {
+          apiToken.revokedAt = new Date().toISOString();
+        }
       }
-    }
-    return user;
+      const consumedAt = new Date().toISOString();
+      for (const identityToken of this.identityTokens.values()) {
+        if (identityToken.userId === user.id && !identityToken.consumedAt) {
+          identityToken.consumedAt = consumedAt;
+        }
+      }
+      this.recordAudit({
+        actorId: user.id,
+        action: "identity.password_reset_completed",
+        targetType: "user",
+        targetId: user.id,
+      });
+      return user;
+    });
   }
   resetBetterAuthPassword(_token: string, _passwordHash: string): StoredUser {
     throw new DomainError(
@@ -3647,6 +3707,173 @@ export class MemoryRepository {
         : this.enqueueAttachmentInspection(attachment),
       deduplicated: false,
     };
+  }
+
+  stageFileUpload(input: StageFileUploadInput): FileUploadStage {
+    if (input.purpose !== "assistants") {
+      throw new DomainError("unsupported_purpose", "File purpose is not supported", 422);
+    }
+    this.validateAttachmentInput({
+      ownerId: input.ownerId,
+      objectKey: input.objectKey,
+      filename: input.filename,
+      mimeType: input.mimeType,
+      sizeBytes: input.sizeBytes,
+      sha256: input.sha256,
+      state: input.attachmentState,
+      inspectionError: input.inspectionError,
+    });
+    if (!isCanonicalFileUploadObjectKey(input.ownerId, input.sha256, input.objectKey)) {
+      throw new DomainError("validation_error", "File upload object key is invalid", 422);
+    }
+    const request = this.#apiRequest(input.requestId);
+    if (request.endpoint !== "files" || request.userId !== input.ownerId) {
+      throw new DomainError("idempotency_conflict", "File upload stage owner differs", 409);
+    }
+    const prior = this.fileUploadStages.get(input.requestId);
+    if (prior) {
+      const comparable = {
+        requestId: prior.requestId,
+        ownerId: prior.ownerId,
+        objectKey: prior.objectKey,
+        filename: prior.filename,
+        mimeType: prior.mimeType,
+        sizeBytes: prior.sizeBytes,
+        sha256: prior.sha256,
+        purpose: prior.purpose,
+        attachmentState: prior.attachmentState,
+        inspectionError: prior.inspectionError,
+      };
+      if (JSON.stringify(comparable) !== JSON.stringify(input)) {
+        throw new DomainError("idempotency_conflict", "File upload stage differs", 409);
+      }
+      return structuredClone(prior);
+    }
+    const now = new Date().toISOString();
+    const stage: FileUploadStage = {
+      ...input,
+      state: "pending",
+      attachmentId: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.fileUploadStages.set(input.requestId, stage);
+    return structuredClone(stage);
+  }
+  markFileUploadStored(requestId: string, leaseToken: string) {
+    const request = this.#apiRequest(requestId);
+    this.#assertLease(request, leaseToken);
+    const stage = this.fileUploadStages.get(requestId);
+    if (!stage) throw new DomainError("not_found", "File upload stage not found", 404);
+    if (stage.state === "finalized") {
+      throw new DomainError("file_upload_finalized", "File upload is already finalized", 409);
+    }
+    stage.state = "stored";
+    stage.updatedAt = new Date().toISOString();
+    return structuredClone(stage);
+  }
+  listStaleFileUploads(limit = 100) {
+    return [...this.fileUploadStages.values()].flatMap((stage) => {
+      const request = this.apiIdempotencyRequests.get(stage.requestId);
+      return stage.state !== "finalized" && request?.state === "in_progress" &&
+          request.leaseExpiresAt !== null && Date.parse(request.leaseExpiresAt) <= Date.now()
+        ? [{ stage: structuredClone(stage), request: structuredClone(request) }]
+        : [];
+    }).slice(0, limit);
+  }
+  attachmentObjectReferenceCount(objectKey: string) {
+    return [...this.attachments.values()].filter((attachment) =>
+      attachment.objectKey === objectKey && attachment.state !== "deleted"
+    ).length;
+  }
+
+  finalizeFileUpload(input: FinalizeFileUploadInput): FinalizeFileUploadResult {
+    this.validateAttachmentInput(input.attachment);
+    const request = this.#apiRequest(input.request.id);
+    if (
+      input.request.responseStatus !== 201 || input.request.costMicros !== 0 ||
+      input.request.inputTokens !== 0 || input.request.outputTokens !== 0
+    ) throw new DomainError("validation_error", "File completion accounting is invalid", 422);
+    if (request.endpoint !== "files" || request.userId !== input.attachment.ownerId) {
+      throw new DomainError("idempotency_conflict", "File completion owner differs", 409);
+    }
+    if (request.state === "completed") {
+      const id = JSON.parse(request.responseBody ?? "{}")?.id;
+      const prior = typeof id === "string" ? this.attachments.get(id) : undefined;
+      if (!prior || prior.ownerId !== input.attachment.ownerId) {
+        throw new DomainError("idempotency_corrupt", "Stored file replay is invalid", 500);
+      }
+      return { attachment: structuredClone(prior), request: structuredClone(request) };
+    }
+    this.#assertLease(request, input.request.leaseToken);
+    if (
+      request.endpoint !== "files" || request.model !== "files/upload" ||
+      input.request.responseStatus !== 201 || input.request.costMicros !== 0 ||
+      input.request.inputTokens !== 0 || input.request.outputTokens !== 0
+    ) throw new DomainError("validation_error", "File completion accounting is invalid", 422);
+    const stage = this.fileUploadStages.get(request.id);
+    if (
+      !stage || stage.state !== "stored" ||
+      stage.ownerId !== input.attachment.ownerId ||
+      stage.objectKey !== input.attachment.objectKey ||
+      stage.filename !== input.attachment.filename ||
+      stage.mimeType !== input.attachment.mimeType ||
+      stage.sizeBytes !== input.attachment.sizeBytes ||
+      stage.sha256 !== input.attachment.sha256 ||
+      stage.attachmentState !== (input.attachment.state ?? "pending") ||
+      stage.inspectionError !== (input.attachment.inspectionError ?? null)
+    ) throw new DomainError("file_upload_stage_conflict", "File upload stage differs", 409);
+    if (!this.users.has(input.attachment.ownerId)) {
+      throw new DomainError("not_found", "User not found", 404);
+    }
+    const objectPeers = [...this.attachments.values()].filter((attachment) =>
+      attachment.objectKey === input.attachment.objectKey && attachment.state !== "deleted"
+    );
+    if (
+      objectPeers.some((attachment) =>
+        attachment.ownerId !== input.attachment.ownerId ||
+        attachment.sha256 !== input.attachment.sha256 ||
+        attachment.sizeBytes !== input.attachment.sizeBytes ||
+        attachment.mimeType !== input.attachment.mimeType
+      )
+    ) throw new DomainError("object_key_taken", "Attachment object key already exists", 409);
+    const jobsBefore = this.jobs.length;
+    const now = new Date().toISOString();
+    const attachment: AttachmentRecord = {
+      ...input.attachment,
+      id: crypto.randomUUID(),
+      state: input.attachment.state ?? "pending",
+      inspectionError: input.attachment.inspectionError ?? null,
+      ingestionStatus: input.attachment.state === "ready" &&
+          isIngestibleDocumentMime(input.attachment.mimeType)
+        ? "queued"
+        : "not_applicable",
+      ingestionError: null,
+      ingestedAt: null,
+      createdAt: now,
+      updatedAt: now,
+      deletedAt: null,
+    };
+    this.attachments.set(attachment.id, attachment);
+    this.enqueueAttachmentIngestion(attachment);
+    if (!input.attachment.inspectionComplete) this.enqueueAttachmentInspection(attachment);
+    try {
+      const completed = this.#completeApi({
+        ...input.request,
+        responseBody: input.responseBody(attachment),
+      }, false);
+      stage.state = "finalized";
+      stage.attachmentId = attachment.id;
+      stage.updatedAt = new Date().toISOString();
+      return {
+        attachment: structuredClone(attachment),
+        request: completed,
+      };
+    } catch (error) {
+      this.attachments.delete(attachment.id);
+      this.jobs.splice(jobsBefore);
+      throw error;
+    }
   }
 
   listAttachments(ownerId: string, includeDeleted = false) {
@@ -6749,6 +6976,12 @@ export class MemoryRepository {
     }
     request.leaseExpiresAt = new Date(Date.now() + leaseSeconds * 1000).toISOString();
   }
+  releaseApiRequestLease(id: string, leaseToken: string) {
+    const request = this.#apiRequest(id);
+    this.#assertLease(request, leaseToken);
+    request.leaseExpiresAt = new Date(Date.now() - 1).toISOString();
+    return structuredClone(request);
+  }
   reclaimApiRequest(id: string, expiredLeaseToken: string, leaseSeconds = 120) {
     if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1) {
       throw new DomainError("validation_error", "Lease duration is invalid", 422);
@@ -6980,6 +7213,10 @@ export class MemoryRepository {
         request.endpoint === "images.generations" &&
         [...this.generatedAssets.values()].some((asset) => asset.usageRunId === request.usageRunId)
       ) continue;
+      const fileStage = request.endpoint === "files"
+        ? this.fileUploadStages.get(request.id)
+        : undefined;
+      if (fileStage && fileStage.state !== "finalized") continue;
       for (const attempt of this.providerAttempts.values()) {
         if (attempt.usageRunId !== request.usageRunId || attempt.status !== "running") continue;
         attempt.status = "cancelled";
@@ -7099,12 +7336,22 @@ export class MemoryRepository {
     };
   }
   adminSummary() {
-    return {
+    const result = {
       calls: this.usageRuns.size,
       users: this.users.size,
       balanceMicros: [...this.users.values()].reduce((sum, value) => sum + value.balanceMicros, 0),
-      ledger: [...this.ledger],
     };
+    if (
+      !Number.isSafeInteger(result.calls) || !Number.isSafeInteger(result.users) ||
+      !Number.isSafeInteger(result.balanceMicros)
+    ) {
+      throw new DomainError(
+        "accounting_overflow",
+        "Administrative usage summary exceeds safe integer bounds",
+        500,
+      );
+    }
+    return result;
   }
   adminAnalytics(query: AdminAnalyticsQuery): AdminAnalytics {
     const from = Date.parse(query.from);
@@ -7454,7 +7701,11 @@ export class MemoryRepository {
       responseBytes: responses.reduce((sum, value) => sum + value.responseBytes, 0),
     };
   }
-  enqueueRetentionScrub(input: EnqueueRetentionScrubInput, actorId: string): RetentionScrubRun {
+  enqueueRetentionScrub(
+    input: EnqueueRetentionScrubInput,
+    actorId: string | null,
+    validationNow = Date.now(),
+  ): RetentionScrubRun {
     if (
       !input.idempotencyKey || input.idempotencyKey.length < 8 ||
       input.idempotencyKey.length > 200 ||
@@ -7479,8 +7730,10 @@ export class MemoryRepository {
     if (input.expectedPolicyVersion !== this.retentionPolicy.version) {
       throw new DomainError("version_conflict", "Retention preview is stale", 409);
     }
-    const maximumRequestCutoff = Date.now() - this.retentionPolicy.requestBodyDays * 86_400_000;
-    const maximumResponseCutoff = Date.now() - this.retentionPolicy.responseBodyDays * 86_400_000;
+    const maximumRequestCutoff = validationNow -
+      this.retentionPolicy.requestBodyDays * 86_400_000;
+    const maximumResponseCutoff = validationNow -
+      this.retentionPolicy.responseBodyDays * 86_400_000;
     if (
       Date.parse(input.requestCutoffAt) > maximumRequestCutoff ||
       Date.parse(input.responseCutoffAt) > maximumResponseCutoff
@@ -7526,6 +7779,96 @@ export class MemoryRepository {
       metadata: { policyVersion: run.policy.version },
     });
     return structuredClone(run);
+  }
+  scheduleRetentionScrub(input: ScheduleRetentionScrubInput): RetentionScheduleResult {
+    if (
+      !Number.isSafeInteger(input.intervalSeconds) || input.intervalSeconds < 300 ||
+      input.intervalSeconds > 2_592_000
+    ) {
+      throw new DomainError(
+        "validation_error",
+        "Retention schedule interval must be between 300 and 2592000 seconds",
+        422,
+      );
+    }
+    const now = new Date(input.now ?? new Date().toISOString());
+    if (!Number.isFinite(now.getTime())) {
+      throw new DomainError("validation_error", "Retention schedule time is invalid", 422);
+    }
+    const state = this.retentionScheduleState;
+    let dueAt = new Date(state.nextDueAt);
+    if (state.lastScheduledAt === null && state.lastPolicyVersion === null) {
+      dueAt = new Date(now);
+      state.nextDueAt = dueAt.toISOString();
+    }
+    if (state.intervalSeconds !== input.intervalSeconds) {
+      const cadenceAnchor = state.lastScheduledAt === null
+        ? now.getTime()
+        : Date.parse(state.lastScheduledAt);
+      dueAt = new Date(cadenceAnchor + input.intervalSeconds * 1_000);
+      state.nextDueAt = dueAt.toISOString();
+    }
+    const intervalDue = dueAt.getTime() <= now.getTime();
+    const policyChanged = state.lastPolicyVersion !== this.retentionPolicy.version;
+    const overdueSeconds = intervalDue
+      ? Math.max(0, Math.floor((now.getTime() - dueAt.getTime()) / 1_000))
+      : 0;
+    state.intervalSeconds = input.intervalSeconds;
+    if (!intervalDue && !policyChanged) {
+      state.updatedAt = now.toISOString();
+      return {
+        scheduled: false,
+        reason: null,
+        run: null,
+        intervalSeconds: state.intervalSeconds,
+        nextDueAt: state.nextDueAt,
+        overdueSeconds,
+      };
+    }
+    const reason = policyChanged ? "policy_changed" : "interval_due";
+    const preview = {
+      expectedPolicyVersion: this.retentionPolicy.version,
+      requestCutoffAt: new Date(
+        now.getTime() - this.retentionPolicy.requestBodyDays * 86_400_000,
+      ).toISOString(),
+      responseCutoffAt: new Date(
+        now.getTime() - this.retentionPolicy.responseBodyDays * 86_400_000,
+      ).toISOString(),
+      // The singleton schedule state is the exactly-once fence. A unique key cannot collide with
+      // administrator-chosen idempotency keys created before automatic scheduling existed.
+      idempotencyKey: `retention.auto:${crypto.randomUUID()}`,
+    };
+    const run = this.enqueueRetentionScrub(preview, null, now.getTime());
+    const intervalMs = input.intervalSeconds * 1_000;
+    const nextDueMs = intervalDue
+      ? dueAt.getTime() +
+        (Math.floor((now.getTime() - dueAt.getTime()) / intervalMs) + 1) * intervalMs
+      : now.getTime() + intervalMs;
+    state.nextDueAt = new Date(nextDueMs).toISOString();
+    state.lastPolicyVersion = this.retentionPolicy.version;
+    state.lastScheduledAt = now.toISOString();
+    state.lastRunId = run.id;
+    state.updatedAt = now.toISOString();
+    this.recordAudit({
+      action: "retention.schedule.enqueued",
+      targetType: "retention_scrub_run",
+      targetId: run.id,
+      metadata: {
+        reason,
+        policyVersion: run.policy.version,
+        intervalSeconds: input.intervalSeconds,
+        overdueSeconds,
+        nextDueAt: state.nextDueAt,
+      },
+    });
+    return {
+      scheduled: true,
+      reason,
+      run,
+      intervalSeconds: state.intervalSeconds,
+      nextDueAt: state.nextDueAt,
+      overdueSeconds,
+    };
   }
   getRetentionScrubRun(id: string): RetentionScrubRun {
     if (!/^[0-9a-f-]{36}$/i.test(id)) {
@@ -7639,7 +7982,25 @@ export class MemoryRepository {
     return this.ledger.filter((entry) => entry.userId === userId);
   }
 
-  enqueueJob(type: string, payload: unknown): string {
+  enqueueJob(
+    type: string,
+    payload: unknown,
+    availableAt?: string,
+    idempotencyKey?: string,
+  ): string {
+    if (idempotencyKey !== undefined) {
+      const prior = this.jobs.find((job) => job.idempotencyKey === idempotencyKey);
+      if (prior) {
+        if (prior.type !== type || JSON.stringify(prior.payload) !== JSON.stringify(payload)) {
+          throw new DomainError(
+            "job_idempotency_conflict",
+            "Job idempotency key payload differs",
+            409,
+          );
+        }
+        return prior.id;
+      }
+    }
     const id = crypto.randomUUID();
     this.jobs.push({
       id,
@@ -7647,11 +8008,12 @@ export class MemoryRepository {
       payload,
       status: "queued",
       attempts: 0,
-      availableAt: new Date().toISOString(),
+      availableAt: availableAt ?? new Date().toISOString(),
       lockedAt: null,
       lockedBy: null,
       lastError: null,
       completedAt: null,
+      idempotencyKey,
       createdAt: new Date().toISOString(),
     });
     return id;

@@ -779,6 +779,56 @@ export interface CreateAttachmentResult {
   inspectionJobId: string | null;
   deduplicated: boolean;
 }
+export interface FinalizeFileUploadInput {
+  attachment: CreateAttachmentInput;
+  request: Omit<
+    CompleteApiRequestInput,
+    "responseBody" | "responseBodyEncoding" | "frames" | "terminalFrame"
+  >;
+  responseBody: (attachment: AttachmentRecord) => string;
+}
+export interface FinalizeFileUploadResult {
+  attachment: AttachmentRecord;
+  request: ApiIdempotencyRequest;
+}
+export interface FileUploadStage {
+  requestId: string;
+  ownerId: string;
+  objectKey: string;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+  sha256: string;
+  purpose: string;
+  attachmentState: "ready" | "quarantined";
+  inspectionError: string | null;
+  state: "pending" | "stored" | "finalized";
+  attachmentId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+export type StageFileUploadInput = Omit<
+  FileUploadStage,
+  "state" | "attachmentId" | "createdAt" | "updatedAt"
+>;
+
+/** Accept only the content-addressed namespace shared by Files uploads and cleanup jobs. */
+export function isCanonicalFileUploadObjectKey(
+  ownerId: string,
+  sha256: string,
+  objectKey: string,
+): boolean {
+  if (!/^[a-zA-Z0-9_-]{1,128}$/.test(ownerId) || !/^[0-9a-f]{64}$/.test(sha256)) return false;
+  const escapedOwner = ownerId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(
+    `^uploads/${escapedOwner}/blobs/${sha256.slice(0, 2)}/${sha256}\\.[a-z0-9]{1,12}$`,
+  ).test(objectKey);
+}
+
+export interface StaleFileUpload {
+  stage: FileUploadStage;
+  request: ApiIdempotencyRequest;
+}
 
 export type GeneratedAssetInputRole = "source" | "mask" | "reference";
 export interface GeneratedAssetInput {
@@ -1320,7 +1370,6 @@ export interface AdminSummary {
   calls: number;
   users: number;
   balanceMicros: number;
-  ledger: LedgerEntry[];
 }
 export type AnalyticsBucket = "hour" | "day";
 export type AdminAnalyticsStatus = "reserved" | "completed" | "failed";
@@ -1513,10 +1562,27 @@ export interface EnqueueRetentionScrubInput {
   requestCutoffAt: string;
   responseCutoffAt: string;
 }
+export interface ScheduleRetentionScrubInput {
+  /** Durable cadence. Production configuration is bounded to five minutes through thirty days. */
+  intervalSeconds: number;
+  /** Injectable only so memory and PostgreSQL implementations can exercise identical boundaries. */
+  now?: string;
+}
+export type RetentionScheduleReason = "interval_due" | "policy_changed";
+export interface RetentionScheduleResult {
+  scheduled: boolean;
+  reason: RetentionScheduleReason | null;
+  run: RetentionScrubRun | null;
+  intervalSeconds: number;
+  nextDueAt: string;
+  /** How late the due slot was when this scheduling transaction began. */
+  overdueSeconds: number;
+}
 export type ApiIdempotencyEndpoint =
   | "chat.completions"
   | "responses"
   | "embeddings"
+  | "files"
   | "images.generations"
   | "images.edits"
   | "audio.transcriptions"
@@ -2121,6 +2187,7 @@ export type UsageRecoveryOwner =
 export interface DomainRepository {
   readonly storageKind: "postgres" | "memory";
   close(): MaybePromise<void>;
+  /** Creates the first administrator, credit grant, and bootstrap audit as one transaction. */
   bootstrapAdmin(input: CreateUserInput, startingCreditMicros: number): MaybePromise<StoredUser>;
   createUser(input: CreateUserInput): MaybePromise<StoredUser>;
   findUser(id: string): MaybePromise<StoredUser | undefined>;
@@ -2167,9 +2234,12 @@ export interface DomainRepository {
     expiresAt: string,
     expectedAuthorityEpoch: number,
   ): MaybePromise<void>;
+  /** Consumes the token, verifies the identity, and appends its audit as one transaction. */
   verifyEmail(tokenHash: string): MaybePromise<StoredUser>;
   markUserEmailVerified(userId: string): MaybePromise<StoredUser>;
+  /** Changes the credential, revokes prior authority, and appends its audit as one transaction. */
   resetPassword(tokenHash: string, passwordHash: string): MaybePromise<StoredUser>;
+  /** Better Auth equivalent of resetPassword, with the same transactional audit invariant. */
   resetBetterAuthPassword(token: string, passwordHash: string): MaybePromise<StoredUser>;
   recordAudit(input: AuditEventInput): MaybePromise<AuditEvent>;
   listAudit(query?: AuditQuery): MaybePromise<AuditPage>;
@@ -2324,6 +2394,11 @@ export interface DomainRepository {
     expectedVersion: number,
   ): MaybePromise<Conversation>;
   createAttachment(input: CreateAttachmentInput): MaybePromise<CreateAttachmentResult>;
+  stageFileUpload(input: StageFileUploadInput): MaybePromise<FileUploadStage>;
+  markFileUploadStored(requestId: string, leaseToken: string): MaybePromise<FileUploadStage>;
+  listStaleFileUploads(limit?: number): MaybePromise<StaleFileUpload[]>;
+  attachmentObjectReferenceCount(objectKey: string): MaybePromise<number>;
+  finalizeFileUpload(input: FinalizeFileUploadInput): MaybePromise<FinalizeFileUploadResult>;
   listAttachments(ownerId: string, includeDeleted?: boolean): MaybePromise<AttachmentRecord[]>;
   listAttachmentPage(
     ownerId: string,
@@ -2665,6 +2740,7 @@ export interface DomainRepository {
     leaseSeconds?: number,
     observation?: ApiUsageObservation,
   ): MaybePromise<void>;
+  releaseApiRequestLease(id: string, leaseToken: string): MaybePromise<ApiIdempotencyRequest>;
   reclaimApiRequest(
     id: string,
     expiredLeaseToken: string,
@@ -2677,7 +2753,12 @@ export interface DomainRepository {
   pruneExpiredApiRequests(limit?: number): MaybePromise<number>;
   usage(userId: string): MaybePromise<UsageSummary>;
   listLedger(userId: string): MaybePromise<LedgerEntry[]>;
-  enqueueJob(type: string, payload: unknown, availableAt?: string): MaybePromise<string>;
+  enqueueJob(
+    type: string,
+    payload: unknown,
+    availableAt?: string,
+    idempotencyKey?: string,
+  ): MaybePromise<string>;
   adminSummary(): MaybePromise<AdminSummary>;
   adminAnalytics(query: AdminAnalyticsQuery): MaybePromise<AdminAnalytics>;
   listJobs(query?: AdminJobQuery): MaybePromise<AdminJobPage>;
@@ -2695,8 +2776,15 @@ export interface DomainRepository {
   previewRetentionScrub(): MaybePromise<RetentionPreview>;
   enqueueRetentionScrub(
     input: EnqueueRetentionScrubInput,
-    actorId: string,
+    actorId: string | null,
   ): MaybePromise<RetentionScrubRun>;
+  /**
+   * Atomically fences all scheduler replicas, snapshots the current policy/cutoffs, and enqueues
+   * at most one durable retention.scrub job for the due slot or newly activated policy version.
+   */
+  scheduleRetentionScrub(
+    input: ScheduleRetentionScrubInput,
+  ): MaybePromise<RetentionScheduleResult>;
   getRetentionScrubRun(id: string): MaybePromise<RetentionScrubRun>;
   listRetentionScrubRuns(query?: RetentionScrubQuery): MaybePromise<RetentionScrubPage>;
   scrubRetentionBatch(runId: string, limit?: number): MaybePromise<RetentionScrubBatchResult>;

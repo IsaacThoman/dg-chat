@@ -64,6 +64,27 @@ describe("operational admin API", () => {
       expect.objectContaining({ method: "POST", credentials: "include" }),
     );
   });
+
+  it("keeps the admin usage client contract bounded even if a server adds extra data", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      Response.json({
+        calls: 12,
+        users: 3,
+        balanceMicros: 4_500_000,
+        ledger: Array.from({ length: 10 }, () => ({ secret: "must-not-propagate" })),
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(api.adminUsage()).resolves.toEqual({
+      calls: 12,
+      users: 3,
+      balanceMicros: 4_500_000,
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/admin/usage",
+      expect.objectContaining({ credentials: "include" }),
+    );
+  });
 });
 
 describe("admin user security and billing API", () => {

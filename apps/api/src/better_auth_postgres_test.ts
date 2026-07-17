@@ -23,6 +23,14 @@ async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 
   throw new Error("Timed out waiting for asynchronous identity delivery");
 }
 
+function assertPrivateCookieResponse(response: Response): void {
+  assertEquals(response.headers.get("cache-control"), "private, no-store");
+  assertEquals(response.headers.get("pragma"), "no-cache");
+  assert(
+    (response.headers.get("vary") ?? "").split(",").map((value) => value.trim()).includes("Cookie"),
+  );
+}
+
 Deno.test({
   name: "Better Auth creates UUID-backed pending identities and limited sessions",
   ignore: !databaseUrl,
@@ -35,6 +43,7 @@ Deno.test({
     let repository: PostgresRepository | undefined;
     const verificationDeliveries: Array<{ email: string; url: string; token: string }> = [];
     const passwordResetDeliveries: Array<{ email: string; url: string; token: string }> = [];
+    const authOperationalLogs: string[] = [];
     let rejectPasswordResetDelivery = false;
     let rejectVerificationDelivery = false;
     let heldPasswordResetDelivery: Promise<void> | undefined;
@@ -222,6 +231,7 @@ Deno.test({
             mockOidc.fetch(input instanceof Request ? input : new Request(input, init)),
         },
         requireEmailVerification: true,
+        authLogSink: (line) => authOperationalLogs.push(line),
         sendVerificationEmail: (delivery) => {
           if (rejectVerificationDelivery) {
             return Promise.reject(new Error("injected verification delivery failure"));
@@ -296,6 +306,7 @@ Deno.test({
       assert(oidcSessionCookie);
       const oidcMe = await app.request("/api/auth/me", { headers: { cookie: oidcSessionCookie } });
       assertEquals(oidcMe.status, 200, await oidcMe.clone().text());
+      assertPrivateCookieResponse(oidcMe);
       const oidcIdentity = await oidcMe.json() as {
         user: { id: string; email: string; approvalStatus: string };
         limited: boolean;
@@ -379,6 +390,13 @@ Deno.test({
         { userId: legacyId, limited: false },
       );
       assertMatch(legacySession.authenticatedAt, /^\d{4}-\d{2}-\d{2}T/u);
+      const legacySignOut = await app.request("/api/auth/sign-out", {
+        method: "POST",
+        headers: { cookie: legacyCookie, origin: "http://localhost:5173" },
+      });
+      assertEquals(legacySignOut.status, 200, await legacySignOut.clone().text());
+      assertPrivateCookieResponse(legacySignOut);
+      assertEquals(await service.getSession(new Headers({ cookie: legacyCookie })), null);
       assertEquals(bootstrap.passwordHash, null);
       assertEquals(bootstrap.balanceMicros, 5_000_000);
       const bootstrapSignin = await service.handler(
@@ -637,6 +655,7 @@ Deno.test({
         }),
       });
       assertEquals(signup.status, 200, await signup.clone().text());
+      assertPrivateCookieResponse(signup);
       const body = await signup.json() as { user: { id: string; email: string } };
       assertMatch(
         body.user.id,
@@ -809,6 +828,61 @@ Deno.test({
         startingCreditMicros: 0,
         reason: "Exercise stale-cookie reauthentication",
       });
+      // Rejection invalidates full authority but deliberately leaves the already-issued physical
+      // status session able to observe the terminal decision.
+      assertEquals(
+        await (await app.request("/api/auth/status", { headers: { cookie } })).json(),
+        {
+          approvalStatus: "rejected",
+          state: "active",
+          emailVerified: true,
+          emailVerificationRequired: true,
+          sessionLimited: true,
+          fullSessionEligible: false,
+          fullAccess: false,
+        },
+      );
+      // A rejected identity must not use its password to mint another status capability.
+      const rejectedSignin = await app.request("/api/auth/sign-in/email", {
+        method: "POST",
+        headers: {
+          origin: "http://localhost:5173",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          email: "bridge@example.com",
+          password: "correct horse battery staple",
+        }),
+      });
+      assertEquals(rejectedSignin.status, 401, await rejectedSignin.clone().text());
+      assertPrivateCookieResponse(rejectedSignin);
+      assertEquals(rejectedSignin.headers.has("set-cookie"), false);
+      const resetRowsBeforeRejection = Number(
+        (await adminSql`
+          SELECT count(*)::int count FROM auth_verifications
+          WHERE identifier LIKE 'reset-password:%' AND value=${body.user.id}
+        `)[0].count,
+      );
+      const resetDeliveriesBeforeRejection = passwordResetDeliveries.length;
+      const rejectedReset = await app.request("/api/auth/password-reset/request", {
+        method: "POST",
+        headers: {
+          origin: "http://localhost:5173",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ email: "bridge@example.com" }),
+      });
+      assertEquals(rejectedReset.status, 202);
+      assertEquals(
+        Number(
+          (await adminSql`
+            SELECT count(*)::int count FROM auth_verifications
+            WHERE identifier LIKE 'reset-password:%' AND value=${body.user.id}
+          `)[0].count,
+        ),
+        resetRowsBeforeRejection,
+      );
+      assertEquals(passwordResetDeliveries.length, resetDeliveriesBeforeRejection);
       bridgeManaged = await repository.decideUserApproval({
         actorId: bootstrap.id,
         targetUserId: body.user.id,
@@ -987,6 +1061,42 @@ Deno.test({
         { userId: body.user.id, limited: false },
       );
       assertMatch(approvedSession.authenticatedAt, /^\d{4}-\d{2}-\d{2}T/u);
+      const originalRecordAudit = repository.recordAudit.bind(repository);
+      repository.recordAudit = (input) => {
+        if (input.action === "identity.login_succeeded") {
+          return Promise.reject(new Error("sensitive injected persistence details"));
+        }
+        return originalRecordAudit(input);
+      };
+      const loginWithUnavailableAudit = await (async () => {
+        try {
+          return await app.request("/api/auth/sign-in/email", {
+            method: "POST",
+            headers: {
+              origin: "http://localhost:5173",
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({
+              email: "bridge@example.com",
+              password: "correct horse battery staple",
+            }),
+          });
+        } finally {
+          repository.recordAudit = originalRecordAudit;
+        }
+      })();
+      assertEquals(
+        loginWithUnavailableAudit.status,
+        200,
+        await loginWithUnavailableAudit.clone().text(),
+      );
+      const outcomeFailureLog = authOperationalLogs.find((line) =>
+        line.includes("Authentication outcome audit persistence failed")
+      );
+      assert(outcomeFailureLog);
+      assertEquals(outcomeFailureLog.includes("bridge@example.com"), false);
+      assertEquals(outcomeFailureLog.includes("correct horse battery staple"), false);
+      assertEquals(outcomeFailureLog.includes("sensitive injected persistence details"), false);
       const staleLimitedRevoke = await app.request(
         `/api/sessions/better_auth:${approvedSession.id}`,
         {
@@ -1136,6 +1246,31 @@ Deno.test({
         })),
         [{ provider_id: "credential", password: true }],
       );
+      const authenticationAudit = (await repository.listAudit({ limit: 100 })).data;
+      for (
+        const action of [
+          "identity.signup",
+          "identity.login_succeeded",
+          "identity.login_failed",
+          "identity.oidc_login_succeeded",
+          "session.signed_out",
+        ]
+      ) {
+        assert(
+          authenticationAudit.some((event) => event.action === action),
+          `Missing durable authentication audit event ${action}`,
+        );
+      }
+      for (
+        const event of authenticationAudit.filter((candidate) =>
+          candidate.action === "identity.signup" ||
+          candidate.action.startsWith("identity.login_") ||
+          candidate.action.startsWith("identity.oidc_login_") ||
+          candidate.action.startsWith("session.sign")
+        )
+      ) {
+        assertEquals(event.metadata, {});
+      }
     } finally {
       await service?.close();
       await repository?.close();

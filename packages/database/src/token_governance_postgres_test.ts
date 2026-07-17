@@ -2,6 +2,7 @@ import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.14";
 import postgres from "npm:postgres@3.4.7";
 import { DomainError } from "./memory.ts";
 import { PostgresRepository } from "./normalized-postgres.ts";
+import { runAuditTestMaintenanceSql } from "./postgres-test-maintenance.ts";
 
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
 
@@ -12,9 +13,12 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 4 });
-    await sql`TRUNCATE access_group_tokens,access_group_models,access_group_users,access_groups,
-      model_aliases,model_price_versions,provider_models,providers,ledger_entries,usage_runs,
-      api_tokens,sessions,messages,conversations,users RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      `TRUNCATE access_group_tokens,access_group_models,access_group_users,access_groups,
+        model_aliases,model_price_versions,provider_models,providers,ledger_entries,usage_runs,
+        api_tokens,sessions,messages,conversations,users RESTART IDENTITY CASCADE`,
+    );
     const repo = await PostgresRepository.connect(databaseUrl!);
     try {
       const user = await repo.createUser({

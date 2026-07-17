@@ -1,5 +1,9 @@
 import { assertEquals, assertNotEquals } from "jsr:@std/assert@1.0.14";
 import postgres from "npm:postgres@3.4.7";
+import {
+  runAuditTestMaintenanceSql,
+  withAuditTestMaintenance,
+} from "../../../packages/database/src/postgres-test-maintenance.ts";
 import { recordIngestionFailure } from "./attachment-ingestion.ts";
 import {
   claimJob,
@@ -133,8 +137,11 @@ Deno.test({
     const jobId = crypto.randomUUID();
     const sentinel = "super-secret-parser-detail";
     try {
-      await sql`TRUNCATE jobs,retention_scrub_runs,retention_policy_state,
-        retention_policy_versions,users RESTART IDENTITY CASCADE`;
+      await runAuditTestMaintenanceSql(
+        sql,
+        `TRUNCATE jobs,retention_scrub_runs,retention_policy_state,
+          retention_policy_versions,users RESTART IDENTITY CASCADE`,
+      );
       await sql`INSERT INTO users(id,email,name,role,approval_status,state)
         VALUES(${userId},${`${userId}@retention-worker.test`},'Retention worker','admin','approved','active')`;
       await sql`INSERT INTO retention_policy_versions(version,capture_enabled,request_body_days,
@@ -181,7 +188,10 @@ Deno.test({
       assertEquals(audit.includes("invalid_job_payload"), true);
     } finally {
       await sql`DELETE FROM jobs WHERE id=${jobId}`;
-      await sql`DELETE FROM audit_events WHERE target_id=${runId}`;
+      await withAuditTestMaintenance(
+        sql,
+        (tx) => tx`DELETE FROM audit_events WHERE target_id=${runId}`,
+      );
       await sql`DELETE FROM retention_scrub_runs WHERE id=${runId}`;
       await sql`DELETE FROM users WHERE id=${userId}`;
       await sql.end();

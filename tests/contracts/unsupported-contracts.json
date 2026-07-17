@@ -8,8 +8,8 @@
     "reason": "Non-empty include arrays, including reasoning.encrypted_content, and background=true are not implemented."
   },
   {
-    "endpoint": "POST /v1/files (purposes/idempotency)",
-    "reason": "Only purpose=assistants is accepted, and file upload does not yet implement Idempotency-Key replay or conflict detection."
+    "endpoint": "POST /v1/files (purposes)",
+    "reason": "Only purpose=assistants is accepted."
   },
   {
     "endpoint": "POST /v1/images/generations and /v1/images/edits (URL replay)",

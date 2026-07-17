@@ -21,6 +21,101 @@ import {
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
 
 Deno.test({
+  name: "terminal document-embedding ownership is conservatively reaped after its job fence",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 2 });
+    const repository = await PostgresRepository.connect(databaseUrl!);
+    const userId = crypto.randomUUID();
+    const jobId = crypto.randomUUID();
+    const claimToken = `embedding-owner-regression:${crypto.randomUUID()}`;
+    const job = {
+      id: jobId,
+      type: "document.embed",
+      payload: {},
+      attempts: 1,
+      claimToken,
+      idempotencyKey: `embedding-owner-regression:${jobId}`,
+      externalDeadlineMonotonicMs: performance.now() + 60_000,
+    };
+    try {
+      await sql`INSERT INTO users(id,email,name,password_hash,role,approval_status,balance_micros)
+        VALUES(${userId},${`${userId}@embedding-owner-regression.test`},'Embedding owner',
+          'hash','admin','approved',100)`;
+      await sql`INSERT INTO jobs(id,type,payload,status,attempts,locked_at,locked_by,idempotency_key)
+        VALUES(${jobId},'document.embed','{}'::jsonb,'running',1,now(),${claimToken},
+          ${job.idempotencyKey})`;
+      const prepared = await prepareDurableEmbeddingBatch(
+        sql,
+        job,
+        0,
+        "a".repeat(64),
+        1,
+        1,
+        5,
+      );
+      await repository.ensureIdempotentReservation({
+        userId,
+        usageRunId: prepared.usageRunId,
+        model: "embedding-owner-regression",
+        provider: "embedding:regression",
+        reservedMicros: 10,
+        recoveryOwner: "document_embedding",
+      });
+      await repository.startEmbeddingProviderAttempt({
+        usageRunId: prepared.usageRunId,
+        purpose: "document",
+        provider: "regression",
+        model: "embedding-owner-regression",
+        upstreamModel: "embedding-owner-regression",
+        itemCount: 1,
+      });
+      await beginDurableEmbeddingDispatch(sql, job, prepared);
+      await sql`UPDATE usage_runs SET run_lease_expires_at='2000-01-01T00:00:00Z'
+        WHERE id=${prepared.usageRunId}`;
+
+      // A running or queued owner is the no-double-dispatch fence even after accounting expires.
+      assertEquals(await repository.reapStaleProviderExecutionLeases(), 0);
+      await sql`UPDATE jobs SET status='failed',locked_at=NULL,locked_by=NULL,
+        last_error='uncertain provider outcome' WHERE id=${jobId}`;
+      assertEquals(await repository.reapStaleProviderExecutionLeases(), 1);
+      assertEquals(await repository.reapStaleProviderExecutionLeases(), 0);
+
+      assertEquals(
+        [
+          ...await sql`SELECT status,input_tokens::int,cost_micros::int,token_source,cost_source
+            FROM embedding_provider_attempts WHERE usage_run_id=${prepared.usageRunId}`,
+        ],
+        [{
+          status: "cancelled",
+          input_tokens: 5,
+          cost_micros: 10,
+          token_source: "estimated",
+          cost_source: "calculated",
+        }],
+      );
+      assertEquals(
+        [
+          ...await sql`SELECT status,input_tokens::int,cost_micros::int
+            FROM usage_runs WHERE id=${prepared.usageRunId}`,
+        ],
+        [{ status: "failed", input_tokens: 5, cost_micros: 10 }],
+      );
+      assertEquals(
+        (await sql<{ balance: number }[]>`SELECT balance_micros::int balance FROM users
+          WHERE id=${userId}`)[0].balance,
+        90,
+      );
+    } finally {
+      await repository.close();
+      await sql.end();
+    }
+  },
+});
+
+Deno.test({
   name:
     "durable embedding dispatch survives lease reaping and job reclamation without duplicate execution or charge",
   ignore: !databaseUrl,

@@ -1,5 +1,6 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.14";
 import postgres from "npm:postgres@3.4.7";
+import { runAuditTestMaintenanceSql } from "./postgres-test-maintenance.ts";
 import { PostgresToolExecutionStore } from "./tool-store.ts";
 
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
@@ -12,7 +13,10 @@ Deno.test({
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
     const store = PostgresToolExecutionStore.connect(databaseUrl!);
-    await sql`TRUNCATE auth_verifications, auth_sessions, auth_accounts, auth_users, tool_executions, tool_policies, audit_events, users RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      "TRUNCATE auth_verifications, auth_sessions, auth_accounts, auth_users, tool_executions, tool_policies, audit_events, users RESTART IDENTITY CASCADE",
+    );
     const users = await sql<{ id: string }[]>`
       INSERT INTO users(email,name,password_hash,approval_status)
       VALUES ('tool-owner@example.com','Owner','x','approved'),

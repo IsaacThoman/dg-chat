@@ -614,10 +614,34 @@ if (
 
 const fileText = `JavaScript files contract ${crypto.randomUUID()}\n`;
 const fileName = `javascript-contract-${crypto.randomUUID()}.txt`;
-const uploaded = await client.files.create({
+const fileIdempotencyKey = `javascript-file-${crypto.randomUUID()}`;
+const uploadResult = await client.files.create({
   file: await toFile(new TextEncoder().encode(fileText), fileName, { type: "text/plain" }),
   purpose: "assistants",
-});
+}, { headers: { "Idempotency-Key": fileIdempotencyKey } }).withResponse();
+const uploaded = uploadResult.data;
+const uploadReplay = await client.files.create({
+  file: await toFile(new TextEncoder().encode(fileText), fileName, { type: "text/plain" }),
+  purpose: "assistants",
+}, { headers: { "Idempotency-Key": fileIdempotencyKey } }).withResponse();
+if (
+  uploadReplay.data.id !== uploaded.id ||
+  JSON.stringify(uploadReplay.data) !== JSON.stringify(uploaded) ||
+  uploadReplay.response.headers.get("x-idempotent-replay") !== "true"
+) throw new Error("JavaScript files.create() idempotent replay contract failed");
+let fileConflict = false;
+try {
+  await client.files.create({
+    file: await toFile(new TextEncoder().encode(`${fileText}drift`), fileName, {
+      type: "text/plain",
+    }),
+    purpose: "assistants",
+  }, { headers: { "Idempotency-Key": fileIdempotencyKey } });
+} catch (error) {
+  const candidate = error as { status?: number; code?: string };
+  fileConflict = candidate.status === 409 && candidate.code === "idempotency_conflict";
+}
+if (!fileConflict) throw new Error("JavaScript files.create() idempotency drift was not rejected");
 let deleted = false;
 const paginationUploads = [uploaded];
 try {

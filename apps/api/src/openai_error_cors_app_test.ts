@@ -1,5 +1,6 @@
 import { assertEquals, assertStringIncludes } from "jsr:@std/assert@1.0.14";
 import { MemoryRepository } from "@dg-chat/database";
+import OpenAI from "npm:openai@6.16.0";
 import { createApp } from "./app.ts";
 
 async function json(response: Response) {
@@ -158,10 +159,38 @@ Deno.test("OpenAI validation preserves exact parameter paths and exposes governa
       origin: "http://localhost:5173",
       "access-control-request-method": "POST",
       "access-control-request-headers":
-        "authorization, content-type, idempotency-key, x-request-id",
+        "authorization, content-type, idempotency-key, openai-beta, openai-organization, " +
+        "openai-project, x-request-id, x-stainless-arch, x-stainless-custom-poll-interval, " +
+        "x-stainless-helper-method, x-stainless-lang, x-stainless-os, " +
+        "x-stainless-package-version, x-stainless-poll-helper, x-stainless-retry-count, " +
+        "x-stainless-runtime, x-stainless-runtime-version, x-stainless-timeout",
     },
   });
   assertEquals(preflight.status, 204);
+  const allowedRequestHeaders = (preflight.headers.get("access-control-allow-headers") ?? "")
+    .toLowerCase();
+  for (
+    const header of [
+      "authorization",
+      "content-type",
+      "idempotency-key",
+      "openai-beta",
+      "openai-organization",
+      "openai-project",
+      "x-request-id",
+      "x-stainless-arch",
+      "x-stainless-custom-poll-interval",
+      "x-stainless-helper-method",
+      "x-stainless-lang",
+      "x-stainless-os",
+      "x-stainless-package-version",
+      "x-stainless-poll-helper",
+      "x-stainless-retry-count",
+      "x-stainless-runtime",
+      "x-stainless-runtime-version",
+      "x-stainless-timeout",
+    ]
+  ) assertStringIncludes(allowedRequestHeaders, header);
   assertStringIncludes(
     (preflight.headers.get("access-control-expose-headers") ?? "").toLowerCase(),
     "x-idempotent-replay",
@@ -180,4 +209,57 @@ Deno.test("OpenAI validation preserves exact parameter paths and exposes governa
     (oversized.headers.get("access-control-expose-headers") ?? "").toLowerCase(),
     "retry-after",
   );
+});
+
+Deno.test("CORS accepts the metadata headers emitted by the official OpenAI JavaScript client", async () => {
+  const observed = new Set<string>();
+  const client = new OpenAI({
+    apiKey: "browser-test-token",
+    baseURL: "http://localhost:5173/v1",
+    organization: "org_browser_test",
+    project: "proj_browser_test",
+    dangerouslyAllowBrowser: true,
+    timeout: 12_000,
+    fetch: (_input, init) => {
+      new Headers(init?.headers).forEach((_value, name) => observed.add(name.toLowerCase()));
+      return Promise.resolve(Response.json({ object: "list", data: [] }));
+    },
+  });
+  await client.models.list();
+
+  const sdkMetadataHeaders = [...observed].filter((name) =>
+    name === "authorization" || name === "content-type" || name.startsWith("openai-") ||
+    name.startsWith("x-stainless-")
+  );
+  for (
+    const required of [
+      "authorization",
+      "openai-organization",
+      "openai-project",
+      "x-stainless-arch",
+      "x-stainless-lang",
+      "x-stainless-os",
+      "x-stainless-package-version",
+      "x-stainless-retry-count",
+      "x-stainless-runtime",
+      "x-stainless-runtime-version",
+    ]
+  ) assertEquals(sdkMetadataHeaders.includes(required), true, `SDK omitted ${required}`);
+
+  const { app } = createApp();
+  const preflight = await app.request("/v1/models", {
+    method: "OPTIONS",
+    headers: {
+      origin: "http://localhost:5173",
+      "access-control-request-method": "GET",
+      "access-control-request-headers": sdkMetadataHeaders.join(", "),
+    },
+  });
+  assertEquals(preflight.status, 204);
+  const allowed = new Set(
+    (preflight.headers.get("access-control-allow-headers") ?? "").toLowerCase().split(/\s*,\s*/),
+  );
+  for (const name of sdkMetadataHeaders) {
+    assertEquals(allowed.has(name), true, `CORS omitted SDK header ${name}`);
+  }
 });

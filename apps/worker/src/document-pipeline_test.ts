@@ -201,7 +201,10 @@ Deno.test("real extraction worker returns a structured document", async () => {
     bytes,
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     {},
-    Date.now() + 5_000,
+    // A real module worker performs a cold module graph check before its first message. Keep this
+    // integration assertion independent of host/CI contention; deadline behavior is covered by
+    // the deterministic timeout tests above.
+    Date.now() + 30_000,
   );
   assertEquals(result.text, "isolated text");
 });

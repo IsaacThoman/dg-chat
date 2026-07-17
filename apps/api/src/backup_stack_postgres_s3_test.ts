@@ -10,6 +10,7 @@ import {
   sha256Hex,
   verifyBackupDataCatalog,
 } from "@dg-chat/database";
+import { runAuditTestMaintenanceSql } from "../../../packages/database/src/postgres-test-maintenance.ts";
 import type { BackupArchiveSink } from "@dg-chat/database";
 import { DefaultBackupAdminService } from "./backup-service.ts";
 import { createPostgresBackupDataPort } from "./postgres-backup-data.ts";
@@ -92,7 +93,8 @@ Deno.test({
     const createdObjectKeys: string[] = [];
     try {
       await verifyBackupDataCatalog(databaseUrl!);
-      await sql.unsafe(
+      await runAuditTestMaintenanceSql(
+        sql,
         `TRUNCATE ${
           [
             ...new Set([

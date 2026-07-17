@@ -2,6 +2,7 @@ import { assertEquals, assertNotEquals, assertRejects } from "jsr:@std/assert@1.
 import postgres from "npm:postgres@3.4.7";
 import { DomainError } from "./memory.ts";
 import { PostgresRepository } from "./normalized-postgres.ts";
+import { withAuditTestMaintenance } from "./postgres-test-maintenance.ts";
 import type { CreateConversationShareInput } from "./repository.ts";
 
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
@@ -137,7 +138,10 @@ Deno.test({
       ]);
       assertEquals(JSON.stringify(audit).includes(input.secretHash), false);
     } finally {
-      await sql`DELETE FROM audit_events WHERE actor_id IN (${owner.id},${other.id})`;
+      await withAuditTestMaintenance(
+        sql,
+        (tx) => tx`DELETE FROM audit_events WHERE actor_id IN (${owner.id},${other.id})`,
+      );
       await sql`DELETE FROM conversation_share_snapshots WHERE owner_id IN (${owner.id},${other.id})`;
       await sql`DELETE FROM message_attachments WHERE attachment_id=${attachmentId}`;
       await sql`DELETE FROM attachments WHERE owner_id IN (${owner.id},${other.id})`;

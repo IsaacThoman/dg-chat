@@ -10,7 +10,9 @@
 - Put registration behind an abuse-resistant reverse proxy until distributed rate limiting and email
   verification are enabled.
 - Set upload byte, pixel, archive-expansion, processing-time, and per-user quota limits.
-- Keep payload retention disabled unless explicitly required; scrub content on schedule.
+- Keep payload retention disabled unless explicitly required. The worker automatically enqueues a
+  system-owned, policy-snapshotted scrub on the durable daily schedule by default; monitor scheduler
+  failure and overdue metrics rather than relying on an administrator to enqueue runs manually.
 - Back up the encryption keyring separately and test restore before production use.
 
 ## Application controls

@@ -2,6 +2,7 @@ import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.14";
 import postgres from "npm:postgres@3.4.7";
 import { DomainError } from "./memory.ts";
 import { PostgresRepository } from "./normalized-postgres.ts";
+import { withAuditTestMaintenance } from "./postgres-test-maintenance.ts";
 
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
 
@@ -113,7 +114,10 @@ Deno.test({
       );
     } finally {
       await sql`DELETE FROM attachments WHERE owner_id IN (${owner.id},${other.id})`;
-      await sql`DELETE FROM audit_events WHERE actor_id IN (${owner.id},${other.id})`;
+      await withAuditTestMaintenance(
+        sql,
+        (tx) => tx`DELETE FROM audit_events WHERE actor_id IN (${owner.id},${other.id})`,
+      );
       await sql`DELETE FROM users WHERE id IN (${owner.id},${other.id})`;
       await sql.end();
       await repo.close();

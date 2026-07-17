@@ -6,14 +6,6 @@ export interface MetricsListenerConfig {
   port: number;
 }
 
-function boundedPort(name: string, value: string | undefined, fallback: number): number {
-  const parsed = value === undefined || value.trim() === "" ? fallback : Number(value);
-  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > 65_535) {
-    throw new Error(`${name} must be an integer from 1 to 65535`);
-  }
-  return parsed;
-}
-
 function boolean(name: string, value: string | undefined, fallback: boolean): boolean {
   if (value === undefined || value.trim() === "") return fallback;
   if (value === "true") return true;
@@ -25,6 +17,15 @@ export function metricsListenerConfig(
   env: ObservabilityEnvironment,
   defaults: { port: number; enabled?: boolean },
 ): MetricsListenerConfig {
+  if (!Number.isSafeInteger(defaults.port) || defaults.port < 1 || defaults.port > 65_535) {
+    throw new Error("The internal metrics port must be an integer from 1 to 65535");
+  }
+  const legacyPort = env.METRICS_PORT?.trim();
+  if (legacyPort && legacyPort !== String(defaults.port)) {
+    throw new Error(
+      `METRICS_PORT is fixed at ${defaults.port}; remove the deprecated override`,
+    );
+  }
   const hostname = env.METRICS_HOST?.trim() || "127.0.0.1";
   if (hostname.includes("/") || hostname.includes("://") || hostname.length > 255) {
     throw new Error("METRICS_HOST must be a hostname or IP address without a URL scheme");
@@ -32,7 +33,7 @@ export function metricsListenerConfig(
   return {
     enabled: boolean("METRICS_ENABLED", env.METRICS_ENABLED, defaults.enabled ?? false),
     hostname,
-    port: boundedPort("METRICS_PORT", env.METRICS_PORT, defaults.port),
+    port: defaults.port,
   };
 }
 
@@ -97,9 +98,15 @@ export function telemetryConfig(
       "OTEL_EXPORTER_OTLP_ENDPOINT or OTEL_EXPORTER_OTLP_TRACES_ENDPOINT is required when tracing is enabled",
     );
   }
-  const sampler = env.OTEL_TRACES_SAMPLER?.trim() || "parentbased_traceidratio";
-  if (sampler !== "parentbased_traceidratio") {
-    throw new Error("OTEL_TRACES_SAMPLER must be parentbased_traceidratio");
+  const legacySampler = env.OTEL_TRACES_SAMPLER?.trim();
+  if (enabled && legacySampler && legacySampler !== "parentbased_traceidratio") {
+    throw new Error(
+      "OTEL_TRACES_SAMPLER must be removed or use the deprecated parentbased_traceidratio migration alias",
+    );
+  }
+  const sampler = env.DG_CHAT_OTEL_SAMPLER?.trim() || "local_random_ratio";
+  if (sampler !== "local_random_ratio") {
+    throw new Error("DG_CHAT_OTEL_SAMPLER must be local_random_ratio");
   }
   const sampleRatio = Number(env.OTEL_TRACES_SAMPLER_ARG ?? "0.1");
   if (!Number.isFinite(sampleRatio) || sampleRatio < 0 || sampleRatio > 1) {

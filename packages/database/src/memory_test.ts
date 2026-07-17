@@ -3090,6 +3090,190 @@ Deno.test("stale API reaping never exceeds an exact replay reservation", () => {
   assertEquals(legacyFailed.responseStatus, 200);
 });
 
+Deno.test("generic stale reaping leaves staged Files requests to upload recovery", () => {
+  const repo = new MemoryRepository();
+  const user = repo.createUser({
+    email: "stale-file-reaper@example.com",
+    name: "Stale file reaper",
+    passwordHash: "x",
+  });
+  const runId = `${user.id}:files:${crypto.randomUUID()}`;
+  const input = {
+    userId: user.id,
+    endpoint: "files" as const,
+    idempotencyKey: "stale-file-cleanup",
+    requestHash: "a".repeat(64),
+    stream: false,
+    model: "files/upload",
+    runId,
+    reserveMicros: 0,
+    provider: "local",
+    replayReservedBytes: 16 * 1024,
+  };
+  const begun = repo.beginApiRequest(input);
+  if (begun.kind !== "started") throw new Error("expected started request");
+  const objectKey = `uploads/${user.id}/blobs/aa/${"a".repeat(64)}.txt`;
+  repo.stageFileUpload({
+    requestId: begun.request.id,
+    ownerId: user.id,
+    objectKey,
+    filename: "abandoned.txt",
+    mimeType: "text/plain",
+    sizeBytes: 4,
+    sha256: "a".repeat(64),
+    purpose: "assistants",
+    attachmentState: "ready",
+    inspectionError: null,
+  });
+  repo.releaseApiRequestLease(begun.request.id, begun.leaseToken);
+
+  assertEquals(repo.reapStaleApiRequests(), 0);
+  assertEquals(repo.reapStaleApiRequests(), 0);
+  const replay = repo.beginApiRequest(input);
+  assertEquals(replay.kind, "in_progress");
+  assertEquals(repo.usageRuns.get(runId)?.status, "reserved");
+  const reclaimed = repo.reclaimApiRequest(
+    begun.request.id,
+    begun.leaseToken,
+    30,
+  );
+  repo.failApiRequest({
+    id: begun.request.id,
+    leaseToken: reclaimed.leaseToken,
+    responseStatus: 500,
+    responseHeaders: { "content-type": "application/json" },
+    responseBody: JSON.stringify({ error: { code: "upload_interrupted" } }),
+    billing: { mode: "refund" },
+  });
+  assertEquals(repo.usageRuns.get(runId)?.status, "failed");
+  assertEquals(
+    repo.jobs.filter((job) => job.idempotencyKey === `file_object.cleanup:${begun.request.id}`)
+      .length,
+    0,
+  );
+});
+
+Deno.test("Files finalization binds canonical object keys and inspection decisions", () => {
+  const repo = new MemoryRepository();
+  const user = repo.createUser({
+    email: "file-stage-invariants@example.com",
+    name: "File stage invariants",
+    passwordHash: "x",
+  });
+  const digest = "a".repeat(64);
+  const begun = repo.beginApiRequest({
+    userId: user.id,
+    endpoint: "files",
+    idempotencyKey: "file-stage-invariants",
+    requestHash: digest,
+    stream: false,
+    model: "files/upload",
+    runId: `${user.id}:files:${crypto.randomUUID()}`,
+    reserveMicros: 0,
+    provider: "local",
+    replayReservedBytes: 16 * 1024,
+  });
+  if (begun.kind !== "started") throw new Error("expected started request");
+  const base = {
+    requestId: begun.request.id,
+    ownerId: user.id,
+    objectKey: `uploads/${user.id}/blobs/aa/${digest}.txt`,
+    filename: "stage.txt",
+    mimeType: "text/plain",
+    sizeBytes: 4,
+    sha256: digest,
+    purpose: "assistants",
+    attachmentState: "ready" as const,
+    inspectionError: null,
+  };
+  assertThrows(
+    () => repo.stageFileUpload({ ...base, objectKey: base.objectKey.replace("/aa/", "/ff/") }),
+    DomainError,
+    "object key",
+  );
+  repo.stageFileUpload(base);
+  repo.markFileUploadStored(begun.request.id, begun.leaseToken);
+  const completion = {
+    id: begun.request.id,
+    leaseToken: begun.leaseToken,
+    responseStatus: 201,
+    responseHeaders: { "content-type": "application/json" },
+    costMicros: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    latencyMs: 1,
+  };
+  assertThrows(
+    () =>
+      repo.finalizeFileUpload({
+        attachment: {
+          ownerId: user.id,
+          objectKey: base.objectKey,
+          filename: base.filename,
+          mimeType: base.mimeType,
+          sizeBytes: base.sizeBytes,
+          sha256: digest,
+          state: "quarantined",
+          inspectionError: "stage decision drift",
+          inspectionComplete: true,
+        },
+        request: completion,
+        responseBody: (file) => JSON.stringify({ id: file.id }),
+      }),
+    DomainError,
+    "stage differs",
+  );
+  assertEquals(repo.attachments.size, 0);
+  const finalized = repo.finalizeFileUpload({
+    attachment: {
+      ownerId: user.id,
+      objectKey: base.objectKey,
+      filename: base.filename,
+      mimeType: base.mimeType,
+      sizeBytes: base.sizeBytes,
+      sha256: digest,
+      state: "ready",
+      inspectionError: null,
+      inspectionComplete: true,
+    },
+    request: completion,
+    responseBody: (file) => JSON.stringify({ id: file.id }),
+  });
+  assertEquals(finalized.attachment.state, "ready");
+  assertEquals(repo.attachments.size, 1);
+});
+
+Deno.test("generic stale reaping terminalizes a Files request that crashed before staging", () => {
+  const repo = new MemoryRepository();
+  const user = repo.createUser({
+    email: "unstaged-file-reaper@example.com",
+    name: "Unstaged file reaper",
+    passwordHash: "x",
+  });
+  const runId = `${user.id}:files:${crypto.randomUUID()}`;
+  const input = {
+    userId: user.id,
+    endpoint: "files" as const,
+    idempotencyKey: "unstaged-file-cleanup",
+    requestHash: "b".repeat(64),
+    stream: false,
+    model: "files/upload",
+    runId,
+    reserveMicros: 0,
+    provider: "local",
+    replayReservedBytes: 16 * 1024,
+  };
+  const begun = repo.beginApiRequest(input);
+  if (begun.kind !== "started") throw new Error("expected started request");
+  repo.releaseApiRequestLease(begun.request.id, begun.leaseToken);
+
+  assertEquals(repo.reapStaleApiRequests(), 1);
+  const replay = repo.beginApiRequest(input);
+  assertEquals(replay.kind, "failed");
+  assertEquals(replay.request.responseStatus, 500);
+  assertEquals(repo.usageRuns.get(runId)?.status, "failed");
+});
+
 Deno.test("stale API reaping preserves partial spend and its explicit attempt cause", () => {
   const repo = new MemoryRepository();
   const user = repo.createUser({

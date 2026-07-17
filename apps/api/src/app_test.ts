@@ -2831,6 +2831,8 @@ Deno.test("attachment and OpenAI Files routes enforce security, ownership, scope
   const webText = "immutable attachment bytes";
   const webForm = new FormData();
   webForm.set("file", new File([webText], "notes.txt", { type: "text/plain" }));
+  const inspectionJobsBeforeWebUpload =
+    repository.jobs.filter((job) => job.type === "attachment.inspect").length;
   const webUploadResponse = await app.request("/api/attachments", {
     method: "POST",
     headers: adminSession,
@@ -2844,6 +2846,10 @@ Deno.test("attachment and OpenAI Files routes enforce security, ownership, scope
   assertEquals(JSON.stringify(webUpload).includes("objectKey"), false);
   assertEquals(JSON.stringify(webUpload).includes("sha256"), false);
   assertEquals(objectStore.objects.size, 1);
+  assertEquals(
+    repository.jobs.filter((job) => job.type === "attachment.inspect").length,
+    inspectionJobsBeforeWebUpload,
+  );
   assertEquals(
     (await app.request(`/api/attachments/${webUpload.id}/chunks`, { headers: adminSession }))
       .status,

@@ -9,6 +9,7 @@ import {
   LEGACY_BACKUP_DATA_OMITTED_TABLES,
   ObjectAlreadyExistsError,
   parseBackupArchiveStream,
+  PRE_AUTOMATIC_RETENTION_BACKUP_DATA_OMITTED_TABLES,
   PRE_IMMUTABLE_SHARING_BACKUP_DATA_OMITTED_TABLES,
   sha256Hex,
   signBackupManifest,
@@ -586,7 +587,10 @@ Deno.test("postgres backup data previews and applies a signed legacy 0028 table 
   });
   try {
     const omittedNames = new Set(
-      [...LEGACY_BACKUP_DATA_OMITTED_TABLES].map((name) => `tables/${name}.ndjson`),
+      [
+        ...LEGACY_BACKUP_DATA_OMITTED_TABLES,
+        ...PRE_AUTOMATIC_RETENTION_BACKUP_DATA_OMITTED_TABLES,
+      ].map((name) => `tables/${name}.ndjson`),
     );
     const entries = snapshot.manifest.entries.filter((entry) => !omittedNames.has(entry.name));
     const { signature: _signature, ...unsigned } = snapshot.manifest;
@@ -643,7 +647,9 @@ Deno.test("postgres backup data accepts supported pre-0039 catalogs", async () =
         ? PRE_IMMUTABLE_SHARING_BACKUP_DATA_OMITTED_TABLES
         : ADMIN_LIFECYCLE_BACKUP_DATA_OMITTED_TABLES;
       const omittedNames = new Set(
-        [...omitted].map((name) => `tables/${name}.ndjson`),
+        [...omitted, ...PRE_AUTOMATIC_RETENTION_BACKUP_DATA_OMITTED_TABLES].map((name) =>
+          `tables/${name}.ndjson`
+        ),
       );
       let entries = snapshot.manifest.entries.filter((entry) => !omittedNames.has(entry.name));
       const payloads = new Map(snapshot.payloads);
@@ -692,6 +698,60 @@ Deno.test("postgres backup data accepts supported pre-0039 catalogs", async () =
     } finally {
       await snapshot.cleanup?.();
     }
+  }
+});
+
+Deno.test("postgres backup data previews and applies a genuine 0045 catalog", async () => {
+  const fx = await fixture();
+  const snapshot = await fx.adapter.exportSnapshot({
+    includeDiagnostics: false,
+    installationId: "installation-test",
+  });
+  try {
+    const omittedNames = new Set(
+      [...PRE_AUTOMATIC_RETENTION_BACKUP_DATA_OMITTED_TABLES].map((name) =>
+        `tables/${name}.ndjson`
+      ),
+    );
+    const entries = snapshot.manifest.entries.filter((entry) => !omittedNames.has(entry.name));
+    const { signature: _signature, ...unsigned } = snapshot.manifest;
+    const manifest = await signBackupManifest({
+      ...unsigned,
+      schemaVersion: "0045",
+      entries,
+      contentRootSha256: await backupContentRoot(entries),
+    }, fx.authenticator);
+    const payloads = new Map(snapshot.payloads);
+    for (const name of omittedNames) payloads.delete(name);
+    const archive = await payloadBytes(
+      writeBackupArchiveStream(manifest, payloads, fx.authenticator),
+    );
+
+    const previewSession = await fx.adapter.restoreSession("preview", { restoreOperationId });
+    const previewManifest = await parseBackupArchiveStream(
+      archive,
+      fx.authenticator,
+      previewSession.sink,
+    );
+    const preview = await previewSession.summarize(previewManifest);
+    assertEquals(preview.counts.find((row) => row.resource === "attachments")?.create, 1);
+    await previewSession.rollback();
+
+    const applySession = await fx.adapter.restoreSession("apply", { restoreOperationId });
+    const applyManifest = await parseBackupArchiveStream(
+      archive,
+      fx.authenticator,
+      applySession.sink,
+    );
+    const committed = await applySession.commit!(applyManifest, {
+      restoreOperationId,
+      expectedOperationVersion: 2,
+      expectedInstallationVersion: 3,
+    });
+    if (Array.isArray(committed)) throw new Error("versioned commit result expected");
+    assertEquals(committed.counts.find((row) => row.resource === "attachments")?.create, 1);
+  } finally {
+    await snapshot.cleanup?.();
   }
 });
 

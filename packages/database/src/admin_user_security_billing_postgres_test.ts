@@ -2,6 +2,7 @@ import { assertEquals, assertExists, assertRejects } from "jsr:@std/assert@1.0.1
 import postgres from "npm:postgres@3.4.7";
 import { DomainError } from "./memory.ts";
 import { PostgresRepository } from "./normalized-postgres.ts";
+import { runAuditTestMaintenanceSql } from "./postgres-test-maintenance.ts";
 
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
 const HASH_A = "a".repeat(64);
@@ -23,10 +24,13 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 3 });
-    await sql`TRUNCATE admin_balance_adjustments,audit_events,ledger_entries,identity_tokens,
-      access_group_tokens,access_group_users,access_group_models,access_groups,api_tokens,
-      auth_verifications,auth_sessions,auth_accounts,auth_users,sessions,users
-      RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      `TRUNCATE admin_balance_adjustments,audit_events,ledger_entries,identity_tokens,
+        access_group_tokens,access_group_users,access_group_models,access_groups,api_tokens,
+        auth_verifications,auth_sessions,auth_accounts,auth_users,sessions,users
+        RESTART IDENTITY CASCADE`,
+    );
     const actorId = crypto.randomUUID();
     const targetId = crypto.randomUUID();
     await sql`INSERT INTO users(id,email,name,role,approval_status,state,email_verified_at)

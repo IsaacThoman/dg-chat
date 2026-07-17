@@ -1084,10 +1084,16 @@ export const api = {
           body: JSON.stringify({ leafId, expectedVersion: conversation.version ?? 0 }),
         }),
       ),
-  adminUsage: () =>
-    request<{ calls: number; users: number; balanceMicros: number; ledger: unknown[] }>(
+  adminUsage: async () => {
+    const value = await request<{ calls: number; users: number; balanceMicros: number }>(
       "/admin/usage",
-    ),
+    );
+    return {
+      calls: value.calls,
+      users: value.users,
+      balanceMicros: value.balanceMicros,
+    };
+  },
   adminSettings: () => request<{ defaultApprovalCreditMicros: number }>("/admin/settings"),
   adminAnalytics: (filters: AdminAnalyticsFilters) =>
     request<AdminAnalyticsData>(`/admin/analytics?${adminAnalyticsQuery(filters)}`),

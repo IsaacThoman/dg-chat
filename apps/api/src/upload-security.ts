@@ -726,6 +726,20 @@ export function safeUploadObjectKey(ownerId: string, mime: string): string {
   return `uploads/${ownerId}/${id.slice(0, 2)}/${id}.${extension}`;
 }
 
+export function safeUploadBlobObjectKey(ownerId: string, sha256: string, mime: string): string {
+  if (!/^[a-zA-Z0-9_-]{1,128}$/.test(ownerId)) {
+    throw new UploadSecurityError("invalid_owner_id", "Upload owner identifier is invalid");
+  }
+  if (!/^[0-9a-f]{64}$/.test(sha256)) {
+    throw new UploadSecurityError("invalid_upload_digest", "Upload digest is invalid");
+  }
+  const extension = EXTENSIONS[canonicalMime(mime)];
+  if (!extension) {
+    throw new UploadSecurityError("unsupported_media_type", "Media type is not allowed", 415);
+  }
+  return `uploads/${ownerId}/blobs/${sha256.slice(0, 2)}/${sha256}.${extension}`;
+}
+
 export function secureUploadStream(
   source: ReadableStream<Uint8Array>,
   filename: string,

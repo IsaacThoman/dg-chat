@@ -11,17 +11,17 @@ Deno.test("metrics listener defaults are service-owned and configuration is boun
     metricsListenerConfig({
       METRICS_ENABLED: "false",
       METRICS_HOST: "0.0.0.0",
-      METRICS_PORT: "9191",
+      METRICS_PORT: "9090",
     }, { port: 9090, enabled: true }),
     {
       enabled: false,
       hostname: "0.0.0.0",
-      port: 9191,
+      port: 9090,
     },
   );
-  for (const port of ["0", "65536", "1.5", "nope"]) {
-    assertThrows(() => metricsListenerConfig({ METRICS_PORT: port }, { port: 9090 }));
-  }
+  assertThrows(() => metricsListenerConfig({ METRICS_PORT: "9191" }, { port: 9090 }));
+  assertThrows(() => metricsListenerConfig({ METRICS_PORT: "09090" }, { port: 9090 }));
+  assertThrows(() => metricsListenerConfig({}, { port: 0 }));
   assertThrows(() => metricsListenerConfig({ METRICS_HOST: "http://0.0.0.0" }, { port: 9090 }));
 });
 
@@ -53,6 +53,38 @@ Deno.test("telemetry configuration requires an explicit credential-free OTLP end
   assertThrows(() => telemetryConfig({ DG_CHAT_OTEL_ENABLED: "true" }, "dg-chat-api"));
   assertThrows(() => telemetryConfig({ OTEL_DENO: "true" }, "dg-chat-api"));
   assertThrows(() => telemetryConfig({ OTEL_EXPORTER_OTLP_PROTOCOL: "http/json" }, "dg-chat-api"));
+  assertEquals(
+    telemetryConfig({ OTEL_TRACES_SAMPLER: "always_on" }, "dg-chat-api"),
+    {
+      enabled: false,
+      serviceName: "dg-chat-api",
+      protocol: "http/protobuf",
+      endpoint: null,
+      sampleRatio: 0.1,
+    },
+  );
+  assertEquals(
+    telemetryConfig({
+      DG_CHAT_OTEL_ENABLED: "true",
+      OTEL_EXPORTER_OTLP_ENDPOINT: "https://collector.example/",
+      OTEL_TRACES_SAMPLER: "parentbased_traceidratio",
+    }, "dg-chat-api"),
+    {
+      enabled: true,
+      serviceName: "dg-chat-api",
+      protocol: "http/protobuf",
+      endpoint: "https://collector.example/",
+      sampleRatio: 0.1,
+    },
+  );
+  assertThrows(() =>
+    telemetryConfig({
+      DG_CHAT_OTEL_ENABLED: "true",
+      OTEL_EXPORTER_OTLP_ENDPOINT: "https://collector.example/",
+      OTEL_TRACES_SAMPLER: "always_on",
+    }, "dg-chat-api")
+  );
+  assertThrows(() => telemetryConfig({ DG_CHAT_OTEL_SAMPLER: "traceidratio" }, "dg-chat-api"));
   assertThrows(() =>
     telemetryConfig({
       DG_CHAT_OTEL_ENABLED: "true",

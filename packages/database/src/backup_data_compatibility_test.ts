@@ -6,12 +6,13 @@ import {
 } from "./backup-data.ts";
 
 Deno.test("portable backup catalog versions user authority and retains supported history", () => {
-  assertEquals(BACKUP_DATA_SCHEMA_VERSION, "0045");
+  assertEquals(BACKUP_DATA_SCHEMA_VERSION, "0049");
   assertEquals(
-    ["0045", "0043", "0039", "0038", "0037", "0034", "0033", "0032", "0028", "0036", "0027"].map(
-      (version) => isSupportedBackupDataSchemaVersion(version),
-    ),
-    [true, true, true, true, true, true, true, true, true, false, false],
+    ["0049", "0045", "0043", "0039", "0038", "0037", "0034", "0033", "0032", "0028", "0036", "0027"]
+      .map(
+        (version) => isSupportedBackupDataSchemaVersion(version),
+      ),
+    [true, true, true, true, true, true, true, true, true, true, false, false],
   );
   const users = BACKUP_DATA_TABLES.find((table) => table.name === "users");
   assertEquals(users?.columns.includes("version"), true);
@@ -28,4 +29,9 @@ Deno.test("portable backup catalog versions user authority and retains supported
   assertEquals(ledger?.kinds.sequence, "bigint");
   const usage = BACKUP_DATA_TABLES.find((table) => table.name === "usage_runs");
   assertEquals(usage?.columns.includes("recovery_owner"), true);
+  const retentionSchedule = BACKUP_DATA_TABLES.find((table) =>
+    table.name === "retention_schedule_state"
+  );
+  assertEquals(retentionSchedule?.kinds.interval_seconds, "integer");
+  assertEquals(retentionSchedule?.kinds.last_run_id, "uuid");
 });

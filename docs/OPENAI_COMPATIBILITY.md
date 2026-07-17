@@ -46,10 +46,11 @@ objects report `store: false` and `previous_response_id: null` so they never imp
 continuation exists.
 
 Files currently accept and report only the `assistants` purpose. Upload, list, retrieve, content,
-and delete are owner-scoped, but file upload does not yet implement `Idempotency-Key` replay or
-changed-payload conflict detection. Image generation and editing support exact idempotent replay for
-base64 responses and streams; expiring `response_format: "url"` responses reject `Idempotency-Key`
-rather than returning a replay that could expire between attempts.
+and delete are owner-scoped. File upload accepts an optional `Idempotency-Key`, replays the exact
+completed File object for identical content and metadata, and rejects changed payloads. Image
+generation and editing support exact idempotent replay for base64 responses and streams; expiring
+`response_format: "url"` responses reject `Idempotency-Key` rather than returning a replay that
+could expire between attempts.
 
 Chat Completions currently supports one choice (`n` omitted or `n: 1`). When a Chat request targets
 a native Responses provider, parameters that cannot be translated losslessly—currently `stop`,
@@ -62,12 +63,12 @@ rates fails closed until duration-based price versions are added to the accounti
 without usage use clearly marked conservative estimates derived from uploaded/prompt bytes and
 validated transcript text.
 
-Except for the file-upload and expiring-image-URL boundaries above, use a unique `Idempotency-Key`
-for each mutation request. Keys are scoped to the authenticated user and endpoint. Chat, Responses,
-embeddings, image base64/stream, and audio endpoints replay a completed response for an identical
-logical request and reject the same key with changed input. Audio identity uses the validated file
-digest rather than a multipart boundary or filename. Client disconnects cancel upstream work where
-possible, and requests reserve a conservative maximum before provider work begins.
+Except for the expiring-image-URL boundary above, use a unique `Idempotency-Key` for each mutation
+request. Keys are scoped to the authenticated user and endpoint. Chat, Responses, embeddings, file
+uploads, image base64/stream, and audio endpoints replay a completed response for an identical
+logical request and reject the same key with changed input. Audio and file identity use validated
+content and metadata rather than multipart boundary bytes. Client disconnects cancel upstream work
+where possible, and requests reserve a conservative maximum before provider work begins.
 
 Every API token consumes a fixed 60-second rotation-family quota, including tokens that inherit the
 deployment default. Rotation therefore does not reset the effective RPM budget. Every token also

@@ -15,6 +15,7 @@ import {
   withRepeatableReadBackupSnapshot,
 } from "./backup-data.ts";
 import { PostgresBackupStore } from "./backup-postgres.ts";
+import { runAuditTestMaintenanceSql } from "./postgres-test-maintenance.ts";
 
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
 
@@ -128,7 +129,8 @@ Deno.test({
         ...BACKUP_DATA_TABLES.map((table) => table.name),
         ...BACKUP_EPHEMERAL_TABLES,
       ];
-      await sql.unsafe(
+      await runAuditTestMaintenanceSql(
+        sql,
         `TRUNCATE ${[...new Set(resetTables)].join(",")} RESTART IDENTITY CASCADE`,
       );
       await sql`INSERT INTO installation_state(singleton_id) VALUES(1)`;
@@ -301,6 +303,9 @@ Deno.test({
         version,capture_enabled,request_body_days,response_body_days,updated_by
       ) VALUES(1,false,30,30,${userId})`;
       await sql`INSERT INTO retention_policy_state(singleton_id,current_version) VALUES(1,1)`;
+      await sql`INSERT INTO retention_schedule_state(
+        singleton_id,interval_seconds,next_due_at,updated_at
+      ) VALUES(1,86400,now(),now())`;
       await sql`INSERT INTO sessions(user_id,token_hash,limited,expires_at)
         VALUES(${userId},'legacy-session',false,now()+interval '1 hour')`;
       await sql`INSERT INTO auth_sessions(
@@ -395,7 +400,16 @@ Deno.test({
       assertEquals(Number((await sql`SELECT count(*) count FROM conversations`)[0].count), 3);
       assertEquals(Number((await sql`SELECT count(*) count FROM sessions`)[0].count), 1);
 
+      const missingScheduleState = structuredClone(captured);
+      missingScheduleState.set("retention_schedule_state", []);
+      await assertRejects(
+        () => dryRunBackupData(databaseUrl!, replaySource(missingScheduleState)),
+        BackupDataError,
+        "exactly one retention schedule state",
+      );
+
       const preToolAccountingCaptured = structuredClone(captured);
+      preToolAccountingCaptured.delete("retention_schedule_state");
       preToolAccountingCaptured.set(
         "usage_runs",
         preToolAccountingCaptured.get("usage_runs")!.map((batch, index) => {
@@ -1381,6 +1395,29 @@ Deno.test({
       await assertRejects(() => verifyBackupDataCatalog(databaseUrl!), BackupDataError);
     } finally {
       await sql`DROP TABLE IF EXISTS backup_unclassified_probe`;
+      await sql.end();
+    }
+  },
+});
+
+Deno.test({
+  name: "backup catalog fails closed when immutable audit history loses its database guard",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 1 });
+    try {
+      await sql`DROP TRIGGER dg_chat_audit_events_append_only ON audit_events`;
+      await assertRejects(
+        () => verifyBackupDataCatalog(databaseUrl!),
+        BackupDataError,
+        "append-only guard",
+      );
+    } finally {
+      await sql`CREATE TRIGGER dg_chat_audit_events_append_only
+        BEFORE UPDATE OR DELETE OR TRUNCATE ON audit_events
+        FOR EACH STATEMENT EXECUTE FUNCTION dg_chat_enforce_audit_event_immutability()`;
       await sql.end();
     }
   },

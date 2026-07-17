@@ -7,6 +7,7 @@ import {
   MetricsRegistry,
   statusClass,
 } from "./metrics.ts";
+import type { ResponseLifecycleOutcome } from "./response-lifecycle.ts";
 import { withHttpServerSpan } from "./tracing.ts";
 
 const REQUEST_BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10];
@@ -15,6 +16,7 @@ const JOB_TYPES = new Set([
   "attachment.inspect",
   "attachment.ingest",
   "document.embed",
+  "file_object.cleanup",
   "generated_object.cleanup",
   "retention.scrub",
 ]);
@@ -78,16 +80,22 @@ export function createApiMetrics(version = "0.1.0"): ApiMetrics {
       "HTTP requests completed by bounded route group and status class",
     ),
   );
+  const responseLifecycles = registry.register(
+    new Counter(
+      "dg_chat_http_response_lifecycle_total",
+      "Terminal HTTP response lifecycles by bounded route group and outcome",
+    ),
+  );
   const inFlight = registry.register(
     new Gauge(
       "dg_chat_http_requests_in_flight",
-      "HTTP requests whose response headers have not completed",
+      "HTTP requests whose response bodies have not completed or been cancelled",
     ),
   );
   const duration = registry.register(
     new Histogram(
       "dg_chat_http_request_duration_seconds",
-      "Time until HTTP response headers are produced",
+      "Time until the HTTP response body completes, errors, or is cancelled",
       REQUEST_BUCKETS,
     ),
   );
@@ -145,20 +153,35 @@ export function createApiMetrics(version = "0.1.0"): ApiMetrics {
         inFlight.add(1, labels);
         const started = performance.now();
         let status = 500;
+        let settled = false;
+        const settle = (
+          outcome: ResponseLifecycleOutcome,
+          responseStatus = status,
+        ) => {
+          if (settled) return;
+          settled = true;
+          status = responseStatus;
+          inFlight.add(-1, labels);
+          requests.add(1, { ...labels, status_class: statusClass(status) });
+          responseLifecycles.add(1, { ...labels, outcome });
+          duration.observe((performance.now() - started) / 1_000, labels);
+        };
         try {
           const response = await withHttpServerSpan(
             request,
             method,
             route,
             () => Promise.resolve(handler(request)),
+            {
+              onResponseSettled: settle,
+            },
           );
           status = response.status;
           if (route === "ready") void inspectReadiness(response);
           return response;
-        } finally {
-          inFlight.add(-1, labels);
-          requests.add(1, { ...labels, status_class: statusClass(status) });
-          duration.observe((performance.now() - started) / 1_000, labels);
+        } catch (error) {
+          settle("failed");
+          throw error;
         }
       };
     },
@@ -174,6 +197,8 @@ export interface WorkerMetrics {
   setDependencyReady(dependency: "postgres" | "s3", ready: boolean): void;
   setQueue(status: "queued" | "running" | "failed", count: number, oldestSeconds: number): void;
   recordLoopFailure(kind: "database" | "heartbeat" | "storage" | "application"): void;
+  setRetentionScheduleOverdue(seconds: number): void;
+  recordRetentionScheduleOutcome(outcome: "scheduled" | "not_due" | "failed"): void;
   runJob<T>(type: string, operation: () => Promise<T>): Promise<T>;
   recordJobOutcome(type: string, outcome: string, durationSeconds: number): void;
 }
@@ -230,6 +255,19 @@ export function createWorkerMetrics(version = "0.1.0"): WorkerMetrics {
       "Categorical worker runtime failures",
     ),
   );
+  const retentionScheduleOverdue = registry.register(
+    new Gauge(
+      "dg_chat_retention_schedule_overdue_seconds",
+      "Seconds the durable automatic retention schedule was overdue at its latest check",
+    ),
+  );
+  retentionScheduleOverdue.set(0);
+  const retentionScheduleOutcomes = registry.register(
+    new Counter(
+      "dg_chat_retention_schedule_checks_total",
+      "Automatic retention scheduler checks by bounded outcome",
+    ),
+  );
 
   const recordJobOutcome = (type: string, outcome: string, elapsed: number) => {
     const labels = { type: boundedJobType(type), outcome: safeJobOutcome(outcome) };
@@ -250,6 +288,12 @@ export function createWorkerMetrics(version = "0.1.0"): WorkerMetrics {
     },
     recordLoopFailure(kind) {
       failures.add(1, { kind });
+    },
+    setRetentionScheduleOverdue(seconds) {
+      retentionScheduleOverdue.set(Math.max(0, seconds));
+    },
+    recordRetentionScheduleOutcome(outcome) {
+      retentionScheduleOutcomes.add(1, { outcome });
     },
     async runJob(type, operation) {
       const started = performance.now();

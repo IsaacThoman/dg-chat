@@ -8,6 +8,7 @@ import {
   withRepeatableReadBackupSnapshot,
 } from "./backup-data.ts";
 import { PostgresRepository } from "./normalized-postgres.ts";
+import { runAuditTestMaintenanceSql } from "./postgres-test-maintenance.ts";
 
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
 
@@ -20,9 +21,12 @@ Deno.test({
     const sql = postgres(databaseUrl!, { max: 4 });
     const repository = await PostgresRepository.connect(databaseUrl!);
     try {
-      await sql`TRUNCATE admin_balance_adjustments,audit_events,ledger_entries,api_tokens,
-        auth_verifications,auth_sessions,auth_accounts,auth_users,sessions,users
-        RESTART IDENTITY CASCADE`;
+      await runAuditTestMaintenanceSql(
+        sql,
+        `TRUNCATE admin_balance_adjustments,audit_events,ledger_entries,api_tokens,
+          auth_verifications,auth_sessions,auth_accounts,auth_users,sessions,users
+          RESTART IDENTITY CASCADE`,
+      );
       await sql`INSERT INTO installation_state(singleton_id) VALUES(1)
         ON CONFLICT(singleton_id) DO NOTHING`;
       const actorId = crypto.randomUUID();

@@ -24,6 +24,7 @@ import {
   isSupportedBackupDataSchemaVersion,
   LEGACY_BACKUP_DATA_OMITTED_TABLES,
   ObjectAlreadyExistsError,
+  PRE_AUTOMATIC_RETENTION_BACKUP_DATA_OMITTED_TABLES,
   PRE_IMMUTABLE_SHARING_BACKUP_DATA_OMITTED_TABLES,
   restoreBackupData,
   signBackupManifest,
@@ -649,6 +650,8 @@ export function createPostgresBackupDataPort(
           const path = paths.get(`${TABLE_PREFIX}${tableName}.ndjson`);
           if (!path) {
             if (
+              (stagedSchemaVersion !== BACKUP_DATA_SCHEMA_VERSION &&
+                PRE_AUTOMATIC_RETENTION_BACKUP_DATA_OMITTED_TABLES.has(tableName)) ||
               (stagedSchemaVersion === "0028" &&
                 LEGACY_BACKUP_DATA_OMITTED_TABLES.has(tableName)) ||
               (["0037", "0034"].includes(stagedSchemaVersion) &&
@@ -693,17 +696,24 @@ export function createPostgresBackupDataPort(
           manifest.diagnosticPayloadPolicy !== "excluded" ||
           table.name !== "provider_payload_captures"
         ).map((table) => `${TABLE_PREFIX}${table.name}.ndjson`);
-        const legacyExpectedTables = currentExpectedTables.filter((name) =>
+        const preAutomaticRetentionExpectedTables = currentExpectedTables.filter((name) =>
+          !PRE_AUTOMATIC_RETENTION_BACKUP_DATA_OMITTED_TABLES.has(
+            name.slice(TABLE_PREFIX.length, -".ndjson".length),
+          )
+        );
+        const legacyExpectedTables = preAutomaticRetentionExpectedTables.filter((name) =>
           !LEGACY_BACKUP_DATA_OMITTED_TABLES.has(
             name.slice(TABLE_PREFIX.length, -".ndjson".length),
           )
         );
-        const adminLifecycleExpectedTables = currentExpectedTables.filter((name) =>
+        const adminLifecycleExpectedTables = preAutomaticRetentionExpectedTables.filter((name) =>
           !ADMIN_LIFECYCLE_BACKUP_DATA_OMITTED_TABLES.has(
             name.slice(TABLE_PREFIX.length, -".ndjson".length),
           )
         );
-        const preImmutableSharingExpectedTables = currentExpectedTables.filter((name) =>
+        const preImmutableSharingExpectedTables = preAutomaticRetentionExpectedTables.filter((
+          name,
+        ) =>
           !PRE_IMMUTABLE_SHARING_BACKUP_DATA_OMITTED_TABLES.has(
             name.slice(TABLE_PREFIX.length, -".ndjson".length),
           )
@@ -719,6 +729,9 @@ export function createPostgresBackupDataPort(
           );
         const expectedTables = matches(currentExpectedTables)
           ? currentExpectedTables
+          : manifest.schemaVersion !== BACKUP_DATA_SCHEMA_VERSION &&
+              matches(preAutomaticRetentionExpectedTables)
+          ? preAutomaticRetentionExpectedTables
           : ["0037", "0034"].includes(manifest.schemaVersion) &&
               matches(adminLifecycleExpectedTables)
           ? adminLifecycleExpectedTables

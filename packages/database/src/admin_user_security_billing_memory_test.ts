@@ -158,6 +158,7 @@ Deno.test("memory admin session and token revocation are target-bound, versioned
   });
   assertEquals(token.revokedAt !== null, true);
   assertEquals(repository.auditEvents.map((event) => event.action), [
+    "identity.bootstrap_admin",
     "user.session.revoked",
     "user.api_token_family.revoked",
   ]);
