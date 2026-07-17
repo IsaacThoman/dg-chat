@@ -16,6 +16,19 @@ export interface RetentionScrubRequest {
   responseCutoffAt: string;
 }
 
+export function hostOrchestrationFailureMessage(value: unknown): string {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("Host orchestration failure marker is not an object");
+  }
+  const marker = value as Record<string, unknown>;
+  const stage = typeof marker.stage === "string" ? marker.stage.trim() : "";
+  const reason = typeof marker.reason === "string" ? marker.reason.trim() : "";
+  if (!stage || !reason || stage.length > 100 || reason.length > 500) {
+    throw new TypeError("Host orchestration failure marker is invalid");
+  }
+  return `Host worker chaos failed during ${stage}: ${reason}`;
+}
+
 /**
  * Retention cutoffs are server-issued fences, not durations the load client may reconstruct.
  * Keeping the preview timestamps byte-for-byte also avoids weakening a longer current policy.

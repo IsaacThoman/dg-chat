@@ -282,71 +282,132 @@ done
 
 crash_job_id="$(jq -r '.crashJobId' "$LOAD_ARTIFACT_DIR/queue-enqueued.json")"
 [[ "$crash_job_id" =~ ^[0-9a-f-]{36}$ ]] || die "queue marker has an invalid crash job id."
-# Do not wait for health before observing the deliberately short claim stall. The worker's real
-# five-second PostgreSQL statement timeout is part of the invariant, so the runner keeps the
-# injected database statement below that limit and makes the crash target first in the queue.
-bounded_host_command 30 "start worker replicas for crash claim" \
-  "${compose[@]}" up -d --scale worker=3 worker
-claim_deadline=$((SECONDS + 45))
+worker_chaos_stage="start-workers"
 old_claim_token=""
+claim_instance=""
+killed_worker=""
+
+capture_worker_chaos_diagnostics() {
+  local reason="$1"
+  local diagnostics_tmp="$LOAD_ARTIFACT_DIR/.worker-chaos-diagnostics.$$.tmp"
+  {
+    printf 'stage=%s\nreason=%s\nobservedAt=%s\n' \
+      "$worker_chaos_stage" "$reason" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    bounded_host_command 8 "snapshot crash target state" \
+      "${compose[@]}" exec -T \
+      -e PGCONNECT_TIMEOUT=3 \
+      -e PGOPTIONS=-c\ statement_timeout=5000 \
+      postgres psql -v ON_ERROR_STOP=1 -At -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+      -c "select json_build_object(
+        'id',id,'status',status,'attempts',attempts,'lockedBy',locked_by,
+        'lockedAt',locked_at,'availableAt',available_at,'observedAt',clock_timestamp()
+      ) from jobs where id='$crash_job_id'" || true
+    bounded_host_command 8 "snapshot worker replica state" \
+      "${compose[@]}" ps worker || true
+    bounded_host_command 8 "snapshot worker logs" \
+      "${compose[@]}" logs --no-color --tail 120 worker || true
+  } >"$diagnostics_tmp" 2>&1
+  mv "$diagnostics_tmp" "$LOAD_ARTIFACT_DIR/worker-chaos-diagnostics.log"
+}
+
+publish_worker_chaos_failure() {
+  local reason="$1"
+  local failure_tmp="$LOAD_ARTIFACT_DIR/.worker-chaos-failed.$$.tmp"
+  jq -n \
+    --arg stage "$worker_chaos_stage" \
+    --arg reason "$reason" \
+    --arg crashJobId "$crash_job_id" \
+    --arg claimInstance "$claim_instance" \
+    --arg killedContainer "$killed_worker" \
+    '{
+      stage:$stage,
+      reason:$reason,
+      crashJobId:$crashJobId,
+      claimInstance:($claimInstance | if length > 0 then . else null end),
+      killedContainer:($killedContainer | if length > 0 then . else null end),
+      diagnostics:"worker-chaos-diagnostics.log"
+    }' >"$failure_tmp"
+  mv "$failure_tmp" "$LOAD_ARTIFACT_DIR/worker-chaos-failed.json"
+}
+
+fail_worker_chaos() {
+  local reason="$1"
+  capture_worker_chaos_diagnostics "$reason"
+  publish_worker_chaos_failure "$reason"
+  cat "$LOAD_ARTIFACT_DIR/worker-chaos-diagnostics.log" >&2
+  die "$reason"
+}
+
+# The exact three worker containers were stopped above; starting them in place avoids spending the
+# deliberately short claim-stall window recreating dependencies. Do not wait for health before
+# observing the claim: the worker's real five-second PostgreSQL statement timeout is part of the
+# invariant, so the runner keeps its injected statement below that limit.
+if ! bounded_host_command 15 "start worker replicas for crash claim" \
+  "${compose[@]}" start worker; then
+  fail_worker_chaos "worker replicas did not start within the 15-second host bound."
+fi
+worker_chaos_stage="observe-claim"
+claim_deadline=$((SECONDS + 45))
 while [[ -z "$old_claim_token" ]]; do
-  old_claim_token="$(bounded_host_command 5 "read crash target claim" \
+  if ! old_claim_token="$(bounded_host_command 5 "read crash target claim" \
     "${compose[@]}" exec -T \
     -e PGCONNECT_TIMEOUT=3 \
     -e PGOPTIONS=-c\ statement_timeout=3000 \
     postgres psql -v ON_ERROR_STOP=1 -At -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
     -c "select coalesce(locked_by,'') from jobs where id='$crash_job_id' and status='running'" |
-    tr -d '\r')"
+    tr -d '\r')"; then
+    fail_worker_chaos "the bounded crash-target claim query failed."
+  fi
   if ! kill -0 "$runner_pid" 2>/dev/null; then
-    wait "$runner_pid"
-    die "load runner exited before a worker claimed the crash target."
+    wait "$runner_pid" || true
+    fail_worker_chaos "load runner exited before a worker claimed the crash target."
   fi
   if ((SECONDS >= claim_deadline)); then
-    {
-      echo "Crash target was not observed running within 45 seconds."
-      bounded_host_command 8 "snapshot crash target state" \
-        "${compose[@]}" exec -T \
-        -e PGCONNECT_TIMEOUT=3 \
-        -e PGOPTIONS=-c\ statement_timeout=5000 \
-        postgres psql -v ON_ERROR_STOP=1 -At -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-        -c "select json_build_object(
-          'id',id,'status',status,'attempts',attempts,'lockedBy',locked_by,
-          'lockedAt',locked_at,'availableAt',available_at,'observedAt',clock_timestamp()
-        ) from jobs where id='$crash_job_id'" || true
-      bounded_host_command 8 "snapshot worker replica state" \
-        "${compose[@]}" ps worker || true
-      bounded_host_command 8 "snapshot worker logs" \
-        "${compose[@]}" logs --no-color --tail 120 worker || true
-    } >"$LOAD_ARTIFACT_DIR/worker-chaos-diagnostics.log" 2>&1
-    cat "$LOAD_ARTIFACT_DIR/worker-chaos-diagnostics.log" >&2
-    die "no worker claimed the crash target before the 45-second recovery bound."
+    fail_worker_chaos "no worker claimed the crash target within the 45-second recovery bound."
   fi
   [[ -n "$old_claim_token" ]] || sleep 0.1
 done
 claim_instance="$(cut -d: -f2 <<<"$old_claim_token")"
-[[ "$claim_instance" =~ ^[0-9a-f-]{36}$ ]] || die "worker claim token lacked an instance identity."
-killed_worker=""
-for container in $("${compose[@]}" ps -q worker); do
-  instance="$(bounded_host_command 5 "read worker instance identity" \
-    docker exec "$container" sh -c 'cat /tmp/dg-chat-worker-instance' 2>/dev/null || true)"
+[[ "$claim_instance" =~ ^[0-9a-f-]{36}$ ]] ||
+  fail_worker_chaos "worker claim token lacked an instance identity."
+worker_chaos_stage="map-claim-owner"
+if ! worker_containers="$(bounded_host_command 8 "list worker replicas for claim mapping" \
+  "${compose[@]}" ps -q worker)"; then
+  fail_worker_chaos "worker replicas could not be listed for claim-owner mapping."
+fi
+for container in $worker_containers; do
+  if ! instance="$(bounded_host_command 5 "read worker instance identity" \
+    docker exec "$container" sh -c 'cat /tmp/dg-chat-worker-instance')"; then
+    instance=""
+  fi
   if [[ "$instance" == "$claim_instance" ]]; then
     killed_worker="$container"
     break
   fi
 done
-[[ -n "$killed_worker" ]] || die "could not map the real claim owner to a worker container."
-bounded_host_command 15 "kill real crash target claim owner" \
-  docker kill --signal KILL "$killed_worker" >/dev/null
-bounded_host_command 75 "restore killed worker replica" \
-  "${compose[@]}" up -d --scale worker=3 --wait --wait-timeout 60 worker
+[[ -n "$killed_worker" ]] ||
+  fail_worker_chaos "could not map the real claim owner to a worker container."
+worker_chaos_stage="kill-claim-owner"
+if ! bounded_host_command 15 "kill real crash target claim owner" \
+  docker kill --signal KILL "$killed_worker" >/dev/null; then
+  fail_worker_chaos "the real claim owner did not stop within the 15-second host bound."
+fi
+worker_chaos_stage="restore-worker-capacity"
+if ! bounded_host_command 75 "restore killed worker replica" \
+  "${compose[@]}" up -d --scale worker=3 --wait --wait-timeout 60 worker; then
+  fail_worker_chaos "worker capacity did not recover within the 75-second health bound."
+fi
+worker_chaos_stage="publish-success"
 worker_marker_tmp="$LOAD_ARTIFACT_DIR/.worker-chaos-complete.$$.tmp"
-jq -n \
+if ! jq -n \
   --arg killedContainer "$killed_worker" \
   --arg killedInstance "$claim_instance" \
   --arg oldClaimToken "$old_claim_token" \
   '{killedContainer:$killedContainer,killedInstance:$killedInstance,oldClaimToken:$oldClaimToken}' \
-  >"$worker_marker_tmp"
-mv "$worker_marker_tmp" "$LOAD_ARTIFACT_DIR/worker-chaos-complete.json"
+  >"$worker_marker_tmp" ||
+  ! mv "$worker_marker_tmp" "$LOAD_ARTIFACT_DIR/worker-chaos-complete.json"; then
+  fail_worker_chaos "the atomic worker-chaos success marker could not be published."
+fi
 
 wait "$runner_pid"
 runner_pid=""

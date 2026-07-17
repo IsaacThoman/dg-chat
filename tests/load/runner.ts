@@ -4,6 +4,7 @@ import {
   abortableDelay,
   consumeLiveSse,
   derivedTimeoutSignal,
+  hostOrchestrationFailureMessage,
   percentile,
   retentionScrubRequest,
   type TimedSseFrame,
@@ -153,12 +154,25 @@ async function phase(
   await writeJsonArtifact("progress.json", { profile: profileName, phases: results });
 }
 
-async function waitForFile(name: string, timeoutMs: number): Promise<Record<string, unknown>> {
+async function waitForFile(
+  name: string,
+  timeoutMs: number,
+  failureName?: string,
+): Promise<Record<string, unknown>> {
   const deadline = Date.now() + timeoutMs;
   const path = `${artifactDirectory}/${name}`;
+  const failurePath = failureName ? `${artifactDirectory}/${failureName}` : undefined;
   let lastInvalidJson = "";
   while (Date.now() < deadline) {
     if (signal.aborted) throw signal.reason;
+    if (failurePath) {
+      try {
+        const failure = JSON.parse(await Deno.readTextFile(failurePath));
+        throw new Error(hostOrchestrationFailureMessage(failure));
+      } catch (error) {
+        if (!(error instanceof Deno.errors.NotFound)) throw error;
+      }
+    }
     try {
       const text = await Deno.readTextFile(path);
       try {
@@ -1103,7 +1117,11 @@ async function queuePhase(): Promise<Record<string, Json>> {
   // probes, and the kill. Keeping the runner's deadline above the sum prevents it from racing the
   // host and hiding the specific failed operation, without giving workers any longer to claim the
   // crash target.
-  const chaos = await waitForFile("worker-chaos-complete.json", 240_000);
+  const chaos = await waitForFile(
+    "worker-chaos-complete.json",
+    240_000,
+    "worker-chaos-failed.json",
+  );
   const oldClaimToken = String(chaos.oldClaimToken ?? "");
   invariant(oldClaimToken.length > 20, "host captured the killed worker's real claim token");
   const deadline = Date.now() + 180_000;

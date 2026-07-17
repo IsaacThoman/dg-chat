@@ -3,6 +3,7 @@ import {
   abortableDelay,
   consumeLiveSse,
   derivedTimeoutSignal,
+  hostOrchestrationFailureMessage,
   percentile,
   retentionScrubRequest,
 } from "./runtime.ts";
@@ -64,4 +65,30 @@ Deno.test("live SSE consumer timestamps frames and supports intentional disconne
 Deno.test("percentile uses a bounded nearest-rank calculation", () => {
   assertEquals(percentile([9, 1, 5, 3], 0.95), 9);
   assertEquals(percentile([9, 1, 5, 3], 0.5), 3);
+});
+
+Deno.test("host orchestration failure markers preserve the bounded stage diagnosis", () => {
+  assertEquals(
+    hostOrchestrationFailureMessage({
+      stage: "map-claim-owner",
+      reason: "worker instance files did not match the durable claim token",
+    }),
+    "Host worker chaos failed during map-claim-owner: " +
+      "worker instance files did not match the durable claim token",
+  );
+  for (
+    const marker of [
+      null,
+      [],
+      { stage: "", reason: "failed" },
+      { stage: "claim", reason: "" },
+      { stage: "x".repeat(101), reason: "failed" },
+    ]
+  ) {
+    assertThrows(
+      () => hostOrchestrationFailureMessage(marker),
+      TypeError,
+      "failure marker",
+    );
+  }
 });
