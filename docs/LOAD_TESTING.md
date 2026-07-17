@@ -3,13 +3,17 @@
 The load harness proves four distributed invariants against a fresh, production-shaped Compose
 stack:
 
-1. simultaneous long-lived SSE responses remain incremental and all reach one terminal event;
+1. simultaneous long-lived SSE responses remain incremental and all reach one terminal event; the
+   host restarts the exact API replica whose per-target in-flight gauge proves it owns an open
+   streaming request;
 2. edits append immutable sibling branches, while same-version concurrent-tab edits produce one
    winner and bounded `409` conflicts without losing the original branch;
 3. concurrent API calls create one terminal usage run, one reserve entry, and one settle-or-refund
    entry each, while balances remain nonnegative and ledger sequences reconcile;
 4. work queued while every worker is stopped completes exactly once after three worker replicas
-   restart, including exactly one completion audit event.
+   restart, including exactly one completion audit event; a test-only transaction pause covers both
+   `queued → running` and empty-retention `queued → completed` paths, allowing the host to map a
+   durable claim identity to its real worker container, kill that owner, and prove lease recovery.
 
 This is a destructive test. It must never target an existing installation.
 
@@ -24,6 +28,11 @@ This is a destructive test. It must never target an existing installation.
 - the artifact directory is below `test-results/load`;
 - every started container has both the expected Compose project label and the load-owned label;
 - PostgreSQL reports the generated database as its current database.
+
+PostgreSQL, the mock provider, and Prometheus join a disposable non-internal `load-host` bridge in
+addition to the production-shaped internal backend. Docker requires that extra bridge for their
+loopback-only host publications to work; it does not publish them on a LAN address or make the
+production backend non-internal.
 
 The host script, rather than a container, performs the controlled worker stop/start. No container
 receives the Docker socket. Every run uses new named volumes, installs a cleanup trap before
@@ -70,7 +79,11 @@ deno task load
 
 The summary is written to `test-results/load/<run-id>/summary.json`. It is versioned, contains one
 bounded result object per phase, and does not contain generated credentials. `progress.json`,
-`runner.log`, `compose.log`, and the queue coordination marker make failed runs diagnosable.
+`runner.log`, `compose.log`, and the coordination markers make failed runs diagnosable.
+`streams-active.json` is emitted only after the runner has observed at least two concurrently open
+response bodies. The host independently confirms a positive per-replica Prometheus in-flight gauge,
+maps that scrape target to its Docker container IP, and records the exact restarted container and
+metric target in `api-chaos-complete.json`.
 
 To exercise only the fail-closed preflight without touching Docker:
 
@@ -87,6 +100,8 @@ runs the `scheduled` profile, and manual dispatches can select any bounded profi
 uploaded even after failure. The job has a 45-minute outer timeout in addition to the runner and
 per-request timeouts.
 
-When the check fails, inspect `summary.json` first. A missing queue phase combined with
-`queue-enqueued.json` means recovery failed after the worker restart; no marker means an earlier API
-or invariant phase failed. `compose.log` is the authoritative service log for that disposable run.
+When the check fails, inspect `summary.json` first. A `streams-active.json` marker without
+`api-chaos-complete.json` means no active Prometheus target could be mapped or restarted. A missing
+queue phase combined with `queue-enqueued.json` means claimed-job recovery failed after the worker
+restart; no marker means an earlier API or invariant phase failed. `compose.log` is the
+authoritative service log for that disposable run.
