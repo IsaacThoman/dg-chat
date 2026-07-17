@@ -41,7 +41,10 @@ jobs:
       - name: E2E harness policy tests
         run: |
           deno test tests/e2e/env_test.ts tests/e2e/target-safety_test.ts \
-            tests/run-postgres-test-group_test.ts --allow-env
+            tests/run-postgres-test-group_test.ts tests/load/safety_test.ts \
+            --allow-env
+          deno test tests/load/run_script_test.ts \
+            --allow-env --allow-read --allow-write --allow-run=bash,openssl,deno
           bash tests/assert-compose-graceful-restart_test.sh
       - name: Production web build
         run: deno task build
@@ -423,7 +426,7 @@ jobs:
       APP_SECRET: production-smoke-app-secret-at-least-thirty-two-bytes
       ENCRYPTION_KEY: cHJvZHVjdGlvbi1zbW9rZS1lbmNyeXB0aW9uLWtleSE=
       BACKUP_SIGNING_KEY: QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=
-      SETUP_TOKEN: production-smoke-setup-token
+      SETUP_TOKEN: production-smoke-setup-token-at-least-thirty-two-bytes
       S3_ACCESS_KEY: production-smoke-app-user
       S3_SECRET_KEY: production-smoke-app-password
       SEARXNG_SECRET: production-smoke-searxng-secret
