@@ -23,6 +23,27 @@ const token: Token = {
 };
 
 test("personal token governance and admin entitlements are explicit and responsive", async ({ page, request }) => {
+  await page.addInitScript(() => {
+    const clipboard = {
+      mode: "success" as "success" | "failure",
+      writes: [] as string[],
+    };
+    Object.defineProperty(globalThis, "__dgClipboardTest", {
+      configurable: true,
+      value: clipboard,
+    });
+    const browser = globalThis as unknown as { navigator: { clipboard: object } };
+    Object.defineProperty(Object.getPrototypeOf(browser.navigator.clipboard), "writeText", {
+      configurable: true,
+      value: (value: string) => {
+        if (clipboard.mode === "failure") {
+          return Promise.reject(new DOMException("Denied", "NotAllowedError"));
+        }
+        clipboard.writes.push(value);
+        return Promise.resolve();
+      },
+    });
+  });
   await bootstrap(request);
   await login(page);
   let tokens: Token[] = [token];
@@ -115,13 +136,31 @@ test("personal token governance and admin entitlements are explicit and responsi
   await expect(secret.getByLabel("API token secret")).toHaveValue("dg_one_time_secret");
   await page.keyboard.press("Escape");
   await expect(secret).toBeVisible();
+  const copyToken = secret.getByRole("button", { name: "Copy token" });
+  await copyToken.focus();
   await page.evaluate(() => {
-    Object.defineProperty(navigator, "clipboard", {
-      configurable: true,
-      value: { writeText: () => Promise.reject(new DOMException("Denied", "NotAllowedError")) },
-    });
+    const browser = globalThis as unknown as {
+      requestAnimationFrame(callback: () => void): number;
+    };
+    return new Promise<void>((resolve) =>
+      browser.requestAnimationFrame(() => browser.requestAnimationFrame(() => resolve()))
+    );
   });
-  await secret.getByRole("button", { name: "Copy token" }).focus();
+  await expect(copyToken).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(secret.getByText("Token copied.", { exact: true })).toBeVisible();
+  expect(
+    await page.evaluate(() =>
+      (globalThis as unknown as { __dgClipboardTest: { writes: string[] } })
+        .__dgClipboardTest.writes
+    ),
+  ).toEqual(["dg_one_time_secret"]);
+  await page.evaluate(() => {
+    (globalThis as unknown as {
+      __dgClipboardTest: { mode: "success" | "failure" };
+    }).__dgClipboardTest.mode = "failure";
+  });
+  await copyToken.focus();
   await page.keyboard.press("Enter");
   await expect(secret.getByText(/Clipboard access failed/)).toBeVisible();
   await expect(secret.getByLabel("API token secret")).toHaveValue("dg_one_time_secret");
@@ -479,9 +518,9 @@ test("token settings expose loading, fetch failure, retry, and empty states", as
   await page.getByRole("button", { name: "API tokens", exact: true }).focus();
   await page.keyboard.press("Enter");
   await expect(page.getByRole("status").filter({ hasText: "Loading API tokens" })).toBeVisible();
-  await expect(page.getByRole("alert").filter({ hasText: "Token service unavailable" }))
-    .toBeVisible();
-  await page.getByRole("button", { name: "Retry" }).focus();
+  const failure = page.getByRole("alert").filter({ hasText: "Token service unavailable" });
+  await expect(failure).toBeVisible();
+  await failure.getByRole("button", { name: "Retry", exact: true }).focus();
   await page.keyboard.press("Enter");
   await expect(page.getByText("No API tokens yet")).toBeVisible();
 });

@@ -91,6 +91,7 @@ Deno.test("admin lifecycle uses optimistic versions and keeps deletion independe
     "password_reset",
     "pending-password-reset",
     new Date(Date.now() + 60_000).toISOString(),
+    user.authorityEpoch,
   );
   const originalVersion = user.version;
 

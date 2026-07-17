@@ -1540,6 +1540,67 @@ Deno.test("rejected applicants retain only a status session", async () => {
   assertEquals((await json(privileged)).error.code, "session_refresh_required");
 });
 
+Deno.test("a rejected unverified applicant can verify before reconsideration", async () => {
+  const mailer = new TestIdentityMailer();
+  const { app, repository } = createApp({ mailer, requireEmailVerification: true });
+  const actor = await repository.bootstrapAdmin({
+    email: "reconsideration-admin@example.com",
+    name: "Reconsideration Administrator",
+    passwordHash: "test-only-hash",
+  }, 0);
+  const signup = await app.request("/api/auth/sign-up/email", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email: "reconsidered-applicant@example.com",
+      password: "correct horse battery",
+      name: "Reconsidered Applicant",
+    }),
+  });
+  assertEquals(signup.status, 201);
+  const signed = await json(signup);
+  const statusCookie = sessionCookie(signup);
+  const rejected = await repository.decideUserApproval({
+    actorId: actor.id,
+    targetUserId: signed.user.id,
+    expectedVersion: signed.user.version,
+    status: "rejected",
+    startingCreditMicros: 0,
+    reason: "Exercise verification before reconsideration",
+  });
+  const deliveriesBeforeResend = mailer.messages.length;
+
+  const resend = await app.request("/api/auth/verify-email/request", {
+    method: "POST",
+    headers: {
+      cookie: statusCookie,
+      origin: "http://localhost:5173",
+      "content-type": "application/json",
+    },
+  });
+  assertEquals(resend.status, 202, await resend.clone().text());
+  assertEquals(mailer.messages.length, deliveriesBeforeResend + 1);
+  const verificationToken = mailer.messages.at(-1)?.token;
+  assertExists(verificationToken);
+  const verification = await app.request("/api/auth/verify-email", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token: verificationToken }),
+  });
+  assertEquals(verification.status, 200, await verification.clone().text());
+
+  const approved = await repository.decideUserApproval({
+    actorId: actor.id,
+    targetUserId: signed.user.id,
+    expectedVersion: rejected.version,
+    status: "approved",
+    startingCreditMicros: 0,
+    requireEmailVerification: true,
+  });
+  assertEquals(approved.approvalStatus, "approved");
+  assertEquals(approved.emailVerifiedAt !== null, true);
+});
+
 Deno.test("legacy identity tokens return stable safe errors and reset requests do not enumerate", async () => {
   const mailer = new TestIdentityMailer();
   const { app, repository } = createApp({ mailer, requireEmailVerification: true });
@@ -1558,11 +1619,14 @@ Deno.test("legacy identity tokens return stable safe errors and reset requests d
   )?.token;
   assertExists(verificationToken);
   const expiredVerification = "verify_expired_contract_token_000000000000";
+  const storedUser = await repository.findUser(signed.user.id);
+  assertExists(storedUser);
   await repository.createIdentityToken(
     signed.user.id,
     "email_verification",
     await sha256(expiredVerification),
     new Date(Date.now() - 1_000).toISOString(),
+    storedUser.authorityEpoch,
   );
   const verificationRequest = (token: string) =>
     app.request("/api/auth/verify-email", {
@@ -1613,6 +1677,7 @@ Deno.test("legacy identity tokens return stable safe errors and reset requests d
     "password_reset",
     await sha256(expiredReset),
     new Date(Date.now() - 1_000).toISOString(),
+    storedUser.authorityEpoch,
   );
   const resetRequest = (token: string) =>
     app.request("/api/auth/password-reset", {
@@ -2728,6 +2793,24 @@ Deno.test("attachment and OpenAI Files routes enforce security, ownership, scope
   const adminToken = await createToken(adminSession, ["files:read", "files:write", "chat:write"]);
   const otherToken = await createToken(otherSession, ["files:read", "files:write"]);
 
+  for (const [method, suffix] of [["GET", ""], ["GET", "/content"], ["DELETE", ""]]) {
+    const invalidFileId = await app.request(`/v1/files/not-a-uuid${suffix}`, {
+      method,
+      headers: {
+        authorization: `Bearer ${method === "DELETE" ? writeOnly : readOnly}`,
+      },
+    });
+    assertEquals(invalidFileId.status, 400);
+    assertEquals(await json(invalidFileId), {
+      error: {
+        message: "id must be a valid file identifier",
+        type: "invalid_request_error",
+        param: "id",
+        code: "invalid_file_id",
+      },
+    });
+  }
+
   const deniedWrite = new FormData();
   deniedWrite.set("file", new File(["scope"], "scope.txt", { type: "text/plain" }));
   assertEquals(
@@ -3407,6 +3490,36 @@ Deno.test("attachment and OpenAI Files routes enforce security, ownership, scope
   assertEquals(responseWithFilesReplay.headers.get("x-idempotent-replay"), "true");
   assertEquals(await json(responseWithFilesReplay), responseWithFilesBody);
   assertEquals(responseObjectGets, getsBeforeResponseReplay);
+
+  const inProgressResponse = [...repository.apiIdempotencyRequests.values()].find((candidate) =>
+    candidate.userId === admin.id && candidate.endpoint === "responses" &&
+    candidate.idempotencyKey === "responses-uploaded-files-replay"
+  );
+  assertExists(inProgressResponse);
+  const originalReplayState = inProgressResponse.state;
+  const originalReplayModel = inProgressResponse.model;
+  inProgressResponse.state = "in_progress";
+  inProgressResponse.model = "deleted/model";
+  inProgressResponse.leaseExpiresAt = new Date(Date.now() + 5_000).toISOString();
+  const dispatchesBeforeInProgress = openAIProviderDispatches;
+  const usageBeforeInProgress = repository.usageRuns.size;
+  const inProgress = await app.request("/v1/responses", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${adminToken}`,
+      "content-type": "application/json",
+      "idempotency-key": "responses-uploaded-files-replay",
+    },
+    body: JSON.stringify(responseWithFilesRequest),
+  });
+  assertEquals(inProgress.status, 409);
+  assertEquals((await json(inProgress)).error.code, "idempotency_in_progress");
+  assertEquals(Number(inProgress.headers.get("retry-after")) >= 1, true);
+  assertEquals(responseObjectGets, getsBeforeResponseReplay);
+  assertEquals(openAIProviderDispatches, dispatchesBeforeInProgress);
+  assertEquals(repository.usageRuns.size, usageBeforeInProgress);
+  inProgressResponse.state = originalReplayState;
+  inProgressResponse.model = originalReplayModel;
   objectStore.objects.set(openAIObjectKey, storedOpenAIObject);
 
   const getsBeforeRepeatedFile = responseObjectGets;

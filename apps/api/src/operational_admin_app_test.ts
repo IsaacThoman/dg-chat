@@ -245,3 +245,57 @@ Deno.test("admin jobs are paginated, redacted, validated, and retry failed jobs 
   assertEquals(missing.status, 404);
   assertEquals((await missing.json() as { error: { code: string } }).error.code, "not_found");
 });
+
+Deno.test("admin worker fleet is authenticated, no-store, bounded, and sanitized", async () => {
+  const { app, repository, headers } = await adminFixture();
+  const instanceId = crypto.randomUUID();
+  const jobId = crypto.randomUUID();
+  let observedQuery: unknown;
+  repository.listWorkerInstances = (query) => {
+    observedQuery = query;
+    return {
+      items: [{
+        instanceId,
+        workerName: "worker-compose",
+        state: "running",
+        liveness: "fresh",
+        startedAt: "2026-07-16T12:00:00.000Z",
+        heartbeatAt: "2026-07-16T12:00:05.000Z",
+        progressAt: "2026-07-16T12:00:04.000Z",
+        heartbeatAgeMs: 100,
+        progressAgeMs: 1_100,
+        heartbeatStaleMs: 20_000,
+        progressStaleMs: 180_000,
+        healthClockToleranceMs: 5_000,
+        currentJobId: jobId,
+        currentJobType: "attachment.ingest",
+        lastCompletedAt: null,
+        lastCompletedJobId: null,
+        lastCompletedJobType: null,
+      }],
+      scope: query?.scope ?? "active",
+      limit: query?.limit ?? 50,
+      nextCursor: "next-worker-page",
+      hasMore: true,
+    };
+  };
+  assertEquals((await app.request("/api/admin/workers")).status, 401);
+  for (const invalid of ["?limit=0", "?limit=101", "?limit=1.5", "?scope=dead", "?cursor="]) {
+    assertEquals((await app.request(`/api/admin/workers${invalid}`, { headers })).status, 422);
+  }
+  const response = await app.request(
+    "/api/admin/workers?scope=history&limit=25&cursor=opaque",
+    { headers },
+  );
+  assertEquals(response.status, 200);
+  assertEquals(response.headers.get("cache-control"), "private, no-store");
+  assertEquals(observedQuery, { scope: "history", limit: 25, cursor: "opaque" });
+  const payload = await response.json() as { items: unknown[]; hasMore: boolean };
+  assertEquals(payload.items.length, 1);
+  assertEquals(payload.hasMore, true);
+  const serialized = JSON.stringify(payload);
+  assertStringIncludes(serialized, instanceId);
+  assertEquals(serialized.includes("lockedBy"), false);
+  assertEquals(serialized.includes("claimToken"), false);
+  assertEquals(serialized.includes("DATABASE_URL"), false);
+});

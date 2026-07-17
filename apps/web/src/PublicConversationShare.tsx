@@ -1,10 +1,8 @@
 import { useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { FileText, Link2, ShieldX, Sparkles } from "lucide-react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import rehypeHighlight from "rehype-highlight";
 import { api } from "./api.ts";
+import { RichMarkdown } from "./rich-output/RichMarkdown.tsx";
 import type { PublicShareAttachment } from "./types.ts";
 
 const capabilityPattern = /^[A-Za-z0-9_-]{43}$/;
@@ -59,6 +57,13 @@ export function PublicConversationShareView({ capability }: { capability: string
     enabled: valid,
     retry: false,
   });
+  useEffect(() => {
+    document.title = share.data?.title
+      ? `${share.data.title} · DG Chat snapshot`
+      : share.isError || !valid
+      ? "Snapshot unavailable · DG Chat"
+      : "Opening snapshot · DG Chat";
+  }, [share.data?.title, share.isError, valid]);
 
   if (!valid || share.isError) {
     return (
@@ -138,24 +143,7 @@ export function PublicConversationShareView({ capability }: { capability: string
                   )}
                 </div>
               )}
-              <div className="markdown">
-                <ReactMarkdown
-                  remarkPlugins={[remarkGfm]}
-                  rehypePlugins={[rehypeHighlight]}
-                  components={{
-                    a: ({ node: _node, ...props }) => (
-                      <a {...props} target="_blank" rel="noopener noreferrer" />
-                    ),
-                    img: ({ node: _node, alt }) => (
-                      <span className="public-share-remote-image">
-                        Remote image blocked{alt ? `: ${alt}` : ""}
-                      </span>
-                    ),
-                  }}
-                >
-                  {message.content}
-                </ReactMarkdown>
-              </div>
+              <RichMarkdown source={message.content} blockRemoteImages />
             </article>
           ))}
         </section>

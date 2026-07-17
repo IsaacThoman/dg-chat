@@ -18,6 +18,7 @@ import {
   ResetPasswordScreen,
   VerifyEmailScreen,
 } from "./IdentityRecovery.tsx";
+import { PwaUpdateNotice } from "./PwaUpdateNotice.tsx";
 import "./styles.css";
 
 const rootRoute = createRootRoute({ component: () => <Outlet /> });
@@ -131,6 +132,7 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
       <RouterProvider router={router} />
+      <PwaUpdateNotice />
     </QueryClientProvider>
   </React.StrictMode>,
 );

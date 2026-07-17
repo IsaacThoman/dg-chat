@@ -5,25 +5,17 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="referrer" content="no-referrer" />
     <meta name="theme-color" content="#f7f7f5" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="DG Chat" />
     <meta name="description" content="DG Chat — your private AI workspace" />
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/icon-192.png" />
     <title>DG Chat</title>
+    <script src="/theme-bootstrap.js"></script>
   </head>
-  <script>
-  try {
-    const saved = localStorage.getItem("dg-chat.theme");
-    const preference = saved === "dark" || saved === "light" ? saved : "system";
-    const theme = preference === "system" && matchMedia("(prefers-color-scheme: dark)").matches
-      ? "dark"
-      : preference === "system"
-      ? "light"
-      : preference;
-    document.documentElement.dataset.theme = theme;
-    document.documentElement.dataset.themePreference = preference;
-    document.documentElement.style.colorScheme = theme;
-  } catch {
-    document.documentElement.dataset.theme = "light";
-  }
-  </script>
   <body>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>

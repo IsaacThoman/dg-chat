@@ -130,6 +130,35 @@ Deno.test("breaker adapter carries permits through resilience outcomes", async (
   assertEquals((await breaker.inspect(target, policy)).state, "open");
 });
 
+Deno.test("breaker adapter translates server-relative failure delay across clock skew", async () => {
+  let serverNow = 1_000;
+  const appNow = 100_000;
+  const breaker = new MemoryCircuitBreaker({ now: () => serverNow });
+  const oneFailure = { ...policy, failureThreshold: 1 };
+  const adapter = new CircuitBreakerStoreAdapter(breaker, oneFailure, () => appNow);
+  const resiliencePolicy = {
+    maxRetries: 0,
+    baseDelayMs: 0,
+    maxDelayMs: 0,
+    backoffMultiplier: 2,
+    maxAttempts: 1,
+    maxHops: 0,
+    totalTimeoutMs: 10_000,
+    firstVisibleTimeoutMs: 100,
+    idleTimeoutMs: 100,
+    maxPreVisibleChunks: 10,
+    maxPreVisibleBytes: 10_000,
+    circuitFailureThreshold: 1,
+    circuitOpenMs: 5_000,
+  };
+  const permit = await adapter.acquire(target, resiliencePolicy);
+  const outcome = await adapter.failure(target, permit, resiliencePolicy);
+  assertEquals(outcome, { state: "open", retryAt: appNow + 5_000 });
+  assertEquals((await breaker.inspect(target, oneFailure)).retryAfterMs, 5_000);
+  serverNow += 1_250;
+  assertEquals((await breaker.inspect(target, oneFailure)).retryAfterMs, 3_750);
+});
+
 Deno.test("breaker policy and target identifiers are strictly bounded", () => {
   assertThrows(() => validateBreakerPolicy({ ...policy, failureThreshold: 0 }));
   assertThrows(() => validateBreakerPolicy({ ...policy, openSeconds: 86_401 }));
@@ -180,7 +209,12 @@ Deno.test({
     };
     try {
       const permit = await one.beforeAttempt(uniqueTarget, short);
-      await one.recordFailure(uniqueTarget, permit, short);
+      const opened = await one.recordFailure(uniqueTarget, permit, short);
+      assertEquals(
+        opened.retryAfterMs !== undefined && opened.retryAfterMs > 0 &&
+          opened.retryAfterMs <= 1_000,
+        true,
+      );
       assertEquals((await two.beforeAttempt(uniqueTarget, short)).state, "open");
       await new Promise((resolve) => setTimeout(resolve, 1_050));
       const probes = await Promise.all([

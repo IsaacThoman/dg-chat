@@ -9,6 +9,7 @@ interface MemoryObject {
 
 /** Small test double that still drains upload streams, so route tests exercise streaming I/O. */
 export class TestObjectStore implements ObjectStore {
+  readonly implementation = "memory" as const;
   readonly objects = new Map<string, MemoryObject>();
 
   async put(input: PutObjectInput) {

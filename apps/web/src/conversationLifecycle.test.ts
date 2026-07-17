@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  activeConversationIdForView,
   conversationsForView,
   fallbackConversationId,
   mergeConversationSnapshot,
@@ -29,6 +30,11 @@ describe("conversation lifecycle lists", () => {
     expect(fallbackConversationId([conversation("first"), conversation("second")], "chat", "first"))
       .toBe("second");
     expect(fallbackConversationId([conversation("only")], "chat", "only")).toBe("");
+  });
+  it("does not expose a retained session from another lifecycle view", () => {
+    expect(activeConversationIdForView(all, "archived", "chat")).toBe("");
+    expect(activeConversationIdForView(all, "trash", "archived")).toBe("");
+    expect(activeConversationIdForView(all, "archived", "archived")).toBe("archived");
   });
   it("publishes newer graph versions without regressing concurrent metadata", () => {
     const current = conversation("chat", {

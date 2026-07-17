@@ -3,10 +3,12 @@ import {
   adminAnalyticsQuery,
   adminJobsQuery,
   api,
+  mapConversation,
   responseError,
   uploadAttachment,
 } from "./api.ts";
 import type { Conversation, KnowledgeCollection } from "./types.ts";
+import { reconcileConversationSearchResult } from "./useConversationSearch.ts";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -507,6 +509,21 @@ describe("conversation lifecycle API", () => {
     archivedAt: null,
     deletedAt,
     updatedAt: "2026-07-10T00:00:00.000Z",
+  });
+
+  it("keeps canonical timestamps so search reconciliation orders 10:00 after 09:00", () => {
+    const nine = mapConversation({
+      ...rawConversation("nine"),
+      updatedAt: "2026-07-15T09:00:00.000Z",
+    });
+    const ten = mapConversation({
+      ...rawConversation("ten"),
+      updatedAt: "2026-07-15T10:00:00.000Z",
+    });
+
+    expect(nine.updatedAt).toBe("2026-07-15T09:00:00.000Z");
+    expect(ten.updatedAt).toBe("2026-07-15T10:00:00.000Z");
+    expect(reconcileConversationSearchResult([nine], [], ten).conversations).toEqual([ten, nine]);
   });
 
   it("lists only deleted conversations from the include-deleted endpoint", async () => {

@@ -6,13 +6,17 @@ services:
       DENO_ENV: development
       APP_URL: http://localhost:8000
       WEB_URL: http://localhost:5173
+      DATABASE_URL: postgresql://${POSTGRES_USER:-dgchat}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-dgchat}
+      REDIS_URL: redis://redis:6379
+      S3_ENDPOINT: http://minio:9000
+      S3_ALLOW_INSECURE: "true"
     command: ["task", "--filter", "@dg-chat/api", "dev"]
     volumes:
       - .:/workspace
       - deno-cache:/deno-dir
     read_only: false
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -32,8 +36,9 @@ services:
     volumes:
       - .:/workspace
       - deno-cache:/deno-dir
-    ports:
-      - "5173:5173"
+    # Replace the production 8000:8080 mapping instead of merging it with Vite's port.
+    ports: !override
+      - "127.0.0.1:5173:5173"
     networks:
       - backend
 
@@ -44,7 +49,12 @@ services:
       DENO_ENV: development
       APP_URL: http://localhost:8000
       WEB_URL: http://localhost:5173
-    command: ["task", "--filter", "@dg-chat/worker", "dev"]
+      DATABASE_URL: postgresql://${POSTGRES_USER:-dgchat}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-dgchat}
+      S3_ENDPOINT: http://minio:9000
+      S3_ALLOW_INSECURE: "true"
+    # Let the container exit and Docker restart it after an unrecoverable fault. `deno --watch`
+    # otherwise keeps PID 1 alive while its failed child waits forever for a source-file change.
+    command: ["task", "--filter", "@dg-chat/worker", "start"]
     volumes:
       - .:/workspace
       - deno-cache:/deno-dir
@@ -52,18 +62,38 @@ services:
     healthcheck:
       disable: true
 
+  migrate:
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-dgchat}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-dgchat}
+
   postgres:
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
+    networks:
+      - backend
+      - dev-host
 
   redis:
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
+    networks:
+      - backend
+      - dev-host
 
   minio:
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    networks:
+      - backend
+      - dev-host
+
+networks:
+  # Docker does not publish ports for a container attached only to an internal network. This
+  # development-only bridge makes the loopback bindings above effective without changing the
+  # production topology or exposing them on a LAN interface.
+  dev-host:
+    driver: bridge
 
 volumes:
   deno-cache:

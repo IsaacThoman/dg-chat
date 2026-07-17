@@ -191,6 +191,178 @@ Deno.test("circuit permit is reacquired before every physical retry", async () =
   assertEquals(events.includes("skipped:a:1"), true);
 });
 
+Deno.test("all-open fallback circuits preserve the earliest safe retry without dispatch", async () => {
+  const now = 1_000;
+  const skippedRetryAfterMs: number[] = [];
+  let dispatches = 0;
+  let caught: unknown;
+  try {
+    await executeProviderRequest({
+      initialCandidateId: "primary",
+      resolveCandidate: (id) => ({
+        id,
+        fallbackId: id === "primary" ? "fallback" : null,
+      }),
+      policy: { ...policy, maxRetries: 0 },
+      now: () => now,
+      signal: new AbortController().signal,
+      circuitStore: {
+        acquire: (candidateId) => ({
+          allowed: false,
+          state: "open",
+          retryAt: now + (candidateId === "primary" ? 8_000 : 2_000),
+        }),
+        success: () => undefined,
+        failure: () => undefined,
+      },
+      onAttempt: (event) => {
+        if (event.type === "skipped" && event.retryAfterMs !== undefined) {
+          skippedRetryAfterMs.push(event.retryAfterMs);
+        }
+      },
+      attempt: () => {
+        dispatches++;
+        return Promise.resolve("must not run");
+      },
+    });
+  } catch (error) {
+    caught = error;
+  }
+  assertEquals(caught instanceof ResilienceExhaustedError, true);
+  assertEquals((caught as ResilienceExhaustedError).attempts, 0);
+  assertEquals((caught as ResilienceExhaustedError).retryAfterMs, 2_000);
+  assertEquals(skippedRetryAfterMs, [8_000, 2_000]);
+  assertEquals(dispatches, 0);
+});
+
+Deno.test("candidate eligibility takes the later upstream and breaker deadline", async () => {
+  const now = 10_000;
+  let caught: unknown;
+  try {
+    await executeProviderRequest({
+      initialCandidateId: "only",
+      resolveCandidate: (id) => ({ id }),
+      policy: { ...policy, maxRetries: 0 },
+      now: () => now,
+      signal: new AbortController().signal,
+      circuitStore: {
+        acquire: () => ({ allowed: true, state: "closed" }),
+        success: () => undefined,
+        failure: () => ({ state: "open", retryAt: now + 7_000 }),
+      },
+      attempt: () => {
+        throw new ProviderAttemptError("limited", { status: 429, retryAfterMs: 1_000 });
+      },
+    });
+  } catch (error) {
+    caught = error;
+  }
+  assertEquals(caught instanceof ResilienceExhaustedError, true);
+  assertEquals((caught as ResilienceExhaustedError).retryAfterMs, 7_000);
+});
+
+Deno.test("exhaustion selects the first eligible fallback candidate", async () => {
+  const now = 20_000;
+  let caught: unknown;
+  try {
+    await executeProviderRequest({
+      initialCandidateId: "primary",
+      resolveCandidate: (id) => ({ id, fallbackId: id === "primary" ? "fallback" : null }),
+      policy: { ...policy, maxRetries: 0 },
+      now: () => now,
+      signal: new AbortController().signal,
+      circuitStore: {
+        acquire: () => ({ allowed: true, state: "closed" }),
+        success: () => undefined,
+        failure: (id) => ({
+          state: "open",
+          retryAt: now + (id === "primary" ? 7_000 : 10_000),
+        }),
+      },
+      attempt: (candidate) => {
+        throw candidate.id === "primary"
+          ? new ProviderAttemptError("limited", { status: 429, retryAfterMs: 1_000 })
+          : new ProviderAttemptError("unavailable", { status: 503 });
+      },
+    });
+  } catch (error) {
+    caught = error;
+  }
+  assertEquals(caught instanceof ResilienceExhaustedError, true);
+  assertEquals((caught as ResilienceExhaustedError).retryAfterMs, 7_000);
+  assertEquals(
+    ((caught as ResilienceExhaustedError).lastError as ProviderAttemptError).options.status,
+    429,
+  );
+});
+
+Deno.test("candidate-local incompatibility cannot represent an open fallback", async () => {
+  const now = 25_000;
+  let caught: unknown;
+  try {
+    await executeProviderRequest({
+      initialCandidateId: "incompatible",
+      resolveCandidate: (id) => ({ id, fallbackId: id === "incompatible" ? "fallback" : null }),
+      policy: { ...policy, maxRetries: 0 },
+      now: () => now,
+      signal: new AbortController().signal,
+      circuitStore: {
+        acquire: (id) =>
+          id === "fallback"
+            ? { allowed: false, state: "open", retryAt: now + 5_000 }
+            : { allowed: true, state: "closed" },
+        success: () => undefined,
+        failure: () => undefined,
+      },
+      attempt: () => {
+        throw new ProviderAttemptError("protocol detail must stay private", {
+          category: "invalid_request",
+          transient: false,
+          candidateLocal: true,
+        });
+      },
+    });
+  } catch (error) {
+    caught = error;
+  }
+  assertEquals(caught instanceof ResilienceExhaustedError, true);
+  assertEquals((caught as ResilienceExhaustedError).lastError, undefined);
+  assertEquals((caught as ResilienceExhaustedError).retryAfterMs, 5_000);
+});
+
+Deno.test("an immediately eligible primary suppresses an unrelated fallback delay", async () => {
+  const now = 30_000;
+  let caught: unknown;
+  try {
+    await executeProviderRequest({
+      initialCandidateId: "primary",
+      resolveCandidate: (id) => ({ id, fallbackId: id === "primary" ? "fallback" : null }),
+      policy: { ...policy, maxRetries: 0 },
+      now: () => now,
+      signal: new AbortController().signal,
+      circuitStore: {
+        acquire: (id) =>
+          id === "fallback"
+            ? { allowed: false, state: "open", retryAt: now + 10_000 }
+            : { allowed: true, state: "closed" },
+        success: () => undefined,
+        failure: () => ({ state: "closed" }),
+      },
+      attempt: () => {
+        throw new ProviderAttemptError("unavailable", { status: 503 });
+      },
+    });
+  } catch (error) {
+    caught = error;
+  }
+  assertEquals(caught instanceof ResilienceExhaustedError, true);
+  assertEquals((caught as ResilienceExhaustedError).retryAfterMs, undefined);
+  assertEquals(
+    ((caught as ResilienceExhaustedError).lastError as ProviderAttemptError).options.status,
+    503,
+  );
+});
+
 Deno.test("non-transient failures do not retry or fall back and fallback cycles are guarded", async () => {
   let calls = 0;
   await assertRejects(
@@ -257,24 +429,26 @@ Deno.test("candidate-local protocol incompatibilities skip only that fallback ta
   assertEquals(result, "later Chat fallback won");
   assertEquals(calls, ["chat-primary", "responses-incompatible", "chat-compatible"]);
 
-  await assertRejects(
-    () =>
-      executeProviderRequest({
-        initialCandidateId: "responses-only",
-        resolveCandidate: (id) => ({ id }),
-        policy: { ...policy, maxRetries: 0 },
-        signal: new AbortController().signal,
-        attempt: () => {
-          throw new ProviderAttemptError("unsupported stop", {
-            category: "invalid_request",
-            transient: false,
-            candidateLocal: true,
-          });
-        },
-      }),
-    ProviderAttemptError,
-    "unsupported stop",
-  );
+  let incompatible: unknown;
+  try {
+    await executeProviderRequest({
+      initialCandidateId: "responses-only",
+      resolveCandidate: (id) => ({ id }),
+      policy: { ...policy, maxRetries: 0 },
+      signal: new AbortController().signal,
+      attempt: () => {
+        throw new ProviderAttemptError("unsupported stop", {
+          category: "invalid_request",
+          transient: false,
+          candidateLocal: true,
+        });
+      },
+    });
+  } catch (error) {
+    incompatible = error;
+  }
+  assertEquals(incompatible instanceof ResilienceExhaustedError, true);
+  assertEquals((incompatible as ResilienceExhaustedError).lastError, undefined);
 });
 
 Deno.test("stream buffers role and keepalive chunks, retries before visibility, then publishes", async () => {

@@ -20,6 +20,7 @@ Deno.test({
       const user = await repo.createUser({
         email: "governance-pg@example.com",
         name: "Governance",
+        approvalStatus: "approved",
       });
       const original = await repo.createApiToken(user.id, {
         name: "race",

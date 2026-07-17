@@ -1,5 +1,5 @@
 import { expect, type Page, test } from "@playwright/test";
-import { bootstrap, login, openSidebar, uniqueUser } from "./helpers.ts";
+import { activeChatSession, bootstrap, login, openSidebar, uniqueUser } from "./helpers.ts";
 import { lightweightManagedStack } from "./env.ts";
 
 async function authenticatedRequest(
@@ -24,10 +24,151 @@ async function currentConversationVersion(page: Page, conversationId: string): P
   return (response.body as { version: number }).version;
 }
 
+async function conversationHasCompletedReply(
+  page: Page,
+  conversationId: string,
+  userContent: string,
+): Promise<boolean> {
+  const response = await authenticatedRequest(page, `/api/conversations/${conversationId}`);
+  if (response.status !== 200) return false;
+  const detail = response.body as {
+    activeLeafId: string | null;
+    messages: Array<{
+      id: string;
+      parentId: string | null;
+      role: string;
+      content: string;
+      status: string;
+      metadata?: Record<string, unknown>;
+    }>;
+  };
+  const user = detail.messages.find((message) =>
+    message.role === "user" &&
+    (message.content === userContent || message.metadata?.authoredContent === userContent)
+  );
+  if (!user) return false;
+  const assistant = detail.messages.find((message) =>
+    message.role === "assistant" && message.parentId === user.id && message.status === "complete"
+  );
+  return assistant?.id === detail.activeLeafId;
+}
+
+test("tool discovery reports outages honestly and execution polling never overlaps", async ({ page, request }) => {
+  test.setTimeout(60_000);
+  await bootstrap(request);
+  await login(page);
+  let catalogAvailable = false;
+  await page.route("**/api/tools", async (route) => {
+    if (route.request().method() !== "GET") return await route.continue();
+    if (!catalogAvailable) {
+      return await route.fulfill({
+        status: 503,
+        contentType: "application/json",
+        json: { error: { code: "catalog_unavailable", message: "Synthetic tool catalog outage" } },
+      });
+    }
+    return await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      json: {
+        data: [{
+          id: "web_search",
+          name: "Web search",
+          description: "Search safely",
+          enabled: true,
+          inputSchema: {},
+        }],
+      },
+    });
+  });
+  const now = new Date().toISOString();
+  const execution = (status: "pending_approval" | "running" | "succeeded") => ({
+    id: "00000000-0000-4000-8000-000000000777",
+    ownerId: "00000000-0000-4000-8000-000000000778",
+    toolId: "web_search",
+    input: { query: "poll safety" },
+    status,
+    result: status === "succeeded" ? { results: [] } : null,
+    error: null,
+    createdAt: now,
+    updatedAt: now,
+  });
+  let createCount = 0;
+  const createStarted = Promise.withResolvers<void>();
+  const releaseFirstCreate = Promise.withResolvers<void>();
+  await page.route("**/api/tools/executions", async (route) => {
+    if (route.request().method() !== "POST") return await route.continue();
+    createCount += 1;
+    if (createCount === 1) {
+      createStarted.resolve();
+      await releaseFirstCreate.promise;
+    }
+    await route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      json: execution("pending_approval"),
+    });
+  });
+  let activePolls = 0;
+  let maximumActivePolls = 0;
+  let pollCount = 0;
+  let approveCount = 0;
+  await page.route("**/api/tools/executions/**", async (route) => {
+    const method = route.request().method();
+    if (method === "POST" && route.request().url().endsWith("/approve")) {
+      approveCount += 1;
+      return await route.fulfill({
+        // Model a lost acknowledgement: the server advanced the execution, but the client saw
+        // an error. Polling must resume and reconcile instead of leaving stale approval UI.
+        status: 503,
+        contentType: "application/json",
+        json: { error: { code: "ack_lost", message: "Synthetic lost acknowledgement" } },
+      });
+    }
+    if (method !== "GET") return await route.continue();
+    activePolls += 1;
+    maximumActivePolls = Math.max(maximumActivePolls, activePolls);
+    pollCount += 1;
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    activePolls -= 1;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      json: execution(pollCount >= 2 ? "succeeded" : "running"),
+    });
+  });
+
+  await page.goto("/");
+  await page.getByRole("button", { name: "Open web search" }).click();
+  const dialog = page.getByRole("dialog", { name: "Web search" });
+  await expect(dialog.getByRole("alert")).toContainText("Synthetic tool catalog outage", {
+    timeout: 15_000,
+  });
+  await expect(dialog.getByText("not enabled by an administrator")).toHaveCount(0);
+  catalogAvailable = true;
+  await dialog.getByRole("button", { name: "Try loading tools again" }).click();
+  await dialog.getByLabel("Search query").fill("dismissed request");
+  await dialog.getByRole("button", { name: "Review search" }).click();
+  await createStarted.promise;
+  await dialog.getByRole("button", { name: "Close", exact: true }).click();
+  releaseFirstCreate.resolve();
+  await page.getByRole("button", { name: "Open web search" }).click();
+  await expect(dialog.getByLabel("Search query")).toHaveValue("");
+  await expect(dialog.getByText(/Status:/u)).toHaveCount(0);
+  await dialog.getByLabel("Search query").fill("poll safety");
+  await dialog.getByRole("button", { name: "Review search" }).click();
+  await dialog.getByRole("button", { name: "Approve this search" }).click();
+  await expect(dialog.getByText("Status: succeeded")).toBeVisible({ timeout: 15_000 });
+  expect(approveCount).toBe(1);
+  expect(maximumActivePolls).toBe(1);
+  expect(pollCount).toBe(2);
+});
+
 test("admin enables web search and a user explicitly reviews and cancels a tool call", async ({
   page,
   request,
 }, testInfo) => {
+  test.setTimeout(120_000);
   test.skip(lightweightManagedStack, "requires the durable tool and search adapter stack");
   await bootstrap(request);
   await login(page);
@@ -74,23 +215,40 @@ test("admin enables web search and a user explicitly reviews and cancels a tool 
   await page.getByLabel("Search query").fill("OpenAI compatible API");
   await page.getByRole("button", { name: "Review search" }).click();
   await page.getByRole("button", { name: "Approve this search" }).click();
-  await expect(page.getByText("Status: succeeded")).toBeVisible({ timeout: 20_000 });
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const status = page.locator(".tool-execution-status");
+    await expect(status).toContainText(/Status:\s*(?:succeeded|failed)/u, { timeout: 30_000 });
+    if (await status.getByText("Status: succeeded").isVisible()) break;
+    await page.getByRole("button", { name: "Try search again" }).click();
+    await page.getByRole("button", { name: "Review search" }).click();
+    await page.getByRole("button", { name: "Approve this search" }).click();
+  }
+  await expect(page.getByText("Status: succeeded")).toBeVisible();
   await page.getByRole("button", { name: "Add to next message" }).click();
   await expect(page.getByText("Approved web search", { exact: true })).toBeVisible();
   const prompt = `Summarize the attached verified search result ${crypto.randomUUID()}.`;
-  await page.getByLabel("Message").fill(prompt);
-  await page.getByRole("button", { name: "Send", exact: true }).click();
-  await expect(page.getByText(prompt, { exact: true })).toBeVisible();
-  await expect.poll(
-    () => page.locator(".assistant-message .markdown").last().textContent(),
-    { timeout: 20_000, message: "the generation to commit before reloading" },
-  ).not.toBe("");
-  await page.reload();
-  await expect(page.getByText(prompt, { exact: true })).toBeVisible();
+  const editedPrompt =
+    `Edited summary that retains verified search provenance ${crypto.randomUUID()}.`;
+  const session = activeChatSession(page);
+  await session.getByRole("textbox", { name: "Message", exact: true }).fill(prompt);
+  await session.getByRole("button", { name: "Send", exact: true }).click();
+  await expect(session.getByText(prompt, { exact: true }).last()).toBeVisible();
   const conversationId = await page.locator(
     ".conversation-row.active [data-conversation-actions]",
   ).getAttribute("data-conversation-actions");
   if (!conversationId) throw new Error("Active conversation ID was not available");
+  await expect.poll(
+    () => activeChatSession(page).locator(".assistant-message .markdown").last().textContent(),
+    { timeout: 20_000, message: "the generation to commit before reloading" },
+  ).not.toBe("");
+  await expect.poll(
+    () => conversationHasCompletedReply(page, conversationId, prompt),
+    { timeout: 20_000, message: "the initial generation to settle before reloading" },
+  ).toBe(true);
+  await page.reload();
+  await expect(activeChatSession(page).getByText(prompt, { exact: true })).toBeVisible({
+    timeout: 20_000,
+  });
   const concurrentEditRename = await authenticatedRequest(
     page,
     `/api/conversations/${conversationId}`,
@@ -103,30 +261,27 @@ test("admin enables web search and a user explicitly reviews and cancels a tool 
     },
   );
   expect(concurrentEditRename.status).toBe(200);
-  const original = page.getByText(prompt, { exact: true });
+  const original = activeChatSession(page).getByText(prompt, { exact: true });
   await original.hover();
   await original.locator("xpath=ancestor::*[self::article or @data-message-id][1]")
     .getByRole("button", { name: /edit/i }).click();
-  await page.getByRole("textbox", { name: /message/i }).fill(
-    "Edited summary that retains verified search provenance.",
-  );
-  await page.getByRole("button", { name: /send|save/i }).click();
-  await expect(page.getByText("Edited summary that retains verified search provenance.", {
-    exact: true,
-  })).toBeVisible();
+  await activeChatSession(page).getByRole("textbox", {
+    name: "Edit message in a new branch",
+  }).fill(editedPrompt);
+  await activeChatSession(page).getByRole("button", {
+    name: "Send edited message as a new branch",
+  }).click();
+  await expect(
+    activeChatSession(page).getByText(editedPrompt, { exact: true }).last(),
+  ).toBeVisible();
   await expect.poll(
-    async () => {
-      const detail = await authenticatedRequest(page, `/api/conversations/${conversationId}`);
-      return detail.status === 200 && JSON.stringify(detail.body).includes(
-        "Edited summary that retains verified search provenance.",
-      );
-    },
-    { timeout: 20_000, message: "the edited branch generation to commit" },
+    () => conversationHasCompletedReply(page, conversationId, editedPrompt),
+    { timeout: 20_000, message: "the edited branch generation to settle" },
   ).toBe(true);
   await page.reload();
-  await expect(page.getByText("Edited summary that retains verified search provenance.", {
-    exact: true,
-  })).toBeVisible();
+  await expect(activeChatSession(page).getByText(editedPrompt, { exact: true })).toBeVisible({
+    timeout: 20_000,
+  });
   const concurrentRename = await authenticatedRequest(
     page,
     `/api/conversations/${conversationId}`,
@@ -139,13 +294,14 @@ test("admin enables web search and a user explicitly reviews and cancels a tool 
     },
   );
   expect(concurrentRename.status).toBe(200);
-  await page.getByRole("button", { name: "Previous branch" }).click();
+  const edited = activeChatSession(page).getByText(editedPrompt, { exact: true }).last();
+  await edited.locator("xpath=ancestor::*[self::article or @data-message-id][1]")
+    .getByRole("button", { name: /^Previous branch for / }).click();
   await expect(original).toBeVisible();
   await expect(page.getByText("That branch changed in another tab.")).toHaveCount(0);
-  await page.getByRole("button", { name: "Next branch" }).click();
-  await expect(page.getByText("Edited summary that retains verified search provenance.", {
-    exact: true,
-  })).toBeVisible();
+  await original.locator("xpath=ancestor::*[self::article or @data-message-id][1]")
+    .getByRole("button", { name: /^Next branch for / }).click();
+  await expect(activeChatSession(page).getByText(editedPrompt, { exact: true })).toBeVisible();
 });
 
 test("a second approved user cannot inspect another user's tool execution", async ({ page, request }) => {

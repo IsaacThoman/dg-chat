@@ -714,6 +714,15 @@ async function completeAttempt(
     throw new Error("Provider returned a non-object chat completion");
   }
   const data = payload as Record<string, unknown>;
+  // Some OpenAI-compatible gateways incorrectly return HTTP 200 while placing a provider failure
+  // beside a nominal `choices` array. Never treat or diagnostically capture that envelope as a
+  // successful completion: its error object commonly contains credentials and raw request data.
+  if (data.error !== undefined && data.error !== null) {
+    throw new ProviderAttemptError("Provider returned an error in a successful HTTP response", {
+      category: "invalid_response",
+      transient: true,
+    });
+  }
   boundedString(data.id, "completion id");
   boundedString(data.object, "completion object");
   boundedString(data.model, "completion model");

@@ -1,5 +1,5 @@
 import { assertEquals, assertExists, assertThrows } from "jsr:@std/assert@1.0.14";
-import { createApp } from "./app.ts";
+import { assertEmailVerificationAdminReadiness, createApp } from "./app.ts";
 import { MemoryRepository } from "@dg-chat/database";
 
 async function json(response: Response) {
@@ -13,13 +13,14 @@ function sessionCookie(response: Response): string {
   return cookie;
 }
 
-async function fixture(startingCreditMicros?: number) {
+async function fixture(startingCreditMicros?: number, requireEmailVerification = false) {
   const repository = new MemoryRepository();
   let now = Date.now();
   const { app } = createApp({
     repository,
     setupToken: "admin-lifecycle-setup",
     startingCreditMicros,
+    requireEmailVerification,
     now: () => now,
   });
   const bootstrap = await app.request("/api/setup/bootstrap", {
@@ -64,6 +65,49 @@ async function fixture(startingCreditMicros?: number) {
     advance: (milliseconds: number) => now += milliseconds,
   };
 }
+
+Deno.test("required email verification fails startup before an unusable admin lockout", () => {
+  const repository = new MemoryRepository();
+  const unavailableAdmin = repository.createUser({
+    email: "unverified-admin@example.com",
+    name: "Unverified administrator",
+    role: "admin",
+    approvalStatus: "pending",
+  });
+  unavailableAdmin.approvalStatus = "approved";
+
+  assertThrows(
+    () => assertEmailVerificationAdminReadiness(repository.listUsers(), true),
+    Error,
+    "needs at least one verified, approved, active administrator",
+  );
+  assertEmailVerificationAdminReadiness(repository.listUsers(), false);
+  unavailableAdmin.emailVerifiedAt = new Date().toISOString();
+  assertEmailVerificationAdminReadiness(repository.listUsers(), true);
+});
+
+Deno.test("required email verification rejects promotion of an unverified approved user", async () => {
+  const { app, repository, applicant, headers } = await fixture(undefined, true);
+  const approved = repository.decideUserApproval({
+    actorId: repository.listUsers().find((user) => user.role === "admin")!.id,
+    targetUserId: applicant.id,
+    expectedVersion: applicant.version,
+    status: "approved",
+    startingCreditMicros: 0,
+  });
+  const response = await app.request(`/api/admin/users/${applicant.id}/role`, {
+    method: "PATCH",
+    headers,
+    body: JSON.stringify({
+      role: "admin",
+      expectedVersion: approved.version,
+      reason: "Must verify before promotion",
+    }),
+  });
+  assertEquals(response.status, 409);
+  assertEquals((await json(response)).error.code, "email_not_verified");
+  assertEquals(repository.findUser(applicant.id)?.role, "user");
+});
 
 Deno.test("admin settings expose and approval applies the configured default credit", async () => {
   const { app, applicant, headers } = await fixture(6_750_001);

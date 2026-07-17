@@ -1,6 +1,7 @@
 import { ArrowLeft, ChevronLeft, ChevronRight, Download, Pencil } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useContext, useEffect, useState } from "react";
 import { Modal } from "../Modal.tsx";
+import { ChatSessionActivityContext } from "../chatSessionActivity.ts";
 import { assetAlt } from "./ImageCard.tsx";
 import { imageApi } from "./imageApi.ts";
 import type { GeneratedAsset } from "./types.ts";
@@ -13,6 +14,7 @@ export function ImageLightbox({ assets, activeId, close, select, edit, embedded 
   edit?: (asset: GeneratedAsset) => void;
   embedded?: boolean;
 }) {
+  const sessionActive = useContext(ChatSessionActivityContext);
   const [resolvedSources, setResolvedSources] = useState<GeneratedAsset[]>([]);
   const [sourceFailures, setSourceFailures] = useState<ReadonlySet<string>>(new Set());
   const [sourceRetryVersion, setSourceRetryVersion] = useState(0);
@@ -76,6 +78,7 @@ export function ImageLightbox({ assets, activeId, close, select, edit, embedded 
     if (assets.some((candidate) => candidate.id === id)) select(id);
   };
   useEffect(() => {
+    if (!sessionActive) return;
     const keydown = (event: KeyboardEvent) => {
       const target = event.target;
       if (
@@ -93,7 +96,7 @@ export function ImageLightbox({ assets, activeId, close, select, edit, embedded 
     };
     document.addEventListener("keydown", keydown);
     return () => document.removeEventListener("keydown", keydown);
-  }, [viewAssets, index, select]);
+  }, [viewAssets, index, select, sessionActive]);
   if (!asset) return null;
   const content = (
     <div className="image-lightbox">

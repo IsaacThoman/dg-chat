@@ -164,6 +164,7 @@ describe("chat stream adapter", () => {
     });
     expect(events.at(-1)).toMatchObject({
       type: "completed",
+      outcome: "complete",
       assistant: { id: "assistant", content: rawAssistant.content },
     });
   });
@@ -257,6 +258,55 @@ describe("chat stream adapter", () => {
       "/api/conversations/conversation/generations/generation-stable/stop",
       expect.objectContaining({ method: "POST" }),
     );
+  });
+
+  it("preserves a stopped terminal outcome for product recovery messaging", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(eventStream([
+      {
+        type: "generation.started",
+        generationId: "generation-stopped",
+        sequence: 0,
+        user: rawUser,
+        conversation: rawConversation,
+      },
+      {
+        type: "response.text.delta",
+        generationId: "generation-stopped",
+        sequence: 1,
+        delta: "partial",
+      },
+      {
+        type: "generation.stopped",
+        generationId: "generation-stopped",
+        sequence: 2,
+        assistant: { ...rawAssistant, content: "partial", status: "stopped" },
+        conversation: rawConversation,
+      },
+    ]));
+    const events = [];
+    for await (
+      const event of chatStreamAdapter.stream({
+        conversation: {
+          id: "conversation",
+          title: "Chat",
+          preview: "",
+          updatedAt: "now",
+          activeLeafId: null,
+          version: 0,
+        },
+        content: "hello",
+        model: "model",
+        operationId: "operation-stopped",
+        attachmentIds: [],
+        mode: "send",
+      }, new AbortController().signal)
+    ) events.push(event);
+
+    expect(events.at(-1)).toMatchObject({
+      type: "completed",
+      outcome: "stopped",
+      assistant: { content: "partial", status: "stopped" },
+    });
   });
 });
 

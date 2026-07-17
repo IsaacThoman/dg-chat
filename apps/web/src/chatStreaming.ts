@@ -27,7 +27,13 @@ export type ChatStreamEvent =
     outputTokens: number;
     reasoningTokens: number;
   }
-  | { type: "completed"; user: Message; assistant: Message; conversation: Conversation };
+  | {
+    type: "completed";
+    outcome: "complete" | "stopped" | "error";
+    user: Message;
+    assistant: Message;
+    conversation: Conversation;
+  };
 
 export interface ChatStreamAdapter {
   stream(request: ChatStreamRequest, signal: AbortSignal): AsyncIterable<ChatStreamEvent>;
@@ -265,6 +271,11 @@ export const chatStreamAdapter: ChatStreamAdapter = {
           terminal = true;
           yield {
             type: "completed",
+            outcome: event.type === "generation.stopped"
+              ? "stopped"
+              : event.type === "generation.error"
+              ? "error"
+              : "complete",
             user: acceptedUser,
             assistant: mapMessage(event.assistant),
             conversation: mapConversation(event.conversation),

@@ -2,6 +2,7 @@ import {
   bigint,
   boolean,
   check,
+  customType,
   doublePrecision,
   foreignKey,
   index,
@@ -16,6 +17,7 @@ import {
   unique,
   uniqueIndex,
   uuid,
+  varchar,
   vector,
 } from "npm:drizzle-orm@0.45.2/pg-core";
 import { sql } from "npm:drizzle-orm@0.45.2";
@@ -26,6 +28,7 @@ export const userRole = pgEnum("user_role", ["user", "admin"]);
 // safely remove enum values in-place. Application state is intentionally narrower: soft deletion
 // is represented independently by users.deleted_at and migration 0037 prevents new legacy values.
 export const accountState = pgEnum("account_state", ["active", "suspended"]);
+const xid8 = customType<{ data: string }>({ dataType: () => "xid8" });
 export const messageRole = pgEnum("message_role", [
   "system",
   "developer",
@@ -59,6 +62,7 @@ export const users = pgTable("users", {
   approvalStatus: approvalStatus("approval_status").notNull().default("pending"),
   state: accountState("state").notNull().default("active"),
   version: integer("version").notNull().default(1),
+  authorityEpoch: bigint("authority_epoch", { mode: "number" }).notNull().default(1),
   balanceMicros: bigint("balance_micros", { mode: "number" }).notNull().default(0),
   emailVerifiedAt: timestamp("email_verified_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -68,6 +72,7 @@ export const users = pgTable("users", {
   uniqueIndex("users_email_uq").on(table.email),
   index("users_created_cursor_idx").on(table.createdAt.desc(), table.id.desc()),
   check("users_version_check", sql`${table.version} >= 1`),
+  check("users_authority_epoch_check", sql`${table.authorityEpoch} BETWEEN 1 AND 9007199254740991`),
   check("users_account_state_check", sql`${table.state} IN ('active','suspended')`),
   check(
     "users_balance_safe_check",
@@ -99,11 +104,20 @@ export const authSessions = pgTable("auth_sessions", {
   userAgent: text("user_agent"),
   userId: uuid("user_id").notNull().references(() => authUsers.id, { onDelete: "cascade" }),
   limited: boolean("limited").notNull().default(true),
+  authorityEpoch: bigint("authority_epoch", { mode: "number" }).notNull().default(1),
 }, (table) => [
   uniqueIndex("auth_sessions_token_uq").on(table.token),
+  check(
+    "auth_sessions_authority_epoch_check",
+    sql`${table.authorityEpoch} BETWEEN 1 AND 9007199254740991`,
+  ),
   index("auth_sessions_user_idx").on(table.userId),
   index("auth_sessions_user_page_idx").on(table.userId, table.createdAt.desc(), table.id.desc()),
 ]);
+
+// Migration 0042 installs the database-level issuance fence for this table. Drizzle does not
+// model triggers: every full-session insert is serialized against the matching domain users row
+// and revalidates approval/lifecycle state; only limited pre-provision signup sessions may lack it.
 
 export const authAccounts = pgTable("auth_accounts", {
   id: uuid("id").primaryKey().defaultRandom(),
@@ -131,6 +145,7 @@ export const authVerifications = pgTable("auth_verifications", {
   expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  authorityEpoch: bigint("authority_epoch", { mode: "number" }),
 }, (table) => [index("auth_verifications_identifier_idx").on(table.identifier)]);
 
 export const sessions = pgTable(
@@ -140,6 +155,7 @@ export const sessions = pgTable(
     userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
     tokenHash: text("token_hash").notNull(),
     limited: boolean("limited").notNull().default(false),
+    authorityEpoch: bigint("authority_epoch", { mode: "number" }).notNull().default(1),
     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     invalidatedAt: timestamp("invalidated_at", { withTimezone: true }),
@@ -148,6 +164,10 @@ export const sessions = pgTable(
     table,
   ) => [
     uniqueIndex("sessions_token_hash_uq").on(table.tokenHash),
+    check(
+      "sessions_authority_epoch_check",
+      sql`${table.authorityEpoch} BETWEEN 1 AND 9007199254740991`,
+    ),
     index("sessions_user_idx").on(table.userId),
     index("sessions_user_page_idx").on(table.userId, table.createdAt.desc(), table.id.desc()),
   ],
@@ -160,6 +180,7 @@ export const identityTokens = pgTable("identity_tokens", {
   tokenHash: text("token_hash").notNull(),
   expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
   consumedAt: timestamp("consumed_at", { withTimezone: true }),
+  authorityEpoch: bigint("authority_epoch", { mode: "number" }).notNull().default(1),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [
   uniqueIndex("identity_tokens_hash_uq").on(table.tokenHash),
@@ -181,6 +202,14 @@ export const conversations = pgTable("conversations", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [
   index("conversations_owner_updated_idx").on(table.ownerId, table.updatedAt),
+  index("conversations_title_trgm_idx").using("gin", sql`lower(${table.title}) gin_trgm_ops`),
+  index("conversations_owner_lifecycle_search_idx").on(
+    table.ownerId,
+    table.deletedAt,
+    table.archivedAt,
+    table.updatedAt.desc(),
+    table.id.desc(),
+  ),
   index("conversations_owner_temporary_expiry_idx").on(
     table.ownerId,
     table.temporaryExpiresAt,
@@ -360,6 +389,10 @@ export const messages = pgTable("messages", {
   ),
   uniqueIndex("messages_sibling_uq").on(table.conversationId, table.parentId, table.siblingIndex),
   index("messages_parent_idx").on(table.parentId),
+  index("messages_search_content_trgm_idx").using(
+    "gin",
+    sql`lower(CASE WHEN ${table.role}='user' AND jsonb_typeof(${table.metadata}->'authoredContent')='string' THEN ${table.metadata}->>'authoredContent' ELSE ${table.content} END) gin_trgm_ops`,
+  ).where(sql`${table.role} IN ('user','assistant') AND ${table.status} <> 'tombstoned'`),
 ]);
 
 export const conversationShareSnapshots = pgTable("conversation_share_snapshots", {
@@ -542,6 +575,7 @@ export const apiTokens = pgTable(
     tokenHash: text("token_hash").notNull(),
     preview: text("preview").notNull(),
     scopes: jsonb("scopes").$type<string[]>().notNull(),
+    authorityEpoch: bigint("authority_epoch", { mode: "number" }).notNull().default(1),
     version: integer("version").notNull().default(1),
     rpmLimit: integer("rpm_limit"),
     burstLimit: integer("burst_limit"),
@@ -560,6 +594,10 @@ export const apiTokens = pgTable(
     table,
   ) => [
     uniqueIndex("api_tokens_hash_uq").on(table.tokenHash),
+    check(
+      "api_tokens_authority_epoch_check",
+      sql`${table.authorityEpoch} BETWEEN 1 AND 9007199254740991`,
+    ),
     index("api_tokens_user_idx").on(table.userId),
     index("api_tokens_user_page_idx").on(table.userId, table.createdAt.desc(), table.id.desc()),
     uniqueIndex("api_tokens_family_generation_uq").on(
@@ -642,6 +680,7 @@ export const usageRuns = pgTable("usage_runs", {
   tokenId: uuid("token_id").references(() => apiTokens.id),
   model: text("model").notNull(),
   provider: text("provider").notNull(),
+  recoveryOwner: text("recovery_owner").notNull(),
   status: text("status").notNull(),
   reservedMicros: bigint("reserved_micros", { mode: "number" }).notNull().default(0),
   pricingVersionId: uuid("pricing_version_id").references(() => modelPriceVersions.id, {
@@ -684,6 +723,10 @@ export const usageRuns = pgTable("usage_runs", {
 }, (table) => [
   index("usage_runs_analytics_time_idx").on(table.createdAt.desc(), table.id),
   index("usage_runs_analytics_user_time_idx").on(table.userId, table.createdAt.desc(), table.id),
+  check(
+    "usage_runs_recovery_owner_check",
+    sql`${table.recoveryOwner} IN ('provider','api_replay','document_embedding','tool')`,
+  ),
   check(
     "usage_runs_pricing_snapshot_check",
     sql`(
@@ -762,6 +805,112 @@ export const jobs = pgTable("jobs", {
   index("jobs_claim_idx").on(table.status, table.availableAt),
   index("jobs_admin_page_idx").on(table.createdAt.desc(), table.id.desc()),
   uniqueIndex("jobs_idempotency_key_uq").on(table.idempotencyKey),
+]);
+
+// Operational and intentionally non-portable: every process boot owns one immutable identity.
+// Migration 0046 adds the restore-maintenance trigger, which Drizzle does not model.
+export const workerInstances = pgTable("worker_instances", {
+  instanceId: uuid("instance_id").primaryKey(),
+  workerName: varchar("worker_name", { length: 128 }).notNull(),
+  state: varchar("state", { length: 16 }).$type<"starting" | "running" | "draining" | "stopped">()
+    .notNull(),
+  startedAt: timestamp("started_at", { withTimezone: true }).notNull().defaultNow(),
+  heartbeatAt: timestamp("heartbeat_at", { withTimezone: true }).notNull().defaultNow(),
+  progressAt: timestamp("progress_at", { withTimezone: true }).notNull().defaultNow(),
+  heartbeatStaleMs: integer("heartbeat_stale_ms").notNull().default(20_000),
+  progressStaleMs: integer("progress_stale_ms").notNull().default(180_000),
+  healthClockToleranceMs: integer("health_clock_tolerance_ms").notNull().default(5_000),
+  currentJobId: uuid("current_job_id"),
+  currentJobType: varchar("current_job_type", { length: 100 }),
+  lastCompletedAt: timestamp("last_completed_at", { withTimezone: true }),
+  lastCompletedJobId: uuid("last_completed_job_id"),
+  lastCompletedJobType: varchar("last_completed_job_type", { length: 100 }),
+  stoppedAt: timestamp("stopped_at", { withTimezone: true }),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  index("worker_instances_freshness_idx").on(
+    table.state,
+    table.heartbeatAt.desc(),
+    table.progressAt.desc(),
+  ),
+  index("worker_instances_name_started_idx").on(table.workerName, table.startedAt.desc()),
+  check(
+    "worker_instances_state_check",
+    sql`${table.state} IN ('starting','running','draining','stopped')`,
+  ),
+  check(
+    "worker_instances_current_job_check",
+    sql`(${table.currentJobId} IS NULL) = (${table.currentJobType} IS NULL)`,
+  ),
+  check(
+    "worker_instances_last_completed_job_check",
+    sql`(${table.lastCompletedJobId} IS NULL) = (${table.lastCompletedJobType} IS NULL)`,
+  ),
+  check(
+    "worker_instances_last_completed_tuple_check",
+    sql`(${table.lastCompletedAt} IS NULL) = (${table.lastCompletedJobId} IS NULL)`,
+  ),
+  check(
+    "worker_instances_stopped_at_check",
+    sql`(${table.state} = 'stopped') = (${table.stoppedAt} IS NOT NULL)`,
+  ),
+  check(
+    "worker_instances_heartbeat_stale_check",
+    sql`${table.heartbeatStaleMs} BETWEEN 1000 AND 300000`,
+  ),
+  check(
+    "worker_instances_progress_stale_check",
+    sql`${table.progressStaleMs} BETWEEN 1000 AND 3600000`,
+  ),
+  check(
+    "worker_instances_clock_tolerance_check",
+    sql`${table.healthClockToleranceMs} BETWEEN 0 AND 60000`,
+  ),
+]);
+
+export const documentEmbeddingBatches = pgTable("document_embedding_batches", {
+  jobId: uuid("job_id").notNull().references(() => jobs.id, { onDelete: "cascade" }),
+  batchOrdinal: integer("batch_ordinal").notNull(),
+  dispatchEpoch: integer("dispatch_epoch").notNull().default(0),
+  usageRunId: text("usage_run_id").notNull().unique(),
+  requestSha256: text("request_sha256").notNull(),
+  itemCount: integer("item_count").notNull(),
+  batchSize: integer("batch_size").notNull(),
+  maximumInputTokens: integer("maximum_input_tokens").notNull(),
+  phase: text("phase").$type<"pre_dispatch" | "dispatched" | "succeeded" | "committed">()
+    .notNull().default("pre_dispatch"),
+  retrySafe: boolean("retry_safe").notNull().default(false),
+  dispatchClaimToken: text("dispatch_claim_token"),
+  providerResponse: jsonb("provider_response"),
+  providerResponseSha256: text("provider_response_sha256"),
+  inputTokens: integer("input_tokens"),
+  latencyMs: integer("latency_ms"),
+  dispatchedAt: timestamp("dispatched_at", { withTimezone: true }),
+  respondedAt: timestamp("responded_at", { withTimezone: true }),
+  committedAt: timestamp("committed_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  primaryKey({ columns: [table.jobId, table.batchOrdinal] }),
+  index("document_embedding_batches_active_usage_idx").on(table.usageRunId, table.phase)
+    .where(sql`${table.phase} IN ('pre_dispatch','dispatched','succeeded')`),
+  check(
+    "document_embedding_batches_identity_check",
+    sql`${table.batchOrdinal} >= 0 AND ${table.dispatchEpoch} >= 0 AND ${table.requestSha256} ~ '^[0-9a-f]{64}$' AND ${table.itemCount} BETWEEN 1 AND 256 AND ${table.batchSize} BETWEEN 1 AND 256 AND ${table.batchOrdinal} % ${table.batchSize} = 0 AND ${table.itemCount} <= ${table.batchSize} AND ${table.maximumInputTokens} >= 0 AND (${table.providerResponseSha256} IS NULL OR ${table.providerResponseSha256} ~ '^[0-9a-f]{64}$') AND (${table.inputTokens} IS NULL OR ${table.inputTokens} >= 0) AND (${table.latencyMs} IS NULL OR ${table.latencyMs} >= 0)`,
+  ),
+  check(
+    "document_embedding_batches_phase_check",
+    sql`${table.phase} IN ('pre_dispatch','dispatched','succeeded','committed')`,
+  ),
+  check(
+    "document_embedding_batches_state_check",
+    sql`(
+      (${table.phase}='pre_dispatch' AND ${table.retrySafe}=false AND ${table.dispatchClaimToken} IS NULL AND ${table.dispatchedAt} IS NULL AND ${table.providerResponse} IS NULL AND ${table.providerResponseSha256} IS NULL AND ${table.inputTokens} IS NULL AND ${table.latencyMs} IS NULL AND ${table.respondedAt} IS NULL AND ${table.committedAt} IS NULL)
+      OR (${table.phase}='dispatched' AND ${table.dispatchClaimToken} IS NOT NULL AND ${table.dispatchedAt} IS NOT NULL AND ${table.providerResponse} IS NULL AND ${table.providerResponseSha256} IS NULL AND ${table.inputTokens} IS NULL AND ${table.latencyMs} IS NULL AND ${table.respondedAt} IS NULL AND ${table.committedAt} IS NULL)
+      OR (${table.phase}='succeeded' AND ${table.retrySafe}=false AND ${table.dispatchClaimToken} IS NOT NULL AND ${table.dispatchedAt} IS NOT NULL AND ${table.providerResponse} IS NOT NULL AND ${table.providerResponseSha256} IS NOT NULL AND ${table.inputTokens} IS NOT NULL AND ${table.latencyMs} IS NOT NULL AND ${table.respondedAt} IS NOT NULL AND ${table.committedAt} IS NULL)
+      OR (${table.phase}='committed' AND ${table.retrySafe}=false AND ${table.dispatchClaimToken} IS NOT NULL AND ${table.dispatchedAt} IS NOT NULL AND ${table.providerResponse} IS NULL AND ${table.providerResponseSha256} IS NOT NULL AND ${table.inputTokens} IS NOT NULL AND ${table.latencyMs} IS NOT NULL AND ${table.respondedAt} IS NOT NULL AND ${table.committedAt} IS NOT NULL)
+    )`,
+  ),
 ]);
 
 export const documentChunks = pgTable("document_chunks", {
@@ -1684,6 +1833,7 @@ export const installationState = pgTable("installation_state", {
   maintenanceEnabled: boolean("maintenance_enabled").notNull().default(false),
   version: integer("version").notNull().default(1),
   restoreEpoch: bigint("restore_epoch", { mode: "number" }).notNull().default(0),
+  restoreTransactionId: xid8("restore_transaction_id"),
   activeRestoreId: uuid("active_restore_id").references(() => backupOperations.id, {
     onDelete: "restrict",
   }),
@@ -1693,6 +1843,10 @@ export const installationState = pgTable("installation_state", {
   check("installation_state_singleton_check", sql`${table.singletonId}=1`),
   check("installation_state_version_check", sql`${table.version} >= 1`),
   check("installation_state_restore_epoch_check", sql`${table.restoreEpoch} >= 0`),
+  check(
+    "installation_state_restore_transaction_check",
+    sql`${table.restoreTransactionId} IS NULL OR ${table.maintenanceEnabled}=true`,
+  ),
   check(
     "installation_state_maintenance_check",
     sql`${table.maintenanceEnabled} = (${table.activeRestoreId} IS NOT NULL)`,

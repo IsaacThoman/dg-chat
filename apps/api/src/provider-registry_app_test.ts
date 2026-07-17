@@ -574,10 +574,18 @@ Deno.test("OpenAI embeddings route enforces capability, billing, safe failures, 
   });
   let malformed = false;
   let fallbackMode = false;
+  let failureStatus: number | undefined;
   let calls = 0;
-  const { app, repository } = createApp({
+  const breakerPolicy = {
+    failureThreshold: 1,
+    failureWindowSeconds: 60,
+    openSeconds: 7,
+    halfOpenLeaseSeconds: 5,
+  };
+  const { app, repository, circuitBreaker } = createApp({
     setupToken: "embeddings-route-setup",
     providerKeyring: keyring,
+    breakerPolicy,
     embeddingsFetch: (input, init) => {
       calls++;
       const fallback = String(input).includes("fallback-embed.example");
@@ -587,6 +595,14 @@ Deno.test("OpenAI embeddings route enforces capability, billing, safe failures, 
       );
       if (fallbackMode && !fallback) {
         return Promise.resolve(new Response("unavailable", { status: 503 }));
+      }
+      if (failureStatus !== undefined) {
+        return Promise.resolve(
+          new Response("{", {
+            status: failureStatus,
+            headers: { "retry-after": failureStatus === 429 ? "1" : "0" },
+          }),
+        );
       }
       return Promise.resolve(
         new Response(
@@ -738,6 +754,12 @@ Deno.test("OpenAI embeddings route enforces capability, billing, safe failures, 
       ["fallback", "succeeded", fallbackModel.id],
     ],
   );
+  const openedPrimary = await circuitBreaker.inspect(provider.id, breakerPolicy);
+  assertEquals(openedPrimary.state, "open");
+  assertEquals(
+    await circuitBreaker.reset(provider.id, openedPrimary.version),
+    true,
+  );
   const restrictedFallbackGroup = await repository.createAccessGroup({
     name: "restricted-embedding-fallback",
   });
@@ -858,6 +880,99 @@ Deno.test("OpenAI embeddings route enforces capability, billing, safe failures, 
   });
   assertEquals(failed.status, 502);
   assertEquals((await body(failed)).error.code, "provider_error");
+  malformed = false;
+  failureStatus = 429;
+  const rateLimited = await app.request("/v1/embeddings", {
+    method: "POST",
+    headers: { ...headers, "idempotency-key": "embeddings-rate-limit-replay" },
+    body: JSON.stringify(request),
+  });
+  assertEquals(rateLimited.status, 429);
+  // The one-second upstream delay is not sufficient while the same candidate's breaker remains
+  // open for seven seconds. The route exposes the later, actually actionable deadline.
+  assertEquals(rateLimited.headers.get("retry-after"), "7");
+  assertEquals((await body(rateLimited)).error.code, "rate_limit_exceeded");
+  const rateLimitedRun = [...(repository as MemoryRepository).usageRuns.values()].at(-1);
+  assertExists(rateLimitedRun);
+  const rateLimitedAttempt = (await repository.listProviderAttempts(rateLimitedRun.id))[0];
+  assertEquals({
+    status: rateLimitedAttempt.status,
+    httpStatus: rateLimitedAttempt.httpStatus,
+    retryable: rateLimitedAttempt.retryable,
+    costMicros: rateLimitedAttempt.costMicros,
+  }, { status: "failed", httpStatus: 429, retryable: true, costMicros: 12 });
+  const callsBeforeRateLimitReplay = calls;
+  const rateLimitedReplay = await app.request("/v1/embeddings", {
+    method: "POST",
+    headers: { ...headers, "idempotency-key": "embeddings-rate-limit-replay" },
+    body: JSON.stringify(request),
+  });
+  assertEquals(rateLimitedReplay.status, 429);
+  assertEquals(rateLimitedReplay.headers.get("retry-after"), "7");
+  assertEquals(rateLimitedReplay.headers.get("x-idempotent-replay"), "true");
+  assertEquals((await body(rateLimitedReplay)).error.code, "rate_limit_exceeded");
+  assertEquals(calls, callsBeforeRateLimitReplay);
+  failureStatus = undefined;
+  const balanceBeforeOpenCircuit = adminUser.balanceMicros;
+  const callsBeforeOpenCircuit = calls;
+  const openCircuitRequest = await app.request("/v1/embeddings", {
+    method: "POST",
+    headers: { ...headers, "idempotency-key": "embeddings-open-circuit-replay" },
+    body: JSON.stringify(request),
+  });
+  assertEquals(openCircuitRequest.status, 503);
+  assertEquals(openCircuitRequest.headers.get("retry-after"), "7");
+  assertEquals(await body(openCircuitRequest), {
+    error: {
+      message: "Provider request failed",
+      type: "server_error",
+      param: null,
+      code: "provider_error",
+    },
+  });
+  assertEquals(calls, callsBeforeOpenCircuit);
+  assertEquals(adminUser.balanceMicros, balanceBeforeOpenCircuit);
+  const openCircuitRun = [...(repository as MemoryRepository).usageRuns.values()].at(-1);
+  assertExists(openCircuitRun);
+  assertEquals({ cost: openCircuitRun.costMicros, status: openCircuitRun.status }, {
+    cost: 0,
+    status: "failed",
+  });
+  assertEquals(
+    (await repository.listProviderAttempts(openCircuitRun.id)).map((attempt) => ({
+      reason: attempt.reason,
+      status: attempt.status,
+      cost: attempt.costMicros,
+      input: attempt.inputTokens,
+      output: attempt.outputTokens,
+    })),
+    [{ reason: "circuit_skip", status: "skipped", cost: 0, input: 0, output: 0 }],
+  );
+  const openCircuitReplay = await app.request("/v1/embeddings", {
+    method: "POST",
+    headers: { ...headers, "idempotency-key": "embeddings-open-circuit-replay" },
+    body: JSON.stringify(request),
+  });
+  assertEquals(openCircuitReplay.status, 503);
+  assertEquals(openCircuitReplay.headers.get("retry-after"), "7");
+  assertEquals(openCircuitReplay.headers.get("x-idempotent-replay"), "true");
+  assertEquals(calls, callsBeforeOpenCircuit);
+  assertEquals(adminUser.balanceMicros, balanceBeforeOpenCircuit);
+  const storedOpenCircuitRequest = [
+    ...(repository as MemoryRepository).apiIdempotencyRequests.values(),
+  ].find((item) => item.idempotencyKey === "embeddings-open-circuit-replay");
+  assertExists(storedOpenCircuitRequest);
+  storedOpenCircuitRequest.completedAt = new Date(Date.now() - 8_000).toISOString();
+  const expiredRetryReplay = await app.request("/v1/embeddings", {
+    method: "POST",
+    headers: { ...headers, "idempotency-key": "embeddings-open-circuit-replay" },
+    body: JSON.stringify(request),
+  });
+  assertEquals(expiredRetryReplay.status, 503);
+  assertEquals(expiredRetryReplay.headers.get("retry-after"), null);
+  assertEquals(expiredRetryReplay.headers.get("x-idempotent-replay"), "true");
+  assertEquals(calls, callsBeforeOpenCircuit);
+  assertEquals(adminUser.balanceMicros, balanceBeforeOpenCircuit);
   adminUser.balanceMicros = 0;
   const insufficient = await app.request("/v1/embeddings", {
     method: "POST",

@@ -47,6 +47,14 @@ const images = {
   lastPrompt: null as string | null,
 };
 
+const embeddings = {
+  calls: 0,
+  lastAuthorized: false,
+  lastModel: null as string | null,
+  lastDimensions: null as number | null,
+  lastInputCount: 0,
+};
+
 // Valid 1x1 PNG. The API decodes and validates dimensions before persistence.
 const imagePngBase64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZQmcAAAAASUVORK5CYII=";
@@ -533,6 +541,13 @@ Deno.serve({ port }, async (request) => {
       lastCount: 0,
       lastPrompt: null,
     });
+    Object.assign(embeddings, {
+      calls: 0,
+      lastAuthorized: false,
+      lastModel: null,
+      lastDimensions: null,
+      lastInputCount: 0,
+    });
     return json({ reset: true });
   }
   if (url.pathname === "/__test/state" && request.method === "GET") {
@@ -543,6 +558,7 @@ Deno.serve({ port }, async (request) => {
       audio,
       speech,
       images,
+      embeddings,
     });
   }
   if (url.pathname === "/v1/models" && request.method === "GET") {
@@ -575,13 +591,34 @@ Deno.serve({ port }, async (request) => {
     }
     const body = await request.json() as Record<string, unknown>;
     const inputs = Array.isArray(body.input) ? body.input : [body.input];
+    const dimensions = typeof body.dimensions === "number" &&
+        Number.isSafeInteger(body.dimensions) && body.dimensions > 0 && body.dimensions <= 4096
+      ? body.dimensions
+      : 4;
+    embeddings.calls++;
+    embeddings.lastAuthorized = true;
+    embeddings.lastModel = modelFrom(body);
+    embeddings.lastDimensions = dimensions;
+    embeddings.lastInputCount = inputs.length;
+    const vector = Array.from(
+      { length: dimensions },
+      (_, component) => ((component % 17) + 1) / 100,
+    );
+    const embedding = body.encoding_format === "base64"
+      ? (() => {
+        const bytes = new Uint8Array(dimensions * Float32Array.BYTES_PER_ELEMENT);
+        const view = new DataView(bytes.buffer);
+        vector.forEach((component, index) => view.setFloat32(index * 4, component, true));
+        return btoa(String.fromCharCode(...bytes));
+      })()
+      : vector;
     return json({
       object: "list",
       model: modelFrom(body),
       data: inputs.map((_, index) => ({
         object: "embedding",
         index,
-        embedding: [0.1, 0.2, 0.3, 0.4],
+        embedding,
       })),
       usage: { prompt_tokens: inputs.length, total_tokens: inputs.length },
     });

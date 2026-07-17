@@ -1,5 +1,6 @@
 import { z } from "npm:zod@4.1.12";
 import { PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH } from "./password-policy.ts";
+import { hasVisibleConversationSearchText } from "./conversation_search.ts";
 
 export const emailSchema = z.string().email().max(320).transform((value) => value.toLowerCase());
 export const passwordSchema = z.string().min(PASSWORD_MIN_LENGTH).max(PASSWORD_MAX_LENGTH);
@@ -28,6 +29,21 @@ export const createConversationSchema = z.object({
 
 export const keepTemporaryConversationSchema = z.object({
   expectedVersion: z.number().int().nonnegative(),
+}).strict();
+
+export const conversationSearchSchema = z.object({
+  query: z.string().trim().min(2).max(200).refine(
+    (value) => !value.includes("\u0000") && hasVisibleConversationSearchText(value),
+    "Search query must contain safe visible text",
+  ),
+  view: z.enum(["chat", "archived", "trash"]),
+  folderId: z.string().uuid().optional(),
+  tagIds: z.array(z.string().uuid()).max(20).refine(
+    (ids) => new Set(ids).size === ids.length,
+    "Tag identifiers must be unique",
+  ).default([]),
+  limit: z.number().int().min(1).max(100).default(25),
+  cursor: z.string().min(1).max(2048).optional(),
 }).strict();
 
 /** Owner-controlled policy for one immutable, revocable conversation snapshot. */

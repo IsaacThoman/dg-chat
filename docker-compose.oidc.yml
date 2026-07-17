@@ -14,6 +14,10 @@ services:
 
   mock-oidc:
     image: denoland/deno:alpine-2.9.2
+    # Keep the test provider aligned with the durable services it supports. Desktop container
+    # runtimes can restart independently of Compose; without a restart policy the provider stays
+    # exited while app/web recover, leaving an apparently healthy but unusable OIDC stack.
+    restart: unless-stopped
     working_dir: /workspace/apps/mock-oidc
     command: ["task", "start"]
     environment:
@@ -30,7 +34,7 @@ services:
     volumes:
       - ./apps/mock-oidc:/workspace/apps/mock-oidc:ro
     ports:
-      - "4020:4020"
+      - "127.0.0.1:4020:4020"
     networks:
       - backend
       - egress

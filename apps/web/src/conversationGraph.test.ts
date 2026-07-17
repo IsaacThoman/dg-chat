@@ -4,6 +4,7 @@ import {
   conversationTree,
   messageBranch,
   preferredLeaf,
+  reconcileBranchPreview,
 } from "./conversationGraph.ts";
 import type { Message } from "./types.ts";
 
@@ -65,5 +66,32 @@ describe("immutable conversation graph", () => {
     ]);
     expect(tree[0].children[0].children[0].active).toBe(false);
     expect(tree[0].children[0].children[1].children[0].active).toBe(true);
+  });
+  it("preserves a valid read-only preview across same-conversation metadata refreshes", () => {
+    expect(reconcileBranchPreview("a2-edit", "conversation-1", "conversation-1", messages))
+      .toBe("a2-edit");
+  });
+  it("clears a read-only preview only when its identity or terminal leaf becomes invalid", () => {
+    expect(reconcileBranchPreview("a2-edit", "conversation-1", "conversation-2", messages))
+      .toBeNull();
+    expect(
+      reconcileBranchPreview(
+        "a2-edit",
+        "conversation-1",
+        "conversation-1",
+        messages.filter((message) => message.id !== "a2-edit"),
+      ),
+    ).toBeNull();
+    expect(
+      reconcileBranchPreview("a2-edit", "conversation-1", "conversation-1", [
+        ...messages,
+        node("u3", "a2-edit", 0, "2026-01-01T00:06:00Z"),
+      ]),
+    ).toBeNull();
+  });
+  it("clears a preview before the conversation becomes editable", () => {
+    expect(
+      reconcileBranchPreview("a2-original", "conversation-1", "conversation-1", messages, false),
+    ).toBeNull();
   });
 });

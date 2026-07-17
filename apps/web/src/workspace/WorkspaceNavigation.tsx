@@ -1,7 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowDown, ArrowUp, Check, Ellipsis, Folder, Plus, X } from "lucide-react";
 import { type FormEvent, useRef, useState } from "react";
-import { api } from "../api.ts";
+import { api, ApiError } from "../api.ts";
+import { invalidateConversationSearch } from "../useConversationSearch.ts";
 import type {
   Conversation,
   ConversationFolder,
@@ -11,6 +12,7 @@ import type {
   ConversationTagSet,
 } from "../types.ts";
 import { Modal } from "../Modal.tsx";
+import { rebaseConversationTagSelection, sameConversationTagSelection } from "./tagSelection.ts";
 
 export const foldersKey = ["folders"] as const;
 export const tagsKey = ["tags"] as const;
@@ -472,42 +474,68 @@ export function OrganizeConversationDialog({
   const client = useQueryClient();
   const currentFolder =
     folders.memberships.find((item) => item.conversationId === conversation.id)?.folderId ?? "";
-  const currentTags = tags.bindings.filter((item) => item.conversationId === conversation.id).map((
-    item,
-  ) => item.tagId);
+  const currentTags = useRef(
+    tags.bindings.filter((item) => item.conversationId === conversation.id).map((item) =>
+      item.tagId
+    ),
+  ).current;
   const [folderId, setFolderId] = useState(currentFolder);
   const [tagIds, setTagIds] = useState(currentTags);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const persistFolder = async (snapshot: FolderData) => {
+    const sourceFolder =
+      snapshot.memberships.find((item) => item.conversationId === conversation.id)?.folderId ?? "";
+    if (folderId === sourceFolder) return false;
+    const targetId = folderId || sourceFolder;
+    const target = snapshot.data.find((item) => item.id === targetId);
+    if (!target) throw new Error("The project no longer exists");
+    const ids = snapshot.memberships.filter((item) => item.folderId === targetId).map((item) =>
+      item.conversationId
+    );
+    const next = folderId
+      ? [...ids.filter((value) => value !== conversation.id), conversation.id]
+      : ids.filter((value) => value !== conversation.id);
+    const affectedIds = [sourceFolder, folderId].filter((id): id is string => Boolean(id));
+    const expectedMembershipVersions = Object.fromEntries(affectedIds.map((id) => {
+      const folder = snapshot.data.find((item) => item.id === id);
+      if (!folder) throw new Error("A project changed in another tab");
+      return [id, folder.membershipVersion];
+    }));
+    await api.setFolderConversations(target, next, expectedMembershipVersions);
+    return true;
+  };
+  const persistTags = async (snapshot: TagData) => {
+    const savedTagIds = snapshot.bindings.filter((item) => item.conversationId === conversation.id)
+      .map((item) => item.tagId);
+    const rebasedTagIds = rebaseConversationTagSelection(currentTags, tagIds, savedTagIds);
+    if (sameConversationTagSelection(rebasedTagIds, savedTagIds)) return false;
+    const version = snapshot.tagSets.find((item) => item.conversationId === conversation.id)
+      ?.version ?? 0;
+    await api.setConversationTags(conversation.id, rebasedTagIds, version);
+    return true;
+  };
   const save = async () => {
     setBusy(true);
     setError("");
     let folderSaved = folderId === currentFolder;
     try {
       if (folderId !== currentFolder) {
-        const targetId = folderId || currentFolder;
-        const target = folders.data.find((item) => item.id === targetId);
-        if (!target) throw new Error("The project no longer exists");
-        const ids = folders.memberships.filter((item) => item.folderId === targetId).map((item) =>
-          item.conversationId
-        );
-        const next = folderId
-          ? [...ids.filter((value) => value !== conversation.id), conversation.id]
-          : ids.filter((value) => value !== conversation.id);
-        const affectedIds = [currentFolder, folderId].filter((id): id is string => Boolean(id));
-        const expectedMembershipVersions = Object.fromEntries(affectedIds.map((id) => {
-          const folder = folders.data.find((item) => item.id === id);
-          if (!folder) throw new Error("A project changed in another tab");
-          return [id, folder.membershipVersion];
-        }));
-        await api.setFolderConversations(target, next, expectedMembershipVersions);
+        try {
+          await persistFolder(folders);
+        } catch (saveError) {
+          if (!(saveError instanceof ApiError) || saveError.status !== 409) throw saveError;
+          await persistFolder(await api.folders());
+        }
         folderSaved = true;
       }
-      if (tagIds.join("|") !== currentTags.join("|")) {
-        const version = tags.tagSets.find((item) =>
-          item.conversationId === conversation.id
-        )?.version ?? 0;
-        await api.setConversationTags(conversation.id, tagIds, version);
+      if (!sameConversationTagSelection(tagIds, currentTags)) {
+        try {
+          await persistTags(tags);
+        } catch (saveError) {
+          if (!(saveError instanceof ApiError) || saveError.status !== 409) throw saveError;
+          await persistTags(await api.tags());
+        }
       }
       close();
     } catch {
@@ -521,6 +549,7 @@ export function OrganizeConversationDialog({
         client.invalidateQueries({ queryKey: foldersKey }),
         client.invalidateQueries({ queryKey: tagsKey }),
       ]);
+      invalidateConversationSearch();
       setBusy(false);
     }
   };

@@ -4,8 +4,8 @@ x-app-environment: &app-environment
   DENO_ENV: production
   APP_URL: ${APP_URL:-http://localhost:8000}
   WEB_URL: ${WEB_URL:-http://localhost:8000}
-  DATABASE_URL: postgresql://${POSTGRES_USER:-dgchat}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-dgchat}
-  REDIS_URL: redis://redis:6379
+  DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-dgchat}:${POSTGRES_PASSWORD:-}@postgres:5432/${POSTGRES_DB:-dgchat}}
+  REDIS_URL: ${REDIS_URL:-redis://redis:6379}
   READINESS_TIMEOUT_MS: ${READINESS_TIMEOUT_MS:-2000}
   POSTGRES_READINESS_TIMEOUT_MS: ${POSTGRES_READINESS_TIMEOUT_MS:-}
   REDIS_READINESS_TIMEOUT_MS: ${REDIS_READINESS_TIMEOUT_MS:-}
@@ -33,6 +33,15 @@ x-app-environment: &app-environment
   SETUP_TOKEN: ${SETUP_TOKEN:?SETUP_TOKEN is required}
   DEFAULT_APPROVAL_CREDIT_USD: ${DEFAULT_APPROVAL_CREDIT_USD:-5.00}
   TEMPORARY_CHAT_RETENTION_DAYS: ${TEMPORARY_CHAT_RETENTION_DAYS:-30}
+  AUTH_RATE_LIMIT: ${AUTH_RATE_LIMIT:-10}
+  AUTH_CLIENT_RATE_LIMIT: ${AUTH_CLIENT_RATE_LIMIT:-100}
+  CONVERSATION_SEARCH_RATE_LIMIT: ${CONVERSATION_SEARCH_RATE_LIMIT:-30}
+  CONVERSATION_SEARCH_MAX_CONCURRENT: ${CONVERSATION_SEARCH_MAX_CONCURRENT:-4}
+  CONVERSATION_SEARCH_MAX_CONCURRENT_PER_USER: ${CONVERSATION_SEARCH_MAX_CONCURRENT_PER_USER:-1}
+  CONVERSATION_SEARCH_CONCURRENCY_LEASE_SECONDS: ${CONVERSATION_SEARCH_CONCURRENCY_LEASE_SECONDS:-15}
+  UPLOAD_MAX_BYTES: ${UPLOAD_MAX_BYTES:-26214400}
+  UPLOAD_MAX_CONCURRENT: ${UPLOAD_MAX_CONCURRENT:-4}
+  UPLOAD_MAX_CONCURRENT_PER_USER: ${UPLOAD_MAX_CONCURRENT_PER_USER:-2}
   AUDIO_MAX_CONCURRENT: ${AUDIO_MAX_CONCURRENT:-4}
   AUDIO_MAX_CONCURRENT_PER_USER: ${AUDIO_MAX_CONCURRENT_PER_USER:-2}
   AUDIO_CONCURRENCY_LEASE_SECONDS: ${AUDIO_CONCURRENCY_LEASE_SECONDS:-120}
@@ -58,10 +67,25 @@ x-app-environment: &app-environment
   KNOWLEDGE_EMBEDDING_VERSION: ${KNOWLEDGE_EMBEDDING_VERSION:-}
   KNOWLEDGE_EMBEDDING_BATCH_SIZE: ${KNOWLEDGE_EMBEDDING_BATCH_SIZE:-64}
   KNOWLEDGE_EMBEDDING_QUERY_TIMEOUT_MS: ${KNOWLEDGE_EMBEDDING_QUERY_TIMEOUT_MS:-10000}
+  KNOWLEDGE_EMBEDDING_INPUT_MICROS_PER_MILLION: ${KNOWLEDGE_EMBEDDING_INPUT_MICROS_PER_MILLION:-0}
+  KNOWLEDGE_EMBEDDING_FIXED_CALL_MICROS: ${KNOWLEDGE_EMBEDDING_FIXED_CALL_MICROS:-0}
   SEARXNG_URL: ${SEARXNG_URL:-http://search-proxy:8080}
   SEARXNG_ALLOW_PRIVATE_NETWORK: ${SEARXNG_ALLOW_PRIVATE_NETWORK:-true}
   SEARXNG_TIMEOUT_MS: ${SEARXNG_TIMEOUT_MS:-8000}
   SEARXNG_MAX_RESPONSE_BYTES: ${SEARXNG_MAX_RESPONSE_BYTES:-2000000}
+  # Prometheus binds only inside the private backend network. Public nginx keeps /metrics denied.
+  METRICS_ENABLED: ${METRICS_ENABLED:-true}
+  METRICS_HOST: 0.0.0.0
+  METRICS_PORT: ${API_METRICS_PORT:-9090}
+  # Native Deno auto-instrumentation includes raw URLs; keep it off and use the bounded SDK spans.
+  OTEL_DENO: "false"
+  DG_CHAT_OTEL_ENABLED: ${DG_CHAT_OTEL_ENABLED:-false}
+  OTEL_SERVICE_NAME: ${OTEL_API_SERVICE_NAME:-dg-chat-api}
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+  OTEL_EXPORTER_OTLP_PROTOCOL: ${OTEL_EXPORTER_OTLP_PROTOCOL:-http/protobuf}
+  OTEL_EXPORTER_OTLP_HEADERS: ${OTEL_EXPORTER_OTLP_HEADERS:-}
+  OTEL_TRACES_SAMPLER: ${OTEL_TRACES_SAMPLER:-parentbased_traceidratio}
+  OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACES_SAMPLER_ARG:-0.1}
 
 x-app-service: &app-service
   build:
@@ -122,7 +146,7 @@ services:
     command: ["task", "db:migrate"]
     environment:
       DENO_ENV: production
-      DATABASE_URL: postgresql://${POSTGRES_USER:-dgchat}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-dgchat}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-dgchat}:${POSTGRES_PASSWORD:-}@postgres:5432/${POSTGRES_DB:-dgchat}}
     depends_on:
       postgres:
         condition: service_healthy
@@ -153,10 +177,12 @@ services:
       # Docker Desktop does not publish ports for containers attached only to an internal
       # network. Keep proxy-to-app traffic private while exposing nginx through this bridge.
       - egress
-    labels:
-      # The web container joins multiple networks. Pin Traefik to Coolify's injected
-      # resource network so it does not select an unreachable internal bridge.
-      - "traefik.docker.network=kvrktwghpyzt1dled95jc23x"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
     read_only: true
     tmpfs:
       - /tmp:size=32m,mode=1777
@@ -175,11 +201,23 @@ services:
     restart: unless-stopped
     environment:
       DENO_ENV: production
-      DATABASE_URL: postgresql://${POSTGRES_USER:-dgchat}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-dgchat}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-dgchat}:${POSTGRES_PASSWORD:-}@postgres:5432/${POSTGRES_DB:-dgchat}}
       WORKER_ID: ${WORKER_ID:-worker-compose}
       WORKER_POLL_MS: ${WORKER_POLL_MS:-1000}
       WORKER_JOB_LEASE_SECONDS: ${WORKER_JOB_LEASE_SECONDS:-120}
       WORKER_JOB_DEADLINE_MARGIN_MS: ${WORKER_JOB_DEADLINE_MARGIN_MS:-5000}
+      WORKER_DATABASE_RETRY_INITIAL_MS: ${WORKER_DATABASE_RETRY_INITIAL_MS:-250}
+      WORKER_DATABASE_RETRY_MAX_MS: ${WORKER_DATABASE_RETRY_MAX_MS:-10000}
+      WORKER_DATABASE_RETRY_JITTER_RATIO: ${WORKER_DATABASE_RETRY_JITTER_RATIO:-0.2}
+      WORKER_DATABASE_OPERATION_TIMEOUT_MS: ${WORKER_DATABASE_OPERATION_TIMEOUT_MS:-5000}
+      WORKER_SHUTDOWN_SETTLEMENT_TIMEOUT_MS: ${WORKER_SHUTDOWN_SETTLEMENT_TIMEOUT_MS:-10000}
+      WORKER_HEARTBEAT_INTERVAL_MS: ${WORKER_HEARTBEAT_INTERVAL_MS:-5000}
+      WORKER_HEARTBEAT_STALE_MS: ${WORKER_HEARTBEAT_STALE_MS:-20000}
+      WORKER_PROGRESS_STALE_MS: ${WORKER_PROGRESS_STALE_MS:-180000}
+      WORKER_HEALTH_TIMEOUT_MS: ${WORKER_HEALTH_TIMEOUT_MS:-4000}
+      WORKER_HEALTH_CLOCK_TOLERANCE_MS: ${WORKER_HEALTH_CLOCK_TOLERANCE_MS:-5000}
+      WORKER_INSTANCE_RETENTION_HOURS: ${WORKER_INSTANCE_RETENTION_HOURS:-168}
+      WORKER_INSTANCE_FILE: ${WORKER_INSTANCE_FILE:-/tmp/dg-chat-worker-instance}
       GENERATED_OBJECT_CLEANUP_GRACE_SECONDS: ${GENERATED_OBJECT_CLEANUP_GRACE_SECONDS:-600}
       GENERATED_OBJECT_CLEANUP_SWEEP_MS: ${GENERATED_OBJECT_CLEANUP_SWEEP_MS:-60000}
       TEMPORARY_CHAT_RETENTION_DAYS: ${TEMPORARY_CHAT_RETENTION_DAYS:-30}
@@ -197,6 +235,14 @@ services:
       DOCUMENT_EXTRACTION_MAX_ZIP_ENTRY_BYTES: ${DOCUMENT_EXTRACTION_MAX_ZIP_ENTRY_BYTES:-26214400}
       DOCUMENT_EXTRACTION_MAX_ZIP_EXPANDED_BYTES: ${DOCUMENT_EXTRACTION_MAX_ZIP_EXPANDED_BYTES:-104857600}
       DOCUMENT_EXTRACTION_MAX_ZIP_RATIO: ${DOCUMENT_EXTRACTION_MAX_ZIP_RATIO:-200}
+      KNOWLEDGE_EMBEDDING_BASE_URL: ${KNOWLEDGE_EMBEDDING_BASE_URL:-}
+      KNOWLEDGE_EMBEDDING_API_KEY: ${KNOWLEDGE_EMBEDDING_API_KEY:-}
+      KNOWLEDGE_EMBEDDING_MODEL: ${KNOWLEDGE_EMBEDDING_MODEL:-}
+      KNOWLEDGE_EMBEDDING_UPSTREAM_MODEL: ${KNOWLEDGE_EMBEDDING_UPSTREAM_MODEL:-}
+      KNOWLEDGE_EMBEDDING_VERSION: ${KNOWLEDGE_EMBEDDING_VERSION:-}
+      KNOWLEDGE_EMBEDDING_BATCH_SIZE: ${KNOWLEDGE_EMBEDDING_BATCH_SIZE:-64}
+      KNOWLEDGE_EMBEDDING_INPUT_MICROS_PER_MILLION: ${KNOWLEDGE_EMBEDDING_INPUT_MICROS_PER_MILLION:-0}
+      KNOWLEDGE_EMBEDDING_FIXED_CALL_MICROS: ${KNOWLEDGE_EMBEDDING_FIXED_CALL_MICROS:-0}
       S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
       S3_ALLOW_INSECURE: ${S3_ALLOW_INSECURE:-true}
       S3_REGION: ${S3_REGION:-us-east-1}
@@ -204,6 +250,17 @@ services:
       S3_ACCESS_KEY: ${S3_ACCESS_KEY:?S3_ACCESS_KEY is required}
       S3_SECRET_KEY: ${S3_SECRET_KEY:?S3_SECRET_KEY is required}
       S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
+      METRICS_ENABLED: ${METRICS_ENABLED:-true}
+      METRICS_HOST: 0.0.0.0
+      METRICS_PORT: ${WORKER_METRICS_PORT:-9091}
+      OTEL_DENO: "false"
+      DG_CHAT_OTEL_ENABLED: ${DG_CHAT_OTEL_ENABLED:-false}
+      OTEL_SERVICE_NAME: ${OTEL_WORKER_SERVICE_NAME:-dg-chat-worker}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_EXPORTER_OTLP_PROTOCOL: ${OTEL_EXPORTER_OTLP_PROTOCOL:-http/protobuf}
+      OTEL_EXPORTER_OTLP_HEADERS: ${OTEL_EXPORTER_OTLP_HEADERS:-}
+      OTEL_TRACES_SAMPLER: ${OTEL_TRACES_SAMPLER:-parentbased_traceidratio}
+      OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACES_SAMPLER_ARG:-0.1}
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -277,13 +334,21 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
 
   postgres:
     image: pgvector/pgvector:pg17
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-dgchat}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      # The official image refuses an empty password at runtime. Keeping interpolation optional
+      # lets the managed-dependencies overlay render without credentials for this disabled service.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
       POSTGRES_DB: ${POSTGRES_DB:-dgchat}
     volumes:
       - postgres-data:/var/lib/postgresql/data
@@ -318,8 +383,10 @@ services:
     restart: unless-stopped
     command: ["server", "/data", "--console-address", ":9001"]
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?MINIO_ROOT_USER is required}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
+      # Deliberately invalid MinIO credentials keep the bundled service fail-closed while allowing
+      # the managed overlay to render this profile-disabled service without local secrets.
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-x}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-x}
     volumes:
       - minio-data:/data
     networks:
@@ -366,8 +433,8 @@ services:
           mc --config-dir /tmp/.mc admin policy create local "$${policy_name}" /tmp/dg-chat-app-policy.json
           mc --config-dir /tmp/.mc admin policy attach local "$${policy_name}" --user "$${S3_ACCESS_KEY}"
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?MINIO_ROOT_USER is required}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-x}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-x}
       S3_BUCKET: ${S3_BUCKET:-dg-chat}
       S3_ACCESS_KEY: ${S3_ACCESS_KEY:?S3_ACCESS_KEY is required}
       S3_SECRET_KEY: ${S3_SECRET_KEY:?S3_SECRET_KEY is required}
@@ -377,6 +444,37 @@ services:
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    profiles: ["observability"]
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-15d}
+      - --web.enable-lifecycle
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "${PROMETHEUS_BIND_ADDRESS:-127.0.0.1}:${PROMETHEUS_HOST_PORT:-9090}:9090"
+    networks:
+      - backend
+      - egress
+    depends_on:
+      app:
+        condition: service_healthy
+      worker:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -401,3 +499,4 @@ volumes:
   postgres-data:
   redis-data:
   minio-data:
+  prometheus-data:

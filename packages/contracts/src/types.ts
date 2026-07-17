@@ -163,6 +163,31 @@ export interface ConversationDetail extends Conversation {
   messages: MessageNode[];
 }
 
+export type ConversationSearchView = "chat" | "archived" | "trash";
+export type ConversationSearchMatchSource = "title" | "message";
+
+/** A conversation projection with a bounded, display-as-text search excerpt. */
+export interface ConversationSearchResult extends Conversation {
+  snippet: string;
+  matchSource: ConversationSearchMatchSource;
+  messageId: string | null;
+  messageRole: "user" | "assistant" | null;
+}
+
+export interface ConversationSearchQuery {
+  query: string;
+  view: ConversationSearchView;
+  folderId?: string;
+  tagIds?: string[];
+  limit?: number;
+  cursor?: string;
+}
+
+export interface ConversationSearchPage {
+  data: ConversationSearchResult[];
+  nextCursor: string | null;
+}
+
 /** Visibility of the conversation owner's identity on an immutable public share. */
 export type ConversationShareIdentityVisibility = "owner" | "anonymous";
 /** Attachment materialization policy selected when a share is created. */

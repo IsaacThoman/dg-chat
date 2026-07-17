@@ -1,7 +1,12 @@
+/// <reference lib="dom" />
+
 import { expect, test } from "@playwright/test";
 import { bootstrap, createChat, login } from "./helpers.ts";
 
 declare global {
+  var __speechPlays: number;
+  var __speechPauses: number;
+  var __speechRevokes: string[];
   interface Window {
     __speechPlays: number;
     __speechPauses: number;
@@ -69,6 +74,17 @@ test("assistant speech is capability-aware, exclusive, controllable, and cleaned
     });
   });
   let speechBody: Record<string, unknown> | undefined;
+  let conversationDetailGets = 0;
+  await page.route("**/api/conversations/*", async (route) => {
+    const url = new URL(route.request().url());
+    if (
+      route.request().method() === "GET" &&
+      /^\/api\/conversations\/[0-9a-f-]+$/i.test(url.pathname)
+    ) {
+      conversationDetailGets += 1;
+    }
+    await route.continue();
+  });
   await page.route("**/api/audio/speech", async (route) => {
     speechBody = route.request().postDataJSON() as Record<string, unknown>;
     await new Promise((resolve) => setTimeout(resolve, 80));
@@ -107,6 +123,32 @@ test("assistant speech is capability-aware, exclusive, controllable, and cleaned
   await expect(page.getByRole("button", { name: "Pause read aloud" })).toBeVisible();
 
   expect(await page.evaluate(() => globalThis.__speechPlays)).toBeGreaterThanOrEqual(2);
+  const detailGetsBeforeFocus = conversationDetailGets;
+  const revokesBeforeRefetch = await page.evaluate(() => globalThis.__speechRevokes.length);
+  await page.evaluate(() => {
+    // Advance only the query freshness clock so focus exercises a real no-op network refetch
+    // without adding a 30-second wall-clock delay to every browser project.
+    const actualNow = Date.now;
+    const baseline = actualNow();
+    const runtime = globalThis as typeof globalThis & { __restoreDateNow?: () => void };
+    runtime.__restoreDateNow = () => {
+      Date.now = actualNow;
+    };
+    Date.now = () => baseline + 31_000;
+  });
+  // A real offline/online transition drives TanStack's reconnect manager in headless Chromium;
+  // synthetic focus events are intentionally ignored when the page never actually lost focus.
+  await page.context().setOffline(true);
+  await page.context().setOffline(false);
+  await expect.poll(() => conversationDetailGets).toBeGreaterThan(detailGetsBeforeFocus);
+  await page.evaluate(() => {
+    const runtime = globalThis as typeof globalThis & { __restoreDateNow?: () => void };
+    runtime.__restoreDateNow?.();
+    delete runtime.__restoreDateNow;
+  });
+  await expect(page.getByRole("button", { name: "Pause read aloud" })).toBeVisible();
+  expect(await page.evaluate(() => globalThis.__speechRevokes.length)).toBe(revokesBeforeRefetch);
+
   await createChat(page);
   await expect.poll(() => page.evaluate(() => globalThis.__speechRevokes.length)).toBeGreaterThan(
     0,
@@ -120,6 +162,19 @@ test("assistant speech is capability-aware, exclusive, controllable, and cleaned
 
 test("read aloud explains when no speech-capable model is available", async ({ page, request }) => {
   await bootstrap(request);
+  await page.route("**/api/models", async (route) => {
+    const upstream = await route.fetch();
+    const payload = await upstream.json() as {
+      data: Array<{ capabilities?: string[] }>;
+    };
+    await route.fulfill({
+      response: upstream,
+      json: {
+        ...payload,
+        data: payload.data.filter((model) => !model.capabilities?.includes("speech")),
+      },
+    });
+  });
   await login(page);
   await createChat(page);
   await page.getByRole("textbox", { name: "Message" }).fill("response without speech capability");

@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { apiURL, bootstrap, createChat, login, openSidebar } from "./helpers.ts";
+import { activeChatSession, apiURL, bootstrap, createChat, login, openSidebar } from "./helpers.ts";
 
 test.beforeEach(async ({ page, request }) => {
   await bootstrap(request);
@@ -8,7 +8,7 @@ test.beforeEach(async ({ page, request }) => {
 });
 
 async function selectSlowStream(page: import("@playwright/test").Page) {
-  await page.locator('button.model-trigger[aria-haspopup="listbox"]').click();
+  await activeChatSession(page).locator('button.model-trigger[aria-haspopup="listbox"]').click();
   await page.getByRole("listbox", { name: "Chat model" })
     .getByRole("option", { name: /DG Chat Slow Stream/ }).click();
   await expect(page.getByRole("button", { name: /DG Chat Slow Stream/ })).toBeVisible();
@@ -25,7 +25,13 @@ test("renders real incremental SSE and runs queued prompts in FIFO order", async
   await composer.fill(first);
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.getByRole("button", { name: "Stop generating" })).toBeVisible();
-  await expect(page.locator(".assistant-message")).toContainText("This is a simulated");
+  await expect(
+    activeChatSession(page).getByRole("status").filter({
+      hasText: "Assistant response is streaming",
+    }),
+  ).toHaveText("Assistant response is streaming");
+  await expect(activeChatSession(page).locator(".assistant-message"))
+    .toContainText("This is a simulated");
   await expect(page.getByRole("button", { name: "Stop generating" })).toBeVisible();
 
   await composer.fill("cancel this prompt");
@@ -49,12 +55,62 @@ test("renders real incremental SSE and runs queued prompts in FIFO order", async
   await expect(page.getByText(`This is a simulated response to: ${third}`, { exact: true }))
     .toBeVisible();
   await expect(page.getByRole("button", { name: "Stop generating" })).toBeHidden();
-  const userMessages = await page.locator(".user-message").allTextContents();
+  await expect(
+    activeChatSession(page).getByRole("status").filter({
+      hasText: "Assistant response complete",
+    }),
+  ).toContainText("Response actions are available");
+  const userMessages = await activeChatSession(page).locator(".user-message").allTextContents();
   expect(userMessages.join("\n")).not.toContain("cancel this prompt");
   expect(userMessages).toHaveLength(3);
   expect(userMessages[0]).toContain(first);
   expect(userMessages[1]).toContain(second);
   expect(userMessages[2]).toContain(third);
+
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: () => Promise.reject(new Error("clipboard denied")) },
+    });
+  });
+  await activeChatSession(page).getByRole("button", { name: "Copy response" }).last().click();
+  await expect(
+    activeChatSession(page).getByRole("button", { name: "Copy response failed" }).last(),
+  ).toBeVisible();
+  await expect(
+    activeChatSession(page).getByRole("status").filter({ hasText: "could not be copied" }),
+  ).toContainText("clipboard permissions");
+
+  await page.evaluate(() => {
+    const state = window as typeof window & { rejectFirstCopy?: () => void };
+    let calls = 0;
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText: () => {
+          calls += 1;
+          if (calls > 1) return Promise.resolve();
+          return new Promise<void>((_resolve, reject) => {
+            state.rejectFirstCopy = () => reject(new Error("older clipboard denial"));
+          });
+        },
+      },
+    });
+  });
+  const retryCopy = activeChatSession(page).getByRole("button", {
+    name: "Copy response failed",
+  }).last();
+  await retryCopy.click();
+  await retryCopy.click();
+  await expect(
+    activeChatSession(page).getByRole("button", { name: "Response copied" }).last(),
+  ).toBeVisible();
+  await page.evaluate(() =>
+    (window as typeof window & { rejectFirstCopy?: () => void }).rejectFirstCopy?.()
+  );
+  await expect(
+    activeChatSession(page).getByRole("button", { name: "Response copied" }).last(),
+  ).toBeVisible();
 });
 
 test("stop persists exactly one partial assistant node across reload", async ({ page }) => {
@@ -67,10 +123,13 @@ test("stop persists exactly one partial assistant node across reload", async ({ 
     "stream alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon final-sentinel";
   await page.getByRole("textbox", { name: "Message" }).fill(prompt);
   await page.getByRole("button", { name: "Send" }).click();
-  const assistant = page.locator(".assistant-message");
+  const assistant = activeChatSession(page).locator(".assistant-message");
   await expect(assistant).toContainText("This is a simulated response");
   await page.getByRole("button", { name: "Stop generating" }).click();
   await expect(page.getByRole("button", { name: "Stop generating" })).toBeHidden();
+  await expect(
+    activeChatSession(page).getByRole("status").filter({ hasText: "Generation stopped" }),
+  ).toContainText("saved conversation remains available");
   await expect(page.getByText("Stopped", { exact: true })).toBeVisible();
   await expect(assistant).not.toContainText("final-sentinel");
   let persisted = "";
@@ -91,29 +150,57 @@ test("stop persists exactly one partial assistant node across reload", async ({ 
   await page.locator(
     `.conversation-row:has([data-conversation-actions="${conversationId}"]) button.conversation-open`,
   ).click();
-  await expect(page.locator(".assistant-message")).toHaveCount(1);
+  await expect(activeChatSession(page).locator(".assistant-message")).toHaveCount(1);
   await expect(page.getByText(persisted, { exact: true })).toBeVisible();
   await expect(page.getByText("Stopped", { exact: true })).toBeVisible();
-  await expect(page.locator(".assistant-message")).not.toContainText("final-sentinel");
+  await expect(activeChatSession(page).locator(".assistant-message"))
+    .not.toContainText("final-sentinel");
+});
+
+test("discarding a failed prompt releases its retained-session protection", async ({ page }) => {
+  await page.route("**/api/conversations/*/generate/stream", (route) =>
+    route.fulfill({
+      status: 503,
+      contentType: "application/json",
+      json: { error: { message: "Synthetic generation outage" } },
+    }));
+
+  await page.getByRole("textbox", { name: "Message" }).fill("Prompt that should remain retryable");
+  await page.getByRole("button", { name: "Send" }).click();
+  const failure = page.getByRole("alert").filter({ hasText: "Generation was interrupted" });
+  await expect(failure).toBeVisible();
+  const sidebar = await openSidebar(page);
+  const activeRow = sidebar.locator(".conversation-row.active");
+  await expect(activeRow.locator('[data-protected-work="unfinished"]')).toHaveText("Unfinished");
+  const closeSidebar = sidebar.getByRole("button", { name: "Close sidebar", exact: true });
+  if (await closeSidebar.isVisible()) await closeSidebar.click();
+
+  await failure.getByRole("button", { name: "Discard failed prompt" }).click();
+  await expect(failure).toBeHidden();
+  await expect(activeRow.locator('[data-protected-work="unfinished"]')).toHaveCount(0);
 });
 
 test("regenerate and continue append recoverable assistant branches", async ({ page }) => {
   const prompt = "original immutable branch";
-  await page.getByRole("textbox", { name: "Message" }).fill(prompt);
-  await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.getByText(`This is a simulated response to: ${prompt}`, { exact: true }))
+  const session = activeChatSession(page);
+  await session.getByRole("textbox", { name: "Message" }).fill(prompt);
+  await session.getByRole("button", { name: "Send" }).click();
+  await expect(session.getByText(`This is a simulated response to: ${prompt}`, { exact: true }))
     .toBeVisible();
 
-  await page.getByRole("button", { name: "Regenerate response in a new branch" }).click();
-  await expect(page.getByLabel("Branch 2 of 2")).toBeVisible();
-  await page.getByRole("button", { name: "Previous branch" }).click();
-  await expect(page.getByLabel("Branch 1 of 2")).toBeVisible();
-  await page.getByRole("button", { name: "Continue response" }).click();
-  await expect(page.getByLabel("Branch 3 of 3")).toBeVisible();
+  await session.getByRole("button", { name: "Regenerate response in a new branch" }).click();
+  await expect(session.getByRole("status", { name: /Branch position for .*: 2 of 2/ }))
+    .toBeVisible();
+  await session.getByRole("button", { name: /^Previous branch for / }).click();
+  await expect(session.getByRole("status", { name: /Branch position for .*: 1 of 2/ }))
+    .toBeVisible();
+  await session.getByRole("button", { name: "Continue response" }).click();
+  await expect(session.getByRole("status", { name: /Branch position for .*: 3 of 3/ }))
+    .toBeVisible();
   expect(
-    await page.locator(".assistant-message .message-actions").evaluate((element) =>
-      element.scrollWidth <= element.clientWidth
-    ),
+    await activeChatSession(page).locator(".assistant-message .message-actions").evaluate((
+      element,
+    ) => element.scrollWidth <= element.clientWidth),
   ).toBe(true);
 
   const conversationId = await page.locator(
@@ -140,17 +227,20 @@ test("regenerate and continue append recoverable assistant branches", async ({ p
 });
 
 test("regenerating an earlier turn selects and keeps the new branch", async ({ page }) => {
-  const composer = page.getByRole("textbox", { name: "Message" });
+  const session = activeChatSession(page);
+  const composer = session.getByRole("textbox", { name: "Message" });
   await composer.fill("first turn with a later descendant");
-  await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.locator(".assistant-message")).toHaveCount(1);
+  await session.getByRole("button", { name: "Send" }).click();
+  await expect(activeChatSession(page).locator(".assistant-message")).toHaveCount(1);
   await composer.fill("second turn makes the first assistant non-leaf");
-  await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.locator(".assistant-message")).toHaveCount(2);
+  await session.getByRole("button", { name: "Send" }).click();
+  await expect(activeChatSession(page).locator(".assistant-message")).toHaveCount(2);
 
-  await page.getByRole("button", { name: "Regenerate response in a new branch" }).first().click();
-  await expect(page.locator(".assistant-message")).toHaveCount(1);
-  await expect(page.getByLabel("Branch 2 of 2")).toBeVisible();
+  await session.getByRole("button", { name: "Regenerate response in a new branch" }).first()
+    .click();
+  await expect(activeChatSession(page).locator(".assistant-message")).toHaveCount(1);
+  await expect(session.getByRole("status", { name: /Branch position for .*: 2 of 2/ }))
+    .toBeVisible();
   await expect(page.getByText("second turn makes the first assistant non-leaf")).toBeHidden();
 
   const conversationId = await page.locator(
@@ -162,7 +252,9 @@ test("regenerating an earlier turn selects and keeps the new branch", async ({ p
   await page.locator(
     `.conversation-row:has([data-conversation-actions="${conversationId}"]) button.conversation-open`,
   ).click();
-  await expect(page.locator(".assistant-message")).toHaveCount(1);
-  await expect(page.getByLabel("Branch 2 of 2")).toBeVisible();
+  await expect(activeChatSession(page).locator(".assistant-message")).toHaveCount(1);
+  await expect(
+    activeChatSession(page).getByRole("status", { name: /Branch position for .*: 2 of 2/ }),
+  ).toBeVisible();
   await expect(page.getByText("second turn makes the first assistant non-leaf")).toBeHidden();
 });

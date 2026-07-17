@@ -12,6 +12,7 @@ import type {
 } from "@dg-chat/database";
 import { DomainError } from "@dg-chat/database";
 import type { ChatCompletionRequest } from "@dg-chat/contracts";
+import { recordProviderAttemptMetric } from "@dg-chat/observability";
 import { Buffer } from "node:buffer";
 import { type ProviderSecretEnvelope, ProviderSecretKeyring } from "./provider-secrets.ts";
 import {
@@ -46,6 +47,7 @@ import {
 import { estimateInputTokens } from "./pricing.ts";
 import {
   createEmbeddings,
+  EmbeddingsProviderError,
   type EmbeddingsRequest,
   type EmbeddingsResponse,
   type ProviderFetch,
@@ -97,6 +99,7 @@ import {
   providerDiagnosticError,
   ProviderStreamDiagnostic,
 } from "./provider-payload-capture.ts";
+import { responsesRequestToChatCompletions } from "./provider-protocol.ts";
 
 const OCR_MAX_OUTPUT_TOKENS = 4_096;
 
@@ -117,6 +120,173 @@ function assertResponseFieldsCompatible(
       { category: "invalid_request", transient: false, candidateLocal: true },
     );
   }
+}
+
+type JsonRecord = Record<string, unknown>;
+
+function jsonRecord(value: unknown): JsonRecord | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as JsonRecord
+    : undefined;
+}
+
+function sameJson(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function ocrReconciliationFailure(): ProviderAttemptError {
+  return new ProviderAttemptError(
+    "OCR-rewritten input cannot be represented safely by the native Responses request",
+    { category: "invalid_request", transient: false, candidateLocal: true },
+  );
+}
+
+interface NativeImagePath {
+  itemIndex: number;
+  partIndex: number;
+}
+
+/**
+ * Build the exact native-to-canonical image path map used by the Responses converter. Function
+ * calls can coalesce into one Chat assistant message; all other native input items consume one
+ * canonical message, while instructions occupy the first message when present.
+ */
+function nativeImagePaths(
+  nativeRequest: JsonRecord,
+  canonicalMessageCount: number,
+): Map<string, NativeImagePath> {
+  if (!Array.isArray(nativeRequest.input)) throw ocrReconciliationFailure();
+  const paths = new Map<string, NativeImagePath>();
+  let messageIndex = nativeRequest.instructions === undefined || nativeRequest.instructions === null
+    ? 0
+    : 1;
+  let previousWasFunctionCall = false;
+  for (const [itemIndex, itemValue] of nativeRequest.input.entries()) {
+    const item = jsonRecord(itemValue);
+    if (!item) throw ocrReconciliationFailure();
+    if (item.type === "function_call") {
+      if (!previousWasFunctionCall) messageIndex++;
+      previousWasFunctionCall = true;
+      continue;
+    }
+    previousWasFunctionCall = false;
+    if (
+      item.type !== "function_call_output" && item.type !== "reasoning" &&
+      Array.isArray(item.content)
+    ) {
+      for (const [partIndex, partValue] of item.content.entries()) {
+        if (jsonRecord(partValue)?.type !== "input_image") continue;
+        const key = `${messageIndex}:${partIndex}`;
+        if (paths.has(key)) throw ocrReconciliationFailure();
+        paths.set(key, { itemIndex, partIndex });
+      }
+    }
+    messageIndex++;
+  }
+  if (messageIndex !== canonicalMessageCount) throw ocrReconciliationFailure();
+  return paths;
+}
+
+/**
+ * Reconcile the only mutation OCR interception is allowed to make—Chat image parts becoming
+ * text—back into a preserved native Responses input. Native-only reasoning/call items and their
+ * transport identities remain untouched. Any unexpected mutation or shape mismatch fails closed
+ * before the primary provider can be claimed or dispatched.
+ */
+export function reconcileNativeResponsesAfterOcr(
+  original: ChatCompletionRequest,
+  rewritten: ChatCompletionRequest,
+  fields?: NativeResponsesRequestFields,
+): NativeResponsesRequestFields | undefined {
+  if (
+    sameJson(original, rewritten) || !fields ||
+    (fields.request === undefined && fields.input === undefined)
+  ) return fields;
+
+  const originalEnvelope = structuredClone(original) as unknown as JsonRecord;
+  const rewrittenEnvelope = structuredClone(rewritten) as unknown as JsonRecord;
+  delete originalEnvelope.messages;
+  delete rewrittenEnvelope.messages;
+  if (!sameJson(originalEnvelope, rewrittenEnvelope)) throw ocrReconciliationFailure();
+  if (original.messages.length !== rewritten.messages.length) throw ocrReconciliationFailure();
+
+  const replacements = new Map<
+    string,
+    { url: string; detail?: string; text: string }
+  >();
+  for (const [messageIndex, originalMessage] of original.messages.entries()) {
+    const rewrittenMessage = rewritten.messages[messageIndex];
+    const originalMetadata = structuredClone(originalMessage) as unknown as JsonRecord;
+    const rewrittenMetadata = structuredClone(rewrittenMessage) as unknown as JsonRecord;
+    delete originalMetadata.content;
+    delete rewrittenMetadata.content;
+    if (!sameJson(originalMetadata, rewrittenMetadata)) throw ocrReconciliationFailure();
+    if (sameJson(originalMessage.content, rewrittenMessage.content)) continue;
+    if (
+      !Array.isArray(originalMessage.content) || !Array.isArray(rewrittenMessage.content) ||
+      originalMessage.content.length !== rewrittenMessage.content.length
+    ) {
+      throw ocrReconciliationFailure();
+    }
+    for (const [partIndex, originalPartValue] of originalMessage.content.entries()) {
+      const rewrittenPartValue = rewrittenMessage.content[partIndex];
+      if (sameJson(originalPartValue, rewrittenPartValue)) continue;
+      const originalPart = jsonRecord(originalPartValue);
+      const rewrittenPart = jsonRecord(rewrittenPartValue);
+      const image = jsonRecord(originalPart?.image_url);
+      if (
+        originalPart?.type !== "image_url" || !image || typeof image.url !== "string" ||
+        (image.detail !== undefined && typeof image.detail !== "string") ||
+        rewrittenPart?.type !== "text" || typeof rewrittenPart.text !== "string" ||
+        Object.keys(rewrittenPart).some((key) => key !== "type" && key !== "text")
+      ) throw ocrReconciliationFailure();
+      const key = `${messageIndex}:${partIndex}`;
+      if (replacements.has(key)) throw ocrReconciliationFailure();
+      replacements.set(key, {
+        url: image.url,
+        ...(image.detail === undefined ? {} : { detail: image.detail }),
+        text: rewrittenPart.text,
+      });
+    }
+  }
+  if (!replacements.size) throw ocrReconciliationFailure();
+
+  const nativeRequest = structuredClone(
+    fields.request ?? { model: original.model, input: fields.input },
+  );
+  if (!Array.isArray(nativeRequest.input)) throw ocrReconciliationFailure();
+  let canonicalMessages: unknown;
+  try {
+    canonicalMessages = responsesRequestToChatCompletions(nativeRequest).messages;
+  } catch {
+    throw ocrReconciliationFailure();
+  }
+  if (!Array.isArray(canonicalMessages) || !sameJson(canonicalMessages, original.messages)) {
+    throw ocrReconciliationFailure();
+  }
+
+  const paths = nativeImagePaths(nativeRequest, canonicalMessages.length);
+  if (paths.size !== replacements.size) throw ocrReconciliationFailure();
+  for (const [canonicalPath, replacement] of replacements) {
+    const path = paths.get(canonicalPath);
+    if (!path) throw ocrReconciliationFailure();
+    const item = jsonRecord(nativeRequest.input[path.itemIndex]);
+    const content = item && Array.isArray(item.content) ? [...item.content] : undefined;
+    const part = content && jsonRecord(content[path.partIndex]);
+    if (
+      !item || !content || !part || part.type !== "input_image" ||
+      part.image_url !== replacement.url || part.detail !== replacement.detail ||
+      Object.keys(part).some((key) => !["type", "image_url", "detail"].includes(key))
+    ) throw ocrReconciliationFailure();
+    content[path.partIndex] = { type: "input_text", text: replacement.text };
+    nativeRequest.input[path.itemIndex] = { ...item, content };
+  }
+
+  return {
+    ...fields,
+    input: structuredClone(nativeRequest.input),
+    ...(fields.request === undefined ? {} : { request: nativeRequest }),
+  };
 }
 
 function validateNoVisibleChatStream(frames: readonly string[]): void {
@@ -947,6 +1117,7 @@ export class ProviderExecutionEngine {
           breakerAfter: breakerState(event.circuitState),
           retryable: true,
         });
+        recordProviderAttemptMetric("skipped", breakerState(event.circuitState));
         return;
       }
       if (event.type === "started") {
@@ -1028,6 +1199,7 @@ export class ProviderExecutionEngine {
           // implementations treat this as an idempotent replay, including when a commit succeeded
           // but its acknowledgement was lost.
           await this.#repository.finishProviderAttempt(finish);
+          recordProviderAttemptMetric(finish.status, finish.breakerAfter);
           return;
         } catch (error) {
           lastError = error;
@@ -1048,7 +1220,11 @@ export class ProviderExecutionEngine {
   }
 
   #circuitStore(candidates: Map<string, RuntimeCandidate>): CircuitStore {
-    const adapter = new CircuitBreakerStoreAdapter(this.#circuitBreaker, this.#breakerPolicy);
+    const adapter = new CircuitBreakerStoreAdapter(
+      this.#circuitBreaker,
+      this.#breakerPolicy,
+      this.#now,
+    );
     const circuitId = (candidateId: string) => {
       const candidate = candidates.get(candidateId);
       if (!candidate) throw new TypeError("Provider execution circuit candidate is unavailable");
@@ -1064,6 +1240,21 @@ export class ProviderExecutionEngine {
   }
 
   #normalizeError(error: unknown, plan: ProviderExecutionPlan): never {
+    if (error instanceof EmbeddingsProviderError) {
+      if (error.upstreamStatus !== undefined) {
+        const retryable = plan.retryPolicy?.retryableStatuses ?? defaultRetryableStatuses;
+        error = new ProviderAttemptError(error.message, {
+          status: error.upstreamStatus,
+          transient: retryable.includes(error.upstreamStatus),
+          retryAfterMs: error.retryAfterMs,
+        });
+      } else {
+        error = new ProviderAttemptError(error.message, {
+          category: "invalid_response",
+          transient: false,
+        });
+      }
+    }
     if (
       (error instanceof AudioProviderError || error instanceof SpeechProviderError ||
         error instanceof ImageProviderError) &&
@@ -1099,6 +1290,7 @@ export class ProviderExecutionEngine {
     responseFields?: NativeResponsesRequestFields,
   ): Promise<Completion> {
     const { plan, candidates } = await this.#prepare(sourceModelId, frozenPlan);
+    const originalRequest = request;
     request = await this.#interceptOcr(
       sourceModelId,
       usageRunId,
@@ -1108,6 +1300,7 @@ export class ProviderExecutionEngine {
       plan,
       ocrUserId,
     );
+    responseFields = reconcileNativeResponsesAfterOcr(originalRequest, request, responseFields);
     const claim = await this.#repository.claimProviderExecution(usageRunId, ownerLeaseToken);
     const remainingAttempts = policyFor(plan, undefined, this.#slowStream).maxAttempts -
       claim.consumedAttempts;
@@ -1237,6 +1430,7 @@ export class ProviderExecutionEngine {
             const observed = metrics.get(key(candidate.id, context)) ??
               emptyMetrics(estimatedInput);
             observed.dispatched = true;
+            metrics.set(key(candidate.id, context), observed);
             const result = await createEmbeddings(request, {
               baseUrl: upstream.baseUrl,
               apiKey: upstream.apiKey,
@@ -1253,6 +1447,12 @@ export class ProviderExecutionEngine {
             metrics.set(key(candidate.id, context), observed);
             return result;
           } catch (error) {
+            if (
+              error instanceof EmbeddingsProviderError && error.dispatchOutcome === "rejected"
+            ) {
+              const observed = metrics.get(key(candidate.id, context));
+              if (observed) observed.dispatched = false;
+            }
             this.#normalizeError(error, plan);
           }
         },
@@ -1941,6 +2141,7 @@ export class ProviderExecutionEngine {
     responseFields?: NativeResponsesRequestFields,
   ): AsyncGenerator<string> {
     const { plan, candidates } = await this.#prepare(sourceModelId, frozenPlan);
+    const originalRequest = request;
     request = await this.#interceptOcr(
       sourceModelId,
       usageRunId,
@@ -1950,6 +2151,7 @@ export class ProviderExecutionEngine {
       plan,
       ocrUserId,
     );
+    responseFields = reconcileNativeResponsesAfterOcr(originalRequest, request, responseFields);
     const claim = await this.#repository.claimProviderExecution(usageRunId, ownerLeaseToken);
     const remainingAttempts = policyFor(plan, undefined, this.#slowStream).maxAttempts -
       claim.consumedAttempts;

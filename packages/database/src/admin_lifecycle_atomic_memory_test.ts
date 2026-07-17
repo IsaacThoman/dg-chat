@@ -49,6 +49,7 @@ Deno.test("memory admin lifecycle rolls back grants and authority revocation whe
     "password_reset",
     "atomic-reset-token",
     new Date(Date.now() + 60_000).toISOString(),
+    approved.authorityEpoch,
   );
   const auditCount = repository.auditEvents.length;
   repository.failAuditAppend = true;

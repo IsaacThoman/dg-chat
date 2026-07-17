@@ -1,7 +1,20 @@
 import { type APIRequestContext, expect, type Page } from "@playwright/test";
 import { env } from "./env.ts";
+import { assertSafeE2ETarget } from "./target-safety.ts";
 
 export const apiURL = env("E2E_API_URL") ?? "http://localhost:8000";
+const baseURL = env("E2E_BASE_URL") ?? "http://localhost:5173";
+
+// Playwright config enforces this before suite discovery. Keep the assertion beside the
+// destructive bootstrap helper as defense in depth for scripts that import helpers directly.
+assertSafeE2ETarget({
+  targetUrls: [baseURL, apiURL],
+  allowDestructiveRemote: env("E2E_ALLOW_DESTRUCTIVE_REMOTE"),
+  setupToken: env("SETUP_TOKEN"),
+  adminEmail: env("E2E_ADMIN_EMAIL"),
+  adminPassword: env("E2E_ADMIN_PASSWORD"),
+});
+
 export const adminEmail = env("E2E_ADMIN_EMAIL") ?? "admin@e2e.invalid";
 export const adminPassword = env("E2E_ADMIN_PASSWORD") ?? "Correct-Horse-42-Battery!";
 
@@ -39,11 +52,16 @@ export async function login(
   // Password verification is deliberately expensive and can exceed the global assertion timeout
   // on constrained self-hosted runners. Keep the production-strength hash and give this one
   // boundary enough time to complete.
-  await expect(page).toHaveURL(/\/$/, { timeout: 30_000 });
+  await expect(page).toHaveURL(/\/$/, { timeout: 60_000 });
 }
 
 export function workspaceSidebar(page: Page) {
   return page.locator('aside.sidebar[aria-label="Workspace navigation"]');
+}
+
+/** The session host retains inactive chats, so raw CSS locators should start from this root. */
+export function activeChatSession(page: Page) {
+  return page.locator("[data-chat-session]:not([hidden])");
 }
 
 async function sidebarIsExposed(page: Page): Promise<boolean> {
@@ -89,17 +107,22 @@ export async function openSidebar(page: Page) {
 }
 
 export async function createChat(page: Page): Promise<void> {
-  const activeActions = page.locator(".conversation-row.active [data-conversation-actions]");
-  const previousId = await activeActions.count() === 1
-    ? await activeActions.getAttribute("data-conversation-actions")
-    : null;
   const button = page.getByRole("button", { name: "New chat ⌘ K", exact: true });
   await openSidebar(page);
+  const createdResponse = page.waitForResponse((response) =>
+    response.request().method() === "POST" &&
+    new URL(response.url()).pathname === "/api/conversations"
+  );
   await button.click();
-  await expect.poll(
-    () => activeActions.getAttribute("data-conversation-actions"),
-    { message: "the newly created conversation to become active" },
-  ).not.toBe(previousId);
+  const response = await createdResponse;
+  expect(response.ok(), response.ok() ? "conversation created" : await response.text())
+    .toBeTruthy();
+  const created = await response.json() as { id: string };
+  await expect(
+    page.locator(".conversation-row.active [data-conversation-actions]"),
+    "the exact newly created conversation to become active",
+  ).toHaveAttribute("data-conversation-actions", created.id);
+  await expect(activeChatSession(page)).toHaveAttribute("data-chat-session", created.id);
 }
 
 export function uniqueUser(prefix = "applicant") {

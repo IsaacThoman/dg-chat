@@ -55,6 +55,22 @@ function StatusChips({ user }: { user: AdminUser }) {
   );
 }
 
+export function adminUserDetailTitle(
+  user: Pick<AdminUser, "name"> | undefined,
+  loading: boolean,
+  error: unknown,
+): string {
+  if (user) return `${user.name} · Users · DG Chat Admin`;
+  if (loading) return "Loading user · Users · DG Chat Admin";
+  if (error instanceof ApiError && error.status === 404) {
+    return "User not found · Users · DG Chat Admin";
+  }
+  if (error instanceof ApiError && error.status === 403) {
+    return "Administrator access changed · DG Chat Admin";
+  }
+  return "User details unavailable · Users · DG Chat Admin";
+}
+
 export function AdminUserDetail(
   { userId, tab, onTabChange, onBack, onReauthenticate }: AdminUserDetailProps,
 ) {
@@ -66,8 +82,8 @@ export function AdminUserDetail(
     queryFn: ({ signal }) => api.adminUserDetail(userId, signal),
   });
   useEffect(() => {
-    if (user.data) document.title = `${user.data.name} · Users · DG Chat Admin`;
-  }, [user.data]);
+    document.title = adminUserDetailTitle(user.data, user.isLoading, user.error);
+  }, [user.data, user.error, user.isLoading]);
   useEffect(() => {
     if (user.data?.id !== userId || focusedUserIdRef.current === userId) return;
     focusedUserIdRef.current = userId;

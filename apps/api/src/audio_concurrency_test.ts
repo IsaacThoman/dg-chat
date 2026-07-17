@@ -41,6 +41,60 @@ Deno.test("memory audio admission expires abandoned leases", async () => {
   await limiter.close();
 });
 
+Deno.test("memory admission isolates capacity by workload namespace", async () => {
+  const limiter = new MemoryAudioConcurrencyLimiter();
+  const audio = await limiter.acquire("user-a", { global: 1, perUser: 1 });
+  assert(audio);
+  assertEquals(await limiter.acquire("user-b", { global: 1, perUser: 1 }), null);
+
+  const search = await limiter.acquire("user-a", { global: 1, perUser: 1 }, "search");
+  assert(search);
+  assertEquals(
+    await limiter.acquire("user-b", { global: 1, perUser: 1 }, "search"),
+    null,
+  );
+
+  await Promise.all([audio.release(), search.release()]);
+  await limiter.close();
+});
+
+Deno.test("memory search admission immediately recovers release and expires a crashed holder", async () => {
+  let now = 10_000;
+  const limiter = new MemoryAudioConcurrencyLimiter({
+    leaseMs: 1_000,
+    now: () => now,
+    autoRenew: false,
+  });
+  const released = await limiter.acquire(
+    "user-a",
+    { global: 1, perUser: 1 },
+    "search",
+  );
+  assert(released);
+  await released.release();
+  const abandoned = await limiter.acquire(
+    "user-b",
+    { global: 1, perUser: 1 },
+    "search",
+  );
+  assert(abandoned);
+  assertEquals(
+    await limiter.acquire("user-c", { global: 1, perUser: 1 }, "search"),
+    null,
+  );
+
+  now += 1_001;
+  const recovered = await limiter.acquire(
+    "user-c",
+    { global: 1, perUser: 1 },
+    "search",
+  );
+  assert(recovered);
+  assertEquals(abandoned.signal.aborted, true);
+  await recovered.release();
+  await limiter.close();
+});
+
 class RenewalClient {
   status = "ready";
   calls = 0;

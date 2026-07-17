@@ -117,6 +117,13 @@ Deno.test("admin user detail lists and atomically revokes target sessions and to
   assertEquals(sessionPage.data[0].current, false);
   assertEquals("tokenHash" in sessionPage.data[0], false);
 
+  const removedLegacyRevoke = await app.request(
+    `/api/admin/sessions/legacy:${targetSession.id}`,
+    { method: "DELETE", headers },
+  );
+  assertEquals(removedLegacyRevoke.status, 404);
+  assertEquals(repository.getSession(await sha256("target-session-secret"))?.id, targetSession.id);
+
   const crossOwnerSession = await app.request(
     `/api/admin/users/${admin.id}/sessions/legacy/${targetSession.id}/revoke`,
     {

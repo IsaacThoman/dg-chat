@@ -148,6 +148,51 @@ Deno.test("parameterless and nullable Chat tools become valid Responses function
   ]);
 });
 
+Deno.test("Chat audio input is preserved when translated to Responses", () => {
+  const translated = chatCompletionsRequestToResponses({
+    model: "audio/model",
+    messages: [{
+      role: "user",
+      content: [
+        { type: "text", text: "Transcribe this" },
+        { type: "input_audio", input_audio: { data: "UklGRg==", format: "wav" } },
+      ],
+    }],
+  });
+  assertEquals(translated.input, [{
+    role: "user",
+    content: [
+      { type: "input_text", text: "Transcribe this" },
+      { type: "input_audio", input_audio: { data: "UklGRg==", format: "wav" } },
+    ],
+  }]);
+  assertEquals(
+    responsesRequestToChatCompletions(translated).messages,
+    [{
+      role: "user",
+      content: [
+        { type: "text", text: "Transcribe this" },
+        { type: "input_audio", input_audio: { data: "UklGRg==", format: "wav" } },
+      ],
+    }],
+  );
+});
+
+Deno.test("Chat audio output requests fail with a precise cross-protocol capability error", () => {
+  const error = assertThrows(
+    () =>
+      chatCompletionsRequestToResponses({
+        model: "audio/model",
+        messages: [{ role: "user", content: "Speak" }],
+        modalities: ["text", "audio"],
+        audio: { voice: "alloy", format: "wav" },
+      }),
+    ProviderProtocolError,
+  );
+  assertEquals(error.code, "unsupported_feature");
+  assertEquals(error.path, "request.modalities");
+});
+
 Deno.test("Chat to Responses rejects role-specific tool fields instead of dropping them", () => {
   for (
     const messages of [
@@ -255,6 +300,89 @@ Deno.test("responses request converts instructions, multimodal input, calls, res
     reasoning_summary: "none",
     user: "caller-456",
   });
+});
+
+Deno.test("Responses provider-managed network tools fail closed", () => {
+  for (const tool of [{ type: "web_search" }, { type: "mcp", server_label: "docs" }]) {
+    const policyError = assertThrows(
+      () =>
+        responsesRequestRequiresNativeInput({
+          model: "provider/model",
+          input: "search",
+          tools: [tool],
+        }),
+      ProviderProtocolError,
+    );
+    assertEquals(policyError.code, "unsupported_feature");
+    const error = assertThrows(
+      () =>
+        responsesRequestToChatCompletions({
+          model: "provider/model",
+          input: "search",
+          tools: [tool],
+        }),
+      ProviderProtocolError,
+    );
+    assertEquals(error.code, "unsupported_feature");
+  }
+});
+
+Deno.test("Responses tool definitions are bounded before native dispatch", () => {
+  const tooMany = assertThrows(
+    () =>
+      responsesRequestRequiresNativeInput({
+        model: "provider/model",
+        input: "tools",
+        tools: Array.from({ length: 129 }, (_, index) => ({
+          type: "function",
+          name: `tool_${index}`,
+        })),
+      }),
+    ProviderProtocolError,
+  );
+  assertEquals(tooMany.code, "malformed_payload");
+  const oversizedDescription = assertThrows(
+    () =>
+      responsesRequestRequiresNativeInput({
+        model: "provider/model",
+        input: "tools",
+        tools: [{ type: "function", name: "large", description: "x".repeat(8_193) }],
+      }),
+    ProviderProtocolError,
+  );
+  assertEquals(oversizedDescription.code, "malformed_payload");
+});
+
+Deno.test("Chat audio inputs reject malformed and oversized base64 before dispatch", () => {
+  for (const data of ["not base64", "AAAA="]) {
+    const error = assertThrows(
+      () =>
+        chatCompletionsRequestToResponses({
+          model: "audio/model",
+          messages: [{
+            role: "user",
+            content: [{ type: "input_audio", input_audio: { data, format: "wav" } }],
+          }],
+        }),
+      ProviderProtocolError,
+    );
+    assertEquals(error.code, "malformed_payload");
+  }
+  const oversized = assertThrows(
+    () =>
+      chatCompletionsRequestToResponses({
+        model: "audio/model",
+        messages: [{
+          role: "user",
+          content: [{
+            type: "input_audio",
+            input_audio: { data: "AAAA".repeat(1_048_577), format: "wav" },
+          }],
+        }],
+      }),
+    ProviderProtocolError,
+  );
+  assertEquals(oversized.code, "payload_too_large");
 });
 
 Deno.test("stateless Responses continuation validates a bounded shadow without losing native items", () => {

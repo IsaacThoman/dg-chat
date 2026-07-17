@@ -218,6 +218,8 @@ Deno.test("admin analytics are bounded, canonical, and deterministically buckete
     userId: crypto.randomUUID(),
     model: "provider/model",
     provider: "provider",
+    recoveryOwner: "provider" as const,
+    tokenId: null,
     reservedMicros: 0,
     executionEpoch: 0,
     executionOwnerLeaseToken: null,
@@ -1365,13 +1367,106 @@ Deno.test("customer settlement remains separate from provider costs and stale le
   stale.executionEpoch = 1;
   stale.actualProviderCostMicros = 3;
   stale.runLeaseExpiresAt = new Date(Date.now() - 1).toISOString();
-  assertEquals(repo.reapStaleProviderExecutionLeases(), 1);
+  // Provider name and run-ID prefixes are not ownership signals: only recoveryOwner controls
+  // which generic reaper may settle a stale run.
+  const providerOwnedToolNamedRun = repo.reserve(
+    user.id,
+    `tool:${crypto.randomUUID()}`,
+    "tool/echo",
+    100,
+    "tool",
+  );
+  providerOwnedToolNamedRun.runLeaseExpiresAt = new Date(Date.now() - 1).toISOString();
+  const staleTool = repo.ensureIdempotentReservation({
+    userId: user.id,
+    usageRunId: `tool:${crypto.randomUUID()}`,
+    model: "tool/echo",
+    provider: "tool",
+    reservedMicros: 100,
+    recoveryOwner: "tool",
+  });
+  staleTool.runLeaseExpiresAt = new Date(Date.now() - 1).toISOString();
+  assertEquals(repo.reapStaleProviderExecutionLeases(), 2);
   assertEquals({ status: stale.status, cost: stale.costMicros, lease: stale.runLeaseToken }, {
     status: "failed",
     cost: 0,
     lease: null,
   });
   assertEquals(stale.actualProviderCostMicros, 3);
+  assertEquals(providerOwnedToolNamedRun.provider, "tool");
+  assertEquals(providerOwnedToolNamedRun.recoveryOwner, "provider");
+  assertEquals(providerOwnedToolNamedRun.status, "failed");
+  assertEquals(staleTool.recoveryOwner, "tool");
+  assertEquals(staleTool.status, "reserved");
+  assertEquals(
+    repo.ledger.filter((entry) => entry.usageRunId === staleTool.id).map((entry) => entry.kind),
+    ["reserve"],
+  );
+});
+
+Deno.test("idempotent reservations reject recovery-owner collisions in memory", () => {
+  const repo = new MemoryRepository();
+  const user = repo.bootstrapAdmin({
+    email: "memory-recovery-owner-collision@example.com",
+    name: "Recovery owner collision",
+    passwordHash: "hash",
+  }, 1_000);
+  const input = {
+    userId: user.id,
+    usageRunId: "memory-recovery-owner-collision",
+    model: "tool/echo",
+    provider: "tool",
+    reservedMicros: 100,
+    recoveryOwner: "tool" as const,
+  };
+  repo.ensureIdempotentReservation(input);
+  assertThrows(
+    () => repo.ensureIdempotentReservation({ ...input, recoveryOwner: "provider" }),
+    DomainError,
+    "Existing reservation does not match",
+  );
+  assertEquals(repo.usageRuns.get(input.usageRunId)?.recoveryOwner, "tool");
+  assertEquals(
+    repo.ledger.filter((entry) => entry.usageRunId === input.usageRunId).map((entry) => entry.kind),
+    ["reserve"],
+  );
+});
+
+Deno.test("idempotent reservations reject API-token ownership collisions in memory", () => {
+  const repo = new MemoryRepository();
+  const user = repo.bootstrapAdmin({
+    email: "memory-token-owner-collision@example.com",
+    name: "Token owner collision",
+    passwordHash: "hash",
+  }, 1_000);
+  const usageRunId = "memory-token-owner-collision";
+  const reserved = repo.reserve(
+    user.id,
+    usageRunId,
+    "tool/echo",
+    100,
+    "tool",
+    "personal-token-id",
+  );
+  assertEquals(reserved.tokenId, "personal-token-id");
+  assertThrows(
+    () =>
+      repo.ensureIdempotentReservation({
+        userId: user.id,
+        usageRunId,
+        model: "tool/echo",
+        provider: "tool",
+        reservedMicros: 100,
+        recoveryOwner: "provider",
+      }),
+    DomainError,
+    "Existing reservation does not match",
+  );
+  assertEquals(repo.usageRuns.get(usageRunId)?.tokenId, "personal-token-id");
+  assertEquals(
+    repo.ledger.filter((entry) => entry.usageRunId === usageRunId).map((entry) => entry.kind),
+    ["reserve"],
+  );
 });
 
 Deno.test("paid provider generation failure remains failed and replays durably", () => {
@@ -2604,13 +2699,13 @@ Deno.test("approval grant is minted once and rejection revokes sessions and toke
     startingCreditMicros: 100,
   });
   assertEquals(user.balanceMicros, 0);
-  repo.createSession(user.id, "session", false);
+  repo.createSession(user.id, "session", false, user.authorityEpoch);
   const token = repo.createApiToken(user.id, {
     name: "token",
     scopes: ["chat:write"],
     tokenHash: "hash",
     preview: "hash",
-  });
+  }, user.authorityEpoch);
   repo.decideUserApproval({
     actorId: actor.id,
     targetUserId: user.id,
@@ -2654,7 +2749,22 @@ Deno.test("identity tokens are one-time and password reset invalidates credentia
     "email_verification",
     "verify-hash",
     new Date(Date.now() + 60_000).toISOString(),
+    user.authorityEpoch,
   );
+  repo.users.get(user.id)!.authorityEpoch++;
+  assertThrows(
+    () =>
+      repo.createIdentityToken(
+        user.id,
+        "email_verification",
+        "verify-hash",
+        new Date(Date.now() + 60_000).toISOString(),
+        user.authorityEpoch,
+      ),
+    DomainError,
+    "conflicts",
+  );
+  repo.users.get(user.id)!.authorityEpoch--;
   // A provider may resend the same still-valid token. Registration is idempotent only while its
   // exact authority remains unconsumed and owner/purpose-identical.
   repo.createIdentityToken(
@@ -2662,6 +2772,7 @@ Deno.test("identity tokens are one-time and password reset invalidates credentia
     "email_verification",
     "verify-hash",
     new Date(Date.now() + 60_000).toISOString(),
+    user.authorityEpoch,
   );
   const otherUser = repo.createUser({
     email: "identity-other@example.com",
@@ -2675,6 +2786,7 @@ Deno.test("identity tokens are one-time and password reset invalidates credentia
         "email_verification",
         "verify-hash",
         new Date(Date.now() + 60_000).toISOString(),
+        otherUser.authorityEpoch,
       ),
     DomainError,
     "conflicts",
@@ -2684,6 +2796,7 @@ Deno.test("identity tokens are one-time and password reset invalidates credentia
     "email_verification",
     "verify-hash-concurrent",
     new Date(Date.now() + 60_000).toISOString(),
+    user.authorityEpoch,
   );
   assertEquals(repo.verifyEmail("verify-hash").emailVerifiedAt !== null, true);
   assertThrows(
@@ -2693,12 +2806,21 @@ Deno.test("identity tokens are one-time and password reset invalidates credentia
         "email_verification",
         "verify-hash",
         new Date(Date.now() + 60_000).toISOString(),
+        user.authorityEpoch,
       ),
     DomainError,
     "conflicts",
   );
   assertEquals(repo.verifyEmail("verify-hash-concurrent").emailVerifiedAt !== null, true);
   assertThrows(() => repo.verifyEmail("verify-hash"), DomainError, "invalid or expired");
+  repo.decideUserApproval({
+    actorId: actor.id,
+    targetUserId: user.id,
+    expectedVersion: user.version,
+    status: "approved",
+    startingCreditMicros: 0,
+    requireEmailVerification: true,
+  });
   const session = repo.createSession(user.id, "session-hash", false);
   const token = repo.createApiToken(user.id, {
     name: "token",
@@ -2711,12 +2833,14 @@ Deno.test("identity tokens are one-time and password reset invalidates credentia
     "password_reset",
     "reset-hash",
     new Date(Date.now() + 60_000).toISOString(),
+    user.authorityEpoch,
   );
   repo.createIdentityToken(
     user.id,
     "password_reset",
     "reset-hash-concurrent",
     new Date(Date.now() + 60_000).toISOString(),
+    user.authorityEpoch,
   );
   repo.resetPassword("reset-hash", "new");
   assertEquals(repo.getSession("session-hash"), undefined);
@@ -2739,14 +2863,30 @@ Deno.test("identity tokens cannot mutate a soft-deleted active account", () => {
     passwordHash: "old",
   });
   const expiry = new Date(Date.now() + 60_000).toISOString();
-  repo.createIdentityToken(user.id, "email_verification", "deleted-verify", expiry);
-  repo.createIdentityToken(user.id, "password_reset", "deleted-reset", expiry);
+  repo.createIdentityToken(
+    user.id,
+    "email_verification",
+    "deleted-verify",
+    expiry,
+    user.authorityEpoch,
+  );
+  repo.createIdentityToken(
+    user.id,
+    "password_reset",
+    "deleted-reset",
+    expiry,
+    user.authorityEpoch,
+  );
   repo.users.get(user.id)!.deletedAt = new Date().toISOString();
 
   assertThrows(() => repo.verifyEmail("deleted-verify"), DomainError, "invalid or expired");
   assertThrows(() => repo.resetPassword("deleted-reset", "new"), DomainError, "invalid or expired");
   assertThrows(() => repo.markUserEmailVerified(user.id), DomainError, "unavailable");
-  assertThrows(() => repo.secureAfterPasswordReset(user.id, "ignored"), DomainError, "unavailable");
+  assertThrows(
+    () => repo.resetBetterAuthPassword("ignored", "new"),
+    DomainError,
+    "durable authentication storage",
+  );
 });
 
 Deno.test("durable API idempotency lifecycle reserves once, replays frames, and fences stale leases", () => {

@@ -186,7 +186,7 @@ Deno.test("embeddings adapter rejects unsafe provider URLs and upstream failures
     EmbeddingsProviderError,
     "invalid",
   );
-  await assertRejects(
+  const serverFailure = await assertRejects(
     () =>
       createEmbeddings(request, {
         baseUrl: "https://provider.example/v1",
@@ -200,4 +200,102 @@ Deno.test("embeddings adapter rejects unsafe provider URLs and upstream failures
     EmbeddingsProviderError,
     "request failed",
   );
+  assertEquals((serverFailure as EmbeddingsProviderError).dispatchOutcome, "uncertain");
+  assertEquals((serverFailure as EmbeddingsProviderError).upstreamStatus, 500);
+  for (const status of [401, 408, 422, 429, 500, 503]) {
+    const ambiguous = await assertRejects(() =>
+      createEmbeddings(request, {
+        baseUrl: "https://provider.example/v1",
+        apiKey: "secret",
+        upstreamModel: "embed",
+        publicModel: "embed",
+        signal: new AbortController().signal,
+        fetch: () =>
+          Promise.resolve(
+            new Response(status % 2 === 0 ? "{" : "not-json", {
+              status,
+              headers: { "retry-after": status === 429 ? "999999" : "2.25" },
+            }),
+          ),
+      })
+    );
+    assertEquals((ambiguous as EmbeddingsProviderError).upstreamStatus, status);
+    assertEquals(
+      (ambiguous as EmbeddingsProviderError).dispatchOutcome,
+      [401, 422].includes(status) ? "rejected" : "uncertain",
+    );
+    assertEquals(
+      (ambiguous as EmbeddingsProviderError).retryAfterMs,
+      status === 429 ? 300_000 : 2_250,
+    );
+  }
+  const rejected = await assertRejects(() =>
+    createEmbeddings(request, {
+      baseUrl: "https://provider.example/v1",
+      apiKey: "secret",
+      upstreamModel: "embed",
+      publicModel: "embed",
+      signal: new AbortController().signal,
+      fetch: () => Promise.resolve(Response.json({ error: "invalid" }, { status: 422 })),
+    })
+  );
+  assertEquals((rejected as EmbeddingsProviderError).dispatchOutcome, "rejected");
+  const transport = new TypeError("connection reset");
+  assertEquals(
+    await assertRejects(() =>
+      createEmbeddings(request, {
+        baseUrl: "https://provider.example/v1",
+        apiKey: "secret",
+        upstreamModel: "embed",
+        publicModel: "embed",
+        signal: new AbortController().signal,
+        fetch: () => Promise.reject(transport),
+      })
+    ),
+    transport,
+  );
+});
+
+Deno.test("embeddings adapter does not wait for nonsettling error-body cancellation", async () => {
+  let cancelStarted = false;
+  const neverSettles = new Promise<void>(() => undefined);
+  const timeout = Promise.withResolvers<never>();
+  const timer = setTimeout(
+    () => timeout.reject(new Error("embedding provider status was blocked by body cancellation")),
+    250,
+  );
+  try {
+    const failure = await Promise.race([
+      assertRejects(() =>
+        createEmbeddings(
+          { model: "embed", input: "hello" },
+          {
+            baseUrl: "https://provider.example/v1",
+            apiKey: "secret",
+            upstreamModel: "embed",
+            publicModel: "embed",
+            signal: new AbortController().signal,
+            fetch: () =>
+              Promise.resolve(
+                new Response(
+                  new ReadableStream({
+                    cancel() {
+                      cancelStarted = true;
+                      return neverSettles;
+                    },
+                  }),
+                  { status: 429, headers: { "retry-after": "7" } },
+                ),
+              ),
+          },
+        )
+      ),
+      timeout.promise,
+    ]);
+    assertEquals(cancelStarted, true);
+    assertEquals((failure as EmbeddingsProviderError).upstreamStatus, 429);
+    assertEquals((failure as EmbeddingsProviderError).retryAfterMs, 7_000);
+  } finally {
+    clearTimeout(timer);
+  }
 });

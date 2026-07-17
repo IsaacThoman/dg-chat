@@ -60,11 +60,17 @@ export function knowledgeEmbeddingIdentityVersion(input: {
   baseUrl: string;
   model: string;
   upstreamModel: string;
+  batchSize?: number;
 }): string {
+  if (
+    input.batchSize !== undefined &&
+    (!Number.isSafeInteger(input.batchSize) || input.batchSize < 1 || input.batchSize > 256)
+  ) throw new TypeError("Embedding batch size is invalid");
   const canonical = JSON.stringify({
     baseUrl: new URL(input.baseUrl).toString().replace(/\/$/, ""),
     model: input.model,
     upstreamModel: input.upstreamModel,
+    ...(input.batchSize === undefined ? {} : { batchSize: input.batchSize }),
   });
   let digest = 0xcbf29ce484222325n;
   for (const byte of new TextEncoder().encode(canonical)) {

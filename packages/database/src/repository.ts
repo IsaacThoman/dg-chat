@@ -20,6 +20,8 @@ import type {
   ConversationFolder,
   ConversationFolderMembership,
   ConversationPortabilityV1,
+  ConversationSearchPage,
+  ConversationSearchQuery,
   ConversationShareAttachmentPolicy,
   ConversationShareIdentityVisibility,
   ConversationShareSummary,
@@ -36,6 +38,10 @@ import type {
   UserPreferences,
   UserRole,
 } from "@dg-chat/contracts";
+import {
+  hasVisibleConversationSearchText,
+  stripConversationSearchControls,
+} from "@dg-chat/contracts";
 import type { LedgerEntry, StoredApiToken, StoredSession, StoredUser, UsageRun } from "./memory.ts";
 export {
   DOCX_MIME_TYPE,
@@ -44,6 +50,164 @@ export {
 } from "./attachment-policy.ts";
 
 export type MaybePromise<T> = T | Promise<T>;
+
+const CONVERSATION_SEARCH_CURSOR_VERSION = 1;
+export const CONVERSATION_SEARCH_CURSOR_MAX_CHARS = 2_048;
+const CONVERSATION_SEARCH_CURSOR_PATTERN = /^[A-Za-z0-9_-]+$/;
+/** PostgreSQL cancels a conversation search before an admission lease may expire. */
+export const CONVERSATION_SEARCH_STATEMENT_TIMEOUT_MS = 5_000;
+/** Search reads cannot starve transactional application work in the repository's primary pool. */
+export const CONVERSATION_SEARCH_POOL_MAX = 4;
+export const CONVERSATION_SEARCH_APPLICATION_NAME = "dg-chat-conversation-search";
+export const CONVERSATION_SEARCH_QUERY_VALIDATION_MESSAGE =
+  "Search query must be between 2 and 200 characters and contain safe visible text";
+const CONVERSATION_SEARCH_SNIPPET_CHARS = 240;
+const CONVERSATION_SEARCH_SCAN_CHARS = 4_096;
+const CONVERSATION_SEARCH_EXCERPT_CHARS = 1_024;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const CURSOR_TIMESTAMP_PATTERN = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3})(?:\d{3})?Z$/;
+
+function validConversationSearchCursorTimestamp(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const match = CURSOR_TIMESTAMP_PATTERN.exec(value);
+  if (!match || value.startsWith("0000-")) return false;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) && new Date(timestamp).toISOString() === `${match[1]}Z`;
+}
+
+function conversationSearchFingerprint(
+  query: Pick<ConversationSearchQuery, "query" | "view" | "folderId" | "tagIds">,
+  ownerId: string,
+) {
+  // A compact one-way binding keeps the search text itself out of the opaque cursor. The cursor
+  // is only a position hint; owner authorization is independently enforced by every query.
+  const input = JSON.stringify({
+    ownerId,
+    view: query.view,
+    query: query.query.trim().toLowerCase(),
+    folderId: query.folderId ?? null,
+    tagIds: [...(query.tagIds ?? [])].sort(),
+  });
+  let left = 0x811c9dc5;
+  let right = 0x9e3779b9;
+  for (const byte of new TextEncoder().encode(input)) {
+    left = Math.imul(left ^ byte, 0x01000193) >>> 0;
+    right = Math.imul(right ^ byte, 0x85ebca6b) >>> 0;
+  }
+  return left.toString(16).padStart(8, "0") + right.toString(16).padStart(8, "0");
+}
+
+export function encodeConversationSearchCursor(
+  value: { updatedAt: string; id: string },
+  query: Pick<ConversationSearchQuery, "query" | "view" | "folderId" | "tagIds">,
+  ownerId: string,
+): string {
+  const bytes = new TextEncoder().encode(JSON.stringify([
+    CONVERSATION_SEARCH_CURSOR_VERSION,
+    value.updatedAt,
+    value.id,
+    conversationSearchFingerprint(query, ownerId),
+  ]));
+  return btoa(String.fromCharCode(...bytes)).replaceAll("+", "-").replaceAll("/", "_")
+    .replace(/=+$/, "");
+}
+
+export function decodeConversationSearchCursor(
+  cursor: string,
+  query: Pick<ConversationSearchQuery, "query" | "view" | "folderId" | "tagIds">,
+  ownerId: string,
+): { updatedAt: string; id: string } | undefined {
+  try {
+    if (
+      cursor.length === 0 || cursor.length > CONVERSATION_SEARCH_CURSOR_MAX_CHARS ||
+      !CONVERSATION_SEARCH_CURSOR_PATTERN.test(cursor)
+    ) return undefined;
+    const base64 = cursor.replaceAll("-", "+").replaceAll("_", "/");
+    const binary = atob(base64.padEnd(Math.ceil(base64.length / 4) * 4, "="));
+    // Reject alternate encodings with non-zero trailing bits. Keeping one canonical wire form
+    // makes cursors safely comparable in logs and prevents padded/non-base64url variants from
+    // bypassing validation at repository boundaries.
+    const canonical = btoa(binary).replaceAll("+", "-").replaceAll("/", "_")
+      .replace(/=+$/, "");
+    if (canonical !== cursor) return undefined;
+    const value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(
+      Uint8Array.from(binary, (character) => character.charCodeAt(0)),
+    ));
+    if (
+      !Array.isArray(value) || value.length !== 4 ||
+      value[0] !== CONVERSATION_SEARCH_CURSOR_VERSION ||
+      !validConversationSearchCursorTimestamp(value[1]) || typeof value[2] !== "string" ||
+      !UUID_PATTERN.test(value[2]) || value[3] !== conversationSearchFingerprint(query, ownerId)
+    ) return undefined;
+    return { updatedAt: value[1], id: value[2] };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Finds case-insensitive text without allocating a normalized copy of a potentially huge body. */
+export function conversationSearchMatchIndex(content: string, query: string): number {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return -1;
+  const overlap = Math.min(Math.max(needle.length * 3, 32), CONVERSATION_SEARCH_SCAN_CHARS - 1);
+  for (let offset = 0; offset < content.length; offset += CONVERSATION_SEARCH_SCAN_CHARS) {
+    const start = Math.max(0, offset - overlap);
+    const chunk = content.slice(start, offset + CONVERSATION_SEARCH_SCAN_CHARS);
+    const match = chunk.toLowerCase().indexOf(needle);
+    if (match >= 0) return start + match;
+  }
+  return -1;
+}
+
+/** Removes terminal/bidi controls and produces a short single-line plain-text excerpt. */
+export function conversationSearchSnippet(content: string, query: string): string {
+  const rawMatch = conversationSearchMatchIndex(content, query);
+  const rawStart = Math.max(0, rawMatch < 0 ? 0 : rawMatch - 256);
+  const rawEnd = Math.min(content.length, rawStart + CONVERSATION_SEARCH_EXCERPT_CHARS);
+  const plain = stripConversationSearchControls(content.slice(rawStart, rawEnd), " ")
+    .replace(/\s+/gu, " ").trim();
+  if (
+    plain.length <= CONVERSATION_SEARCH_SNIPPET_CHARS && rawStart === 0 &&
+    rawEnd === content.length
+  ) return plain;
+  const match = conversationSearchMatchIndex(plain, query);
+  let prefix = rawStart > 0;
+  let suffix = rawEnd < content.length;
+  let available = CONVERSATION_SEARCH_SNIPPET_CHARS - Number(prefix) - Number(suffix);
+  let start = Math.max(
+    0,
+    Math.min(match < 0 ? 0 : match - 80, plain.length - available),
+  );
+  prefix ||= start > 0;
+  available = CONVERSATION_SEARCH_SNIPPET_CHARS - Number(prefix) - Number(suffix);
+  start = Math.max(0, Math.min(match < 0 ? 0 : match - 80, plain.length - available));
+  suffix ||= start + available < plain.length;
+  available = CONVERSATION_SEARCH_SNIPPET_CHARS - Number(prefix) - Number(suffix);
+  start = Math.max(0, Math.min(match < 0 ? 0 : match - 80, plain.length - available));
+  const excerpt = plain.slice(
+    start,
+    start + available,
+  );
+  return `${prefix ? "…" : ""}${excerpt}${suffix ? "…" : ""}`;
+}
+
+export function validConversationSearchTerm(value: string): boolean {
+  const trimmed = value.trim();
+  return trimmed.length >= 2 && trimmed.length <= 200 && !trimmed.includes("\u0000") &&
+    hasVisibleConversationSearchText(trimmed);
+}
+
+export function validConversationSearchScopeId(value: string): boolean {
+  return UUID_PATTERN.test(value);
+}
+
+export function conversationSearchMessageContent(
+  message: Pick<MessageNode, "role" | "content" | "metadata">,
+): string {
+  return message.role === "user" && typeof message.metadata.authoredContent === "string"
+    ? message.metadata.authoredContent
+    : message.content;
+}
 
 export interface ConversationPortabilityExportOptions {
   includeTemporary?: boolean;
@@ -122,15 +286,18 @@ export interface AdminApprovalCommand extends AdminUserCommand {
 export interface AdminRoleCommand extends AdminUserCommand {
   role: UserRole;
   reason: string;
+  requireEmailVerification?: boolean;
 }
 
 export interface AdminStateCommand extends AdminUserCommand {
   state: AccountState;
+  requireEmailVerification?: boolean;
 }
 
 export interface AdminDeletionCommand extends AdminUserCommand {
   deleted: boolean;
   reason: string;
+  requireEmailVerification?: boolean;
 }
 
 const ADMIN_USER_CURSOR_VERSION = 2;
@@ -392,6 +559,20 @@ export interface AttachmentRecord {
   createdAt: string;
   updatedAt: string;
   deletedAt: string | null;
+}
+export type AttachmentListOrder = "asc" | "desc";
+/**
+ * Owner-scoped keyset pagination for attachment-backed file APIs. `after` is the public
+ * attachment identifier returned by the preceding page, rather than an opaque internal cursor.
+ */
+export interface AttachmentListQuery {
+  limit: number;
+  order: AttachmentListOrder;
+  after?: string;
+}
+export interface AttachmentPage {
+  data: AttachmentRecord[];
+  hasMore: boolean;
 }
 export interface DocumentChunkMetadata extends Record<string, unknown> {
   sourceAttachmentId?: string;
@@ -1219,6 +1400,38 @@ export interface RetriedAdminJob {
   job: AdminJobSummary;
   priorAttempts: number;
 }
+export interface AdminWorkerInstance {
+  instanceId: string;
+  workerName: string;
+  state: "starting" | "running" | "draining" | "stopped";
+  startedAt: string;
+  heartbeatAt: string;
+  progressAt: string;
+  heartbeatAgeMs: number;
+  progressAgeMs: number;
+  heartbeatStaleMs: number;
+  progressStaleMs: number;
+  healthClockToleranceMs: number;
+  liveness: "fresh" | "heartbeat_stale" | "progress_stalled" | "inactive";
+  currentJobId: string | null;
+  currentJobType: string | null;
+  lastCompletedAt: string | null;
+  lastCompletedJobId: string | null;
+  lastCompletedJobType: string | null;
+}
+export type AdminWorkerScope = "active" | "history" | "all";
+export interface AdminWorkerQuery {
+  scope?: AdminWorkerScope;
+  cursor?: string;
+  limit?: number;
+}
+export interface AdminWorkerPage {
+  items: AdminWorkerInstance[];
+  scope: AdminWorkerScope;
+  limit: number;
+  nextCursor: string | null;
+  hasMore: boolean;
+}
 export type RetentionDays = 1 | 7 | 14 | 30 | 90;
 export interface RetentionPolicy {
   version: number;
@@ -1895,7 +2108,14 @@ export interface EnsureIdempotentReservationInput {
   model: string;
   provider: string;
   reservedMicros: number;
+  recoveryOwner: UsageRecoveryOwner;
 }
+
+export type UsageRecoveryOwner =
+  | "provider"
+  | "api_replay"
+  | "document_embedding"
+  | "tool";
 
 /** Persistence boundary shared by synchronous test stores and async production stores. */
 export interface DomainRepository {
@@ -1908,7 +2128,12 @@ export interface DomainRepository {
   listUsers(): MaybePromise<PublicUser[]>;
   listAdminUsers(query?: AdminUserQuery): MaybePromise<AdminUserPage>;
   getAdminUser(id: string): MaybePromise<AdminUser>;
-  createSession(userId: string, tokenHash: string, limited: boolean): MaybePromise<StoredSession>;
+  createSession(
+    userId: string,
+    tokenHash: string,
+    limited: boolean,
+    expectedAuthorityEpoch?: number,
+  ): MaybePromise<StoredSession>;
   getSession(tokenHash: string): MaybePromise<StoredSession | undefined>;
   invalidateUserSessions(userId: string): MaybePromise<void>;
   deleteSession(tokenHash: string): MaybePromise<void>;
@@ -1940,12 +2165,12 @@ export interface DomainRepository {
     purpose: IdentityTokenPurpose,
     tokenHash: string,
     expiresAt: string,
+    expectedAuthorityEpoch: number,
   ): MaybePromise<void>;
   verifyEmail(tokenHash: string): MaybePromise<StoredUser>;
   markUserEmailVerified(userId: string): MaybePromise<StoredUser>;
   resetPassword(tokenHash: string, passwordHash: string): MaybePromise<StoredUser>;
-  prepareBetterAuthPasswordReset(token: string): MaybePromise<void>;
-  secureAfterPasswordReset(userId: string, token: string): MaybePromise<void>;
+  resetBetterAuthPassword(token: string, passwordHash: string): MaybePromise<StoredUser>;
   recordAudit(input: AuditEventInput): MaybePromise<AuditEvent>;
   listAudit(query?: AuditQuery): MaybePromise<AuditPage>;
   decideUserApproval(input: AdminApprovalCommand): MaybePromise<AdminUser>;
@@ -1963,6 +2188,11 @@ export interface DomainRepository {
     ownerId: string,
     includeDeleted?: boolean,
   ): MaybePromise<LifecycleConversation[]>;
+  searchConversations(
+    ownerId: string,
+    query: ConversationSearchQuery,
+    signal?: AbortSignal,
+  ): MaybePromise<ConversationSearchPage>;
   updateConversation(
     ownerId: string,
     id: string,
@@ -2095,6 +2325,10 @@ export interface DomainRepository {
   ): MaybePromise<Conversation>;
   createAttachment(input: CreateAttachmentInput): MaybePromise<CreateAttachmentResult>;
   listAttachments(ownerId: string, includeDeleted?: boolean): MaybePromise<AttachmentRecord[]>;
+  listAttachmentPage(
+    ownerId: string,
+    query: AttachmentListQuery,
+  ): MaybePromise<AttachmentPage>;
   getAttachment(
     id: string,
     ownerId: string,
@@ -2227,7 +2461,11 @@ export interface DomainRepository {
     ownerId: string,
     input: ReplaceConversationKnowledgeInput,
   ): MaybePromise<KnowledgeConversationBinding[]>;
-  createApiToken(userId: string, input: CreateApiTokenInput): MaybePromise<StoredApiToken>;
+  createApiToken(
+    userId: string,
+    input: CreateApiTokenInput,
+    expectedAuthorityEpoch?: number,
+  ): MaybePromise<StoredApiToken>;
   authenticateApiToken(hash: string): MaybePromise<StoredApiToken | undefined>;
   findApiTokenByHash(hash: string): MaybePromise<StoredApiToken | undefined>;
   listApiTokens(userId: string): MaybePromise<ApiTokenSummary[]>;
@@ -2241,6 +2479,7 @@ export interface DomainRepository {
     userId: string,
     id: string,
     input: RotateApiTokenInput,
+    expectedAuthorityEpoch?: number,
   ): MaybePromise<RotatedApiToken>;
   revokeApiTokenFamily(id: string, userId: string, expectedVersion: number): MaybePromise<void>;
   searchApiTokens(
@@ -2442,6 +2681,7 @@ export interface DomainRepository {
   adminSummary(): MaybePromise<AdminSummary>;
   adminAnalytics(query: AdminAnalyticsQuery): MaybePromise<AdminAnalytics>;
   listJobs(query?: AdminJobQuery): MaybePromise<AdminJobPage>;
+  listWorkerInstances(query?: AdminWorkerQuery): MaybePromise<AdminWorkerPage>;
   /** Atomically requeues a failed job and records the privileged actor in the audit log. */
   retryFailedJob(id: string, actorId: string): MaybePromise<RetriedAdminJob>;
   getRetentionPolicy(): MaybePromise<RetentionPolicy>;

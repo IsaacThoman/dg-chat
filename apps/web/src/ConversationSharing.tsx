@@ -1,15 +1,35 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Copy, ExternalLink, Link2, RefreshCw, Share2, Shield, X } from "lucide-react";
 import { api, ApiError } from "./api.ts";
 import { Modal } from "./Modal.tsx";
+import { LatestClipboardOperation } from "./shareClipboard.ts";
 import type {
+  Attachment,
   Conversation,
   ConversationShareSummary,
   Message,
   ShareAttachmentPolicy,
   ShareIdentityVisibility,
 } from "./types.ts";
+
+export function uniqueShareAttachments(messages: Message[]): Attachment[] {
+  const unique = new Map<string, Attachment>();
+  for (const message of messages) {
+    for (const attachment of message.attachments ?? []) {
+      if (!unique.has(attachment.id)) unique.set(attachment.id, attachment);
+    }
+  }
+  return [...unique.values()];
+}
+
+export function validSelectedShareAttachmentIds(
+  selectedAttachmentIds: string[],
+  attachments: Attachment[],
+): string[] {
+  const visibleIds = new Set(attachments.map((attachment) => attachment.id));
+  return [...new Set(selectedAttachmentIds)].filter((id) => visibleIds.has(id));
+}
 
 const errorMessage = (error: unknown) =>
   error instanceof ApiError || error instanceof Error ? error.message : "The request failed.";
@@ -37,15 +57,23 @@ function expirationValue(value: "never" | "day" | "week" | "month"): string | nu
 export function ConversationShareButton({
   conversation,
   messages,
+  visibleLeafId,
   disabled,
+  onRetentionProtectionChange,
 }: {
   conversation: Conversation;
   messages: Message[];
+  visibleLeafId: string | null;
   disabled?: boolean;
+  onRetentionProtectionChange?: (protect: boolean) => void;
 }) {
   const [open, setOpen] = useState(false);
+  useEffect(() => {
+    onRetentionProtectionChange?.(open);
+    return () => onRetentionProtectionChange?.(false);
+  }, [onRetentionProtectionChange, open]);
   const unavailable = !conversation.deleted && (
-    disabled || conversation.temporary || !conversation.activeLeafId ||
+    disabled || conversation.temporary || !visibleLeafId ||
     conversation.version === undefined
   );
   const reason = conversation.temporary
@@ -54,7 +82,7 @@ export function ConversationShareButton({
     ? "Manage shared snapshots"
     : disabled
     ? "Wait for the current response to finish"
-    : !conversation.activeLeafId
+    : !visibleLeafId
     ? "Add a completed message before sharing"
     : "Share an immutable snapshot";
   return (
@@ -73,6 +101,7 @@ export function ConversationShareButton({
         <ShareDialog
           conversation={conversation}
           messages={messages}
+          visibleLeafId={visibleLeafId}
           close={() => setOpen(false)}
         />
       )}
@@ -83,10 +112,12 @@ export function ConversationShareButton({
 function ShareDialog({
   conversation,
   messages,
+  visibleLeafId,
   close,
 }: {
   conversation: Conversation;
   messages: Message[];
+  visibleLeafId: string | null;
   close: () => void;
 }) {
   const queryClient = useQueryClient();
@@ -102,6 +133,9 @@ function ShareDialog({
       expiresAt: string | null;
     } | null
   >(null);
+  const shareLinkRef = useRef<HTMLInputElement>(null);
+  const copyOperationRef = useRef<LatestClipboardOperation | null>(null);
+  if (!copyOperationRef.current) copyOperationRef.current = new LatestClipboardOperation();
   const [identityVisibility, setIdentityVisibility] = useState<ShareIdentityVisibility>(
     "anonymous",
   );
@@ -114,23 +148,34 @@ function ShareDialog({
   const [createdUrl, setCreatedUrl] = useState("");
   const [copied, setCopied] = useState(false);
   const [linkStored, setLinkStored] = useState(false);
-  const attachments = useMemo(
-    () => messages.flatMap((message) => message.attachments ?? []),
-    [messages],
+  const attachments = useMemo(() => uniqueShareAttachments(messages), [messages]);
+  const effectiveAttachmentIds = useMemo(
+    () => validSelectedShareAttachmentIds(selectedAttachmentIds, attachments),
+    [attachments, selectedAttachmentIds],
   );
+  const selectedAttachmentsUnavailable = attachmentPolicy === "selected" &&
+    selectedAttachmentIds.length > 0 && effectiveAttachmentIds.length === 0;
   const conversationShares = (shares.data ?? []).filter((share) =>
     share.conversationId === conversation.id
   );
 
+  useEffect(() => {
+    if (!createdUrl) return;
+    shareLinkRef.current?.focus();
+    shareLinkRef.current?.select();
+  }, [createdUrl]);
+
+  useEffect(() => () => copyOperationRef.current?.dispose(), []);
+
   const create = async () => {
-    if (!conversation.activeLeafId || conversation.version === undefined) return;
-    const effectiveAttachmentIds = attachmentPolicy === "selected" ? selectedAttachmentIds : [];
+    if (!visibleLeafId || conversation.version === undefined) return;
+    const selectedIds = attachmentPolicy === "selected" ? effectiveAttachmentIds : [];
     const fingerprint = JSON.stringify({
-      leafId: conversation.activeLeafId,
+      leafId: visibleLeafId,
       expectedConversationVersion: conversation.version,
       identityVisibility,
       attachmentPolicy,
-      selectedAttachmentIds: [...effectiveAttachmentIds].sort(),
+      selectedAttachmentIds: [...selectedIds].sort(),
       expiry,
     });
     if (createOperation.current?.fingerprint !== fingerprint) {
@@ -147,11 +192,11 @@ function ShareDialog({
     try {
       const result = await api.createConversationShare({
         conversationId: conversation.id,
-        leafId: conversation.activeLeafId,
+        leafId: visibleLeafId,
         expectedConversationVersion: conversation.version,
         identityVisibility,
         attachmentPolicy,
-        selectedAttachmentIds: effectiveAttachmentIds,
+        selectedAttachmentIds: selectedIds,
         expiresAt: operation.expiresAt,
         capability: operation.capability,
         idempotencyKey: operation.idempotencyKey,
@@ -179,14 +224,22 @@ function ShareDialog({
   };
 
   const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(createdUrl);
-      setLinkStored(true);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1_500);
-    } catch {
-      setError("Copy failed. Select and copy the link manually.");
-    }
+    await copyOperationRef.current!.write(
+      createdUrl,
+      (value) => navigator.clipboard.writeText(value),
+      {
+        onStart: () => {
+          setCopied(false);
+          setError("");
+        },
+        onSuccess: () => {
+          setLinkStored(true);
+          setCopied(true);
+        },
+        onFailure: () => setError("Copy failed. Select and copy the link manually."),
+        onClearSuccess: () => setCopied(false),
+      },
+    );
   };
 
   const requestClose = () => {
@@ -241,6 +294,7 @@ function ShareDialog({
               <p>This link is shown once. Store it before closing.</p>
               <div className="share-link-row">
                 <input
+                  ref={shareLinkRef}
                   aria-label="Share link"
                   value={createdUrl}
                   readOnly
@@ -352,16 +406,28 @@ function ShareDialog({
                           <input
                             type="checkbox"
                             checked={selectedAttachmentIds.includes(attachment.id)}
-                            onChange={(event) =>
+                            onChange={(event) => {
+                              // React may defer or replay a functional updater after the synthetic
+                              // event's currentTarget is no longer available. Snapshot the DOM
+                              // value while the handler is active.
+                              const checked = event.currentTarget.checked;
                               setSelectedAttachmentIds((current) =>
-                                event.currentTarget.checked
+                                checked
                                   ? [...current, attachment.id]
                                   : current.filter((id) => id !== attachment.id)
-                              )}
+                              );
+                            }}
                           />
                           <span>{attachment.filename}</span>
                         </label>
                       ))}
+                      {effectiveAttachmentIds.length === 0 && (
+                        <p id="share-attachment-selection-note" className="share-selection-note">
+                          {selectedAttachmentsUnavailable
+                            ? "Your selected files are no longer on this branch. Choose at least one file to create the snapshot."
+                            : "Choose at least one file to create the snapshot."}
+                        </p>
+                      )}
                     </div>
                   )}
                 </fieldset>
@@ -444,8 +510,11 @@ function ShareDialog({
           <button
             type="button"
             className="primary"
+            aria-describedby={attachmentPolicy === "selected" && effectiveAttachmentIds.length === 0
+              ? "share-attachment-selection-note"
+              : undefined}
             disabled={creating ||
-              (attachmentPolicy === "selected" && selectedAttachmentIds.length === 0)}
+              (attachmentPolicy === "selected" && effectiveAttachmentIds.length === 0)}
             onClick={() => void create()}
           >
             {creating ? <RefreshCw className="spin" size={15} /> : <Link2 size={15} />}

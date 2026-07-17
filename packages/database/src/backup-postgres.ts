@@ -262,8 +262,14 @@ export class PostgresBackupStore {
 
   static async connect(url: string): Promise<PostgresBackupStore> {
     const sql = postgres(url, { max: 5 });
-    await sql`SELECT 1`;
-    return new PostgresBackupStore(sql);
+    try {
+      await sql`SELECT 1`;
+      return new PostgresBackupStore(sql);
+    } catch (error) {
+      // No instance is returned on a failed probe, so the constructor retains cleanup ownership.
+      await sql.end({ timeout: 0 }).catch(() => undefined);
+      throw error;
+    }
   }
 
   async close(): Promise<void> {

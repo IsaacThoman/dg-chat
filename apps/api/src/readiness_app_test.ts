@@ -67,9 +67,9 @@ Deno.test("ready returns a sanitized 503 promptly and cancels hung dependency pr
   assertEquals(elapsed < 250, true);
   assertEquals(await responses[0].json(), {
     status: "not_ready",
-    storage: { ready: false, storage: "memory" },
-    redis: false,
-    objects: { configured: true, ready: false },
+    storage: { configured: false, ready: false, implementation: "memory" },
+    redis: { configured: true, ready: false, implementation: "custom" },
+    objects: { configured: true, ready: false, implementation: "custom" },
   });
   assertEquals(postgresAborted.value, true);
   assertEquals(redisAborted.value, true);
@@ -116,10 +116,11 @@ Deno.test("ready coalesces concurrent probes and caches the sanitized snapshot b
   const base = new MemoryRepository();
   const repository = new Proxy(base, {
     get(target, property, receiver) {
+      if (property === "storageKind") return "postgres";
       if (property === "readiness") {
         return () => {
           postgresProbes++;
-          return delayed({ ready: true, storage: "memory" });
+          return delayed({ ready: true, storage: "postgres" });
         };
       }
       return Reflect.get(target, property, receiver);
@@ -161,9 +162,9 @@ Deno.test("ready coalesces concurrent probes and caches the sanitized snapshot b
   assertEquals([postgresProbes, redisProbes, objectProbes], [1, 1, 1]);
   assertEquals(await concurrent[0].json(), {
     status: "ready",
-    storage: { ready: true, storage: "memory" },
-    redis: true,
-    objects: { configured: true, ready: true },
+    storage: { configured: true, ready: true, implementation: "postgres" },
+    redis: { configured: true, ready: true, implementation: "custom" },
+    objects: { configured: true, ready: true, implementation: "custom" },
   });
 
   assertEquals((await app.request("/ready")).status, 200);
@@ -171,6 +172,77 @@ Deno.test("ready coalesces concurrent probes and caches the sanitized snapshot b
   await new Promise((resolve) => setTimeout(resolve, 35));
   assertEquals((await app.request("/ready")).status, 200);
   assertEquals([postgresProbes, redisProbes, objectProbes], [2, 2, 2]);
+});
+
+Deno.test("production readiness rejects a memory repository whose health payload claims postgres", async () => {
+  const base = new MemoryRepository();
+  const lyingRepository = new Proxy(base, {
+    get(target, property, receiver) {
+      if (property === "readiness") {
+        return () => Promise.resolve({ ready: true, storage: "postgres" as const });
+      }
+      return Reflect.get(target, property, receiver);
+    },
+  }) as DomainRepository;
+  const redis: RateLimiter = {
+    implementation: "redis",
+    consume: () => Promise.reject(new Error("unused")),
+    health: () => Promise.resolve(true),
+    close: () => Promise.resolve(),
+  };
+  const objects: ObjectStore = {
+    implementation: "s3",
+    put: () => Promise.reject(new Error("unused")),
+    get: () => Promise.reject(new Error("unused")),
+    delete: () => Promise.reject(new Error("unused")),
+    readiness: () => Promise.resolve(true),
+    close: () => undefined,
+  };
+  const { app } = createApp({
+    repository: lyingRepository,
+    rateLimiter: redis,
+    objectStore: objects,
+    readinessRequirements: { storage: "postgres", redis: "redis", objects: "s3" },
+    requestLogSink: () => undefined,
+  });
+
+  const response = await app.request("/ready");
+  assertEquals(response.status, 503);
+  assertEquals(await response.json(), {
+    status: "not_ready",
+    storage: { configured: false, ready: true, implementation: "memory" },
+    redis: { configured: true, ready: true, implementation: "redis" },
+    objects: { configured: true, ready: true, implementation: "s3" },
+  });
+});
+
+Deno.test("readiness identifies local adapters without claiming Redis or object storage", async () => {
+  const { app } = createApp({ requestLogSink: () => undefined });
+  const response = await app.request("/ready");
+
+  assertEquals(response.status, 200);
+  assertEquals(await response.json(), {
+    status: "ready",
+    storage: { configured: false, ready: true, implementation: "memory" },
+    redis: { configured: false, ready: true, implementation: "memory" },
+    objects: { configured: false, ready: false, implementation: "none" },
+  });
+});
+
+Deno.test("production readiness stays closed when required durable adapters are absent", async () => {
+  const { app } = createApp({
+    readinessRequirements: { storage: "postgres", redis: "redis", objects: "s3" },
+    requestLogSink: () => undefined,
+  });
+  const response = await app.request("/ready");
+
+  assertEquals(response.status, 503);
+  assertEquals(await response.json(), {
+    status: "not_ready",
+    storage: { configured: false, ready: true, implementation: "memory" },
+    redis: { configured: false, ready: true, implementation: "memory" },
+    objects: { configured: false, ready: false, implementation: "none" },
+  });
 });
 
 Deno.test("readiness cache configuration rejects unbounded values", () => {

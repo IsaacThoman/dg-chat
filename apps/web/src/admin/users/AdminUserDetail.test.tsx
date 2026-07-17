@@ -8,7 +8,7 @@ import type {
   AdminUser,
 } from "../../../../../packages/contracts/src/types.ts";
 import { ApiError } from "../../api.ts";
-import { AdminUserDetail } from "./AdminUserDetail.tsx";
+import { AdminUserDetail, adminUserDetailTitle } from "./AdminUserDetail.tsx";
 import { canRevokeAdminSession, canRevokeAdminToken } from "./AdminUserSecurityTabs.tsx";
 import { adminUserKeys } from "./adminUserKeys.ts";
 import { isStaleAdminResource } from "./AdminUserPrimitives.tsx";
@@ -50,6 +50,20 @@ function render(
 }
 
 describe("AdminUserDetail", () => {
+  it("provides deterministic titles throughout loading, success, and failure states", () => {
+    expect(adminUserDetailTitle(undefined, true, null)).toBe(
+      "Loading user · Users · DG Chat Admin",
+    );
+    expect(adminUserDetailTitle(user, false, null)).toBe(
+      "Security Operator · Users · DG Chat Admin",
+    );
+    expect(adminUserDetailTitle(undefined, false, new ApiError(404, "missing", "missing")))
+      .toBe("User not found · Users · DG Chat Admin");
+    expect(adminUserDetailTitle(undefined, false, new Error("offline"))).toBe(
+      "User details unavailable · Users · DG Chat Admin",
+    );
+  });
+
   it("classifies stale security resources that must not retry a captured selection", () => {
     expect(isStaleAdminResource(new ApiError(409, "version_conflict", "changed"))).toBe(true);
     expect(isStaleAdminResource(new ApiError(409, "no_state_change", "already revoked"))).toBe(

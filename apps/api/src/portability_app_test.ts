@@ -274,7 +274,7 @@ Deno.test("owner portability mutations enforce CSRF, session-only auth, and acti
     name: "Pending",
   });
   const pendingToken = `session-${crypto.randomUUID()}`;
-  repository.createSession(pending.id, await sha256(pendingToken), false);
+  repository.createSession(pending.id, await sha256(pendingToken), true);
   const pendingResponse = await post({
     cookie: `dg_session=${pendingToken}`,
     origin: "http://localhost:5173",
@@ -282,7 +282,7 @@ Deno.test("owner portability mutations enforce CSRF, session-only auth, and acti
     "idempotency-key": "pending-account",
   });
   assertEquals(pendingResponse.status, 403);
-  assertEquals((await pendingResponse.json()).error.code, "approval_required");
+  assertEquals((await pendingResponse.json()).error.code, "session_refresh_required");
 
   repository.setAdminUserState({
     actorId: actor.id,

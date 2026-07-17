@@ -46,15 +46,38 @@ Deno.test({
         approvedAt: null,
         approvedBy: null,
         cancellationRequestedAt: null,
+        billingSnapshot: null,
         createdAt: now,
         updatedAt: now,
       });
       assertEquals(await store.getExecution(created.id, users[1].id), undefined);
       assertEquals((await store.getExecution(created.id, users[0].id))?.input, created.input);
       assertEquals(
-        (await store.transitionExecution(created.id, ["pending_approval"], { status: "queued" }))
+        (await store.transitionExecution(created.id, ["pending_approval"], {
+          status: "queued",
+          billingSnapshot: {
+            reservedMicros: 1_000,
+            provider: "tool",
+            model: "tool/web_search",
+          },
+        }))
           ?.status,
         "queued",
+      );
+      assertEquals((await store.getExecution(created.id))?.billingSnapshot, {
+        reservedMicros: 1_000,
+        provider: "tool",
+        model: "tool/web_search",
+      });
+      assertEquals(
+        await store.transitionExecution(created.id, ["queued"], {
+          billingSnapshot: {
+            reservedMicros: 2_000,
+            provider: "tool",
+            model: "tool/web_search",
+          },
+        }),
+        undefined,
       );
       assertEquals(
         await store.transitionExecution(created.id, ["pending_approval"], { status: "cancelled" }),
@@ -100,6 +123,51 @@ Deno.test({
       assertEquals(
         (await sql`SELECT 1 FROM messages WHERE idempotency_key='tool-link-forbidden'`).length,
         0,
+      );
+      const recoverable = await store.createExecution({
+        ...created,
+        id: crypto.randomUUID(),
+        status: "queued",
+        result: null,
+        billingSnapshot: {
+          reservedMicros: 1_000,
+          provider: "tool",
+          model: "tool/web_search",
+        },
+      });
+      const [claimed] = await store.claimRecoverable(1);
+      assertEquals(claimed.id, recoverable.id);
+      assertEquals(typeof claimed.claimToken, "string");
+      assertEquals(await store.renewClaim(claimed.id, crypto.randomUUID(), 120_000), false);
+      assertEquals(await store.renewClaim(claimed.id, claimed.claimToken!, 120_000), true);
+      assertEquals(
+        await store.transitionExecution(
+          claimed.id,
+          ["running"],
+          {
+            status: "failed_pending_refund",
+            error: { code: "tool_execution_failed", message: "Tool execution failed" },
+          },
+          crypto.randomUUID(),
+        ),
+        undefined,
+      );
+      const refundPending = await store.transitionExecution(
+        claimed.id,
+        ["running"],
+        {
+          status: "failed_pending_refund",
+          error: { code: "tool_execution_failed", message: "Tool execution failed" },
+        },
+        claimed.claimToken!,
+      );
+      assertEquals(refundPending?.status, "failed_pending_refund");
+      assertEquals((await store.listPendingRefund(10)).map((row) => row.id), [claimed.id]);
+      assertEquals(
+        (await store.transitionExecution(claimed.id, ["failed_pending_refund"], {
+          status: "failed",
+        }))?.status,
+        "failed",
       );
       const audits = await sql<{ action: string }[]>`
         SELECT action FROM audit_events WHERE target_id IN ('web_search', ${created.id})

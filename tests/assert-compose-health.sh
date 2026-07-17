@@ -19,7 +19,9 @@ container_id() {
 dump_failure() {
   local service="$1"
   local id="$2"
-  docker inspect "$id" >&2 || true
+  docker inspect --format \
+    'service='"$service"' status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} error={{json .State.Error}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}} restarts={{.RestartCount}} started={{.State.StartedAt}} finished={{.State.FinishedAt}}' \
+    "$id" >&2 || true
   "${compose[@]}" logs --no-color "$service" >&2 || true
 }
 
@@ -110,21 +112,25 @@ assert_no_restarts() {
   fi
 }
 
-for service in postgres redis minio searxng app worker; do
+for service in postgres redis minio searxng search-proxy app worker web; do
   wait_healthy "$service"
 done
 for service in migrate minio-init; do
   wait_completed "$service"
 done
-for service in search-proxy web; do
-  wait_running "$service"
-done
-
 worker_id="$(container_id worker)"
-worker_env="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$worker_id")"
-for name in S3_ENDPOINT S3_ALLOW_INSECURE S3_REGION S3_BUCKET S3_ACCESS_KEY S3_SECRET_KEY S3_FORCE_PATH_STYLE; do
-  if ! grep -q "^${name}=." <<<"$worker_env"; then
-    echo "worker is missing required object-storage environment: $name" >&2
+worker_env_names="$(
+  docker inspect --format '{{range .Config.Env}}{{println (index (split . "=") 0)}}{{end}}' \
+    "$worker_id"
+)"
+for name in \
+  S3_ENDPOINT S3_ALLOW_INSECURE S3_REGION S3_BUCKET S3_ACCESS_KEY S3_SECRET_KEY S3_FORCE_PATH_STYLE \
+  KNOWLEDGE_EMBEDDING_BASE_URL KNOWLEDGE_EMBEDDING_API_KEY KNOWLEDGE_EMBEDDING_MODEL \
+  KNOWLEDGE_EMBEDDING_UPSTREAM_MODEL KNOWLEDGE_EMBEDDING_VERSION \
+  KNOWLEDGE_EMBEDDING_BATCH_SIZE KNOWLEDGE_EMBEDDING_INPUT_MICROS_PER_MILLION \
+  KNOWLEDGE_EMBEDDING_FIXED_CALL_MICROS; do
+  if ! grep -qx "$name" <<<"$worker_env_names"; then
+    echo "worker is missing required production environment: $name" >&2
     exit 1
   fi
 done

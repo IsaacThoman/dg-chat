@@ -41,7 +41,11 @@ export interface CircuitStore {
     candidateId: string,
     permit: CircuitPermit,
     policy: ResiliencePolicy,
-  ): CircuitState | void | Promise<CircuitState | void>;
+  ):
+    | CircuitState
+    | { state: CircuitState; retryAt?: number }
+    | void
+    | Promise<CircuitState | { state: CircuitState; retryAt?: number } | void>;
 }
 
 export type AttemptEvent = {
@@ -95,6 +99,8 @@ export class ProviderAttemptError extends Error {
       retryAfterMs?: number;
       /** OpenAI-compatible public error code when the upstream supplied a safe one. */
       code?: string;
+      /** Trusted request field path; the public boundary validates it before exposure. */
+      param?: string;
       /** The request is valid, but this candidate's upstream protocol cannot represent it. */
       candidateLocal?: boolean;
     } = {},
@@ -109,6 +115,8 @@ export class ResilienceExhaustedError extends Error {
     message: string,
     public readonly attempts: number,
     public readonly lastError?: unknown,
+    /** Delay until the first exhausted candidate can actually accept another attempt. */
+    public readonly retryAfterMs?: number,
   ) {
     super(message);
     this.name = "ResilienceExhaustedError";
@@ -321,28 +329,56 @@ async function candidateSequence(
   let candidateId: string | null = options.initialCandidateId;
   let attempt = 0;
   let hop = 0;
-  let lastError: unknown;
+  const candidateEligibility = new Map<string, { at: number; error?: unknown }>();
+  const updateEligibility = (id: string, deadline: number, error?: unknown) => {
+    if (!Number.isSafeInteger(deadline) || deadline < 0) return;
+    const prior = candidateEligibility.get(id);
+    candidateEligibility.set(id, {
+      at: Math.max(prior?.at ?? 0, deadline),
+      ...(error === undefined
+        ? prior?.error === undefined ? {} : { error: prior.error }
+        : { error }),
+    });
+  };
+  const aggregateEligibility = () => {
+    let earliest: { at: number; error?: unknown } | undefined;
+    for (const candidate of candidateEligibility.values()) {
+      if (!earliest || candidate.at < earliest.at) earliest = candidate;
+    }
+    if (!earliest) return {};
+    const remaining = earliest.at - now();
+    return {
+      ...(remaining > 0 ? { retryAfterMs: remaining } : {}),
+      ...(earliest.error === undefined ? {} : { error: earliest.error }),
+    };
+  };
+  const exhausted = (message: string) => {
+    const aggregate = aggregateEligibility();
+    return new ResilienceExhaustedError(
+      message,
+      attempt,
+      aggregate.error,
+      aggregate.retryAfterMs,
+    );
+  };
   while (candidateId) {
     options.signal.throwIfAborted();
     if (visited.has(candidateId)) {
-      throw new ResilienceExhaustedError("Fallback cycle detected", attempt, lastError);
+      throw exhausted("Fallback cycle detected");
     }
     if (hop > policy.maxHops) {
-      throw new ResilienceExhaustedError("Fallback hop limit exceeded", attempt, lastError);
+      throw exhausted("Fallback hop limit exceeded");
     }
     visited.add(candidateId);
     const candidate = await options.resolveCandidate(candidateId);
     if (!candidate || candidate.id !== candidateId) {
-      throw new ResilienceExhaustedError(
-        `Provider candidate '${candidateId}' is unavailable`,
-        attempt,
-        lastError,
-      );
+      throw exhausted("Provider candidate is unavailable");
     }
+    updateEligibility(candidate.id, now());
     let retryAfterMs = 0;
     for (let retry = 0; retry <= policy.maxRetries; retry++) {
       if (attempt >= policy.maxAttempts) {
-        throw new ResilienceExhaustedError("Provider attempt limit exceeded", attempt, lastError);
+        throw exhausted("Provider attempt limit exceeded");
       }
       if (retry > 0) {
         await abortableBackoff(
@@ -358,6 +394,10 @@ async function candidateSequence(
         ? await options.circuitStore.acquire(candidate.id, policy)
         : { allowed: true, state: "closed" as const };
       if (!permit.allowed) {
+        const retryAt = Number.isSafeInteger(permit.retryAt) && Number(permit.retryAt) >= 0
+          ? Number(permit.retryAt)
+          : undefined;
+        if (retryAt !== undefined) updateEligibility(candidate.id, retryAt);
         await emit(options.onAttempt, {
           type: "skipped",
           candidateId: candidate.id,
@@ -366,6 +406,7 @@ async function candidateSequence(
           retry,
           circuitState: permit.state,
           reason: "circuit_open",
+          ...(retryAt === undefined ? {} : { retryAfterMs: Math.max(0, retryAt - now()) }),
         });
         break;
       }
@@ -390,7 +431,6 @@ async function candidateSequence(
         });
         return;
       }
-      lastError = result.error;
       retryAfterMs = result.error instanceof ProviderAttemptError
         ? result.error.options.retryAfterMs ?? 0
         : 0;
@@ -401,9 +441,24 @@ async function candidateSequence(
         });
       }
       const classified = classifyProviderError(result.error);
-      const breakerAfter = classified.transient || permit.state === "half_open"
+      const breakerOutcome = classified.transient || permit.state === "half_open"
         ? await options.circuitStore?.failure(candidate.id, permit, policy)
         : undefined;
+      const breakerAfter = typeof breakerOutcome === "string"
+        ? breakerOutcome
+        : breakerOutcome?.state;
+      const breakerRetryAt = typeof breakerOutcome === "object" &&
+          Number.isSafeInteger(breakerOutcome.retryAt) && Number(breakerOutcome.retryAt) >= 0
+        ? Number(breakerOutcome.retryAt)
+        : breakerAfter === "open"
+        ? now() + policy.circuitOpenMs
+        : undefined;
+      const upstreamRetryAt = retryAfterMs > 0 ? now() + retryAfterMs : now();
+      updateEligibility(
+        candidate.id,
+        Math.max(upstreamRetryAt, breakerRetryAt ?? 0),
+        result.error,
+      );
       await emit(options.onAttempt, {
         type: "failed",
         candidateId: candidate.id,
@@ -420,8 +475,13 @@ async function candidateSequence(
       if (!classified.transient) {
         if (
           result.error instanceof ProviderAttemptError &&
-          result.error.options.candidateLocal === true && candidate.fallbackId
-        ) break;
+          result.error.options.candidateLocal === true
+        ) {
+          // This protocol-incompatible target can never satisfy this request, so it must not
+          // advertise immediate eligibility or determine the public exhaustion category.
+          candidateEligibility.delete(candidate.id);
+          break;
+        }
         throw result.error;
       }
       if (permit.state === "half_open") break;
@@ -429,7 +489,7 @@ async function candidateSequence(
     candidateId = candidate.fallbackId ?? null;
     hop += 1;
   }
-  throw new ResilienceExhaustedError("All provider candidates were exhausted", attempt, lastError);
+  throw exhausted("All provider candidates were exhausted");
 }
 
 export async function executeProviderRequest<T>(
@@ -790,7 +850,11 @@ export class MemoryCircuitStore implements CircuitStore {
     return "closed";
   }
 
-  failure(candidateId: string, _permit: CircuitPermit, policy: ResiliencePolicy): CircuitState {
+  failure(
+    candidateId: string,
+    _permit: CircuitPermit,
+    policy: ResiliencePolicy,
+  ): { state: CircuitState; retryAt?: number } {
     const time = this.now();
     const current = this.#entries.get(candidateId) ?? {
       failures: 0,
@@ -806,7 +870,11 @@ export class MemoryCircuitStore implements CircuitStore {
     }
     this.#entries.set(candidateId, current);
     this.#evict();
-    return this.state(candidateId);
+    const state = this.state(candidateId);
+    return {
+      state,
+      ...(state === "open" ? { retryAt: current.openUntil } : {}),
+    };
   }
 
   state(candidateId: string): CircuitState {

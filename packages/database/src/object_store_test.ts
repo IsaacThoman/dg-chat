@@ -211,3 +211,36 @@ Deno.test("S3 readiness forwards cancellation to the SDK request", async () => {
   assertEquals(await readiness, false);
   assertEquals(observedSignal, controller.signal);
 });
+
+Deno.test("S3 get and delete abort active SDK requests", async () => {
+  const observed: AbortSignal[] = [];
+  const store = new S3ObjectStore({
+    bucket: "dg-chat-files",
+    region: "us-east-1",
+    forcePathStyle: true,
+  }, {
+    send(_command: unknown, options?: { abortSignal?: AbortSignal }) {
+      if (!options?.abortSignal) throw new Error("missing operation signal");
+      observed.push(options.abortSignal);
+      return new Promise((_resolve, reject) => {
+        options.abortSignal!.addEventListener(
+          "abort",
+          () => reject(options.abortSignal!.reason),
+          { once: true },
+        );
+      });
+    },
+  });
+  for (
+    const operation of [
+      (signal: AbortSignal) => store.get("users/user/files/file.txt", signal),
+      (signal: AbortSignal) => store.delete("users/user/files/file.txt", signal),
+    ]
+  ) {
+    const controller = new AbortController();
+    const pending = operation(controller.signal);
+    controller.abort(new DOMException("Worker stopping", "AbortError"));
+    await assertRejects(() => pending, DOMException, "Worker stopping");
+    assertEquals(observed.at(-1), controller.signal);
+  }
+});

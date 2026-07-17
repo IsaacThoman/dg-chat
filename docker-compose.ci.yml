@@ -8,3 +8,4 @@ services:
       LOG_LEVEL: warn
       # Browser suites intentionally exercise repeated sign-in journeys from one runner address.
       AUTH_RATE_LIMIT: "1000"
+      AUTH_CLIENT_RATE_LIMIT: "1000"

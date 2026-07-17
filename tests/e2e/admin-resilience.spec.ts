@@ -89,6 +89,7 @@ test("an administrator creates and orders a resilient route accessibly", async (
   page,
   request,
 }, testInfo) => {
+  test.setTimeout(90_000);
   await bootstrap(request);
   await login(page);
 

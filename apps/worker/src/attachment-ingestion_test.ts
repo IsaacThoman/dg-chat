@@ -78,6 +78,36 @@ Deno.test("ingestion enforces stream byte and time bounds", async () => {
   await assertRejects(() => readIngestionText(stalled, "text/plain", 10, 5), Error, "timed out");
 });
 
+Deno.test("ingestion cancels an active object stream on worker shutdown", async () => {
+  let cancelled: unknown;
+  const stalled: StoredObject = {
+    key: "stalled",
+    contentLength: null,
+    contentType: "text/plain",
+    etag: null,
+    metadata: {},
+    body: new ReadableStream({
+      pull: () => new Promise(() => {}),
+      cancel(reason) {
+        cancelled = reason;
+      },
+    }),
+  };
+  const controller = new AbortController();
+  const reading = readIngestionText(
+    stalled,
+    "text/plain",
+    10,
+    60_000,
+    undefined,
+    controller.signal,
+  );
+  const reason = new DOMException("Worker stopping", "AbortError");
+  controller.abort(reason);
+  await assertRejects(() => reading, DOMException, "Worker stopping");
+  assertEquals(cancelled, reason);
+});
+
 Deno.test("ingestion fails explicitly when its object is missing", async () => {
   await assertRejects(
     () => requireIngestionObject({ get: () => Promise.resolve(undefined) } as never, "missing"),

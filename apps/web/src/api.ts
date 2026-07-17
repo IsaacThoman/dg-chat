@@ -7,6 +7,8 @@ import type {
   AdminModel,
   AdminProvider,
   AdminTokenAccessItem,
+  AdminWorkerPage,
+  AdminWorkerScope,
   Attachment,
   AuditEvent,
   AuditFilters,
@@ -23,6 +25,7 @@ import type {
   ConversationKnowledge,
   ConversationPortabilityDownload,
   ConversationPortabilityImportResult,
+  ConversationSearchPage,
   ConversationShareCreated,
   ConversationShareSummary,
   ConversationTag,
@@ -119,6 +122,31 @@ type RawConversation = {
   updatedAt: string;
   messages?: RawMessage[];
 };
+type RawConversationSearchResult = RawConversation & {
+  snippet: string;
+  matchSource: "title" | "message";
+  messageId: string | null;
+  messageRole: "user" | "assistant" | null;
+};
+
+export function demoConversationSearch(
+  conversations: Conversation[],
+  query: string,
+  view: "chat" | "archived" | "trash",
+  scopeConversationIds?: readonly string[],
+): ConversationSearchPage {
+  const needle = query.toLowerCase();
+  const scope = scopeConversationIds ? new Set(scopeConversationIds) : null;
+  return {
+    data: structuredClone(conversations).filter((conversation) =>
+      (!scope || scope.has(conversation.id)) &&
+      Boolean(conversation.deleted) === (view === "trash") &&
+      (view === "trash" || Boolean(conversation.archived) === (view === "archived")) &&
+      `${conversation.title} ${conversation.preview}`.toLowerCase().includes(needle)
+    ),
+    nextCursor: null,
+  };
+}
 type RawMessage = {
   id: string;
   parentId: string | null;
@@ -144,6 +172,7 @@ export type ToolDefinition = {
   name: string;
   description: string;
   enabled: boolean;
+  recoverySafety: "read_only" | "idempotent_by_execution_id";
   inputSchema: Record<string, unknown>;
 };
 export type ToolPolicy = {
@@ -166,6 +195,8 @@ export type ToolExecution = {
     | "queued_pending_reservation"
     | "queued"
     | "running"
+    | "failed_pending_refund"
+    | "cancelled_pending_refund"
     | "succeeded_pending_settlement"
     | "succeeded"
     | "failed"
@@ -195,7 +226,7 @@ export function mapConversation(value: RawConversation): Conversation {
     id: value.id,
     title: value.title,
     preview: "",
-    updatedAt: new Date(value.updatedAt).toLocaleString(),
+    updatedAt: value.updatedAt,
     pinned: value.pinned,
     temporary: value.temporary ?? false,
     temporaryExpiresAt: value.temporaryExpiresAt ?? null,
@@ -567,6 +598,44 @@ export const api = {
     demoMode
       ? structuredClone(demoConversations)
       : (await request<{ data: RawConversation[] }>("/conversations")).data.map(mapConversation),
+  searchConversations: async (
+    query: string,
+    view: "chat" | "archived" | "trash",
+    cursor?: string,
+    signal?: AbortSignal,
+    folderId?: string,
+    tagIds: string[] = [],
+    demoScopeIds?: string[],
+  ): Promise<ConversationSearchPage> => {
+    if (demoMode) {
+      return demoConversationSearch(demoConversations, query, view, demoScopeIds);
+    }
+    const page = await request<{ data: RawConversationSearchResult[]; nextCursor: string | null }>(
+      "/conversations/search",
+      {
+        method: "POST",
+        signal,
+        body: JSON.stringify({
+          query,
+          view,
+          limit: 25,
+          tagIds,
+          ...(folderId ? { folderId } : {}),
+          ...(cursor ? { cursor } : {}),
+        }),
+      },
+    );
+    return {
+      data: page.data.map((value) => ({
+        ...mapConversation(value),
+        preview: value.snippet,
+        searchMatchSource: value.matchSource,
+        searchMessageId: value.messageId,
+        searchMessageRole: value.messageRole,
+      })),
+      nextCursor: page.nextCursor,
+    };
+  },
   deletedConversations: async () =>
     demoMode
       ? structuredClone(demoConversations.filter((conversation) => conversation.deleted))
@@ -1181,20 +1250,23 @@ export const api = {
       body: JSON.stringify({ ...input, expectedVersion: tool.policy?.version ?? 0 }),
     }),
   tools: async () => (await request<{ data: ToolDefinition[] }>("/tools")).data,
-  requestToolExecution: (toolId: string, input: unknown) =>
+  requestToolExecution: (toolId: string, input: unknown, signal?: AbortSignal) =>
     request<ToolExecution>("/tools/executions", {
       method: "POST",
       body: JSON.stringify({ toolId, input }),
+      signal,
     }),
-  toolExecution: (id: string) =>
-    request<ToolExecution>(`/tools/executions/${encodeURIComponent(id)}`),
-  approveToolExecution: (id: string) =>
+  toolExecution: (id: string, signal?: AbortSignal) =>
+    request<ToolExecution>(`/tools/executions/${encodeURIComponent(id)}`, { signal }),
+  approveToolExecution: (id: string, signal?: AbortSignal) =>
     request<ToolExecution>(`/tools/executions/${encodeURIComponent(id)}/approve`, {
       method: "POST",
+      signal,
     }),
-  cancelToolExecution: (id: string) =>
+  cancelToolExecution: (id: string, signal?: AbortSignal) =>
     request<ToolExecution>(`/tools/executions/${encodeURIComponent(id)}`, {
       method: "DELETE",
+      signal,
     }),
   createAdminModel: (input: {
     providerId: string;
@@ -1233,6 +1305,11 @@ export const api = {
     }),
   adminJobs: (filters: AdminJobFilters = {}, cursor?: string, limit = 50) =>
     request<AdminJobPage>(`/admin/jobs?${adminJobsQuery(filters, cursor, limit)}`),
+  adminWorkers: (scope: AdminWorkerScope = "active", cursor?: string, limit = 50) => {
+    const query = new URLSearchParams({ scope, limit: String(limit) });
+    if (cursor) query.set("cursor", cursor);
+    return request<AdminWorkerPage>(`/admin/workers?${query}`);
+  },
   retryAdminJob: (id: string) =>
     request<RetriedAdminJob>(`/admin/jobs/${encodeURIComponent(id)}/retry`, { method: "POST" }),
   adminRetentionPolicy: () => request<RetentionPolicy>("/admin/retention/policy"),

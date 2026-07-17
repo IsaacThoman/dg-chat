@@ -20,8 +20,13 @@ export function parseAttachmentIngestionPayload(payload: unknown): AttachmentIng
   return { attachmentId, ownerId };
 }
 
-export async function requireIngestionObject(store: ObjectStore, key: string) {
-  const object = await store.get(key);
+export async function requireIngestionObject(
+  store: ObjectStore,
+  key: string,
+  signal?: AbortSignal,
+) {
+  signal?.throwIfAborted();
+  const object = await store.get(key, signal);
   if (!object) throw new Error("Attachment object is missing");
   return object;
 }
@@ -55,8 +60,9 @@ export async function readIngestionText(
   maxBytes = 4 * 1024 * 1024,
   timeoutMs = 30_000,
   expectedSha256?: string,
+  signal?: AbortSignal,
 ): Promise<string> {
-  const raw = await readIngestionBytes(object, maxBytes, timeoutMs, expectedSha256);
+  const raw = await readIngestionBytes(object, maxBytes, timeoutMs, expectedSha256, signal);
   let text: string;
   try {
     text = new TextDecoder("utf-8", { fatal: true }).decode(raw);
@@ -79,21 +85,39 @@ export async function readIngestionBytes(
   maxBytes: number,
   timeoutMs: number,
   expectedSha256?: string,
+  signal?: AbortSignal,
 ): Promise<Uint8Array> {
+  signal?.throwIfAborted();
   if (object.contentLength !== null && object.contentLength > maxBytes) {
     throw new Error("Attachment exceeds the ingestion byte limit");
   }
   const reader = object.body.getReader();
   let timedOut = false;
+  let aborted = false;
   const deadline = setTimeout(() => {
     timedOut = true;
     void reader.cancel("Ingestion timed out");
   }, timeoutMs);
+  const onAbort = () => {
+    aborted = true;
+    void reader.cancel(signal?.reason);
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+  // Close the check/listener race if shutdown landed after the initial throwIfAborted call.
+  if (signal?.aborted) onAbort();
   let bytes = 0;
   const rawChunks: Uint8Array[] = [];
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      let result: ReadableStreamReadResult<Uint8Array>;
+      try {
+        result = await reader.read();
+      } catch (error) {
+        if (aborted) throw signal?.reason ?? new DOMException("Aborted", "AbortError");
+        throw error;
+      }
+      const { done, value } = result;
+      if (aborted) throw signal?.reason ?? new DOMException("Aborted", "AbortError");
       if (timedOut) throw new Error("Attachment ingestion timed out");
       if (done) break;
       bytes += value.byteLength;
@@ -103,6 +127,7 @@ export async function readIngestionBytes(
     if (timedOut) throw new Error("Attachment ingestion timed out");
   } finally {
     clearTimeout(deadline);
+    signal?.removeEventListener("abort", onAbort);
     await reader.cancel().catch(() => undefined);
     reader.releaseLock();
   }
@@ -182,7 +207,9 @@ export async function deterministicChunks(input: {
     };
   }>;
   deadlineAt?: number;
+  signal?: AbortSignal;
 }): Promise<DocumentChunkInput[]> {
+  input.signal?.throwIfAborted();
   const chunkChars = input.chunkChars ?? 4000;
   const overlap = input.overlapChars ?? 400;
   if (chunkChars < 2 || overlap < 0 || overlap >= chunkChars) {
@@ -196,6 +223,7 @@ export async function deterministicChunks(input: {
   for (const [unitIndex, unit] of sourceUnits.entries()) {
     const newlines = newlineOffsets(unit.text);
     for (let start = 0; start < unit.text.length;) {
+      input.signal?.throwIfAborted();
       if (input.deadlineAt !== undefined && Date.now() >= input.deadlineAt) {
         throw new Error("Document processing timed out");
       }
@@ -226,6 +254,7 @@ export async function deterministicChunks(input: {
           charEnd: end,
         },
       });
+      input.signal?.throwIfAborted();
       if (input.deadlineAt !== undefined && Date.now() >= input.deadlineAt) {
         throw new Error("Document processing timed out");
       }

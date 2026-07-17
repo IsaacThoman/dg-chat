@@ -28,6 +28,7 @@ import {
   appendMessageSchema,
   chatCompletionSchema,
   conversationPortabilityV1Schema,
+  conversationSearchSchema,
   createAccessGroupSchema,
   createConversationFolderSchema,
   createConversationSchema,
@@ -116,7 +117,14 @@ import {
   usagePricingSnapshotsEqual,
 } from "@dg-chat/database";
 import { hashPassword, randomToken, sha256, sha256Hex, verifyPassword } from "./crypto.ts";
-import { boundedReadiness, type ReadinessTimeouts, readinessTimeoutsFromEnv } from "./readiness.ts";
+import { openAIParameterFromZodIssues, safeOpenAIParameter } from "./openai-parameter.ts";
+import {
+  boundedReadiness,
+  type ReadinessRequirements,
+  type ReadinessSnapshot,
+  type ReadinessTimeouts,
+  readinessTimeoutsFromEnv,
+} from "./readiness.ts";
 import {
   maximumBufferedChatReplayBytes,
   maximumChatStreamReplayBytes,
@@ -238,7 +246,11 @@ import {
   providerRetryPolicyCreate,
   providerRetryPolicyPatch,
 } from "./provider-resilience-validation.ts";
-import { ProviderAttemptError, ResilienceExhaustedError } from "./provider-resilience.ts";
+import {
+  classifyProviderError,
+  ProviderAttemptError,
+  ResilienceExhaustedError,
+} from "./provider-resilience.ts";
 import {
   normalizeChatCompletionResult,
   normalizeChatStreamChunk,
@@ -262,6 +274,7 @@ import {
 import { runAccountedEmbeddingCall } from "./embedding-accounting.ts";
 import {
   MemoryToolExecutionStore,
+  normalizeToolExecutionForRead,
   type ToolAdapter,
   ToolExecutionError,
   ToolExecutionService,
@@ -283,6 +296,8 @@ type Variables = {
   sessionSource?: "better_auth" | "legacy";
   sessionAuthenticatedAt?: string;
   sessionLimited?: boolean;
+  /** Server-observed credential generation; never sourced from the request. */
+  authorityEpoch: number;
   tokenId?: string;
   tokenScopes?: string[];
   tokenRatePolicy?: TokenRatePolicy;
@@ -326,6 +341,10 @@ export interface AppOptions {
   publicShareRateLimit?: number;
   publicShareClientRateLimit?: number;
   shareMutationRateLimit?: number;
+  conversationSearchRateLimit?: number;
+  conversationSearchConcurrencyLimiter?: AudioConcurrencyLimiter;
+  conversationSearchMaxConcurrent?: number;
+  conversationSearchMaxConcurrentPerUser?: number;
   webComplete?: typeof complete;
   objectStore?: ObjectStore;
   attachmentContextMaxRawBytes?: number;
@@ -359,6 +378,8 @@ export interface AppOptions {
   readinessTimeouts?: ReadinessTimeouts;
   /** Short test seam for the public readiness single-flight cache. */
   readinessCacheMs?: number;
+  /** Durable implementations required before this process may receive traffic. */
+  readinessRequirements?: ReadinessRequirements;
   /** Testable wall clock for security decisions. */
   now?: () => number;
 }
@@ -373,6 +394,26 @@ export function hasRecentAuthentication(authenticatedAt: string | undefined, now
   const age = now - timestamp;
   return age >= -RECENT_AUTHENTICATION_CLOCK_SKEW_MS &&
     age <= RECENT_AUTHENTICATION_MAX_AGE_MS;
+}
+
+/** Fail at startup instead of serving an installation whose administrators cannot authenticate. */
+export function assertEmailVerificationAdminReadiness(
+  users: readonly PublicUser[],
+  requireEmailVerification: boolean,
+): void {
+  if (!requireEmailVerification) return;
+  const administrators = users.filter((user) => user.role === "admin");
+  if (
+    administrators.length > 0 &&
+    !administrators.some((user) =>
+      user.approvalStatus === "approved" && user.state === "active" &&
+      user.deletedAt === null && user.emailVerifiedAt !== null
+    )
+  ) {
+    throw new Error(
+      "REQUIRE_EMAIL_VERIFICATION needs at least one verified, approved, active administrator; disable it until an administrator can be verified",
+    );
+  }
 }
 
 export function legacyModelHarnessAllowed(environment: string | undefined): boolean {
@@ -552,31 +593,111 @@ const openAIError = (
   message: string,
   code: string | null = null,
   typeOrStatus: OpenAIErrorType | number = defaultOpenAIErrorType(code),
+  param: string | null = null,
 ) => ({
   error: {
     message,
     type: typeof typeOrStatus === "number" ? statusOpenAIErrorType(typeOrStatus) : typeOrStatus,
-    param: null,
+    param,
     code,
   },
 });
-const publicProviderFailure = (error: unknown, cancelled = false) => {
+
+class OpenAIParameterError extends Error {
+  constructor(
+    readonly param: string,
+    readonly code: string,
+    message: string,
+    readonly status = 400,
+  ) {
+    super(message);
+    this.name = "OpenAIParameterError";
+  }
+}
+
+const OPENAI_FILE_LIST_MAX_LIMIT = 10_000;
+const OPENAI_FILE_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+function openAIFileId(value: string): string {
+  if (!OPENAI_FILE_ID_PATTERN.test(value)) {
+    throw new OpenAIParameterError("id", "invalid_file_id", "id must be a valid file identifier");
+  }
+  return value;
+}
+function openAIFileListQuery(request: Request): {
+  limit: number;
+  order: "asc" | "desc";
+  after?: string;
+  purpose?: string;
+} {
+  const params = new URL(request.url).searchParams;
+  for (const name of ["limit", "order", "after", "purpose"]) {
+    if (params.getAll(name).length > 1) {
+      throw new OpenAIParameterError(
+        name,
+        "invalid_parameter",
+        `${name} may only be provided once`,
+      );
+    }
+  }
+  const rawLimit = params.get("limit");
+  if (rawLimit !== null && !/^[1-9]\d{0,4}$/.test(rawLimit)) {
+    throw new OpenAIParameterError(
+      "limit",
+      "invalid_file_limit",
+      `limit must be an integer between 1 and ${OPENAI_FILE_LIST_MAX_LIMIT}`,
+    );
+  }
+  const limit = rawLimit === null ? OPENAI_FILE_LIST_MAX_LIMIT : Number(rawLimit);
+  if (limit > OPENAI_FILE_LIST_MAX_LIMIT) {
+    throw new OpenAIParameterError(
+      "limit",
+      "invalid_file_limit",
+      `limit must be an integer between 1 and ${OPENAI_FILE_LIST_MAX_LIMIT}`,
+    );
+  }
+  const rawOrder = params.get("order");
+  if (rawOrder !== null && rawOrder !== "asc" && rawOrder !== "desc") {
+    throw new OpenAIParameterError(
+      "order",
+      "invalid_file_order",
+      "order must be either asc or desc",
+    );
+  }
+  const after = params.get("after") ?? undefined;
+  if (after !== undefined && !OPENAI_FILE_ID_PATTERN.test(after)) {
+    throw new OpenAIParameterError(
+      "after",
+      "invalid_file_cursor",
+      "after must be a valid file identifier",
+    );
+  }
+  const purpose = params.get("purpose") ?? undefined;
+  return { limit, order: rawOrder ?? "desc", after, purpose };
+}
+export const publicProviderFailure = (error: unknown, cancelled = false) => {
   if (cancelled) {
     return {
       status: 499,
       code: "request_cancelled",
       message: "Request cancelled",
+      param: null,
       type: "server_error" as const,
     };
   }
+  const exhaustionRetryAfterMs = error instanceof ResilienceExhaustedError &&
+      Number.isSafeInteger(error.retryAfterMs) && Number(error.retryAfterMs) >= 0
+    ? Number(error.retryAfterMs)
+    : undefined;
   const candidate = error instanceof ResilienceExhaustedError ? error.lastError : error;
   if (candidate instanceof ProviderAttemptError) {
-    const category = candidate.options.category;
+    const category = candidate.options.category ?? classifyProviderError(candidate).category;
     if (category === "authentication") {
       return {
         status: 502,
         code: "provider_authentication_error",
         message: "The configured provider rejected its credentials",
+        param: null,
         type: "server_error" as const,
       };
     }
@@ -598,11 +719,39 @@ const publicProviderFailure = (error: unknown, cancelled = false) => {
         : category === "timeout"
         ? "timeout"
         : "provider_error");
+    const publicMessage = category === "rate_limited"
+      ? "The provider rate limit was exceeded"
+      : category === "invalid_request"
+      ? "The provider rejected the request"
+      : category === "timeout"
+      ? "The provider request timed out"
+      : "Provider request failed";
+    const candidateRetryAfterMs = Number.isSafeInteger(candidate.options.retryAfterMs) &&
+        Number(candidate.options.retryAfterMs) >= 0
+      ? Number(candidate.options.retryAfterMs)
+      : undefined;
+    // Resilience exhaustion has already combined upstream and breaker deadlines per candidate and
+    // selected the first candidate that can actually be tried. Do not recombine unrelated delays.
+    const retryAfterMs = error instanceof ResilienceExhaustedError
+      ? exhaustionRetryAfterMs
+      : candidateRetryAfterMs;
     return {
       status,
-      code,
-      message: candidate.message,
-      retryAfterMs: candidate.options.retryAfterMs,
+      // Provider error messages are untrusted payloads and can contain credentials, signed URLs,
+      // internal hosts, or echoed user content. Detailed redacted diagnostics remain available to
+      // administrators through provider-attempt capture; the public contract is deliberately fixed.
+      code: category === "rate_limited"
+        ? "rate_limit_exceeded"
+        : category === "invalid_request"
+        ? "invalid_request_error"
+        : category === "timeout"
+        ? "timeout"
+        : code === "provider_authentication_error"
+        ? code
+        : "provider_error",
+      message: publicMessage,
+      retryAfterMs,
+      param: safeOpenAIParameter(candidate.options.param),
       type: category === "rate_limited"
         ? "rate_limit_error" as const
         : category === "invalid_request"
@@ -610,10 +759,21 @@ const publicProviderFailure = (error: unknown, cancelled = false) => {
         : "server_error" as const,
     };
   }
+  if (exhaustionRetryAfterMs !== undefined) {
+    return {
+      status: 503,
+      code: "provider_error",
+      message: "Provider request failed",
+      retryAfterMs: exhaustionRetryAfterMs,
+      param: null,
+      type: "server_error" as const,
+    };
+  }
   return {
     status: 502,
     code: "provider_error",
     message: "Provider request failed",
+    param: null,
     type: "server_error" as const,
   };
 };
@@ -888,6 +1048,23 @@ const parseAdminJobQuery = (c: Context) => {
   };
 };
 
+const parseAdminWorkerQuery = (c: Context) => {
+  const limitValue = c.req.query("limit");
+  const limit = limitValue === undefined ? 50 : Number(limitValue);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+    throw new DomainError("validation_error", "limit must be an integer from 1 to 100", 422);
+  }
+  const scope = c.req.query("scope") ?? "active";
+  if (!["active", "history", "all"].includes(scope)) {
+    throw new DomainError("validation_error", "scope is invalid", 422);
+  }
+  const cursor = c.req.query("cursor");
+  if (cursor !== undefined && (!cursor || cursor.length > 2048 || hasAsciiControl(cursor))) {
+    throw new DomainError("validation_error", "cursor is invalid", 422);
+  }
+  return { scope: scope as "active" | "history" | "all", cursor, limit };
+};
+
 function nodeReadableAsWeb(source: Readable): ReadableStream<Uint8Array> {
   const iterator = source[Symbol.asyncIterator]();
   return new ReadableStream<Uint8Array>({
@@ -952,6 +1129,7 @@ const publicUser = (user: Awaited<ReturnType<DomainRepository["findUser"]>>) => 
   const {
     passwordHash: _passwordHash,
     passwordResetPending: _passwordResetPending,
+    authorityEpoch: _authorityEpoch,
     ...safe
   } = user;
   return safe;
@@ -959,7 +1137,11 @@ const publicUser = (user: Awaited<ReturnType<DomainRepository["findUser"]>>) => 
 const parseJson = async <T>(
   c: Context,
   schema: {
-    safeParse: (value: unknown) => { success: boolean; data?: T; error?: { issues: unknown[] } };
+    safeParse: (value: unknown) => {
+      success: boolean;
+      data?: T;
+      error?: { issues: Array<{ path?: readonly PropertyKey[] }> };
+    };
   },
 ): Promise<T> => {
   let body: unknown;
@@ -969,7 +1151,18 @@ const parseJson = async <T>(
     throw new DomainError("invalid_json", "Request body must be valid JSON", 400);
   }
   const result = schema.safeParse(body);
-  if (!result.success) throw new DomainError("validation_error", "Request validation failed", 422);
+  if (!result.success) {
+    const param = openAIParameterFromZodIssues(result.error?.issues);
+    if (c.req.path.startsWith("/v1/") && param) {
+      throw new OpenAIParameterError(
+        param,
+        "validation_error",
+        "Request validation failed",
+        422,
+      );
+    }
+    throw new DomainError("validation_error", "Request validation failed", 422);
+  }
   return result.data!;
 };
 
@@ -1323,6 +1516,8 @@ export function createApp(options: AppOptions = {}) {
   const audioConcurrencyLimiter = options.audioConcurrencyLimiter ??
     new MemoryAudioConcurrencyLimiter();
   const imageConcurrencyLimiter = options.imageConcurrencyLimiter ?? audioConcurrencyLimiter;
+  const conversationSearchConcurrencyLimiter = options.conversationSearchConcurrencyLimiter ??
+    audioConcurrencyLimiter;
   const providerStream = options.providerStream ?? streamChatCompletion;
   const providerComplete = options.providerComplete ?? complete;
   const idempotencyHeartbeatMs = Math.max(10, options.idempotencyHeartbeatMs ?? 30_000);
@@ -1457,12 +1652,33 @@ export function createApp(options: AppOptions = {}) {
     positiveInteger("PUBLIC_SHARE_CLIENT_RATE_LIMIT", 240);
   const configuredShareMutationLimit = options.shareMutationRateLimit ??
     positiveInteger("SHARE_MUTATION_RATE_LIMIT", 20);
+  const configuredConversationSearchLimit = options.conversationSearchRateLimit ??
+    positiveInteger("CONVERSATION_SEARCH_RATE_LIMIT", 30);
   if (
     !Number.isSafeInteger(configuredPublicShareLimit) || configuredPublicShareLimit < 1 ||
     !Number.isSafeInteger(configuredPublicShareClientLimit) ||
     configuredPublicShareClientLimit < 1 ||
     !Number.isSafeInteger(configuredShareMutationLimit) || configuredShareMutationLimit < 1
   ) throw new Error("Share rate limits must be positive safe integers");
+  if (
+    !Number.isSafeInteger(configuredConversationSearchLimit) ||
+    configuredConversationSearchLimit < 1
+  ) throw new Error("CONVERSATION_SEARCH_RATE_LIMIT must be a positive safe integer");
+  const conversationSearchMaxConcurrent = options.conversationSearchMaxConcurrent ??
+    positiveInteger("CONVERSATION_SEARCH_MAX_CONCURRENT", 4);
+  const conversationSearchMaxConcurrentPerUser = options.conversationSearchMaxConcurrentPerUser ??
+    positiveInteger("CONVERSATION_SEARCH_MAX_CONCURRENT_PER_USER", 1);
+  if (
+    !Number.isSafeInteger(conversationSearchMaxConcurrent) ||
+    conversationSearchMaxConcurrent < 1 ||
+    !Number.isSafeInteger(conversationSearchMaxConcurrentPerUser) ||
+    conversationSearchMaxConcurrentPerUser < 1 ||
+    conversationSearchMaxConcurrentPerUser > conversationSearchMaxConcurrent
+  ) {
+    throw new Error(
+      "Conversation search concurrency limits must be positive and per-user cannot exceed global",
+    );
+  }
   const configuredRateWindow = positiveInteger("RATE_LIMIT_WINDOW_SECONDS", 60);
   const effectiveTokenRpmLimit = Math.ceil(
     configuredOpenAILimit * 60 / configuredRateWindow,
@@ -1726,7 +1942,7 @@ export function createApp(options: AppOptions = {}) {
       ]
       : []),
     {
-      async reserve(execution) {
+      async admit(execution) {
         const rate = await rateLimiter.consume(
           `tool:${execution.toolId}:user:${execution.ownerId}`,
           toolRateLimit,
@@ -1739,16 +1955,46 @@ export function createApp(options: AppOptions = {}) {
             429,
           );
         }
+      },
+      billingSnapshot(execution) {
+        return {
+          reservedMicros: toolReserveMicros,
+          provider: "tool",
+          model: `tool/${execution.toolId}`,
+        };
+      },
+      async reserve(execution) {
+        const billing = execution.billingSnapshot!;
         await repo.ensureIdempotentReservation({
           userId: execution.ownerId,
           usageRunId: `tool:${execution.id}`,
-          model: `tool/${execution.toolId}`,
-          provider: "tool",
-          reservedMicros: toolReserveMicros,
+          model: billing.model,
+          provider: billing.provider,
+          reservedMicros: billing.reservedMicros,
+          recoveryOwner: "tool",
+        });
+      },
+      async reconcileReservation(execution) {
+        // Reconciliation repairs an already-admitted request. It must not consume or enforce a
+        // fresh request rate-limit slot, or cancellation can outrun an in-flight reservation.
+        const billing = execution.billingSnapshot!;
+        await repo.ensureIdempotentReservation({
+          userId: execution.ownerId,
+          usageRunId: `tool:${execution.id}`,
+          model: billing.model,
+          provider: billing.provider,
+          reservedMicros: billing.reservedMicros,
+          recoveryOwner: "tool",
         });
       },
       async settle(execution, latencyMs) {
-        await repo.settle(`tool:${execution.id}`, toolReserveMicros, 0, 0, latencyMs);
+        await repo.settle(
+          `tool:${execution.id}`,
+          execution.billingSnapshot!.reservedMicros,
+          0,
+          0,
+          latencyMs,
+        );
       },
       async refund(execution, error) {
         return (await repo.refund(`tool:${execution.id}`, error)) !== undefined;
@@ -2024,6 +2270,23 @@ export function createApp(options: AppOptions = {}) {
       },
     }),
   );
+  // Install CORS before maintenance and body-limit gates so their early error responses expose the
+  // same request, retry, rate-limit, and replay metadata as successful API responses.
+  app.use(
+    "*",
+    cors({
+      origin: webOrigin,
+      credentials: true,
+      allowHeaders: ["Authorization", "Content-Type", "Idempotency-Key", "X-Request-Id"],
+      exposeHeaders: [
+        "X-Request-Id",
+        "Retry-After",
+        "X-RateLimit-Limit",
+        "X-RateLimit-Remaining",
+        "X-Idempotent-Replay",
+      ],
+    }),
+  );
   app.use("*", async (c, next) => {
     if (!options.backupAdmin) return next();
     const openAiSurface = c.req.path.startsWith("/v1/");
@@ -2094,15 +2357,6 @@ export function createApp(options: AppOptions = {}) {
           ].includes(c.req.path)
         ? next()
         : openAIBodyLimit(c, next),
-  );
-  app.use(
-    "*",
-    cors({
-      origin: webOrigin,
-      credentials: true,
-      allowHeaders: ["Authorization", "Content-Type", "Idempotency-Key", "X-Request-Id"],
-      exposeHeaders: ["X-Request-Id"],
-    }),
   );
   app.use("*", async (c, next) => {
     if (c.req.method === "OPTIONS") return next();
@@ -2305,7 +2559,8 @@ export function createApp(options: AppOptions = {}) {
         if (
           !legacySession || !legacyUser || legacyUser.state !== "active" ||
           legacyUser.deletedAt !== null ||
-          legacyUser.passwordResetPending === true
+          legacyUser.passwordResetPending === true ||
+          (!legacySession.limited && legacyUser.authorityEpoch !== legacySession.authorityEpoch)
         ) {
           return c.json(openAIError("Invalid or expired session", "unauthorized"), 401);
         }
@@ -2314,13 +2569,15 @@ export function createApp(options: AppOptions = {}) {
         c.set("sessionId", legacySession.id);
         c.set("sessionSource", "legacy");
         c.set("sessionLimited", legacySession.limited);
+        c.set("authorityEpoch", legacySession.authorityEpoch);
         c.set("sessionAuthenticatedAt", legacySession.createdAt);
         return next();
       }
       const user = await repo.findUser(session.userId);
       if (
         !user || user.state !== "active" || user.deletedAt !== null ||
-        user.passwordResetPending === true
+        user.passwordResetPending === true ||
+        (!session.limited && user.authorityEpoch !== session.authorityEpoch)
       ) {
         return c.json(openAIError("Invalid or expired session", "unauthorized"), 401);
       }
@@ -2329,6 +2586,7 @@ export function createApp(options: AppOptions = {}) {
       c.set("sessionId", session.id);
       c.set("sessionSource", "better_auth");
       c.set("sessionLimited", session.limited);
+      c.set("authorityEpoch", session.authorityEpoch);
       c.set("sessionAuthenticatedAt", session.authenticatedAt);
       return next();
     }
@@ -2345,6 +2603,7 @@ export function createApp(options: AppOptions = {}) {
         user.passwordResetPending === true ||
         user.approvalStatus !== "approved" ||
         (requireEmailVerification && !user.emailVerifiedAt) ||
+        user.authorityEpoch !== apiToken.authorityEpoch ||
         apiToken.revokedAt || (apiToken.expiresAt && Date.parse(apiToken.expiresAt) <= Date.now())
       ) return c.json(openAIError("Invalid or expired token", "unauthorized"), 401);
       c.set("user", publicUser(user)!);
@@ -2356,13 +2615,15 @@ export function createApp(options: AppOptions = {}) {
         requestsPerMinute: apiToken.rpmLimit,
         burst: apiToken.burstLimit,
       });
+      c.set("authorityEpoch", apiToken.authorityEpoch);
       return next();
     }
     const session = await repo.getSession(hash);
     const user = session ? await repo.findUser(session.userId) : undefined;
     if (
       !session || !user || user.state !== "active" || user.deletedAt !== null ||
-      user.passwordResetPending === true
+      user.passwordResetPending === true ||
+      (!session.limited && user.authorityEpoch !== session.authorityEpoch)
     ) {
       return c.json(openAIError("Invalid or expired session", "unauthorized"), 401);
     }
@@ -2371,6 +2632,7 @@ export function createApp(options: AppOptions = {}) {
     c.set("sessionId", session.id);
     c.set("sessionSource", "legacy");
     c.set("sessionLimited", session.limited);
+    c.set("authorityEpoch", session.authorityEpoch);
     c.set("sessionAuthenticatedAt", session.createdAt);
     if (legacySession && raw === legacySession) {
       setCookie(c, sessionCookie, legacySession, {
@@ -2393,6 +2655,7 @@ export function createApp(options: AppOptions = {}) {
       !apiToken || !user || user.state !== "active" || user.deletedAt !== null ||
       user.passwordResetPending === true ||
       user.approvalStatus !== "approved" ||
+      user.authorityEpoch !== apiToken.authorityEpoch ||
       (requireEmailVerification && !user.emailVerifiedAt) || apiToken.revokedAt ||
       (apiToken.expiresAt && Date.parse(apiToken.expiresAt) <= Date.now())
     ) return c.json(openAIError("Invalid or expired token", "unauthorized"), 401);
@@ -2405,6 +2668,7 @@ export function createApp(options: AppOptions = {}) {
       requestsPerMinute: apiToken.rpmLimit,
       burst: apiToken.burstLimit,
     });
+    c.set("authorityEpoch", apiToken.authorityEpoch);
     return next();
   };
   const approved: MiddlewareHandler<{ Variables: Variables }> = async (c, next) => {
@@ -2461,16 +2725,10 @@ export function createApp(options: AppOptions = {}) {
     };
 
   app.get("/health", (c) => c.json({ status: "ok", service: "api" }));
-  type ReadinessSnapshot = {
-    status: "ready" | "not_ready";
-    storage: { ready: boolean; storage: string };
-    redis: boolean;
-    objects: { configured: boolean; ready: boolean };
-  };
   let readinessCache: { snapshot: ReadinessSnapshot; expiresAt: number } | undefined;
   let readinessInFlight: Promise<ReadinessSnapshot> | undefined;
   const probeReadiness = async (): Promise<ReadinessSnapshot> => {
-    const [storage, redis, objects] = await Promise.all([
+    const [storageProbe, redisReady, objectsReady] = await Promise.all([
       boundedReadiness(
         readinessTimeouts.postgresMs,
         { ready: false, storage: repo.storageKind },
@@ -2485,12 +2743,44 @@ export function createApp(options: AppOptions = {}) {
         )
         : Promise.resolve(false),
     ]);
-    const ready = storage.ready && redis && (objectStore ? objects : true);
+    const redisImplementation = rateLimiter.implementation ?? "custom";
+    const objectImplementation = objectStore?.implementation ?? (objectStore ? "custom" : "none");
+    // Repository identity is constructor-owned authority. A compromised or buggy health response
+    // may report liveness only; it must never upgrade a memory adapter into durable PostgreSQL.
+    const storageImplementation = repo.storageKind;
+    const storage = {
+      // Memory is a healthy local adapter, not configured durable PostgreSQL.
+      configured: storageImplementation !== "memory",
+      ready: storageProbe.ready,
+      implementation: storageImplementation,
+    };
+    const redis = {
+      // A memory adapter is a supported local implementation, not configured Redis.
+      configured: redisImplementation !== "memory",
+      ready: redisReady,
+      implementation: redisImplementation,
+    };
+    const objects = {
+      configured: Boolean(objectStore),
+      ready: objectsReady,
+      implementation: objectImplementation,
+    };
+    const requirements = options.readinessRequirements;
+    const requirementsReady = (!requirements?.storage ||
+      (storage.configured && storage.ready &&
+        storage.implementation === requirements.storage)) &&
+      (!requirements?.redis ||
+        (redis.configured && redis.ready && redis.implementation === requirements.redis)) &&
+      (!requirements?.objects ||
+        (objects.configured && objects.ready &&
+          objects.implementation === requirements.objects));
+    const ready = storage.ready && redis.ready && (objects.configured ? objects.ready : true) &&
+      requirementsReady;
     return {
       status: ready ? "ready" : "not_ready",
       storage,
       redis,
-      objects: { configured: Boolean(objectStore), ready: objects },
+      objects,
     };
   };
   const readinessSnapshot = (): Promise<ReadinessSnapshot> => {
@@ -3231,6 +3521,7 @@ export function createApp(options: AppOptions = {}) {
         "email_verification",
         await sha256(verificationToken),
         new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+        user.authorityEpoch,
       );
       try {
         await mailer.send({
@@ -3253,7 +3544,7 @@ export function createApp(options: AppOptions = {}) {
       }
     }
     const token = randomToken("sess_");
-    await repo.createSession(user.id, await sha256(token), true);
+    await repo.createSession(user.id, await sha256(token), true, user.authorityEpoch);
     setCookie(c, sessionCookie, token, {
       httpOnly: true,
       sameSite: "Lax",
@@ -3307,22 +3598,9 @@ export function createApp(options: AppOptions = {}) {
   app.post("/api/auth/verify-email", async (c) => {
     const body = await parseJson(c, identityTokenSchema);
     if (browserAuth && !body.token.startsWith("verify_")) {
-      const url = new URL(c.req.url);
-      url.pathname = "/api/auth/verify-email";
-      url.search = new URLSearchParams({ token: body.token }).toString();
-      const response = await browserAuth.handler(
-        new Request(url, { method: "GET", headers: c.req.raw.headers }),
-      );
-      if (!response.ok) {
-        throw new DomainError(
-          "invalid_identity_token",
-          "Verification token is invalid or expired",
-          400,
-        );
-      }
-      // The digest was registered when the mail was emitted. Consuming it after Better Auth's
-      // signature/expiry check provides an atomic, one-response-only replay fence without ever
-      // trusting JWT payload fields for identity lookup.
+      // The exact opaque token digest was registered when Better Auth emitted the mail. Consume
+      // that record directly so auth_users and domain users change in one repository transaction;
+      // forwarding through Better Auth first would create a cross-transaction authority race.
       const verified = await repo.verifyEmail(await sha256(body.token));
       await repo.recordAudit({
         actorId: verified.id,
@@ -3358,12 +3636,22 @@ export function createApp(options: AppOptions = {}) {
     }
     const user = c.get("user");
     if (user.emailVerifiedAt) return c.body(null, 204);
+    // Limited status sessions intentionally survive rejection so applicants can observe their
+    // state. Rejection advances full-authority epochs and consumes prior verification links, but
+    // must not make an unverified account impossible to reconsider: rejected users cannot sign in
+    // for a fresh status session. Re-read current domain authority and let createIdentityToken's
+    // user-row fence reject any lifecycle change that races this resend.
+    const currentUser = await repo.findUser(user.id);
+    if (!currentUser || currentUser.state !== "active" || currentUser.deletedAt !== null) {
+      throw new DomainError("account_unavailable", "This account is unavailable", 403);
+    }
     const token = randomToken("verify_");
     await repo.createIdentityToken(
       user.id,
       "email_verification",
       await sha256(token),
       new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+      currentUser.authorityEpoch,
     );
     await mailer.send({
       to: user.email,
@@ -3382,63 +3670,76 @@ export function createApp(options: AppOptions = {}) {
   app.post("/api/auth/password-reset/request", async (c) => {
     if (browserAuth) {
       const body = await parseJson(c, passwordResetRequestSchema);
-      const response = await forwardBetterAuthJson(c, "/api/auth/request-password-reset", {
-        email: body.email,
-        redirectTo: `${webOrigin}/reset-password`,
-      });
-      // Better Auth deliberately does not disclose whether the account exists. Normalize its
-      // successful response too so local and durable auth have the same product contract.
-      if (!response.ok) {
+      try {
+        const response = await forwardBetterAuthJson(c, "/api/auth/request-password-reset", {
+          email: body.email,
+          redirectTo: `${webOrigin}/reset-password`,
+        });
+        if (!response.ok) {
+          emitOperationalLog({
+            level: "error",
+            message: "Password reset request could not be processed",
+            status: response.status,
+          });
+        }
+      } catch {
+        // Public reset requests are deliberately non-enumerating. Storage, lifecycle, and
+        // delivery setup failures are observable internally but never distinguish an address.
         emitOperationalLog({
           level: "error",
           message: "Password reset request could not be processed",
-          status: response.status,
         });
       }
       return c.body(null, 202);
     }
     const body = await parseJson(c, passwordResetRequestSchema);
-    const user = await repo.findUserByEmail(body.email);
-    if (user && user.state === "active" && user.deletedAt === null && mailer) {
-      const token = randomToken("reset_");
-      await repo.createIdentityToken(
-        user.id,
-        "password_reset",
-        await sha256(token),
-        new Date(Date.now() + 60 * 60 * 1000).toISOString(),
-      );
-      dispatchIdentityDelivery(
-        user.id,
-        null,
-        (signal) =>
-          mailer.send({
-            to: user.email,
-            kind: "password_reset",
-            token,
-            url: `${webOrigin}/reset-password#token=${encodeURIComponent(token)}`,
-          }, signal),
-        "identity.password_reset_requested",
-        "identity.password_reset_delivery_failed",
-      );
+    try {
+      const user = await repo.findUserByEmail(body.email);
+      if (user && user.state === "active" && user.deletedAt === null && mailer) {
+        const token = randomToken("reset_");
+        await repo.createIdentityToken(
+          user.id,
+          "password_reset",
+          await sha256(token),
+          new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+          user.authorityEpoch,
+        );
+        dispatchIdentityDelivery(
+          user.id,
+          null,
+          (signal) =>
+            mailer.send({
+              to: user.email,
+              kind: "password_reset",
+              token,
+              url: `${webOrigin}/reset-password#token=${encodeURIComponent(token)}`,
+            }, signal),
+          "identity.password_reset_requested",
+          "identity.password_reset_delivery_failed",
+        );
+      }
+    } catch {
+      emitOperationalLog({
+        level: "error",
+        message: "Password reset request could not be processed",
+      });
     }
     return c.body(null, 202);
   });
   app.post("/api/auth/password-reset", async (c) => {
     const body = await parseJson(c, passwordResetSchema);
     if (browserAuth && !body.token.startsWith("reset_")) {
-      await repo.prepareBetterAuthPasswordReset(body.token);
-      const url = new URL(c.req.url);
-      url.pathname = "/api/auth/reset-password";
-      const headers = new Headers(c.req.raw.headers);
-      headers.set("x-dg-password-reset-token", body.token);
-      const response = await browserAuth.handler(
-        new Request(url, {
-          method: "POST",
-          headers,
-          body: JSON.stringify({ token: body.token, newPassword: body.password }),
-        }),
+      const user = await repo.resetBetterAuthPassword(
+        body.token,
+        await hashPassword(body.password),
       );
-      return response.ok ? c.body(null, 204) : response;
+      await repo.recordAudit({
+        actorId: user.id,
+        action: "identity.password_reset_completed",
+        targetType: "user",
+        targetId: user.id,
+      });
+      return c.body(null, 204);
     }
     const user = await repo.resetPassword(
       await sha256(body.token),
@@ -3476,7 +3777,7 @@ export function createApp(options: AppOptions = {}) {
     const limited = user.approvalStatus !== "approved" ||
       (requireEmailVerification && !user.emailVerifiedAt);
     const token = randomToken("sess_");
-    await repo.createSession(user.id, await sha256(token), limited);
+    await repo.createSession(user.id, await sha256(token), limited, user.authorityEpoch);
     await repo.recordAudit({
       actorId: user.id,
       action: "identity.login_succeeded",
@@ -3584,6 +3885,7 @@ export function createApp(options: AppOptions = {}) {
     "/api/sessions",
     authenticate,
     sessionOnly,
+    approved,
     async (c) => {
       const ownerId = c.get("user").id;
       const presentedBetterAuth = browserAuth?.presentedSessionToken(c.req.raw.headers);
@@ -3614,7 +3916,7 @@ export function createApp(options: AppOptions = {}) {
       return c.json({ data: [...durable, ...legacy] });
     },
   );
-  app.delete("/api/sessions/:id", authenticate, sessionOnly, async (c) => {
+  app.delete("/api/sessions/:id", authenticate, sessionOnly, approved, async (c) => {
     const requestedId = c.req.param("id");
     if (browserAuth && requestedId.startsWith("better_auth:")) {
       await browserAuth.revokeUserSession(
@@ -4281,6 +4583,79 @@ export function createApp(options: AppOptions = {}) {
       ),
       201,
     );
+  });
+  app.post("/api/conversations/search", async (c) => {
+    privateNoStore(c);
+    let rate;
+    try {
+      rate = await rateLimiter.consume(
+        `conversation-search:owner:${c.get("user").id}`,
+        configuredConversationSearchLimit,
+        configuredRateWindow,
+      );
+    } catch {
+      c.header("Retry-After", "5");
+      throw new DomainError(
+        "service_unavailable",
+        "Conversation search is temporarily unavailable",
+        503,
+      );
+    }
+    c.header("X-RateLimit-Limit", String(rate.limit));
+    c.header("X-RateLimit-Remaining", String(rate.remaining));
+    if (!rate.allowed) {
+      c.header("Retry-After", String(rate.retryAfterSeconds));
+      throw new DomainError("rate_limit_exceeded", "Too many requests", 429);
+    }
+    const body = await parseJson(c, conversationSearchSchema);
+    let lease;
+    try {
+      lease = await conversationSearchConcurrencyLimiter.acquire(c.get("user").id, {
+        global: conversationSearchMaxConcurrent,
+        perUser: conversationSearchMaxConcurrentPerUser,
+      }, "search");
+    } catch {
+      c.header("Retry-After", "5");
+      throw new DomainError(
+        "service_unavailable",
+        "Conversation search is temporarily unavailable",
+        503,
+      );
+    }
+    if (!lease) {
+      c.header("Retry-After", "1");
+      throw new DomainError(
+        "conversation_search_capacity_exceeded",
+        "Too many conversation searches are in progress",
+        429,
+      );
+    }
+    try {
+      const requestSignal = c.req.raw.signal;
+      const searchSignal = AbortSignal.any([requestSignal, lease.signal]);
+      const result = await repo.searchConversations(c.get("user").id, body, searchSignal);
+      if (lease.signal.aborted) {
+        c.header("Retry-After", "5");
+        throw new DomainError(
+          "service_unavailable",
+          "Conversation search is temporarily unavailable",
+          503,
+        );
+      }
+      return c.json(result);
+    } catch (error) {
+      if (!c.req.raw.signal.aborted && lease.signal.aborted) {
+        c.header("Retry-After", "5");
+        throw new DomainError(
+          "service_unavailable",
+          "Conversation search is temporarily unavailable",
+          503,
+        );
+      }
+      throw error;
+    } finally {
+      await lease.release().catch(() => undefined);
+    }
   });
   app.post("/api/conversations/:id/keep", async (c) => {
     const ownerId = c.get("user").id;
@@ -5271,8 +5646,13 @@ export function createApp(options: AppOptions = {}) {
       ...body,
       tokenHash: await sha256(secret),
       preview: `${secret.slice(0, 7)}…${secret.slice(-4)}`,
-    });
-    const { tokenHash: _h, userId: _u, ...summary } = record;
+    }, c.get("authorityEpoch"));
+    const {
+      tokenHash: _h,
+      userId: _u,
+      authorityEpoch: _authorityEpoch,
+      ...summary
+    } = record;
     await repo.recordAudit({
       actorId: c.get("user").id,
       action: "api_token.created",
@@ -5299,7 +5679,7 @@ export function createApp(options: AppOptions = {}) {
       ...body,
       tokenHash: await sha256(secret),
       preview: `${secret.slice(0, 7)}…${secret.slice(-4)}`,
-    });
+    }, c.get("authorityEpoch"));
     await repo.recordAudit({
       actorId: c.get("user").id,
       action: "api_token.rotated",
@@ -5343,6 +5723,16 @@ export function createApp(options: AppOptions = {}) {
       .map(({ definition }) => definition);
     return c.json({ data: available });
   });
+  const publicToolExecution = (execution: Awaited<ReturnType<ToolExecutionService["get"]>>) => {
+    const normalized = normalizeToolExecutionForRead(execution);
+    const {
+      claimToken: _claimToken,
+      claimExpiresAt: _claimExpiresAt,
+      billingSnapshot: _billingSnapshot,
+      ...view
+    } = normalized;
+    return view;
+  };
   app.post("/api/tools/executions", async (c) => {
     let body: unknown;
     try {
@@ -5368,11 +5758,12 @@ export function createApp(options: AppOptions = {}) {
       targetId: execution.id,
       metadata: { toolId: execution.toolId },
     });
-    return c.json(execution, 201);
+    return c.json(publicToolExecution(execution), 201);
   });
   app.get(
     "/api/tools/executions/:id",
-    async (c) => c.json(await toolExecution.get(c.get("user").id, c.req.param("id"))),
+    async (c) =>
+      c.json(publicToolExecution(await toolExecution.get(c.get("user").id, c.req.param("id")))),
   );
   app.post("/api/tools/executions/:id/approve", async (c) => {
     const execution = await toolExecution.approve(c.get("user").id, c.req.param("id"));
@@ -5383,7 +5774,7 @@ export function createApp(options: AppOptions = {}) {
       targetId: execution.id,
       metadata: { toolId: execution.toolId },
     });
-    return c.json(execution, 202);
+    return c.json(publicToolExecution(execution), 202);
   });
   app.delete("/api/tools/executions/:id", async (c) => {
     const execution = await toolExecution.cancel(c.get("user").id, c.req.param("id"));
@@ -5394,7 +5785,7 @@ export function createApp(options: AppOptions = {}) {
       targetId: execution.id,
       metadata: { toolId: execution.toolId },
     });
-    return c.json(execution);
+    return c.json(publicToolExecution(execution));
   });
 
   app.use("/api/admin/*", authenticate, approved, sessionOnly, admin);
@@ -6299,6 +6690,7 @@ export function createApp(options: AppOptions = {}) {
       expectedVersion: body.expectedVersion,
       role: body.role,
       reason: body.reason,
+      requireEmailVerification,
     });
     privateNoStore(c);
     c.header("Vary", "Cookie");
@@ -6313,6 +6705,7 @@ export function createApp(options: AppOptions = {}) {
       expectedVersion: body.expectedVersion,
       state: body.state,
       reason: body.reason,
+      requireEmailVerification,
     });
     privateNoStore(c);
     c.header("Vary", "Cookie");
@@ -6327,6 +6720,7 @@ export function createApp(options: AppOptions = {}) {
       expectedVersion: body.expectedVersion,
       deleted: true,
       reason: body.reason,
+      requireEmailVerification,
     });
     privateNoStore(c);
     c.header("Vary", "Cookie");
@@ -6341,27 +6735,11 @@ export function createApp(options: AppOptions = {}) {
       expectedVersion: body.expectedVersion,
       deleted: false,
       reason: body.reason,
+      requireEmailVerification,
     });
     privateNoStore(c);
     c.header("Vary", "Cookie");
     return c.json(updated);
-  });
-  app.delete("/api/admin/sessions/:id", async (c) => {
-    const requestedId = c.req.param("id");
-    if (browserAuth && requestedId.startsWith("better_auth:")) {
-      await browserAuth.revokeSessionAsAdmin(requestedId.slice("better_auth:".length));
-    } else {
-      await repo.revokeSession(
-        requestedId.startsWith("legacy:") ? requestedId.slice("legacy:".length) : requestedId,
-      );
-    }
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "session.admin_revoked",
-      targetType: "session",
-      targetId: c.req.param("id"),
-    });
-    return c.body(null, 204);
   });
   app.get(
     "/api/admin/audit",
@@ -6403,6 +6781,10 @@ export function createApp(options: AppOptions = {}) {
   app.get("/api/admin/jobs", async (c) => {
     c.header("Cache-Control", "private, no-store");
     return c.json(await repo.listJobs(parseAdminJobQuery(c)));
+  });
+  app.get("/api/admin/workers", async (c) => {
+    c.header("Cache-Control", "private, no-store");
+    return c.json(await repo.listWorkerInstances(parseAdminWorkerQuery(c)));
   });
   app.post("/api/admin/jobs/:id/retry", async (c) => {
     c.header("Cache-Control", "private, no-store");
@@ -6982,6 +7364,28 @@ export function createApp(options: AppOptions = {}) {
       (request.state === "completed" || request.failureStartedStream);
     const headers = new Headers(request.responseHeaders);
     headers.set("X-Idempotent-Replay", "true");
+    const storedRetryAfter = headers.get("Retry-After");
+    if (storedRetryAfter !== null && /^\d+$/.test(storedRetryAfter)) {
+      const seconds = Number(storedRetryAfter);
+      const completedAt = Date.parse(request.completedAt ?? "");
+      const delayMs = seconds * 1_000;
+      if (
+        !Number.isSafeInteger(seconds) || seconds < 0 ||
+        !Number.isSafeInteger(delayMs) || !Number.isSafeInteger(completedAt) ||
+        !Number.isSafeInteger(completedAt + delayMs)
+      ) {
+        headers.delete("Retry-After");
+      } else {
+        const remainingMs = completedAt + delayMs - Date.now();
+        if (remainingMs <= 0) headers.delete("Retry-After");
+        else headers.set("Retry-After", String(Math.ceil(remainingMs / 1_000)));
+      }
+    } else if (storedRetryAfter !== null) {
+      const absoluteDeadline = Date.parse(storedRetryAfter);
+      if (!Number.isSafeInteger(absoluteDeadline) || absoluteDeadline <= Date.now()) {
+        headers.delete("Retry-After");
+      }
+    }
     if (replayAsStream && !headers.has("Content-Type")) {
       headers.set("Content-Type", "text/event-stream");
     } else if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
@@ -6995,6 +7399,21 @@ export function createApp(options: AppOptions = {}) {
       { status: request.responseStatus ?? 500, headers },
     );
   };
+  const inProgressApiResponse = (retryAfterSeconds: number) =>
+    new Response(
+      JSON.stringify(
+        openAIError("An identical request is still in progress", "idempotency_in_progress"),
+      ),
+      {
+        status: 409,
+        headers: {
+          "content-type": "application/json",
+          "retry-after": String(
+            Number.isSafeInteger(retryAfterSeconds) ? Math.max(1, retryAfterSeconds) : 1,
+          ),
+        },
+      },
+    );
   const keepApiLeaseAlive = (
     idempotency?: { id: string; leaseToken: string },
     runLease?: { runId: string; leaseToken: string },
@@ -7118,18 +7537,7 @@ export function createApp(options: AppOptions = {}) {
     if (result.kind === "in_progress") {
       return {
         kind: "replay" as const,
-        response: new Response(
-          JSON.stringify(
-            openAIError("An identical request is still in progress", "idempotency_in_progress"),
-          ),
-          {
-            status: 409,
-            headers: {
-              "content-type": "application/json",
-              "retry-after": String(result.retryAfterSeconds),
-            },
-          },
-        ),
+        response: inProgressApiResponse(result.retryAfterSeconds),
       };
     }
     if (result.kind === "started") {
@@ -8477,27 +8885,36 @@ export function createApp(options: AppOptions = {}) {
       return new Response(responseBody, { headers: { "content-type": "application/json" } });
     } catch (error) {
       if (terminalAccounting) throw error;
-      const responseStatus = error instanceof EmbeddingsProviderError ? error.status : 502;
-      const code = error instanceof EmbeddingsProviderError ? error.code : "provider_error";
+      const classifiedError = error instanceof EmbeddingsProviderError
+        ? new ProviderAttemptError(error.message, {
+          category: error.upstreamStatus === undefined ? "invalid_response" : undefined,
+          status: error.upstreamStatus ?? error.status,
+          retryAfterMs: error.retryAfterMs,
+        })
+        : error;
+      const failure = publicProviderFailure(classifiedError, c.req.raw.signal.aborted);
+      const responseHeaders = {
+        "content-type": "application/json",
+        ...(failure.retryAfterMs !== undefined
+          ? { "retry-after": String(Math.max(1, Math.ceil(failure.retryAfterMs / 1_000))) }
+          : {}),
+      };
       const responseBody = JSON.stringify(
-        openAIError(
-          c.req.raw.signal.aborted ? "Request cancelled" : "Embedding provider request failed",
-          c.req.raw.signal.aborted ? "request_cancelled" : code,
-        ),
+        openAIError(failure.message, failure.code, failure.type, failure.param),
       );
       if (idempotency) {
         await failOpenAIUsage({
           id: idempotency.id,
           leaseToken: idempotency.leaseToken,
-          responseStatus: c.req.raw.signal.aborted ? 499 : responseStatus,
-          responseHeaders: { "content-type": "application/json" },
+          responseStatus: failure.status,
+          responseHeaders,
           responseBody,
           billing: { mode: "refund" },
         });
       } else await repo.refund(runId);
       return new Response(responseBody, {
-        status: c.req.raw.signal.aborted ? 499 : responseStatus,
-        headers: { "content-type": "application/json" },
+        status: failure.status,
+        headers: responseHeaders,
       });
     } finally {
       await lease.stop();
@@ -8509,6 +8926,17 @@ export function createApp(options: AppOptions = {}) {
     const model = resolvedModel?.info;
     if (!model) {
       return c.json(openAIError("The requested model is unavailable", "model_not_found"), 404);
+    }
+    if (request.tools?.length && !model.capabilities.includes("tools")) {
+      return c.json(
+        openAIError(
+          "The requested model does not support tools",
+          "unsupported_feature",
+          400,
+          "tools",
+        ),
+        400,
+      );
     }
     const maxOutput = request.max_tokens ?? request.max_completion_tokens ?? 4096;
     const providerPlan = resolvedModel.registryModel && providerExecution
@@ -9085,7 +9513,8 @@ export function createApp(options: AppOptions = {}) {
   app.post("/v1/responses", requireScope("chat:write"), async (c) => {
     const body = await parseJson(c, responsesSchema);
     if (body.store === true) {
-      throw new DomainError(
+      throw new OpenAIParameterError(
+        "store",
         "unsupported_parameter",
         "store=true is not supported until stored Responses can be retrieved by public response ID",
         400,
@@ -9118,32 +9547,44 @@ export function createApp(options: AppOptions = {}) {
             409,
           );
         }
-        if (existing.state !== "in_progress") {
-          if (!await replayModelIsEntitled(c, existing.model, "chat")) {
-            return c.json(
-              openAIError("The requested model is unavailable", "model_not_found"),
-              404,
-            );
-          }
-          return replayResponse(existing);
+        if (existing.state === "in_progress") {
+          const leaseRemaining = existing.leaseExpiresAt === null
+            ? 1
+            : Math.ceil((Date.parse(existing.leaseExpiresAt) - Date.now()) / 1_000);
+          return inProgressApiResponse(leaseRemaining);
         }
+        if (!await replayModelIsEntitled(c, existing.model, "chat")) {
+          return c.json(
+            openAIError("The requested model is unavailable", "model_not_found"),
+            404,
+          );
+        }
+        return replayResponse(existing);
       }
     }
     let request: ChatCompletionRequest;
     let nativeResponseInput: unknown;
+    let nativeResponseRequest: Record<string, unknown>;
     let requiresNativeInput = false;
+    let resolvedBody: Record<string, unknown>;
     try {
-      const resolvedBody = await resolveResponseInputFiles(
+      resolvedBody = await resolveResponseInputFiles(
         body as Record<string, unknown>,
         c.get("user").id,
       );
       nativeResponseInput = structuredClone(resolvedBody.input);
       requiresNativeInput = responsesRequestRequiresNativeInput(resolvedBody);
-      request = responsesRequestToChatCompletions(resolvedBody) as unknown as ChatCompletionRequest;
+      nativeResponseRequest = structuredClone(resolvedBody);
+      request = responsesRequestToChatCompletions(
+        resolvedBody,
+      ) as unknown as ChatCompletionRequest;
     } catch (error) {
       if (error instanceof ProviderProtocolError) {
         const status = error.code === "payload_too_large" ? 413 : 400;
-        return c.json(openAIError(error.message, error.code, status), status);
+        return c.json(
+          openAIError(error.message, error.code, status, safeOpenAIParameter(error.path)),
+          status,
+        );
       }
       throw error;
     }
@@ -9152,11 +9593,26 @@ export function createApp(options: AppOptions = {}) {
     if (!model) {
       return c.json(openAIError("The requested model is unavailable", "model_not_found"), 404);
     }
+    if (
+      Array.isArray(body.tools) && body.tools.length > 0 && !model.capabilities.includes("tools")
+    ) {
+      return c.json(
+        openAIError(
+          "The requested model does not support tools",
+          "unsupported_feature",
+          400,
+          "tools",
+        ),
+        400,
+      );
+    }
     if (requiresNativeInput && (!resolvedModel.registryModel || !providerExecution)) {
       return c.json(
         openAIError(
           "This Responses input requires a native Responses provider",
           "unsupported_feature",
+          400,
+          "input",
         ),
         400,
       );
@@ -9269,6 +9725,7 @@ export function createApp(options: AppOptions = {}) {
       store: false,
       input: nativeResponseInput,
       requiresNativeInput,
+      request: nativeResponseRequest,
       ...(body.metadata && typeof body.metadata === "object" && !Array.isArray(body.metadata)
         ? { metadata: body.metadata as Record<string, unknown> }
         : {}),
@@ -9463,7 +9920,7 @@ export function createApp(options: AppOptions = {}) {
               type: "error",
               code: publicFailure.code,
               message: publicFailure.message,
-              param: null,
+              param: publicFailure.param,
             };
             const terminalFrame = eventFrame(failure);
             if (idempotency) {
@@ -9476,7 +9933,12 @@ export function createApp(options: AppOptions = {}) {
                   "cache-control": "no-cache",
                 },
                 responseBody: JSON.stringify(
-                  openAIError(failure.message, failure.code, publicFailure.type),
+                  openAIError(
+                    failure.message,
+                    failure.code,
+                    publicFailure.type,
+                    publicFailure.param,
+                  ),
                 ),
                 terminalFrame,
                 billing: hasBillableWork
@@ -9530,7 +9992,7 @@ export function createApp(options: AppOptions = {}) {
       if (!providerCompleted && idempotency) {
         const failure = publicProviderFailure(error, c.req.raw.signal.aborted);
         const failureBody = JSON.stringify(
-          openAIError(failure.message, failure.code, failure.type),
+          openAIError(failure.message, failure.code, failure.type, failure.param),
         );
         const responseHeaders = {
           "content-type": "application/json",
@@ -9556,7 +10018,7 @@ export function createApp(options: AppOptions = {}) {
         await repo.refund(runId);
         const failure = publicProviderFailure(error, c.req.raw.signal.aborted);
         return c.json(
-          openAIError(failure.message, failure.code, failure.type),
+          openAIError(failure.message, failure.code, failure.type, failure.param),
           failure.status as 400,
           {
             ...(failure.retryAfterMs !== undefined
@@ -9650,7 +10112,9 @@ export function createApp(options: AppOptions = {}) {
           "Response replay persistence failed",
           status,
         );
-        const failureBody = JSON.stringify(openAIError(failure.message, failure.code));
+        const failureBody = JSON.stringify(
+          openAIError(failure.message, failure.code),
+        );
         await failOpenAIUsage({
           id: idempotency.id,
           leaseToken: idempotency.leaseToken,
@@ -9856,7 +10320,12 @@ export function createApp(options: AppOptions = {}) {
         });
       }
       const activeAudioSlot = audioSlot;
-      audioSignal = AbortSignal.any([c.req.raw.signal, activeAudioSlot.signal]);
+      const audioDownstreamAbort = new AbortController();
+      audioSignal = AbortSignal.any([
+        c.req.raw.signal,
+        activeAudioSlot.signal,
+        audioDownstreamAbort.signal,
+      ]);
       if (activeAudioSlot.signal.aborted) {
         const responseBody = JSON.stringify(
           openAIError(
@@ -9903,6 +10372,11 @@ export function createApp(options: AppOptions = {}) {
           leaseDeferred = true;
           audioSlotDeferred = true;
           return streamSSE(c, async (stream) => {
+            stream.onAbort(() =>
+              audioDownstreamAbort.abort(
+                new DOMException("Client disconnected", "AbortError"),
+              )
+            );
             let sequence = 0;
             let settled = false;
             let visibleCharacters = 0;
@@ -10670,14 +11144,33 @@ export function createApp(options: AppOptions = {}) {
   app.get(
     "/v1/files",
     requireScope("files:read"),
-    async (c) =>
-      c.json({
+    async (c) => {
+      const query = openAIFileListQuery(c.req.raw);
+      let page: { data: AttachmentRecord[]; hasMore: boolean };
+      try {
+        if (query.purpose !== undefined && query.purpose !== "assistants") {
+          // The OpenAI contract accepts an arbitrary purpose string. Unsupported purposes simply
+          // have no matches, but an `after` cursor must still belong to this owner so combining a
+          // filter with a foreign cursor cannot bypass cursor validation.
+          if (query.after !== undefined) {
+            await repo.listAttachmentPage(c.get("user").id, { ...query, limit: 1 });
+          }
+          page = { data: [], hasMore: false };
+        } else page = await repo.listAttachmentPage(c.get("user").id, query);
+      } catch (error) {
+        if (error instanceof DomainError && error.code === "invalid_file_cursor") {
+          throw new OpenAIParameterError("after", error.code, error.message);
+        }
+        throw error;
+      }
+      return c.json({
         object: "list",
-        has_more: false,
-        data: (await repo.listAttachments(c.get("user").id)).map((attachment) =>
-          openAIFile(attachment)
-        ),
-      }),
+        data: page.data.map((attachment) => openAIFile(attachment)),
+        first_id: page.data[0]?.id ?? null,
+        last_id: page.data.at(-1)?.id ?? null,
+        has_more: page.hasMore,
+      });
+    },
   );
   app.post(
     "/v1/files",
@@ -10692,7 +11185,7 @@ export function createApp(options: AppOptions = {}) {
     requireScope("files:read"),
     async (c) =>
       c.json(openAIFile(
-        await repo.getAttachment(c.req.param("id"), c.get("user").id),
+        await repo.getAttachment(openAIFileId(c.req.param("id")), c.get("user").id),
       )),
   );
   app.get(
@@ -10700,19 +11193,29 @@ export function createApp(options: AppOptions = {}) {
     requireScope("files:read"),
     async (c) =>
       await attachmentContent(
-        await repo.getAttachment(c.req.param("id"), c.get("user").id),
+        await repo.getAttachment(openAIFileId(c.req.param("id")), c.get("user").id),
       ),
   );
   app.delete(
     "/v1/files/:id",
     requireScope("files:write"),
     async (c) => {
-      await repo.deleteAttachment(c.req.param("id"), c.get("user").id);
-      return c.json({ id: c.req.param("id"), object: "file", deleted: true });
+      const id = openAIFileId(c.req.param("id"));
+      await repo.deleteAttachment(id, c.get("user").id);
+      return c.json({ id, object: "file", deleted: true });
     },
   );
 
   app.onError((error, c) => {
+    if (
+      c.req.raw.signal.aborted &&
+      (error === c.req.raw.signal.reason ||
+        (error instanceof DOMException && error.name === "AbortError"))
+    ) {
+      // The client is gone. Avoid reporting an expected disconnect as a server defect while still
+      // giving direct in-process callers a deterministic terminal response.
+      return new Response(null, { status: 499 });
+    }
     if (error instanceof HTTPException) {
       if (c.req.path.startsWith("/v1/")) {
         const code = error.status === 413 ? "request_too_large" : "request_error";
@@ -10738,6 +11241,12 @@ export function createApp(options: AppOptions = {}) {
       return c.req.path.startsWith("/v1/")
         ? c.json(openAIError(error.message, error.code, error.status), error.status as 400)
         : c.json({ error: { code: error.code, message: error.message } }, error.status as 400);
+    }
+    if (error instanceof OpenAIParameterError) {
+      return c.json(
+        openAIError(error.message, error.code, error.status, error.param),
+        error.status as 400,
+      );
     }
     if (error instanceof BackupServiceError) {
       const status = error.code === "not_found"

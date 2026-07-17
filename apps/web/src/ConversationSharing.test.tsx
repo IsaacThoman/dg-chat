@@ -7,7 +7,12 @@ import {
   listConversationShares,
   revokeConversationShare,
 } from "./api.ts";
-import { ConversationShareButton, createShareCapability } from "./ConversationSharing.tsx";
+import {
+  ConversationShareButton,
+  createShareCapability,
+  uniqueShareAttachments,
+  validSelectedShareAttachmentIds,
+} from "./ConversationSharing.tsx";
 import { PublicConversationShareView } from "./PublicConversationShare.tsx";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -29,6 +34,15 @@ const summary = {
 };
 
 describe("conversation sharing", () => {
+  const attachment = (id: string, filename = `${id}.txt`) => ({
+    id,
+    filename,
+    mimeType: "text/plain",
+    sizeBytes: 12,
+    state: "ready",
+    createdAt: "2026-07-13T00:00:00.000Z",
+  });
+
   it("generates 256-bit unpadded base64url capabilities", () => {
     const one = createShareCapability();
     const two = createShareCapability();
@@ -50,6 +64,7 @@ describe("conversation sharing", () => {
           version: 1,
         }}
         messages={[]}
+        visibleLeafId="message-1"
       />,
     );
     expect(temporary).toContain("Temporary chats cannot be shared");
@@ -67,11 +82,44 @@ describe("conversation sharing", () => {
           deleted: true,
         }}
         messages={[]}
+        visibleLeafId={null}
         disabled
       />,
     );
     expect(deleted).toContain("Manage shared snapshots");
     expect(deleted).not.toContain("disabled");
+  });
+
+  it("deduplicates immutable attachments shared by multiple visible messages", () => {
+    const first = attachment("attachment-1", "original.txt");
+    const messages = [
+      {
+        id: "message-1",
+        role: "user" as const,
+        content: "one",
+        createdAt: "now",
+        attachments: [first],
+      },
+      {
+        id: "message-2",
+        role: "assistant" as const,
+        content: "two",
+        createdAt: "now",
+        attachments: [attachment("attachment-1", "duplicate.txt"), attachment("attachment-2")],
+      },
+    ];
+    expect(uniqueShareAttachments(messages)).toEqual([first, attachment("attachment-2")]);
+  });
+
+  it("derives unique selected IDs from only the currently visible branch", () => {
+    const visible = [attachment("attachment-2"), attachment("attachment-3")];
+    expect(
+      validSelectedShareAttachmentIds(
+        ["attachment-1", "attachment-2", "attachment-2", "attachment-3"],
+        visible,
+      ),
+    ).toEqual(["attachment-2", "attachment-3"]);
+    expect(validSelectedShareAttachmentIds(["attachment-1"], visible)).toEqual([]);
   });
 
   it("sends the capability and idempotency header only to the authenticated create route", async () => {

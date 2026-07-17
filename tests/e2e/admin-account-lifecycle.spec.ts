@@ -1,10 +1,12 @@
 import { expect, type Locator, test } from "@playwright/test";
+import { formatStartingCreditMicros } from "../../apps/web/src/adminLifecycleUi.ts";
 import { adminEmail, bootstrap, login, uniqueUser } from "./helpers.ts";
 import { apiURL } from "./helpers.ts";
 
 test.describe.configure({ timeout: 120_000 });
 
 test("administrators approve, search, and manage an immutable account lifecycle", async ({
+  browser,
   page,
   request,
 }, testInfo) => {
@@ -32,10 +34,19 @@ test("administrators approve, search, and manage an immutable account lifecycle"
   await page.getByLabel(/email/i).fill(applicant.email);
   await page.getByLabel(/^password/i).fill(applicant.password);
   await page.getByRole("button", { name: "Request access" }).click();
-  await expect(page).toHaveURL(/\/pending$/u);
+  // Account creation performs password hashing plus several transactionally fenced identity
+  // writes. Keep this assertion bounded, but allow a busy self-hosted PostgreSQL instance to
+  // finish safely instead of encouraging the client to retry an already-committed signup.
+  await expect(page).toHaveURL(/\/pending$/u, { timeout: 20_000 });
 
   await page.context().clearCookies();
   await login(page);
+  const settingsResponse = await page.request.get(`${apiURL}/api/admin/settings`);
+  expect(settingsResponse.ok()).toBeTruthy();
+  const defaultApprovalCreditMicros = (await settingsResponse.json() as {
+    defaultApprovalCreditMicros: number;
+  }).defaultApprovalCreditMicros;
+  const defaultApprovalCredit = formatStartingCreditMicros(defaultApprovalCreditMicros);
   const compactApplicants = page.waitForResponse((response) => {
     const url = new URL(response.url());
     return url.pathname === "/api/admin/users" &&
@@ -59,7 +70,10 @@ test("administrators approve, search, and manage an immutable account lifecycle"
   await expect(approvalDialog).toBeVisible();
   const startingCredit = approvalDialog.getByLabel("Starting credit override (USD, optional)");
   await expect(startingCredit).toHaveValue("");
-  await expect(startingCredit).toHaveAttribute("placeholder", "Server default: $6.75");
+  await expect(startingCredit).toHaveAttribute(
+    "placeholder",
+    `Server default: $${defaultApprovalCredit}`,
+  );
   await approvalDialog.getByLabel("Internal note (optional)").fill("Approved in E2E review");
   const approvalRequest = page.waitForRequest((request) =>
     request.method() === "PATCH" && new URL(request.url()).pathname.endsWith("/approval")
@@ -78,7 +92,7 @@ test("administrators approve, search, and manage an immutable account lifecycle"
   };
   expect(approvedPage.data[0]).toMatchObject({
     approvalStatus: "approved",
-    balanceMicros: 6_750_000,
+    balanceMicros: defaultApprovalCreditMicros,
   });
 
   // Seed real target security resources through the owner surface. Signing in again also creates
@@ -91,7 +105,7 @@ test("administrators approve, search, and manage an immutable account lifecycle"
     // the API's browser-CSRF boundary.
     headers: { origin: new URL(page.url()).origin },
     data: {
-      name: "Lifecycle automation",
+      name: "Pre-promotion automation",
       scopes: ["chat:write"],
       rpmLimit: 60,
       burstLimit: 10,
@@ -116,6 +130,7 @@ test("administrators approve, search, and manage an immutable account lifecycle"
   const detailHeading = page.getByRole("heading", { name: applicant.name, exact: true });
   await expect(detailHeading).toBeVisible();
   await expect(detailHeading).toBeFocused();
+  await expect(page).toHaveTitle(`${applicant.name} · Users · DG Chat Admin`);
   const tabs = page.getByRole("tablist", { name: "User administration" });
   await expect(tabs.getByRole("tab", { name: "Account" })).toHaveAttribute(
     "aria-selected",
@@ -128,6 +143,29 @@ test("administrators approve, search, and manage an immutable account lifecycle"
   await promoteDialog.getByRole("button", { name: "Confirm promote" }).click();
   await expect(promoteDialog).toBeHidden();
   await expect(page.getByLabel("Account status")).toContainText("admin");
+
+  // Promotion is an authority change, so every credential issued under the user's previous
+  // authority epoch must already be revoked. Sign in through an isolated browser context and
+  // create a fresh credential under the new epoch so this journey can independently exercise
+  // both automatic lifecycle invalidation and an administrator-initiated family revocation.
+  const ownerContext = await browser.newContext({ baseURL: testInfo.project.use.baseURL });
+  try {
+    const ownerPage = await ownerContext.newPage();
+    await login(ownerPage, applicant.email, applicant.password);
+    const postPromotionToken = await ownerPage.request.post(`${apiURL}/api/tokens`, {
+      headers: { origin: new URL(ownerPage.url()).origin },
+      data: {
+        name: "Lifecycle automation",
+        scopes: ["chat:write"],
+        rpmLimit: 60,
+        burstLimit: 10,
+      },
+    });
+    expect(postPromotionToken.status()).toBe(201);
+  } finally {
+    await ownerContext.close();
+  }
+
   // Modal teardown restores focus to its opener. Wait for that accessibility contract before
   // deliberately moving into the tab strip, otherwise the cleanup can reclaim focus mid-keypress.
   await expect(page.getByRole("button", { name: "Demote to user" })).toBeFocused();
@@ -156,6 +194,13 @@ test("administrators approve, search, and manage an immutable account lifecycle"
 
   await tabs.getByRole("tab", { name: "API tokens" }).click();
   await expect(page).toHaveURL(/\/tokens(?:\?|$)/u);
+  const automaticallyRevokedToken = page.locator(".admin-user-token-card").filter({
+    hasText: "Pre-promotion automation",
+  });
+  await expect(automaticallyRevokedToken).toContainText("revoked");
+  await expect(
+    automaticallyRevokedToken.getByRole("button", { name: "Revoke token family" }),
+  ).toHaveCount(0);
   const tokenCard = page.locator(".admin-user-token-card").filter({
     hasText: "Lifecycle automation",
   });
@@ -171,19 +216,20 @@ test("administrators approve, search, and manage an immutable account lifecycle"
 
   await tabs.getByRole("tab", { name: "Billing" }).click();
   await expect(page).toHaveURL(/\/billing(?:\?|$)/u);
-  await expect(page.getByText("$6.75", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText(`$${defaultApprovalCredit}`, { exact: true }).first()).toBeVisible();
   const adjustBalance = page.getByRole("button", { name: "Adjust balance" });
   await assertMobileLayout(adjustBalance);
   await adjustBalance.click();
   const adjustmentDialog = page.getByRole("dialog", { name: "Adjust balance" });
   await adjustmentDialog.getByLabel("Amount (USD)").fill("1.234567");
   await adjustmentDialog.getByLabel("Reason").fill("Exact E2E support credit");
-  await expect(adjustmentDialog.getByText("$7.984567", { exact: true })).toBeVisible();
+  const adjustedBalance = formatStartingCreditMicros(defaultApprovalCreditMicros + 1_234_567);
+  await expect(adjustmentDialog.getByText(`$${adjustedBalance}`, { exact: true })).toBeVisible();
   const addCredit = adjustmentDialog.getByRole("button", { name: "Add credit" });
   await assertMobileLayout(addCredit);
   await addCredit.click();
   await expect(adjustmentDialog).toBeHidden();
-  await expect(page.getByText("$7.984567", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText(`$${adjustedBalance}`, { exact: true }).first()).toBeVisible();
   const adjustmentRow = page.locator(".admin-user-ledger tbody tr").filter({
     hasText: "Exact E2E support credit",
   });

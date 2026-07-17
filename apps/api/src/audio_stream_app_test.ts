@@ -184,6 +184,58 @@ Deno.test("audio terminal done is withheld until stream accounting is durable", 
   await reader.cancel();
 });
 
+Deno.test("cancelling a stalled transcription stream aborts upstream and releases admission", async () => {
+  let released = false;
+  let observedSignal: AbortSignal | undefined;
+  const limiter: AudioConcurrencyLimiter = {
+    acquire: () =>
+      Promise.resolve({
+        id: "stalled-stream",
+        signal: new AbortController().signal,
+        release: () => {
+          released = true;
+          return Promise.resolve();
+        },
+      }),
+    close: () => Promise.resolve(),
+  };
+  const value = await fixture((_input, init) => {
+    observedSignal = init?.signal ?? undefined;
+    return Promise.resolve(
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(
+              new TextEncoder().encode(
+                'data: {"type":"transcript.text.delta","delta":"hello"}\n\n',
+              ),
+            );
+            observedSignal?.addEventListener("abort", () => {
+              controller.error(observedSignal?.reason ?? new DOMException("Aborted", "AbortError"));
+            }, { once: true });
+          },
+        }),
+        { headers: { "content-type": "text/event-stream" } },
+      ),
+    );
+  }, limiter);
+  const response = await value.request();
+  const reader = response.body!.getReader();
+  const first = new TextDecoder().decode((await reader.read()).value);
+  assertStringIncludes(first, "transcript.text.delta");
+  await reader.cancel();
+  const cleanedUp = await Promise.race([
+    (async () => {
+      while (!observedSignal?.aborted || !released) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+      return true;
+    })(),
+    new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 1_000)),
+  ]);
+  assertEquals(cleanedUp, true);
+});
+
 Deno.test("audio failure bills matching delta and segment representations only once", async () => {
   const value = await fixture(
     () =>

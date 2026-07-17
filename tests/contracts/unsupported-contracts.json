@@ -1,1 +1,22 @@
-[]
+[
+  {
+    "endpoint": "POST /v1/responses (stored continuation)",
+    "reason": "The endpoint is stateless: store=true and previous_response_id are not implemented; resend prior output items in input."
+  },
+  {
+    "endpoint": "POST /v1/responses (include/background)",
+    "reason": "Non-empty include arrays, including reasoning.encrypted_content, and background=true are not implemented."
+  },
+  {
+    "endpoint": "POST /v1/files (purposes/idempotency)",
+    "reason": "Only purpose=assistants is accepted, and file upload does not yet implement Idempotency-Key replay or conflict detection."
+  },
+  {
+    "endpoint": "POST /v1/images/generations and /v1/images/edits (URL replay)",
+    "reason": "Idempotency-Key is rejected for expiring response_format=url results; use b64_json for exact replay."
+  },
+  {
+    "endpoint": "POST /v1/chat/completions (multiple choices and Responses translation)",
+    "reason": "Only n=1 is supported; Responses-backed models reject stop, penalties, seed, and other parameters that cannot be translated losslessly."
+  }
+]

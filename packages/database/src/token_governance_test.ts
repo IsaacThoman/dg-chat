@@ -19,7 +19,11 @@ Deno.test("token lineage migration restricts destructive generation deletion", a
 
 Deno.test("token rotation is versioned, overlap bounded, restriction preserving, and family revoked", () => {
   const repo = new MemoryRepository();
-  const user = repo.createUser({ email: "token@example.com", name: "Token owner" });
+  const user = repo.createUser({
+    email: "token@example.com",
+    name: "Token owner",
+    approvalStatus: "approved",
+  });
   const token = repo.createApiToken(user.id, {
     name: "automation",
     scopes: ["chat"],
@@ -86,7 +90,11 @@ Deno.test("token rotation is versioned, overlap bounded, restriction preserving,
 
 Deno.test("model aliases cannot bypass user and explicit token entitlements", () => {
   const repo = new MemoryRepository();
-  const user = repo.createUser({ email: "entitled@example.com", name: "Entitled" });
+  const user = repo.createUser({
+    email: "entitled@example.com",
+    name: "Entitled",
+    approvalStatus: "approved",
+  });
   const other = repo.createUser({ email: "other@example.com", name: "Other" });
   const now = new Date().toISOString();
   const modelId = crypto.randomUUID();
@@ -136,7 +144,11 @@ Deno.test("model aliases cannot bypass user and explicit token entitlements", ()
 
 Deno.test("restricted access mode fails closed when its last group assignment disappears", () => {
   const repo = new MemoryRepository();
-  const user = repo.createUser({ email: "closed@example.com", name: "Fail closed" });
+  const user = repo.createUser({
+    email: "closed@example.com",
+    name: "Fail closed",
+    approvalStatus: "approved",
+  });
   const now = new Date().toISOString();
   const model1 = crypto.randomUUID(), model2 = crypto.randomUUID();
   for (const [id, publicModelId] of [[model1, "group/one"], [model2, "group/two"]]) {
@@ -202,7 +214,11 @@ Deno.test("restricted access mode fails closed when its last group assignment di
 
 Deno.test("atomic access group policy validates owners and previews widening", () => {
   const repo = new MemoryRepository();
-  const owner = repo.createUser({ email: "owner@example.com", name: "Owner" });
+  const owner = repo.createUser({
+    email: "owner@example.com",
+    name: "Owner",
+    approvalStatus: "approved",
+  });
   const token = repo.createApiToken(owner.id, {
     name: "t",
     scopes: [],

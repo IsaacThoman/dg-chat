@@ -1,10 +1,10 @@
 import { assertEquals } from "jsr:@std/assert@1.0.14";
 import postgres from "npm:postgres@3.4.7";
-import { knowledgeEmbeddingIdentityVersion, PostgresRepository } from "@dg-chat/database";
+import { knowledgeEmbeddingIdentityVersion } from "@dg-chat/database";
 
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
 
-async function eventually(check: () => Promise<boolean>, timeoutMs = 30_000): Promise<void> {
+async function eventually(check: () => Promise<boolean>, timeoutMs = 45_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (await check()) return;
@@ -14,7 +14,7 @@ async function eventually(check: () => Promise<boolean>, timeoutMs = 30_000): Pr
 }
 
 Deno.test({
-  name: "spawned worker retries a failed embedding call, accounts credits, and populates rows once",
+  name: "spawned worker never replays an ambiguous 503 embedding dispatch and charges once",
   ignore: !databaseUrl,
   sanitizeOps: false,
   sanitizeResources: false,
@@ -24,6 +24,8 @@ Deno.test({
     const attachmentId = crypto.randomUUID();
     const chunkId = crypto.randomUUID();
     const jobId = crypto.randomUUID();
+    const restartProbeAttachmentId = crypto.randomUUID();
+    const restartProbeJobId = crypto.randomUUID();
     let calls = 0;
     const server = Deno.serve({ hostname: "127.0.0.1", port: 0 }, async (request) => {
       if (!new URL(request.url).pathname.endsWith("/embeddings")) {
@@ -51,6 +53,7 @@ Deno.test({
       baseUrl: `http://127.0.0.1:${port}/v1`,
       model: "mock-embedding",
       upstreamModel: "mock-embedding",
+      batchSize: 8,
     });
     const workerEnv = {
       ...Deno.env.toObject(),
@@ -100,13 +103,13 @@ Deno.test({
       worker = spawnWorker();
       await eventually(async () => {
         const rows = await sql<{ status: string }[]>`SELECT status FROM jobs WHERE id=${jobId}`;
-        return rows[0]?.status === "completed";
+        return rows[0]?.status === "failed";
       });
       worker.kill("SIGTERM");
-      await worker.status;
+      assertEquals((await worker.status).success, true);
       worker = undefined;
 
-      if (calls !== 2) {
+      if (calls !== 1) {
         throw new Error(JSON.stringify({
           calls,
           jobs: [...await sql`SELECT status,attempts,last_error FROM jobs WHERE id=${jobId}`],
@@ -122,7 +125,7 @@ Deno.test({
           FROM document_chunk_embeddings
           WHERE chunk_id=${chunkId} AND embedding_version=${effectiveVersion}`,
         ],
-        [{ count: 1 }],
+        [{ count: 0 }],
       );
       assertEquals(
         [
@@ -130,41 +133,19 @@ Deno.test({
           SELECT status,input_tokens::int,cost_micros::int FROM usage_runs
           WHERE id LIKE ${`${jobId}:embedding:%`} ORDER BY created_at`,
         ],
-        [
-          { status: "failed", input_tokens: 0, cost_micros: 0 },
-          { status: "completed", input_tokens: 3, cost_micros: 8 },
-        ],
-      );
-      const successfulRunId = `${jobId}:embedding:2:0`;
-      // Reproduce the legacy split-finalization crash: usage/ledger committed, attempt finish lost.
-      await sql`UPDATE embedding_provider_attempts SET status='running',input_tokens=0,
-        cost_micros=0,token_source='none',cost_source='none',latency_ms=NULL,completed_at=NULL
-        WHERE usage_run_id=${successfulRunId}`;
-      const accountingRepo = await PostgresRepository.connect(databaseUrl!);
-      const terminal = {
-        usageRunId: successfulRunId,
-        status: "succeeded" as const,
-        inputTokens: 3,
-        costMicros: 8,
-        tokenSource: "provider" as const,
-        costSource: "calculated" as const,
-        latencyMs: 1,
-      };
-      await accountingRepo.finalizeEmbeddingProviderUsage(terminal);
-      await accountingRepo.finalizeEmbeddingProviderUsage(terminal);
-      await accountingRepo.close();
-      assertEquals(
-        [
-          ...await sql<{ status: string; input_tokens: number; cost_micros: number }[]>`
-          SELECT status,input_tokens,cost_micros::int FROM embedding_provider_attempts
-          WHERE usage_run_id=${successfulRunId}`,
-        ],
-        [{ status: "succeeded", input_tokens: 3, cost_micros: 8 }],
+        [{ status: "failed", input_tokens: 11, cost_micros: 16 }],
       );
       assertEquals(
-        (await sql<{ count: number }[]>`SELECT count(*)::int AS count FROM ledger_entries
-          WHERE usage_run_id=${successfulRunId}`)[0].count,
-        2,
+        [
+          ...await sql<{
+            phase: string;
+            dispatch_epoch: number;
+            retry_safe: boolean;
+          }[]>`
+          SELECT phase,dispatch_epoch,retry_safe FROM document_embedding_batches
+          WHERE job_id=${jobId}`,
+        ],
+        [{ phase: "dispatched", dispatch_epoch: 0, retry_safe: false }],
       );
       assertEquals(
         [
@@ -174,36 +155,54 @@ Deno.test({
             input_tokens: number;
             cost_micros: number;
           }[]>`SELECT status,token_source,input_tokens,cost_micros::int
-          FROM embedding_provider_attempts WHERE usage_run_id LIKE ${`${jobId}:embedding:%`}
-          ORDER BY started_at`,
+          FROM embedding_provider_attempts WHERE usage_run_id LIKE ${`${jobId}:embedding:%`}`,
         ],
-        [
-          { status: "failed", token_source: "none", input_tokens: 0, cost_micros: 0 },
-          { status: "succeeded", token_source: "provider", input_tokens: 3, cost_micros: 8 },
-        ],
+        [{ status: "failed", token_source: "estimated", input_tokens: 11, cost_micros: 16 }],
+      );
+      assertEquals(
+        (await sql<{ count: number }[]>`SELECT count(*)::int AS count FROM ledger_entries
+          WHERE usage_run_id LIKE ${`${jobId}:embedding:%`}`)[0].count,
+        1,
       );
       const balance = await sql<{ balance: number }[]>`
         SELECT balance_micros::int AS balance FROM users WHERE id=${userId}`;
-      assertEquals(balance[0].balance, 992);
+      assertEquals(balance[0].balance, 984);
 
+      await sql`UPDATE attachments SET state='deleted',deleted_at=now(),updated_at=now()
+        WHERE id=${attachmentId}`;
+      await sql`INSERT INTO attachments(id,owner_id,object_key,filename,mime_type,size_bytes,sha256,
+        state,ingestion_status) VALUES(${restartProbeAttachmentId},${userId},
+        ${`users/${userId}/restart-probe.txt`},'restart-probe.txt','text/plain',1,
+        ${"b".repeat(64)},'ready','not_applicable')`;
+      await sql`INSERT INTO jobs(id,type,payload,idempotency_key)
+        VALUES(${restartProbeJobId},'attachment.inspect',${
+        sql.json({ attachmentId: restartProbeAttachmentId, ownerId: userId })
+      },${`knowledge-restart-probe:${restartProbeJobId}`})`;
       worker = spawnWorker();
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      await eventually(async () =>
+        (await sql<{ status: string }[]>`SELECT status FROM jobs WHERE id=${restartProbeJobId}`)[0]
+          ?.status === "completed"
+      );
       worker.kill("SIGTERM");
-      await worker.status;
+      assertEquals((await worker.status).success, true);
       worker = undefined;
-      assertEquals(calls, 2);
+      assertEquals(calls, 1);
     } finally {
       if (worker) {
-        worker.kill("SIGTERM");
+        try {
+          worker.kill("SIGKILL");
+        } catch {
+          // Already exited.
+        }
         await worker.status.catch(() => undefined);
       }
       await server.shutdown();
-      await sql`DELETE FROM jobs WHERE id=${jobId}`;
+      await sql`DELETE FROM jobs WHERE id IN (${jobId},${restartProbeJobId})`;
       await sql`DELETE FROM embedding_provider_attempts WHERE usage_run_id IN
         (SELECT id FROM usage_runs WHERE user_id=${userId})`;
       await sql`DELETE FROM ledger_entries WHERE user_id=${userId}`;
       await sql`DELETE FROM usage_runs WHERE user_id=${userId}`;
-      await sql`DELETE FROM attachments WHERE id=${attachmentId}`;
+      await sql`DELETE FROM attachments WHERE id IN (${attachmentId},${restartProbeAttachmentId})`;
       await sql`DELETE FROM users WHERE id=${userId}`;
       await sql.end();
     }

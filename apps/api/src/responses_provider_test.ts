@@ -300,6 +300,41 @@ Deno.test("native Responses buffered adapter transforms the request and preserve
   }]);
 });
 
+Deno.test("native Responses adapter never dispatches provider-managed network tools", async () => {
+  for (
+    const tool of [
+      { type: "web_search", search_context_size: "medium" },
+      { type: "mcp", server_label: "docs", server_url: "https://mcp.example.test" },
+    ]
+  ) {
+    let dispatched = false;
+    await assertRejects(
+      () =>
+        completeResponsesChat(
+          { model: "public/model", messages: [{ role: "user", content: "search" }] },
+          new AbortController().signal,
+          {
+            baseUrl: "https://provider.example/v1",
+            apiKey: "secret",
+            upstreamModel: "upstream-model",
+            requestFields: {
+              request: { model: "public/model", input: "search", tools: [tool] },
+              store: false,
+              requiresNativeInput: true,
+            },
+            fetch: () => {
+              dispatched = true;
+              return Promise.resolve(Response.json({}));
+            },
+          },
+        ),
+      ProviderAttemptError,
+      tool.type === "mcp" ? "Remote MCP tools are disabled" : "web search is disabled",
+    );
+    assertEquals(dispatched, false);
+  }
+});
+
 Deno.test("native Responses SSE adapter exposes Chat chunks, usage, and one DONE", async () => {
   let capturedBody: Record<string, unknown> = {};
   const events = [
@@ -1175,6 +1210,7 @@ Deno.test("lossy Chat to Responses options fail before transport without fallbac
   assertEquals(dispatched, false);
   assertEquals(error.options.category, "invalid_request");
   assertEquals(error.options.transient, false);
+  assertEquals(error.options.param, "request.stop");
 });
 
 Deno.test("Responses streaming rejects authoritative done values that conflict with deltas", async () => {

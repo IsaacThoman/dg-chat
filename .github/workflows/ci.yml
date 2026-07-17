@@ -38,6 +38,11 @@ jobs:
         run: deno task test
       - name: Web unit tests
         run: deno task test:web
+      - name: E2E harness policy tests
+        run: |
+          deno test tests/e2e/env_test.ts tests/e2e/target-safety_test.ts \
+            tests/run-postgres-test-group_test.ts --allow-env
+          bash tests/assert-compose-graceful-restart_test.sh
       - name: Production web build
         run: deno task build
       - name: Validate Compose model
@@ -52,13 +57,154 @@ jobs:
           docker compose -f docker-compose.yml -f docker-compose.ci.yml config --quiet
           docker compose -f docker-compose.yml -f docker-compose.ci.yml -f docker-compose.contracts.yml config --quiet
           docker compose -f docker-compose.yml -f docker-compose.ci.yml -f docker-compose.oidc.yml config --quiet
+          dev_model="$(docker compose -f docker-compose.yml -f docker-compose.dev.yml config --format json)"
+          ci_model="$(docker compose -f docker-compose.yml -f docker-compose.ci.yml config --format json)"
+          contract_model="$(docker compose -f docker-compose.yml -f docker-compose.ci.yml -f docker-compose.contracts.yml config --format json)"
+          oidc_model="$(docker compose -f docker-compose.yml -f docker-compose.ci.yml -f docker-compose.oidc.yml config --format json)"
+          default_model="$(env -u DATABASE_URL -u REDIS_URL docker compose -f docker-compose.yml config --format json)"
+          external_database_url='postgresql://external-db.example/dgchat?sslmode=require'
+          external_redis_url='rediss://external-redis.example:6380/4'
+          external_model="$(DATABASE_URL="$external_database_url" REDIS_URL="$external_redis_url" docker compose -f docker-compose.yml config --format json)"
+          hostile_host_database_url='postgresql://host:host@localhost:5432/host'
+          hostile_host_redis_url='redis://localhost:6379/9'
+          hostile_host_s3_endpoint='http://localhost:9000'
+          dev_dns_model="$(DATABASE_URL="$hostile_host_database_url" REDIS_URL="$hostile_host_redis_url" S3_ENDPOINT="$hostile_host_s3_endpoint" docker compose -f docker-compose.yml -f docker-compose.dev.yml config --format json)"
+          managed_s3_endpoint='https://objects.example'
+          managed_model="$(env -u POSTGRES_PASSWORD -u MINIO_ROOT_USER -u MINIO_ROOT_PASSWORD DATABASE_URL="$external_database_url" REDIS_URL="$external_redis_url" S3_ENDPOINT="$managed_s3_endpoint" S3_ALLOW_INSECURE=false docker compose -f docker-compose.yml -f docker-compose.managed.yml config --format json)"
+          managed_profiles="$(env -u POSTGRES_PASSWORD -u MINIO_ROOT_USER -u MINIO_ROOT_PASSWORD DATABASE_URL="$external_database_url" REDIS_URL="$external_redis_url" S3_ENDPOINT="$managed_s3_endpoint" docker compose -f docker-compose.yml -f docker-compose.managed.yml config --profiles)"
+          jq -e '
+            (.services.web.ports | length) == 1 and
+            .services.web.ports[0].target == 5173 and
+            .services.web.ports[0].published == "5173" and
+            .services.web.ports[0].host_ip == "127.0.0.1" and
+            (.services.app.ports | length) == 1 and
+            .services.app.ports[0].target == 8000 and
+            .services.app.ports[0].published == "8000" and
+            .services.app.ports[0].host_ip == "127.0.0.1" and
+            .services.app.environment.AUTH_RATE_LIMIT == "10" and
+            .services.app.environment.AUTH_CLIENT_RATE_LIMIT == "100" and
+            .services.app.environment.CONVERSATION_SEARCH_RATE_LIMIT == "30" and
+            .services.app.environment.CONVERSATION_SEARCH_MAX_CONCURRENT == "4" and
+            .services.app.environment.CONVERSATION_SEARCH_MAX_CONCURRENT_PER_USER == "1" and
+            .services.app.environment.CONVERSATION_SEARCH_CONCURRENCY_LEASE_SECONDS == "15" and
+            .services.app.environment.UPLOAD_MAX_BYTES == "26214400" and
+            .services.app.environment.UPLOAD_MAX_CONCURRENT == "4" and
+            .services.app.environment.UPLOAD_MAX_CONCURRENT_PER_USER == "2" and
+            .services.worker.command == ["task", "--filter", "@dg-chat/worker", "start"] and
+            .services.worker.environment.WORKER_DATABASE_RETRY_INITIAL_MS == "250" and
+            .services.worker.environment.WORKER_DATABASE_RETRY_MAX_MS == "10000" and
+            (.networks["dev-host"].internal != true) and
+            (.services.postgres.networks | has("dev-host")) and
+            (.services.redis.networks | has("dev-host")) and
+            (.services.minio.networks | has("dev-host")) and
+            (.services.postgres.ports | length) == 1 and
+            .services.postgres.ports[0].target == 5432 and
+            .services.postgres.ports[0].published == "5432" and
+            .services.postgres.ports[0].host_ip == "127.0.0.1" and
+            (.services.redis.ports | length) == 1 and
+            .services.redis.ports[0].target == 6379 and
+            .services.redis.ports[0].published == "6379" and
+            .services.redis.ports[0].host_ip == "127.0.0.1" and
+            (.services.minio.ports | length) == 2 and
+            ([.services.minio.ports[].target] | sort) == [9000, 9001] and
+            ([.services.minio.ports[].published] | sort) == ["9000", "9001"] and
+            all(.services.minio.ports[]; .host_ip == "127.0.0.1")
+          ' <<<"$dev_model"
+          jq -e '
+            .services.app.environment.AUTH_RATE_LIMIT == "1000" and
+            .services.app.environment.AUTH_CLIENT_RATE_LIMIT == "1000"
+          ' <<<"$ci_model"
+          jq -e '.services["mock-provider"].restart == "unless-stopped"' <<<"$contract_model"
+          jq -e '
+            (.services["mock-oidc"].ports | length) == 1 and
+            .services["mock-oidc"].ports[0].target == 4020 and
+            .services["mock-oidc"].ports[0].published == "4020" and
+            .services["mock-oidc"].ports[0].host_ip == "127.0.0.1" and
+            .services["mock-oidc"].restart == "unless-stopped"
+          ' <<<"$oidc_model"
+          jq -e '
+            .services.app.environment.DATABASE_URL == .services.migrate.environment.DATABASE_URL and
+            .services.app.environment.DATABASE_URL == .services.worker.environment.DATABASE_URL and
+            .services.app.environment.REDIS_URL == "redis://redis:6379" and
+            (.services.app.environment.DATABASE_URL | contains("@postgres:5432/"))
+          ' <<<"$default_model"
+          jq -e --arg database "$external_database_url" --arg redis "$external_redis_url" '
+            .services.app.environment.DATABASE_URL == $database and
+            .services.migrate.environment.DATABASE_URL == $database and
+            .services.worker.environment.DATABASE_URL == $database and
+            .services.app.environment.REDIS_URL == $redis
+          ' <<<"$external_model"
+          jq -e '
+            .services.app.environment.DATABASE_URL == "postgresql://dgchat:ci-postgres-password@postgres:5432/dgchat" and
+            .services.migrate.environment.DATABASE_URL == .services.app.environment.DATABASE_URL and
+            .services.worker.environment.DATABASE_URL == .services.app.environment.DATABASE_URL and
+            .services.app.environment.REDIS_URL == "redis://redis:6379" and
+            .services.app.environment.S3_ENDPOINT == "http://minio:9000" and
+            .services.worker.environment.S3_ENDPOINT == "http://minio:9000"
+          ' <<<"$dev_dns_model"
+          jq -e --arg database "$external_database_url" --arg redis "$external_redis_url" --arg s3 "$managed_s3_endpoint" '
+            .services.app.environment.DATABASE_URL == $database and
+            .services.migrate.environment.DATABASE_URL == $database and
+            .services.worker.environment.DATABASE_URL == $database and
+            .services.app.environment.REDIS_URL == $redis and
+            .services.app.environment.S3_ENDPOINT == $s3 and
+            .services.worker.environment.S3_ENDPOINT == $s3 and
+            (.services.app.depends_on | keys) == ["migrate"] and
+            (.services.worker.depends_on | keys) == ["migrate"] and
+            .services.migrate.depends_on == null and
+            (.services.migrate.networks | has("egress")) and
+            (.services | has("postgres") | not) and
+            (.services | has("redis") | not) and
+            (.services | has("minio") | not) and
+            (.services | has("minio-init") | not)
+          ' <<<"$managed_model"
+          grep -qx 'bundled-dependencies' <<<"$managed_profiles"
+          if env -u DATABASE_URL -u POSTGRES_PASSWORD -u MINIO_ROOT_USER -u MINIO_ROOT_PASSWORD \
+            REDIS_URL="$external_redis_url" S3_ENDPOINT="$managed_s3_endpoint" \
+            docker compose -f docker-compose.yml -f docker-compose.managed.yml config --quiet \
+            >/dev/null 2>&1; then
+            echo "managed Compose unexpectedly accepted a missing DATABASE_URL" >&2
+            exit 1
+          fi
           test "$(docker compose -f docker-compose.yml config --format json | jq -r '.services.app.environment.DENO_ENV')" = production
           test "$(docker compose -f docker-compose.yml -f docker-compose.ci.yml config --format json | jq -r '.services.app.environment.DENO_ENV')" = test
+
+  redis-integration:
+    name: Redis rate limit, circuit breaker, and concurrency
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      TEST_REDIS_URL: redis://127.0.0.1:6379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+          cache: true
+      - name: Install dependencies
+        run: deno install --frozen
+      - name: Run distributed Redis integration tests
+        run: >-
+          deno test
+          apps/api/src/rate_limit_redis_test.ts
+          apps/api/src/provider_circuit_test.ts
+          apps/api/src/audio_concurrency_redis_test.ts
+          --allow-env --allow-net
 
   postgres-integration:
     name: PostgreSQL integration and concurrency
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
     services:
       postgres:
         image: pgvector/pgvector:pg17
@@ -76,6 +222,8 @@ jobs:
     env:
       DATABASE_URL: postgresql://dgchat:integration-password@localhost:5432/dgchat_test
       TEST_DATABASE_URL: postgresql://dgchat:integration-password@localhost:5432/dgchat_test
+      DG_CHAT_ALLOW_DESTRUCTIVE_TEST_DATABASES: "true"
+      POSTGRES_TEST_DATABASE_PREFIX: dgchat_ci_${{ github.run_id }}_${{ github.run_attempt }}_
     steps:
       - uses: actions/checkout@v4
       - uses: denoland/setup-deno@v2
@@ -84,25 +232,55 @@ jobs:
           cache: true
       - name: Install dependencies
         run: deno install --frozen
-      - name: Apply migrations
-        run: deno task db:migrate
-      - name: Run database integration, concurrency, and backfill tests
+      - name: Prepare freshly migrated test template
+        run: >-
+          deno run --allow-env --allow-net --allow-run
+          tests/run-postgres-test-group.ts --prepare-template
+      - name: Prove destructive database ownership fencing
+        run: >-
+          deno test tests/run-postgres-test-group_ownership_postgres_test.ts
+          --allow-env --allow-net --allow-read --allow-run
+      - name: Run isolated database, API, and worker integration tests sequentially
         run: |
-          deno test packages/database \
-            --ignore=packages/database/src/backup_restore_migration_test.ts \
-            --ignore=packages/database/src/backup_postgres_test.ts \
-            --ignore=packages/database/src/backup_data_postgres_test.ts \
-            --allow-env --allow-net --allow-read --allow-write
-          deno test packages/database/src/backup_restore_migration_test.ts \
-            --allow-env --allow-net --allow-read --allow-write
-          deno test packages/database/src/backup_postgres_test.ts \
-            --allow-env --allow-net --allow-read --allow-write
-          deno test packages/database/src/backup_data_postgres_test.ts \
-            --allow-env --allow-net --allow-read --allow-write
-          deno test apps/api/src/better_auth_postgres_test.ts --allow-env --allow-net --allow-read --allow-write
-          deno test apps/api/src/knowledge_context_postgres_test.ts --allow-env --allow-net --allow-read --allow-write
-          deno test apps/api/src/tool-execution_postgres_test.ts --allow-env --allow-net --allow-read --allow-write
-          deno test --unstable-worker-options apps/worker --allow-env --allow-net --allow-read --allow-write --allow-run
+          mapfile -t database_tests < <(rg -l 'TEST_DATABASE_URL' \
+            packages/database/src --glob '*_test.ts' | sort)
+          mapfile -t api_tests < <(rg -l 'TEST_DATABASE_URL' apps/api/src --glob '*_test.ts' \
+            | rg -v 'backup_stack_postgres_s3_test.ts$' | sort)
+          mapfile -t worker_tests < <(rg -l 'TEST_DATABASE_URL' \
+            apps/worker/src --glob '*_test.ts' | sort)
+          ((${#database_tests[@]} > 0))
+          ((${#api_tests[@]} > 0))
+          ((${#worker_tests[@]} > 0))
+
+          index=0
+          for test_file in "${database_tests[@]}"; do
+            index=$((index + 1))
+            printf -v group 'db_test_%03d' "$index"
+            deno run --allow-env --allow-net --allow-run tests/run-postgres-test-group.ts \
+              "$group" deno test "$test_file" \
+              --allow-env --allow-net --allow-read --allow-write
+          done
+
+          for test_file in "${api_tests[@]}"; do
+            index=$((index + 1))
+            printf -v group 'api_test_%03d' "$index"
+            deno run --allow-env --allow-net --allow-run tests/run-postgres-test-group.ts \
+              "$group" deno test "$test_file" \
+              --allow-env --allow-net --allow-read --allow-write
+          done
+
+          for test_file in "${worker_tests[@]}"; do
+            index=$((index + 1))
+            printf -v group 'worker_test_%03d' "$index"
+            deno run --allow-env --allow-net --allow-run tests/run-postgres-test-group.ts \
+              "$group" deno test --unstable-worker-options "$test_file" \
+              --allow-env --allow-net --allow-read --allow-write --allow-run
+          done
+      - name: Remove isolated database template
+        if: always()
+        run: >-
+          deno run --allow-env --allow-net --allow-run
+          tests/run-postgres-test-group.ts --cleanup-template
 
   backup-stack-integration:
     name: PostgreSQL and S3 backup roundtrip
@@ -145,7 +323,7 @@ jobs:
             --env MINIO_ROOT_USER="$TEST_S3_ACCESS_KEY" \
             --env MINIO_ROOT_PASSWORD="$TEST_S3_SECRET_KEY" \
             minio/minio:RELEASE.2025-04-22T22-12-26Z server /data
-          for attempt in $(seq 1 30); do
+          for _attempt in $(seq 1 30); do
             if curl --fail --silent http://127.0.0.1:9000/minio/health/live >/dev/null; then
               exit 0
             fi
@@ -208,10 +386,60 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.target }}
           cache-to: type=gha,mode=max,scope=${{ matrix.target }}
 
+  production-compose-smoke:
+    name: Production Compose startup and graceful restart
+    runs-on: ubuntu-latest
+    needs: [containers]
+    timeout-minutes: 30
+    env:
+      COMPOSE_PROJECT_NAME: dg-chat-production-smoke
+      POSTGRES_PASSWORD: production-smoke-postgres-password
+      MINIO_ROOT_USER: production-smoke-minio-user
+      MINIO_ROOT_PASSWORD: production-smoke-minio-password
+      APP_SECRET: production-smoke-app-secret-at-least-thirty-two-bytes
+      ENCRYPTION_KEY: cHJvZHVjdGlvbi1zbW9rZS1lbmNyeXB0aW9uLWtleSE=
+      SETUP_TOKEN: production-smoke-setup-token
+      WEB_HOST_PORT: "8000"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+          cache: true
+      - name: Start fresh production stack
+        run: docker compose -f docker-compose.yml up -d --build
+      - name: Assert production startup and health
+        run: |
+          deno run --allow-net tests/wait-for-ready.ts http://localhost:8000/ready 180000
+          bash tests/assert-compose-health.sh -f docker-compose.yml
+          app_id="$(docker compose -f docker-compose.yml ps --quiet app)"
+          worker_id="$(docker compose -f docker-compose.yml ps --quiet worker)"
+          test "$(docker inspect --format '{{range .Config.Env}}{{if eq . "DENO_ENV=production"}}true{{end}}{{end}}' "$app_id")" = true
+          test "$(docker inspect --format '{{range .Config.Env}}{{if eq . "DENO_ENV=production"}}true{{end}}{{end}}' "$worker_id")" = true
+      - name: Assert bounded graceful stop and restart
+        run: |
+          bash tests/assert-compose-graceful-restart.sh -f docker-compose.yml
+          deno run --allow-net tests/wait-for-ready.ts http://localhost:8000/ready 180000
+          bash tests/assert-compose-health.sh -f docker-compose.yml
+      - name: Capture production service logs
+        if: failure()
+        run: docker compose -f docker-compose.yml logs --no-color > compose-production-smoke.log
+      - name: Upload production service logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-production-smoke-log
+          path: compose-production-smoke.log
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Stop production stack
+        if: always()
+        run: docker compose -f docker-compose.yml down -v --remove-orphans
+
   openai-contracts:
     name: Official OpenAI SDK contracts
     runs-on: ubuntu-latest
-    needs: [quality, containers, postgres-integration]
+    needs: [quality, containers, postgres-integration, production-compose-smoke]
     timeout-minutes: 30
     env:
       POSTGRES_PASSWORD: contract-postgres-password
@@ -257,11 +485,18 @@ jobs:
         run: docker compose -f docker-compose.yml -f docker-compose.ci.yml -f docker-compose.contracts.yml down -v --remove-orphans
 
   e2e:
-    name: Browser tests
+    name: Browser tests (${{ matrix.project }})
     runs-on: ubuntu-latest
-    needs: [quality, containers, postgres-integration]
-    timeout-minutes: 30
+    needs: [quality, containers, postgres-integration, production-compose-smoke]
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [chromium, mobile-chromium]
     env:
+      # Matrix jobs run on separate GitHub runners. An explicit Compose project name also keeps
+      # every database, object bucket, network, and volume scoped to its browser project.
+      COMPOSE_PROJECT_NAME: dg-chat-e2e-${{ matrix.project }}
       POSTGRES_PASSWORD: ci-postgres-password
       MINIO_ROOT_USER: ci-minio-user
       MINIO_ROOT_PASSWORD: ci-minio-password
@@ -270,9 +505,10 @@ jobs:
       SETUP_TOKEN: e2e-setup-token
       E2E_BASE_URL: http://localhost:8000
       E2E_API_URL: http://localhost:8000
-      E2E_ADMIN_EMAIL: admin@e2e.invalid
+      E2E_ADMIN_EMAIL: admin-${{ matrix.project }}@e2e.invalid
       E2E_ADMIN_PASSWORD: Correct-Horse-42-Battery!
       DEFAULT_APPROVAL_CREDIT_USD: "6.75"
+      E2E_KNOWLEDGE_EMBEDDINGS: "true"
       CI: "true"
     steps:
       - uses: actions/checkout@v4
@@ -283,20 +519,20 @@ jobs:
       - name: Install test dependencies
         run: deno install --frozen
       - name: Start disposable stack
-        run: docker compose -f docker-compose.yml -f docker-compose.ci.yml -f docker-compose.oidc.yml up -d --build
+        run: docker compose -f docker-compose.yml -f docker-compose.ci.yml -f docker-compose.contracts.yml -f docker-compose.oidc.yml up -d --build
       - name: Wait for readiness
         run: deno run --allow-net tests/wait-for-ready.ts http://localhost:8000/ready 180000
       - name: Assert migration-safe worker startup
-        run: bash tests/assert-compose-health.sh -f docker-compose.yml -f docker-compose.ci.yml -f docker-compose.oidc.yml
+        run: bash tests/assert-compose-health.sh -f docker-compose.yml -f docker-compose.ci.yml -f docker-compose.contracts.yml -f docker-compose.oidc.yml
       - name: Install browser
         run: npx playwright install --with-deps chromium
       - name: Run Playwright
-        run: npx playwright test
+        run: npx playwright test --project=${{ matrix.project }}
       - name: Upload browser report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: playwright-report
+          name: playwright-report-${{ matrix.project }}
           path: |
             playwright-report
             test-results
@@ -305,7 +541,7 @@ jobs:
       - name: Capture service logs
         if: failure()
         run: |
-          docker compose -f docker-compose.yml -f docker-compose.ci.yml -f docker-compose.oidc.yml logs --no-color > compose.log
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml -f docker-compose.contracts.yml -f docker-compose.oidc.yml logs --no-color > compose.log
           curl --fail --silent --show-error \
             -H 'Authorization: Bearer ci-mock-oidc-control-token' \
             http://localhost:4020/control/state > mock-oidc-state.json || true
@@ -313,11 +549,11 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: compose-logs
+          name: compose-logs-${{ matrix.project }}
           path: |
             compose.log
             mock-oidc-state.json
           retention-days: 7
       - name: Stop disposable stack
         if: always()
-        run: docker compose -f docker-compose.yml -f docker-compose.ci.yml -f docker-compose.oidc.yml down -v --remove-orphans
+        run: docker compose -f docker-compose.yml -f docker-compose.ci.yml -f docker-compose.contracts.yml -f docker-compose.oidc.yml down -v --remove-orphans

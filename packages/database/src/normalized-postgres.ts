@@ -21,6 +21,9 @@ import type {
   ConversationFolder,
   ConversationFolderMembership,
   ConversationPortabilityV1,
+  ConversationSearchPage,
+  ConversationSearchQuery,
+  ConversationSearchResult,
   ConversationShareSummary,
   ConversationTag,
   ConversationTagBinding,
@@ -47,7 +50,14 @@ import {
   API_SSE_REPLAY_REQUEST_MAX_EVENTS,
   apiResponseBodyByteLength,
   canonicalWorkspaceName,
+  CONVERSATION_SEARCH_APPLICATION_NAME,
+  CONVERSATION_SEARCH_POOL_MAX,
+  CONVERSATION_SEARCH_QUERY_VALIDATION_MESSAGE,
+  CONVERSATION_SEARCH_STATEMENT_TIMEOUT_MS,
+  conversationSearchSnippet,
+  decodeConversationSearchCursor,
   DEFAULT_API_REPLAY_QUOTA,
+  encodeConversationSearchCursor,
   KNOWLEDGE_EMBEDDING_DIMENSIONS,
   MAX_ACTIVE_CONVERSATION_SHARES,
   MAX_CONVERSATION_SHARE_ATTACHMENTS,
@@ -58,6 +68,8 @@ import {
   splitApiSseReplayFrame,
   validateChunkEmbeddings,
   validateDocumentChunkInputs,
+  validConversationSearchScopeId,
+  validConversationSearchTerm,
 } from "./repository.ts";
 import type { LedgerEntry, StoredApiToken, StoredSession, StoredUser, UsageRun } from "./memory.ts";
 import type {
@@ -76,6 +88,9 @@ import type {
   AdminRoleCommand,
   AdminStateCommand,
   AdminTokenLookupPage,
+  AdminWorkerInstance,
+  AdminWorkerPage,
+  AdminWorkerQuery,
   ApiIdempotencyEndpoint,
   ApiIdempotencyFrame,
   ApiIdempotencyRequest,
@@ -83,6 +98,8 @@ import type {
   ApiSseFrameInput,
   ApiUsageObservation,
   AppendMessageInput,
+  AttachmentListQuery,
+  AttachmentPage,
   AttachmentRecord,
   AttachmentState,
   AuditEvent,
@@ -199,9 +216,9 @@ const iso = (value: unknown) => value instanceof Date ? value.toISOString() : St
 const nullableIso = (value: unknown) => value == null ? null : iso(value);
 const number = (value: unknown) => Number(value);
 
-const isEffectiveAdminRow = (row: Row): boolean =>
+const isEffectiveAdminRow = (row: Row, requireEmailVerification = false): boolean =>
   row.role === "admin" && row.approval_status === "approved" && row.state === "active" &&
-  row.deleted_at == null;
+  row.deleted_at == null && (!requireEmailVerification || row.email_verified_at != null);
 
 function adminUser(row: Row): AdminUser {
   const stored = user(row);
@@ -255,9 +272,10 @@ function adminMutationMetadata(
 async function assertEffectiveAdminActor(
   tx: postgres.TransactionSql,
   actorId: string,
+  requireEmailVerification = false,
 ): Promise<void> {
   const actors = await tx<Row[]>`SELECT * FROM users WHERE id=${actorId} FOR UPDATE`;
-  if (!actors[0] || !isEffectiveAdminRow(actors[0])) {
+  if (!actors[0] || !isEffectiveAdminRow(actors[0], requireEmailVerification)) {
     throw new DomainError(
       "admin_authority_required",
       "Administrator authority changed before the request completed",
@@ -270,6 +288,8 @@ async function invalidateFullUserAuthority(
   tx: postgres.TransactionSql,
   userId: string,
 ): Promise<void> {
+  await tx`UPDATE users SET authority_epoch=authority_epoch+1,updated_at=now()
+    WHERE id=${userId}`;
   await tx`UPDATE sessions SET invalidated_at=now()
     WHERE user_id=${userId} AND limited=false AND invalidated_at IS NULL`;
   await tx`DELETE FROM auth_sessions WHERE user_id=${userId} AND limited=false`;
@@ -364,6 +384,7 @@ function user(row: Row): StoredUser {
     name: String(row.name),
     passwordHash: row.password_hash == null ? null : String(row.password_hash),
     passwordResetPending: row.password_reset_pending === true,
+    authorityEpoch: number(row.authority_epoch ?? 1),
     role: row.role as StoredUser["role"],
     approvalStatus: row.approval_status as StoredUser["approvalStatus"],
     state: row.state as StoredUser["state"],
@@ -528,6 +549,7 @@ function token(row: Row): StoredApiToken {
     tokenHash: String(row.token_hash),
     preview: String(row.preview),
     scopes: row.scopes as string[],
+    authorityEpoch: number(row.authority_epoch ?? 1),
     version: number(row.version),
     rpmLimit: row.rpm_limit == null ? null : number(row.rpm_limit),
     burstLimit: row.burst_limit == null ? null : number(row.burst_limit),
@@ -546,7 +568,12 @@ function token(row: Row): StoredApiToken {
   };
 }
 function tokenSummary(value: StoredApiToken) {
-  const { tokenHash: _hash, userId: _userId, ...summary } = value;
+  const {
+    tokenHash: _hash,
+    userId: _userId,
+    authorityEpoch: _authorityEpoch,
+    ...summary
+  } = value;
   return summary;
 }
 function adminBalanceAdjustment(row: Row, replayed: boolean): AdminBalanceAdjustment {
@@ -586,8 +613,10 @@ function run(row: Row): UsageRun {
   return {
     id: String(row.id),
     userId: String(row.user_id),
+    tokenId: row.token_id == null ? null : String(row.token_id),
     model: String(row.model),
     provider: String(row.provider),
+    recoveryOwner: String(row.recovery_owner) as UsageRun["recoveryOwner"],
     status: row.status as UsageRun["status"],
     reservedMicros: number(row.reserved_micros),
     costMicros: number(row.cost_micros),
@@ -1129,19 +1158,173 @@ function apiFrame(row: Row): ApiIdempotencyFrame {
   };
 }
 
+interface CancellablePostgresQuery<T> extends PromiseLike<T> {
+  cancel(): void | Promise<void>;
+}
+
+async function endPostgresPool(
+  sql: ReturnType<typeof postgres>,
+  timeout: number,
+): Promise<void> {
+  await sql.end({ timeout });
+}
+
+/**
+ * Closes every distinct pool owned by a repository before reporting any failure. Keeping this
+ * settlement at the repository boundary prevents a rejected driver close from being mistaken for
+ * proof that shutdown completed.
+ */
+export async function closeOwnedPostgresPools<T extends object>(
+  pools: readonly (T | undefined)[],
+  timeout: number,
+  closePool: (pool: T, timeout: number) => Promise<void>,
+): Promise<void> {
+  const uniquePools = [...new Set(pools.filter((pool): pool is T => pool !== undefined))];
+  const results = await Promise.allSettled(
+    uniquePools.map(async (pool) => await closePool(pool, timeout)),
+  );
+  const failures = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+  if (failures.length) throw new AggregateError(failures, "Failed to close PostgreSQL pools");
+}
+
+/**
+ * A search has one wall-clock deadline across scope checks and the result query. The PostgreSQL
+ * startup parameter is the authoritative per-statement limit; this watchdog also bounds time spent
+ * waiting for a connection in postgres.js' queue, where PostgreSQL cannot yet enforce a timeout.
+ */
+async function awaitConversationSearchQuery<T>(
+  query: CancellablePostgresQuery<T>,
+  deadlineAt: number,
+  callerSignal?: AbortSignal,
+): Promise<T> {
+  callerSignal?.throwIfAborted();
+  let deadlineElapsed = false;
+  const cancel = () => {
+    try {
+      void Promise.resolve(query.cancel()).catch(() => undefined);
+    } catch {
+      // The query may have completed between the abort event and cancellation dispatch.
+    }
+  };
+  const remainingMs = Math.max(0, deadlineAt - performance.now());
+  const deadlineTimer = setTimeout(() => {
+    deadlineElapsed = true;
+    cancel();
+  }, remainingMs);
+  callerSignal?.addEventListener("abort", cancel, { once: true });
+  try {
+    const result = await query;
+    // A caller cancellation always wins a same-turn race with the internal deadline.
+    callerSignal?.throwIfAborted();
+    if (deadlineElapsed) {
+      throw new DomainError(
+        "search_timeout",
+        "Conversation search took too long. Try a more specific phrase.",
+        503,
+      );
+    }
+    return result;
+  } catch (error) {
+    callerSignal?.throwIfAborted();
+    if (deadlineElapsed || (error as { code?: string }).code === "57014") {
+      throw new DomainError(
+        "search_timeout",
+        "Conversation search took too long. Try a more specific phrase.",
+        503,
+      );
+    }
+    throw error;
+  } finally {
+    clearTimeout(deadlineTimer);
+    callerSignal?.removeEventListener("abort", cancel);
+  }
+}
+
 export class PostgresRepository implements DomainRepository {
   readonly storageKind = "postgres" as const;
   readonly #sql: ReturnType<typeof postgres>;
-  private constructor(sql: ReturnType<typeof postgres>) {
+  readonly #conversationSearchSql: ReturnType<typeof postgres>;
+  private constructor(
+    sql: ReturnType<typeof postgres>,
+    conversationSearchSql: ReturnType<typeof postgres>,
+  ) {
     this.#sql = sql;
+    this.#conversationSearchSql = conversationSearchSql;
   }
-  static async connect(url: string) {
-    const sql = postgres(url, { max: 10 });
-    await sql`SELECT 1`;
-    return new PostgresRepository(sql);
+  static async connect(
+    url: string,
+    options: {
+      connectTimeoutSeconds?: number;
+      statementTimeoutMs?: number;
+      /** Worker processes never execute conversation search and must not reserve its pool. */
+      conversationSearch?: boolean;
+      poolMax?: number;
+    } = {},
+  ) {
+    const connectTimeoutSeconds = options.connectTimeoutSeconds;
+    const statementTimeoutMs = options.statementTimeoutMs;
+    if (
+      statementTimeoutMs !== undefined &&
+      (!Number.isSafeInteger(statementTimeoutMs) || statementTimeoutMs < 1 ||
+        statementTimeoutMs > 2_147_483_647)
+    ) throw new TypeError("PostgreSQL statement timeout is invalid");
+    let sql: ReturnType<typeof postgres> | undefined;
+    if (
+      options.poolMax !== undefined &&
+      (!Number.isSafeInteger(options.poolMax) || options.poolMax < 1 || options.poolMax > 100)
+    ) throw new TypeError("PostgreSQL pool maximum is invalid");
+    let conversationSearchSql: ReturnType<typeof postgres> | undefined;
+    try {
+      sql = postgres(url, {
+        max: options.poolMax ?? 10,
+        ...(connectTimeoutSeconds === undefined ? {} : { connect_timeout: connectTimeoutSeconds }),
+        ...(statementTimeoutMs === undefined
+          ? {}
+          : { connection: { statement_timeout: statementTimeoutMs } }),
+      });
+      conversationSearchSql = options.conversationSearch === false ? sql : postgres(url, {
+        max: CONVERSATION_SEARCH_POOL_MAX,
+        connect_timeout: connectTimeoutSeconds ?? 5,
+        idle_timeout: 20,
+        max_lifetime: 60 * 30,
+        connection: {
+          application_name: CONVERSATION_SEARCH_APPLICATION_NAME,
+          statement_timeout: statementTimeoutMs === undefined
+            ? CONVERSATION_SEARCH_STATEMENT_TIMEOUT_MS
+            : Math.min(statementTimeoutMs, CONVERSATION_SEARCH_STATEMENT_TIMEOUT_MS),
+        },
+      });
+      await sql`SELECT 1`;
+      if (conversationSearchSql !== sql) {
+        await conversationSearchSql`/* dg-chat:conversation-search:connect */ SELECT 1`;
+      }
+      return new PostgresRepository(sql, conversationSearchSql);
+    } catch (error) {
+      // A failed constructor or startup connection never reaches an instance whose close() caller
+      // can invoke. Attempt both closes even if one pool failed to initialize or close cleanly.
+      await closeOwnedPostgresPools(
+        [sql, conversationSearchSql],
+        0,
+        endPostgresPool,
+      ).catch(() => undefined);
+      throw error;
+    }
   }
   async close() {
-    await this.#sql.end({ timeout: 5 });
+    await closeOwnedPostgresPools(
+      [this.#sql, this.#conversationSearchSql],
+      5,
+      endPostgresPool,
+    );
+  }
+
+  /** Immediately destroys owned pools. Used only by the worker's absolute shutdown watchdog. */
+  async forceClose(): Promise<void> {
+    await closeOwnedPostgresPools(
+      [this.#sql, this.#conversationSearchSql],
+      0,
+      endPostgresPool,
+    );
   }
 
   async bootstrapAdmin(input: CreateUserInput, credit: number) {
@@ -1270,30 +1453,55 @@ export class PostgresRepository implements DomainRepository {
     if (!rows[0]) throw new DomainError("not_found", "User not found", 404);
     return adminUser(rows[0]);
   }
-  async createSession(userId: string, tokenHash: string, limited: boolean) {
-    const rows = await this.#sql<
-      Row[]
-    >`INSERT INTO sessions (user_id,token_hash,limited,expires_at) VALUES (${userId},${tokenHash},${limited},now()+interval '30 days') RETURNING *`;
-    return {
-      id: String(rows[0].id),
-      tokenHash: String(rows[0].token_hash),
-      userId: String(rows[0].user_id),
-      limited: Boolean(rows[0].limited),
-      expiresAt: new Date(rows[0].expires_at as string).getTime(),
-      createdAt: iso(rows[0].created_at),
-      invalidatedAt: nullableIso(rows[0].invalidated_at),
-    };
+  async createSession(
+    userId: string,
+    tokenHash: string,
+    limited: boolean,
+    expectedAuthorityEpoch = 1,
+  ) {
+    return await this.#sql.begin(async (tx) => {
+      // Credential issuance and administrative authority loss take the same row lock. If a
+      // suspension/rejection/deletion commits first, issuance observes the terminal state and
+      // fails. If issuance commits first, the lifecycle transaction invalidates this session.
+      const users = await tx<Row[]>`SELECT approval_status,state,deleted_at,
+        password_reset_pending,authority_epoch FROM users WHERE id=${userId} FOR UPDATE`;
+      const user = users[0];
+      const eligible = user && user.state === "active" && user.deleted_at == null &&
+        user.password_reset_pending !== true && user.approval_status !== "rejected" &&
+        (limited || user.approval_status === "approved") &&
+        number(user.authority_epoch) === expectedAuthorityEpoch;
+      if (!eligible) {
+        throw new DomainError("account_unavailable", "Account cannot create this session", 403);
+      }
+      const rows = await tx<
+        Row[]
+      >`INSERT INTO sessions (user_id,token_hash,limited,authority_epoch,expires_at)
+        VALUES (${userId},${tokenHash},${limited},${expectedAuthorityEpoch},now()+interval '30 days') RETURNING *`;
+      return {
+        id: String(rows[0].id),
+        tokenHash: String(rows[0].token_hash),
+        userId: String(rows[0].user_id),
+        limited: Boolean(rows[0].limited),
+        authorityEpoch: number(rows[0].authority_epoch),
+        expiresAt: new Date(rows[0].expires_at as string).getTime(),
+        createdAt: iso(rows[0].created_at),
+        invalidatedAt: nullableIso(rows[0].invalidated_at),
+      };
+    });
   }
   async getSession(tokenHash: string): Promise<StoredSession | undefined> {
     const rows = await this.#sql<
       Row[]
-    >`SELECT * FROM sessions WHERE token_hash=${tokenHash} AND invalidated_at IS NULL AND expires_at>now()`;
+    >`SELECT s.* FROM sessions s JOIN users u ON u.id=s.user_id
+      WHERE s.token_hash=${tokenHash} AND s.invalidated_at IS NULL AND s.expires_at>now()
+        AND (s.limited=true OR s.authority_epoch=u.authority_epoch)`;
     return rows[0]
       ? {
         id: String(rows[0].id),
         tokenHash,
         userId: String(rows[0].user_id),
         limited: Boolean(rows[0].limited),
+        authorityEpoch: number(rows[0].authority_epoch),
         expiresAt: new Date(rows[0].expires_at as string).getTime(),
         createdAt: iso(rows[0].created_at),
         invalidatedAt: nullableIso(rows[0].invalidated_at),
@@ -1403,7 +1611,9 @@ export class PostgresRepository implements DomainRepository {
       WHERE (${query.source ?? null}::text IS NULL OR source=${query.source ?? null})
         AND (${query.status ?? null}::text IS NULL OR status=${query.status ?? null})
         AND (${cursor?.position ?? null}::text IS NULL OR
-          (created_at,sort_id)<(${cursor?.position ?? null}::timestamptz,${cursor?.id ?? null}))
+          (created_at,sort_id)<(
+            ${cursor?.position ?? null}::text::timestamptz,${cursor?.id ?? null}
+          ))
       ORDER BY created_at DESC,sort_id DESC LIMIT ${limit + 1}`;
       const data = rows.slice(0, limit).map((row) => ({
         id: String(row.sort_id),
@@ -1462,7 +1672,9 @@ export class PostgresRepository implements DomainRepository {
       ) SELECT * FROM token_page
       WHERE (${query.status ?? null}::text IS NULL OR status=${query.status ?? null})
         AND (${cursor?.position ?? null}::text IS NULL OR
-          (created_at,id)<(${cursor?.position ?? null}::timestamptz,${cursor?.id ?? null}::uuid))
+          (created_at,id)<(
+            ${cursor?.position ?? null}::text::timestamptz,${cursor?.id ?? null}::uuid
+          ))
       ORDER BY created_at DESC,id DESC LIMIT ${limit + 1}`;
       const data = rows.slice(0, limit).map((row) => ({
         ...tokenSummary(token(row)),
@@ -1672,16 +1884,26 @@ export class PostgresRepository implements DomainRepository {
     purpose: IdentityTokenPurpose,
     tokenHash: string,
     expiresAt: string,
+    expectedAuthorityEpoch: number,
   ) {
-    const rows = await this.#sql<{ user_id: string }[]>`
-      INSERT INTO identity_tokens(user_id,purpose,token_hash,expires_at)
-      VALUES(${userId},${purpose},${tokenHash},${expiresAt})
+    const rows = await this.#sql.begin(async (tx) => {
+      const users = await tx<Row[]>`SELECT authority_epoch,state,deleted_at FROM users
+        WHERE id=${userId} FOR UPDATE`;
+      if (
+        !users[0] || users[0].state !== "active" || users[0].deleted_at != null ||
+        number(users[0].authority_epoch) !== expectedAuthorityEpoch
+      ) throw new DomainError("account_unavailable", "Identity authority changed", 403);
+      return await tx<{ user_id: string }[]>`
+      INSERT INTO identity_tokens(user_id,purpose,token_hash,expires_at,authority_epoch)
+      VALUES(${userId},${purpose},${tokenHash},${expiresAt},${expectedAuthorityEpoch})
       ON CONFLICT(token_hash) DO UPDATE SET token_hash=EXCLUDED.token_hash
       WHERE identity_tokens.user_id=EXCLUDED.user_id
         AND identity_tokens.purpose=EXCLUDED.purpose
+        AND identity_tokens.authority_epoch=EXCLUDED.authority_epoch
         AND identity_tokens.consumed_at IS NULL
       RETURNING user_id
-    `;
+      `;
+    });
     if (!rows[0]) {
       throw new DomainError(
         "identity_token_conflict",
@@ -1692,13 +1914,28 @@ export class PostgresRepository implements DomainRepository {
   }
   async verifyEmail(tokenHash: string) {
     return await this.#sql.begin(async (tx) => {
-      const tokens = await tx<
-        Row[]
-      >`UPDATE identity_tokens t SET consumed_at=now() FROM users u
-        WHERE t.token_hash=${tokenHash} AND t.purpose='email_verification'
-          AND t.consumed_at IS NULL AND t.expires_at>now() AND u.id=t.user_id
-          AND u.state='active' AND u.deleted_at IS NULL
-        RETURNING t.user_id`;
+      const candidates = await tx<Row[]>`SELECT user_id FROM identity_tokens
+        WHERE token_hash=${tokenHash} AND purpose='email_verification'`;
+      if (!candidates[0]) {
+        throw new DomainError(
+          "invalid_identity_token",
+          "Verification token is invalid or expired",
+          400,
+        );
+      }
+      const userId = String(candidates[0].user_id);
+      const users = await tx<Row[]>`SELECT * FROM users WHERE id=${userId} FOR UPDATE`;
+      if (!users[0] || users[0].state !== "active" || users[0].deleted_at !== null) {
+        throw new DomainError(
+          "invalid_identity_token",
+          "Verification token is invalid or expired",
+          400,
+        );
+      }
+      const tokens = await tx<Row[]>`SELECT id FROM identity_tokens
+        WHERE token_hash=${tokenHash} AND purpose='email_verification' AND user_id=${userId}
+          AND authority_epoch=${number(users[0].authority_epoch)}
+          AND consumed_at IS NULL AND expires_at>now() FOR UPDATE`;
       if (!tokens[0]) {
         throw new DomainError(
           "invalid_identity_token",
@@ -1706,14 +1943,14 @@ export class PostgresRepository implements DomainRepository {
           400,
         );
       }
+      await tx`UPDATE identity_tokens SET consumed_at=now() WHERE id=${String(tokens[0].id)}`;
       const rows = await tx<
         Row[]
-      >`UPDATE users SET email_verified_at=COALESCE(email_verified_at,now()),updated_at=now() WHERE id=${
-        String(tokens[0].user_id)
-      } RETURNING *`;
+      >`UPDATE users SET email_verified_at=COALESCE(email_verified_at,now()),updated_at=now()
+        WHERE id=${userId} RETURNING *`;
       await tx`
         UPDATE auth_users SET email_verified=true,updated_at=now()
-        WHERE id=${String(tokens[0].user_id)}
+        WHERE id=${userId}
       `;
       return user(rows[0]);
     });
@@ -1730,17 +1967,26 @@ export class PostgresRepository implements DomainRepository {
   }
   async resetPassword(tokenHash: string, passwordHash: string) {
     return await this.#sql.begin(async (tx) => {
-      const tokens = await tx<
-        Row[]
-      >`UPDATE identity_tokens t SET consumed_at=now() FROM users u
-        WHERE t.token_hash=${tokenHash} AND t.purpose='password_reset'
-          AND t.consumed_at IS NULL AND t.expires_at>now() AND u.id=t.user_id
-          AND u.state='active' AND u.deleted_at IS NULL
-        RETURNING t.user_id`;
+      // Discover the subject without a lock, then take every durable lock in the global
+      // user-before-verification order used by lifecycle invalidation.
+      const candidates = await tx<Row[]>`SELECT user_id FROM identity_tokens
+        WHERE token_hash=${tokenHash} AND purpose='password_reset'`;
+      if (!candidates[0]) {
+        throw new DomainError("invalid_identity_token", "Reset token is invalid or expired", 400);
+      }
+      const userId = String(candidates[0].user_id);
+      const users = await tx<Row[]>`SELECT * FROM users WHERE id=${userId} FOR UPDATE`;
+      if (!users[0] || users[0].state !== "active" || users[0].deleted_at !== null) {
+        throw new DomainError("invalid_identity_token", "Reset token is invalid or expired", 400);
+      }
+      const tokens = await tx<Row[]>`SELECT id FROM identity_tokens
+        WHERE token_hash=${tokenHash} AND purpose='password_reset' AND user_id=${userId}
+          AND authority_epoch=${number(users[0].authority_epoch)}
+          AND consumed_at IS NULL AND expires_at>now() FOR UPDATE`;
       if (!tokens[0]) {
         throw new DomainError("invalid_identity_token", "Reset token is invalid or expired", 400);
       }
-      const userId = String(tokens[0].user_id);
+      await tx`UPDATE identity_tokens SET consumed_at=now() WHERE id=${String(tokens[0].id)}`;
       const credentials = await tx`
         UPDATE auth_accounts SET password=${passwordHash},updated_at=now()
         WHERE provider_id='credential' AND account_id=${userId} AND user_id=${userId}
@@ -1751,7 +1997,8 @@ export class PostgresRepository implements DomainRepository {
       }
       const rows = await tx<
         Row[]
-      >`UPDATE users SET password_hash=NULL,updated_at=now() WHERE id=${userId} RETURNING *`;
+      >`UPDATE users SET password_hash=NULL,authority_epoch=authority_epoch+1,updated_at=now()
+        WHERE id=${userId} RETURNING *`;
       await tx`UPDATE sessions SET invalidated_at=now() WHERE user_id=${userId} AND invalidated_at IS NULL`;
       await tx`DELETE FROM auth_sessions WHERE user_id=${userId}`;
       await tx`UPDATE api_tokens SET revoked_at=now() WHERE user_id=${userId} AND revoked_at IS NULL`;
@@ -1759,59 +2006,56 @@ export class PostgresRepository implements DomainRepository {
       return user(rows[0]);
     });
   }
-  async prepareBetterAuthPasswordReset(token: string) {
-    await this.#sql.begin(async (tx) => {
-      const verifications = await tx<{ value: string }[]>`
+  async resetBetterAuthPassword(token: string, passwordHash: string) {
+    return await this.#sql.begin(async (tx) => {
+      const identifier = `reset-password:${token}`;
+      // Subject discovery is deliberately non-locking. Every authority-changing transaction
+      // takes the durable user lock first, followed by the verification lock.
+      const candidates = await tx<{ value: string }[]>`
         SELECT value FROM auth_verifications
-        WHERE identifier=${`reset-password:${token}`} AND expires_at>now()
+        WHERE identifier=${identifier} AND expires_at>now()
+      `;
+      if (!candidates[0]) {
+        throw new DomainError("invalid_identity_token", "Reset token is invalid or expired", 400);
+      }
+      const userId = candidates[0].value;
+      const users = await tx<Row[]>`SELECT * FROM users WHERE id=${userId} FOR UPDATE`;
+      if (!users[0] || users[0].state !== "active" || users[0].deleted_at !== null) {
+        throw new DomainError("invalid_identity_token", "Reset token is invalid or expired", 400);
+      }
+      const authorityEpoch = number(users[0].authority_epoch);
+      const verifications = await tx<Row[]>`
+        SELECT id FROM auth_verifications
+        WHERE identifier=${identifier} AND value=${userId}
+          AND authority_epoch=${authorityEpoch} AND expires_at>now()
         FOR UPDATE
       `;
       if (!verifications[0]) {
         throw new DomainError("invalid_identity_token", "Reset token is invalid or expired", 400);
       }
-      const userId = verifications[0].value;
-      const users = await tx<Row[]>`SELECT * FROM users WHERE id=${userId} FOR UPDATE`;
-      if (!users[0] || users[0].state !== "active" || users[0].deleted_at !== null) {
-        throw new DomainError("account_unavailable", "Account is unavailable", 403);
+      const credentials = await tx`
+        UPDATE auth_accounts SET password=${passwordHash},updated_at=now()
+        WHERE provider_id='credential' AND account_id=${userId} AND user_id=${userId}
+        RETURNING id
+      `;
+      if (!credentials.length) {
+        throw new DomainError("credential_not_found", "Local credential is unavailable", 409);
       }
-      const identifier = `reset-password:${token}`;
-      if (
-        users[0].password_reset_pending === true &&
-        users[0].password_reset_token_identifier !== identifier
-      ) {
-        await tx`DELETE FROM auth_verifications
-          WHERE identifier=${String(users[0].password_reset_token_identifier)}`;
-      }
-      // Fail closed before Better Auth changes the credential. If any later
-      // reset step fails, authorization remains denied and all old authority
-      // stays revoked. The same unconsumed token may retry safely.
-      await tx`UPDATE users SET password_reset_pending=true,
-        password_reset_token_identifier=${identifier},password_hash=NULL,updated_at=now()
-        WHERE id=${userId}`;
+      const rows = await tx<Row[]>`
+        UPDATE users SET password_hash=NULL,authority_epoch=authority_epoch+1,
+          password_reset_pending=false,password_reset_token_identifier=NULL,updated_at=now()
+        WHERE id=${userId} RETURNING *
+      `;
       await tx`UPDATE sessions SET invalidated_at=now()
         WHERE user_id=${userId} AND invalidated_at IS NULL`;
       await tx`DELETE FROM auth_sessions WHERE user_id=${userId}`;
-      await tx`UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,now()) WHERE user_id=${userId}`;
-      await tx`UPDATE identity_tokens SET consumed_at=COALESCE(consumed_at,now()) WHERE user_id=${userId}`;
-    });
-  }
-  async secureAfterPasswordReset(userId: string, token: string) {
-    await this.#sql.begin(async (tx) => {
-      const users = await tx`UPDATE users SET password_hash=NULL,
-        password_reset_pending=false,password_reset_token_identifier=NULL,
-        updated_at=now()
-        WHERE id=${userId} AND password_reset_pending=true
-          AND state='active' AND deleted_at IS NULL
-          AND password_reset_token_identifier=${`reset-password:${token}`} RETURNING id`;
-      if (!users.length) {
-        throw new DomainError("password_reset_guard_mismatch", "Password reset guard changed", 409);
-      }
-      await tx`UPDATE sessions SET invalidated_at=now()
-        WHERE user_id=${userId} AND invalidated_at IS NULL`;
-      await tx`DELETE FROM auth_sessions WHERE user_id=${userId}`;
-      await tx`UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,now()) WHERE user_id=${userId}`;
+      await tx`UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,now())
+        WHERE user_id=${userId}`;
       await tx`UPDATE identity_tokens SET consumed_at=COALESCE(consumed_at,now())
         WHERE user_id=${userId}`;
+      await tx`DELETE FROM auth_verifications
+        WHERE value=${userId} AND identifier LIKE 'reset-password:%'`;
+      return user(rows[0]);
     });
   }
   async recordAudit(input: AuditEventInput): Promise<AuditEvent> {
@@ -1898,7 +2142,7 @@ export class PostgresRepository implements DomainRepository {
     ) throw new DomainError("validation_error", "Starting credit is invalid", 422);
     return await this.#sql.begin(async (tx) => {
       await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-final-admin'))`;
-      await assertEffectiveAdminActor(tx, input.actorId);
+      await assertEffectiveAdminActor(tx, input.actorId, input.requireEmailVerification);
       const rows = await tx<Row[]>`SELECT * FROM users WHERE id=${input.targetUserId} FOR UPDATE`;
       const row = rows[0];
       if (!row) throw new DomainError("not_found", "User not found", 404);
@@ -1919,12 +2163,15 @@ export class PostgresRepository implements DomainRepository {
         throw new DomainError("email_not_verified", "Email must be verified before approval", 409);
       }
       const remainsEffective = row.role === "admin" && input.status === "approved" &&
-        row.state === "active" && row.deleted_at == null;
-      if (isEffectiveAdminRow(row) && !remainsEffective) {
+        row.state === "active" && row.deleted_at == null &&
+        (!input.requireEmailVerification || row.email_verified_at != null);
+      if (isEffectiveAdminRow(row, input.requireEmailVerification) && !remainsEffective) {
         const others = await tx<{ count: number }[]>`
           SELECT count(*)::int count FROM users WHERE id<>${input.targetUserId}
             AND role='admin' AND approval_status='approved' AND state='active'
-            AND deleted_at IS NULL`;
+            AND deleted_at IS NULL AND (${
+          input.requireEmailVerification === true
+        }=false OR email_verified_at IS NOT NULL)`;
         if (others[0].count === 0) {
           throw new DomainError("final_admin", "The final active administrator is protected", 409);
         }
@@ -1969,7 +2216,7 @@ export class PostgresRepository implements DomainRepository {
     const reason = validateAdminCommand(input, true);
     return await this.#sql.begin(async (tx) => {
       await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-final-admin'))`;
-      await assertEffectiveAdminActor(tx, input.actorId);
+      await assertEffectiveAdminActor(tx, input.actorId, input.requireEmailVerification);
       const rows = await tx<Row[]>`SELECT * FROM users WHERE id=${input.targetUserId} FOR UPDATE`;
       const row = rows[0];
       if (!row) throw new DomainError("not_found", "User not found", 404);
@@ -1996,13 +2243,19 @@ export class PostgresRepository implements DomainRepository {
           409,
         );
       }
+      if (input.role === "admin" && input.requireEmailVerification && !row.email_verified_at) {
+        throw new DomainError("email_not_verified", "Email must be verified before promotion", 409);
+      }
       const remainsEffective = input.role === "admin" && row.approval_status === "approved" &&
-        row.state === "active" && row.deleted_at == null;
-      if (isEffectiveAdminRow(row) && !remainsEffective) {
+        row.state === "active" && row.deleted_at == null &&
+        (!input.requireEmailVerification || row.email_verified_at != null);
+      if (isEffectiveAdminRow(row, input.requireEmailVerification) && !remainsEffective) {
         const others = await tx<{ count: number }[]>`
           SELECT count(*)::int count FROM users WHERE id<>${input.targetUserId}
             AND role='admin' AND approval_status='approved' AND state='active'
-            AND deleted_at IS NULL`;
+            AND deleted_at IS NULL AND (${
+          input.requireEmailVerification === true
+        }=false OR email_verified_at IS NOT NULL)`;
         if (others[0].count === 0) {
           throw new DomainError("final_admin", "The final active administrator is protected", 409);
         }
@@ -2010,6 +2263,9 @@ export class PostgresRepository implements DomainRepository {
       const before = adminMutationBefore(row);
       const updated = await tx<Row[]>`UPDATE users SET role=${input.role},version=version+1,
         updated_at=now() WHERE id=${input.targetUserId} RETURNING *`;
+      // Promotion and demotion both invalidate the privilege represented by every full
+      // credential. An old user session must never become an administrator session in place.
+      await invalidateFullUserAuthority(tx, input.targetUserId);
       const result = updated[0];
       await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
         VALUES(${input.actorId},${`user.role.${input.role}`},'user',${input.targetUserId},
@@ -2022,7 +2278,7 @@ export class PostgresRepository implements DomainRepository {
     const reason = validateAdminCommand(input, input.state === "suspended");
     return await this.#sql.begin(async (tx) => {
       await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-final-admin'))`;
-      await assertEffectiveAdminActor(tx, input.actorId);
+      await assertEffectiveAdminActor(tx, input.actorId, input.requireEmailVerification);
       const rows = await tx<Row[]>`SELECT * FROM users WHERE id=${input.targetUserId} FOR UPDATE`;
       const row = rows[0];
       if (!row) throw new DomainError("not_found", "User not found", 404);
@@ -2040,12 +2296,15 @@ export class PostgresRepository implements DomainRepository {
         throw new DomainError("self_action_forbidden", "You cannot suspend your own account", 403);
       }
       const remainsEffective = row.role === "admin" && row.approval_status === "approved" &&
-        input.state === "active" && row.deleted_at == null;
-      if (isEffectiveAdminRow(row) && !remainsEffective) {
+        input.state === "active" && row.deleted_at == null &&
+        (!input.requireEmailVerification || row.email_verified_at != null);
+      if (isEffectiveAdminRow(row, input.requireEmailVerification) && !remainsEffective) {
         const others = await tx<{ count: number }[]>`
           SELECT count(*)::int count FROM users WHERE id<>${input.targetUserId}
             AND role='admin' AND approval_status='approved' AND state='active'
-            AND deleted_at IS NULL`;
+            AND deleted_at IS NULL AND (${
+          input.requireEmailVerification === true
+        }=false OR email_verified_at IS NOT NULL)`;
         if (others[0].count === 0) {
           throw new DomainError("final_admin", "The final active administrator is protected", 409);
         }
@@ -2068,7 +2327,7 @@ export class PostgresRepository implements DomainRepository {
     const reason = validateAdminCommand(input, true);
     return await this.#sql.begin(async (tx) => {
       await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-final-admin'))`;
-      await assertEffectiveAdminActor(tx, input.actorId);
+      await assertEffectiveAdminActor(tx, input.actorId, input.requireEmailVerification);
       const rows = await tx<Row[]>`SELECT * FROM users WHERE id=${input.targetUserId} FOR UPDATE`;
       const row = rows[0];
       if (!row) throw new DomainError("not_found", "User not found", 404);
@@ -2086,12 +2345,15 @@ export class PostgresRepository implements DomainRepository {
         throw new DomainError("self_action_forbidden", "You cannot delete your own account", 403);
       }
       const remainsEffective = row.role === "admin" && row.approval_status === "approved" &&
-        row.state === "active" && !input.deleted;
-      if (isEffectiveAdminRow(row) && !remainsEffective) {
+        row.state === "active" && !input.deleted &&
+        (!input.requireEmailVerification || row.email_verified_at != null);
+      if (isEffectiveAdminRow(row, input.requireEmailVerification) && !remainsEffective) {
         const others = await tx<{ count: number }[]>`
           SELECT count(*)::int count FROM users WHERE id<>${input.targetUserId}
             AND role='admin' AND approval_status='approved' AND state='active'
-            AND deleted_at IS NULL`;
+            AND deleted_at IS NULL AND (${
+          input.requireEmailVerification === true
+        }=false OR email_verified_at IS NOT NULL)`;
         if (others[0].count === 0) {
           throw new DomainError("final_admin", "The final active administrator is protected", 409);
         }
@@ -2239,6 +2501,207 @@ export class PostgresRepository implements DomainRepository {
         Row[]
       >`SELECT * FROM conversations WHERE owner_id=${ownerId} AND deleted_at IS NULL ORDER BY updated_at DESC`;
     return rows.map(conversation);
+  }
+  async searchConversations(
+    ownerId: string,
+    query: ConversationSearchQuery,
+    signal?: AbortSignal,
+  ): Promise<ConversationSearchPage> {
+    signal?.throwIfAborted();
+    const deadlineAt = performance.now() + CONVERSATION_SEARCH_STATEMENT_TIMEOUT_MS;
+    const limit = query.limit ?? 25;
+    const needle = query.query.trim();
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new DomainError("validation_error", "Search limit must be between 1 and 100", 422);
+    }
+    const tagIds = query.tagIds ?? [];
+    if (
+      !validConversationSearchTerm(query.query) ||
+      !["chat", "archived", "trash"].includes(query.view) ||
+      (query.folderId !== undefined && !validConversationSearchScopeId(query.folderId)) ||
+      tagIds.length > 20 || new Set(tagIds).size !== tagIds.length ||
+      tagIds.some((id) => !validConversationSearchScopeId(id))
+    ) {
+      if (!validConversationSearchTerm(query.query)) {
+        throw new DomainError(
+          "validation_error",
+          CONVERSATION_SEARCH_QUERY_VALIDATION_MESSAGE,
+          422,
+        );
+      }
+      throw new DomainError("validation_error", "Invalid conversation search", 422);
+    }
+    if (query.folderId) {
+      const folder = await awaitConversationSearchQuery(
+        this.#conversationSearchSql<Row[]>`/* dg-chat:conversation-search:folder-scope */
+          SELECT 1 FROM conversation_folders
+          WHERE id=${query.folderId} AND owner_id=${ownerId}`,
+        deadlineAt,
+        signal,
+      );
+      if (!folder[0]) {
+        throw new DomainError(
+          "validation_error",
+          query.cursor ? "Invalid conversation search cursor" : "Invalid conversation search scope",
+          422,
+        );
+      }
+    }
+    if (tagIds.length) {
+      const tags = await awaitConversationSearchQuery(
+        this.#conversationSearchSql<Row[]>`/* dg-chat:conversation-search:tag-scope */
+          SELECT count(*)::integer AS count FROM conversation_tags
+          WHERE owner_id=${ownerId} AND id=ANY(${
+          this.#conversationSearchSql.array(tagIds)
+        }::uuid[])`,
+        deadlineAt,
+        signal,
+      );
+      if (Number(tags[0]?.count) !== tagIds.length) {
+        throw new DomainError(
+          "validation_error",
+          query.cursor ? "Invalid conversation search cursor" : "Invalid conversation search scope",
+          422,
+        );
+      }
+    }
+    const cursor = query.cursor
+      ? decodeConversationSearchCursor(query.cursor, query, ownerId)
+      : undefined;
+    if (query.cursor && !cursor) {
+      throw new DomainError("validation_error", "Invalid conversation search cursor", 422);
+    }
+    const cursorTimestamp = cursor?.updatedAt ?? null;
+    const cursorId = cursor?.id ?? null;
+    const literalPattern = `%${
+      needle.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_")
+    }%`;
+    const rows = await awaitConversationSearchQuery(
+      this.#conversationSearchSql<Row[]>`/* dg-chat:conversation-search:results */
+      WITH RECURSIVE eligible_base AS (
+        SELECT c.* FROM conversations c
+        WHERE c.owner_id=${ownerId}
+          AND (
+            (${query.view}::text='chat' AND c.deleted_at IS NULL AND c.archived_at IS NULL) OR
+            (${query.view}::text='archived' AND c.deleted_at IS NULL AND c.archived_at IS NOT NULL) OR
+            (${query.view}::text='trash' AND c.deleted_at IS NOT NULL)
+          )
+          AND (${query.folderId ?? null}::uuid IS NULL OR EXISTS(
+            SELECT 1 FROM conversation_folder_memberships folder_scope
+            WHERE folder_scope.owner_id=${ownerId} AND folder_scope.folder_id=${
+        query.folderId ?? null
+      }::uuid AND folder_scope.conversation_id=c.id
+          ))
+          AND (${tagIds.length}=0 OR (
+            SELECT count(*) FROM conversation_tag_bindings tag_scope
+            WHERE tag_scope.owner_id=${ownerId} AND tag_scope.conversation_id=c.id
+              AND tag_scope.tag_id=ANY(${this.#conversationSearchSql.array(tagIds)}::uuid[])
+          )=${tagIds.length})
+      ), matching_titles AS (
+        SELECT c.id
+        FROM conversations c JOIN eligible_base scoped ON scoped.id=c.id
+        WHERE lower(c.title) LIKE lower(${literalPattern}) ESCAPE chr(92)
+      ), searchable_messages AS (
+        SELECT m.id,m.conversation_id,
+          CASE WHEN m.role='user' AND jsonb_typeof(m.metadata->'authoredContent')='string'
+            THEN m.metadata->>'authoredContent' ELSE m.content END AS search_content
+        FROM eligible_base c JOIN messages m ON m.conversation_id=c.id
+        WHERE m.role IN ('user','assistant') AND m.status<>'tombstoned'
+      ), matching_messages AS (
+        SELECT id,conversation_id,
+          substring(search_content FROM greatest(
+            1,strpos(lower(search_content),lower(${needle}))-256
+          ) FOR 1024) AS search_content
+        FROM searchable_messages
+        WHERE lower(search_content) LIKE lower(${literalPattern}) ESCAPE chr(92)
+      ), message_candidate_conversations AS (
+        SELECT DISTINCT conversation_id FROM matching_messages
+      ), active_path AS (
+        SELECT m.id,m.conversation_id,m.parent_id,m.role,m.created_at,
+          ARRAY[m.id]::uuid[] AS visited_ids
+        FROM eligible_base c
+        JOIN message_candidate_conversations candidate ON candidate.conversation_id=c.id
+        JOIN messages m ON m.id=c.active_leaf_id AND m.conversation_id=c.id
+        UNION ALL
+        SELECT parent.id,parent.conversation_id,parent.parent_id,parent.role,parent.created_at,
+          child.visited_ids || parent.id
+        FROM active_path child JOIN messages parent
+          ON parent.id=child.parent_id AND parent.conversation_id=child.conversation_id
+        WHERE NOT parent.id=ANY(child.visited_ids)
+      ), message_matches AS (
+        SELECT DISTINCT ON (path.conversation_id)
+          path.conversation_id,path.id,path.role,candidate.search_content
+        FROM active_path path JOIN matching_messages candidate ON candidate.id=path.id
+        ORDER BY path.conversation_id,path.created_at DESC,path.id DESC
+      ), all_matches AS (
+        SELECT c.*,matched.id AS search_message_id,matched.role AS search_message_role,
+          matched.search_content AS search_message_content,
+          (title_match.id IS NOT NULL) AS search_title_match,
+          to_char(c.updated_at AT TIME ZONE 'UTC',
+            'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS search_cursor_updated_at
+        FROM eligible_base c
+        LEFT JOIN matching_titles title_match ON title_match.id=c.id
+        LEFT JOIN message_matches matched ON matched.conversation_id=c.id
+        WHERE title_match.id IS NOT NULL OR matched.id IS NOT NULL
+      ), cursor_guard AS (
+        SELECT ${cursorTimestamp}::text::timestamptz IS NULL OR EXISTS(
+          SELECT 1 FROM all_matches cursor_match
+          WHERE cursor_match.id=${cursorId}::uuid
+            AND cursor_match.updated_at=${cursorTimestamp}::text::timestamptz
+        ) AS valid
+      ), page AS (
+        SELECT * FROM all_matches candidate
+        WHERE ${cursorTimestamp}::text::timestamptz IS NULL OR
+          -- Cast through text so postgres.js does not coerce the ISO cursor through a
+          -- millisecond-precision JavaScript Date before PostgreSQL compares it.
+          (candidate.updated_at,candidate.id)<(
+            ${cursorTimestamp}::text::timestamptz,${cursorId}::uuid
+          )
+        ORDER BY candidate.updated_at DESC,candidate.id DESC
+        LIMIT ${limit + 1}
+      )
+      -- RIGHT JOIN deliberately emits one null page row when the page is empty. That lets the
+      -- repository distinguish an ordinary final page from an invalid/stale state-bound cursor
+      -- without a second statement or a race between cursor validation and the search snapshot.
+      SELECT page.*,cursor_guard.valid AS search_cursor_valid
+      FROM page RIGHT JOIN cursor_guard ON cursor_guard.valid
+      ORDER BY page.updated_at DESC,page.id DESC NULLS LAST`,
+      deadlineAt,
+      signal,
+    );
+    signal?.throwIfAborted();
+    if (rows[0]?.search_cursor_valid !== true) {
+      throw new DomainError("validation_error", "Invalid conversation search cursor", 422);
+    }
+    const resultRows = rows.filter((row) => row.id != null);
+    const hasMore = resultRows.length > limit;
+    const data: ConversationSearchResult[] = resultRows.slice(0, limit).map((row) => {
+      const titleMatch = Boolean(row.search_title_match);
+      const base = conversation(row);
+      return {
+        ...base,
+        snippet: conversationSearchSnippet(
+          titleMatch ? base.title : String(row.search_message_content),
+          needle,
+        ),
+        matchSource: titleMatch ? "title" : "message",
+        messageId: titleMatch ? null : String(row.search_message_id),
+        messageRole: titleMatch ? null : row.search_message_role as "user" | "assistant",
+      };
+    });
+    return {
+      data,
+      nextCursor: hasMore
+        ? encodeConversationSearchCursor(
+          {
+            updatedAt: String(resultRows[limit - 1].search_cursor_updated_at),
+            id: String(resultRows[limit - 1].id),
+          },
+          query,
+          ownerId,
+        )
+        : null,
+    };
   }
   async updateConversation(ownerId: string, id: string, patch: ConversationPatch) {
     return await this.#sql.begin(async (tx) => {
@@ -3637,9 +4100,11 @@ export class PostgresRepository implements DomainRepository {
       const pricing = input.pricingSnapshot;
       const runs = await tx<
         Row[]
-      >`INSERT INTO usage_runs(id,user_id,token_id,model,provider,status,reserved_micros,pricing_version_id,pricing_input_micros_per_million,pricing_cached_input_micros_per_million,pricing_reasoning_micros_per_million,pricing_output_micros_per_million,pricing_fixed_call_micros,pricing_source,generation_lease_token,generation_lease_expires_at) VALUES(${input.runId},${input.message.ownerId},${
+      >`INSERT INTO usage_runs(id,user_id,token_id,model,provider,recovery_owner,status,reserved_micros,pricing_version_id,pricing_input_micros_per_million,pricing_cached_input_micros_per_million,pricing_reasoning_micros_per_million,pricing_output_micros_per_million,pricing_fixed_call_micros,pricing_source,generation_lease_token,generation_lease_expires_at) VALUES(${input.runId},${input.message.ownerId},${
         input.tokenId ?? null
-      },${input.message.model ?? "unknown"},${input.provider},'reserved',${input.reserveMicros},${
+      },${
+        input.message.model ?? "unknown"
+      },${input.provider},'provider','reserved',${input.reserveMicros},${
         pricing?.pricingVersionId ?? null
       },${pricing?.inputMicrosPerMillion ?? null},${pricing?.cachedInputMicrosPerMillion ?? null},${
         pricing?.reasoningMicrosPerMillion ?? null
@@ -3784,11 +4249,11 @@ export class PostgresRepository implements DomainRepository {
       const pricing = input.pricingSnapshot;
       const runs = await tx<
         Row[]
-      >`INSERT INTO usage_runs(id,user_id,model,provider,status,reserved_micros,
+      >`INSERT INTO usage_runs(id,user_id,model,provider,recovery_owner,status,reserved_micros,
         pricing_version_id,pricing_input_micros_per_million,pricing_cached_input_micros_per_million,
         pricing_reasoning_micros_per_million,pricing_output_micros_per_million,
         pricing_fixed_call_micros,pricing_source,generation_lease_token,generation_lease_expires_at)
-        VALUES(${input.runId},${input.ownerId},${input.model},${input.provider},'reserved',${input.reserveMicros},${
+        VALUES(${input.runId},${input.ownerId},${input.model},${input.provider},'provider','reserved',${input.reserveMicros},${
         pricing?.pricingVersionId ?? null
       },${pricing?.inputMicrosPerMillion ?? null},${pricing?.cachedInputMicrosPerMillion ?? null},${
         pricing?.reasoningMicrosPerMillion ?? null
@@ -4231,6 +4696,68 @@ export class PostgresRepository implements DomainRepository {
         Row[]
       >`SELECT * FROM attachments WHERE owner_id=${ownerId} AND deleted_at IS NULL ORDER BY created_at DESC,id`;
     return rows.map(attachment);
+  }
+
+  async listAttachmentPage(
+    ownerId: string,
+    query: AttachmentListQuery,
+  ): Promise<AttachmentPage> {
+    if (!Number.isInteger(query.limit) || query.limit < 1 || query.limit > 10_000) {
+      throw new DomainError(
+        "invalid_file_limit",
+        "File list limit must be between 1 and 10000",
+        400,
+      );
+    }
+    if (query.order !== "asc" && query.order !== "desc") {
+      throw new DomainError("invalid_file_order", "File list order must be asc or desc", 400);
+    }
+
+    let cursor: { id: string; created_at: string } | undefined;
+    if (query.after !== undefined) {
+      const cursorRows = await this.#sql<{ id: string; created_at: string }[]>`
+        SELECT id,created_at::text AS created_at
+        FROM attachments
+        WHERE id=${query.after} AND owner_id=${ownerId}`;
+      cursor = cursorRows[0];
+      if (!cursor) {
+        throw new DomainError(
+          "invalid_file_cursor",
+          "The file list cursor is invalid for this owner",
+          400,
+        );
+      }
+    }
+
+    const fetchLimit = query.limit + 1;
+    let rows: Row[];
+    if (query.order === "asc") {
+      rows = query.after === undefined
+        ? await this.#sql<Row[]>`
+          SELECT * FROM attachments
+          WHERE owner_id=${ownerId} AND deleted_at IS NULL
+          ORDER BY created_at ASC,id ASC LIMIT ${fetchLimit}`
+        : await this.#sql<Row[]>`
+          SELECT * FROM attachments
+          WHERE owner_id=${ownerId} AND deleted_at IS NULL
+            AND (created_at,id)>(${cursor!.created_at}::text::timestamptz,${cursor!.id}::uuid)
+          ORDER BY created_at ASC,id ASC LIMIT ${fetchLimit}`;
+    } else {
+      rows = query.after === undefined
+        ? await this.#sql<Row[]>`
+          SELECT * FROM attachments
+          WHERE owner_id=${ownerId} AND deleted_at IS NULL
+          ORDER BY created_at DESC,id DESC LIMIT ${fetchLimit}`
+        : await this.#sql<Row[]>`
+          SELECT * FROM attachments
+          WHERE owner_id=${ownerId} AND deleted_at IS NULL
+            AND (created_at,id)<(${cursor!.created_at}::text::timestamptz,${cursor!.id}::uuid)
+          ORDER BY created_at DESC,id DESC LIMIT ${fetchLimit}`;
+    }
+    return {
+      data: rows.slice(0, query.limit).map(attachment),
+      hasMore: rows.length > query.limit,
+    };
   }
 
   async getAttachment(id: string, ownerId: string, includeDeleted = false) {
@@ -4799,6 +5326,20 @@ export class PostgresRepository implements DomainRepository {
           ${input.provider},${input.model},${input.upstreamModel},${input.itemCount})`;
     } catch (error) {
       if ((error as { code?: string }).code === "23505") {
+        const rows = await this.#sql<Row[]>`SELECT * FROM embedding_provider_attempts
+          WHERE usage_run_id=${input.usageRunId}`;
+        const existing = rows[0];
+        if (
+          existing && String(existing.status) === "running" &&
+          (existing.parent_usage_run_id === null
+              ? undefined
+              : String(existing.parent_usage_run_id)) ===
+            input.parentUsageRunId &&
+          String(existing.purpose) === input.purpose &&
+          String(existing.provider) === input.provider && String(existing.model) === input.model &&
+          String(existing.upstream_model) === input.upstreamModel &&
+          number(existing.item_count) === input.itemCount
+        ) return;
         throw new DomainError("idempotency_conflict", "Embedding attempt already exists", 409);
       }
       throw error;
@@ -6351,11 +6892,11 @@ export class PostgresRepository implements DomainRepository {
       let rows: Row[];
       try {
         rows = await tx<Row[]>`INSERT INTO usage_runs(
-          id,user_id,model,provider,status,reserved_micros,run_lease_token,run_lease_expires_at,
+          id,user_id,model,provider,recovery_owner,status,reserved_micros,run_lease_token,run_lease_expires_at,
           pricing_version_id,pricing_input_micros_per_million,
           pricing_cached_input_micros_per_million,pricing_reasoning_micros_per_million,
           pricing_output_micros_per_million,pricing_fixed_call_micros,pricing_source)
-          VALUES(${input.runId},${userId},${input.model},${input.provider},'reserved',
+          VALUES(${input.runId},${userId},${input.model},${input.provider},'provider','reserved',
           ${input.reserveMicros},${leaseToken},now()+120*interval '1 second',
           ${p.pricingVersionId},${p.inputMicrosPerMillion},${p.cachedInputMicrosPerMillion},
           ${p.reasoningMicrosPerMillion},${p.outputMicrosPerMillion},${p.fixedCallMicros},${p.source})
@@ -6412,27 +6953,83 @@ export class PostgresRepository implements DomainRepository {
   }
 
   async ensureIdempotentReservation(input: EnsureIdempotentReservationInput): Promise<UsageRun> {
-    try {
-      return await this.reserve(
-        input.userId,
-        input.usageRunId,
-        input.model,
-        input.reservedMicros,
-        input.provider,
-      );
-    } catch (error) {
-      if (!(error instanceof DomainError) || error.code !== "idempotency_conflict") throw error;
-      const rows = await this.#sql<Row[]>`SELECT * FROM usage_runs WHERE id=${input.usageRunId}`;
-      const existing = rows[0];
+    if (
+      typeof input.userId !== "string" || input.userId.length < 1 || input.userId.length > 128 ||
+      typeof input.usageRunId !== "string" || input.usageRunId.length < 1 ||
+      input.usageRunId.length > 512 || typeof input.model !== "string" ||
+      input.model.length < 1 || input.model.length > 255 || typeof input.provider !== "string" ||
+      input.provider.length < 1 || input.provider.length > 255 ||
+      !(["provider", "api_replay", "document_embedding", "tool"] as const).includes(
+        input.recoveryOwner,
+      ) || !Number.isSafeInteger(input.reservedMicros) || input.reservedMicros < 0
+    ) throw new DomainError("validation_error", "Usage reservation is invalid", 422);
+    const acceptExisting = (existing: Row) => {
       if (
-        !existing || String(existing.user_id) !== input.userId ||
+        String(existing.user_id) !== input.userId ||
         String(existing.model) !== input.model || String(existing.provider) !== input.provider ||
+        String(existing.recovery_owner) !== input.recoveryOwner ||
         number(existing.reserved_micros) !== input.reservedMicros ||
         String(existing.status) !== "reserved" || existing.token_id !== null
       ) {
         throw new DomainError("idempotency_conflict", "Existing reservation does not match", 409);
       }
       return run(existing);
+    };
+    try {
+      return await this.#sql.begin(async (tx) => {
+        // Existing runs use the same run -> user lock order as settlement/refund, avoiding an
+        // otherwise needless deadlock. Most importantly, inspect the already-committed debit
+        // before current-balance admission: consuming the last cent must not make it invisible.
+        let rows = await tx<Row[]>`SELECT * FROM usage_runs
+          WHERE id=${input.usageRunId} FOR UPDATE`;
+        if (rows[0]) return acceptExisting(rows[0]);
+
+        // New reservations for an account serialize on the user row. Recheck after acquiring it:
+        // another same-account reconciler may have committed while this transaction was waiting.
+        const users = await tx<Row[]>`SELECT balance_micros FROM users
+          WHERE id=${input.userId} FOR UPDATE`;
+        if (!users[0]) throw new DomainError("not_found", "User not found", 404);
+        rows = await tx<Row[]>`SELECT * FROM usage_runs
+          WHERE id=${input.usageRunId} FOR UPDATE`;
+        if (rows[0]) return acceptExisting(rows[0]);
+
+        const balance = number(users[0].balance_micros);
+        if (balance < input.reservedMicros) {
+          throw new DomainError("insufficient_credit", "Insufficient credit", 402);
+        }
+        const runLeaseToken = crypto.randomUUID();
+        const inserted = await tx<Row[]>`INSERT INTO usage_runs(
+          id,user_id,token_id,model,provider,recovery_owner,status,reserved_micros,
+          run_lease_token,run_lease_expires_at)
+          VALUES(${input.usageRunId},${input.userId},NULL,${input.model},${input.provider},
+            ${input.recoveryOwner},'reserved',${input.reservedMicros},${runLeaseToken},
+            now()+120*interval '1 second')
+          RETURNING *`;
+        const after = balance - input.reservedMicros;
+        await tx`UPDATE users SET balance_micros=${after},updated_at=now()
+          WHERE id=${input.userId}`;
+        await tx`INSERT INTO ledger_entries(
+          user_id,usage_run_id,kind,amount_micros,balance_after_micros)
+          VALUES(${input.userId},${input.usageRunId},'reserve',${-input.reservedMicros},${after})`;
+        return run(inserted[0]);
+      });
+    } catch (error) {
+      // Different accounts do not share a user lock. A globally colliding run ID can therefore
+      // lose at the unique constraint even after both transactions observed a missing row. Keep
+      // the repository contract categorical and never expose a driver-specific 23505.
+      if ((error as { code?: string }).code === "23505") {
+        const rows = await this.#sql<Row[]>`SELECT * FROM usage_runs
+          WHERE id=${input.usageRunId}`;
+        if (rows[0]) {
+          return acceptExisting(rows[0]);
+        }
+        throw new DomainError(
+          "idempotency_conflict",
+          "This idempotency key has already been used",
+          409,
+        );
+      }
+      throw error;
     }
   }
 
@@ -6443,30 +7040,61 @@ export class PostgresRepository implements DomainRepository {
     return await this.#sql.begin(async (tx) => {
       const rows = await tx<Row[]>`SELECT r.* FROM usage_runs r
         WHERE r.status='reserved' AND r.run_lease_token IS NOT NULL
+          AND r.recovery_owner='provider'
           AND r.run_lease_expires_at<=now() AND r.generation_lease_token IS NULL
           AND NOT EXISTS(SELECT 1 FROM api_idempotency_requests a WHERE a.usage_run_id=r.id)
+          AND NOT EXISTS(
+            SELECT 1 FROM document_embedding_batches b
+            JOIN jobs j ON j.id=b.job_id
+            WHERE b.usage_run_id=r.id
+              AND b.phase IN ('pre_dispatch','dispatched','succeeded')
+              AND j.status IN ('queued','running')
+          )
         ORDER BY r.run_lease_expires_at FOR UPDATE SKIP LOCKED LIMIT ${limit}`;
       for (const row of rows) {
         const runId = String(row.id);
-        const uncertainty = await tx<{ uncertain: boolean; embedding_uncertain: boolean }[]>`
+        const uncertainty = await tx<{
+          uncertain: boolean;
+          embedding_uncertain: boolean;
+          embedding_retry_safe: boolean;
+          embedding_estimated_input_tokens: number;
+        }[]>`
           SELECT EXISTS(SELECT 1 FROM provider_attempts
             WHERE usage_run_id=${runId} AND status='running') AS uncertain,
           EXISTS(SELECT 1 FROM embedding_provider_attempts
-            WHERE usage_run_id=${runId} AND status='running') AS embedding_uncertain`;
+            WHERE usage_run_id=${runId} AND status='running') AS embedding_uncertain,
+          COALESCE((SELECT retry_safe FROM document_embedding_batches
+            WHERE usage_run_id=${runId} AND phase='dispatched'),false) AS embedding_retry_safe,
+          COALESCE((SELECT maximum_input_tokens FROM document_embedding_batches
+            WHERE usage_run_id=${runId}),0)::int AS embedding_estimated_input_tokens`;
         await tx`UPDATE provider_attempts SET status='cancelled',phase='planning',
           error_code='execution_lease_expired',breaker_after='unavailable',retryable=true,
           latency_ms=GREATEST(0,floor(extract(epoch FROM (now()-started_at))*1000)::int),
           completed_at=now() WHERE usage_run_id=${runId} AND status='running'`;
-        await tx`UPDATE embedding_provider_attempts SET status='cancelled',
-          cost_micros=${number(row.reserved_micros)},cost_source='calculated',
-          token_source='estimated',error='execution lease expired',
+        const retrySafeEmbedding = uncertainty[0].embedding_retry_safe === true;
+        const embeddingCost = uncertainty[0].embedding_uncertain && !retrySafeEmbedding
+          ? number(row.reserved_micros)
+          : 0;
+        const embeddingInputTokens = uncertainty[0].embedding_uncertain && !retrySafeEmbedding
+          ? number(uncertainty[0].embedding_estimated_input_tokens)
+          : 0;
+        await tx`UPDATE embedding_provider_attempts SET
+          status=${retrySafeEmbedding ? "failed" : "cancelled"},
+          input_tokens=${embeddingInputTokens},cost_micros=${embeddingCost},
+          cost_source=${retrySafeEmbedding ? "none" : "calculated"},
+          token_source=${retrySafeEmbedding ? "none" : "estimated"},
+          error=${
+          retrySafeEmbedding
+            ? "definitive provider rejection settlement interrupted"
+            : "execution lease expired"
+        },
           latency_ms=GREATEST(0,floor(extract(epoch FROM (now()-started_at))*1000)::int),
           completed_at=now() WHERE usage_run_id=${runId} AND status='running'`;
         const userId = String(row.user_id);
         const users = await tx<
           Row[]
         >`SELECT balance_micros FROM users WHERE id=${userId} FOR UPDATE`;
-        const cost = uncertainty[0].embedding_uncertain ? number(row.reserved_micros) : 0;
+        const cost = uncertainty[0].embedding_uncertain ? embeddingCost : 0;
         const delta = number(row.reserved_micros) - cost;
         const after = number(users[0].balance_micros) + delta;
         await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${userId}`;
@@ -6474,7 +7102,8 @@ export class PostgresRepository implements DomainRepository {
           await tx`INSERT INTO ledger_entries(user_id,usage_run_id,kind,amount_micros,balance_after_micros)
             VALUES(${userId},${runId},${delta > 0 ? "refund" : "settle"},${delta},${after})`;
         }
-        await tx`UPDATE usage_runs SET status='failed',cost_micros=${cost},input_tokens=0,
+        await tx`UPDATE usage_runs SET status='failed',cost_micros=${cost},
+          input_tokens=${uncertainty[0].embedding_uncertain ? embeddingInputTokens : 0},
           output_tokens=0,run_lease_token=NULL,run_lease_expires_at=NULL,error='provider execution lease expired',
           completed_at=now() WHERE id=${runId}`;
       }
@@ -6482,17 +7111,37 @@ export class PostgresRepository implements DomainRepository {
     });
   }
 
-  async createApiToken(userId: string, input: CreateApiTokenInput) {
+  async createApiToken(
+    userId: string,
+    input: CreateApiTokenInput,
+    expectedAuthorityEpoch = 1,
+  ) {
     validateTokenRates(input.rpmLimit ?? null, input.burstLimit ?? null);
     const id = crypto.randomUUID();
-    const rows = await this.#sql<
-      Row[]
-    >`INSERT INTO api_tokens(id,user_id,name,token_hash,preview,scopes,expires_at,rpm_limit,burst_limit,rotation_family_id) VALUES(${id},${userId},${input.name},${input.tokenHash},${input.preview},${
-      this.#sql.json(input.scopes)
-    },${input.expiresAt ?? null},${input.rpmLimit ?? null},${
-      input.burstLimit ?? null
-    },${id}) RETURNING *`;
-    return token(rows[0]);
+    return await this.#sql.begin(async (tx) => {
+      // See createSession: this lock makes token creation linearizable with every lifecycle
+      // transition that invalidates full user authority.
+      const users = await tx<Row[]>`SELECT approval_status,state,deleted_at,
+        password_reset_pending,authority_epoch FROM users WHERE id=${userId} FOR UPDATE`;
+      const user = users[0];
+      if (
+        !user || user.approval_status !== "approved" || user.state !== "active" ||
+        user.deleted_at != null || user.password_reset_pending === true ||
+        number(user.authority_epoch) !== expectedAuthorityEpoch
+      ) {
+        throw new DomainError("account_unavailable", "Account cannot create API tokens", 403);
+      }
+      const rows = await tx<
+        Row[]
+      >`INSERT INTO api_tokens(id,user_id,name,token_hash,preview,scopes,authority_epoch,
+        expires_at,rpm_limit,burst_limit,rotation_family_id)
+        VALUES(${id},${userId},${input.name},${input.tokenHash},${input.preview},${
+        tx.json(input.scopes)
+      },${expectedAuthorityEpoch},${input.expiresAt ?? null},${input.rpmLimit ?? null},${
+        input.burstLimit ?? null
+      },${id}) RETURNING *`;
+      return token(rows[0]);
+    });
   }
   async findApiTokenByHash(hash: string) {
     return await this.authenticateApiToken(hash);
@@ -6500,16 +7149,24 @@ export class PostgresRepository implements DomainRepository {
   async authenticateApiToken(hash: string) {
     const rows = await this.#sql<
       Row[]
-    >`UPDATE api_tokens SET last_used_at=now() WHERE token_hash=${hash} AND revoked_at IS NULL
-      AND (expires_at IS NULL OR expires_at>now())
-      AND (replaced_by_token_id IS NULL OR overlap_ends_at>now()) RETURNING *`;
+    >`UPDATE api_tokens t SET last_used_at=now() FROM users u
+      WHERE t.token_hash=${hash} AND t.user_id=u.id
+        AND t.authority_epoch=u.authority_epoch AND u.state='active' AND u.deleted_at IS NULL
+        AND u.password_reset_pending=false AND u.approval_status='approved'
+        AND t.revoked_at IS NULL AND (t.expires_at IS NULL OR t.expires_at>now())
+        AND (t.replaced_by_token_id IS NULL OR t.overlap_ends_at>now()) RETURNING t.*`;
     return rows[0] ? token(rows[0]) : undefined;
   }
   async listApiTokens(userId: string) {
     return (await this.#sql<
       Row[]
     >`SELECT * FROM api_tokens WHERE user_id=${userId} ORDER BY created_at DESC`).map((row) => {
-      const { tokenHash: _hash, userId: _userId, ...summary } = token(row);
+      const {
+        tokenHash: _hash,
+        userId: _userId,
+        authorityEpoch: _authorityEpoch,
+        ...summary
+      } = token(row);
       return summary;
     });
   }
@@ -6570,6 +7227,7 @@ export class PostgresRepository implements DomainRepository {
     userId: string,
     id: string,
     input: RotateApiTokenInput,
+    expectedAuthorityEpoch = 1,
   ): Promise<RotatedApiToken> {
     if (
       !Number.isInteger(input.overlapSeconds) || input.overlapSeconds < 0 ||
@@ -6582,6 +7240,22 @@ export class PostgresRepository implements DomainRepository {
       );
     }
     return await this.#sql.begin(async (tx) => {
+      // Keep the user row first in the lock order. Lifecycle transitions also lock the user before
+      // revoking token rows, so taking a family/token lock first would introduce a user<->token
+      // deadlock. It also makes replacement issuance linearizable with authority loss: either the
+      // replacement commits first and is revoked by the transition, or the transition commits first
+      // and this eligibility check fails.
+      const users = await tx<Row[]>`SELECT approval_status,state,deleted_at,
+        password_reset_pending,authority_epoch FROM users WHERE id=${userId} FOR UPDATE`;
+      const currentUser = users[0];
+      if (
+        !currentUser || currentUser.approval_status !== "approved" ||
+        currentUser.state !== "active" || currentUser.deleted_at != null ||
+        currentUser.password_reset_pending === true ||
+        number(currentUser.authority_epoch) !== expectedAuthorityEpoch
+      ) {
+        throw new DomainError("account_unavailable", "Account cannot rotate API tokens", 403);
+      }
       const family = await tx<
         Row[]
       >`SELECT rotation_family_id FROM api_tokens WHERE id=${id} AND user_id=${userId}`;
@@ -6610,9 +7284,12 @@ export class PostgresRepository implements DomainRepository {
       try {
         inserted = await tx<
           Row[]
-        >`INSERT INTO api_tokens(id,user_id,name,token_hash,preview,scopes,expires_at,rpm_limit,burst_limit,access_mode,rotation_family_id,rotation_generation,rotated_from_token_id) VALUES(${nextId},${userId},${old.name},${input.tokenHash},${input.preview},${
+        >`INSERT INTO api_tokens(id,user_id,name,token_hash,preview,scopes,authority_epoch,
+          expires_at,rpm_limit,burst_limit,access_mode,rotation_family_id,rotation_generation,
+          rotated_from_token_id)
+          VALUES(${nextId},${userId},${old.name},${input.tokenHash},${input.preview},${
           tx.json(old.scopes)
-        },${old.expiresAt},${old.rpmLimit},${old.burstLimit},${old.accessMode},${old.rotationFamilyId},${
+        },${expectedAuthorityEpoch},${old.expiresAt},${old.rpmLimit},${old.burstLimit},${old.accessMode},${old.rotationFamilyId},${
           old.rotationGeneration + 1
         },${old.id}) RETURNING *`;
       } catch (error) {
@@ -7126,9 +7803,9 @@ export class PostgresRepository implements DomainRepository {
         const runLeaseToken = crypto.randomUUID();
         const runs = await tx<
           Row[]
-        >`INSERT INTO usage_runs(id,user_id,token_id,model,provider,status,reserved_micros,run_lease_token,run_lease_expires_at,pricing_version_id,pricing_input_micros_per_million,pricing_cached_input_micros_per_million,pricing_reasoning_micros_per_million,pricing_output_micros_per_million,pricing_fixed_call_micros,pricing_source) VALUES(${runId},${userId},${
+        >`INSERT INTO usage_runs(id,user_id,token_id,model,provider,recovery_owner,status,reserved_micros,run_lease_token,run_lease_expires_at,pricing_version_id,pricing_input_micros_per_million,pricing_cached_input_micros_per_million,pricing_reasoning_micros_per_million,pricing_output_micros_per_million,pricing_fixed_call_micros,pricing_source) VALUES(${runId},${userId},${
           tokenId ?? null
-        },${model},${provider},'reserved',${amount},${runLeaseToken},now()+120*interval '1 second',${
+        },${model},${provider},'provider','reserved',${amount},${runLeaseToken},now()+120*interval '1 second',${
           pricingSnapshot?.pricingVersionId ?? null
         },${pricingSnapshot?.inputMicrosPerMillion ?? null},${
           pricingSnapshot?.cachedInputMicrosPerMillion ?? null
@@ -7335,9 +8012,9 @@ export class PostgresRepository implements DomainRepository {
       const pricing = input.pricingSnapshot;
       const runs = await tx<
         Row[]
-      >`INSERT INTO usage_runs(id,user_id,token_id,model,provider,status,reserved_micros,pricing_version_id,pricing_input_micros_per_million,pricing_cached_input_micros_per_million,pricing_reasoning_micros_per_million,pricing_output_micros_per_million,pricing_fixed_call_micros,pricing_source) VALUES(${input.runId},${input.userId},${
+      >`INSERT INTO usage_runs(id,user_id,token_id,model,provider,recovery_owner,status,reserved_micros,pricing_version_id,pricing_input_micros_per_million,pricing_cached_input_micros_per_million,pricing_reasoning_micros_per_million,pricing_output_micros_per_million,pricing_fixed_call_micros,pricing_source) VALUES(${input.runId},${input.userId},${
         input.tokenId ?? null
-      },${input.model},${input.provider},'reserved',${input.reserveMicros},${
+      },${input.model},${input.provider},'api_replay','reserved',${input.reserveMicros},${
         pricing?.pricingVersionId ?? null
       },${pricing?.inputMicrosPerMillion ?? null},${pricing?.cachedInputMicrosPerMillion ?? null},${
         pricing?.reasoningMicrosPerMillion ?? null
@@ -8320,6 +8997,98 @@ export class PostgresRepository implements DomainRepository {
         VALUES(${actorId}::uuid,'job.retried','job',${id},${auditMetadata})`;
       return { job: adminJob(updated[0]), priorAttempts };
     });
+  }
+  async listWorkerInstances(query: AdminWorkerQuery = {}): Promise<AdminWorkerPage> {
+    const limit = query.limit ?? 50;
+    const scope = query.scope ?? "active";
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new DomainError("validation_error", "Worker page limit must be between 1 and 100", 422);
+    }
+    if (!["active", "history", "all"].includes(scope)) {
+      throw new DomainError("validation_error", "Worker scope is invalid", 422);
+    }
+    let cursor: { startedAtMicros: string; id: string; scope: string } | undefined;
+    if (query.cursor) {
+      try {
+        const decoded = JSON.parse(atob(query.cursor));
+        if (
+          !decoded || typeof decoded.startedAtMicros !== "string" ||
+          !/^\d{1,20}$/u.test(decoded.startedAtMicros) ||
+          BigInt(decoded.startedAtMicros) > 253_402_300_799_999_999n ||
+          typeof decoded.id !== "string" || !UUID_PATTERN.test(decoded.id) ||
+          decoded.scope !== scope
+        ) throw new Error();
+        cursor = decoded;
+      } catch {
+        throw new DomainError("validation_error", "Worker cursor is invalid", 422);
+      }
+    }
+    const rows = await this.#sql<Row[]>`SELECT instance_id,worker_name,state,started_at,
+      heartbeat_at,progress_at,current_job_id,current_job_type,last_completed_at,
+      last_completed_job_id,last_completed_job_type,heartbeat_stale_ms,progress_stale_ms,
+      health_clock_tolerance_ms,
+      greatest(0,floor(extract(epoch FROM (clock_timestamp()-heartbeat_at))*1000))::bigint
+        heartbeat_age_ms,
+      greatest(0,floor(extract(epoch FROM (clock_timestamp()-progress_at))*1000))::bigint
+        progress_age_ms,
+      CASE
+        WHEN state='stopped' THEN 'inactive'
+        WHEN heartbeat_at NOT BETWEEN
+          clock_timestamp()-heartbeat_stale_ms*interval '1 millisecond'
+          AND clock_timestamp()+health_clock_tolerance_ms*interval '1 millisecond'
+          THEN 'heartbeat_stale'
+        WHEN progress_at NOT BETWEEN
+          clock_timestamp()-progress_stale_ms*interval '1 millisecond'
+          AND clock_timestamp()+health_clock_tolerance_ms*interval '1 millisecond'
+          THEN 'progress_stalled'
+        ELSE 'fresh'
+      END liveness,
+      floor(extract(epoch FROM started_at)*1000000)::bigint started_at_micros
+      FROM worker_instances
+      WHERE (${scope === "all"} OR (${scope === "active"} AND state<>'stopped') OR
+        (${scope === "history"} AND state='stopped'))
+      AND (${cursor === undefined} OR started_at<to_timestamp(${
+      cursor?.startedAtMicros ?? "0"
+    }::numeric/1000000) OR
+        (started_at=to_timestamp(${cursor?.startedAtMicros ?? "0"}::numeric/1000000)
+          AND instance_id<${cursor?.id ?? "00000000-0000-4000-8000-000000000000"}::uuid))
+      ORDER BY started_at DESC,instance_id DESC LIMIT ${limit + 1}`;
+    const page = rows.slice(0, limit);
+    const last = page.at(-1);
+    const items = page.map((row) => ({
+      instanceId: String(row.instance_id),
+      workerName: String(row.worker_name),
+      state: row.state as AdminWorkerInstance["state"],
+      startedAt: iso(row.started_at),
+      heartbeatAt: iso(row.heartbeat_at),
+      progressAt: iso(row.progress_at),
+      heartbeatAgeMs: number(row.heartbeat_age_ms),
+      progressAgeMs: number(row.progress_age_ms),
+      heartbeatStaleMs: number(row.heartbeat_stale_ms),
+      progressStaleMs: number(row.progress_stale_ms),
+      healthClockToleranceMs: number(row.health_clock_tolerance_ms),
+      liveness: String(row.liveness) as AdminWorkerInstance["liveness"],
+      currentJobId: row.current_job_id ? String(row.current_job_id) : null,
+      currentJobType: row.current_job_type ? String(row.current_job_type) : null,
+      lastCompletedAt: row.last_completed_at ? iso(row.last_completed_at) : null,
+      lastCompletedJobId: row.last_completed_job_id ? String(row.last_completed_job_id) : null,
+      lastCompletedJobType: row.last_completed_job_type
+        ? String(row.last_completed_job_type)
+        : null,
+    }));
+    return {
+      items,
+      scope,
+      limit,
+      hasMore: rows.length > limit,
+      nextCursor: rows.length > limit && last
+        ? btoa(JSON.stringify({
+          startedAtMicros: String(last.started_at_micros),
+          id: String(last.instance_id),
+          scope,
+        }))
+        : null,
+    };
   }
   async getRetentionPolicy(): Promise<RetentionPolicy> {
     const rows = await this.#sql<Row[]>`SELECT v.* FROM retention_policy_state s

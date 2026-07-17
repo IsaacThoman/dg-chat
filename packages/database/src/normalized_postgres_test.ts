@@ -8,6 +8,81 @@ import { decodeApiResponseBody, InvalidApiResponseBodyError } from "./repository
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
 
 Deno.test({
+  name: "Postgres idempotent reservations reject recovery-owner collisions",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 1 });
+    const repo = await PostgresRepository.connect(databaseUrl!);
+    await sql`TRUNCATE audit_events,ledger_entries,usage_runs,api_tokens,sessions,messages,
+      conversations,auth_sessions,auth_accounts,auth_verifications,auth_users,users
+      RESTART IDENTITY CASCADE`;
+    try {
+      const user = await repo.bootstrapAdmin({
+        email: "postgres-recovery-owner-collision@example.com",
+        name: "Recovery owner collision",
+        passwordHash: "hash",
+      }, 1_000);
+      const input = {
+        userId: user.id,
+        usageRunId: "postgres-recovery-owner-collision",
+        model: "tool/echo",
+        provider: "tool",
+        reservedMicros: 100,
+        recoveryOwner: "tool" as const,
+      };
+      await repo.ensureIdempotentReservation(input);
+      await assertRejects(
+        () => repo.ensureIdempotentReservation({ ...input, recoveryOwner: "provider" }),
+        DomainError,
+        "Existing reservation does not match",
+      );
+      const runs = await sql<{ recovery_owner: string }[]>`SELECT recovery_owner FROM usage_runs
+        WHERE id=${input.usageRunId}`;
+      assertEquals(runs[0]?.recovery_owner, "tool");
+      const ledger = await sql<{ kind: string }[]>`SELECT kind FROM ledger_entries
+        WHERE usage_run_id=${input.usageRunId} ORDER BY sequence`;
+      assertEquals([...ledger], [{ kind: "reserve" }]);
+
+      const tokenId = crypto.randomUUID();
+      await sql`INSERT INTO api_tokens(
+        id,user_id,name,token_hash,preview,scopes,authority_epoch,rotation_family_id
+      ) VALUES(
+        ${tokenId},${user.id},'Collision token',${`collision-${tokenId}`},'fixture',
+        '["chat:write"]'::jsonb,1,${tokenId}
+      )`;
+      const tokenRunId = "postgres-token-owner-collision";
+      const tokenRun = await repo.reserve(
+        user.id,
+        tokenRunId,
+        "tool/echo",
+        100,
+        "tool",
+        tokenId,
+      );
+      assertEquals(tokenRun.tokenId, tokenId);
+      await assertRejects(
+        () =>
+          repo.ensureIdempotentReservation({
+            userId: user.id,
+            usageRunId: tokenRunId,
+            model: "tool/echo",
+            provider: "tool",
+            reservedMicros: 100,
+            recoveryOwner: "provider",
+          }),
+        DomainError,
+        "Existing reservation does not match",
+      );
+    } finally {
+      await repo.close();
+      await sql.end();
+    }
+  },
+});
+
+Deno.test({
   name: "Postgres retention policy atomically gates capture and bounded scrubbing",
   ignore: !databaseUrl,
   sanitizeOps: false,
@@ -30,8 +105,8 @@ Deno.test({
     const attemptId = crypto.randomUUID();
     await sql`INSERT INTO users(id,email,name,role,approval_status,state)
       VALUES(${userId},'retention-pg@example.com','Retention','admin','approved','active')`;
-    await sql`INSERT INTO usage_runs(id,user_id,model,provider,status)
-      VALUES('retention-pg-run',${userId},'retention/model','retention','completed')`;
+    await sql`INSERT INTO usage_runs(id,user_id,model,provider,recovery_owner,status)
+      VALUES('retention-pg-run',${userId},'retention/model','retention','provider','completed')`;
     await sql`INSERT INTO providers(id,slug,display_name,base_url,protocol)
       VALUES(${providerId},'retention','Retention','https://example.com/v1','responses')`;
     await sql`INSERT INTO provider_models(id,provider_id,public_model_id,upstream_model_id,
@@ -197,11 +272,11 @@ Deno.test({
         name: "Operational admin",
         passwordHash: "hash",
       }, 1_000);
-      await sql`INSERT INTO usage_runs(id,user_id,model,provider,status,cost_micros,input_tokens,
+      await sql`INSERT INTO usage_runs(id,user_id,model,provider,recovery_owner,status,cost_micros,input_tokens,
         output_tokens,latency_ms,ttft_ms,actual_provider_cost_micros,
         actual_provider_input_tokens,actual_provider_cached_input_tokens,
         actual_provider_reasoning_tokens,actual_provider_output_tokens,created_at)
-        VALUES ('analytics-run',${user.id},'provider/model','provider','completed',40,10,5,100,20,
+        VALUES ('analytics-run',${user.id},'provider/model','provider','provider','completed',40,10,5,100,20,
         25,10,2,1,5,'2026-01-01T00:00:00Z')`;
       const analytics = await repo.adminAnalytics({
         from: "2026-01-01T00:00:00Z",
@@ -593,6 +668,26 @@ Deno.test({
       const stale = await repo.reserve(user.id, "postgres-provider-stale", "provider/model", 100);
       await sql`UPDATE usage_runs SET execution_epoch=1,actual_provider_cost_micros=5,
         run_lease_expires_at=now()-interval '1 second' WHERE id=${stale.id}`;
+      // The generic reaper keys on durable ownership, never provider strings or run prefixes.
+      const providerOwnedToolNamedRun = await repo.reserve(
+        user.id,
+        `tool:${crypto.randomUUID()}`,
+        "tool/echo",
+        100,
+        "tool",
+      );
+      await sql`UPDATE usage_runs SET run_lease_expires_at=now()-interval '1 second'
+        WHERE id=${providerOwnedToolNamedRun.id}`;
+      const staleTool = await repo.ensureIdempotentReservation({
+        userId: user.id,
+        usageRunId: `tool:${crypto.randomUUID()}`,
+        model: "tool/echo",
+        provider: "tool",
+        reservedMicros: 100,
+        recoveryOwner: "tool",
+      });
+      await sql`UPDATE usage_runs SET run_lease_expires_at=now()-interval '1 second'
+        WHERE id=${staleTool.id}`;
       const providers = await sql<{ id: string }[]>`INSERT INTO providers
         (slug,display_name,base_url,protocol) VALUES
         ('uncertain-provider','Uncertain provider','https://uncertain.example/v1','chat_completions')
@@ -620,7 +715,7 @@ Deno.test({
         },'uncertain/model','upstream',1,
             ${prices[0].id},100000,50000,200000,300000,10,'test')`;
       await insertUncertainAttempt(stale.id);
-      assertEquals(await repo.reapStaleProviderExecutionLeases(), 1);
+      assertEquals(await repo.reapStaleProviderExecutionLeases(), 2);
       assertEquals(await repo.reapStaleProviderExecutionLeases(), 0);
       const reaped = await sql<
         { status: string; cost: string; run_lease_token: string | null }[]
@@ -630,6 +725,24 @@ Deno.test({
         { status: string; error_code: string | null }[]
       >`SELECT status,error_code FROM provider_attempts WHERE usage_run_id=${stale.id}`;
       assertEquals([...attempts], [{ status: "cancelled", error_code: "execution_lease_expired" }]);
+      assertEquals(
+        (await sql<{ status: string; provider: string; recovery_owner: string }[]>`
+          SELECT status,provider,recovery_owner FROM usage_runs
+          WHERE id=${providerOwnedToolNamedRun.id}`)[0],
+        { status: "failed", provider: "tool", recovery_owner: "provider" },
+      );
+      const preservedTool = await sql<
+        { status: string; run_lease_token: string | null; recovery_owner: string }[]
+      >`SELECT status,run_lease_token::text,recovery_owner FROM usage_runs
+        WHERE id=${staleTool.id}`;
+      assertEquals(preservedTool[0].status, "reserved");
+      assertEquals(preservedTool[0].recovery_owner, "tool");
+      assertEquals(typeof preservedTool[0].run_lease_token, "string");
+      assertEquals(
+        (await sql`SELECT kind FROM ledger_entries WHERE usage_run_id=${staleTool.id}`)
+          .map((entry) => entry.kind),
+        ["reserve"],
+      );
 
       const api = await repo.beginApiRequest({
         userId: user.id,
@@ -684,7 +797,7 @@ Deno.test({
         userId: user.id,
       });
       assertEquals(analytics.summary.completed, 2);
-      assertEquals(analytics.summary.failed, 3);
+      assertEquals(analytics.summary.failed, 4);
 
       const conversation = await repo.createConversation(user.id, "Uncertain generation");
       const generation = await repo.beginGeneration({
@@ -841,12 +954,14 @@ Deno.test({
           "email_verification",
           "verify-db-hash",
           new Date(Date.now() + 60_000).toISOString(),
+          identityUser.authorityEpoch,
         ),
         repo.createIdentityToken(
           identityUser.id,
           "email_verification",
           "verify-db-hash-concurrent",
           new Date(Date.now() + 60_000).toISOString(),
+          identityUser.authorityEpoch,
         ),
       ]);
       await repo.verifyEmail("verify-db-hash");
@@ -856,6 +971,14 @@ Deno.test({
         DomainError,
         "invalid or expired",
       );
+      await repo.decideUserApproval({
+        actorId: admin.id,
+        targetUserId: identityUser.id,
+        expectedVersion: identityUser.version,
+        status: "approved",
+        startingCreditMicros: 0,
+        requireEmailVerification: true,
+      });
       const identitySession = await repo.createSession(
         identityUser.id,
         "identity-session-hash",
@@ -873,12 +996,14 @@ Deno.test({
           "password_reset",
           "reset-db-hash",
           new Date(Date.now() + 60_000).toISOString(),
+          identityUser.authorityEpoch,
         ),
         repo.createIdentityToken(
           identityUser.id,
           "password_reset",
           "reset-db-hash-concurrent",
           new Date(Date.now() + 60_000).toISOString(),
+          identityUser.authorityEpoch,
         ),
       ]);
       await repo.resetPassword("reset-db-hash", "new-hash");
@@ -2218,6 +2343,7 @@ Deno.test({
       messageId = crypto.randomUUID();
     const tokenId = crypto.randomUUID(),
       ledgerId = crypto.randomUUID(),
+      reserveLedgerId = crypto.randomUUID(),
       jobId = crypto.randomUUID();
     const now = new Date().toISOString();
     const snapshot = {
@@ -2229,7 +2355,7 @@ Deno.test({
         role: "user",
         approvalStatus: "approved",
         state: "active",
-        balanceMicros: 100,
+        balanceMicros: 80,
         createdAt: now,
       }]],
       sessions: [["session-hash", {
@@ -2286,10 +2412,19 @@ Deno.test({
         amountMicros: 100,
         balanceAfterMicros: 100,
         createdAt: now,
+      }, {
+        id: reserveLedgerId,
+        userId,
+        usageRunId: "legacy-reserved-run",
+        kind: "reserve",
+        amountMicros: -20,
+        balanceAfterMicros: 80,
+        createdAt: now,
       }],
       usageRuns: [["legacy-run", {
         id: "legacy-run",
         userId,
+        tokenId,
         model: "legacy/model",
         status: "completed",
         reservedMicros: 100,
@@ -2297,6 +2432,18 @@ Deno.test({
         inputTokens: 1,
         outputTokens: 1,
         latencyMs: 1,
+        createdAt: now,
+      }], ["legacy-reserved-run", {
+        id: "legacy-reserved-run",
+        userId,
+        tokenId: null,
+        model: "legacy/model",
+        status: "reserved",
+        reservedMicros: 20,
+        costMicros: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        latencyMs: null,
         createdAt: now,
       }]],
       jobs: [{
@@ -2331,12 +2478,50 @@ Deno.test({
       const rows = await verify.unsafe<{ count: number }[]>(
         `SELECT count(*)::int count FROM ${table}`,
       );
-      assertEquals(rows[0].count, 1, table);
+      assertEquals(
+        rows[0].count,
+        table === "ledger_entries" ? 3 : table === "usage_runs" ? 2 : 1,
+        table,
+      );
     }
     const imported = await verify<
       { idempotency_key: string }[]
     >`SELECT idempotency_key FROM messages WHERE id=${messageId}`;
     assertEquals(imported[0].idempotency_key, "legacy-message");
+    const importedUsage = await verify<
+      { id: string; recovery_owner: string; status: string; token_id: string | null }[]
+    >`SELECT id,recovery_owner,status,token_id FROM usage_runs ORDER BY id`;
+    assertEquals([...importedUsage], [
+      {
+        id: "legacy-reserved-run",
+        recovery_owner: "provider",
+        status: "failed",
+        token_id: null,
+      },
+      {
+        id: "legacy-run",
+        recovery_owner: "provider",
+        status: "completed",
+        token_id: tokenId,
+      },
+    ]);
+    assertEquals(
+      [
+        ...await verify<{ kind: string; sequence: string; balance: string }[]>`
+        SELECT kind,sequence::text,balance_after_micros::text balance
+        FROM ledger_entries ORDER BY sequence`,
+      ],
+      [
+        { kind: "grant", sequence: "1", balance: "100" },
+        { kind: "reserve", sequence: "2", balance: "80" },
+        { kind: "refund", sequence: "3", balance: "100" },
+      ],
+    );
+    assertEquals(
+      (await verify<{ balance: string }[]>`SELECT balance_micros::text balance FROM users
+        WHERE id=${userId}`)[0].balance,
+      "100",
+    );
     await verify.end();
   },
 });

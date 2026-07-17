@@ -1,0 +1,94 @@
+groups:
+  - name: dg-chat-runtime
+    rules:
+      - alert: DgChatTargetDown
+        expr: up{job=~"dg-chat-(api|worker)"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "DG Chat {{ $labels.job }} metrics target is down"
+          description: "Prometheus has been unable to scrape the private metrics listener for two minutes."
+      - alert: DgChatApiNotReady
+        expr: dg_chat_process_ready{service="api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: DG Chat API is not ready
+          description: "The most recent readiness request failed; remove this replica from traffic."
+      - alert: DgChatWorkerNotReady
+        expr: dg_chat_process_ready{service="worker"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: DG Chat worker is not ready
+          description: "The worker has not reported a ready durable poll loop for two minutes."
+      - alert: DgChatDependencyUnavailable
+        expr: dg_chat_dependency_ready == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "DG Chat {{ $labels.service }} cannot reach {{ $labels.dependency }}"
+          description: "A bounded dependency readiness probe has failed for two minutes."
+      - alert: DgChatHttpErrorRatioHigh
+        expr: sum(rate(dg_chat_http_requests_total{status_class="5xx"}[5m])) / clamp_min(sum(rate(dg_chat_http_requests_total[5m])), 0.001) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: DG Chat API error ratio is high
+          description: "More than five percent of requests have returned 5xx for ten minutes."
+
+  - name: dg-chat-durable-work
+    rules:
+      - alert: DgChatQueueBacklog
+        expr: dg_chat_job_queue_depth{status="queued"} > 100
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: DG Chat durable queue is backing up
+          description: "More than 100 jobs have remained queued for ten minutes."
+      - alert: DgChatQueueStalled
+        expr: dg_chat_job_queue_oldest_seconds{status="queued"} > 300 and dg_chat_job_queue_depth{status="queued"} > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: DG Chat durable queue appears stalled
+          description: "The oldest runnable queued job is more than five minutes old."
+      - alert: DgChatRunningJobLeaseStalled
+        expr: dg_chat_job_queue_oldest_seconds{status="running"} > 240
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: DG Chat has an unusually old running job
+          description: "A running job has exceeded the normal two-minute lease by a wide margin."
+      - alert: DgChatWorkerDatabaseFailures
+        expr: increase(dg_chat_worker_loop_failures_total{kind="database"}[5m]) > 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: DG Chat worker is repeatedly losing PostgreSQL
+          description: "The worker has recorded repeated bounded database-loop failures."
+      - alert: DgChatProviderFailures
+        expr: sum(increase(dg_chat_provider_attempts_total{outcome="failed"}[5m])) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: DG Chat providers are failing
+          description: "More than five provider attempts failed in the rolling five-minute collection window."
+      - alert: DgChatProviderCircuitOpen
+        expr: dg_chat_provider_circuit_last_open_timestamp_seconds > 0 and time() - dg_chat_provider_circuit_last_open_timestamp_seconds < 300
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: A DG Chat provider circuit is open
+          description: "Provider routing recorded an open-circuit state or circuit skip in the last five minutes."

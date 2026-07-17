@@ -1,5 +1,6 @@
-import { assertEquals, assertFalse } from "jsr:@std/assert@1.0.14";
+import { assertEquals, assertFalse, assertThrows } from "jsr:@std/assert@1.0.14";
 import { betterAuth } from "npm:better-auth@1.6.23/minimal";
+import { APIError } from "npm:better-auth@1.6.23/api";
 import {
   createSanitizedAuthOperationalEmitter,
   createSanitizedBetterAuthLogger,
@@ -45,6 +46,45 @@ Deno.test("Better Auth log sink failures never alter authentication control flow
     throw new Error("stderr unavailable");
   });
   logger.log("error", "private authentication detail", { state: "secret" });
+});
+
+Deno.test("unexpected Better Auth errors become sanitized typed errors before global logging", () => {
+  const lines: string[] = [];
+  const logging = createSanitizedBetterAuthLogging((line) => lines.push(line));
+  const error = assertThrows(
+    () => logging.onAPIError.onError(new Error("reset-password:private-token")),
+    APIError,
+  );
+  assertEquals(error.status, "INTERNAL_SERVER_ERROR");
+  assertEquals(error.message, "Authentication request failed");
+  assertEquals(lines.map((line) => JSON.parse(line)), [{
+    level: "error",
+    component: "better_auth",
+    message: "Authentication subsystem event",
+  }]);
+  assertFalse(lines[0].includes("private-token"));
+});
+
+Deno.test("Better Auth logging replaces sensitive 5xx API errors but preserves intended 4xx", () => {
+  const lines: string[] = [];
+  const logging = createSanitizedBetterAuthLogging((line) => lines.push(line));
+  const secret = "private-adapter-token";
+  const internal = new APIError("INTERNAL_SERVER_ERROR", {
+    message: secret,
+    cause: new Error(`database:${secret}`),
+  });
+  const sanitized = assertThrows(() => logging.onAPIError.onError(internal), APIError);
+  assertEquals(sanitized.statusCode, 500);
+  assertEquals(sanitized.message, "Authentication request failed");
+  assertFalse(JSON.stringify(sanitized.body).includes(secret));
+  assertFalse(String(sanitized.cause).includes(secret));
+
+  const intended = new APIError("BAD_REQUEST", { message: "Invalid authentication request" });
+  logging.onAPIError.onError(intended);
+  assertEquals(intended.statusCode, 400);
+  assertEquals(intended.message, "Invalid authentication request");
+  assertEquals(lines.length, 2);
+  assertFalse(lines.join("\n").includes(secret));
 });
 
 Deno.test("auth audit and logging failures cannot reject an applied identity operation", async () => {

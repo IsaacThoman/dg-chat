@@ -10,7 +10,9 @@ import {
   type ProviderProtocol,
 } from "./provider-model-invariants.ts";
 
-export const BACKUP_DATA_SCHEMA_VERSION = "0039" as const;
+export const BACKUP_DATA_SCHEMA_VERSION = "0045" as const;
+const PRE_TOOL_ACCOUNTING_BACKUP_DATA_SCHEMA_VERSION = "0043" as const;
+const PRE_AUTHORITY_EPOCH_BACKUP_DATA_SCHEMA_VERSION = "0039" as const;
 const ADMIN_SECURITY_BILLING_BACKUP_DATA_SCHEMA_VERSION = "0038" as const;
 const ADMIN_LIFECYCLE_BACKUP_DATA_SCHEMA_VERSION = "0037" as const;
 const IMMUTABLE_SHARING_BACKUP_DATA_SCHEMA_VERSION = "0034" as const;
@@ -37,6 +39,8 @@ export const PRE_IMMUTABLE_SHARING_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
 );
 export function isSupportedBackupDataSchemaVersion(value: string): boolean {
   return value === BACKUP_DATA_SCHEMA_VERSION ||
+    value === PRE_TOOL_ACCOUNTING_BACKUP_DATA_SCHEMA_VERSION ||
+    value === PRE_AUTHORITY_EPOCH_BACKUP_DATA_SCHEMA_VERSION ||
     value === ADMIN_SECURITY_BILLING_BACKUP_DATA_SCHEMA_VERSION ||
     value === ADMIN_LIFECYCLE_BACKUP_DATA_SCHEMA_VERSION ||
     value === IMMUTABLE_SHARING_BACKUP_DATA_SCHEMA_VERSION ||
@@ -157,10 +161,11 @@ const T = (
 export const BACKUP_DATA_TABLES: readonly BackupDataTable[] = Object.freeze([
   T(
     "users",
-    "id email name password_hash role approval_status state version balance_micros created_at updated_at deleted_at email_verified_at",
+    "id email name password_hash role approval_status state version authority_epoch balance_micros created_at updated_at deleted_at email_verified_at",
     "id",
     {
       version: "integer",
+      authority_epoch: "bigint",
       balance_micros: "bigint",
     },
   ),
@@ -246,7 +251,7 @@ export const BACKUP_DATA_TABLES: readonly BackupDataTable[] = Object.freeze([
   }),
   T(
     "api_tokens",
-    "id user_id name token_hash preview scopes expires_at revoked_at last_used_at created_at version rpm_limit burst_limit access_mode rotation_family_id rotation_generation rotated_from_token_id replaced_by_token_id overlap_ends_at",
+    "id user_id name token_hash preview scopes expires_at revoked_at last_used_at created_at version rpm_limit burst_limit access_mode rotation_family_id rotation_generation rotated_from_token_id replaced_by_token_id overlap_ends_at authority_epoch",
     "id",
     {
       scopes: "json",
@@ -254,6 +259,7 @@ export const BACKUP_DATA_TABLES: readonly BackupDataTable[] = Object.freeze([
       rpm_limit: "integer",
       burst_limit: "integer",
       rotation_generation: "integer",
+      authority_epoch: "bigint",
     },
   ),
   T("access_groups", "id name description version created_at updated_at", "id", {
@@ -365,7 +371,7 @@ export const BACKUP_DATA_TABLES: readonly BackupDataTable[] = Object.freeze([
   ),
   T(
     "usage_runs",
-    "id user_id token_id model provider status input_tokens output_tokens cost_micros latency_ms ttft_ms error created_at completed_at reserved_micros pricing_version_id pricing_input_micros_per_million pricing_cached_input_micros_per_million pricing_reasoning_micros_per_million pricing_output_micros_per_million pricing_fixed_call_micros pricing_source execution_epoch actual_provider_cost_micros actual_provider_input_tokens actual_provider_cached_input_tokens actual_provider_reasoning_tokens actual_provider_output_tokens",
+    "id user_id token_id model provider recovery_owner status input_tokens output_tokens cost_micros latency_ms ttft_ms error created_at completed_at reserved_micros pricing_version_id pricing_input_micros_per_million pricing_cached_input_micros_per_million pricing_reasoning_micros_per_million pricing_output_micros_per_million pricing_fixed_call_micros pricing_source execution_epoch actual_provider_cost_micros actual_provider_input_tokens actual_provider_cached_input_tokens actual_provider_reasoning_tokens actual_provider_output_tokens",
     "id",
     {
       id: "text",
@@ -504,12 +510,13 @@ export const BACKUP_DATA_TABLES: readonly BackupDataTable[] = Object.freeze([
   ),
   T(
     "tool_executions",
-    "id owner_id tool_id input status result error approved_at approved_by cancellation_requested_at created_at updated_at",
+    "id owner_id tool_id input status result error approved_at approved_by cancellation_requested_at billing_snapshot created_at updated_at",
     "id",
     {
       input: "json",
       result: "json",
       error: "json",
+      billing_snapshot: "json",
     },
   ),
   T("message_tool_executions", "message_id execution_id created_at", "message_id,execution_id", {
@@ -749,8 +756,10 @@ export const BACKUP_EPHEMERAL_TABLES = Object.freeze(
     "api_idempotency_requests",
     "generation_controls",
     "jobs",
+    "document_embedding_batches",
     "generated_object_staging",
     "runtime_snapshots",
+    "worker_instances",
   ] as const,
 );
 
@@ -822,6 +831,21 @@ async function withBackupSnapshot<T>(
         SELECT installation_id FROM installation_state WHERE singleton_id=1
       `;
       if (!state) throw new BackupDataError("invariant", "Installation state is missing");
+      const [activeEmbeddingBatch] = await tx<{ phase: string }[]>`
+        SELECT b.phase FROM document_embedding_batches b
+        JOIN jobs j ON j.id=b.job_id
+        LEFT JOIN usage_runs u ON u.id=b.usage_run_id
+        LEFT JOIN embedding_provider_attempts a ON a.usage_run_id=b.usage_run_id
+        WHERE b.phase<>'committed' AND (
+          j.status IN ('queued','running') OR u.status='reserved' OR a.status='running'
+        )
+        ORDER BY b.updated_at LIMIT 1`;
+      if (activeEmbeddingBatch) {
+        throw new BackupDataError(
+          "conflict",
+          "Backup cannot start while document embedding publication is incomplete",
+        );
+      }
       const tables = policy === "excluded"
         ? BACKUP_DATA_TABLES.filter((entry) => entry.name !== "provider_payload_captures")
         : BACKUP_DATA_TABLES;
@@ -947,25 +971,93 @@ function exactSourceRow(
   schemaVersion: string,
 ): Record<string, unknown> {
   if (
+    schemaVersion === BACKUP_DATA_SCHEMA_VERSION && definition.name === "usage_runs" && value &&
+    typeof value === "object" && !Array.isArray(value) &&
+    (value as Record<string, unknown>).status === "reserved"
+  ) {
+    const amount = (value as Record<string, unknown>).reserved_micros;
+    let validRecoveryReserve = false;
+    try {
+      const parsed = typeof amount === "number" && Number.isSafeInteger(amount)
+        ? BigInt(amount)
+        : typeof amount === "string" && /^-?[0-9]+$/u.test(amount)
+        ? BigInt(amount)
+        : null;
+      validRecoveryReserve = parsed !== null && parsed >= 1n && parsed <= 9_007_199_254_740_991n;
+    } catch {
+      validRecoveryReserve = false;
+    }
+    if (!validRecoveryReserve) {
+      throw new BackupDataError("invariant", "Backup contains unsafe recovery accounting state");
+    }
+  }
+  if (
+    schemaVersion !== BACKUP_DATA_SCHEMA_VERSION && definition.name === "usage_runs" && value &&
+    typeof value === "object" && !Array.isArray(value) && !("recovery_owner" in value)
+  ) {
+    return exactRow(definition, {
+      ...(value as Record<string, unknown>),
+      // Cross-table ownership is assigned after every row has been staged. Never infer authority
+      // from an attacker-controlled run-ID prefix.
+      recovery_owner: "provider",
+    });
+  }
+  if (
+    schemaVersion !== BACKUP_DATA_SCHEMA_VERSION && definition.name === "tool_executions" &&
+    value &&
+    typeof value === "object" && !Array.isArray(value) && !("billing_snapshot" in value)
+  ) {
+    const legacy = value as Record<string, unknown>;
+    const activeWithRequiredSnapshot = ["queued_pending_reservation", "queued", "running"].includes(
+      String(legacy.status),
+    );
+    return exactRow(definition, {
+      ...legacy,
+      // Preserve the legacy state until every table is staged. The relationship-aware accounting
+      // repair below can then distinguish an outstanding debit (which must enter a settlement or
+      // refund outbox) from an unreserved external call (which must fail closed without replay).
+      // Current staging constraints require a snapshot for queued/running states, so use the
+      // snapshot-free pending state as a staging-only sentinel; both paths are still nonterminal
+      // and the repair always resolves them before staged validation.
+      status: activeWithRequiredSnapshot ? "pending_approval" : legacy.status,
+      result: activeWithRequiredSnapshot ? null : legacy.result,
+      error: legacy.error == null
+        ? null
+        : { code: "tool_execution_failed", message: "Tool execution failed" },
+      billing_snapshot: null,
+    });
+  }
+  if (
     schemaVersion !== BACKUP_DATA_SCHEMA_VERSION && definition.name === "ledger_entries" && value &&
     typeof value === "object" && !Array.isArray(value)
   ) {
     return exactRow(definition, { ...(value as Record<string, unknown>), sequence: null });
   }
   if (
-    schemaVersion !== BACKUP_DATA_SCHEMA_VERSION && definition.name === "users" && value &&
-    typeof value === "object" && !Array.isArray(value) && !("version" in value)
+    schemaVersion !== BACKUP_DATA_SCHEMA_VERSION &&
+    schemaVersion !== PRE_TOOL_ACCOUNTING_BACKUP_DATA_SCHEMA_VERSION &&
+    definition.name === "users" && value &&
+    typeof value === "object" && !Array.isArray(value)
   ) {
     const legacy = value as Record<string, unknown>;
     const wasDeleted = legacy.state === "deleted";
     return exactRow(definition, {
       ...legacy,
       state: wasDeleted ? "suspended" : legacy.state,
-      version: 1,
+      version: legacy.version ?? 1,
+      authority_epoch: 1,
       deleted_at: wasDeleted
         ? legacy.deleted_at ?? legacy.updated_at ?? legacy.created_at
         : legacy.deleted_at,
     });
+  }
+  if (
+    schemaVersion !== BACKUP_DATA_SCHEMA_VERSION &&
+    schemaVersion !== PRE_TOOL_ACCOUNTING_BACKUP_DATA_SCHEMA_VERSION &&
+    definition.name === "api_tokens" && value &&
+    typeof value === "object" && !Array.isArray(value)
+  ) {
+    return exactRow(definition, { ...(value as Record<string, unknown>), authority_epoch: 1 });
   }
   if (
     schemaVersion !== BACKUP_DATA_SCHEMA_VERSION && definition.name === "attachments" && value &&
@@ -1131,6 +1223,17 @@ async function stageSource(
     counts[definition.name] = count;
   }
   if (source.schemaVersion !== BACKUP_DATA_SCHEMA_VERSION) {
+    // Legacy wire formats predate explicit recovery ownership. Recover only the relationship that
+    // is actually present in the portable catalog; API replay and document-batch controls are
+    // intentionally ephemeral and therefore cannot appear in an archive.
+    await tx.unsafe(
+      `UPDATE ${safeIdentifier(stage.get("usage_runs")!)} AS usage SET recovery_owner='tool'
+       FROM ${safeIdentifier(stage.get("tool_executions")!)} AS execution
+       WHERE usage.id='tool:' || execution.id::text AND usage.user_id=execution.owner_id
+         AND usage.token_id IS NULL`,
+    );
+  }
+  if (source.schemaVersion !== BACKUP_DATA_SCHEMA_VERSION) {
     const ledgerName = stage.get("ledger_entries")!;
     const usersName = stage.get("users")!;
     try {
@@ -1147,8 +1250,74 @@ async function stageSource(
     await tx.unsafe(
       `ALTER TABLE ${safeIdentifier(ledgerName)} ALTER COLUMN sequence SET NOT NULL`,
     );
+    await upgradeLegacyToolAccounting(tx, stage);
   }
   return { stage, counts };
+}
+
+async function upgradeLegacyToolAccounting(
+  tx: postgres.TransactionSql,
+  stage: ReadonlyMap<string, string>,
+): Promise<void> {
+  const table = (name: string) => safeIdentifier(stage.get(name)!);
+  const usage = table("usage_runs");
+  const tools = table("tool_executions");
+  const ledger = table("ledger_entries");
+  const repair = safeIdentifier(
+    `backup_tool_repair_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`,
+  );
+  await tx.unsafe(`CREATE TEMP TABLE ${repair} ON COMMIT DROP AS
+    SELECT e.id execution_id,u.reserved_micros,u.provider,u.model,
+      (u.id IS NOT NULL AND u.user_id=e.owner_id AND u.token_id IS NULL
+        AND u.recovery_owner='tool' AND u.status='reserved'
+        AND u.reserved_micros BETWEEN 1 AND 9007199254740991
+        AND char_length(u.provider) BETWEEN 1 AND 255
+        AND char_length(u.model) BETWEEN 1 AND 255
+        AND evidence.reserve_count=1 AND evidence.reserve_total=-u.reserved_micros
+        AND evidence.terminal_count=0 AND evidence.owner_mismatch_count=0) owned_reserved,
+      (u.id IS NOT NULL AND u.user_id=e.owner_id AND u.token_id IS NULL
+        AND u.recovery_owner='tool' AND u.status='reserved'
+        AND u.reserved_micros BETWEEN 1 AND 9007199254740991
+        AND u.provider='tool' AND u.model='tool/' || e.tool_id
+        AND evidence.reserve_count=1 AND evidence.reserve_total=-u.reserved_micros
+        AND evidence.terminal_count=0 AND evidence.owner_mismatch_count=0) canonical_reserved
+    FROM ${tools} e LEFT JOIN ${usage} u ON u.id='tool:' || e.id::text
+    LEFT JOIN LATERAL (
+      SELECT count(*) FILTER (WHERE kind='reserve')::int reserve_count,
+        COALESCE(sum(amount_micros) FILTER (WHERE kind='reserve'),0)::bigint reserve_total,
+        count(*) FILTER (WHERE kind IN ('settle','refund'))::int terminal_count,
+        count(*) FILTER (WHERE user_id IS DISTINCT FROM e.owner_id)::int owner_mismatch_count
+      FROM ${ledger} WHERE usage_run_id=u.id
+    ) evidence ON true`);
+  await tx.unsafe(`UPDATE ${tools} e SET billing_snapshot=jsonb_build_object(
+      'reservedMicros',r.reserved_micros,'provider',r.provider,'model',r.model)
+    FROM ${repair} r WHERE e.id=r.execution_id AND r.owned_reserved`);
+  // A restore never replays an old external call. Outstanding canonical successes settle; every
+  // other owned debit enters the refund outbox. Rows without debit evidence fail closed.
+  await tx.unsafe(`UPDATE ${tools} e SET
+      status=CASE WHEN e.status='succeeded' AND r.canonical_reserved
+        THEN 'succeeded_pending_settlement'
+        WHEN e.status='failed' THEN 'failed_pending_refund'
+        ELSE 'cancelled_pending_refund' END,
+      result=CASE WHEN e.status='succeeded' AND r.canonical_reserved THEN e.result ELSE NULL END,
+      error=CASE WHEN e.status='failed'
+        THEN jsonb_build_object('code','tool_execution_failed','message','Tool execution failed')
+        ELSE NULL END,
+      cancellation_requested_at=CASE
+        WHEN e.status IN ('failed','succeeded') AND r.canonical_reserved
+          THEN e.cancellation_requested_at
+        ELSE COALESCE(e.cancellation_requested_at,now()) END
+    FROM ${repair} r WHERE e.id=r.execution_id AND r.owned_reserved
+      AND e.status IN ('pending_approval','queued_pending_reservation','queued','running',
+        'succeeded','failed','cancelled')`);
+  await tx.unsafe(`UPDATE ${tools} e SET status='failed',result=NULL,
+      error=jsonb_build_object('code','tool_execution_failed','message','Tool execution failed')
+    FROM ${repair} r WHERE e.id=r.execution_id AND NOT r.owned_reserved
+      AND e.status IN ('pending_approval','queued_pending_reservation','queued','running')`);
+  await tx.unsafe(`UPDATE ${usage} u SET error=CASE
+      WHEN e.status IN ('cancelled_pending_refund','cancelled') THEN 'Tool execution was cancelled'
+      ELSE COALESCE(e.error->>'message','Tool execution failed') END
+    FROM ${tools} e WHERE u.id='tool:' || e.id::text AND u.error IS NOT NULL`);
 }
 
 function insertSelection(definition: BackupDataTable): string {
@@ -1576,6 +1745,16 @@ async function validateStagedDatabase(
   if (!admins || admins.count < 1) {
     throw new BackupDataError("invariant", "Restore must contain an active approved administrator");
   }
+  const staleCredentials = await tx.unsafe(
+    `SELECT 1 FROM ${staged("api_tokens")} t JOIN ${staged("users")} u ON u.id=t.user_id
+      WHERE t.revoked_at IS NULL AND (
+        t.authority_epoch<>u.authority_epoch OR u.approval_status<>'approved' OR
+        u.state<>'active' OR u.deleted_at IS NOT NULL OR u.password_reset_pending=true
+      ) LIMIT 1`,
+  );
+  if (staleCredentials.length) {
+    throw new BackupDataError("invariant", "Backup contains invalid active API-token authority");
+  }
   await validateProviderModels(tx, stage.get("providers")!, stage.get("provider_models")!);
   for await (
     const rows of tx.unsafe(`SELECT id,title,conversation_version,identity_visibility,
@@ -1687,16 +1866,51 @@ async function validateStagedDatabase(
   }
   const terminalChecks = [
     ["messages", "status='streaming'"],
-    ["usage_runs", "status='reserved'"],
     ["provider_attempts", "status='running'"],
     ["embedding_provider_attempts", "status='running'"],
-    ["tool_executions", "status IN ('queued','running')"],
+    [
+      "tool_executions",
+      "status IN ('pending_approval','queued_pending_reservation','queued','running')",
+    ],
     ["retention_scrub_runs", "status IN ('queued','running')"],
   ] as const;
   for (const [name, predicate] of terminalChecks) {
     if ((await tx.unsafe(`SELECT 1 FROM ${staged(name)} WHERE ${predicate} LIMIT 1`)).length) {
       throw new BackupDataError("invariant", `Backup contains nonterminal ${name} state`);
     }
+  }
+  const invalidRecoveryAccounting = await tx.unsafe(`
+    WITH valid AS (
+      SELECT u.id usage_run_id,e.id execution_id
+      FROM ${staged("usage_runs")} u JOIN ${staged("tool_executions")} e
+        ON u.id='tool:' || e.id::text AND u.user_id=e.owner_id
+      JOIN LATERAL (
+        SELECT count(*) FILTER (WHERE kind='reserve')::int reserve_count,
+          COALESCE(sum(amount_micros) FILTER (WHERE kind='reserve'),0)::bigint reserve_total,
+          count(*) FILTER (WHERE kind IN ('settle','refund'))::int terminal_count,
+          count(*) FILTER (WHERE user_id IS DISTINCT FROM u.user_id)::int owner_mismatch_count
+        FROM ${staged("ledger_entries")} l
+        WHERE l.usage_run_id=u.id
+      ) evidence ON true
+      WHERE u.status='reserved' AND u.token_id IS NULL AND u.recovery_owner='tool'
+        AND e.status IN ('failed_pending_refund','cancelled_pending_refund',
+          'succeeded_pending_settlement')
+        AND u.reserved_micros BETWEEN 1 AND 9007199254740991
+        AND e.billing_snapshot=jsonb_build_object('reservedMicros',u.reserved_micros,
+          'provider',u.provider,'model',u.model)
+        AND evidence.reserve_count=1 AND evidence.reserve_total=-u.reserved_micros
+        AND evidence.terminal_count=0 AND evidence.owner_mismatch_count=0
+    )
+    SELECT 1 FROM ${staged("usage_runs")} u WHERE u.status='reserved'
+      AND NOT EXISTS(SELECT 1 FROM valid v WHERE v.usage_run_id=u.id)
+    UNION ALL
+    SELECT 1 FROM ${staged("tool_executions")} e
+      WHERE e.status IN ('failed_pending_refund','cancelled_pending_refund',
+        'succeeded_pending_settlement')
+        AND NOT EXISTS(SELECT 1 FROM valid v WHERE v.execution_id=e.id)
+    LIMIT 1`);
+  if (invalidRecoveryAccounting.length) {
+    throw new BackupDataError("invariant", "Backup contains unsafe recovery accounting state");
   }
 }
 
@@ -1800,9 +2014,21 @@ async function applyBackupData(
           );
         }
         restoreControl = maintenance;
-        // Bind the transaction-local bypass to the durable operation identity. The trigger also
-        // verifies this backend owns the exact transaction advisory lock and that the operation
-        // still owns active maintenance; the caller-controlled setting is not trusted by itself.
+        const [transactionBinding] = await tx`
+          UPDATE installation_state SET restore_transaction_id=pg_current_xact_id()
+          WHERE singleton_id=1 AND maintenance_enabled=true
+            AND active_restore_id=${options.restoreOperationId!}
+            AND restore_transaction_id IS NULL
+          RETURNING singleton_id
+        `;
+        if (!transactionBinding) {
+          throw new BackupDataError(
+            "maintenance",
+            "Restore transaction authority is already bound",
+          );
+        }
+        // Bind the local setting to both the durable operation and this exact transaction. Unlike
+        // pg_locks, the xid8 binding cannot confuse a same-key session lock with an xact lock.
         await tx`SELECT set_config('dg_chat.restore_bypass',${options.restoreOperationId!},true)`;
       }
       const suffix = crypto.randomUUID().replaceAll("-", "").slice(0, 12);
@@ -1884,6 +2110,15 @@ async function applyBackupData(
       if (!fenced) throw new BackupDataError("conflict", "Restore database commit fence is stale");
       impact = Object.freeze({ ...impact, restoreOperationVersion: fenced.version });
       await options.beforeCommit?.();
+      const [releasedBinding] = await tx`
+        UPDATE installation_state SET restore_transaction_id=NULL
+        WHERE singleton_id=1 AND active_restore_id=${options.restoreOperationId!}
+          AND restore_transaction_id=pg_current_xact_id()
+        RETURNING singleton_id
+      `;
+      if (!releasedBinding) {
+        throw new BackupDataError("maintenance", "Restore transaction authority was lost");
+      }
       return impact;
     });
   } finally {

@@ -77,10 +77,13 @@ boundary.
 ## Trust boundaries
 
 All browser input, uploaded content, provider output, tool calls, and fetched URLs are untrusted.
-Authorization is evaluated on every object read, not only when signed URLs are created. Provider and
-search egress must reject private, loopback, link-local, and metadata-network destinations after
-every redirect. Optional code execution is a separate, authenticated service with no default
-network, read-only inputs, strict resources, and no Docker socket.
+Authorization is evaluated on every object read, not only when signed URLs are created. Search
+adapters are trusted in-process application code: their `networkTarget` metadata supports policy
+checks but is advisory and cannot sandbox a custom adapter. The built-in SearXNG adapter's
+DNS-resolved, address-pinned, no-redirect transport is the actual SSRF enforcement boundary and
+rejects private, loopback, link-local, and metadata-network destinations. Custom adapters must
+provide an equivalent transport boundary. Optional code execution is a separate, authenticated
+service with no default network, read-only inputs, strict resources, and no Docker socket.
 
 ## Availability and observability
 
@@ -88,9 +91,14 @@ network, read-only inputs, strict resources, and no Docker socket.
 remove an instance from service when readiness fails without restarting it solely for a transient
 provider outage. HTTP request logs carry a server-generated request ID and a registered route
 template while excluding raw URLs, queries, headers, identities, secrets, and prompt bodies. Durable
-usage runs and provider attempts retain their own relational correlation. End-to-end trace
-correlation, Prometheus metrics, OpenTelemetry exporters, and alert rules remain a planned
-operational milestone and must not be assumed present by deployments.
+usage runs and provider attempts retain their own relational correlation. The API and worker expose
+separate Prometheus listeners on the private deployment network with closed, low-cardinality label
+sets. A manual OpenTelemetry SDK supplies W3C trace-context extraction and batched OTLP export when
+enabled. API spans contain only bounded method/route attributes; worker job spans contain only a
+bounded job-type attribute. Exception text is never attached. Deno's native auto-instrumentation is
+explicitly disabled because its exported attribute list retains the original `url.full`, `url.path`,
+and `url.query`, even if application code adds redacted replacements. This prevents conversation
+identifiers, share capabilities, signed URLs, and query content from entering traces.
 
 See [SECURITY.md](SECURITY.md) for controls and [DEPLOYMENT.md](DEPLOYMENT.md) for the production
 topology.

@@ -34,8 +34,16 @@ parameters, identity values, and adapter exception details are never forwarded t
 
 Markdown, citations, filenames, provider errors, and tool results are rendered as hostile content
 under a restrictive Content Security Policy. Raw HTML is disabled unless passed through a maintained
-sanitizer. Spreadsheet formulas are escaped in CSV exports. Mermaid and artifact rendering are not
-currently exposed by the product.
+sanitizer. Spreadsheet formulas are escaped in CSV exports. Mermaid diagrams are rendered from
+fenced source through the product's bounded, sanitized rich-output path, and code/document artifacts
+use inert text previews or explicitly sandboxed previews rather than injecting model output into the
+application document. The production proxy permits scripts and connections only from the product
+origin, rejects inline script and dynamic evaluation, disables embedding and plugins, and applies
+`nosniff`. Its narrow blob/media and inline-style allowances preserve local previews, playback,
+React positioning, KaTeX, and sanitized Mermaid output. Remote images remain blocked until the user
+approves the exact source URL, and the CSP then permits only HTTPS remote image transport. The
+public proxy always returns a JSON 404 for `/metrics`; expose future metrics only on an internal
+listener.
 
 File upload routes stream multipart bodies through byte and concurrency limits, MIME sniffing,
 filename normalization, immutable object keys, ownership checks, and image dimension/decompression
@@ -63,6 +71,12 @@ special-use destinations, and pins the approved address while preserving TLS hos
 rejects redirects and bounds response and streaming bytes. OCR, SearXNG search, approved tools, and
 ingestion each enforce their own network, redirect, byte, MIME, and relevant image/archive limits.
 Any future sandbox fetcher must preserve those controls independently.
+
+Search adapters execute as trusted code inside the API process. Adapter `networkTarget` metadata is
+advisory input to tool policy checks, not an isolation or SSRF boundary. The built-in SearXNG
+adapter enforces SSRF protection in its DNS-resolved, address-pinned, no-redirect transport; any
+custom in-process adapter must implement equivalent egress controls and receive the same scrutiny as
+application code.
 
 ## Secrets and privacy
 

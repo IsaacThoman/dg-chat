@@ -82,22 +82,29 @@ Deno.test({
       assertEquals(promoted.effectiveAdmin, true);
       assertEquals(promoted.version, 3);
 
-      await sql`INSERT INTO sessions(user_id,token_hash,limited,expires_at) VALUES
-        (${targetId},'full-session',false,now()+interval '1 day'),
-        (${targetId},'limited-session',true,now()+interval '1 day')`;
+      await sql`INSERT INTO sessions(user_id,token_hash,limited,authority_epoch,expires_at) VALUES
+        (${targetId},'full-session',false,2,now()+interval '1 day'),
+        (${targetId},'limited-session',true,2,now()+interval '1 day')`;
       await sql`INSERT INTO auth_users(id,name,email,email_verified)
         VALUES(${targetId},'Target','target@example.com',true)`;
-      await sql`INSERT INTO auth_sessions(id,expires_at,token,updated_at,user_id,limited) VALUES
-        (${crypto.randomUUID()},now()+interval '1 day','auth-full',now(),${targetId},false),
-        (${crypto.randomUUID()},now()+interval '1 day','auth-limited',now(),${targetId},true)`;
+      await sql`INSERT INTO auth_sessions(
+        id,expires_at,token,updated_at,user_id,limited,authority_epoch
+      ) VALUES
+        (${crypto.randomUUID()},now()+interval '1 day','auth-full',now(),${targetId},false,2),
+        (${crypto.randomUUID()},now()+interval '1 day','auth-limited',now(),${targetId},true,2)`;
       const tokenId = crypto.randomUUID();
-      await sql`INSERT INTO api_tokens(id,user_id,name,token_hash,preview,scopes,rotation_family_id)
-        VALUES(${tokenId},${targetId},'test','token-hash','dg_test','["chat"]',${tokenId})`;
-      await sql`INSERT INTO identity_tokens(user_id,purpose,token_hash,expires_at)
-        VALUES(${targetId},'password_reset','pending-reset',now()+interval '1 hour')`;
-      await sql`INSERT INTO auth_verifications(id,identifier,value,expires_at)
-        VALUES(${crypto.randomUUID()},'reset-password:pending-better-auth',${targetId},
-          now()+interval '1 hour')`;
+      await sql`INSERT INTO api_tokens(
+        id,user_id,name,token_hash,preview,scopes,authority_epoch,rotation_family_id
+      ) VALUES(${tokenId},${targetId},'test','token-hash','dg_test','["chat"]',2,${tokenId})`;
+      await sql`INSERT INTO identity_tokens(
+        user_id,purpose,token_hash,expires_at,authority_epoch
+      ) VALUES(${targetId},'password_reset','pending-reset',now()+interval '1 hour',2)`;
+      await sql`INSERT INTO auth_verifications(
+        id,identifier,value,expires_at,authority_epoch
+      ) VALUES(
+        ${crypto.randomUUID()},'reset-password:pending-better-auth',${targetId},
+        now()+interval '1 hour',2
+      )`;
       const suspended = await repo.setAdminUserState({
         actorId,
         targetUserId: targetId,
@@ -206,6 +213,88 @@ Deno.test({
         "admin_authority_required",
       );
       assertEquals((await repo.getAdminUser(secondId)).approvalStatus, "pending");
+    } finally {
+      await repo.close();
+      await sql.end();
+    }
+  },
+});
+
+Deno.test({
+  name: "Postgres administrator promotion invalidates every pre-promotion full credential",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 1 });
+    await sql`TRUNCATE audit_events,ledger_entries,identity_tokens,api_tokens,auth_verifications,
+      auth_sessions,auth_accounts,auth_users,sessions,users RESTART IDENTITY CASCADE`;
+    const actorId = crypto.randomUUID();
+    const targetId = crypto.randomUUID();
+    const authFullId = crypto.randomUUID();
+    const authLimitedId = crypto.randomUUID();
+    const tokenId = crypto.randomUUID();
+    await sql`INSERT INTO users(id,email,name,role,approval_status,state,email_verified_at)
+      VALUES
+        (${actorId},'promotion-actor@example.com','Actor','admin','approved','active',now()),
+        (${targetId},'promotion-target@example.com','Target','user','approved','active',now())`;
+    await sql`INSERT INTO auth_users(id,name,email,email_verified)
+      VALUES(${targetId},'Target','promotion-target@example.com',true)`;
+    await sql`INSERT INTO sessions(user_id,token_hash,limited,authority_epoch,expires_at) VALUES
+      (${targetId},'promotion-full',false,1,now()+interval '1 day'),
+      (${targetId},'promotion-limited',true,1,now()+interval '1 day')`;
+    await sql`INSERT INTO auth_sessions(id,expires_at,token,updated_at,user_id,limited,authority_epoch)
+      VALUES
+        (${authFullId},now()+interval '1 day','promotion-auth-full',now(),${targetId},false,1),
+        (${authLimitedId},now()+interval '1 day','promotion-auth-limited',now(),${targetId},true,1)`;
+    await sql`INSERT INTO api_tokens(
+      id,user_id,name,token_hash,preview,scopes,authority_epoch,rotation_family_id
+    ) VALUES(
+      ${tokenId},${targetId},'pre-promotion','promotion-token','dg_test','["models:read"]',1,
+      ${tokenId}
+    )`;
+    await sql`INSERT INTO identity_tokens(
+      user_id,purpose,token_hash,expires_at,authority_epoch
+    ) VALUES(
+      ${targetId},'password_reset','promotion-reset',now()+interval '1 hour',1
+    )`;
+    const repo = await PostgresRepository.connect(databaseUrl!);
+    try {
+      await repo.setAdminUserRole({
+        actorId,
+        targetUserId: targetId,
+        expectedVersion: 1,
+        role: "admin",
+        reason: "Require fresh administrator authentication",
+      });
+      assertEquals(
+        Number(
+          (await sql`SELECT authority_epoch FROM users WHERE id=${targetId}`)[0].authority_epoch,
+        ),
+        2,
+      );
+      assertEquals(
+        (await sql`SELECT token_hash FROM sessions WHERE user_id=${targetId}
+          AND invalidated_at IS NULL ORDER BY token_hash`).map((row) => row.token_hash),
+        ["promotion-limited"],
+      );
+      assertEquals(
+        (await sql`SELECT token FROM auth_sessions WHERE user_id=${targetId} ORDER BY token`).map(
+          (row) => row.token,
+        ),
+        ["promotion-auth-limited"],
+      );
+      assertEquals(
+        Boolean((await sql`SELECT revoked_at FROM api_tokens WHERE id=${tokenId}`)[0].revoked_at),
+        true,
+      );
+      assertEquals(
+        Boolean(
+          (await sql`SELECT consumed_at FROM identity_tokens
+            WHERE token_hash='promotion-reset'`)[0].consumed_at,
+        ),
+        true,
+      );
     } finally {
       await repo.close();
       await sql.end();

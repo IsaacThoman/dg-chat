@@ -31,23 +31,28 @@ Deno.test({
     const messageAttachmentId = crypto.randomUUID();
     const generatedAttachmentId = crypto.randomUUID();
     const lineageAttachmentId = crypto.randomUUID();
+    const replayAttachmentId = crypto.randomUUID();
     const cleanupStageId = crypto.randomUUID();
     const messageStageId = crypto.randomUUID();
     const generatedStageId = crypto.randomUUID();
     const lineageStageId = crypto.randomUUID();
+    const replayStageId = crypto.randomUUID();
     const generatedAssetId = crypto.randomUUID();
     const generatedJobId = crypto.randomUUID();
+    const replayJobId = crypto.randomUUID();
     const runIds = {
       cleanup: `cleanup-run-${suffix}`,
       message: `message-run-${suffix}`,
       generated: `generated-run-${suffix}`,
       lineage: `lineage-run-${suffix}`,
+      replay: `replay-run-${suffix}`,
     };
     const objectKeys = {
       cleanup: `generated/${ownerId}/cleanup-${suffix}.png`,
       message: `generated/${ownerId}/message-${suffix}.png`,
       generated: `generated/${ownerId}/asset-${suffix}.png`,
       lineage: `generated/${ownerId}/lineage-${suffix}.png`,
+      replay: `generated/${ownerId}/replay-${suffix}.png`,
     };
     const deletes: string[] = [];
     let transientCleanupFailures = 0;
@@ -93,6 +98,7 @@ Deno.test({
       stdout: "null",
       stderr: "piped",
     }).spawn();
+    let shutdownFailure: string | undefined;
     try {
       await sql`INSERT INTO users(id,email,name,password_hash,role,approval_status)
         VALUES(${ownerId},${`cleanup-${suffix}@worker.test`},'Cleanup owner','hash','admin','approved')`;
@@ -106,14 +112,15 @@ Deno.test({
         output_micros_per_million,fixed_call_micros,source)
         VALUES(${priceId},${modelId},'2020-01-01',0,0,0,0,1,'cleanup-test')`;
       for (const runId of Object.values(runIds)) {
-        await sql`INSERT INTO usage_runs(id,user_id,model,provider,status)
-          VALUES(${runId},${ownerId},${`cleanup-${suffix}/image`},${`cleanup-${suffix}`},'completed')`;
+        await sql`INSERT INTO usage_runs(id,user_id,model,provider,recovery_owner,status)
+          VALUES(${runId},${ownerId},${`cleanup-${suffix}/image`},${`cleanup-${suffix}`},'provider','completed')`;
       }
       const attachments = [
         [cleanupAttachmentId, objectKeys.cleanup, "a"],
         [messageAttachmentId, objectKeys.message, "b"],
         [generatedAttachmentId, objectKeys.generated, "c"],
         [lineageAttachmentId, objectKeys.lineage, "f"],
+        [replayAttachmentId, objectKeys.replay, "9"],
       ] as const;
       for (const [id, key, sha] of attachments) {
         await sql`INSERT INTO attachments(id,owner_id,object_key,filename,mime_type,size_bytes,
@@ -137,6 +144,7 @@ Deno.test({
           "cleanup_pending",
         ],
         [lineageStageId, runIds.lineage, lineageAttachmentId, objectKeys.lineage, "f", "attached"],
+        [replayStageId, runIds.replay, replayAttachmentId, objectKeys.replay, "9", "cleaning"],
       ] as const;
       for (const [id, runId, attachmentId, key, sha, state] of stages) {
         await sql`INSERT INTO generated_object_staging(id,owner_id,usage_run_id,ordinal,object_key,
@@ -146,6 +154,10 @@ Deno.test({
       }
       await sql`UPDATE generated_object_staging SET purpose='edit_input'
         WHERE id=${cleanupStageId}`;
+      // Model an uncertain first fencing commit: PostgreSQL committed both the stage transition and
+      // attachment tombstone, but the worker lost the transaction response before deleting S3.
+      await sql`UPDATE attachments SET state='deleted',deleted_at=now(),updated_at=now()
+        WHERE id=${replayAttachmentId}`;
       await sql`INSERT INTO generated_assets(id,owner_id,usage_run_id,provider_model_id,
         public_model_id,upstream_model_id,provider_slug,pricing_version_id,
         pricing_input_micros_per_million,pricing_cached_input_micros_per_million,
@@ -165,6 +177,10 @@ Deno.test({
         VALUES(${generatedJobId},'generated_object.cleanup',${
         sql.json({ stageId: generatedStageId, ownerId })
       },${`generated_object.cleanup:${generatedStageId}`})`;
+      await sql`INSERT INTO jobs(id,type,payload,idempotency_key)
+        VALUES(${replayJobId},'generated_object.cleanup',${
+        sql.json({ stageId: replayStageId, ownerId })
+      },${`generated_object.cleanup:${replayStageId}`})`;
 
       // The cleanup transaction must fence the attachment before the non-transactional S3
       // delete. While deletion is paused, both message and generated-asset reference writers
@@ -207,6 +223,13 @@ Deno.test({
         return rows[0]?.state === "cleaned" && rows[0].status === "completed";
       });
       await eventually(async () => {
+        const rows = await sql<{ state: string; status: string }[]>`
+          SELECT s.state,j.status FROM generated_object_staging s JOIN jobs j
+            ON j.id=${replayJobId}
+          WHERE s.id=${replayStageId}`;
+        return rows[0]?.state === "cleaned" && rows[0].status === "completed";
+      });
+      await eventually(async () => {
         const rows = await sql<{ count: number }[]>`SELECT count(*)::int AS count FROM jobs
           WHERE idempotency_key IN (${`generated_object.cleanup:${messageStageId}`},
             ${`generated_object.cleanup:${generatedStageId}`},
@@ -215,10 +238,14 @@ Deno.test({
         return rows[0]?.count === 3;
       });
 
-      assertEquals(deletes, [
-        `/cleanup-test/${objectKeys.cleanup}`,
-        `/cleanup-test/${objectKeys.cleanup}`,
-      ]);
+      assertEquals(
+        deletes.filter((path) => path === `/cleanup-test/${objectKeys.cleanup}`).length,
+        2,
+      );
+      assertEquals(
+        deletes.filter((path) => path === `/cleanup-test/${objectKeys.replay}`).length,
+        1,
+      );
       assertEquals(
         [
           ...await sql`SELECT state,deleted_at IS NOT NULL AS deleted FROM attachments
@@ -232,6 +259,14 @@ Deno.test({
           WHERE id=${cleanupStageId}`,
         ],
         [{ state: "cleaned", cleanup_error: null }],
+      );
+      assertEquals(
+        [
+          ...await sql`SELECT a.state,a.deleted_at IS NOT NULL AS deleted,s.state AS stage_state
+          FROM attachments a JOIN generated_object_staging s ON s.attachment_id=a.id
+          WHERE a.id=${replayAttachmentId}`,
+        ],
+        [{ state: "deleted", deleted: true, stage_state: "cleaned" }],
       );
       assertEquals(
         [
@@ -255,12 +290,9 @@ Deno.test({
     } finally {
       worker.kill("SIGTERM");
       const status = await worker.status;
-      if (!status.success && status.code !== 143) {
-        const stderr = new TextDecoder().decode(
-          await worker.stderr.getReader().read().then((x) => x.value),
-        );
-        console.error(stderr);
-      }
+      const stderr = status.success ? "" : new TextDecoder().decode(
+        await worker.stderr.getReader().read().then((x) => x.value),
+      );
       await s3.shutdown();
       await sql`DELETE FROM jobs WHERE idempotency_key LIKE ${`generated_object.cleanup:%`}
         AND payload->>'ownerId'=${ownerId}`;
@@ -277,6 +309,10 @@ Deno.test({
       await sql`DELETE FROM providers WHERE id=${providerId}`;
       await sql`DELETE FROM users WHERE id=${ownerId}`;
       await sql.end();
+      if (!status.success) {
+        shutdownFailure = `Cleanup worker did not shut down successfully: ${stderr}`;
+      }
     }
+    if (shutdownFailure) throw new Error(shutdownFailure);
   },
 });

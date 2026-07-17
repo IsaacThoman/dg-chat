@@ -1,4 +1,6 @@
 import { betterAuth } from "npm:better-auth@1.6.23/minimal";
+import { APIError } from "npm:better-auth@1.6.23/api";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { drizzleAdapter } from "npm:better-auth@1.6.23/adapters/drizzle";
 import { drizzle } from "npm:drizzle-orm@0.45.2/postgres-js";
 import postgres from "npm:postgres@3.4.7";
@@ -76,7 +78,17 @@ export function createSanitizedBetterAuthLogging(
       // Better Auth otherwise sends APIError messages through its package-global logger for warn
       // and error levels, bypassing the configured logger. Supplying this callback takes over that
       // path before the library fallback can print callback or adapter details.
-      onError: () => logger.log("error", "Authentication API error"),
+      onError: (error: unknown) => {
+        logger.log("error", "Authentication API error");
+        // better-call logs any non-API error after a void callback returns, including adapter
+        // query parameters that can contain reset tokens. Re-throw a sanitized typed error so
+        // the router renders it without forwarding the original exception to global stderr.
+        if (!(error instanceof APIError) || error.statusCode >= 500) {
+          throw new APIError("INTERNAL_SERVER_ERROR", {
+            message: "Authentication request failed",
+          });
+        }
+      },
     },
   };
 }
@@ -116,8 +128,24 @@ export interface BetterAuthBrowserSession {
   id: string;
   userId: string;
   limited: boolean;
+  authorityEpoch: number;
   /** Time the user proved their identity, not the session's rolling refresh time. */
   authenticatedAt: string;
+}
+
+type AuthRequestObservation = {
+  kind: "sign_in" | "password_reset";
+  userId: string;
+  authorityEpoch: number;
+  eligible: boolean;
+};
+
+export function matchesPasswordResetObservation(
+  observation: AuthRequestObservation | undefined,
+  userId: string,
+): observation is AuthRequestObservation & { kind: "password_reset"; eligible: true } {
+  return observation?.kind === "password_reset" && observation.eligible &&
+    observation.userId === userId;
 }
 
 /**
@@ -132,10 +160,22 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
   const authOperationalLog = createSanitizedAuthOperationalEmitter(options.authLogSink);
   const authLogging = createSanitizedBetterAuthLogging(options.authLogSink);
   const sql = postgres(options.databaseUrl, { max: 10 });
-  const database = drizzle(sql, {
-    schema: { authUsers, authSessions, authAccounts, authVerifications },
-  });
+  const closeFailedPool = () => void sql.end({ timeout: 0 }).catch(() => undefined);
+  const constructDatabase = () =>
+    drizzle(sql, {
+      schema: { authUsers, authSessions, authAccounts, authVerifications },
+    });
+  let database: ReturnType<typeof constructDatabase>;
+  try {
+    database = constructDatabase();
+  } catch (error) {
+    closeFailedPool();
+    throw error;
+  }
   const normalizeEmail = (email: string) => email.trim().toLowerCase();
+  // Better Auth performs credential work before its database hooks. Capture domain authority at
+  // the request boundary so sign-in and password-reset issuance cannot cross an authority loss.
+  const authRequestObservation = new AsyncLocalStorage<AuthRequestObservation | undefined>();
   const provisionDomainUser = async (authUser: {
     id: string;
     email: string;
@@ -252,165 +292,249 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
   const drainIdentityDeliveries = (abortAfterMs?: number) =>
     drainIdentityDeliverySet(pendingIdentityDeliveries, abortAfterMs);
 
-  const auth = betterAuth({
-    appName: "DG Chat",
-    baseURL: options.appUrl,
-    basePath: "/api/auth",
-    secret: options.secret,
-    trustedOrigins: [options.webOrigin],
-    ...authLogging,
-    database: drizzleAdapter(database, {
-      provider: "pg",
-      schema: {
-        user: authUsers,
-        session: authSessions,
-        account: authAccounts,
-        verification: authVerifications,
-      },
-    }),
-    advanced: {
-      database: { generateId: "uuid" },
-      cookiePrefix: "dg_chat",
-    },
-    account: {
-      encryptOAuthTokens: true,
-      storeStateStrategy: "database",
-      accountLinking: { enabled: false, disableImplicitLinking: true },
-    },
-    plugins: options.oidc
-      ? [oidcPlugin({
-        ...options.oidc,
-        appUrl: options.appUrl,
-        webOrigin: options.webOrigin,
-        pruneExpiredState: async () => {
-          await sql`DELETE FROM auth_verifications WHERE expires_at<=now()`;
+  const constructAuth = () =>
+    betterAuth({
+      appName: "DG Chat",
+      baseURL: options.appUrl,
+      basePath: "/api/auth",
+      secret: options.secret,
+      trustedOrigins: [options.webOrigin],
+      ...authLogging,
+      database: drizzleAdapter(database, {
+        provider: "pg",
+        schema: {
+          user: authUsers,
+          session: authSessions,
+          account: authAccounts,
+          verification: authVerifications,
         },
-      })]
-      : [],
-    session: {
-      additionalFields: {
-        limited: {
-          type: "boolean",
-          required: true,
-          defaultValue: true,
-          input: false,
+      }),
+      advanced: {
+        database: { generateId: "uuid" },
+        cookiePrefix: "dg_chat",
+      },
+      account: {
+        encryptOAuthTokens: true,
+        storeStateStrategy: "database",
+        accountLinking: { enabled: false, disableImplicitLinking: true },
+      },
+      plugins: options.oidc
+        ? [oidcPlugin({
+          ...options.oidc,
+          appUrl: options.appUrl,
+          webOrigin: options.webOrigin,
+          pruneExpiredState: async () => {
+            await sql`DELETE FROM auth_verifications WHERE expires_at<=now()`;
+          },
+        })]
+        : [],
+      session: {
+        additionalFields: {
+          limited: {
+            type: "boolean",
+            required: true,
+            defaultValue: true,
+            input: false,
+          },
+          authorityEpoch: {
+            type: "number",
+            required: true,
+            defaultValue: 1,
+            input: false,
+          },
         },
       },
-    },
-    emailAndPassword: {
-      enabled: true,
-      // Keep a narrow status session for unverified applicants. Domain authorization and the
-      // limited session field enforce verification until the one-time link is completed.
-      requireEmailVerification: false,
-      revokeSessionsOnPasswordReset: true,
-      password: {
-        hash: hashPassword,
-        verify: ({ hash, password }) => verifyPassword(password, hash),
+      verification: {
+        additionalFields: {
+          authorityEpoch: {
+            type: "number",
+            required: false,
+            input: false,
+          },
+        },
       },
-      sendResetPassword: options.sendPasswordResetEmail
-        ? async ({ user, url, token }) => {
-          const domainUser = await options.repository.findUser(user.id);
-          if (
-            !domainUser || domainUser.state !== "active" || domainUser.deletedAt !== null
-          ) return;
-          dispatchIdentityEmail(
-            user.id,
-            null,
-            (signal) => options.sendPasswordResetEmail!({ email: user.email, url, token }, signal),
-            "identity.password_reset_requested",
-            "identity.password_reset_delivery_failed",
-          );
+      emailAndPassword: {
+        enabled: true,
+        // Keep a narrow status session for unverified applicants. Domain authorization and the
+        // limited session field enforce verification until the one-time link is completed.
+        requireEmailVerification: false,
+        revokeSessionsOnPasswordReset: true,
+        password: {
+          hash: hashPassword,
+          verify: ({ hash, password }) => verifyPassword(password, hash),
+        },
+        sendResetPassword: options.sendPasswordResetEmail
+          ? async ({ user, url, token }) => {
+            const domainUser = await options.repository.findUser(user.id);
+            if (
+              !domainUser || domainUser.state !== "active" || domainUser.deletedAt !== null
+            ) return;
+            dispatchIdentityEmail(
+              user.id,
+              null,
+              (signal) =>
+                options.sendPasswordResetEmail!({ email: user.email, url, token }, signal),
+              "identity.password_reset_requested",
+              "identity.password_reset_delivery_failed",
+            );
+          }
+          : undefined,
+      },
+      emailVerification: options.sendVerificationEmail
+        ? {
+          expiresIn: 24 * 60 * 60,
+          sendOnSignUp: options.requireEmailVerification ?? false,
+          sendVerificationEmail: async ({ user, url, token }) => {
+            const domainUser = await provisionDomainUser(user);
+            await options.repository.createIdentityToken(
+              domainUser.id,
+              "email_verification",
+              await sha256(token),
+              new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+              domainUser.authorityEpoch,
+            );
+            dispatchIdentityEmail(
+              user.id,
+              null,
+              (signal) => options.sendVerificationEmail!({ email: user.email, url, token }, signal),
+              "identity.verification_sent",
+              "identity.verification_delivery_failed",
+            );
+          },
         }
         : undefined,
-      onPasswordReset: async ({ user }, request) => {
-        const token = request?.headers.get("x-dg-password-reset-token");
-        if (!token) throw new Error("Password reset guard token is missing");
-        await options.repository.secureAfterPasswordReset(user.id, token);
-        await recordAuthAuditWithSanitizedFailure(
-          () =>
-            options.repository.recordAudit({
-              actorId: user.id,
-              action: "identity.password_reset_completed",
-              targetType: "user",
-              targetId: user.id,
-            }),
-          authOperationalLog,
-          {
-            level: "error",
-            message: "Password reset audit persistence failed",
+      databaseHooks: {
+        verification: {
+          create: {
+            before: async (verification) => {
+              if (!verification.identifier.startsWith("reset-password:")) {
+                return { data: { ...verification, authorityEpoch: null } };
+              }
+              const observation = authRequestObservation.getStore();
+              if (!matchesPasswordResetObservation(observation, verification.value)) {
+                // Better Auth does not consistently treat a false hook result as a failed write.
+                // Throw so no reset link can be delivered without a fenced durable record.
+                throw new Error("Password reset authority observation is unavailable");
+              }
+              // Reject an authority loss that completed after request admission before reaching the
+              // adapter. The database trigger repeats this predicate under a user-row lock to fence
+              // the final read/insert race.
+              const current = await options.repository.findUser(verification.value);
+              if (
+                !current || current.authorityEpoch !== observation.authorityEpoch ||
+                current.state !== "active" || current.deletedAt !== null ||
+                current.passwordResetPending === true
+              ) {
+                throw new Error("Password reset authority observation is stale");
+              }
+              return {
+                data: { ...verification, authorityEpoch: observation.authorityEpoch },
+              };
+            },
           },
-        );
+        },
+        user: {
+          create: {
+            after: async (authUser) => {
+              await provisionDomainUser(authUser);
+            },
+          },
+          update: {
+            after: async (authUser) => {
+              if (authUser.emailVerified) {
+                await options.repository.markUserEmailVerified(authUser.id);
+                // The status-only session remains limited by its immutable session field. Keeping
+                // it alive lets the pending screen observe verification without silently granting
+                // workspace access; a fresh sign-in is still required for a full session.
+              }
+            },
+          },
+        },
+        session: {
+          create: {
+            before: async (session, context) => {
+              let domainUser = await options.repository.findUser(session.userId);
+              // Better Auth queues user.create.after until its adapter transaction commits. A new
+              // signup can therefore reach session creation just before domain provisioning runs;
+              // keep that session limited and let request authorization fail closed until the
+              // matching domain row exists.
+              const authUser = await loadAuthUser(session.userId);
+              if (authUser) domainUser = await provisionDomainUser(authUser);
+              const requestObservation = authRequestObservation.getStore();
+              const passwordObservation = requestObservation?.kind === "sign_in"
+                ? requestObservation
+                : undefined;
+              const existingSessionEpoch = context?.context?.session?.session &&
+                  "authorityEpoch" in context.context.session.session
+                ? Number(context.context.session.session.authorityEpoch)
+                : undefined;
+              const freshPasswordEpoch = passwordObservation?.userId === session.userId
+                ? passwordObservation.authorityEpoch
+                : undefined;
+              if (passwordObservation?.userId === session.userId && !passwordObservation.eligible) {
+                return false;
+              }
+              const freshOidcAuthentication = context?.path === "/oidc/callback";
+              const authorityEpoch = freshPasswordEpoch ??
+                (freshOidcAuthentication ? domainUser?.authorityEpoch : existingSessionEpoch) ??
+                domainUser?.authorityEpoch ?? 1;
+              if (!domainUser) {
+                return { data: { ...session, limited: true, authorityEpoch: 1 } };
+              }
+              if (
+                domainUser.state !== "active" || domainUser.deletedAt !== null ||
+                domainUser.passwordResetPending === true
+              ) {
+                return false;
+              }
+              const limited = domainUser.approvalStatus !== "approved" ||
+                ((options.requireEmailVerification ?? false) && !domainUser.emailVerifiedAt);
+              return { data: { ...session, limited, authorityEpoch } };
+            },
+          },
+        },
       },
-    },
-    emailVerification: options.sendVerificationEmail
-      ? {
-        sendOnSignUp: options.requireEmailVerification ?? false,
-        sendVerificationEmail: async ({ user, url, token }) => {
-          const domainUser = await provisionDomainUser(user);
-          await options.repository.createIdentityToken(
-            domainUser.id,
-            "email_verification",
-            await sha256(token),
-            new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
-          );
-          dispatchIdentityEmail(
-            user.id,
-            null,
-            (signal) => options.sendVerificationEmail!({ email: user.email, url, token }, signal),
-            "identity.verification_sent",
-            "identity.verification_delivery_failed",
-          );
-        },
-      }
-      : undefined,
-    databaseHooks: {
-      user: {
-        create: {
-          after: async (authUser) => {
-            await provisionDomainUser(authUser);
-          },
-        },
-        update: {
-          after: async (authUser) => {
-            if (authUser.emailVerified) {
-              await options.repository.markUserEmailVerified(authUser.id);
-              // The status-only session remains limited by its immutable session field. Keeping
-              // it alive lets the pending screen observe verification without silently granting
-              // workspace access; a fresh sign-in is still required for a full session.
-            }
-          },
-        },
-      },
-      session: {
-        create: {
-          before: async (session) => {
-            let domainUser = await options.repository.findUser(session.userId);
-            // Better Auth queues user.create.after until its adapter transaction commits. A new
-            // signup can therefore reach session creation just before domain provisioning runs;
-            // keep that session limited and let request authorization fail closed until the
-            // matching domain row exists.
-            const authUser = await loadAuthUser(session.userId);
-            if (authUser) domainUser = await provisionDomainUser(authUser);
-            if (!domainUser) return { data: { ...session, limited: true } };
-            if (
-              domainUser.state !== "active" || domainUser.deletedAt !== null ||
-              domainUser.passwordResetPending === true
-            ) {
-              return false;
-            }
-            const limited = domainUser.approvalStatus !== "approved" ||
-              ((options.requireEmailVerification ?? false) && !domainUser.emailVerifiedAt);
-            return { data: { ...session, limited } };
-          },
-        },
-      },
-    },
-  });
+    });
+  let auth: ReturnType<typeof constructAuth>;
+  try {
+    auth = constructAuth();
+  } catch (error) {
+    // This synchronous factory has no instance to return on construction failure. Begin closing
+    // its newly allocated pool immediately; postgres.js has not yet admitted request traffic.
+    closeFailedPool();
+    throw error;
+  }
 
   return {
     auth,
     oidcEnabled: Boolean(options.oidc),
-    handler: (request: Request) => auth.handler(request),
+    handler: async (request: Request) => {
+      let observation: AuthRequestObservation | undefined;
+      const path = new URL(request.url).pathname;
+      if (
+        request.method === "POST" &&
+        (path.endsWith("/sign-in/email") || path.endsWith("/request-password-reset"))
+      ) {
+        try {
+          const body = await request.clone().json() as { email?: unknown };
+          if (typeof body.email === "string") {
+            const user = await options.repository.findUserByEmail(normalizeEmail(body.email));
+            if (user) {
+              observation = {
+                kind: path.endsWith("/request-password-reset") ? "password_reset" : "sign_in",
+                userId: user.id,
+                authorityEpoch: user.authorityEpoch,
+                eligible: user.state === "active" && user.deletedAt === null &&
+                  user.passwordResetPending !== true,
+              };
+            }
+          }
+        } catch {
+          // Better Auth owns request validation and its public error contract.
+        }
+      }
+      return await authRequestObservation.run(observation, () => auth.handler(request));
+    },
     presentedSessionToken,
     async getSession(headers: Headers): Promise<BetterAuthBrowserSession | null> {
       const result = await auth.api.getSession({ headers });
@@ -426,6 +550,18 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
         domainUser.passwordResetPending === true ||
         normalizeEmail(domainUser.email) !== normalizeEmail(result.user.email)
       ) return null;
+      const authorityEpoch = Number(
+        (result.session as typeof result.session & { authorityEpoch?: number }).authorityEpoch,
+      );
+      const physicallyLimited = Boolean(
+        (result.session as typeof result.session & { limited?: boolean }).limited,
+      );
+      if (
+        !Number.isSafeInteger(authorityEpoch) ||
+        (!physicallyLimited && authorityEpoch !== domainUser.authorityEpoch)
+      ) {
+        return null;
+      }
       const domainLimited = domainUser.approvalStatus !== "approved" ||
         ((options.requireEmailVerification ?? false) && !domainUser.emailVerifiedAt);
       const createdAt = (result.session as typeof result.session & {
@@ -442,8 +578,8 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
       return {
         id: result.session.id,
         userId: result.user.id,
-        limited: domainLimited ||
-          Boolean((result.session as typeof result.session & { limited?: boolean }).limited),
+        limited: domainLimited || physicallyLimited,
+        authorityEpoch,
         authenticatedAt: authenticatedAt.toISOString(),
       };
     },
@@ -483,10 +619,6 @@ export function createBetterAuthService(options: BetterAuthServiceOptions) {
       const deleted = await sql`
         DELETE FROM auth_sessions WHERE id=${sessionId} AND user_id=${userId} RETURNING id
       `;
-      if (!deleted.length) throw new DomainError("not_found", "Session not found", 404);
-    },
-    revokeSessionAsAdmin: async (sessionId: string) => {
-      const deleted = await sql`DELETE FROM auth_sessions WHERE id=${sessionId} RETURNING id`;
       if (!deleted.length) throw new DomainError("not_found", "Session not found", 404);
     },
     drainIdentityDeliveries,
