@@ -38,6 +38,10 @@ fi
 
 if [[ "$1" == "run" ]]; then
   printf 'run-holder\n' >> "$FAKE_DOCKER_LOG"
+  if [[ "$*" == *" --ip "* ]]; then
+    echo "static IP requests require a user-configured Docker subnet" >&2
+    exit 95
+  fi
   if [[ "${FAKE_HOLDER_RUN_FAILURE:-false}" == "true" ]]; then exit 93; fi
   printf 'holder-id\n'
   exit 0

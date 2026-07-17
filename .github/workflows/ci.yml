@@ -242,12 +242,18 @@ jobs:
           --allow-env --allow-net --allow-read --allow-run
       - name: Run isolated database, API, and worker integration tests sequentially
         run: |
-          mapfile -t database_tests < <(rg -l 'TEST_DATABASE_URL' \
-            packages/database/src --glob '*_test.ts' | sort)
-          mapfile -t api_tests < <(rg -l 'TEST_DATABASE_URL' apps/api/src --glob '*_test.ts' \
-            | rg -v 'backup_stack_postgres_s3_test.ts$' | sort)
-          mapfile -t worker_tests < <(rg -l 'TEST_DATABASE_URL' \
-            apps/worker/src --glob '*_test.ts' | sort)
+          discover_postgres_tests() {
+            local root="$1"
+            grep --recursive --files-with-matches --include='*_test.ts' \
+              'TEST_DATABASE_URL' "$root" | sort
+          }
+
+          mapfile -t database_tests < <(discover_postgres_tests packages/database/src)
+          mapfile -t api_tests < <(
+            discover_postgres_tests apps/api/src \
+              | grep --invert-match 'backup_stack_postgres_s3_test.ts$'
+          )
+          mapfile -t worker_tests < <(discover_postgres_tests apps/worker/src)
           ((${#database_tests[@]} > 0))
           ((${#api_tests[@]} > 0))
           ((${#worker_tests[@]} > 0))

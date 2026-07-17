@@ -149,9 +149,10 @@ fi
 new_app_addresses="$(resolved_app_addresses)"
 if [[ "$new_app_addresses" == "$old_app_addresses" ]]; then
   # Some engines retain a stopped container's address. Recreate only after graceful-shutdown
-  # evidence has been collected. A short-lived holder occupies nginx's cached address so Docker
-  # must place the replacement app elsewhere; this makes DNS churn deterministic instead of
-  # relying on a particular engine's address-allocation order.
+  # evidence has been collected. A short-lived holder takes the first available address after
+  # the app is removed, so Docker must place the replacement app elsewhere. Do not request the
+  # released address explicitly: Docker rejects --ip on otherwise-valid user-defined networks
+  # that rely on its default IPAM subnet allocation.
   current_app_id="$("${compose[@]}" ps --quiet app)"
   old_primary_address="${old_app_addresses%%$'\n'*}"
   shared_network="$(
@@ -170,7 +171,7 @@ if [[ "$new_app_addresses" == "$old_app_addresses" ]]; then
   dns_holder="dg-chat-dns-churn-$$-$RANDOM"
   docker run --detach --rm --name "$dns_holder" \
     --label "dg-chat.test-purpose=proxy-dns-churn" --network "$shared_network" \
-    --ip "$old_primary_address" --entrypoint /bin/sh "$web_image" -c 'sleep 120' >/dev/null
+    --entrypoint /bin/sh "$web_image" -c 'sleep 120' >/dev/null
   "${compose[@]}" up -d --no-deps app
   new_app_addresses=""
   web_ready=""
