@@ -20,6 +20,8 @@ services:
 
   web:
     labels: *load-labels
+    ports: !override
+      - "127.0.0.1:${LOAD_WEB_HOST_PORT:?LOAD_WEB_HOST_PORT is required}:8080"
 
   worker:
     labels: *load-labels
@@ -36,6 +38,11 @@ services:
 
   postgres:
     labels: *load-labels
+    # Docker does not publish ports for a container attached exclusively to an internal network.
+    # This disposable bridge exists only so the host-side invariant runner can query PostgreSQL.
+    networks:
+      - backend
+      - load-host
     ports:
       - "127.0.0.1:${LOAD_POSTGRES_HOST_PORT:?LOAD_POSTGRES_HOST_PORT is required}:5432"
 
@@ -50,6 +57,9 @@ services:
 
   mock-provider:
     labels: *load-labels
+    networks:
+      - backend
+      - load-host
     ports:
       - "127.0.0.1:${LOAD_MOCK_HOST_PORT:?LOAD_MOCK_HOST_PORT is required}:4010"
 
@@ -58,5 +68,16 @@ services:
     profiles: ["observability"]
     volumes:
       - ./tests/load/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - backend
+      - load-host
     ports:
       - "127.0.0.1:${LOAD_PROMETHEUS_HOST_PORT:?LOAD_PROMETHEUS_HOST_PORT is required}:9090"
+
+networks:
+  # Docker does not publish ports for containers attached only to an internal network. This
+  # disposable bridge makes the loopback host bindings above reachable without changing the
+  # production backend topology or exposing them on a LAN interface.
+  load-host:
+    driver: bridge
+    labels: *load-labels

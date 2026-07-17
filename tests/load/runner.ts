@@ -220,10 +220,16 @@ function terminalFrame(frames: TimedSseFrame[]): TimedSseFrame | undefined {
 async function openWebStream(
   conversationId: string,
   body: Record<string, unknown>,
-  options: { slowReaderDelayMs?: number; disconnectAfterDataFrames?: number } = {},
+  options: {
+    slowReaderDelayMs?: number;
+    disconnectAfterDataFrames?: number;
+    onOpen?: () => void;
+    onClose?: () => void;
+  } = {},
 ) {
   const requestStarted = performance.now();
   const timeout = derivedTimeoutSignal(signal, 180_000, "web SSE");
+  let opened = false;
   try {
     const response = await fetch(
       new URL(`/api/conversations/${conversationId}/generate/stream`, baseUrl),
@@ -246,14 +252,18 @@ async function openWebStream(
         completedAtMs: headerAtMs,
       };
     }
+    opened = true;
+    options.onOpen?.();
     const live = await consumeLiveSse(response, {
       signal: timeout.signal,
       startedAtMs: requestStarted,
       headerAtMs,
-      ...options,
+      slowReaderDelayMs: options.slowReaderDelayMs,
+      disconnectAfterDataFrames: options.disconnectAfterDataFrames,
     });
     return { status: response.status, text: "", ...live };
   } finally {
+    if (opened) options.onClose?.();
     timeout.dispose();
   }
 }
@@ -320,10 +330,22 @@ async function streamsPhase(): Promise<Record<string, Json>> {
     )
   );
   const started = performance.now();
+  let currentlyOpen = 0;
+  let maximumOpen = 0;
+  const openConversationIds = new Set<string>();
   const attempts = bodies.map((body, index) =>
     openWebStream(conversations[index].id, body, {
       slowReaderDelayMs: index % 3 === 1 ? 150 : undefined,
       disconnectAfterDataFrames: index === 0 ? 3 : undefined,
+      onOpen: () => {
+        currentlyOpen++;
+        maximumOpen = Math.max(maximumOpen, currentlyOpen);
+        openConversationIds.add(conversations[index].id);
+      },
+      onClose: () => {
+        currentlyOpen--;
+        openConversationIds.delete(conversations[index].id);
+      },
     }).catch((error) => ({
       status: 0,
       text: error instanceof Error ? error.message : "stream interrupted",
@@ -333,13 +355,33 @@ async function streamsPhase(): Promise<Record<string, Json>> {
       completedAtMs: 0,
     }))
   );
-  await abortableDelay(300, signal);
+  const requiredOpen = Math.min(2, profile.streams);
+  const openDeadline = Date.now() + 30_000;
+  while (currentlyOpen < requiredOpen && Date.now() < openDeadline) {
+    await abortableDelay(25, signal);
+  }
+  invariant(
+    currentlyOpen >= requiredOpen,
+    `at least ${requiredOpen} response bodies are concurrently open before API chaos`,
+  );
   await Deno.writeTextFile(
     `${artifactDirectory}/streams-active.json`,
-    `${JSON.stringify({ conversations: conversations.map(({ id }) => id) })}\n`,
+    `${
+      JSON.stringify({
+        observedAt: new Date().toISOString(),
+        activeStreams: currentlyOpen,
+        maximumOpen,
+        openConversationIds: [...openConversationIds],
+      })
+    }\n`,
   );
   const chaos = await waitForFile("api-chaos-complete.json", 60_000);
   invariant(typeof chaos.restartedContainer === "string", "host restarted one API container");
+  invariant(
+    typeof chaos.activeMetricInstance === "string" &&
+      Number(chaos.activeRequestsBeforeRestart) >= 1,
+    "host restarted the API replica that exposed an active streaming request",
+  );
   const initial = await Promise.all(attempts);
   const replayed = await Promise.all(
     bodies.map((body, index) => replayUntilTerminal(conversations[index].id, body)),
@@ -409,6 +451,8 @@ async function streamsPhase(): Promise<Record<string, Json>> {
     intentionalDisconnects: initial.filter((result) => result.disconnected).length,
     replayedToTerminal: replayed.length,
     apiTargetsWithTraffic: apiTargets.length,
+    maximumConcurrentlyOpen: maximumOpen,
+    restartedActiveMetricInstance: String(chaos.activeMetricInstance),
     p95TtftMs: Math.round(percentile(ttfts, 0.95)),
     p99InterFrameGapMs: Math.round(percentile(gaps, 0.99)),
     throughputPerSecond: Number((profile.streams / elapsedSeconds).toFixed(3)),
@@ -881,7 +925,8 @@ async function queuePhase(): Promise<Record<string, Json>> {
   await sql.unsafe(`
     CREATE FUNCTION load_crash_once() RETURNS trigger LANGUAGE plpgsql AS $$
     BEGIN
-      IF NEW.id='${crashRun.id}'::uuid AND OLD.status='queued' AND NEW.status='running'
+      IF NEW.id='${crashRun.id}'::uuid AND OLD.status='queued'
+         AND NEW.status IN ('running','completed')
          AND nextval('load_crash_once_seq')=1 THEN
         PERFORM pg_sleep(20);
       END IF;

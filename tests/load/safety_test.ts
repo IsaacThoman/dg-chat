@@ -1,4 +1,4 @@
-import { assertEquals, assertThrows } from "jsr:@std/assert@1.0.14";
+import { assertEquals, assertStringIncludes, assertThrows } from "jsr:@std/assert@1.0.14";
 import { assertSafeLoadTarget, loadProfile } from "./safety.ts";
 
 const safe = {
@@ -66,4 +66,44 @@ Deno.test("load profiles stay bounded and reject accidental unbounded names", ()
   });
   assertEquals(loadProfile("scheduled").queueJobs, 500);
   assertThrows(() => loadProfile("unlimited"), Error, "ci, standard, or scheduled");
+});
+
+Deno.test("load topology keeps published dependencies on a disposable host bridge", async () => {
+  const compose = await Deno.readTextFile(
+    new URL("../../docker-compose.load.yml", import.meta.url),
+  );
+  assertStringIncludes(
+    compose,
+    'ports: !override\n      - "127.0.0.1:${LOAD_WEB_HOST_PORT:',
+    "the public web proxy must replace the production binding with a loopback-only port",
+  );
+  for (const service of ["postgres", "mock-provider", "prometheus"]) {
+    const serviceStart = compose.indexOf(`  ${service}:\n`);
+    assertEquals(serviceStart >= 0, true, `${service} service must exist`);
+    const following = compose.slice(serviceStart + 1);
+    const nextBlock = following.search(/\n(?:[ ]{2}[a-z][a-z0-9-]*:|networks:)\n/u);
+    const serviceBlock = nextBlock < 0 ? following : following.slice(0, nextBlock);
+    assertStringIncludes(
+      serviceBlock,
+      "      - load-host",
+      `${service} must join load-host so its loopback-published port is reachable`,
+    );
+  }
+  assertStringIncludes(compose, "  load-host:\n    driver: bridge");
+});
+
+Deno.test("chaos markers prove live work and bind faults to real claim owners", async () => {
+  const runner = await Deno.readTextFile(new URL("./runner.ts", import.meta.url));
+  const script = await Deno.readTextFile(new URL("./run.sh", import.meta.url));
+  assertStringIncludes(runner, "activeStreams: currentlyOpen");
+  assertStringIncludes(runner, "onOpen:");
+  assertStringIncludes(runner, "onClose:");
+  assertStringIncludes(runner, "NEW.status IN ('running','completed')");
+  assertStringIncludes(
+    script,
+    'dg_chat_http_requests_in_flight{job="dg-chat-api",method="POST",route="api"} > 0',
+  );
+  assertStringIncludes(script, "activeMetricInstance");
+  assertStringIncludes(script, "cat /tmp/dg-chat-worker-instance");
+  assertStringIncludes(script, "status='running'");
 });

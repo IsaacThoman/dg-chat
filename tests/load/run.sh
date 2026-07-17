@@ -86,6 +86,7 @@ fi
 
 command -v docker >/dev/null || die "Docker is required."
 command -v jq >/dev/null || die "jq is required."
+command -v curl >/dev/null || die "curl is required."
 docker compose version >/dev/null || die "Docker Compose v2 is required."
 docker_endpoint="$(docker context inspect --format '{{ .Endpoints.docker.Host }}' 2>/dev/null)"
 case "$docker_endpoint" in
@@ -141,6 +142,22 @@ done
   die "the disposable Compose project does not contain exactly two running API replicas."
 [[ "$(container_count "$("${compose[@]}" ps -q --status running worker)")" == 3 ]] ||
   die "the disposable Compose project does not contain exactly three running worker replicas."
+
+assert_loopback_port() {
+  local service="$1"
+  local target_port="$2"
+  local expected_port="$3"
+  local published
+  published="$("${compose[@]}" port "$service" "$target_port" 2>/dev/null)" ||
+    die "$service does not expose its load-harness endpoint."
+  [[ "$published" == "127.0.0.1:${expected_port}" ]] ||
+    die "$service is not published on the expected loopback-only port."
+}
+assert_loopback_port web 8080 "$LOAD_WEB_HOST_PORT"
+assert_loopback_port postgres 5432 "$LOAD_POSTGRES_HOST_PORT"
+assert_loopback_port mock-provider 4010 "$LOAD_MOCK_HOST_PORT"
+assert_loopback_port prometheus 9090 "$LOAD_PROMETHEUS_HOST_PORT"
+
 for container in $owned_containers; do
   actual_project="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' "$container")"
   load_owned="$(docker inspect -f '{{ index .Config.Labels "com.dg-chat.load-owned" }}' "$container")"
@@ -183,6 +200,9 @@ while [[ ! -f "$LOAD_ARTIFACT_DIR/streams-active.json" ]]; do
   (( SECONDS < streams_deadline )) || die "timed out waiting for active streams."
   sleep 0.1
 done
+active_streams="$(jq -r '.activeStreams // 0' "$LOAD_ARTIFACT_DIR/streams-active.json")"
+[[ "$active_streams" =~ ^[0-9]+$ ]] && ((active_streams >= 1)) ||
+  die "stream marker did not prove an open response body."
 
 app_containers="$("${compose[@]}" ps -q app)"
 [[ "$(wc -w <<<"$app_containers" | tr -d ' ')" == 2 ]] ||
@@ -191,7 +211,36 @@ for container in $app_containers; do
   docker exec "$container" busybox wget -q -O /dev/null http://127.0.0.1:8000/health ||
     die "direct API replica probe failed before restart."
 done
-restarted_container="$(head -n 1 <<<"$app_containers")"
+
+# Prometheus scrapes each API replica directly. Select a container whose own in-flight gauge proves
+# it currently owns a streaming POST, then restart that exact replica rather than an arbitrary one.
+active_metric_instance=""
+active_requests_before_restart=""
+restarted_container=""
+metric_deadline=$((SECONDS + 30))
+while [[ -z "$restarted_container" ]]; do
+  metrics_response="$(curl --fail --silent --show-error --get \
+    --data-urlencode \
+    'query=dg_chat_http_requests_in_flight{job="dg-chat-api",method="POST",route="api"} > 0' \
+    "$LOAD_PROMETHEUS_URL/api/v1/query")" ||
+    die "could not query Prometheus for active API streams."
+  while IFS=$'\t' read -r candidate_instance candidate_value; do
+    [[ -n "$candidate_instance" && "$candidate_value" =~ ^[0-9]+([.][0-9]+)?$ ]] || continue
+    candidate_ip="${candidate_instance%:*}"
+    for container in $app_containers; do
+      if docker inspect -f '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' \
+        "$container" | grep -Fxq "$candidate_ip"; then
+        active_metric_instance="$candidate_instance"
+        active_requests_before_restart="$candidate_value"
+        restarted_container="$container"
+        break 2
+      fi
+    done
+  done < <(jq -r '.data.result[]? | [.metric.instance, .value[1]] | @tsv' <<<"$metrics_response")
+  (( SECONDS < metric_deadline )) ||
+    die "Prometheus never identified an API replica with an active streaming request."
+  [[ -n "$restarted_container" ]] || sleep 0.1
+done
 docker restart --time 2 "$restarted_container" >/dev/null
 restart_deadline=$((SECONDS + 60))
 until [[ "$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' \
@@ -203,8 +252,18 @@ for container in $app_containers; do
   docker exec "$container" busybox wget -q -O /dev/null http://127.0.0.1:8000/health ||
     die "direct API replica probe failed after restart."
 done
-jq -n --arg restartedContainer "$restarted_container" \
-  '{restartedContainer:$restartedContainer,directReplicaProbes:2}' \
+jq -n \
+  --arg restartedContainer "$restarted_container" \
+  --arg activeMetricInstance "$active_metric_instance" \
+  --argjson activeRequestsBeforeRestart "$active_requests_before_restart" \
+  --argjson markerActiveStreams "$active_streams" \
+  '{
+    restartedContainer:$restartedContainer,
+    activeMetricInstance:$activeMetricInstance,
+    activeRequestsBeforeRestart:$activeRequestsBeforeRestart,
+    markerActiveStreams:$markerActiveStreams,
+    directReplicaProbes:2
+  }' \
   >"$LOAD_ARTIFACT_DIR/api-chaos-complete.json"
 
 marker_deadline=$((SECONDS + marker_timeout))

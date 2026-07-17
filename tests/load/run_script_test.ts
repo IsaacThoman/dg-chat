@@ -51,4 +51,12 @@ Deno.test("load runner script rejects invalid profiles and privileged ports", as
   });
   assertEquals(invalidPort.code, 2);
   assertStringIncludes(invalidPort.stderr, "unprivileged TCP port");
+
+  const duplicatePort = await preflight({
+    DG_CHAT_LOAD_ALLOW_DESTRUCTIVE: "true",
+    LOAD_WEB_HOST_PORT: "18080",
+    LOAD_POSTGRES_HOST_PORT: "18080",
+  });
+  assertEquals(duplicatePort.code, 2);
+  assertStringIncludes(duplicatePort.stderr, "ports must differ");
 });
