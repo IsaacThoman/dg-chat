@@ -342,9 +342,12 @@ fail_worker_chaos() {
 # deliberately short claim-stall window recreating dependencies. Do not wait for health before
 # observing the claim: the worker's real five-second PostgreSQL statement timeout is part of the
 # invariant, so the runner keeps its injected statement below that limit.
-if ! bounded_host_command 15 "start worker replicas for crash claim" \
+# Compose starts stopped replicas serially and waits for each container's health transition before
+# moving to the next one. Three healthy replicas can legitimately take more than 15 seconds on a
+# cold or contended CI host, so keep this operation bounded above the aggregate health-start budget.
+if ! bounded_host_command 45 "start worker replicas for crash claim" \
   "${compose[@]}" start worker; then
-  fail_worker_chaos "worker replicas did not start within the 15-second host bound."
+  fail_worker_chaos "worker replicas did not start within the 45-second host bound."
 fi
 worker_chaos_stage="observe-claim"
 claim_deadline=$((SECONDS + 45))
