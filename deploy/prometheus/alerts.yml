@@ -10,21 +10,21 @@ groups:
           summary: "DG Chat {{ $labels.job }} metrics target is down"
           description: "Prometheus has been unable to scrape the private metrics listener for two minutes."
       - alert: DgChatApiTargetsAbsent
-        expr: absent(up{job="dg-chat-api"})
+        expr: absent(up{job="dg-chat-api"} == 1)
         for: 2m
         labels:
           severity: critical
         annotations:
-          summary: DG Chat has no discoverable API metrics targets
-          description: "Docker DNS discovery has returned no API replica for two minutes."
+          summary: DG Chat has no healthy API metrics targets
+          description: "Prometheus has observed no healthy API scrape target for two minutes."
       - alert: DgChatWorkerTargetsAbsent
-        expr: absent(up{job="dg-chat-worker"})
+        expr: absent(up{job="dg-chat-worker"} == 1)
         for: 2m
         labels:
           severity: critical
         annotations:
-          summary: DG Chat has no discoverable worker metrics targets
-          description: "Docker DNS discovery has returned no worker replica for two minutes."
+          summary: DG Chat has no healthy worker metrics targets
+          description: "Prometheus has observed no healthy worker scrape target for two minutes."
       - alert: DgChatApiNotReady
         expr: dg_chat_process_ready{service="api"} == 0
         for: 2m

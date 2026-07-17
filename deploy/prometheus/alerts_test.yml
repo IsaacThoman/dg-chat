@@ -13,8 +13,8 @@ tests:
               job: dg-chat-api
               severity: critical
             exp_annotations:
-              summary: DG Chat has no discoverable API metrics targets
-              description: "Docker DNS discovery has returned no API replica for two minutes."
+              summary: DG Chat has no healthy API metrics targets
+              description: "Prometheus has observed no healthy API scrape target for two minutes."
       - eval_time: 3m
         alertname: DgChatWorkerTargetsAbsent
         exp_alerts:
@@ -22,8 +22,8 @@ tests:
               job: dg-chat-worker
               severity: critical
             exp_annotations:
-              summary: DG Chat has no discoverable worker metrics targets
-              description: "Docker DNS discovery has returned no worker replica for two minutes."
+              summary: DG Chat has no healthy worker metrics targets
+              description: "Prometheus has observed no healthy worker scrape target for two minutes."
 
   - interval: 1m
     input_series:
@@ -38,6 +38,34 @@ tests:
       - eval_time: 3m
         alertname: DgChatWorkerTargetsAbsent
         exp_alerts: []
+
+  # DNS discovery can retain its previous targets as down series after a scaled service stops.
+  # Fleet detection must therefore handle present `up=0` samples, not only missing series.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="dg-chat-api",instance="api-stale"}'
+        values: "0x4"
+      - series: 'up{job="dg-chat-worker",instance="worker-stale"}'
+        values: "0x4"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: DgChatApiTargetsAbsent
+        exp_alerts:
+          - exp_labels:
+              job: dg-chat-api
+              severity: critical
+            exp_annotations:
+              summary: DG Chat has no healthy API metrics targets
+              description: "Prometheus has observed no healthy API scrape target for two minutes."
+      - eval_time: 3m
+        alertname: DgChatWorkerTargetsAbsent
+        exp_alerts:
+          - exp_labels:
+              job: dg-chat-worker
+              severity: critical
+            exp_annotations:
+              summary: DG Chat has no healthy worker metrics targets
+              description: "Prometheus has observed no healthy worker scrape target for two minutes."
 
   - interval: 1m
     input_series:
