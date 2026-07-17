@@ -31,6 +31,50 @@ export async function requireIngestionObject(
   return object;
 }
 
+export async function requireVerifiedIngestionObject(
+  store: ObjectStore,
+  key: string,
+  expected: {
+    ownerId: string;
+    sha256: string;
+    sizeBytes: number;
+    maxBytes: number;
+    timeoutMs: number;
+  },
+  signal?: AbortSignal,
+): Promise<StoredObject> {
+  const object = await requireIngestionObject(store, key, signal);
+  if (object.metadata.owner !== expected.ownerId) {
+    throw new Error("Attachment object owner metadata does not match its record");
+  }
+  if (object.metadata.sha256 !== expected.sha256) {
+    throw new Error("Attachment object digest metadata does not match its record");
+  }
+  if (object.contentLength !== null && object.contentLength !== expected.sizeBytes) {
+    throw new Error("Attachment object size does not match its record");
+  }
+  const bytes = await readIngestionBytes(
+    object,
+    expected.maxBytes,
+    expected.timeoutMs,
+    expected.sha256,
+    signal,
+  );
+  if (bytes.byteLength !== expected.sizeBytes) {
+    throw new Error("Attachment object size does not match its record");
+  }
+  return {
+    ...object,
+    contentLength: bytes.byteLength,
+    body: new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(bytes);
+        controller.close();
+      },
+    }),
+  };
+}
+
 export async function recordIngestionFailure(
   sql: Sql,
   job: ClaimedJob,

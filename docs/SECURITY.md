@@ -52,21 +52,35 @@ filename normalization, immutable object keys, ownership checks, and image dimen
 guards. Objects are private in S3-compatible storage; direct reads require ownership, while
 tombstoned objects remain available only through an immutable historical message link. PNG and JPEG
 files receive a bounded full decode before becoming ready. GIF and WebP files remain quarantined
-because a trusted full decoder is not yet configured.
+because a trusted full decoder is not yet configured. Retained physical-byte quotas apply to browser
+uploads, generated media, and OpenAI Files, and intentionally include historical soft-deleted
+objects. The administrative storage inventory never exposes object keys or credentials.
+Administrators cannot manually release quarantined files: they may only enqueue a reason-bound,
+optimistic reinspection through the current worker policy.
 
-The current attachment worker acknowledges terminal inspection states; it is not an antivirus or
-content-disarm scanner. Audio acceptance still relies on bounded upload handling and MIME/signature
-checks, so deployments requiring malware scanning must add an external quarantine scanner. Bounded,
-strict UTF-8 ingestion is implemented for `text/plain` and fully validated JSON. PDF extraction has
+The attachment worker fences inspection results to a monotonic policy epoch; stale jobs cannot
+overwrite a later decision. Its built-in bounded stream verifies the stored SHA-256 digest and
+quarantines the standard EICAR test marker, but that narrow deterministic signature is not a general
+antivirus or content-disarm engine. Deployments that require malware verdicts can enable the
+authenticated external scanner integration. Enablement is a strict boolean and requires a credential
+plus an exact hostname allowlist. The integration fails closed, resolves and pins DNS once, manually
+rejects redirects, blocks private-network access unless the configured scanner itself is explicitly
+private, and bounds the request body, response body, and complete deadline. Scanner failures are
+sanitized before reaching users or logs. The required mode and shared policy version are persisted
+at upload time, preventing a differently configured worker from silently weakening the decision.
+Audio acceptance still relies on bounded upload handling and MIME/signature checks. Bounded, strict
+UTF-8 ingestion is implemented for `text/plain` and fully validated JSON. PDF extraction has
 raw-byte, page-count, and output limits. PDF and DOCX parsing runs in a terminable worker isolate
 under one absolute, lease-margined job deadline. DOCX extraction preflights the ZIP directory and
 rejects ZIP64/multidisk archives, traversal, encryption, macros, external relationships, excessive
 entries, per-entry size, aggregate expansion, and suspicious compression ratios before extraction.
-Other Office formats, object garbage collection, and retention-aware deletion are not implemented.
-OCR interception, PostgreSQL vector persistence, and hybrid lexical/vector retrieval are implemented
-with bounded inputs, owner scoping, cache keys derived from content hashes, and durable accounting.
-Embeddings and audio provider calls use the same DNS-pinned, private-network-blocking transport and
-strict bounded response validation as chat providers.
+Other Office formats and general retention-policy-driven deletion are not implemented. Durable
+staging cleanup and generated-object cleanup are reference-fenced, retry-safe, and settle
+append-only physical-storage release records only after object deletion. OCR interception,
+PostgreSQL vector persistence, and hybrid lexical/vector retrieval are implemented with bounded
+inputs, owner scoping, cache keys derived from content hashes, and durable accounting. Embeddings
+and audio provider calls use the same DNS-pinned, private-network-blocking transport and strict
+bounded response validation as chat providers.
 
 The current OpenAI-compatible provider transport resolves every A and AAAA answer, rejects
 special-use destinations, and pins the approved address while preserving TLS hostname validation. It

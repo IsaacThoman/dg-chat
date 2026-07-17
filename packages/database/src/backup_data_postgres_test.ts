@@ -134,6 +134,7 @@ Deno.test({
         `TRUNCATE ${[...new Set(resetTables)].join(",")} RESTART IDENTITY CASCADE`,
       );
       await sql`INSERT INTO installation_state(singleton_id) VALUES(1)`;
+      await sql`INSERT INTO attachment_storage_installation(singleton_id) VALUES(1)`;
       const userId = crypto.randomUUID();
       const conversationId = crypto.randomUUID();
       const temporaryConversationId = crypto.randomUUID();
@@ -400,6 +401,56 @@ Deno.test({
       assertEquals(Number((await sql`SELECT count(*) count FROM conversations`)[0].count), 3);
       assertEquals(Number((await sql`SELECT count(*) count FROM sessions`)[0].count), 1);
 
+      const canonicalManifestOnly = structuredClone(captured);
+      canonicalManifestOnly.set(
+        "attachments",
+        canonicalManifestOnly.get("attachments")!.map((batch) =>
+          batch.map((row) =>
+            row.id === attachmentId
+              ? {
+                ...row,
+                object_key: `imports/${userId}/${attachmentId}/manifest-only`,
+                state: "failed",
+                inspection_error: "Attachment bytes were not included in the .dgchat manifest",
+                physical_object: false,
+                deleted_at: "2026-07-02T00:00:00.000Z",
+                ingestion_status: "failed",
+                ingestion_error: "Attachment bytes require a separate restore",
+                ingested_at: null,
+              }
+              : row
+          )
+        ),
+      );
+      canonicalManifestOnly.set("attachment_storage_blobs", []);
+      canonicalManifestOnly.set("attachment_storage_usage", []);
+      canonicalManifestOnly.set(
+        "attachment_storage_installation",
+        canonicalManifestOnly.get("attachment_storage_installation")!.map((batch) =>
+          batch.map((row) => ({ ...row, physical_bytes: "0", physical_objects: "0" }))
+        ),
+      );
+      assertEquals(
+        (await dryRunBackupData(databaseUrl!, replaySource(canonicalManifestOnly))).attachments,
+        1,
+      );
+      const forgedNonphysical = structuredClone(canonicalManifestOnly);
+      forgedNonphysical.set(
+        "attachments",
+        forgedNonphysical.get("attachments")!.map((batch) =>
+          batch.map((row) =>
+            row.id === attachmentId
+              ? { ...row, object_key: `imports/${userId}/${attachmentId}/not-canonical` }
+              : row
+          )
+        ),
+      );
+      await assertRejects(
+        () => dryRunBackupData(databaseUrl!, replaySource(forgedNonphysical)),
+        BackupDataError,
+        "attachment storage accounting is inconsistent",
+      );
+
       const missingScheduleState = structuredClone(captured);
       missingScheduleState.set("retention_schedule_state", []);
       await assertRejects(
@@ -637,6 +688,50 @@ Deno.test({
         operation.version,
         operation.confirmationFingerprint!,
       );
+      const excludedFileRequestId = crypto.randomUUID();
+      await sql`INSERT INTO api_idempotency_requests(
+        id,user_id,endpoint,idempotency_key,request_hash,stream,model,state,usage_run_id,
+        response_status,completed_at,expires_at
+      ) VALUES(
+        ${excludedFileRequestId},${userId},'files','excluded-file-stage',${"6".repeat(64)},
+        false,'files','completed',${`tool:${terminalToolId}`},201,now(),now()+interval '1 day'
+      )`;
+      await sql`INSERT INTO generated_object_staging(
+        owner_id,usage_run_id,ordinal,object_key,mime_type,size_bytes,sha256,state
+      ) VALUES(
+        ${userId},${`tool:${terminalToolId}`},0,'restore-excluded/generated','image/png',1,
+        ${"3".repeat(64)},'pending'
+      )`;
+      await sql`INSERT INTO file_upload_staging(
+        request_id,owner_id,object_key,filename,mime_type,size_bytes,sha256,purpose,
+        attachment_state,state
+      ) VALUES(
+        ${excludedFileRequestId},${userId},'restore-excluded/file','file.txt','text/plain',1,
+        ${"4".repeat(64)},'assistants','ready','pending'
+      )`;
+      await sql`INSERT INTO attachment_upload_staging(
+        id,owner_id,object_key,filename,mime_type,size_bytes,sha256,state
+      ) VALUES(
+        ${crypto.randomUUID()},${userId},'restore-excluded/browser','browser.txt','text/plain',1,
+        ${"5".repeat(64)},'pending'
+      )`;
+      assertEquals(
+        [
+          ...await sql`
+            SELECT 'generated_object_staging' name,count(*)::int count
+              FROM generated_object_staging
+            UNION ALL SELECT 'file_upload_staging',count(*)::int FROM file_upload_staging
+            UNION ALL SELECT 'attachment_upload_staging',count(*)::int
+              FROM attachment_upload_staging
+            ORDER BY name
+          `,
+        ],
+        [
+          { name: "attachment_upload_staging", count: 1 },
+          { name: "file_upload_staging", count: 1 },
+          { name: "generated_object_staging", count: 1 },
+        ],
+      );
       const maintenance = await store.beginRestoreMaintenance(operation.id, operation.version);
       // pg_locks cannot distinguish session and transaction advisory locks. Prove a same-key
       // session lock plus a forged operation GUC cannot impersonate the restore transaction.
@@ -832,6 +927,23 @@ Deno.test({
       assertEquals(Number((await sql`SELECT count(*) count FROM auth_sessions`)[0].count), 0);
       assertEquals(Number((await sql`SELECT count(*) count FROM auth_verifications`)[0].count), 0);
       assertEquals(Number((await sql`SELECT count(*) count FROM jobs`)[0].count), 0);
+      assertEquals(
+        [
+          ...await sql`
+            SELECT 'generated_object_staging' name,count(*)::int count
+              FROM generated_object_staging
+            UNION ALL SELECT 'file_upload_staging',count(*)::int FROM file_upload_staging
+            UNION ALL SELECT 'attachment_upload_staging',count(*)::int
+              FROM attachment_upload_staging
+            ORDER BY name
+          `,
+        ],
+        [
+          { name: "attachment_upload_staging", count: 0 },
+          { name: "file_upload_staging", count: 0 },
+          { name: "generated_object_staging", count: 0 },
+        ],
+      );
       assertEquals(
         [
           ...await sql`SELECT id,actor_id,target_user_id,amount_micros,balance_before_micros,
@@ -1418,6 +1530,30 @@ Deno.test({
       await sql`CREATE TRIGGER dg_chat_audit_events_append_only
         BEFORE UPDATE OR DELETE OR TRUNCATE ON audit_events
         FOR EACH STATEMENT EXECUTE FUNCTION dg_chat_enforce_audit_event_immutability()`;
+      await sql.end();
+    }
+  },
+});
+
+Deno.test({
+  name: "backup catalog fails closed when attachment release history loses its guard",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 1 });
+    try {
+      await sql`DROP TRIGGER dg_chat_attachment_storage_releases_append_only
+        ON attachment_storage_releases`;
+      await assertRejects(
+        () => verifyBackupDataCatalog(databaseUrl!),
+        BackupDataError,
+        "append-only guard",
+      );
+    } finally {
+      await sql`CREATE TRIGGER dg_chat_attachment_storage_releases_append_only
+        BEFORE UPDATE OR DELETE OR TRUNCATE ON attachment_storage_releases
+        FOR EACH STATEMENT EXECUTE FUNCTION dg_chat_enforce_attachment_blob_history()`;
       await sql.end();
     }
   },

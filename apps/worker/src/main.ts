@@ -11,10 +11,12 @@ import {
   validateDocumentChunkInputs,
 } from "@dg-chat/database";
 import {
-  assertAttachmentInspectionTerminal,
-  AttachmentInspectionPendingError,
   parseAttachmentInspectionPayload,
+  processAttachmentInspection,
+  recordAttachmentInspectionFailure,
+  transitionClaimedAttachmentInspection,
 } from "./attachment-inspection.ts";
+import { parseMalwareScannerConfig } from "./malware-scanner.ts";
 import {
   claimJob,
   completeJob,
@@ -27,7 +29,7 @@ import {
 import {
   parseAttachmentIngestionPayload,
   recordIngestionFailure,
-  requireIngestionObject,
+  requireVerifiedIngestionObject,
 } from "./attachment-ingestion.ts";
 import { buildDocumentChunks, DocumentPipelineTimeoutError } from "./document-pipeline.ts";
 import type { DocumentExtractionLimits } from "./document-extraction.ts";
@@ -57,6 +59,7 @@ import {
   scheduleAutomaticRetention,
 } from "./retention-scheduler.ts";
 import { processFileObjectCleanup } from "./file-object-cleanup.ts";
+import { processAttachmentObjectCleanup } from "./attachment-object-cleanup.ts";
 import { purgeTemporaryConversationBatch } from "./temporary-lifecycle.ts";
 import { retryClaimSettlement, settleClaimedJobFault } from "./claimed-job-recovery.ts";
 import { retryWorkerClaimedDatabaseOperation } from "./worker-database.ts";
@@ -70,6 +73,7 @@ import {
 } from "./resilient-loop.ts";
 import { operationSignal, raceAbort } from "./operation-signal.ts";
 import {
+  reconcileAttachmentUploadCleanupBatch,
   reconcileGeneratedCleanupBatch,
   reconcileStartupQueues,
 } from "./startup-reconciliation.ts";
@@ -165,6 +169,11 @@ const documentExtractionLimits: DocumentExtractionLimits = {
 const jobDeadlineMarginMs = positiveInteger("WORKER_JOB_DEADLINE_MARGIN_MS", 5_000);
 const generatedCleanupGraceSeconds = positiveInteger("GENERATED_OBJECT_CLEANUP_GRACE_SECONDS", 600);
 const generatedCleanupSweepMs = positiveInteger("GENERATED_OBJECT_CLEANUP_SWEEP_MS", 60_000);
+const attachmentInspectionMaxBytes = positiveInteger(
+  "ATTACHMENT_INSPECTION_MAX_BYTES",
+  25 * 1024 * 1024,
+);
+const malwareScannerConfig = parseMalwareScannerConfig();
 const databaseRetryInitialMs = positiveInteger("WORKER_DATABASE_RETRY_INITIAL_MS", 250, 10);
 const databaseRetryMaxMs = positiveInteger("WORKER_DATABASE_RETRY_MAX_MS", 10_000, 10);
 const databaseRetryJitterRatio = Number(
@@ -363,6 +372,7 @@ async function runShutdownDatabaseOperation<T>(operation: () => T | PromiseLike<
 
 async function enqueueStaleGeneratedObjectCleanup() {
   await reconcileGeneratedCleanupBatch(sql, generatedCleanupGraceSeconds);
+  await reconcileAttachmentUploadCleanupBatch(sql, generatedCleanupGraceSeconds);
 }
 async function initializeDurableQueues() {
   await reconcileStartupQueues(sql, {
@@ -457,21 +467,45 @@ async function processJob(
 ): Promise<ProcessJobOutcome> {
   switch (job.type) {
     case "attachment.inspect": {
-      const { attachmentId, ownerId } = parseAttachmentInspectionPayload(job.payload);
-      const rows = await runDatabaseOperation(() =>
-        sql<{ state: string }[]>`
-        SELECT state FROM attachments WHERE id=${attachmentId} AND owner_id=${ownerId}
-      `
+      const payload = parseAttachmentInspectionPayload(job.payload);
+      const remainingLeaseMs = Math.max(
+        0,
+        job.externalDeadlineMonotonicMs - performance.now() - jobDeadlineMarginMs,
       );
-      const state = rows[0]?.state;
-      assertAttachmentInspectionTerminal(state);
+      const inspectionOperation = operationSignal(
+        shutdownSignal,
+        Date.now() + remainingLeaseMs,
+        () => new DOMException("Attachment inspection deadline exceeded", "TimeoutError"),
+      );
+      const outcome = await processAttachmentInspection({
+        payload,
+        repository,
+        objectStore,
+        limits: { maxBytes: attachmentInspectionMaxBytes },
+        scanner: malwareScannerConfig,
+        signal: inspectionOperation.signal,
+        transition: (input, audit) =>
+          runDatabaseOperation(() =>
+            transitionClaimedAttachmentInspection(
+              sql,
+              repository,
+              job,
+              input,
+              audit,
+              jobLeaseSeconds,
+            )
+          ),
+      }).finally(inspectionOperation.dispose);
       console.log(
         JSON.stringify({
           level: "info",
-          message: "Attachment inspection result acknowledged",
+          message: outcome.status === "superseded"
+            ? "Attachment inspection job superseded"
+            : "Attachment inspection completed",
           jobId: job.id,
-          attachmentId,
-          state,
+          attachmentId: payload.attachmentId,
+          inspectionEpoch: payload.inspectionEpoch,
+          outcome: outcome.status,
         }),
       );
       return "requires_completion";
@@ -509,20 +543,18 @@ async function processJob(
         deadlineAt,
         () => new DocumentPipelineTimeoutError(),
       );
-      const object = await requireIngestionObject(
+      const object = await requireVerifiedIngestionObject(
         objectStore,
         source.object_key,
+        {
+          ownerId,
+          sha256: source.sha256,
+          sizeBytes: Number(source.size_bytes),
+          maxBytes: documentExtractionLimits.maxRawBytes!,
+          timeoutMs: Math.max(1, deadlineAt - Date.now()),
+        },
         acquisition.signal,
       ).finally(acquisition.dispose);
-      if (object.contentLength !== null && object.contentLength !== Number(source.size_bytes)) {
-        throw new Error("Attachment object size does not match its record");
-      }
-      if (object.metadata.sha256 && object.metadata.sha256 !== source.sha256) {
-        throw new Error("Attachment object digest metadata does not match its record");
-      }
-      if (object.metadata.owner && object.metadata.owner !== ownerId) {
-        throw new Error("Attachment object owner metadata does not match its record");
-      }
       const chunks = validateDocumentChunkInputs(
         await buildDocumentChunks(
           {
@@ -937,7 +969,8 @@ async function processJob(
             object_key: string;
             attachment_id: string | null;
             cleanup_attachment: boolean;
-          }[]>`SELECT state,object_key,attachment_id,cleanup_attachment
+            usage_run_id: string;
+          }[]>`SELECT state,object_key,attachment_id,cleanup_attachment,usage_run_id
           FROM generated_object_staging
           WHERE id=${stageId} AND owner_id=${ownerId}`;
           const candidate = candidates[0];
@@ -970,8 +1003,32 @@ async function processJob(
               WHERE ga.usage_run_id=s.usage_run_id OR ga.attachment_id=s.attachment_id))
             AND (NOT s.cleanup_attachment OR NOT EXISTS(SELECT 1 FROM message_attachments ma
               WHERE ma.attachment_id=s.attachment_id))
+            AND (NOT s.cleanup_attachment OR NOT EXISTS(
+              SELECT 1 FROM knowledge_collection_attachments ka
+              WHERE ka.attachment_id=s.attachment_id))
+            AND (NOT s.cleanup_attachment OR NOT EXISTS(SELECT 1 FROM document_chunks dc
+              WHERE dc.attachment_id=s.attachment_id))
             AND (NOT s.cleanup_attachment OR NOT EXISTS(SELECT 1 FROM generated_asset_inputs gai
               WHERE gai.attachment_id=s.attachment_id))
+            AND (NOT s.cleanup_attachment OR NOT EXISTS(SELECT 1 FROM attachments peer
+              WHERE peer.owner_id=s.owner_id AND peer.object_key=s.object_key
+                AND peer.id<>s.attachment_id))
+            AND (NOT s.cleanup_attachment OR NOT EXISTS(SELECT 1
+              FROM generated_object_staging peer
+              WHERE peer.id<>s.id AND peer.state<>'cleaned'
+                AND (peer.attachment_id=s.attachment_id OR
+                  peer.owner_id=s.owner_id AND peer.object_key=s.object_key)))
+            AND (NOT s.cleanup_attachment OR NOT EXISTS(SELECT 1 FROM file_upload_staging upload
+              WHERE upload.attachment_id=s.attachment_id OR
+                upload.owner_id=s.owner_id AND upload.object_key=s.object_key))
+            AND (NOT s.cleanup_attachment OR NOT EXISTS(
+              SELECT 1 FROM attachment_upload_staging upload
+              WHERE upload.attachment_id=s.attachment_id OR
+                upload.owner_id=s.owner_id AND upload.object_key=s.object_key))
+            AND (NOT s.cleanup_attachment OR NOT EXISTS(
+              SELECT 1 FROM conversation_share_snapshots snapshot
+              CROSS JOIN LATERAL jsonb_each(snapshot.source_attachments) source
+              WHERE source.value->>'attachmentId'=s.attachment_id::text))
           RETURNING s.object_key,s.attachment_id,s.cleanup_attachment`;
           if (rows[0]) {
             if (rows[0].attachment_id && rows[0].cleanup_attachment) {
@@ -1019,23 +1076,18 @@ async function processJob(
         ),
       );
       await objectStore.delete(claimed.object_key, deletion.signal).finally(deletion.dispose);
-      const committed = await runDatabaseOperation(() =>
-        sql.begin(async (tx) => {
-          const fence = await tx`SELECT id FROM jobs WHERE id=${job.id} AND status='running'
-          AND locked_by=${job.claimToken} FOR UPDATE`;
-          if (!fence.length) return false;
-          const stages = await tx`SELECT id FROM generated_object_staging
-          WHERE id=${stageId} AND owner_id=${ownerId} AND state='cleaning'
-          FOR UPDATE`;
-          if (!stages.length) return false;
-          await tx`UPDATE generated_object_staging SET state='cleaned',cleanup_error=NULL,
-          updated_at=now() WHERE id=${stageId}`;
-          await tx`UPDATE jobs SET status='completed',completed_at=now(),locked_at=NULL,
-          locked_by=NULL,last_error=NULL WHERE id=${job.id}`;
-          return true;
-        })
+      const settlement = await runDatabaseOperation(() =>
+        repository.settleGeneratedObjectCleanup(stageId, ownerId)
       );
-      if (!committed) throw new Error("Generated object cleanup claim was reclaimed");
+      const completed = await runDatabaseOperation(() => completeJob(sql, job));
+      if (!completed) throw new Error("Generated object cleanup claim was reclaimed");
+      console.log(JSON.stringify({
+        level: "info",
+        message: "Generated object cleanup settled",
+        jobId: job.id,
+        stageId,
+        storageReleased: settlement.storageReleased,
+      }));
       return "completed";
     }
     case "file_object.cleanup": {
@@ -1048,6 +1100,25 @@ async function processJob(
       );
       const outcome = await runDatabaseOperation(() =>
         processFileObjectCleanup(sql, objectStore, job, deletion.signal)
+      ).finally(deletion.dispose);
+      return outcome === "deferred" ? "deferred" : "completed";
+    }
+    case "attachment_object.cleanup": {
+      const deletion = operationSignal(
+        shutdownSignal,
+        Date.now() + Math.max(
+          0,
+          job.externalDeadlineMonotonicMs - performance.now() - jobDeadlineMarginMs,
+        ),
+      );
+      const outcome = await runDatabaseOperation(() =>
+        processAttachmentObjectCleanup(
+          sql,
+          objectStore,
+          job,
+          jobLeaseSeconds,
+          deletion.signal,
+        )
       ).finally(deletion.dispose);
       return outcome === "deferred" ? "deferred" : "completed";
     }
@@ -1104,6 +1175,20 @@ async function recordApplicationJobFailure(
       return await failOrRetryJob(sql, job, message);
     }
     return await recordIngestionFailure(sql, job, payload, message);
+  }
+  if (job.type === "attachment.inspect") {
+    let payload;
+    try {
+      payload = parseAttachmentInspectionPayload(job.payload);
+    } catch {
+      return await failOrRetryJob(
+        sql,
+        job,
+        "Attachment inspection job payload is invalid",
+        1,
+      );
+    }
+    return await recordAttachmentInspectionFailure(sql, job, payload, jobLeaseSeconds);
   }
   if (job.type === "retention.scrub") {
     let payload;
@@ -1267,11 +1352,6 @@ try {
           jobMetricOutcome = "deferred";
           // Avoid a hot reclaim loop when the lease-derived deadline is consistently too short.
           await runShutdownDatabaseOperation(() => deferJob(sql, job, 1));
-          return;
-        }
-        if (error instanceof AttachmentInspectionPendingError) {
-          jobMetricOutcome = "deferred";
-          await retryClaimSettlement(() => deferJob(sql, job, 5), claimSettlementOptions);
           return;
         }
         const disposition = await settleClaimedJobFault({

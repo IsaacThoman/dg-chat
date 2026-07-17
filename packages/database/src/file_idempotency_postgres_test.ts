@@ -3,6 +3,7 @@ import postgres from "npm:postgres@3.4.7";
 import { DomainError } from "./memory.ts";
 import { PostgresRepository } from "./normalized-postgres.ts";
 import { runAuditTestMaintenanceSql } from "./postgres-test-maintenance.ts";
+import { ATTACHMENT_INSPECTION_POLICY_VERSION } from "./repository.ts";
 
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
 
@@ -94,6 +95,8 @@ Deno.test({
             purpose: "fine-tune",
             attachmentState: "ready",
             inspectionError: null,
+            requiredInspectionMode: "local",
+            inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
           }),
         DomainError,
         "purpose",
@@ -146,6 +149,8 @@ Deno.test({
           purpose: "assistants",
           attachmentState: value.state,
           inspectionError: null,
+          requiredInspectionMode: "local",
+          inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
         });
         await repository.markFileUploadStored(id, leaseToken);
       };
@@ -286,6 +291,8 @@ Deno.test({
         purpose: "assistants",
         attachmentState: "ready",
         inspectionError: null,
+        requiredInspectionMode: "local",
+        inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
       });
       await repository.releaseApiRequestLease(abandoned.request.id, abandoned.leaseToken);
       assertEquals(await repository.reapStaleApiRequests(), 0);

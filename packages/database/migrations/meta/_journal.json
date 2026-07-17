@@ -351,6 +351,13 @@
       "when": 1783998014000,
       "tag": "0049_automatic_retention_schedule",
       "breakpoints": true
+    },
+    {
+      "idx": 50,
+      "version": "7",
+      "when": 1783998015000,
+      "tag": "0050_attachment_control_plane",
+      "breakpoints": true
     }
   ]
 }

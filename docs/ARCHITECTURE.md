@@ -33,8 +33,9 @@ flowchart LR
 - S3-compatible storage owns immutable upload objects. Browser attachment routes and the
   OpenAI-compatible Files lifecycle stream uploads into private objects and authorize every read by
   owner or immutable historical message link. Attachment deletion is a logical tombstone so edits
-  cannot break an earlier conversation branch; retention-aware object garbage collection remains
-  planned.
+  cannot break an earlier conversation branch. Durable upload staging reconciles interrupted writes,
+  and generated-object cleanup uses row-locked reference fences plus append-only release settlement
+  after physical deletion. General retention-policy-driven deletion remains planned.
 - The worker claims durable jobs using `FOR UPDATE SKIP LOCKED`. Handlers must be idempotent and
   retry-safe. Text and JSON attachments use a separate, fenced ingestion state machine that streams
   private objects through byte/time and format validation, then transactionally replaces stable,
@@ -46,8 +47,15 @@ flowchart LR
   or section provenance. Conversation-bound collections support hybrid lexical/vector retrieval or
   bounded full-context injection with persisted source provenance. The OpenAI-compatible embeddings
   endpoint and durable pgvector indexing are implemented for capable provider-registry models. OCR
-  interception is implemented with bounded image fetching and a hashed TTL cache. Other Office
-  formats, malware scanning, and quarantined-file reprocessing remain planned.
+  interception is implemented with bounded image fetching and a hashed TTL cache. Administrative
+  attachment reinspection increments a policy epoch and enters the same durable worker boundary;
+  stale jobs cannot overwrite newer policy decisions and there is no manual release bypass. A
+  disabled-by-default authenticated external scanner integration supplies malware verdicts when
+  configured; the built-in pass verifies the stored digest and detects the EICAR test marker, while
+  the external path uses exact-host allowlisting, one pinned DNS resolution, manual redirect
+  rejection, bounded streaming/time/response limits, and sanitized failures. Scanner requirements
+  and the policy version are persisted with each upload so split API/worker configuration fails
+  closed. Other Office formats remain planned.
 
 ## Core invariants
 

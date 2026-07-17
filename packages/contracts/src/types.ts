@@ -438,6 +438,72 @@ export interface AdminLedgerPage {
   nextCursor: string | null;
 }
 
+export type AdminAttachmentState =
+  | "pending"
+  | "inspecting"
+  | "ready"
+  | "quarantined"
+  | "failed"
+  | "deleted";
+export type AdminAttachmentDeletionFilter = "present" | "deleted" | "all";
+
+/** Filter-bound keyset query for the installation-wide attachment inventory. */
+export interface AdminAttachmentQuery {
+  ownerId?: string;
+  state?: AdminAttachmentState;
+  deletion?: AdminAttachmentDeletionFilter;
+  cursor?: string;
+  limit?: number;
+}
+
+/** Credential-free administrative projection. Object-store keys never cross this contract. */
+export interface AdminAttachmentSummary {
+  id: string;
+  ownerId: string;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+  state: AdminAttachmentState;
+  inspectionError: string | null;
+  inspectionEpoch: number;
+  version: number;
+  reinspectionEligible: boolean;
+  reinspectionBlockedReason: "deleted" | "nonterminal" | "policy_quarantine" | null;
+  createdAt: string;
+  updatedAt: string;
+  deletedAt: string | null;
+}
+
+export interface AdminAttachmentPage {
+  data: AdminAttachmentSummary[];
+  nextCursor: string | null;
+}
+
+/** Fixed-size installation storage projection; historical retained blobs remain included. */
+export interface AdminStorageSummary {
+  physicalBytes: number;
+  physicalObjects: number;
+  attachmentRecords: number;
+  activeRecords: number;
+  deletedRecords: number;
+  quarantinedRecords: number;
+  ownersWithStorage: number;
+  perUserBytesLimit?: number | null;
+  perUserObjectsLimit?: number | null;
+  installationBytesLimit?: number | null;
+  installationObjectsLimit?: number | null;
+  installationBytesRemaining?: number | null;
+  installationObjectsRemaining?: number | null;
+  installationBytesPercent?: number | null;
+  installationObjectsPercent?: number | null;
+}
+
+export interface AttachmentStorageUsage {
+  ownerId: string;
+  physicalBytes: number;
+  physicalObjects: number;
+}
+
 export interface AdminBalanceAdjustmentRequest {
   amountMicros: number;
   expectedBalanceMicros: number;

@@ -105,6 +105,22 @@ Deno.test({
       assertEquals(detail.activeLeafId, applied.idMap[id(5)]);
       assertEquals(detail.messages[0].id, applied.idMap[id(5)]);
       assertEquals((await repo.listAttachments(owner.id, true))[0].state, "failed");
+      assertEquals(
+        [...await sql`SELECT physical_object FROM attachments WHERE owner_id=${owner.id}`],
+        [{ physical_object: false }],
+      );
+      assertEquals(
+        Number(
+          (await sql`SELECT count(*) count FROM attachment_storage_blobs
+            WHERE owner_id=${owner.id}`)[0].count,
+        ),
+        0,
+      );
+      assertEquals(await repo.attachmentStorageUsage(owner.id), {
+        ownerId: owner.id,
+        physicalBytes: 0,
+        physicalObjects: 0,
+      });
       assertEquals((await repo.getUserPreferences(owner.id)).theme, "dark");
       const workspace = await repo.listConversationFolders(owner.id);
       assertEquals(workspace.memberships[0].conversationId, applied.idMap[id(4)]);

@@ -8,6 +8,9 @@ import type {
   AdminApiTokenPage,
   AdminApiTokenQuery,
   AdminApiTokenRevocationCommand,
+  AdminAttachmentPage,
+  AdminAttachmentQuery,
+  AdminAttachmentSummary,
   AdminBalanceAdjustment,
   AdminBalanceAdjustmentCommand,
   AdminLedgerPage,
@@ -15,9 +18,11 @@ import type {
   AdminSessionPage,
   AdminSessionQuery,
   AdminSessionRevocationCommand,
+  AdminStorageSummary,
   AdminUser,
   AdminUserPage,
   AdminUserQuery,
+  AttachmentStorageUsage,
   ConversationFolder,
   ConversationFolderMembership,
   ConversationPortabilityV1,
@@ -49,14 +54,18 @@ import {
   API_SSE_REPLAY_REQUEST_MAX_BYTES,
   API_SSE_REPLAY_REQUEST_MAX_EVENTS,
   apiResponseBodyByteLength,
+  ATTACHMENT_INSPECTION_POLICY_VERSION,
+  attachmentReinspectionEligibility,
   canonicalWorkspaceName,
   CONVERSATION_SEARCH_APPLICATION_NAME,
   CONVERSATION_SEARCH_POOL_MAX,
   CONVERSATION_SEARCH_QUERY_VALIDATION_MESSAGE,
   CONVERSATION_SEARCH_STATEMENT_TIMEOUT_MS,
   conversationSearchSnippet,
+  decodeAdminAttachmentCursor,
   decodeConversationSearchCursor,
   DEFAULT_API_REPLAY_QUOTA,
+  encodeAdminAttachmentCursor,
   encodeConversationSearchCursor,
   isCanonicalFileUploadObjectKey,
   KNOWLEDGE_EMBEDDING_DIMENSIONS,
@@ -102,7 +111,10 @@ import type {
   AttachmentListQuery,
   AttachmentPage,
   AttachmentRecord,
+  AttachmentReinspectionResult,
   AttachmentState,
+  AttachmentStorageQuota,
+  AttachmentUploadStage,
   AuditEvent,
   AuditEventInput,
   AuditPage,
@@ -175,6 +187,7 @@ import type {
   RegistryMutationContext,
   ReplaceAccessGroupPolicyInput,
   ReplaceConversationKnowledgeInput,
+  RequestAttachmentReinspectionInput,
   ReserveChildProviderUsageInput,
   RetentionPolicy,
   RetentionPreview,
@@ -190,11 +203,13 @@ import type {
   SearchConversationKnowledgeInput,
   SessionSummary,
   SetProviderModelRouteInput,
+  StageAttachmentUploadInput,
   StageFileUploadInput,
   StageGeneratedObjectInput,
   StartProviderAttemptInput,
   StoredProviderCredential,
   TokenAccessSubject,
+  TransitionAttachmentInspectionInput,
   UpdateAccessGroupInput,
   UpdateApiTokenInput,
   UpdateModelAliasInput,
@@ -277,7 +292,7 @@ function adminMutationMetadata(
 }
 
 async function assertEffectiveAdminActor(
-  tx: postgres.TransactionSql,
+  tx: postgres.Sql,
   actorId: string,
   requireEmailVerification = false,
 ): Promise<void> {
@@ -658,6 +673,14 @@ function attachment(row: Row): AttachmentRecord {
     sha256: String(row.sha256),
     state: row.state as AttachmentState,
     inspectionError: row.inspection_error ? String(row.inspection_error) : null,
+    requiredInspectionMode: String(
+      row.required_inspection_mode ?? "local",
+    ) as AttachmentRecord["requiredInspectionMode"],
+    inspectionPolicyVersion: String(
+      row.inspection_policy_version ?? ATTACHMENT_INSPECTION_POLICY_VERSION,
+    ) as AttachmentRecord["inspectionPolicyVersion"],
+    inspectionEpoch: number(row.inspection_epoch ?? 1),
+    version: number(row.version ?? 1),
     ingestionStatus: String(
       row.ingestion_status ?? "not_applicable",
     ) as AttachmentRecord["ingestionStatus"],
@@ -680,8 +703,32 @@ function fileUploadStage(row: Row): FileUploadStage {
     purpose: String(row.purpose),
     attachmentState: row.attachment_state as FileUploadStage["attachmentState"],
     inspectionError: row.inspection_error ? String(row.inspection_error) : null,
+    requiredInspectionMode: row.required_inspection_mode as FileUploadStage[
+      "requiredInspectionMode"
+    ],
+    inspectionPolicyVersion: String(row.inspection_policy_version) as FileUploadStage[
+      "inspectionPolicyVersion"
+    ],
     state: row.state as FileUploadStage["state"],
     attachmentId: row.attachment_id ? String(row.attachment_id) : null,
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+  };
+}
+function attachmentUploadStage(row: Row): AttachmentUploadStage {
+  return {
+    id: String(row.id),
+    ownerId: String(row.owner_id),
+    objectKey: String(row.object_key),
+    filename: String(row.filename),
+    mimeType: String(row.mime_type),
+    sizeBytes: number(row.size_bytes),
+    sha256: String(row.sha256),
+    state: row.state as AttachmentUploadStage["state"],
+    attachmentId: row.attachment_id ? String(row.attachment_id) : null,
+    cleanupError: row.cleanup_error ? String(row.cleanup_error) : null,
+    uploadLeaseToken: String(row.upload_lease_token),
+    uploadLeaseExpiresAt: iso(row.upload_lease_expires_at),
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at),
   };
@@ -1123,12 +1170,88 @@ function validateAttachmentInput(input: CreateAttachmentInput) {
     throw new DomainError("validation_error", "Attachment size is invalid", 422);
   }
   if (
+    input.requiredInspectionMode != null &&
+      !["local", "external"].includes(input.requiredInspectionMode) ||
+    input.inspectionPolicyVersion != null &&
+      input.inspectionPolicyVersion !== ATTACHMENT_INSPECTION_POLICY_VERSION
+  ) throw new DomainError("validation_error", "Attachment inspection policy is invalid", 422);
+  if (
     !input.filename || input.filename.length > 255 || /[\\/\0]/.test(input.filename) ||
     !input.mimeType || input.mimeType.length > 255 ||
     !/^[\w.+-]+\/[\w.+-]+$/.test(input.mimeType) ||
     !input.objectKey || input.objectKey.length > 1024 || input.objectKey.startsWith("/") ||
     input.objectKey.split("/").some((part) => part === ".." || part === "")
   ) throw new DomainError("validation_error", "Attachment metadata is invalid", 422);
+}
+
+function validateAttachmentStorageQuota(quota?: AttachmentStorageQuota): void {
+  if (
+    quota && (
+      !Number.isSafeInteger(quota.perUserBytes) || quota.perUserBytes < 0 ||
+      !Number.isSafeInteger(quota.perUserObjects) || quota.perUserObjects < 0 ||
+      !Number.isSafeInteger(quota.installationBytes) || quota.installationBytes < 0 ||
+      !Number.isSafeInteger(quota.installationObjects) || quota.installationObjects < 0
+    )
+  ) throw new DomainError("validation_error", "Attachment storage quota is invalid", 422);
+}
+
+async function admitAttachmentStorage(
+  tx: postgres.TransactionSql,
+  input: CreateAttachmentInput,
+  quota?: AttachmentStorageQuota,
+): Promise<void> {
+  validateAttachmentStorageQuota(quota);
+  try {
+    await tx`SELECT dg_chat_admit_attachment_storage(
+      ${input.ownerId},${input.objectKey},${input.sizeBytes},${input.sha256},${input.mimeType},
+      ${quota?.perUserBytes ?? null},${quota?.perUserObjects ?? null},
+      ${quota?.installationBytes ?? null},${quota?.installationObjects ?? null}
+    )`;
+  } catch (error) {
+    const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+    const message = error instanceof Error ? error.message : "";
+    if (code === "P0001" && message.includes("quota exceeded")) {
+      throw new DomainError("storage_quota_exceeded", "Attachment storage quota exceeded", 413);
+    }
+    if (
+      code === "23514" &&
+      (message.includes("retained blob") || message.includes("cannot be reused"))
+    ) {
+      throw new DomainError(
+        "attachment_object_conflict",
+        "Attachment object metadata differs from retained history",
+        409,
+      );
+    }
+    throw error;
+  }
+}
+
+/**
+ * Every writer that makes attachment bytes durably reachable takes this row lock before writing
+ * its reference. Generated-object cleanup takes the same lock before tombstoning and deleting the
+ * object, so either the reference commits first and fences deletion or the writer observes the
+ * tombstone. Sorting the unique IDs gives multi-attachment writers one global lock order.
+ */
+async function lockReferenceableAttachments(
+  tx: postgres.TransactionSql,
+  ownerId: string,
+  attachmentIds: readonly string[],
+  code: string,
+  message: string,
+): Promise<Row[]> {
+  const ids = [...new Set(attachmentIds)].sort();
+  if (!ids.length) return [];
+  const rows = await tx<Row[]>`
+    SELECT * FROM attachments
+    WHERE owner_id=${ownerId} AND id=ANY(${ids}::uuid[])
+    ORDER BY id
+    FOR UPDATE`;
+  if (
+    rows.length !== ids.length ||
+    rows.some((row) => String(row.state) !== "ready" || row.deleted_at !== null)
+  ) throw new DomainError(code, message, 409);
+  return rows;
 }
 
 function validateGeneratedObjectStageInput(input: StageGeneratedObjectInput) {
@@ -3065,11 +3188,12 @@ export class PostgresRepository implements DomainRepository {
         const id = idMap[value.id];
         await tx`INSERT INTO attachments(
           id,owner_id,object_key,filename,mime_type,size_bytes,sha256,state,inspection_error,
-          ingestion_status,ingestion_error,width,height,created_at,updated_at,deleted_at
+          ingestion_status,ingestion_error,width,height,physical_object,
+          created_at,updated_at,deleted_at
         ) VALUES(${id},${ownerId},${`imports/${ownerId}/${id}/manifest-only`},${value.filename},
           ${value.mimeType},${value.byteSize},${value.sha256},'failed',
           'Attachment bytes were not included in the .dgchat manifest','failed',
-          'Attachment bytes require a separate restore',${value.width},${value.height},
+          'Attachment bytes require a separate restore',${value.width},${value.height},false,
           ${value.createdAt},${importedAt},${importedAt})`;
       }
       const foldersWithMemberships = new Set<string>();
@@ -3329,13 +3453,13 @@ export class PostgresRepository implements DomainRepository {
           422,
         );
       }
-      const attachmentRows = selected.length
-        ? await tx<Row[]>`SELECT * FROM attachments WHERE id=ANY(${selected}::uuid[])
-          AND owner_id=${ownerId} AND state='ready' AND deleted_at IS NULL`
-        : [];
-      if (attachmentRows.length !== selected.length) {
-        throw new DomainError("invalid_attachment", "Shared attachment is unavailable", 409);
-      }
+      const attachmentRows = await lockReferenceableAttachments(
+        tx,
+        ownerId,
+        selected,
+        "invalid_attachment",
+        "Shared attachment is unavailable",
+      );
       const attachmentById = new Map(attachmentRows.map((value) => [String(value.id), value]));
       const attachmentPublicIds = new Map(selected.map((id) => [id, crypto.randomUUID()]));
       const publicAttachments: PublicConversationShareAttachment[] = selected.map(
@@ -4111,17 +4235,13 @@ export class PostgresRepository implements DomainRepository {
           );
         }
       }
-      for (const attachmentId of attachmentIds) {
-        const ready = await tx`
-          SELECT id FROM attachments
-          WHERE id=${attachmentId} AND owner_id=${input.message.ownerId}
-            AND state='ready' AND deleted_at IS NULL
-          FOR UPDATE
-        `;
-        if (!ready.length) {
-          throw new DomainError("attachment_not_ready", "Attachment is not ready", 409);
-        }
-      }
+      await lockReferenceableAttachments(
+        tx,
+        input.message.ownerId,
+        attachmentIds,
+        "attachment_not_ready",
+        "Attachment is not ready",
+      );
       const account = await tx<
         Row[]
       >`SELECT balance_micros FROM users WHERE id=${input.message.ownerId} FOR UPDATE`;
@@ -4677,16 +4797,34 @@ export class PostgresRepository implements DomainRepository {
     });
   }
 
-  async createAttachment(input: CreateAttachmentInput): Promise<CreateAttachmentResult> {
+  async createAttachment(
+    input: CreateAttachmentInput,
+    quota?: AttachmentStorageQuota,
+  ): Promise<CreateAttachmentResult> {
     validateAttachmentInput(input);
+    validateAttachmentStorageQuota(quota);
+    const requiredInspectionMode = input.requiredInspectionMode ?? "local";
+    const inspectionPolicyVersion = input.inspectionPolicyVersion ??
+      ATTACHMENT_INSPECTION_POLICY_VERSION;
     return await this.#sql.begin(async (tx) => {
       await tx`SELECT pg_advisory_xact_lock(hashtextextended(${`attachment-dedup:${input.ownerId}:${input.sha256}`},0))`;
       await tx`SELECT pg_advisory_xact_lock(hashtextextended(${input.objectKey},0))`;
+      const stagedObject = await tx`SELECT id FROM attachment_upload_staging
+        WHERE object_key=${input.objectKey} LIMIT 1`;
+      if (stagedObject.length) {
+        throw new DomainError(
+          "upload_stage_conflict",
+          "Attachment object is controlled by a browser upload stage",
+          409,
+        );
+      }
       const owner = await tx`SELECT id FROM users WHERE id=${input.ownerId} FOR UPDATE`;
       if (!owner.length) throw new DomainError("not_found", "User not found", 404);
       const existing = await tx<
         Row[]
       >`SELECT * FROM attachments WHERE owner_id=${input.ownerId} AND sha256=${input.sha256}
+        AND required_inspection_mode=${requiredInspectionMode}
+        AND inspection_policy_version=${inspectionPolicyVersion}
         AND deleted_at IS NULL ORDER BY created_at,id LIMIT 1 FOR UPDATE`;
       let record = existing[0];
       const deduplicated = Boolean(record);
@@ -4707,11 +4845,15 @@ export class PostgresRepository implements DomainRepository {
         if (objectConflict.length) {
           throw new DomainError("object_key_taken", "Attachment object key already exists", 409);
         }
+        await admitAttachmentStorage(tx, input, quota);
         const inserted = await tx<
           Row[]
-        >`INSERT INTO attachments(owner_id,object_key,filename,mime_type,size_bytes,sha256,state,inspection_error,ingestion_status) VALUES(${input.ownerId},${input.objectKey},${input.filename},${input.mimeType},${input.sizeBytes},${input.sha256},${
-          input.state ?? "pending"
-        },${input.inspectionError ?? null},${
+        >`INSERT INTO attachments(owner_id,object_key,filename,mime_type,size_bytes,sha256,state,
+          inspection_error,required_inspection_mode,inspection_policy_version,ingestion_status)
+          VALUES(${input.ownerId},${input.objectKey},${input.filename},${input.mimeType},
+          ${input.sizeBytes},${input.sha256},${input.state ?? "pending"},${
+          input.inspectionError ?? null
+        },${requiredInspectionMode},${inspectionPolicyVersion},${
           input.state === "ready" && isIngestibleDocumentMime(input.mimeType)
             ? "queued"
             : "not_applicable"
@@ -4719,11 +4861,18 @@ export class PostgresRepository implements DomainRepository {
         record = inserted[0];
       }
       const attachmentId = String(record.id);
-      const idempotencyKey = `attachment.inspect:${attachmentId}`;
+      const inspectionEpoch = number(record.inspection_epoch ?? 1);
+      const idempotencyKey = `attachment.inspect:${attachmentId}:${inspectionEpoch}`;
       const jobs = input.inspectionComplete ? [] : await tx<
         Row[]
       >`INSERT INTO jobs(type,payload,idempotency_key) VALUES('attachment.inspect',${
-        tx.json({ attachmentId, ownerId: input.ownerId })
+        tx.json({
+          attachmentId,
+          ownerId: input.ownerId,
+          inspectionEpoch,
+          requiredInspectionMode: String(record.required_inspection_mode),
+          inspectionPolicyVersion: String(record.inspection_policy_version),
+        })
       },${idempotencyKey}) ON CONFLICT(idempotency_key) DO UPDATE SET idempotency_key=EXCLUDED.idempotency_key RETURNING id`;
       if (String(record.ingestion_status) === "queued") {
         await tx`INSERT INTO jobs(type,payload,idempotency_key) VALUES('attachment.ingest',${
@@ -4736,6 +4885,213 @@ export class PostgresRepository implements DomainRepository {
         deduplicated,
       };
     });
+  }
+
+  async stageAttachmentUpload(input: StageAttachmentUploadInput, leaseSeconds: number) {
+    validateAttachmentInput({
+      ownerId: input.ownerId,
+      objectKey: input.objectKey,
+      filename: input.filename,
+      mimeType: input.mimeType,
+      sizeBytes: input.sizeBytes,
+      sha256: input.sha256,
+    });
+    if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1 || leaseSeconds > 86_400) {
+      throw new DomainError("validation_error", "Attachment upload lease is invalid", 422);
+    }
+    const rows = await this.#sql<Row[]>`
+      INSERT INTO attachment_upload_staging(
+        id,owner_id,object_key,filename,mime_type,size_bytes,sha256,upload_lease_expires_at
+      ) VALUES(${input.id},${input.ownerId},${input.objectKey},${input.filename},
+        ${input.mimeType},${input.sizeBytes},${input.sha256},
+        now()+${leaseSeconds}*interval '1 second')
+      ON CONFLICT(id) DO UPDATE SET id=EXCLUDED.id RETURNING *`;
+    const stage = attachmentUploadStage(rows[0]);
+    if (
+      stage.ownerId !== input.ownerId || stage.objectKey !== input.objectKey ||
+      stage.filename !== input.filename || stage.mimeType !== input.mimeType ||
+      stage.sizeBytes !== input.sizeBytes || stage.sha256 !== input.sha256
+    ) throw new DomainError("idempotency_conflict", "Attachment upload stage differs", 409);
+    return stage;
+  }
+
+  async markAttachmentUploadStored(
+    id: string,
+    ownerId: string,
+    uploadLeaseToken: string,
+    leaseSeconds: number,
+  ) {
+    if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1 || leaseSeconds > 86_400) {
+      throw new DomainError("validation_error", "Attachment upload lease is invalid", 422);
+    }
+    const rows = await this.#sql<Row[]>`UPDATE attachment_upload_staging
+      SET state='stored',upload_lease_expires_at=now()+${leaseSeconds}*interval '1 second',
+        updated_at=now() WHERE id=${id} AND owner_id=${ownerId}
+        AND upload_lease_token=${uploadLeaseToken} AND upload_lease_expires_at>now()
+        AND state IN('pending','stored') RETURNING *`;
+    if (!rows[0]) {
+      throw new DomainError("upload_stage_conflict", "Attachment upload stage changed", 409);
+    }
+    return attachmentUploadStage(rows[0]);
+  }
+
+  async heartbeatAttachmentUpload(
+    id: string,
+    ownerId: string,
+    uploadLeaseToken: string,
+    leaseSeconds: number,
+  ) {
+    if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1 || leaseSeconds > 86_400) {
+      throw new DomainError("validation_error", "Attachment upload lease is invalid", 422);
+    }
+    const rows = await this.#sql<Row[]>`UPDATE attachment_upload_staging
+      SET upload_lease_expires_at=now()+${leaseSeconds}*interval '1 second',updated_at=now()
+      WHERE id=${id} AND owner_id=${ownerId} AND upload_lease_token=${uploadLeaseToken}
+        AND upload_lease_expires_at>now() AND state IN('pending','stored') RETURNING *`;
+    if (!rows[0]) {
+      throw new DomainError("upload_stage_conflict", "Attachment upload stage changed", 409);
+    }
+    return attachmentUploadStage(rows[0]);
+  }
+
+  async createAttachmentFromUploadStage(
+    id: string,
+    ownerId: string,
+    uploadLeaseToken: string,
+    input: CreateAttachmentInput,
+    quota?: AttachmentStorageQuota,
+  ) {
+    validateAttachmentInput(input);
+    validateAttachmentStorageQuota(quota);
+    if (input.ownerId !== ownerId) {
+      throw new DomainError("upload_stage_conflict", "Attachment upload owner differs", 409);
+    }
+    const requiredInspectionMode = input.requiredInspectionMode ?? "local";
+    const inspectionPolicyVersion = input.inspectionPolicyVersion ??
+      ATTACHMENT_INSPECTION_POLICY_VERSION;
+    return await this.#sql.begin(async (tx) => {
+      const stages = await tx<Row[]>`SELECT * FROM attachment_upload_staging
+        WHERE id=${id} AND owner_id=${ownerId} AND upload_lease_token=${uploadLeaseToken}
+          AND upload_lease_expires_at>now() FOR UPDATE`;
+      const stage = stages[0] ? attachmentUploadStage(stages[0]) : undefined;
+      if (
+        !stage || stage.state !== "stored" || stage.objectKey !== input.objectKey ||
+        stage.filename !== input.filename || stage.mimeType !== input.mimeType ||
+        stage.sizeBytes !== input.sizeBytes || stage.sha256 !== input.sha256
+      ) throw new DomainError("upload_stage_conflict", "Attachment upload stage differs", 409);
+      await tx`SELECT pg_advisory_xact_lock(hashtextextended(${`attachment-dedup:${ownerId}:${input.sha256}`},0))`;
+      await tx`SELECT pg_advisory_xact_lock(hashtextextended(${input.objectKey},0))`;
+      const existing = await tx<Row[]>`SELECT * FROM attachments
+        WHERE owner_id=${ownerId} AND sha256=${input.sha256}
+          AND required_inspection_mode=${requiredInspectionMode}
+          AND inspection_policy_version=${inspectionPolicyVersion}
+          AND deleted_at IS NULL
+        ORDER BY created_at,id LIMIT 1 FOR UPDATE`;
+      if (existing[0]) {
+        if (
+          number(existing[0].size_bytes) !== input.sizeBytes ||
+          String(existing[0].mime_type) !== input.mimeType
+        ) {
+          throw new DomainError(
+            "attachment_hash_conflict",
+            "Attachment digest metadata differs",
+            409,
+          );
+        }
+        await tx`UPDATE attachment_upload_staging SET state='cleanup_pending',
+          cleanup_error='deduplicated browser upload',updated_at=now() WHERE id=${id}`;
+        await tx`INSERT INTO jobs(type,payload,idempotency_key,status,attempts,available_at)
+          VALUES('attachment_object.cleanup',${tx.json({ stageId: id, ownerId })},
+            ${`attachment_object.cleanup:${id}`},'queued',0,${stages[0]
+          .upload_lease_expires_at as Date})
+          ON CONFLICT(idempotency_key) DO NOTHING`;
+        return {
+          attachment: attachment(existing[0]),
+          inspectionJobId: null,
+          deduplicated: true,
+        };
+      }
+      const conflict = await tx`SELECT 1 FROM attachments WHERE object_key=${input.objectKey}
+        LIMIT 1`;
+      if (conflict.length) {
+        throw new DomainError("object_key_taken", "Attachment object key already exists", 409);
+      }
+      await admitAttachmentStorage(tx, input, quota);
+      const inserted = await tx<Row[]>`INSERT INTO attachments(
+        owner_id,object_key,filename,mime_type,size_bytes,sha256,state,inspection_error,
+        required_inspection_mode,inspection_policy_version,ingestion_status
+      ) VALUES(${ownerId},${input.objectKey},${input.filename},${input.mimeType},
+        ${input.sizeBytes},${input.sha256},${input.state ?? "pending"},
+        ${input.inspectionError ?? null},${requiredInspectionMode},${inspectionPolicyVersion},${
+        input.state === "ready" && isIngestibleDocumentMime(input.mimeType)
+          ? "queued"
+          : "not_applicable"
+      }) RETURNING *`;
+      const record = inserted[0];
+      const attachmentId = String(record.id);
+      const inspectionEpoch = number(record.inspection_epoch ?? 1);
+      let inspectionJobId: string | null = null;
+      if (!input.inspectionComplete) {
+        const jobs = await tx<Row[]>`INSERT INTO jobs(type,payload,idempotency_key)
+          VALUES('attachment.inspect',${
+          tx.json({
+            attachmentId,
+            ownerId,
+            inspectionEpoch,
+            requiredInspectionMode: String(record.required_inspection_mode),
+            inspectionPolicyVersion: String(record.inspection_policy_version),
+          })
+        },${`attachment.inspect:${attachmentId}:${inspectionEpoch}`}) RETURNING id`;
+        inspectionJobId = String(jobs[0].id);
+      }
+      if (String(record.ingestion_status) === "queued") {
+        await tx`INSERT INTO jobs(type,payload,idempotency_key)
+          VALUES('attachment.ingest',${tx.json({ attachmentId, ownerId })},
+            ${`attachment.ingest:${attachmentId}`}) ON CONFLICT(idempotency_key) DO NOTHING`;
+      }
+      await tx`UPDATE attachment_upload_staging SET state='finalized',
+        attachment_id=${attachmentId},cleanup_error=NULL,upload_lease_expires_at=now(),
+        updated_at=now() WHERE id=${id}`;
+      return { attachment: attachment(record), inspectionJobId, deduplicated: false };
+    });
+  }
+
+  async requestAttachmentUploadCleanup(
+    id: string,
+    ownerId: string,
+    uploadLeaseToken: string,
+    reason: string,
+  ) {
+    return await this.#sql.begin(async (tx) => {
+      const rows = await tx<Row[]>`UPDATE attachment_upload_staging
+        SET state='cleanup_pending',cleanup_error=${reason.slice(0, 1000)},updated_at=now()
+        WHERE id=${id} AND owner_id=${ownerId} AND upload_lease_token=${uploadLeaseToken}
+          AND state IN('pending','stored','cleanup_pending','cleaning','cleaned') RETURNING *`;
+      if (!rows[0]) {
+        throw new DomainError("upload_stage_conflict", "Attachment upload stage changed", 409);
+      }
+      await tx`INSERT INTO jobs(type,payload,idempotency_key,status,attempts,available_at)
+        VALUES('attachment_object.cleanup',${tx.json({ stageId: id, ownerId })},
+          ${`attachment_object.cleanup:${id}`},'queued',0,${rows[0]
+        .upload_lease_expires_at as Date})
+        ON CONFLICT(idempotency_key) DO UPDATE SET status='queued',
+          attempts=0,
+          available_at=EXCLUDED.available_at,
+          last_error=NULL,locked_at=NULL,locked_by=NULL,completed_at=NULL
+        WHERE jobs.status IN('completed','failed')`;
+      return attachmentUploadStage(rows[0]);
+    });
+  }
+
+  async abandonAttachmentUpload(id: string, ownerId: string, reason: string) {
+    const rows = await this.#sql<Row[]>`UPDATE attachment_upload_staging
+      SET state='abandoned',cleanup_error=${reason.slice(0, 1000)},updated_at=now()
+      WHERE id=${id} AND owner_id=${ownerId} AND state IN('pending','abandoned')
+      RETURNING *`;
+    if (!rows[0]) {
+      throw new DomainError("upload_stage_conflict", "Attachment upload stage changed", 409);
+    }
+    return attachmentUploadStage(rows[0]);
   }
 
   async stageFileUpload(input: StageFileUploadInput) {
@@ -4765,10 +5121,12 @@ export class PostgresRepository implements DomainRepository {
       ) throw new DomainError("idempotency_conflict", "File upload stage owner differs", 409);
       const rows = await tx<Row[]>`
         INSERT INTO file_upload_staging(request_id,owner_id,object_key,filename,mime_type,
-          size_bytes,sha256,purpose,attachment_state,inspection_error)
+          size_bytes,sha256,purpose,attachment_state,inspection_error,
+          required_inspection_mode,inspection_policy_version)
         VALUES(${input.requestId},${input.ownerId},${input.objectKey},${input.filename},
           ${input.mimeType},${input.sizeBytes},${input.sha256},${input.purpose},
-          ${input.attachmentState},${input.inspectionError})
+          ${input.attachmentState},${input.inspectionError},${input.requiredInspectionMode},
+          ${input.inspectionPolicyVersion})
         ON CONFLICT(request_id) DO UPDATE SET request_id=EXCLUDED.request_id RETURNING *`;
       const stage = fileUploadStage(rows[0]);
       if (
@@ -4776,7 +5134,9 @@ export class PostgresRepository implements DomainRepository {
         stage.filename !== input.filename || stage.mimeType !== input.mimeType ||
         stage.sizeBytes !== input.sizeBytes || stage.sha256 !== input.sha256 ||
         stage.purpose !== input.purpose || stage.attachmentState !== input.attachmentState ||
-        stage.inspectionError !== input.inspectionError
+        stage.inspectionError !== input.inspectionError ||
+        stage.requiredInspectionMode !== input.requiredInspectionMode ||
+        stage.inspectionPolicyVersion !== input.inspectionPolicyVersion
       ) throw new DomainError("idempotency_conflict", "File upload stage differs", 409);
       return stage;
     });
@@ -4810,8 +5170,10 @@ export class PostgresRepository implements DomainRepository {
 
   async finalizeFileUpload(
     input: FinalizeFileUploadInput,
+    quota?: AttachmentStorageQuota,
   ): Promise<FinalizeFileUploadResult> {
     validateAttachmentInput(input.attachment);
+    validateAttachmentStorageQuota(quota);
     if (
       input.request.responseStatus !== 201 || input.request.costMicros !== 0 ||
       input.request.inputTokens !== 0 || input.request.outputTokens !== 0
@@ -4867,7 +5229,10 @@ export class PostgresRepository implements DomainRepository {
         stage.sizeBytes !== input.attachment.sizeBytes ||
         stage.sha256 !== input.attachment.sha256 ||
         stage.attachmentState !== (input.attachment.state ?? "pending") ||
-        stage.inspectionError !== (input.attachment.inspectionError ?? null)
+        stage.inspectionError !== (input.attachment.inspectionError ?? null) ||
+        stage.requiredInspectionMode !== (input.attachment.requiredInspectionMode ?? "local") ||
+        stage.inspectionPolicyVersion !==
+          (input.attachment.inspectionPolicyVersion ?? ATTACHMENT_INSPECTION_POLICY_VERSION)
       ) throw new DomainError("file_upload_stage_conflict", "File upload stage differs", 409);
       const peers = await tx<Row[]>`
         SELECT * FROM attachments WHERE object_key=${input.attachment.objectKey}
@@ -4880,13 +5245,18 @@ export class PostgresRepository implements DomainRepository {
           String(peer.mime_type) !== input.attachment.mimeType
         )
       ) throw new DomainError("object_key_taken", "Attachment object key already exists", 409);
+      await admitAttachmentStorage(tx, input.attachment, quota);
+      const requiredInspectionMode = input.attachment.requiredInspectionMode ?? "local";
+      const inspectionPolicyVersion = input.attachment.inspectionPolicyVersion ??
+        ATTACHMENT_INSPECTION_POLICY_VERSION;
       const inserted = await tx<Row[]>`
         INSERT INTO attachments(owner_id,object_key,filename,mime_type,size_bytes,sha256,state,
-          inspection_error,ingestion_status)
+          inspection_error,required_inspection_mode,inspection_policy_version,ingestion_status)
         VALUES(${input.attachment.ownerId},${input.attachment.objectKey},
           ${input.attachment.filename},${input.attachment.mimeType},
           ${input.attachment.sizeBytes},${input.attachment.sha256},
-          ${input.attachment.state ?? "pending"},${input.attachment.inspectionError ?? null},${
+          ${input.attachment.state ?? "pending"},${input.attachment.inspectionError ?? null},
+          ${requiredInspectionMode},${inspectionPolicyVersion},${
         input.attachment.state === "ready" &&
           isIngestibleDocumentMime(input.attachment.mimeType)
           ? "queued"
@@ -4894,11 +5264,18 @@ export class PostgresRepository implements DomainRepository {
       }) RETURNING *`;
       const record = inserted[0];
       const attachmentId = String(record.id);
+      const inspectionEpoch = number(record.inspection_epoch ?? 1);
       if (!input.attachment.inspectionComplete) {
         await tx`INSERT INTO jobs(type,payload,idempotency_key)
           VALUES('attachment.inspect',${
-          tx.json({ attachmentId, ownerId: input.attachment.ownerId })
-        },${`attachment.inspect:${attachmentId}`})`;
+          tx.json({
+            attachmentId,
+            ownerId: input.attachment.ownerId,
+            inspectionEpoch,
+            requiredInspectionMode: String(record.required_inspection_mode),
+            inspectionPolicyVersion: String(record.inspection_policy_version),
+          })
+        },${`attachment.inspect:${attachmentId}:${inspectionEpoch}`})`;
       }
       if (String(record.ingestion_status) === "queued") {
         await tx`INSERT INTO jobs(type,payload,idempotency_key)
@@ -5022,7 +5399,10 @@ export class PostgresRepository implements DomainRepository {
   async deleteAttachment(id: string, ownerId: string) {
     const rows = await this.#sql<
       Row[]
-    >`UPDATE attachments SET state='deleted',deleted_at=COALESCE(deleted_at,now()),updated_at=now() WHERE id=${id} AND owner_id=${ownerId} RETURNING *`;
+    >`UPDATE attachments SET state='deleted',
+      version=CASE WHEN deleted_at IS NULL THEN version+1 ELSE version END,
+      deleted_at=COALESCE(deleted_at,now()),updated_at=now()
+      WHERE id=${id} AND owner_id=${ownerId} RETURNING *`;
     if (!rows[0]) throw new DomainError("not_found", "Attachment not found", 404);
     return attachment(rows[0]);
   }
@@ -5034,9 +5414,22 @@ export class PostgresRepository implements DomainRepository {
     nextState: AttachmentState,
     inspectionError: string | null = null,
   ) {
+    if (
+      expectedState === "inspecting" &&
+      ["ready", "quarantined", "failed"].includes(nextState)
+    ) {
+      return await this.transitionAttachmentInspection({
+        attachmentId: id,
+        ownerId,
+        inspectionEpoch: 1,
+        expectedState,
+        nextState: nextState as "ready" | "quarantined" | "failed",
+        inspectionError,
+      });
+    }
     const allowed: Record<AttachmentState, AttachmentState[]> = {
       pending: ["inspecting", "deleted"],
-      inspecting: ["ready", "quarantined", "failed", "deleted"],
+      inspecting: ["deleted"],
       ready: ["deleted"],
       quarantined: ["deleted"],
       failed: ["pending", "deleted"],
@@ -5053,12 +5446,14 @@ export class PostgresRepository implements DomainRepository {
       const rows = await tx<
         Row[]
       >`UPDATE attachments SET state=${nextState},inspection_error=${inspectionError},
+        version=version+1,
         ingestion_status=CASE WHEN ${nextState}='ready' AND mime_type = ANY(${[
         ...INGESTIBLE_DOCUMENT_MIME_TYPES,
       ]}) THEN 'queued' ELSE ingestion_status END,
         ingestion_error=CASE WHEN ${nextState}='ready' THEN NULL ELSE ingestion_error END,
         deleted_at=CASE WHEN ${nextState}='deleted' THEN COALESCE(deleted_at,now()) ELSE deleted_at END,
-        updated_at=now() WHERE id=${id} AND owner_id=${ownerId} AND state=${expectedState} RETURNING *`;
+        updated_at=now() WHERE id=${id} AND owner_id=${ownerId} AND state=${expectedState}
+        AND inspection_epoch=1 RETURNING *`;
       if (rows[0] && nextState === "ready" && isIngestibleDocumentMime(String(rows[0].mime_type))) {
         await tx`INSERT INTO jobs(type,payload,idempotency_key) VALUES('attachment.ingest',${
           tx.json({ attachmentId: id, ownerId })
@@ -5067,14 +5462,271 @@ export class PostgresRepository implements DomainRepository {
       if (rows[0]) return attachment(rows[0]);
       const exists = await tx`SELECT id FROM attachments WHERE id=${id} AND owner_id=${ownerId}`;
       if (!exists.length) throw new DomainError("not_found", "Attachment not found", 404);
+      const versioned = await tx`
+        SELECT id FROM attachments WHERE id=${id} AND owner_id=${ownerId}
+          AND inspection_epoch<>1`;
+      if (versioned.length) {
+        throw new DomainError(
+          "attachment_inspection_conflict",
+          "Versioned reinspection requires an epoch-bound transition",
+          409,
+        );
+      }
       throw new DomainError("attachment_state_conflict", "Attachment state changed", 409);
+    });
+  }
+
+  async requestAttachmentReinspection(
+    input: RequestAttachmentReinspectionInput,
+  ): Promise<AttachmentReinspectionResult> {
+    const reason = validateAdminCommand(input, true)!;
+    return await this.#sql.begin(async (tx) => {
+      await assertEffectiveAdminActor(tx, input.actorId);
+      const rows = await tx<Row[]>`
+        SELECT * FROM attachments WHERE id=${input.attachmentId} FOR UPDATE`;
+      const prior = rows[0];
+      if (!prior) throw new DomainError("not_found", "Attachment not found", 404);
+      const eligibility = attachmentReinspectionEligibility(attachment(prior));
+      if (eligibility.blockedReason === "deleted") {
+        throw new DomainError(
+          "attachment_deleted",
+          "Deleted attachments cannot be reinspected",
+          409,
+        );
+      }
+      if (!eligibility.eligible) {
+        throw new DomainError(
+          "attachment_state_conflict",
+          eligibility.blockedReason === "policy_quarantine"
+            ? "This quarantine was issued by a non-retriable upload policy"
+            : "Only terminal attachments can be reinspected",
+          409,
+        );
+      }
+      if (number(prior.version) !== input.expectedVersion) {
+        throw new DomainError(
+          "version_conflict",
+          "Attachment was modified by another administrator",
+          409,
+        );
+      }
+      const updated = await tx<Row[]>`
+        UPDATE attachments SET state='pending',inspection_error=NULL,
+          inspection_epoch=inspection_epoch+1,version=version+1,updated_at=now()
+        WHERE id=${input.attachmentId} RETURNING *`;
+      const record = updated[0];
+      const epoch = number(record.inspection_epoch);
+      const key = `attachment.inspect:${input.attachmentId}:${epoch}`;
+      const jobs = await tx<Row[]>`
+        INSERT INTO jobs(type,payload,idempotency_key)
+        VALUES('attachment.inspect',${
+        tx.json({
+          attachmentId: input.attachmentId,
+          ownerId: String(record.owner_id),
+          inspectionEpoch: epoch,
+          requiredInspectionMode: String(record.required_inspection_mode),
+          inspectionPolicyVersion: String(record.inspection_policy_version),
+        })
+      },${key})
+        ON CONFLICT(idempotency_key) DO UPDATE SET idempotency_key=EXCLUDED.idempotency_key
+        RETURNING id`;
+      const jobId = String(jobs[0].id);
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${input.actorId},'attachment.reinspection_requested','attachment',${input.attachmentId},${
+        tx.json({
+          ownerId: String(record.owner_id),
+          reason,
+          before: {
+            state: String(prior.state),
+            inspectionEpoch: number(prior.inspection_epoch),
+            version: number(prior.version),
+          },
+          after: { state: "pending", inspectionEpoch: epoch, version: number(record.version) },
+          inspectionJobId: jobId,
+        })
+      })`;
+      return { attachment: attachment(record), inspectionJobId: jobId };
+    });
+  }
+
+  async transitionAttachmentInspection(
+    input: TransitionAttachmentInspectionInput,
+  ): Promise<AttachmentRecord> {
+    const inspectionError = input.inspectionError?.trim() || null;
+    const requiresReason = ["quarantined", "failed"].includes(input.nextState);
+    if (
+      !Number.isSafeInteger(input.inspectionEpoch) || input.inspectionEpoch < 1 ||
+      (input.expectedState === "pending" && input.nextState !== "inspecting") ||
+      (input.expectedState === "inspecting" &&
+        !["ready", "quarantined", "failed"].includes(input.nextState)) ||
+      (requiresReason ? inspectionError === null : inspectionError !== null) ||
+      (inspectionError !== null && inspectionError.length > 1_000)
+    ) throw new DomainError("validation_error", "Attachment inspection transition is invalid", 422);
+    return await this.#sql.begin(async (tx) => {
+      const rows = await tx<Row[]>`
+        UPDATE attachments SET state=${input.nextState},
+          inspection_error=${inspectionError},version=version+1,
+          ingestion_status=CASE
+            WHEN ${input.nextState}='ready'
+              AND ingestion_status<>'ready'
+              AND mime_type=ANY(${[...INGESTIBLE_DOCUMENT_MIME_TYPES]})
+            THEN 'queued' ELSE ingestion_status END,
+          ingestion_error=CASE WHEN ${input.nextState}='ready' THEN NULL ELSE ingestion_error END,
+          updated_at=now()
+        WHERE id=${input.attachmentId} AND owner_id=${input.ownerId}
+          AND deleted_at IS NULL AND inspection_epoch=${input.inspectionEpoch}
+          AND state=${input.expectedState}
+        RETURNING *`;
+      if (!rows[0]) {
+        const exists = await tx`
+          SELECT id FROM attachments WHERE id=${input.attachmentId}
+            AND owner_id=${input.ownerId}`;
+        if (!exists.length) throw new DomainError("not_found", "Attachment not found", 404);
+        throw new DomainError(
+          "attachment_inspection_conflict",
+          "Attachment inspection epoch or state changed",
+          409,
+        );
+      }
+      if (
+        input.nextState === "ready" && String(rows[0].ingestion_status) === "queued"
+      ) {
+        await tx`INSERT INTO jobs(type,payload,idempotency_key)
+          VALUES('attachment.ingest',${
+          tx.json({ attachmentId: input.attachmentId, ownerId: input.ownerId })
+        },${`attachment.ingest:${input.attachmentId}`})
+          ON CONFLICT(idempotency_key) DO NOTHING`;
+      }
+      if (["ready", "quarantined", "failed"].includes(input.nextState)) {
+        await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+          VALUES(NULL,'attachment.inspection.completed','attachment',${input.attachmentId},${
+          tx.json({
+            ownerId: input.ownerId,
+            inspectionEpoch: input.inspectionEpoch,
+            outcome: input.nextState,
+            reason: inspectionError,
+          })
+        })`;
+      }
+      return attachment(rows[0]);
+    });
+  }
+
+  async attachmentStorageUsage(ownerId: string): Promise<AttachmentStorageUsage> {
+    const rows = await this.#sql<Row[]>`
+      SELECT physical_bytes,physical_objects FROM attachment_storage_usage
+      WHERE owner_id=${ownerId}`;
+    return {
+      ownerId,
+      physicalBytes: number(rows[0]?.physical_bytes ?? 0),
+      physicalObjects: number(rows[0]?.physical_objects ?? 0),
+    };
+  }
+
+  async adminStorageSummary(actorId: string): Promise<AdminStorageSummary> {
+    return await this.#sql.begin(async (tx) => {
+      await assertEffectiveAdminActor(tx, actorId);
+      const rows = await tx<Row[]>`
+        SELECT installation.physical_bytes,installation.physical_objects,
+          (SELECT count(*) FROM attachments) attachment_records,
+          (SELECT count(*) FROM attachments WHERE deleted_at IS NULL) active_records,
+          (SELECT count(*) FROM attachments WHERE deleted_at IS NOT NULL) deleted_records,
+          (SELECT count(*) FROM attachments
+            WHERE deleted_at IS NULL AND state='quarantined') quarantined_records,
+          (SELECT count(*) FROM attachment_storage_usage
+            WHERE physical_objects>0) owners_with_storage
+        FROM attachment_storage_installation installation WHERE singleton_id=1`;
+      const row = rows[0];
+      return {
+        physicalBytes: number(row.physical_bytes),
+        physicalObjects: number(row.physical_objects),
+        attachmentRecords: number(row.attachment_records),
+        activeRecords: number(row.active_records),
+        deletedRecords: number(row.deleted_records),
+        quarantinedRecords: number(row.quarantined_records),
+        ownersWithStorage: number(row.owners_with_storage),
+      };
+    });
+  }
+
+  async listAdminAttachments(
+    actorId: string,
+    query: AdminAttachmentQuery,
+  ): Promise<AdminAttachmentPage> {
+    const limit = query.limit ?? 50;
+    const deletion = query.deletion ?? "present";
+    if (
+      !Number.isSafeInteger(limit) || limit < 1 || limit > 200 ||
+      (query.ownerId !== undefined && !UUID_PATTERN.test(query.ownerId)) ||
+      !["present", "deleted", "all"].includes(deletion)
+    ) throw new DomainError("validation_error", "Attachment inventory query is invalid", 422);
+    const cursor = query.cursor ? decodeAdminAttachmentCursor(query.cursor, query) : undefined;
+    if (query.cursor && !cursor) {
+      throw new DomainError("invalid_cursor", "Attachment inventory cursor is invalid", 400);
+    }
+    const fetchLimit = limit + 1;
+    return await this.#sql.begin(async (tx) => {
+      await assertEffectiveAdminActor(tx, actorId);
+      const rows = await tx<Row[]>`
+        SELECT attachments.*,
+          to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+            AS created_at_cursor
+        FROM attachments
+        WHERE (${query.ownerId ?? null}::uuid IS NULL OR owner_id=${query.ownerId ?? null}::uuid)
+          AND (${query.state ?? null}::text IS NULL OR state=${query.state ?? null}::text)
+          AND (${deletion}='all'
+            OR (${deletion}='deleted' AND deleted_at IS NOT NULL)
+            OR (${deletion}='present' AND deleted_at IS NULL))
+          AND (${cursor?.createdAt ?? null}::timestamptz IS NULL
+            OR (created_at,id)<(
+              ${cursor?.createdAt ?? null}::timestamptz,
+              ${cursor?.id ?? null}::uuid
+            ))
+        ORDER BY created_at DESC,id DESC LIMIT ${fetchLimit}`;
+      const project = (row: Row): AdminAttachmentSummary => {
+        const item = attachment(row);
+        return {
+          id: item.id,
+          ownerId: item.ownerId,
+          filename: item.filename,
+          mimeType: item.mimeType,
+          sizeBytes: item.sizeBytes,
+          state: item.state,
+          inspectionError: item.inspectionError,
+          inspectionEpoch: item.inspectionEpoch,
+          version: item.version,
+          reinspectionEligible: attachmentReinspectionEligibility(item).eligible,
+          reinspectionBlockedReason: attachmentReinspectionEligibility(item).blockedReason,
+          createdAt: item.createdAt,
+          updatedAt: item.updatedAt,
+          deletedAt: item.deletedAt,
+        };
+      };
+      return {
+        data: rows.slice(0, limit).map(project),
+        nextCursor: rows.length > limit
+          ? encodeAdminAttachmentCursor(
+            String(rows[limit - 1].created_at_cursor),
+            String(rows[limit - 1].id),
+            query,
+          )
+          : null,
+      };
     });
   }
 
   async linkAttachmentToMessage(messageId: string, attachmentId: string, ownerId: string) {
     await this.#sql.begin(async (tx) => {
-      const ready = await tx`SELECT id FROM attachments WHERE id=${attachmentId}
-        AND owner_id=${ownerId} AND state='ready' AND deleted_at IS NULL FOR UPDATE`;
+      const ready = await lockReferenceableAttachments(
+        tx,
+        ownerId,
+        [attachmentId],
+        "attachment_not_ready",
+        "Message or ready attachment not found",
+      ).catch((error) => {
+        if (error instanceof DomainError && error.code === "attachment_not_ready") return [];
+        throw error;
+      });
       const message = await tx`SELECT m.id FROM messages m JOIN conversations c
         ON c.id=m.conversation_id WHERE m.id=${messageId} AND c.owner_id=${ownerId} FOR UPDATE OF m`;
       if (!ready.length || !message.length) {
@@ -5168,16 +5820,13 @@ export class PostgresRepository implements DomainRepository {
           ...(asset.inputs ?? []).map((source) => source.attachmentId),
         ])),
       ];
-      const ready = await tx<{ id: string; mime_type: string }[]>`
-        SELECT id,mime_type FROM attachments WHERE owner_id=${input.ownerId} AND id=ANY(${attachmentIds})
-          AND state='ready' AND deleted_at IS NULL FOR UPDATE`;
-      if (ready.length !== attachmentIds.length) {
-        throw new DomainError(
-          "attachment_not_ready",
-          "Generated asset attachment is not ready",
-          409,
-        );
-      }
+      const ready = await lockReferenceableAttachments(
+        tx,
+        input.ownerId,
+        attachmentIds,
+        "attachment_not_ready",
+        "Generated asset attachment is not ready",
+      );
       const mimeById = new Map(ready.map((attachment) => [
         String(attachment.id),
         String(attachment.mime_type).toLowerCase(),
@@ -5408,19 +6057,43 @@ export class PostgresRepository implements DomainRepository {
     attachmentId: string,
     cleanupAttachment = true,
   ) {
-    const rows = await this.#sql<Row[]>`UPDATE generated_object_staging s SET state='attached',
-      attachment_id=${attachmentId},cleanup_attachment=${cleanupAttachment},updated_at=now()
-      FROM attachments a
-      WHERE s.id=${id} AND s.owner_id=${ownerId} AND s.state IN ('stored','attached')
-        AND (s.attachment_id IS NULL OR s.attachment_id=${attachmentId})
-        AND (s.state='stored' OR s.cleanup_attachment=${cleanupAttachment})
-        AND a.id=${attachmentId} AND a.owner_id=${ownerId} AND a.state='ready'
-        AND a.deleted_at IS NULL RETURNING s.*`;
-    if (rows[0]) return generatedObjectStage(rows[0]);
-    const exists = await this.#sql`SELECT id FROM generated_object_staging
-      WHERE id=${id} AND owner_id=${ownerId}`;
-    if (!exists.length) throw new DomainError("not_found", "Generated object stage not found", 404);
-    throw new DomainError("generated_stage_conflict", "Generated object stage changed", 409);
+    return await this.#sql.begin(async (tx) => {
+      // Generated staging is itself a durable path to attachment bytes. Take the same row lock as
+      // every other reference writer before publishing that path. Cleanup takes this lock before
+      // tombstoning, so a concurrent attach either commits first and fences cleanup or wakes after
+      // the tombstone and fails without publishing a dangling attachment_id.
+      const [attachment] = await lockReferenceableAttachments(
+        tx,
+        ownerId,
+        [attachmentId],
+        "generated_stage_conflict",
+        "Generated object attachment is not ready",
+      );
+      if (attachment.physical_object !== true) {
+        throw new DomainError(
+          "generated_stage_conflict",
+          "Generated object attachment differs from the staged object",
+          409,
+        );
+      }
+      const rows = await tx<Row[]>`UPDATE generated_object_staging SET state='attached',
+        attachment_id=${attachmentId},cleanup_attachment=${cleanupAttachment},updated_at=now()
+        WHERE id=${id} AND owner_id=${ownerId} AND state IN ('stored','attached')
+          AND (attachment_id IS NULL OR attachment_id=${attachmentId})
+          AND (state='stored' OR cleanup_attachment=${cleanupAttachment})
+          AND (${!cleanupAttachment} OR object_key=${String(attachment.object_key)})
+          AND size_bytes=${number(attachment.size_bytes)}
+          AND sha256=${String(attachment.sha256)}
+          AND mime_type=${String(attachment.mime_type)}
+        RETURNING *`;
+      if (rows[0]) return generatedObjectStage(rows[0]);
+      const exists = await tx`SELECT id FROM generated_object_staging
+        WHERE id=${id} AND owner_id=${ownerId}`;
+      if (!exists.length) {
+        throw new DomainError("not_found", "Generated object stage not found", 404);
+      }
+      throw new DomainError("generated_stage_conflict", "Generated object stage changed", 409);
+    });
   }
 
   async requestGeneratedObjectCleanup(ownerId: string, usageRunId: string, reason: string) {
@@ -5433,12 +6106,49 @@ export class PostgresRepository implements DomainRepository {
         await tx`INSERT INTO jobs(type,payload,idempotency_key,status,attempts,available_at)
           VALUES('generated_object.cleanup',${tx.json({ stageId: String(row.id), ownerId })},
             ${`generated_object.cleanup:${String(row.id)}`},'queued',0,now())
-          ON CONFLICT(idempotency_key) DO UPDATE SET status='queued',available_at=now(),
+          ON CONFLICT(idempotency_key) DO UPDATE SET status='queued',attempts=0,available_at=now(),
             last_error=NULL,locked_at=NULL,locked_by=NULL,completed_at=NULL
             WHERE jobs.status IN ('completed','failed')`;
       }
       return rows.length;
     });
+  }
+
+  async settleGeneratedObjectCleanup(stageId: string, ownerId: string) {
+    try {
+      return await this.#sql.begin(async (tx) => {
+        const settled = await tx<{ storage_released: boolean }[]>`
+          SELECT dg_chat_settle_generated_object_cleanup(
+            ${stageId},${ownerId}
+          ) storage_released`;
+        const rows = await tx<Row[]>`SELECT * FROM generated_object_staging
+          WHERE id=${stageId} AND owner_id=${ownerId}`;
+        if (!rows[0]) throw new DomainError("not_found", "Generated object stage not found", 404);
+        return {
+          stage: generatedObjectStage(rows[0]),
+          storageReleased: Boolean(settled[0]?.storage_released),
+        };
+      });
+    } catch (error) {
+      if (error instanceof DomainError) throw error;
+      const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+      const message = error instanceof Error ? error.message : "";
+      if (
+        code === "55000" &&
+        (message.includes("requires the exact tombstoned attachment") ||
+          message.includes("fenced by a durable reference") ||
+          message.includes("release stage is invalid"))
+      ) {
+        throw new DomainError("generated_cleanup_fenced", message, 409);
+      }
+      if (
+        code === "55000" &&
+        (message.includes("storage") || message.includes("cleaned generated stage"))
+      ) {
+        throw new DomainError("generated_cleanup_invariant", message, 500);
+      }
+      throw error;
+    }
   }
 
   async beginAttachmentIngestion(id: string, ownerId: string) {
@@ -5853,10 +6563,20 @@ export class PostgresRepository implements DomainRepository {
       if (!collections[0]) {
         throw new DomainError("not_found", "Knowledge collection not found", 404);
       }
-      const attachments = await tx<
-        Row[]
-      >`SELECT id FROM attachments WHERE id=${attachmentId} AND owner_id=${ownerId} AND state='ready' AND deleted_at IS NULL`;
-      if (!attachments[0]) throw new DomainError("not_found", "Ready attachment not found", 404);
+      try {
+        await lockReferenceableAttachments(
+          tx,
+          ownerId,
+          [attachmentId],
+          "not_found",
+          "Ready attachment not found",
+        );
+      } catch (error) {
+        if (error instanceof DomainError && error.code === "not_found") {
+          throw new DomainError("not_found", "Ready attachment not found", 404);
+        }
+        throw error;
+      }
       const prior =
         await tx`SELECT 1 FROM knowledge_collection_attachments WHERE collection_id=${collectionId} AND attachment_id=${attachmentId}`;
       if (prior.length) return knowledgeCollection(collections[0]);

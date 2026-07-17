@@ -284,6 +284,44 @@ Deno.test("generated object crash stages are durably queued for cleanup", () => 
   }
 });
 
+Deno.test("generated stages reject unrelated attachments without publishing a cleanup reference", () => {
+  const { repo, owner, createAttachment } = fixture();
+  const stagedObject = createAttachment("staged-object", "6");
+  const unrelated = createAttachment("unrelated-object", "7");
+  const stage = repo.stageGeneratedObject({
+    ownerId: owner.id,
+    usageRunId: "asset-run-0001",
+    ordinal: 0,
+    objectKey: stagedObject.objectKey,
+    mimeType: stagedObject.mimeType,
+    sizeBytes: stagedObject.sizeBytes,
+    sha256: stagedObject.sha256,
+  });
+  repo.markGeneratedObjectStored(stage.id, owner.id);
+
+  assertThrows(
+    () => repo.attachGeneratedObject(stage.id, owner.id, unrelated.id),
+    DomainError,
+    "differs from the staged object",
+  );
+  assertEquals(repo.generatedObjectStages.get(stage.id)?.state, "stored");
+  assertEquals(repo.generatedObjectStages.get(stage.id)?.attachmentId, null);
+  assertEquals(repo.getAttachment(unrelated.id, owner.id).state, "ready");
+
+  repo.attachmentStorageBlobs.delete(`${owner.id}\0${stagedObject.objectKey}`);
+  assertThrows(
+    () => repo.attachGeneratedObject(stage.id, owner.id, stagedObject.id),
+    DomainError,
+    "differs from the staged object",
+  );
+  assertEquals(repo.generatedObjectStages.get(stage.id)?.attachmentId, null);
+
+  assertEquals(repo.requestGeneratedObjectCleanup(owner.id, "asset-run-0001", "abandoned"), 1);
+  assertEquals(repo.generatedObjectStages.get(stage.id)?.state, "cleanup_pending");
+  assertEquals(repo.generatedObjectStages.get(stage.id)?.attachmentId, null);
+  assertEquals(repo.getAttachment(unrelated.id, owner.id).state, "ready");
+});
+
 Deno.test("image edit lineage enforces ownership, image masks, dimensions, and staged outputs", () => {
   const { repo, owner, stranger, model, identitySnapshot, createAttachment } = fixture();
   const source = createAttachment("edit-source", "1");

@@ -248,6 +248,44 @@ Deno.test({
       );
       assertEquals(
         [
+          ...await sql`SELECT physical_bytes::int,physical_objects::int
+            FROM attachment_storage_usage WHERE owner_id=${ownerId}`,
+        ],
+        [{ physical_bytes: 204, physical_objects: 3 }],
+      );
+      assertEquals(
+        [
+          ...await sql`SELECT stage_id::text,object_key FROM attachment_storage_releases
+            WHERE owner_id=${ownerId} ORDER BY stage_id`,
+        ],
+        [
+          { stage_id: cleanupStageId, object_key: objectKeys.cleanup },
+          { stage_id: replayStageId, object_key: objectKeys.replay },
+        ].sort((left, right) => left.stage_id.localeCompare(right.stage_id)),
+      );
+      // A crash after settlement but before the client observes completion may replay the durable
+      // job. The cleaned stage converges without another object delete or counter decrement.
+      await sql`UPDATE jobs SET status='queued',completed_at=NULL,available_at=now()
+        WHERE id=${replayJobId}`;
+      await eventually(async () =>
+        Boolean(
+          (await sql<{ status: string }[]>`SELECT status FROM jobs
+          WHERE id=${replayJobId}`)[0]?.status === "completed",
+        )
+      );
+      assertEquals(
+        deletes.filter((path) => path === `/cleanup-test/${objectKeys.replay}`).length,
+        1,
+      );
+      assertEquals(
+        [
+          ...await sql`SELECT physical_bytes::int,physical_objects::int
+            FROM attachment_storage_usage WHERE owner_id=${ownerId}`,
+        ],
+        [{ physical_bytes: 204, physical_objects: 3 }],
+      );
+      assertEquals(
+        [
           ...await sql`SELECT state,deleted_at IS NOT NULL AS deleted FROM attachments
           WHERE id=${cleanupAttachmentId}`,
         ],
@@ -299,15 +337,14 @@ Deno.test({
       await sql`DELETE FROM generated_assets WHERE id=${generatedAssetId}`;
       await sql`DELETE FROM message_attachments WHERE message_id=${messageId}`;
       await sql`DELETE FROM generated_object_staging WHERE owner_id=${ownerId}`;
-      await sql`DELETE FROM attachments WHERE owner_id=${ownerId}`;
       await sql`DELETE FROM messages WHERE id=${concurrentMessageId}`;
       await sql`DELETE FROM messages WHERE id=${messageId}`;
       await sql`DELETE FROM conversations WHERE id=${conversationId}`;
-      await sql`DELETE FROM usage_runs WHERE user_id=${ownerId}`;
       await sql`DELETE FROM model_price_versions WHERE id=${priceId}`;
       await sql`DELETE FROM provider_models WHERE id=${modelId}`;
       await sql`DELETE FROM providers WHERE id=${providerId}`;
-      await sql`DELETE FROM users WHERE id=${ownerId}`;
+      // Retained admission/release and attachment history intentionally keep this unique fixture
+      // owner and its immutable attachment records alive in the disposable per-file database.
       await sql.end();
       if (!status.success) {
         shutdownFailure = `Cleanup worker did not shut down successfully: ${stderr}`;

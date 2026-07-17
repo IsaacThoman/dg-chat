@@ -1,6 +1,7 @@
 import { assertEquals, assertStringIncludes, assertThrows } from "jsr:@std/assert@1.0.14";
 import { DomainError, MemoryRepository } from "./memory.ts";
 import {
+  ATTACHMENT_INSPECTION_POLICY_VERSION,
   decodeApiResponseBody,
   InvalidApiResponseBodyError,
   splitApiSseReplayFrame,
@@ -3124,6 +3125,8 @@ Deno.test("generic stale reaping leaves staged Files requests to upload recovery
     purpose: "assistants",
     attachmentState: "ready",
     inspectionError: null,
+    requiredInspectionMode: "local",
+    inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
   });
   repo.releaseApiRequestLease(begun.request.id, begun.leaseToken);
 
@@ -3185,6 +3188,8 @@ Deno.test("Files finalization binds canonical object keys and inspection decisio
     purpose: "assistants",
     attachmentState: "ready" as const,
     inspectionError: null,
+    requiredInspectionMode: "local" as const,
+    inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
   };
   assertThrows(
     () => repo.stageFileUpload({ ...base, objectKey: base.objectKey.replace("/aa/", "/ff/") }),

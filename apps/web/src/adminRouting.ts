@@ -11,6 +11,7 @@ export const adminSections = [
   "audit",
   "retention",
   "storage",
+  "backups",
 ] as const;
 
 export type AdminSection = (typeof adminSections)[number];

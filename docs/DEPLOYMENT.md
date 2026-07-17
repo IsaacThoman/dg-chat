@@ -55,10 +55,41 @@ a public or externally routed endpoint. Terminate TLS at the object store for th
 Uploads default to 25 MiB with at most four concurrent uploads per application replica and two per
 user. Tune `UPLOAD_MAX_BYTES`, `UPLOAD_MAX_CONCURRENT`, and `UPLOAD_MAX_CONCURRENT_PER_USER` while
 keeping the application `/tmp` tmpfs large enough for the resulting worst-case staged bytes.
-Interrupted content-addressed uploads remain resumable for seven days by default. After
-`FILE_UPLOAD_RECOVERY_MAX_AGE_SECONDS`, the API refunds the reservation, records an explicit
-`upload_recovery_expired` terminal response, and schedules delayed reference-fenced object cleanup.
-This age policy bounds permanently ambiguous storage failures without labeling them as corruption.
+Retained attachment storage defaults to 5 GiB per user and 100 GiB installation-wide. Configure
+`ATTACHMENT_STORAGE_PER_USER_BYTES` and `ATTACHMENT_STORAGE_INSTALLATION_BYTES` as whole byte counts
+between 1 MiB and 1 PiB. Object-count limits default to 10,000 per user and 1,000,000
+installation-wide; configure them with `ATTACHMENT_STORAGE_PER_USER_OBJECTS` and
+`ATTACHMENT_STORAGE_INSTALLATION_OBJECTS`. Installation byte and object capacity must each be at
+least their corresponding per-user value. These limits count distinct immutable physical objects,
+including objects referenced only by soft-deleted attachments, so deleting a chat or attachment does
+not silently restore capacity. Admission is transactional across browser uploads, generated media,
+and OpenAI Files finalization. Interrupted content-addressed uploads remain resumable for seven days
+by default. After `FILE_UPLOAD_RECOVERY_MAX_AGE_SECONDS`, the API refunds the reservation, records
+an explicit `upload_recovery_expired` terminal response, and schedules delayed reference-fenced
+object cleanup. This age policy bounds permanently ambiguous storage failures without labeling them
+as corruption.
+
+Every attachment worker performs the built-in bounded integrity pass: it streams no more than
+`ATTACHMENT_INSPECTION_MAX_BYTES`, verifies the stored SHA-256 digest, and quarantines the standard
+EICAR test marker. This is a deterministic integrity and test-signature gate, not a general-purpose
+antivirus engine. Installations that require a malware verdict can configure the optional external
+scanner:
+
+- `ATTACHMENT_SCANNER_ENABLED` must be exactly `true` or `false`; malformed values fail startup.
+- `ATTACHMENT_SCANNER_URL`, `ATTACHMENT_SCANNER_TOKEN`, and `ATTACHMENT_SCANNER_ALLOWED_HOSTS`
+  configure an authenticated scanner and an exact hostname allowlist. Public endpoints must use
+  HTTPS.
+- `ATTACHMENT_SCANNER_ALLOW_PRIVATE_NETWORK=true` is required for a scanner on a private, loopback,
+  or single-label container address. DNS is resolved once and pinned; a public scanner cannot
+  resolve privately, and a private scanner cannot resolve publicly.
+- `ATTACHMENT_SCANNER_TIMEOUT_MS`, `ATTACHMENT_SCANNER_MAX_BYTES`, and
+  `ATTACHMENT_SCANNER_MAX_RESPONSE_BYTES` bound the complete request, streamed attachment body, and
+  categorical JSON response. Redirects are handled manually and rejected.
+
+The API and every worker replica must receive the same scanner configuration. Upload records persist
+the required scanner mode and policy version, so a worker missing a scanner cannot silently approve
+an externally-required upload. Transport failures expose only a sanitized inspection failure; they
+never relay scanner response bodies, credentials, or network details to users.
 
 Audio transcription is independently bounded to 25 MiB per request and defaults to four active
 requests across all API replicas, with two per user. Tune `AUDIO_MAX_CONCURRENT` and
@@ -69,6 +100,15 @@ validated audio body and a bounded retry body in memory.
 
 For an external object store, set an HTTPS `S3_ENDPOINT`, `S3_REGION`, and `S3_FORCE_PATH_STYLE` as
 required by that service in addition to the bucket and scoped credentials.
+
+Browser uploads are staged before object-store transfer so abandoned PUTs can be reclaimed without
+racing a successful publication. `ATTACHMENT_UPLOAD_PUT_TIMEOUT_MS` defaults to 300 seconds and is
+the hard API-side deadline for the object-store PUT. `ATTACHMENT_UPLOAD_LEASE_SECONDS` defaults to
+900 seconds and must exceed the PUT timeout by at least 60 seconds. The API renews the opaque,
+owner-bound lease while the PUT is active; renewal failure aborts the request and fails closed.
+Workers evaluate lease expiry with the PostgreSQL clock and never delete an object protected by an
+active lease. Keep both values identical on every API replica, and increase the lease whenever the
+PUT timeout is raised.
 
 Validate and launch:
 
@@ -216,7 +256,7 @@ direct browser uploads are enabled.
 
 ## Backups and restore
 
-The Storage section of the admin console creates a versioned `.dgbackup` recovery artifact
+The Backups section of the admin console creates a versioned `.dgbackup` recovery artifact
 containing a repeatable-read relational snapshot and every referenced immutable object. The manifest
 and every entry are integrity checked and authenticated with `BACKUP_SIGNING_KEY`; normal exports
 redact provider credentials and exclude diagnostic request/response bodies by default. They still

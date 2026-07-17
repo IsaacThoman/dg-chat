@@ -77,6 +77,8 @@ import {
 } from "@dg-chat/contracts";
 import type {
   AdminApiTokenQuery,
+  AdminAttachmentQuery,
+  AdminAttachmentSummary,
   AdminLedgerQuery,
   AdminSessionQuery,
   AdminUserQuery,
@@ -93,7 +95,10 @@ import {
   type ApiIdempotencyEndpoint,
   type ApiIdempotencyRequest,
   type ApiReplayQuota,
+  ATTACHMENT_INSPECTION_POLICY_VERSION,
   type AttachmentRecord,
+  attachmentReinspectionEligibility,
+  type AttachmentStorageQuota,
   type AuditEvent,
   type AuditQuery,
   decodeApiResponseBody,
@@ -351,6 +356,18 @@ export interface AppOptions {
   objectStore?: ObjectStore;
   /** Short test/deployment seam; production defaults to UPLOAD_MAX_BYTES. */
   uploadMaxBytes?: number;
+  /** Hard deadline for the S3 PUT. It must end well before the durable upload lease expires. */
+  attachmentUploadPutTimeoutMs?: number;
+  /** Database lease protecting an in-flight S3 PUT from stale-upload cleanup. */
+  attachmentUploadLeaseSeconds?: number;
+  /** Test/deployment seam for renewing a long-running object PUT lease. */
+  attachmentUploadHeartbeatMs?: number;
+  /** Per-renewal database deadline; a stuck heartbeat must abort rather than hang the request. */
+  attachmentUploadHeartbeatTimeoutMs?: number;
+  /** Retained physical-byte limits applied atomically when attachment blobs are admitted. */
+  attachmentStorageQuota?: AttachmentStorageQuota;
+  /** Keep otherwise-clean user uploads pending until the durable worker scanner accepts them. */
+  attachmentExternalInspectionRequired?: boolean;
   /** Maximum time an ambiguous durable upload remains recoverable before terminal cleanup. */
   fileUploadRecoveryMaxAgeMs?: number;
   attachmentContextMaxRawBytes?: number;
@@ -568,7 +585,11 @@ const openAIFile = (attachment: AttachmentRecord, purpose = "assistants") => ({
   created_at: Math.floor(Date.parse(attachment.createdAt) / 1000),
   filename: attachment.filename,
   purpose,
-  status: attachment.state === "ready" ? "processed" : "error",
+  status: attachment.state === "ready"
+    ? "processed"
+    : ["pending", "inspecting"].includes(attachment.state)
+    ? "uploaded"
+    : "error",
   status_details: attachment.inspectionError,
 });
 
@@ -1327,6 +1348,89 @@ const parseAdminApiTokenQuery = (c: Context): AdminApiTokenQuery =>
 const parseAdminLedgerQuery = (c: Context): AdminLedgerQuery =>
   parseAdminDetailQuery(c, ["kind", "cursor", "limit"], adminLedgerQuerySchema, "Ledger");
 
+const adminAttachmentStates = new Set([
+  "pending",
+  "inspecting",
+  "ready",
+  "quarantined",
+  "failed",
+  "deleted",
+]);
+const adminAttachmentDeletions = new Set(["present", "deleted", "all"]);
+const parseAdminAttachmentQuery = (c: Context): AdminAttachmentQuery => {
+  const url = new URL(c.req.url);
+  const allowed = new Set(["ownerId", "state", "deletion", "cursor", "limit"]);
+  for (const key of url.searchParams.keys()) {
+    if (!allowed.has(key) || url.searchParams.getAll(key).length !== 1) {
+      throw new DomainError("validation_error", "Attachment query parameters are invalid", 422);
+    }
+  }
+  const ownerId = url.searchParams.get("ownerId")?.trim() || undefined;
+  const state = url.searchParams.get("state")?.trim() || undefined;
+  const deletion = url.searchParams.get("deletion")?.trim() || "present";
+  const cursor = url.searchParams.get("cursor")?.trim() || undefined;
+  const rawLimit = url.searchParams.get("limit");
+  const limit = rawLimit === null ? 50 : Number(rawLimit);
+  if (
+    (ownerId !== undefined && !auditUuid.test(ownerId)) ||
+    (state !== undefined && !adminAttachmentStates.has(state)) ||
+    !adminAttachmentDeletions.has(deletion) ||
+    (cursor !== undefined &&
+      (cursor.length > 2_048 || !/^[A-Za-z0-9_-]+$/.test(cursor))) ||
+    !Number.isSafeInteger(limit) || limit < 1 || limit > 100
+  ) throw new DomainError("validation_error", "Attachment query parameters are invalid", 422);
+  return {
+    ownerId,
+    state: state as AdminAttachmentQuery["state"],
+    deletion: deletion as AdminAttachmentQuery["deletion"],
+    cursor,
+    limit,
+  };
+};
+
+const publicAdminAttachment = (attachment: AttachmentRecord): AdminAttachmentSummary => ({
+  id: attachment.id,
+  ownerId: attachment.ownerId,
+  filename: attachment.filename,
+  mimeType: attachment.mimeType,
+  sizeBytes: attachment.sizeBytes,
+  state: attachment.state,
+  inspectionError: attachment.inspectionError,
+  inspectionEpoch: attachment.inspectionEpoch,
+  version: attachment.version,
+  reinspectionEligible: attachmentReinspectionEligibility(attachment).eligible,
+  reinspectionBlockedReason: attachmentReinspectionEligibility(attachment).blockedReason,
+  createdAt: attachment.createdAt,
+  updatedAt: attachment.updatedAt,
+  deletedAt: attachment.deletedAt,
+});
+
+const parseAttachmentReinspection = async (c: Context) => {
+  let value: unknown;
+  try {
+    value = await c.req.json();
+  } catch {
+    throw new DomainError("validation_error", "Reinspection request is invalid", 422);
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new DomainError("validation_error", "Reinspection request is invalid", 422);
+  }
+  const input = value as Record<string, unknown>;
+  const keys = Object.keys(input);
+  const reason = typeof input.reason === "string" ? input.reason.trim() : "";
+  if (
+    keys.length !== 2 || !keys.includes("expectedVersion") || !keys.includes("reason") ||
+    !Number.isSafeInteger(input.expectedVersion) || Number(input.expectedVersion) < 1 ||
+    Number(input.expectedVersion) > 2_147_483_647 ||
+    reason.length < 8 || reason.length > 500 ||
+    [...reason].some((character) => {
+      const code = character.charCodeAt(0);
+      return code < 32 && character !== "\n" && character !== "\t" || code === 127;
+    })
+  ) throw new DomainError("validation_error", "Reinspection request is invalid", 422);
+  return { expectedVersion: Number(input.expectedVersion), reason };
+};
+
 const isCanonicalShareCapability = (value: string): boolean => {
   if (!/^[A-Za-z0-9_-]{43}$/.test(value)) return false;
   try {
@@ -1574,6 +1678,47 @@ export function createApp(options: AppOptions = {}) {
     !Number.isSafeInteger(temporaryRetentionDays) || temporaryRetentionDays < 1 ||
     temporaryRetentionDays > 3650
   ) throw new Error("Temporary chat retention must be an integer between 1 and 3650 days");
+  const attachmentStorageQuota = options.attachmentStorageQuota;
+  const attachmentUploadPutTimeoutMs = options.attachmentUploadPutTimeoutMs ?? 300_000;
+  const attachmentUploadLeaseSeconds = options.attachmentUploadLeaseSeconds ?? 900;
+  const attachmentUploadHeartbeatMs = options.attachmentUploadHeartbeatMs ??
+    Math.min(30_000, Math.floor(attachmentUploadLeaseSeconds * 1_000 / 3));
+  const attachmentUploadHeartbeatTimeoutMs = options.attachmentUploadHeartbeatTimeoutMs ??
+    Math.min(10_000, Math.max(1_000, Math.floor(attachmentUploadPutTimeoutMs / 4)));
+  if (
+    !Number.isSafeInteger(attachmentUploadPutTimeoutMs) ||
+    attachmentUploadPutTimeoutMs < 1_000 ||
+    attachmentUploadPutTimeoutMs > 3_600_000 ||
+    !Number.isSafeInteger(attachmentUploadLeaseSeconds) ||
+    attachmentUploadLeaseSeconds < 60 ||
+    attachmentUploadLeaseSeconds > 86_400 ||
+    attachmentUploadLeaseSeconds * 1_000 < attachmentUploadPutTimeoutMs + 60_000 ||
+    !Number.isSafeInteger(attachmentUploadHeartbeatMs) ||
+    attachmentUploadHeartbeatMs < 10 ||
+    attachmentUploadHeartbeatMs >= attachmentUploadLeaseSeconds * 500 ||
+    !Number.isSafeInteger(attachmentUploadHeartbeatTimeoutMs) ||
+    attachmentUploadHeartbeatTimeoutMs < 10 ||
+    attachmentUploadHeartbeatTimeoutMs > attachmentUploadPutTimeoutMs
+  ) {
+    throw new Error(
+      "Attachment upload PUT, lease, and heartbeat bounds are invalid",
+    );
+  }
+  const attachmentExternalInspectionRequired = options.attachmentExternalInspectionRequired ??
+    false;
+  if (
+    attachmentStorageQuota &&
+    (
+      !Number.isSafeInteger(attachmentStorageQuota.perUserBytes) ||
+      attachmentStorageQuota.perUserBytes < 1 ||
+      !Number.isSafeInteger(attachmentStorageQuota.perUserObjects) ||
+      attachmentStorageQuota.perUserObjects < 1 ||
+      !Number.isSafeInteger(attachmentStorageQuota.installationBytes) ||
+      attachmentStorageQuota.installationBytes < attachmentStorageQuota.perUserBytes ||
+      !Number.isSafeInteger(attachmentStorageQuota.installationObjects) ||
+      attachmentStorageQuota.installationObjects < attachmentStorageQuota.perUserObjects
+    )
+  ) throw new Error("Attachment storage quota is invalid");
   const webComplete = options.webComplete ?? complete;
   const activeWebGenerations = new Map<string, AbortController>();
   const setupToken = validateSetupToken(
@@ -2269,9 +2414,10 @@ export function createApp(options: AppOptions = {}) {
       path === "/api/sessions" || path.startsWith("/api/sessions/") ||
       path === "/api/tokens" || path.startsWith("/api/tokens/");
     const setupSurface = path === "/api/setup" || path.startsWith("/api/setup/");
-    if (!cookieSurface && !setupSurface) return;
+    const adminSurface = path === "/api/admin" || path.startsWith("/api/admin/");
+    if (!cookieSurface && !setupSurface && !adminSurface) return;
     privateNoStore(c);
-    if (cookieSurface) c.header("Vary", "Cookie", { append: true });
+    if (cookieSurface || adminSurface) c.header("Vary", "Cookie", { append: true });
   };
   const accessSubject = (c: Context<{ Variables: Variables }>): TokenAccessSubject => ({
     userId: c.get("user").id,
@@ -2914,61 +3060,164 @@ export function createApp(options: AppOptions = {}) {
     });
   });
 
-  const persistUpload = async (ownerId: string, staged: StagedUpload) => {
+  const persistUpload = async (
+    ownerId: string,
+    staged: StagedUpload,
+    requestSignal: AbortSignal,
+  ) => {
     if (!objectStore) {
       throw new DomainError("storage_not_configured", "Object storage is not configured", 503);
     }
     const objectKey = safeUploadObjectKey(ownerId, staged.inspection.mime);
+    const uploadStageId = crypto.randomUUID();
     let stored = false;
     let registered = false;
+    let objectAttempted = false;
+    let provenCollision = false;
+    const uploadStage = await repo.stageAttachmentUpload({
+      id: uploadStageId,
+      ownerId,
+      objectKey,
+      filename: staged.inspection.filename,
+      mimeType: staged.inspection.mime,
+      sizeBytes: staged.inspection.size,
+      sha256: staged.inspection.sha256,
+    }, attachmentUploadLeaseSeconds);
+    const uploadSignal = AbortSignal.any([
+      requestSignal,
+      AbortSignal.timeout(attachmentUploadPutTimeoutMs),
+    ]);
+    const heartbeatAbort = new AbortController();
+    const putSignal = AbortSignal.any([uploadSignal, heartbeatAbort.signal]);
+    let heartbeatFailure: unknown;
+    let heartbeatInFlight: Promise<void> | undefined;
+    let heartbeatClosed = false;
+    const heartbeatInterval = setInterval(() => {
+      if (heartbeatClosed || heartbeatInFlight) return;
+      const operation = Promise.resolve(
+        repo.heartbeatAttachmentUpload(
+          uploadStageId,
+          ownerId,
+          uploadStage.uploadLeaseToken,
+          attachmentUploadLeaseSeconds,
+        ),
+      ).then(() => undefined);
+      let deadline: ReturnType<typeof setTimeout> | undefined;
+      const bounded = Promise.race([
+        operation,
+        new Promise<void>((_, reject) => {
+          deadline = setTimeout(
+            () => reject(new Error("Attachment upload heartbeat timed out")),
+            attachmentUploadHeartbeatTimeoutMs,
+          );
+        }),
+      ]).finally(() => clearTimeout(deadline));
+      heartbeatInFlight = bounded.catch((error) => {
+        if (!heartbeatClosed) {
+          heartbeatFailure = error;
+          heartbeatAbort.abort(error);
+        }
+      }).finally(() => {
+        heartbeatInFlight = undefined;
+      });
+    }, attachmentUploadHeartbeatMs);
     try {
       const file = await Deno.open(staged.path, { read: true });
       try {
-        await objectStore.put({
-          key: objectKey,
-          body: file.readable,
-          contentLength: staged.inspection.size,
-          contentType: staged.inspection.mime,
-          metadata: { sha256: staged.inspection.sha256, owner: ownerId },
-        });
+        objectAttempted = true;
+        try {
+          await objectStore.put({
+            key: objectKey,
+            body: file.readable,
+            contentLength: staged.inspection.size,
+            contentType: staged.inspection.mime,
+            metadata: { sha256: staged.inspection.sha256, owner: ownerId },
+            signal: putSignal,
+          });
+        } catch (error) {
+          if (heartbeatFailure) throw heartbeatFailure;
+          throw error;
+        }
+        clearInterval(heartbeatInterval);
+        await heartbeatInFlight;
+        if (heartbeatFailure) throw heartbeatFailure;
+        heartbeatClosed = true;
         stored = true;
       } catch (error) {
         if (error instanceof ObjectAlreadyExistsError) {
+          provenCollision = true;
+          await repo.abandonAttachmentUpload(
+            uploadStageId,
+            ownerId,
+            "object key collision; existing bytes were not deleted",
+          );
           throw new DomainError("object_key_conflict", "Upload identifier collision", 409);
         }
         throw error;
       }
-      const created = await repo.createAttachment({
+      await repo.markAttachmentUploadStored(
+        uploadStageId,
         ownerId,
-        objectKey,
-        filename: staged.inspection.filename,
-        mimeType: staged.inspection.mime,
-        sizeBytes: staged.inspection.size,
-        sha256: staged.inspection.sha256,
-        state: staged.inspection.decision.state === "ready" ? "ready" : "quarantined",
-        inspectionError: staged.inspection.decision.state === "ready"
-          ? null
-          : staged.inspection.decision.reason,
-        // stageMultipartUpload has already completed the bounded synchronous inspection. Enqueuing
-        // the legacy acknowledgement-only inspection job would amplify the durable queue without
-        // adding another security decision.
-        inspectionComplete: true,
-      });
+        uploadStage.uploadLeaseToken,
+        attachmentUploadLeaseSeconds,
+      );
+      const requiresExternalInspection = attachmentExternalInspectionRequired &&
+        staged.inspection.decision.state === "ready";
+      const created = await repo.createAttachmentFromUploadStage(
+        uploadStageId,
+        ownerId,
+        uploadStage.uploadLeaseToken,
+        {
+          ownerId,
+          objectKey,
+          filename: staged.inspection.filename,
+          mimeType: staged.inspection.mime,
+          sizeBytes: staged.inspection.size,
+          sha256: staged.inspection.sha256,
+          state: requiresExternalInspection
+            ? "pending"
+            : staged.inspection.decision.state === "ready"
+            ? "ready"
+            : "quarantined",
+          inspectionError: staged.inspection.decision.state === "ready"
+            ? null
+            : staged.inspection.decision.reason,
+          requiredInspectionMode: requiresExternalInspection ? "external" : "local",
+          inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
+          // Synchronous parsing remains the first policy layer. An enabled external scanner is a
+          // second durable decision, so clean uploads stay unavailable until its epoch-bound job
+          // completes. Synchronously quarantined bytes never need to reach that service.
+          inspectionComplete: !requiresExternalInspection,
+        },
+        attachmentStorageQuota,
+      );
       if (created.deduplicated) {
-        await objectStore.delete(objectKey).catch(() => {
-          emitOperationalLog({
-            level: "error",
-            message: "Duplicate upload object cleanup failed",
-          });
-        });
         stored = false;
         return created.attachment;
       }
       registered = true;
       return created.attachment;
     } catch (error) {
-      if (stored && !registered) await objectStore.delete(objectKey).catch(() => undefined);
+      if ((stored || objectAttempted) && !registered && !provenCollision) {
+        await Promise.resolve(
+          repo.requestAttachmentUploadCleanup(
+            uploadStageId,
+            ownerId,
+            uploadStage.uploadLeaseToken,
+            error instanceof Error ? error.message : "browser upload finalization failed",
+          ),
+        ).catch((cleanupError) => {
+          emitOperationalLog({
+            level: "error",
+            message: "Durable browser upload cleanup enqueue failed",
+            error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+          });
+        });
+      }
       throw error;
+    } finally {
+      heartbeatClosed = true;
+      clearInterval(heartbeatInterval);
     }
   };
 
@@ -2998,7 +3247,7 @@ export function createApp(options: AppOptions = {}) {
   };
   const uploadFor = async (request: Request, ownerId: string, requirePurpose = false) =>
     await withStagedUpload(request, ownerId, requirePurpose, async (staged) => ({
-      attachment: await persistUpload(ownerId, staged),
+      attachment: await persistUpload(ownerId, staged, request.signal),
       purpose: staged.purpose,
     }));
 
@@ -5891,6 +6140,54 @@ export function createApp(options: AppOptions = {}) {
     c.header("Vary", "Cookie");
     return c.json({ defaultApprovalCreditMicros: startingCredit });
   });
+  app.get("/api/admin/storage/summary", async (c) => {
+    const summary = await repo.adminStorageSummary(c.get("user").id);
+    const bytesLimit = attachmentStorageQuota?.installationBytes ?? null;
+    const objectsLimit = attachmentStorageQuota?.installationObjects ?? null;
+    return c.json({
+      summary: {
+        ...summary,
+        perUserBytesLimit: attachmentStorageQuota?.perUserBytes ?? null,
+        perUserObjectsLimit: attachmentStorageQuota?.perUserObjects ?? null,
+        installationBytesLimit: bytesLimit,
+        installationObjectsLimit: objectsLimit,
+        installationBytesRemaining: bytesLimit === null
+          ? null
+          : Math.max(0, bytesLimit - summary.physicalBytes),
+        installationObjectsRemaining: objectsLimit === null
+          ? null
+          : Math.max(0, objectsLimit - summary.physicalObjects),
+        installationBytesPercent: bytesLimit === null
+          ? null
+          : Math.min(100, summary.physicalBytes / bytesLimit * 100),
+        installationObjectsPercent: objectsLimit === null
+          ? null
+          : Math.min(100, summary.physicalObjects / objectsLimit * 100),
+      },
+    });
+  });
+  app.get("/api/admin/storage/attachments", async (c) => {
+    const page = await repo.listAdminAttachments(
+      c.get("user").id,
+      parseAdminAttachmentQuery(c),
+    );
+    return c.json(page);
+  });
+  app.post("/api/admin/storage/attachments/:id/reinspect", async (c) => {
+    requireRecentAdminAuthentication(c, "requesting attachment reinspection");
+    const attachmentId = requireUuid(c.req.param("id"), "Attachment id");
+    const input = await parseAttachmentReinspection(c);
+    const result = await repo.requestAttachmentReinspection({
+      attachmentId,
+      actorId: c.get("user").id,
+      expectedVersion: input.expectedVersion,
+      reason: input.reason,
+    });
+    return c.json({
+      attachment: publicAdminAttachment(result.attachment),
+      inspectionJobId: result.inspectionJobId,
+    }, 202);
+  });
   const requireBackupAdmin = (): BackupAdminService => {
     if (!options.backupAdmin) {
       throw new DomainError(
@@ -7733,7 +8030,7 @@ export function createApp(options: AppOptions = {}) {
         state: "ready",
         inspectionError: null,
         inspectionComplete: true,
-      });
+      }, attachmentStorageQuota);
       await repo.attachGeneratedObject(
         stage.id,
         ownerId,
@@ -7858,7 +8155,7 @@ export function createApp(options: AppOptions = {}) {
         state: "ready",
         inspectionError: null,
         inspectionComplete: true,
-      });
+      }, attachmentStorageQuota);
       await repo.attachGeneratedObject(
         stage.id,
         ownerId,
@@ -11403,7 +11700,9 @@ export function createApp(options: AppOptions = {}) {
             sha256: stage.sha256,
             state: stage.attachmentState,
             inspectionError: stage.inspectionError,
-            inspectionComplete: true,
+            requiredInspectionMode: stage.requiredInspectionMode,
+            inspectionPolicyVersion: stage.inspectionPolicyVersion,
+            inspectionComplete: stage.attachmentState !== "pending",
           },
           request: {
             id: request.id,
@@ -11417,12 +11716,41 @@ export function createApp(options: AppOptions = {}) {
             quota: replayQuota,
           },
           responseBody: (attachment) => JSON.stringify(openAIFile(attachment, stage.purpose)),
-        });
+        }, attachmentStorageQuota);
         terminal = true;
         recovered++;
-      } catch {
-        // Storage ambiguity and transient database failures remain resumable until the explicit
-        // recovery-age policy above expires.
+      } catch (error) {
+        if (error instanceof DomainError && error.code === "storage_quota_exceeded") {
+          const body = JSON.stringify(
+            openAIError(error.message, error.code, error.status),
+          );
+          try {
+            await repo.enqueueJob(
+              "file_object.cleanup",
+              {
+                requestId: request.id,
+                ownerId: stage.ownerId,
+                objectKey: stage.objectKey,
+              },
+              new Date(Date.now() + 5 * 60_000).toISOString(),
+              `file_object.cleanup:${request.id}`,
+            );
+            await failOpenAIUsage({
+              id: request.id,
+              leaseToken,
+              responseStatus: error.status,
+              responseHeaders: { "content-type": "application/json" },
+              responseBody: body,
+              billing: { mode: "refund" },
+            });
+            terminal = true;
+            recovered++;
+          } catch {
+            // A later pass reconciles ambiguous cleanup or terminal-request persistence.
+          }
+        }
+        // Other storage ambiguity and transient database failures remain resumable until the
+        // explicit recovery-age policy above expires.
       } finally {
         await lease.stop();
         if (!terminal) {
@@ -11558,10 +11886,20 @@ export function createApp(options: AppOptions = {}) {
             sizeBytes: staged.inspection.size,
             sha256: staged.inspection.sha256,
             purpose: staged.purpose,
-            attachmentState: staged.inspection.decision.state === "ready" ? "ready" : "quarantined",
+            attachmentState: attachmentExternalInspectionRequired &&
+                staged.inspection.decision.state === "ready"
+              ? "pending"
+              : staged.inspection.decision.state === "ready"
+              ? "ready"
+              : "quarantined",
             inspectionError: staged.inspection.decision.state === "ready"
               ? null
               : staged.inspection.decision.reason,
+            requiredInspectionMode: attachmentExternalInspectionRequired &&
+                staged.inspection.decision.state === "ready"
+              ? "external"
+              : "local",
+            inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
           });
           const verifyStoredBlob = async () => {
             const existing = await objectStore.get(objectKey);
@@ -11620,11 +11958,22 @@ export function createApp(options: AppOptions = {}) {
               mimeType: staged.inspection.mime,
               sizeBytes: staged.inspection.size,
               sha256: staged.inspection.sha256,
-              state: staged.inspection.decision.state === "ready" ? "ready" : "quarantined",
+              state: attachmentExternalInspectionRequired &&
+                  staged.inspection.decision.state === "ready"
+                ? "pending"
+                : staged.inspection.decision.state === "ready"
+                ? "ready"
+                : "quarantined",
               inspectionError: staged.inspection.decision.state === "ready"
                 ? null
                 : staged.inspection.decision.reason,
-              inspectionComplete: true,
+              requiredInspectionMode: attachmentExternalInspectionRequired &&
+                  staged.inspection.decision.state === "ready"
+                ? "external"
+                : "local",
+              inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
+              inspectionComplete: staged.inspection.decision.state !== "ready" ||
+                !attachmentExternalInspectionRequired,
             },
             request: {
               id: begun.request.id,
@@ -11638,7 +11987,7 @@ export function createApp(options: AppOptions = {}) {
               quota: replayQuota,
             },
             responseBody: (attachment) => JSON.stringify(openAIFile(attachment, staged.purpose)),
-          });
+          }, attachmentStorageQuota);
           terminal = true;
           const body = finalized.request.responseBody!;
           return new Response(body, {
@@ -11653,6 +12002,28 @@ export function createApp(options: AppOptions = {}) {
           if (reconciled?.state === "completed") {
             terminal = true;
             return replayResponse(reconciled);
+          }
+          if (error instanceof DomainError && error.code === "storage_quota_exceeded") {
+            const body = JSON.stringify(openAIError(error.message, error.code, error.status));
+            await repo.enqueueJob(
+              "file_object.cleanup",
+              { requestId: active.request.id, ownerId, objectKey },
+              new Date(Date.now() + 5 * 60_000).toISOString(),
+              `file_object.cleanup:${active.request.id}`,
+            );
+            await failOpenAIUsage({
+              id: active.request.id,
+              leaseToken: active.leaseToken,
+              responseStatus: error.status,
+              responseHeaders: { "content-type": "application/json" },
+              responseBody: body,
+              billing: { mode: "refund" },
+            });
+            terminal = true;
+            return new Response(body, {
+              status: error.status,
+              headers: { "content-type": "application/json" },
+            });
           }
           if ((blobDurable || objectAttempted) && !provenCollision) {
             // The exact blob is content-addressed and durably named by the replay row. Leave the

@@ -7,7 +7,8 @@
     "@xmldom/xmldom": "npm:@xmldom/xmldom@0.9.10",
     "fflate": "npm:fflate@0.8.3",
     "pdfjs-dist": "npm:pdfjs-dist@6.1.200",
-    "postgres": "npm:postgres@3.4.7"
+    "postgres": "npm:postgres@3.4.7",
+    "undici": "npm:undici@7.28.0"
   },
   "tasks": {
     "dev": "deno run --unstable-worker-options --watch -A src/main.ts",

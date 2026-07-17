@@ -19,6 +19,7 @@ import { createPortal } from "react-dom";
 import {
   Activity,
   Archive,
+  ArchiveRestore,
   ArrowDown,
   ArrowRight,
   BarChart3,
@@ -69,10 +70,11 @@ import {
   Volume2,
   X,
 } from "lucide-react";
-import { type AdminUserFilters, api, ApiError } from "./api.ts";
+import { type AdminUserFilters, api, ApiError, pollAttachmentInspection } from "./api.ts";
 import type { AdminSearch, AdminSection } from "./adminRouting.ts";
 import { AdminAnalyticsView, AdminJobsView } from "./AdminOperations.tsx";
 import { AdminRetentionView } from "./AdminRetention.tsx";
+import { AdminStorageView } from "./AdminStorage.tsx";
 import { AdminBackupsView } from "./AdminBackups.tsx";
 import { PersonalTokenSettings } from "./TokenGovernance.tsx";
 import { UserPortability } from "./UserPortability.tsx";
@@ -1771,6 +1773,7 @@ export function Composer(
   imageHistoryFiltersRef.current = imageHistoryFilters;
   type UploadState =
     | "uploading"
+    | "scanning"
     | "ready"
     | "failed"
     | "cancelled"
@@ -2059,7 +2062,7 @@ export function Composer(
           current.map((item) => item.key === key ? { ...item, progress } : item)
         ),
       controller.signal,
-    ).then((attachment) => {
+    ).then(async (attachment) => {
       uploadControllers.current.delete(key);
       if (!liveUploadKeys.current.has(key)) {
         claimedRetryKeys.current.delete(key);
@@ -2095,6 +2098,45 @@ export function Composer(
         });
         return;
       }
+      if (["pending", "inspecting"].includes(attachment.state)) {
+        const polling = new AbortController();
+        uploadControllers.current.set(key, polling);
+        setUploads((current) =>
+          current.map((item) =>
+            item.key === key
+              ? {
+                ...item,
+                status: "scanning",
+                progress: 100,
+                attachment,
+                error: "Scanning with the installation policy…",
+              }
+              : item
+          )
+        );
+        try {
+          attachment = await pollAttachmentInspection(attachment.id, polling.signal);
+        } catch (error) {
+          if (polling.signal.aborted || !liveUploadKeys.current.has(key)) return;
+          setUploads((current) =>
+            current.map((item) =>
+              item.key === key
+                ? {
+                  ...item,
+                  status: "not-ready",
+                  error: error instanceof Error
+                    ? error.message
+                    : "Inspection status is unavailable.",
+                }
+                : item
+            )
+          );
+          return;
+        } finally {
+          uploadControllers.current.delete(key);
+        }
+      }
+      if (!liveUploadKeys.current.has(key)) return;
       setUploads((current) =>
         current.map((item) =>
           item.key === key
@@ -2105,7 +2147,8 @@ export function Composer(
                 status: "not-ready",
                 progress: 100,
                 attachment,
-                error: `Upload is ${attachment.state}; it is not ready to send.`,
+                error: attachment.inspectionError ??
+                  `Upload is ${attachment.state}; it is not ready to send.`,
               }
             : item
         )
@@ -2128,6 +2171,53 @@ export function Composer(
         )
       );
     });
+  };
+  const refreshAttachment = async (item: UploadItem) => {
+    if (!item.attachment || uploadControllers.current.has(item.key)) return;
+    const controller = new AbortController();
+    uploadControllers.current.set(item.key, controller);
+    setUploads((current) =>
+      current.map((candidate) =>
+        candidate.key === item.key
+          ? { ...candidate, status: "scanning", error: "Checking inspection status…" }
+          : candidate
+      )
+    );
+    try {
+      const attachment = await pollAttachmentInspection(item.attachment.id, controller.signal);
+      if (!liveUploadKeys.current.has(item.key)) return;
+      setUploads((current) =>
+        current.map((candidate) =>
+          candidate.key === item.key
+            ? attachment.state === "ready"
+              ? { ...candidate, attachment, status: "ready", error: undefined }
+              : {
+                ...candidate,
+                attachment,
+                status: "not-ready",
+                error: attachment.inspectionError ??
+                  `Upload is ${attachment.state}; it is not ready to send.`,
+              }
+            : candidate
+        )
+      );
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        setUploads((current) =>
+          current.map((candidate) =>
+            candidate.key === item.key
+              ? {
+                ...candidate,
+                status: "not-ready",
+                error: error instanceof Error ? error.message : "Inspection status is unavailable.",
+              }
+              : candidate
+          )
+        );
+      }
+    } finally {
+      uploadControllers.current.delete(item.key);
+    }
   };
   const retryUpload = (item: UploadItem) => {
     if (claimedRetryKeys.current.has(item.key)) return;
@@ -2177,6 +2267,7 @@ export function Composer(
       uploadControllers.current.get(item.key)?.abort();
       return;
     }
+    if (item.status === "scanning") uploadControllers.current.get(item.key)?.abort();
     if (!item.attachment) {
       liveUploadKeys.current.delete(item.key);
       setUploads((current) => current.filter((candidate) => candidate.key !== item.key));
@@ -2349,6 +2440,8 @@ export function Composer(
                     ? `${Math.max(1, Math.ceil(item.file.size / 1024))} KB · Ready`
                     : item.status === "uploading"
                     ? `Uploading ${item.progress}%`
+                    : item.status === "scanning"
+                    ? item.error ?? "Scanning…"
                     : item.status === "removing"
                     ? "Removing…"
                     : item.error}
@@ -2377,9 +2470,19 @@ export function Composer(
                   <RefreshCw size={15} />
                 </IconButton>
               )}
+              {item.status === "not-ready" && item.attachment && (
+                <IconButton
+                  label={`Check inspection status for ${item.file.name}`}
+                  onClick={() => void refreshAttachment(item)}
+                >
+                  <RefreshCw size={15} />
+                </IconButton>
+              )}
               <IconButton
                 label={item.status === "uploading"
                   ? `Cancel upload ${item.file.name}`
+                  : item.status === "scanning"
+                  ? `Cancel inspection and remove ${item.file.name}`
                   : `Remove attachment ${item.file.name}`}
                 disabled={item.status === "removing"}
                 onClick={() =>
@@ -4169,7 +4272,8 @@ const adminNav: { id: AdminSection; label: string; icon: typeof Gauge }[] = [
   { id: "jobs", label: "Background jobs", icon: Boxes },
   { id: "audit", label: "Audit log", icon: Shield },
   { id: "retention", label: "Retention", icon: Database },
-  { id: "storage", label: "Storage & backups", icon: HardDrive },
+  { id: "storage", label: "Attachment storage", icon: HardDrive },
+  { id: "backups", label: "Backups", icon: ArchiveRestore },
 ];
 function AdminView(
   {
@@ -4322,6 +4426,9 @@ function AdminSectionContent(
   }
   if (section === "retention") {
     return <AdminRetentionView search={search} onSearch={setSearch} />;
+  }
+  if (section === "storage") {
+    return <AdminStorageView onReauthenticate={reauthenticate} />;
   }
   return <AdminBackupsView />;
 }
@@ -5230,12 +5337,13 @@ export function App(
     });
   };
   const reauthenticateAdminUser = () => {
-    if (!initialAdminUserDetail) return;
-    try {
-      storeAdminUserReturnPath(`${location.pathname}${location.search}`);
-    } catch {
-      // Reauthentication still works when private browsing blocks session storage;
-      // only restoration of the exact detail route is unavailable.
+    if (initialAdminUserDetail) {
+      try {
+        storeAdminUserReturnPath(`${location.pathname}${location.search}`);
+      } catch {
+        // Reauthentication still works when private browsing blocks session storage;
+        // only restoration of the exact detail route is unavailable.
+      }
     }
     location.assign("/login");
   };

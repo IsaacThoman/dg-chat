@@ -64,6 +64,9 @@ import type { SetupStatus } from "./setupDiscovery.ts";
 import type {
   AdminApiTokenPage,
   AdminApiTokenQuery,
+  AdminAttachmentPage,
+  AdminAttachmentQuery,
+  AdminAttachmentSummary,
   AdminBalanceAdjustment,
   AdminBalanceAdjustmentRequest,
   AdminLedgerPage,
@@ -71,6 +74,7 @@ import type {
   AdminSessionPage,
   AdminSessionQuery,
   AdminSessionSource,
+  AdminStorageSummary,
   AdminUser,
   ModelCapability,
 } from "../../../packages/contracts/src/types.ts";
@@ -484,6 +488,16 @@ export function adminAnalyticsQuery(filters: AdminAnalyticsFilters) {
   return query.toString();
 }
 
+export function adminAttachmentsQuery(query: AdminAttachmentQuery = {}) {
+  const params = new URLSearchParams();
+  if (query.ownerId) params.set("ownerId", query.ownerId);
+  if (query.state) params.set("state", query.state);
+  if (query.deletion) params.set("deletion", query.deletion);
+  if (query.cursor) params.set("cursor", query.cursor);
+  params.set("limit", String(query.limit ?? 25));
+  return params.toString();
+}
+
 export function adminJobsQuery(
   filters: AdminJobFilters = {},
   cursor?: string,
@@ -554,6 +568,51 @@ export function uploadAttachment(
     form.append("file", file);
     xhr.send(form);
   });
+}
+
+export async function pollAttachmentInspection(
+  id: string,
+  signal: AbortSignal,
+  options: {
+    load?: (id: string, signal: AbortSignal) => Promise<Attachment>;
+    wait?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
+    timeoutMs?: number;
+  } = {},
+): Promise<Attachment> {
+  const load = options.load ?? api.attachment;
+  const wait = options.wait ??
+    ((milliseconds, currentSignal) =>
+      new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const cleanup = () => currentSignal.removeEventListener("abort", onAbort);
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          resolve();
+        };
+        const onAbort = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          cleanup();
+          reject(currentSignal.reason);
+        };
+        const timer = setTimeout(finish, milliseconds);
+        currentSignal.addEventListener("abort", onAbort, { once: true });
+      }));
+  const deadline = Date.now() + (options.timeoutMs ?? 120_000);
+  let delay = 500;
+  while (true) {
+    signal.throwIfAborted();
+    const attachment = await load(id, signal);
+    if (!["pending", "inspecting"].includes(attachment.state)) return attachment;
+    if (Date.now() + delay > deadline) {
+      throw new Error("Inspection is still running. Check status again shortly.");
+    }
+    await wait(delay, signal);
+    delay = Math.min(5_000, Math.ceil(delay * 1.6));
+  }
 }
 
 export const api = {
@@ -647,6 +706,11 @@ export const api = {
     );
     return result.data ?? result.attachments ?? [];
   },
+  attachment: (id: string, signal?: AbortSignal) =>
+    request<{ attachment: Attachment }>(
+      `/attachments/${encodeURIComponent(id)}`,
+      { signal },
+    ).then((result) => result.attachment),
   collections: async () => (await request<{ data: KnowledgeCollection[] }>("/collections")).data,
   collection: (id: string) =>
     request<{ collection: KnowledgeCollection; attachments: Attachment[] }>(
@@ -1346,6 +1410,22 @@ export const api = {
   adminRetentionScrubRun: (id: string) =>
     request<RetentionScrubRun>(`/admin/retention/scrub-runs/${encodeURIComponent(id)}`),
   adminRetentionScrubRuns: () => request<RetentionScrubRunPage>("/admin/retention/scrub-runs"),
+  adminStorageSummary: () =>
+    request<{ summary: AdminStorageSummary }>("/admin/storage/summary")
+      .then((result) => result.summary),
+  adminAttachments: (query: AdminAttachmentQuery = {}) =>
+    request<AdminAttachmentPage>(`/admin/storage/attachments?${adminAttachmentsQuery(query)}`),
+  reinspectAdminAttachment: (
+    attachment: Pick<AdminAttachmentSummary, "id" | "version">,
+    reason: string,
+  ) =>
+    request<{ attachment: AdminAttachmentSummary; inspectionJobId: string }>(
+      `/admin/storage/attachments/${encodeURIComponent(attachment.id)}/reinspect`,
+      {
+        method: "POST",
+        body: JSON.stringify({ expectedVersion: attachment.version, reason }),
+      },
+    ),
   adminBackups: () => request<BackupExportPage>("/admin/backups"),
   createAdminBackupExport: (idempotencyKey: string) =>
     request<BackupExport>("/admin/backups/exports", {

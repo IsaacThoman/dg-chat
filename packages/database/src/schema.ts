@@ -494,6 +494,11 @@ export const attachments = pgTable("attachments", {
   height: integer("height"),
   state: text("state").notNull().default("pending"),
   inspectionError: text("inspection_error"),
+  inspectionEpoch: integer("inspection_epoch").notNull().default(1),
+  version: integer("version").notNull().default(1),
+  physicalObject: boolean("physical_object").notNull().default(true),
+  requiredInspectionMode: text("required_inspection_mode").notNull().default("local"),
+  inspectionPolicyVersion: text("inspection_policy_version").notNull().default("worker-policy-v1"),
   ingestionStatus: text("ingestion_status").notNull().default("not_applicable"),
   ingestionError: text("ingestion_error"),
   ingestedAt: timestamp("ingested_at", { withTimezone: true }),
@@ -509,6 +514,136 @@ export const attachments = pgTable("attachments", {
     "attachments_dimensions_check",
     sql`(${table.width} IS NULL AND ${table.height} IS NULL) OR (${table.width} BETWEEN 1 AND 100000 AND ${table.height} BETWEEN 1 AND 100000)`,
   ),
+  check("attachments_inspection_epoch_check", sql`${table.inspectionEpoch} >= 1`),
+  check("attachments_version_check", sql`${table.version} >= 1`),
+  check(
+    "attachments_required_inspection_mode_check",
+    sql`${table.requiredInspectionMode} IN ('local','external')`,
+  ),
+  check(
+    "attachments_inspection_policy_version_check",
+    sql`${table.inspectionPolicyVersion}='worker-policy-v1'`,
+  ),
+  check(
+    "attachments_terminal_inspection_reason_check",
+    sql`${table.state} NOT IN ('quarantined','failed') OR (${table.inspectionError} IS NOT NULL AND char_length(btrim(${table.inspectionError})) BETWEEN 1 AND 1000)`,
+  ),
+]);
+
+/** Append-only physical-blob registry. Deleting metadata never removes retained-byte accounting. */
+export const attachmentStorageBlobs = pgTable("attachment_storage_blobs", {
+  ownerId: uuid("owner_id").notNull().references(() => users.id),
+  objectKey: text("object_key").notNull(),
+  sizeBytes: bigint("size_bytes", { mode: "number" }).notNull(),
+  sha256: text("sha256").notNull(),
+  mimeType: text("mime_type").notNull(),
+  admittedAt: timestamp("admitted_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  primaryKey({ columns: [table.ownerId, table.objectKey] }),
+  check(
+    "attachment_storage_blobs_size_check",
+    sql`${table.sizeBytes} BETWEEN 0 AND 9007199254740991`,
+  ),
+  check("attachment_storage_blobs_sha_check", sql`${table.sha256} ~ '^[0-9a-f]{64}$'`),
+  check(
+    "attachment_storage_blobs_mime_check",
+    sql`char_length(${table.mimeType}) BETWEEN 3 AND 255 AND ${table.mimeType} ~ '^[A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+$'`,
+  ),
+]);
+
+/** Append-only proof that a staged generated orphan was physically deleted and de-accounted. */
+export const attachmentStorageReleases = pgTable("attachment_storage_releases", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  stageId: uuid("stage_id").notNull().unique(),
+  usageRunId: text("usage_run_id").notNull(),
+  ownerId: uuid("owner_id").notNull().references(() => users.id),
+  objectKey: text("object_key").notNull(),
+  attachmentId: uuid("attachment_id").notNull(),
+  sizeBytes: bigint("size_bytes", { mode: "number" }).notNull(),
+  sha256: text("sha256").notNull(),
+  mimeType: text("mime_type").notNull(),
+  reason: text("reason").notNull().default("generated_object_cleanup"),
+  releasedAt: timestamp("released_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique("attachment_storage_releases_object_uq").on(table.ownerId, table.objectKey),
+  foreignKey({
+    columns: [table.ownerId, table.objectKey],
+    foreignColumns: [attachmentStorageBlobs.ownerId, attachmentStorageBlobs.objectKey],
+    name: "attachment_storage_releases_blob_fk",
+  }),
+  check(
+    "attachment_storage_releases_size_check",
+    sql`${table.sizeBytes} BETWEEN 0 AND 9007199254740991`,
+  ),
+  check("attachment_storage_releases_sha_check", sql`${table.sha256} ~ '^[0-9a-f]{64}$'`),
+  check(
+    "attachment_storage_releases_mime_check",
+    sql`char_length(${table.mimeType}) BETWEEN 3 AND 255 AND ${table.mimeType} ~ '^[A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+$'`,
+  ),
+  check(
+    "attachment_storage_releases_reason_check",
+    sql`${table.reason}='generated_object_cleanup'`,
+  ),
+]);
+
+export const attachmentStorageUsage = pgTable("attachment_storage_usage", {
+  ownerId: uuid("owner_id").primaryKey().references(() => users.id),
+  physicalBytes: bigint("physical_bytes", { mode: "number" }).notNull().default(0),
+  physicalObjects: bigint("physical_objects", { mode: "number" }).notNull().default(0),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  check(
+    "attachment_storage_usage_bounds_check",
+    sql`${table.physicalBytes} BETWEEN 0 AND 9007199254740991 AND ${table.physicalObjects} BETWEEN 0 AND 9007199254740991`,
+  ),
+]);
+
+export const attachmentStorageInstallation = pgTable("attachment_storage_installation", {
+  singletonId: integer("singleton_id").primaryKey().default(1),
+  physicalBytes: bigint("physical_bytes", { mode: "number" }).notNull().default(0),
+  physicalObjects: bigint("physical_objects", { mode: "number" }).notNull().default(0),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  check("attachment_storage_installation_singleton_check", sql`${table.singletonId}=1`),
+  check(
+    "attachment_storage_installation_bounds_check",
+    sql`${table.physicalBytes} BETWEEN 0 AND 9007199254740991 AND ${table.physicalObjects} BETWEEN 0 AND 9007199254740991`,
+  ),
+]);
+
+export const attachmentUploadStaging = pgTable("attachment_upload_staging", {
+  id: uuid("id").primaryKey(),
+  ownerId: uuid("owner_id").notNull().references(() => users.id),
+  objectKey: text("object_key").notNull().unique(),
+  filename: text("filename").notNull(),
+  mimeType: text("mime_type").notNull(),
+  sizeBytes: bigint("size_bytes", { mode: "number" }).notNull(),
+  sha256: text("sha256").notNull(),
+  state: text("state").notNull().default("pending"),
+  attachmentId: uuid("attachment_id"),
+  cleanupError: text("cleanup_error"),
+  uploadLeaseToken: uuid("upload_lease_token").notNull().defaultRandom(),
+  uploadLeaseExpiresAt: timestamp("upload_lease_expires_at", { withTimezone: true }).notNull()
+    .default(sql`now()+interval '15 minutes'`),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  foreignKey({
+    columns: [table.ownerId, table.attachmentId],
+    foreignColumns: [attachments.ownerId, attachments.id],
+    name: "attachment_upload_staging_attachment_fk",
+  }),
+  index("attachment_upload_staging_cleanup_idx").on(
+    table.state,
+    table.uploadLeaseExpiresAt,
+    table.updatedAt,
+    table.id,
+  ).where(sql`${table.state} IN ('cleanup_pending','cleaning')`),
+  check(
+    "attachment_upload_staging_size_check",
+    sql`${table.sizeBytes} BETWEEN 0 AND 26214400`,
+  ),
+  check("attachment_upload_staging_sha_check", sql`${table.sha256} ~ '^[0-9a-f]{64}$'`),
 ]);
 
 export const messageAttachments = pgTable("message_attachments", {
@@ -1105,6 +1240,9 @@ export const fileUploadStaging = pgTable("file_upload_staging", {
   purpose: text("purpose").notNull(),
   attachmentState: text("attachment_state").notNull(),
   inspectionError: text("inspection_error"),
+  requiredInspectionMode: text("required_inspection_mode").notNull().default("local"),
+  inspectionPolicyVersion: text("inspection_policy_version").notNull()
+    .default("worker-policy-v1"),
   state: text("state").notNull().default("pending"),
   attachmentId: uuid("attachment_id").references(() => attachments.id),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -1117,7 +1255,7 @@ export const fileUploadStaging = pgTable("file_upload_staging", {
   check("file_upload_staging_purpose_check", sql`${table.purpose} = 'assistants'`),
   check(
     "file_upload_staging_attachment_state_check",
-    sql`${table.attachmentState} IN ('ready','quarantined')`,
+    sql`${table.attachmentState} IN ('pending','ready','quarantined')`,
   ),
 ]);
 

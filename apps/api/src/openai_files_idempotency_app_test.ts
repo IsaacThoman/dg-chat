@@ -1,5 +1,9 @@
 import { assertEquals, assertExists, assertNotEquals } from "jsr:@std/assert@1.0.14";
-import { MemoryRepository, type PutObjectInput } from "@dg-chat/database";
+import {
+  ATTACHMENT_INSPECTION_POLICY_VERSION,
+  MemoryRepository,
+  type PutObjectInput,
+} from "@dg-chat/database";
 import { createApp } from "./app.ts";
 import { sha256, sha256Hex } from "./crypto.ts";
 import { TestObjectStore } from "./test-object-store.ts";
@@ -368,6 +372,8 @@ Deno.test("file recovery heartbeats slow object verification before atomic final
     purpose: "assistants",
     attachmentState: "ready",
     inspectionError: null,
+    requiredInspectionMode: "local",
+    inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
   });
   await value.objectStore.put({
     key: objectKey,
@@ -452,6 +458,8 @@ Deno.test("file recovery rotates beyond its batch limit while generic reaping st
       purpose: "assistants",
       attachmentState: "ready",
       inspectionError: null,
+      requiredInspectionMode: "local",
+      inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
     });
     value.repository.releaseApiRequestLease(begun.request.id, begun.leaseToken);
     requests.push(begun.request.id);
@@ -497,6 +505,8 @@ Deno.test("file recovery has an explicit terminal age without calling ambiguity 
     purpose: "assistants",
     attachmentState: "ready",
     inspectionError: null,
+    requiredInspectionMode: "local",
+    inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
   });
   value.repository.apiIdempotencyRequests.get(begun.request.id)!.createdAt = new Date(
     Date.now() - 10_000,
@@ -543,6 +553,8 @@ Deno.test("file recovery deduplicates cleanup after a lost enqueue acknowledgeme
     purpose: "assistants",
     attachmentState: "ready",
     inspectionError: null,
+    requiredInspectionMode: "local",
+    inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
   });
   value.repository.apiIdempotencyRequests.get(begun.request.id)!.createdAt = new Date(
     Date.now() - 10_000,

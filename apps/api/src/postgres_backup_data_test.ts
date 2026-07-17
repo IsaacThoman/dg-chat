@@ -9,6 +9,7 @@ import {
   LEGACY_BACKUP_DATA_OMITTED_TABLES,
   ObjectAlreadyExistsError,
   parseBackupArchiveStream,
+  PRE_ATTACHMENT_CONTROL_BACKUP_DATA_OMITTED_TABLES,
   PRE_AUTOMATIC_RETENTION_BACKUP_DATA_OMITTED_TABLES,
   PRE_IMMUTABLE_SHARING_BACKUP_DATA_OMITTED_TABLES,
   sha256Hex,
@@ -140,6 +141,12 @@ async function fixture(
     abortDatabase?: AbortController;
     throwAfterRestoreCommit?: boolean;
     providerCredentials?: boolean;
+    attachmentState?: "pending" | "inspecting" | "ready" | "quarantined" | "failed" | "deleted";
+    attachmentDeleted?: boolean;
+    attachmentReleased?: boolean;
+    manifestOnly?: boolean;
+    reverseTableOrder?: boolean;
+    ambiguousOwner?: boolean;
   } = {},
 ) {
   const objects = new FakeObjects();
@@ -147,7 +154,7 @@ async function fixture(
     ? new Uint8Array(64 * 1024 * 3 + 17).fill(7)
     : new TextEncoder().encode("bounded attachment body");
   const digest = await sha256Hex(body);
-  if (!options.missing) {
+  if (!options.missing && !options.manifestOnly) {
     objects.values.set("attachments/original", {
       value: options.tampered ? new TextEncoder().encode("x".repeat(body.length)) : body,
       type: "text/plain",
@@ -169,13 +176,18 @@ async function fixture(
     mime_type: "text/plain",
     size_bytes: String(body.length),
     sha256: digest,
-    state: "ready",
+    state: options.manifestOnly ? "failed" : options.attachmentState ?? "ready",
     created_at: "2026-07-12T00:00:00.000Z",
-    inspection_error: null,
+    inspection_error: options.manifestOnly
+      ? "Attachment bytes were not included in the .dgchat manifest"
+      : null,
+    physical_object: !options.manifestOnly,
     updated_at: "2026-07-12T00:00:00.000Z",
-    deleted_at: null,
-    ingestion_status: "not_applicable",
-    ingestion_error: null,
+    deleted_at: options.attachmentDeleted || options.manifestOnly
+      ? "2026-07-13T00:00:00.000Z"
+      : null,
+    ingestion_status: options.manifestOnly ? "failed" : "not_applicable",
+    ingestion_error: options.manifestOnly ? "Attachment bytes require a separate restore" : null,
     ingested_at: null,
   };
   let restoredMap: ReadonlyMap<string, string> | undefined;
@@ -200,7 +212,16 @@ async function fixture(
     return count;
   };
   const duplicateObjectKey = ["attachments", "duplicate"].join("/");
-  const rows = options.duplicate
+  const rows = options.ambiguousOwner
+    ? [
+      { ...row },
+      {
+        ...row,
+        id: "10000000-0000-4000-8000-000000000003",
+        owner_id: "10000000-0000-4000-8000-000000000099",
+      },
+    ]
+    : options.duplicate
     ? [{ ...row }, {
       ...row,
       id: "10000000-0000-4000-8000-000000000003",
@@ -208,6 +229,31 @@ async function fixture(
       filename: "duplicate.txt",
     }]
     : [row];
+  const storageRows = rows.filter((attachment) => attachment.physical_object).map(
+    (attachment) => ({
+      owner_id: attachment.owner_id,
+      object_key: attachment.object_key,
+      size_bytes: attachment.size_bytes,
+      sha256: attachment.sha256,
+      mime_type: attachment.mime_type,
+      admitted_at: attachment.created_at,
+    }),
+  );
+  const releaseRows = options.attachmentReleased
+    ? rows.map((attachment, index) => ({
+      id: `30000000-0000-4000-8001-${String(index + 1).padStart(12, "0")}`,
+      stage_id: `30000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+      usage_run_id: `released-run-${index + 1}`,
+      owner_id: attachment.owner_id,
+      object_key: attachment.object_key,
+      attachment_id: attachment.id,
+      size_bytes: attachment.size_bytes,
+      sha256: attachment.sha256,
+      mime_type: attachment.mime_type,
+      reason: "generated_object_cleanup",
+      released_at: "2026-07-14T00:00:00.000Z",
+    }))
+    : [];
   const lifecycle: string[] = [];
   let catalogChecks = 0;
   let catalogFailure = options.catalogFailure === true;
@@ -224,12 +270,21 @@ async function fixture(
       const result = consumer({
         schemaVersion: BACKUP_DATA_SCHEMA_VERSION,
         installationId: "installation-test",
-        tables: BACKUP_DATA_TABLES.filter((table) => table.name !== "provider_payload_captures"),
+        tables: (options.reverseTableOrder ? [...BACKUP_DATA_TABLES].reverse() : BACKUP_DATA_TABLES)
+          .filter((table) => table.name !== "provider_payload_captures"),
         rows(tableName: string): AsyncIterable<BackupDataBatch> {
           return tableName === "attachments"
             ? (async function* () {
               options.abortDatabase?.abort(new Error("database snapshot cancelled"));
               yield rows;
+            })()
+            : tableName === "attachment_storage_blobs"
+            ? (async function* () {
+              yield storageRows;
+            })()
+            : tableName === "attachment_storage_releases"
+            ? (async function* () {
+              if (releaseRows.length) yield releaseRows;
             })()
             : (async function* () {})();
         },
@@ -243,11 +298,20 @@ async function fixture(
       const result = consumer({
         schemaVersion: BACKUP_DATA_SCHEMA_VERSION,
         installationId: "installation-test",
-        tables: BACKUP_DATA_TABLES.filter((table) => table.name !== "provider_payload_captures"),
+        tables: (options.reverseTableOrder ? [...BACKUP_DATA_TABLES].reverse() : BACKUP_DATA_TABLES)
+          .filter((table) => table.name !== "provider_payload_captures"),
         rows(tableName: string): AsyncIterable<BackupDataBatch> {
           return tableName === "attachments"
             ? (async function* () {
               yield rows;
+            })()
+            : tableName === "attachment_storage_blobs"
+            ? (async function* () {
+              yield storageRows;
+            })()
+            : tableName === "attachment_storage_releases"
+            ? (async function* () {
+              if (releaseRows.length) yield releaseRows;
             })()
             : (async function* () {})();
         },
@@ -397,8 +461,12 @@ Deno.test("postgres backup data streams a bounded object roundtrip and retains c
     assertEquals(committed.restoreOperationVersion, 3);
     assertEquals(committed.installationVersion, 4);
     const target = fx.restoredMap()?.get("attachments/original");
-    assertEquals(target, `restores/${restoreOperationId}/${fx.digest}`);
+    assertEquals(target, `restores/${restoreOperationId}/users/${ownerId}/${fx.digest}`);
     assertEquals(fx.objects.values.get(target!)?.value, fx.body);
+    assertEquals(fx.objects.values.get(target!)?.metadata, {
+      sha256: fx.digest,
+      owner: ownerId,
+    });
     assertEquals(fx.catalogChecks(), 2);
   } finally {
     await snapshot.cleanup?.();
@@ -459,14 +527,14 @@ Deno.test("postgres backup data deterministically removes only precommit crash s
     // `summarize` on an apply session exercises the same staging path and intentionally leaves the
     // object behind, modeling a process exit after object PUT and before the database transaction.
     await apply.summarize(applyManifest);
-    const stagedKey = `restores/${restoreOperationId}/${fx.digest}`;
+    const stagedKey = `restores/${restoreOperationId}/users/${ownerId}/${fx.digest}`;
     assertEquals(fx.objects.values.has(stagedKey), true);
 
-    const unrelatedKey = `restores/${crypto.randomUUID()}/${fx.digest}`;
+    const unrelatedKey = `restores/${crypto.randomUUID()}/users/${ownerId}/${fx.digest}`;
     fx.objects.values.set(unrelatedKey, {
       value: fx.body,
       type: "text/plain",
-      metadata: { sha256: fx.digest },
+      metadata: { sha256: fx.digest, owner: ownerId },
     });
     const cleanup = await fx.adapter.restoreSession("cleanup", { restoreOperationId });
     const cleanupManifest = await parseBackupArchiveStream(
@@ -511,7 +579,7 @@ Deno.test("postgres backup data preserves staged objects when the database commi
       Error,
       "database commit response lost",
     );
-    const stagedKey = `restores/${restoreOperationId}/${fx.digest}`;
+    const stagedKey = `restores/${restoreOperationId}/users/${ownerId}/${fx.digest}`;
     assertEquals(fx.objects.values.has(stagedKey), true);
 
     // A confirmed pre-commit outcome is the only authority that invokes rollback. It remains
@@ -589,6 +657,7 @@ Deno.test("postgres backup data previews and applies a signed legacy 0028 table 
     const omittedNames = new Set(
       [
         ...LEGACY_BACKUP_DATA_OMITTED_TABLES,
+        ...PRE_ATTACHMENT_CONTROL_BACKUP_DATA_OMITTED_TABLES,
         ...PRE_AUTOMATIC_RETENTION_BACKUP_DATA_OMITTED_TABLES,
       ].map((name) => `tables/${name}.ndjson`),
     );
@@ -647,9 +716,11 @@ Deno.test("postgres backup data accepts supported pre-0039 catalogs", async () =
         ? PRE_IMMUTABLE_SHARING_BACKUP_DATA_OMITTED_TABLES
         : ADMIN_LIFECYCLE_BACKUP_DATA_OMITTED_TABLES;
       const omittedNames = new Set(
-        [...omitted, ...PRE_AUTOMATIC_RETENTION_BACKUP_DATA_OMITTED_TABLES].map((name) =>
-          `tables/${name}.ndjson`
-        ),
+        [
+          ...omitted,
+          ...PRE_ATTACHMENT_CONTROL_BACKUP_DATA_OMITTED_TABLES,
+          ...PRE_AUTOMATIC_RETENTION_BACKUP_DATA_OMITTED_TABLES,
+        ].map((name) => `tables/${name}.ndjson`),
       );
       let entries = snapshot.manifest.entries.filter((entry) => !omittedNames.has(entry.name));
       const payloads = new Map(snapshot.payloads);
@@ -709,9 +780,10 @@ Deno.test("postgres backup data previews and applies a genuine 0045 catalog", as
   });
   try {
     const omittedNames = new Set(
-      [...PRE_AUTOMATIC_RETENTION_BACKUP_DATA_OMITTED_TABLES].map((name) =>
-        `tables/${name}.ndjson`
-      ),
+      [
+        ...PRE_ATTACHMENT_CONTROL_BACKUP_DATA_OMITTED_TABLES,
+        ...PRE_AUTOMATIC_RETENTION_BACKUP_DATA_OMITTED_TABLES,
+      ].map((name) => `tables/${name}.ndjson`),
     );
     const entries = snapshot.manifest.entries.filter((entry) => !omittedNames.has(entry.name));
     const { signature: _signature, ...unsigned } = snapshot.manifest;
@@ -755,7 +827,41 @@ Deno.test("postgres backup data previews and applies a genuine 0045 catalog", as
   }
 });
 
-Deno.test("postgres backup data binds the object index exactly to ready attachment rows", async () => {
+Deno.test("postgres backup data accepts the pre-control-plane 0049 catalog", async () => {
+  const fx = await fixture();
+  const snapshot = await fx.adapter.exportSnapshot({
+    includeDiagnostics: false,
+    installationId: "installation-test",
+  });
+  try {
+    const omittedNames = new Set(
+      [...PRE_ATTACHMENT_CONTROL_BACKUP_DATA_OMITTED_TABLES].map((name) => `tables/${name}.ndjson`),
+    );
+    const entries = snapshot.manifest.entries.filter((entry) => !omittedNames.has(entry.name));
+    const { signature: _signature, ...unsigned } = snapshot.manifest;
+    const manifest = await signBackupManifest({
+      ...unsigned,
+      schemaVersion: "0049",
+      entries,
+      contentRootSha256: await backupContentRoot(entries),
+    }, fx.authenticator);
+    const payloads = new Map(snapshot.payloads);
+    for (const name of omittedNames) payloads.delete(name);
+    const session = await fx.adapter.restoreSession("preview", { restoreOperationId });
+    const parsed = await parseBackupArchiveStream(
+      writeBackupArchiveStream(manifest, payloads, fx.authenticator),
+      fx.authenticator,
+      session.sink,
+    );
+    const preview = await session.summarize(parsed);
+    assertEquals(preview.counts.find((row) => row.resource === "attachments")?.create, 1);
+    await session.rollback();
+  } finally {
+    await snapshot.cleanup?.();
+  }
+});
+
+Deno.test("postgres backup data binds the object index exactly to retained attachment storage", async () => {
   const fx = await fixture();
   const snapshot = await fx.adapter.exportSnapshot({
     includeDiagnostics: false,
@@ -821,7 +927,7 @@ Deno.test("postgres backup data binds the object index exactly to ready attachme
     await assertRejects(
       () => extraSession.summarize(extraParsed),
       TypeError,
-      "extra attachment reference",
+      "no attachment metadata",
     );
     await extraSession.rollback();
 
@@ -864,6 +970,122 @@ Deno.test("postgres backup data binds the object index exactly to ready attachme
       "extra attachment reference",
     );
     await inconsistentSession.rollback();
+  } finally {
+    await snapshot.cleanup?.();
+  }
+});
+
+Deno.test("postgres backup retained-object export is independent of adapter table order", async () => {
+  const fx = await fixture({ reverseTableOrder: true });
+  const snapshot = await fx.adapter.exportSnapshot({
+    includeDiagnostics: false,
+    installationId: "installation-test",
+  });
+  try {
+    assertEquals(snapshot.objectsTotal, 1);
+    assertEquals(
+      snapshot.manifest.entries.filter((entry) => entry.name.startsWith("tables/")).map(
+        (entry) => entry.name,
+      ),
+      BACKUP_DATA_TABLES.filter((table) => table.name !== "provider_payload_captures").map(
+        (table) => `tables/${table.name}.ndjson`,
+      ),
+    );
+  } finally {
+    await snapshot.cleanup?.();
+  }
+});
+
+Deno.test("postgres backup rejects a source object key claimed by different owners", async () => {
+  const fx = await fixture({ ambiguousOwner: true });
+  await assertRejects(
+    () =>
+      fx.adapter.exportSnapshot({
+        includeDiagnostics: false,
+        installationId: "installation-test",
+      }),
+    TypeError,
+    "ambiguously owned",
+  );
+});
+
+Deno.test("postgres backup data includes every active lifecycle state and historical tombstones", async () => {
+  for (
+    const state of ["pending", "inspecting", "ready", "quarantined", "failed"] as const
+  ) {
+    const fx = await fixture({ attachmentState: state });
+    const snapshot = await fx.adapter.exportSnapshot({
+      includeDiagnostics: false,
+      installationId: "installation-test",
+    });
+    try {
+      assertEquals(snapshot.objectsTotal, 1, `${state} attachment object must be portable`);
+      const index = new TextDecoder().decode(
+        await payloadBytes(snapshot.payloads.get("objects/index.ndjson")!),
+      );
+      assertEquals(index.includes('"objectKey":"attachments/original"'), true);
+    } finally {
+      await snapshot.cleanup?.();
+    }
+  }
+
+  const historical = await fixture({
+    attachmentState: "deleted",
+    attachmentDeleted: true,
+  });
+  const snapshot = await historical.adapter.exportSnapshot({
+    includeDiagnostics: false,
+    installationId: "installation-test",
+  });
+  try {
+    assertEquals(snapshot.objectsTotal, 1);
+  } finally {
+    await snapshot.cleanup?.();
+  }
+});
+
+Deno.test("postgres backup data excludes reference-fenced physically released objects", async () => {
+  const fx = await fixture({
+    attachmentState: "deleted",
+    attachmentDeleted: true,
+    attachmentReleased: true,
+  });
+  const snapshot = await fx.adapter.exportSnapshot({
+    includeDiagnostics: false,
+    installationId: "installation-test",
+  });
+  try {
+    assertEquals(snapshot.objectsTotal, 0);
+    const index = await payloadBytes(snapshot.payloads.get("objects/index.ndjson")!);
+    assertEquals(index.length, 0);
+  } finally {
+    await snapshot.cleanup?.();
+  }
+});
+
+Deno.test("postgres backup data preserves manifest placeholders without fetching nonexistent bytes", async () => {
+  const fx = await fixture({ manifestOnly: true });
+  let objectReads = 0;
+  const get = fx.objects.get.bind(fx.objects);
+  fx.objects.get = (key) => {
+    objectReads++;
+    return get(key);
+  };
+  const snapshot = await fx.adapter.exportSnapshot({
+    includeDiagnostics: false,
+    installationId: "installation-test",
+  });
+  try {
+    assertEquals(snapshot.objectsTotal, 0);
+    assertEquals(objectReads, 0);
+    assertEquals(
+      (await payloadBytes(snapshot.payloads.get("objects/index.ndjson")!)).length,
+      0,
+    );
+    const attachments = new TextDecoder().decode(
+      await payloadBytes(snapshot.payloads.get("tables/attachments.ndjson")!),
+    );
+    assertEquals(attachments.includes('"physical_object":false'), true);
   } finally {
     await snapshot.cleanup?.();
   }

@@ -8,6 +8,9 @@ import type {
   AdminApiTokenPage,
   AdminApiTokenQuery,
   AdminApiTokenRevocationCommand,
+  AdminAttachmentPage,
+  AdminAttachmentQuery,
+  AdminAttachmentSummary,
   AdminBalanceAdjustment,
   AdminBalanceAdjustmentCommand,
   AdminLedgerPage,
@@ -15,11 +18,13 @@ import type {
   AdminSessionPage,
   AdminSessionQuery,
   AdminSessionRevocationCommand,
+  AdminStorageSummary,
   AdminUser,
   AdminUserPage,
   AdminUserQuery,
   ApiTokenSummary,
   ApprovalStatus,
+  AttachmentStorageUsage,
   Conversation,
   ConversationFolder,
   ConversationFolderMembership,
@@ -103,7 +108,10 @@ import type {
   AttachmentListQuery,
   AttachmentPage,
   AttachmentRecord,
+  AttachmentReinspectionResult,
   AttachmentState,
+  AttachmentStorageQuota,
+  AttachmentUploadStage,
   AuditEvent,
   AuditEventInput,
   AuditPage,
@@ -177,6 +185,7 @@ import type {
   RegistryMutationContext,
   ReplaceAccessGroupPolicyInput,
   ReplaceConversationKnowledgeInput,
+  RequestAttachmentReinspectionInput,
   ReserveChildProviderUsageInput,
   RetentionPolicy,
   RetentionPreview,
@@ -192,11 +201,13 @@ import type {
   SearchConversationKnowledgeInput,
   SessionSummary,
   SetProviderModelRouteInput,
+  StageAttachmentUploadInput,
   StageFileUploadInput,
   StageGeneratedObjectInput,
   StartProviderAttemptInput,
   StoredProviderCredential,
   TokenAccessSubject,
+  TransitionAttachmentInspectionInput,
   UpdateAccessGroupInput,
   UpdateApiTokenInput,
   UpdateModelAliasInput,
@@ -208,7 +219,11 @@ import type {
   UsageRecoveryOwner,
 } from "./repository.ts";
 import {
+  ATTACHMENT_INSPECTION_POLICY_VERSION,
+  attachmentReinspectionEligibility,
+  decodeAdminAttachmentCursor,
   decodeAuditCursor,
+  encodeAdminAttachmentCursor,
   encodeAuditCursor,
   isUsagePricingSnapshot,
   sameGeneratedAssetFinalization,
@@ -569,6 +584,30 @@ export class MemoryRepository {
   }>();
   readonly auditEvents: AuditEvent[] = [];
   readonly attachments = new Map<string, AttachmentRecord>();
+  readonly attachmentStorageBlobs = new Map<
+    string,
+    { ownerId: string; objectKey: string; sizeBytes: number; sha256: string; mimeType: string }
+  >();
+  readonly attachmentStorageReleases = new Map<
+    string,
+    {
+      id: string;
+      stageId: string;
+      usageRunId: string;
+      ownerId: string;
+      objectKey: string;
+      attachmentId: string;
+      sizeBytes: number;
+      sha256: string;
+      mimeType: string;
+      releasedAt: string;
+    }
+  >();
+  readonly attachmentStorageUsageByOwner = new Map<
+    string,
+    { physicalBytes: number; physicalObjects: number }
+  >();
+  attachmentStorageInstallation = { physicalBytes: 0, physicalObjects: 0 };
   readonly attachmentDimensions = new Map<
     string,
     { width: number | null; height: number | null }
@@ -649,6 +688,8 @@ export class MemoryRepository {
   readonly apiIdempotencyRequests = new Map<string, ApiIdempotencyRequest>();
   readonly apiIdempotencyKeys = new Map<string, string>();
   readonly fileUploadStages = new Map<string, FileUploadStage>();
+  readonly attachmentUploadStages = new Map<string, AttachmentUploadStage>();
+  #attachmentUploadFinalizeStageId: string | null = null;
   readonly jobs: Array<
     {
       id: string;
@@ -2271,6 +2312,10 @@ export class MemoryRepository {
         sha256: value.sha256,
         state: "failed",
         inspectionError: "Attachment bytes were not included in the .dgchat manifest",
+        requiredInspectionMode: "local",
+        inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
+        inspectionEpoch: 1,
+        version: 1,
         ingestionStatus: "failed",
         ingestionError: "Attachment bytes require a separate restore",
         ingestedAt: null,
@@ -3657,12 +3702,109 @@ export class MemoryRepository {
     return conversation;
   }
 
-  createAttachment(input: CreateAttachmentInput): CreateAttachmentResult {
+  #admitAttachmentStorage(input: CreateAttachmentInput, quota?: AttachmentStorageQuota): boolean {
+    if (
+      quota && (
+        !Number.isSafeInteger(quota.perUserBytes) || quota.perUserBytes < 0 ||
+        !Number.isSafeInteger(quota.perUserObjects) || quota.perUserObjects < 0 ||
+        !Number.isSafeInteger(quota.installationBytes) || quota.installationBytes < 0 ||
+        !Number.isSafeInteger(quota.installationObjects) || quota.installationObjects < 0
+      )
+    ) throw new DomainError("validation_error", "Attachment storage quota is invalid", 422);
+    const key = `${input.ownerId}\0${input.objectKey}`;
+    const prior = this.attachmentStorageBlobs.get(key);
+    if (prior) {
+      if (
+        prior.sizeBytes !== input.sizeBytes || prior.sha256 !== input.sha256 ||
+        prior.mimeType !== input.mimeType
+      ) {
+        throw new DomainError(
+          "attachment_object_conflict",
+          "Attachment object metadata differs from retained history",
+          409,
+        );
+      }
+      if (
+        [...this.attachmentStorageReleases.values()].some((release) =>
+          release.ownerId === input.ownerId && release.objectKey === input.objectKey
+        )
+      ) {
+        throw new DomainError(
+          "attachment_object_conflict",
+          "Released attachment object keys cannot be reused",
+          409,
+        );
+      }
+      return false;
+    }
+    const owner = this.attachmentStorageUsageByOwner.get(input.ownerId) ??
+      { physicalBytes: 0, physicalObjects: 0 };
+    if (
+      quota && (
+        owner.physicalBytes > quota.perUserBytes - input.sizeBytes ||
+        owner.physicalObjects >= quota.perUserObjects ||
+        this.attachmentStorageInstallation.physicalBytes >
+          quota.installationBytes - input.sizeBytes ||
+        this.attachmentStorageInstallation.physicalObjects >= quota.installationObjects
+      )
+    ) throw new DomainError("storage_quota_exceeded", "Attachment storage quota exceeded", 413);
+    this.attachmentStorageBlobs.set(key, {
+      ownerId: input.ownerId,
+      objectKey: input.objectKey,
+      sizeBytes: input.sizeBytes,
+      sha256: input.sha256,
+      mimeType: input.mimeType,
+    });
+    this.attachmentStorageUsageByOwner.set(input.ownerId, {
+      physicalBytes: owner.physicalBytes + input.sizeBytes,
+      physicalObjects: owner.physicalObjects + 1,
+    });
+    this.attachmentStorageInstallation = {
+      physicalBytes: this.attachmentStorageInstallation.physicalBytes + input.sizeBytes,
+      physicalObjects: this.attachmentStorageInstallation.physicalObjects + 1,
+    };
+    return true;
+  }
+
+  #rollbackAttachmentStorageAdmission(input: CreateAttachmentInput): void {
+    const key = `${input.ownerId}\0${input.objectKey}`;
+    if (!this.attachmentStorageBlobs.delete(key)) return;
+    const owner = this.attachmentStorageUsageByOwner.get(input.ownerId)!;
+    this.attachmentStorageUsageByOwner.set(input.ownerId, {
+      physicalBytes: owner.physicalBytes - input.sizeBytes,
+      physicalObjects: owner.physicalObjects - 1,
+    });
+    this.attachmentStorageInstallation = {
+      physicalBytes: this.attachmentStorageInstallation.physicalBytes - input.sizeBytes,
+      physicalObjects: this.attachmentStorageInstallation.physicalObjects - 1,
+    };
+  }
+
+  createAttachment(
+    input: CreateAttachmentInput,
+    quota?: AttachmentStorageQuota,
+  ): CreateAttachmentResult {
     this.validateAttachmentInput(input);
     if (!this.users.has(input.ownerId)) throw new DomainError("not_found", "User not found", 404);
+    if (
+      [...this.attachmentUploadStages.values()].some((stage) =>
+        stage.objectKey === input.objectKey && stage.id !== this.#attachmentUploadFinalizeStageId
+      )
+    ) {
+      throw new DomainError(
+        "upload_stage_conflict",
+        "Attachment object is controlled by a browser upload stage",
+        409,
+      );
+    }
+    const requiredInspectionMode = input.requiredInspectionMode ?? "local";
+    const inspectionPolicyVersion = input.inspectionPolicyVersion ??
+      ATTACHMENT_INSPECTION_POLICY_VERSION;
     const prior = [...this.attachments.values()].find((attachment) =>
       attachment.ownerId === input.ownerId && attachment.sha256 === input.sha256 &&
-      attachment.state !== "deleted"
+      attachment.state !== "deleted" &&
+      attachment.requiredInspectionMode === requiredInspectionMode &&
+      attachment.inspectionPolicyVersion === inspectionPolicyVersion
     );
     if (prior) {
       if (prior.sizeBytes !== input.sizeBytes || prior.mimeType !== input.mimeType) {
@@ -3683,12 +3825,18 @@ export class MemoryRepository {
     ) {
       throw new DomainError("object_key_taken", "Attachment object key already exists", 409);
     }
+    const admitted = this.#admitAttachmentStorage(input, quota);
+    const jobsBefore = this.jobs.length;
     const now = new Date().toISOString();
     const attachment: AttachmentRecord = {
       ...input,
       id: crypto.randomUUID(),
       state: input.state ?? "pending",
       inspectionError: input.inspectionError ?? null,
+      requiredInspectionMode,
+      inspectionPolicyVersion,
+      inspectionEpoch: 1,
+      version: 1,
       ingestionStatus: input.state === "ready" && isIngestibleDocumentMime(input.mimeType)
         ? "queued"
         : "not_applicable",
@@ -3698,15 +3846,194 @@ export class MemoryRepository {
       updatedAt: now,
       deletedAt: null,
     };
-    this.attachments.set(attachment.id, attachment);
-    this.enqueueAttachmentIngestion(attachment);
-    return {
-      attachment,
-      inspectionJobId: input.inspectionComplete
-        ? null
-        : this.enqueueAttachmentInspection(attachment),
-      deduplicated: false,
+    try {
+      this.attachments.set(attachment.id, attachment);
+      this.enqueueAttachmentIngestion(attachment);
+      return {
+        attachment,
+        inspectionJobId: input.inspectionComplete
+          ? null
+          : this.enqueueAttachmentInspection(attachment),
+        deduplicated: false,
+      };
+    } catch (error) {
+      this.attachments.delete(attachment.id);
+      this.jobs.splice(jobsBefore);
+      if (admitted) this.#rollbackAttachmentStorageAdmission(input);
+      throw error;
+    }
+  }
+
+  stageAttachmentUpload(
+    input: StageAttachmentUploadInput,
+    leaseSeconds: number,
+  ): AttachmentUploadStage {
+    this.validateAttachmentInput(input);
+    if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1 || leaseSeconds > 86_400) {
+      throw new DomainError("validation_error", "Attachment upload lease is invalid", 422);
+    }
+    const prior = this.attachmentUploadStages.get(input.id);
+    if (prior) {
+      if (
+        prior.ownerId !== input.ownerId || prior.objectKey !== input.objectKey ||
+        prior.filename !== input.filename || prior.mimeType !== input.mimeType ||
+        prior.sizeBytes !== input.sizeBytes || prior.sha256 !== input.sha256
+      ) throw new DomainError("idempotency_conflict", "Attachment upload stage differs", 409);
+      return structuredClone(prior);
+    }
+    if (
+      [...this.attachmentUploadStages.values()].some((stage) => stage.objectKey === input.objectKey)
+    ) {
+      throw new DomainError("object_key_taken", "Attachment upload object key already exists", 409);
+    }
+    const now = new Date().toISOString();
+    const stage: AttachmentUploadStage = {
+      ...input,
+      state: "pending",
+      attachmentId: null,
+      cleanupError: null,
+      uploadLeaseToken: crypto.randomUUID(),
+      uploadLeaseExpiresAt: new Date(Date.now() + leaseSeconds * 1_000).toISOString(),
+      createdAt: now,
+      updatedAt: now,
     };
+    this.attachmentUploadStages.set(stage.id, stage);
+    return structuredClone(stage);
+  }
+
+  markAttachmentUploadStored(
+    id: string,
+    ownerId: string,
+    uploadLeaseToken: string,
+    leaseSeconds: number,
+  ): AttachmentUploadStage {
+    if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1 || leaseSeconds > 86_400) {
+      throw new DomainError("validation_error", "Attachment upload lease is invalid", 422);
+    }
+    const stage = this.attachmentUploadStages.get(id);
+    if (
+      !stage || stage.ownerId !== ownerId || stage.uploadLeaseToken !== uploadLeaseToken ||
+      Date.parse(stage.uploadLeaseExpiresAt) <= Date.now() ||
+      !["pending", "stored"].includes(stage.state)
+    ) {
+      throw new DomainError("upload_stage_conflict", "Attachment upload stage changed", 409);
+    }
+    stage.state = "stored";
+    stage.uploadLeaseExpiresAt = new Date(Date.now() + leaseSeconds * 1_000).toISOString();
+    stage.updatedAt = new Date().toISOString();
+    return structuredClone(stage);
+  }
+
+  heartbeatAttachmentUpload(
+    id: string,
+    ownerId: string,
+    uploadLeaseToken: string,
+    leaseSeconds: number,
+  ): AttachmentUploadStage {
+    if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1 || leaseSeconds > 86_400) {
+      throw new DomainError("validation_error", "Attachment upload lease is invalid", 422);
+    }
+    const stage = this.attachmentUploadStages.get(id);
+    if (
+      !stage || stage.ownerId !== ownerId || stage.uploadLeaseToken !== uploadLeaseToken ||
+      Date.parse(stage.uploadLeaseExpiresAt) <= Date.now() ||
+      !["pending", "stored"].includes(stage.state)
+    ) throw new DomainError("upload_stage_conflict", "Attachment upload stage changed", 409);
+    stage.uploadLeaseExpiresAt = new Date(Date.now() + leaseSeconds * 1_000).toISOString();
+    stage.updatedAt = new Date().toISOString();
+    return structuredClone(stage);
+  }
+
+  createAttachmentFromUploadStage(
+    id: string,
+    ownerId: string,
+    uploadLeaseToken: string,
+    input: CreateAttachmentInput,
+    quota?: AttachmentStorageQuota,
+  ): CreateAttachmentResult {
+    const stage = this.attachmentUploadStages.get(id);
+    if (
+      !stage || stage.ownerId !== ownerId || stage.uploadLeaseToken !== uploadLeaseToken ||
+      Date.parse(stage.uploadLeaseExpiresAt) <= Date.now() || stage.state !== "stored" ||
+      input.ownerId !== ownerId || stage.objectKey !== input.objectKey ||
+      stage.filename !== input.filename || stage.mimeType !== input.mimeType ||
+      stage.sizeBytes !== input.sizeBytes || stage.sha256 !== input.sha256
+    ) throw new DomainError("upload_stage_conflict", "Attachment upload stage differs", 409);
+    let result: CreateAttachmentResult;
+    this.#attachmentUploadFinalizeStageId = id;
+    try {
+      result = this.createAttachment(input, quota);
+    } finally {
+      this.#attachmentUploadFinalizeStageId = null;
+    }
+    if (result.deduplicated) {
+      stage.state = "cleanup_pending";
+      stage.cleanupError = "deduplicated browser upload";
+      stage.updatedAt = new Date().toISOString();
+      this.enqueueJob(
+        "attachment_object.cleanup",
+        { stageId: id, ownerId },
+        stage.uploadLeaseExpiresAt,
+        `attachment_object.cleanup:${id}`,
+      );
+      return {
+        ...result,
+        attachment: structuredClone(result.attachment),
+        inspectionJobId: null,
+      };
+    }
+    stage.state = "finalized";
+    stage.attachmentId = result.attachment.id;
+    stage.cleanupError = null;
+    stage.uploadLeaseExpiresAt = new Date().toISOString();
+    stage.updatedAt = new Date().toISOString();
+    return { ...result, attachment: structuredClone(result.attachment) };
+  }
+
+  requestAttachmentUploadCleanup(
+    id: string,
+    ownerId: string,
+    uploadLeaseToken: string,
+    reason: string,
+  ): AttachmentUploadStage {
+    const stage = this.attachmentUploadStages.get(id);
+    if (
+      !stage || stage.ownerId !== ownerId || stage.uploadLeaseToken !== uploadLeaseToken ||
+      !["pending", "stored", "cleanup_pending", "cleaning", "cleaned"].includes(stage.state)
+    ) throw new DomainError("upload_stage_conflict", "Attachment upload stage changed", 409);
+    stage.state = "cleanup_pending";
+    stage.cleanupError = reason.slice(0, 1000);
+    stage.updatedAt = new Date().toISOString();
+    const key = `attachment_object.cleanup:${id}`;
+    const prior = this.jobs.find((job) => job.idempotencyKey === key);
+    if (prior && ["completed", "failed"].includes(prior.status)) {
+      prior.status = "queued";
+      prior.attempts = 0;
+      prior.availableAt = stage.uploadLeaseExpiresAt;
+      prior.lockedAt = null;
+      prior.lockedBy = null;
+      prior.lastError = null;
+      prior.completedAt = null;
+    } else {
+      this.enqueueJob(
+        "attachment_object.cleanup",
+        { stageId: id, ownerId },
+        stage.uploadLeaseExpiresAt,
+        key,
+      );
+    }
+    return structuredClone(stage);
+  }
+
+  abandonAttachmentUpload(id: string, ownerId: string, reason: string): AttachmentUploadStage {
+    const stage = this.attachmentUploadStages.get(id);
+    if (
+      !stage || stage.ownerId !== ownerId || !["pending", "abandoned"].includes(stage.state)
+    ) throw new DomainError("upload_stage_conflict", "Attachment upload stage changed", 409);
+    stage.state = "abandoned";
+    stage.cleanupError = reason.slice(0, 1000);
+    stage.updatedAt = new Date().toISOString();
+    return structuredClone(stage);
   }
 
   stageFileUpload(input: StageFileUploadInput): FileUploadStage {
@@ -3743,6 +4070,8 @@ export class MemoryRepository {
         purpose: prior.purpose,
         attachmentState: prior.attachmentState,
         inspectionError: prior.inspectionError,
+        requiredInspectionMode: prior.requiredInspectionMode,
+        inspectionPolicyVersion: prior.inspectionPolicyVersion,
       };
       if (JSON.stringify(comparable) !== JSON.stringify(input)) {
         throw new DomainError("idempotency_conflict", "File upload stage differs", 409);
@@ -3787,7 +4116,10 @@ export class MemoryRepository {
     ).length;
   }
 
-  finalizeFileUpload(input: FinalizeFileUploadInput): FinalizeFileUploadResult {
+  finalizeFileUpload(
+    input: FinalizeFileUploadInput,
+    quota?: AttachmentStorageQuota,
+  ): FinalizeFileUploadResult {
     this.validateAttachmentInput(input.attachment);
     const request = this.#apiRequest(input.request.id);
     if (
@@ -3821,7 +4153,10 @@ export class MemoryRepository {
       stage.sizeBytes !== input.attachment.sizeBytes ||
       stage.sha256 !== input.attachment.sha256 ||
       stage.attachmentState !== (input.attachment.state ?? "pending") ||
-      stage.inspectionError !== (input.attachment.inspectionError ?? null)
+      stage.inspectionError !== (input.attachment.inspectionError ?? null) ||
+      stage.requiredInspectionMode !== (input.attachment.requiredInspectionMode ?? "local") ||
+      stage.inspectionPolicyVersion !==
+        (input.attachment.inspectionPolicyVersion ?? ATTACHMENT_INSPECTION_POLICY_VERSION)
     ) throw new DomainError("file_upload_stage_conflict", "File upload stage differs", 409);
     if (!this.users.has(input.attachment.ownerId)) {
       throw new DomainError("not_found", "User not found", 404);
@@ -3838,12 +4173,18 @@ export class MemoryRepository {
       )
     ) throw new DomainError("object_key_taken", "Attachment object key already exists", 409);
     const jobsBefore = this.jobs.length;
+    const admitted = this.#admitAttachmentStorage(input.attachment, quota);
     const now = new Date().toISOString();
     const attachment: AttachmentRecord = {
       ...input.attachment,
       id: crypto.randomUUID(),
       state: input.attachment.state ?? "pending",
       inspectionError: input.attachment.inspectionError ?? null,
+      requiredInspectionMode: input.attachment.requiredInspectionMode ?? "local",
+      inspectionPolicyVersion: input.attachment.inspectionPolicyVersion ??
+        ATTACHMENT_INSPECTION_POLICY_VERSION,
+      inspectionEpoch: 1,
+      version: 1,
       ingestionStatus: input.attachment.state === "ready" &&
           isIngestibleDocumentMime(input.attachment.mimeType)
         ? "queued"
@@ -3872,13 +4213,14 @@ export class MemoryRepository {
     } catch (error) {
       this.attachments.delete(attachment.id);
       this.jobs.splice(jobsBefore);
+      if (admitted) this.#rollbackAttachmentStorageAdmission(input.attachment);
       throw error;
     }
   }
 
   listAttachments(ownerId: string, includeDeleted = false) {
     return [...this.attachments.values()].filter((attachment) =>
-      attachment.ownerId === ownerId && (includeDeleted || attachment.state !== "deleted")
+      attachment.ownerId === ownerId && (includeDeleted || attachment.deletedAt === null)
     ).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 
@@ -3907,7 +4249,7 @@ export class MemoryRepository {
       );
     }
     const ordered = [...this.attachments.values()].filter((attachment) =>
-      attachment.ownerId === ownerId && attachment.state !== "deleted"
+      attachment.ownerId === ownerId && attachment.deletedAt === null
     ).sort(compare);
     // Deleted attachments are retained as tombstones. Their immutable creation tuple remains a
     // valid keyset position so deleting the last item from one page does not break the next page.
@@ -3925,7 +4267,7 @@ export class MemoryRepository {
     const attachment = this.attachments.get(id);
     if (
       !attachment || attachment.ownerId !== ownerId ||
-      (!includeDeleted && attachment.state === "deleted")
+      (!includeDeleted && attachment.deletedAt !== null)
     ) throw new DomainError("not_found", "Attachment not found", 404);
     return attachment;
   }
@@ -3937,6 +4279,7 @@ export class MemoryRepository {
     attachment.state = "deleted";
     attachment.deletedAt = now;
     attachment.updatedAt = now;
+    attachment.version++;
     return attachment;
   }
 
@@ -3947,13 +4290,33 @@ export class MemoryRepository {
     nextState: AttachmentState,
     inspectionError: string | null = null,
   ) {
+    if (
+      expectedState === "inspecting" &&
+      ["ready", "quarantined", "failed"].includes(nextState)
+    ) {
+      return this.transitionAttachmentInspection({
+        attachmentId: id,
+        ownerId,
+        inspectionEpoch: 1,
+        expectedState,
+        nextState: nextState as "ready" | "quarantined" | "failed",
+        inspectionError,
+      });
+    }
     const attachment = this.getAttachment(id, ownerId, true);
+    if (attachment.inspectionEpoch !== 1) {
+      throw new DomainError(
+        "attachment_inspection_conflict",
+        "Versioned reinspection requires an epoch-bound transition",
+        409,
+      );
+    }
     if (attachment.state !== expectedState) {
       throw new DomainError("attachment_state_conflict", "Attachment state changed", 409);
     }
     const allowed: Record<AttachmentState, AttachmentState[]> = {
       pending: ["inspecting", "deleted"],
-      inspecting: ["ready", "quarantined", "failed", "deleted"],
+      inspecting: ["deleted"],
       ready: ["deleted"],
       quarantined: ["deleted"],
       failed: ["pending", "deleted"],
@@ -3968,6 +4331,7 @@ export class MemoryRepository {
     }
     attachment.state = nextState;
     attachment.inspectionError = inspectionError;
+    attachment.version++;
     attachment.updatedAt = new Date().toISOString();
     if (nextState === "deleted") attachment.deletedAt = attachment.updatedAt;
     if (nextState === "ready" && isIngestibleDocumentMime(attachment.mimeType)) {
@@ -3976,6 +4340,216 @@ export class MemoryRepository {
       this.enqueueAttachmentIngestion(attachment);
     }
     return attachment;
+  }
+
+  requestAttachmentReinspection(
+    input: RequestAttachmentReinspectionInput,
+  ): AttachmentReinspectionResult {
+    this.#assertEffectiveAdminActor(input.actorId);
+    const reason = input.reason.trim();
+    if (
+      !reason || reason.length > 500 || !Number.isSafeInteger(input.expectedVersion) ||
+      input.expectedVersion < 1
+    ) throw new DomainError("validation_error", "Reinspection request is invalid", 422);
+    const attachment = this.attachments.get(input.attachmentId);
+    if (!attachment) throw new DomainError("not_found", "Attachment not found", 404);
+    const eligibility = attachmentReinspectionEligibility(attachment);
+    if (eligibility.blockedReason === "deleted") {
+      throw new DomainError("attachment_deleted", "Deleted attachments cannot be reinspected", 409);
+    }
+    if (!eligibility.eligible) {
+      throw new DomainError(
+        "attachment_state_conflict",
+        eligibility.blockedReason === "policy_quarantine"
+          ? "This quarantine was issued by a non-retriable upload policy"
+          : "Only terminal attachments can be reinspected",
+        409,
+      );
+    }
+    if (attachment.version !== input.expectedVersion) {
+      throw new DomainError(
+        "version_conflict",
+        "Attachment was modified by another administrator",
+        409,
+      );
+    }
+    const before = {
+      state: attachment.state,
+      inspectionError: attachment.inspectionError,
+      inspectionEpoch: attachment.inspectionEpoch,
+      version: attachment.version,
+      updatedAt: attachment.updatedAt,
+    };
+    const jobsBefore = this.jobs.length;
+    const auditsBefore = this.auditEvents.length;
+    try {
+      attachment.state = "pending";
+      attachment.inspectionError = null;
+      attachment.inspectionEpoch++;
+      attachment.version++;
+      attachment.updatedAt = new Date().toISOString();
+      const inspectionJobId = this.enqueueAttachmentInspection(attachment);
+      this.recordAudit({
+        actorId: input.actorId,
+        action: "attachment.reinspection_requested",
+        targetType: "attachment",
+        targetId: attachment.id,
+        metadata: {
+          ownerId: attachment.ownerId,
+          reason,
+          before,
+          after: {
+            state: attachment.state,
+            inspectionEpoch: attachment.inspectionEpoch,
+            version: attachment.version,
+          },
+          inspectionJobId,
+        },
+      });
+      return { attachment: structuredClone(attachment), inspectionJobId };
+    } catch (error) {
+      attachment.state = before.state;
+      attachment.inspectionError = before.inspectionError;
+      attachment.inspectionEpoch = before.inspectionEpoch;
+      attachment.version = before.version;
+      attachment.updatedAt = before.updatedAt;
+      this.jobs.splice(jobsBefore);
+      this.auditEvents.splice(auditsBefore);
+      throw error;
+    }
+  }
+
+  transitionAttachmentInspection(input: TransitionAttachmentInspectionInput): AttachmentRecord {
+    const inspectionError = input.inspectionError?.trim() || null;
+    const requiresReason = ["quarantined", "failed"].includes(input.nextState);
+    if (
+      !Number.isSafeInteger(input.inspectionEpoch) || input.inspectionEpoch < 1 ||
+      (input.expectedState === "pending" && input.nextState !== "inspecting") ||
+      (input.expectedState === "inspecting" &&
+        !["ready", "quarantined", "failed"].includes(input.nextState)) ||
+      (requiresReason ? inspectionError === null : inspectionError !== null) ||
+      (inspectionError !== null && inspectionError.length > 1_000)
+    ) throw new DomainError("validation_error", "Attachment inspection transition is invalid", 422);
+    const attachment = this.getAttachment(input.attachmentId, input.ownerId, true);
+    if (
+      attachment.deletedAt !== null || attachment.state !== input.expectedState ||
+      attachment.inspectionEpoch !== input.inspectionEpoch
+    ) {
+      throw new DomainError(
+        "attachment_inspection_conflict",
+        "Attachment inspection epoch or state changed",
+        409,
+      );
+    }
+    const before = structuredClone(attachment);
+    const jobsBefore = this.jobs.length;
+    const auditsBefore = this.auditEvents.length;
+    try {
+      attachment.state = input.nextState;
+      attachment.inspectionError = inspectionError;
+      attachment.version++;
+      attachment.updatedAt = new Date().toISOString();
+      if (input.nextState === "ready" && isIngestibleDocumentMime(attachment.mimeType)) {
+        if (attachment.ingestionStatus !== "ready") {
+          attachment.ingestionStatus = "queued";
+          attachment.ingestionError = null;
+          this.enqueueAttachmentIngestion(attachment);
+        }
+      }
+      if (["ready", "quarantined", "failed"].includes(input.nextState)) {
+        this.recordAudit({
+          actorId: null,
+          action: "attachment.inspection.completed",
+          targetType: "attachment",
+          targetId: attachment.id,
+          metadata: {
+            ownerId: attachment.ownerId,
+            inspectionEpoch: input.inspectionEpoch,
+            outcome: input.nextState,
+            reason: inspectionError,
+          },
+        });
+      }
+      return structuredClone(attachment);
+    } catch (error) {
+      this.attachments.set(attachment.id, before);
+      this.jobs.splice(jobsBefore);
+      this.auditEvents.splice(auditsBefore);
+      throw error;
+    }
+  }
+
+  attachmentStorageUsage(ownerId: string): AttachmentStorageUsage {
+    const usage = this.attachmentStorageUsageByOwner.get(ownerId) ??
+      { physicalBytes: 0, physicalObjects: 0 };
+    return { ownerId, ...usage };
+  }
+
+  adminStorageSummary(actorId: string): AdminStorageSummary {
+    this.#assertEffectiveAdminActor(actorId);
+    const records = [...this.attachments.values()];
+    return {
+      ...this.attachmentStorageInstallation,
+      attachmentRecords: records.length,
+      activeRecords: records.filter((item) => item.deletedAt === null).length,
+      deletedRecords: records.filter((item) => item.deletedAt !== null).length,
+      quarantinedRecords:
+        records.filter((item) => item.deletedAt === null && item.state === "quarantined").length,
+      ownersWithStorage:
+        [...this.attachmentStorageUsageByOwner.values()].filter((usage) =>
+          usage.physicalObjects > 0
+        ).length,
+    };
+  }
+
+  listAdminAttachments(actorId: string, query: AdminAttachmentQuery): AdminAttachmentPage {
+    this.#assertEffectiveAdminActor(actorId);
+    const limit = query.limit ?? 50;
+    const deletion = query.deletion ?? "present";
+    if (
+      !Number.isSafeInteger(limit) || limit < 1 || limit > 200 ||
+      (query.ownerId !== undefined &&
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+          .test(query.ownerId)) ||
+      !["present", "deleted", "all"].includes(deletion)
+    ) throw new DomainError("validation_error", "Attachment inventory query is invalid", 422);
+    const cursor = query.cursor ? decodeAdminAttachmentCursor(query.cursor, query) : undefined;
+    if (query.cursor && !cursor) {
+      throw new DomainError("invalid_cursor", "Attachment inventory cursor is invalid", 400);
+    }
+    const filtered = [...this.attachments.values()].filter((item) =>
+      (query.ownerId === undefined || item.ownerId === query.ownerId) &&
+      (query.state === undefined || item.state === query.state) &&
+      (deletion === "all" || (deletion === "deleted") === (item.deletedAt !== null)) &&
+      (!cursor ||
+        item.createdAt < cursor.createdAt ||
+        (item.createdAt === cursor.createdAt && item.id < cursor.id))
+    ).sort((left, right) =>
+      right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id)
+    );
+    const rows = filtered.slice(0, limit + 1);
+    const project = (item: AttachmentRecord): AdminAttachmentSummary => ({
+      id: item.id,
+      ownerId: item.ownerId,
+      filename: item.filename,
+      mimeType: item.mimeType,
+      sizeBytes: item.sizeBytes,
+      state: item.state,
+      inspectionError: item.inspectionError,
+      inspectionEpoch: item.inspectionEpoch,
+      version: item.version,
+      reinspectionEligible: attachmentReinspectionEligibility(item).eligible,
+      reinspectionBlockedReason: attachmentReinspectionEligibility(item).blockedReason,
+      createdAt: item.createdAt,
+      updatedAt: item.updatedAt,
+      deletedAt: item.deletedAt,
+    });
+    return {
+      data: rows.slice(0, limit).map(project),
+      nextCursor: rows.length > limit
+        ? encodeAdminAttachmentCursor(rows[limit - 1].createdAt, rows[limit - 1].id, query)
+        : null,
+    };
   }
 
   linkAttachmentToMessage(messageId: string, attachmentId: string, ownerId: string) {
@@ -4268,6 +4842,25 @@ export class MemoryRepository {
     if (attachment.state !== "ready") {
       throw new DomainError("attachment_not_ready", "Generated attachment is not ready", 409);
     }
+    const retainedBlob = this.attachmentStorageBlobs.get(
+      `${ownerId}\0${attachment.objectKey}`,
+    );
+    if (
+      (cleanupAttachment && stage.objectKey !== attachment.objectKey) ||
+      stage.sizeBytes !== attachment.sizeBytes ||
+      stage.sha256 !== attachment.sha256 ||
+      stage.mimeType !== attachment.mimeType ||
+      !retainedBlob ||
+      retainedBlob.sizeBytes !== attachment.sizeBytes ||
+      retainedBlob.sha256 !== attachment.sha256 ||
+      retainedBlob.mimeType !== attachment.mimeType
+    ) {
+      throw new DomainError(
+        "generated_stage_conflict",
+        "Generated object attachment differs from the staged object",
+        409,
+      );
+    }
     if (stage.state === "stored") {
       stage.state = "attached";
       stage.attachmentId = attachmentId;
@@ -4297,6 +4890,147 @@ export class MemoryRepository {
       count++;
     }
     return count;
+  }
+
+  settleGeneratedObjectCleanup(stageId: string, ownerId: string) {
+    const stage = this.generatedObjectStages.get(stageId);
+    if (!stage || stage.ownerId !== ownerId) {
+      throw new DomainError("not_found", "Generated object stage not found", 404);
+    }
+    const priorRelease = this.attachmentStorageReleases.get(stageId);
+    if (stage.state === "cleaned") {
+      if (!stage.cleanupAttachment && !priorRelease) {
+        return { stage: structuredClone(stage), storageReleased: false };
+      }
+      if (
+        priorRelease?.ownerId === ownerId && priorRelease.objectKey === stage.objectKey &&
+        priorRelease.attachmentId === stage.attachmentId
+      ) return { stage: structuredClone(stage), storageReleased: false };
+      throw new DomainError(
+        "generated_cleanup_invariant",
+        "Cleaned generated stage has inconsistent storage release history",
+        500,
+      );
+    }
+    if (stage.state !== "cleaning") {
+      throw new DomainError(
+        "generated_stage_conflict",
+        "Generated object stage is not being cleaned",
+        409,
+      );
+    }
+    if (!stage.cleanupAttachment) {
+      stage.state = "cleaned";
+      stage.cleanupError = null;
+      stage.updatedAt = new Date().toISOString();
+      return { stage: structuredClone(stage), storageReleased: false };
+    }
+    const attachment = stage.attachmentId ? this.attachments.get(stage.attachmentId) : undefined;
+    if (
+      !attachment || attachment.ownerId !== ownerId || attachment.state !== "deleted" ||
+      attachment.deletedAt === null || attachment.objectKey !== stage.objectKey ||
+      attachment.sizeBytes !== stage.sizeBytes || attachment.sha256 !== stage.sha256
+    ) {
+      throw new DomainError(
+        "generated_cleanup_fenced",
+        "Generated cleanup requires the exact tombstoned attachment",
+        409,
+      );
+    }
+    const attachmentId = attachment.id;
+    const hasReference =
+      [...this.attachments.values()].some((candidate) =>
+        candidate.ownerId === ownerId && candidate.objectKey === stage.objectKey &&
+        candidate.id !== attachmentId
+      ) ||
+      [...this.messageAttachments.values()].some((ids) => ids.has(attachmentId)) ||
+      [...this.knowledgeAttachments.values()].some((ids) => ids.has(attachmentId)) ||
+      this.documentChunks.has(attachmentId) ||
+      [...this.generatedAssets.values()].some((asset) =>
+        asset.usageRunId === stage.usageRunId || asset.attachmentId === attachmentId ||
+        asset.inputs.some((input) => input.attachmentId === attachmentId)
+      ) ||
+      [...this.generatedObjectStages.values()].some((candidate) =>
+        candidate.id !== stage.id && candidate.state !== "cleaned" &&
+        (candidate.attachmentId === attachmentId ||
+          candidate.ownerId === ownerId && candidate.objectKey === stage.objectKey)
+      ) ||
+      [...this.fileUploadStages.values()].some((candidate) =>
+        candidate.attachmentId === attachmentId ||
+        candidate.ownerId === ownerId && candidate.objectKey === stage.objectKey
+      ) ||
+      [...this.attachmentUploadStages.values()].some((candidate) =>
+        candidate.attachmentId === attachmentId ||
+        candidate.ownerId === ownerId && candidate.objectKey === stage.objectKey
+      ) ||
+      [...this.conversationShares.values()].some((share) =>
+        Object.values(share.sourceAttachments).some((source) =>
+          source.attachmentId === attachmentId
+        )
+      );
+    if (hasReference) {
+      throw new DomainError(
+        "generated_cleanup_fenced",
+        "Generated cleanup is fenced by a durable reference",
+        409,
+      );
+    }
+    const storageKey = `${ownerId}\0${stage.objectKey}`;
+    const blob = this.attachmentStorageBlobs.get(storageKey);
+    if (
+      !blob || blob.sizeBytes !== stage.sizeBytes || blob.sha256 !== stage.sha256 ||
+      blob.mimeType !== stage.mimeType
+    ) {
+      throw new DomainError(
+        "generated_cleanup_invariant",
+        "Generated cleanup storage history differs",
+        500,
+      );
+    }
+    const usage = this.attachmentStorageUsageByOwner.get(ownerId);
+    if (
+      !usage || usage.physicalBytes < blob.sizeBytes || usage.physicalObjects < 1 ||
+      this.attachmentStorageInstallation.physicalBytes < blob.sizeBytes ||
+      this.attachmentStorageInstallation.physicalObjects < 1
+    ) {
+      throw new DomainError(
+        "generated_cleanup_invariant",
+        "Generated cleanup storage accounting would underflow",
+        500,
+      );
+    }
+    const releasedAt = new Date().toISOString();
+    this.recordAudit({
+      actorId: ownerId,
+      action: "attachment.storage_reclaimed",
+      targetType: "attachment",
+      targetId: attachmentId,
+      metadata: { sizeBytes: blob.sizeBytes, stageId },
+    });
+    this.attachmentStorageReleases.set(stageId, {
+      id: crypto.randomUUID(),
+      stageId,
+      usageRunId: stage.usageRunId,
+      ownerId,
+      objectKey: stage.objectKey,
+      attachmentId,
+      sizeBytes: blob.sizeBytes,
+      sha256: blob.sha256,
+      mimeType: blob.mimeType,
+      releasedAt,
+    });
+    this.attachmentStorageUsageByOwner.set(ownerId, {
+      physicalBytes: usage.physicalBytes - blob.sizeBytes,
+      physicalObjects: usage.physicalObjects - 1,
+    });
+    this.attachmentStorageInstallation = {
+      physicalBytes: this.attachmentStorageInstallation.physicalBytes - blob.sizeBytes,
+      physicalObjects: this.attachmentStorageInstallation.physicalObjects - 1,
+    };
+    stage.state = "cleaned";
+    stage.cleanupError = null;
+    stage.updatedAt = releasedAt;
+    return { stage: structuredClone(stage), storageReleased: true };
   }
 
   beginAttachmentIngestion(id: string, ownerId: string) {
@@ -4783,14 +5517,20 @@ export class MemoryRepository {
   }
 
   private enqueueAttachmentInspection(attachment: AttachmentRecord) {
-    const idempotencyKey = `attachment.inspect:${attachment.id}`;
+    const idempotencyKey = `attachment.inspect:${attachment.id}:${attachment.inspectionEpoch}`;
     const prior = this.jobs.find((job) => job.idempotencyKey === idempotencyKey);
     if (prior) return prior.id;
     const id = crypto.randomUUID();
     this.jobs.push({
       id,
       type: "attachment.inspect",
-      payload: { attachmentId: attachment.id, ownerId: attachment.ownerId },
+      payload: {
+        attachmentId: attachment.id,
+        ownerId: attachment.ownerId,
+        inspectionEpoch: attachment.inspectionEpoch,
+        requiredInspectionMode: attachment.requiredInspectionMode,
+        inspectionPolicyVersion: attachment.inspectionPolicyVersion,
+      },
       status: "queued",
       attempts: 0,
       availableAt: new Date().toISOString(),
@@ -4834,6 +5574,12 @@ export class MemoryRepository {
     if (!Number.isSafeInteger(input.sizeBytes) || input.sizeBytes < 0) {
       throw new DomainError("validation_error", "Attachment size is invalid", 422);
     }
+    if (
+      input.requiredInspectionMode != null &&
+        !["local", "external"].includes(input.requiredInspectionMode) ||
+      input.inspectionPolicyVersion != null &&
+        input.inspectionPolicyVersion !== ATTACHMENT_INSPECTION_POLICY_VERSION
+    ) throw new DomainError("validation_error", "Attachment inspection policy is invalid", 422);
     if (
       !input.filename || input.filename.length > 255 || /[\\/\0]/.test(input.filename) ||
       !input.mimeType || input.mimeType.length > 255 ||

@@ -42,6 +42,10 @@ import {
   telemetryConfig,
 } from "@dg-chat/observability";
 import { validateAppSecret } from "./auth-config.ts";
+import {
+  attachmentExternalInspectionRequiredFromEnv,
+  attachmentStorageQuotaFromEnv,
+} from "./attachment-storage-config.ts";
 
 const startupResources = new StartupResourceOwner();
 try {
@@ -261,6 +265,16 @@ try {
     repository,
     rateLimiter,
     objectStore,
+    attachmentUploadPutTimeoutMs: Number(
+      Deno.env.get("ATTACHMENT_UPLOAD_PUT_TIMEOUT_MS") ?? 300_000,
+    ),
+    attachmentUploadLeaseSeconds: Number(
+      Deno.env.get("ATTACHMENT_UPLOAD_LEASE_SECONDS") ?? 900,
+    ),
+    attachmentStorageQuota: attachmentStorageQuotaFromEnv(Deno.env.toObject()),
+    attachmentExternalInspectionRequired: attachmentExternalInspectionRequiredFromEnv(
+      Deno.env.toObject(),
+    ),
     providerKeyring,
     circuitBreaker,
     ocrCache,

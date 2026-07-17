@@ -3,6 +3,8 @@ import type {
   AdminApiTokenPage,
   AdminApiTokenQuery,
   AdminApiTokenRevocationCommand,
+  AdminAttachmentPage,
+  AdminAttachmentQuery,
   AdminBalanceAdjustment,
   AdminBalanceAdjustmentCommand,
   AdminLedgerPage,
@@ -10,11 +12,13 @@ import type {
   AdminSessionPage,
   AdminSessionQuery,
   AdminSessionRevocationCommand,
+  AdminStorageSummary,
   AdminUser,
   AdminUserPage,
   AdminUserQuery,
   ApiTokenSummary,
   ApprovalStatus,
+  AttachmentStorageUsage,
   Conversation,
   ConversationDetail,
   ConversationFolder,
@@ -553,12 +557,56 @@ export interface AttachmentRecord {
   sha256: string;
   state: AttachmentState;
   inspectionError: string | null;
+  requiredInspectionMode: RequiredAttachmentInspectionMode;
+  inspectionPolicyVersion: typeof ATTACHMENT_INSPECTION_POLICY_VERSION;
+  /** Monotonic policy epoch. Inspection results must bind to the epoch they examined. */
+  inspectionEpoch: number;
+  /** Optimistic administrative version, independent from the immutable content digest. */
+  version: number;
   ingestionStatus: AttachmentIngestionStatus;
   ingestionError: string | null;
   ingestedAt: string | null;
   createdAt: string;
   updatedAt: string;
   deletedAt: string | null;
+}
+/** Stable machine-readable inspection outcomes shared by workers and authorization decisions. */
+export const ATTACHMENT_INSPECTION_REASON = Object.freeze(
+  {
+    localPolicyRejected: "worker_local_policy_rejected",
+    malwareDetected: "worker_malware_detected",
+    retryExhausted: "worker_retry_exhausted",
+    externalScannerUnavailable: "worker_external_scanner_unavailable",
+  } as const,
+);
+export const ATTACHMENT_INSPECTION_POLICY_VERSION = "worker-policy-v1" as const;
+export type RequiredAttachmentInspectionMode = "local" | "external";
+export type AttachmentReinspectionBlockReason =
+  | "deleted"
+  | "nonterminal"
+  | "policy_quarantine";
+export interface AttachmentReinspectionEligibility {
+  eligible: boolean;
+  blockedReason: AttachmentReinspectionBlockReason | null;
+}
+export function attachmentReinspectionEligibility(
+  attachment: Pick<AttachmentRecord, "state" | "inspectionError" | "deletedAt">,
+): AttachmentReinspectionEligibility {
+  if (attachment.deletedAt !== null || attachment.state === "deleted") {
+    return { eligible: false, blockedReason: "deleted" };
+  }
+  if (attachment.state === "ready" || attachment.state === "failed") {
+    return { eligible: true, blockedReason: null };
+  }
+  if (attachment.state === "quarantined") {
+    const workerOwned = attachment.inspectionError ===
+        ATTACHMENT_INSPECTION_REASON.localPolicyRejected ||
+      attachment.inspectionError === ATTACHMENT_INSPECTION_REASON.malwareDetected;
+    return workerOwned
+      ? { eligible: true, blockedReason: null }
+      : { eligible: false, blockedReason: "policy_quarantine" };
+  }
+  return { eligible: false, blockedReason: "nonterminal" };
 }
 export type AttachmentListOrder = "asc" | "desc";
 /**
@@ -573,6 +621,55 @@ export interface AttachmentListQuery {
 export interface AttachmentPage {
   data: AttachmentRecord[];
   hasMore: boolean;
+}
+
+const ADMIN_ATTACHMENT_CURSOR_VERSION = 1;
+function adminAttachmentFingerprint(query: AdminAttachmentQuery): string {
+  // The bounded filter tuple itself is safe to embed and avoids accepting deliberate collisions
+  // from a short non-cryptographic digest.
+  return JSON.stringify({
+    ownerId: query.ownerId ?? null,
+    state: query.state ?? null,
+    deletion: query.deletion ?? "present",
+  });
+}
+export function encodeAdminAttachmentCursor(
+  createdAt: string,
+  id: string,
+  query: AdminAttachmentQuery,
+): string {
+  return btoa(JSON.stringify([
+    ADMIN_ATTACHMENT_CURSOR_VERSION,
+    createdAt,
+    id,
+    adminAttachmentFingerprint(query),
+  ])).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+export function decodeAdminAttachmentCursor(
+  cursor: string,
+  query: AdminAttachmentQuery,
+): { createdAt: string; id: string } | undefined {
+  try {
+    if (!cursor || cursor.length > 2_048 || !/^[A-Za-z0-9_-]+$/.test(cursor)) return undefined;
+    const base64 = cursor.replaceAll("-", "+").replaceAll("_", "/");
+    const decoded = atob(base64.padEnd(Math.ceil(base64.length / 4) * 4, "="));
+    if (
+      btoa(decoded).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "") !== cursor
+    ) return undefined;
+    const value = JSON.parse(decoded);
+    if (
+      !Array.isArray(value) || value.length !== 4 ||
+      value[0] !== ADMIN_ATTACHMENT_CURSOR_VERSION ||
+      typeof value[1] !== "string" ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$/.test(value[1]) ||
+      !Number.isFinite(Date.parse(value[1])) ||
+      typeof value[2] !== "string" || !UUID_PATTERN.test(value[2]) ||
+      value[3] !== adminAttachmentFingerprint(query)
+    ) return undefined;
+    return { createdAt: value[1], id: value[2] };
+  } catch {
+    return undefined;
+  }
 }
 export interface DocumentChunkMetadata extends Record<string, unknown> {
   sourceAttachmentId?: string;
@@ -771,8 +868,38 @@ export interface CreateAttachmentInput {
   sha256: string;
   state?: "pending" | "ready" | "quarantined";
   inspectionError?: string | null;
+  requiredInspectionMode?: RequiredAttachmentInspectionMode;
+  inspectionPolicyVersion?: typeof ATTACHMENT_INSPECTION_POLICY_VERSION;
   /** Set only when trusted server-side validation has already completed. */
   inspectionComplete?: boolean;
+}
+export interface AttachmentStorageQuota {
+  /** Retained physical bytes for one owner, inclusive of historical soft-deleted attachments. */
+  perUserBytes: number;
+  /** Retained physical object count for one owner. */
+  perUserObjects: number;
+  /** Retained physical bytes across the installation. */
+  installationBytes: number;
+  /** Retained physical object count across the installation. */
+  installationObjects: number;
+}
+export interface RequestAttachmentReinspectionInput {
+  attachmentId: string;
+  actorId: string;
+  expectedVersion: number;
+  reason: string;
+}
+export interface AttachmentReinspectionResult {
+  attachment: AttachmentRecord;
+  inspectionJobId: string;
+}
+export interface TransitionAttachmentInspectionInput {
+  attachmentId: string;
+  ownerId: string;
+  inspectionEpoch: number;
+  expectedState: "pending" | "inspecting";
+  nextState: "inspecting" | "ready" | "quarantined" | "failed";
+  inspectionError?: string | null;
 }
 export interface CreateAttachmentResult {
   attachment: AttachmentRecord;
@@ -800,8 +927,10 @@ export interface FileUploadStage {
   sizeBytes: number;
   sha256: string;
   purpose: string;
-  attachmentState: "ready" | "quarantined";
+  attachmentState: "pending" | "ready" | "quarantined";
   inspectionError: string | null;
+  requiredInspectionMode: RequiredAttachmentInspectionMode;
+  inspectionPolicyVersion: typeof ATTACHMENT_INSPECTION_POLICY_VERSION;
   state: "pending" | "stored" | "finalized";
   attachmentId: string | null;
   createdAt: string;
@@ -810,6 +939,35 @@ export interface FileUploadStage {
 export type StageFileUploadInput = Omit<
   FileUploadStage,
   "state" | "attachmentId" | "createdAt" | "updatedAt"
+>;
+
+export interface AttachmentUploadStage {
+  id: string;
+  ownerId: string;
+  objectKey: string;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+  sha256: string;
+  state:
+    | "pending"
+    | "stored"
+    | "cleanup_pending"
+    | "cleaning"
+    | "finalized"
+    | "cleaned"
+    | "abandoned";
+  attachmentId: string | null;
+  cleanupError: string | null;
+  /** Untrusted workers may clean this object only after the active PUT lease expires. */
+  uploadLeaseToken: string;
+  uploadLeaseExpiresAt: string;
+  createdAt: string;
+  updatedAt: string;
+}
+export type StageAttachmentUploadInput = Pick<
+  AttachmentUploadStage,
+  "id" | "ownerId" | "objectKey" | "filename" | "mimeType" | "sizeBytes" | "sha256"
 >;
 
 /** Accept only the content-addressed namespace shared by Files uploads and cleanup jobs. */
@@ -920,6 +1078,11 @@ export interface StageGeneratedObjectInput {
   mimeType: string;
   sizeBytes: number;
   sha256: string;
+}
+export interface GeneratedObjectCleanupSettlement {
+  stage: GeneratedObjectStage;
+  /** True only for the first durable release of an admitted generated object. */
+  storageReleased: boolean;
 }
 
 const unicodeScalarLength = (value: string): number => [...value].length;
@@ -2393,12 +2556,52 @@ export interface DomainRepository {
     leafId: string,
     expectedVersion: number,
   ): MaybePromise<Conversation>;
-  createAttachment(input: CreateAttachmentInput): MaybePromise<CreateAttachmentResult>;
+  createAttachment(
+    input: CreateAttachmentInput,
+    quota?: AttachmentStorageQuota,
+  ): MaybePromise<CreateAttachmentResult>;
+  stageAttachmentUpload(
+    input: StageAttachmentUploadInput,
+    leaseSeconds: number,
+  ): MaybePromise<AttachmentUploadStage>;
+  heartbeatAttachmentUpload(
+    id: string,
+    ownerId: string,
+    uploadLeaseToken: string,
+    leaseSeconds: number,
+  ): MaybePromise<AttachmentUploadStage>;
+  markAttachmentUploadStored(
+    id: string,
+    ownerId: string,
+    uploadLeaseToken: string,
+    leaseSeconds: number,
+  ): MaybePromise<AttachmentUploadStage>;
+  createAttachmentFromUploadStage(
+    id: string,
+    ownerId: string,
+    uploadLeaseToken: string,
+    input: CreateAttachmentInput,
+    quota?: AttachmentStorageQuota,
+  ): MaybePromise<CreateAttachmentResult>;
+  requestAttachmentUploadCleanup(
+    id: string,
+    ownerId: string,
+    uploadLeaseToken: string,
+    reason: string,
+  ): MaybePromise<AttachmentUploadStage>;
+  abandonAttachmentUpload(
+    id: string,
+    ownerId: string,
+    reason: string,
+  ): MaybePromise<AttachmentUploadStage>;
   stageFileUpload(input: StageFileUploadInput): MaybePromise<FileUploadStage>;
   markFileUploadStored(requestId: string, leaseToken: string): MaybePromise<FileUploadStage>;
   listStaleFileUploads(limit?: number): MaybePromise<StaleFileUpload[]>;
   attachmentObjectReferenceCount(objectKey: string): MaybePromise<number>;
-  finalizeFileUpload(input: FinalizeFileUploadInput): MaybePromise<FinalizeFileUploadResult>;
+  finalizeFileUpload(
+    input: FinalizeFileUploadInput,
+    quota?: AttachmentStorageQuota,
+  ): MaybePromise<FinalizeFileUploadResult>;
   listAttachments(ownerId: string, includeDeleted?: boolean): MaybePromise<AttachmentRecord[]>;
   listAttachmentPage(
     ownerId: string,
@@ -2417,6 +2620,18 @@ export interface DomainRepository {
     nextState: AttachmentState,
     inspectionError?: string | null,
   ): MaybePromise<AttachmentRecord>;
+  requestAttachmentReinspection(
+    input: RequestAttachmentReinspectionInput,
+  ): MaybePromise<AttachmentReinspectionResult>;
+  transitionAttachmentInspection(
+    input: TransitionAttachmentInspectionInput,
+  ): MaybePromise<AttachmentRecord>;
+  attachmentStorageUsage(ownerId: string): MaybePromise<AttachmentStorageUsage>;
+  adminStorageSummary(actorId: string): MaybePromise<AdminStorageSummary>;
+  listAdminAttachments(
+    actorId: string,
+    query: AdminAttachmentQuery,
+  ): MaybePromise<AdminAttachmentPage>;
   linkAttachmentToMessage(
     messageId: string,
     attachmentId: string,
@@ -2460,6 +2675,14 @@ export interface DomainRepository {
     usageRunId: string,
     reason: string,
   ): MaybePromise<number>;
+  /**
+   * Settle a generated cleanup only after the object-store delete succeeds. Replays are
+   * idempotent; cleanupAttachment=false stages never decrement retained-storage counters.
+   */
+  settleGeneratedObjectCleanup(
+    stageId: string,
+    ownerId: string,
+  ): MaybePromise<GeneratedObjectCleanupSettlement>;
   beginAttachmentIngestion(id: string, ownerId: string): MaybePromise<AttachmentRecord>;
   completeAttachmentIngestion(
     id: string,

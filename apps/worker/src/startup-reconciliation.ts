@@ -47,6 +47,38 @@ export async function reconcileGeneratedCleanupBatch(
   });
 }
 
+export async function reconcileAttachmentUploadCleanupBatch(
+  sql: Sql,
+  graceSeconds: number,
+): Promise<number> {
+  return await sql.begin(async (tx) => {
+    const rows = await tx<{ id: string; owner_id: string }[]>`
+      WITH candidates AS (
+        SELECT id FROM attachment_upload_staging
+        WHERE state IN('pending','stored','cleaning')
+          AND upload_lease_expires_at<=now()
+          AND updated_at < now() - ${graceSeconds} * interval '1 second'
+          AND upload_lease_expires_at <= now()
+        ORDER BY updated_at,id FOR UPDATE SKIP LOCKED LIMIT ${BATCH_SIZE}
+      )
+      UPDATE attachment_upload_staging stage
+      SET state='cleanup_pending',
+        cleanup_error=COALESCE(cleanup_error,'stale browser attachment upload'),
+        updated_at=now()
+      FROM candidates WHERE stage.id=candidates.id RETURNING stage.id,stage.owner_id`;
+    for (const row of rows) {
+      await tx`INSERT INTO jobs(type,payload,idempotency_key,status,attempts,available_at)
+        VALUES('attachment_object.cleanup',${
+        tx.json({ stageId: String(row.id), ownerId: String(row.owner_id) })
+      },${`attachment_object.cleanup:${String(row.id)}`},'queued',0,now())
+        ON CONFLICT(idempotency_key) DO UPDATE SET status='queued',attempts=0,available_at=now(),
+          last_error=NULL,locked_at=NULL,locked_by=NULL,completed_at=NULL
+          WHERE jobs.status IN('completed','failed')`;
+    }
+    return rows.length;
+  });
+}
+
 export async function reconcileEmbeddingJobsBatch(
   sql: Sql,
   identity: StartupEmbeddingIdentity,
@@ -93,6 +125,15 @@ export async function reconcileStartupQueues(
   while (true) {
     options.signal.throwIfAborted();
     const count = await reconcileGeneratedCleanupBatch(
+      sql,
+      options.generatedCleanupGraceSeconds,
+    );
+    cleanup += count;
+    if (count < BATCH_SIZE) break;
+  }
+  while (true) {
+    options.signal.throwIfAborted();
+    const count = await reconcileAttachmentUploadCleanupBatch(
       sql,
       options.generatedCleanupGraceSeconds,
     );

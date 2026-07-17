@@ -22,10 +22,10 @@ Deno.test({
         VALUES(${userId},${`${userId}@startup-reconciliation.test`},'Startup reconciliation',
           'hash','admin','approved','active')`;
       await sql`INSERT INTO attachments(id,owner_id,object_key,filename,mime_type,size_bytes,
-          sha256,state,ingestion_status,ingested_at,created_at)
+          sha256,state,ingestion_status,ingested_at,created_at,physical_object)
         SELECT gen_random_uuid(),${userId},'users/'||${userId}||'/startup-'||n||'.txt',
           'startup-'||n||'.txt','text/plain',1,lpad(to_hex(n),64,'0'),'ready','ready',now(),
-          now()+n*interval '1 millisecond' FROM generate_series(1,205) n`;
+          now()+n*interval '1 millisecond',false FROM generate_series(1,205) n`;
       await sql`INSERT INTO document_chunks(id,attachment_id,ordinal,content,metadata)
         SELECT gen_random_uuid(),id,0,'startup content','{}'::jsonb FROM attachments
         WHERE owner_id=${userId}`;

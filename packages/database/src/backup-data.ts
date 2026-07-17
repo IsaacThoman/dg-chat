@@ -10,7 +10,8 @@ import {
   type ProviderProtocol,
 } from "./provider-model-invariants.ts";
 
-export const BACKUP_DATA_SCHEMA_VERSION = "0049" as const;
+export const BACKUP_DATA_SCHEMA_VERSION = "0050" as const;
+const PRE_ATTACHMENT_CONTROL_BACKUP_DATA_SCHEMA_VERSION = "0049" as const;
 const PRE_AUTOMATIC_RETENTION_BACKUP_DATA_SCHEMA_VERSION = "0045" as const;
 const PRE_TOOL_ACCOUNTING_BACKUP_DATA_SCHEMA_VERSION = "0043" as const;
 const PRE_AUTHORITY_EPOCH_BACKUP_DATA_SCHEMA_VERSION = "0039" as const;
@@ -22,6 +23,14 @@ const TEMPORARY_LIFECYCLE_BACKUP_DATA_SCHEMA_VERSION = "0032" as const;
 const LEGACY_BACKUP_DATA_SCHEMA_VERSION = "0028" as const;
 export const PRE_AUTOMATIC_RETENTION_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
   new Set(["retention_schedule_state"]),
+);
+export const PRE_ATTACHMENT_CONTROL_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
+  new Set([
+    "attachment_storage_installation",
+    "attachment_storage_usage",
+    "attachment_storage_blobs",
+    "attachment_storage_releases",
+  ]),
 );
 export const LEGACY_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
   new Set([
@@ -44,6 +53,7 @@ export const PRE_IMMUTABLE_SHARING_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
 );
 export function isSupportedBackupDataSchemaVersion(value: string): boolean {
   return value === BACKUP_DATA_SCHEMA_VERSION ||
+    value === PRE_ATTACHMENT_CONTROL_BACKUP_DATA_SCHEMA_VERSION ||
     value === PRE_AUTOMATIC_RETENTION_BACKUP_DATA_SCHEMA_VERSION ||
     value === PRE_TOOL_ACCOUNTING_BACKUP_DATA_SCHEMA_VERSION ||
     value === PRE_AUTHORITY_EPOCH_BACKUP_DATA_SCHEMA_VERSION ||
@@ -56,8 +66,26 @@ export function isSupportedBackupDataSchemaVersion(value: string): boolean {
 }
 const hasCurrentPortableRowShape = (version: string) =>
   version === BACKUP_DATA_SCHEMA_VERSION ||
+  version === PRE_ATTACHMENT_CONTROL_BACKUP_DATA_SCHEMA_VERSION ||
   version === PRE_AUTOMATIC_RETENTION_BACKUP_DATA_SCHEMA_VERSION;
 const requiresLegacyPortableUpgrade = (version: string) => !hasCurrentPortableRowShape(version);
+const requiresAttachmentControlUpgrade = (version: string) =>
+  version !== BACKUP_DATA_SCHEMA_VERSION;
+
+export function isCanonicalManifestOnlyAttachmentMetadata(
+  value: Readonly<Record<string, unknown>>,
+): boolean {
+  return value.object_key ===
+      `imports/${String(value.owner_id)}/${String(value.id)}/manifest-only` &&
+    value.state === "failed" &&
+    value.deleted_at !== null &&
+    value.deleted_at !== undefined &&
+    value.inspection_error === "Attachment bytes were not included in the .dgchat manifest" &&
+    value.ingestion_status === "failed" &&
+    value.ingestion_error === "Attachment bytes require a separate restore" &&
+    value.ingested_at === null;
+}
+
 export const BACKUP_DATA_BATCH_SIZE = 100;
 export const BACKUP_DATA_MAX_BATCH_SIZE = 500;
 export const BACKUP_DATA_MAX_ROWS_PER_TABLE = 10_000_000;
@@ -280,13 +308,47 @@ export const BACKUP_DATA_TABLES: readonly BackupDataTable[] = Object.freeze([
   T("access_group_models", "group_id provider_model_id", "group_id,provider_model_id"),
   T("access_group_tokens", "group_id token_id user_id", "group_id,token_id"),
   T(
+    "attachment_storage_installation",
+    "singleton_id physical_bytes physical_objects updated_at",
+    "singleton_id",
+    {
+      singleton_id: "integer",
+      physical_bytes: "bigint",
+      physical_objects: "bigint",
+    },
+  ),
+  T(
+    "attachment_storage_usage",
+    "owner_id physical_bytes physical_objects updated_at",
+    "owner_id",
+    {
+      physical_bytes: "bigint",
+      physical_objects: "bigint",
+    },
+  ),
+  T(
+    "attachment_storage_blobs",
+    "owner_id object_key size_bytes sha256 mime_type admitted_at",
+    "owner_id,object_key",
+    { size_bytes: "bigint" },
+  ),
+  T(
+    "attachment_storage_releases",
+    "id stage_id usage_run_id owner_id object_key attachment_id size_bytes sha256 mime_type reason released_at",
+    "id",
+    { size_bytes: "bigint" },
+  ),
+  T(
     "attachments",
-    "id owner_id object_key filename mime_type size_bytes sha256 width height state created_at inspection_error updated_at deleted_at ingestion_status ingestion_error ingested_at",
+    "id owner_id object_key filename mime_type size_bytes sha256 width height state created_at inspection_error inspection_epoch version physical_object required_inspection_mode inspection_policy_version updated_at deleted_at ingestion_status ingestion_error ingested_at",
     "id",
     {
       size_bytes: "bigint",
       width: "integer",
       height: "integer",
+      inspection_epoch: "integer",
+      version: "integer",
+      physical_object: "boolean",
     },
   ),
   T(
@@ -738,6 +800,36 @@ export async function verifyBackupDataCatalog(databaseUrl: string): Promise<void
         "Database audit history is missing its append-only guard",
       );
     }
+    const storageGuards = await sql<{
+      table_name: string;
+      trigger_name: string;
+      trigger_type: number;
+      function_name: string;
+    }[]>`
+      SELECT c.relname table_name,t.tgname trigger_name,t.tgtype::int trigger_type,
+        p.proname function_name
+      FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid
+      JOIN pg_namespace n ON n.oid=c.relnamespace
+      JOIN pg_proc p ON p.oid=t.tgfoid
+      WHERE n.nspname='public' AND NOT t.tgisinternal AND (
+        (c.relname='attachment_storage_blobs' AND
+          t.tgname='dg_chat_attachment_storage_blobs_append_only') OR
+        (c.relname='attachment_storage_releases' AND
+          t.tgname='dg_chat_attachment_storage_releases_append_only')
+      ) ORDER BY c.relname
+    `;
+    if (
+      storageGuards.length !== 2 ||
+      storageGuards.some((guard) =>
+        guard.trigger_type !== 58 ||
+        guard.function_name !== "dg_chat_enforce_attachment_blob_history"
+      )
+    ) {
+      throw new BackupDataError(
+        "invariant",
+        "Database attachment storage history is missing its append-only guard",
+      );
+    }
   } finally {
     await sql.end({ timeout: 5 });
   }
@@ -803,6 +895,7 @@ export const BACKUP_EPHEMERAL_TABLES = Object.freeze(
     "api_idempotency_events",
     "api_idempotency_requests",
     "file_upload_staging",
+    "attachment_upload_staging",
     "generation_controls",
     "jobs",
     "document_embedding_batches",
@@ -1109,6 +1202,26 @@ function exactSourceRow(
     return exactRow(definition, { ...(value as Record<string, unknown>), authority_epoch: 1 });
   }
   if (
+    requiresAttachmentControlUpgrade(schemaVersion) &&
+    definition.name === "attachments" && value &&
+    typeof value === "object" && !Array.isArray(value)
+  ) {
+    const legacy = value as Record<string, unknown>;
+    return exactRow(definition, {
+      ...legacy,
+      width: "width" in legacy ? legacy.width : null,
+      height: "height" in legacy ? legacy.height : null,
+      inspection_epoch: 1,
+      version: 1,
+      // Pre-0050 conversation imports used an exact, server-authored tombstone shape because a
+      // physical-presence column did not yet exist. This compatibility rule is intentionally
+      // confined to legacy archives; all new writes persist the explicit physical_object bit.
+      physical_object: !isCanonicalManifestOnlyAttachmentMetadata(legacy),
+      required_inspection_mode: "local",
+      inspection_policy_version: "worker-policy-v1",
+    });
+  }
+  if (
     requiresLegacyPortableUpgrade(schemaVersion) && definition.name === "attachments" && value &&
     typeof value === "object" && !Array.isArray(value) && !("width" in value) &&
     !("height" in value)
@@ -1224,6 +1337,15 @@ async function stageSource(
       );
     }
     let count = 0;
+    const omittedByWireVersion = requiresAttachmentControlUpgrade(source.schemaVersion) &&
+        PRE_ATTACHMENT_CONTROL_BACKUP_DATA_OMITTED_TABLES.has(definition.name) ||
+      source.schemaVersion !== BACKUP_DATA_SCHEMA_VERSION &&
+        source.schemaVersion !== PRE_ATTACHMENT_CONTROL_BACKUP_DATA_SCHEMA_VERSION &&
+        PRE_AUTOMATIC_RETENTION_BACKUP_DATA_OMITTED_TABLES.has(definition.name);
+    if (omittedByWireVersion) {
+      counts[definition.name] = 0;
+      continue;
+    }
     for await (const batch of source.rows(definition.name)) {
       if (!Array.isArray(batch) || batch.length > BACKUP_DATA_MAX_BATCH_SIZE) {
         throw new BackupDataError("invalid_source", `${definition.name} batch is invalid`);
@@ -1238,7 +1360,10 @@ async function stageSource(
         const placeholders = definition.columns.map((column) => {
           let value = row[column];
           if (
-            definition.name === "attachments" && column === "object_key" &&
+            (definition.name === "attachments" ||
+              definition.name === "attachment_storage_blobs" ||
+              definition.name === "attachment_storage_releases") &&
+            column === "object_key" &&
             typeof value === "string"
           ) {
             value = objectKeyMap.get(value) ?? value;
@@ -1276,6 +1401,30 @@ async function stageSource(
     await tx.unsafe(
       `INSERT INTO ${schedule}(singleton_id,interval_seconds,next_due_at,updated_at)
        VALUES(1,86400,now(),now()) ON CONFLICT(singleton_id) DO NOTHING`,
+    );
+  }
+  if (requiresAttachmentControlUpgrade(source.schemaVersion)) {
+    const attachments = safeIdentifier(stage.get("attachments")!);
+    const blobs = safeIdentifier(stage.get("attachment_storage_blobs")!);
+    const usage = safeIdentifier(stage.get("attachment_storage_usage")!);
+    const installation = safeIdentifier(stage.get("attachment_storage_installation")!);
+    await tx.unsafe(
+      `INSERT INTO ${blobs}(owner_id,object_key,size_bytes,sha256,mime_type,admitted_at)
+       SELECT DISTINCT ON(owner_id,object_key)
+         owner_id,object_key,size_bytes,sha256,mime_type,created_at
+       FROM ${attachments} WHERE physical_object=true
+       ORDER BY owner_id,object_key,created_at,id`,
+    );
+    await tx.unsafe(
+      `INSERT INTO ${usage}(owner_id,physical_bytes,physical_objects,updated_at)
+       SELECT owner_id,sum(size_bytes),count(*),now()
+       FROM ${blobs} GROUP BY owner_id`,
+    );
+    await tx.unsafe(
+      `INSERT INTO ${installation}(
+         singleton_id,physical_bytes,physical_objects,updated_at
+       )
+       SELECT 1,COALESCE(sum(size_bytes),0),count(*),now() FROM ${blobs}`,
     );
   }
   if (requiresLegacyPortableUpgrade(source.schemaVersion)) {
@@ -1479,6 +1628,36 @@ const RELATIONS: readonly BackupRelation[] = Object.freeze([
     columns: ["user_id", "token_id"],
     to: "api_tokens",
     target: ["user_id", "id"],
+  },
+  {
+    from: "attachment_storage_usage",
+    columns: ["owner_id"],
+    to: "users",
+    target: ["id"],
+  },
+  {
+    from: "attachment_storage_blobs",
+    columns: ["owner_id"],
+    to: "users",
+    target: ["id"],
+  },
+  {
+    from: "attachment_storage_releases",
+    columns: ["owner_id", "object_key"],
+    to: "attachment_storage_blobs",
+    target: ["owner_id", "object_key"],
+  },
+  {
+    from: "attachment_storage_releases",
+    columns: ["owner_id", "usage_run_id"],
+    to: "usage_runs",
+    target: ["user_id", "id"],
+  },
+  {
+    from: "attachment_storage_releases",
+    columns: ["owner_id", "attachment_id"],
+    to: "attachments",
+    target: ["owner_id", "id"],
   },
   { from: "attachments", columns: ["owner_id"], to: "users", target: ["id"] },
   { from: "conversations", columns: ["owner_id"], to: "users", target: ["id"] },
@@ -1795,6 +1974,116 @@ async function validateStagedDatabase(
       "Restore must contain exactly one retention schedule state",
     );
   }
+  const invalidStorageSingleton = await tx.unsafe(
+    `SELECT 1 FROM ${staged("attachment_storage_installation")}
+      WHERE singleton_id<>1
+      UNION ALL
+      SELECT 1 WHERE (SELECT count(*) FROM ${staged("attachment_storage_installation")})<>1
+      LIMIT 1`,
+  );
+  if (invalidStorageSingleton.length) {
+    throw new BackupDataError(
+      "invariant",
+      "Restore must contain exactly one attachment storage installation state",
+    );
+  }
+  const invalidStorageAccounting = await tx.unsafe(
+    `WITH expected_owner AS (
+       SELECT blob.owner_id,sum(blob.size_bytes) physical_bytes,count(*) physical_objects
+       FROM ${staged("attachment_storage_blobs")} blob
+       LEFT JOIN ${staged("attachment_storage_releases")} release
+         ON release.owner_id=blob.owner_id AND release.object_key=blob.object_key
+       WHERE release.id IS NULL GROUP BY blob.owner_id
+     ), owner_mismatch AS (
+       SELECT 1 FROM ${staged("attachment_storage_usage")} usage
+       FULL JOIN expected_owner expected USING(owner_id)
+       WHERE COALESCE(usage.physical_bytes,0)<>COALESCE(expected.physical_bytes,0)
+          OR COALESCE(usage.physical_objects,0)<>COALESCE(expected.physical_objects,0)
+     ), installation_mismatch AS (
+       SELECT 1 FROM ${staged("attachment_storage_installation")} installation
+       CROSS JOIN (
+         SELECT COALESCE(sum(blob.size_bytes),0) physical_bytes,count(*) physical_objects
+         FROM ${staged("attachment_storage_blobs")} blob
+         LEFT JOIN ${staged("attachment_storage_releases")} release
+           ON release.owner_id=blob.owner_id AND release.object_key=blob.object_key
+         WHERE release.id IS NULL
+       ) expected
+       WHERE installation.physical_bytes<>expected.physical_bytes
+          OR installation.physical_objects<>expected.physical_objects
+     ), attachment_mismatch AS (
+       SELECT 1 FROM ${staged("attachments")} attachment
+       LEFT JOIN ${staged("attachment_storage_blobs")} blob
+         ON blob.owner_id=attachment.owner_id AND blob.object_key=attachment.object_key
+       WHERE attachment.physical_object=true AND (
+         blob.owner_id IS NULL OR blob.size_bytes<>attachment.size_bytes
+          OR blob.sha256<>attachment.sha256 OR blob.mime_type<>attachment.mime_type)
+     ), invalid_nonphysical_attachment AS (
+       SELECT 1 FROM ${staged("attachments")} attachment
+       WHERE attachment.physical_object=false AND (
+         attachment.object_key='imports/' || attachment.owner_id::text || '/' ||
+           attachment.id::text || '/manifest-only' AND
+         attachment.state='failed' AND attachment.deleted_at IS NOT NULL AND
+         attachment.inspection_error=
+           'Attachment bytes were not included in the .dgchat manifest' AND
+         attachment.ingestion_status='failed' AND
+         attachment.ingestion_error='Attachment bytes require a separate restore' AND
+         attachment.ingested_at IS NULL
+       ) IS NOT TRUE
+     ), active_blob_without_attachment AS (
+       SELECT 1 FROM ${staged("attachment_storage_blobs")} blob
+       WHERE NOT EXISTS(
+         SELECT 1 FROM ${staged("attachment_storage_releases")} release
+         WHERE release.owner_id=blob.owner_id AND release.object_key=blob.object_key
+       ) AND NOT EXISTS(
+         SELECT 1 FROM ${staged("attachments")} attachment
+         WHERE attachment.owner_id=blob.owner_id AND attachment.object_key=blob.object_key
+           AND attachment.physical_object=true
+       )
+     ), invalid_release AS (
+       SELECT 1 FROM ${staged("attachment_storage_releases")} release
+       JOIN ${staged("attachment_storage_blobs")} blob
+         ON blob.owner_id=release.owner_id AND blob.object_key=release.object_key
+       LEFT JOIN ${staged("attachments")} attachment
+         ON attachment.id=release.attachment_id AND attachment.owner_id=release.owner_id
+       WHERE release.size_bytes<>blob.size_bytes OR release.sha256<>blob.sha256 OR
+         release.mime_type<>blob.mime_type OR
+         release.released_at<blob.admitted_at OR attachment.id IS NULL OR
+         attachment.physical_object IS NOT TRUE OR
+         attachment.object_key<>release.object_key OR attachment.size_bytes<>release.size_bytes OR
+         attachment.sha256<>release.sha256 OR attachment.mime_type<>release.mime_type OR
+         attachment.deleted_at IS NULL OR attachment.state<>'deleted' OR
+         EXISTS(SELECT 1 FROM ${staged("attachments")} other
+           WHERE other.owner_id=release.owner_id AND other.object_key=release.object_key
+             AND other.id<>release.attachment_id) OR
+         EXISTS(SELECT 1 FROM ${staged("message_attachments")} r
+           WHERE r.attachment_id=release.attachment_id) OR
+         EXISTS(SELECT 1 FROM ${staged("knowledge_collection_attachments")} r
+           WHERE r.attachment_id=release.attachment_id) OR
+         EXISTS(SELECT 1 FROM ${staged("document_chunks")} r
+           WHERE r.attachment_id=release.attachment_id) OR
+         EXISTS(SELECT 1 FROM ${staged("generated_assets")} r
+           WHERE r.attachment_id=release.attachment_id OR
+             r.usage_run_id=release.usage_run_id) OR
+         EXISTS(SELECT 1 FROM ${staged("generated_asset_inputs")} r
+           WHERE r.attachment_id=release.attachment_id) OR
+         EXISTS(SELECT 1 FROM ${staged("conversation_share_snapshots")} snapshot
+           CROSS JOIN LATERAL jsonb_each(snapshot.source_attachments) source
+           WHERE source.value->>'attachmentId'=release.attachment_id::text)
+     )
+     SELECT 1 FROM owner_mismatch
+     UNION ALL SELECT 1 FROM installation_mismatch
+     UNION ALL SELECT 1 FROM attachment_mismatch
+     UNION ALL SELECT 1 FROM invalid_nonphysical_attachment
+     UNION ALL SELECT 1 FROM active_blob_without_attachment
+     UNION ALL SELECT 1 FROM invalid_release
+     LIMIT 1`,
+  );
+  if (invalidStorageAccounting.length) {
+    throw new BackupDataError(
+      "invariant",
+      "Backup attachment storage accounting is inconsistent",
+    );
+  }
   for (const relation of RELATIONS) {
     const present = relation.columns.map((column) => `f.${safeIdentifier(column)} IS NOT NULL`)
       .join(" AND ");
@@ -1999,6 +2288,119 @@ async function validateRestoredDatabase(tx: postgres.TransactionSql): Promise<vo
   `;
   if (!admins || admins.count < 1) {
     throw new BackupDataError("invariant", "Restore must contain an active approved administrator");
+  }
+  // All three staging catalogs are deliberately excluded from portable data and are truncated
+  // before live rows are installed. Keep them in the release audit anyway: this makes the
+  // post-apply invariant exactly match online cleanup fencing and fails closed if restore ordering
+  // is ever changed without updating validation.
+  const invalidStorageAccounting = await tx`
+    WITH expected_owner AS (
+      SELECT blob.owner_id,sum(blob.size_bytes) physical_bytes,count(*) physical_objects
+      FROM attachment_storage_blobs blob
+      LEFT JOIN attachment_storage_releases release
+        ON release.owner_id=blob.owner_id AND release.object_key=blob.object_key
+      WHERE release.id IS NULL GROUP BY blob.owner_id
+    ), owner_mismatch AS (
+      SELECT 1 FROM attachment_storage_usage usage
+      FULL JOIN expected_owner expected USING(owner_id)
+      WHERE COALESCE(usage.physical_bytes,0)<>COALESCE(expected.physical_bytes,0)
+        OR COALESCE(usage.physical_objects,0)<>COALESCE(expected.physical_objects,0)
+    ), installation_mismatch AS (
+      SELECT 1 FROM attachment_storage_installation installation
+      CROSS JOIN (
+        SELECT COALESCE(sum(blob.size_bytes),0) physical_bytes,count(*) physical_objects
+        FROM attachment_storage_blobs blob
+        LEFT JOIN attachment_storage_releases release
+          ON release.owner_id=blob.owner_id AND release.object_key=blob.object_key
+        WHERE release.id IS NULL
+      ) expected
+      WHERE installation.singleton_id<>1
+        OR installation.physical_bytes<>expected.physical_bytes
+        OR installation.physical_objects<>expected.physical_objects
+    ), attachment_mismatch AS (
+      SELECT 1 FROM attachments attachment
+      LEFT JOIN attachment_storage_blobs blob
+        ON blob.owner_id=attachment.owner_id AND blob.object_key=attachment.object_key
+      WHERE attachment.physical_object=true AND (
+        blob.owner_id IS NULL OR blob.size_bytes<>attachment.size_bytes
+        OR blob.sha256<>attachment.sha256 OR blob.mime_type<>attachment.mime_type)
+    ), invalid_nonphysical_attachment AS (
+      SELECT 1 FROM attachments attachment
+      WHERE attachment.physical_object=false AND (
+        attachment.object_key='imports/' || attachment.owner_id::text || '/' ||
+          attachment.id::text || '/manifest-only' AND
+        attachment.state='failed' AND attachment.deleted_at IS NOT NULL AND
+        attachment.inspection_error=
+          'Attachment bytes were not included in the .dgchat manifest' AND
+        attachment.ingestion_status='failed' AND
+        attachment.ingestion_error='Attachment bytes require a separate restore' AND
+        attachment.ingested_at IS NULL
+      ) IS NOT TRUE
+    ), active_blob_without_attachment AS (
+      SELECT 1 FROM attachment_storage_blobs blob
+      WHERE NOT EXISTS(
+        SELECT 1 FROM attachment_storage_releases release
+        WHERE release.owner_id=blob.owner_id AND release.object_key=blob.object_key
+      ) AND NOT EXISTS(
+        SELECT 1 FROM attachments attachment
+        WHERE attachment.owner_id=blob.owner_id AND attachment.object_key=blob.object_key
+          AND attachment.physical_object=true
+      )
+    ), invalid_release AS (
+      SELECT 1 FROM attachment_storage_releases release
+      JOIN attachment_storage_blobs blob
+        ON blob.owner_id=release.owner_id AND blob.object_key=release.object_key
+      LEFT JOIN attachments attachment
+        ON attachment.id=release.attachment_id AND attachment.owner_id=release.owner_id
+      WHERE release.size_bytes<>blob.size_bytes OR release.sha256<>blob.sha256 OR
+        release.mime_type<>blob.mime_type OR
+        release.released_at<blob.admitted_at OR attachment.id IS NULL OR
+        attachment.physical_object IS NOT TRUE OR
+        attachment.object_key<>release.object_key OR attachment.size_bytes<>release.size_bytes OR
+        attachment.sha256<>release.sha256 OR attachment.mime_type<>release.mime_type OR
+        attachment.deleted_at IS NULL OR attachment.state<>'deleted' OR
+        EXISTS(SELECT 1 FROM attachments other
+          WHERE other.owner_id=release.owner_id AND other.object_key=release.object_key
+            AND other.id<>release.attachment_id) OR
+        EXISTS(SELECT 1 FROM message_attachments r
+          WHERE r.attachment_id=release.attachment_id) OR
+        EXISTS(SELECT 1 FROM knowledge_collection_attachments r
+          WHERE r.attachment_id=release.attachment_id) OR
+        EXISTS(SELECT 1 FROM document_chunks r
+          WHERE r.attachment_id=release.attachment_id) OR
+        EXISTS(SELECT 1 FROM generated_assets r
+          WHERE r.attachment_id=release.attachment_id OR
+            r.usage_run_id=release.usage_run_id) OR
+        EXISTS(SELECT 1 FROM generated_asset_inputs r
+          WHERE r.attachment_id=release.attachment_id) OR
+        EXISTS(SELECT 1 FROM generated_object_staging r
+          WHERE r.id<>release.stage_id AND r.state<>'cleaned' AND
+            (r.attachment_id=release.attachment_id OR
+              r.owner_id=release.owner_id AND r.object_key=release.object_key)) OR
+        EXISTS(SELECT 1 FROM file_upload_staging r
+          WHERE r.attachment_id=release.attachment_id OR
+            r.owner_id=release.owner_id AND r.object_key=release.object_key) OR
+        EXISTS(SELECT 1 FROM attachment_upload_staging r
+          WHERE r.attachment_id=release.attachment_id OR
+            r.owner_id=release.owner_id AND r.object_key=release.object_key) OR
+        EXISTS(SELECT 1 FROM conversation_share_snapshots snapshot
+          CROSS JOIN LATERAL jsonb_each(snapshot.source_attachments) source
+          WHERE source.value->>'attachmentId'=release.attachment_id::text)
+    )
+    SELECT 1 FROM owner_mismatch
+    UNION ALL SELECT 1 FROM installation_mismatch
+    UNION ALL SELECT 1 FROM attachment_mismatch
+    UNION ALL SELECT 1 FROM invalid_nonphysical_attachment
+    UNION ALL SELECT 1 FROM active_blob_without_attachment
+    UNION ALL SELECT 1 FROM invalid_release
+    UNION ALL SELECT 1 WHERE (SELECT count(*) FROM attachment_storage_installation)<>1
+    LIMIT 1
+  `;
+  if (invalidStorageAccounting.length) {
+    throw new BackupDataError(
+      "invariant",
+      "Backup attachment storage accounting is inconsistent",
+    );
   }
   await validateProviderModels(tx, "providers", "provider_models");
   const cycles = await tx`

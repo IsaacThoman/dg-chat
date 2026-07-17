@@ -1,7 +1,7 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.14";
 import postgres from "npm:postgres@3.4.7";
 import type { ObjectStore, PutObjectInput, StoredObject } from "@dg-chat/database";
-import { PostgresRepository } from "@dg-chat/database";
+import { ATTACHMENT_INSPECTION_POLICY_VERSION, PostgresRepository } from "@dg-chat/database";
 import { runAuditTestMaintenanceSql } from "../../../packages/database/src/postgres-test-maintenance.ts";
 import type { ClaimedJob } from "./job-queue.ts";
 import { parseFileObjectCleanupPayload, processFileObjectCleanup } from "./file-object-cleanup.ts";
@@ -110,6 +110,8 @@ Deno.test({
           purpose: "assistants",
           attachmentState: "ready",
           inspectionError: null,
+          requiredInspectionMode: "local",
+          inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
         });
         await repository.markFileUploadStored(begun.request.id, begun.leaseToken);
         await repository.releaseApiRequestLease(begun.request.id, begun.leaseToken);
@@ -220,6 +222,8 @@ Deno.test({
         purpose: "assistants",
         attachmentState: "ready",
         inspectionError: null,
+        requiredInspectionMode: "local",
+        inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
       });
       const activeClaim = await claimCleanup(active.begun.request.id);
       assertEquals(await processFileObjectCleanup(sql, store, activeClaim), "deferred");
