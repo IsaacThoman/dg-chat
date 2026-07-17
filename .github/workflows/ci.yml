@@ -315,17 +315,18 @@ jobs:
         env:
           POSTGRES_USER: dgchat
           POSTGRES_PASSWORD: backup-integration-password
-          POSTGRES_DB: dgchat_backup_test
+          POSTGRES_DB: dgchat_ci_backup_roundtrip_a
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U dgchat -d dgchat_backup_test"
+          --health-cmd "pg_isready -U dgchat -d dgchat_ci_backup_roundtrip_a"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
     env:
-      DATABASE_URL: postgresql://dgchat:backup-integration-password@localhost:5432/dgchat_backup_test
-      TEST_DATABASE_URL: postgresql://dgchat:backup-integration-password@localhost:5432/dgchat_backup_test
+      DATABASE_URL: postgresql://dgchat:backup-integration-password@localhost:5432/dgchat_ci_backup_roundtrip_a
+      TEST_DATABASE_URL: postgresql://dgchat:backup-integration-password@localhost:5432/dgchat_ci_backup_roundtrip_a
+      DG_CHAT_ALLOW_DESTRUCTIVE_TEST_DATABASES: "true"
       TEST_S3_ENDPOINT: http://127.0.0.1:9000
       TEST_S3_REGION: us-east-1
       TEST_S3_BUCKET: dg-chat-backup-test
