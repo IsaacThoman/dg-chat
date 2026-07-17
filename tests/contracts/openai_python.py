@@ -213,7 +213,7 @@ if (
     or len(embeddings.data) != 2
     or embeddings.data[0].index != 0
     or embeddings.data[1].index != 1
-    or embeddings.data[0].embedding != [0.1, 0.2, 0.3, 0.4]
+    or embeddings.data[0].embedding != [0.01, 0.02, 0.03, 0.04]
     or embeddings.usage.prompt_tokens != 2
     or embeddings.usage.total_tokens != 2
 ):

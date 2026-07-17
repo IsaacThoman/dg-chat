@@ -313,7 +313,7 @@ if (
   embeddings.object !== "list" || embeddings.model !== embeddingModel ||
   embeddings.data.length !== 2 || embeddings.data[0]?.index !== 0 ||
   embeddings.data[1]?.index !== 1 ||
-  JSON.stringify(embeddings.data[0]?.embedding) !== JSON.stringify([0.1, 0.2, 0.3, 0.4]) ||
+  JSON.stringify(embeddings.data[0]?.embedding) !== JSON.stringify([0.01, 0.02, 0.03, 0.04]) ||
   embeddings.usage.prompt_tokens !== 2 || embeddings.usage.total_tokens !== 2
 ) {
   throw new Error("JavaScript embeddings.create() returned an invalid response");
