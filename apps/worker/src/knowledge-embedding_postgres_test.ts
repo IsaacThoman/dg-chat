@@ -1,6 +1,9 @@
 import { assertEquals } from "jsr:@std/assert@1.0.14";
 import postgres from "npm:postgres@3.4.7";
-import { knowledgeEmbeddingIdentityVersion } from "@dg-chat/database";
+import {
+  ATTACHMENT_INSPECTION_POLICY_VERSION,
+  knowledgeEmbeddingIdentityVersion,
+} from "@dg-chat/database";
 import { withAuditTestMaintenance } from "../../../packages/database/src/postgres-test-maintenance.ts";
 
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
@@ -177,7 +180,13 @@ Deno.test({
         ${"b".repeat(64)},'ready','not_applicable')`;
       await sql`INSERT INTO jobs(id,type,payload,idempotency_key)
         VALUES(${restartProbeJobId},'attachment.inspect',${
-        sql.json({ attachmentId: restartProbeAttachmentId, ownerId: userId })
+        sql.json({
+          attachmentId: restartProbeAttachmentId,
+          ownerId: userId,
+          inspectionEpoch: 1,
+          requiredInspectionMode: "local",
+          inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
+        })
       },${`knowledge-restart-probe:${restartProbeJobId}`})`;
       worker = spawnWorker();
       await eventually(async () =>
