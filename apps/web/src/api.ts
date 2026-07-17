@@ -76,7 +76,12 @@ import type {
   AdminSessionSource,
   AdminStorageSummary,
   AdminUser,
+  CommunityLeaderboardMetric,
+  CommunityLeaderboardPage,
+  CommunityLeaderboardWindow,
+  CommunityProfile,
   ModelCapability,
+  UpdateCommunityProfileRequest,
 } from "../../../packages/contracts/src/types.ts";
 
 const json = { "Content-Type": "application/json" };
@@ -628,6 +633,44 @@ export const api = {
     if (demoMode) return demoUser;
     const result = await request<{ user: RawUser; limited: boolean }>("/auth/me");
     return mapUser(result.user, result.limited);
+  },
+  communityProfile: () =>
+    request<CommunityProfile>("/community/profile", undefined, {
+      userId: "demo",
+      optedIn: false,
+      identityMode: "anonymous",
+      nickname: null,
+      color: "slate",
+      shareBalance: false,
+      version: 1,
+      createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString(),
+    }),
+  updateCommunityProfile: (input: UpdateCommunityProfileRequest) =>
+    request<CommunityProfile>("/community/profile", {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    }),
+  communityLeaderboard: (
+    metric: CommunityLeaderboardMetric,
+    window: CommunityLeaderboardWindow,
+    cursor?: string,
+  ) => {
+    const query = new URLSearchParams({ metric, limit: "25" });
+    if (metric !== "balance") query.set("window", window);
+    if (cursor) query.set("cursor", cursor);
+    return request<CommunityLeaderboardPage>(
+      `/community/leaderboard?${query}`,
+      undefined,
+      {
+        metric,
+        window: metric === "balance" ? "current" : window,
+        from: null,
+        asOf: new Date(0).toISOString(),
+        data: [],
+        nextCursor: null,
+      },
+    );
   },
   status: () => request<import("./identityState.ts").AuthStatus>("/auth/status"),
   requestPasswordReset: (email: string) =>

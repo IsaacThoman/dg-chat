@@ -11,6 +11,7 @@ import {
   parseBackupArchiveStream,
   PRE_ATTACHMENT_CONTROL_BACKUP_DATA_OMITTED_TABLES,
   PRE_AUTOMATIC_RETENTION_BACKUP_DATA_OMITTED_TABLES,
+  PRE_COMMUNITY_PROFILE_BACKUP_DATA_OMITTED_TABLES,
   PRE_IMMUTABLE_SHARING_BACKUP_DATA_OMITTED_TABLES,
   sha256Hex,
   signBackupManifest,
@@ -728,6 +729,7 @@ Deno.test("postgres backup data previews and applies a signed legacy 0028 table 
     const omittedNames = new Set(
       [
         ...LEGACY_BACKUP_DATA_OMITTED_TABLES,
+        ...PRE_COMMUNITY_PROFILE_BACKUP_DATA_OMITTED_TABLES,
         ...PRE_ATTACHMENT_CONTROL_BACKUP_DATA_OMITTED_TABLES,
         ...PRE_AUTOMATIC_RETENTION_BACKUP_DATA_OMITTED_TABLES,
       ].map((name) => `tables/${name}.ndjson`),
@@ -789,6 +791,7 @@ Deno.test("postgres backup data accepts supported pre-0039 catalogs", async () =
       const omittedNames = new Set(
         [
           ...omitted,
+          ...PRE_COMMUNITY_PROFILE_BACKUP_DATA_OMITTED_TABLES,
           ...PRE_ATTACHMENT_CONTROL_BACKUP_DATA_OMITTED_TABLES,
           ...PRE_AUTOMATIC_RETENTION_BACKUP_DATA_OMITTED_TABLES,
         ].map((name) => `tables/${name}.ndjson`),
@@ -852,6 +855,7 @@ Deno.test("postgres backup data previews and applies a genuine 0045 catalog", as
   try {
     const omittedNames = new Set(
       [
+        ...PRE_COMMUNITY_PROFILE_BACKUP_DATA_OMITTED_TABLES,
         ...PRE_ATTACHMENT_CONTROL_BACKUP_DATA_OMITTED_TABLES,
         ...PRE_AUTOMATIC_RETENTION_BACKUP_DATA_OMITTED_TABLES,
       ].map((name) => `tables/${name}.ndjson`),
@@ -898,6 +902,40 @@ Deno.test("postgres backup data previews and applies a genuine 0045 catalog", as
   }
 });
 
+Deno.test("postgres backup data accepts the pre-community 0050 catalog without consent", async () => {
+  const fx = await fixture();
+  const snapshot = await fx.adapter.exportSnapshot({
+    includeDiagnostics: false,
+    installationId: "installation-test",
+  });
+  try {
+    const omittedNames = new Set(
+      [...PRE_COMMUNITY_PROFILE_BACKUP_DATA_OMITTED_TABLES].map((name) => `tables/${name}.ndjson`),
+    );
+    const entries = snapshot.manifest.entries.filter((entry) => !omittedNames.has(entry.name));
+    const { signature: _signature, ...unsigned } = snapshot.manifest;
+    const manifest = await signBackupManifest({
+      ...unsigned,
+      schemaVersion: "0050",
+      entries,
+      contentRootSha256: await backupContentRoot(entries),
+    }, fx.authenticator);
+    const payloads = new Map(snapshot.payloads);
+    for (const name of omittedNames) payloads.delete(name);
+    const session = await fx.adapter.restoreSession("preview", { restoreOperationId });
+    const parsed = await parseBackupArchiveStream(
+      writeBackupArchiveStream(manifest, payloads, fx.authenticator),
+      fx.authenticator,
+      session.sink,
+    );
+    const preview = await session.summarize(parsed);
+    assertEquals(preview.counts.find((row) => row.resource === "attachments")?.create, 1);
+    await session.rollback();
+  } finally {
+    await snapshot.cleanup?.();
+  }
+});
+
 Deno.test("postgres backup data accepts the pre-control-plane 0049 catalog", async () => {
   const fx = await fixture();
   const snapshot = await fx.adapter.exportSnapshot({
@@ -906,7 +944,10 @@ Deno.test("postgres backup data accepts the pre-control-plane 0049 catalog", asy
   });
   try {
     const omittedNames = new Set(
-      [...PRE_ATTACHMENT_CONTROL_BACKUP_DATA_OMITTED_TABLES].map((name) => `tables/${name}.ndjson`),
+      [
+        ...PRE_COMMUNITY_PROFILE_BACKUP_DATA_OMITTED_TABLES,
+        ...PRE_ATTACHMENT_CONTROL_BACKUP_DATA_OMITTED_TABLES,
+      ].map((name) => `tables/${name}.ndjson`),
     );
     const entries = snapshot.manifest.entries.filter((entry) => !omittedNames.has(entry.name));
     const { signature: _signature, ...unsigned } = snapshot.manifest;

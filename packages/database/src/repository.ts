@@ -19,6 +19,11 @@ import type {
   ApiTokenSummary,
   ApprovalStatus,
   AttachmentStorageUsage,
+  CommunityColorToken,
+  CommunityIdentityMode,
+  CommunityLeaderboardMetric,
+  CommunityLeaderboardWindow,
+  CommunityProfile,
   Conversation,
   ConversationDetail,
   ConversationFolder,
@@ -38,11 +43,13 @@ import type {
   PublicConversationShare,
   PublicConversationShareAttachment,
   PublicUser,
+  UpdateCommunityProfileRequest,
   UsageSummary,
   UserPreferences,
   UserRole,
 } from "@dg-chat/contracts";
 import {
+  COMMUNITY_COLOR_TOKENS,
   hasVisibleConversationSearchText,
   stripConversationSearchControls,
 } from "@dg-chat/contracts";
@@ -1559,6 +1566,145 @@ export type UserPreferencesPatch =
     >
   >
   & { expectedVersion: number };
+
+/** Authenticated self-service actor for an atomically audited consent mutation. */
+export interface CommunityProfileMutationContext {
+  actorId: string;
+}
+
+export type CommunityProfilePatch = UpdateCommunityProfileRequest;
+
+/** Expected validation failure at the persistence boundary, safe to project as a client error. */
+export class CommunityProfileValidationError extends TypeError {}
+
+const COMMUNITY_NICKNAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9_. -]{0,30}[A-Za-z0-9])?$/;
+const COMMUNITY_PROFILE_PATCH_FIELDS = new Set([
+  "expectedVersion",
+  "optedIn",
+  "identityMode",
+  "nickname",
+  "color",
+  "shareBalance",
+]);
+
+/**
+ * Persistence-boundary canonicalization. API schemas are defense in depth; direct repository
+ * callers and future transports receive the exact same consent and display-identity invariants.
+ */
+export function applyCommunityProfilePatch(
+  current: CommunityProfile,
+  patch: CommunityProfilePatch,
+): Omit<CommunityProfile, "version" | "createdAt" | "updatedAt"> {
+  const nickname = typeof patch?.nickname === "string" ? patch.nickname.trim() : patch?.nickname;
+  if (
+    !patch || typeof patch !== "object" || Array.isArray(patch) ||
+    Object.keys(patch).some((key) => !COMMUNITY_PROFILE_PATCH_FIELDS.has(key)) ||
+    !Number.isSafeInteger(patch.expectedVersion) || patch.expectedVersion < 1 ||
+    Object.keys(patch).every((key) => key === "expectedVersion") ||
+    (patch.optedIn !== undefined && typeof patch.optedIn !== "boolean") ||
+    (patch.identityMode !== undefined &&
+      patch.identityMode !== "anonymous" && patch.identityMode !== "nickname") ||
+    (nickname !== undefined && nickname !== null &&
+      (typeof nickname !== "string" || nickname.length < 2 ||
+        nickname.length > 32 || !COMMUNITY_NICKNAME_PATTERN.test(nickname))) ||
+    (patch.color !== undefined &&
+      !(COMMUNITY_COLOR_TOKENS as readonly string[]).includes(patch.color)) ||
+    (patch.shareBalance !== undefined && typeof patch.shareBalance !== "boolean")
+  ) {
+    throw new CommunityProfileValidationError("Community profile update is invalid");
+  }
+
+  const optedIn = patch.optedIn ?? current.optedIn;
+  const identityMode = patch.identityMode ?? current.identityMode;
+  let canonicalNickname = nickname === undefined ? current.nickname : nickname;
+  if (identityMode === "anonymous") {
+    if (nickname != null) {
+      throw new CommunityProfileValidationError("Anonymous identity cannot publish a nickname");
+    }
+    canonicalNickname = null;
+  } else if (!canonicalNickname) {
+    throw new CommunityProfileValidationError("Nickname identity requires a nickname");
+  }
+  if (!optedIn && patch.shareBalance === true) {
+    throw new CommunityProfileValidationError(
+      "Balance sharing requires leaderboard participation",
+    );
+  }
+  return {
+    userId: current.userId,
+    optedIn,
+    identityMode,
+    nickname: canonicalNickname,
+    color: patch.color ?? current.color,
+    shareBalance: optedIn ? patch.shareBalance ?? current.shareBalance : false,
+  };
+}
+
+export interface CommunityLeaderboardBoundary {
+  score: number;
+  userId: string;
+  position: number;
+}
+
+export interface CommunityLeaderboardReadQuery {
+  metric: CommunityLeaderboardMetric;
+  window: CommunityLeaderboardWindow | "current";
+  from: string | null;
+  asOf: string;
+  limit: number;
+  after?: CommunityLeaderboardBoundary;
+}
+
+/** Internal row; API projection must remove `userId` before serialization. */
+export interface CommunityLeaderboardRepositoryEntry {
+  userId: string;
+  position: number;
+  identityMode: CommunityIdentityMode;
+  nickname: string | null;
+  color: CommunityColorToken;
+  value: number;
+}
+
+export interface CommunityLeaderboardRepositoryPage {
+  data: CommunityLeaderboardRepositoryEntry[];
+  nextBoundary: CommunityLeaderboardBoundary | null;
+}
+
+const COMMUNITY_LEADERBOARD_METRIC_SET = new Set(["calls", "tokens", "cost", "balance"]);
+const COMMUNITY_LEADERBOARD_WINDOW_DAYS = { "7d": 7, "30d": 30, "90d": 90 } as const;
+const COMMUNITY_LEADERBOARD_UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+export function validateCommunityLeaderboardReadQuery(
+  input: CommunityLeaderboardReadQuery,
+): CommunityLeaderboardReadQuery {
+  const asOfMs = Date.parse(input?.asOf);
+  const fromMs = input?.from === null ? null : Date.parse(input?.from);
+  const days = input?.window === "current"
+    ? null
+    : COMMUNITY_LEADERBOARD_WINDOW_DAYS[input?.window];
+  if (
+    !input || typeof input !== "object" ||
+    !COMMUNITY_LEADERBOARD_METRIC_SET.has(input.metric) ||
+    !Number.isFinite(asOfMs) || new Date(asOfMs).toISOString() !== input.asOf ||
+    !Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 100 ||
+    (input.metric === "balance" &&
+      (input.window !== "current" || input.from !== null)) ||
+    (input.metric !== "balance" &&
+      (input.window === "current" ||
+        days == null || fromMs === null ||
+        !Number.isFinite(fromMs) || new Date(fromMs).toISOString() !== input.from ||
+        fromMs >= asOfMs || asOfMs - fromMs !== days * 86_400_000)) ||
+    (input.after !== undefined &&
+      (!input.after || !Number.isSafeInteger(input.after.score) || input.after.score < 0 ||
+        !Number.isSafeInteger(input.after.position) || input.after.position < 1 ||
+        !COMMUNITY_LEADERBOARD_UUID_PATTERN.test(input.after.userId)))
+  ) {
+    throw new TypeError("Community leaderboard query is invalid");
+  }
+  return input;
+}
+
 export interface WorkspaceList {
   folders: ConversationFolder[];
   memberships: ConversationFolderMembership[];
@@ -2480,6 +2626,7 @@ export interface DomainRepository {
     input: PurgeTemporaryConversationsInput,
   ): MaybePromise<PurgeTemporaryConversationsResult>;
   getUserPreferences(ownerId: string): MaybePromise<UserPreferences>;
+  getCommunityProfile(ownerId: string): MaybePromise<CommunityProfile>;
   exportConversationPortability(
     ownerId: string,
     options?: ConversationPortabilityExportOptions,
@@ -2517,6 +2664,15 @@ export interface DomainRepository {
     ownerId: string,
     patch: UserPreferencesPatch,
   ): MaybePromise<UserPreferences>;
+  /** Updates installation-community consent and appends its audit in the same transaction. */
+  updateCommunityProfile(
+    ownerId: string,
+    patch: CommunityProfilePatch,
+    context: CommunityProfileMutationContext,
+  ): MaybePromise<CommunityProfile>;
+  listCommunityLeaderboard(
+    query: CommunityLeaderboardReadQuery,
+  ): MaybePromise<CommunityLeaderboardRepositoryPage>;
   listConversationFolders(ownerId: string): MaybePromise<WorkspaceList>;
   createConversationFolder(
     ownerId: string,

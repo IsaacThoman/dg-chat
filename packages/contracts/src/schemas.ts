@@ -1,6 +1,12 @@
 import { z } from "npm:zod@4.1.12";
 import { PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH } from "./password-policy.ts";
 import { hasVisibleConversationSearchText } from "./conversation_search.ts";
+import {
+  COMMUNITY_COLOR_TOKENS,
+  COMMUNITY_IDENTITY_MODES,
+  COMMUNITY_LEADERBOARD_METRICS,
+  COMMUNITY_LEADERBOARD_WINDOWS,
+} from "./types.ts";
 
 export const emailSchema = z.string().email().max(320).transform((value) => value.toLowerCase());
 export const passwordSchema = z.string().min(PASSWORD_MIN_LENGTH).max(PASSWORD_MAX_LENGTH);
@@ -101,6 +107,64 @@ export const updatePreferencesSchema = z.object({
   preferredModelId: z.string().trim().min(1).max(200).nullable().optional(),
 }).strict().refine((value) => Object.keys(value).some((key) => key !== "expectedVersion"), {
   message: "At least one preference is required",
+});
+
+/**
+ * Nicknames are intentionally a narrow, display-as-text identifier. Keeping this ASCII-only
+ * prevents bidi/control confusables, markup, mentions, URLs, emoji variation, and normalization
+ * ambiguity from entering rankings rendered by multiple clients.
+ */
+export const communityNicknameSchema = z.string().trim().min(2).max(32).regex(
+  /^[A-Za-z0-9](?:[A-Za-z0-9_. -]{0,30}[A-Za-z0-9])?$/,
+  "Nickname may use letters, numbers, single-byte spaces, underscores, periods, and hyphens",
+);
+
+export const updateCommunityProfileSchema = z.object({
+  expectedVersion: z.number().int().positive(),
+  optedIn: z.boolean().optional(),
+  identityMode: z.enum(COMMUNITY_IDENTITY_MODES).optional(),
+  nickname: communityNicknameSchema.nullable().optional(),
+  color: z.enum(COMMUNITY_COLOR_TOKENS).optional(),
+  shareBalance: z.boolean().optional(),
+}).strict().refine((value) => Object.keys(value).some((key) => key !== "expectedVersion"), {
+  message: "At least one community profile field is required",
+}).superRefine((value, context) => {
+  if (value.optedIn === false && value.shareBalance === true) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["shareBalance"],
+      message: "Balance sharing requires leaderboard participation",
+    });
+  }
+  if (value.identityMode === "anonymous" && value.nickname != null) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["nickname"],
+      message: "Anonymous identity cannot publish a nickname",
+    });
+  }
+  if (value.identityMode === "nickname" && value.nickname === null) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["nickname"],
+      message: "Nickname identity cannot clear its nickname",
+    });
+  }
+});
+
+export const communityLeaderboardQuerySchema = z.object({
+  metric: z.enum(COMMUNITY_LEADERBOARD_METRICS).default("calls"),
+  window: z.enum(COMMUNITY_LEADERBOARD_WINDOWS).optional(),
+  limit: z.number().int().min(1).max(100).default(25),
+  cursor: z.string().regex(/^[A-Za-z0-9_-]+$/).min(32).max(2_048).optional(),
+}).strict().superRefine((value, context) => {
+  if (value.metric === "balance" && value.window !== undefined) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["window"],
+      message: "The balance leaderboard is a current snapshot and does not accept a window",
+    });
+  }
 });
 
 const workspaceNameSchema = z.string().trim().min(1).max(120);

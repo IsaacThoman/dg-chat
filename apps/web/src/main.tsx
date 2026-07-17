@@ -19,10 +19,47 @@ import {
   VerifyEmailScreen,
 } from "./IdentityRecovery.tsx";
 import { PwaUpdateNotice } from "./PwaUpdateNotice.tsx";
+import { parseCommunitySearch } from "./communityRouting.ts";
 import "./styles.css";
 
 const rootRoute = createRootRoute({ component: () => <Outlet /> });
 const indexRoute = createRoute({ getParentRoute: () => rootRoute, path: "/", component: App });
+const communityRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/community",
+  validateSearch: parseCommunitySearch,
+  component: () => (
+    <App
+      initialView="community"
+      initialCommunitySearch={communityRoute.useSearch()}
+    />
+  ),
+});
+const archivedRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/archived",
+  component: () => <App initialView="archived" />,
+});
+const trashRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/trash",
+  component: () => <App initialView="trash" />,
+});
+const knowledgeRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/knowledge",
+  component: () => <App initialView="knowledge" />,
+});
+const settingsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/settings",
+  component: () => <App initialView="settings" />,
+});
+const tokensRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/tokens",
+  component: () => <App initialView="tokens" />,
+});
 const loginRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/login",
@@ -108,6 +145,12 @@ const adminUserDetailRoute = createRoute({
 });
 const routeTree = rootRoute.addChildren([
   indexRoute,
+  communityRoute,
+  archivedRoute,
+  trashRoute,
+  knowledgeRoute,
+  settingsRoute,
+  tokensRoute,
   loginRoute,
   setupRoute,
   pendingRoute,

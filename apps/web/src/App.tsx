@@ -65,6 +65,7 @@ import {
   Square,
   Sun,
   Trash2,
+  Trophy,
   UserCheck,
   Users,
   Volume2,
@@ -154,6 +155,8 @@ import {
   storeAdminUserReturnPath,
 } from "./admin/users/adminUserRouting.ts";
 import { ConversationKnowledgePicker, KnowledgeView } from "./Knowledge.tsx";
+import { CommunityView } from "./Community.tsx";
+import type { CommunitySearch } from "./communityRouting.ts";
 import { VoiceRecorder } from "./voice/VoiceRecorder.tsx";
 import { ScreenCapture } from "./screen-capture/ScreenCapture.tsx";
 import { chatScreenCaptureTargetKey } from "./screen-capture/captureDisplay.ts";
@@ -205,7 +208,15 @@ import {
 import { conversationMenuPosition } from "./workspace/conversationMenu.ts";
 import type { Attachment, AuditFilters, Conversation, Message, Model, User } from "./types.ts";
 
-type View = "chat" | "archived" | "trash" | "knowledge" | "settings" | "tokens" | "admin";
+type View =
+  | "chat"
+  | "archived"
+  | "trash"
+  | "knowledge"
+  | "community"
+  | "settings"
+  | "tokens"
+  | "admin";
 const cn = (...v: Array<string | false | null | undefined>) => v.filter(Boolean).join(" ");
 const mobileSidebarQuery = "(max-width: 760px)";
 
@@ -694,6 +705,14 @@ function Sidebar({
           aria-current={view === "knowledge" ? "page" : undefined}
         >
           <BookOpen size={17} /> Knowledge
+        </button>
+        <button
+          type="button"
+          onClick={() => select("community")}
+          className={view === "community" ? "selected" : ""}
+          aria-current={view === "community" ? "page" : undefined}
+        >
+          <Trophy size={17} /> Community
         </button>
         <button
           onClick={() => select("archived")}
@@ -5257,11 +5276,13 @@ export function App(
     initialAdminSection = "overview",
     initialAdminSearch = {},
     initialAdminUserDetail,
+    initialCommunitySearch = { metric: "calls", window: "30d" },
   }: {
     initialView?: View;
     initialAdminSection?: AdminSection;
     initialAdminSearch?: AdminSearch;
     initialAdminUserDetail?: { userId: string; tab: AdminUserTab };
+    initialCommunitySearch?: CommunitySearch;
   } = {},
 ) {
   const navigate = useNavigate();
@@ -5342,10 +5363,31 @@ export function App(
       void navigate({ to: "/admin/$section", params: { section: adminSection } });
       return;
     }
-    if (view === "admin") {
-      void navigate({ to: "/" });
+    if (next === "community") {
+      void navigate({ to: "/community", search: initialCommunitySearch });
+      return;
     }
-    setViewState(next);
+    if (next === "archived") {
+      void navigate({ to: "/archived" });
+      return;
+    }
+    if (next === "trash") {
+      void navigate({ to: "/trash" });
+      return;
+    }
+    if (next === "knowledge") {
+      void navigate({ to: "/knowledge" });
+      return;
+    }
+    if (next === "settings") {
+      void navigate({ to: "/settings" });
+      return;
+    }
+    if (next === "tokens") {
+      void navigate({ to: "/tokens" });
+      return;
+    }
+    void navigate({ to: "/" });
   };
   const setAdminSection = (next: AdminSection) => {
     setAdminSectionState(next);
@@ -5748,6 +5790,8 @@ export function App(
       ? "Trash"
       : view === "knowledge"
       ? "Knowledge"
+      : view === "community"
+      ? "Community"
       : view === "tokens"
       ? "API tokens"
       : "Settings";
@@ -5785,7 +5829,7 @@ export function App(
     await Promise.allSettled([conversationQuery.refetch(), deletedConversationQuery.refetch()]);
     if (
       conversation.id !== activeId || view === "settings" || view === "tokens" ||
-      view === "admin" || view === "knowledge"
+      view === "admin" || view === "knowledge" || view === "community"
     ) return;
     const regular = queryClient.getQueryData<Conversation[]>(["conversations"]) ?? [];
     const deleted = queryClient.getQueryData<Conversation[]>(["conversations", "deleted"]) ?? [];
@@ -6123,6 +6167,13 @@ export function App(
         />
       )}
       {view === "knowledge" && <KnowledgeView onMenu={() => setMobile(true)} />}
+      {view === "community" && (
+        <CommunityView
+          onMenu={() => setMobile(true)}
+          initialSearch={initialCommunitySearch}
+          onSearchChange={(search) => void navigate({ to: "/community", search })}
+        />
+      )}
     </div>
   );
 }

@@ -25,6 +25,7 @@ import type {
   ApiTokenSummary,
   ApprovalStatus,
   AttachmentStorageUsage,
+  CommunityProfile,
   Conversation,
   ConversationFolder,
   ConversationFolderMembership,
@@ -58,6 +59,7 @@ import {
   API_SSE_REPLAY_REQUEST_MAX_BYTES,
   API_SSE_REPLAY_REQUEST_MAX_EVENTS,
   apiResponseBodyByteLength,
+  applyCommunityProfilePatch,
   canonicalWorkspaceName,
   CONVERSATION_SEARCH_QUERY_VALIDATION_MESSAGE,
   conversationSearchMatchIndex,
@@ -122,6 +124,10 @@ import type {
   BeginAssistantGenerationInput,
   BeginGenerationInput,
   BeginGenerationResult,
+  CommunityLeaderboardReadQuery,
+  CommunityLeaderboardRepositoryPage,
+  CommunityProfileMutationContext,
+  CommunityProfilePatch,
   CompleteApiRequestInput,
   CompleteGenerationInput,
   ConversationPortabilityImportResult,
@@ -231,6 +237,7 @@ import {
   isUsagePricingSnapshot,
   sameGeneratedAssetFinalization,
   usagePricingSnapshotsEqual,
+  validateCommunityLeaderboardReadQuery,
   validateGeneratedAssetFinalization,
 } from "./repository.ts";
 
@@ -300,6 +307,8 @@ export interface UsageRun {
   generationLeaseToken: string | null;
   generationLeaseExpiresAt: string | null;
   createdAt: string;
+  /** Settlement fence used by analytics; legacy in-memory fixtures may omit it. */
+  completedAt?: string | null;
 }
 
 export class DomainError extends Error {
@@ -667,6 +676,7 @@ export class MemoryRepository {
   };
   readonly conversations = new Map<string, Conversation>();
   readonly userPreferences = new Map<string, UserPreferences>();
+  readonly communityProfiles = new Map<string, CommunityProfile>();
   readonly conversationFolders = new Map<string, ConversationFolder>();
   readonly conversationFolderMemberships = new Map<string, ConversationFolderMembership>();
   readonly conversationTags = new Map<string, ConversationTag>();
@@ -2125,6 +2135,27 @@ export class MemoryRepository {
     return { ...value };
   }
 
+  getCommunityProfile(ownerId: string): CommunityProfile {
+    if (!this.users.has(ownerId)) throw new DomainError("not_found", "User not found", 404);
+    let value = this.communityProfiles.get(ownerId);
+    if (!value) {
+      const now = new Date().toISOString();
+      value = {
+        userId: ownerId,
+        optedIn: false,
+        identityMode: "anonymous",
+        nickname: null,
+        color: "slate",
+        shareBalance: false,
+        version: 1,
+        createdAt: now,
+        updatedAt: now,
+      };
+      this.communityProfiles.set(ownerId, value);
+    }
+    return { ...value };
+  }
+
   exportConversationPortability(
     ownerId: string,
     options: import("./repository.ts").ConversationPortabilityExportOptions = {},
@@ -2817,6 +2848,141 @@ export class MemoryRepository {
     } as UserPreferences;
     this.userPreferences.set(ownerId, next);
     return { ...next };
+  }
+
+  updateCommunityProfile(
+    ownerId: string,
+    patch: CommunityProfilePatch,
+    context: CommunityProfileMutationContext,
+  ): CommunityProfile {
+    if (!context || context.actorId !== ownerId) {
+      throw new DomainError("forbidden", "Community profile can only be changed by its owner", 403);
+    }
+    const existed = this.communityProfiles.has(ownerId);
+    const current = this.getCommunityProfile(ownerId);
+    if (current.version !== patch.expectedVersion) {
+      if (!existed) this.communityProfiles.delete(ownerId);
+      throw new DomainError(
+        "version_conflict",
+        "Community profile changed in another request",
+        409,
+      );
+    }
+    let canonical: ReturnType<typeof applyCommunityProfilePatch>;
+    try {
+      canonical = applyCommunityProfilePatch(current, patch);
+    } catch (error) {
+      if (!existed) this.communityProfiles.delete(ownerId);
+      throw error;
+    }
+    const next: CommunityProfile = {
+      ...canonical,
+      version: current.version + 1,
+      createdAt: current.createdAt,
+      updatedAt: new Date().toISOString(),
+    };
+    const auditLength = this.auditEvents.length;
+    this.communityProfiles.set(ownerId, next);
+    try {
+      const changedFields = (
+        ["optedIn", "identityMode", "nickname", "color", "shareBalance"] as const
+      ).filter((field) => current[field] !== next[field]);
+      this.recordAudit({
+        actorId: ownerId,
+        action: "community.profile_updated",
+        targetType: "community_profile",
+        targetId: ownerId,
+        metadata: {
+          changedFields,
+          optedIn: next.optedIn,
+          identityMode: next.identityMode,
+          color: next.color,
+          shareBalance: next.shareBalance,
+          nicknameChanged: current.nickname !== next.nickname,
+          version: next.version,
+        },
+      });
+      return { ...next };
+    } catch (error) {
+      this.auditEvents.length = auditLength;
+      if (existed) this.communityProfiles.set(ownerId, current);
+      else this.communityProfiles.delete(ownerId);
+      throw error;
+    }
+  }
+
+  listCommunityLeaderboard(
+    input: CommunityLeaderboardReadQuery,
+  ): CommunityLeaderboardRepositoryPage {
+    const query = validateCommunityLeaderboardReadQuery(input);
+    const asOf = Date.parse(query.asOf);
+    const from = query.from === null ? null : Date.parse(query.from);
+    const add = (left: number, right: number) => {
+      const safeLeft = Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, left));
+      const safeRight = Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, right));
+      return safeLeft >= Number.MAX_SAFE_INTEGER - safeRight
+        ? Number.MAX_SAFE_INTEGER
+        : safeLeft + safeRight;
+    };
+    const eligible = [...this.communityProfiles.values()].flatMap((profile) => {
+      const user = this.users.get(profile.userId);
+      if (
+        !user || !profile.optedIn || user.approvalStatus !== "approved" ||
+        user.state !== "active" || user.deletedAt !== null ||
+        (query.metric === "balance" && !profile.shareBalance)
+      ) return [];
+      let value = query.metric === "balance" ? Math.max(0, user.balanceMicros) : 0;
+      if (query.metric !== "balance") {
+        for (const run of this.usageRuns.values()) {
+          const completedAt = Date.parse(run.completedAt ?? run.createdAt);
+          if (
+            run.userId !== user.id ||
+            (run.status !== "completed" && run.costMicros <= 0) ||
+            !Number.isFinite(completedAt) ||
+            (from !== null && completedAt < from) || completedAt >= asOf
+          ) continue;
+          value = query.metric === "calls"
+            ? add(value, 1)
+            : query.metric === "tokens"
+            ? add(value, add(run.inputTokens, run.outputTokens))
+            : add(value, run.costMicros);
+        }
+      }
+      return [{
+        userId: user.id,
+        identityMode: profile.identityMode,
+        nickname: profile.identityMode === "nickname" ? profile.nickname : null,
+        color: profile.color,
+        value,
+      }];
+    }).sort((left, right) =>
+      right.value - left.value ||
+      (left.userId < right.userId ? -1 : left.userId > right.userId ? 1 : 0)
+    );
+    let densePosition = 0;
+    let previousValue: number | undefined;
+    const ranked = eligible.map((entry) => {
+      if (previousValue === undefined || entry.value !== previousValue) densePosition++;
+      previousValue = entry.value;
+      return { ...entry, position: densePosition };
+    });
+    const after = query.after;
+    const remaining = after
+      ? ranked.filter((entry) =>
+        entry.value < after.score ||
+        (entry.value === after.score && entry.userId > after.userId)
+      )
+      : ranked;
+    const selected = remaining.slice(0, query.limit + 1);
+    const page = selected.slice(0, query.limit);
+    const data = page;
+    const last = data.at(-1);
+    return {
+      data,
+      nextBoundary: selected.length > query.limit && last
+        ? { score: last.value, userId: last.userId, position: last.position }
+        : null,
+    };
   }
 
   listConversationFolders(ownerId: string) {
@@ -8110,6 +8276,7 @@ export class MemoryRepository {
       generationLeaseToken: null,
       generationLeaseExpiresAt: null,
       createdAt: new Date().toISOString(),
+      completedAt: null,
     };
     this.usageRuns.set(runId, run);
     return run;
@@ -8144,6 +8311,7 @@ export class MemoryRepository {
     run.runLeaseExpiresAt = null;
     run.generationLeaseToken = null;
     run.generationLeaseExpiresAt = null;
+    run.completedAt = new Date().toISOString();
     return run;
   }
 
@@ -8158,6 +8326,7 @@ export class MemoryRepository {
       run.costMicros = run.reservedMicros;
       run.runLeaseToken = null;
       run.runLeaseExpiresAt = null;
+      run.completedAt = new Date().toISOString();
       return run;
     }
     if (run.executionEpoch > 0) {
@@ -8169,10 +8338,12 @@ export class MemoryRepository {
       run.outputTokens = 0;
       run.runLeaseToken = null;
       run.runLeaseExpiresAt = null;
+      run.completedAt = new Date().toISOString();
       return run;
     }
     this.credit(run.userId, runId, "refund", run.reservedMicros);
     run.status = "failed";
+    run.completedAt = new Date().toISOString();
     return run;
   }
 

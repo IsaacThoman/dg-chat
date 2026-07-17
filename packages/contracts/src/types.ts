@@ -3,6 +3,86 @@ export type UserRole = "user" | "admin";
 /** Whether an account may obtain authority. Soft deletion is tracked independently. */
 export type AccountState = "active" | "suspended";
 
+/** Deliberately small identity surface for the opt-in installation community leaderboard. */
+export const COMMUNITY_IDENTITY_MODES = ["anonymous", "nickname"] as const;
+export type CommunityIdentityMode = (typeof COMMUNITY_IDENTITY_MODES)[number];
+
+/** Stable design tokens; arbitrary CSS colors are never accepted or persisted. */
+export const COMMUNITY_COLOR_TOKENS = [
+  "slate",
+  "blue",
+  "cyan",
+  "emerald",
+  "amber",
+  "orange",
+  "rose",
+  "violet",
+] as const;
+export type CommunityColorToken = (typeof COMMUNITY_COLOR_TOKENS)[number];
+
+/**
+ * User-owned installation community profile.
+ *
+ * `shareBalance` is separately explicit because opting into aggregate rankings must never
+ * silently disclose an account balance. Anonymous is the default even after opting in.
+ */
+export interface CommunityProfile {
+  userId: string;
+  optedIn: boolean;
+  identityMode: CommunityIdentityMode;
+  nickname: string | null;
+  color: CommunityColorToken;
+  shareBalance: boolean;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface UpdateCommunityProfileRequest {
+  expectedVersion: number;
+  optedIn?: boolean;
+  identityMode?: CommunityIdentityMode;
+  nickname?: string | null;
+  color?: CommunityColorToken;
+  shareBalance?: boolean;
+}
+
+export const COMMUNITY_LEADERBOARD_METRICS = ["calls", "tokens", "cost", "balance"] as const;
+export type CommunityLeaderboardMetric = (typeof COMMUNITY_LEADERBOARD_METRICS)[number];
+export const COMMUNITY_LEADERBOARD_WINDOWS = ["7d", "30d", "90d"] as const;
+export type CommunityLeaderboardWindow = (typeof COMMUNITY_LEADERBOARD_WINDOWS)[number];
+
+export interface CommunityLeaderboardQuery {
+  metric: CommunityLeaderboardMetric;
+  /** Omitted for the current-balance view. */
+  window?: CommunityLeaderboardWindow;
+  limit: number;
+  cursor?: string;
+}
+
+/**
+ * Privacy-safe public ranking row. Internal account identifiers and account profile fields are
+ * deliberately absent; `position` is scoped to this ordered result, not a stable user identity.
+ */
+export interface CommunityLeaderboardEntry {
+  position: number;
+  identityMode: CommunityIdentityMode;
+  nickname: string | null;
+  /** Anonymous rows deliberately have no user-selected color fingerprint. */
+  color: CommunityColorToken | null;
+  /** Calls/tokens are units; cost/balance are integer USD micros. */
+  value: number;
+}
+
+export interface CommunityLeaderboardPage {
+  metric: CommunityLeaderboardMetric;
+  window: CommunityLeaderboardWindow | "current";
+  from: string | null;
+  asOf: string;
+  data: CommunityLeaderboardEntry[];
+  nextCursor: string | null;
+}
+
 /** Canonical provider-model capabilities shared by persistence, API validation, and clients. */
 export const MODEL_CAPABILITIES = [
   "chat",

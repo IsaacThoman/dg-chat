@@ -245,6 +245,40 @@ export const userPreferences = pgTable("user_preferences", {
   ),
 ]);
 
+export const communityProfiles = pgTable("community_profiles", {
+  userId: uuid("user_id").primaryKey().references(() => users.id, { onDelete: "cascade" }),
+  optedIn: boolean("opted_in").notNull().default(false),
+  identityMode: text("identity_mode").notNull().default("anonymous"),
+  nickname: text("nickname"),
+  color: text("color").notNull().default("slate"),
+  shareBalance: boolean("share_balance").notNull().default(false),
+  version: integer("version").notNull().default(1),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  check("community_profiles_version_check", sql`${table.version} >= 1`),
+  check(
+    "community_profiles_identity_mode_check",
+    sql`${table.identityMode} IN ('anonymous','nickname')`,
+  ),
+  check(
+    "community_profiles_color_check",
+    sql`${table.color} IN ('slate','blue','cyan','emerald','amber','orange','rose','violet')`,
+  ),
+  check(
+    "community_profiles_nickname_check",
+    sql`(${table.identityMode} = 'anonymous' AND ${table.nickname} IS NULL) OR
+      (${table.identityMode} = 'nickname' AND ${table.nickname} IS NOT NULL AND
+       char_length(${table.nickname}) BETWEEN 2 AND 32 AND
+       ${table.nickname} = btrim(${table.nickname}) AND
+       ${table.nickname} ~ '^[A-Za-z0-9]([A-Za-z0-9_. -]{0,30}[A-Za-z0-9])?$')`,
+  ),
+  check(
+    "community_profiles_consent_check",
+    sql`${table.optedIn} = true OR ${table.shareBalance} = false`,
+  ),
+]);
+
 export const conversationPortabilityImports = pgTable("conversation_portability_imports", {
   ownerId: uuid("owner_id").notNull().references(() => users.id, { onDelete: "cascade" }),
   idempotencyKey: text("idempotency_key").notNull(),

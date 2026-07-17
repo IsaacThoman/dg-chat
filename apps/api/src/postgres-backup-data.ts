@@ -26,6 +26,7 @@ import {
   ObjectAlreadyExistsError,
   PRE_ATTACHMENT_CONTROL_BACKUP_DATA_OMITTED_TABLES,
   PRE_AUTOMATIC_RETENTION_BACKUP_DATA_OMITTED_TABLES,
+  PRE_COMMUNITY_PROFILE_BACKUP_DATA_OMITTED_TABLES,
   PRE_IMMUTABLE_SHARING_BACKUP_DATA_OMITTED_TABLES,
   restoreBackupData,
   signBackupManifest,
@@ -756,9 +757,10 @@ export function createPostgresBackupDataPort(
           if (!path) {
             if (
               (stagedSchemaVersion !== BACKUP_DATA_SCHEMA_VERSION &&
+                PRE_COMMUNITY_PROFILE_BACKUP_DATA_OMITTED_TABLES.has(tableName)) ||
+              (!["0053", "0050"].includes(stagedSchemaVersion) &&
                 PRE_ATTACHMENT_CONTROL_BACKUP_DATA_OMITTED_TABLES.has(tableName)) ||
-              (stagedSchemaVersion !== BACKUP_DATA_SCHEMA_VERSION &&
-                stagedSchemaVersion !== "0049" &&
+              (!["0053", "0050", "0049"].includes(stagedSchemaVersion) &&
                 PRE_AUTOMATIC_RETENTION_BACKUP_DATA_OMITTED_TABLES.has(tableName)) ||
               (stagedSchemaVersion === "0028" &&
                 LEGACY_BACKUP_DATA_OMITTED_TABLES.has(tableName)) ||
@@ -804,7 +806,14 @@ export function createPostgresBackupDataPort(
           manifest.diagnosticPayloadPolicy !== "excluded" ||
           table.name !== "provider_payload_captures"
         ).map((table) => `${TABLE_PREFIX}${table.name}.ndjson`);
-        const preAttachmentControlExpectedTables = currentExpectedTables.filter((name) =>
+        const preCommunityProfileExpectedTables = currentExpectedTables.filter((name) =>
+          !PRE_COMMUNITY_PROFILE_BACKUP_DATA_OMITTED_TABLES.has(
+            name.slice(TABLE_PREFIX.length, -".ndjson".length),
+          )
+        );
+        const preAttachmentControlExpectedTables = preCommunityProfileExpectedTables.filter((
+          name,
+        ) =>
           !PRE_ATTACHMENT_CONTROL_BACKUP_DATA_OMITTED_TABLES.has(
             name.slice(TABLE_PREFIX.length, -".ndjson".length),
           )
@@ -845,10 +854,13 @@ export function createPostgresBackupDataPort(
         const expectedTables = manifest.schemaVersion === BACKUP_DATA_SCHEMA_VERSION &&
             matches(currentExpectedTables)
           ? currentExpectedTables
+          : manifest.schemaVersion === "0050" &&
+              matches(preCommunityProfileExpectedTables)
+          ? preCommunityProfileExpectedTables
           : manifest.schemaVersion === "0049" &&
               matches(preAttachmentControlExpectedTables)
           ? preAttachmentControlExpectedTables
-          : ![BACKUP_DATA_SCHEMA_VERSION, "0049"].includes(manifest.schemaVersion) &&
+          : ![BACKUP_DATA_SCHEMA_VERSION, "0050", "0049"].includes(manifest.schemaVersion) &&
               matches(preAutomaticRetentionExpectedTables)
           ? preAutomaticRetentionExpectedTables
           : ["0037", "0034"].includes(manifest.schemaVersion) &&

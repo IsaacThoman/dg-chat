@@ -10,7 +10,8 @@ import {
   type ProviderProtocol,
 } from "./provider-model-invariants.ts";
 
-export const BACKUP_DATA_SCHEMA_VERSION = "0050" as const;
+export const BACKUP_DATA_SCHEMA_VERSION = "0053" as const;
+const PRE_COMMUNITY_PROFILE_BACKUP_DATA_SCHEMA_VERSION = "0050" as const;
 const PRE_ATTACHMENT_CONTROL_BACKUP_DATA_SCHEMA_VERSION = "0049" as const;
 const PRE_AUTOMATIC_RETENTION_BACKUP_DATA_SCHEMA_VERSION = "0045" as const;
 const PRE_TOOL_ACCOUNTING_BACKUP_DATA_SCHEMA_VERSION = "0043" as const;
@@ -23,6 +24,9 @@ const TEMPORARY_LIFECYCLE_BACKUP_DATA_SCHEMA_VERSION = "0032" as const;
 const LEGACY_BACKUP_DATA_SCHEMA_VERSION = "0028" as const;
 export const PRE_AUTOMATIC_RETENTION_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
   new Set(["retention_schedule_state"]),
+);
+export const PRE_COMMUNITY_PROFILE_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
+  new Set(["community_profiles"]),
 );
 export const PRE_ATTACHMENT_CONTROL_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
   new Set([
@@ -53,6 +57,7 @@ export const PRE_IMMUTABLE_SHARING_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
 );
 export function isSupportedBackupDataSchemaVersion(value: string): boolean {
   return value === BACKUP_DATA_SCHEMA_VERSION ||
+    value === PRE_COMMUNITY_PROFILE_BACKUP_DATA_SCHEMA_VERSION ||
     value === PRE_ATTACHMENT_CONTROL_BACKUP_DATA_SCHEMA_VERSION ||
     value === PRE_AUTOMATIC_RETENTION_BACKUP_DATA_SCHEMA_VERSION ||
     value === PRE_TOOL_ACCOUNTING_BACKUP_DATA_SCHEMA_VERSION ||
@@ -66,11 +71,13 @@ export function isSupportedBackupDataSchemaVersion(value: string): boolean {
 }
 const hasCurrentPortableRowShape = (version: string) =>
   version === BACKUP_DATA_SCHEMA_VERSION ||
+  version === PRE_COMMUNITY_PROFILE_BACKUP_DATA_SCHEMA_VERSION ||
   version === PRE_ATTACHMENT_CONTROL_BACKUP_DATA_SCHEMA_VERSION ||
   version === PRE_AUTOMATIC_RETENTION_BACKUP_DATA_SCHEMA_VERSION;
 const requiresLegacyPortableUpgrade = (version: string) => !hasCurrentPortableRowShape(version);
 const requiresAttachmentControlUpgrade = (version: string) =>
-  version !== BACKUP_DATA_SCHEMA_VERSION;
+  version !== BACKUP_DATA_SCHEMA_VERSION &&
+  version !== PRE_COMMUNITY_PROFILE_BACKUP_DATA_SCHEMA_VERSION;
 
 export function isCanonicalManifestOnlyAttachmentMetadata(
   value: Readonly<Record<string, unknown>>,
@@ -206,6 +213,16 @@ export const BACKUP_DATA_TABLES: readonly BackupDataTable[] = Object.freeze([
       version: "integer",
       authority_epoch: "bigint",
       balance_micros: "bigint",
+    },
+  ),
+  T(
+    "community_profiles",
+    "user_id opted_in identity_mode nickname color share_balance version created_at updated_at",
+    "user_id",
+    {
+      opted_in: "boolean",
+      share_balance: "boolean",
+      version: "integer",
     },
   ),
   T("auth_users", "id name email email_verified image created_at updated_at", "id", {
@@ -1337,9 +1354,12 @@ async function stageSource(
       );
     }
     let count = 0;
-    const omittedByWireVersion = requiresAttachmentControlUpgrade(source.schemaVersion) &&
+    const omittedByWireVersion = source.schemaVersion !== BACKUP_DATA_SCHEMA_VERSION &&
+        PRE_COMMUNITY_PROFILE_BACKUP_DATA_OMITTED_TABLES.has(definition.name) ||
+      requiresAttachmentControlUpgrade(source.schemaVersion) &&
         PRE_ATTACHMENT_CONTROL_BACKUP_DATA_OMITTED_TABLES.has(definition.name) ||
       source.schemaVersion !== BACKUP_DATA_SCHEMA_VERSION &&
+        source.schemaVersion !== PRE_COMMUNITY_PROFILE_BACKUP_DATA_SCHEMA_VERSION &&
         source.schemaVersion !== PRE_ATTACHMENT_CONTROL_BACKUP_DATA_SCHEMA_VERSION &&
         PRE_AUTOMATIC_RETENTION_BACKUP_DATA_OMITTED_TABLES.has(definition.name);
     if (omittedByWireVersion) {
@@ -1561,6 +1581,7 @@ interface BackupRelation {
 }
 
 const RELATIONS: readonly BackupRelation[] = Object.freeze([
+  { from: "community_profiles", columns: ["user_id"], to: "users", target: ["id"] },
   { from: "auth_users", columns: ["id"], to: "users", target: ["id"] },
   { from: "auth_accounts", columns: ["user_id"], to: "auth_users", target: ["id"] },
   { from: "provider_models", columns: ["provider_id"], to: "providers", target: ["id"] },

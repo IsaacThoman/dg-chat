@@ -8,9 +8,10 @@ import {
 } from "./backup-data.ts";
 
 Deno.test("portable backup catalog versions user authority and retains supported history", () => {
-  assertEquals(BACKUP_DATA_SCHEMA_VERSION, "0050");
+  assertEquals(BACKUP_DATA_SCHEMA_VERSION, "0053");
   assertEquals(
     [
+      "0053",
       "0050",
       "0049",
       "0045",
@@ -28,12 +29,16 @@ Deno.test("portable backup catalog versions user authority and retains supported
       .map(
         (version) => isSupportedBackupDataSchemaVersion(version),
       ),
-    [true, true, true, true, true, true, true, true, true, true, true, false, false],
+    [true, true, true, true, true, true, true, true, true, true, true, true, false, false],
   );
   const users = BACKUP_DATA_TABLES.find((table) => table.name === "users");
   assertEquals(users?.columns.includes("version"), true);
   assertEquals(users?.kinds.version, "integer");
   assertEquals(users?.kinds.authority_epoch, "bigint");
+  const communityProfiles = BACKUP_DATA_TABLES.find((table) => table.name === "community_profiles");
+  assertEquals(communityProfiles?.kinds.opted_in, "boolean");
+  assertEquals(communityProfiles?.kinds.share_balance, "boolean");
+  assertEquals(communityProfiles?.kinds.version, "integer");
   const tokens = BACKUP_DATA_TABLES.find((table) => table.name === "api_tokens");
   assertEquals(tokens?.kinds.authority_epoch, "bigint");
   const adjustments = BACKUP_DATA_TABLES.find((table) =>

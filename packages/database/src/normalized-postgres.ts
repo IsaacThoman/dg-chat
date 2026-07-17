@@ -23,6 +23,7 @@ import type {
   AdminUserPage,
   AdminUserQuery,
   AttachmentStorageUsage,
+  CommunityProfile,
   ConversationFolder,
   ConversationFolderMembership,
   ConversationPortabilityV1,
@@ -54,6 +55,7 @@ import {
   API_SSE_REPLAY_REQUEST_MAX_BYTES,
   API_SSE_REPLAY_REQUEST_MAX_EVENTS,
   apiResponseBodyByteLength,
+  applyCommunityProfilePatch,
   ATTACHMENT_INSPECTION_POLICY_VERSION,
   attachmentReinspectionEligibility,
   canonicalWorkspaceName,
@@ -124,6 +126,10 @@ import type {
   BeginApiRequestResult,
   BeginAssistantGenerationInput,
   BeginGenerationInput,
+  CommunityLeaderboardReadQuery,
+  CommunityLeaderboardRepositoryPage,
+  CommunityProfileMutationContext,
+  CommunityProfilePatch,
   CompleteApiRequestInput,
   CompleteGenerationInput,
   ConversationPatch,
@@ -232,6 +238,7 @@ import {
   isUsagePricingSnapshot,
   sameGeneratedAssetFinalization,
   usagePricingSnapshotsEqual,
+  validateCommunityLeaderboardReadQuery,
   validateGeneratedAssetFinalization,
 } from "./repository.ts";
 
@@ -576,6 +583,19 @@ function preferences(row: Row): UserPreferences {
     useMemory: Boolean(row.use_memory),
     saveHistory: Boolean(row.save_history),
     preferredModelId: row.preferred_model_id == null ? null : String(row.preferred_model_id),
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+  };
+}
+function communityProfile(row: Row): CommunityProfile {
+  return {
+    userId: String(row.user_id),
+    optedIn: Boolean(row.opted_in),
+    identityMode: String(row.identity_mode) as CommunityProfile["identityMode"],
+    nickname: row.nickname == null ? null : String(row.nickname),
+    color: String(row.color) as CommunityProfile["color"],
+    shareBalance: Boolean(row.share_balance),
+    version: number(row.version),
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at),
   };
@@ -3070,6 +3090,24 @@ export class PostgresRepository implements DomainRepository {
     }
     return preferences(rows[0]);
   }
+  async getCommunityProfile(ownerId: string): Promise<CommunityProfile> {
+    let rows = await this.#sql<Row[]>`SELECT * FROM community_profiles WHERE user_id=${ownerId}`;
+    if (!rows[0]) {
+      const inserted = await this.#sql<Row[]>`
+        INSERT INTO community_profiles(user_id)
+        SELECT id FROM users WHERE id=${ownerId}
+        ON CONFLICT(user_id) DO NOTHING
+        RETURNING *
+      `;
+      if (!inserted[0]) {
+        rows = await this.#sql<Row[]>`SELECT * FROM community_profiles WHERE user_id=${ownerId}`;
+        if (!rows[0]) throw new DomainError("not_found", "User not found", 404);
+      } else {
+        rows = inserted;
+      }
+    }
+    return communityProfile(rows[0]);
+  }
   async exportConversationPortability(
     ownerId: string,
     options: ConversationPortabilityExportOptions = {},
@@ -3797,6 +3835,179 @@ export class PostgresRepository implements DomainRepository {
     }
     return preferences(rows[0]);
   }
+  async updateCommunityProfile(
+    ownerId: string,
+    patch: CommunityProfilePatch,
+    context: CommunityProfileMutationContext,
+  ): Promise<CommunityProfile> {
+    if (!context || context.actorId !== ownerId) {
+      throw new DomainError("forbidden", "Community profile can only be changed by its owner", 403);
+    }
+    return await this.#sql.begin(async (tx) => {
+      const inserted = await tx<Row[]>`
+        INSERT INTO community_profiles(user_id)
+        SELECT id FROM users WHERE id=${ownerId}
+        ON CONFLICT(user_id) DO NOTHING
+        RETURNING *
+      `;
+      let rows = inserted;
+      if (!rows[0]) {
+        rows = await tx<Row[]>`
+          SELECT * FROM community_profiles WHERE user_id=${ownerId} FOR UPDATE
+        `;
+      }
+      if (!rows[0]) throw new DomainError("not_found", "User not found", 404);
+      const current = communityProfile(rows[0]);
+      if (current.version !== patch.expectedVersion) {
+        throw new DomainError(
+          "version_conflict",
+          "Community profile changed in another request",
+          409,
+        );
+      }
+      const canonical = applyCommunityProfilePatch(current, patch);
+      const changedFields = (
+        ["optedIn", "identityMode", "nickname", "color", "shareBalance"] as const
+      ).filter((field) => current[field] !== canonical[field]);
+      const updated = await tx<Row[]>`
+        UPDATE community_profiles SET
+          opted_in=${canonical.optedIn},
+          identity_mode=${canonical.identityMode},
+          nickname=${canonical.nickname},
+          color=${canonical.color},
+          share_balance=${canonical.shareBalance},
+          version=version+1,
+          updated_at=now()
+        WHERE user_id=${ownerId} AND version=${patch.expectedVersion}
+        RETURNING *
+      `;
+      if (!updated[0]) {
+        throw new DomainError(
+          "version_conflict",
+          "Community profile changed in another request",
+          409,
+        );
+      }
+      const next = communityProfile(updated[0]);
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(
+          ${ownerId},
+          'community.profile_updated',
+          'community_profile',
+          ${ownerId},
+          ${
+        tx.json({
+          changedFields,
+          optedIn: next.optedIn,
+          identityMode: next.identityMode,
+          color: next.color,
+          shareBalance: next.shareBalance,
+          nicknameChanged: current.nickname !== next.nickname,
+          version: next.version,
+        })
+      }
+        )`;
+      return next;
+    });
+  }
+
+  async listCommunityLeaderboard(
+    input: CommunityLeaderboardReadQuery,
+  ): Promise<CommunityLeaderboardRepositoryPage> {
+    const query = validateCommunityLeaderboardReadQuery(input);
+    const afterScore = query.after?.score ?? 0;
+    const afterUserId = query.after?.userId ?? "00000000-0000-0000-0000-000000000000";
+    const hasAfter = query.after !== undefined;
+    const rows = await this.#sql<Row[]>`
+      WITH aggregated AS (
+        SELECT
+          users.id AS user_id,
+          profiles.identity_mode,
+          profiles.nickname,
+          profiles.color,
+          GREATEST(0, LEAST(
+            CASE ${query.metric}
+              WHEN 'balance' THEN users.balance_micros::numeric
+              WHEN 'calls' THEN count(runs.id)::numeric
+              WHEN 'tokens' THEN COALESCE(
+                sum(runs.input_tokens::numeric + runs.output_tokens::numeric),
+                0
+              )
+              ELSE COALESCE(sum(runs.cost_micros::numeric), 0)
+            END,
+            ${Number.MAX_SAFE_INTEGER}::numeric
+          ))::bigint AS value
+        FROM community_profiles profiles
+        JOIN users ON users.id=profiles.user_id
+        LEFT JOIN usage_runs runs ON
+          ${query.metric !== "balance"}
+          AND runs.user_id=users.id
+          AND (runs.status='completed' OR runs.cost_micros>0)
+          AND (
+            ${query.from === null}
+            OR COALESCE(runs.completed_at,runs.created_at)>=${query.from}::timestamptz
+          )
+          AND COALESCE(runs.completed_at,runs.created_at)<${query.asOf}::timestamptz
+        WHERE profiles.opted_in=true
+          AND users.approval_status='approved'
+          AND users.state='active'
+          AND users.deleted_at IS NULL
+          AND (${query.metric !== "balance"} OR profiles.share_balance=true)
+        GROUP BY
+          users.id,
+          users.balance_micros,
+          profiles.identity_mode,
+          profiles.nickname,
+          profiles.color
+      ),
+      ranked AS (
+        SELECT
+          user_id,
+          identity_mode,
+          nickname,
+          color,
+          value,
+          dense_rank() OVER (ORDER BY value DESC)::bigint AS position
+        FROM aggregated
+      )
+      SELECT user_id,identity_mode,nickname,color,value,position
+      FROM ranked
+      WHERE (
+        ${!hasAfter}
+        OR value<${afterScore}::bigint
+        OR (value=${afterScore}::bigint AND user_id>${afterUserId}::uuid)
+      )
+      ORDER BY value DESC,user_id ASC
+      LIMIT ${query.limit + 1}
+    `;
+    const selected = rows.slice(0, query.limit);
+    const data = selected.map((row) => ({
+      userId: String(row.user_id),
+      position: number(row.position),
+      identityMode: String(row.identity_mode) as "anonymous" | "nickname",
+      nickname: row.identity_mode === "nickname" && row.nickname != null
+        ? String(row.nickname)
+        : null,
+      color: String(row.color) as
+        | "slate"
+        | "blue"
+        | "cyan"
+        | "emerald"
+        | "amber"
+        | "orange"
+        | "rose"
+        | "violet",
+      value: number(row.value),
+    }));
+    const last = data.at(-1);
+    return {
+      data,
+      nextBoundary: rows.length > query.limit && last
+        ? { score: last.value, userId: last.userId, position: last.position }
+        : null,
+    };
+  }
+
   async listConversationFolders(ownerId: string) {
     const [folders, memberships] = await Promise.all([
       this.#sql<

@@ -166,6 +166,9 @@ Deno.test({
         ${userId},'portable-admin@example.com','Portable Admin',NULL,
         'admin','approved','active',125,now()
       )`;
+      await sql`INSERT INTO community_profiles(
+        user_id,opted_in,identity_mode,nickname,color,share_balance,version
+      ) VALUES(${userId},true,'nickname','Portable-user','cyan',true,4)`;
       await sql`INSERT INTO auth_users(id,name,email,email_verified)
         VALUES(${userId},'Portable Admin','portable-admin@example.com',true)`;
       await sql`INSERT INTO auth_accounts(
@@ -357,6 +360,17 @@ Deno.test({
       const capturedAccount = captured.get("auth_accounts")!.flat()[0];
       assertEquals("access_token" in capturedAccount, false);
       assertEquals(captured.get("conversation_share_snapshots")!.flat().length, 3);
+      assertEquals(captured.get("community_profiles")!.flat(), [{
+        user_id: userId,
+        opted_in: true,
+        identity_mode: "nickname",
+        nickname: "Portable-user",
+        color: "cyan",
+        share_balance: true,
+        version: 4,
+        created_at: captured.get("community_profiles")!.flat()[0].created_at,
+        updated_at: captured.get("community_profiles")!.flat()[0].updated_at,
+      }]);
 
       const concurrentProviderId = crypto.randomUUID();
       const privilegedCredentials: BackupProviderCredential[] = [];
@@ -401,6 +415,20 @@ Deno.test({
       const preview = await dryRunBackupData(databaseUrl!, source);
       assertEquals(preview.users, 1);
       assertEquals(preview.providersDisabledForRedactedCredentials, 1);
+      const preCommunitySource: BackupDataSource = {
+        schemaVersion: "0050",
+        rows(name) {
+          return (async function* () {
+            if (name === "community_profiles") {
+              throw new Error("0050 restore must not request community consent");
+            }
+            for (const batch of captured.get(name) ?? []) yield structuredClone(batch);
+          })();
+        },
+      };
+      const preCommunityPreview = await dryRunBackupData(databaseUrl!, preCommunitySource);
+      assertEquals(preCommunityPreview.rowsByTable.community_profiles, 0);
+      assertEquals(preCommunityPreview.rowsByTable.retention_schedule_state, 1);
       assertEquals(Number((await sql`SELECT count(*) count FROM conversations`)[0].count), 3);
       assertEquals(Number((await sql`SELECT count(*) count FROM sessions`)[0].count), 1);
 
@@ -973,6 +1001,11 @@ Deno.test({
         ),
         1,
       );
+      // Wire versions before 0053 deliberately omit installation-community consent.
+      assertEquals(
+        Number((await sql`SELECT count(*) count FROM community_profiles`)[0].count),
+        0,
+      );
 
       // Add a genuine released object after the legacy-source exercise. The current wire-format
       // round trip below must preserve its history without staging nonexistent bytes.
@@ -1005,11 +1038,19 @@ Deno.test({
         ),
         true,
       );
+      await sql`INSERT INTO community_profiles(
+        user_id,opted_in,identity_mode,nickname,color,share_balance,version
+      ) VALUES(${userId},true,'nickname','Portable-user','cyan',true,4)`;
 
       // Capture the repaired database in the current wire format and apply it again. This proves
       // that a valid pending tool-accounting outbox and physical release history are portable.
       const currentCaptured = await captureData(databaseUrl!);
       assertEquals(currentCaptured.get("attachment_storage_releases")?.flat().length, 1);
+      assertEquals(currentCaptured.get("community_profiles")?.flat().length, 1);
+      await sql`UPDATE community_profiles SET
+        opted_in=false,identity_mode='anonymous',nickname=NULL,color='slate',
+        share_balance=false,version=5
+        WHERE user_id=${userId}`;
       const currentSource = replaySource(currentCaptured);
       const currentPreview = await dryRunBackupData(databaseUrl!, currentSource);
       assertEquals(currentPreview.rowsByTable.attachment_storage_releases, 1);
@@ -1077,6 +1118,20 @@ Deno.test({
           stage_id: releasedStageId,
           attachment_id: releasedAttachmentId,
           object_key: `users/${userId}/released.png`,
+        }],
+      );
+      assertEquals(
+        [
+          ...await sql`SELECT opted_in,identity_mode,nickname,color,share_balance,version
+          FROM community_profiles WHERE user_id=${userId}`,
+        ],
+        [{
+          opted_in: true,
+          identity_mode: "nickname",
+          nickname: "Portable-user",
+          color: "cyan",
+          share_balance: true,
+          version: 4,
         }],
       );
       assertEquals(

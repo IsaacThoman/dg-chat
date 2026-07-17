@@ -1,4 +1,12 @@
 import type {
+  CommunityColorToken,
+  CommunityIdentityMode,
+  CommunityLeaderboardEntry,
+  CommunityLeaderboardMetric,
+  CommunityLeaderboardPage,
+  CommunityLeaderboardQuery,
+  CommunityLeaderboardWindow,
+  CommunityProfile,
   ConversationFolder,
   ConversationFolderMembership,
   ConversationShareAttachmentPolicy,
@@ -11,14 +19,24 @@ import type {
   PublicConversationShare,
   PublicConversationShareAttachment,
   PublicConversationShareMessage,
+  UpdateCommunityProfileRequest,
   UserPreferences,
 } from "../../../packages/contracts/src/types.ts";
 export type {
+  CommunityColorToken,
+  CommunityIdentityMode,
+  CommunityLeaderboardEntry,
+  CommunityLeaderboardMetric,
+  CommunityLeaderboardPage,
+  CommunityLeaderboardQuery,
+  CommunityLeaderboardWindow,
+  CommunityProfile,
   ConversationFolder,
   ConversationFolderMembership,
   ConversationTag,
   ConversationTagBinding,
   ConversationTagSet,
+  UpdateCommunityProfileRequest,
   UserPreferences,
 };
 export type { ConversationShareSummary, PublicConversationShare };

@@ -27,6 +27,7 @@ import {
   adminUserQuerySchema,
   appendMessageSchema,
   chatCompletionSchema,
+  communityLeaderboardQuerySchema,
   conversationPortabilityV1Schema,
   conversationSearchSchema,
   createAccessGroupSchema,
@@ -66,6 +67,7 @@ import {
   setTokenAccessModeSchema,
   streamGenerationSchema,
   updateAccessGroupSchema,
+  updateCommunityProfileSchema,
   updateConversationFolderSchema,
   updateConversationSchema,
   updateConversationTagSchema,
@@ -84,6 +86,9 @@ import type {
   AdminUserQuery,
   AuthStatusResponse,
   ChatCompletionRequest,
+  CommunityLeaderboardMetric,
+  CommunityLeaderboardPage,
+  CommunityLeaderboardWindow,
   ModelInfo,
   PublicUser,
   WebGenerationEvent,
@@ -101,6 +106,7 @@ import {
   type AttachmentStorageQuota,
   type AuditEvent,
   type AuditQuery,
+  CommunityProfileValidationError,
   decodeApiResponseBody,
   DomainError,
   type DomainRepository,
@@ -329,6 +335,8 @@ export interface AppOptions {
   /** Test/embedding seam. Production defaults to one JSON object per stderr line. */
   requestErrorLogSink?: (line: string) => void;
   setupToken?: string;
+  /** Stable secret used to encrypt privacy-sensitive community leaderboard cursors. */
+  communityCursorSecret?: string;
   startingCreditMicros?: number;
   rateLimiter?: RateLimiter;
   providerStream?: typeof streamChatCompletion;
@@ -1282,6 +1290,133 @@ const privateNoStore = (c: Context) => {
   c.header("Cache-Control", "private, no-store");
   c.header("Pragma", "no-cache");
   c.header("X-Content-Type-Options", "nosniff");
+  const vary = (c.res.headers.get("Vary") ?? "").split(",").map((value) => value.trim()).filter(
+    Boolean,
+  );
+  if (!vary.some((value) => value.toLowerCase() === "cookie")) {
+    c.header("Vary", [...vary, "Cookie"].join(", "));
+  }
+};
+
+const COMMUNITY_CURSOR_AAD = new TextEncoder().encode("dg-chat:community-leaderboard:v1");
+const COMMUNITY_WINDOW_MS = { "7d": 7, "30d": 30, "90d": 90 } as const;
+type CommunityCursorPayload = {
+  v: 1;
+  metric: CommunityLeaderboardMetric;
+  window: CommunityLeaderboardWindow | "current";
+  from: string | null;
+  asOf: string;
+  score: number;
+  userId: string;
+  position: number;
+};
+
+const communityCursorError = () =>
+  new DomainError("validation_error", "Community leaderboard cursor is invalid", 422);
+
+export function createCommunityLeaderboardCursorCodec(secret: string) {
+  if (typeof secret !== "string" || secret.length < 16) {
+    throw new Error("Community leaderboard cursor secret must be at least 16 characters");
+  }
+  const key = crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(`dg-chat:community-leaderboard:key:v1:${secret}`),
+  ).then((digest) =>
+    crypto.subtle.importKey("raw", digest, { name: "AES-GCM" }, false, ["encrypt", "decrypt"])
+  );
+  const validate = (value: CommunityCursorPayload) => {
+    const fromMs = value?.from === null ? null : Date.parse(value?.from);
+    const asOfMs = Date.parse(value?.asOf);
+    if (
+      !value || value.v !== 1 ||
+      !["calls", "tokens", "cost", "balance"].includes(value.metric) ||
+      !["7d", "30d", "90d", "current"].includes(value.window) ||
+      !Number.isFinite(asOfMs) || new Date(asOfMs).toISOString() !== value.asOf ||
+      (value.from !== null &&
+        (!Number.isFinite(fromMs) || new Date(fromMs!).toISOString() !== value.from)) ||
+      (value.metric === "balance"
+        ? value.window !== "current" || value.from !== null
+        : value.window === "current" || value.from === null ||
+          asOfMs - fromMs! !== COMMUNITY_WINDOW_MS[value.window] * 86_400_000) ||
+      !Number.isSafeInteger(value.score) || value.score < 0 ||
+      !Number.isSafeInteger(value.position) || value.position < 1 ||
+      !auditUuid.test(value.userId)
+    ) throw communityCursorError();
+    return value;
+  };
+  return {
+    async encode(value: CommunityCursorPayload): Promise<string> {
+      validate(value);
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const plaintext = new TextEncoder().encode(JSON.stringify(value));
+      const ciphertext = new Uint8Array(
+        await crypto.subtle.encrypt(
+          { name: "AES-GCM", iv, additionalData: COMMUNITY_CURSOR_AAD },
+          await key,
+          plaintext,
+        ),
+      );
+      return Buffer.concat([iv, ciphertext]).toString("base64url");
+    },
+    async decode(
+      encoded: string,
+      expected: {
+        metric: CommunityLeaderboardMetric;
+        window: CommunityLeaderboardWindow | "current";
+      },
+    ): Promise<CommunityCursorPayload> {
+      try {
+        const bytes = new Uint8Array(Buffer.from(encoded, "base64url"));
+        if (
+          bytes.byteLength < 29 || Buffer.from(bytes).toString("base64url") !== encoded
+        ) throw communityCursorError();
+        const value = JSON.parse(new TextDecoder().decode(
+          await crypto.subtle.decrypt(
+            {
+              name: "AES-GCM",
+              iv: bytes.slice(0, 12),
+              additionalData: COMMUNITY_CURSOR_AAD,
+            },
+            await key,
+            bytes.slice(12),
+          ),
+        )) as CommunityCursorPayload;
+        validate(value);
+        if (value.metric !== expected.metric || value.window !== expected.window) {
+          throw communityCursorError();
+        }
+        return value;
+      } catch (error) {
+        if (error instanceof DomainError) throw error;
+        throw communityCursorError();
+      }
+    },
+  };
+}
+
+const parseCommunityLeaderboardQuery = (c: Context) => {
+  const url = new URL(c.req.url);
+  const allowed = new Set(["metric", "window", "limit", "cursor"]);
+  for (const key of url.searchParams.keys()) {
+    if (!allowed.has(key) || url.searchParams.getAll(key).length !== 1) {
+      throw new DomainError("validation_error", "Community leaderboard query is invalid", 422);
+    }
+  }
+  const raw: Record<string, unknown> = {};
+  for (const key of allowed) {
+    const value = url.searchParams.get(key);
+    if (value !== null) {
+      if (key === "limit" && !/^(?:[1-9]|[1-9][0-9]|100)$/u.test(value)) {
+        throw new DomainError("validation_error", "Community leaderboard query is invalid", 422);
+      }
+      raw[key] = key === "limit" ? Number(value) : value;
+    }
+  }
+  const parsed = communityLeaderboardQuerySchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new DomainError("validation_error", "Community leaderboard query is invalid", 422);
+  }
+  return parsed.data;
 };
 
 const parseAdminUserQuery = (c: Context): AdminUserQuery => {
@@ -1635,6 +1770,10 @@ async function stageMultipartUpload(
 
 export function createApp(options: AppOptions = {}) {
   const repo = options.repository ?? new MemoryRepository();
+  const communityCursorCodec = createCommunityLeaderboardCursorCodec(
+    options.communityCursorSecret ?? Deno.env.get("APP_SECRET") ??
+      `test-only-${crypto.randomUUID()}`,
+  );
   const requestLogSink = options.requestLogSink ?? ((line: string) => console.log(line));
   const requestErrorLogSink = options.requestErrorLogSink ??
     ((line: string) => console.error(line));
@@ -2415,9 +2554,10 @@ export function createApp(options: AppOptions = {}) {
       path === "/api/tokens" || path.startsWith("/api/tokens/");
     const setupSurface = path === "/api/setup" || path.startsWith("/api/setup/");
     const adminSurface = path === "/api/admin" || path.startsWith("/api/admin/");
-    if (!cookieSurface && !setupSurface && !adminSurface) return;
+    const communitySurface = path === "/api/community/profile" ||
+      path === "/api/community/leaderboard";
+    if (!cookieSurface && !setupSurface && !adminSurface && !communitySurface) return;
     privateNoStore(c);
-    if (cookieSurface || adminSurface) c.header("Vary", "Cookie", { append: true });
   };
   const accessSubject = (c: Context<{ Variables: Variables }>): TokenAccessSubject => ({
     userId: c.get("user").id,
@@ -4769,6 +4909,84 @@ export function createApp(options: AppOptions = {}) {
         await parseJson(c, updatePreferencesSchema),
       ),
     );
+  });
+  app.use("/api/community/*", authenticate, approved, sessionOnly);
+  app.use("/api/community", authenticate, approved, sessionOnly);
+  app.use("/api/community/leaderboard", authenticate, approved, sessionOnly);
+  app.get("/api/community/profile", async (c) => {
+    privateNoStore(c);
+    return c.json(await repo.getCommunityProfile(c.get("user").id));
+  });
+  app.patch("/api/community/profile", async (c) => {
+    privateNoStore(c);
+    const patch = await parseJson(c, updateCommunityProfileSchema);
+    try {
+      return c.json(
+        await repo.updateCommunityProfile(
+          c.get("user").id,
+          patch,
+          { actorId: c.get("user").id },
+        ),
+      );
+    } catch (error) {
+      if (error instanceof CommunityProfileValidationError) {
+        throw new DomainError(
+          "validation_error",
+          "Community profile update is invalid",
+          422,
+        );
+      }
+      throw error;
+    }
+  });
+  app.get("/api/community/leaderboard", async (c) => {
+    privateNoStore(c);
+    const parsed = parseCommunityLeaderboardQuery(c);
+    const window = parsed.metric === "balance" ? "current" : parsed.window ?? "30d";
+    const cursor = parsed.cursor
+      ? await communityCursorCodec.decode(parsed.cursor, { metric: parsed.metric, window })
+      : undefined;
+    const asOf = cursor?.asOf ??
+      new Date(options.now?.() ?? Date.now()).toISOString();
+    const from = cursor?.from ??
+      (window === "current"
+        ? null
+        : new Date(Date.parse(asOf) - COMMUNITY_WINDOW_MS[window] * 86_400_000).toISOString());
+    const page = await repo.listCommunityLeaderboard({
+      metric: parsed.metric,
+      window,
+      from,
+      asOf,
+      limit: parsed.limit,
+      after: cursor
+        ? { score: cursor.score, userId: cursor.userId, position: cursor.position }
+        : undefined,
+    });
+    const nextCursor = page.nextBoundary
+      ? await communityCursorCodec.encode({
+        v: 1,
+        metric: parsed.metric,
+        window,
+        from,
+        asOf,
+        ...page.nextBoundary,
+      })
+      : null;
+    const response: CommunityLeaderboardPage = {
+      metric: parsed.metric,
+      window,
+      from,
+      asOf,
+      data: page.data.map(({ position, identityMode, nickname, color, value }) => ({
+        position,
+        identityMode,
+        nickname: identityMode === "nickname" ? nickname : null,
+        color: identityMode === "nickname" ? color : null,
+        value,
+      })),
+      nextCursor,
+    };
+    return c.json(response);
   });
   app.use("/api/folders/*", authenticate, approved, sessionOnly);
   app.use("/api/folders", authenticate, approved, sessionOnly);

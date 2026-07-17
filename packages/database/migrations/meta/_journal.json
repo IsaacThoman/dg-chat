@@ -372,6 +372,13 @@
       "when": 1783998017000,
       "tag": "0052_attachment_cleanup_ownership",
       "breakpoints": true
+    },
+    {
+      "idx": 53,
+      "version": "7",
+      "when": 1783998018000,
+      "tag": "0053_community_profiles",
+      "breakpoints": true
     }
   ]
 }

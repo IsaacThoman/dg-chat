@@ -117,6 +117,13 @@ Deno.test("conversation portability v1 rejects unknown and sensitive fields at e
   for (
     const mutate of [
       (value: any) => value.apiTokens = [],
+      (value: any) =>
+        value.communityProfile = {
+          optedIn: true,
+          identityMode: "nickname",
+          nickname: "PortableConsent",
+          shareBalance: true,
+        },
       (value: any) => value.preferences.ownerId = IDS.root,
       (value: any) => value.conversations[0].balanceMicros = 5_000_000,
       (value: any) => value.conversations[0].messages[0].providerKey = "secret",

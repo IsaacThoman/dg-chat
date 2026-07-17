@@ -283,6 +283,7 @@ try {
     imageConcurrencyLimiter: audioConcurrencyLimiter,
     conversationSearchConcurrencyLimiter,
     browserAuth,
+    communityCursorSecret: appSecret!,
     mailer,
     requireEmailVerification,
     backupAdmin,

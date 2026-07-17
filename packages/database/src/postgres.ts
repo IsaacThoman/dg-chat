@@ -7,6 +7,7 @@ type Snapshot = {
   sessions: unknown[][];
   tokens: unknown[][];
   conversations: unknown[][];
+  communityProfiles: unknown[][];
   messages: unknown[][];
   idempotency: unknown[][];
   ledger: unknown[];
@@ -67,6 +68,9 @@ export class PostgresStateRepository extends MemoryRepository {
     for (const [key, value] of snapshot.conversations ?? []) {
       this.conversations.set(String(key), value as never);
     }
+    for (const [key, value] of snapshot.communityProfiles ?? []) {
+      this.communityProfiles.set(String(key), value as never);
+    }
     for (const [key, value] of snapshot.messages ?? []) {
       this.messages.set(String(key), value as never);
     }
@@ -87,6 +91,7 @@ export class PostgresStateRepository extends MemoryRepository {
       sessions: [...this.sessions],
       tokens: [...this.tokens],
       conversations: [...this.conversations],
+      communityProfiles: [...this.communityProfiles],
       messages: [...this.messages],
       idempotency: [...this.idempotency],
       ledger: this.ledger,
