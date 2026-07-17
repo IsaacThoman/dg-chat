@@ -116,7 +116,13 @@ Deno.test({
       await sql`DELETE FROM attachments WHERE owner_id IN (${owner.id},${other.id})`;
       await withAuditTestMaintenance(
         sql,
-        (tx) => tx`DELETE FROM audit_events WHERE actor_id IN (${owner.id},${other.id})`,
+        async (tx) => {
+          await tx`DELETE FROM audit_events WHERE actor_id IN (${owner.id},${other.id})`;
+          await tx`DELETE FROM attachment_storage_usage
+            WHERE owner_id IN (${owner.id},${other.id})`;
+          await tx`DELETE FROM attachment_storage_blobs
+            WHERE owner_id IN (${owner.id},${other.id})`;
+        },
       );
       await sql`DELETE FROM users WHERE id IN (${owner.id},${other.id})`;
       await sql.end();
