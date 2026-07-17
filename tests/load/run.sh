@@ -121,9 +121,26 @@ trap cleanup EXIT INT TERM
 "${compose[@]}" config --quiet
 "${compose[@]}" up -d --build --scale app=2 --scale worker=3 --wait web worker prometheus
 
-owned_containers="$("${compose[@]}" ps -q)"
-owned_count="$(wc -w <<<"$owned_containers" | tr -d ' ')"
-(( owned_count >= 12 )) || die "the disposable Compose project is incomplete."
+container_count() {
+  local containers="$1"
+  wc -w <<<"$containers" | tr -d ' '
+}
+
+# `docker compose ps -q` intentionally omits successful one-shot services. Inspect all project
+# containers so migrations and bucket initialization remain ownership-fenced, while separately
+# proving that every long-running replica is present and healthy.
+owned_containers="$("${compose[@]}" ps -aq)"
+[[ "$(container_count "$owned_containers")" == 13 ]] ||
+  die "the disposable Compose project does not contain exactly 13 expected containers."
+for service in web postgres redis minio minio-init migrate mock-provider prometheus; do
+  service_containers="$("${compose[@]}" ps -aq "$service")"
+  [[ "$(container_count "$service_containers")" == 1 ]] ||
+    die "the disposable Compose project does not contain exactly one $service container."
+done
+[[ "$(container_count "$("${compose[@]}" ps -q --status running app)")" == 2 ]] ||
+  die "the disposable Compose project does not contain exactly two running API replicas."
+[[ "$(container_count "$("${compose[@]}" ps -q --status running worker)")" == 3 ]] ||
+  die "the disposable Compose project does not contain exactly three running worker replicas."
 for container in $owned_containers; do
   actual_project="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' "$container")"
   load_owned="$(docker inspect -f '{{ index .Config.Labels "com.dg-chat.load-owned" }}' "$container")"
