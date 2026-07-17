@@ -494,6 +494,8 @@ export interface AdminStorageSummary {
   installationObjectsLimit?: number | null;
   installationBytesRemaining?: number | null;
   installationObjectsRemaining?: number | null;
+  installationBytesOverage?: number | null;
+  installationObjectsOverage?: number | null;
   installationBytesPercent?: number | null;
   installationObjectsPercent?: number | null;
 }

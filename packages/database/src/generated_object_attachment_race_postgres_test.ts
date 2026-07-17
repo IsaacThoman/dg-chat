@@ -245,3 +245,85 @@ Deno.test({
     }
   },
 });
+
+Deno.test({
+  name:
+    "generated attachment admission rolls back attachment and storage accounting on attach failure",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const suffix = crypto.randomUUID();
+    const repo = await PostgresRepository.connect(databaseUrl!);
+    const control = postgres(databaseUrl!, { max: 1 });
+    const owner = await repo.createUser({
+      email: `generated-atomic-rollback-${suffix}@example.com`,
+      name: "Generated atomic rollback",
+      approvalStatus: "approved",
+    });
+    const usageRunId = `generated-atomic-rollback-${suffix}`;
+    const objectKey = `generated/${owner.id}/atomic-rollback-${suffix}.png`;
+    try {
+      await control`INSERT INTO usage_runs(
+        id,user_id,model,provider,recovery_owner,status
+      ) VALUES(
+        ${usageRunId},${owner.id},'atomic/image','atomic','provider','completed'
+      )`;
+      const stage = await repo.stageGeneratedObject({
+        ownerId: owner.id,
+        usageRunId,
+        purpose: "output",
+        ordinal: 0,
+        objectKey,
+        mimeType: "image/png",
+        sizeBytes: 68,
+        sha256: "7".repeat(64),
+      });
+      await repo.markGeneratedObjectStored(stage.id, owner.id);
+
+      await assertRejects(
+        () =>
+          repo.createAttachmentFromGeneratedObjectStage(stage.id, owner.id, {
+            ownerId: owner.id,
+            objectKey,
+            filename: "must-rollback.png",
+            mimeType: "image/png",
+            sizeBytes: 68,
+            sha256: "7".repeat(64),
+            state: "pending",
+            inspectionComplete: true,
+          }),
+        DomainError,
+        "Generated object attachment is not ready",
+      );
+      assertEquals(
+        [...await control`SELECT id FROM attachments WHERE object_key=${objectKey}`],
+        [],
+      );
+      assertEquals(
+        [
+          ...await control`SELECT owner_id FROM attachment_storage_blobs
+          WHERE owner_id=${owner.id} AND object_key=${objectKey}`,
+        ],
+        [],
+      );
+      assertEquals(
+        [
+          ...await control`SELECT state,attachment_id FROM generated_object_staging
+          WHERE id=${stage.id}`,
+        ],
+        [{ state: "stored", attachment_id: null }],
+      );
+      assertEquals(
+        [
+          ...await control`SELECT physical_bytes::int,physical_objects::int
+          FROM attachment_storage_usage WHERE owner_id=${owner.id}`,
+        ],
+        [],
+      );
+    } finally {
+      await control.end();
+      await repo.close();
+    }
+  },
+});

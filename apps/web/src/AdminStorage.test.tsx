@@ -54,6 +54,8 @@ describe("AdminStorage", () => {
           installationObjectsLimit: 1_000,
           installationBytesRemaining: 9_958_000,
           installationObjectsRemaining: 999,
+          installationBytesOverage: 0,
+          installationObjectsOverage: 0,
           installationBytesPercent: 0.42,
           installationObjectsPercent: 0.1,
         }}
@@ -68,6 +70,64 @@ describe("AdminStorage", () => {
     expect(markup).not.toContain("Release");
     expect(markup).not.toContain("objectKey");
     expect(markup).not.toContain("users/private");
+  });
+
+  it("renders actual storage overage instead of clamping it to the limit", () => {
+    const markup = renderToStaticMarkup(
+      <AdminStorage
+        {...base}
+        summary={{
+          physicalBytes: 15_000_000,
+          physicalObjects: 1_500,
+          attachmentRecords: 1_500,
+          activeRecords: 1_500,
+          deletedRecords: 0,
+          quarantinedRecords: 0,
+          ownersWithStorage: 2,
+          installationBytesLimit: 10_000_000,
+          installationObjectsLimit: 1_000,
+          installationBytesRemaining: 0,
+          installationObjectsRemaining: 0,
+          installationBytesOverage: 5_000_000,
+          installationObjectsOverage: 500,
+          installationBytesPercent: 150,
+          installationObjectsPercent: 150,
+        }}
+        page={{ data: [], nextCursor: null }}
+      />,
+    );
+    expect(markup).toContain("150.0% used");
+    expect(markup).toContain("5MB over limit");
+    expect(markup).toContain("500 over limit");
+  });
+
+  it("uses readable over-limit copy when a configured zero limit has existing usage", () => {
+    const markup = renderToStaticMarkup(
+      <AdminStorage
+        {...base}
+        summary={{
+          physicalBytes: 1,
+          physicalObjects: 1,
+          attachmentRecords: 1,
+          activeRecords: 1,
+          deletedRecords: 0,
+          quarantinedRecords: 0,
+          ownersWithStorage: 1,
+          installationBytesLimit: 0,
+          installationObjectsLimit: 0,
+          installationBytesRemaining: 0,
+          installationObjectsRemaining: 0,
+          installationBytesOverage: 1,
+          installationObjectsOverage: 1,
+          installationBytesPercent: null,
+          installationObjectsPercent: null,
+        }}
+        page={{ data: [], nextCursor: null }}
+      />,
+    );
+    expect(markup).toContain("Over limit · 1B over limit");
+    expect(markup).toContain("Over limit · 1 over limit");
+    expect(markup).not.toContain("Over limit% used");
   });
 
   it("provides explicit blocking error and empty states with retry actions", () => {

@@ -358,6 +358,13 @@
       "when": 1783998015000,
       "tag": "0050_attachment_control_plane",
       "breakpoints": true
+    },
+    {
+      "idx": 51,
+      "version": "7",
+      "when": 1783998016000,
+      "tag": "0051_attachment_release_compatibility",
+      "breakpoints": true
     }
   ]
 }

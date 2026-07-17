@@ -4803,87 +4803,137 @@ export class PostgresRepository implements DomainRepository {
   ): Promise<CreateAttachmentResult> {
     validateAttachmentInput(input);
     validateAttachmentStorageQuota(quota);
+    return await this.#sql.begin((tx) => this.#createAttachment(tx, input, quota));
+  }
+
+  async #createAttachment(
+    tx: postgres.TransactionSql,
+    input: CreateAttachmentInput,
+    quota?: AttachmentStorageQuota,
+  ): Promise<CreateAttachmentResult> {
     const requiredInspectionMode = input.requiredInspectionMode ?? "local";
     const inspectionPolicyVersion = input.inspectionPolicyVersion ??
       ATTACHMENT_INSPECTION_POLICY_VERSION;
-    return await this.#sql.begin(async (tx) => {
-      await tx`SELECT pg_advisory_xact_lock(hashtextextended(${`attachment-dedup:${input.ownerId}:${input.sha256}`},0))`;
-      await tx`SELECT pg_advisory_xact_lock(hashtextextended(${input.objectKey},0))`;
-      const stagedObject = await tx`SELECT id FROM attachment_upload_staging
+    await tx`SELECT pg_advisory_xact_lock(hashtextextended(${`attachment-dedup:${input.ownerId}:${input.sha256}`},0))`;
+    await tx`SELECT pg_advisory_xact_lock(hashtextextended(${input.objectKey},0))`;
+    const stagedObject = await tx`SELECT id FROM attachment_upload_staging
         WHERE object_key=${input.objectKey} LIMIT 1`;
-      if (stagedObject.length) {
-        throw new DomainError(
-          "upload_stage_conflict",
-          "Attachment object is controlled by a browser upload stage",
-          409,
-        );
-      }
-      const owner = await tx`SELECT id FROM users WHERE id=${input.ownerId} FOR UPDATE`;
-      if (!owner.length) throw new DomainError("not_found", "User not found", 404);
-      const existing = await tx<
-        Row[]
-      >`SELECT * FROM attachments WHERE owner_id=${input.ownerId} AND sha256=${input.sha256}
+    if (stagedObject.length) {
+      throw new DomainError(
+        "upload_stage_conflict",
+        "Attachment object is controlled by a browser upload stage",
+        409,
+      );
+    }
+    const owner = await tx`SELECT id FROM users WHERE id=${input.ownerId} FOR UPDATE`;
+    if (!owner.length) throw new DomainError("not_found", "User not found", 404);
+    const existing = await tx<
+      Row[]
+    >`SELECT * FROM attachments WHERE owner_id=${input.ownerId} AND sha256=${input.sha256}
         AND required_inspection_mode=${requiredInspectionMode}
         AND inspection_policy_version=${inspectionPolicyVersion}
         AND deleted_at IS NULL ORDER BY created_at,id LIMIT 1 FOR UPDATE`;
-      let record = existing[0];
-      const deduplicated = Boolean(record);
-      if (record) {
-        if (
-          number(record.size_bytes) !== input.sizeBytes ||
-          String(record.mime_type) !== input.mimeType
-        ) {
-          throw new DomainError(
-            "attachment_hash_conflict",
-            "Attachment digest metadata differs",
-            409,
-          );
-        }
-      } else {
-        const objectConflict = await tx`
+    let record = existing[0];
+    const deduplicated = Boolean(record);
+    if (record) {
+      if (
+        number(record.size_bytes) !== input.sizeBytes ||
+        String(record.mime_type) !== input.mimeType
+      ) {
+        throw new DomainError(
+          "attachment_hash_conflict",
+          "Attachment digest metadata differs",
+          409,
+        );
+      }
+    } else {
+      const objectConflict = await tx`
           SELECT id FROM attachments WHERE object_key=${input.objectKey} LIMIT 1`;
-        if (objectConflict.length) {
-          throw new DomainError("object_key_taken", "Attachment object key already exists", 409);
-        }
-        await admitAttachmentStorage(tx, input, quota);
-        const inserted = await tx<
-          Row[]
-        >`INSERT INTO attachments(owner_id,object_key,filename,mime_type,size_bytes,sha256,state,
+      if (objectConflict.length) {
+        throw new DomainError("object_key_taken", "Attachment object key already exists", 409);
+      }
+      await admitAttachmentStorage(tx, input, quota);
+      const inserted = await tx<
+        Row[]
+      >`INSERT INTO attachments(owner_id,object_key,filename,mime_type,size_bytes,sha256,state,
           inspection_error,required_inspection_mode,inspection_policy_version,ingestion_status)
           VALUES(${input.ownerId},${input.objectKey},${input.filename},${input.mimeType},
           ${input.sizeBytes},${input.sha256},${input.state ?? "pending"},${
-          input.inspectionError ?? null
-        },${requiredInspectionMode},${inspectionPolicyVersion},${
-          input.state === "ready" && isIngestibleDocumentMime(input.mimeType)
-            ? "queued"
-            : "not_applicable"
-        }) RETURNING *`;
-        record = inserted[0];
+        input.inspectionError ?? null
+      },${requiredInspectionMode},${inspectionPolicyVersion},${
+        input.state === "ready" && isIngestibleDocumentMime(input.mimeType)
+          ? "queued"
+          : "not_applicable"
+      }) RETURNING *`;
+      record = inserted[0];
+    }
+    const attachmentId = String(record.id);
+    const inspectionEpoch = number(record.inspection_epoch ?? 1);
+    const idempotencyKey = `attachment.inspect:${attachmentId}:${inspectionEpoch}`;
+    const jobs = input.inspectionComplete ? [] : await tx<
+      Row[]
+    >`INSERT INTO jobs(type,payload,idempotency_key) VALUES('attachment.inspect',${
+      tx.json({
+        attachmentId,
+        ownerId: input.ownerId,
+        inspectionEpoch,
+        requiredInspectionMode: String(record.required_inspection_mode),
+        inspectionPolicyVersion: String(record.inspection_policy_version),
+      })
+    },${idempotencyKey}) ON CONFLICT(idempotency_key) DO UPDATE SET idempotency_key=EXCLUDED.idempotency_key RETURNING id`;
+    if (String(record.ingestion_status) === "queued") {
+      await tx`INSERT INTO jobs(type,payload,idempotency_key) VALUES('attachment.ingest',${
+        tx.json({ attachmentId, ownerId: input.ownerId })
+      },${`attachment.ingest:${attachmentId}`}) ON CONFLICT(idempotency_key) DO NOTHING`;
+    }
+    return {
+      attachment: attachment(record),
+      inspectionJobId: jobs[0] ? String(jobs[0].id) : null,
+      deduplicated,
+    };
+  }
+
+  async createAttachmentFromGeneratedObjectStage(
+    id: string,
+    ownerId: string,
+    input: CreateAttachmentInput,
+    quota?: AttachmentStorageQuota,
+  ): Promise<CreateAttachmentResult> {
+    validateAttachmentInput(input);
+    validateAttachmentStorageQuota(quota);
+    return await this.#sql.begin(async (tx) => {
+      const stages = await tx<Row[]>`SELECT * FROM generated_object_staging
+        WHERE id=${id} AND owner_id=${ownerId} FOR UPDATE`;
+      const stage = stages[0];
+      if (!stage) throw new DomainError("not_found", "Generated object stage not found", 404);
+      if (
+        String(stage.state) !== "stored" || input.ownerId !== ownerId ||
+        String(stage.object_key) !== input.objectKey ||
+        number(stage.size_bytes) !== input.sizeBytes ||
+        String(stage.sha256) !== input.sha256 ||
+        String(stage.mime_type) !== input.mimeType
+      ) {
+        throw new DomainError("generated_stage_conflict", "Generated object stage changed", 409);
       }
-      const attachmentId = String(record.id);
-      const inspectionEpoch = number(record.inspection_epoch ?? 1);
-      const idempotencyKey = `attachment.inspect:${attachmentId}:${inspectionEpoch}`;
-      const jobs = input.inspectionComplete ? [] : await tx<
-        Row[]
-      >`INSERT INTO jobs(type,payload,idempotency_key) VALUES('attachment.inspect',${
-        tx.json({
-          attachmentId,
-          ownerId: input.ownerId,
-          inspectionEpoch,
-          requiredInspectionMode: String(record.required_inspection_mode),
-          inspectionPolicyVersion: String(record.inspection_policy_version),
-        })
-      },${idempotencyKey}) ON CONFLICT(idempotency_key) DO UPDATE SET idempotency_key=EXCLUDED.idempotency_key RETURNING id`;
-      if (String(record.ingestion_status) === "queued") {
-        await tx`INSERT INTO jobs(type,payload,idempotency_key) VALUES('attachment.ingest',${
-          tx.json({ attachmentId, ownerId: input.ownerId })
-        },${`attachment.ingest:${attachmentId}`}) ON CONFLICT(idempotency_key) DO NOTHING`;
+      const created = await this.#createAttachment(tx, input, quota);
+      const referenceable = await tx`SELECT id FROM attachments
+        WHERE id=${created.attachment.id} AND owner_id=${ownerId}
+          AND state='ready' AND deleted_at IS NULL AND physical_object FOR UPDATE`;
+      if (!referenceable.length) {
+        throw new DomainError(
+          "generated_stage_conflict",
+          "Generated object attachment is not ready",
+          409,
+        );
       }
-      return {
-        attachment: attachment(record),
-        inspectionJobId: jobs[0] ? String(jobs[0].id) : null,
-        deduplicated,
-      };
+      const attached = await tx`UPDATE generated_object_staging SET state='attached',
+        attachment_id=${created.attachment.id},cleanup_attachment=${!created.deduplicated},
+        updated_at=now() WHERE id=${id} AND owner_id=${ownerId} AND state='stored'
+        RETURNING id`;
+      if (!attached.length) {
+        throw new DomainError("generated_stage_conflict", "Generated object stage changed", 409);
+      }
+      return created;
     });
   }
 

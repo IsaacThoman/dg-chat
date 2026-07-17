@@ -229,9 +229,15 @@ export function AdminStorage(props: AdminStorageProps) {
           : `${bytes(props.summary.physicalBytes)} / ${
             bytes(props.summary.installationBytesLimit)
           }`,
-        detail: props.summary.installationBytesPercent == null
+        detail: props.summary.installationBytesLimit == null
           ? "No configured limit reported"
-          : `${props.summary.installationBytesPercent.toFixed(1)}% used · ${
+          : (props.summary.installationBytesOverage ?? 0) > 0
+          ? `${
+            props.summary.installationBytesPercent == null
+              ? "Over limit"
+              : `${props.summary.installationBytesPercent.toFixed(1)}% used`
+          } · ${bytes(props.summary.installationBytesOverage ?? 0)} over limit`
+          : `${props.summary.installationBytesPercent?.toFixed(1) ?? "0.0"}% used · ${
             bytes(props.summary.installationBytesRemaining ?? 0)
           } remaining`,
         icon: HardDrive,
@@ -241,9 +247,15 @@ export function AdminStorage(props: AdminStorageProps) {
         value: props.summary.installationObjectsLimit == null
           ? props.summary.physicalObjects.toLocaleString()
           : `${props.summary.physicalObjects.toLocaleString()} / ${props.summary.installationObjectsLimit.toLocaleString()}`,
-        detail: props.summary.installationObjectsPercent == null
+        detail: props.summary.installationObjectsLimit == null
           ? "No configured limit reported"
-          : `${props.summary.installationObjectsPercent.toFixed(1)}% used · ${
+          : (props.summary.installationObjectsOverage ?? 0) > 0
+          ? `${
+            props.summary.installationObjectsPercent == null
+              ? "Over limit"
+              : `${props.summary.installationObjectsPercent.toFixed(1)}% used`
+          } · ${(props.summary.installationObjectsOverage ?? 0).toLocaleString()} over limit`
+          : `${props.summary.installationObjectsPercent?.toFixed(1) ?? "0.0"}% used · ${
             (props.summary.installationObjectsRemaining ?? 0).toLocaleString()
           } remaining`,
         icon: FileArchive,
@@ -483,6 +495,12 @@ export function AdminStorage(props: AdminStorageProps) {
             This does not release or approve the file. A worker will evaluate{" "}
             <strong>{selected.filename}</strong> using the current inspection policy.
           </p>
+          {selected.state === "ready" && (
+            <p role="note">
+              This attachment will be temporarily unavailable to users until reinspection finishes
+              successfully.
+            </p>
+          )}
           <label className="storage-reason">
             Reason
             <textarea

@@ -101,6 +101,18 @@ interface TempPayload {
   entry: BackupManifestEntryV1;
 }
 
+function restoredObjectKey(
+  restoreNamespace: string,
+  ownerId: string,
+  reference: ObjectReference,
+) {
+  // Archive payloads are intentionally deduplicated by content digest, but retained storage
+  // identity is the original object key. Include both so equal bytes from two independently
+  // governed objects never collapse into one restored blob.
+  const sourceObjectIdentity = createHash("sha256").update(reference.objectKey).digest("hex");
+  return `restores/${restoreNamespace}/users/${ownerId}/${sourceObjectIdentity}/${reference.sha256}`;
+}
+
 const defaultDatabase: DatabaseAdapter = {
   verifyCatalog: verifyBackupDataCatalog,
   snapshot: withRepeatableReadBackupSnapshot,
@@ -988,7 +1000,7 @@ export function createPostgresBackupDataPort(
           }
           uniqueObjects.set(reference.sha256, reference.bytes);
           referencedEntries.add(row.entry);
-          const key = `restores/${restoreNamespace}/users/${ownerId}/${reference.sha256}`;
+          const key = restoredObjectKey(restoreNamespace, ownerId, reference);
           if (mode === "apply") {
             try {
               await options.objects.put({
@@ -1003,6 +1015,7 @@ export function createPostgresBackupDataPort(
               const existing = await options.objects.get(key);
               if (
                 !existing || existing.contentLength !== reference.bytes ||
+                existing.contentType !== reference.contentType ||
                 existing.metadata.sha256 !== reference.sha256 ||
                 existing.metadata.owner !== ownerId
               ) throw new TypeError("Staged backup object conflicts with existing content");
@@ -1015,11 +1028,12 @@ export function createPostgresBackupDataPort(
               stagedKeySet.add(key);
               stagedKeys.push(key);
             }
-          } else if (mode === "cleanup" && !cleanedEntries.has(`${ownerId}\0${reference.sha256}`)) {
+          } else if (mode === "cleanup" && !cleanedEntries.has(key)) {
             const existing = await options.objects.get(key);
             if (existing) {
               if (
                 existing.contentLength !== reference.bytes ||
+                existing.contentType !== reference.contentType ||
                 existing.metadata.sha256 !== reference.sha256 ||
                 existing.metadata.owner !== ownerId
               ) {
@@ -1029,7 +1043,7 @@ export function createPostgresBackupDataPort(
               await existing.body.cancel().catch(() => undefined);
               await options.objects.delete(key);
             }
-            cleanedEntries.add(`${ownerId}\0${reference.sha256}`);
+            cleanedEntries.add(key);
           }
           const previous = map.get(reference.objectKey);
           if (previous && previous !== key) throw new TypeError("Backup object key is duplicated");

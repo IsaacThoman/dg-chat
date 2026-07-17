@@ -1312,6 +1312,58 @@ Deno.test("completed provider work is charged when immutable storage fails", asy
   assertEquals(repository.listGeneratedAssets(run.userId).length, 0);
 });
 
+Deno.test("generated persistence failures retain bytes for durable cleanup, including ambiguous commits", async () => {
+  for (const ambiguousCommit of [false, true]) {
+    const { app, repository, objectStore, cookie } = await fixture();
+    const original = repository.createAttachmentFromGeneratedObjectStage.bind(repository);
+    let deletionAttempts = 0;
+    objectStore.delete = (key) => {
+      deletionAttempts++;
+      objectStore.objects.delete(key);
+      return Promise.resolve();
+    };
+    repository.createAttachmentFromGeneratedObjectStage = (id, ownerId, input, quota) => {
+      if (ambiguousCommit) original(id, ownerId, input, quota);
+      throw new Error(
+        ambiguousCommit
+          ? "simulated lost commit acknowledgement"
+          : "simulated attachment transaction failure",
+      );
+    };
+    const response = await app.request("/v1/images/generations", {
+      method: "POST",
+      headers: {
+        cookie,
+        "content-type": "application/json",
+        "idempotency-key": `generated-attachment-${ambiguousCommit ? "ambiguous" : "failed"}`,
+      },
+      body: JSON.stringify({ model: "images/public", prompt: "retain durable bytes" }),
+    });
+    assertEquals(response.status, 502);
+    assertEquals(deletionAttempts, 0, "the request path must never race durable cleanup");
+    assertEquals(
+      objectStore.objects.size,
+      1,
+      "stored bytes remain available to the cleanup worker",
+    );
+    const stages = [...repository.generatedObjectStages.values()];
+    assertEquals(stages.length, 1);
+    assertEquals(stages[0].state, "cleanup_pending");
+    assertEquals(
+      [...repository.attachments.values()].filter((attachment) => attachment.deletedAt === null)
+        .length,
+      ambiguousCommit ? 1 : 0,
+    );
+    assertEquals(
+      repository.jobs.some((job) =>
+        job.idempotencyKey === `generated_object.cleanup:${stages[0].id}` &&
+        job.status === "queued"
+      ),
+      true,
+    );
+  }
+});
+
 Deno.test("stale image finalization reauthorizes its stored canonical model before reclaim", async () => {
   const { app, repository, cookie, calls } = await fixture();
   const originalComplete = repository.completeApiJson.bind(repository);

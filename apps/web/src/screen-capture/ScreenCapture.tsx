@@ -16,12 +16,14 @@ export function ScreenCapture({
   disabled,
   visionCapable,
   targetKey,
+  getCurrentTargetKey,
   onCapture,
   onBusyChange,
 }: {
   disabled?: boolean;
   visionCapable: boolean;
   targetKey: string;
+  getCurrentTargetKey?: () => string;
   onCapture: (file: File) => void;
   onBusyChange?: (busy: boolean) => void;
 }) {
@@ -112,7 +114,7 @@ export function ScreenCapture({
         request !== requestRef.current ||
         !screenCaptureResultIsUsable(
           requestedTargetKey,
-          targetKeyRef.current,
+          getCurrentTargetKey?.() ?? targetKeyRef.current,
           eligibleRef.current,
         )
       ) return;
@@ -122,7 +124,7 @@ export function ScreenCapture({
         request !== requestRef.current ||
         !screenCaptureResultIsUsable(
           requestedTargetKey,
-          targetKeyRef.current,
+          getCurrentTargetKey?.() ?? targetKeyRef.current,
           eligibleRef.current,
         )
       ) return;
@@ -137,7 +139,7 @@ export function ScreenCapture({
         request !== requestRef.current ||
         !screenCaptureResultIsUsable(
           requestedTargetKey,
-          targetKeyRef.current,
+          getCurrentTargetKey?.() ?? targetKeyRef.current,
           eligibleRef.current,
         )
       ) return;
@@ -154,7 +156,7 @@ export function ScreenCapture({
       !result ||
       !screenCaptureResultIsUsable(
         resultTargetRef.current,
-        targetKeyRef.current,
+        getCurrentTargetKey?.() ?? targetKeyRef.current,
         eligibleRef.current,
       )
     ) {

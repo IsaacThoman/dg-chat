@@ -1012,7 +1012,8 @@ async function processJob(
               WHERE gai.attachment_id=s.attachment_id))
             AND (NOT s.cleanup_attachment OR NOT EXISTS(SELECT 1 FROM attachments peer
               WHERE peer.owner_id=s.owner_id AND peer.object_key=s.object_key
-                AND peer.id<>s.attachment_id))
+                AND peer.physical_object
+                AND (s.attachment_id IS NULL OR peer.id<>s.attachment_id)))
             AND (NOT s.cleanup_attachment OR NOT EXISTS(SELECT 1
               FROM generated_object_staging peer
               WHERE peer.id<>s.id AND peer.state<>'cleaned'

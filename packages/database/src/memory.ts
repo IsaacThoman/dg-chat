@@ -3802,7 +3802,7 @@ export class MemoryRepository {
       ATTACHMENT_INSPECTION_POLICY_VERSION;
     const prior = [...this.attachments.values()].find((attachment) =>
       attachment.ownerId === input.ownerId && attachment.sha256 === input.sha256 &&
-      attachment.state !== "deleted" &&
+      attachment.deletedAt === null &&
       attachment.requiredInspectionMode === requiredInspectionMode &&
       attachment.inspectionPolicyVersion === inspectionPolicyVersion
     );
@@ -3860,6 +3860,55 @@ export class MemoryRepository {
       this.attachments.delete(attachment.id);
       this.jobs.splice(jobsBefore);
       if (admitted) this.#rollbackAttachmentStorageAdmission(input);
+      throw error;
+    }
+  }
+
+  createAttachmentFromGeneratedObjectStage(
+    id: string,
+    ownerId: string,
+    input: CreateAttachmentInput,
+    quota?: AttachmentStorageQuota,
+  ): CreateAttachmentResult {
+    const stage = this.generatedObjectStages.get(id);
+    if (!stage || stage.ownerId !== ownerId) {
+      throw new DomainError("not_found", "Generated object stage not found", 404);
+    }
+    if (
+      stage.state !== "stored" || input.ownerId !== ownerId ||
+      stage.objectKey !== input.objectKey || stage.sizeBytes !== input.sizeBytes ||
+      stage.sha256 !== input.sha256 || stage.mimeType !== input.mimeType
+    ) {
+      throw new DomainError("generated_stage_conflict", "Generated object stage changed", 409);
+    }
+    const requiredInspectionMode = input.requiredInspectionMode ?? "local";
+    const inspectionPolicyVersion = input.inspectionPolicyVersion ??
+      ATTACHMENT_INSPECTION_POLICY_VERSION;
+    const prior = [...this.attachments.values()].find((attachment) =>
+      attachment.ownerId === input.ownerId && attachment.sha256 === input.sha256 &&
+      attachment.deletedAt === null &&
+      attachment.requiredInspectionMode === requiredInspectionMode &&
+      attachment.inspectionPolicyVersion === inspectionPolicyVersion
+    );
+    if (prior ? prior.state !== "ready" : input.state !== "ready") {
+      throw new DomainError(
+        "generated_stage_conflict",
+        "Generated object attachment is not ready",
+        409,
+      );
+    }
+    const jobsBefore = this.jobs.length;
+    let created: CreateAttachmentResult | undefined;
+    try {
+      created = this.createAttachment(input, quota);
+      this.attachGeneratedObject(id, ownerId, created.attachment.id, !created.deduplicated);
+      return created;
+    } catch (error) {
+      this.jobs.splice(jobsBefore);
+      if (created && !created.deduplicated) {
+        this.attachments.delete(created.attachment.id);
+        this.#rollbackAttachmentStorageAdmission(input);
+      }
       throw error;
     }
   }
@@ -4716,14 +4765,24 @@ export class MemoryRepository {
       stage.state = stage.cleanupAttachment ? "finalized" : "cleanup_pending";
       stage.updatedAt = now;
       if (!stage.cleanupAttachment) {
-        this.enqueueJob("generated_object.cleanup", { stageId: stage.id, ownerId: input.ownerId });
+        this.enqueueJob(
+          "generated_object.cleanup",
+          { stageId: stage.id, ownerId: input.ownerId },
+          undefined,
+          `generated_object.cleanup:${stage.id}`,
+        );
       }
     }
     for (const stage of editStages) {
       stage.state = stage.cleanupAttachment ? "finalized" : "cleanup_pending";
       stage.updatedAt = now;
       if (!stage.cleanupAttachment) {
-        this.enqueueJob("generated_object.cleanup", { stageId: stage.id, ownerId: input.ownerId });
+        this.enqueueJob(
+          "generated_object.cleanup",
+          { stageId: stage.id, ownerId: input.ownerId },
+          undefined,
+          `generated_object.cleanup:${stage.id}`,
+        );
       }
     }
     return created;
@@ -4886,7 +4945,20 @@ export class MemoryRepository {
       stage.state = "cleanup_pending";
       stage.cleanupError = reason.slice(0, 1000);
       stage.updatedAt = new Date().toISOString();
-      this.enqueueJob("generated_object.cleanup", { stageId: stage.id, ownerId });
+      const payload = { stageId: stage.id, ownerId };
+      const key = `generated_object.cleanup:${stage.id}`;
+      const prior = this.jobs.find((job) => job.idempotencyKey === key);
+      if (prior && ["completed", "failed"].includes(prior.status)) {
+        prior.status = "queued";
+        prior.attempts = 0;
+        prior.availableAt = new Date().toISOString();
+        prior.lockedAt = null;
+        prior.lockedBy = null;
+        prior.lastError = null;
+        prior.completedAt = null;
+      } else {
+        this.enqueueJob("generated_object.cleanup", payload, undefined, key);
+      }
       count++;
     }
     return count;

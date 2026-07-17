@@ -2560,6 +2560,16 @@ export interface DomainRepository {
     input: CreateAttachmentInput,
     quota?: AttachmentStorageQuota,
   ): MaybePromise<CreateAttachmentResult>;
+  /**
+   * Atomically admits an attachment and binds it to a stored generated-object stage.
+   * Callers must use this instead of publishing the attachment and stage in separate commits.
+   */
+  createAttachmentFromGeneratedObjectStage(
+    id: string,
+    ownerId: string,
+    input: CreateAttachmentInput,
+    quota?: AttachmentStorageQuota,
+  ): MaybePromise<CreateAttachmentResult>;
   stageAttachmentUpload(
     input: StageAttachmentUploadInput,
     leaseSeconds: number,

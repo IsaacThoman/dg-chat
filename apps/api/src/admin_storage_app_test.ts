@@ -106,10 +106,7 @@ Deno.test("enabled external inspection keeps new web and OpenAI files pending", 
   );
 });
 
-Deno.test("a stuck browser-upload heartbeat aborts the PUT and never hangs the request", async () => {
-  const repository = new MemoryRepository();
-  repository.heartbeatAttachmentUpload =
-    (() => new Promise(() => {})) as unknown as typeof repository.heartbeatAttachmentUpload;
+Deno.test("failed browser-upload heartbeats abort the PUT without escaping or hanging", async () => {
   class BlockingPutStore extends TestObjectStore {
     override async put(input: PutObjectInput): Promise<never> {
       if (input.signal?.aborted) throw input.signal.reason;
@@ -118,62 +115,77 @@ Deno.test("a stuck browser-upload heartbeat aborts the PUT and never hangs the r
       });
     }
   }
-  const { app } = createApp({
-    repository,
-    objectStore: new BlockingPutStore(),
-    setupToken: "heartbeat-setup-token",
-    attachmentUploadPutTimeoutMs: 1_000,
-    attachmentUploadLeaseSeconds: 120,
-    attachmentUploadHeartbeatMs: 10,
-    attachmentUploadHeartbeatTimeoutMs: 20,
-  });
-  await app.request("/api/setup/bootstrap", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-setup-token": "heartbeat-setup-token",
-    },
-    body: JSON.stringify({
-      email: "heartbeat-admin@example.test",
-      password: "correct horse battery",
-      name: "Heartbeat admin",
-    }),
-  });
-  const login = await app.request("/api/auth/sign-in/email", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      email: "heartbeat-admin@example.test",
-      password: "correct horse battery",
-    }),
-  });
-  const cookie = login.headers.get("set-cookie")?.split(";", 1)[0];
-  assertExists(cookie);
-  const form = new FormData();
-  form.set("file", new File(["heartbeat"], "heartbeat.txt", { type: "text/plain" }));
-  const started = performance.now();
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  const response = await Promise.race([
-    app.request("/api/attachments", {
+  for (
+    const [variant, heartbeat] of [
+      ["timeout", () => new Promise(() => {})],
+      ["sync-throw", () => {
+        throw new Error("synchronous heartbeat failure");
+      }],
+    ] as const
+  ) {
+    const repository = new MemoryRepository();
+    repository.heartbeatAttachmentUpload =
+      heartbeat as unknown as typeof repository.heartbeatAttachmentUpload;
+    const setupToken = `heartbeat-${variant}-setup-token`;
+    const email = `heartbeat-${variant}@example.test`;
+    const { app } = createApp({
+      repository,
+      objectStore: new BlockingPutStore(),
+      setupToken,
+      attachmentUploadPutTimeoutMs: 1_000,
+      attachmentUploadLeaseSeconds: 120,
+      attachmentUploadHeartbeatMs: 10,
+      attachmentUploadHeartbeatTimeoutMs: 20,
+    });
+    await app.request("/api/setup/bootstrap", {
       method: "POST",
-      headers: { cookie, origin: "http://localhost:5173" },
-      body: form,
-    }),
-    new Promise<never>((_, reject) => {
-      timeout = setTimeout(() => reject(new Error("upload route remained pending")), 500);
-    }),
-  ]).finally(() => clearTimeout(timeout));
-  assertEquals(response.status, 500);
-  assertEquals(performance.now() - started < 500, true);
-  const [stage] = [...repository.attachmentUploadStages.values()];
-  assertEquals(stage.state, "cleanup_pending");
-  assertEquals(
-    repository.jobs.some((job) =>
-      job.idempotencyKey === `attachment_object.cleanup:${stage.id}` &&
-      Date.parse(job.availableAt) >= Date.parse(stage.uploadLeaseExpiresAt)
-    ),
-    true,
-  );
+      headers: {
+        "content-type": "application/json",
+        "x-setup-token": setupToken,
+      },
+      body: JSON.stringify({
+        email,
+        password: "correct horse battery",
+        name: "Heartbeat admin",
+      }),
+    });
+    const login = await app.request("/api/auth/sign-in/email", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        email,
+        password: "correct horse battery",
+      }),
+    });
+    const cookie = login.headers.get("set-cookie")?.split(";", 1)[0];
+    assertExists(cookie);
+    const form = new FormData();
+    form.set("file", new File(["heartbeat"], "heartbeat.txt", { type: "text/plain" }));
+    const started = performance.now();
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const response = await Promise.race([
+      app.request("/api/attachments", {
+        method: "POST",
+        headers: { cookie, origin: "http://localhost:5173" },
+        body: form,
+      }),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error("upload route remained pending")), 500);
+      }),
+    ]).finally(() => clearTimeout(timeout));
+    assertEquals(response.status, 500, variant);
+    assertEquals(performance.now() - started < 500, true, variant);
+    const [stage] = [...repository.attachmentUploadStages.values()];
+    assertEquals(stage.state, "cleanup_pending", variant);
+    assertEquals(
+      repository.jobs.some((job) =>
+        job.idempotencyKey === `attachment_object.cleanup:${stage.id}` &&
+        Date.parse(job.availableAt) >= Date.parse(stage.uploadLeaseExpiresAt)
+      ),
+      true,
+      variant,
+    );
+  }
 });
 
 Deno.test("admin storage inventory is session-only, filter-bound, private, and credential-free", async () => {
@@ -243,6 +255,44 @@ Deno.test("admin storage inventory is session-only, filter-bound, private, and c
   });
   assertEquals(tokenDenied.status, 403);
   assertEquals((await json(tokenDenied)).error.code, "session_required");
+});
+
+Deno.test("admin storage summary reports actual overage above configured limits", async () => {
+  const { app, repository, admin, cookie } = await fixture({
+    perUserBytes: 20,
+    perUserObjects: 1,
+    installationBytes: 20,
+    installationObjects: 1,
+  });
+  repository.createAttachment({
+    ownerId: admin.id,
+    objectKey: `users/${admin.id}/over-limit-first`,
+    filename: "first.txt",
+    mimeType: "text/plain",
+    sizeBytes: 15,
+    sha256: "1".repeat(64),
+    state: "ready",
+    inspectionComplete: true,
+  });
+  repository.createAttachment({
+    ownerId: admin.id,
+    objectKey: `users/${admin.id}/over-limit-second`,
+    filename: "second.txt",
+    mimeType: "text/plain",
+    sizeBytes: 15,
+    sha256: "2".repeat(64),
+    state: "ready",
+    inspectionComplete: true,
+  });
+  const response = await app.request("/api/admin/storage/summary", { headers: { cookie } });
+  assertEquals(response.status, 200);
+  const summary = (await json(response)).summary;
+  assertEquals(summary.installationBytesPercent, 150);
+  assertEquals(summary.installationObjectsPercent, 200);
+  assertEquals(summary.installationBytesRemaining, 0);
+  assertEquals(summary.installationObjectsRemaining, 0);
+  assertEquals(summary.installationBytesOverage, 10);
+  assertEquals(summary.installationObjectsOverage, 1);
 });
 
 Deno.test("admin reinspection validates CSRF, reason and version without exposing object keys", async () => {

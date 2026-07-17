@@ -130,6 +130,11 @@ const attachmentId = "10000000-0000-4000-8000-000000000001";
 const ownerId = "10000000-0000-4000-8000-000000000002";
 const restoreOperationId = "10000000-0000-4000-8000-000000000004";
 
+async function restoredKey(operationId: string, owner: string, objectKey: string, digest: string) {
+  const identity = await sha256Hex(new TextEncoder().encode(objectKey));
+  return `restores/${operationId}/users/${owner}/${identity}/${digest}`;
+}
+
 async function fixture(
   options: {
     missing?: boolean;
@@ -461,7 +466,10 @@ Deno.test("postgres backup data streams a bounded object roundtrip and retains c
     assertEquals(committed.restoreOperationVersion, 3);
     assertEquals(committed.installationVersion, 4);
     const target = fx.restoredMap()?.get("attachments/original");
-    assertEquals(target, `restores/${restoreOperationId}/users/${ownerId}/${fx.digest}`);
+    assertEquals(
+      target,
+      await restoredKey(restoreOperationId, ownerId, "attachments/original", fx.digest),
+    );
     assertEquals(fx.objects.values.get(target!)?.value, fx.body);
     assertEquals(fx.objects.values.get(target!)?.metadata, {
       sha256: fx.digest,
@@ -508,6 +516,54 @@ Deno.test("postgres backup data releases the snapshot before object storage and 
   }
 });
 
+Deno.test("postgres backup restore preserves distinct same-owner objects with equal bytes", async () => {
+  const fx = await fixture({ duplicate: true });
+  const snapshot = await fx.adapter.exportSnapshot({
+    includeDiagnostics: false,
+    installationId: "installation-test",
+  });
+  try {
+    const archive = await payloadBytes(
+      writeBackupArchiveStream(snapshot.manifest, snapshot.payloads, fx.authenticator),
+    );
+    const apply = await fx.adapter.restoreSession("apply", { restoreOperationId });
+    const manifest = await parseBackupArchiveStream(archive, fx.authenticator, apply.sink);
+    await apply.commit!(manifest, {
+      restoreOperationId,
+      expectedOperationVersion: 2,
+      expectedInstallationVersion: 3,
+    });
+
+    const original = fx.restoredMap()?.get("attachments/original");
+    const duplicate = fx.restoredMap()?.get("attachments/duplicate");
+    assertEquals(
+      original,
+      await restoredKey(restoreOperationId, ownerId, "attachments/original", fx.digest),
+    );
+    assertEquals(
+      duplicate,
+      await restoredKey(restoreOperationId, ownerId, "attachments/duplicate", fx.digest),
+    );
+    assertEquals(original === duplicate, false);
+    assertEquals(fx.objects.values.get(original!)?.value, fx.body);
+    assertEquals(fx.objects.values.get(duplicate!)?.value, fx.body);
+
+    const cleanup = await fx.adapter.restoreSession("cleanup", { restoreOperationId });
+    const cleanupManifest = await parseBackupArchiveStream(
+      archive,
+      fx.authenticator,
+      cleanup.sink,
+    );
+    await cleanup.cleanup!(cleanupManifest);
+    await cleanup.rollback();
+    assertEquals(fx.objects.values.has(original!), false);
+    assertEquals(fx.objects.values.has(duplicate!), false);
+    await apply.rollback();
+  } finally {
+    await snapshot.cleanup?.();
+  }
+});
+
 Deno.test("postgres backup data deterministically removes only precommit crash staging", async () => {
   const fx = await fixture();
   const snapshot = await fx.adapter.exportSnapshot({
@@ -527,10 +583,20 @@ Deno.test("postgres backup data deterministically removes only precommit crash s
     // `summarize` on an apply session exercises the same staging path and intentionally leaves the
     // object behind, modeling a process exit after object PUT and before the database transaction.
     await apply.summarize(applyManifest);
-    const stagedKey = `restores/${restoreOperationId}/users/${ownerId}/${fx.digest}`;
+    const stagedKey = await restoredKey(
+      restoreOperationId,
+      ownerId,
+      "attachments/original",
+      fx.digest,
+    );
     assertEquals(fx.objects.values.has(stagedKey), true);
 
-    const unrelatedKey = `restores/${crypto.randomUUID()}/users/${ownerId}/${fx.digest}`;
+    const unrelatedKey = await restoredKey(
+      crypto.randomUUID(),
+      ownerId,
+      "attachments/original",
+      fx.digest,
+    );
     fx.objects.values.set(unrelatedKey, {
       value: fx.body,
       type: "text/plain",
@@ -579,7 +645,12 @@ Deno.test("postgres backup data preserves staged objects when the database commi
       Error,
       "database commit response lost",
     );
-    const stagedKey = `restores/${restoreOperationId}/users/${ownerId}/${fx.digest}`;
+    const stagedKey = await restoredKey(
+      restoreOperationId,
+      ownerId,
+      "attachments/original",
+      fx.digest,
+    );
     assertEquals(fx.objects.values.has(stagedKey), true);
 
     // A confirmed pre-commit outcome is the only authority that invokes rollback. It remains

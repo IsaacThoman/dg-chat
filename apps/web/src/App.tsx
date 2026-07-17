@@ -182,6 +182,7 @@ import {
 } from "./useConversationSearch.ts";
 import { conversationTimestampLabel } from "./conversationTimestamp.ts";
 import { visibleComposerUploads } from "./uploadContinuity.ts";
+import { friendlyAttachmentInspectionError } from "./attachment-inspection.ts";
 import {
   AppearancePreferences,
   PersonalizationPreferences,
@@ -1711,6 +1712,7 @@ export function Composer(
     onRetentionProtectionChange,
     voiceTargetKey,
     screenCaptureTargetKey,
+    getScreenCaptureTargetKey,
     onVoiceBusyChange,
   }: {
     onSend: (
@@ -1736,6 +1738,7 @@ export function Composer(
     onRetentionProtectionChange?: (protect: boolean) => void;
     voiceTargetKey?: string;
     screenCaptureTargetKey?: string;
+    getScreenCaptureTargetKey?: () => string;
     onVoiceBusyChange?: (busy: boolean) => void;
   },
 ) {
@@ -2147,7 +2150,7 @@ export function Composer(
                 status: "not-ready",
                 progress: 100,
                 attachment,
-                error: attachment.inspectionError ??
+                error: friendlyAttachmentInspectionError(attachment.inspectionError) ??
                   `Upload is ${attachment.state}; it is not ready to send.`,
               }
             : item
@@ -2195,7 +2198,7 @@ export function Composer(
                 ...candidate,
                 attachment,
                 status: "not-ready",
-                error: attachment.inspectionError ??
+                error: friendlyAttachmentInspectionError(attachment.inspectionError) ??
                   `Upload is ${attachment.state}; it is not ready to send.`,
               }
             : candidate
@@ -2593,6 +2596,7 @@ export function Composer(
             disabled={interactionDisabled}
             visionCapable={visionCapable}
             targetKey={screenCaptureTargetKey ?? ""}
+            getCurrentTargetKey={getScreenCaptureTargetKey}
             onBusyChange={setScreenCaptureBusy}
             onCapture={(file) => addFiles([file])}
           />
@@ -3091,6 +3095,19 @@ function ChatView({
     () => models.filter((model) => model.capabilities.includes("chat")),
     [models],
   );
+  // React batches a model-picker click until the native event finishes. Keep the selected ID
+  // authoritative synchronously as well, so a stale preview action later in that same event task
+  // cannot upload content captured for the model that is being left.
+  const selectedModelRef = useRef(selectedModel);
+  const renderedSelectedModelRef = useRef(selectedModel);
+  if (renderedSelectedModelRef.current !== selectedModel) {
+    renderedSelectedModelRef.current = selectedModel;
+    selectedModelRef.current = selectedModel;
+  }
+  const selectModel = (modelId: string) => {
+    selectedModelRef.current = modelId;
+    setSelectedModel(modelId);
+  };
   const transcriptionModels = useMemo(
     () => models.filter((model) => model.capabilities.includes("transcription")),
     [models],
@@ -3596,7 +3613,7 @@ function ChatView({
         <IconButton label="Open menu" className="mobile-only" onClick={onMenu}>
           <Menu size={20} />
         </IconButton>
-        <ModelPicker models={chatModels} selected={selectedModel} setSelected={setSelectedModel} />
+        <ModelPicker models={chatModels} selected={selectedModel} setSelected={selectModel} />
         {modelPreferenceError && (
           <span className="model-preference-error" role="alert">{modelPreferenceError}</span>
         )}
@@ -3941,6 +3958,21 @@ function ChatView({
                   ),
                 ),
               })}
+              getScreenCaptureTargetKey={() => {
+                const currentModelId = selectedModelRef.current;
+                return chatScreenCaptureTargetKey({
+                  sessionActive,
+                  conversationId: activeId,
+                  leafId: effectiveActiveLeafId,
+                  editId: edit?.id,
+                  selectedModelId: currentModelId,
+                  visionCapable: Boolean(
+                    chatModels.find((model) => model.id === currentModelId)?.capabilities.includes(
+                      "vision",
+                    ),
+                  ),
+                });
+              }}
               voiceTargetKey={`${sessionActive ? "active" : "inactive"}:${activeId}:${
                 effectiveActiveLeafId ?? ""
               }:${edit?.id ?? ""}:${transcriptionModel}`}

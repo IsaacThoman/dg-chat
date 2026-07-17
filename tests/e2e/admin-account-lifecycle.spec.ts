@@ -216,7 +216,11 @@ test("administrators approve, search, and manage an immutable account lifecycle"
 
   await tabs.getByRole("tab", { name: "Billing" }).click();
   await expect(page).toHaveURL(/\/billing(?:\?|$)/u);
-  await expect(page.getByText(`$${defaultApprovalCredit}`, { exact: true }).first()).toBeVisible();
+  const billingBalance = page.getByRole("tabpanel", { name: "Billing" }).locator(
+    ".admin-user-balance-hero strong",
+  );
+  await expect(billingBalance).toBeVisible();
+  await expect(billingBalance).toHaveText(`$${defaultApprovalCredit}`);
   const adjustBalance = page.getByRole("button", { name: "Adjust balance" });
   await assertMobileLayout(adjustBalance);
   await adjustBalance.click();
@@ -229,7 +233,8 @@ test("administrators approve, search, and manage an immutable account lifecycle"
   await assertMobileLayout(addCredit);
   await addCredit.click();
   await expect(adjustmentDialog).toBeHidden();
-  await expect(page.getByText(`$${adjustedBalance}`, { exact: true }).first()).toBeVisible();
+  await expect(billingBalance).toBeVisible();
+  await expect(billingBalance).toHaveText(`$${adjustedBalance}`);
   const adjustmentRow = page.locator(".admin-user-ledger tbody tr").filter({
     hasText: "Exact E2E support credit",
   });

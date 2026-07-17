@@ -3094,13 +3094,13 @@ export function createApp(options: AppOptions = {}) {
     let heartbeatClosed = false;
     const heartbeatInterval = setInterval(() => {
       if (heartbeatClosed || heartbeatInFlight) return;
-      const operation = Promise.resolve(
+      const operation = Promise.resolve().then(() =>
         repo.heartbeatAttachmentUpload(
           uploadStageId,
           ownerId,
           uploadStage.uploadLeaseToken,
           attachmentUploadLeaseSeconds,
-        ),
+        )
       ).then(() => undefined);
       let deadline: ReturnType<typeof setTimeout> | undefined;
       const bounded = Promise.race([
@@ -6157,12 +6157,22 @@ export function createApp(options: AppOptions = {}) {
         installationObjectsRemaining: objectsLimit === null
           ? null
           : Math.max(0, objectsLimit - summary.physicalObjects),
+        installationBytesOverage: bytesLimit === null
+          ? null
+          : Math.max(0, summary.physicalBytes - bytesLimit),
+        installationObjectsOverage: objectsLimit === null
+          ? null
+          : Math.max(0, summary.physicalObjects - objectsLimit),
         installationBytesPercent: bytesLimit === null
           ? null
-          : Math.min(100, summary.physicalBytes / bytesLimit * 100),
+          : bytesLimit === 0
+          ? summary.physicalBytes === 0 ? 0 : null
+          : summary.physicalBytes / bytesLimit * 100,
         installationObjectsPercent: objectsLimit === null
           ? null
-          : Math.min(100, summary.physicalObjects / objectsLimit * 100),
+          : objectsLimit === 0
+          ? summary.physicalObjects === 0 ? 0 : null
+          : summary.physicalObjects / objectsLimit * 100,
       },
     });
   });
@@ -7988,7 +7998,6 @@ export function createApp(options: AppOptions = {}) {
       sizeBytes: output.bytes.byteLength,
       sha256: digest,
     });
-    let stored = false;
     try {
       await objectStore.put({
         key: objectKey,
@@ -7997,7 +8006,6 @@ export function createApp(options: AppOptions = {}) {
         contentType: mimeType,
         metadata: { sha256: digest, owner: ownerId, usage_run: runId },
       });
-      stored = true;
     } catch (error) {
       if (!(error instanceof ObjectAlreadyExistsError)) throw error;
       // A reclaimed idempotent execution can encounter an object written before a crash.
@@ -8020,7 +8028,7 @@ export function createApp(options: AppOptions = {}) {
     }
     await repo.markGeneratedObjectStored(stage.id, ownerId);
     try {
-      const created = await repo.createAttachment({
+      const created = await repo.createAttachmentFromGeneratedObjectStage(stage.id, ownerId, {
         ownerId,
         objectKey,
         filename: `generated-${ordinal + 1}.${extension}`,
@@ -8031,15 +8039,15 @@ export function createApp(options: AppOptions = {}) {
         inspectionError: null,
         inspectionComplete: true,
       }, attachmentStorageQuota);
-      await repo.attachGeneratedObject(
-        stage.id,
-        ownerId,
-        created.attachment.id,
-        !created.deduplicated,
-      );
       return created.attachment;
     } catch (error) {
-      if (stored) await objectStore.delete(objectKey).catch(() => undefined);
+      await Promise.resolve().then(() =>
+        repo.requestGeneratedObjectCleanup(
+          ownerId,
+          runId,
+          "generated object persistence did not complete",
+        )
+      ).catch(() => undefined);
       throw error;
     }
   };
@@ -8113,7 +8121,6 @@ export function createApp(options: AppOptions = {}) {
       sizeBytes: input.bytes.byteLength,
       sha256: input.sha256,
     });
-    let stored = false;
     try {
       await objectStore.put({
         key: objectKey,
@@ -8122,7 +8129,6 @@ export function createApp(options: AppOptions = {}) {
         contentType: input.mimeType,
         metadata: { sha256: input.sha256, owner: ownerId },
       });
-      stored = true;
     } catch (error) {
       if (!(error instanceof ObjectAlreadyExistsError)) throw error;
       const prior = await objectStore.get(objectKey);
@@ -8145,7 +8151,7 @@ export function createApp(options: AppOptions = {}) {
     }
     await repo.markGeneratedObjectStored(stage.id, ownerId);
     try {
-      const created = await repo.createAttachment({
+      const created = await repo.createAttachmentFromGeneratedObjectStage(stage.id, ownerId, {
         ownerId,
         objectKey,
         filename: input.filename,
@@ -8156,15 +8162,15 @@ export function createApp(options: AppOptions = {}) {
         inspectionError: null,
         inspectionComplete: true,
       }, attachmentStorageQuota);
-      await repo.attachGeneratedObject(
-        stage.id,
-        ownerId,
-        created.attachment.id,
-        !created.deduplicated,
-      );
       return created.attachment;
     } catch (error) {
-      if (stored) await objectStore.delete(objectKey).catch(() => undefined);
+      await Promise.resolve().then(() =>
+        repo.requestGeneratedObjectCleanup(
+          ownerId,
+          runId,
+          "generated edit input persistence did not complete",
+        )
+      ).catch(() => undefined);
       throw error;
     }
   };

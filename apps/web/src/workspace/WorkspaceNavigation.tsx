@@ -268,7 +268,7 @@ export function WorkspaceNavigation({
           <Plus size={14} />
         </button>
       </div>
-      <div className="tag-filter-list" aria-label="Filter conversations by tag">
+      <div className="tag-filter-list" role="group" aria-label="Filter conversations by tag">
         {tags?.data.map((tag) => {
           const selected = selectedTags.includes(tag.id);
           return (

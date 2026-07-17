@@ -32,20 +32,24 @@ Deno.test({
     const generatedAttachmentId = crypto.randomUUID();
     const lineageAttachmentId = crypto.randomUUID();
     const replayAttachmentId = crypto.randomUUID();
+    const nullStagePeerAttachmentId = crypto.randomUUID();
     const cleanupStageId = crypto.randomUUID();
     const messageStageId = crypto.randomUUID();
     const generatedStageId = crypto.randomUUID();
     const lineageStageId = crypto.randomUUID();
     const replayStageId = crypto.randomUUID();
+    const nullAttachmentStageId = crypto.randomUUID();
     const generatedAssetId = crypto.randomUUID();
     const generatedJobId = crypto.randomUUID();
     const replayJobId = crypto.randomUUID();
+    const nullAttachmentJobId = crypto.randomUUID();
     const runIds = {
       cleanup: `cleanup-run-${suffix}`,
       message: `message-run-${suffix}`,
       generated: `generated-run-${suffix}`,
       lineage: `lineage-run-${suffix}`,
       replay: `replay-run-${suffix}`,
+      nullAttachment: `null-attachment-run-${suffix}`,
     };
     const objectKeys = {
       cleanup: `generated/${ownerId}/cleanup-${suffix}.png`,
@@ -53,6 +57,7 @@ Deno.test({
       generated: `generated/${ownerId}/asset-${suffix}.png`,
       lineage: `generated/${ownerId}/lineage-${suffix}.png`,
       replay: `generated/${ownerId}/replay-${suffix}.png`,
+      nullAttachment: `generated/${ownerId}/null-attachment-${suffix}.png`,
     };
     const deletes: string[] = [];
     let transientCleanupFailures = 0;
@@ -121,6 +126,7 @@ Deno.test({
         [generatedAttachmentId, objectKeys.generated, "c"],
         [lineageAttachmentId, objectKeys.lineage, "f"],
         [replayAttachmentId, objectKeys.replay, "9"],
+        [nullStagePeerAttachmentId, objectKeys.nullAttachment, "8"],
       ] as const;
       for (const [id, key, sha] of attachments) {
         await sql`INSERT INTO attachments(id,owner_id,object_key,filename,mime_type,size_bytes,
@@ -154,6 +160,11 @@ Deno.test({
       }
       await sql`UPDATE generated_object_staging SET purpose='edit_input'
         WHERE id=${cleanupStageId}`;
+      await sql`INSERT INTO generated_object_staging(id,owner_id,usage_run_id,ordinal,object_key,
+        mime_type,size_bytes,sha256,attachment_id,state,cleanup_attachment,updated_at)
+        VALUES(${nullAttachmentStageId},${ownerId},${runIds.nullAttachment},0,
+          ${objectKeys.nullAttachment},'image/png',68,${"8".repeat(64)},NULL,
+          'cleanup_pending',true,now() - interval '5 seconds')`;
       // Model an uncertain first fencing commit: PostgreSQL committed both the stage transition and
       // attachment tombstone, but the worker lost the transaction response before deleting S3.
       await sql`UPDATE attachments SET state='deleted',deleted_at=now(),updated_at=now()
@@ -181,6 +192,10 @@ Deno.test({
         VALUES(${replayJobId},'generated_object.cleanup',${
         sql.json({ stageId: replayStageId, ownerId })
       },${`generated_object.cleanup:${replayStageId}`})`;
+      await sql`INSERT INTO jobs(id,type,payload,idempotency_key)
+        VALUES(${nullAttachmentJobId},'generated_object.cleanup',${
+        sql.json({ stageId: nullAttachmentStageId, ownerId })
+      },${`generated_object.cleanup:${nullAttachmentStageId}`})`;
 
       // The cleanup transaction must fence the attachment before the non-transactional S3
       // delete. While deletion is paused, both message and generated-asset reference writers
@@ -233,9 +248,10 @@ Deno.test({
         const rows = await sql<{ count: number }[]>`SELECT count(*)::int AS count FROM jobs
           WHERE idempotency_key IN (${`generated_object.cleanup:${messageStageId}`},
             ${`generated_object.cleanup:${generatedStageId}`},
-            ${`generated_object.cleanup:${lineageStageId}`})
+            ${`generated_object.cleanup:${lineageStageId}`},
+            ${`generated_object.cleanup:${nullAttachmentStageId}`})
             AND last_error LIKE '%durable reference%'`;
-        return rows[0]?.count === 3;
+        return rows[0]?.count === 4;
       });
 
       assertEquals(
@@ -247,11 +263,15 @@ Deno.test({
         1,
       );
       assertEquals(
+        deletes.filter((path) => path === `/cleanup-test/${objectKeys.nullAttachment}`).length,
+        0,
+      );
+      assertEquals(
         [
           ...await sql`SELECT physical_bytes::int,physical_objects::int
             FROM attachment_storage_usage WHERE owner_id=${ownerId}`,
         ],
-        [{ physical_bytes: 204, physical_objects: 3 }],
+        [{ physical_bytes: 272, physical_objects: 4 }],
       );
       assertEquals(
         [
@@ -282,7 +302,7 @@ Deno.test({
           ...await sql`SELECT physical_bytes::int,physical_objects::int
             FROM attachment_storage_usage WHERE owner_id=${ownerId}`,
         ],
-        [{ physical_bytes: 204, physical_objects: 3 }],
+        [{ physical_bytes: 272, physical_objects: 4 }],
       );
       assertEquals(
         [
@@ -309,9 +329,10 @@ Deno.test({
       assertEquals(
         [
           ...await sql`SELECT state FROM attachments WHERE id IN
-          (${messageAttachmentId},${generatedAttachmentId}) ORDER BY id`,
+          (${messageAttachmentId},${generatedAttachmentId},${nullStagePeerAttachmentId})
+          ORDER BY id`,
         ],
-        [{ state: "ready" }, { state: "ready" }],
+        [{ state: "ready" }, { state: "ready" }, { state: "ready" }],
       );
       assertEquals(
         [
@@ -323,7 +344,8 @@ Deno.test({
       const fenced = await sql<{ last_error: string }[]>`SELECT last_error FROM jobs WHERE
         idempotency_key IN (${`generated_object.cleanup:${messageStageId}`},
           ${`generated_object.cleanup:${generatedStageId}`},
-          ${`generated_object.cleanup:${lineageStageId}`})`;
+          ${`generated_object.cleanup:${lineageStageId}`},
+          ${`generated_object.cleanup:${nullAttachmentStageId}`})`;
       for (const row of fenced) assertStringIncludes(row.last_error, "durable reference");
     } finally {
       worker.kill("SIGTERM");

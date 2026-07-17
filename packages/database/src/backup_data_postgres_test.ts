@@ -140,6 +140,9 @@ Deno.test({
       const temporaryConversationId = crypto.randomUUID();
       const messageId = crypto.randomUUID();
       const attachmentId = crypto.randomUUID();
+      const releasedAttachmentId = crypto.randomUUID();
+      const releasedStageId = crypto.randomUUID();
+      const releasedUsageRunId = `released-attachment:${releasedStageId}`;
       const activeShareId = crypto.randomUUID();
       const revokedShareId = crypto.randomUUID();
       const expiredShareId = crypto.randomUUID();
@@ -423,6 +426,7 @@ Deno.test({
         ),
       );
       canonicalManifestOnly.set("attachment_storage_blobs", []);
+      canonicalManifestOnly.set("attachment_storage_releases", []);
       canonicalManifestOnly.set("attachment_storage_usage", []);
       canonicalManifestOnly.set(
         "attachment_storage_installation",
@@ -970,12 +974,45 @@ Deno.test({
         1,
       );
 
+      // Add a genuine released object after the legacy-source exercise. The current wire-format
+      // round trip below must preserve its history without staging nonexistent bytes.
+      await sql`INSERT INTO usage_runs(
+        id,user_id,model,provider,recovery_owner,status,reserved_micros
+      ) VALUES(
+        ${releasedUsageRunId},${userId},'portable/released','portable','provider','completed',0
+      )`;
+      await sql`INSERT INTO attachments(
+        id,owner_id,object_key,filename,mime_type,size_bytes,sha256,state,ingestion_status
+      ) VALUES(
+        ${releasedAttachmentId},${userId},${`users/${userId}/released.png`},'released.png',
+        'image/png',7,${"7".repeat(64)},'ready','not_applicable'
+      )`;
+      await sql`INSERT INTO generated_object_staging(
+        id,owner_id,usage_run_id,ordinal,object_key,mime_type,size_bytes,sha256,attachment_id,
+        state,cleanup_attachment
+      ) VALUES(
+        ${releasedStageId},${userId},${releasedUsageRunId},0,
+        ${`users/${userId}/released.png`},'image/png',7,${"7".repeat(64)},
+        ${releasedAttachmentId},'cleaning',true
+      )`;
+      await sql`UPDATE attachments SET state='deleted',deleted_at=now()
+        WHERE id=${releasedAttachmentId}`;
+      assertEquals(
+        Boolean(
+          (await sql`SELECT dg_chat_settle_generated_object_cleanup(
+            ${releasedStageId},${userId}
+          ) released`)[0].released,
+        ),
+        true,
+      );
+
       // Capture the repaired database in the current wire format and apply it again. This proves
-      // that a valid pending tool-accounting outbox is portable without either replaying the tool
-      // call or being rejected as a generic nonterminal usage run.
+      // that a valid pending tool-accounting outbox and physical release history are portable.
       const currentCaptured = await captureData(databaseUrl!);
+      assertEquals(currentCaptured.get("attachment_storage_releases")?.flat().length, 1);
       const currentSource = replaySource(currentCaptured);
       const currentPreview = await dryRunBackupData(databaseUrl!, currentSource);
+      assertEquals(currentPreview.rowsByTable.attachment_storage_releases, 1);
       let currentOperation = await store.create({
         kind: "restore",
         actorId: userId,
@@ -1014,6 +1051,14 @@ Deno.test({
         expectedOperationVersion: currentOperation.version,
         expectedInstallationVersion: currentMaintenance.installation.version,
       });
+      assertEquals(currentRestored.rowsByTable.attachment_storage_releases, 1);
+      assertEquals(
+        Number(
+          (await sql`SELECT count(*) count FROM attachment_storage_releases
+            WHERE stage_id=${releasedStageId}`)[0].count,
+        ),
+        1,
+      );
       await store.finishRestore(
         currentOperation.id,
         currentRestored.restoreOperationVersion!,
@@ -1022,6 +1067,35 @@ Deno.test({
           archiveSha256: "9".repeat(64),
           impact: currentRestored as unknown as Record<string, unknown>,
         },
+      );
+      assertEquals(
+        [
+          ...await sql`SELECT stage_id,attachment_id,object_key
+          FROM attachment_storage_releases WHERE stage_id=${releasedStageId}`,
+        ],
+        [{
+          stage_id: releasedStageId,
+          attachment_id: releasedAttachmentId,
+          object_key: `users/${userId}/released.png`,
+        }],
+      );
+      assertEquals(
+        [
+          ...await sql`SELECT physical_bytes::int,physical_objects::int
+          FROM attachment_storage_usage WHERE owner_id=${userId}`,
+        ],
+        [{ physical_bytes: 4, physical_objects: 1 }],
+      );
+      await assertRejects(
+        () =>
+          sql`INSERT INTO attachments(
+            owner_id,object_key,filename,mime_type,size_bytes,sha256,state,ingestion_status
+          ) VALUES(
+            ${userId},${`users/${userId}/released.png`},'illegal-reuse.png','image/png',7,
+            ${"7".repeat(64)},'ready','not_applicable'
+          )`,
+        Error,
+        "released attachment object keys cannot be reused",
       );
       assertEquals(
         (await sql<{ status: string; billing_snapshot: unknown }[]>`

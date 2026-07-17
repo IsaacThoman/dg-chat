@@ -117,15 +117,36 @@ test.beforeEach(async ({ page, request }, testInfo) => {
   });
   await login(page);
   await createChat(page);
+
+  // Model choice is an intentionally persisted user preference. Each test must establish its
+  // vision-capable precondition because the downgrade journeys below leave the shared full-stack
+  // administrator on the text-only model for the next test (and for Playwright retries).
+  const session = activeChatSession(page);
+  const modelTrigger = session.locator('button.model-trigger[aria-haspopup="listbox"]');
+  await modelTrigger.click();
+  const preferenceSaved = page.waitForResponse((response) =>
+    response.request().method() === "PATCH" &&
+    new URL(response.url()).pathname === "/api/preferences"
+  );
+  await page.getByRole("option", { name: /DG Chat Simulated/ }).click();
+  const preferenceResponse = await preferenceSaved;
+  expect(
+    preferenceResponse.ok(),
+    preferenceResponse.ok() ? "vision model preference saved" : await preferenceResponse.text(),
+  ).toBeTruthy();
+  await expect(modelTrigger).toContainText("DG Chat Simulated");
+  await expect(session.getByRole("button", { name: "Capture screen", exact: true })).toBeEnabled();
 });
 
 test("previews a normalized still before routing it through the attachment uploader", async ({ page }) => {
   let uploadBody = "";
+  let uploadedFilename = "";
   await page.route("**/api/attachments", async (route) => {
     const state = await page.evaluate(() =>
       (globalThis as typeof globalThis & { __captureTest: CaptureTestState }).__captureTest
     );
     uploadBody = route.request().postDataBuffer()?.toString("utf8") ?? "";
+    uploadedFilename = /filename="([^"]+)"/u.exec(uploadBody)?.[1] ?? "";
     await page.evaluate(() => {
       (globalThis as typeof globalThis & { __captureTest: CaptureTestState }).__captureTest
         .uploadCount++;
@@ -136,7 +157,7 @@ test("previews a normalized still before routing it through the attachment uploa
       json: {
         attachment: {
           id: "captured-screen",
-          filename: "screen-capture.png",
+          filename: uploadedFilename,
           mimeType: "image/png",
           sizeBytes: 68,
           state: "ready",
@@ -177,9 +198,13 @@ test("previews a normalized still before routing it through the attachment uploa
 
   await dialog.getByRole("button", { name: "Use screenshot", exact: true }).click();
   await expect(dialog).toBeHidden();
-  await expect(session.locator(".upload-ready").filter({ hasText: "screen-capture.png" }))
-    .toBeVisible();
-  expect(uploadBody).toContain('filename="screen-capture-');
+  await expect.poll(() => uploadedFilename).toMatch(
+    /^screen-capture-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}(?:\.\d{3})?Z\.png$/u,
+  );
+  await expect(
+    session.locator(".upload-ready").getByText(uploadedFilename, { exact: true }),
+  ).toBeVisible();
+  expect(uploadBody).toContain(`filename="${uploadedFilename}"`);
   expect(uploadBody).toContain("Content-Type: image/png");
   await expect(session.getByRole("button", { name: "Capture screen", exact: true }))
     .toBeFocused();
