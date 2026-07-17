@@ -204,6 +204,7 @@ Deno.test({
         name: "Bootstrap Admin",
         passwordHash: await hashPassword("bootstrap password remains valid"),
       }, 5_000_000);
+      let bootstrapAuthorityEpoch = 1;
       const mockOidc = await createMockOidcProvider({
         publicIssuer: "http://localhost:4020",
         internalBaseUrl: "http://mock-oidc:4020",
@@ -328,7 +329,7 @@ Deno.test({
       );
       const firstOidcApproval = await repository.decideUserApproval({
         actorId: bootstrap.id,
-        expectedAuthorityEpoch: 1,
+        expectedAuthorityEpoch: bootstrapAuthorityEpoch,
         targetUserId: oidcIdentity.user.id,
         expectedVersion: 1,
         status: "approved",
@@ -336,7 +337,7 @@ Deno.test({
       });
       const rejectedOidcIdentity = await repository.decideUserApproval({
         actorId: bootstrap.id,
-        expectedAuthorityEpoch: 1,
+        expectedAuthorityEpoch: bootstrapAuthorityEpoch,
         targetUserId: oidcIdentity.user.id,
         expectedVersion: firstOidcApproval.version,
         status: "rejected",
@@ -345,7 +346,7 @@ Deno.test({
       });
       const repeatedOidcApproval = await repository.decideUserApproval({
         actorId: bootstrap.id,
-        expectedAuthorityEpoch: 1,
+        expectedAuthorityEpoch: bootstrapAuthorityEpoch,
         targetUserId: oidcIdentity.user.id,
         expectedVersion: rejectedOidcIdentity.version,
         status: "approved",
@@ -518,6 +519,12 @@ Deno.test({
         }),
       });
       assertEquals(reset.status, 204, await reset.clone().text());
+      bootstrapAuthorityEpoch = Number(
+        (await adminSql<{ authority_epoch: number | string }[]>`
+          SELECT authority_epoch FROM users WHERE id=${bootstrap.id}
+        `)[0].authority_epoch,
+      );
+      assertEquals(bootstrapAuthorityEpoch, 2);
       for (
         const token of [
           resetToken,
@@ -799,7 +806,7 @@ Deno.test({
 
       let bridgeManaged = await repository.decideUserApproval({
         actorId: bootstrap.id,
-        expectedAuthorityEpoch: 1,
+        expectedAuthorityEpoch: bootstrapAuthorityEpoch,
         targetUserId: body.user.id,
         expectedVersion: domainUser!.version,
         status: "approved",
@@ -826,7 +833,7 @@ Deno.test({
       );
       bridgeManaged = await repository.decideUserApproval({
         actorId: bootstrap.id,
-        expectedAuthorityEpoch: 1,
+        expectedAuthorityEpoch: bootstrapAuthorityEpoch,
         targetUserId: body.user.id,
         expectedVersion: bridgeManaged.version,
         status: "rejected",
@@ -890,7 +897,7 @@ Deno.test({
       assertEquals(passwordResetDeliveries.length, resetDeliveriesBeforeRejection);
       bridgeManaged = await repository.decideUserApproval({
         actorId: bootstrap.id,
-        expectedAuthorityEpoch: 1,
+        expectedAuthorityEpoch: bootstrapAuthorityEpoch,
         targetUserId: body.user.id,
         expectedVersion: bridgeManaged.version,
         status: "approved",
@@ -969,7 +976,7 @@ Deno.test({
       await runDelayedResetIssuance(async () => {
         bridgeManaged = await repository!.setAdminUserState({
           actorId: bootstrap.id,
-          expectedAuthorityEpoch: 1,
+          expectedAuthorityEpoch: bootstrapAuthorityEpoch,
           targetUserId: body.user.id,
           expectedVersion: bridgeManaged.version,
           state: "suspended",
@@ -977,7 +984,7 @@ Deno.test({
         });
         bridgeManaged = await repository!.setAdminUserState({
           actorId: bootstrap.id,
-          expectedAuthorityEpoch: 1,
+          expectedAuthorityEpoch: bootstrapAuthorityEpoch,
           targetUserId: body.user.id,
           expectedVersion: bridgeManaged.version,
           state: "active",
@@ -987,7 +994,7 @@ Deno.test({
 
       bridgeManaged = await repository.setAdminUserState({
         actorId: bootstrap.id,
-        expectedAuthorityEpoch: 1,
+        expectedAuthorityEpoch: bootstrapAuthorityEpoch,
         targetUserId: body.user.id,
         expectedVersion: bridgeManaged.version,
         state: "suspended",
@@ -998,7 +1005,7 @@ Deno.test({
       await runDelayedResetIssuance(async () => {
         bridgeManaged = await repository!.setAdminUserState({
           actorId: bootstrap.id,
-          expectedAuthorityEpoch: 1,
+          expectedAuthorityEpoch: bootstrapAuthorityEpoch,
           targetUserId: body.user.id,
           expectedVersion: bridgeManaged.version,
           state: "active",
@@ -1032,7 +1039,7 @@ Deno.test({
       await observed.promise;
       bridgeManaged = await repository.setAdminUserState({
         actorId: bootstrap.id,
-        expectedAuthorityEpoch: 1,
+        expectedAuthorityEpoch: bootstrapAuthorityEpoch,
         targetUserId: body.user.id,
         expectedVersion: bridgeManaged.version,
         state: "suspended",
@@ -1040,7 +1047,7 @@ Deno.test({
       });
       bridgeManaged = await repository.setAdminUserState({
         actorId: bootstrap.id,
-        expectedAuthorityEpoch: 1,
+        expectedAuthorityEpoch: bootstrapAuthorityEpoch,
         targetUserId: body.user.id,
         expectedVersion: bridgeManaged.version,
         state: "active",
@@ -1224,7 +1231,7 @@ Deno.test({
       const bridgeUser = await repository.getAdminUser(body.user.id);
       await repository.setAdminUserState({
         actorId: bootstrap.id,
-        expectedAuthorityEpoch: 1,
+        expectedAuthorityEpoch: bootstrapAuthorityEpoch,
         targetUserId: body.user.id,
         expectedVersion: bridgeUser.version,
         state: "suspended",
