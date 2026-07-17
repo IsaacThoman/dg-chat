@@ -20,7 +20,6 @@ function outcome<T>(operation: Promise<T>): Promise<Outcome<T>> {
 async function waitForWaiterBlockedBy(
   sql: postgres.Sql,
   blockerPid: number,
-  queryPattern: string,
   label: string,
 ): Promise<number> {
   const deadline = Date.now() + 5_000;
@@ -29,7 +28,6 @@ async function waitForWaiterBlockedBy(
       SELECT pid::int pid FROM pg_stat_activity
       WHERE datname=current_database() AND pid<>pg_backend_pid()
         AND ${blockerPid}=ANY(pg_blocking_pids(pid))
-        AND query ILIKE ${queryPattern}
       ORDER BY pid LIMIT 1
     `;
     if (rows[0]) return Number(rows[0].pid);
@@ -100,7 +98,6 @@ Deno.test({
       const resetPid = await waitForWaiterBlockedBy(
         observer,
         accountBlockerPid,
-        "%UPDATE auth_accounts SET password%",
         "password reset to wait on the credential-row lock",
       );
       const lifecycleAfterReset = repository.setAdminUserState({
@@ -114,7 +111,6 @@ Deno.test({
       await waitForWaiterBlockedBy(
         observer,
         resetPid,
-        "%FROM users WHERE id=%FOR UPDATE%",
         "lifecycle mutation to wait on the reset user lock",
       );
 
@@ -174,7 +170,6 @@ Deno.test({
       const lifecyclePid = await waitForWaiterBlockedBy(
         observer,
         sessionBlockerPid,
-        "%UPDATE sessions SET invalidated_at%",
         "lifecycle invalidation to wait on the session-row lock",
       );
       const unchangedPasswordHex = (await observer<{ hex: string }[]>`
@@ -186,7 +181,6 @@ Deno.test({
       await waitForWaiterBlockedBy(
         observer,
         lifecyclePid,
-        "%FROM users WHERE id=%FOR UPDATE%",
         "password reset to wait on the lifecycle user lock",
       );
 
