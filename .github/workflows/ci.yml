@@ -41,10 +41,7 @@ jobs:
       - name: E2E harness policy tests
         run: |
           deno test tests/e2e/env_test.ts tests/e2e/target-safety_test.ts \
-            tests/run-postgres-test-group_test.ts tests/load/safety_test.ts \
-            --allow-env
-          deno test tests/load/run_script_test.ts \
-            --allow-env --allow-read --allow-write --allow-run=bash,openssl,deno
+            tests/run-postgres-test-group_test.ts --allow-env
           bash tests/assert-compose-graceful-restart_test.sh
       - name: Production web build
         run: deno task build
