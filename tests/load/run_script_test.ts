@@ -6,6 +6,7 @@ async function preflight(patch: Record<string, string>) {
   const command = new Deno.Command("bash", {
     args: ["tests/load/run.sh", "--preflight-only"],
     cwd: root,
+    clearEnv: true,
     env: {
       PATH: Deno.env.get("PATH") ?? "",
       HOME: Deno.env.get("HOME") ?? "",

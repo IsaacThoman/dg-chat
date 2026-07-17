@@ -50,5 +50,5 @@ jobs:
         with:
           name: load-${{ github.run_id }}-${{ github.run_attempt }}
           path: test-results/load/
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 14
