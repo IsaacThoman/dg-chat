@@ -640,12 +640,24 @@ async function accountingPhase(): Promise<Record<string, Json>> {
     content: `scarce-credit ${"hold reservation ".repeat(40)}`,
   }];
   const maximumOutput = 32;
-  const requestBody = {
+  const calibrationBody = {
     model: "openai/mock-slow",
     messages,
     max_tokens: maximumOutput,
     stream: true,
     stream_options: { include_usage: true },
+  };
+  // A Chat stream reserves its worst-case replay envelope (roughly 50 MiB at the default
+  // provider/event bounds). The default per-user replay quota intentionally admits only one
+  // such envelope at a time, so streaming contenders would exercise replay admission before
+  // scarce-credit admission. Buffered Chat replay reservations are bounded to roughly 4 MiB;
+  // all CI contenders fit under the same production replay quota and therefore reach the
+  // atomic credit boundary this phase is designed to verify.
+  const contentionBody = {
+    model: "openai/mock-slow",
+    messages,
+    max_tokens: maximumOutput,
+    stream: false,
   };
   const calibrationKey = `load-reservation-calibration-${crypto.randomUUID()}`;
   const calibration = await fetchBounded(
@@ -657,7 +669,7 @@ async function accountingPhase(): Promise<Record<string, Json>> {
         "content-type": "application/json",
         "idempotency-key": calibrationKey,
       },
-      body: JSON.stringify(requestBody),
+      body: JSON.stringify(calibrationBody),
     },
     90_000,
     "reservation calibration",
@@ -734,7 +746,7 @@ async function accountingPhase(): Promise<Record<string, Json>> {
           "content-type": "application/json",
           "idempotency-key": key,
         },
-        body: JSON.stringify(requestBody),
+        body: JSON.stringify(contentionBody),
       },
       90_000,
       "scarce-credit completion",
@@ -749,9 +761,24 @@ async function accountingPhase(): Promise<Record<string, Json>> {
   }));
   const accepted = responses.filter((response) => response.status === 200);
   const denied = responses.filter((response) => response.status === 402);
+  const responseDistribution = Object.fromEntries(
+    Array.from(
+      Map.groupBy(responses, (response) => {
+        try {
+          const parsed = JSON.parse(response.body) as { error?: { code?: string } };
+          return `${response.status}:${parsed.error?.code ?? "success"}`;
+        } catch {
+          return `${response.status}:invalid_json`;
+        }
+      }),
+      ([key, values]) => [key, values.length],
+    ),
+  );
   invariant(
     accepted.length === profile.accountingSlots,
-    "scarce credit admits exactly the configured reservation slots",
+    `scarce credit admits exactly the configured reservation slots (${
+      JSON.stringify(responseDistribution)
+    })`,
   );
   invariant(
     denied.length === profile.accountingAttempts - profile.accountingSlots,
@@ -784,7 +811,7 @@ async function accountingPhase(): Promise<Record<string, Json>> {
             "content-type": "application/json",
             "idempotency-key": acceptedRequest.key,
           },
-          body: JSON.stringify(requestBody),
+          body: JSON.stringify(contentionBody),
         },
         30_000,
         "accepted-key replay",
