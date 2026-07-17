@@ -252,6 +252,7 @@ for container in $app_containers; do
   docker exec "$container" busybox wget -q -O /dev/null http://127.0.0.1:8000/health ||
     die "direct API replica probe failed after restart."
 done
+api_marker_tmp="$LOAD_ARTIFACT_DIR/.api-chaos-complete.$$.tmp"
 jq -n \
   --arg restartedContainer "$restarted_container" \
   --arg activeMetricInstance "$active_metric_instance" \
@@ -264,7 +265,8 @@ jq -n \
     markerActiveStreams:$markerActiveStreams,
     directReplicaProbes:2
   }' \
-  >"$LOAD_ARTIFACT_DIR/api-chaos-complete.json"
+  >"$api_marker_tmp"
+mv "$api_marker_tmp" "$LOAD_ARTIFACT_DIR/api-chaos-complete.json"
 
 marker_deadline=$((SECONDS + marker_timeout))
 while [[ ! -f "$LOAD_ARTIFACT_DIR/queue-enqueued.json" ]]; do

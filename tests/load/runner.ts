@@ -125,6 +125,18 @@ async function jsonRequest<T>(
   return text ? JSON.parse(text) as T : undefined as T;
 }
 
+async function writeJsonArtifact(name: string, value: unknown): Promise<void> {
+  const path = `${artifactDirectory}/${name}`;
+  const temporary = `${artifactDirectory}/.${name}.${crypto.randomUUID()}.tmp`;
+  try {
+    await Deno.writeTextFile(temporary, `${JSON.stringify(value, null, 2)}\n`);
+    await Deno.rename(temporary, path);
+  } catch (error) {
+    await Deno.remove(temporary).catch(() => undefined);
+    throw error;
+  }
+}
+
 async function phase(
   name: string,
   operation: () => Promise<Record<string, Json>>,
@@ -137,25 +149,39 @@ async function phase(
     durationMs: Math.round(performance.now() - before),
     assertions,
   });
-  await Deno.writeTextFile(
-    `${artifactDirectory}/progress.json`,
-    `${JSON.stringify({ profile: profileName, phases: results }, null, 2)}\n`,
-  );
+  await writeJsonArtifact("progress.json", { profile: profileName, phases: results });
 }
 
 async function waitForFile(name: string, timeoutMs: number): Promise<Record<string, unknown>> {
   const deadline = Date.now() + timeoutMs;
   const path = `${artifactDirectory}/${name}`;
+  let lastInvalidJson = "";
   while (Date.now() < deadline) {
     if (signal.aborted) throw signal.reason;
     try {
-      return JSON.parse(await Deno.readTextFile(path));
+      const text = await Deno.readTextFile(path);
+      try {
+        const value = JSON.parse(text);
+        if (!value || typeof value !== "object" || Array.isArray(value)) {
+          lastInvalidJson = "marker is not a JSON object";
+        } else return value as Record<string, unknown>;
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+        // Host-side markers are published by a separate process. A legacy/non-atomic writer may
+        // briefly expose a prefix, so wait for the bounded deadline instead of failing the entire
+        // load run on a partial read.
+        lastInvalidJson = error.message;
+      }
     } catch (error) {
       if (!(error instanceof Deno.errors.NotFound)) throw error;
     }
     await abortableDelay(100, signal);
   }
-  throw new Error(`Timed out waiting for host orchestration marker ${name}`);
+  throw new Error(
+    `Timed out waiting for host orchestration marker ${name}${
+      lastInvalidJson ? `: ${lastInvalidJson.slice(0, 160)}` : ""
+    }`,
+  );
 }
 
 async function bootstrap(): Promise<void> {
@@ -364,17 +390,12 @@ async function streamsPhase(): Promise<Record<string, Json>> {
     currentlyOpen >= requiredOpen,
     `at least ${requiredOpen} response bodies are concurrently open before API chaos`,
   );
-  await Deno.writeTextFile(
-    `${artifactDirectory}/streams-active.json`,
-    `${
-      JSON.stringify({
-        observedAt: new Date().toISOString(),
-        activeStreams: currentlyOpen,
-        maximumOpen,
-        openConversationIds: [...openConversationIds],
-      })
-    }\n`,
-  );
+  await writeJsonArtifact("streams-active.json", {
+    observedAt: new Date().toISOString(),
+    activeStreams: currentlyOpen,
+    maximumOpen,
+    openConversationIds: [...openConversationIds],
+  });
   const chaos = await waitForFile("api-chaos-complete.json", 60_000);
   invariant(typeof chaos.restartedContainer === "string", "host restarted one API container");
   invariant(
@@ -974,17 +995,12 @@ async function queuePhase(): Promise<Record<string, Json>> {
         ${sql.json({ stageId: item.stageId, ownerId: userId })},'queued',now(),${item.key})
     `;
   }
-  await Deno.writeTextFile(
-    `${artifactDirectory}/queue-enqueued.json`,
-    `${
-      JSON.stringify({
-        crashRunId: crashRun.id,
-        crashJobId: crashJob[0].id,
-        retentionJobs: runs.length,
-        mixedJobs: mixed.length,
-      })
-    }\n`,
-  );
+  await writeJsonArtifact("queue-enqueued.json", {
+    crashRunId: crashRun.id,
+    crashJobId: crashJob[0].id,
+    retentionJobs: runs.length,
+    mixedJobs: mixed.length,
+  });
   const chaos = await waitForFile("worker-chaos-complete.json", 90_000);
   const oldClaimToken = String(chaos.oldClaimToken ?? "");
   invariant(oldClaimToken.length > 20, "host captured the killed worker's real claim token");
@@ -1106,46 +1122,28 @@ async function run(): Promise<void> {
 
 try {
   await run();
-  await Deno.writeTextFile(
-    `${artifactDirectory}/summary.json`,
-    `${
-      JSON.stringify(
-        {
-          schemaVersion: 2,
-          passed: true,
-          profile: profileName,
-          projectName,
-          startedAt: startedAt.toISOString(),
-          completedAt: new Date().toISOString(),
-          phases: results,
-        },
-        null,
-        2,
-      )
-    }\n`,
-  );
+  await writeJsonArtifact("summary.json", {
+    schemaVersion: 2,
+    passed: true,
+    profile: profileName,
+    projectName,
+    startedAt: startedAt.toISOString(),
+    completedAt: new Date().toISOString(),
+    phases: results,
+  });
 } catch (error) {
   if (!signal.aborted) rootController.abort(error);
   const message = error instanceof Error ? error.message : "Unknown load harness failure";
-  await Deno.writeTextFile(
-    `${artifactDirectory}/summary.json`,
-    `${
-      JSON.stringify(
-        {
-          schemaVersion: 2,
-          passed: false,
-          profile: profileName,
-          projectName,
-          startedAt: startedAt.toISOString(),
-          completedAt: new Date().toISOString(),
-          phases: results,
-          error: message.slice(0, 500),
-        },
-        null,
-        2,
-      )
-    }\n`,
-  );
+  await writeJsonArtifact("summary.json", {
+    schemaVersion: 2,
+    passed: false,
+    profile: profileName,
+    projectName,
+    startedAt: startedAt.toISOString(),
+    completedAt: new Date().toISOString(),
+    phases: results,
+    error: message.slice(0, 500),
+  });
   console.error(message);
   Deno.exitCode = 1;
 } finally {
