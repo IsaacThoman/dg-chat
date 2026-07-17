@@ -1,0 +1,54 @@
+name: Bounded load invariants
+
+on:
+  pull_request:
+  schedule:
+    - cron: "41 4 * * 6"
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Bounded load profile
+        type: choice
+        required: true
+        default: standard
+        options:
+          - ci
+          - standard
+          - scheduled
+
+permissions:
+  contents: read
+
+concurrency:
+  group: load-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  multi-replica:
+    name: Bounded multi-replica invariants
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DG_CHAT_LOAD_ALLOW_DESTRUCTIVE: "true"
+      LOAD_PROFILE: ${{ github.event_name == 'schedule' && 'scheduled' || inputs.profile || 'ci' }}
+      LOAD_RUN_ID: gha-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+          cache: true
+      - name: Install dependencies
+        run: deno install --frozen
+      - name: Validate destructive-target safety
+        run: deno task test:load:safety
+      - name: Exercise streams, immutable edits, accounting, and queue recovery
+        run: bash tests/load/run.sh
+      - name: Upload bounded load evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: load-${{ github.run_id }}-${{ github.run_attempt }}
+          path: test-results/load/
+          if-no-files-found: error
+          retention-days: 14
