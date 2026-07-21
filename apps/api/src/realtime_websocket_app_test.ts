@@ -51,6 +51,14 @@ Deno.test("raw Realtime WebSocket relays standard JSON events and settles termin
   });
 
   const repository = new MemoryRepository();
+  let usageLeaseHeartbeats = 0;
+  const heartbeatProviderExecutionLease = repository.heartbeatProviderExecutionLease.bind(
+    repository,
+  );
+  repository.heartbeatProviderExecutionLease = (...args) => {
+    usageLeaseHeartbeats += 1;
+    return heartbeatProviderExecutionLease(...args);
+  };
   const keyring = new ProviderSecretKeyring({
     primaryKeyId: "test",
     keys: new Map([["test", new Uint8Array(32).fill(5)]]),
@@ -59,6 +67,7 @@ Deno.test("raw Realtime WebSocket relays standard JSON events and settles termin
     repository,
     setupToken: "realtime-ws-setup",
     providerKeyring: keyring,
+    idempotencyHeartbeatMs: 10,
   });
   const setup = await app.request("/api/setup/bootstrap", {
     method: "POST",
@@ -131,6 +140,8 @@ Deno.test("raw Realtime WebSocket relays standard JSON events and settles termin
       type: "session.created",
       session: { model: "vendor/realtime-ws" },
     });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assertEquals(usageLeaseHeartbeats > 0, true);
 
     const forwarded = message(upstreamSocket!);
     client.send(JSON.stringify({

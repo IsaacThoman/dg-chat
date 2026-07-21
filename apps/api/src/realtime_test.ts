@@ -16,6 +16,13 @@ Deno.test("Realtime endpoint construction preserves provider API roots and rejec
     "https://provider.example/v1/realtime/calls",
   );
   assertThrows(() => realtimeProviderEndpoint("https://provider.example/v1", "/chat/completions"));
+  assertThrows(() =>
+    realtimeProviderEndpoint("https://provider.example/v1", "/realtime/../models")
+  );
+  assertThrows(() =>
+    realtimeProviderEndpoint("https://provider.example/v1", "/realtime/%2e%2e/models")
+  );
+  assertThrows(() => realtimeProviderEndpoint("https://provider.example/v1", "/realtime?model=x"));
   assertThrows(() => realtimeProviderEndpoint("https://user@provider.example/v1", "/realtime"));
 });
 

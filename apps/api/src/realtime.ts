@@ -133,7 +133,19 @@ export function realtimeProviderEndpoint(baseUrl: string, path = "/realtime"): U
       500,
     );
   }
-  if (!/^\/realtime(?:\/|$)/.test(path)) {
+  const segments = path.split("/");
+  const validSegments = segments[0] === "" && segments[1] === "realtime" &&
+    segments.slice(2).every((segment) => {
+      if (!segment || !/^(?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2})+$/.test(segment)) return false;
+      try {
+        const decoded = decodeURIComponent(segment);
+        return decoded !== "." && decoded !== ".." && !decoded.includes("/") &&
+          !decoded.includes("\\");
+      } catch {
+        return false;
+      }
+    });
+  if (!validSegments) {
     throw new RealtimeProtocolError("invalid_path", "Realtime provider path is invalid", 500);
   }
   const endpoint = new URL(base.toString().replace(/\/$/, "") + path);

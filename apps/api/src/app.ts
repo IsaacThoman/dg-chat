@@ -8388,6 +8388,7 @@ export function createApp(options: AppOptions = {}) {
     };
     sideband: Awaited<ReturnType<typeof connectRealtimeWebSocket>>;
     concurrencyLease: Awaited<ReturnType<typeof claimAudioSlot>>;
+    usageLease: { stop(): Promise<void> };
     maximumTimer: ReturnType<typeof setTimeout>;
   };
   const realtimeCalls = new Map<string, ActiveRealtimeCall>();
@@ -8447,8 +8448,9 @@ export function createApp(options: AppOptions = {}) {
       { reasoningTokens: resolved.info.contextWindow },
     ).costMicros;
     const concurrencyLease = await claimAudioSlot(c.get("user").id);
+    let usageRun;
     try {
-      await repo.reserve(
+      usageRun = await repo.reserve(
         c.get("user").id,
         runId,
         prepared.model,
@@ -8460,6 +8462,15 @@ export function createApp(options: AppOptions = {}) {
     } catch (error) {
       await concurrencyLease.release();
       throw error;
+    }
+    if (!usageRun.runLeaseToken) {
+      await repo.refund(runId, "Realtime execution lease was not created");
+      await concurrencyLease.release();
+      throw new RealtimeProtocolError(
+        "execution_lease_missing",
+        "Realtime execution lease was not created",
+        500,
+      );
     }
     let response: Response;
     try {
@@ -8532,6 +8543,19 @@ export function createApp(options: AppOptions = {}) {
         fetch: options.realtimeFetch,
       }).catch(() => undefined);
     }, realtimeMaxSessionSeconds * 1_000);
+    const usageLease = keepApiLeaseAlive(
+      undefined,
+      { runId, leaseToken: usageRun.runLeaseToken },
+      () => {
+        sideband.close(1013, "Realtime accounting lease was lost");
+        void proxyRealtimeHttp({
+          baseUrl: resolved.upstream!.baseUrl!,
+          apiKey: resolved.upstream!.apiKey!,
+          path: `/realtime/calls/${encodeURIComponent(upstreamCallId)}/hangup`,
+          fetch: options.realtimeFetch,
+        }).catch(() => undefined);
+      },
+    );
     const call: ActiveRealtimeCall = {
       ownerId: c.get("user").id,
       upstreamCallId,
@@ -8544,6 +8568,7 @@ export function createApp(options: AppOptions = {}) {
       resolved: completeResolved,
       sideband,
       concurrencyLease,
+      usageLease,
       maximumTimer,
     };
     realtimeCalls.set(localCallId, call);
@@ -8575,6 +8600,7 @@ export function createApp(options: AppOptions = {}) {
         cachedInputTokens: call.cachedInputTokens,
       }).costMicros;
       try {
+        await call.usageLease.stop();
         await repo.settle(
           call.runId,
           cost,
@@ -8820,8 +8846,9 @@ export function createApp(options: AppOptions = {}) {
       { reasoningTokens: resolved.info.contextWindow },
     ).costMicros;
     const concurrencyLease = await claimAudioSlot(c.get("user").id);
+    let usageRun;
     try {
-      await repo.reserve(
+      usageRun = await repo.reserve(
         c.get("user").id,
         runId,
         modelId,
@@ -8833,6 +8860,15 @@ export function createApp(options: AppOptions = {}) {
     } catch (error) {
       await concurrencyLease.release();
       throw error;
+    }
+    if (!usageRun.runLeaseToken) {
+      await repo.refund(runId, "Realtime execution lease was not created");
+      await concurrencyLease.release();
+      throw new RealtimeProtocolError(
+        "execution_lease_missing",
+        "Realtime execution lease was not created",
+        500,
+      );
     }
     let upstream;
     try {
@@ -8863,11 +8899,17 @@ export function createApp(options: AppOptions = {}) {
     let inputTokens = 0;
     let cachedInputTokens = 0;
     let outputTokens = 0;
+    let stopRelay: () => void = () => undefined;
+    const usageLease = keepApiLeaseAlive(
+      undefined,
+      { runId, leaseToken: usageRun.runLeaseToken },
+      () => stopRelay(),
+    );
     const maximumTimer = setTimeout(
       () => stopRelay(),
       realtimeMaxSessionSeconds * 1_000,
     );
-    const stopRelay = relayRealtimeWebSocket(upgraded.socket, upstream, {
+    stopRelay = relayRealtimeWebSocket(upgraded.socket, upstream, {
       publicModel: modelId,
       upstreamModel: resolved.registryModel.upstreamModelId,
       onServerEvent(event) {
@@ -8895,6 +8937,7 @@ export function createApp(options: AppOptions = {}) {
           cachedInputTokens,
         }).costMicros;
         try {
+          await usageLease.stop();
           await repo.settle(runId, cost, inputTokens, outputTokens, Date.now() - startedAt);
         } catch {
           // Durable reconciliation owns any active reservation left by an accounting outage.
@@ -8967,6 +9010,7 @@ export function createApp(options: AppOptions = {}) {
   const keepApiLeaseAlive = (
     idempotency?: { id: string; leaseToken: string },
     runLease?: { runId: string; leaseToken: string },
+    onFailure?: (error: unknown) => void | Promise<void>,
   ) => {
     let stopped = false;
     let heartbeatError: unknown;
@@ -8997,6 +9041,7 @@ export function createApp(options: AppOptions = {}) {
           }
         } catch (error) {
           heartbeatError = error;
+          void onFailure?.(error);
         }
       });
       return inFlight;

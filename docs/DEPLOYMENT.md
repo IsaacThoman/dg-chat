@@ -98,6 +98,13 @@ Redis-backed admission uses renewable, crash-safe leases. `AUDIO_CONCURRENCY_LEA
 to 120 seconds; keep it comfortably longer than transient Redis outages. Each active request keeps a
 validated audio body and a bounded retry body in memory.
 
+Realtime WebSocket, WebRTC, and sideband sessions use this same Redis-backed capacity pool. Set
+`REALTIME_MAX_SESSION_SECONDS` between 30 and 7200 (the default is 1800). Set
+`REALTIME_CALL_SIGNING_SECRET` to an independent 32–256 byte secret when desired; otherwise
+`APP_SECRET` signs cross-replica call-control URLs and encrypts short-lived DG Realtime client
+secrets. Every API replica must use the same value, and rotations invalidate outstanding ephemeral
+tokens and call-control URLs.
+
 For an external object store, set an HTTPS `S3_ENDPOINT`, `S3_REGION`, and `S3_FORCE_PATH_STYLE` as
 required by that service in addition to the bucket and scoped credentials.
 

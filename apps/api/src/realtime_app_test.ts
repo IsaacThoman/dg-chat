@@ -13,6 +13,14 @@ Deno.test("Realtime session endpoints authorize, rewrite model IDs, and replace 
   sidebandServer.on("connection", (socket) => providerSideband = socket);
   let createdCalls = 0;
   const repository = new MemoryRepository();
+  let usageLeaseHeartbeats = 0;
+  const heartbeatProviderExecutionLease = repository.heartbeatProviderExecutionLease.bind(
+    repository,
+  );
+  repository.heartbeatProviderExecutionLease = (...args) => {
+    usageLeaseHeartbeats += 1;
+    return heartbeatProviderExecutionLease(...args);
+  };
   const keyring = new ProviderSecretKeyring({
     primaryKeyId: "test",
     keys: new Map([["test", new Uint8Array(32).fill(4)]]),
@@ -22,6 +30,7 @@ Deno.test("Realtime session endpoints authorize, rewrite model IDs, and replace 
     repository,
     setupToken: "realtime-setup",
     providerKeyring: keyring,
+    idempotencyHeartbeatMs: 10,
     realtimeCallSigningSecret: "realtime-call-test-secret-32-bytes-minimum",
     realtimeFetch: async (input, init) => {
       const request = new Request(input, init);
@@ -205,7 +214,8 @@ Deno.test("Realtime session endpoints authorize, rewrite model IDs, and replace 
       },
     },
   }));
-  await new Promise((resolve) => setTimeout(resolve, 10));
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assertEquals(usageLeaseHeartbeats > 0, true);
   const closed = new Promise<void>((resolve) => providerSideband!.once("close", () => resolve()));
   const { app: secondReplica } = createApp({
     repository,
