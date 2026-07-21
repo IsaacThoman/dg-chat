@@ -11,7 +11,10 @@ images; administration and analytics; and a secure Docker Compose deployment.
 
 The web application must be polished, accessible, responsive, and installable as a PWA. There is no
 native mobile application. Conversations are private by default. Live collaborative editing,
-Assistants, batches, fine-tuning, and realtime API compatibility remain intentionally out of scope.
+Assistants, batches, and fine-tuning remain intentionally out of scope. OpenAI Realtime API
+compatibility is required, including production-ready WebSocket and browser WebRTC transports,
+Realtime conversation and transcription sessions, bidirectional client/server events, audio,
+interruptions, tools, accounting, authorization, and distributed lifecycle handling.
 
 ## Recovered project status
 
@@ -74,14 +77,31 @@ the durable implementation handoff.
 - Re-run dependency, secret, filesystem, SBOM, and image vulnerability checks.
 - Ensure documentation, environment examples, and operator runbooks match verified behavior.
 
-## Completion record and exact evidence
+### 5. OpenAI Realtime API compatibility — active
 
-PR #31 completed the roadmap on 2026-07-21. The release-candidate source revision is `7d1c5d3`. The
-retained-chat architecture now preserves bounded chat sessions, drafts, uploads, immutable edits,
-streams, prompt queues, voice resources, media preferences, and one-time share links across all
-workspace routes. Worker recovery, database timeout handling, attachment claims, container builds,
-and current GitHub Actions runtimes were also hardened. The requested shadcn preset `b6ZjldV0i` is
-the documented and installed design-system foundation.
+- Expose the current GA `/v1/realtime` WebSocket event protocol for trusted server clients and media
+  pipelines, authenticated with owner-scoped DG Chat personal API tokens.
+- Expose the current GA `/v1/realtime/calls` WebRTC session-establishment flow for browser clients,
+  without disclosing provider credentials, and support a server sideband control connection.
+- Implement Realtime conversation and transcription session types, text/audio input, streamed
+  text/audio/transcript output, VAD and push-to-talk, interruption/cancellation/truncation, tools,
+  session updates, conversation-item lifecycle, and structured protocol errors.
+- Route only to entitled, enabled, explicitly priced Realtime-capable registry models. Apply the
+  existing provider fallback, circuit-breaker, credit reservation/settlement, rate-limit, audit,
+  safety-identifier, and tenancy boundaries without silently degrading unsupported events.
+- Add bounded session lifetime, message/audio/event sizes, backpressure, idle timeouts, disconnect
+  cleanup, multi-replica coordination, graceful shutdown, observability, and privacy-safe logs.
+- Verify protocol behavior with official event schemas and SDK/client flows, isolated integration
+  tests, adversarial tests, bounded load, WebRTC browser journeys, and fresh/upgrade Compose runs.
+
+## Prior completion record and exact evidence
+
+PR #31 completed roadmap items 1–4 on 2026-07-21. The release-candidate source revision is
+`7d1c5d3`. The retained-chat architecture now preserves bounded chat sessions, drafts, uploads,
+immutable edits, streams, prompt queues, voice resources, media preferences, and one-time share
+links across all workspace routes. Worker recovery, database timeout handling, attachment claims,
+container builds, and current GitHub Actions runtimes were also hardened. The requested shadcn
+preset `b6ZjldV0i` is the documented and installed design-system foundation.
 
 Exact GitHub evidence for that revision:
 
@@ -99,10 +119,10 @@ Exact GitHub evidence for that revision:
   passed the multi-replica concurrency, rate-limit, accounting, and recovery invariants.
 
 Fresh local production Compose verification independently reproduced the hosted Knowledge failure
-and proved its corrected desktop and mobile journeys before the final source revision was pushed. No
-known missing in-scope feature, unresolved defect, failing required gate, unreviewed placeholder, or
-undocumented release risk remains at this handoff. The intentional exclusions under the overarching
-goal remain unchanged.
+and proved its corrected desktop and mobile journeys before the final source revision was pushed.
+That handoff's completeness claim applied to the earlier scope and was superseded when Realtime API
+compatibility became required on 2026-07-21. The overarching goal is active until roadmap item 5 and
+its revised release gates are complete.
 
 ## Definition of done
 
@@ -116,9 +136,11 @@ The application is complete for the agreed scope when:
    or placeholder states.
 5. Security boundaries for auth, credits, uploads, secrets, tools, network access, and tenancy have
    automated adversarial coverage.
-6. The project docs record supported behavior, intentional exclusions, residual operational risks,
+6. Realtime WebSocket and WebRTC clients pass the documented GA event lifecycle, audio,
+   transcription, interruption, tool, reconnect, accounting, and multi-replica safety contracts.
+7. The project docs record supported behavior, intentional exclusions, residual operational risks,
    and exact verification evidence.
-7. All completion work is committed and pushed in reviewable milestones; unrelated local files are
+8. All completion work is committed and pushed in reviewable milestones; unrelated local files are
    never included.
 
 Software can always be extended, so "no possible improvements" is operationalized here as no known
