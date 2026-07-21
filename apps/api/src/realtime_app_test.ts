@@ -21,6 +21,7 @@ Deno.test("Realtime session endpoints authorize, rewrite model IDs, and replace 
     repository,
     setupToken: "realtime-setup",
     providerKeyring: keyring,
+    realtimeCallSigningSecret: "realtime-call-test-secret-32-bytes-minimum",
     realtimeFetch: async (input, init) => {
       const request = new Request(input, init);
       if (request.url.endsWith("/realtime/calls")) {
@@ -190,7 +191,24 @@ Deno.test("Realtime session endpoints authorize, rewrite model IDs, and replace 
   }));
   await new Promise((resolve) => setTimeout(resolve, 10));
   const closed = new Promise<void>((resolve) => providerSideband!.once("close", () => resolve()));
-  const hangup = await app.request(`${localLocation}/hangup`, {
+  const { app: secondReplica } = createApp({
+    repository,
+    providerKeyring: keyring,
+    realtimeCallSigningSecret: "realtime-call-test-secret-32-bytes-minimum",
+    realtimeFetch: async (input, init) => {
+      const request = new Request(input, init);
+      assertEquals(
+        request.url,
+        "https://realtime.example/v1/realtime/calls/call_provider_1/hangup",
+      );
+      assertEquals(request.headers.get("authorization"), "Bearer provider-secret");
+      providerSideband!.close(1000, "hangup");
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+  const hangup = await secondReplica.request(`${localLocation}/hangup`, {
     method: "POST",
     headers: { cookie },
   });

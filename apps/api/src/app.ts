@@ -405,6 +405,7 @@ export interface AppOptions {
   realtimeFetch?: typeof fetch;
   realtimeWebSocketConnect?: typeof connectRealtimeWebSocket;
   imageUrlSigningSecret?: string;
+  realtimeCallSigningSecret?: string;
   audioConcurrencyLimiter?: AudioConcurrencyLimiter;
   imageConcurrencyLimiter?: AudioConcurrencyLimiter;
   circuitBreaker?: CircuitBreaker;
@@ -1916,6 +1917,25 @@ export function createApp(options: AppOptions = {}) {
     imageUrlSigningSecretBytes &&
     (imageUrlSigningSecretBytes.byteLength < 32 || imageUrlSigningSecretBytes.byteLength > 256)
   ) throw new Error("IMAGE_URL_SIGNING_SECRET must contain between 32 and 256 bytes");
+  const realtimeCallSigningSecret = options.realtimeCallSigningSecret ??
+    Deno.env.get("REALTIME_CALL_SIGNING_SECRET") ?? Deno.env.get("APP_SECRET");
+  const realtimeCallSigningSecretBytes = realtimeCallSigningSecret === undefined
+    ? undefined
+    : new TextEncoder().encode(realtimeCallSigningSecret);
+  if (
+    realtimeCallSigningSecretBytes &&
+    (realtimeCallSigningSecretBytes.byteLength < 32 ||
+      realtimeCallSigningSecretBytes.byteLength > 256)
+  ) throw new Error("REALTIME_CALL_SIGNING_SECRET must contain between 32 and 256 bytes");
+  const realtimeCallSigningKey = realtimeCallSigningSecretBytes
+    ? crypto.subtle.importKey(
+      "raw",
+      realtimeCallSigningSecretBytes,
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"],
+    )
+    : undefined;
   const mailer = options.mailer ?? (Deno.env.get("SMTP_URL")
     ? smtpIdentityMailer(
       Deno.env.get("SMTP_URL")!,
@@ -8129,6 +8149,68 @@ export function createApp(options: AppOptions = {}) {
     }
     return response;
   };
+  type RealtimeCallToken = { c: string; m: string; o: string; e: number };
+  const signRealtimeCall = async (payload: RealtimeCallToken): Promise<string> => {
+    if (!realtimeCallSigningKey) {
+      throw new RealtimeProtocolError(
+        "call_control_not_configured",
+        "Realtime call control requires REALTIME_CALL_SIGNING_SECRET",
+        501,
+      );
+    }
+    const encoded = Buffer.from(JSON.stringify(payload)).toString("base64url");
+    const signature = Buffer.from(
+      await crypto.subtle.sign(
+        "HMAC",
+        await realtimeCallSigningKey,
+        new TextEncoder().encode(encoded),
+      ),
+    ).toString("base64url");
+    return `${encoded}.${signature}`;
+  };
+  const verifyRealtimeCall = async (
+    token: string,
+    ownerId: string,
+  ): Promise<RealtimeCallToken | undefined> => {
+    if (!realtimeCallSigningKey || token.length > 2_048) return undefined;
+    const [encoded, supplied, extra] = token.split(".");
+    if (
+      extra !== undefined || !encoded || !supplied ||
+      !/^[A-Za-z0-9_-]+$/.test(encoded) || !/^[A-Za-z0-9_-]{43}$/.test(supplied)
+    ) return undefined;
+    const expected = new Uint8Array(
+      await crypto.subtle.sign(
+        "HMAC",
+        await realtimeCallSigningKey,
+        new TextEncoder().encode(encoded),
+      ),
+    );
+    let suppliedBytes: Uint8Array;
+    try {
+      suppliedBytes = new Uint8Array(Buffer.from(supplied, "base64url"));
+    } catch {
+      return undefined;
+    }
+    if (Buffer.from(suppliedBytes).toString("base64url") !== supplied) return undefined;
+    let mismatch = expected.byteLength ^ suppliedBytes.byteLength;
+    for (let index = 0; index < expected.byteLength; index++) {
+      mismatch |= expected[index] ^ (suppliedBytes[index] ?? 0);
+    }
+    if (mismatch !== 0) return undefined;
+    try {
+      const payload = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+      if (
+        !payload || typeof payload !== "object" || typeof payload.c !== "string" ||
+        typeof payload.m !== "string" || payload.o !== ownerId ||
+        !Number.isSafeInteger(payload.e) || payload.e <= Math.floor(Date.now() / 1000) ||
+        payload.c.length < 1 || payload.c.length > 256 || payload.m.length < 1 ||
+        payload.m.length > 256
+      ) return undefined;
+      return payload as RealtimeCallToken;
+    } catch {
+      return undefined;
+    }
+  };
   type ActiveRealtimeCall = {
     ownerId: string;
     upstreamCallId: string;
@@ -8148,6 +8230,13 @@ export function createApp(options: AppOptions = {}) {
   const realtimeCalls = new Map<string, ActiveRealtimeCall>();
 
   app.post("/v1/realtime/calls", requireScope("chat:write"), async (c) => {
+    if (!realtimeCallSigningKey) {
+      throw new RealtimeProtocolError(
+        "call_control_not_configured",
+        "Realtime call control requires REALTIME_CALL_SIGNING_SECRET",
+        501,
+      );
+    }
     const declared = Number(c.req.header("content-length"));
     if (Number.isFinite(declared) && declared > REALTIME_MAX_HTTP_BODY_BYTES) {
       throw new RealtimeProtocolError(
@@ -8246,7 +8335,12 @@ export function createApp(options: AppOptions = {}) {
         502,
       );
     }
-    const localCallId = crypto.randomUUID();
+    const localCallId = await signRealtimeCall({
+      c: upstreamCallId,
+      m: prepared.model,
+      o: c.get("user").id,
+      e: Math.floor(Date.now() / 1000) + 2 * 60 * 60,
+    });
     const call: ActiveRealtimeCall = {
       ownerId: c.get("user").id,
       upstreamCallId,
@@ -8300,10 +8394,25 @@ export function createApp(options: AppOptions = {}) {
 
   for (const action of ["accept", "hangup", "refer", "reject"] as const) {
     app.post(`/v1/realtime/calls/:id/${action}`, requireScope("chat:write"), async (c) => {
-      const call = realtimeCalls.get(c.req.param("id"));
-      if (!call || call.ownerId !== c.get("user").id) {
+      const localId = c.req.param("id");
+      const call = realtimeCalls.get(localId);
+      const token = call ? undefined : await verifyRealtimeCall(localId, c.get("user").id);
+      if ((call && call.ownerId !== c.get("user").id) || (!call && !token)) {
         throw new RealtimeProtocolError("call_not_found", "Realtime call was not found", 404);
       }
+      const resolved = call?.resolved ?? await resolveRealtimeRuntimeModel(
+        token!.m,
+        "realtime",
+        accessSubject(c),
+      );
+      if (!resolved?.upstream) {
+        throw new RealtimeProtocolError(
+          "model_not_found",
+          "Realtime model is unavailable or not entitled",
+          404,
+        );
+      }
+      const upstreamCallId = call?.upstreamCallId ?? token!.c;
       const body = new Uint8Array(await c.req.raw.arrayBuffer());
       if (body.byteLength > REALTIME_MAX_HTTP_BODY_BYTES) {
         throw new RealtimeProtocolError(
@@ -8313,9 +8422,9 @@ export function createApp(options: AppOptions = {}) {
         );
       }
       const response = await proxyRealtimeHttp({
-        baseUrl: call.resolved.upstream.baseUrl!,
-        apiKey: call.resolved.upstream.apiKey!,
-        path: `/realtime/calls/${encodeURIComponent(call.upstreamCallId)}/${action}`,
+        baseUrl: resolved.upstream.baseUrl!,
+        apiKey: resolved.upstream.apiKey!,
+        path: `/realtime/calls/${encodeURIComponent(upstreamCallId)}/${action}`,
         headers: c.req.header("content-type")
           ? { "content-type": c.req.header("content-type")! }
           : undefined,
@@ -8323,7 +8432,7 @@ export function createApp(options: AppOptions = {}) {
         signal: c.req.raw.signal,
         fetch: options.realtimeFetch,
       });
-      if (response.ok && (action === "hangup" || action === "reject")) {
+      if (call && response.ok && (action === "hangup" || action === "reject")) {
         call.sideband.close(1000, action);
       }
       return response;
