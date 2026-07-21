@@ -34,9 +34,11 @@ editing accepts official multipart image arrays and owned JSON file references, 
 self-hosted installation can expose multiple unrelated providers and has no unambiguous global
 default. Omission returns HTTP 422 with `model_required`. Image models require fixed-call-only
 pricing when their provider supplies no authoritative token usage. Assistants, batches, and
-fine-tuning are not supported. Realtime is not yet supported in the released server, but it is now a
-required active roadmap item rather than an intentional compatibility boundary; see
-`PROJECT_PLAN.md`.
+fine-tuning are not supported. Realtime is not yet supported in the released server, but its full
+current surface—raw WebSocket events, WebRTC calls, conversation/transcription/translation session
+creation, client secrets, sideband control, and call lifecycle controls—is now a required active
+roadmap item rather than an intentional compatibility boundary; see `PROJECT_PLAN.md` and
+`REALTIME_ARCHITECTURE.md`.
 
 ### Deliberate compatibility boundaries
 

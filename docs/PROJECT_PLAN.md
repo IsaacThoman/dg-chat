@@ -81,16 +81,21 @@ the durable implementation handoff.
 
 - Expose the current GA `/v1/realtime` WebSocket event protocol for trusted server clients and media
   pipelines, authenticated with owner-scoped DG Chat personal API tokens.
-- Expose the current GA `/v1/realtime/calls` WebRTC session-establishment flow for browser clients,
-  without disclosing provider credentials, and support a server sideband control connection.
-- Implement Realtime conversation and transcription session types, text/audio input, streamed
-  text/audio/transcript output, VAD and push-to-talk, interruption/cancellation/truncation, tools,
-  session updates, conversation-item lifecycle, and structured protocol errors.
+- Expose the current GA WebRTC REST surface: `/v1/realtime/calls`, client secrets, conversation and
+  transcription session creation, translation client secrets, and call accept/reject/hangup/refer
+  controls. Browser clients must not receive long-lived provider credentials; server sideband
+  connections retain policy, tool, and accounting control.
+- Implement Realtime conversation, transcription, and translation session types, text/audio input,
+  streamed text/audio/transcript output, VAD and push-to-talk, interruption/cancellation/truncation,
+  tools, session updates, conversation-item lifecycle, and structured protocol errors.
 - Route only to entitled, enabled, explicitly priced Realtime-capable registry models. Apply the
   existing provider fallback, circuit-breaker, credit reservation/settlement, rate-limit, audit,
   safety-identifier, and tenancy boundaries without silently degrading unsupported events.
 - Add bounded session lifetime, message/audio/event sizes, backpressure, idle timeouts, disconnect
   cleanup, multi-replica coordination, graceful shutdown, observability, and privacy-safe logs.
+  Reliability comes from protocol-native sequence tracking, idempotent terminal accounting,
+  heartbeats, replay/resynchronization where the public protocol permits it, and explicit
+  close/error semantics—not an incompatible Socket.IO wrapper around the OpenAI WebSocket endpoint.
 - Verify protocol behavior with official event schemas and SDK/client flows, isolated integration
   tests, adversarial tests, bounded load, WebRTC browser journeys, and fresh/upgrade Compose runs.
 
