@@ -1,13 +1,17 @@
 import { assertEquals, assertNotEquals } from "jsr:@std/assert@1.0.14";
 import postgres from "npm:postgres@3.4.7";
 import { withAuditTestMaintenance } from "../../../packages/database/src/postgres-test-maintenance.ts";
+import { ATTACHMENT_INSPECTION_POLICY_VERSION } from "../../../packages/database/src/repository.ts";
 import { claimJob, completeJob } from "./job-queue.ts";
 import { operationSignal, raceAbort } from "./operation-signal.ts";
 import { runResilientLoop } from "./resilient-loop.ts";
 
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
 
-async function eventually(check: () => Promise<boolean>, timeoutMs = 10_000): Promise<void> {
+// A freshly spawned Deno worker can spend several seconds type-checking on a saturated CI runner.
+// Startup readiness is not the bounded-shutdown behavior under test, so give readiness a generous
+// ceiling while retaining the strict three-second assertions around the shutdown paths themselves.
+async function eventually(check: () => Promise<boolean>, timeoutMs = 30_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (await check()) return;
@@ -118,7 +122,15 @@ Deno.test({
           ${`users/${userId}/blocked.txt`},'blocked.txt','text/plain',1,${"a".repeat(64)},
           'ready','not_applicable')`;
       await sql`INSERT INTO jobs(id,type,payload,idempotency_key)
-        VALUES(${jobId},'attachment.inspect',${sql.json({ attachmentId, ownerId: userId })},
+        VALUES(${jobId},'attachment.inspect',${
+        sql.json({
+          attachmentId,
+          ownerId: userId,
+          inspectionEpoch: 1,
+          requiredInspectionMode: "local",
+          inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
+        })
+      },
           ${`blocked-worker:${jobId}`})`;
 
       lockTransaction = locker.begin(async (tx) => {
@@ -143,8 +155,8 @@ Deno.test({
           S3_ACCESS_KEY: "test",
           S3_SECRET_KEY: "test-secret",
         },
-        stdout: "null",
-        stderr: "null",
+        stdout: "inherit",
+        stderr: "inherit",
       }).spawn();
       await eventually(async () =>
         Boolean(
@@ -226,7 +238,13 @@ Deno.test({
       }
       await sql`INSERT INTO jobs(id,type,payload,idempotency_key,created_at)
         VALUES(${blockedJobId},'attachment.inspect',${
-        sql.json({ attachmentId: blockedAttachmentId, ownerId: userId })
+        sql.json({
+          attachmentId: blockedAttachmentId,
+          ownerId: userId,
+          inspectionEpoch: 1,
+          requiredInspectionMode: "local",
+          inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
+        })
       },${`timeout-worker:${blockedJobId}`},now()-interval '1 day')`;
 
       lockTransaction = locker.begin(async (tx) => {
@@ -251,8 +269,8 @@ Deno.test({
           S3_ACCESS_KEY: "test",
           S3_SECRET_KEY: "test-secret",
         },
-        stdout: "null",
-        stderr: "null",
+        stdout: "inherit",
+        stderr: "inherit",
       }).spawn();
       await eventually(async () =>
         (await sql<{ status: string }[]>`SELECT status FROM jobs WHERE id=${blockedJobId}`)[0]
@@ -269,7 +287,13 @@ Deno.test({
       lockTransaction = undefined;
       await sql`INSERT INTO jobs(id,type,payload,idempotency_key,created_at)
         VALUES(${healthyJobId},'attachment.inspect',${
-        sql.json({ attachmentId: healthyAttachmentId, ownerId: userId })
+        sql.json({
+          attachmentId: healthyAttachmentId,
+          ownerId: userId,
+          inspectionEpoch: 1,
+          requiredInspectionMode: "local",
+          inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
+        })
       },${`timeout-worker:${healthyJobId}`},now()-interval '12 hours')`;
       await eventually(async () =>
         (await sql<{ status: string }[]>`SELECT status FROM jobs WHERE id=${healthyJobId}`)[0]

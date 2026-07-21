@@ -390,6 +390,11 @@ export async function transitionClaimedAttachmentInspection(
     (reason !== null && reason.length > 1_000)
   ) throw new TypeError("Attachment inspection transition is invalid");
   await sql.begin(async (tx) => {
+    // Acquire the attachment lock before the durable claim row. If attachment storage is blocked,
+    // the worker's statement timeout can roll this transaction back without pinning the claim row,
+    // allowing the neutral-defer settlement path to release the job for another replica.
+    await tx`SELECT id FROM attachments WHERE id=${input.attachmentId}
+      AND owner_id=${input.ownerId} FOR UPDATE`;
     const claim = await tx`SELECT id FROM jobs WHERE id=${job.id} AND type='attachment.inspect'
       AND status='running' AND locked_by=${job.claimToken}
       AND payload->>'attachmentId'=${input.attachmentId}

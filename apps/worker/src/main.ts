@@ -477,15 +477,15 @@ async function processJob(
         Date.now() + remainingLeaseMs,
         () => new DOMException("Attachment inspection deadline exceeded", "TimeoutError"),
       );
-      const outcome = await processAttachmentInspection({
-        payload,
-        repository,
-        objectStore,
-        limits: { maxBytes: attachmentInspectionMaxBytes },
-        scanner: malwareScannerConfig,
-        signal: inspectionOperation.signal,
-        transition: (input, audit) =>
-          runDatabaseOperation(() =>
+      const outcome = await runDatabaseOperation(() =>
+        processAttachmentInspection({
+          payload,
+          repository,
+          objectStore,
+          limits: { maxBytes: attachmentInspectionMaxBytes },
+          scanner: malwareScannerConfig,
+          signal: inspectionOperation.signal,
+          transition: (input, audit) =>
             transitionClaimedAttachmentInspection(
               sql,
               repository,
@@ -493,9 +493,9 @@ async function processJob(
               input,
               audit,
               jobLeaseSeconds,
-            )
-          ),
-      }).finally(inspectionOperation.dispose);
+            ),
+        })
+      ).finally(inspectionOperation.dispose);
       console.log(
         JSON.stringify({
           level: "info",
