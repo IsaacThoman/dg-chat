@@ -1407,10 +1407,13 @@ try {
   let closureProven = false;
   try {
     workerLiveness.current?.stopHeartbeat();
-    await signalDrainPromise;
-    await runShutdownDatabaseOperation(() => workerLiveness.current!.markDraining()).catch(() =>
-      undefined
-    );
+    if (signalDrainPromise) {
+      await signalDrainPromise;
+    } else {
+      await runShutdownDatabaseOperation(() => workerLiveness.current!.markDraining()).catch(() =>
+        undefined
+      );
+    }
     await runShutdownDatabaseOperation(() => workerLiveness.current!.markStopped()).catch(() =>
       undefined
     );
