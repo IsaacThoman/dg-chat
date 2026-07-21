@@ -11,6 +11,7 @@ Deno.test("Realtime session endpoints authorize, rewrite model IDs, and replace 
   if (!sidebandAddress || typeof sidebandAddress === "string") throw new Error("Missing WS port");
   let providerSideband: NodeWebSocket | undefined;
   sidebandServer.on("connection", (socket) => providerSideband = socket);
+  let createdCalls = 0;
   const repository = new MemoryRepository();
   const keyring = new ProviderSecretKeyring({
     primaryKeyId: "test",
@@ -25,8 +26,10 @@ Deno.test("Realtime session endpoints authorize, rewrite model IDs, and replace 
     realtimeFetch: async (input, init) => {
       const request = new Request(input, init);
       if (request.url.endsWith("/realtime/calls")) {
-        const form = await request.formData();
-        const session = JSON.parse(await (form.get("session") as File).text());
+        createdCalls += 1;
+        const session = request.headers.get("content-type")?.startsWith("application/sdp")
+          ? { rawSdp: await request.text() }
+          : JSON.parse(await ((await request.formData()).get("session") as File).text());
         requests.push({
           url: request.url,
           authorization: request.headers.get("authorization") ?? "",
@@ -36,11 +39,11 @@ Deno.test("Realtime session endpoints authorize, rewrite model IDs, and replace 
           status: 201,
           headers: {
             "content-type": "application/sdp",
-            location: "/v1/realtime/calls/call_provider_1",
+            location: `/v1/realtime/calls/call_provider_${createdCalls}`,
           },
         });
       }
-      if (request.url.endsWith("/realtime/calls/call_provider_1/hangup")) {
+      if (/\/realtime\/calls\/call_provider_\d+\/hangup$/.test(request.url)) {
         return new Response(JSON.stringify({ ok: true }), {
           headers: { "content-type": "application/json" },
         });
@@ -60,7 +63,7 @@ Deno.test("Realtime session endpoints authorize, rewrite model IDs, and replace 
       );
     },
     realtimeWebSocketConnect: async (input) => {
-      assertEquals(input.callId, "call_provider_1");
+      assertEquals(/^call_provider_\d+$/.test(input.callId ?? ""), true);
       const socket = new NodeWebSocket(`ws://127.0.0.1:${sidebandAddress.port}`);
       await new Promise<void>((resolve, reject) => {
         socket.once("open", resolve);
@@ -119,10 +122,20 @@ Deno.test("Realtime session endpoints authorize, rewrite model IDs, and replace 
   });
   const cookie = login.headers.get("set-cookie")?.split(";", 1)[0];
   assertExists(cookie);
+  const tokenResponse = await app.request("/api/tokens", {
+    method: "POST",
+    headers: { cookie, origin: "http://localhost:5173", "content-type": "application/json" },
+    body: JSON.stringify({ name: "Realtime", scopes: ["chat:write"] }),
+  });
+  const apiToken = (await tokenResponse.json()).token as string;
+  const tokenHeaders = {
+    authorization: `Bearer ${apiToken}`,
+    "content-type": "application/json",
+  };
 
   const response = await app.request("/v1/realtime/client_secrets", {
     method: "POST",
-    headers: { cookie, "content-type": "application/json" },
+    headers: tokenHeaders,
     body: JSON.stringify({
       expires_after: { anchor: "created_at", seconds: 60 },
       session: { type: "realtime", model: "vendor/realtime", instructions: "keep opaque" },
@@ -137,14 +150,17 @@ Deno.test("Realtime session endpoints authorize, rewrite model IDs, and replace 
       session: { type: "realtime", model: "gpt-realtime-upstream", instructions: "keep opaque" },
     },
   }]);
-  assertEquals(await response.json(), {
-    value: "ek_provider_ephemeral",
-    session: { model: "vendor/realtime", type: "realtime" },
+  const managedSecretResponse = await response.json();
+  assertEquals(managedSecretResponse.session, {
+    model: "vendor/realtime",
+    type: "realtime",
   });
+  assertEquals(managedSecretResponse.value.startsWith("ek_dg_"), true);
+  assertEquals(managedSecretResponse.value.includes("ek_provider_ephemeral"), false);
 
   const missing = await app.request("/v1/realtime/sessions", {
     method: "POST",
-    headers: { cookie, "content-type": "application/json" },
+    headers: tokenHeaders,
     body: JSON.stringify({ instructions: "no implicit self-hosted default" }),
   });
   assertEquals(missing.status, 422);
@@ -218,5 +234,35 @@ Deno.test("Realtime session endpoints authorize, rewrite model IDs, and replace 
   await closed;
   await new Promise((resolve) => setTimeout(resolve, 10));
   assertEquals((await repository.usage(user.id)).calls, 1);
+
+  const ephemeralCall = await app.request("/v1/realtime/calls", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${managedSecretResponse.value}`,
+      "content-type": "application/sdp",
+    },
+    body: "v=0\r\nephemeral-offer",
+  });
+  assertEquals(ephemeralCall.status, 201, await ephemeralCall.clone().text());
+  assertEquals(requests.at(-1), {
+    url: "https://realtime.example/v1/realtime/calls",
+    authorization: "Bearer ek_provider_ephemeral",
+    body: { rawSdp: "v=0\r\nephemeral-offer" },
+  });
+  const ephemeralLocation = ephemeralCall.headers.get("location");
+  assertExists(ephemeralLocation);
+  assertEquals(ephemeralLocation.startsWith("/v1/realtime/calls/"), true);
+  assertExists(providerSideband);
+  const ephemeralClosed = new Promise<void>((resolve) =>
+    providerSideband!.once("close", () => resolve())
+  );
+  const ephemeralHangup = await app.request(`${ephemeralLocation}/hangup`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${apiToken}` },
+  });
+  assertEquals(ephemeralHangup.status, 200);
+  await ephemeralClosed;
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assertEquals((await repository.usage(user.id)).calls, 2);
   sidebandServer.close();
 });

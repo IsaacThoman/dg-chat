@@ -327,6 +327,7 @@ type Variables = {
   tokenId?: string;
   tokenScopes?: string[];
   tokenRatePolicy?: TokenRatePolicy;
+  realtimeEphemeral?: { model: string; upstreamKey: string };
   imageAssetOwnerId?: string;
 };
 type WebGenerationEventInput = WebGenerationEvent extends infer Event
@@ -1936,6 +1937,11 @@ export function createApp(options: AppOptions = {}) {
       ["sign"],
     )
     : undefined;
+  const realtimeEphemeralEncryptionKey = realtimeCallSigningSecretBytes
+    ? crypto.subtle.digest("SHA-256", realtimeCallSigningSecretBytes).then((digest) =>
+      crypto.subtle.importKey("raw", digest, "AES-GCM", false, ["encrypt", "decrypt"])
+    )
+    : undefined;
   const mailer = options.mailer ?? (Deno.env.get("SMTP_URL")
     ? smtpIdentityMailer(
       Deno.env.get("SMTP_URL")!,
@@ -3035,9 +3041,13 @@ export function createApp(options: AppOptions = {}) {
       return next();
     }
     const legacySession = production ? getCookie(c, "dg_session") : undefined;
-    const raw = c.req.header("authorization")?.replace(/^Bearer\s+/i, "") ??
+    const presentedRaw = c.req.header("authorization")?.replace(/^Bearer\s+/i, "") ??
       getCookie(c, sessionCookie) ?? legacySession;
-    if (!raw) return c.json(openAIError("Authentication required", "unauthorized"), 401);
+    if (!presentedRaw) return c.json(openAIError("Authentication required", "unauthorized"), 401);
+    const ephemeral = c.req.path === "/v1/realtime/calls" && presentedRaw.startsWith("ek_dg_")
+      ? await openRealtimeEphemeral(presentedRaw)
+      : undefined;
+    const raw = ephemeral?.d ?? presentedRaw;
     const hash = await sha256(raw);
     const apiToken = await repo.authenticateApiToken(hash);
     if (apiToken) {
@@ -3060,6 +3070,9 @@ export function createApp(options: AppOptions = {}) {
         burst: apiToken.burstLimit,
       });
       c.set("authorityEpoch", apiToken.authorityEpoch);
+      if (ephemeral) {
+        c.set("realtimeEphemeral", { model: ephemeral.m, upstreamKey: ephemeral.u });
+      }
       return next();
     }
     const session = await repo.getSession(hash);
@@ -3091,8 +3104,12 @@ export function createApp(options: AppOptions = {}) {
     return next();
   };
   const authenticateApiToken: MiddlewareHandler<{ Variables: Variables }> = async (c, next) => {
-    const raw = c.req.header("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
-    if (!raw) return c.json(openAIError("Authentication required", "unauthorized"), 401);
+    const presented = c.req.header("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
+    if (!presented) return c.json(openAIError("Authentication required", "unauthorized"), 401);
+    const ephemeral = c.req.path === "/v1/realtime/calls" && presented.startsWith("ek_dg_")
+      ? await openRealtimeEphemeral(presented)
+      : undefined;
+    const raw = ephemeral?.d ?? presented;
     const apiToken = await repo.authenticateApiToken(await sha256(raw));
     const user = apiToken ? await repo.findUser(apiToken.userId) : undefined;
     if (
@@ -3113,6 +3130,9 @@ export function createApp(options: AppOptions = {}) {
       burst: apiToken.burstLimit,
     });
     c.set("authorityEpoch", apiToken.authorityEpoch);
+    if (ephemeral) {
+      c.set("realtimeEphemeral", { model: ephemeral.m, upstreamKey: ephemeral.u });
+    }
     return next();
   };
   const approved: MiddlewareHandler<{ Variables: Variables }> = async (c, next) => {
@@ -8131,7 +8151,56 @@ export function createApp(options: AppOptions = {}) {
           JSON.parse(text),
           resolved.registryModel.upstreamModelId,
           selected.model,
-        );
+        ) as Record<string, unknown>;
+        const sourceCredential = c.req.header("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1]
+          ?.trim();
+        if (!sourceCredential) {
+          throw new RealtimeProtocolError(
+            "api_token_required",
+            "Realtime client secrets require a personal API token",
+            401,
+          );
+        }
+        const nowSeconds = Math.floor(Date.now() / 1000);
+        const managedSecret = async (upstreamKey: string, expires: unknown) => {
+          const providerExpiry = Number.isSafeInteger(expires) ? Number(expires) : nowSeconds + 60;
+          const effectiveExpiry = Math.min(providerExpiry, nowSeconds + 600);
+          if (effectiveExpiry <= nowSeconds) {
+            throw new RealtimeProtocolError(
+              "invalid_provider_response",
+              "Realtime provider returned an expired client secret",
+              502,
+            );
+          }
+          return await sealRealtimeEphemeral({
+            d: sourceCredential,
+            u: upstreamKey,
+            m: selected.model as string,
+            e: effectiveExpiry,
+          });
+        };
+        if (typeof value.value === "string") {
+          value.value = await managedSecret(value.value, value.expires_at);
+        } else if (
+          value.client_secret && typeof value.client_secret === "object" &&
+          !Array.isArray(value.client_secret)
+        ) {
+          const secret = value.client_secret as Record<string, unknown>;
+          if (typeof secret.value !== "string") {
+            throw new RealtimeProtocolError(
+              "invalid_provider_response",
+              "Realtime provider omitted the client secret",
+              502,
+            );
+          }
+          secret.value = await managedSecret(secret.value, secret.expires_at);
+        } else {
+          throw new RealtimeProtocolError(
+            "invalid_provider_response",
+            "Realtime provider omitted the client secret",
+            502,
+          );
+        }
         const headers = new Headers(response.headers);
         headers.delete("content-length");
         return new Response(JSON.stringify(value), {
@@ -8139,7 +8208,8 @@ export function createApp(options: AppOptions = {}) {
           statusText: response.statusText,
           headers,
         });
-      } catch {
+      } catch (error) {
+        if (error instanceof RealtimeProtocolError) throw error;
         throw new RealtimeProtocolError(
           "invalid_provider_response",
           "Realtime provider returned invalid JSON",
@@ -8150,6 +8220,62 @@ export function createApp(options: AppOptions = {}) {
     return response;
   };
   type RealtimeCallToken = { c: string; m: string; o: string; e: number };
+  type RealtimeEphemeralToken = { d: string; u: string; m: string; e: number };
+  const sealRealtimeEphemeral = async (payload: RealtimeEphemeralToken): Promise<string> => {
+    if (!realtimeEphemeralEncryptionKey) {
+      throw new RealtimeProtocolError(
+        "client_secrets_not_configured",
+        "Realtime client secrets require REALTIME_CALL_SIGNING_SECRET",
+        501,
+      );
+    }
+    const nonce = crypto.getRandomValues(new Uint8Array(12));
+    const ciphertext = new Uint8Array(
+      await crypto.subtle.encrypt(
+        { name: "AES-GCM", iv: nonce, additionalData: new TextEncoder().encode("dg-realtime-v1") },
+        await realtimeEphemeralEncryptionKey,
+        new TextEncoder().encode(JSON.stringify(payload)),
+      ),
+    );
+    const token = new Uint8Array(nonce.byteLength + ciphertext.byteLength);
+    token.set(nonce);
+    token.set(ciphertext, nonce.byteLength);
+    return `ek_dg_${Buffer.from(token).toString("base64url")}`;
+  };
+  const openRealtimeEphemeral = async (
+    token: string,
+  ): Promise<RealtimeEphemeralToken | undefined> => {
+    if (
+      !realtimeEphemeralEncryptionKey || !/^ek_dg_[A-Za-z0-9_-]+$/.test(token) ||
+      token.length > 8_192
+    ) {
+      return undefined;
+    }
+    try {
+      const packed = new Uint8Array(Buffer.from(token.slice(6), "base64url"));
+      if (packed.byteLength < 29) return undefined;
+      const plaintext = await crypto.subtle.decrypt(
+        {
+          name: "AES-GCM",
+          iv: packed.slice(0, 12),
+          additionalData: new TextEncoder().encode("dg-realtime-v1"),
+        },
+        await realtimeEphemeralEncryptionKey,
+        packed.slice(12),
+      );
+      const payload = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(plaintext));
+      if (
+        !payload || typeof payload !== "object" || typeof payload.d !== "string" ||
+        typeof payload.u !== "string" || typeof payload.m !== "string" ||
+        !Number.isSafeInteger(payload.e) || payload.e <= Math.floor(Date.now() / 1000) ||
+        payload.d.length < 16 || payload.d.length > 4_096 || payload.u.length < 1 ||
+        payload.u.length > 4_096 || payload.m.length < 1 || payload.m.length > 256
+      ) return undefined;
+      return payload as RealtimeEphemeralToken;
+    } catch {
+      return undefined;
+    }
+  };
   const signRealtimeCall = async (payload: RealtimeCallToken): Promise<string> => {
     if (!realtimeCallSigningKey) {
       throw new RealtimeProtocolError(
@@ -8246,11 +8372,19 @@ export function createApp(options: AppOptions = {}) {
       );
     }
     const rawBody = new Uint8Array(await c.req.raw.arrayBuffer());
+    const ephemeral = c.get("realtimeEphemeral");
     const prepared = await prepareRealtimeCall(
       c.req.header("content-type") ?? "",
       rawBody,
-      c.req.query("model"),
+      ephemeral?.model ?? c.req.query("model"),
     );
+    if (ephemeral && prepared.model !== ephemeral.model) {
+      throw new RealtimeProtocolError(
+        "model_mismatch",
+        "Realtime client secret is bound to a different model",
+        403,
+      );
+    }
     const resolved = await resolveRealtimeRuntimeModel(
       prepared.model,
       "realtime",
@@ -8288,7 +8422,7 @@ export function createApp(options: AppOptions = {}) {
     try {
       response = await proxyRealtimeHttp({
         baseUrl: resolved.upstream.baseUrl!,
-        apiKey: resolved.upstream.apiKey!,
+        apiKey: ephemeral?.upstreamKey ?? resolved.upstream.apiKey!,
         path: "/realtime/calls",
         headers: { "content-type": rewritten.contentType, accept: "application/sdp" },
         body: rewritten.body,
