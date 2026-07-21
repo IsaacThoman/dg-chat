@@ -201,6 +201,13 @@ import {
 } from "./models.ts";
 import { providerResponseByteLimit } from "./provider-limits.ts";
 import { estimateInputTokens, priceUsage, reservationPrice } from "./pricing.ts";
+import {
+  proxyRealtimeHttp,
+  REALTIME_MAX_HTTP_BODY_BYTES,
+  type RealtimeCapability,
+  RealtimeProtocolError,
+  rewriteRealtimeModels,
+} from "./realtime.ts";
 import { responseObject, responseRequestFields } from "./responses.ts";
 import { ResponsesStreamProjector } from "./responses-stream.ts";
 import {
@@ -389,6 +396,7 @@ export interface AppOptions {
   audioFetch?: typeof fetch;
   speechFetch?: typeof fetch;
   imageFetch?: typeof fetch;
+  realtimeFetch?: typeof fetch;
   imageUrlSigningSecret?: string;
   audioConcurrencyLimiter?: AudioConcurrencyLimiter;
   imageConcurrencyLimiter?: AudioConcurrencyLimiter;
@@ -2523,6 +2531,33 @@ export function createApp(options: AppOptions = {}) {
     const resolved = await registryModelInfo(model, provider);
     if (!resolved.price) return undefined;
     return resolved;
+  };
+  const resolveRealtimeRuntimeModel = async (
+    id: string,
+    capability: RealtimeCapability,
+    subject: TokenAccessSubject,
+  ): Promise<RuntimeModel | undefined> => {
+    const model = (await repo.resolveEntitledProviderModel(subject, id))?.model;
+    if (!model?.enabled || !model.capabilities.includes(capability)) return undefined;
+    const provider = await repo.findProvider(model.providerId);
+    if (!provider?.enabled || !provider.hasCredential || !providerKeyring) return undefined;
+    const credential = await repo.getProviderCredential(provider.id);
+    if (!credential) return undefined;
+    let apiKey: string;
+    try {
+      apiKey = await providerKeyring.decrypt(
+        provider.id,
+        credential.envelope as unknown as ProviderSecretEnvelope,
+      );
+    } catch {
+      return undefined;
+    }
+    const resolved = await registryModelInfo(model, provider);
+    if (!resolved.price) return undefined;
+    return {
+      ...resolved,
+      upstream: { baseUrl: provider.baseUrl, apiKey, upstreamModel: model.upstreamModelId },
+    };
   };
   const replayModelIsEntitled = async (
     c: Context<{ Variables: Variables }>,
@@ -7994,6 +8029,149 @@ export function createApp(options: AppOptions = {}) {
     }
     await next();
   });
+  const realtimeJsonProxy = async (
+    c: Context<{ Variables: Variables }>,
+    path: string,
+    select: (body: Record<string, unknown>) => {
+      model: unknown;
+      capability: RealtimeCapability;
+    },
+  ): Promise<Response> => {
+    const declared = Number(c.req.header("content-length"));
+    if (Number.isFinite(declared) && declared > REALTIME_MAX_HTTP_BODY_BYTES) {
+      throw new RealtimeProtocolError(
+        "request_too_large",
+        "Realtime request exceeds the size limit",
+        413,
+      );
+    }
+    const bytes = new Uint8Array(await c.req.raw.arrayBuffer());
+    if (bytes.byteLength > REALTIME_MAX_HTTP_BODY_BYTES) {
+      throw new RealtimeProtocolError(
+        "request_too_large",
+        "Realtime request exceeds the size limit",
+        413,
+      );
+    }
+    let body: unknown;
+    try {
+      body = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    } catch {
+      throw new RealtimeProtocolError("invalid_request", "Realtime request must be valid JSON");
+    }
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      throw new RealtimeProtocolError("invalid_request", "Realtime request must be a JSON object");
+    }
+    const selected = select(body as Record<string, unknown>);
+    if (typeof selected.model !== "string" || selected.model.length < 1) {
+      throw new RealtimeProtocolError(
+        "model_required",
+        "A Realtime model must be selected explicitly",
+        422,
+      );
+    }
+    const resolved = await resolveRealtimeRuntimeModel(
+      selected.model,
+      selected.capability,
+      accessSubject(c),
+    );
+    if (!resolved?.upstream || !resolved.registryModel) {
+      throw new RealtimeProtocolError(
+        "model_not_found",
+        "Realtime model is unavailable or not entitled",
+        404,
+      );
+    }
+    const upstreamBody = new TextEncoder().encode(JSON.stringify(rewriteRealtimeModels(
+      body,
+      selected.model,
+      resolved.registryModel.upstreamModelId,
+    )));
+    const response = await proxyRealtimeHttp({
+      baseUrl: resolved.upstream.baseUrl!,
+      apiKey: resolved.upstream.apiKey!,
+      path,
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: upstreamBody,
+      signal: c.req.raw.signal,
+      fetch: options.realtimeFetch,
+    });
+    if (response.headers.get("content-type")?.includes("application/json")) {
+      const text = await response.text();
+      try {
+        const value = rewriteRealtimeModels(
+          JSON.parse(text),
+          resolved.registryModel.upstreamModelId,
+          selected.model,
+        );
+        const headers = new Headers(response.headers);
+        headers.delete("content-length");
+        return new Response(JSON.stringify(value), {
+          status: response.status,
+          statusText: response.statusText,
+          headers,
+        });
+      } catch {
+        throw new RealtimeProtocolError(
+          "invalid_provider_response",
+          "Realtime provider returned invalid JSON",
+          502,
+        );
+      }
+    }
+    return response;
+  };
+
+  app.post(
+    "/v1/realtime/client_secrets",
+    requireScope("chat:write"),
+    (c) =>
+      realtimeJsonProxy(c, "/realtime/client_secrets", (body) => {
+        const session =
+          body.session && typeof body.session === "object" && !Array.isArray(body.session)
+            ? body.session as Record<string, unknown>
+            : {};
+        return {
+          model: session.model,
+          capability: session.type === "transcription" ? "realtime_transcription" : "realtime",
+        };
+      }),
+  );
+  app.post(
+    "/v1/realtime/sessions",
+    requireScope("chat:write"),
+    (c) =>
+      realtimeJsonProxy(c, "/realtime/sessions", (body) => ({
+        model: body.model,
+        capability: "realtime",
+      })),
+  );
+  app.post(
+    "/v1/realtime/transcription_sessions",
+    requireScope("chat:write"),
+    (c) =>
+      realtimeJsonProxy(c, "/realtime/transcription_sessions", (body) => {
+        const transcription = body.input_audio_transcription &&
+            typeof body.input_audio_transcription === "object" &&
+            !Array.isArray(body.input_audio_transcription)
+          ? body.input_audio_transcription as Record<string, unknown>
+          : {};
+        return { model: transcription.model, capability: "realtime_transcription" };
+      }),
+  );
+  app.post(
+    "/v1/realtime/translations/client_secrets",
+    requireScope("chat:write"),
+    (c) =>
+      realtimeJsonProxy(c, "/realtime/translations/client_secrets", (body) => {
+        const session =
+          body.session && typeof body.session === "object" && !Array.isArray(body.session)
+            ? body.session as Record<string, unknown>
+            : {};
+        return { model: session.model, capability: "realtime_translation" };
+      }),
+  );
   const replayResponse = (request: ApiIdempotencyRequest) => {
     // A streaming request can fail before the first event is exposed. In that case the
     // original response is the stored JSON error, not an empty event stream.
@@ -12386,6 +12564,12 @@ export function createApp(options: AppOptions = {}) {
     if (error instanceof OpenAIParameterError) {
       return c.json(
         openAIError(error.message, error.code, error.status, error.param),
+        error.status as 400,
+      );
+    }
+    if (error instanceof RealtimeProtocolError) {
+      return c.json(
+        openAIError(error.message, error.code, error.status),
         error.status as 400,
       );
     }
