@@ -8725,6 +8725,73 @@ export function createApp(options: AppOptions = {}) {
         426,
       );
     }
+    const localCallId = c.req.query("call_id")?.trim();
+    if (localCallId) {
+      const token = await verifyRealtimeCall(localCallId, c.get("user").id);
+      if (!token) {
+        throw new RealtimeProtocolError("call_not_found", "Realtime call was not found", 404);
+      }
+      const resolved = await resolveRealtimeRuntimeModel(token.m, token.q, accessSubject(c));
+      if (!resolved?.upstream || !resolved.registryModel) {
+        throw new RealtimeProtocolError(
+          "model_not_found",
+          "Realtime model is unavailable or not entitled",
+          404,
+        );
+      }
+      const concurrencyLease = await claimAudioSlot(c.get("user").id);
+      let upstream;
+      try {
+        upstream = await (options.realtimeWebSocketConnect ?? connectRealtimeWebSocket)({
+          baseUrl: resolved.upstream.baseUrl!,
+          apiKey: resolved.upstream.apiKey!,
+          callId: token.c,
+          signal: c.req.raw.signal,
+        });
+      } catch {
+        await concurrencyLease.release();
+        throw new RealtimeProtocolError(
+          "provider_unavailable",
+          "Realtime sideband connection failed",
+          502,
+        );
+      }
+      let upgraded: ReturnType<typeof Deno.upgradeWebSocket>;
+      try {
+        upgraded = Deno.upgradeWebSocket(c.req.raw, { idleTimeout: 120 });
+      } catch (error) {
+        upstream.terminate();
+        await concurrencyLease.release();
+        throw error;
+      }
+      const maximumTimer = setTimeout(
+        () => stopRelay(),
+        realtimeMaxSessionSeconds * 1_000,
+      );
+      const stopRelay = relayRealtimeWebSocket(upgraded.socket, upstream, {
+        publicModel: token.m,
+        upstreamModel: resolved.registryModel.upstreamModelId,
+        async onClose(details) {
+          clearTimeout(maximumTimer);
+          recordRealtimeSessionEnded(
+            "websocket",
+            details.code === 1000
+              ? "completed"
+              : details.code === 1001
+              ? "client_closed"
+              : details.code === 1013
+              ? "capacity_lost"
+              : "failed",
+            details.clientEvents,
+            details.serverEvents,
+          );
+          await concurrencyLease.release();
+        },
+      });
+      concurrencyLease.signal.addEventListener("abort", stopRelay, { once: true });
+      recordRealtimeSessionStarted("websocket");
+      return upgraded.response;
+    }
     const modelId = c.req.query("model")?.trim();
     if (!modelId) {
       throw new RealtimeProtocolError(
