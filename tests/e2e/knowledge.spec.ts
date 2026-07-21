@@ -227,7 +227,10 @@ test("manages a collection and persists conversation knowledge", async ({ page }
     expect(createBox?.height ?? 0).toBeGreaterThanOrEqual(44);
   }
   await removeFile.click();
-  await expect(page.getByText(filename, { exact: true })).toBeHidden();
+  // Retained chat sessions intentionally keep their composer uploads mounted while this
+  // workspace view is active, so the filename can still exist outside the collection.
+  // Assert the collection-specific control disappears instead of using a page-wide text match.
+  await expect(removeFile).toBeHidden();
 
   await page.getByRole("button", { name: `Delete ${renamedName}` }).click();
   const deleteDialog = page.getByRole("dialog", { name: "Delete collection?" });
