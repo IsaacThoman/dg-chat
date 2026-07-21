@@ -1418,9 +1418,29 @@ try {
         undefined
       );
     }
-    await runShutdownDatabaseOperation(() => workerLiveness.current!.markStopped()).catch(() =>
-      undefined
+    // Terminal liveness is observational, not a claim/accounting settlement. Give its normally
+    // sub-millisecond UPDATE whatever remains of the absolute shutdown window instead of refusing
+    // to start it merely because a full retry attempt no longer fits.
+    const stoppedOperation = operationSignal(
+      new AbortController().signal,
+      closeDeadline,
+      () => new DOMException("Worker stopped-state deadline elapsed", "TimeoutError"),
     );
+    try {
+      await raceAbort(
+        runDatabaseOperation(() => workerLiveness.current!.markStopped()),
+        stoppedOperation.signal,
+      );
+    } catch (error) {
+      console.warn(JSON.stringify({
+        level: "warn",
+        message: "Worker terminal liveness update failed",
+        workerId,
+        error: error instanceof Error ? error.name : "UnknownError",
+      }));
+    } finally {
+      stoppedOperation.dispose();
+    }
     await closeResourcesBeforeDeadline({
       graceful: [
         () => sql.end({ timeout: 5 }),
