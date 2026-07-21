@@ -1,5 +1,8 @@
 import { assertEquals, assertExists } from "jsr:@std/assert@1";
 import { MemoryRepository } from "@dg-chat/database";
+import OpenAI from "openai";
+import { OpenAIRealtimeWS } from "openai/realtime/ws";
+import { connect } from "node:net";
 import { WebSocket as NodeWebSocket, WebSocketServer } from "ws";
 import { createApp } from "./app.ts";
 import { ProviderSecretKeyring } from "./provider-secrets.ts";
@@ -127,12 +130,26 @@ Deno.test("raw Realtime WebSocket relays standard JSON events and settles termin
 
   const server = Deno.serve({ hostname: "127.0.0.1", port: 0 }, app.fetch);
   const address = server.addr as Deno.NetAddr;
-  const client = new NodeWebSocket(
-    `ws://127.0.0.1:${address.port}/v1/realtime?model=vendor%2Frealtime-ws`,
-    { headers: { authorization: `Bearer ${token}` } },
+  const realtimeClient = new OpenAIRealtimeWS(
+    {
+      model: "vendor/realtime-ws",
+      options: {
+        createConnection: () => connect(address.port, "127.0.0.1"),
+      },
+    },
+    new OpenAI({
+      apiKey: token,
+      baseURL: `https://127.0.0.1:${address.port}/v1`,
+    }),
   );
+  const client = realtimeClient.socket;
   try {
-    const createdEvent = message(client);
+    const createdEvent = new Promise<Record<string, unknown>>((resolve) => {
+      realtimeClient.on(
+        "session.created",
+        (event) => resolve(event as unknown as Record<string, unknown>),
+      );
+    });
     await Promise.all([opened(client), upstreamConnected]);
     assertEquals(upstreamAuthorization, "Bearer provider-ws-secret");
     assertEquals(upstreamPath, "/v1/realtime?model=gpt-realtime-upstream");
