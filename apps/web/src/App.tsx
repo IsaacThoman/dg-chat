@@ -5599,6 +5599,10 @@ export function App(
     if (view !== "chat" && view !== "archived" && view !== "trash") return;
     if (lifecycleQuery.isLoading) return;
     const visible = conversationsForView(allConversations, view);
+    // A successful create is placed in the query cache and activated in the same task. React can
+    // render the active id before the cache observer publishes that new conversation. Do not let
+    // the lifecycle fallback replace that intentional activation during this one-render gap.
+    if (pendingNewConversationFocusRef.current === activeId) return;
     if (!visible.some((conversation) => conversation.id === activeId)) {
       activateChatSession(visible[0]?.id ?? "");
     }

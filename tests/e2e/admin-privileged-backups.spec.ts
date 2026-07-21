@@ -90,8 +90,8 @@ test("admin creates and downloads a separately encrypted provider-secret backup"
     return await route.fallback();
   });
 
-  await page.goto("/admin/storage");
-  await expect(page).toHaveTitle("Storage & backups · DG Chat Admin");
+  await page.goto("/admin/backups");
+  await expect(page).toHaveTitle("Backups · DG Chat Admin");
   const create = page.getByRole("button", { name: "Create paired export" });
   await expect(create).toBeDisabled();
   await page.getByLabel("Type EXPORT PROVIDER SECRETS to continue").fill(
@@ -222,7 +222,7 @@ test("admin dry-runs and exactly confirms provider-secret recovery", async ({ pa
     return await route.fallback();
   });
 
-  await page.goto("/admin/storage");
+  await page.goto("/admin/backups");
   await page.getByLabel("Completed base restore ID").fill(restoreId);
   const picker = page.locator('input[type="file"][accept*=".dgsecrets"]');
   await picker.focus();
@@ -240,7 +240,7 @@ test("admin dry-runs and exactly confirms provider-secret recovery", async ({ pa
   await expect(page).toHaveURL(/\/login$/);
   // A successful reauthentication returns to the admin route; safe identifiers in session storage
   // are sufficient to reload server-owned recovery state without retaining the file or confirmation.
-  await page.goto("/admin/storage");
+  await page.goto("/admin/backups");
   await expect(page.getByText("provider-secrets.dgsecrets", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Run dry check", exact: true }).last().click();
   await expect(page.getByRole("heading", { name: "Provider impact" })).toBeVisible();

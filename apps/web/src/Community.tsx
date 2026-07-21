@@ -221,6 +221,10 @@ function CommunityProfileSettings({ profile }: { profile: CommunityProfile }) {
     setBaseVersion(profile.version);
   }, [dirty, profile]);
 
+  useEffect(() => {
+    if (conflictMessage) conflictRef.current?.focus();
+  }, [conflictMessage]);
+
   const change = (field: CommunityDirtyField, patch: Partial<CommunityDraft>) => {
     setDraft((current) => {
       const next = { ...current, ...patch };
@@ -280,7 +284,6 @@ function CommunityProfileSettings({ profile }: { profile: CommunityProfile }) {
               }. Your local choice is still unsaved; review it before saving again.`
               : "The latest profile was loaded. Your unsaved changes were rebased without overwriting settings changed elsewhere.",
           );
-          requestAnimationFrame(() => conflictRef.current?.focus());
         } catch {
           setSaveError(
             "Your profile changed elsewhere, and the latest version could not be loaded. Your draft is still here. Check your connection and try again.",

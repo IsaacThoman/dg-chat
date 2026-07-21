@@ -56,7 +56,7 @@ test("community participation is private by default, durable, and conflict-safe"
   await login(page, member.email, member.password);
   const sidebar = await openSidebar(page);
   await sidebar.getByRole("button", { name: "Community", exact: true }).click();
-  await expect(page).toHaveURL(/\/community$/);
+  await expect(page).toHaveURL(/\/community\?metric=calls&window=30d$/);
   await expect(page.getByRole("heading", { name: "See how the community is creating" }))
     .toBeVisible();
 
@@ -69,15 +69,17 @@ test("community participation is private by default, durable, and conflict-safe"
 
   await join.check();
   await page.getByRole("radio", { name: /^Nickname/ }).check();
-  await page.getByLabel("Nickname").fill(nickname);
+  await page.getByRole("textbox", { name: "Nickname", exact: true }).fill(nickname);
   await page.getByRole("radio", { name: "Violet" }).check();
   await expect(shareBalance).toBeEnabled();
   await expect(shareBalance).not.toBeChecked();
   await page.getByRole("button", { name: "Save profile" }).click();
-  await expect(page.getByRole("status")).toContainText("Profile saved");
+  await expect(page.getByRole("status").filter({ hasText: "Profile saved" })).toBeVisible();
 
   await page.reload();
-  await expect(page.getByLabel("Nickname")).toHaveValue(nickname);
+  await expect(page.getByRole("textbox", { name: "Nickname", exact: true })).toHaveValue(
+    nickname,
+  );
   await expect(join).toBeChecked();
   await expect(shareBalance).not.toBeChecked();
 
@@ -107,19 +109,21 @@ test("community participation is private by default, durable, and conflict-safe"
   expect(external.ok(), await external.text()).toBeTruthy();
 
   const draftName = `${nickname} X`;
-  await page.getByLabel("Nickname").fill(draftName);
+  await page.getByRole("textbox", { name: "Nickname", exact: true }).fill(draftName);
   await page.getByRole("button", { name: "Save profile" }).click();
   const conflict = page.getByRole("alert");
   await expect(conflict).toContainText("without overwriting");
   await expect(conflict).toBeFocused();
-  await expect(page.getByLabel("Nickname")).toHaveValue(draftName);
+  await expect(page.getByRole("textbox", { name: "Nickname", exact: true })).toHaveValue(
+    draftName,
+  );
   await expect(page.getByRole("radio", { name: "Blue" })).toBeChecked();
   await page.getByRole("button", { name: "Review and save again" }).click();
-  await expect(page.getByRole("status")).toContainText("Profile saved");
+  await expect(page.getByRole("status").filter({ hasText: "Profile saved" })).toBeVisible();
 
   await shareBalance.check();
   await page.getByRole("button", { name: "Save profile" }).click();
-  await expect(page.getByRole("status")).toContainText("Profile saved");
+  await expect(page.getByRole("status").filter({ hasText: "Profile saved" })).toBeVisible();
   await page.getByRole("tab", { name: "Balance" }).click();
   await expect(page.getByRole("tabpanel")).toContainText(draftName);
 
@@ -135,7 +139,7 @@ test("community participation is private by default, durable, and conflict-safe"
       const control of [
         page.getByRole("tab", { name: "Calls" }),
         page.getByRole("button", { name: "Save profile" }),
-        page.getByRole("radio", { name: "Violet" }),
+        page.getByTitle("Violet", { exact: true }),
       ]
     ) {
       const box = await control.boundingBox();
