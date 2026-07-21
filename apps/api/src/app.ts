@@ -312,6 +312,7 @@ import type { BetterAuthService } from "./better-auth.ts";
 import type { BackupAdminService } from "./backup-admin.ts";
 import { timingSafeTextEqual, validateSetupToken } from "./auth-config.ts";
 import { BackupServiceError } from "./backup-service.ts";
+import { recordRealtimeSessionEnded, recordRealtimeSessionStarted } from "@dg-chat/observability";
 
 type Variables = {
   requestId: string;
@@ -8351,6 +8352,7 @@ export function createApp(options: AppOptions = {}) {
     inputTokens: number;
     cachedInputTokens: number;
     outputTokens: number;
+    serverEvents: number;
     resolved: RuntimeModel & {
       provider: ProviderRecord;
       registryModel: ProviderModelRecord;
@@ -8510,16 +8512,19 @@ export function createApp(options: AppOptions = {}) {
       inputTokens: 0,
       cachedInputTokens: 0,
       outputTokens: 0,
+      serverEvents: 0,
       resolved: completeResolved,
       sideband,
       concurrencyLease,
       maximumTimer,
     };
     realtimeCalls.set(localCallId, call);
+    recordRealtimeSessionStarted("webrtc");
     sideband.on("message", (data, binary) => {
       if (binary) return sideband.close(1003, "Realtime events must be JSON text frames");
       try {
         const event = parseRealtimeEvent(data.toString());
+        call.serverEvents += 1;
         const usage = realtimeUsage(event);
         if (!usage) return;
         call.inputTokens += usage.inputTokens;
@@ -8529,9 +8534,15 @@ export function createApp(options: AppOptions = {}) {
         sideband.close(1007, "Invalid Realtime provider event");
       }
     });
-    sideband.once("close", async () => {
+    sideband.once("close", async (code) => {
       clearTimeout(call.maximumTimer);
       realtimeCalls.delete(localCallId);
+      recordRealtimeSessionEnded(
+        "webrtc",
+        code === 1000 ? "completed" : code === 1013 ? "capacity_lost" : "provider_closed",
+        0,
+        call.serverEvents,
+      );
       const cost = priceUsage(call.resolved.info, call.inputTokens, call.outputTokens, {
         cachedInputTokens: call.cachedInputTokens,
       }).costMicros;
@@ -8768,8 +8779,20 @@ export function createApp(options: AppOptions = {}) {
         cachedInputTokens += usage.cachedInputTokens;
         outputTokens += usage.outputTokens;
       },
-      async onClose() {
+      async onClose(details) {
         clearTimeout(maximumTimer);
+        recordRealtimeSessionEnded(
+          "websocket",
+          details.code === 1000
+            ? "completed"
+            : details.code === 1001
+            ? "client_closed"
+            : details.code === 1013
+            ? "capacity_lost"
+            : "failed",
+          details.clientEvents,
+          details.serverEvents,
+        );
         const cost = priceUsage(resolved.info, inputTokens, outputTokens, {
           cachedInputTokens,
         }).costMicros;
@@ -8782,6 +8805,7 @@ export function createApp(options: AppOptions = {}) {
         }
       },
     });
+    recordRealtimeSessionStarted("websocket");
     concurrencyLease.signal.addEventListener("abort", stopRelay, { once: true });
     return upgraded.response;
   });

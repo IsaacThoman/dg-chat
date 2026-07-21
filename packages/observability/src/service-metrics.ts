@@ -28,6 +28,33 @@ let providerAttemptObserver = (
   _outcome: string,
   _breakerAfter: string | null | undefined,
 ): void => {};
+type RealtimeTransport = "websocket" | "webrtc";
+type RealtimeOutcome =
+  | "completed"
+  | "client_closed"
+  | "provider_closed"
+  | "capacity_lost"
+  | "failed";
+let realtimeStartObserver = (_transport: RealtimeTransport): void => {};
+let realtimeEndObserver = (
+  _transport: RealtimeTransport,
+  _outcome: RealtimeOutcome,
+  _clientEvents: number,
+  _serverEvents: number,
+): void => {};
+
+export function recordRealtimeSessionStarted(transport: RealtimeTransport): void {
+  realtimeStartObserver(transport);
+}
+
+export function recordRealtimeSessionEnded(
+  transport: RealtimeTransport,
+  outcome: RealtimeOutcome,
+  clientEvents = 0,
+  serverEvents = 0,
+): void {
+  realtimeEndObserver(transport, outcome, clientEvents, serverEvents);
+}
 
 /** Record only the categorical terminal provider state; provider/model/error identities are excluded. */
 export function recordProviderAttemptMetric(
@@ -112,6 +139,29 @@ export function createApiMetrics(version = "0.1.0"): ApiMetrics {
     ),
   );
   providerCircuitOpened.set(0);
+  const realtimeActive = registry.register(
+    new Gauge("dg_chat_realtime_sessions_active", "Active Realtime sessions by transport"),
+  );
+  const realtimeSessions = registry.register(
+    new Counter(
+      "dg_chat_realtime_sessions_total",
+      "Terminal Realtime sessions by transport and outcome",
+    ),
+  );
+  const realtimeEvents = registry.register(
+    new Counter(
+      "dg_chat_realtime_events_total",
+      "Validated Realtime JSON events by transport and direction",
+    ),
+  );
+  for (const transport of ["websocket", "webrtc"] as const) realtimeActive.set(0, { transport });
+  realtimeStartObserver = (transport) => realtimeActive.add(1, { transport });
+  realtimeEndObserver = (transport, outcome, clientEvents, serverEvents) => {
+    realtimeActive.add(-1, { transport });
+    realtimeSessions.add(1, { transport, outcome });
+    realtimeEvents.add(clientEvents, { transport, direction: "client" });
+    realtimeEvents.add(serverEvents, { transport, direction: "server" });
+  };
   providerAttemptObserver = (outcome, breakerAfter) => {
     const safeOutcome = PROVIDER_OUTCOMES.has(outcome) ? outcome : "failed";
     const candidate = breakerAfter ?? "none";
