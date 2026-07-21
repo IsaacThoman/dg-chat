@@ -405,6 +405,7 @@ export interface AppOptions {
   imageFetch?: typeof fetch;
   realtimeFetch?: typeof fetch;
   realtimeWebSocketConnect?: typeof connectRealtimeWebSocket;
+  realtimeMaxSessionSeconds?: number;
   imageUrlSigningSecret?: string;
   realtimeCallSigningSecret?: string;
   audioConcurrencyLimiter?: AudioConcurrencyLimiter;
@@ -2078,6 +2079,11 @@ export function createApp(options: AppOptions = {}) {
   const audioMaxConcurrentPerUser = positiveInteger("AUDIO_MAX_CONCURRENT_PER_USER", 2);
   if (audioMaxConcurrentPerUser > audioMaxConcurrent) {
     throw new Error("AUDIO_MAX_CONCURRENT_PER_USER cannot exceed AUDIO_MAX_CONCURRENT");
+  }
+  const realtimeMaxSessionSeconds = options.realtimeMaxSessionSeconds ??
+    positiveInteger("REALTIME_MAX_SESSION_SECONDS", 1_800);
+  if (realtimeMaxSessionSeconds < 30 || realtimeMaxSessionSeconds > 7_200) {
+    throw new Error("REALTIME_MAX_SESSION_SECONDS must be between 30 and 7200");
   }
   const claimAudioSlot = async (ownerId: string) => {
     const lease = await audioConcurrencyLimiter.acquire(ownerId, {
@@ -8352,6 +8358,8 @@ export function createApp(options: AppOptions = {}) {
       price: ModelPriceVersion;
     };
     sideband: Awaited<ReturnType<typeof connectRealtimeWebSocket>>;
+    concurrencyLease: Awaited<ReturnType<typeof claimAudioSlot>>;
+    maximumTimer: ReturnType<typeof setTimeout>;
   };
   const realtimeCalls = new Map<string, ActiveRealtimeCall>();
 
@@ -8409,15 +8417,21 @@ export function createApp(options: AppOptions = {}) {
       resolved.info.contextWindow,
       { reasoningTokens: resolved.info.contextWindow },
     ).costMicros;
-    await repo.reserve(
-      c.get("user").id,
-      runId,
-      prepared.model,
-      reserveMicros,
-      resolved.provider.slug,
-      c.get("tokenId"),
-      pricingSnapshot(resolved.price),
-    );
+    const concurrencyLease = await claimAudioSlot(c.get("user").id);
+    try {
+      await repo.reserve(
+        c.get("user").id,
+        runId,
+        prepared.model,
+        reserveMicros,
+        resolved.provider.slug,
+        c.get("tokenId"),
+        pricingSnapshot(resolved.price),
+      );
+    } catch (error) {
+      await concurrencyLease.release();
+      throw error;
+    }
     let response: Response;
     try {
       response = await proxyRealtimeHttp({
@@ -8431,16 +8445,19 @@ export function createApp(options: AppOptions = {}) {
       });
     } catch (error) {
       await repo.refund(runId, "Realtime call creation failed");
+      await concurrencyLease.release();
       throw error;
     }
     if (response.status !== 201) {
       await repo.refund(runId, "Realtime provider rejected call creation");
+      await concurrencyLease.release();
       return response;
     }
     const location = response.headers.get("location") ?? "";
     const match = location.match(/\/realtime\/calls\/([^/?#]+)/);
     if (!match) {
       await repo.refund(runId, "Realtime provider omitted the call identifier");
+      await concurrencyLease.release();
       throw new RealtimeProtocolError(
         "invalid_provider_response",
         "Realtime provider omitted the call identifier",
@@ -8463,6 +8480,7 @@ export function createApp(options: AppOptions = {}) {
         fetch: options.realtimeFetch,
       }).catch(() => undefined);
       await repo.refund(runId, "Realtime sideband connection failed");
+      await concurrencyLease.release();
       throw new RealtimeProtocolError(
         "provider_unavailable",
         "Realtime sideband connection failed",
@@ -8475,6 +8493,15 @@ export function createApp(options: AppOptions = {}) {
       o: c.get("user").id,
       e: Math.floor(Date.now() / 1000) + 2 * 60 * 60,
     });
+    const maximumTimer = setTimeout(() => {
+      sideband.close(1000, "Realtime session duration reached");
+      void proxyRealtimeHttp({
+        baseUrl: resolved.upstream!.baseUrl!,
+        apiKey: resolved.upstream!.apiKey!,
+        path: `/realtime/calls/${encodeURIComponent(upstreamCallId)}/hangup`,
+        fetch: options.realtimeFetch,
+      }).catch(() => undefined);
+    }, realtimeMaxSessionSeconds * 1_000);
     const call: ActiveRealtimeCall = {
       ownerId: c.get("user").id,
       upstreamCallId,
@@ -8485,6 +8512,8 @@ export function createApp(options: AppOptions = {}) {
       outputTokens: 0,
       resolved: completeResolved,
       sideband,
+      concurrencyLease,
+      maximumTimer,
     };
     realtimeCalls.set(localCallId, call);
     sideband.on("message", (data, binary) => {
@@ -8501,6 +8530,7 @@ export function createApp(options: AppOptions = {}) {
       }
     });
     sideband.once("close", async () => {
+      clearTimeout(call.maximumTimer);
       realtimeCalls.delete(localCallId);
       const cost = priceUsage(call.resolved.info, call.inputTokens, call.outputTokens, {
         cachedInputTokens: call.cachedInputTokens,
@@ -8515,8 +8545,19 @@ export function createApp(options: AppOptions = {}) {
         );
       } catch {
         // Durable reconciliation owns any active reservation left by an accounting outage.
+      } finally {
+        await call.concurrencyLease.release();
       }
     });
+    concurrencyLease.signal.addEventListener("abort", () => {
+      sideband.close(1013, "Realtime capacity lease was lost");
+      void proxyRealtimeHttp({
+        baseUrl: resolved.upstream!.baseUrl!,
+        apiKey: resolved.upstream!.apiKey!,
+        path: `/realtime/calls/${encodeURIComponent(upstreamCallId)}/hangup`,
+        fetch: options.realtimeFetch,
+      }).catch(() => undefined);
+    }, { once: true });
     const headers = new Headers(response.headers);
     const callPrefix = c.req.path.startsWith("/api/")
       ? "/api/realtime/calls"
@@ -8669,15 +8710,21 @@ export function createApp(options: AppOptions = {}) {
       resolved.info.contextWindow,
       { reasoningTokens: resolved.info.contextWindow },
     ).costMicros;
-    await repo.reserve(
-      c.get("user").id,
-      runId,
-      modelId,
-      reserveMicros,
-      resolved.provider?.slug,
-      c.get("tokenId"),
-      pricingSnapshot(resolved.price),
-    );
+    const concurrencyLease = await claimAudioSlot(c.get("user").id);
+    try {
+      await repo.reserve(
+        c.get("user").id,
+        runId,
+        modelId,
+        reserveMicros,
+        resolved.provider?.slug,
+        c.get("tokenId"),
+        pricingSnapshot(resolved.price),
+      );
+    } catch (error) {
+      await concurrencyLease.release();
+      throw error;
+    }
     let upstream;
     try {
       upstream = await (options.realtimeWebSocketConnect ?? connectRealtimeWebSocket)({
@@ -8688,6 +8735,7 @@ export function createApp(options: AppOptions = {}) {
       });
     } catch {
       await repo.refund(runId, "Realtime provider connection failed");
+      await concurrencyLease.release();
       throw new RealtimeProtocolError(
         "provider_unavailable",
         "Realtime provider connection failed",
@@ -8700,12 +8748,17 @@ export function createApp(options: AppOptions = {}) {
     } catch (error) {
       upstream.terminate();
       await repo.refund(runId, "Realtime WebSocket upgrade failed");
+      await concurrencyLease.release();
       throw error;
     }
     let inputTokens = 0;
     let cachedInputTokens = 0;
     let outputTokens = 0;
-    relayRealtimeWebSocket(upgraded.socket, upstream, {
+    const maximumTimer = setTimeout(
+      () => stopRelay(),
+      realtimeMaxSessionSeconds * 1_000,
+    );
+    const stopRelay = relayRealtimeWebSocket(upgraded.socket, upstream, {
       publicModel: modelId,
       upstreamModel: resolved.registryModel.upstreamModelId,
       onServerEvent(event) {
@@ -8716,6 +8769,7 @@ export function createApp(options: AppOptions = {}) {
         outputTokens += usage.outputTokens;
       },
       async onClose() {
+        clearTimeout(maximumTimer);
         const cost = priceUsage(resolved.info, inputTokens, outputTokens, {
           cachedInputTokens,
         }).costMicros;
@@ -8723,9 +8777,12 @@ export function createApp(options: AppOptions = {}) {
           await repo.settle(runId, cost, inputTokens, outputTokens, Date.now() - startedAt);
         } catch {
           // Durable reconciliation owns any active reservation left by an accounting outage.
+        } finally {
+          await concurrencyLease.release();
         }
       },
     });
+    concurrencyLease.signal.addEventListener("abort", stopRelay, { once: true });
     return upgraded.response;
   });
   const replayResponse = (request: ApiIdempotencyRequest) => {

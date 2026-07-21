@@ -12,6 +12,7 @@ export const REALTIME_MAX_HTTP_RESPONSE_BYTES = 4_194_304;
 export const REALTIME_HTTP_TIMEOUT_MS = 30_000;
 export const REALTIME_WEBSOCKET_CONNECT_TIMEOUT_MS = 10_000;
 export const REALTIME_MAX_BUFFERED_BYTES = 4_194_304;
+export const REALTIME_HEARTBEAT_MS = 20_000;
 
 export type RealtimeCapability =
   | "realtime"
@@ -398,6 +399,14 @@ export async function connectRealtimeWebSocket(
     socket.once("open", () => {
       settled = true;
       input.signal?.removeEventListener("abort", abort);
+      let responsive = true;
+      const heartbeat = setInterval(() => {
+        if (!responsive) return socket.terminate();
+        responsive = false;
+        socket.ping();
+      }, REALTIME_HEARTBEAT_MS);
+      socket.on("pong", () => responsive = true);
+      socket.once("close", () => clearInterval(heartbeat));
       resolve(socket);
     });
     socket.once("error", (error) => {
