@@ -66,7 +66,7 @@ Deno.test("raw Realtime WebSocket relays standard JSON events and settles termin
     primaryKeyId: "test",
     keys: new Map([["test", new Uint8Array(32).fill(5)]]),
   });
-  const { app, drainRealtimeSessions } = createApp({
+  const { app, circuitBreaker, drainRealtimeSessions } = createApp({
     repository,
     setupToken: "realtime-ws-setup",
     providerKeyring: keyring,
@@ -86,16 +86,16 @@ Deno.test("raw Realtime WebSocket relays standard JSON events and settles termin
   const created = repository.createProvider({
     slug: "realtime-ws-provider",
     displayName: "Realtime WebSocket provider",
-    baseUrl: `http://127.0.0.1:${upstreamAddress.port}/v1`,
+    baseUrl: "http://127.0.0.1:1/v1",
     protocol: "responses",
   }, mutation);
   const provider = repository.setProviderCredential(created.id, created.version, {
-    envelope: await keyring.encrypt(created.id, created.version + 1, "provider-ws-secret"),
+    envelope: await keyring.encrypt(created.id, created.version + 1, "provider-primary-secret"),
   }, mutation);
   const model = repository.createProviderModel({
     providerId: provider.id,
     publicModelId: "vendor/realtime-ws",
-    upstreamModelId: "gpt-realtime-upstream",
+    upstreamModelId: "gpt-realtime-primary",
     displayName: "Vendor Realtime WS",
     capabilities: ["realtime"],
     contextWindow: 32_000,
@@ -110,6 +110,48 @@ Deno.test("raw Realtime WebSocket relays standard JSON events and settles termin
     outputMicrosPerMillion: 2_000_000,
     fixedCallMicros: 7,
     source: "test",
+  }, mutation);
+  const fallbackCreated = repository.createProvider({
+    slug: "realtime-ws-fallback-provider",
+    displayName: "Realtime WebSocket fallback provider",
+    baseUrl: `http://127.0.0.1:${upstreamAddress.port}/v1`,
+    protocol: "responses",
+  }, mutation);
+  const fallbackProvider = repository.setProviderCredential(
+    fallbackCreated.id,
+    fallbackCreated.version,
+    {
+      envelope: await keyring.encrypt(
+        fallbackCreated.id,
+        fallbackCreated.version + 1,
+        "provider-ws-secret",
+      ),
+    },
+    mutation,
+  );
+  const fallbackModel = repository.createProviderModel({
+    providerId: fallbackProvider.id,
+    publicModelId: "vendor/realtime-ws-fallback",
+    upstreamModelId: "gpt-realtime-upstream",
+    displayName: "Vendor Realtime WS fallback",
+    capabilities: ["realtime"],
+    contextWindow: 32_000,
+  }, mutation);
+  repository.createModelPriceVersion({
+    providerModelId: fallbackModel.id,
+    expectedModelVersion: fallbackModel.version,
+    effectiveAt: "2020-01-01T00:00:00.000Z",
+    inputMicrosPerMillion: 1_000_000,
+    cachedInputMicrosPerMillion: 500_000,
+    reasoningMicrosPerMillion: 1_000_000,
+    outputMicrosPerMillion: 2_000_000,
+    fixedCallMicros: 7,
+    source: "test",
+  }, mutation);
+  repository.setProviderModelRoute({
+    sourceModelId: model.id,
+    expectedVersion: 0,
+    fallbackModelIds: [fallbackModel.id],
   }, mutation);
   const login = await app.request("/api/auth/login", {
     method: "POST",
@@ -153,6 +195,15 @@ Deno.test("raw Realtime WebSocket relays standard JSON events and settles termin
     await Promise.all([opened(client), upstreamConnected]);
     assertEquals(upstreamAuthorization, "Bearer provider-ws-secret");
     assertEquals(upstreamPath, "/v1/realtime?model=gpt-realtime-upstream");
+    assertEquals(
+      (await circuitBreaker.inspect(created.id, {
+        failureThreshold: 3,
+        failureWindowSeconds: 60,
+        openSeconds: 30,
+        halfOpenLeaseSeconds: 10,
+      })).failureCount,
+      1,
+    );
     assertEquals(await createdEvent, {
       type: "session.created",
       session: { model: "vendor/realtime-ws" },

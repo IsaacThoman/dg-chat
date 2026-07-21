@@ -26,6 +26,7 @@ Deno.test("Realtime session endpoints authorize, rewrite model IDs, and replace 
     keys: new Map([["test", new Uint8Array(32).fill(4)]]),
   });
   const requests: Array<{ url: string; authorization: string; body: unknown }> = [];
+  let failPrimaryClientSecret = true;
   const { app, drainRealtimeSessions } = createApp({
     repository,
     setupToken: "realtime-setup",
@@ -34,6 +35,16 @@ Deno.test("Realtime session endpoints authorize, rewrite model IDs, and replace 
     realtimeCallSigningSecret: "realtime-call-test-secret-32-bytes-minimum",
     realtimeFetch: async (input, init) => {
       const request = new Request(input, init);
+      if (
+        failPrimaryClientSecret &&
+        request.url === "https://realtime.example/v1/realtime/client_secrets"
+      ) {
+        failPrimaryClientSecret = false;
+        return new Response('{"error":{"message":"temporarily unavailable"}}', {
+          status: 503,
+          headers: { "content-type": "application/json" },
+        });
+      }
       if (request.url.endsWith("/realtime/calls")) {
         createdCalls += 1;
         const session = request.headers.get("content-type")?.startsWith("application/sdp")
@@ -63,10 +74,13 @@ Deno.test("Realtime session endpoints authorize, rewrite model IDs, and replace 
         authorization: request.headers.get("authorization") ?? "",
         body,
       });
+      const upstreamModel = request.url.startsWith("https://realtime-fallback.example/")
+        ? "gpt-realtime-fallback"
+        : "gpt-realtime-upstream";
       return new Response(
         JSON.stringify({
           value: "ek_provider_ephemeral",
-          session: { model: "gpt-realtime-upstream", type: "realtime" },
+          session: { model: upstreamModel, type: "realtime" },
         }),
         { headers: { "content-type": "application/json" } },
       );
@@ -121,6 +135,48 @@ Deno.test("Realtime session endpoints authorize, rewrite model IDs, and replace 
     fixedCallMicros: 1,
     source: "test",
   }, mutation);
+  const fallbackCreated = repository.createProvider({
+    slug: "realtime-fallback-provider",
+    displayName: "Realtime fallback provider",
+    baseUrl: "https://realtime-fallback.example/v1",
+    protocol: "responses",
+  }, mutation);
+  const fallbackProvider = repository.setProviderCredential(
+    fallbackCreated.id,
+    fallbackCreated.version,
+    {
+      envelope: await keyring.encrypt(
+        fallbackCreated.id,
+        fallbackCreated.version + 1,
+        "provider-fallback-secret",
+      ),
+    },
+    mutation,
+  );
+  const fallbackModel = repository.createProviderModel({
+    providerId: fallbackProvider.id,
+    publicModelId: "vendor/realtime-fallback",
+    upstreamModelId: "gpt-realtime-fallback",
+    displayName: "Vendor Realtime fallback",
+    capabilities: ["realtime", "realtime_transcription", "realtime_translation"],
+    contextWindow: 32_000,
+  }, mutation);
+  repository.createModelPriceVersion({
+    providerModelId: fallbackModel.id,
+    expectedModelVersion: fallbackModel.version,
+    effectiveAt: "2020-01-01T00:00:00.000Z",
+    inputMicrosPerMillion: 1,
+    cachedInputMicrosPerMillion: 1,
+    reasoningMicrosPerMillion: 1,
+    outputMicrosPerMillion: 1,
+    fixedCallMicros: 1,
+    source: "test",
+  }, mutation);
+  repository.setProviderModelRoute({
+    sourceModelId: model.id,
+    expectedVersion: 0,
+    fallbackModelIds: [fallbackModel.id],
+  }, mutation);
   const login = await app.request("/api/auth/login", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -152,11 +208,11 @@ Deno.test("Realtime session endpoints authorize, rewrite model IDs, and replace 
   });
   assertEquals(response.status, 200, await response.clone().text());
   assertEquals(requests, [{
-    url: "https://realtime.example/v1/realtime/client_secrets",
-    authorization: "Bearer provider-secret",
+    url: "https://realtime-fallback.example/v1/realtime/client_secrets",
+    authorization: "Bearer provider-fallback-secret",
     body: {
       expires_after: { anchor: "created_at", seconds: 60 },
-      session: { type: "realtime", model: "gpt-realtime-upstream", instructions: "keep opaque" },
+      session: { type: "realtime", model: "gpt-realtime-fallback", instructions: "keep opaque" },
     },
   }]);
   const managedSecretResponse = await response.json();
@@ -255,7 +311,7 @@ Deno.test("Realtime session endpoints authorize, rewrite model IDs, and replace 
   });
   assertEquals(ephemeralCall.status, 201, await ephemeralCall.clone().text());
   assertEquals(requests.at(-1), {
-    url: "https://realtime.example/v1/realtime/calls",
+    url: "https://realtime-fallback.example/v1/realtime/calls",
     authorization: "Bearer ek_provider_ephemeral",
     body: { rawSdp: "v=0\r\nephemeral-offer" },
   });

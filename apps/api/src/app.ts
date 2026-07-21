@@ -330,6 +330,7 @@ type Variables = {
   tokenRatePolicy?: TokenRatePolicy;
   realtimeEphemeral?: {
     model: string;
+    targetModel: string;
     upstreamKey: string;
     capability: RealtimeCapability;
   };
@@ -2658,6 +2659,78 @@ export function createApp(options: AppOptions = {}) {
     }
     return plan;
   };
+  type ResolvedRealtimeRuntime = RuntimeModel & {
+    provider: ProviderRecord;
+    registryModel: ProviderModelRecord;
+    upstream: UpstreamStreamOptions;
+    price: ModelPriceVersion;
+  };
+  const resolveRealtimeTargets = async (
+    sourceModelId: string,
+    capability: RealtimeCapability,
+    subject: TokenAccessSubject,
+  ): Promise<ResolvedRealtimeRuntime[]> => {
+    const source = await resolveRealtimeRuntimeModel(sourceModelId, capability, subject);
+    if (!source?.provider || !source.registryModel || !source.upstream || !source.price) return [];
+    const plan = await resolveEntitledPlan(subject, source.registryModel.id);
+    const targets: ResolvedRealtimeRuntime[] = [];
+    for (const target of plan.targets) {
+      const resolved = await resolveRealtimeRuntimeModel(
+        target.publicModelId,
+        capability,
+        subject,
+      );
+      if (resolved?.provider && resolved.registryModel && resolved.upstream && resolved.price) {
+        targets.push(resolved as ResolvedRealtimeRuntime);
+      }
+    }
+    return targets;
+  };
+  const attemptRealtimeTargets = async <T>(
+    targets: readonly ResolvedRealtimeRuntime[],
+    attempt: (target: ResolvedRealtimeRuntime) => Promise<T>,
+    retryable: (result: T) => boolean = () => false,
+  ): Promise<{ target: ResolvedRealtimeRuntime; result: T }> => {
+    let lastError: unknown;
+    let lastRetryable: { target: ResolvedRealtimeRuntime; result: T } | undefined;
+    for (const target of targets) {
+      let permit;
+      try {
+        permit = await circuitBreaker.beforeAttempt(target.provider.id, breakerPolicy);
+      } catch (error) {
+        lastError = error;
+        continue;
+      }
+      if (!permit.allowed) continue;
+      if (lastRetryable?.result instanceof Response) {
+        await lastRetryable.result.body?.cancel().catch(() => undefined);
+        lastRetryable = undefined;
+      }
+      try {
+        const result = await attempt(target);
+        if (retryable(result)) {
+          lastRetryable = { target, result };
+          await circuitBreaker.recordFailure(target.provider.id, permit, breakerPolicy).catch(
+            () => undefined,
+          );
+          continue;
+        }
+        await circuitBreaker.recordSuccess(target.provider.id, permit).catch(() => undefined);
+        return { target, result };
+      } catch (error) {
+        lastError = error;
+        await circuitBreaker.recordFailure(target.provider.id, permit, breakerPolicy).catch(
+          () => undefined,
+        );
+      }
+    }
+    if (lastRetryable) return lastRetryable;
+    throw lastError ?? new RealtimeProtocolError(
+      "provider_unavailable",
+      "No Realtime provider target is available",
+      503,
+    );
+  };
   app.use("*", async (c, next) => {
     // Correlation IDs are server-owned. Even a syntactically valid caller UUID can be replayed to
     // merge unrelated incidents, so incoming X-Request-Id values are deliberately ignored.
@@ -3084,6 +3157,7 @@ export function createApp(options: AppOptions = {}) {
       if (ephemeral) {
         c.set("realtimeEphemeral", {
           model: ephemeral.m,
+          targetModel: ephemeral.t,
           upstreamKey: ephemeral.u,
           capability: ephemeral.q,
         });
@@ -3148,6 +3222,7 @@ export function createApp(options: AppOptions = {}) {
     if (ephemeral) {
       c.set("realtimeEphemeral", {
         model: ephemeral.m,
+        targetModel: ephemeral.t,
         upstreamKey: ephemeral.u,
         capability: ephemeral.q,
       });
@@ -8136,33 +8211,40 @@ export function createApp(options: AppOptions = {}) {
         422,
       );
     }
-    const resolved = await resolveRealtimeRuntimeModel(
+    const targets = await resolveRealtimeTargets(
       selected.model,
       selected.capability,
       accessSubject(c),
     );
-    if (!resolved?.upstream || !resolved.registryModel) {
+    if (!targets.length) {
       throw new RealtimeProtocolError(
         "model_not_found",
         "Realtime model is unavailable or not entitled",
         404,
       );
     }
-    const upstreamBody = new TextEncoder().encode(JSON.stringify(rewriteRealtimeModels(
-      body,
-      selected.model,
-      resolved.registryModel.upstreamModelId,
-    )));
-    const response = await proxyRealtimeHttp({
-      baseUrl: resolved.upstream.baseUrl!,
-      apiKey: resolved.upstream.apiKey!,
-      path,
-      method: "POST",
-      headers: { "content-type": "application/json", accept: "application/json" },
-      body: upstreamBody,
-      signal: c.req.raw.signal,
-      fetch: options.realtimeFetch,
-    });
+    const proxied = await attemptRealtimeTargets(
+      targets,
+      async (target) => {
+        const upstreamBody = new TextEncoder().encode(JSON.stringify(rewriteRealtimeModels(
+          body,
+          selected.model as string,
+          target.registryModel.upstreamModelId,
+        )));
+        return await proxyRealtimeHttp({
+          baseUrl: target.upstream.baseUrl!,
+          apiKey: target.upstream.apiKey!,
+          path,
+          method: "POST",
+          headers: { "content-type": "application/json", accept: "application/json" },
+          body: upstreamBody,
+          signal: c.req.raw.signal,
+          fetch: options.realtimeFetch,
+        });
+      },
+      (candidate) => candidate.status === 429 || candidate.status >= 500,
+    );
+    const { result: response, target: resolved } = proxied;
     if (response.headers.get("content-type")?.includes("application/json")) {
       const text = await response.text();
       try {
@@ -8195,6 +8277,7 @@ export function createApp(options: AppOptions = {}) {
             d: sourceCredential,
             u: upstreamKey,
             m: selected.model as string,
+            t: resolved.info.id,
             q: selected.capability,
             e: effectiveExpiry,
           });
@@ -8242,6 +8325,7 @@ export function createApp(options: AppOptions = {}) {
   type RealtimeCallToken = {
     c: string;
     m: string;
+    t: string;
     o: string;
     q: RealtimeCapability;
     e: number;
@@ -8250,6 +8334,7 @@ export function createApp(options: AppOptions = {}) {
     d: string;
     u: string;
     m: string;
+    t: string;
     q: RealtimeCapability;
     e: number;
   };
@@ -8299,10 +8384,12 @@ export function createApp(options: AppOptions = {}) {
       if (
         !payload || typeof payload !== "object" || typeof payload.d !== "string" ||
         typeof payload.u !== "string" || typeof payload.m !== "string" ||
+        typeof payload.t !== "string" ||
         !["realtime", "realtime_transcription", "realtime_translation"].includes(payload.q) ||
         !Number.isSafeInteger(payload.e) || payload.e <= Math.floor(Date.now() / 1000) ||
         payload.d.length < 16 || payload.d.length > 4_096 || payload.u.length < 1 ||
-        payload.u.length > 4_096 || payload.m.length < 1 || payload.m.length > 256
+        payload.u.length > 4_096 || payload.m.length < 1 || payload.m.length > 256 ||
+        payload.t.length < 1 || payload.t.length > 256
       ) return undefined;
       return payload as RealtimeEphemeralToken;
     } catch {
@@ -8360,11 +8447,11 @@ export function createApp(options: AppOptions = {}) {
       const payload = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
       if (
         !payload || typeof payload !== "object" || typeof payload.c !== "string" ||
-        typeof payload.m !== "string" || payload.o !== ownerId ||
+        typeof payload.m !== "string" || typeof payload.t !== "string" || payload.o !== ownerId ||
         !["realtime", "realtime_transcription", "realtime_translation"].includes(payload.q) ||
         !Number.isSafeInteger(payload.e) || payload.e <= Math.floor(Date.now() / 1000) ||
         payload.c.length < 1 || payload.c.length > 256 || payload.m.length < 1 ||
-        payload.m.length > 256
+        payload.m.length > 256 || payload.t.length < 1 || payload.t.length > 256
       ) return undefined;
       return payload as RealtimeCallToken;
     } catch {
@@ -8433,30 +8520,31 @@ export function createApp(options: AppOptions = {}) {
         403,
       );
     }
-    const resolved = await resolveRealtimeRuntimeModel(
+    let targets = await resolveRealtimeTargets(
       prepared.model,
       ephemeral?.capability ?? "realtime",
       accessSubject(c),
     );
-    if (
-      !resolved?.provider || !resolved.upstream || !resolved.registryModel || !resolved.price
-    ) {
+    if (ephemeral) {
+      targets = targets.filter((target) => target.info.id === ephemeral.targetModel).slice(0, 1);
+    }
+    if (!targets.length) {
       throw new RealtimeProtocolError(
         "model_not_found",
         "Realtime model is unavailable or not entitled",
         404,
       );
     }
-    const completeResolved = resolved as ActiveRealtimeCall["resolved"];
-    const rewritten = await rewriteRealtimeCall(prepared, resolved.registryModel.upstreamModelId);
     const runId = crypto.randomUUID();
     const startedAt = Date.now();
-    const reserveMicros = priceUsage(
-      resolved.info,
-      resolved.info.contextWindow,
-      resolved.info.contextWindow,
-      { reasoningTokens: resolved.info.contextWindow },
-    ).costMicros;
+    const reserveMicros = Math.max(...targets.map((target) =>
+      priceUsage(
+        target.info,
+        target.info.contextWindow,
+        target.info.contextWindow,
+        { reasoningTokens: target.info.contextWindow },
+      ).costMicros
+    ));
     const concurrencyLease = await claimAudioSlot(c.get("user").id);
     let usageRun;
     try {
@@ -8465,9 +8553,9 @@ export function createApp(options: AppOptions = {}) {
         runId,
         prepared.model,
         reserveMicros,
-        resolved.provider.slug,
+        targets[0].provider.slug,
         c.get("tokenId"),
-        pricingSnapshot(resolved.price),
+        pricingSnapshot(targets[0].price),
       );
     } catch (error) {
       await concurrencyLease.release();
@@ -8483,21 +8571,35 @@ export function createApp(options: AppOptions = {}) {
       );
     }
     let response: Response;
+    let resolved: ResolvedRealtimeRuntime;
     try {
-      response = await proxyRealtimeHttp({
-        baseUrl: resolved.upstream.baseUrl!,
-        apiKey: ephemeral?.upstreamKey ?? resolved.upstream.apiKey!,
-        path: "/realtime/calls",
-        headers: { "content-type": rewritten.contentType, accept: "application/sdp" },
-        body: rewritten.body,
-        signal: c.req.raw.signal,
-        fetch: options.realtimeFetch,
-      });
+      const created = await attemptRealtimeTargets(
+        targets,
+        async (target) => {
+          const rewritten = await rewriteRealtimeCall(
+            prepared,
+            target.registryModel.upstreamModelId,
+          );
+          return await proxyRealtimeHttp({
+            baseUrl: target.upstream.baseUrl!,
+            apiKey: ephemeral?.upstreamKey ?? target.upstream.apiKey!,
+            path: "/realtime/calls",
+            headers: { "content-type": rewritten.contentType, accept: "application/sdp" },
+            body: rewritten.body,
+            signal: c.req.raw.signal,
+            fetch: options.realtimeFetch,
+          });
+        },
+        (candidate) => candidate.status === 429 || candidate.status >= 500,
+      );
+      response = created.result;
+      resolved = created.target;
     } catch (error) {
       await repo.refund(runId, "Realtime call creation failed");
       await concurrencyLease.release();
       throw error;
     }
+    const completeResolved = resolved as ActiveRealtimeCall["resolved"];
     if (response.status !== 201) {
       await repo.refund(runId, "Realtime provider rejected call creation");
       await concurrencyLease.release();
@@ -8540,6 +8642,7 @@ export function createApp(options: AppOptions = {}) {
     const localCallId = await signRealtimeCall({
       c: upstreamCallId,
       m: prepared.model,
+      t: resolved.info.id,
       o: c.get("user").id,
       q: ephemeral?.capability ?? "realtime",
       e: Math.floor(Date.now() / 1000) + 2 * 60 * 60,
@@ -8673,7 +8776,7 @@ export function createApp(options: AppOptions = {}) {
         throw new RealtimeProtocolError("call_not_found", "Realtime call was not found", 404);
       }
       const resolved = call?.resolved ?? await resolveRealtimeRuntimeModel(
-        token!.m,
+        token!.t,
         token!.q,
         accessSubject(c),
       );
@@ -8787,7 +8890,7 @@ export function createApp(options: AppOptions = {}) {
       if (!token) {
         throw new RealtimeProtocolError("call_not_found", "Realtime call was not found", 404);
       }
-      const resolved = await resolveRealtimeRuntimeModel(token.m, token.q, accessSubject(c));
+      const resolved = await resolveRealtimeRuntimeModel(token.t, token.q, accessSubject(c));
       if (!resolved?.upstream || !resolved.registryModel) {
         throw new RealtimeProtocolError(
           "model_not_found",
@@ -8870,10 +8973,14 @@ export function createApp(options: AppOptions = {}) {
       );
     }
     const subject = accessSubject(c);
-    const resolved = await resolveRealtimeRuntimeModel(modelId, "realtime", subject) ??
-      await resolveRealtimeRuntimeModel(modelId, "realtime_transcription", subject) ??
-      await resolveRealtimeRuntimeModel(modelId, "realtime_translation", subject);
-    if (!resolved?.upstream || !resolved.registryModel || !resolved.price) {
+    let targets = await resolveRealtimeTargets(modelId, "realtime", subject);
+    if (!targets.length) {
+      targets = await resolveRealtimeTargets(modelId, "realtime_transcription", subject);
+    }
+    if (!targets.length) {
+      targets = await resolveRealtimeTargets(modelId, "realtime_translation", subject);
+    }
+    if (!targets.length) {
       throw new RealtimeProtocolError(
         "model_not_found",
         "Realtime model is unavailable or not entitled",
@@ -8882,12 +8989,14 @@ export function createApp(options: AppOptions = {}) {
     }
     const startedAt = Date.now();
     const runId = crypto.randomUUID();
-    const reserveMicros = priceUsage(
-      resolved.info,
-      resolved.info.contextWindow,
-      resolved.info.contextWindow,
-      { reasoningTokens: resolved.info.contextWindow },
-    ).costMicros;
+    const reserveMicros = Math.max(...targets.map((target) =>
+      priceUsage(
+        target.info,
+        target.info.contextWindow,
+        target.info.contextWindow,
+        { reasoningTokens: target.info.contextWindow },
+      ).costMicros
+    ));
     const concurrencyLease = await claimAudioSlot(c.get("user").id);
     let usageRun;
     try {
@@ -8896,9 +9005,9 @@ export function createApp(options: AppOptions = {}) {
         runId,
         modelId,
         reserveMicros,
-        resolved.provider?.slug,
+        targets[0].provider.slug,
         c.get("tokenId"),
-        pricingSnapshot(resolved.price),
+        pricingSnapshot(targets[0].price),
       );
     } catch (error) {
       await concurrencyLease.release();
@@ -8914,13 +9023,20 @@ export function createApp(options: AppOptions = {}) {
       );
     }
     let upstream;
+    let resolved;
     try {
-      upstream = await (options.realtimeWebSocketConnect ?? connectRealtimeWebSocket)({
-        baseUrl: resolved.upstream.baseUrl!,
-        apiKey: resolved.upstream.apiKey!,
-        upstreamModel: resolved.registryModel.upstreamModelId,
-        signal: c.req.raw.signal,
-      });
+      const connected = await attemptRealtimeTargets(
+        targets,
+        async (target) =>
+          await (options.realtimeWebSocketConnect ?? connectRealtimeWebSocket)({
+            baseUrl: target.upstream.baseUrl!,
+            apiKey: target.upstream.apiKey!,
+            upstreamModel: target.registryModel.upstreamModelId,
+            signal: c.req.raw.signal,
+          }),
+      );
+      upstream = connected.result;
+      resolved = connected.target;
     } catch {
       await repo.refund(runId, "Realtime provider connection failed");
       await concurrencyLease.release();
