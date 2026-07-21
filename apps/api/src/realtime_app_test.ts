@@ -1,9 +1,16 @@
 import { assertEquals, assertExists } from "jsr:@std/assert@1";
 import { MemoryRepository } from "@dg-chat/database";
+import { WebSocket as NodeWebSocket, WebSocketServer } from "ws";
 import { createApp } from "./app.ts";
 import { ProviderSecretKeyring } from "./provider-secrets.ts";
 
 Deno.test("Realtime session endpoints authorize, rewrite model IDs, and replace credentials", async () => {
+  const sidebandServer = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  await new Promise<void>((resolve) => sidebandServer.once("listening", resolve));
+  const sidebandAddress = sidebandServer.address();
+  if (!sidebandAddress || typeof sidebandAddress === "string") throw new Error("Missing WS port");
+  let providerSideband: NodeWebSocket | undefined;
+  sidebandServer.on("connection", (socket) => providerSideband = socket);
   const repository = new MemoryRepository();
   const keyring = new ProviderSecretKeyring({
     primaryKeyId: "test",
@@ -16,6 +23,27 @@ Deno.test("Realtime session endpoints authorize, rewrite model IDs, and replace 
     providerKeyring: keyring,
     realtimeFetch: async (input, init) => {
       const request = new Request(input, init);
+      if (request.url.endsWith("/realtime/calls")) {
+        const form = await request.formData();
+        const session = JSON.parse(await (form.get("session") as File).text());
+        requests.push({
+          url: request.url,
+          authorization: request.headers.get("authorization") ?? "",
+          body: session,
+        });
+        return new Response("v=0\r\nanswer", {
+          status: 201,
+          headers: {
+            "content-type": "application/sdp",
+            location: "/v1/realtime/calls/call_provider_1",
+          },
+        });
+      }
+      if (request.url.endsWith("/realtime/calls/call_provider_1/hangup")) {
+        return new Response(JSON.stringify({ ok: true }), {
+          headers: { "content-type": "application/json" },
+        });
+      }
       const body = await request.json();
       requests.push({
         url: request.url,
@@ -29,6 +57,15 @@ Deno.test("Realtime session endpoints authorize, rewrite model IDs, and replace 
         }),
         { headers: { "content-type": "application/json" } },
       );
+    },
+    realtimeWebSocketConnect: async (input) => {
+      assertEquals(input.callId, "call_provider_1");
+      const socket = new NodeWebSocket(`ws://127.0.0.1:${sidebandAddress.port}`);
+      await new Promise<void>((resolve, reject) => {
+        socket.once("open", resolve);
+        socket.once("error", reject);
+      });
+      return socket;
     },
   });
   const setup = await app.request("/api/setup/bootstrap", {
@@ -111,4 +148,55 @@ Deno.test("Realtime session endpoints authorize, rewrite model IDs, and replace 
   });
   assertEquals(missing.status, 422);
   assertEquals((await missing.json()).error.code, "model_required");
+
+  const form = new FormData();
+  form.set("sdp", new Blob(["v=0\r\noffer"], { type: "application/sdp" }), "offer.sdp");
+  form.set(
+    "session",
+    new Blob([JSON.stringify({
+      type: "realtime",
+      model: "vendor/realtime",
+      instructions: "voice",
+    })], { type: "application/json" }),
+    "session.json",
+  );
+  const callResponse = await app.request("/v1/realtime/calls", {
+    method: "POST",
+    headers: { cookie },
+    body: form,
+  });
+  assertEquals(callResponse.status, 201, await callResponse.clone().text());
+  assertEquals(await callResponse.text(), "v=0\r\nanswer");
+  const localLocation = callResponse.headers.get("location");
+  assertExists(localLocation);
+  assertEquals(localLocation.startsWith("/v1/realtime/calls/"), true);
+  assertEquals(localLocation.includes("call_provider_1"), false);
+  assertEquals(requests.at(-1), {
+    url: "https://realtime.example/v1/realtime/calls",
+    authorization: "Bearer provider-secret",
+    body: { type: "realtime", model: "gpt-realtime-upstream", instructions: "voice" },
+  });
+  assertExists(providerSideband);
+  providerSideband.send(JSON.stringify({
+    type: "response.done",
+    response: {
+      usage: {
+        input_tokens: 3,
+        input_token_details: { cached_tokens: 1, text_tokens: 1, audio_tokens: 2 },
+        output_tokens: 2,
+        output_token_details: { text_tokens: 1, audio_tokens: 1 },
+      },
+    },
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const closed = new Promise<void>((resolve) => providerSideband!.once("close", () => resolve()));
+  const hangup = await app.request(`${localLocation}/hangup`, {
+    method: "POST",
+    headers: { cookie },
+  });
+  assertEquals(hangup.status, 200);
+  await closed;
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assertEquals((await repository.usage(user.id)).calls, 1);
+  sidebandServer.close();
 });

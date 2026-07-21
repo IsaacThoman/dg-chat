@@ -203,12 +203,15 @@ import { providerResponseByteLimit } from "./provider-limits.ts";
 import { estimateInputTokens, priceUsage, reservationPrice } from "./pricing.ts";
 import {
   connectRealtimeWebSocket,
+  parseRealtimeEvent,
+  prepareRealtimeCall,
   proxyRealtimeHttp,
   REALTIME_MAX_HTTP_BODY_BYTES,
   type RealtimeCapability,
   RealtimeProtocolError,
   realtimeUsage,
   relayRealtimeWebSocket,
+  rewriteRealtimeCall,
   rewriteRealtimeModels,
 } from "./realtime.ts";
 import { responseObject, responseRequestFields } from "./responses.ts";
@@ -8126,6 +8129,206 @@ export function createApp(options: AppOptions = {}) {
     }
     return response;
   };
+  type ActiveRealtimeCall = {
+    ownerId: string;
+    upstreamCallId: string;
+    runId: string;
+    startedAt: number;
+    inputTokens: number;
+    cachedInputTokens: number;
+    outputTokens: number;
+    resolved: RuntimeModel & {
+      provider: ProviderRecord;
+      registryModel: ProviderModelRecord;
+      upstream: UpstreamStreamOptions;
+      price: ModelPriceVersion;
+    };
+    sideband: Awaited<ReturnType<typeof connectRealtimeWebSocket>>;
+  };
+  const realtimeCalls = new Map<string, ActiveRealtimeCall>();
+
+  app.post("/v1/realtime/calls", requireScope("chat:write"), async (c) => {
+    const declared = Number(c.req.header("content-length"));
+    if (Number.isFinite(declared) && declared > REALTIME_MAX_HTTP_BODY_BYTES) {
+      throw new RealtimeProtocolError(
+        "request_too_large",
+        "Realtime request exceeds the size limit",
+        413,
+      );
+    }
+    const rawBody = new Uint8Array(await c.req.raw.arrayBuffer());
+    const prepared = await prepareRealtimeCall(
+      c.req.header("content-type") ?? "",
+      rawBody,
+      c.req.query("model"),
+    );
+    const resolved = await resolveRealtimeRuntimeModel(
+      prepared.model,
+      "realtime",
+      accessSubject(c),
+    );
+    if (
+      !resolved?.provider || !resolved.upstream || !resolved.registryModel || !resolved.price
+    ) {
+      throw new RealtimeProtocolError(
+        "model_not_found",
+        "Realtime model is unavailable or not entitled",
+        404,
+      );
+    }
+    const completeResolved = resolved as ActiveRealtimeCall["resolved"];
+    const rewritten = await rewriteRealtimeCall(prepared, resolved.registryModel.upstreamModelId);
+    const runId = crypto.randomUUID();
+    const startedAt = Date.now();
+    const reserveMicros = priceUsage(
+      resolved.info,
+      resolved.info.contextWindow,
+      resolved.info.contextWindow,
+      { reasoningTokens: resolved.info.contextWindow },
+    ).costMicros;
+    await repo.reserve(
+      c.get("user").id,
+      runId,
+      prepared.model,
+      reserveMicros,
+      resolved.provider.slug,
+      c.get("tokenId"),
+      pricingSnapshot(resolved.price),
+    );
+    let response: Response;
+    try {
+      response = await proxyRealtimeHttp({
+        baseUrl: resolved.upstream.baseUrl!,
+        apiKey: resolved.upstream.apiKey!,
+        path: "/realtime/calls",
+        headers: { "content-type": rewritten.contentType, accept: "application/sdp" },
+        body: rewritten.body,
+        signal: c.req.raw.signal,
+        fetch: options.realtimeFetch,
+      });
+    } catch (error) {
+      await repo.refund(runId, "Realtime call creation failed");
+      throw error;
+    }
+    if (response.status !== 201) {
+      await repo.refund(runId, "Realtime provider rejected call creation");
+      return response;
+    }
+    const location = response.headers.get("location") ?? "";
+    const match = location.match(/\/realtime\/calls\/([^/?#]+)/);
+    if (!match) {
+      await repo.refund(runId, "Realtime provider omitted the call identifier");
+      throw new RealtimeProtocolError(
+        "invalid_provider_response",
+        "Realtime provider omitted the call identifier",
+        502,
+      );
+    }
+    const upstreamCallId = decodeURIComponent(match[1]);
+    let sideband: ActiveRealtimeCall["sideband"];
+    try {
+      sideband = await (options.realtimeWebSocketConnect ?? connectRealtimeWebSocket)({
+        baseUrl: resolved.upstream.baseUrl!,
+        apiKey: resolved.upstream.apiKey!,
+        callId: upstreamCallId,
+      });
+    } catch {
+      await proxyRealtimeHttp({
+        baseUrl: resolved.upstream.baseUrl!,
+        apiKey: resolved.upstream.apiKey!,
+        path: `/realtime/calls/${encodeURIComponent(upstreamCallId)}/hangup`,
+        fetch: options.realtimeFetch,
+      }).catch(() => undefined);
+      await repo.refund(runId, "Realtime sideband connection failed");
+      throw new RealtimeProtocolError(
+        "provider_unavailable",
+        "Realtime sideband connection failed",
+        502,
+      );
+    }
+    const localCallId = crypto.randomUUID();
+    const call: ActiveRealtimeCall = {
+      ownerId: c.get("user").id,
+      upstreamCallId,
+      runId,
+      startedAt,
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      outputTokens: 0,
+      resolved: completeResolved,
+      sideband,
+    };
+    realtimeCalls.set(localCallId, call);
+    sideband.on("message", (data, binary) => {
+      if (binary) return sideband.close(1003, "Realtime events must be JSON text frames");
+      try {
+        const event = parseRealtimeEvent(data.toString());
+        const usage = realtimeUsage(event);
+        if (!usage) return;
+        call.inputTokens += usage.inputTokens;
+        call.cachedInputTokens += usage.cachedInputTokens;
+        call.outputTokens += usage.outputTokens;
+      } catch {
+        sideband.close(1007, "Invalid Realtime provider event");
+      }
+    });
+    sideband.once("close", async () => {
+      realtimeCalls.delete(localCallId);
+      const cost = priceUsage(call.resolved.info, call.inputTokens, call.outputTokens, {
+        cachedInputTokens: call.cachedInputTokens,
+      }).costMicros;
+      try {
+        await repo.settle(
+          call.runId,
+          cost,
+          call.inputTokens,
+          call.outputTokens,
+          Date.now() - call.startedAt,
+        );
+      } catch {
+        // Durable reconciliation owns any active reservation left by an accounting outage.
+      }
+    });
+    const headers = new Headers(response.headers);
+    headers.set("location", `/v1/realtime/calls/${localCallId}`);
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+  });
+
+  for (const action of ["accept", "hangup", "refer", "reject"] as const) {
+    app.post(`/v1/realtime/calls/:id/${action}`, requireScope("chat:write"), async (c) => {
+      const call = realtimeCalls.get(c.req.param("id"));
+      if (!call || call.ownerId !== c.get("user").id) {
+        throw new RealtimeProtocolError("call_not_found", "Realtime call was not found", 404);
+      }
+      const body = new Uint8Array(await c.req.raw.arrayBuffer());
+      if (body.byteLength > REALTIME_MAX_HTTP_BODY_BYTES) {
+        throw new RealtimeProtocolError(
+          "request_too_large",
+          "Realtime request exceeds the size limit",
+          413,
+        );
+      }
+      const response = await proxyRealtimeHttp({
+        baseUrl: call.resolved.upstream.baseUrl!,
+        apiKey: call.resolved.upstream.apiKey!,
+        path: `/realtime/calls/${encodeURIComponent(call.upstreamCallId)}/${action}`,
+        headers: c.req.header("content-type")
+          ? { "content-type": c.req.header("content-type")! }
+          : undefined,
+        body,
+        signal: c.req.raw.signal,
+        fetch: options.realtimeFetch,
+      });
+      if (response.ok && (action === "hangup" || action === "reject")) {
+        call.sideband.close(1000, action);
+      }
+      return response;
+    });
+  }
 
   app.post(
     "/v1/realtime/client_secrets",

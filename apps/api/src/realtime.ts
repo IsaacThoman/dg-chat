@@ -216,10 +216,138 @@ export interface RealtimeHttpProxyInput {
   timeoutMs?: number;
 }
 
+export interface PreparedRealtimeCall {
+  model: string;
+  body: Uint8Array;
+  contentType: string;
+}
+
+async function formText(value: FormDataEntryValue | null, name: string): Promise<string> {
+  if (typeof value === "string") return value;
+  if (value instanceof File) return await value.text();
+  throw new RealtimeProtocolError("invalid_request", `Realtime call ${name} is required`, 422);
+}
+
+/** Parses and re-encodes both official WebRTC call creation request variants. */
+export async function prepareRealtimeCall(
+  contentType: string,
+  body: Uint8Array,
+  queryModel?: string,
+): Promise<PreparedRealtimeCall> {
+  if (body.byteLength > REALTIME_MAX_HTTP_BODY_BYTES) {
+    throw new RealtimeProtocolError(
+      "request_too_large",
+      "Realtime request exceeds the size limit",
+      413,
+    );
+  }
+  if (contentType.toLowerCase().startsWith("application/sdp")) {
+    if (!queryModel?.trim()) {
+      throw new RealtimeProtocolError(
+        "model_required",
+        "A model query is required when a DG Chat API token submits raw SDP",
+        422,
+      );
+    }
+    return { model: queryModel.trim(), body, contentType: "application/sdp" };
+  }
+  if (!contentType.toLowerCase().startsWith("multipart/form-data")) {
+    throw new RealtimeProtocolError(
+      "invalid_content_type",
+      "Realtime calls require multipart/form-data or application/sdp",
+      415,
+    );
+  }
+  const copy = bodyBuffer(body)!;
+  let form: FormData;
+  try {
+    form = await new Request("http://localhost/realtime-call", {
+      method: "POST",
+      headers: { "content-type": contentType },
+      body: copy,
+    }).formData();
+  } catch {
+    throw new RealtimeProtocolError("invalid_request", "Realtime call multipart body is invalid");
+  }
+  const sessionText = await formText(form.get("session"), "session");
+  let session: unknown;
+  try {
+    session = JSON.parse(sessionText);
+  } catch {
+    throw new RealtimeProtocolError("invalid_request", "Realtime call session must be valid JSON");
+  }
+  if (!session || typeof session !== "object" || Array.isArray(session)) {
+    throw new RealtimeProtocolError(
+      "invalid_request",
+      "Realtime call session must be a JSON object",
+    );
+  }
+  const model = (session as Record<string, unknown>).model;
+  if (typeof model !== "string" || !model.trim()) {
+    throw new RealtimeProtocolError(
+      "model_required",
+      "Realtime call session.model is required",
+      422,
+    );
+  }
+  // Re-encoding normalizes the caller-controlled multipart boundary before provider dispatch.
+  const output = new FormData();
+  for (const [name, value] of form.entries()) {
+    if (name === "session") continue;
+    output.append(name, value);
+  }
+  output.set(
+    "session",
+    new Blob([JSON.stringify(session)], { type: "application/json" }),
+    "session.json",
+  );
+  const encoded = new Request("http://localhost/realtime-call", { method: "POST", body: output });
+  const encodedBody = new Uint8Array(await encoded.arrayBuffer());
+  if (encodedBody.byteLength > REALTIME_MAX_HTTP_BODY_BYTES) {
+    throw new RealtimeProtocolError(
+      "request_too_large",
+      "Realtime request exceeds the size limit",
+      413,
+    );
+  }
+  return {
+    model: model.trim(),
+    body: encodedBody,
+    contentType: encoded.headers.get("content-type")!,
+  };
+}
+
+export async function rewriteRealtimeCall(
+  prepared: PreparedRealtimeCall,
+  upstreamModel: string,
+): Promise<PreparedRealtimeCall> {
+  if (prepared.contentType === "application/sdp") return prepared;
+  const form = await new Request("http://localhost/realtime-call", {
+    method: "POST",
+    headers: { "content-type": prepared.contentType },
+    body: bodyBuffer(prepared.body),
+  }).formData();
+  const session = JSON.parse(await formText(form.get("session"), "session"));
+  form.set(
+    "session",
+    new Blob([
+      JSON.stringify(rewriteRealtimeModels(session, prepared.model, upstreamModel)),
+    ], { type: "application/json" }),
+    "session.json",
+  );
+  const encoded = new Request("http://localhost/realtime-call", { method: "POST", body: form });
+  return {
+    model: prepared.model,
+    body: new Uint8Array(await encoded.arrayBuffer()),
+    contentType: encoded.headers.get("content-type")!,
+  };
+}
+
 export interface RealtimeWebSocketConnectInput {
   baseUrl: string;
   apiKey: string;
-  upstreamModel: string;
+  upstreamModel?: string;
+  callId?: string;
   signal?: AbortSignal;
   timeoutMs?: number;
 }
@@ -232,7 +360,15 @@ export async function connectRealtimeWebSocket(
 ): Promise<RealtimeUpstreamSocket> {
   const endpoint = realtimeProviderEndpoint(input.baseUrl);
   endpoint.protocol = endpoint.protocol === "https:" ? "wss:" : "ws:";
-  endpoint.searchParams.set("model", input.upstreamModel);
+  if (Boolean(input.upstreamModel) === Boolean(input.callId)) {
+    throw new RealtimeProtocolError(
+      "invalid_connection",
+      "Exactly one Realtime model or call ID is required",
+      500,
+    );
+  }
+  if (input.upstreamModel) endpoint.searchParams.set("model", input.upstreamModel);
+  else endpoint.searchParams.set("call_id", input.callId!);
   const production = Deno.env.get("DENO_ENV") === "production";
   const pinned = endpoint.protocol === "wss:"
     ? await resolvePinnedAddress(endpoint.hostname, undefined, input.signal)

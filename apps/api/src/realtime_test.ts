@@ -1,10 +1,12 @@
 import { assertEquals, assertRejects, assertThrows } from "jsr:@std/assert@1";
 import {
   parseRealtimeEvent,
+  prepareRealtimeCall,
   proxyRealtimeHttp,
   REALTIME_MAX_EVENT_BYTES,
   realtimeProviderEndpoint,
   realtimeUsage,
+  rewriteRealtimeCall,
   rewriteRealtimeModels,
 } from "./realtime.ts";
 
@@ -15,6 +17,38 @@ Deno.test("Realtime endpoint construction preserves provider API roots and rejec
   );
   assertThrows(() => realtimeProviderEndpoint("https://provider.example/v1", "/chat/completions"));
   assertThrows(() => realtimeProviderEndpoint("https://user@provider.example/v1", "/realtime"));
+});
+
+Deno.test("Realtime WebRTC multipart calls preserve SDP and rewrite only session model IDs", async () => {
+  const form = new FormData();
+  form.set("sdp", new Blob(["v=0\r\n"], { type: "application/sdp" }), "offer.sdp");
+  form.set(
+    "session",
+    new Blob([JSON.stringify({
+      type: "realtime",
+      model: "vendor/realtime",
+      instructions: "mention vendor/realtime literally",
+    })], { type: "application/json" }),
+    "session.json",
+  );
+  const request = new Request("http://localhost", { method: "POST", body: form });
+  const prepared = await prepareRealtimeCall(
+    request.headers.get("content-type")!,
+    new Uint8Array(await request.arrayBuffer()),
+  );
+  assertEquals(prepared.model, "vendor/realtime");
+  const rewritten = await rewriteRealtimeCall(prepared, "gpt-realtime");
+  const providerForm = await new Request("http://localhost", {
+    method: "POST",
+    headers: { "content-type": rewritten.contentType },
+    body: rewritten.body.slice().buffer,
+  }).formData();
+  assertEquals(await (providerForm.get("sdp") as File).text(), "v=0\r\n");
+  assertEquals(JSON.parse(await (providerForm.get("session") as File).text()), {
+    type: "realtime",
+    model: "gpt-realtime",
+    instructions: "mention vendor/realtime literally",
+  });
 });
 
 Deno.test("Realtime events are bounded JSON objects with a valid type", () => {
