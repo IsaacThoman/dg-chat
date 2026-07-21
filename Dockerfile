@@ -3,6 +3,7 @@
 FROM denoland/deno:alpine AS dependencies
 WORKDIR /workspace
 ENV DENO_DIR=/deno-dir
+RUN apk add --no-cache musl-dev
 COPY deno.json package.json deno.lock ./
 COPY apps/api/deno.json apps/api/deno.json
 COPY apps/mock-oidc/deno.json apps/mock-oidc/deno.json
@@ -14,6 +15,17 @@ COPY packages/observability/deno.json packages/observability/deno.json
 # Keep the resolved dependency cache in the image. Runtime containers are read-only
 # and must never need network access or mutate workspace links during startup.
 RUN deno install --frozen
+# Deno materializes optional npm dependency links for the host that generated the
+# lockfile. The web build runs on Alpine, so install the explicitly locked musl
+# binding at Lightning CSS's native fallback path as well.
+RUN set -eux; \
+    case "$(uname -m)" in \
+      x86_64) lightning_arch=x64 ;; \
+      aarch64) lightning_arch=arm64 ;; \
+      *) echo "Unsupported build architecture: $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    cp "/workspace/node_modules/lightningcss-linux-${lightning_arch}-musl/lightningcss.linux-${lightning_arch}-musl.node" \
+      "/workspace/node_modules/.deno/lightningcss@1.32.0/node_modules/lightningcss/lightningcss.linux-${lightning_arch}-musl.node"
 
 FROM dependencies AS source
 COPY apps ./apps
