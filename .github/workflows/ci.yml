@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
@@ -203,7 +203,7 @@ jobs:
     env:
       TEST_REDIS_URL: redis://127.0.0.1:6379
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
@@ -242,7 +242,7 @@ jobs:
       DG_CHAT_ALLOW_DESTRUCTIVE_TEST_DATABASES: "true"
       POSTGRES_TEST_DATABASE_PREFIX: dgchat_ci_${{ github.run_id }}_${{ github.run_attempt }}_
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
@@ -333,7 +333,7 @@ jobs:
       TEST_S3_ACCESS_KEY: backup-integration-user
       TEST_S3_SECRET_KEY: backup-integration-password-123
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
@@ -382,7 +382,7 @@ jobs:
         run: docker logs backup-integration-minio > backup-integration-minio.log 2>&1 || true
       - name: Upload MinIO logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: backup-integration-minio-log
           path: backup-integration-minio.log
@@ -400,9 +400,9 @@ jobs:
       matrix:
         target: [app, web, worker]
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
         with:
           context: .
           target: ${{ matrix.target }}
@@ -429,7 +429,7 @@ jobs:
       SEARXNG_SECRET: production-smoke-searxng-secret
       WEB_HOST_PORT: "8000"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
@@ -474,7 +474,7 @@ jobs:
         run: docker compose -f docker-compose.yml logs --no-color > compose-production-smoke.log
       - name: Upload production service logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: compose-production-smoke-log
           path: compose-production-smoke.log
@@ -499,7 +499,7 @@ jobs:
       CONTRACT_API_URL: http://localhost:8000
       CI: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
@@ -521,7 +521,7 @@ jobs:
             > mock-provider-state.json || true
       - name: Upload service logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: compose-contract-logs
           path: |
@@ -559,7 +559,7 @@ jobs:
       E2E_KNOWLEDGE_EMBEDDINGS: "true"
       CI: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
@@ -578,7 +578,7 @@ jobs:
         run: npx playwright test --project=${{ matrix.project }}
       - name: Upload browser report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: playwright-report-${{ matrix.project }}
           path: |
@@ -595,7 +595,7 @@ jobs:
             http://localhost:4020/control/state > mock-oidc-state.json || true
       - name: Upload service logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: compose-logs-${{ matrix.project }}
           path: |

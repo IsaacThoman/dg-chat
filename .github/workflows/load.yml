@@ -33,7 +33,7 @@ jobs:
       LOAD_PROFILE: ${{ github.event_name == 'schedule' && 'scheduled' || inputs.profile || 'ci' }}
       LOAD_RUN_ID: gha-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
@@ -46,7 +46,7 @@ jobs:
         run: bash tests/load/run.sh
       - name: Upload bounded load evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: load-${{ github.run_id }}-${{ github.run_attempt }}
           path: test-results/load/
