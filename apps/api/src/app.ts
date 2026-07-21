@@ -328,7 +328,11 @@ type Variables = {
   tokenId?: string;
   tokenScopes?: string[];
   tokenRatePolicy?: TokenRatePolicy;
-  realtimeEphemeral?: { model: string; upstreamKey: string };
+  realtimeEphemeral?: {
+    model: string;
+    upstreamKey: string;
+    capability: RealtimeCapability;
+  };
   imageAssetOwnerId?: string;
 };
 type WebGenerationEventInput = WebGenerationEvent extends infer Event
@@ -3078,7 +3082,11 @@ export function createApp(options: AppOptions = {}) {
       });
       c.set("authorityEpoch", apiToken.authorityEpoch);
       if (ephemeral) {
-        c.set("realtimeEphemeral", { model: ephemeral.m, upstreamKey: ephemeral.u });
+        c.set("realtimeEphemeral", {
+          model: ephemeral.m,
+          upstreamKey: ephemeral.u,
+          capability: ephemeral.q,
+        });
       }
       return next();
     }
@@ -3138,7 +3146,11 @@ export function createApp(options: AppOptions = {}) {
     });
     c.set("authorityEpoch", apiToken.authorityEpoch);
     if (ephemeral) {
-      c.set("realtimeEphemeral", { model: ephemeral.m, upstreamKey: ephemeral.u });
+      c.set("realtimeEphemeral", {
+        model: ephemeral.m,
+        upstreamKey: ephemeral.u,
+        capability: ephemeral.q,
+      });
     }
     return next();
   };
@@ -8183,6 +8195,7 @@ export function createApp(options: AppOptions = {}) {
             d: sourceCredential,
             u: upstreamKey,
             m: selected.model as string,
+            q: selected.capability,
             e: effectiveExpiry,
           });
         };
@@ -8226,8 +8239,20 @@ export function createApp(options: AppOptions = {}) {
     }
     return response;
   };
-  type RealtimeCallToken = { c: string; m: string; o: string; e: number };
-  type RealtimeEphemeralToken = { d: string; u: string; m: string; e: number };
+  type RealtimeCallToken = {
+    c: string;
+    m: string;
+    o: string;
+    q: RealtimeCapability;
+    e: number;
+  };
+  type RealtimeEphemeralToken = {
+    d: string;
+    u: string;
+    m: string;
+    q: RealtimeCapability;
+    e: number;
+  };
   const sealRealtimeEphemeral = async (payload: RealtimeEphemeralToken): Promise<string> => {
     if (!realtimeEphemeralEncryptionKey) {
       throw new RealtimeProtocolError(
@@ -8274,6 +8299,7 @@ export function createApp(options: AppOptions = {}) {
       if (
         !payload || typeof payload !== "object" || typeof payload.d !== "string" ||
         typeof payload.u !== "string" || typeof payload.m !== "string" ||
+        !["realtime", "realtime_transcription", "realtime_translation"].includes(payload.q) ||
         !Number.isSafeInteger(payload.e) || payload.e <= Math.floor(Date.now() / 1000) ||
         payload.d.length < 16 || payload.d.length > 4_096 || payload.u.length < 1 ||
         payload.u.length > 4_096 || payload.m.length < 1 || payload.m.length > 256
@@ -8335,6 +8361,7 @@ export function createApp(options: AppOptions = {}) {
       if (
         !payload || typeof payload !== "object" || typeof payload.c !== "string" ||
         typeof payload.m !== "string" || payload.o !== ownerId ||
+        !["realtime", "realtime_transcription", "realtime_translation"].includes(payload.q) ||
         !Number.isSafeInteger(payload.e) || payload.e <= Math.floor(Date.now() / 1000) ||
         payload.c.length < 1 || payload.c.length > 256 || payload.m.length < 1 ||
         payload.m.length > 256
@@ -8397,7 +8424,7 @@ export function createApp(options: AppOptions = {}) {
     }
     const resolved = await resolveRealtimeRuntimeModel(
       prepared.model,
-      "realtime",
+      ephemeral?.capability ?? "realtime",
       accessSubject(c),
     );
     if (
@@ -8493,6 +8520,7 @@ export function createApp(options: AppOptions = {}) {
       c: upstreamCallId,
       m: prepared.model,
       o: c.get("user").id,
+      q: ephemeral?.capability ?? "realtime",
       e: Math.floor(Date.now() / 1000) + 2 * 60 * 60,
     });
     const maximumTimer = setTimeout(() => {
@@ -8597,7 +8625,7 @@ export function createApp(options: AppOptions = {}) {
       }
       const resolved = call?.resolved ?? await resolveRealtimeRuntimeModel(
         token!.m,
-        "realtime",
+        token!.q,
         accessSubject(c),
       );
       if (!resolved?.upstream) {
@@ -8705,7 +8733,10 @@ export function createApp(options: AppOptions = {}) {
         422,
       );
     }
-    const resolved = await resolveRealtimeRuntimeModel(modelId, "realtime", accessSubject(c));
+    const subject = accessSubject(c);
+    const resolved = await resolveRealtimeRuntimeModel(modelId, "realtime", subject) ??
+      await resolveRealtimeRuntimeModel(modelId, "realtime_transcription", subject) ??
+      await resolveRealtimeRuntimeModel(modelId, "realtime_translation", subject);
     if (!resolved?.upstream || !resolved.registryModel || !resolved.price) {
       throw new RealtimeProtocolError(
         "model_not_found",
