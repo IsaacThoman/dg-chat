@@ -23,8 +23,9 @@ the durable implementation handoff.
 - `main` currently includes merged work through PR #30 (`7dd7e91`).
 - Draft PR #31, `codex/chat-session-continuity`, is the active continuation and now includes the
   recovered completion work.
-- Current local verification covers 428 web tests, 1,020 non-PostgreSQL Deno tests, focused isolated
-  PostgreSQL worker tests, type/lint/format gates, and a production PWA build.
+- Final verification covers 428 web tests, 1,020 non-PostgreSQL Deno tests, isolated PostgreSQL and
+  Redis integration suites, 228 browser journeys, type/lint/format gates, and a production PWA
+  build.
 - The inherited lint and storage-cleanup failures are fixed. A later PostgreSQL CI run exposed stale
   attachment-inspection fixtures and an unclassified repository timeout; both are fixed and covered
   by the spawned-worker shutdown/recovery tests.
@@ -35,14 +36,14 @@ the durable implementation handoff.
 
 ## Completion roadmap
 
-### 1. Stabilize the inherited branch
+### 1. Stabilize the inherited branch — completed
 
 - Fix both PR #31 failures at their root cause.
 - Run formatting, lint, type checks, unit tests, PostgreSQL integration, production build, container
   smoke tests, official OpenAI client contracts, and browser journeys.
 - Merge or supersede PR #31 only after its required checks are green.
 
-### 2. Adopt the requested shadcn system
+### 2. Adopt the requested shadcn system — completed
 
 - Initialize shadcn in the existing Vite application with preset `b6ZjldV0i`.
 - Preserve the existing product information architecture and behavior while moving shared primitives
@@ -54,7 +55,7 @@ the durable implementation handoff.
 - Verify dark/light themes, keyboard/focus behavior, reduced motion, narrow screens, and PWA/offline
   states. Update visual baselines intentionally.
 
-### 3. Close documented product and operations gaps
+### 3. Close documented product and operations gaps — completed
 
 - Re-audit the implementation against the original milestones and this repository's documentation.
 - Resolve release-relevant gaps in Redis coordination, attachment inspection and retention, object
@@ -62,7 +63,7 @@ the durable implementation handoff.
   and user-facing workflows.
 - Keep explicitly excluded product areas excluded unless they are necessary for a promised workflow.
 
-### 4. Final verification and release handoff
+### 4. Final verification and release handoff — completed
 
 - Exercise fresh and upgrade migrations against isolated PostgreSQL databases.
 - Validate the full Docker Compose topology, health/readiness, graceful restart, multi-replica
@@ -72,6 +73,36 @@ the durable implementation handoff.
   browser inspection of the highest-risk flows.
 - Re-run dependency, secret, filesystem, SBOM, and image vulnerability checks.
 - Ensure documentation, environment examples, and operator runbooks match verified behavior.
+
+## Completion record and exact evidence
+
+PR #31 completed the roadmap on 2026-07-21. The release-candidate source revision is `7d1c5d3`. The
+retained-chat architecture now preserves bounded chat sessions, drafts, uploads, immutable edits,
+streams, prompt queues, voice resources, media preferences, and one-time share links across all
+workspace routes. Worker recovery, database timeout handling, attachment claims, container builds,
+and current GitHub Actions runtimes were also hardened. The requested shadcn preset `b6ZjldV0i` is
+the documented and installed design-system foundation.
+
+Exact GitHub evidence for that revision:
+
+- [CI run 29811243316](https://github.com/IsaacThoman/dg-chat/actions/runs/29811243316) passed
+  format, lint, types, 1,020 Deno tests, 428 web tests, the production build, all three container
+  builds, isolated PostgreSQL/concurrency, Redis, PostgreSQL/S3 backup roundtrip, production Compose
+  startup/restart/observability, and official JavaScript/Python OpenAI SDK contracts.
+- The same CI run scheduled 228 browser journeys: desktop Chromium passed 112 with two intentional
+  project exclusions, while mobile Chromium passed all 114. These cover accessibility, visual
+  baselines, keyboard behavior, responsive layouts, PWA upgrades, authentication, administration,
+  chat continuity, media, knowledge, tools, sharing, recovery, and portability.
+- [Security run 29811243300](https://github.com/IsaacThoman/dg-chat/actions/runs/29811243300) passed
+  secret, dependency, filesystem, image, SBOM, and CodeQL checks.
+- [Bounded load run 29811243138](https://github.com/IsaacThoman/dg-chat/actions/runs/29811243138)
+  passed the multi-replica concurrency, rate-limit, accounting, and recovery invariants.
+
+Fresh local production Compose verification independently reproduced the hosted Knowledge failure
+and proved its corrected desktop and mobile journeys before the final source revision was pushed. No
+known missing in-scope feature, unresolved defect, failing required gate, unreviewed placeholder, or
+undocumented release risk remains at this handoff. The intentional exclusions under the overarching
+goal remain unchanged.
 
 ## Definition of done
 
