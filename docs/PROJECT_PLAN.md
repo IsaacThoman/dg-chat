@@ -4,10 +4,10 @@ Last updated: 2026-07-21
 
 ## Overarching goal
 
-Deliver a production-ready, self-hostable ChatGPT-style platform as a TypeScript/Deno monorepo.
-The product combines immutable, branch-preserving chat; resilient OpenAI-compatible provider routing;
-user approval, tokens, and credit accounting; uploads, knowledge retrieval, tools, voice, and images;
-administration and analytics; and a secure Docker Compose deployment.
+Deliver a production-ready, self-hostable ChatGPT-style platform as a TypeScript/Deno monorepo. The
+product combines immutable, branch-preserving chat; resilient OpenAI-compatible provider routing;
+user approval, tokens, and credit accounting; uploads, knowledge retrieval, tools, voice, and
+images; administration and analytics; and a secure Docker Compose deployment.
 
 The web application must be polished, accessible, responsive, and installable as a PWA. There is no
 native mobile application. Conversations are private by default. Live collaborative editing,
@@ -26,8 +26,8 @@ the durable implementation handoff.
   PostgreSQL verification before its final push.
 - Its last CI run passed security, SBOM/image scanning, container builds, Redis integration, backup
   roundtrips, load invariants, and production Compose startup.
-- Two inherited failures remain: Deno lint errors in `Community.tsx` and one PostgreSQL worker fixture
-  cleanup failure. Their downstream official-SDK and Playwright jobs were skipped.
+- Two inherited failures remain: Deno lint errors in `Community.tsx` and one PostgreSQL worker
+  fixture cleanup failure. Their downstream official-SDK and Playwright jobs were skipped.
 - A shadcn migration has not started. The requested preset `b6ZjldV0i` resolves to Mira style, mauve
   theme/base/chart colors, small radius, Oxanium font, Remix icons, and subtle default menus.
 
@@ -63,8 +63,8 @@ the durable implementation handoff.
 ### 4. Final verification and release handoff
 
 - Exercise fresh and upgrade migrations against isolated PostgreSQL databases.
-- Validate the full Docker Compose topology, health/readiness, graceful restart, multi-replica safety,
-  backup/restore, storage, Redis, and worker recovery.
+- Validate the full Docker Compose topology, health/readiness, graceful restart, multi-replica
+  safety, backup/restore, storage, Redis, and worker recovery.
 - Run official JavaScript and Python OpenAI client contracts.
 - Run Playwright desktop, mobile, accessibility, keyboard, and visual journeys and perform manual
   browser inspection of the highest-risk flows.
@@ -77,9 +77,10 @@ The application is complete for the agreed scope when:
 
 1. Every promised in-scope workflow is implemented end to end with no known release-blocking defect.
 2. Required local and GitHub quality gates pass from a reproducible checkout.
-3. Fresh self-hosted deployment and upgrade, backup, restore, shutdown, and recovery paths are proven.
-4. Desktop and mobile browser journeys are accessible, visually coherent, and free of known broken or
-   placeholder states.
+3. Fresh self-hosted deployment and upgrade, backup, restore, shutdown, and recovery paths are
+   proven.
+4. Desktop and mobile browser journeys are accessible, visually coherent, and free of known broken
+   or placeholder states.
 5. Security boundaries for auth, credits, uploads, secrets, tools, network access, and tenancy have
    automated adversarial coverage.
 6. The project docs record supported behavior, intentional exclusions, residual operational risks,
