@@ -8389,11 +8389,21 @@ export function createApp(options: AppOptions = {}) {
     sideband: Awaited<ReturnType<typeof connectRealtimeWebSocket>>;
     concurrencyLease: Awaited<ReturnType<typeof claimAudioSlot>>;
     usageLease: { stop(): Promise<void> };
+    terminal: Promise<void>;
     maximumTimer: ReturnType<typeof setTimeout>;
   };
   const realtimeCalls = new Map<string, ActiveRealtimeCall>();
+  const realtimeRelays = new Set<{ stop(): void; terminal: Promise<void> }>();
+  let realtimeDraining = false;
 
   const createRealtimeCall = async (c: Context<{ Variables: Variables }>) => {
+    if (realtimeDraining) {
+      throw new RealtimeProtocolError(
+        "server_shutting_down",
+        "Realtime sessions are draining for server shutdown",
+        503,
+      );
+    }
     if (!realtimeCallSigningKey) {
       throw new RealtimeProtocolError(
         "call_control_not_configured",
@@ -8556,6 +8566,8 @@ export function createApp(options: AppOptions = {}) {
         }).catch(() => undefined);
       },
     );
+    let resolveTerminal!: () => void;
+    const terminal = new Promise<void>((resolve) => resolveTerminal = resolve);
     const call: ActiveRealtimeCall = {
       ownerId: c.get("user").id,
       upstreamCallId,
@@ -8569,6 +8581,7 @@ export function createApp(options: AppOptions = {}) {
       sideband,
       concurrencyLease,
       usageLease,
+      terminal,
       maximumTimer,
     };
     realtimeCalls.set(localCallId, call);
@@ -8592,7 +8605,13 @@ export function createApp(options: AppOptions = {}) {
       realtimeCalls.delete(localCallId);
       recordRealtimeSessionEnded(
         "webrtc",
-        code === 1000 ? "completed" : code === 1013 ? "capacity_lost" : "provider_closed",
+        code === 1000
+          ? "completed"
+          : code === 1001 && realtimeDraining
+          ? "server_shutdown"
+          : code === 1013
+          ? "capacity_lost"
+          : "provider_closed",
         0,
         call.serverEvents,
       );
@@ -8611,7 +8630,11 @@ export function createApp(options: AppOptions = {}) {
       } catch {
         // Durable reconciliation owns any active reservation left by an accounting outage.
       } finally {
-        await call.concurrencyLease.release();
+        try {
+          await call.concurrencyLease.release();
+        } finally {
+          resolveTerminal();
+        }
       }
     });
     concurrencyLease.signal.addEventListener("abort", () => {
@@ -8744,6 +8767,13 @@ export function createApp(options: AppOptions = {}) {
       }),
   );
   app.get("/v1/realtime", requireScope("chat:write"), async (c) => {
+    if (realtimeDraining) {
+      throw new RealtimeProtocolError(
+        "server_shutting_down",
+        "Realtime sessions are draining for server shutdown",
+        503,
+      );
+    }
     if (c.req.header("upgrade")?.toLowerCase() !== "websocket") {
       throw new RealtimeProtocolError(
         "websocket_required",
@@ -8790,11 +8820,17 @@ export function createApp(options: AppOptions = {}) {
         await concurrencyLease.release();
         throw error;
       }
+      let resolveRelayTerminal!: () => void;
+      const relaySession = {
+        stop: (() => undefined) as () => void,
+        terminal: new Promise<void>((resolve) => resolveRelayTerminal = resolve),
+      };
+      realtimeRelays.add(relaySession);
       const maximumTimer = setTimeout(
-        () => stopRelay(),
+        () => relaySession.stop(),
         realtimeMaxSessionSeconds * 1_000,
       );
-      const stopRelay = relayRealtimeWebSocket(upgraded.socket, upstream, {
+      relaySession.stop = relayRealtimeWebSocket(upgraded.socket, upstream, {
         publicModel: token.m,
         upstreamModel: resolved.registryModel.upstreamModelId,
         async onClose(details) {
@@ -8803,6 +8839,8 @@ export function createApp(options: AppOptions = {}) {
             "websocket",
             details.code === 1000
               ? "completed"
+              : details.code === 1001 && realtimeDraining
+              ? "server_shutdown"
               : details.code === 1001
               ? "client_closed"
               : details.code === 1013
@@ -8811,10 +8849,15 @@ export function createApp(options: AppOptions = {}) {
             details.clientEvents,
             details.serverEvents,
           );
-          await concurrencyLease.release();
+          try {
+            await concurrencyLease.release();
+          } finally {
+            realtimeRelays.delete(relaySession);
+            resolveRelayTerminal();
+          }
         },
       });
-      concurrencyLease.signal.addEventListener("abort", stopRelay, { once: true });
+      concurrencyLease.signal.addEventListener("abort", relaySession.stop, { once: true });
       recordRealtimeSessionStarted("websocket");
       return upgraded.response;
     }
@@ -8899,17 +8942,22 @@ export function createApp(options: AppOptions = {}) {
     let inputTokens = 0;
     let cachedInputTokens = 0;
     let outputTokens = 0;
-    let stopRelay: () => void = () => undefined;
+    let resolveRelayTerminal!: () => void;
+    const relaySession = {
+      stop: (() => undefined) as () => void,
+      terminal: new Promise<void>((resolve) => resolveRelayTerminal = resolve),
+    };
+    realtimeRelays.add(relaySession);
     const usageLease = keepApiLeaseAlive(
       undefined,
       { runId, leaseToken: usageRun.runLeaseToken },
-      () => stopRelay(),
+      () => relaySession.stop(),
     );
     const maximumTimer = setTimeout(
-      () => stopRelay(),
+      () => relaySession.stop(),
       realtimeMaxSessionSeconds * 1_000,
     );
-    stopRelay = relayRealtimeWebSocket(upgraded.socket, upstream, {
+    relaySession.stop = relayRealtimeWebSocket(upgraded.socket, upstream, {
       publicModel: modelId,
       upstreamModel: resolved.registryModel.upstreamModelId,
       onServerEvent(event) {
@@ -8925,6 +8973,8 @@ export function createApp(options: AppOptions = {}) {
           "websocket",
           details.code === 1000
             ? "completed"
+            : details.code === 1001 && realtimeDraining
+            ? "server_shutdown"
             : details.code === 1001
             ? "client_closed"
             : details.code === 1013
@@ -8942,14 +8992,40 @@ export function createApp(options: AppOptions = {}) {
         } catch {
           // Durable reconciliation owns any active reservation left by an accounting outage.
         } finally {
-          await concurrencyLease.release();
+          try {
+            await concurrencyLease.release();
+          } finally {
+            realtimeRelays.delete(relaySession);
+            resolveRelayTerminal();
+          }
         }
       },
     });
     recordRealtimeSessionStarted("websocket");
-    concurrencyLease.signal.addEventListener("abort", stopRelay, { once: true });
+    concurrencyLease.signal.addEventListener("abort", relaySession.stop, { once: true });
     return upgraded.response;
   });
+  const drainRealtimeSessions = async () => {
+    realtimeDraining = true;
+    const calls = [...realtimeCalls.values()];
+    const relays = [...realtimeRelays];
+    const hangups = calls.map((call) => {
+      clearTimeout(call.maximumTimer);
+      call.sideband.close(1001, "Realtime server is shutting down");
+      return proxyRealtimeHttp({
+        baseUrl: call.resolved.upstream.baseUrl!,
+        apiKey: call.resolved.upstream.apiKey!,
+        path: `/realtime/calls/${encodeURIComponent(call.upstreamCallId)}/hangup`,
+        fetch: options.realtimeFetch,
+      }).catch(() => undefined);
+    });
+    for (const relay of relays) relay.stop();
+    await Promise.allSettled([
+      ...hangups,
+      ...calls.map((call) => call.terminal),
+      ...relays.map((relay) => relay.terminal),
+    ]);
+  };
   const replayResponse = (request: ApiIdempotencyRequest) => {
     // A streaming request can fail before the first event is exposed. In that case the
     // original response is the stored JSON error, not an empty event stream.
@@ -13398,6 +13474,7 @@ export function createApp(options: AppOptions = {}) {
     toolExecutionService: toolExecution,
     recoverFileUploads,
     drainIdentityDeliveries,
+    drainRealtimeSessions,
     replayQuota,
   };
 }

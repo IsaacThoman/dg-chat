@@ -63,7 +63,7 @@ Deno.test("raw Realtime WebSocket relays standard JSON events and settles termin
     primaryKeyId: "test",
     keys: new Map([["test", new Uint8Array(32).fill(5)]]),
   });
-  const { app } = createApp({
+  const { app, drainRealtimeSessions } = createApp({
     repository,
     setupToken: "realtime-ws-setup",
     providerKeyring: keyring,
@@ -176,8 +176,9 @@ Deno.test("raw Realtime WebSocket relays standard JSON events and settles termin
       },
     });
     const closed = new Promise<void>((resolve) => client.once("close", () => resolve()));
-    upstreamSocket!.close(1000, "complete");
+    const drained = drainRealtimeSessions();
     await closed;
+    await drained;
     await new Promise((resolve) => setTimeout(resolve, 10));
     const usage = await repository.usage(user.id);
     assertEquals(usage.calls, 1);

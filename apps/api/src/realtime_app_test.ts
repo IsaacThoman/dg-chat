@@ -26,7 +26,7 @@ Deno.test("Realtime session endpoints authorize, rewrite model IDs, and replace 
     keys: new Map([["test", new Uint8Array(32).fill(4)]]),
   });
   const requests: Array<{ url: string; authorization: string; body: unknown }> = [];
-  const { app } = createApp({
+  const { app, drainRealtimeSessions } = createApp({
     repository,
     setupToken: "realtime-setup",
     providerKeyring: keyring,
@@ -266,11 +266,7 @@ Deno.test("Realtime session endpoints authorize, rewrite model IDs, and replace 
   const ephemeralClosed = new Promise<void>((resolve) =>
     providerSideband!.once("close", () => resolve())
   );
-  const ephemeralHangup = await app.request(`${ephemeralLocation}/hangup`, {
-    method: "POST",
-    headers: { authorization: `Bearer ${apiToken}` },
-  });
-  assertEquals(ephemeralHangup.status, 200);
+  await drainRealtimeSessions();
   await ephemeralClosed;
   await new Promise((resolve) => setTimeout(resolve, 10));
   assertEquals((await repository.usage(user.id)).calls, 2);

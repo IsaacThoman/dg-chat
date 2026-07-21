@@ -34,6 +34,7 @@ type RealtimeOutcome =
   | "client_closed"
   | "provider_closed"
   | "capacity_lost"
+  | "server_shutdown"
   | "failed";
 let realtimeStartObserver = (_transport: RealtimeTransport): void => {};
 let realtimeEndObserver = (
