@@ -300,13 +300,18 @@ describe("CommunityView", () => {
 
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain("newer privacy choice was applied");
-    expect(
-      (screen.getByRole("checkbox", {
-        name: /Join the community leaderboard/,
-      }) as HTMLInputElement).checked,
-    ).toBe(false);
-    expect((balance as HTMLInputElement).checked).toBe(false);
-    expect((balance as HTMLInputElement).disabled).toBe(true);
+    await waitFor(() => {
+      expect(
+        (screen.getByRole("checkbox", {
+          name: /Join the community leaderboard/,
+        }) as HTMLInputElement).checked,
+      ).toBe(false);
+      const currentBalance = screen.getByRole("checkbox", {
+        name: /Share my current balance/,
+      }) as HTMLInputElement;
+      expect(currentBalance.checked).toBe(false);
+      expect(currentBalance.disabled).toBe(true);
+    });
     expect(screen.queryByRole("button", { name: "Review and save again" })).toBeNull();
     expect(api.updateCommunityProfile).toHaveBeenCalledTimes(1);
   });

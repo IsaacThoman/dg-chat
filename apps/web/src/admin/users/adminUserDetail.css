@@ -26,7 +26,7 @@
   padding: 20px;
   border: 1px solid var(--line);
   border-radius: 15px;
-  background: var(--card);
+  background: var(--surface-card);
   box-shadow: 0 10px 32px color-mix(in srgb, var(--ink) 5%, transparent);
 }
 .admin-user-detail-avatar {
@@ -48,7 +48,7 @@
 }
 .admin-user-detail-header p {
   margin: 4px 0 9px;
-  color: var(--muted);
+  color: var(--text-muted);
   overflow-wrap: anywhere;
 }
 .admin-user-detail-chips {
@@ -64,7 +64,7 @@
 }
 .admin-user-detail-balance small,
 .admin-user-detail-balance span {
-  color: var(--muted);
+  color: var(--text-muted);
   font-size: 10px;
 }
 .admin-user-detail-balance strong {
@@ -76,7 +76,7 @@
   gap: 6px;
   min-height: 16px;
   margin: -10px 0;
-  color: var(--muted);
+  color: var(--text-muted);
   font-size: 10px;
 }
 .admin-user-stale-warning {
@@ -85,7 +85,7 @@
   border: 1px solid color-mix(in srgb, #a76b22 35%, var(--line));
   border-radius: 9px;
   color: var(--supporting-ink);
-  background: color-mix(in srgb, #a76b22 8%, var(--card));
+  background: color-mix(in srgb, #a76b22 8%, var(--surface-card));
   font-size: 11px;
   line-height: 1.45;
 }
@@ -116,7 +116,7 @@
 }
 .admin-user-tabs button[aria-selected="true"] {
   color: var(--purple);
-  background: var(--card);
+  background: var(--surface-card);
   box-shadow: 0 1px 5px color-mix(in srgb, var(--ink) 9%, transparent);
 }
 .admin-user-tab-panel {
@@ -138,7 +138,7 @@
   padding: 18px;
   border: 1px solid var(--line);
   border-radius: 13px;
-  background: var(--card);
+  background: var(--surface-card);
 }
 .admin-user-card-heading,
 .admin-user-tab-heading,
@@ -156,7 +156,7 @@
 .admin-user-card-heading p,
 .admin-user-tab-heading p {
   margin: 5px 0 0;
-  color: var(--muted);
+  color: var(--text-muted);
   font-size: 11px;
   line-height: 1.45;
 }
@@ -182,7 +182,7 @@
 .admin-user-facts dt,
 .admin-user-resource-facts dt,
 .admin-user-adjustment-preview dt {
-  color: var(--muted);
+  color: var(--text-muted);
   font-size: 10px;
 }
 .admin-user-facts dd,
@@ -207,7 +207,7 @@
 }
 .admin-user-inline-note,
 .admin-user-resource-note {
-  color: var(--muted);
+  color: var(--text-muted);
   font-size: 11px;
   line-height: 1.45;
 }
@@ -233,7 +233,7 @@
   border-radius: 9px;
   padding: 9px 10px;
   color: var(--ink);
-  background: var(--card);
+  background: var(--surface-card);
   font: inherit;
 }
 .admin-user-reason-form textarea,
@@ -243,7 +243,7 @@
 }
 .admin-user-reason-form small,
 .admin-user-adjustment small {
-  color: var(--muted);
+  color: var(--text-muted);
   font-weight: 400;
 }
 .admin-user-consequence {
@@ -265,7 +265,7 @@
   display: grid;
   min-width: 150px;
   gap: 5px;
-  color: var(--muted);
+  color: var(--text-muted);
   font-size: 10px;
   font-weight: 650;
 }
@@ -279,8 +279,8 @@
   padding: 24px;
   border: 1px solid var(--line);
   border-radius: 13px;
-  color: var(--muted);
-  background: var(--card);
+  color: var(--text-muted);
+  background: var(--surface-card);
   text-align: center;
 }
 .admin-user-detail-state p,
@@ -311,7 +311,7 @@
   padding: 13px;
   border: 1px solid var(--line);
   border-radius: 11px;
-  background: var(--card);
+  background: var(--surface-card);
 }
 .admin-user-resource-icon {
   display: grid;
@@ -330,7 +330,7 @@
 }
 .admin-user-resource-main span,
 .admin-user-resource-main small {
-  color: var(--muted);
+  color: var(--text-muted);
   overflow-wrap: anywhere;
   font-size: 10px;
 }
@@ -356,7 +356,7 @@
   gap: 3px;
 }
 .admin-user-token-card code {
-  color: var(--muted);
+  color: var(--text-muted);
   overflow-wrap: anywhere;
 }
 .admin-user-token-card .scope-list {
@@ -380,7 +380,7 @@
   gap: 6px;
 }
 .admin-user-detail-pagination span {
-  color: var(--muted);
+  color: var(--text-muted);
   font-size: 11px;
 }
 .admin-user-balance-hero {
@@ -422,7 +422,7 @@
   overflow-x: auto;
   border: 1px solid var(--line);
   border-radius: 12px;
-  background: var(--card);
+  background: var(--surface-card);
 }
 .admin-user-ledger {
   width: 100%;
@@ -438,7 +438,7 @@
   font-size: 11px;
 }
 .admin-user-ledger th {
-  color: var(--muted);
+  color: var(--text-muted);
   background: var(--panel);
   font-size: 9px;
   letter-spacing: 0.05em;
@@ -461,7 +461,7 @@
 }
 .admin-user-ledger td:last-child small,
 .admin-user-ledger code {
-  color: var(--muted);
+  color: var(--text-muted);
   overflow-wrap: anywhere;
 }
 .admin-user-adjustment fieldset {
@@ -489,7 +489,7 @@
   justify-content: center;
   gap: 7px;
   border-radius: 7px;
-  background: var(--card);
+  background: var(--surface-card);
   font-weight: 650;
 }
 .admin-user-adjustment-preview {

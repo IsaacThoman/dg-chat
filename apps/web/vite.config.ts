@@ -1,5 +1,6 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
 import { VitePWA } from "vite-plugin-pwa";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -10,6 +11,7 @@ const workspaceRoot = fileURLToPath(new URL("../..", import.meta.url));
 export default defineConfig({
   plugins: [
     react(),
+    tailwindcss(),
     VitePWA({
       // Keep the current worker (and its lazy chunks) alive until every client closes. An
       // auto-updating worker can delete version N's precache while a long-lived version N tab is
@@ -58,6 +60,11 @@ export default defineConfig({
       },
     }),
   ],
+  resolve: {
+    alias: {
+      "@": fileURLToPath(new URL("./src", import.meta.url)),
+    },
+  },
   build: {
     rollupOptions: {
       output: {

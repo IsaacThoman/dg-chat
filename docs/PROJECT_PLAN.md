@@ -21,15 +21,17 @@ original plan was recovered from the related planning task, and the repository/G
 the durable implementation handoff.
 
 - `main` currently includes merged work through PR #30 (`7dd7e91`).
-- Draft PR #31, `codex/chat-session-continuity`, contains the latest 34-commit continuation.
-- PR #31 reports 373 web tests, 892 non-PostgreSQL Deno tests, a production PWA build, and focused
-  PostgreSQL verification before its final push.
-- Its last CI run passed security, SBOM/image scanning, container builds, Redis integration, backup
-  roundtrips, load invariants, and production Compose startup.
-- Two inherited failures remain: Deno lint errors in `Community.tsx` and one PostgreSQL worker
-  fixture cleanup failure. Their downstream official-SDK and Playwright jobs were skipped.
-- A shadcn migration has not started. The requested preset `b6ZjldV0i` resolves to Mira style, mauve
-  theme/base/chart colors, small radius, Oxanium font, Remix icons, and subtle default menus.
+- Draft PR #31, `codex/chat-session-continuity`, is the active continuation and now includes the
+  recovered completion work.
+- Current local verification covers 428 web tests, 1,020 non-PostgreSQL Deno tests, focused isolated
+  PostgreSQL worker tests, type/lint/format gates, and a production PWA build.
+- The inherited lint and storage-cleanup failures are fixed. A later PostgreSQL CI run exposed stale
+  attachment-inspection fixtures and an unclassified repository timeout; both are fixed and covered
+  by the spawned-worker shutdown/recovery tests.
+- The shadcn migration is initialized. Preset `b6ZjldV0i` supplies Mira style, mauve semantic
+  tokens, small radius, Oxanium, Remix icons, and subtle default menus. Foundational primitives are
+  installed, theme-token collisions are isolated from legacy variables, and authentication/bootstrap
+  surfaces now use shadcn Card, Button, Input, and TooltipProvider primitives.
 
 ## Completion roadmap
 

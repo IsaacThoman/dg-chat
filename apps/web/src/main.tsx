@@ -20,6 +20,7 @@ import {
 } from "./IdentityRecovery.tsx";
 import { PwaUpdateNotice } from "./PwaUpdateNotice.tsx";
 import { parseCommunitySearch } from "./communityRouting.ts";
+import { TooltipProvider } from "./components/ui/tooltip.tsx";
 import "./styles.css";
 
 const rootRoute = createRootRoute({ component: () => <Outlet /> });
@@ -174,8 +175,10 @@ const queryClient = new QueryClient({
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
-      <RouterProvider router={router} />
-      <PwaUpdateNotice />
+      <TooltipProvider>
+        <RouterProvider router={router} />
+        <PwaUpdateNotice />
+      </TooltipProvider>
     </QueryClientProvider>
   </React.StrictMode>,
 );

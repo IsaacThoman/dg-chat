@@ -148,6 +148,9 @@ import { AdminModels, AdminProviders } from "./AdminRegistry.tsx";
 import { AdminResilience } from "./AdminResilience.tsx";
 import { AdminTools } from "./AdminTools.tsx";
 import { ToolLauncher } from "./ToolLauncher.tsx";
+import { Button as ShadcnButton } from "./components/ui/button.tsx";
+import { Card } from "./components/ui/card.tsx";
+import { Input as ShadcnInput } from "./components/ui/input.tsx";
 import { AdminUserDetail } from "./admin/users/AdminUserDetail.tsx";
 import type { AdminUserTab } from "./admin/users/adminUserRouting.ts";
 import {
@@ -6188,7 +6191,7 @@ export function AuthCard(
     <main className="auth-page">
       <div className="auth-ambient one" />
       <div className="auth-ambient two" />
-      <div className="auth-card">
+      <Card className="auth-card">
         <Brand />
         <div className="auth-title">
           <h1>{title}</h1>
@@ -6198,23 +6201,23 @@ export function AuthCard(
         <p className="auth-footer">
           <Lock size={13} /> Hosted privately on your infrastructure
         </p>
-      </div>
+      </Card>
     </main>
   );
 }
 function DiscoveryLoading({ unavailable = false }: { unavailable?: boolean }) {
   return (
     <main className="auth-page" aria-live="polite">
-      <div className="auth-card discovery-card">
+      <Card className="auth-card discovery-card">
         <Brand />
         {unavailable
           ? (
             <>
               <h1>Workspace unavailable</h1>
               <p>DG Chat could not reach the server. Check the deployment and try again.</p>
-              <button className="secondary wide" onClick={() => location.reload()}>
+              <ShadcnButton className="secondary wide" onClick={() => location.reload()}>
                 <RefreshCw size={16} /> Retry
-              </button>
+              </ShadcnButton>
             </>
           )
           : (
@@ -6227,7 +6230,7 @@ function DiscoveryLoading({ unavailable = false }: { unavailable?: boolean }) {
               <p>Opening your workspace…</p>
             </>
           )}
-      </div>
+      </Card>
     </main>
   );
 }
@@ -6291,7 +6294,7 @@ export function AuthScreen() {
         {signup && (
           <label>
             <span>Name</span>
-            <input
+            <ShadcnInput
               required
               autoComplete="name"
               placeholder="Your name"
@@ -6302,7 +6305,7 @@ export function AuthScreen() {
         )}
         <label>
           <span>Email address</span>
-          <input
+          <ShadcnInput
             required
             autoComplete="email"
             type="email"
@@ -6313,7 +6316,7 @@ export function AuthScreen() {
         </label>
         <label>
           <span>Password</span>
-          <input
+          <ShadcnInput
             required
             minLength={signup ? PASSWORD_MIN_LENGTH : 1}
             maxLength={PASSWORD_MAX_LENGTH}
@@ -6340,14 +6343,14 @@ export function AuthScreen() {
           </p>
         )}
         {error && <p className="form-error" role="alert">{error}</p>}
-        <button
+        <ShadcnButton
           className="primary wide"
           type="submit"
           disabled={busy || Boolean(signupPasswordError)}
         >
           {busy ? "Please wait…" : signup ? "Request access" : "Continue"}
           <ArrowRight size={17} />
-        </button>
+        </ShadcnButton>
       </form>
       {!signup && (
         <p className="auth-help-link">
@@ -6359,14 +6362,27 @@ export function AuthScreen() {
           <div className="divider">
             <span>or</span>
           </div>
-          <button className="oidc-button" type="button" onClick={startOidc} disabled={busy}>
+          <ShadcnButton
+            className="oidc-button"
+            variant="outline"
+            type="button"
+            onClick={startOidc}
+            disabled={busy}
+          >
             <span>SSO</span> Continue with organization SSO
-          </button>
+          </ShadcnButton>
         </>
       )}
       <p className="switch-auth">
         {signup ? "Already have an account?" : "New to this workspace?"}{" "}
-        <button onClick={() => setSignup(!signup)}>{signup ? "Sign in" : "Request access"}</button>
+        <ShadcnButton
+          key={signup ? "sign-in-toggle" : "request-access-toggle"}
+          type="button"
+          variant="link"
+          onClick={() => setSignup(!signup)}
+        >
+          {signup ? "Sign in" : "Request access"}
+        </ShadcnButton>
       </p>
     </AuthCard>
   );
@@ -6432,7 +6448,7 @@ export function SetupScreen() {
       <form className="auth-form" onSubmit={submit}>
         <label>
           <span>Setup token</span>
-          <input
+          <ShadcnInput
             required
             type="password"
             value={setupToken}
@@ -6442,7 +6458,7 @@ export function SetupScreen() {
         </label>
         <label>
           <span>Administrator name</span>
-          <input
+          <ShadcnInput
             required
             value={name}
             onChange={(event) => setName(event.target.value)}
@@ -6451,7 +6467,7 @@ export function SetupScreen() {
         </label>
         <label>
           <span>Email address</span>
-          <input
+          <ShadcnInput
             required
             type="email"
             value={email}
@@ -6461,7 +6477,7 @@ export function SetupScreen() {
         </label>
         <label>
           <span>Password</span>
-          <input
+          <ShadcnInput
             required
             minLength={PASSWORD_MIN_LENGTH}
             maxLength={PASSWORD_MAX_LENGTH}
@@ -6484,13 +6500,13 @@ export function SetupScreen() {
           {setupPasswordError ?? `Use ${PASSWORD_MIN_LENGTH}–${PASSWORD_MAX_LENGTH} characters.`}
         </p>
         {error && <p className="form-error" role="alert">{error}</p>}
-        <button
+        <ShadcnButton
           className="primary wide"
           type="submit"
           disabled={busy || Boolean(setupPasswordError)}
         >
           {busy ? "Creating…" : "Create workspace"} <ArrowRight size={17} />
-        </button>
+        </ShadcnButton>
       </form>
     </AuthCard>
   );
