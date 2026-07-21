@@ -1243,10 +1243,12 @@ try {
     },
     iteration: async () => {
       await runDatabaseOperation(() => workerLiveness.current!.markProgress());
+      if (shutdownSignal.aborted) return;
       if (Date.now() >= nextGeneratedCleanupSweep) {
         await runDatabaseOperation(enqueueStaleGeneratedObjectCleanup);
         nextGeneratedCleanupSweep = Date.now() + generatedCleanupSweepMs;
       }
+      if (shutdownSignal.aborted) return;
       if (Date.now() >= nextTemporaryChatPurge) {
         try {
           const purge = await runDatabaseOperation(() =>
@@ -1266,6 +1268,7 @@ try {
           nextTemporaryChatPurge = Date.now() + temporaryLifecycle.purgeIntervalMs;
         }
       }
+      if (shutdownSignal.aborted) return;
       if (Date.now() >= nextRetentionScheduleCheck) {
         try {
           const schedule = await runDatabaseOperation(() =>
@@ -1294,6 +1297,7 @@ try {
           logOperationalFailure("worker_retention_scheduler");
         }
       }
+      if (shutdownSignal.aborted) return;
       const job = await runDatabaseOperation(() => claimJob(sql, workerId, jobLeaseSeconds));
       if (!job) {
         await abortableDelay(pollMs, shutdownSignal);
