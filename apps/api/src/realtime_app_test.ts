@@ -161,16 +161,16 @@ Deno.test("Realtime session endpoints authorize, rewrite model IDs, and replace 
     })], { type: "application/json" }),
     "session.json",
   );
-  const callResponse = await app.request("/v1/realtime/calls", {
+  const callResponse = await app.request("/api/realtime/calls", {
     method: "POST",
-    headers: { cookie },
+    headers: { cookie, origin: "http://localhost:5173" },
     body: form,
   });
   assertEquals(callResponse.status, 201, await callResponse.clone().text());
   assertEquals(await callResponse.text(), "v=0\r\nanswer");
   const localLocation = callResponse.headers.get("location");
   assertExists(localLocation);
-  assertEquals(localLocation.startsWith("/v1/realtime/calls/"), true);
+  assertEquals(localLocation.startsWith("/api/realtime/calls/"), true);
   assertEquals(localLocation.includes("call_provider_1"), false);
   assertEquals(requests.at(-1), {
     url: "https://realtime.example/v1/realtime/calls",
@@ -195,7 +195,7 @@ Deno.test("Realtime session endpoints authorize, rewrite model IDs, and replace 
     repository,
     providerKeyring: keyring,
     realtimeCallSigningSecret: "realtime-call-test-secret-32-bytes-minimum",
-    realtimeFetch: async (input, init) => {
+    realtimeFetch: (input, init) => {
       const request = new Request(input, init);
       assertEquals(
         request.url,
@@ -203,14 +203,16 @@ Deno.test("Realtime session endpoints authorize, rewrite model IDs, and replace 
       );
       assertEquals(request.headers.get("authorization"), "Bearer provider-secret");
       providerSideband!.close(1000, "hangup");
-      return new Response(JSON.stringify({ ok: true }), {
-        headers: { "content-type": "application/json" },
-      });
+      return Promise.resolve(
+        new Response(JSON.stringify({ ok: true }), {
+          headers: { "content-type": "application/json" },
+        }),
+      );
     },
   });
   const hangup = await secondReplica.request(`${localLocation}/hangup`, {
     method: "POST",
-    headers: { cookie },
+    headers: { cookie, origin: "http://localhost:5173" },
   });
   assertEquals(hangup.status, 200);
   await closed;

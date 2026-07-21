@@ -435,7 +435,10 @@ function rawDataBytes(data: RawData): Uint8Array {
 }
 
 function closeReason(value: unknown): string {
-  return String(value ?? "").replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 120);
+  return [...String(value ?? "")].filter((character) => {
+    const code = character.charCodeAt(0);
+    return code >= 32 && code !== 127;
+  }).join("").slice(0, 120);
 }
 
 /**

@@ -8229,7 +8229,7 @@ export function createApp(options: AppOptions = {}) {
   };
   const realtimeCalls = new Map<string, ActiveRealtimeCall>();
 
-  app.post("/v1/realtime/calls", requireScope("chat:write"), async (c) => {
+  const createRealtimeCall = async (c: Context<{ Variables: Variables }>) => {
     if (!realtimeCallSigningKey) {
       throw new RealtimeProtocolError(
         "call_control_not_configured",
@@ -8384,17 +8384,26 @@ export function createApp(options: AppOptions = {}) {
       }
     });
     const headers = new Headers(response.headers);
-    headers.set("location", `/v1/realtime/calls/${localCallId}`);
+    const callPrefix = c.req.path.startsWith("/api/")
+      ? "/api/realtime/calls"
+      : "/v1/realtime/calls";
+    headers.set("location", `${callPrefix}/${localCallId}`);
     return new Response(response.body, {
       status: response.status,
       statusText: response.statusText,
       headers,
     });
-  });
+  };
+  app.use("/api/realtime/*", authenticate, approved, sessionOnly);
+  app.post("/api/realtime/calls", createRealtimeCall);
+  app.post("/v1/realtime/calls", requireScope("chat:write"), createRealtimeCall);
 
   for (const action of ["accept", "hangup", "refer", "reject"] as const) {
-    app.post(`/v1/realtime/calls/:id/${action}`, requireScope("chat:write"), async (c) => {
+    const controlRealtimeCall = async (c: Context<{ Variables: Variables }>) => {
       const localId = c.req.param("id");
+      if (!localId) {
+        throw new RealtimeProtocolError("call_not_found", "Realtime call was not found", 404);
+      }
       const call = realtimeCalls.get(localId);
       const token = call ? undefined : await verifyRealtimeCall(localId, c.get("user").id);
       if ((call && call.ownerId !== c.get("user").id) || (!call && !token)) {
@@ -8436,7 +8445,13 @@ export function createApp(options: AppOptions = {}) {
         call.sideband.close(1000, action);
       }
       return response;
-    });
+    };
+    app.post(`/api/realtime/calls/:id/${action}`, controlRealtimeCall);
+    app.post(
+      `/v1/realtime/calls/:id/${action}`,
+      requireScope("chat:write"),
+      controlRealtimeCall,
+    );
   }
 
   app.post(

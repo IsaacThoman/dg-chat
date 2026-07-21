@@ -161,6 +161,7 @@ import { ConversationKnowledgePicker, KnowledgeView } from "./Knowledge.tsx";
 import { CommunityView } from "./Community.tsx";
 import type { CommunitySearch } from "./communityRouting.ts";
 import { VoiceRecorder } from "./voice/VoiceRecorder.tsx";
+import { RealtimeVoiceControl } from "./realtime/RealtimeVoiceControl.tsx";
 import { ScreenCapture } from "./screen-capture/ScreenCapture.tsx";
 import { chatScreenCaptureTargetKey } from "./screen-capture/captureDisplay.ts";
 import { insertTranscript } from "./voice/voiceState.ts";
@@ -3138,6 +3139,10 @@ function ChatView({
     () => models.filter((model) => model.capabilities.includes("speech")),
     [models],
   );
+  const realtimeModels = useMemo(
+    () => models.filter((model) => model.capabilities.includes("realtime")),
+    [models],
+  );
   const imageModels = useMemo(
     () => models.filter((model) => model.capabilities.includes("image_generation")),
     [models],
@@ -3643,6 +3648,10 @@ function ChatView({
           <span className="model-preference-error" role="alert">{historyPreferenceWarning}</span>
         )}
         <div className="header-actions">
+          <RealtimeVoiceControl
+            models={realtimeModels}
+            disabled={readOnly || !sessionActive || branchBusy}
+          />
           {speechModels.length > 0 && (
             <div className="speech-preferences" aria-label="Read aloud settings">
               <label>
