@@ -259,6 +259,7 @@ try {
     app,
     toolExecutionService,
     drainIdentityDeliveries,
+    drainRealtimeSessions,
     replayQuota,
     recoverFileUploads,
   } = createApp({
@@ -342,7 +343,10 @@ try {
       // before its first await. Start it before the graceful HTTP drain so backup streams cannot
       // deadlock server.shutdown().
       cancelBackup: () => backupAdmin?.close(),
-      drainServer: () => server.shutdown(),
+      drainServer: async () => {
+        await drainRealtimeSessions();
+        await server.shutdown();
+      },
       forceServer: () => serverAbort.abort(new Error("API shutdown deadline exceeded")),
       closeResources: async () => {
         await closeIdentityAwareResources({

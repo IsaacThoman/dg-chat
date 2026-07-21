@@ -33,8 +33,23 @@ editing accepts official multipart image arrays and owned JSON file references, 
 `image_edit.*` streams. Edits require an explicit `model`: OpenAI permits a hosted default, but a
 self-hosted installation can expose multiple unrelated providers and has no unambiguous global
 default. Omission returns HTTP 422 with `model_required`. Image models require fixed-call-only
-pricing when their provider supplies no authoritative token usage. Assistants, batches, fine-tuning,
-and realtime are not supported.
+pricing when their provider supplies no authoritative token usage. Assistants, batches, and
+fine-tuning are not supported.
+
+Realtime supports the raw `/v1/realtime` WebSocket JSON event protocol, WebRTC SDP exchange at
+`/v1/realtime/calls`, conversation/transcription/translation client-secret and legacy session
+creation, server sideband connections, and accept/reject/hangup/refer call controls. Models require
+an explicit `realtime`, `realtime_transcription`, or `realtime_translation` capability, entitlement,
+provider credential, and effective price. Browser voice uses cookie-authenticated
+`/api/realtime/calls`; trusted clients use personal API tokens. Provider client secrets are wrapped
+as encrypted, short-lived, model-bound DG tokens and revalidate their originating personal token
+when used, so token revocation remains authoritative and provider credentials never become browser
+configuration. Realtime total input/output tokens—including audio-token details—use the model's
+configured input, cached-input, and output rates. Before a session is established, retryable HTTP or
+WebSocket startup failures can route to the next entitled, priced target using the configured
+provider circuit breaker. Active sessions are never silently migrated because ephemeral media and
+provider state cannot be losslessly transferred; reconnect creates a new media session. See
+`REALTIME_ARCHITECTURE.md`.
 
 ### Deliberate compatibility boundaries
 

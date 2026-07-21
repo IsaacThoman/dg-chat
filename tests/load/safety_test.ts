@@ -106,6 +106,7 @@ Deno.test("chaos markers prove live work and bind faults to real claim owners", 
     'dg_chat_http_requests_in_flight{job="dg-chat-api",method="POST",route="api"} > 0',
   );
   assertStringIncludes(script, "activeMetricInstance");
+  assertStringIncludes(script, "activeReplicaCount");
   assertStringIncludes(script, "cat /tmp/dg-chat-worker-instance");
   assertStringIncludes(script, "status='running'");
   assertStringIncludes(script, "bounded_host_command 15");

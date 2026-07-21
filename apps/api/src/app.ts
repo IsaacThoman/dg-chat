@@ -201,6 +201,19 @@ import {
 } from "./models.ts";
 import { providerResponseByteLimit } from "./provider-limits.ts";
 import { estimateInputTokens, priceUsage, reservationPrice } from "./pricing.ts";
+import {
+  connectRealtimeWebSocket,
+  parseRealtimeEvent,
+  prepareRealtimeCall,
+  proxyRealtimeHttp,
+  REALTIME_MAX_HTTP_BODY_BYTES,
+  type RealtimeCapability,
+  RealtimeProtocolError,
+  realtimeUsage,
+  relayRealtimeWebSocket,
+  rewriteRealtimeCall,
+  rewriteRealtimeModels,
+} from "./realtime.ts";
 import { responseObject, responseRequestFields } from "./responses.ts";
 import { ResponsesStreamProjector } from "./responses-stream.ts";
 import {
@@ -299,6 +312,7 @@ import type { BetterAuthService } from "./better-auth.ts";
 import type { BackupAdminService } from "./backup-admin.ts";
 import { timingSafeTextEqual, validateSetupToken } from "./auth-config.ts";
 import { BackupServiceError } from "./backup-service.ts";
+import { recordRealtimeSessionEnded, recordRealtimeSessionStarted } from "@dg-chat/observability";
 
 type Variables = {
   requestId: string;
@@ -314,6 +328,12 @@ type Variables = {
   tokenId?: string;
   tokenScopes?: string[];
   tokenRatePolicy?: TokenRatePolicy;
+  realtimeEphemeral?: {
+    model: string;
+    targetModel: string;
+    upstreamKey: string;
+    capability: RealtimeCapability;
+  };
   imageAssetOwnerId?: string;
 };
 type WebGenerationEventInput = WebGenerationEvent extends infer Event
@@ -389,7 +409,11 @@ export interface AppOptions {
   audioFetch?: typeof fetch;
   speechFetch?: typeof fetch;
   imageFetch?: typeof fetch;
+  realtimeFetch?: typeof fetch;
+  realtimeWebSocketConnect?: typeof connectRealtimeWebSocket;
+  realtimeMaxSessionSeconds?: number;
   imageUrlSigningSecret?: string;
+  realtimeCallSigningSecret?: string;
   audioConcurrencyLimiter?: AudioConcurrencyLimiter;
   imageConcurrencyLimiter?: AudioConcurrencyLimiter;
   circuitBreaker?: CircuitBreaker;
@@ -1901,6 +1925,30 @@ export function createApp(options: AppOptions = {}) {
     imageUrlSigningSecretBytes &&
     (imageUrlSigningSecretBytes.byteLength < 32 || imageUrlSigningSecretBytes.byteLength > 256)
   ) throw new Error("IMAGE_URL_SIGNING_SECRET must contain between 32 and 256 bytes");
+  const realtimeCallSigningSecret = options.realtimeCallSigningSecret ??
+    Deno.env.get("REALTIME_CALL_SIGNING_SECRET") ?? Deno.env.get("APP_SECRET");
+  const realtimeCallSigningSecretBytes = realtimeCallSigningSecret === undefined
+    ? undefined
+    : new TextEncoder().encode(realtimeCallSigningSecret);
+  if (
+    realtimeCallSigningSecretBytes &&
+    (realtimeCallSigningSecretBytes.byteLength < 32 ||
+      realtimeCallSigningSecretBytes.byteLength > 256)
+  ) throw new Error("REALTIME_CALL_SIGNING_SECRET must contain between 32 and 256 bytes");
+  const realtimeCallSigningKey = realtimeCallSigningSecretBytes
+    ? crypto.subtle.importKey(
+      "raw",
+      realtimeCallSigningSecretBytes,
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"],
+    )
+    : undefined;
+  const realtimeEphemeralEncryptionKey = realtimeCallSigningSecretBytes
+    ? crypto.subtle.digest("SHA-256", realtimeCallSigningSecretBytes).then((digest) =>
+      crypto.subtle.importKey("raw", digest, "AES-GCM", false, ["encrypt", "decrypt"])
+    )
+    : undefined;
   const mailer = options.mailer ?? (Deno.env.get("SMTP_URL")
     ? smtpIdentityMailer(
       Deno.env.get("SMTP_URL")!,
@@ -2037,6 +2085,11 @@ export function createApp(options: AppOptions = {}) {
   const audioMaxConcurrentPerUser = positiveInteger("AUDIO_MAX_CONCURRENT_PER_USER", 2);
   if (audioMaxConcurrentPerUser > audioMaxConcurrent) {
     throw new Error("AUDIO_MAX_CONCURRENT_PER_USER cannot exceed AUDIO_MAX_CONCURRENT");
+  }
+  const realtimeMaxSessionSeconds = options.realtimeMaxSessionSeconds ??
+    positiveInteger("REALTIME_MAX_SESSION_SECONDS", 1_800);
+  if (realtimeMaxSessionSeconds < 30 || realtimeMaxSessionSeconds > 7_200) {
+    throw new Error("REALTIME_MAX_SESSION_SECONDS must be between 30 and 7200");
   }
   const claimAudioSlot = async (ownerId: string) => {
     const lease = await audioConcurrencyLimiter.acquire(ownerId, {
@@ -2524,6 +2577,33 @@ export function createApp(options: AppOptions = {}) {
     if (!resolved.price) return undefined;
     return resolved;
   };
+  const resolveRealtimeRuntimeModel = async (
+    id: string,
+    capability: RealtimeCapability,
+    subject: TokenAccessSubject,
+  ): Promise<RuntimeModel | undefined> => {
+    const model = (await repo.resolveEntitledProviderModel(subject, id))?.model;
+    if (!model?.enabled || !model.capabilities.includes(capability)) return undefined;
+    const provider = await repo.findProvider(model.providerId);
+    if (!provider?.enabled || !provider.hasCredential || !providerKeyring) return undefined;
+    const credential = await repo.getProviderCredential(provider.id);
+    if (!credential) return undefined;
+    let apiKey: string;
+    try {
+      apiKey = await providerKeyring.decrypt(
+        provider.id,
+        credential.envelope as unknown as ProviderSecretEnvelope,
+      );
+    } catch {
+      return undefined;
+    }
+    const resolved = await registryModelInfo(model, provider);
+    if (!resolved.price) return undefined;
+    return {
+      ...resolved,
+      upstream: { baseUrl: provider.baseUrl, apiKey, upstreamModel: model.upstreamModelId },
+    };
+  };
   const replayModelIsEntitled = async (
     c: Context<{ Variables: Variables }>,
     modelId: string,
@@ -2578,6 +2658,83 @@ export function createApp(options: AppOptions = {}) {
       }
     }
     return plan;
+  };
+  type ResolvedRealtimeRuntime = RuntimeModel & {
+    provider: ProviderRecord;
+    registryModel: ProviderModelRecord;
+    upstream: UpstreamStreamOptions;
+    price: ModelPriceVersion;
+  };
+  const resolveRealtimeTargets = async (
+    sourceModelId: string,
+    capability: RealtimeCapability,
+    subject: TokenAccessSubject,
+  ): Promise<ResolvedRealtimeRuntime[]> => {
+    const source = await resolveRealtimeRuntimeModel(sourceModelId, capability, subject);
+    if (!source?.provider || !source.registryModel || !source.upstream || !source.price) return [];
+    const plan = await resolveEntitledPlan(subject, source.registryModel.id);
+    const targets: ResolvedRealtimeRuntime[] = [];
+    for (const target of plan.targets) {
+      const resolved = await resolveRealtimeRuntimeModel(
+        target.publicModelId,
+        capability,
+        subject,
+      );
+      if (resolved?.provider && resolved.registryModel && resolved.upstream && resolved.price) {
+        targets.push(resolved as ResolvedRealtimeRuntime);
+      }
+    }
+    return targets;
+  };
+  const attemptRealtimeTargets = async <T>(
+    targets: readonly ResolvedRealtimeRuntime[],
+    attempt: (target: ResolvedRealtimeRuntime) => Promise<T>,
+    retryable: (result: T) => boolean = () => false,
+  ): Promise<{ target: ResolvedRealtimeRuntime; result: T }> => {
+    let lastError: unknown;
+    let lastRetryable: { target: ResolvedRealtimeRuntime; result: T } | undefined;
+    for (const target of targets) {
+      let permit;
+      try {
+        permit = await circuitBreaker.beforeAttempt(target.provider.id, breakerPolicy);
+      } catch (error) {
+        lastError = error;
+        continue;
+      }
+      if (!permit.allowed) continue;
+      if (lastRetryable?.result instanceof Response) {
+        await lastRetryable.result.body?.cancel().catch(() => undefined);
+        lastRetryable = undefined;
+      }
+      try {
+        const result = await attempt(target);
+        if (retryable(result)) {
+          lastRetryable = { target, result };
+          await circuitBreaker.recordFailure(target.provider.id, permit, breakerPolicy).catch(
+            () => undefined,
+          );
+          continue;
+        }
+        await circuitBreaker.recordSuccess(target.provider.id, permit).catch(() => undefined);
+        return { target, result };
+      } catch (error) {
+        lastError = error;
+        const classified = classifyProviderError(error);
+        if (!classified.transient) {
+          await circuitBreaker.recordSuccess(target.provider.id, permit).catch(() => undefined);
+          throw error;
+        }
+        await circuitBreaker.recordFailure(target.provider.id, permit, breakerPolicy).catch(
+          () => undefined,
+        );
+      }
+    }
+    if (lastRetryable) return lastRetryable;
+    throw lastError ?? new RealtimeProtocolError(
+      "provider_unavailable",
+      "No Realtime provider target is available",
+      503,
+    );
   };
   app.use("*", async (c, next) => {
     // Correlation IDs are server-owned. Even a syntactically valid caller UUID can be replayed to
@@ -2973,9 +3130,13 @@ export function createApp(options: AppOptions = {}) {
       return next();
     }
     const legacySession = production ? getCookie(c, "dg_session") : undefined;
-    const raw = c.req.header("authorization")?.replace(/^Bearer\s+/i, "") ??
+    const presentedRaw = c.req.header("authorization")?.replace(/^Bearer\s+/i, "") ??
       getCookie(c, sessionCookie) ?? legacySession;
-    if (!raw) return c.json(openAIError("Authentication required", "unauthorized"), 401);
+    if (!presentedRaw) return c.json(openAIError("Authentication required", "unauthorized"), 401);
+    const ephemeral = c.req.path === "/v1/realtime/calls" && presentedRaw.startsWith("ek_dg_")
+      ? await openRealtimeEphemeral(presentedRaw)
+      : undefined;
+    const raw = ephemeral?.d ?? presentedRaw;
     const hash = await sha256(raw);
     const apiToken = await repo.authenticateApiToken(hash);
     if (apiToken) {
@@ -2998,6 +3159,14 @@ export function createApp(options: AppOptions = {}) {
         burst: apiToken.burstLimit,
       });
       c.set("authorityEpoch", apiToken.authorityEpoch);
+      if (ephemeral) {
+        c.set("realtimeEphemeral", {
+          model: ephemeral.m,
+          targetModel: ephemeral.t,
+          upstreamKey: ephemeral.u,
+          capability: ephemeral.q,
+        });
+      }
       return next();
     }
     const session = await repo.getSession(hash);
@@ -3029,8 +3198,12 @@ export function createApp(options: AppOptions = {}) {
     return next();
   };
   const authenticateApiToken: MiddlewareHandler<{ Variables: Variables }> = async (c, next) => {
-    const raw = c.req.header("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
-    if (!raw) return c.json(openAIError("Authentication required", "unauthorized"), 401);
+    const presented = c.req.header("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
+    if (!presented) return c.json(openAIError("Authentication required", "unauthorized"), 401);
+    const ephemeral = c.req.path === "/v1/realtime/calls" && presented.startsWith("ek_dg_")
+      ? await openRealtimeEphemeral(presented)
+      : undefined;
+    const raw = ephemeral?.d ?? presented;
     const apiToken = await repo.authenticateApiToken(await sha256(raw));
     const user = apiToken ? await repo.findUser(apiToken.userId) : undefined;
     if (
@@ -3051,6 +3224,14 @@ export function createApp(options: AppOptions = {}) {
       burst: apiToken.burstLimit,
     });
     c.set("authorityEpoch", apiToken.authorityEpoch);
+    if (ephemeral) {
+      c.set("realtimeEphemeral", {
+        model: ephemeral.m,
+        targetModel: ephemeral.t,
+        upstreamKey: ephemeral.u,
+        capability: ephemeral.q,
+      });
+    }
     return next();
   };
   const approved: MiddlewareHandler<{ Variables: Variables }> = async (c, next) => {
@@ -7994,6 +8175,987 @@ export function createApp(options: AppOptions = {}) {
     }
     await next();
   });
+  const realtimeJsonProxy = async (
+    c: Context<{ Variables: Variables }>,
+    path: string,
+    select: (body: Record<string, unknown>) => {
+      model: unknown;
+      capability: RealtimeCapability;
+    },
+  ): Promise<Response> => {
+    const declared = Number(c.req.header("content-length"));
+    if (Number.isFinite(declared) && declared > REALTIME_MAX_HTTP_BODY_BYTES) {
+      throw new RealtimeProtocolError(
+        "request_too_large",
+        "Realtime request exceeds the size limit",
+        413,
+      );
+    }
+    const bytes = new Uint8Array(await c.req.raw.arrayBuffer());
+    if (bytes.byteLength > REALTIME_MAX_HTTP_BODY_BYTES) {
+      throw new RealtimeProtocolError(
+        "request_too_large",
+        "Realtime request exceeds the size limit",
+        413,
+      );
+    }
+    let body: unknown;
+    try {
+      body = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    } catch {
+      throw new RealtimeProtocolError("invalid_request", "Realtime request must be valid JSON");
+    }
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      throw new RealtimeProtocolError("invalid_request", "Realtime request must be a JSON object");
+    }
+    const selected = select(body as Record<string, unknown>);
+    if (typeof selected.model !== "string" || selected.model.length < 1) {
+      throw new RealtimeProtocolError(
+        "model_required",
+        "A Realtime model must be selected explicitly",
+        422,
+      );
+    }
+    const targets = await resolveRealtimeTargets(
+      selected.model,
+      selected.capability,
+      accessSubject(c),
+    );
+    if (!targets.length) {
+      throw new RealtimeProtocolError(
+        "model_not_found",
+        "Realtime model is unavailable or not entitled",
+        404,
+      );
+    }
+    const proxied = await attemptRealtimeTargets(
+      targets,
+      async (target) => {
+        const upstreamBody = new TextEncoder().encode(JSON.stringify(rewriteRealtimeModels(
+          body,
+          selected.model as string,
+          target.registryModel.upstreamModelId,
+        )));
+        return await proxyRealtimeHttp({
+          baseUrl: target.upstream.baseUrl!,
+          apiKey: target.upstream.apiKey!,
+          path,
+          method: "POST",
+          headers: { "content-type": "application/json", accept: "application/json" },
+          body: upstreamBody,
+          signal: c.req.raw.signal,
+          fetch: options.realtimeFetch,
+        });
+      },
+      (candidate) => candidate.status === 429 || candidate.status >= 500,
+    );
+    const { result: response, target: resolved } = proxied;
+    if (response.headers.get("content-type")?.includes("application/json")) {
+      const text = await response.text();
+      try {
+        const value = rewriteRealtimeModels(
+          JSON.parse(text),
+          resolved.registryModel.upstreamModelId,
+          selected.model,
+        ) as Record<string, unknown>;
+        const sourceCredential = c.req.header("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1]
+          ?.trim();
+        if (!sourceCredential) {
+          throw new RealtimeProtocolError(
+            "api_token_required",
+            "Realtime client secrets require a personal API token",
+            401,
+          );
+        }
+        const nowSeconds = Math.floor(Date.now() / 1000);
+        const managedSecret = async (upstreamKey: string, expires: unknown) => {
+          const providerExpiry = Number.isSafeInteger(expires) ? Number(expires) : nowSeconds + 60;
+          const effectiveExpiry = Math.min(providerExpiry, nowSeconds + 600);
+          if (effectiveExpiry <= nowSeconds) {
+            throw new RealtimeProtocolError(
+              "invalid_provider_response",
+              "Realtime provider returned an expired client secret",
+              502,
+            );
+          }
+          return await sealRealtimeEphemeral({
+            d: sourceCredential,
+            u: upstreamKey,
+            m: selected.model as string,
+            t: resolved.info.id,
+            q: selected.capability,
+            e: effectiveExpiry,
+          });
+        };
+        if (typeof value.value === "string") {
+          value.value = await managedSecret(value.value, value.expires_at);
+        } else if (
+          value.client_secret && typeof value.client_secret === "object" &&
+          !Array.isArray(value.client_secret)
+        ) {
+          const secret = value.client_secret as Record<string, unknown>;
+          if (typeof secret.value !== "string") {
+            throw new RealtimeProtocolError(
+              "invalid_provider_response",
+              "Realtime provider omitted the client secret",
+              502,
+            );
+          }
+          secret.value = await managedSecret(secret.value, secret.expires_at);
+        } else {
+          throw new RealtimeProtocolError(
+            "invalid_provider_response",
+            "Realtime provider omitted the client secret",
+            502,
+          );
+        }
+        const headers = new Headers(response.headers);
+        headers.delete("content-length");
+        return new Response(JSON.stringify(value), {
+          status: response.status,
+          statusText: response.statusText,
+          headers,
+        });
+      } catch (error) {
+        if (error instanceof RealtimeProtocolError) throw error;
+        throw new RealtimeProtocolError(
+          "invalid_provider_response",
+          "Realtime provider returned invalid JSON",
+          502,
+        );
+      }
+    }
+    return response;
+  };
+  type RealtimeCallToken = {
+    c: string;
+    m: string;
+    t: string;
+    o: string;
+    q: RealtimeCapability;
+    e: number;
+  };
+  type RealtimeEphemeralToken = {
+    d: string;
+    u: string;
+    m: string;
+    t: string;
+    q: RealtimeCapability;
+    e: number;
+  };
+  const sealRealtimeEphemeral = async (payload: RealtimeEphemeralToken): Promise<string> => {
+    if (!realtimeEphemeralEncryptionKey) {
+      throw new RealtimeProtocolError(
+        "client_secrets_not_configured",
+        "Realtime client secrets require REALTIME_CALL_SIGNING_SECRET",
+        501,
+      );
+    }
+    const nonce = crypto.getRandomValues(new Uint8Array(12));
+    const ciphertext = new Uint8Array(
+      await crypto.subtle.encrypt(
+        { name: "AES-GCM", iv: nonce, additionalData: new TextEncoder().encode("dg-realtime-v1") },
+        await realtimeEphemeralEncryptionKey,
+        new TextEncoder().encode(JSON.stringify(payload)),
+      ),
+    );
+    const token = new Uint8Array(nonce.byteLength + ciphertext.byteLength);
+    token.set(nonce);
+    token.set(ciphertext, nonce.byteLength);
+    return `ek_dg_${Buffer.from(token).toString("base64url")}`;
+  };
+  const openRealtimeEphemeral = async (
+    token: string,
+  ): Promise<RealtimeEphemeralToken | undefined> => {
+    if (
+      !realtimeEphemeralEncryptionKey || !/^ek_dg_[A-Za-z0-9_-]+$/.test(token) ||
+      token.length > 8_192
+    ) {
+      return undefined;
+    }
+    try {
+      const packed = new Uint8Array(Buffer.from(token.slice(6), "base64url"));
+      if (packed.byteLength < 29) return undefined;
+      const plaintext = await crypto.subtle.decrypt(
+        {
+          name: "AES-GCM",
+          iv: packed.slice(0, 12),
+          additionalData: new TextEncoder().encode("dg-realtime-v1"),
+        },
+        await realtimeEphemeralEncryptionKey,
+        packed.slice(12),
+      );
+      const payload = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(plaintext));
+      if (
+        !payload || typeof payload !== "object" || typeof payload.d !== "string" ||
+        typeof payload.u !== "string" || typeof payload.m !== "string" ||
+        typeof payload.t !== "string" ||
+        !["realtime", "realtime_transcription", "realtime_translation"].includes(payload.q) ||
+        !Number.isSafeInteger(payload.e) || payload.e <= Math.floor(Date.now() / 1000) ||
+        payload.d.length < 16 || payload.d.length > 4_096 || payload.u.length < 1 ||
+        payload.u.length > 4_096 || payload.m.length < 1 || payload.m.length > 256 ||
+        payload.t.length < 1 || payload.t.length > 256
+      ) return undefined;
+      return payload as RealtimeEphemeralToken;
+    } catch {
+      return undefined;
+    }
+  };
+  const signRealtimeCall = async (payload: RealtimeCallToken): Promise<string> => {
+    if (!realtimeCallSigningKey) {
+      throw new RealtimeProtocolError(
+        "call_control_not_configured",
+        "Realtime call control requires REALTIME_CALL_SIGNING_SECRET",
+        501,
+      );
+    }
+    const encoded = Buffer.from(JSON.stringify(payload)).toString("base64url");
+    const signature = Buffer.from(
+      await crypto.subtle.sign(
+        "HMAC",
+        await realtimeCallSigningKey,
+        new TextEncoder().encode(encoded),
+      ),
+    ).toString("base64url");
+    return `${encoded}.${signature}`;
+  };
+  const verifyRealtimeCall = async (
+    token: string,
+    ownerId: string,
+  ): Promise<RealtimeCallToken | undefined> => {
+    if (!realtimeCallSigningKey || token.length > 2_048) return undefined;
+    const [encoded, supplied, extra] = token.split(".");
+    if (
+      extra !== undefined || !encoded || !supplied ||
+      !/^[A-Za-z0-9_-]+$/.test(encoded) || !/^[A-Za-z0-9_-]{43}$/.test(supplied)
+    ) return undefined;
+    const expected = new Uint8Array(
+      await crypto.subtle.sign(
+        "HMAC",
+        await realtimeCallSigningKey,
+        new TextEncoder().encode(encoded),
+      ),
+    );
+    let suppliedBytes: Uint8Array;
+    try {
+      suppliedBytes = new Uint8Array(Buffer.from(supplied, "base64url"));
+    } catch {
+      return undefined;
+    }
+    if (Buffer.from(suppliedBytes).toString("base64url") !== supplied) return undefined;
+    let mismatch = expected.byteLength ^ suppliedBytes.byteLength;
+    for (let index = 0; index < expected.byteLength; index++) {
+      mismatch |= expected[index] ^ (suppliedBytes[index] ?? 0);
+    }
+    if (mismatch !== 0) return undefined;
+    try {
+      const payload = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+      if (
+        !payload || typeof payload !== "object" || typeof payload.c !== "string" ||
+        typeof payload.m !== "string" || typeof payload.t !== "string" || payload.o !== ownerId ||
+        !["realtime", "realtime_transcription", "realtime_translation"].includes(payload.q) ||
+        !Number.isSafeInteger(payload.e) || payload.e <= Math.floor(Date.now() / 1000) ||
+        payload.c.length < 1 || payload.c.length > 256 || payload.m.length < 1 ||
+        payload.m.length > 256 || payload.t.length < 1 || payload.t.length > 256
+      ) return undefined;
+      return payload as RealtimeCallToken;
+    } catch {
+      return undefined;
+    }
+  };
+  type ActiveRealtimeCall = {
+    ownerId: string;
+    upstreamCallId: string;
+    runId: string;
+    startedAt: number;
+    inputTokens: number;
+    cachedInputTokens: number;
+    outputTokens: number;
+    serverEvents: number;
+    resolved: RuntimeModel & {
+      provider: ProviderRecord;
+      registryModel: ProviderModelRecord;
+      upstream: UpstreamStreamOptions;
+      price: ModelPriceVersion;
+    };
+    sideband: Awaited<ReturnType<typeof connectRealtimeWebSocket>>;
+    concurrencyLease: Awaited<ReturnType<typeof claimAudioSlot>>;
+    usageLease: { stop(): Promise<void> };
+    terminal: Promise<void>;
+    maximumTimer: ReturnType<typeof setTimeout>;
+  };
+  const realtimeCalls = new Map<string, ActiveRealtimeCall>();
+  const realtimeRelays = new Set<{ stop(): void; terminal: Promise<void> }>();
+  let realtimeDraining = false;
+
+  const createRealtimeCall = async (c: Context<{ Variables: Variables }>) => {
+    if (realtimeDraining) {
+      throw new RealtimeProtocolError(
+        "server_shutting_down",
+        "Realtime sessions are draining for server shutdown",
+        503,
+      );
+    }
+    if (!realtimeCallSigningKey) {
+      throw new RealtimeProtocolError(
+        "call_control_not_configured",
+        "Realtime call control requires REALTIME_CALL_SIGNING_SECRET",
+        501,
+      );
+    }
+    const declared = Number(c.req.header("content-length"));
+    if (Number.isFinite(declared) && declared > REALTIME_MAX_HTTP_BODY_BYTES) {
+      throw new RealtimeProtocolError(
+        "request_too_large",
+        "Realtime request exceeds the size limit",
+        413,
+      );
+    }
+    const rawBody = new Uint8Array(await c.req.raw.arrayBuffer());
+    const ephemeral = c.get("realtimeEphemeral");
+    const prepared = await prepareRealtimeCall(
+      c.req.header("content-type") ?? "",
+      rawBody,
+      ephemeral?.model ?? c.req.query("model"),
+    );
+    if (ephemeral && prepared.model !== ephemeral.model) {
+      throw new RealtimeProtocolError(
+        "model_mismatch",
+        "Realtime client secret is bound to a different model",
+        403,
+      );
+    }
+    let targets = await resolveRealtimeTargets(
+      prepared.model,
+      ephemeral?.capability ?? "realtime",
+      accessSubject(c),
+    );
+    if (ephemeral) {
+      targets = targets.filter((target) => target.info.id === ephemeral.targetModel).slice(0, 1);
+    }
+    if (!targets.length) {
+      throw new RealtimeProtocolError(
+        "model_not_found",
+        "Realtime model is unavailable or not entitled",
+        404,
+      );
+    }
+    const runId = crypto.randomUUID();
+    const startedAt = Date.now();
+    const reserveMicros = Math.max(...targets.map((target) =>
+      priceUsage(
+        target.info,
+        target.info.contextWindow,
+        target.info.contextWindow,
+        { reasoningTokens: target.info.contextWindow },
+      ).costMicros
+    ));
+    const concurrencyLease = await claimAudioSlot(c.get("user").id);
+    let usageRun;
+    try {
+      usageRun = await repo.reserve(
+        c.get("user").id,
+        runId,
+        prepared.model,
+        reserveMicros,
+        targets[0].provider.slug,
+        c.get("tokenId"),
+        pricingSnapshot(targets[0].price),
+      );
+    } catch (error) {
+      await concurrencyLease.release();
+      throw error;
+    }
+    if (!usageRun.runLeaseToken) {
+      await repo.refund(runId, "Realtime execution lease was not created");
+      await concurrencyLease.release();
+      throw new RealtimeProtocolError(
+        "execution_lease_missing",
+        "Realtime execution lease was not created",
+        500,
+      );
+    }
+    let response: Response;
+    let resolved: ResolvedRealtimeRuntime;
+    try {
+      const created = await attemptRealtimeTargets(
+        targets,
+        async (target) => {
+          const rewritten = await rewriteRealtimeCall(
+            prepared,
+            target.registryModel.upstreamModelId,
+          );
+          return await proxyRealtimeHttp({
+            baseUrl: target.upstream.baseUrl!,
+            apiKey: ephemeral?.upstreamKey ?? target.upstream.apiKey!,
+            path: "/realtime/calls",
+            headers: { "content-type": rewritten.contentType, accept: "application/sdp" },
+            body: rewritten.body,
+            signal: c.req.raw.signal,
+            fetch: options.realtimeFetch,
+          });
+        },
+        (candidate) => candidate.status === 429 || candidate.status >= 500,
+      );
+      response = created.result;
+      resolved = created.target;
+    } catch (error) {
+      await repo.refund(runId, "Realtime call creation failed");
+      await concurrencyLease.release();
+      throw error;
+    }
+    const completeResolved = resolved as ActiveRealtimeCall["resolved"];
+    if (response.status !== 201) {
+      await repo.refund(runId, "Realtime provider rejected call creation");
+      await concurrencyLease.release();
+      return response;
+    }
+    const location = response.headers.get("location") ?? "";
+    const match = location.match(/\/realtime\/calls\/([^/?#]+)/);
+    if (!match) {
+      await repo.refund(runId, "Realtime provider omitted the call identifier");
+      await concurrencyLease.release();
+      throw new RealtimeProtocolError(
+        "invalid_provider_response",
+        "Realtime provider omitted the call identifier",
+        502,
+      );
+    }
+    const upstreamCallId = decodeURIComponent(match[1]);
+    let sideband: ActiveRealtimeCall["sideband"];
+    try {
+      sideband = await (options.realtimeWebSocketConnect ?? connectRealtimeWebSocket)({
+        baseUrl: resolved.upstream.baseUrl!,
+        apiKey: resolved.upstream.apiKey!,
+        callId: upstreamCallId,
+      });
+    } catch {
+      await proxyRealtimeHttp({
+        baseUrl: resolved.upstream.baseUrl!,
+        apiKey: resolved.upstream.apiKey!,
+        path: `/realtime/calls/${encodeURIComponent(upstreamCallId)}/hangup`,
+        fetch: options.realtimeFetch,
+      }).catch(() => undefined);
+      await repo.refund(runId, "Realtime sideband connection failed");
+      await concurrencyLease.release();
+      throw new RealtimeProtocolError(
+        "provider_unavailable",
+        "Realtime sideband connection failed",
+        502,
+      );
+    }
+    const localCallId = await signRealtimeCall({
+      c: upstreamCallId,
+      m: prepared.model,
+      t: resolved.info.id,
+      o: c.get("user").id,
+      q: ephemeral?.capability ?? "realtime",
+      e: Math.floor(Date.now() / 1000) + 2 * 60 * 60,
+    });
+    const maximumTimer = setTimeout(() => {
+      sideband.close(1000, "Realtime session duration reached");
+      void proxyRealtimeHttp({
+        baseUrl: resolved.upstream!.baseUrl!,
+        apiKey: resolved.upstream!.apiKey!,
+        path: `/realtime/calls/${encodeURIComponent(upstreamCallId)}/hangup`,
+        fetch: options.realtimeFetch,
+      }).catch(() => undefined);
+    }, realtimeMaxSessionSeconds * 1_000);
+    const usageLease = keepApiLeaseAlive(
+      undefined,
+      { runId, leaseToken: usageRun.runLeaseToken },
+      () => {
+        sideband.close(1013, "Realtime accounting lease was lost");
+        void proxyRealtimeHttp({
+          baseUrl: resolved.upstream!.baseUrl!,
+          apiKey: resolved.upstream!.apiKey!,
+          path: `/realtime/calls/${encodeURIComponent(upstreamCallId)}/hangup`,
+          fetch: options.realtimeFetch,
+        }).catch(() => undefined);
+      },
+    );
+    let resolveTerminal!: () => void;
+    const terminal = new Promise<void>((resolve) => resolveTerminal = resolve);
+    const call: ActiveRealtimeCall = {
+      ownerId: c.get("user").id,
+      upstreamCallId,
+      runId,
+      startedAt,
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      outputTokens: 0,
+      serverEvents: 0,
+      resolved: completeResolved,
+      sideband,
+      concurrencyLease,
+      usageLease,
+      terminal,
+      maximumTimer,
+    };
+    realtimeCalls.set(localCallId, call);
+    recordRealtimeSessionStarted("webrtc");
+    sideband.on("message", (data, binary) => {
+      if (binary) return sideband.close(1003, "Realtime events must be JSON text frames");
+      try {
+        const event = parseRealtimeEvent(data.toString());
+        call.serverEvents += 1;
+        const usage = realtimeUsage(event);
+        if (!usage) return;
+        call.inputTokens += usage.inputTokens;
+        call.cachedInputTokens += usage.cachedInputTokens;
+        call.outputTokens += usage.outputTokens;
+      } catch {
+        sideband.close(1007, "Invalid Realtime provider event");
+      }
+    });
+    sideband.once("close", async (code) => {
+      clearTimeout(call.maximumTimer);
+      realtimeCalls.delete(localCallId);
+      recordRealtimeSessionEnded(
+        "webrtc",
+        code === 1000
+          ? "completed"
+          : code === 1001 && realtimeDraining
+          ? "server_shutdown"
+          : code === 1013
+          ? "capacity_lost"
+          : "provider_closed",
+        0,
+        call.serverEvents,
+      );
+      const cost = priceUsage(call.resolved.info, call.inputTokens, call.outputTokens, {
+        cachedInputTokens: call.cachedInputTokens,
+      }).costMicros;
+      try {
+        await call.usageLease.stop();
+        await repo.settle(
+          call.runId,
+          cost,
+          call.inputTokens,
+          call.outputTokens,
+          Date.now() - call.startedAt,
+        );
+      } catch {
+        // Durable reconciliation owns any active reservation left by an accounting outage.
+      } finally {
+        try {
+          await call.concurrencyLease.release();
+        } finally {
+          resolveTerminal();
+        }
+      }
+    });
+    concurrencyLease.signal.addEventListener("abort", () => {
+      sideband.close(1013, "Realtime capacity lease was lost");
+      void proxyRealtimeHttp({
+        baseUrl: resolved.upstream!.baseUrl!,
+        apiKey: resolved.upstream!.apiKey!,
+        path: `/realtime/calls/${encodeURIComponent(upstreamCallId)}/hangup`,
+        fetch: options.realtimeFetch,
+      }).catch(() => undefined);
+    }, { once: true });
+    const headers = new Headers(response.headers);
+    const callPrefix = c.req.path.startsWith("/api/")
+      ? "/api/realtime/calls"
+      : "/v1/realtime/calls";
+    headers.set("location", `${callPrefix}/${localCallId}`);
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+  };
+  app.use("/api/realtime/*", authenticate, approved, sessionOnly);
+  app.post("/api/realtime/calls", createRealtimeCall);
+  app.post("/v1/realtime/calls", requireScope("chat:write"), createRealtimeCall);
+
+  for (const action of ["accept", "hangup", "refer", "reject"] as const) {
+    const controlRealtimeCall = async (c: Context<{ Variables: Variables }>) => {
+      const localId = c.req.param("id");
+      if (!localId) {
+        throw new RealtimeProtocolError("call_not_found", "Realtime call was not found", 404);
+      }
+      const call = realtimeCalls.get(localId);
+      const token = call ? undefined : await verifyRealtimeCall(localId, c.get("user").id);
+      if ((call && call.ownerId !== c.get("user").id) || (!call && !token)) {
+        throw new RealtimeProtocolError("call_not_found", "Realtime call was not found", 404);
+      }
+      const resolved = call?.resolved ?? await resolveRealtimeRuntimeModel(
+        token!.t,
+        token!.q,
+        accessSubject(c),
+      );
+      if (!resolved?.upstream) {
+        throw new RealtimeProtocolError(
+          "model_not_found",
+          "Realtime model is unavailable or not entitled",
+          404,
+        );
+      }
+      const upstreamCallId = call?.upstreamCallId ?? token!.c;
+      const body = new Uint8Array(await c.req.raw.arrayBuffer());
+      if (body.byteLength > REALTIME_MAX_HTTP_BODY_BYTES) {
+        throw new RealtimeProtocolError(
+          "request_too_large",
+          "Realtime request exceeds the size limit",
+          413,
+        );
+      }
+      const response = await proxyRealtimeHttp({
+        baseUrl: resolved.upstream.baseUrl!,
+        apiKey: resolved.upstream.apiKey!,
+        path: `/realtime/calls/${encodeURIComponent(upstreamCallId)}/${action}`,
+        headers: c.req.header("content-type")
+          ? { "content-type": c.req.header("content-type")! }
+          : undefined,
+        body,
+        signal: c.req.raw.signal,
+        fetch: options.realtimeFetch,
+      });
+      if (call && response.ok && (action === "hangup" || action === "reject")) {
+        call.sideband.close(1000, action);
+      }
+      return response;
+    };
+    app.post(`/api/realtime/calls/:id/${action}`, controlRealtimeCall);
+    app.post(
+      `/v1/realtime/calls/:id/${action}`,
+      requireScope("chat:write"),
+      controlRealtimeCall,
+    );
+  }
+
+  app.post(
+    "/v1/realtime/client_secrets",
+    requireScope("chat:write"),
+    (c) =>
+      realtimeJsonProxy(c, "/realtime/client_secrets", (body) => {
+        const session =
+          body.session && typeof body.session === "object" && !Array.isArray(body.session)
+            ? body.session as Record<string, unknown>
+            : {};
+        return {
+          model: session.model,
+          capability: session.type === "transcription" ? "realtime_transcription" : "realtime",
+        };
+      }),
+  );
+  app.post(
+    "/v1/realtime/sessions",
+    requireScope("chat:write"),
+    (c) =>
+      realtimeJsonProxy(c, "/realtime/sessions", (body) => ({
+        model: body.model,
+        capability: "realtime",
+      })),
+  );
+  app.post(
+    "/v1/realtime/transcription_sessions",
+    requireScope("chat:write"),
+    (c) =>
+      realtimeJsonProxy(c, "/realtime/transcription_sessions", (body) => {
+        const transcription = body.input_audio_transcription &&
+            typeof body.input_audio_transcription === "object" &&
+            !Array.isArray(body.input_audio_transcription)
+          ? body.input_audio_transcription as Record<string, unknown>
+          : {};
+        return { model: transcription.model, capability: "realtime_transcription" };
+      }),
+  );
+  app.post(
+    "/v1/realtime/translations/client_secrets",
+    requireScope("chat:write"),
+    (c) =>
+      realtimeJsonProxy(c, "/realtime/translations/client_secrets", (body) => {
+        const session =
+          body.session && typeof body.session === "object" && !Array.isArray(body.session)
+            ? body.session as Record<string, unknown>
+            : {};
+        return { model: session.model, capability: "realtime_translation" };
+      }),
+  );
+  app.get("/v1/realtime", requireScope("chat:write"), async (c) => {
+    if (realtimeDraining) {
+      throw new RealtimeProtocolError(
+        "server_shutting_down",
+        "Realtime sessions are draining for server shutdown",
+        503,
+      );
+    }
+    if (c.req.header("upgrade")?.toLowerCase() !== "websocket") {
+      throw new RealtimeProtocolError(
+        "websocket_required",
+        "The Realtime endpoint requires a WebSocket upgrade",
+        426,
+      );
+    }
+    const localCallId = c.req.query("call_id")?.trim();
+    if (localCallId) {
+      const token = await verifyRealtimeCall(localCallId, c.get("user").id);
+      if (!token) {
+        throw new RealtimeProtocolError("call_not_found", "Realtime call was not found", 404);
+      }
+      const resolved = await resolveRealtimeRuntimeModel(token.t, token.q, accessSubject(c));
+      if (!resolved?.upstream || !resolved.registryModel) {
+        throw new RealtimeProtocolError(
+          "model_not_found",
+          "Realtime model is unavailable or not entitled",
+          404,
+        );
+      }
+      const concurrencyLease = await claimAudioSlot(c.get("user").id);
+      let upstream;
+      try {
+        upstream = await (options.realtimeWebSocketConnect ?? connectRealtimeWebSocket)({
+          baseUrl: resolved.upstream.baseUrl!,
+          apiKey: resolved.upstream.apiKey!,
+          callId: token.c,
+          signal: c.req.raw.signal,
+        });
+      } catch {
+        await concurrencyLease.release();
+        throw new RealtimeProtocolError(
+          "provider_unavailable",
+          "Realtime sideband connection failed",
+          502,
+        );
+      }
+      let upgraded: ReturnType<typeof Deno.upgradeWebSocket>;
+      try {
+        upgraded = Deno.upgradeWebSocket(c.req.raw, { idleTimeout: 120 });
+      } catch (error) {
+        upstream.terminate();
+        await concurrencyLease.release();
+        throw error;
+      }
+      let resolveRelayTerminal!: () => void;
+      const relaySession = {
+        stop: (() => undefined) as () => void,
+        terminal: new Promise<void>((resolve) => resolveRelayTerminal = resolve),
+      };
+      realtimeRelays.add(relaySession);
+      const maximumTimer = setTimeout(
+        () => relaySession.stop(),
+        realtimeMaxSessionSeconds * 1_000,
+      );
+      relaySession.stop = relayRealtimeWebSocket(upgraded.socket, upstream, {
+        publicModel: token.m,
+        upstreamModel: resolved.registryModel.upstreamModelId,
+        async onClose(details) {
+          clearTimeout(maximumTimer);
+          recordRealtimeSessionEnded(
+            "websocket",
+            details.code === 1000
+              ? "completed"
+              : details.code === 1001 && realtimeDraining
+              ? "server_shutdown"
+              : details.code === 1001
+              ? "client_closed"
+              : details.code === 1013
+              ? "capacity_lost"
+              : "failed",
+            details.clientEvents,
+            details.serverEvents,
+          );
+          try {
+            await concurrencyLease.release();
+          } finally {
+            realtimeRelays.delete(relaySession);
+            resolveRelayTerminal();
+          }
+        },
+      });
+      concurrencyLease.signal.addEventListener("abort", relaySession.stop, { once: true });
+      recordRealtimeSessionStarted("websocket");
+      return upgraded.response;
+    }
+    const modelId = c.req.query("model")?.trim();
+    if (!modelId) {
+      throw new RealtimeProtocolError(
+        "model_required",
+        "A Realtime model must be selected explicitly",
+        422,
+      );
+    }
+    const subject = accessSubject(c);
+    let targets = await resolveRealtimeTargets(modelId, "realtime", subject);
+    if (!targets.length) {
+      targets = await resolveRealtimeTargets(modelId, "realtime_transcription", subject);
+    }
+    if (!targets.length) {
+      targets = await resolveRealtimeTargets(modelId, "realtime_translation", subject);
+    }
+    if (!targets.length) {
+      throw new RealtimeProtocolError(
+        "model_not_found",
+        "Realtime model is unavailable or not entitled",
+        404,
+      );
+    }
+    const startedAt = Date.now();
+    const runId = crypto.randomUUID();
+    const reserveMicros = Math.max(...targets.map((target) =>
+      priceUsage(
+        target.info,
+        target.info.contextWindow,
+        target.info.contextWindow,
+        { reasoningTokens: target.info.contextWindow },
+      ).costMicros
+    ));
+    const concurrencyLease = await claimAudioSlot(c.get("user").id);
+    let usageRun;
+    try {
+      usageRun = await repo.reserve(
+        c.get("user").id,
+        runId,
+        modelId,
+        reserveMicros,
+        targets[0].provider.slug,
+        c.get("tokenId"),
+        pricingSnapshot(targets[0].price),
+      );
+    } catch (error) {
+      await concurrencyLease.release();
+      throw error;
+    }
+    if (!usageRun.runLeaseToken) {
+      await repo.refund(runId, "Realtime execution lease was not created");
+      await concurrencyLease.release();
+      throw new RealtimeProtocolError(
+        "execution_lease_missing",
+        "Realtime execution lease was not created",
+        500,
+      );
+    }
+    let upstream;
+    let resolved;
+    try {
+      const connected = await attemptRealtimeTargets(
+        targets,
+        async (target) => {
+          try {
+            return await (options.realtimeWebSocketConnect ?? connectRealtimeWebSocket)({
+              baseUrl: target.upstream.baseUrl!,
+              apiKey: target.upstream.apiKey!,
+              upstreamModel: target.registryModel.upstreamModelId,
+              signal: c.req.raw.signal,
+            });
+          } catch (error) {
+            if (error instanceof Error && error.name === "AbortError") throw error;
+            throw new ProviderAttemptError(
+              error instanceof Error ? error.message : "Realtime WebSocket connection failed",
+              { category: "network", transient: true },
+            );
+          }
+        },
+      );
+      upstream = connected.result;
+      resolved = connected.target;
+    } catch {
+      await repo.refund(runId, "Realtime provider connection failed");
+      await concurrencyLease.release();
+      throw new RealtimeProtocolError(
+        "provider_unavailable",
+        "Realtime provider connection failed",
+        502,
+      );
+    }
+    let upgraded: ReturnType<typeof Deno.upgradeWebSocket>;
+    try {
+      upgraded = Deno.upgradeWebSocket(c.req.raw, { idleTimeout: 120 });
+    } catch (error) {
+      upstream.terminate();
+      await repo.refund(runId, "Realtime WebSocket upgrade failed");
+      await concurrencyLease.release();
+      throw error;
+    }
+    let inputTokens = 0;
+    let cachedInputTokens = 0;
+    let outputTokens = 0;
+    let resolveRelayTerminal!: () => void;
+    const relaySession = {
+      stop: (() => undefined) as () => void,
+      terminal: new Promise<void>((resolve) => resolveRelayTerminal = resolve),
+    };
+    realtimeRelays.add(relaySession);
+    const usageLease = keepApiLeaseAlive(
+      undefined,
+      { runId, leaseToken: usageRun.runLeaseToken },
+      () => relaySession.stop(),
+    );
+    const maximumTimer = setTimeout(
+      () => relaySession.stop(),
+      realtimeMaxSessionSeconds * 1_000,
+    );
+    relaySession.stop = relayRealtimeWebSocket(upgraded.socket, upstream, {
+      publicModel: modelId,
+      upstreamModel: resolved.registryModel.upstreamModelId,
+      onServerEvent(event) {
+        const usage = realtimeUsage(event);
+        if (!usage) return;
+        inputTokens += usage.inputTokens;
+        cachedInputTokens += usage.cachedInputTokens;
+        outputTokens += usage.outputTokens;
+      },
+      async onClose(details) {
+        clearTimeout(maximumTimer);
+        recordRealtimeSessionEnded(
+          "websocket",
+          details.code === 1000
+            ? "completed"
+            : details.code === 1001 && realtimeDraining
+            ? "server_shutdown"
+            : details.code === 1001
+            ? "client_closed"
+            : details.code === 1013
+            ? "capacity_lost"
+            : "failed",
+          details.clientEvents,
+          details.serverEvents,
+        );
+        const cost = priceUsage(resolved.info, inputTokens, outputTokens, {
+          cachedInputTokens,
+        }).costMicros;
+        try {
+          await usageLease.stop();
+          await repo.settle(runId, cost, inputTokens, outputTokens, Date.now() - startedAt);
+        } catch {
+          // Durable reconciliation owns any active reservation left by an accounting outage.
+        } finally {
+          try {
+            await concurrencyLease.release();
+          } finally {
+            realtimeRelays.delete(relaySession);
+            resolveRelayTerminal();
+          }
+        }
+      },
+    });
+    recordRealtimeSessionStarted("websocket");
+    concurrencyLease.signal.addEventListener("abort", relaySession.stop, { once: true });
+    return upgraded.response;
+  });
+  const drainRealtimeSessions = async () => {
+    realtimeDraining = true;
+    const calls = [...realtimeCalls.values()];
+    const relays = [...realtimeRelays];
+    const hangups = calls.map((call) => {
+      clearTimeout(call.maximumTimer);
+      call.sideband.close(1001, "Realtime server is shutting down");
+      return proxyRealtimeHttp({
+        baseUrl: call.resolved.upstream.baseUrl!,
+        apiKey: call.resolved.upstream.apiKey!,
+        path: `/realtime/calls/${encodeURIComponent(call.upstreamCallId)}/hangup`,
+        fetch: options.realtimeFetch,
+      }).catch(() => undefined);
+    });
+    for (const relay of relays) relay.stop();
+    await Promise.allSettled([
+      ...hangups,
+      ...calls.map((call) => call.terminal),
+      ...relays.map((relay) => relay.terminal),
+    ]);
+  };
   const replayResponse = (request: ApiIdempotencyRequest) => {
     // A streaming request can fail before the first event is exposed. In that case the
     // original response is the stored JSON error, not an empty event stream.
@@ -8054,6 +9216,7 @@ export function createApp(options: AppOptions = {}) {
   const keepApiLeaseAlive = (
     idempotency?: { id: string; leaseToken: string },
     runLease?: { runId: string; leaseToken: string },
+    onFailure?: (error: unknown) => void | Promise<void>,
   ) => {
     let stopped = false;
     let heartbeatError: unknown;
@@ -8084,6 +9247,7 @@ export function createApp(options: AppOptions = {}) {
           }
         } catch (error) {
           heartbeatError = error;
+          void onFailure?.(error);
         }
       });
       return inFlight;
@@ -12389,6 +13553,12 @@ export function createApp(options: AppOptions = {}) {
         error.status as 400,
       );
     }
+    if (error instanceof RealtimeProtocolError) {
+      return c.json(
+        openAIError(error.message, error.code, error.status),
+        error.status as 400,
+      );
+    }
     if (error instanceof BackupServiceError) {
       const status = error.code === "not_found"
         ? 404
@@ -12434,6 +13604,7 @@ export function createApp(options: AppOptions = {}) {
     toolExecutionService: toolExecution,
     recoverFileUploads,
     drainIdentityDeliveries,
+    drainRealtimeSessions,
     replayQuota,
   };
 }

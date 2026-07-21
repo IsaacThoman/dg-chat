@@ -5,6 +5,7 @@
   "imports": {
     "@fastify/busboy": "npm:@fastify/busboy@3.2.0",
     "@types/node": "npm:@types/node@22.15.3",
+    "@types/ws": "npm:@types/ws@8.18.1",
     "ajv": "npm:ajv@8.20.0",
     "ajv-formats": "npm:ajv-formats@3.0.1",
     "fflate": "npm:fflate@0.8.3",
@@ -14,6 +15,7 @@
     "ioredis": "npm:ioredis@5.8.2",
     "nodemailer": "npm:nodemailer@9.0.3",
     "undici": "npm:undici@7.28.0",
+    "ws": "npm:ws@8.21.1",
     "zod": "npm:zod@4.1.12"
   },
   "tasks": {

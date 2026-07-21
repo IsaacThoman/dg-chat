@@ -5,6 +5,8 @@ import {
   createApiMetrics,
   createWorkerMetrics,
   recordProviderAttemptMetric,
+  recordRealtimeSessionEnded,
+  recordRealtimeSessionStarted,
   startMetricsServer,
 } from "../mod.ts";
 import { Counter, Gauge, Histogram, MetricsRegistry } from "./metrics.ts";
@@ -62,6 +64,8 @@ Deno.test("HTTP metrics collapse attacker-controlled methods and paths into boun
   );
   await response.body?.cancel();
   recordProviderAttemptMetric("failed", "open");
+  recordRealtimeSessionStarted("websocket");
+  recordRealtimeSessionEnded("websocket", "completed", 2, 3);
   const output = metrics.registry.render();
   assertMatch(
     output,
@@ -79,6 +83,15 @@ Deno.test("HTTP metrics collapse attacker-controlled methods and paths into boun
   assertMatch(
     output,
     /dg_chat_provider_attempts_total\{breaker_after="open",outcome="failed"\} 1/u,
+  );
+  assertMatch(output, /dg_chat_realtime_sessions_active\{transport="websocket"\} 0/u);
+  assertMatch(
+    output,
+    /dg_chat_realtime_sessions_total\{outcome="completed",transport="websocket"\} 1/u,
+  );
+  assertMatch(
+    output,
+    /dg_chat_realtime_events_total\{direction="server",transport="websocket"\} 3/u,
   );
 });
 

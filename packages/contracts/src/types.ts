@@ -95,6 +95,9 @@ export const MODEL_CAPABILITIES = [
   "transcription",
   "translation",
   "speech",
+  "realtime",
+  "realtime_transcription",
+  "realtime_translation",
   "image_generation",
   "image_editing",
 ] as const;

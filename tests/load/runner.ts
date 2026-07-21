@@ -396,7 +396,10 @@ async function streamsPhase(): Promise<Record<string, Json>> {
       completedAtMs: 0,
     }))
   );
-  const requiredOpen = Math.min(2, profile.streams);
+  // Do not publish the chaos marker while part of the bounded cohort is still negotiating. The
+  // host uses per-replica in-flight gauges to prove both API replicas own live bodies before it
+  // restarts one; publishing after only two opens made that proof race slower CI machines.
+  const requiredOpen = profile.streams;
   const openDeadline = Date.now() + 30_000;
   while (currentlyOpen < requiredOpen && Date.now() < openDeadline) {
     await abortableDelay(25, signal);
@@ -415,8 +418,9 @@ async function streamsPhase(): Promise<Record<string, Json>> {
   invariant(typeof chaos.restartedContainer === "string", "host restarted one API container");
   invariant(
     typeof chaos.activeMetricInstance === "string" &&
-      Number(chaos.activeRequestsBeforeRestart) >= 1,
-    "host restarted the API replica that exposed an active streaming request",
+      Number(chaos.activeRequestsBeforeRestart) >= 1 &&
+      Number(chaos.activeReplicaCount) === 2,
+    "host proved both API replicas owned streams and restarted one active replica",
   );
   const initial = await Promise.all(attempts);
   const replayed = await Promise.all(

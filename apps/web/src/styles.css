@@ -1145,6 +1145,77 @@ kbd {
   gap: 4px;
   align-items: center;
 }
+.realtime-voice {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.realtime-voice > select {
+  max-width: 120px;
+  height: 30px;
+  padding: 0 22px 0 7px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text-muted);
+  background: var(--panel);
+  font-size: 9px;
+}
+.realtime-start {
+  color: var(--green);
+}
+.realtime-session-panel {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 34px;
+  padding: 3px 5px 3px 8px;
+  border: 1px solid color-mix(in srgb, var(--green) 35%, var(--line));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--green) 8%, var(--panel));
+  font-size: 11px;
+}
+.realtime-session-panel button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 26px;
+  padding: 4px 7px;
+  font-size: 10px;
+}
+.realtime-session-panel p {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 5;
+  width: min(360px, 80vw);
+  max-height: 120px;
+  overflow: auto;
+  margin: 0;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  box-shadow: var(--shadow-md);
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+.realtime-pulse {
+  display: grid;
+  color: var(--green);
+  animation: realtime-pulse 1.5s ease-in-out infinite;
+}
+@keyframes realtime-pulse {
+  50% {
+    opacity: 0.45;
+    transform: scale(0.92);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .realtime-pulse {
+    animation: none;
+  }
+}
 .speech-preferences {
   display: inline-flex;
   align-items: center;

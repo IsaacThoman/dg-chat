@@ -11,7 +11,10 @@ images; administration and analytics; and a secure Docker Compose deployment.
 
 The web application must be polished, accessible, responsive, and installable as a PWA. There is no
 native mobile application. Conversations are private by default. Live collaborative editing,
-Assistants, batches, fine-tuning, and realtime API compatibility remain intentionally out of scope.
+Assistants, batches, and fine-tuning remain intentionally out of scope. OpenAI Realtime API
+compatibility is required, including production-ready WebSocket and browser WebRTC transports,
+Realtime conversation and transcription sessions, bidirectional client/server events, audio,
+interruptions, tools, accounting, authorization, and distributed lifecycle handling.
 
 ## Recovered project status
 
@@ -20,12 +23,11 @@ when work resumed on 2026-07-21, so the exact task transcript could not be read.
 original plan was recovered from the related planning task, and the repository/GitHub state provides
 the durable implementation handoff.
 
-- `main` currently includes merged work through PR #30 (`7dd7e91`).
-- Draft PR #31, `codex/chat-session-continuity`, is the active continuation and now includes the
-  recovered completion work.
-- Final verification covers 428 web tests, 1,020 non-PostgreSQL Deno tests, isolated PostgreSQL and
-  Redis integration suites, 228 browser journeys, type/lint/format gates, and a production PWA
-  build.
+- `main` includes the recovered completion work through merged PR #31. PR #32, `codex/realtime-api`,
+  is the Realtime compatibility release candidate.
+- Final Realtime verification covers 431 web tests, 1,028 non-PostgreSQL Deno tests, isolated
+  PostgreSQL and Redis integration suites, official OpenAI Realtime SDK coverage, desktop/mobile
+  WebRTC browser journeys, type/lint/format gates, and a production PWA build.
 - The inherited lint and storage-cleanup failures are fixed. A later PostgreSQL CI run exposed stale
   attachment-inspection fixtures and an unclassified repository timeout; both are fixed and covered
   by the spawned-worker shutdown/recovery tests.
@@ -74,14 +76,36 @@ the durable implementation handoff.
 - Re-run dependency, secret, filesystem, SBOM, and image vulnerability checks.
 - Ensure documentation, environment examples, and operator runbooks match verified behavior.
 
-## Completion record and exact evidence
+### 5. OpenAI Realtime API compatibility — completed
 
-PR #31 completed the roadmap on 2026-07-21. The release-candidate source revision is `7d1c5d3`. The
-retained-chat architecture now preserves bounded chat sessions, drafts, uploads, immutable edits,
-streams, prompt queues, voice resources, media preferences, and one-time share links across all
-workspace routes. Worker recovery, database timeout handling, attachment claims, container builds,
-and current GitHub Actions runtimes were also hardened. The requested shadcn preset `b6ZjldV0i` is
-the documented and installed design-system foundation.
+- Expose the current GA `/v1/realtime` WebSocket event protocol for trusted server clients and media
+  pipelines, authenticated with owner-scoped DG Chat personal API tokens.
+- Expose the current GA WebRTC REST surface: `/v1/realtime/calls`, client secrets, conversation and
+  transcription session creation, translation client secrets, and call accept/reject/hangup/refer
+  controls. Browser clients must not receive long-lived provider credentials; server sideband
+  connections retain policy, tool, and accounting control.
+- Implement Realtime conversation, transcription, and translation session types, text/audio input,
+  streamed text/audio/transcript output, VAD and push-to-talk, interruption/cancellation/truncation,
+  tools, session updates, conversation-item lifecycle, and structured protocol errors.
+- Route only to entitled, enabled, explicitly priced Realtime-capable registry models. Apply the
+  existing provider fallback, circuit-breaker, credit reservation/settlement, rate-limit, audit,
+  safety-identifier, and tenancy boundaries without silently degrading unsupported events.
+- Add bounded session lifetime, message/audio/event sizes, backpressure, idle timeouts, disconnect
+  cleanup, multi-replica coordination, graceful shutdown, observability, and privacy-safe logs.
+  Reliability comes from protocol-native sequence tracking, idempotent terminal accounting,
+  heartbeats, replay/resynchronization where the public protocol permits it, and explicit
+  close/error semantics—not an incompatible Socket.IO wrapper around the OpenAI WebSocket endpoint.
+- Verify protocol behavior with official event schemas and SDK/client flows, isolated integration
+  tests, adversarial tests, bounded load, WebRTC browser journeys, and fresh/upgrade Compose runs.
+
+## Prior completion record and exact evidence
+
+PR #31 completed roadmap items 1–4 on 2026-07-21. The release-candidate source revision is
+`7d1c5d3`. The retained-chat architecture now preserves bounded chat sessions, drafts, uploads,
+immutable edits, streams, prompt queues, voice resources, media preferences, and one-time share
+links across all workspace routes. Worker recovery, database timeout handling, attachment claims,
+container builds, and current GitHub Actions runtimes were also hardened. The requested shadcn
+preset `b6ZjldV0i` is the documented and installed design-system foundation.
 
 Exact GitHub evidence for that revision:
 
@@ -99,10 +123,40 @@ Exact GitHub evidence for that revision:
   passed the multi-replica concurrency, rate-limit, accounting, and recovery invariants.
 
 Fresh local production Compose verification independently reproduced the hosted Knowledge failure
-and proved its corrected desktop and mobile journeys before the final source revision was pushed. No
-known missing in-scope feature, unresolved defect, failing required gate, unreviewed placeholder, or
-undocumented release risk remains at this handoff. The intentional exclusions under the overarching
-goal remain unchanged.
+and proved its corrected desktop and mobile journeys before the final source revision was pushed.
+That handoff's completeness claim applied to the earlier scope and was superseded when Realtime API
+compatibility became required on 2026-07-21.
+
+## Realtime completion record and exact evidence
+
+PR #32 completed roadmap item 5 on 2026-07-21. Implementation revision `638df74` adds the raw GA
+Realtime WebSocket surface, WebRTC call and control surfaces, encrypted short-lived browser
+credentials, conversation/transcription/translation session creation, first-party live voice,
+distributed capacity and accounting leases, initial provider failover, circuit breaking, bounded
+backpressure and session lifetime, sideband usage capture, graceful draining, and privacy-safe
+metrics. Mid-session provider migration is deliberately not claimed: an upstream session's ephemeral
+audio and provider state cannot be losslessly transferred, so reconnection establishes a new media
+session.
+
+Exact verification evidence for that revision:
+
+- [CI run 29844825310](https://github.com/IsaacThoman/dg-chat/actions/runs/29844825310) passed
+  format, lint, types, 1,028 Deno tests, 431 web tests, the production build, all three container
+  builds, isolated PostgreSQL/concurrency, Redis, PostgreSQL/S3 backup roundtrip, official OpenAI
+  SDK contracts, production Compose startup/restart, 113 desktop Chromium journeys with two
+  intentional exclusions, and all 115 mobile Chromium journeys.
+- [Security run 29844825411](https://github.com/IsaacThoman/dg-chat/actions/runs/29844825411) passed
+  secret, dependency, filesystem, image, SBOM, and vulnerability checks.
+- [Bounded load run 29844825334](https://github.com/IsaacThoman/dg-chat/actions/runs/29844825334)
+  passed multi-replica concurrency, rate-limit, accounting, shutdown, and recovery invariants.
+- A fresh local production Compose build passed readiness and an API-container restart. The
+  deterministic Realtime browser journey passed desktop and mobile Chromium, covering WebRTC
+  negotiation, ordered data-channel transcript events, interruption, reconnect, hangup, and media
+  cleanup. The official `OpenAIRealtimeWS` client passed the raw WebSocket integration test.
+
+The overarching goal is complete: every roadmap item and revised release gate is satisfied with no
+known missing in-scope feature, unresolved defect, failing required gate, undocumented release risk,
+or unreviewed placeholder.
 
 ## Definition of done
 
@@ -116,9 +170,11 @@ The application is complete for the agreed scope when:
    or placeholder states.
 5. Security boundaries for auth, credits, uploads, secrets, tools, network access, and tenancy have
    automated adversarial coverage.
-6. The project docs record supported behavior, intentional exclusions, residual operational risks,
+6. Realtime WebSocket and WebRTC clients pass the documented GA event lifecycle, audio,
+   transcription, interruption, tool, reconnect, accounting, and multi-replica safety contracts.
+7. The project docs record supported behavior, intentional exclusions, residual operational risks,
    and exact verification evidence.
-7. All completion work is committed and pushed in reviewable milestones; unrelated local files are
+8. All completion work is committed and pushed in reviewable milestones; unrelated local files are
    never included.
 
 Software can always be extended, so "no possible improvements" is operationalized here as no known

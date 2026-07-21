@@ -1243,10 +1243,12 @@ try {
     },
     iteration: async () => {
       await runDatabaseOperation(() => workerLiveness.current!.markProgress());
+      if (shutdownSignal.aborted) return;
       if (Date.now() >= nextGeneratedCleanupSweep) {
         await runDatabaseOperation(enqueueStaleGeneratedObjectCleanup);
         nextGeneratedCleanupSweep = Date.now() + generatedCleanupSweepMs;
       }
+      if (shutdownSignal.aborted) return;
       if (Date.now() >= nextTemporaryChatPurge) {
         try {
           const purge = await runDatabaseOperation(() =>
@@ -1266,6 +1268,7 @@ try {
           nextTemporaryChatPurge = Date.now() + temporaryLifecycle.purgeIntervalMs;
         }
       }
+      if (shutdownSignal.aborted) return;
       if (Date.now() >= nextRetentionScheduleCheck) {
         try {
           const schedule = await runDatabaseOperation(() =>
@@ -1294,6 +1297,7 @@ try {
           logOperationalFailure("worker_retention_scheduler");
         }
       }
+      if (shutdownSignal.aborted) return;
       const job = await runDatabaseOperation(() => claimJob(sql, workerId, jobLeaseSeconds));
       if (!job) {
         await abortableDelay(pollMs, shutdownSignal);
@@ -1407,13 +1411,36 @@ try {
   let closureProven = false;
   try {
     workerLiveness.current?.stopHeartbeat();
-    await signalDrainPromise;
-    await runShutdownDatabaseOperation(() => workerLiveness.current!.markDraining()).catch(() =>
-      undefined
+    if (signalDrainPromise) {
+      await signalDrainPromise;
+    } else {
+      await runShutdownDatabaseOperation(() => workerLiveness.current!.markDraining()).catch(() =>
+        undefined
+      );
+    }
+    // Terminal liveness is observational, not a claim/accounting settlement. Give its normally
+    // sub-millisecond UPDATE whatever remains of the absolute shutdown window instead of refusing
+    // to start it merely because a full retry attempt no longer fits.
+    const stoppedOperation = operationSignal(
+      new AbortController().signal,
+      closeDeadline,
+      () => new DOMException("Worker stopped-state deadline elapsed", "TimeoutError"),
     );
-    await runShutdownDatabaseOperation(() => workerLiveness.current!.markStopped()).catch(() =>
-      undefined
-    );
+    try {
+      await raceAbort(
+        runDatabaseOperation(() => workerLiveness.current!.markStopped()),
+        stoppedOperation.signal,
+      );
+    } catch (error) {
+      console.warn(JSON.stringify({
+        level: "warn",
+        message: "Worker terminal liveness update failed",
+        workerId,
+        error: error instanceof Error ? error.name : "UnknownError",
+      }));
+    } finally {
+      stoppedOperation.dispose();
+    }
     await closeResourcesBeforeDeadline({
       graceful: [
         () => sql.end({ timeout: 5 }),

@@ -195,6 +195,9 @@ Deno.test("admin security and billing command schemas are strict and bounded", (
 Deno.test("model capabilities are canonical and reject near-miss values", () => {
   assertEquals(new Set(MODEL_CAPABILITIES).size, MODEL_CAPABILITIES.length);
   assertEquals(isModelCapability("transcription"), true);
+  assertEquals(isModelCapability("realtime"), true);
+  assertEquals(isModelCapability("realtime_transcription"), true);
+  assertEquals(isModelCapability("realtime_translation"), true);
   assertEquals(isModelCapability("image_editing"), true);
   assertEquals(isModelCapability("image_edit"), false);
   assertEquals(isModelCapability("transcripton"), false);
