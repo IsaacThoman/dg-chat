@@ -45,7 +45,11 @@ provider credential, and effective price. Browser voice uses cookie-authenticate
 as encrypted, short-lived, model-bound DG tokens and revalidate their originating personal token
 when used, so token revocation remains authoritative and provider credentials never become browser
 configuration. Realtime total input/output tokens—including audio-token details—use the model's
-configured input, cached-input, and output rates. See `REALTIME_ARCHITECTURE.md`.
+configured input, cached-input, and output rates. Before a session is established, retryable HTTP or
+WebSocket startup failures can route to the next entitled, priced target using the configured
+provider circuit breaker. Active sessions are never silently migrated because ephemeral media and
+provider state cannot be losslessly transferred; reconnect creates a new media session. See
+`REALTIME_ARCHITECTURE.md`.
 
 ### Deliberate compatibility boundaries
 

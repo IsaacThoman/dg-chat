@@ -47,8 +47,9 @@ reliability as an application and accounting property:
 - make reservation and terminal settlement idempotent so reconnects cannot double-charge;
 - retain server-side call ownership and short-lived client-secret metadata in shared storage so a
   different replica can authorize control requests;
-- use the Realtime sideband connection for server-owned tools, policy enforcement, usage capture,
-  and interruption/cancellation state;
+- use the Realtime sideband connection for policy enforcement, authoritative usage capture,
+  interruption/cancellation state, and optional server-owned tool coordination; standard tool events
+  also pass unchanged so the initiating client can execute functions and return outputs;
 - expose metrics for active sessions, event/audio bytes, backpressure, abnormal closes, upstream
   errors, latency, and unsettled accounting;
 - on reconnect, resynchronize from durable conversation state when supported. The server must never
