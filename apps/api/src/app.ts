@@ -2719,6 +2719,11 @@ export function createApp(options: AppOptions = {}) {
         return { target, result };
       } catch (error) {
         lastError = error;
+        const classified = classifyProviderError(error);
+        if (!classified.transient) {
+          await circuitBreaker.recordSuccess(target.provider.id, permit).catch(() => undefined);
+          throw error;
+        }
         await circuitBreaker.recordFailure(target.provider.id, permit, breakerPolicy).catch(
           () => undefined,
         );
@@ -9027,13 +9032,22 @@ export function createApp(options: AppOptions = {}) {
     try {
       const connected = await attemptRealtimeTargets(
         targets,
-        async (target) =>
-          await (options.realtimeWebSocketConnect ?? connectRealtimeWebSocket)({
-            baseUrl: target.upstream.baseUrl!,
-            apiKey: target.upstream.apiKey!,
-            upstreamModel: target.registryModel.upstreamModelId,
-            signal: c.req.raw.signal,
-          }),
+        async (target) => {
+          try {
+            return await (options.realtimeWebSocketConnect ?? connectRealtimeWebSocket)({
+              baseUrl: target.upstream.baseUrl!,
+              apiKey: target.upstream.apiKey!,
+              upstreamModel: target.registryModel.upstreamModelId,
+              signal: c.req.raw.signal,
+            });
+          } catch (error) {
+            if (error instanceof Error && error.name === "AbortError") throw error;
+            throw new ProviderAttemptError(
+              error instanceof Error ? error.message : "Realtime WebSocket connection failed",
+              { category: "network", transient: true },
+            );
+          }
+        },
       );
       upstream = connected.result;
       resolved = connected.target;
