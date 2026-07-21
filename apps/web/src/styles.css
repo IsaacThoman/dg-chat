@@ -1542,8 +1542,12 @@ kbd {
   text-align: center;
 }
 .mermaid-loading {
-  background: linear-gradient(100deg, transparent 20%, color-mix(in srgb, var(--hover) 70%,
-    transparent) 48%, transparent 75%);
+  background: linear-gradient(
+    100deg,
+    transparent 20%,
+    color-mix(in srgb, var(--hover) 70%, transparent) 48%,
+    transparent 75%
+  );
   background-size: 210% 100%;
   animation: rich-output-shimmer 1.4s linear infinite;
 }
@@ -2307,8 +2311,11 @@ kbd {
   padding: 44px clamp(20px, 5vw, 72px) 72px;
   color: var(--ink);
   background:
-    radial-gradient(circle at 88% 4%, color-mix(in srgb, var(--purple) 9%, transparent), transparent
-    24rem),
+    radial-gradient(
+    circle at 88% 4%,
+    color-mix(in srgb, var(--purple) 9%, transparent),
+    transparent 24rem
+  ),
     var(--bg);
 }
 .community-page-header,
@@ -5749,7 +5756,7 @@ kbd {
   font: inherit;
 }
 .ops-job-filters {
-  grid-template-columns: minmax(140px, .7fr) 1fr 1.5fr auto;
+  grid-template-columns: minmax(140px, 0.7fr) 1fr 1.5fr auto;
 }
 .ops-announcer:empty {
   display: none;
@@ -5789,7 +5796,7 @@ kbd {
 }
 .ops-chart-layout {
   display: grid;
-  grid-template-columns: minmax(0, 1.4fr) minmax(280px, .8fr);
+  grid-template-columns: minmax(0, 1.4fr) minmax(280px, 0.8fr);
   gap: 12px;
 }
 .ops-chart,
@@ -6369,8 +6376,11 @@ kbd {
   height: 520px;
   right: -200px;
   bottom: -300px;
-  background: radial-gradient(circle, color-mix(in srgb, var(--green) 20%, var(--bg)), transparent
-    68%);
+  background: radial-gradient(
+    circle,
+    color-mix(in srgb, var(--green) 20%, var(--bg)),
+    transparent 68%
+  );
 }
 .auth-card {
   box-sizing: border-box;
@@ -7073,7 +7083,7 @@ kbd {
   .admin-user-summary {
     grid-template-columns: auto minmax(0, 1fr);
   }
-  .admin-user-summary > :nth-child(n + 3) {
+  .admin-user-summary > :nth-child(n+3) {
     grid-column: 2;
   }
   .audit-filters {

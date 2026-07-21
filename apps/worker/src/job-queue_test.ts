@@ -284,7 +284,11 @@ Deno.test({
     } finally {
       await sql`DELETE FROM jobs WHERE id=${jobId}`;
       await sql`DELETE FROM attachments WHERE id=${attachmentId}`;
-      await sql`DELETE FROM users WHERE id=${userId}`;
+      await withAuditTestMaintenance(sql, async (tx) => {
+        await tx`DELETE FROM attachment_storage_usage WHERE owner_id=${userId}`;
+        await tx`DELETE FROM attachment_storage_blobs WHERE owner_id=${userId}`;
+        await tx`DELETE FROM users WHERE id=${userId}`;
+      });
       await sql.end();
     }
   },

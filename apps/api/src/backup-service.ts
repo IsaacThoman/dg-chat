@@ -40,6 +40,7 @@ import type {
 } from "./backup-admin.ts";
 import type { PrivilegedBackupSecretKeyring } from "./backup-secret-keyring.ts";
 import type { ProviderSecretEnvelope, ProviderSecretKeyring } from "./provider-secrets.ts";
+import { Buffer } from "node:buffer";
 
 const BACKUP_MIME = "application/vnd.dg-chat.backup";
 const PROVIDER_SECRETS_MIME = "application/vnd.dg-chat.provider-secrets";

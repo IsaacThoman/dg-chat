@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 import type { ProviderSecretRestoreState } from "../../apps/web/src/types.ts";
+import { Buffer } from "node:buffer";
 
 async function mockAdminSession(page: import("@playwright/test").Page) {
   await page.route("**/api/**", async (route) => {

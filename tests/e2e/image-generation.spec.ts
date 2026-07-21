@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { bootstrap, createChat, login } from "./helpers.ts";
+import { Buffer } from "node:buffer";
 
 const pngDataUrl =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZQmcAAAAASUVORK5CYII=";

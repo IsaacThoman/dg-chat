@@ -715,11 +715,12 @@ export function CommunityView({
   const [online, setOnline] = useState(() => typeof navigator === "undefined" || navigator.onLine);
   useEffect(() => {
     const update = () => setOnline(navigator.onLine);
-    window.addEventListener("online", update);
-    window.addEventListener("offline", update);
+    const browserWindow = globalThis.window;
+    browserWindow.addEventListener("online", update);
+    browserWindow.addEventListener("offline", update);
     return () => {
-      window.removeEventListener("online", update);
-      window.removeEventListener("offline", update);
+      browserWindow.removeEventListener("online", update);
+      browserWindow.removeEventListener("offline", update);
     };
   }, []);
   return (
