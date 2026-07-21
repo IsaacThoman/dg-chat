@@ -202,10 +202,13 @@ import {
 import { providerResponseByteLimit } from "./provider-limits.ts";
 import { estimateInputTokens, priceUsage, reservationPrice } from "./pricing.ts";
 import {
+  connectRealtimeWebSocket,
   proxyRealtimeHttp,
   REALTIME_MAX_HTTP_BODY_BYTES,
   type RealtimeCapability,
   RealtimeProtocolError,
+  realtimeUsage,
+  relayRealtimeWebSocket,
   rewriteRealtimeModels,
 } from "./realtime.ts";
 import { responseObject, responseRequestFields } from "./responses.ts";
@@ -397,6 +400,7 @@ export interface AppOptions {
   speechFetch?: typeof fetch;
   imageFetch?: typeof fetch;
   realtimeFetch?: typeof fetch;
+  realtimeWebSocketConnect?: typeof connectRealtimeWebSocket;
   imageUrlSigningSecret?: string;
   audioConcurrencyLimiter?: AudioConcurrencyLimiter;
   imageConcurrencyLimiter?: AudioConcurrencyLimiter;
@@ -8172,6 +8176,97 @@ export function createApp(options: AppOptions = {}) {
         return { model: session.model, capability: "realtime_translation" };
       }),
   );
+  app.get("/v1/realtime", requireScope("chat:write"), async (c) => {
+    if (c.req.header("upgrade")?.toLowerCase() !== "websocket") {
+      throw new RealtimeProtocolError(
+        "websocket_required",
+        "The Realtime endpoint requires a WebSocket upgrade",
+        426,
+      );
+    }
+    const modelId = c.req.query("model")?.trim();
+    if (!modelId) {
+      throw new RealtimeProtocolError(
+        "model_required",
+        "A Realtime model must be selected explicitly",
+        422,
+      );
+    }
+    const resolved = await resolveRealtimeRuntimeModel(modelId, "realtime", accessSubject(c));
+    if (!resolved?.upstream || !resolved.registryModel || !resolved.price) {
+      throw new RealtimeProtocolError(
+        "model_not_found",
+        "Realtime model is unavailable or not entitled",
+        404,
+      );
+    }
+    const startedAt = Date.now();
+    const runId = crypto.randomUUID();
+    const reserveMicros = priceUsage(
+      resolved.info,
+      resolved.info.contextWindow,
+      resolved.info.contextWindow,
+      { reasoningTokens: resolved.info.contextWindow },
+    ).costMicros;
+    await repo.reserve(
+      c.get("user").id,
+      runId,
+      modelId,
+      reserveMicros,
+      resolved.provider?.slug,
+      c.get("tokenId"),
+      pricingSnapshot(resolved.price),
+    );
+    let upstream;
+    try {
+      upstream = await (options.realtimeWebSocketConnect ?? connectRealtimeWebSocket)({
+        baseUrl: resolved.upstream.baseUrl!,
+        apiKey: resolved.upstream.apiKey!,
+        upstreamModel: resolved.registryModel.upstreamModelId,
+        signal: c.req.raw.signal,
+      });
+    } catch {
+      await repo.refund(runId, "Realtime provider connection failed");
+      throw new RealtimeProtocolError(
+        "provider_unavailable",
+        "Realtime provider connection failed",
+        502,
+      );
+    }
+    let upgraded: ReturnType<typeof Deno.upgradeWebSocket>;
+    try {
+      upgraded = Deno.upgradeWebSocket(c.req.raw, { idleTimeout: 120 });
+    } catch (error) {
+      upstream.terminate();
+      await repo.refund(runId, "Realtime WebSocket upgrade failed");
+      throw error;
+    }
+    let inputTokens = 0;
+    let cachedInputTokens = 0;
+    let outputTokens = 0;
+    relayRealtimeWebSocket(upgraded.socket, upstream, {
+      publicModel: modelId,
+      upstreamModel: resolved.registryModel.upstreamModelId,
+      onServerEvent(event) {
+        const usage = realtimeUsage(event);
+        if (!usage) return;
+        inputTokens += usage.inputTokens;
+        cachedInputTokens += usage.cachedInputTokens;
+        outputTokens += usage.outputTokens;
+      },
+      async onClose() {
+        const cost = priceUsage(resolved.info, inputTokens, outputTokens, {
+          cachedInputTokens,
+        }).costMicros;
+        try {
+          await repo.settle(runId, cost, inputTokens, outputTokens, Date.now() - startedAt);
+        } catch {
+          // Durable reconciliation owns any active reservation left by an accounting outage.
+        }
+      },
+    });
+    return upgraded.response;
+  });
   const replayResponse = (request: ApiIdempotencyRequest) => {
     // A streaming request can fail before the first event is exposed. In that case the
     // original response is the stored JSON error, not an empty event stream.

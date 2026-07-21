@@ -1,9 +1,17 @@
-import { isSpecialUseIp, pinnedProviderFetch } from "./provider_transport.ts";
+import { type RawData, WebSocket as NodeWebSocket } from "ws";
+import {
+  createPinnedLookup,
+  isSpecialUseIp,
+  pinnedProviderFetch,
+  resolvePinnedAddress,
+} from "./provider_transport.ts";
 
 export const REALTIME_MAX_EVENT_BYTES = 1_048_576;
 export const REALTIME_MAX_HTTP_BODY_BYTES = 2_097_152;
 export const REALTIME_MAX_HTTP_RESPONSE_BYTES = 4_194_304;
 export const REALTIME_HTTP_TIMEOUT_MS = 30_000;
+export const REALTIME_WEBSOCKET_CONNECT_TIMEOUT_MS = 10_000;
+export const REALTIME_MAX_BUFFERED_BYTES = 4_194_304;
 
 export type RealtimeCapability =
   | "realtime"
@@ -206,6 +214,198 @@ export interface RealtimeHttpProxyInput {
   signal?: AbortSignal;
   fetch?: typeof fetch;
   timeoutMs?: number;
+}
+
+export interface RealtimeWebSocketConnectInput {
+  baseUrl: string;
+  apiKey: string;
+  upstreamModel: string;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}
+
+export type RealtimeUpstreamSocket = NodeWebSocket;
+
+/** Opens an authenticated, DNS-pinned, redirect-free provider Realtime WebSocket. */
+export async function connectRealtimeWebSocket(
+  input: RealtimeWebSocketConnectInput,
+): Promise<RealtimeUpstreamSocket> {
+  const endpoint = realtimeProviderEndpoint(input.baseUrl);
+  endpoint.protocol = endpoint.protocol === "https:" ? "wss:" : "ws:";
+  endpoint.searchParams.set("model", input.upstreamModel);
+  const production = Deno.env.get("DENO_ENV") === "production";
+  const pinned = endpoint.protocol === "wss:"
+    ? await resolvePinnedAddress(endpoint.hostname, undefined, input.signal)
+    : undefined;
+  return await new Promise<RealtimeUpstreamSocket>((resolve, reject) => {
+    let settled = false;
+    const socket = new NodeWebSocket(endpoint, {
+      headers: { authorization: `Bearer ${input.apiKey}` },
+      followRedirects: false,
+      handshakeTimeout: input.timeoutMs ?? REALTIME_WEBSOCKET_CONNECT_TIMEOUT_MS,
+      maxPayload: REALTIME_MAX_EVENT_BYTES,
+      perMessageDeflate: false,
+      ...(pinned
+        ? {
+          family: pinned.family,
+          lookup: createPinnedLookup(pinned),
+          servername: endpoint.hostname,
+          rejectUnauthorized: true,
+        }
+        : { rejectUnauthorized: !production }),
+    });
+    const abort = () => {
+      socket.terminate();
+      if (!settled) reject(input.signal?.reason ?? new DOMException("Aborted", "AbortError"));
+    };
+    input.signal?.addEventListener("abort", abort, { once: true });
+    socket.once("open", () => {
+      settled = true;
+      input.signal?.removeEventListener("abort", abort);
+      resolve(socket);
+    });
+    socket.once("error", (error) => {
+      input.signal?.removeEventListener("abort", abort);
+      if (!settled) reject(error);
+    });
+  });
+}
+
+export interface RealtimeRelayOptions {
+  publicModel: string;
+  upstreamModel: string;
+  onServerEvent?: (event: Record<string, unknown>) => void | Promise<void>;
+  onClose?: (details: {
+    code: number;
+    reason: string;
+    clientEvents: number;
+    serverEvents: number;
+  }) => void | Promise<void>;
+}
+
+function rawDataBytes(data: RawData): Uint8Array {
+  if (data instanceof ArrayBuffer) return new Uint8Array(data);
+  if (Array.isArray(data)) {
+    const length = data.reduce((total, part) => total + part.byteLength, 0);
+    const output = new Uint8Array(length);
+    let offset = 0;
+    for (const part of data) {
+      output.set(part, offset);
+      offset += part.byteLength;
+    }
+    return output;
+  }
+  return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+}
+
+function closeReason(value: unknown): string {
+  return String(value ?? "").replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 120);
+}
+
+/**
+ * Relays protocol JSON without Socket.IO framing. Both directions are validated and bounded, model
+ * aliases remain private to their side, and slow consumers fail explicitly instead of growing an
+ * unbounded process queue.
+ */
+export function relayRealtimeWebSocket(
+  downstream: WebSocket,
+  upstream: RealtimeUpstreamSocket,
+  options: RealtimeRelayOptions,
+): () => void {
+  let closed = false;
+  let clientEvents = 0;
+  let serverEvents = 0;
+  let queuedBytes = 0;
+  const queuedServerEvents: string[] = [];
+  const finish = (code: number, reason: string) => {
+    if (closed) return;
+    closed = true;
+    downstream.removeEventListener("message", fromClient);
+    downstream.removeEventListener("open", downstreamOpen);
+    downstream.removeEventListener("close", clientClose);
+    downstream.removeEventListener("error", clientError);
+    upstream.off("message", fromServer);
+    upstream.off("close", serverClose);
+    upstream.off("error", serverError);
+    void options.onClose?.({ code, reason, clientEvents, serverEvents });
+  };
+  const overloaded = () =>
+    downstream.bufferedAmount > REALTIME_MAX_BUFFERED_BYTES ||
+    upstream.bufferedAmount > REALTIME_MAX_BUFFERED_BYTES;
+  const fail = (code: number, reason: string) => {
+    const safeReason = closeReason(reason);
+    if (downstream.readyState === WebSocket.OPEN) downstream.close(code, safeReason);
+    if (upstream.readyState === NodeWebSocket.OPEN) upstream.close(code, safeReason);
+    else if (upstream.readyState !== NodeWebSocket.CLOSED) upstream.terminate();
+    finish(code, safeReason);
+  };
+  const fromClient = (message: MessageEvent) => {
+    try {
+      if (overloaded()) return fail(1013, "Realtime peer is applying backpressure");
+      if (typeof message.data !== "string") {
+        return fail(1003, "Realtime events must be JSON text frames");
+      }
+      const event = parseRealtimeEvent(message.data);
+      const rewritten = rewriteRealtimeModels(
+        event,
+        options.publicModel,
+        options.upstreamModel,
+      );
+      clientEvents += 1;
+      upstream.send(JSON.stringify(rewritten));
+    } catch (error) {
+      fail(error instanceof RealtimeProtocolError ? 1007 : 1011, "Invalid Realtime client event");
+    }
+  };
+  const fromServer = (data: RawData, isBinary: boolean) => {
+    try {
+      if (overloaded()) return fail(1013, "Realtime peer is applying backpressure");
+      if (isBinary) return fail(1003, "Realtime provider sent a binary event");
+      const event = parseRealtimeEvent(rawDataBytes(data));
+      const rewritten = rewriteRealtimeModels(
+        event,
+        options.upstreamModel,
+        options.publicModel,
+      ) as Record<string, unknown>;
+      serverEvents += 1;
+      const payload = JSON.stringify(rewritten);
+      if (downstream.readyState === WebSocket.OPEN) downstream.send(payload);
+      else {
+        queuedBytes += new TextEncoder().encode(payload).byteLength;
+        if (queuedBytes > REALTIME_MAX_BUFFERED_BYTES) {
+          return fail(1013, "Realtime client did not become ready");
+        }
+        queuedServerEvents.push(payload);
+      }
+      void options.onServerEvent?.(event);
+    } catch (error) {
+      fail(error instanceof RealtimeProtocolError ? 1007 : 1011, "Invalid Realtime provider event");
+    }
+  };
+  const clientClose = (event: CloseEvent) => {
+    const reason = closeReason(event.reason);
+    if (upstream.readyState === NodeWebSocket.OPEN) upstream.close(event.code || 1000, reason);
+    finish(event.code || 1000, reason);
+  };
+  const downstreamOpen = () => {
+    for (const payload of queuedServerEvents.splice(0)) downstream.send(payload);
+    queuedBytes = 0;
+  };
+  const clientError = () => fail(1011, "Realtime client transport failed");
+  const serverClose = (code: number, reason: Buffer) => {
+    const safeReason = closeReason(reason.toString("utf8"));
+    if (downstream.readyState === WebSocket.OPEN) downstream.close(code || 1011, safeReason);
+    finish(code || 1011, safeReason);
+  };
+  const serverError = () => fail(1011, "Realtime provider transport failed");
+  downstream.addEventListener("message", fromClient);
+  downstream.addEventListener("open", downstreamOpen);
+  downstream.addEventListener("close", clientClose);
+  downstream.addEventListener("error", clientError);
+  upstream.on("message", fromServer);
+  upstream.on("close", serverClose);
+  upstream.on("error", serverError);
+  return () => fail(1001, "Realtime server is shutting down");
 }
 
 function bodyBuffer(body: Uint8Array | undefined): ArrayBuffer | undefined {
