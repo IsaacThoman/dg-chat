@@ -313,11 +313,28 @@ if (
   embeddings.object !== "list" || embeddings.model !== embeddingModel ||
   embeddings.data.length !== 2 || embeddings.data[0]?.index !== 0 ||
   embeddings.data[1]?.index !== 1 ||
-  JSON.stringify(embeddings.data[0]?.embedding) !== JSON.stringify([0.1, 0.2, 0.3, 0.4]) ||
+  JSON.stringify(embeddings.data[0]?.embedding) !== JSON.stringify([0.01, 0.02, 0.03, 0.04]) ||
   embeddings.usage.prompt_tokens !== 2 || embeddings.usage.total_tokens !== 2
 ) {
   throw new Error("JavaScript embeddings.create() returned an invalid response");
 }
+const base64Embeddings = await client.embeddings.create({
+  model: embeddingModel,
+  input: "JavaScript base64 embedding",
+  encoding_format: "base64",
+});
+const encodedEmbedding = base64Embeddings.data[0]?.embedding as unknown;
+if (typeof encodedEmbedding !== "string") {
+  throw new Error("JavaScript base64 embeddings did not preserve the encoded vector");
+}
+const embeddingBytes = Uint8Array.from(
+  atob(encodedEmbedding),
+  (character) => character.charCodeAt(0),
+);
+const embeddingView = new DataView(embeddingBytes.buffer);
+if (
+  embeddingBytes.byteLength !== 16 || Math.abs(embeddingView.getFloat32(0, true) - 0.01) > 1e-6
+) throw new Error("JavaScript base64 embedding bytes were invalid");
 
 const completion = await client.chat.completions.create({
   model,
@@ -338,6 +355,15 @@ for await (const chunk of stream) streamedText += chunk.choices[0]?.delta.conten
 if (!streamedText.includes("JavaScript streaming contract")) {
   throw new Error("JavaScript streaming completion did not contain the expected content");
 }
+const usageStream = await client.chat.completions.create({
+  model,
+  stream: true,
+  stream_options: { include_usage: true },
+  messages: [{ role: "user", content: "JavaScript streaming usage contract" }],
+});
+let streamedUsage = 0;
+for await (const chunk of usageStream) streamedUsage = chunk.usage?.total_tokens ?? streamedUsage;
+if (streamedUsage <= 0) throw new Error("JavaScript Chat stream omitted requested terminal usage");
 
 const nullableCompletion = await client.chat.completions.create({
   model,
@@ -475,6 +501,28 @@ const nativeResponse = await client.responses.create({
 if (!nativeResponse.output_text.includes("native Responses public contract")) {
   throw new Error("JavaScript Responses API did not use a native Responses upstream");
 }
+const directToolResponse = await client.responses.create({
+  model: responsesModel,
+  input: "JavaScript direct Responses tool contract",
+  tools: [{
+    type: "function",
+    name: "lookup_weather",
+    description: "Look up weather",
+    parameters: {
+      type: "object",
+      properties: { city: { type: "string" } },
+      required: ["city"],
+      additionalProperties: false,
+    },
+    strict: true,
+  }],
+  tool_choice: { type: "function", name: "lookup_weather" },
+});
+const directToolCall = directToolResponse.output.find((item) => item.type === "function_call");
+if (
+  directToolCall?.type !== "function_call" || directToolCall.name !== "lookup_weather" ||
+  JSON.parse(directToolCall.arguments).city !== "New York"
+) throw new Error("JavaScript direct Responses function tool contract was invalid");
 const statelessNativeResponse = await client.responses.create({
   model: responsesModel,
   input: [
@@ -566,11 +614,36 @@ if (
 
 const fileText = `JavaScript files contract ${crypto.randomUUID()}\n`;
 const fileName = `javascript-contract-${crypto.randomUUID()}.txt`;
-const uploaded = await client.files.create({
+const fileIdempotencyKey = `javascript-file-${crypto.randomUUID()}`;
+const uploadResult = await client.files.create({
   file: await toFile(new TextEncoder().encode(fileText), fileName, { type: "text/plain" }),
   purpose: "assistants",
-});
+}, { headers: { "Idempotency-Key": fileIdempotencyKey } }).withResponse();
+const uploaded = uploadResult.data;
+const uploadReplay = await client.files.create({
+  file: await toFile(new TextEncoder().encode(fileText), fileName, { type: "text/plain" }),
+  purpose: "assistants",
+}, { headers: { "Idempotency-Key": fileIdempotencyKey } }).withResponse();
+if (
+  uploadReplay.data.id !== uploaded.id ||
+  JSON.stringify(uploadReplay.data) !== JSON.stringify(uploaded) ||
+  uploadReplay.response.headers.get("x-idempotent-replay") !== "true"
+) throw new Error("JavaScript files.create() idempotent replay contract failed");
+let fileConflict = false;
+try {
+  await client.files.create({
+    file: await toFile(new TextEncoder().encode(`${fileText}drift`), fileName, {
+      type: "text/plain",
+    }),
+    purpose: "assistants",
+  }, { headers: { "Idempotency-Key": fileIdempotencyKey } });
+} catch (error) {
+  const candidate = error as { status?: number; code?: string };
+  fileConflict = candidate.status === 409 && candidate.code === "idempotency_conflict";
+}
+if (!fileConflict) throw new Error("JavaScript files.create() idempotency drift was not rejected");
 let deleted = false;
+const paginationUploads = [uploaded];
 try {
   if (
     uploaded.object !== "file" || uploaded.filename !== fileName ||
@@ -580,12 +653,47 @@ try {
     throw new Error("JavaScript files.create() returned an invalid file object");
   }
 
-  const files = await client.files.list();
+  for (let index = 0; index < 2; index++) {
+    const text = `JavaScript paginated file ${index} ${crypto.randomUUID()}\n`;
+    paginationUploads.push(
+      await client.files.create({
+        file: await toFile(
+          new TextEncoder().encode(text),
+          `javascript-page-${crypto.randomUUID()}.txt`,
+          { type: "text/plain" },
+        ),
+        purpose: "assistants",
+      }),
+    );
+  }
+
+  const files = await client.files.list({ limit: 1, order: "desc", purpose: "assistants" });
   if (
-    !Array.isArray(files.data) || files.has_more !== false ||
-    !files.data.some((file) => file.id === uploaded.id)
+    files.data.length !== 1 || files.has_more !== true ||
+    !files.hasNextPage()
   ) {
-    throw new Error("JavaScript files.list() did not include the uploaded file");
+    throw new Error("JavaScript files.list() did not return a compatible bounded first page");
+  }
+  const secondFilesPage = await files.getNextPage();
+  if (
+    secondFilesPage.data.length !== 1 ||
+    secondFilesPage.data[0].id === files.data[0].id
+  ) {
+    throw new Error("JavaScript files.list() cursor repeated or skipped its second page");
+  }
+  const expectedPageIds = new Set(paginationUploads.map((file) => file.id));
+  const iteratedPageIds = new Set<string>();
+  for await (
+    const file of client.files.list({ limit: 1, order: "asc", purpose: "assistants" })
+  ) {
+    if (expectedPageIds.has(file.id)) iteratedPageIds.add(file.id);
+  }
+  if (iteratedPageIds.size !== expectedPageIds.size) {
+    throw new Error("JavaScript files.list() auto-pagination did not visit every uploaded file");
+  }
+  const unrelatedPurpose = await client.files.list({ limit: 1, purpose: "fine-tune" });
+  if (unrelatedPurpose.data.length !== 0 || unrelatedPurpose.has_more !== false) {
+    throw new Error("JavaScript files.list() purpose filtering returned unrelated files");
   }
 
   const retrieved = await client.files.retrieve(uploaded.id);
@@ -620,7 +728,13 @@ try {
     }
   }
 } finally {
-  if (!deleted) await client.files.delete(uploaded.id).catch(() => undefined);
+  await Promise.all(
+    paginationUploads.map((file) =>
+      file.id === uploaded.id && deleted
+        ? Promise.resolve()
+        : client.files.delete(file.id).catch(() => undefined)
+    ),
+  );
 }
 
 async function expectApiError(

@@ -74,6 +74,23 @@ export function preferredLeaf(messages: Message[], branchRootId: string): string
   return candidates[0]?.message.id ?? branchRootId;
 }
 
+/**
+ * Keeps a read-only branch preview through ordinary conversation-list refreshes while ensuring it
+ * can never point into a different conversation or at a node that is no longer terminal.
+ */
+export function reconcileBranchPreview(
+  previewLeafId: string | null,
+  previousConversationId: string,
+  nextConversationId: string,
+  messages: readonly Message[],
+  readOnly = true,
+): string | null {
+  if (!readOnly || !previewLeafId || previousConversationId !== nextConversationId) return null;
+  const exists = messages.some((message) => message.id === previewLeafId);
+  const hasChild = messages.some((message) => message.parentId === previewLeafId);
+  return exists && !hasChild ? previewLeafId : null;
+}
+
 export function conversationTree(
   messages: Message[],
   activeLeafId?: string | null,

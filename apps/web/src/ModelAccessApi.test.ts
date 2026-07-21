@@ -50,7 +50,7 @@ describe("token governance and model access API", () => {
     const token = { id: "token/id", ownerId: "owner", version: 7 } as AdminTokenAccessItem;
     const alias = { id: "alias/id", version: 3 } as ModelAlias;
     await api.replaceAdminModelAccessGroupMembers(group, ["user"]);
-    await api.replaceAdminModelAccessGroupModels(group, ["model"]);
+    await api.replaceAdminModelAccessGroupModels(group, ["model"], ["became-public"]);
     await api.setAdminTokenAccessGroups(token, ["group"]);
     await api.adminModelAccessTokens("alice", "opaque+/=", 25);
     await api.deleteAdminModelAlias(alias);
@@ -65,7 +65,9 @@ describe("token governance and model access API", () => {
       userIds: ["owner"],
       modelIds: ["model"],
       tokenIds: ["token/id"],
+      acknowledgePublicModelIds: ["became-public"],
     });
+    await api.deleteAdminModelAccessGroup(group, ["became-public"]);
     await api.setAdminTokenAccessMode(token, "restricted");
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
       "/api/admin/model-access/groups/group%2Fid/users",
@@ -75,13 +77,18 @@ describe("token governance and model access API", () => {
       "/api/admin/model-access/aliases/alias%2Fid",
       "/api/admin/model-access/groups/group%2Fid/impact",
       "/api/admin/model-access/groups/group%2Fid/policy",
+      "/api/admin/model-access/groups/group%2Fid",
       "/api/admin/model-access/tokens/token%2Fid/access-mode",
     ]);
     expect(fetchMock.mock.calls[0][1].body).toBe(
       JSON.stringify({ expectedVersion: 2, ids: ["user"] }),
     );
     expect(fetchMock.mock.calls[1][1].body).toBe(
-      JSON.stringify({ expectedVersion: 2, ids: ["model"] }),
+      JSON.stringify({
+        expectedVersion: 2,
+        ids: ["model"],
+        acknowledgePublicModelIds: ["became-public"],
+      }),
     );
     expect(fetchMock.mock.calls[2][1].body).toBe(
       JSON.stringify({ ownerId: "owner", expectedVersion: 7, groupIds: ["group"] }),
@@ -96,8 +103,16 @@ describe("token governance and model access API", () => {
       userIds: ["owner"],
       modelIds: ["model"],
       tokenIds: ["token/id"],
+      acknowledgePublicModelIds: ["became-public"],
     }));
-    expect(fetchMock.mock.calls[7][1].body).toBe(JSON.stringify({
+    expect(fetchMock.mock.calls[7][1]).toMatchObject({
+      method: "DELETE",
+      body: JSON.stringify({
+        expectedVersion: 2,
+        acknowledgePublicModelIds: ["became-public"],
+      }),
+    });
+    expect(fetchMock.mock.calls[8][1].body).toBe(JSON.stringify({
       ownerId: "owner",
       expectedVersion: 7,
       accessMode: "restricted",

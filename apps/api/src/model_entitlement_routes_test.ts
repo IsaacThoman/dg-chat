@@ -103,7 +103,8 @@ Deno.test("canonical and alias entitlement parity spans catalogs and model route
       password: "correct horse battery staple",
     }),
   });
-  const user = (await setup.json()).user;
+  const setupUser = (await setup.json()).user;
+  const user = repository.findUser(setupUser.id)!;
   const mutation = { actorId: user.id, action: "test.entitlement_matrix" };
   const created = repository.createProvider({
     slug: "matrix",
@@ -141,7 +142,16 @@ Deno.test("canonical and alias entitlement parity spans catalogs and model route
     fixedCallMicros: 1,
     source: "matrix",
   }, mutation);
-  let alias = repository.createModelAlias({ alias: "friendly/matrix", targetModelId: model.id });
+  let alias = repository.createModelAlias(
+    { alias: "friendly/matrix", targetModelId: model.id },
+    {
+      actorId: user.id,
+      action: "test.model_alias.created",
+      targetType: "model_alias",
+      requireEmailVerification: false,
+      expectedAuthorityEpoch: user.authorityEpoch,
+    },
+  );
   const login = await app.request("/api/auth/login", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -273,15 +283,40 @@ Deno.test("canonical and alias entitlement parity spans catalogs and model route
     fixedCallMicros: 1,
     source: "matrix-retarget",
   }, mutation);
-  const replayRestriction = repository.createAccessGroup({ name: "matrix-replay-restricted" });
+  const replayRestriction = repository.createAccessGroup(
+    { name: "matrix-replay-restricted" },
+    {
+      actorId: user.id,
+      action: "test.model_access_group.created",
+      targetType: "model_access_group",
+      requireEmailVerification: false,
+      expectedAuthorityEpoch: user.authorityEpoch,
+    },
+  );
   const replayRestrictionPolicy = repository.replaceAccessGroupModels(
     replayRestriction.id,
     [model.id],
     replayRestriction.version,
+    [],
+    {
+      actorId: user.id,
+      action: "test.model_access_group.models_replaced",
+      targetType: "model_access_group",
+      targetId: replayRestriction.id,
+      requireEmailVerification: false,
+      expectedAuthorityEpoch: user.authorityEpoch,
+    },
   );
   alias = repository.updateModelAlias(alias.id, {
     expectedVersion: alias.version,
     targetModelId: retarget.id,
+  }, {
+    actorId: user.id,
+    action: "test.model_alias.updated",
+    targetType: "model_alias",
+    targetId: alias.id,
+    requireEmailVerification: false,
+    expectedAuthorityEpoch: user.authorityEpoch,
   });
   for (const [path, idempotencyKey, payload] of replayCases) {
     const denied = await app.request(path, {
@@ -295,15 +330,48 @@ Deno.test("canonical and alias entitlement parity spans catalogs and model route
   alias = repository.updateModelAlias(alias.id, {
     expectedVersion: alias.version,
     targetModelId: model.id,
+  }, {
+    actorId: user.id,
+    action: "test.model_alias.updated",
+    targetType: "model_alias",
+    targetId: alias.id,
+    requireEmailVerification: false,
+    expectedAuthorityEpoch: user.authorityEpoch,
   });
-  repository.deleteAccessGroup(replayRestriction.id, replayRestrictionPolicy.version);
+  repository.deleteAccessGroup(
+    replayRestriction.id,
+    replayRestrictionPolicy.version,
+    [model.id],
+    {
+      actorId: user.id,
+      action: "test.model_access_group.deleted",
+      targetType: "model_access_group",
+      targetId: replayRestriction.id,
+      requireEmailVerification: false,
+      expectedAuthorityEpoch: user.authorityEpoch,
+    },
+  );
 
-  const group = repository.createAccessGroup({ name: "matrix-restricted" });
+  const group = repository.createAccessGroup({ name: "matrix-restricted" }, {
+    actorId: user.id,
+    action: "test.model_access_group.created",
+    targetType: "model_access_group",
+    requireEmailVerification: false,
+    expectedAuthorityEpoch: user.authorityEpoch,
+  });
   let policy = repository.replaceAccessGroupPolicy(group.id, {
     expectedVersion: group.version,
     userIds: [user.id],
     modelIds: [model.id],
     tokenIds: [],
+    acknowledgePublicModelIds: [],
+  }, {
+    actorId: user.id,
+    action: "test.model_access_group.policy_replaced",
+    targetType: "model_access_group",
+    targetId: group.id,
+    requireEmailVerification: false,
+    expectedAuthorityEpoch: user.authorityEpoch,
   });
   const entitledLogin = await app.request("/api/auth/login", {
     method: "POST",
@@ -330,6 +398,14 @@ Deno.test("canonical and alias entitlement parity spans catalogs and model route
     userIds: [],
     modelIds: [model.id],
     tokenIds: [],
+    acknowledgePublicModelIds: [],
+  }, {
+    actorId: user.id,
+    action: "test.model_access_group.policy_replaced",
+    targetType: "model_access_group",
+    targetId: group.id,
+    requireEmailVerification: false,
+    expectedAuthorityEpoch: user.authorityEpoch,
   });
   assertEquals(policy.userIds, []);
   const refreshedLogin = await app.request("/api/auth/login", {

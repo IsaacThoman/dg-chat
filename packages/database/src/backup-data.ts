@@ -10,13 +10,32 @@ import {
   type ProviderProtocol,
 } from "./provider-model-invariants.ts";
 
-export const BACKUP_DATA_SCHEMA_VERSION = "0039" as const;
+export const BACKUP_DATA_SCHEMA_VERSION = "0053" as const;
+const PRE_COMMUNITY_PROFILE_BACKUP_DATA_SCHEMA_VERSION = "0050" as const;
+const PRE_ATTACHMENT_CONTROL_BACKUP_DATA_SCHEMA_VERSION = "0049" as const;
+const PRE_AUTOMATIC_RETENTION_BACKUP_DATA_SCHEMA_VERSION = "0045" as const;
+const PRE_TOOL_ACCOUNTING_BACKUP_DATA_SCHEMA_VERSION = "0043" as const;
+const PRE_AUTHORITY_EPOCH_BACKUP_DATA_SCHEMA_VERSION = "0039" as const;
 const ADMIN_SECURITY_BILLING_BACKUP_DATA_SCHEMA_VERSION = "0038" as const;
 const ADMIN_LIFECYCLE_BACKUP_DATA_SCHEMA_VERSION = "0037" as const;
 const IMMUTABLE_SHARING_BACKUP_DATA_SCHEMA_VERSION = "0034" as const;
 const CONVERSATION_PORTABILITY_BACKUP_DATA_SCHEMA_VERSION = "0033" as const;
 const TEMPORARY_LIFECYCLE_BACKUP_DATA_SCHEMA_VERSION = "0032" as const;
 const LEGACY_BACKUP_DATA_SCHEMA_VERSION = "0028" as const;
+export const PRE_AUTOMATIC_RETENTION_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
+  new Set(["retention_schedule_state"]),
+);
+export const PRE_COMMUNITY_PROFILE_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
+  new Set(["community_profiles"]),
+);
+export const PRE_ATTACHMENT_CONTROL_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
+  new Set([
+    "attachment_storage_installation",
+    "attachment_storage_usage",
+    "attachment_storage_blobs",
+    "attachment_storage_releases",
+  ]),
+);
 export const LEGACY_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
   new Set([
     "user_preferences",
@@ -27,6 +46,7 @@ export const LEGACY_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
     "conversation_tag_bindings",
     "conversation_share_snapshots",
     "admin_balance_adjustments",
+    "retention_schedule_state",
   ]),
 );
 export const ADMIN_LIFECYCLE_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
@@ -37,6 +57,11 @@ export const PRE_IMMUTABLE_SHARING_BACKUP_DATA_OMITTED_TABLES = Object.freeze(
 );
 export function isSupportedBackupDataSchemaVersion(value: string): boolean {
   return value === BACKUP_DATA_SCHEMA_VERSION ||
+    value === PRE_COMMUNITY_PROFILE_BACKUP_DATA_SCHEMA_VERSION ||
+    value === PRE_ATTACHMENT_CONTROL_BACKUP_DATA_SCHEMA_VERSION ||
+    value === PRE_AUTOMATIC_RETENTION_BACKUP_DATA_SCHEMA_VERSION ||
+    value === PRE_TOOL_ACCOUNTING_BACKUP_DATA_SCHEMA_VERSION ||
+    value === PRE_AUTHORITY_EPOCH_BACKUP_DATA_SCHEMA_VERSION ||
     value === ADMIN_SECURITY_BILLING_BACKUP_DATA_SCHEMA_VERSION ||
     value === ADMIN_LIFECYCLE_BACKUP_DATA_SCHEMA_VERSION ||
     value === IMMUTABLE_SHARING_BACKUP_DATA_SCHEMA_VERSION ||
@@ -44,6 +69,30 @@ export function isSupportedBackupDataSchemaVersion(value: string): boolean {
     value === TEMPORARY_LIFECYCLE_BACKUP_DATA_SCHEMA_VERSION ||
     value === LEGACY_BACKUP_DATA_SCHEMA_VERSION;
 }
+const hasCurrentPortableRowShape = (version: string) =>
+  version === BACKUP_DATA_SCHEMA_VERSION ||
+  version === PRE_COMMUNITY_PROFILE_BACKUP_DATA_SCHEMA_VERSION ||
+  version === PRE_ATTACHMENT_CONTROL_BACKUP_DATA_SCHEMA_VERSION ||
+  version === PRE_AUTOMATIC_RETENTION_BACKUP_DATA_SCHEMA_VERSION;
+const requiresLegacyPortableUpgrade = (version: string) => !hasCurrentPortableRowShape(version);
+const requiresAttachmentControlUpgrade = (version: string) =>
+  version !== BACKUP_DATA_SCHEMA_VERSION &&
+  version !== PRE_COMMUNITY_PROFILE_BACKUP_DATA_SCHEMA_VERSION;
+
+export function isCanonicalManifestOnlyAttachmentMetadata(
+  value: Readonly<Record<string, unknown>>,
+): boolean {
+  return value.object_key ===
+      `imports/${String(value.owner_id)}/${String(value.id)}/manifest-only` &&
+    value.state === "failed" &&
+    value.deleted_at !== null &&
+    value.deleted_at !== undefined &&
+    value.inspection_error === "Attachment bytes were not included in the .dgchat manifest" &&
+    value.ingestion_status === "failed" &&
+    value.ingestion_error === "Attachment bytes require a separate restore" &&
+    value.ingested_at === null;
+}
+
 export const BACKUP_DATA_BATCH_SIZE = 100;
 export const BACKUP_DATA_MAX_BATCH_SIZE = 500;
 export const BACKUP_DATA_MAX_ROWS_PER_TABLE = 10_000_000;
@@ -130,6 +179,7 @@ const UUID_COLUMNS = new Set([
   "target_user_id",
   "ledger_entry_id",
   "audit_event_id",
+  "last_run_id",
 ]);
 const TIMESTAMP_SUFFIX = /(?:_at|_expires_at)$/u;
 const inferKinds = (columns: readonly string[], explicit: ColumnKinds): ColumnKinds =>
@@ -157,11 +207,22 @@ const T = (
 export const BACKUP_DATA_TABLES: readonly BackupDataTable[] = Object.freeze([
   T(
     "users",
-    "id email name password_hash role approval_status state version balance_micros created_at updated_at deleted_at email_verified_at",
+    "id email name password_hash role approval_status state version authority_epoch balance_micros created_at updated_at deleted_at email_verified_at",
     "id",
     {
       version: "integer",
+      authority_epoch: "bigint",
       balance_micros: "bigint",
+    },
+  ),
+  T(
+    "community_profiles",
+    "user_id opted_in identity_mode nickname color share_balance version created_at updated_at",
+    "user_id",
+    {
+      opted_in: "boolean",
+      share_balance: "boolean",
+      version: "integer",
     },
   ),
   T("auth_users", "id name email email_verified image created_at updated_at", "id", {
@@ -246,7 +307,7 @@ export const BACKUP_DATA_TABLES: readonly BackupDataTable[] = Object.freeze([
   }),
   T(
     "api_tokens",
-    "id user_id name token_hash preview scopes expires_at revoked_at last_used_at created_at version rpm_limit burst_limit access_mode rotation_family_id rotation_generation rotated_from_token_id replaced_by_token_id overlap_ends_at",
+    "id user_id name token_hash preview scopes expires_at revoked_at last_used_at created_at version rpm_limit burst_limit access_mode rotation_family_id rotation_generation rotated_from_token_id replaced_by_token_id overlap_ends_at authority_epoch",
     "id",
     {
       scopes: "json",
@@ -254,6 +315,7 @@ export const BACKUP_DATA_TABLES: readonly BackupDataTable[] = Object.freeze([
       rpm_limit: "integer",
       burst_limit: "integer",
       rotation_generation: "integer",
+      authority_epoch: "bigint",
     },
   ),
   T("access_groups", "id name description version created_at updated_at", "id", {
@@ -263,13 +325,47 @@ export const BACKUP_DATA_TABLES: readonly BackupDataTable[] = Object.freeze([
   T("access_group_models", "group_id provider_model_id", "group_id,provider_model_id"),
   T("access_group_tokens", "group_id token_id user_id", "group_id,token_id"),
   T(
+    "attachment_storage_installation",
+    "singleton_id physical_bytes physical_objects updated_at",
+    "singleton_id",
+    {
+      singleton_id: "integer",
+      physical_bytes: "bigint",
+      physical_objects: "bigint",
+    },
+  ),
+  T(
+    "attachment_storage_usage",
+    "owner_id physical_bytes physical_objects updated_at",
+    "owner_id",
+    {
+      physical_bytes: "bigint",
+      physical_objects: "bigint",
+    },
+  ),
+  T(
+    "attachment_storage_blobs",
+    "owner_id object_key size_bytes sha256 mime_type admitted_at",
+    "owner_id,object_key",
+    { size_bytes: "bigint" },
+  ),
+  T(
+    "attachment_storage_releases",
+    "id stage_id usage_run_id owner_id object_key attachment_id size_bytes sha256 mime_type reason released_at",
+    "id",
+    { size_bytes: "bigint" },
+  ),
+  T(
     "attachments",
-    "id owner_id object_key filename mime_type size_bytes sha256 width height state created_at inspection_error updated_at deleted_at ingestion_status ingestion_error ingested_at",
+    "id owner_id object_key filename mime_type size_bytes sha256 width height state created_at inspection_error inspection_epoch version physical_object required_inspection_mode inspection_policy_version updated_at deleted_at ingestion_status ingestion_error ingested_at",
     "id",
     {
       size_bytes: "bigint",
       width: "integer",
       height: "integer",
+      inspection_epoch: "integer",
+      version: "integer",
+      physical_object: "boolean",
     },
   ),
   T(
@@ -365,7 +461,7 @@ export const BACKUP_DATA_TABLES: readonly BackupDataTable[] = Object.freeze([
   ),
   T(
     "usage_runs",
-    "id user_id token_id model provider status input_tokens output_tokens cost_micros latency_ms ttft_ms error created_at completed_at reserved_micros pricing_version_id pricing_input_micros_per_million pricing_cached_input_micros_per_million pricing_reasoning_micros_per_million pricing_output_micros_per_million pricing_fixed_call_micros pricing_source execution_epoch actual_provider_cost_micros actual_provider_input_tokens actual_provider_cached_input_tokens actual_provider_reasoning_tokens actual_provider_output_tokens",
+    "id user_id token_id model provider recovery_owner status input_tokens output_tokens cost_micros latency_ms ttft_ms error created_at completed_at reserved_micros pricing_version_id pricing_input_micros_per_million pricing_cached_input_micros_per_million pricing_reasoning_micros_per_million pricing_output_micros_per_million pricing_fixed_call_micros pricing_source execution_epoch actual_provider_cost_micros actual_provider_input_tokens actual_provider_cached_input_tokens actual_provider_reasoning_tokens actual_provider_output_tokens",
     "id",
     {
       id: "text",
@@ -504,12 +600,13 @@ export const BACKUP_DATA_TABLES: readonly BackupDataTable[] = Object.freeze([
   ),
   T(
     "tool_executions",
-    "id owner_id tool_id input status result error approved_at approved_by cancellation_requested_at created_at updated_at",
+    "id owner_id tool_id input status result error approved_at approved_by cancellation_requested_at billing_snapshot created_at updated_at",
     "id",
     {
       input: "json",
       result: "json",
       error: "json",
+      billing_snapshot: "json",
     },
   ),
   T("message_tool_executions", "message_id execution_id created_at", "message_id,execution_id", {
@@ -564,6 +661,16 @@ export const BACKUP_DATA_TABLES: readonly BackupDataTable[] = Object.freeze([
       request_bodies_scrubbed: "integer",
       response_bodies_scrubbed: "integer",
       bytes_scrubbed: "bigint",
+    },
+  ),
+  T(
+    "retention_schedule_state",
+    "singleton_id interval_seconds next_due_at last_policy_version last_scheduled_at last_run_id updated_at",
+    "singleton_id",
+    {
+      singleton_id: "integer",
+      interval_seconds: "integer",
+      last_policy_version: "integer",
     },
   ),
   T(
@@ -683,6 +790,63 @@ export async function verifyBackupDataCatalog(databaseUrl: string): Promise<void
         );
       }
     }
+    const auditGuards = await sql<{
+      trigger_count: number;
+      trigger_type: number | null;
+      function_name: string | null;
+    }[]>`
+      SELECT count(*)::int trigger_count,
+        max(t.tgtype::int)::int trigger_type,
+        max(p.proname) function_name
+      FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid
+      JOIN pg_namespace n ON n.oid=c.relnamespace
+      JOIN pg_proc p ON p.oid=t.tgfoid
+      WHERE n.nspname='public' AND c.relname='audit_events'
+        AND t.tgname='dg_chat_audit_events_append_only' AND NOT t.tgisinternal
+    `;
+    const auditGuard = auditGuards[0];
+    if (
+      auditGuard?.trigger_count !== 1 ||
+      // pg_trigger bit flags: BEFORE=2, DELETE=8, UPDATE=16, TRUNCATE=32. The absence of
+      // ROW=1 proves this is a statement trigger, so even a zero-row mutation is rejected.
+      auditGuard.trigger_type !== 58 ||
+      auditGuard.function_name !== "dg_chat_enforce_audit_event_immutability"
+    ) {
+      throw new BackupDataError(
+        "invariant",
+        "Database audit history is missing its append-only guard",
+      );
+    }
+    const storageGuards = await sql<{
+      table_name: string;
+      trigger_name: string;
+      trigger_type: number;
+      function_name: string;
+    }[]>`
+      SELECT c.relname table_name,t.tgname trigger_name,t.tgtype::int trigger_type,
+        p.proname function_name
+      FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid
+      JOIN pg_namespace n ON n.oid=c.relnamespace
+      JOIN pg_proc p ON p.oid=t.tgfoid
+      WHERE n.nspname='public' AND NOT t.tgisinternal AND (
+        (c.relname='attachment_storage_blobs' AND
+          t.tgname='dg_chat_attachment_storage_blobs_append_only') OR
+        (c.relname='attachment_storage_releases' AND
+          t.tgname='dg_chat_attachment_storage_releases_append_only')
+      ) ORDER BY c.relname
+    `;
+    if (
+      storageGuards.length !== 2 ||
+      storageGuards.some((guard) =>
+        guard.trigger_type !== 58 ||
+        guard.function_name !== "dg_chat_enforce_attachment_blob_history"
+      )
+    ) {
+      throw new BackupDataError(
+        "invariant",
+        "Database attachment storage history is missing its append-only guard",
+      );
+    }
   } finally {
     await sql.end({ timeout: 5 });
   }
@@ -747,10 +911,14 @@ export const BACKUP_EPHEMERAL_TABLES = Object.freeze(
     "conversation_portability_imports",
     "api_idempotency_events",
     "api_idempotency_requests",
+    "file_upload_staging",
+    "attachment_upload_staging",
     "generation_controls",
     "jobs",
+    "document_embedding_batches",
     "generated_object_staging",
     "runtime_snapshots",
+    "worker_instances",
   ] as const,
 );
 
@@ -822,6 +990,21 @@ async function withBackupSnapshot<T>(
         SELECT installation_id FROM installation_state WHERE singleton_id=1
       `;
       if (!state) throw new BackupDataError("invariant", "Installation state is missing");
+      const [activeEmbeddingBatch] = await tx<{ phase: string }[]>`
+        SELECT b.phase FROM document_embedding_batches b
+        JOIN jobs j ON j.id=b.job_id
+        LEFT JOIN usage_runs u ON u.id=b.usage_run_id
+        LEFT JOIN embedding_provider_attempts a ON a.usage_run_id=b.usage_run_id
+        WHERE b.phase<>'committed' AND (
+          j.status IN ('queued','running') OR u.status='reserved' OR a.status='running'
+        )
+        ORDER BY b.updated_at LIMIT 1`;
+      if (activeEmbeddingBatch) {
+        throw new BackupDataError(
+          "conflict",
+          "Backup cannot start while document embedding publication is incomplete",
+        );
+      }
       const tables = policy === "excluded"
         ? BACKUP_DATA_TABLES.filter((entry) => entry.name !== "provider_payload_captures")
         : BACKUP_DATA_TABLES;
@@ -947,28 +1130,116 @@ function exactSourceRow(
   schemaVersion: string,
 ): Record<string, unknown> {
   if (
-    schemaVersion !== BACKUP_DATA_SCHEMA_VERSION && definition.name === "ledger_entries" && value &&
+    hasCurrentPortableRowShape(schemaVersion) && definition.name === "usage_runs" && value &&
+    typeof value === "object" && !Array.isArray(value) &&
+    (value as Record<string, unknown>).status === "reserved"
+  ) {
+    const amount = (value as Record<string, unknown>).reserved_micros;
+    let validRecoveryReserve = false;
+    try {
+      const parsed = typeof amount === "number" && Number.isSafeInteger(amount)
+        ? BigInt(amount)
+        : typeof amount === "string" && /^-?[0-9]+$/u.test(amount)
+        ? BigInt(amount)
+        : null;
+      validRecoveryReserve = parsed !== null && parsed >= 1n && parsed <= 9_007_199_254_740_991n;
+    } catch {
+      validRecoveryReserve = false;
+    }
+    if (!validRecoveryReserve) {
+      throw new BackupDataError("invariant", "Backup contains unsafe recovery accounting state");
+    }
+  }
+  if (
+    requiresLegacyPortableUpgrade(schemaVersion) && definition.name === "usage_runs" && value &&
+    typeof value === "object" && !Array.isArray(value) && !("recovery_owner" in value)
+  ) {
+    return exactRow(definition, {
+      ...(value as Record<string, unknown>),
+      // Cross-table ownership is assigned after every row has been staged. Never infer authority
+      // from an attacker-controlled run-ID prefix.
+      recovery_owner: "provider",
+    });
+  }
+  if (
+    requiresLegacyPortableUpgrade(schemaVersion) && definition.name === "tool_executions" &&
+    value &&
+    typeof value === "object" && !Array.isArray(value) && !("billing_snapshot" in value)
+  ) {
+    const legacy = value as Record<string, unknown>;
+    const activeWithRequiredSnapshot = ["queued_pending_reservation", "queued", "running"].includes(
+      String(legacy.status),
+    );
+    return exactRow(definition, {
+      ...legacy,
+      // Preserve the legacy state until every table is staged. The relationship-aware accounting
+      // repair below can then distinguish an outstanding debit (which must enter a settlement or
+      // refund outbox) from an unreserved external call (which must fail closed without replay).
+      // Current staging constraints require a snapshot for queued/running states, so use the
+      // snapshot-free pending state as a staging-only sentinel; both paths are still nonterminal
+      // and the repair always resolves them before staged validation.
+      status: activeWithRequiredSnapshot ? "pending_approval" : legacy.status,
+      result: activeWithRequiredSnapshot ? null : legacy.result,
+      error: legacy.error == null
+        ? null
+        : { code: "tool_execution_failed", message: "Tool execution failed" },
+      billing_snapshot: null,
+    });
+  }
+  if (
+    requiresLegacyPortableUpgrade(schemaVersion) && definition.name === "ledger_entries" && value &&
     typeof value === "object" && !Array.isArray(value)
   ) {
     return exactRow(definition, { ...(value as Record<string, unknown>), sequence: null });
   }
   if (
-    schemaVersion !== BACKUP_DATA_SCHEMA_VERSION && definition.name === "users" && value &&
-    typeof value === "object" && !Array.isArray(value) && !("version" in value)
+    requiresLegacyPortableUpgrade(schemaVersion) &&
+    schemaVersion !== PRE_TOOL_ACCOUNTING_BACKUP_DATA_SCHEMA_VERSION &&
+    definition.name === "users" && value &&
+    typeof value === "object" && !Array.isArray(value)
   ) {
     const legacy = value as Record<string, unknown>;
     const wasDeleted = legacy.state === "deleted";
     return exactRow(definition, {
       ...legacy,
       state: wasDeleted ? "suspended" : legacy.state,
-      version: 1,
+      version: legacy.version ?? 1,
+      authority_epoch: 1,
       deleted_at: wasDeleted
         ? legacy.deleted_at ?? legacy.updated_at ?? legacy.created_at
         : legacy.deleted_at,
     });
   }
   if (
-    schemaVersion !== BACKUP_DATA_SCHEMA_VERSION && definition.name === "attachments" && value &&
+    requiresLegacyPortableUpgrade(schemaVersion) &&
+    schemaVersion !== PRE_TOOL_ACCOUNTING_BACKUP_DATA_SCHEMA_VERSION &&
+    definition.name === "api_tokens" && value &&
+    typeof value === "object" && !Array.isArray(value)
+  ) {
+    return exactRow(definition, { ...(value as Record<string, unknown>), authority_epoch: 1 });
+  }
+  if (
+    requiresAttachmentControlUpgrade(schemaVersion) &&
+    definition.name === "attachments" && value &&
+    typeof value === "object" && !Array.isArray(value)
+  ) {
+    const legacy = value as Record<string, unknown>;
+    return exactRow(definition, {
+      ...legacy,
+      width: "width" in legacy ? legacy.width : null,
+      height: "height" in legacy ? legacy.height : null,
+      inspection_epoch: 1,
+      version: 1,
+      // Pre-0050 conversation imports used an exact, server-authored tombstone shape because a
+      // physical-presence column did not yet exist. This compatibility rule is intentionally
+      // confined to legacy archives; all new writes persist the explicit physical_object bit.
+      physical_object: !isCanonicalManifestOnlyAttachmentMetadata(legacy),
+      required_inspection_mode: "local",
+      inspection_policy_version: "worker-policy-v1",
+    });
+  }
+  if (
+    requiresLegacyPortableUpgrade(schemaVersion) && definition.name === "attachments" && value &&
     typeof value === "object" && !Array.isArray(value) && !("width" in value) &&
     !("height" in value)
   ) {
@@ -979,7 +1250,7 @@ function exactSourceRow(
     });
   }
   if (
-    schemaVersion !== BACKUP_DATA_SCHEMA_VERSION && definition.name === "message_attachments" &&
+    requiresLegacyPortableUpgrade(schemaVersion) && definition.name === "message_attachments" &&
     value && typeof value === "object" && !Array.isArray(value) && !("position" in value)
   ) {
     return exactRow(definition, { ...(value as Record<string, unknown>), position: null });
@@ -1071,7 +1342,7 @@ async function stageSource(
       } INCLUDING ALL) ON COMMIT DROP`,
     );
     if (
-      source.schemaVersion !== BACKUP_DATA_SCHEMA_VERSION && definition.name === "ledger_entries"
+      requiresLegacyPortableUpgrade(source.schemaVersion) && definition.name === "ledger_entries"
     ) {
       await tx.unsafe(
         `ALTER TABLE ${safeIdentifier(temporary)} ALTER COLUMN sequence DROP NOT NULL`,
@@ -1083,6 +1354,18 @@ async function stageSource(
       );
     }
     let count = 0;
+    const omittedByWireVersion = source.schemaVersion !== BACKUP_DATA_SCHEMA_VERSION &&
+        PRE_COMMUNITY_PROFILE_BACKUP_DATA_OMITTED_TABLES.has(definition.name) ||
+      requiresAttachmentControlUpgrade(source.schemaVersion) &&
+        PRE_ATTACHMENT_CONTROL_BACKUP_DATA_OMITTED_TABLES.has(definition.name) ||
+      source.schemaVersion !== BACKUP_DATA_SCHEMA_VERSION &&
+        source.schemaVersion !== PRE_COMMUNITY_PROFILE_BACKUP_DATA_SCHEMA_VERSION &&
+        source.schemaVersion !== PRE_ATTACHMENT_CONTROL_BACKUP_DATA_SCHEMA_VERSION &&
+        PRE_AUTOMATIC_RETENTION_BACKUP_DATA_OMITTED_TABLES.has(definition.name);
+    if (omittedByWireVersion) {
+      counts[definition.name] = 0;
+      continue;
+    }
     for await (const batch of source.rows(definition.name)) {
       if (!Array.isArray(batch) || batch.length > BACKUP_DATA_MAX_BATCH_SIZE) {
         throw new BackupDataError("invalid_source", `${definition.name} batch is invalid`);
@@ -1097,7 +1380,10 @@ async function stageSource(
         const placeholders = definition.columns.map((column) => {
           let value = row[column];
           if (
-            definition.name === "attachments" && column === "object_key" &&
+            (definition.name === "attachments" ||
+              definition.name === "attachment_storage_blobs" ||
+              definition.name === "attachment_storage_releases") &&
+            column === "object_key" &&
             typeof value === "string"
           ) {
             value = objectKeyMap.get(value) ?? value;
@@ -1131,6 +1417,48 @@ async function stageSource(
     counts[definition.name] = count;
   }
   if (source.schemaVersion !== BACKUP_DATA_SCHEMA_VERSION) {
+    const schedule = safeIdentifier(stage.get("retention_schedule_state")!);
+    await tx.unsafe(
+      `INSERT INTO ${schedule}(singleton_id,interval_seconds,next_due_at,updated_at)
+       VALUES(1,86400,now(),now()) ON CONFLICT(singleton_id) DO NOTHING`,
+    );
+  }
+  if (requiresAttachmentControlUpgrade(source.schemaVersion)) {
+    const attachments = safeIdentifier(stage.get("attachments")!);
+    const blobs = safeIdentifier(stage.get("attachment_storage_blobs")!);
+    const usage = safeIdentifier(stage.get("attachment_storage_usage")!);
+    const installation = safeIdentifier(stage.get("attachment_storage_installation")!);
+    await tx.unsafe(
+      `INSERT INTO ${blobs}(owner_id,object_key,size_bytes,sha256,mime_type,admitted_at)
+       SELECT DISTINCT ON(owner_id,object_key)
+         owner_id,object_key,size_bytes,sha256,mime_type,created_at
+       FROM ${attachments} WHERE physical_object=true
+       ORDER BY owner_id,object_key,created_at,id`,
+    );
+    await tx.unsafe(
+      `INSERT INTO ${usage}(owner_id,physical_bytes,physical_objects,updated_at)
+       SELECT owner_id,sum(size_bytes),count(*),now()
+       FROM ${blobs} GROUP BY owner_id`,
+    );
+    await tx.unsafe(
+      `INSERT INTO ${installation}(
+         singleton_id,physical_bytes,physical_objects,updated_at
+       )
+       SELECT 1,COALESCE(sum(size_bytes),0),count(*),now() FROM ${blobs}`,
+    );
+  }
+  if (requiresLegacyPortableUpgrade(source.schemaVersion)) {
+    // Legacy wire formats predate explicit recovery ownership. Recover only the relationship that
+    // is actually present in the portable catalog; API replay and document-batch controls are
+    // intentionally ephemeral and therefore cannot appear in an archive.
+    await tx.unsafe(
+      `UPDATE ${safeIdentifier(stage.get("usage_runs")!)} AS usage SET recovery_owner='tool'
+       FROM ${safeIdentifier(stage.get("tool_executions")!)} AS execution
+       WHERE usage.id='tool:' || execution.id::text AND usage.user_id=execution.owner_id
+         AND usage.token_id IS NULL`,
+    );
+  }
+  if (requiresLegacyPortableUpgrade(source.schemaVersion)) {
     const ledgerName = stage.get("ledger_entries")!;
     const usersName = stage.get("users")!;
     try {
@@ -1147,8 +1475,74 @@ async function stageSource(
     await tx.unsafe(
       `ALTER TABLE ${safeIdentifier(ledgerName)} ALTER COLUMN sequence SET NOT NULL`,
     );
+    await upgradeLegacyToolAccounting(tx, stage);
   }
   return { stage, counts };
+}
+
+async function upgradeLegacyToolAccounting(
+  tx: postgres.TransactionSql,
+  stage: ReadonlyMap<string, string>,
+): Promise<void> {
+  const table = (name: string) => safeIdentifier(stage.get(name)!);
+  const usage = table("usage_runs");
+  const tools = table("tool_executions");
+  const ledger = table("ledger_entries");
+  const repair = safeIdentifier(
+    `backup_tool_repair_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`,
+  );
+  await tx.unsafe(`CREATE TEMP TABLE ${repair} ON COMMIT DROP AS
+    SELECT e.id execution_id,u.reserved_micros,u.provider,u.model,
+      (u.id IS NOT NULL AND u.user_id=e.owner_id AND u.token_id IS NULL
+        AND u.recovery_owner='tool' AND u.status='reserved'
+        AND u.reserved_micros BETWEEN 1 AND 9007199254740991
+        AND char_length(u.provider) BETWEEN 1 AND 255
+        AND char_length(u.model) BETWEEN 1 AND 255
+        AND evidence.reserve_count=1 AND evidence.reserve_total=-u.reserved_micros
+        AND evidence.terminal_count=0 AND evidence.owner_mismatch_count=0) owned_reserved,
+      (u.id IS NOT NULL AND u.user_id=e.owner_id AND u.token_id IS NULL
+        AND u.recovery_owner='tool' AND u.status='reserved'
+        AND u.reserved_micros BETWEEN 1 AND 9007199254740991
+        AND u.provider='tool' AND u.model='tool/' || e.tool_id
+        AND evidence.reserve_count=1 AND evidence.reserve_total=-u.reserved_micros
+        AND evidence.terminal_count=0 AND evidence.owner_mismatch_count=0) canonical_reserved
+    FROM ${tools} e LEFT JOIN ${usage} u ON u.id='tool:' || e.id::text
+    LEFT JOIN LATERAL (
+      SELECT count(*) FILTER (WHERE kind='reserve')::int reserve_count,
+        COALESCE(sum(amount_micros) FILTER (WHERE kind='reserve'),0)::bigint reserve_total,
+        count(*) FILTER (WHERE kind IN ('settle','refund'))::int terminal_count,
+        count(*) FILTER (WHERE user_id IS DISTINCT FROM e.owner_id)::int owner_mismatch_count
+      FROM ${ledger} WHERE usage_run_id=u.id
+    ) evidence ON true`);
+  await tx.unsafe(`UPDATE ${tools} e SET billing_snapshot=jsonb_build_object(
+      'reservedMicros',r.reserved_micros,'provider',r.provider,'model',r.model)
+    FROM ${repair} r WHERE e.id=r.execution_id AND r.owned_reserved`);
+  // A restore never replays an old external call. Outstanding canonical successes settle; every
+  // other owned debit enters the refund outbox. Rows without debit evidence fail closed.
+  await tx.unsafe(`UPDATE ${tools} e SET
+      status=CASE WHEN e.status='succeeded' AND r.canonical_reserved
+        THEN 'succeeded_pending_settlement'
+        WHEN e.status='failed' THEN 'failed_pending_refund'
+        ELSE 'cancelled_pending_refund' END,
+      result=CASE WHEN e.status='succeeded' AND r.canonical_reserved THEN e.result ELSE NULL END,
+      error=CASE WHEN e.status='failed'
+        THEN jsonb_build_object('code','tool_execution_failed','message','Tool execution failed')
+        ELSE NULL END,
+      cancellation_requested_at=CASE
+        WHEN e.status IN ('failed','succeeded') AND r.canonical_reserved
+          THEN e.cancellation_requested_at
+        ELSE COALESCE(e.cancellation_requested_at,now()) END
+    FROM ${repair} r WHERE e.id=r.execution_id AND r.owned_reserved
+      AND e.status IN ('pending_approval','queued_pending_reservation','queued','running',
+        'succeeded','failed','cancelled')`);
+  await tx.unsafe(`UPDATE ${tools} e SET status='failed',result=NULL,
+      error=jsonb_build_object('code','tool_execution_failed','message','Tool execution failed')
+    FROM ${repair} r WHERE e.id=r.execution_id AND NOT r.owned_reserved
+      AND e.status IN ('pending_approval','queued_pending_reservation','queued','running')`);
+  await tx.unsafe(`UPDATE ${usage} u SET error=CASE
+      WHEN e.status IN ('cancelled_pending_refund','cancelled') THEN 'Tool execution was cancelled'
+      ELSE COALESCE(e.error->>'message','Tool execution failed') END
+    FROM ${tools} e WHERE u.id='tool:' || e.id::text AND u.error IS NOT NULL`);
 }
 
 function insertSelection(definition: BackupDataTable): string {
@@ -1187,6 +1581,7 @@ interface BackupRelation {
 }
 
 const RELATIONS: readonly BackupRelation[] = Object.freeze([
+  { from: "community_profiles", columns: ["user_id"], to: "users", target: ["id"] },
   { from: "auth_users", columns: ["id"], to: "users", target: ["id"] },
   { from: "auth_accounts", columns: ["user_id"], to: "auth_users", target: ["id"] },
   { from: "provider_models", columns: ["provider_id"], to: "providers", target: ["id"] },
@@ -1254,6 +1649,36 @@ const RELATIONS: readonly BackupRelation[] = Object.freeze([
     columns: ["user_id", "token_id"],
     to: "api_tokens",
     target: ["user_id", "id"],
+  },
+  {
+    from: "attachment_storage_usage",
+    columns: ["owner_id"],
+    to: "users",
+    target: ["id"],
+  },
+  {
+    from: "attachment_storage_blobs",
+    columns: ["owner_id"],
+    to: "users",
+    target: ["id"],
+  },
+  {
+    from: "attachment_storage_releases",
+    columns: ["owner_id", "object_key"],
+    to: "attachment_storage_blobs",
+    target: ["owner_id", "object_key"],
+  },
+  {
+    from: "attachment_storage_releases",
+    columns: ["owner_id", "usage_run_id"],
+    to: "usage_runs",
+    target: ["user_id", "id"],
+  },
+  {
+    from: "attachment_storage_releases",
+    columns: ["owner_id", "attachment_id"],
+    to: "attachments",
+    target: ["owner_id", "id"],
   },
   { from: "attachments", columns: ["owner_id"], to: "users", target: ["id"] },
   { from: "conversations", columns: ["owner_id"], to: "users", target: ["id"] },
@@ -1472,6 +1897,18 @@ const RELATIONS: readonly BackupRelation[] = Object.freeze([
   },
   { from: "retention_scrub_runs", columns: ["requested_by"], to: "users", target: ["id"] },
   {
+    from: "retention_schedule_state",
+    columns: ["last_policy_version"],
+    to: "retention_policy_versions",
+    target: ["version"],
+  },
+  {
+    from: "retention_schedule_state",
+    columns: ["last_run_id"],
+    to: "retention_scrub_runs",
+    target: ["id"],
+  },
+  {
     from: "provider_payload_captures",
     columns: ["usage_run_id", "provider_attempt_id"],
     to: "provider_attempts",
@@ -1549,6 +1986,125 @@ async function validateStagedDatabase(
   stage: ReadonlyMap<string, string>,
 ): Promise<void> {
   const staged = (name: string) => safeIdentifier(stage.get(name)!);
+  const [scheduleState] = await tx.unsafe<{ count: number }[]>(
+    `SELECT count(*)::int count FROM ${staged("retention_schedule_state")}`,
+  );
+  if (scheduleState?.count !== 1) {
+    throw new BackupDataError(
+      "invariant",
+      "Restore must contain exactly one retention schedule state",
+    );
+  }
+  const invalidStorageSingleton = await tx.unsafe(
+    `SELECT 1 FROM ${staged("attachment_storage_installation")}
+      WHERE singleton_id<>1
+      UNION ALL
+      SELECT 1 WHERE (SELECT count(*) FROM ${staged("attachment_storage_installation")})<>1
+      LIMIT 1`,
+  );
+  if (invalidStorageSingleton.length) {
+    throw new BackupDataError(
+      "invariant",
+      "Restore must contain exactly one attachment storage installation state",
+    );
+  }
+  const invalidStorageAccounting = await tx.unsafe(
+    `WITH expected_owner AS (
+       SELECT blob.owner_id,sum(blob.size_bytes) physical_bytes,count(*) physical_objects
+       FROM ${staged("attachment_storage_blobs")} blob
+       LEFT JOIN ${staged("attachment_storage_releases")} release
+         ON release.owner_id=blob.owner_id AND release.object_key=blob.object_key
+       WHERE release.id IS NULL GROUP BY blob.owner_id
+     ), owner_mismatch AS (
+       SELECT 1 FROM ${staged("attachment_storage_usage")} usage
+       FULL JOIN expected_owner expected USING(owner_id)
+       WHERE COALESCE(usage.physical_bytes,0)<>COALESCE(expected.physical_bytes,0)
+          OR COALESCE(usage.physical_objects,0)<>COALESCE(expected.physical_objects,0)
+     ), installation_mismatch AS (
+       SELECT 1 FROM ${staged("attachment_storage_installation")} installation
+       CROSS JOIN (
+         SELECT COALESCE(sum(blob.size_bytes),0) physical_bytes,count(*) physical_objects
+         FROM ${staged("attachment_storage_blobs")} blob
+         LEFT JOIN ${staged("attachment_storage_releases")} release
+           ON release.owner_id=blob.owner_id AND release.object_key=blob.object_key
+         WHERE release.id IS NULL
+       ) expected
+       WHERE installation.physical_bytes<>expected.physical_bytes
+          OR installation.physical_objects<>expected.physical_objects
+     ), attachment_mismatch AS (
+       SELECT 1 FROM ${staged("attachments")} attachment
+       LEFT JOIN ${staged("attachment_storage_blobs")} blob
+         ON blob.owner_id=attachment.owner_id AND blob.object_key=attachment.object_key
+       WHERE attachment.physical_object=true AND (
+         blob.owner_id IS NULL OR blob.size_bytes<>attachment.size_bytes
+          OR blob.sha256<>attachment.sha256 OR blob.mime_type<>attachment.mime_type)
+     ), invalid_nonphysical_attachment AS (
+       SELECT 1 FROM ${staged("attachments")} attachment
+       WHERE attachment.physical_object=false AND (
+         attachment.object_key='imports/' || attachment.owner_id::text || '/' ||
+           attachment.id::text || '/manifest-only' AND
+         attachment.state='failed' AND attachment.deleted_at IS NOT NULL AND
+         attachment.inspection_error=
+           'Attachment bytes were not included in the .dgchat manifest' AND
+         attachment.ingestion_status='failed' AND
+         attachment.ingestion_error='Attachment bytes require a separate restore' AND
+         attachment.ingested_at IS NULL
+       ) IS NOT TRUE
+     ), active_blob_without_attachment AS (
+       SELECT 1 FROM ${staged("attachment_storage_blobs")} blob
+       WHERE NOT EXISTS(
+         SELECT 1 FROM ${staged("attachment_storage_releases")} release
+         WHERE release.owner_id=blob.owner_id AND release.object_key=blob.object_key
+       ) AND NOT EXISTS(
+         SELECT 1 FROM ${staged("attachments")} attachment
+         WHERE attachment.owner_id=blob.owner_id AND attachment.object_key=blob.object_key
+           AND attachment.physical_object=true
+       )
+     ), invalid_release AS (
+       SELECT 1 FROM ${staged("attachment_storage_releases")} release
+       JOIN ${staged("attachment_storage_blobs")} blob
+         ON blob.owner_id=release.owner_id AND blob.object_key=release.object_key
+       LEFT JOIN ${staged("attachments")} attachment
+         ON attachment.id=release.attachment_id AND attachment.owner_id=release.owner_id
+       WHERE release.size_bytes<>blob.size_bytes OR release.sha256<>blob.sha256 OR
+         release.mime_type<>blob.mime_type OR
+         release.released_at<blob.admitted_at OR attachment.id IS NULL OR
+         attachment.physical_object IS NOT TRUE OR
+         attachment.object_key<>release.object_key OR attachment.size_bytes<>release.size_bytes OR
+         attachment.sha256<>release.sha256 OR attachment.mime_type<>release.mime_type OR
+         attachment.deleted_at IS NULL OR attachment.state<>'deleted' OR
+         EXISTS(SELECT 1 FROM ${staged("attachments")} other
+           WHERE other.owner_id=release.owner_id AND other.object_key=release.object_key
+             AND other.id<>release.attachment_id) OR
+         EXISTS(SELECT 1 FROM ${staged("message_attachments")} r
+           WHERE r.attachment_id=release.attachment_id) OR
+         EXISTS(SELECT 1 FROM ${staged("knowledge_collection_attachments")} r
+           WHERE r.attachment_id=release.attachment_id) OR
+         EXISTS(SELECT 1 FROM ${staged("document_chunks")} r
+           WHERE r.attachment_id=release.attachment_id) OR
+         EXISTS(SELECT 1 FROM ${staged("generated_assets")} r
+           WHERE r.attachment_id=release.attachment_id OR
+             r.usage_run_id=release.usage_run_id) OR
+         EXISTS(SELECT 1 FROM ${staged("generated_asset_inputs")} r
+           WHERE r.attachment_id=release.attachment_id) OR
+         EXISTS(SELECT 1 FROM ${staged("conversation_share_snapshots")} snapshot
+           CROSS JOIN LATERAL jsonb_each(snapshot.source_attachments) source
+           WHERE source.value->>'attachmentId'=release.attachment_id::text)
+     )
+     SELECT 1 FROM owner_mismatch
+     UNION ALL SELECT 1 FROM installation_mismatch
+     UNION ALL SELECT 1 FROM attachment_mismatch
+     UNION ALL SELECT 1 FROM invalid_nonphysical_attachment
+     UNION ALL SELECT 1 FROM active_blob_without_attachment
+     UNION ALL SELECT 1 FROM invalid_release
+     LIMIT 1`,
+  );
+  if (invalidStorageAccounting.length) {
+    throw new BackupDataError(
+      "invariant",
+      "Backup attachment storage accounting is inconsistent",
+    );
+  }
   for (const relation of RELATIONS) {
     const present = relation.columns.map((column) => `f.${safeIdentifier(column)} IS NOT NULL`)
       .join(" AND ");
@@ -1575,6 +2131,16 @@ async function validateStagedDatabase(
   );
   if (!admins || admins.count < 1) {
     throw new BackupDataError("invariant", "Restore must contain an active approved administrator");
+  }
+  const staleCredentials = await tx.unsafe(
+    `SELECT 1 FROM ${staged("api_tokens")} t JOIN ${staged("users")} u ON u.id=t.user_id
+      WHERE t.revoked_at IS NULL AND (
+        t.authority_epoch<>u.authority_epoch OR u.approval_status<>'approved' OR
+        u.state<>'active' OR u.deleted_at IS NOT NULL OR u.password_reset_pending=true
+      ) LIMIT 1`,
+  );
+  if (staleCredentials.length) {
+    throw new BackupDataError("invariant", "Backup contains invalid active API-token authority");
   }
   await validateProviderModels(tx, stage.get("providers")!, stage.get("provider_models")!);
   for await (
@@ -1687,16 +2253,51 @@ async function validateStagedDatabase(
   }
   const terminalChecks = [
     ["messages", "status='streaming'"],
-    ["usage_runs", "status='reserved'"],
     ["provider_attempts", "status='running'"],
     ["embedding_provider_attempts", "status='running'"],
-    ["tool_executions", "status IN ('queued','running')"],
+    [
+      "tool_executions",
+      "status IN ('pending_approval','queued_pending_reservation','queued','running')",
+    ],
     ["retention_scrub_runs", "status IN ('queued','running')"],
   ] as const;
   for (const [name, predicate] of terminalChecks) {
     if ((await tx.unsafe(`SELECT 1 FROM ${staged(name)} WHERE ${predicate} LIMIT 1`)).length) {
       throw new BackupDataError("invariant", `Backup contains nonterminal ${name} state`);
     }
+  }
+  const invalidRecoveryAccounting = await tx.unsafe(`
+    WITH valid AS (
+      SELECT u.id usage_run_id,e.id execution_id
+      FROM ${staged("usage_runs")} u JOIN ${staged("tool_executions")} e
+        ON u.id='tool:' || e.id::text AND u.user_id=e.owner_id
+      JOIN LATERAL (
+        SELECT count(*) FILTER (WHERE kind='reserve')::int reserve_count,
+          COALESCE(sum(amount_micros) FILTER (WHERE kind='reserve'),0)::bigint reserve_total,
+          count(*) FILTER (WHERE kind IN ('settle','refund'))::int terminal_count,
+          count(*) FILTER (WHERE user_id IS DISTINCT FROM u.user_id)::int owner_mismatch_count
+        FROM ${staged("ledger_entries")} l
+        WHERE l.usage_run_id=u.id
+      ) evidence ON true
+      WHERE u.status='reserved' AND u.token_id IS NULL AND u.recovery_owner='tool'
+        AND e.status IN ('failed_pending_refund','cancelled_pending_refund',
+          'succeeded_pending_settlement')
+        AND u.reserved_micros BETWEEN 1 AND 9007199254740991
+        AND e.billing_snapshot=jsonb_build_object('reservedMicros',u.reserved_micros,
+          'provider',u.provider,'model',u.model)
+        AND evidence.reserve_count=1 AND evidence.reserve_total=-u.reserved_micros
+        AND evidence.terminal_count=0 AND evidence.owner_mismatch_count=0
+    )
+    SELECT 1 FROM ${staged("usage_runs")} u WHERE u.status='reserved'
+      AND NOT EXISTS(SELECT 1 FROM valid v WHERE v.usage_run_id=u.id)
+    UNION ALL
+    SELECT 1 FROM ${staged("tool_executions")} e
+      WHERE e.status IN ('failed_pending_refund','cancelled_pending_refund',
+        'succeeded_pending_settlement')
+        AND NOT EXISTS(SELECT 1 FROM valid v WHERE v.execution_id=e.id)
+    LIMIT 1`);
+  if (invalidRecoveryAccounting.length) {
+    throw new BackupDataError("invariant", "Backup contains unsafe recovery accounting state");
   }
 }
 
@@ -1708,6 +2309,119 @@ async function validateRestoredDatabase(tx: postgres.TransactionSql): Promise<vo
   `;
   if (!admins || admins.count < 1) {
     throw new BackupDataError("invariant", "Restore must contain an active approved administrator");
+  }
+  // All three staging catalogs are deliberately excluded from portable data and are truncated
+  // before live rows are installed. Keep them in the release audit anyway: this makes the
+  // post-apply invariant exactly match online cleanup fencing and fails closed if restore ordering
+  // is ever changed without updating validation.
+  const invalidStorageAccounting = await tx`
+    WITH expected_owner AS (
+      SELECT blob.owner_id,sum(blob.size_bytes) physical_bytes,count(*) physical_objects
+      FROM attachment_storage_blobs blob
+      LEFT JOIN attachment_storage_releases release
+        ON release.owner_id=blob.owner_id AND release.object_key=blob.object_key
+      WHERE release.id IS NULL GROUP BY blob.owner_id
+    ), owner_mismatch AS (
+      SELECT 1 FROM attachment_storage_usage usage
+      FULL JOIN expected_owner expected USING(owner_id)
+      WHERE COALESCE(usage.physical_bytes,0)<>COALESCE(expected.physical_bytes,0)
+        OR COALESCE(usage.physical_objects,0)<>COALESCE(expected.physical_objects,0)
+    ), installation_mismatch AS (
+      SELECT 1 FROM attachment_storage_installation installation
+      CROSS JOIN (
+        SELECT COALESCE(sum(blob.size_bytes),0) physical_bytes,count(*) physical_objects
+        FROM attachment_storage_blobs blob
+        LEFT JOIN attachment_storage_releases release
+          ON release.owner_id=blob.owner_id AND release.object_key=blob.object_key
+        WHERE release.id IS NULL
+      ) expected
+      WHERE installation.singleton_id<>1
+        OR installation.physical_bytes<>expected.physical_bytes
+        OR installation.physical_objects<>expected.physical_objects
+    ), attachment_mismatch AS (
+      SELECT 1 FROM attachments attachment
+      LEFT JOIN attachment_storage_blobs blob
+        ON blob.owner_id=attachment.owner_id AND blob.object_key=attachment.object_key
+      WHERE attachment.physical_object=true AND (
+        blob.owner_id IS NULL OR blob.size_bytes<>attachment.size_bytes
+        OR blob.sha256<>attachment.sha256 OR blob.mime_type<>attachment.mime_type)
+    ), invalid_nonphysical_attachment AS (
+      SELECT 1 FROM attachments attachment
+      WHERE attachment.physical_object=false AND (
+        attachment.object_key='imports/' || attachment.owner_id::text || '/' ||
+          attachment.id::text || '/manifest-only' AND
+        attachment.state='failed' AND attachment.deleted_at IS NOT NULL AND
+        attachment.inspection_error=
+          'Attachment bytes were not included in the .dgchat manifest' AND
+        attachment.ingestion_status='failed' AND
+        attachment.ingestion_error='Attachment bytes require a separate restore' AND
+        attachment.ingested_at IS NULL
+      ) IS NOT TRUE
+    ), active_blob_without_attachment AS (
+      SELECT 1 FROM attachment_storage_blobs blob
+      WHERE NOT EXISTS(
+        SELECT 1 FROM attachment_storage_releases release
+        WHERE release.owner_id=blob.owner_id AND release.object_key=blob.object_key
+      ) AND NOT EXISTS(
+        SELECT 1 FROM attachments attachment
+        WHERE attachment.owner_id=blob.owner_id AND attachment.object_key=blob.object_key
+          AND attachment.physical_object=true
+      )
+    ), invalid_release AS (
+      SELECT 1 FROM attachment_storage_releases release
+      JOIN attachment_storage_blobs blob
+        ON blob.owner_id=release.owner_id AND blob.object_key=release.object_key
+      LEFT JOIN attachments attachment
+        ON attachment.id=release.attachment_id AND attachment.owner_id=release.owner_id
+      WHERE release.size_bytes<>blob.size_bytes OR release.sha256<>blob.sha256 OR
+        release.mime_type<>blob.mime_type OR
+        release.released_at<blob.admitted_at OR attachment.id IS NULL OR
+        attachment.physical_object IS NOT TRUE OR
+        attachment.object_key<>release.object_key OR attachment.size_bytes<>release.size_bytes OR
+        attachment.sha256<>release.sha256 OR attachment.mime_type<>release.mime_type OR
+        attachment.deleted_at IS NULL OR attachment.state<>'deleted' OR
+        EXISTS(SELECT 1 FROM attachments other
+          WHERE other.owner_id=release.owner_id AND other.object_key=release.object_key
+            AND other.id<>release.attachment_id) OR
+        EXISTS(SELECT 1 FROM message_attachments r
+          WHERE r.attachment_id=release.attachment_id) OR
+        EXISTS(SELECT 1 FROM knowledge_collection_attachments r
+          WHERE r.attachment_id=release.attachment_id) OR
+        EXISTS(SELECT 1 FROM document_chunks r
+          WHERE r.attachment_id=release.attachment_id) OR
+        EXISTS(SELECT 1 FROM generated_assets r
+          WHERE r.attachment_id=release.attachment_id OR
+            r.usage_run_id=release.usage_run_id) OR
+        EXISTS(SELECT 1 FROM generated_asset_inputs r
+          WHERE r.attachment_id=release.attachment_id) OR
+        EXISTS(SELECT 1 FROM generated_object_staging r
+          WHERE r.id<>release.stage_id AND r.state<>'cleaned' AND
+            (r.attachment_id=release.attachment_id OR
+              r.owner_id=release.owner_id AND r.object_key=release.object_key)) OR
+        EXISTS(SELECT 1 FROM file_upload_staging r
+          WHERE r.attachment_id=release.attachment_id OR
+            r.owner_id=release.owner_id AND r.object_key=release.object_key) OR
+        EXISTS(SELECT 1 FROM attachment_upload_staging r
+          WHERE r.attachment_id=release.attachment_id OR
+            r.owner_id=release.owner_id AND r.object_key=release.object_key) OR
+        EXISTS(SELECT 1 FROM conversation_share_snapshots snapshot
+          CROSS JOIN LATERAL jsonb_each(snapshot.source_attachments) source
+          WHERE source.value->>'attachmentId'=release.attachment_id::text)
+    )
+    SELECT 1 FROM owner_mismatch
+    UNION ALL SELECT 1 FROM installation_mismatch
+    UNION ALL SELECT 1 FROM attachment_mismatch
+    UNION ALL SELECT 1 FROM invalid_nonphysical_attachment
+    UNION ALL SELECT 1 FROM active_blob_without_attachment
+    UNION ALL SELECT 1 FROM invalid_release
+    UNION ALL SELECT 1 WHERE (SELECT count(*) FROM attachment_storage_installation)<>1
+    LIMIT 1
+  `;
+  if (invalidStorageAccounting.length) {
+    throw new BackupDataError(
+      "invariant",
+      "Backup attachment storage accounting is inconsistent",
+    );
   }
   await validateProviderModels(tx, "providers", "provider_models");
   const cycles = await tx`
@@ -1800,9 +2514,21 @@ async function applyBackupData(
           );
         }
         restoreControl = maintenance;
-        // Bind the transaction-local bypass to the durable operation identity. The trigger also
-        // verifies this backend owns the exact transaction advisory lock and that the operation
-        // still owns active maintenance; the caller-controlled setting is not trusted by itself.
+        const [transactionBinding] = await tx`
+          UPDATE installation_state SET restore_transaction_id=pg_current_xact_id()
+          WHERE singleton_id=1 AND maintenance_enabled=true
+            AND active_restore_id=${options.restoreOperationId!}
+            AND restore_transaction_id IS NULL
+          RETURNING singleton_id
+        `;
+        if (!transactionBinding) {
+          throw new BackupDataError(
+            "maintenance",
+            "Restore transaction authority is already bound",
+          );
+        }
+        // Bind the local setting to both the durable operation and this exact transaction. Unlike
+        // pg_locks, the xid8 binding cannot confuse a same-key session lock with an xact lock.
         await tx`SELECT set_config('dg_chat.restore_bypass',${options.restoreOperationId!},true)`;
       }
       const suffix = crypto.randomUUID().replaceAll("-", "").slice(0, 12);
@@ -1813,7 +2539,7 @@ async function applyBackupData(
         options.objectKeyMap ?? new Map(),
       );
       await disableRedactedOcrSources(tx, stage);
-      if (source.schemaVersion !== BACKUP_DATA_SCHEMA_VERSION) {
+      if (requiresLegacyPortableUpgrade(source.schemaVersion)) {
         const legacyLinks = safeIdentifier(stage.get("message_attachments")!);
         await tx.unsafe(`WITH ranked AS (
           SELECT message_id,attachment_id,
@@ -1884,6 +2610,15 @@ async function applyBackupData(
       if (!fenced) throw new BackupDataError("conflict", "Restore database commit fence is stale");
       impact = Object.freeze({ ...impact, restoreOperationVersion: fenced.version });
       await options.beforeCommit?.();
+      const [releasedBinding] = await tx`
+        UPDATE installation_state SET restore_transaction_id=NULL
+        WHERE singleton_id=1 AND active_restore_id=${options.restoreOperationId!}
+          AND restore_transaction_id=pg_current_xact_id()
+        RETURNING singleton_id
+      `;
+      if (!releasedBinding) {
+        throw new BackupDataError("maintenance", "Restore transaction authority was lost");
+      }
       return impact;
     });
   } finally {

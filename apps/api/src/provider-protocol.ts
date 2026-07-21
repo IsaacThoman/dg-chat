@@ -13,7 +13,8 @@ export const MAX_RESPONSE_CITATION_COLLECTION_BYTES = 1_048_576;
 export type CanonicalRole = "system" | "developer" | "user" | "assistant" | "tool";
 export type CanonicalContentPart =
   | { type: "text"; text: string }
-  | { type: "image"; url: string; detail?: "auto" | "low" | "high" };
+  | { type: "image"; url: string; detail?: "auto" | "low" | "high" }
+  | { type: "audio"; data: string; format: "wav" | "mp3" };
 export interface CanonicalUrlCitation {
   type: "url_citation";
   startIndex: number;
@@ -320,6 +321,25 @@ function detail(value: unknown, path: string): "auto" | "low" | "high" | undefin
   return value as "auto" | "low" | "high";
 }
 
+const MAX_INLINE_AUDIO_DECODED_BYTES = 3 * 1024 * 1024;
+function inlineAudioData(value: unknown, path: string): string {
+  const data = string(value, path, MAX_PAYLOAD_BYTES, false);
+  if (
+    data.length % 4 !== 0 ||
+    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(data)
+  ) fail(`${path} must be canonical base64`, path);
+  const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
+  const decodedBytes = data.length / 4 * 3 - padding;
+  if (decodedBytes > MAX_INLINE_AUDIO_DECODED_BYTES) {
+    throw new ProviderProtocolError(
+      "payload_too_large",
+      `Inline audio exceeds ${MAX_INLINE_AUDIO_DECODED_BYTES} decoded bytes`,
+      path,
+    );
+  }
+  return data;
+}
+
 function chatParts(value: unknown, path: string): CanonicalContentPart[] {
   if (typeof value === "string") return [{ type: "text", text: string(value, path) }];
   if (value === null || value === undefined) return [];
@@ -340,6 +360,23 @@ function chatParts(value: unknown, path: string): CanonicalContentPart[] {
         type: "image",
         url: safeUrl(image.url, `${path}[${index}].image_url.url`),
         ...(imageDetail ? { detail: imageDetail } : {}),
+      };
+    }
+    if (part.type === "input_audio") {
+      allowedKeys(part, ["type", "input_audio"], `${path}[${index}]`);
+      const audio = object(part.input_audio, `${path}[${index}].input_audio`);
+      allowedKeys(audio, ["data", "format"], `${path}[${index}].input_audio`);
+      const format = string(audio.format, `${path}[${index}].input_audio.format`, 16, false);
+      if (format !== "wav" && format !== "mp3") {
+        unsupported(
+          `${path}[${index}].input_audio.format`,
+          "Only wav and mp3 Chat audio inputs can be transformed",
+        );
+      }
+      return {
+        type: "audio",
+        data: inlineAudioData(audio.data, `${path}[${index}].input_audio.data`),
+        format,
       };
     }
     unsupported(`${path}[${index}].type`, "Chat content contains an unsupported part type");
@@ -377,26 +414,51 @@ function responseParts(value: unknown, path: string): CanonicalContentPart[] {
         ...(imageDetail ? { detail: imageDetail } : {}),
       };
     }
+    if (part.type === "input_audio") {
+      allowedKeys(part, ["type", "input_audio"], `${path}[${index}]`);
+      const audio = object(part.input_audio, `${path}[${index}].input_audio`);
+      allowedKeys(audio, ["data", "format"], `${path}[${index}].input_audio`);
+      const format = string(audio.format, `${path}[${index}].input_audio.format`, 16, false);
+      if (format !== "wav" && format !== "mp3") {
+        unsupported(
+          `${path}[${index}].input_audio.format`,
+          "Only wav and mp3 Responses audio inputs can be transformed",
+        );
+      }
+      return {
+        type: "audio",
+        data: inlineAudioData(audio.data, `${path}[${index}].input_audio.data`),
+        format,
+      };
+    }
     unsupported(`${path}[${index}].type`, "Responses content contains an unsupported part type");
   });
 }
 
 function toResponsesContent(parts: CanonicalContentPart[]) {
   return parts.map((part) =>
-    part.type === "text" ? { type: "input_text", text: part.text } : {
-      type: "input_image",
-      image_url: part.url,
-      ...(part.detail ? { detail: part.detail } : {}),
-    }
+    part.type === "text"
+      ? { type: "input_text", text: part.text }
+      : part.type === "audio"
+      ? { type: "input_audio", input_audio: { data: part.data, format: part.format } }
+      : {
+        type: "input_image",
+        image_url: part.url,
+        ...(part.detail ? { detail: part.detail } : {}),
+      }
   );
 }
 function toChatContent(parts: CanonicalContentPart[]): string | Array<Record<string, unknown>> {
   if (parts.length === 1 && parts[0].type === "text") return parts[0].text;
   return parts.map((part) =>
-    part.type === "text" ? { type: "text", text: part.text } : {
-      type: "image_url",
-      image_url: { url: part.url, ...(part.detail ? { detail: part.detail } : {}) },
-    }
+    part.type === "text"
+      ? { type: "text", text: part.text }
+      : part.type === "audio"
+      ? { type: "input_audio", input_audio: { data: part.data, format: part.format } }
+      : {
+        type: "image_url",
+        image_url: { url: part.url, ...(part.detail ? { detail: part.detail } : {}) },
+      }
   );
 }
 
@@ -570,12 +632,20 @@ const chatRequestKeys = [
   "user",
   "reasoning_effort",
   "reasoning_summary",
+  "modalities",
+  "audio",
 ];
 
 /** Converts a Chat Completions request into a Responses API request without silent field loss. */
 export function chatCompletionsRequestToResponses(input: unknown): Record<string, unknown> {
   const body = object(clonePayload(input), "request");
   allowedKeys(body, chatRequestKeys, "request");
+  if (body.modalities !== undefined || body.audio !== undefined) {
+    unsupported(
+      body.modalities !== undefined ? "request.modalities" : "request.audio",
+      "Chat audio output cannot be transformed to the Responses API; use a Chat Completions provider",
+    );
+  }
   for (const field of ["stop", "frequency_penalty", "presence_penalty", "seed"] as const) {
     if (body[field] !== undefined && body[field] !== null) unsupported(`request.${field}`);
   }
@@ -749,8 +819,26 @@ const responsesRequestKeys = [
 /** Identifies Responses input items that cannot be represented losslessly for a Chat target. */
 export function responsesRequestRequiresNativeInput(input: unknown): boolean {
   const body = object(input, "request");
+  if (body.tools !== undefined) {
+    for (const [index, raw] of array(body.tools, "request.tools", MAX_TOOLS).entries()) {
+      const tool = object(raw, `request.tools[${index}]`);
+      if (tool.type === "mcp") {
+        unsupported(
+          `request.tools[${index}].type`,
+          "Remote MCP tools are disabled until an administrator-approved server allowlist and audit policy is configured",
+        );
+      }
+      if (tool.type === "web_search" || tool.type === "web_search_preview") {
+        unsupported(
+          `request.tools[${index}].type`,
+          "Provider-managed web search is disabled until model-specific tool policy and bounded result accounting are configured",
+        );
+      }
+      responseTool(raw, `request.tools[${index}]`);
+    }
+  }
   if (!Array.isArray(body.input)) return false;
-  return body.input.some((raw) => {
+  return body.input.some((raw, index) => {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
     const item = raw as Record<string, unknown>;
     if (item.type === "reasoning") return true;
@@ -761,6 +849,7 @@ export function responsesRequestRequiresNativeInput(input: unknown): boolean {
       return item.status === "in_progress" || item.status === "incomplete";
     }
     if (item.type !== "message") return false;
+    responseParts(item.content, `request.input[${index}].content`);
     if (item.id !== undefined || item.status !== undefined) return true;
     return Array.isArray(item.content) &&
       item.content.some((part) =>

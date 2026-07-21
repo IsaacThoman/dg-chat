@@ -324,6 +324,7 @@ Deno.test("sharing routes reject malformed, unsafe, temporary, expired, and unav
   assertEquals((await app.request(`/api/public/shares/${secret}`)).status, 200);
   const suspended = repository.setAdminUserState({
     actorId: actor.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: owner.user.id,
     expectedVersion: owner.user.version,
     state: "suspended",
@@ -332,6 +333,7 @@ Deno.test("sharing routes reject malformed, unsafe, temporary, expired, and unav
   assertEquals((await app.request(`/api/public/shares/${secret}`)).status, 404);
   repository.setAdminUserState({
     actorId: actor.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: owner.user.id,
     expectedVersion: suspended.version,
     state: "active",

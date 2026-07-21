@@ -10,7 +10,9 @@
 - Put registration behind an abuse-resistant reverse proxy until distributed rate limiting and email
   verification are enabled.
 - Set upload byte, pixel, archive-expansion, processing-time, and per-user quota limits.
-- Keep payload retention disabled unless explicitly required; scrub content on schedule.
+- Keep payload retention disabled unless explicitly required. The worker automatically enqueues a
+  system-owned, policy-snapshotted scrub on the durable daily schedule by default; monitor scheduler
+  failure and overdue metrics rather than relying on an administrator to enqueue runs manually.
 - Back up the encryption keyring separately and test restore before production use.
 
 ## Application controls
@@ -34,35 +36,63 @@ parameters, identity values, and adapter exception details are never forwarded t
 
 Markdown, citations, filenames, provider errors, and tool results are rendered as hostile content
 under a restrictive Content Security Policy. Raw HTML is disabled unless passed through a maintained
-sanitizer. Spreadsheet formulas are escaped in CSV exports. Mermaid and artifact rendering are not
-currently exposed by the product.
+sanitizer. Spreadsheet formulas are escaped in CSV exports. Mermaid diagrams are rendered from
+fenced source through the product's bounded, sanitized rich-output path, and code/document artifacts
+use inert text previews or explicitly sandboxed previews rather than injecting model output into the
+application document. The production proxy permits scripts and connections only from the product
+origin, rejects inline script and dynamic evaluation, disables embedding and plugins, and applies
+`nosniff`. Its narrow blob/media and inline-style allowances preserve local previews, playback,
+React positioning, KaTeX, and sanitized Mermaid output. Remote images remain blocked until the user
+approves the exact source URL, and the CSP then permits only HTTPS remote image transport. The
+public proxy always returns a JSON 404 for `/metrics`; expose future metrics only on an internal
+listener.
 
 File upload routes stream multipart bodies through byte and concurrency limits, MIME sniffing,
 filename normalization, immutable object keys, ownership checks, and image dimension/decompression
 guards. Objects are private in S3-compatible storage; direct reads require ownership, while
 tombstoned objects remain available only through an immutable historical message link. PNG and JPEG
 files receive a bounded full decode before becoming ready. GIF and WebP files remain quarantined
-because a trusted full decoder is not yet configured.
+because a trusted full decoder is not yet configured. Retained physical-byte quotas apply to browser
+uploads, generated media, and OpenAI Files, and intentionally include historical soft-deleted
+objects. The administrative storage inventory never exposes object keys or credentials.
+Administrators cannot manually release quarantined files: they may only enqueue a reason-bound,
+optimistic reinspection through the current worker policy.
 
-The current attachment worker acknowledges terminal inspection states; it is not an antivirus or
-content-disarm scanner. Audio acceptance still relies on bounded upload handling and MIME/signature
-checks, so deployments requiring malware scanning must add an external quarantine scanner. Bounded,
-strict UTF-8 ingestion is implemented for `text/plain` and fully validated JSON. PDF extraction has
+The attachment worker fences inspection results to a monotonic policy epoch; stale jobs cannot
+overwrite a later decision. Its built-in bounded stream verifies the stored SHA-256 digest and
+quarantines the standard EICAR test marker, but that narrow deterministic signature is not a general
+antivirus or content-disarm engine. Deployments that require malware verdicts can enable the
+authenticated external scanner integration. Enablement is a strict boolean and requires a credential
+plus an exact hostname allowlist. The integration fails closed, resolves and pins DNS once, manually
+rejects redirects, blocks private-network access unless the configured scanner itself is explicitly
+private, and bounds the request body, response body, and complete deadline. Scanner failures are
+sanitized before reaching users or logs. The required mode and shared policy version are persisted
+at upload time, preventing a differently configured worker from silently weakening the decision.
+Audio acceptance still relies on bounded upload handling and MIME/signature checks. Bounded, strict
+UTF-8 ingestion is implemented for `text/plain` and fully validated JSON. PDF extraction has
 raw-byte, page-count, and output limits. PDF and DOCX parsing runs in a terminable worker isolate
 under one absolute, lease-margined job deadline. DOCX extraction preflights the ZIP directory and
 rejects ZIP64/multidisk archives, traversal, encryption, macros, external relationships, excessive
 entries, per-entry size, aggregate expansion, and suspicious compression ratios before extraction.
-Other Office formats, object garbage collection, and retention-aware deletion are not implemented.
-OCR interception, PostgreSQL vector persistence, and hybrid lexical/vector retrieval are implemented
-with bounded inputs, owner scoping, cache keys derived from content hashes, and durable accounting.
-Embeddings and audio provider calls use the same DNS-pinned, private-network-blocking transport and
-strict bounded response validation as chat providers.
+Other Office formats and general retention-policy-driven deletion are not implemented. Durable
+staging cleanup and generated-object cleanup are reference-fenced, retry-safe, and settle
+append-only physical-storage release records only after object deletion. OCR interception,
+PostgreSQL vector persistence, and hybrid lexical/vector retrieval are implemented with bounded
+inputs, owner scoping, cache keys derived from content hashes, and durable accounting. Embeddings
+and audio provider calls use the same DNS-pinned, private-network-blocking transport and strict
+bounded response validation as chat providers.
 
 The current OpenAI-compatible provider transport resolves every A and AAAA answer, rejects
 special-use destinations, and pins the approved address while preserving TLS hostname validation. It
 rejects redirects and bounds response and streaming bytes. OCR, SearXNG search, approved tools, and
 ingestion each enforce their own network, redirect, byte, MIME, and relevant image/archive limits.
 Any future sandbox fetcher must preserve those controls independently.
+
+Search adapters execute as trusted code inside the API process. Adapter `networkTarget` metadata is
+advisory input to tool policy checks, not an isolation or SSRF boundary. The built-in SearXNG
+adapter enforces SSRF protection in its DNS-resolved, address-pinned, no-redirect transport; any
+custom in-process adapter must implement equivalent egress controls and receive the same scrutiny as
+application code.
 
 ## Secrets and privacy
 

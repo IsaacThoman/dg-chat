@@ -30,6 +30,11 @@ export interface WebSearchResponse {
 
 export interface WebSearchAdapter {
   readonly id: string;
+  /**
+   * Advisory policy metadata only. Adapters are trusted in-process code and must independently
+   * enforce their transport boundary; WebSearchToolAdapter cannot sandbox a custom implementation.
+   */
+  readonly networkTarget: Readonly<{ hostname: string; privateNetwork: boolean }>;
   search(request: WebSearchRequest): Promise<WebSearchResponse>;
 }
 
@@ -104,6 +109,7 @@ export class SearxngSearchAdapter implements WebSearchAdapter {
   readonly id = "searxng";
   readonly targetHostname: string;
   readonly usesPrivateEndpoint: boolean;
+  readonly networkTarget: Readonly<{ hostname: string; privateNetwork: boolean }>;
   readonly #baseUrl: URL;
   readonly #fetch: typeof fetch;
   readonly #resolveDns?: DnsResolver;
@@ -129,6 +135,10 @@ export class SearxngSearchAdapter implements WebSearchAdapter {
     this.#fetch = options.fetch ?? fetch;
     this.targetHostname = this.#baseUrl.hostname;
     this.usesPrivateEndpoint = options.allowPrivateEndpoint === true;
+    this.networkTarget = Object.freeze({
+      hostname: this.targetHostname,
+      privateNetwork: this.usesPrivateEndpoint,
+    });
     this.#resolveDns = options.resolveDns;
     this.#policy = {
       allowedDomains: [this.#baseUrl.hostname],

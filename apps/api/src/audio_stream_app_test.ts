@@ -50,7 +50,9 @@ async function fixture(
     }),
   });
   assertEquals(setup.status, 201);
-  const user = (await setup.json()).user;
+  const publicUser = (await setup.json()).user;
+  const user = repository.findUser(publicUser.id);
+  assertExists(user);
   const mutation = { actorId: user.id, action: "test.audio-stream" };
   const created = repository.createProvider({
     slug: "audio-stream-provider",
@@ -130,8 +132,21 @@ Deno.test("completed transcription and translation replays reauthorize model acc
     const key = `audio-entitlement-replay-${capability}`;
     const completed = await fx.request(false, key);
     assertEquals(completed.status, 200, await completed.clone().text());
-    const group = fx.repository.createAccessGroup({ name: `deny-${capability}` });
-    fx.repository.replaceAccessGroupModels(group.id, [fx.model.id], group.version);
+    const group = fx.repository.createAccessGroup({ name: `deny-${capability}` }, {
+      actorId: fx.user.id,
+      action: "test.model_access_group.created",
+      targetType: "model_access_group",
+      requireEmailVerification: false,
+      expectedAuthorityEpoch: fx.user.authorityEpoch,
+    });
+    fx.repository.replaceAccessGroupModels(group.id, [fx.model.id], group.version, [], {
+      actorId: fx.user.id,
+      action: "test.model_access_group.models_replaced",
+      targetType: "model_access_group",
+      targetId: group.id,
+      requireEmailVerification: false,
+      expectedAuthorityEpoch: fx.user.authorityEpoch,
+    });
     const denied = await fx.request(false, key);
     const deniedBody = await denied.text();
     assertEquals(denied.status, 404, deniedBody);
@@ -182,6 +197,58 @@ Deno.test("audio terminal done is withheld until stream accounting is durable", 
   const terminal = new TextDecoder().decode((await terminalRead).value);
   assertStringIncludes(terminal, "transcript.text.done");
   await reader.cancel();
+});
+
+Deno.test("cancelling a stalled transcription stream aborts upstream and releases admission", async () => {
+  let released = false;
+  let observedSignal: AbortSignal | undefined;
+  const limiter: AudioConcurrencyLimiter = {
+    acquire: () =>
+      Promise.resolve({
+        id: "stalled-stream",
+        signal: new AbortController().signal,
+        release: () => {
+          released = true;
+          return Promise.resolve();
+        },
+      }),
+    close: () => Promise.resolve(),
+  };
+  const value = await fixture((_input, init) => {
+    observedSignal = init?.signal ?? undefined;
+    return Promise.resolve(
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(
+              new TextEncoder().encode(
+                'data: {"type":"transcript.text.delta","delta":"hello"}\n\n',
+              ),
+            );
+            observedSignal?.addEventListener("abort", () => {
+              controller.error(observedSignal?.reason ?? new DOMException("Aborted", "AbortError"));
+            }, { once: true });
+          },
+        }),
+        { headers: { "content-type": "text/event-stream" } },
+      ),
+    );
+  }, limiter);
+  const response = await value.request();
+  const reader = response.body!.getReader();
+  const first = new TextDecoder().decode((await reader.read()).value);
+  assertStringIncludes(first, "transcript.text.delta");
+  await reader.cancel();
+  const cleanedUp = await Promise.race([
+    (async () => {
+      while (!observedSignal?.aborted || !released) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+      return true;
+    })(),
+    new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 1_000)),
+  ]);
+  assertEquals(cleanedUp, true);
 });
 
 Deno.test("audio failure bills matching delta and segment representations only once", async () => {

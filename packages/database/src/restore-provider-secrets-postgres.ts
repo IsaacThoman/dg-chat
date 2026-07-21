@@ -274,8 +274,13 @@ export class PostgresRestoreProviderSecretsStore {
 
   static async connect(databaseUrl: string) {
     const sql = postgres(databaseUrl, { max: 4 });
-    await sql`SELECT 1`;
-    return new PostgresRestoreProviderSecretsStore(sql);
+    try {
+      await sql`SELECT 1`;
+      return new PostgresRestoreProviderSecretsStore(sql);
+    } catch (error) {
+      await sql.end({ timeout: 0 }).catch(() => undefined);
+      throw error;
+    }
   }
 
   close() {

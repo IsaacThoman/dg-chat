@@ -802,11 +802,13 @@ export function AdminResilience(
   const [editingRoute, setEditingRoute] = useState<RouteEntry>();
   const [notice, setNotice] = useState("");
   const saved = async (message: string) => {
+    // Confirm the durable mutation immediately; cache refresh latency must not leave the prior
+    // operation's banner on screen while an administrator waits for a new save to finish.
+    setNotice(message);
     await Promise.all([
       queryClient.invalidateQueries({ queryKey: ["admin-resilience-policies"] }),
       queryClient.invalidateQueries({ queryKey: ["admin-resilience-routes"] }),
     ]);
-    setNotice(message);
   };
   return (
     <section aria-labelledby="resilience-title">

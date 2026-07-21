@@ -23,6 +23,19 @@ export function fallbackConversationId(
   )?.id ?? "";
 }
 
+/** Prevents a retained session from another lifecycle destination becoming visible by accident. */
+export function activeConversationIdForView(
+  conversations: Conversation[],
+  view: ConversationListView,
+  activeId: string,
+): string {
+  return conversationsForView(conversations, view).some((conversation) =>
+      conversation.id === activeId
+    )
+    ? activeId
+    : "";
+}
+
 export function mergeConversationSnapshot(
   conversations: Conversation[] | undefined,
   incoming: Conversation,

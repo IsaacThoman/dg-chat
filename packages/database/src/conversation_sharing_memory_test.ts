@@ -54,6 +54,10 @@ function setup() {
     sha256: "a".repeat(64),
     state: "ready",
     inspectionError: null,
+    requiredInspectionMode: "local",
+    inspectionPolicyVersion: "worker-policy-v1",
+    inspectionEpoch: 1,
+    version: 1,
     ingestionStatus: "not_applicable",
     ingestionError: null,
     ingestedAt: null,
@@ -164,6 +168,7 @@ Deno.test("memory share revocation, expiry, owner suspension/deletion, and attac
   const created = await repo.createConversationShare(owner.id, input);
   const suspended = repo.setAdminUserState({
     actorId: actor.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: owner.id,
     expectedVersion: owner.version,
     state: "suspended",
@@ -172,6 +177,7 @@ Deno.test("memory share revocation, expiry, owner suspension/deletion, and attac
   assertEquals(repo.resolvePublicConversationShare(input.secretHash), undefined);
   repo.setAdminUserState({
     actorId: actor.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: owner.id,
     expectedVersion: suspended.version,
     state: "active",

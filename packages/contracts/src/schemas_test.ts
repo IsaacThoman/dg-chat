@@ -12,6 +12,8 @@ import {
   adminSessionRevocationSchema,
   adminUserQuerySchema,
   chatCompletionSchema,
+  communityLeaderboardQuerySchema,
+  createAccessGroupSchema,
   createConversationFolderSchema,
   createConversationTagSchema,
   createTokenSchema,
@@ -25,6 +27,8 @@ import {
   responsesSchema,
   setActiveLeafSchema,
   streamGenerationSchema,
+  updateAccessGroupSchema,
+  updateCommunityProfileSchema,
   updateConversationFolderSchema,
   updateConversationSchema,
   updateConversationTagSchema,
@@ -54,6 +58,67 @@ Deno.test("identity password policy is shared by registration and recovery", () 
   assertEquals(passwordPolicyError(short), `Use at least ${PASSWORD_MIN_LENGTH} characters.`);
   assertEquals(passwordPolicyError(valid), null);
   assertEquals(passwordPolicyError(long), `Use no more than ${PASSWORD_MAX_LENGTH} characters.`);
+});
+
+Deno.test("community profile updates are strict, versioned, and consent-safe", () => {
+  assertEquals(
+    updateCommunityProfileSchema.parse({
+      expectedVersion: 1,
+      optedIn: true,
+      identityMode: "nickname",
+      nickname: "  Friendly-user.2  ",
+      color: "violet",
+      shareBalance: true,
+    }),
+    {
+      expectedVersion: 1,
+      optedIn: true,
+      identityMode: "nickname",
+      nickname: "Friendly-user.2",
+      color: "violet",
+      shareBalance: true,
+    },
+  );
+  for (
+    const invalid of [
+      { expectedVersion: 1 },
+      { expectedVersion: 0, optedIn: true },
+      { expectedVersion: 1, optedIn: false, shareBalance: true },
+      { expectedVersion: 1, identityMode: "nickname", nickname: null },
+      { expectedVersion: 1, identityMode: "anonymous", nickname: "Named" },
+      { expectedVersion: 1, nickname: "<script>" },
+      { expectedVersion: 1, nickname: "unsafe@example.test" },
+      { expectedVersion: 1, nickname: "right\u202Eleft" },
+      { expectedVersion: 1, color: "#ff00ff" },
+      { expectedVersion: 1, optedIn: true, extra: "not accepted" },
+    ]
+  ) {
+    assertEquals(updateCommunityProfileSchema.safeParse(invalid).success, false);
+  }
+});
+
+Deno.test("community leaderboard queries are strict, bounded, and separate current balance", () => {
+  assertEquals(communityLeaderboardQuerySchema.parse({}), {
+    metric: "calls",
+    limit: 25,
+  });
+  assertEquals(
+    communityLeaderboardQuerySchema.parse({ metric: "tokens", window: "90d", limit: 100 }),
+    { metric: "tokens", window: "90d", limit: 100 },
+  );
+  for (
+    const invalid of [
+      { metric: "provider_cost" },
+      { metric: "calls", window: "all" },
+      { metric: "balance", window: "30d" },
+      { limit: 0 },
+      { limit: 101 },
+      { cursor: "visible-user-id" },
+      { extra: true },
+    ]
+  ) {
+    assertEquals(communityLeaderboardQuerySchema.safeParse(invalid).success, false);
+  }
 });
 
 Deno.test("admin security and billing command schemas are strict and bounded", () => {
@@ -546,6 +611,46 @@ Deno.test("personal token policies are strict and bounded", () => {
     true,
   );
   assertEquals(updateTokenSchema.safeParse({ expectedVersion: 0, name: "Nope" }).success, false);
+});
+
+Deno.test("access-group metadata updates require an actual change", () => {
+  assertEquals(updateAccessGroupSchema.safeParse({ expectedVersion: 1 }).success, false);
+  assertEquals(
+    updateAccessGroupSchema.safeParse({ expectedVersion: 1, name: "Operators" }).success,
+    true,
+  );
+  assertEquals(
+    updateAccessGroupSchema.safeParse({ expectedVersion: 1, description: "" }).success,
+    true,
+  );
+});
+
+Deno.test("access-group creation accepts a bounded initial policy and defaults to empty", () => {
+  assertEquals(createAccessGroupSchema.parse({ name: "Legacy" }), {
+    name: "Legacy",
+    userIds: [],
+    modelIds: [],
+    tokenIds: [],
+  });
+  const id = crypto.randomUUID();
+  assertEquals(
+    createAccessGroupSchema.parse({
+      name: "Restricted",
+      userIds: [id],
+      modelIds: [id],
+      tokenIds: [id],
+    }),
+    {
+      name: "Restricted",
+      userIds: [id],
+      modelIds: [id],
+      tokenIds: [id],
+    },
+  );
+  assertEquals(
+    createAccessGroupSchema.safeParse({ name: "Invalid", userIds: ["not-a-uuid"] }).success,
+    false,
+  );
 });
 
 Deno.test("admin account lifecycle contracts are strict, versioned, and bounded", () => {

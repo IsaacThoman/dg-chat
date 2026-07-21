@@ -2,6 +2,7 @@ import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.14";
 import postgres from "npm:postgres@3.4.7";
 import { DomainError } from "./memory.ts";
 import { PostgresRepository } from "./normalized-postgres.ts";
+import { runAuditTestMaintenanceSql } from "./postgres-test-maintenance.ts";
 
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
 
@@ -17,8 +18,11 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
-    await sql`TRUNCATE audit_events,ledger_entries,identity_tokens,api_tokens,auth_verifications,
-      auth_sessions,auth_accounts,auth_users,sessions,users RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      `TRUNCATE audit_events,ledger_entries,identity_tokens,api_tokens,auth_verifications,
+        auth_sessions,auth_accounts,auth_users,sessions,users RESTART IDENTITY CASCADE`,
+    );
     const actorId = crypto.randomUUID();
     const targetId = crypto.randomUUID();
     await sql`INSERT INTO users(id,email,name,role,approval_status,state,email_verified_at)
@@ -30,6 +34,7 @@ Deno.test({
       await assertDomainCode(() =>
         repository.decideUserApproval({
           actorId,
+          expectedAuthorityEpoch: 1,
           targetUserId: targetId,
           expectedVersion: 1,
           status: "rejected",
@@ -38,6 +43,7 @@ Deno.test({
       await assertDomainCode(() =>
         repository.setAdminUserState({
           actorId,
+          expectedAuthorityEpoch: 1,
           targetUserId: targetId,
           expectedVersion: 1,
           state: "suspended",
@@ -45,6 +51,7 @@ Deno.test({
       await assertDomainCode(() =>
         repository.setAdminUserRole({
           actorId,
+          expectedAuthorityEpoch: 1,
           targetUserId: targetId,
           expectedVersion: 1,
           role: "admin",
@@ -53,6 +60,7 @@ Deno.test({
       await assertDomainCode(() =>
         repository.setAdminUserDeleted({
           actorId,
+          expectedAuthorityEpoch: 1,
           targetUserId: targetId,
           expectedVersion: 1,
           deleted: true,
@@ -61,6 +69,7 @@ Deno.test({
 
       const approved = await repository.decideUserApproval({
         actorId,
+        expectedAuthorityEpoch: 1,
         targetUserId: targetId,
         expectedVersion: 1,
         status: "approved",
@@ -68,6 +77,7 @@ Deno.test({
       });
       const suspended = await repository.setAdminUserState({
         actorId,
+        expectedAuthorityEpoch: 1,
         targetUserId: targetId,
         expectedVersion: approved.version,
         state: "suspended",
@@ -75,6 +85,7 @@ Deno.test({
       });
       const activated = await repository.setAdminUserState({
         actorId,
+        expectedAuthorityEpoch: 1,
         targetUserId: targetId,
         expectedVersion: suspended.version,
         state: "active",

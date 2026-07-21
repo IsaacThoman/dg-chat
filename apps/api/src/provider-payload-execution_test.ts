@@ -1,5 +1,6 @@
-import { assertEquals } from "jsr:@std/assert@1.0.14";
+import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.14";
 import { MemoryRepository, type ProviderPayloadCaptureInput } from "@dg-chat/database";
+import { complete as completeChatAdapter } from "./models.ts";
 import { MemoryCircuitBreaker } from "./provider-circuit.ts";
 import { ProviderExecutionEngine } from "./provider-execution.ts";
 import { ProviderAttemptError } from "./provider-resilience.ts";
@@ -93,6 +94,7 @@ Deno.test("provider diagnostic capture is sanitized, repository-gated, and failu
   const captures: ProviderPayloadCaptureInput[] = [];
   let mode: "disabled" | "throw" | "capture" = "disabled";
   let failNextProvider = false;
+  let nominalErrorPayload = false;
   fx.repository.captureProviderPayload = (input) => {
     captures.push(input);
     if (mode === "throw") throw new Error("diagnostic store unavailable");
@@ -108,7 +110,21 @@ Deno.test("provider diagnostic capture is sanitized, repository-gated, and failu
       openSeconds: 30,
       halfOpenLeaseSeconds: 5,
     },
-    complete: () => {
+    complete: (upstreamRequest, upstreamSignal, upstreamOptions) => {
+      if (nominalErrorPayload) {
+        return completeChatAdapter(upstreamRequest, upstreamSignal, {
+          ...upstreamOptions,
+          fetch: (() =>
+            Promise.resolve(Response.json({
+              error: {
+                message: "authorization=real-adapter-secret",
+                signed_url: "https://objects.example/private?X-Amz-Signature=secret",
+              },
+              choices: [{ message: { role: "assistant", content: "nominal success" } }],
+              usage: { prompt_tokens: 1, completion_tokens: 1 },
+            }))) as typeof fetch,
+        });
+      }
       if (failNextProvider) {
         failNextProvider = false;
         return Promise.reject(
@@ -127,6 +143,12 @@ Deno.test("provider diagnostic capture is sanitized, repository-gated, and failu
           choices: [{ message: { content: "safe result" } }],
           headers: { authorization: "Bearer response-secret" },
           signed_url: "https://objects.example/result?signature=secret",
+          cloud_reference: "AKIAIOSFODNN7EXAMPLE",
+          opaque_reference: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+          metadata: {
+            error: { message: "nested-success-error-secret" },
+            errors: [{ message: "plural-success-error-secret" }],
+          },
         },
       });
     },
@@ -136,6 +158,11 @@ Deno.test("provider diagnostic capture is sanitized, repository-gated, and failu
         choices: [{ delta: { content: "streamed result" } }],
         api_key: "sk-stream-secret-value",
         source_url: "https://objects.example/stream?signature=secret",
+        cloud_reference: "AIzaSyD-example_key_material_1234567890ab",
+        metadata: {
+          error: { message: "nested-stream-error-secret" },
+          errors: [{ message: "plural-stream-error-secret" }],
+        },
       });
       yield JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] });
       yield "[DONE]";
@@ -181,6 +208,10 @@ Deno.test("provider diagnostic capture is sanitized, repository-gated, and failu
   assertEquals(persisted.includes("response-secret"), false);
   assertEquals(persisted.includes("signature=secret"), false);
   assertEquals(persisted.includes("provider-secret"), false);
+  assertEquals(persisted.includes("AKIAIOSFODNN7EXAMPLE"), false);
+  assertEquals(persisted.includes("EXAMPLEKEY"), false);
+  assertEquals(persisted.includes("nested-success-error-secret"), false);
+  assertEquals(persisted.includes("plural-success-error-secret"), false);
 
   mode = "capture";
   const oversizedRequest = {
@@ -215,6 +246,9 @@ Deno.test("provider diagnostic capture is sanitized, repository-gated, and failu
   assertEquals(captures.at(-1)?.responseBody?.includes("streamed result"), true);
   assertEquals(captures.at(-1)?.responseBody?.includes("sk-stream"), false);
   assertEquals(captures.at(-1)?.responseBody?.includes("signature=secret"), false);
+  assertEquals(captures.at(-1)?.responseBody?.includes("AIzaSyD"), false);
+  assertEquals(captures.at(-1)?.responseBody?.includes("nested-stream-error-secret"), false);
+  assertEquals(captures.at(-1)?.responseBody?.includes("plural-stream-error-secret"), false);
 
   failNextProvider = true;
   const beforeRetryCaptures = captures.length;
@@ -230,10 +264,34 @@ Deno.test("provider diagnostic capture is sanitized, repository-gated, and failu
   const retryCaptures = captures.slice(beforeRetryCaptures);
   assertEquals(retryCaptures.length, 2);
   const failed = JSON.parse(retryCaptures[0].responseBody!) as { error: Record<string, unknown> };
-  assertEquals(Object.keys(failed.error), ["name", "status", "code", "message"]);
+  assertEquals(Object.keys(failed.error), ["category", "status"]);
+  assertEquals(failed.error.category, "upstream_unavailable");
   assertEquals(failed.error.status, 503);
   assertEquals(JSON.stringify(failed).includes("failed-attempt-secret"), false);
   assertEquals(JSON.stringify(failed).includes("raw-header-secret"), false);
   assertEquals(JSON.stringify(failed).includes("private provider stack"), false);
   assertEquals(retryCaptures[1].responseBody?.includes("safe result"), true);
+
+  nominalErrorPayload = true;
+  const beforeNominalError = captures.length;
+  await assertRejects(() =>
+    engine.complete(
+      fx.model.id,
+      "capture-nominal-error",
+      fx.run("capture-nominal-error"),
+      request,
+      new AbortController().signal,
+    )
+  );
+  await Promise.resolve();
+  const nominalErrorCaptures = captures.slice(beforeNominalError);
+  assertEquals(nominalErrorCaptures.length, 2);
+  for (const capture of nominalErrorCaptures) {
+    const diagnostic = JSON.parse(capture.responseBody!) as {
+      error: { category: string; status: number | null };
+    };
+    assertEquals(diagnostic.error, { category: "invalid_response", status: null });
+    assertEquals(capture.responseBody?.includes("real-adapter-secret"), false);
+    assertEquals(capture.responseBody?.includes("nominal success"), false);
+  }
 });

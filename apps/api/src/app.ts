@@ -27,7 +27,9 @@ import {
   adminUserQuerySchema,
   appendMessageSchema,
   chatCompletionSchema,
+  communityLeaderboardQuerySchema,
   conversationPortabilityV1Schema,
+  conversationSearchSchema,
   createAccessGroupSchema,
   createConversationFolderSchema,
   createConversationSchema,
@@ -65,6 +67,7 @@ import {
   setTokenAccessModeSchema,
   streamGenerationSchema,
   updateAccessGroupSchema,
+  updateCommunityProfileSchema,
   updateConversationFolderSchema,
   updateConversationSchema,
   updateConversationTagSchema,
@@ -76,11 +79,16 @@ import {
 } from "@dg-chat/contracts";
 import type {
   AdminApiTokenQuery,
+  AdminAttachmentQuery,
+  AdminAttachmentSummary,
   AdminLedgerQuery,
   AdminSessionQuery,
   AdminUserQuery,
   AuthStatusResponse,
   ChatCompletionRequest,
+  CommunityLeaderboardMetric,
+  CommunityLeaderboardPage,
+  CommunityLeaderboardWindow,
   ModelInfo,
   PublicUser,
   WebGenerationEvent,
@@ -92,9 +100,13 @@ import {
   type ApiIdempotencyEndpoint,
   type ApiIdempotencyRequest,
   type ApiReplayQuota,
+  ATTACHMENT_INSPECTION_POLICY_VERSION,
   type AttachmentRecord,
+  attachmentReinspectionEligibility,
+  type AttachmentStorageQuota,
   type AuditEvent,
   type AuditQuery,
+  CommunityProfileValidationError,
   decodeApiResponseBody,
   DomainError,
   type DomainRepository,
@@ -116,7 +128,14 @@ import {
   usagePricingSnapshotsEqual,
 } from "@dg-chat/database";
 import { hashPassword, randomToken, sha256, sha256Hex, verifyPassword } from "./crypto.ts";
-import { boundedReadiness, type ReadinessTimeouts, readinessTimeoutsFromEnv } from "./readiness.ts";
+import { openAIParameterFromZodIssues, safeOpenAIParameter } from "./openai-parameter.ts";
+import {
+  boundedReadiness,
+  type ReadinessRequirements,
+  type ReadinessSnapshot,
+  type ReadinessTimeouts,
+  readinessTimeoutsFromEnv,
+} from "./readiness.ts";
 import {
   maximumBufferedChatReplayBytes,
   maximumChatStreamReplayBytes,
@@ -205,6 +224,7 @@ import {
 } from "./rate-limit.ts";
 import { consumeTokenRateLimits, type TokenRatePolicy } from "./token-rate-limit.ts";
 import {
+  safeUploadBlobObjectKey,
   safeUploadObjectKey,
   secureUploadStream,
   type UploadInspection,
@@ -238,7 +258,11 @@ import {
   providerRetryPolicyCreate,
   providerRetryPolicyPatch,
 } from "./provider-resilience-validation.ts";
-import { ProviderAttemptError, ResilienceExhaustedError } from "./provider-resilience.ts";
+import {
+  classifyProviderError,
+  ProviderAttemptError,
+  ResilienceExhaustedError,
+} from "./provider-resilience.ts";
 import {
   normalizeChatCompletionResult,
   normalizeChatStreamChunk,
@@ -262,6 +286,7 @@ import {
 import { runAccountedEmbeddingCall } from "./embedding-accounting.ts";
 import {
   MemoryToolExecutionStore,
+  normalizeToolExecutionForRead,
   type ToolAdapter,
   ToolExecutionError,
   ToolExecutionService,
@@ -272,6 +297,7 @@ import { WebSearchToolAdapter } from "./search-tool.ts";
 import type { OcrCache } from "./ocr-interception.ts";
 import type { BetterAuthService } from "./better-auth.ts";
 import type { BackupAdminService } from "./backup-admin.ts";
+import { timingSafeTextEqual, validateSetupToken } from "./auth-config.ts";
 import { BackupServiceError } from "./backup-service.ts";
 
 type Variables = {
@@ -283,6 +309,8 @@ type Variables = {
   sessionSource?: "better_auth" | "legacy";
   sessionAuthenticatedAt?: string;
   sessionLimited?: boolean;
+  /** Server-observed credential generation; never sourced from the request. */
+  authorityEpoch: number;
   tokenId?: string;
   tokenScopes?: string[];
   tokenRatePolicy?: TokenRatePolicy;
@@ -307,6 +335,8 @@ export interface AppOptions {
   /** Test/embedding seam. Production defaults to one JSON object per stderr line. */
   requestErrorLogSink?: (line: string) => void;
   setupToken?: string;
+  /** Stable secret used to encrypt privacy-sensitive community leaderboard cursors. */
+  communityCursorSecret?: string;
   startingCreditMicros?: number;
   rateLimiter?: RateLimiter;
   providerStream?: typeof streamChatCompletion;
@@ -326,8 +356,28 @@ export interface AppOptions {
   publicShareRateLimit?: number;
   publicShareClientRateLimit?: number;
   shareMutationRateLimit?: number;
+  conversationSearchRateLimit?: number;
+  conversationSearchConcurrencyLimiter?: AudioConcurrencyLimiter;
+  conversationSearchMaxConcurrent?: number;
+  conversationSearchMaxConcurrentPerUser?: number;
   webComplete?: typeof complete;
   objectStore?: ObjectStore;
+  /** Short test/deployment seam; production defaults to UPLOAD_MAX_BYTES. */
+  uploadMaxBytes?: number;
+  /** Hard deadline for the S3 PUT. It must end well before the durable upload lease expires. */
+  attachmentUploadPutTimeoutMs?: number;
+  /** Database lease protecting an in-flight S3 PUT from stale-upload cleanup. */
+  attachmentUploadLeaseSeconds?: number;
+  /** Test/deployment seam for renewing a long-running object PUT lease. */
+  attachmentUploadHeartbeatMs?: number;
+  /** Per-renewal database deadline; a stuck heartbeat must abort rather than hang the request. */
+  attachmentUploadHeartbeatTimeoutMs?: number;
+  /** Retained physical-byte limits applied atomically when attachment blobs are admitted. */
+  attachmentStorageQuota?: AttachmentStorageQuota;
+  /** Keep otherwise-clean user uploads pending until the durable worker scanner accepts them. */
+  attachmentExternalInspectionRequired?: boolean;
+  /** Maximum time an ambiguous durable upload remains recoverable before terminal cleanup. */
+  fileUploadRecoveryMaxAgeMs?: number;
   attachmentContextMaxRawBytes?: number;
   knowledgeContextMaxCharacters?: number;
   knowledgeRetrievalTopK?: number;
@@ -359,6 +409,8 @@ export interface AppOptions {
   readinessTimeouts?: ReadinessTimeouts;
   /** Short test seam for the public readiness single-flight cache. */
   readinessCacheMs?: number;
+  /** Durable implementations required before this process may receive traffic. */
+  readinessRequirements?: ReadinessRequirements;
   /** Testable wall clock for security decisions. */
   now?: () => number;
 }
@@ -375,6 +427,26 @@ export function hasRecentAuthentication(authenticatedAt: string | undefined, now
     age <= RECENT_AUTHENTICATION_MAX_AGE_MS;
 }
 
+/** Fail at startup instead of serving an installation whose administrators cannot authenticate. */
+export function assertEmailVerificationAdminReadiness(
+  users: readonly PublicUser[],
+  requireEmailVerification: boolean,
+): void {
+  if (!requireEmailVerification) return;
+  const administrators = users.filter((user) => user.role === "admin");
+  if (
+    administrators.length > 0 &&
+    !administrators.some((user) =>
+      user.approvalStatus === "approved" && user.state === "active" &&
+      user.deletedAt === null && user.emailVerifiedAt !== null
+    )
+  ) {
+    throw new Error(
+      "REQUIRE_EMAIL_VERIFICATION needs at least one verified, approved, active administrator; disable it until an administrator can be verified",
+    );
+  }
+}
+
 export function legacyModelHarnessAllowed(environment: string | undefined): boolean {
   return environment !== "production";
 }
@@ -384,6 +456,11 @@ interface StagedUpload {
   inspection: UploadInspection;
   purpose: string;
 }
+
+// Multipart framing is bounded independently from file bytes. Three parts, twenty header pairs,
+// and 8 KiB header blocks fit comfortably inside this allowance without permitting an attacker to
+// stream an unbounded preamble or epilogue when Transfer-Encoding is chunked.
+const MULTIPART_WIRE_OVERHEAD_BYTES = 64 * 1024;
 
 async function finalizeImageInspection(
   path: string,
@@ -516,7 +593,11 @@ const openAIFile = (attachment: AttachmentRecord, purpose = "assistants") => ({
   created_at: Math.floor(Date.parse(attachment.createdAt) / 1000),
   filename: attachment.filename,
   purpose,
-  status: attachment.state === "ready" ? "processed" : "error",
+  status: attachment.state === "ready"
+    ? "processed"
+    : ["pending", "inspecting"].includes(attachment.state)
+    ? "uploaded"
+    : "error",
   status_details: attachment.inspectionError,
 });
 
@@ -552,31 +633,111 @@ const openAIError = (
   message: string,
   code: string | null = null,
   typeOrStatus: OpenAIErrorType | number = defaultOpenAIErrorType(code),
+  param: string | null = null,
 ) => ({
   error: {
     message,
     type: typeof typeOrStatus === "number" ? statusOpenAIErrorType(typeOrStatus) : typeOrStatus,
-    param: null,
+    param,
     code,
   },
 });
-const publicProviderFailure = (error: unknown, cancelled = false) => {
+
+class OpenAIParameterError extends Error {
+  constructor(
+    readonly param: string,
+    readonly code: string,
+    message: string,
+    readonly status = 400,
+  ) {
+    super(message);
+    this.name = "OpenAIParameterError";
+  }
+}
+
+const OPENAI_FILE_LIST_MAX_LIMIT = 10_000;
+const OPENAI_FILE_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+function openAIFileId(value: string): string {
+  if (!OPENAI_FILE_ID_PATTERN.test(value)) {
+    throw new OpenAIParameterError("id", "invalid_file_id", "id must be a valid file identifier");
+  }
+  return value;
+}
+function openAIFileListQuery(request: Request): {
+  limit: number;
+  order: "asc" | "desc";
+  after?: string;
+  purpose?: string;
+} {
+  const params = new URL(request.url).searchParams;
+  for (const name of ["limit", "order", "after", "purpose"]) {
+    if (params.getAll(name).length > 1) {
+      throw new OpenAIParameterError(
+        name,
+        "invalid_parameter",
+        `${name} may only be provided once`,
+      );
+    }
+  }
+  const rawLimit = params.get("limit");
+  if (rawLimit !== null && !/^[1-9]\d{0,4}$/.test(rawLimit)) {
+    throw new OpenAIParameterError(
+      "limit",
+      "invalid_file_limit",
+      `limit must be an integer between 1 and ${OPENAI_FILE_LIST_MAX_LIMIT}`,
+    );
+  }
+  const limit = rawLimit === null ? OPENAI_FILE_LIST_MAX_LIMIT : Number(rawLimit);
+  if (limit > OPENAI_FILE_LIST_MAX_LIMIT) {
+    throw new OpenAIParameterError(
+      "limit",
+      "invalid_file_limit",
+      `limit must be an integer between 1 and ${OPENAI_FILE_LIST_MAX_LIMIT}`,
+    );
+  }
+  const rawOrder = params.get("order");
+  if (rawOrder !== null && rawOrder !== "asc" && rawOrder !== "desc") {
+    throw new OpenAIParameterError(
+      "order",
+      "invalid_file_order",
+      "order must be either asc or desc",
+    );
+  }
+  const after = params.get("after") ?? undefined;
+  if (after !== undefined && !OPENAI_FILE_ID_PATTERN.test(after)) {
+    throw new OpenAIParameterError(
+      "after",
+      "invalid_file_cursor",
+      "after must be a valid file identifier",
+    );
+  }
+  const purpose = params.get("purpose") ?? undefined;
+  return { limit, order: rawOrder ?? "desc", after, purpose };
+}
+export const publicProviderFailure = (error: unknown, cancelled = false) => {
   if (cancelled) {
     return {
       status: 499,
       code: "request_cancelled",
       message: "Request cancelled",
+      param: null,
       type: "server_error" as const,
     };
   }
+  const exhaustionRetryAfterMs = error instanceof ResilienceExhaustedError &&
+      Number.isSafeInteger(error.retryAfterMs) && Number(error.retryAfterMs) >= 0
+    ? Number(error.retryAfterMs)
+    : undefined;
   const candidate = error instanceof ResilienceExhaustedError ? error.lastError : error;
   if (candidate instanceof ProviderAttemptError) {
-    const category = candidate.options.category;
+    const category = candidate.options.category ?? classifyProviderError(candidate).category;
     if (category === "authentication") {
       return {
         status: 502,
         code: "provider_authentication_error",
         message: "The configured provider rejected its credentials",
+        param: null,
         type: "server_error" as const,
       };
     }
@@ -598,11 +759,39 @@ const publicProviderFailure = (error: unknown, cancelled = false) => {
         : category === "timeout"
         ? "timeout"
         : "provider_error");
+    const publicMessage = category === "rate_limited"
+      ? "The provider rate limit was exceeded"
+      : category === "invalid_request"
+      ? "The provider rejected the request"
+      : category === "timeout"
+      ? "The provider request timed out"
+      : "Provider request failed";
+    const candidateRetryAfterMs = Number.isSafeInteger(candidate.options.retryAfterMs) &&
+        Number(candidate.options.retryAfterMs) >= 0
+      ? Number(candidate.options.retryAfterMs)
+      : undefined;
+    // Resilience exhaustion has already combined upstream and breaker deadlines per candidate and
+    // selected the first candidate that can actually be tried. Do not recombine unrelated delays.
+    const retryAfterMs = error instanceof ResilienceExhaustedError
+      ? exhaustionRetryAfterMs
+      : candidateRetryAfterMs;
     return {
       status,
-      code,
-      message: candidate.message,
-      retryAfterMs: candidate.options.retryAfterMs,
+      // Provider error messages are untrusted payloads and can contain credentials, signed URLs,
+      // internal hosts, or echoed user content. Detailed redacted diagnostics remain available to
+      // administrators through provider-attempt capture; the public contract is deliberately fixed.
+      code: category === "rate_limited"
+        ? "rate_limit_exceeded"
+        : category === "invalid_request"
+        ? "invalid_request_error"
+        : category === "timeout"
+        ? "timeout"
+        : code === "provider_authentication_error"
+        ? code
+        : "provider_error",
+      message: publicMessage,
+      retryAfterMs,
+      param: safeOpenAIParameter(candidate.options.param),
       type: category === "rate_limited"
         ? "rate_limit_error" as const
         : category === "invalid_request"
@@ -610,13 +799,36 @@ const publicProviderFailure = (error: unknown, cancelled = false) => {
         : "server_error" as const,
     };
   }
+  if (exhaustionRetryAfterMs !== undefined) {
+    return {
+      status: 503,
+      code: "provider_error",
+      message: "Provider request failed",
+      retryAfterMs: exhaustionRetryAfterMs,
+      param: null,
+      type: "server_error" as const,
+    };
+  }
   return {
     status: 502,
     code: "provider_error",
     message: "Provider request failed",
+    param: null,
     type: "server_error" as const,
   };
 };
+
+const projectOpenAIProviderFailure = (error: unknown, cancelled = false) => {
+  const failure = publicProviderFailure(error, cancelled);
+  const responseBody = JSON.stringify(
+    openAIError(failure.message, failure.code, failure.type, failure.param),
+  );
+  const retryHeaders: Record<string, string> = failure.retryAfterMs === undefined
+    ? {}
+    : { "retry-after": String(Math.max(1, Math.ceil(failure.retryAfterMs / 1_000))) };
+  return { failure, responseBody, retryHeaders };
+};
+
 const auditIdentifier = /^[a-z0-9][a-z0-9._:-]*$/i;
 const auditUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const parseAuditQuery = (c: Context): AuditQuery => {
@@ -888,6 +1100,23 @@ const parseAdminJobQuery = (c: Context) => {
   };
 };
 
+const parseAdminWorkerQuery = (c: Context) => {
+  const limitValue = c.req.query("limit");
+  const limit = limitValue === undefined ? 50 : Number(limitValue);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+    throw new DomainError("validation_error", "limit must be an integer from 1 to 100", 422);
+  }
+  const scope = c.req.query("scope") ?? "active";
+  if (!["active", "history", "all"].includes(scope)) {
+    throw new DomainError("validation_error", "scope is invalid", 422);
+  }
+  const cursor = c.req.query("cursor");
+  if (cursor !== undefined && (!cursor || cursor.length > 2048 || hasAsciiControl(cursor))) {
+    throw new DomainError("validation_error", "cursor is invalid", 422);
+  }
+  return { scope: scope as "active" | "history" | "all", cursor, limit };
+};
+
 function nodeReadableAsWeb(source: Readable): ReadableStream<Uint8Array> {
   const iterator = source[Symbol.asyncIterator]();
   return new ReadableStream<Uint8Array>({
@@ -952,6 +1181,7 @@ const publicUser = (user: Awaited<ReturnType<DomainRepository["findUser"]>>) => 
   const {
     passwordHash: _passwordHash,
     passwordResetPending: _passwordResetPending,
+    authorityEpoch: _authorityEpoch,
     ...safe
   } = user;
   return safe;
@@ -959,7 +1189,11 @@ const publicUser = (user: Awaited<ReturnType<DomainRepository["findUser"]>>) => 
 const parseJson = async <T>(
   c: Context,
   schema: {
-    safeParse: (value: unknown) => { success: boolean; data?: T; error?: { issues: unknown[] } };
+    safeParse: (value: unknown) => {
+      success: boolean;
+      data?: T;
+      error?: { issues: Array<{ path?: readonly PropertyKey[] }> };
+    };
   },
 ): Promise<T> => {
   let body: unknown;
@@ -969,7 +1203,18 @@ const parseJson = async <T>(
     throw new DomainError("invalid_json", "Request body must be valid JSON", 400);
   }
   const result = schema.safeParse(body);
-  if (!result.success) throw new DomainError("validation_error", "Request validation failed", 422);
+  if (!result.success) {
+    const param = openAIParameterFromZodIssues(result.error?.issues);
+    if (c.req.path.startsWith("/v1/") && param) {
+      throw new OpenAIParameterError(
+        param,
+        "validation_error",
+        "Request validation failed",
+        422,
+      );
+    }
+    throw new DomainError("validation_error", "Request validation failed", 422);
+  }
   return result.data!;
 };
 
@@ -1045,6 +1290,133 @@ const privateNoStore = (c: Context) => {
   c.header("Cache-Control", "private, no-store");
   c.header("Pragma", "no-cache");
   c.header("X-Content-Type-Options", "nosniff");
+  const vary = (c.res.headers.get("Vary") ?? "").split(",").map((value) => value.trim()).filter(
+    Boolean,
+  );
+  if (!vary.some((value) => value.toLowerCase() === "cookie")) {
+    c.header("Vary", [...vary, "Cookie"].join(", "));
+  }
+};
+
+const COMMUNITY_CURSOR_AAD = new TextEncoder().encode("dg-chat:community-leaderboard:v1");
+const COMMUNITY_WINDOW_MS = { "7d": 7, "30d": 30, "90d": 90 } as const;
+type CommunityCursorPayload = {
+  v: 1;
+  metric: CommunityLeaderboardMetric;
+  window: CommunityLeaderboardWindow | "current";
+  from: string | null;
+  asOf: string;
+  score: number;
+  userId: string;
+  position: number;
+};
+
+const communityCursorError = () =>
+  new DomainError("validation_error", "Community leaderboard cursor is invalid", 422);
+
+export function createCommunityLeaderboardCursorCodec(secret: string) {
+  if (typeof secret !== "string" || secret.length < 16) {
+    throw new Error("Community leaderboard cursor secret must be at least 16 characters");
+  }
+  const key = crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(`dg-chat:community-leaderboard:key:v1:${secret}`),
+  ).then((digest) =>
+    crypto.subtle.importKey("raw", digest, { name: "AES-GCM" }, false, ["encrypt", "decrypt"])
+  );
+  const validate = (value: CommunityCursorPayload) => {
+    const fromMs = value?.from === null ? null : Date.parse(value?.from);
+    const asOfMs = Date.parse(value?.asOf);
+    if (
+      !value || value.v !== 1 ||
+      !["calls", "tokens", "cost", "balance"].includes(value.metric) ||
+      !["7d", "30d", "90d", "current"].includes(value.window) ||
+      !Number.isFinite(asOfMs) || new Date(asOfMs).toISOString() !== value.asOf ||
+      (value.from !== null &&
+        (!Number.isFinite(fromMs) || new Date(fromMs!).toISOString() !== value.from)) ||
+      (value.metric === "balance"
+        ? value.window !== "current" || value.from !== null
+        : value.window === "current" || value.from === null ||
+          asOfMs - fromMs! !== COMMUNITY_WINDOW_MS[value.window] * 86_400_000) ||
+      !Number.isSafeInteger(value.score) || value.score < 0 ||
+      !Number.isSafeInteger(value.position) || value.position < 1 ||
+      !auditUuid.test(value.userId)
+    ) throw communityCursorError();
+    return value;
+  };
+  return {
+    async encode(value: CommunityCursorPayload): Promise<string> {
+      validate(value);
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const plaintext = new TextEncoder().encode(JSON.stringify(value));
+      const ciphertext = new Uint8Array(
+        await crypto.subtle.encrypt(
+          { name: "AES-GCM", iv, additionalData: COMMUNITY_CURSOR_AAD },
+          await key,
+          plaintext,
+        ),
+      );
+      return Buffer.concat([iv, ciphertext]).toString("base64url");
+    },
+    async decode(
+      encoded: string,
+      expected: {
+        metric: CommunityLeaderboardMetric;
+        window: CommunityLeaderboardWindow | "current";
+      },
+    ): Promise<CommunityCursorPayload> {
+      try {
+        const bytes = new Uint8Array(Buffer.from(encoded, "base64url"));
+        if (
+          bytes.byteLength < 29 || Buffer.from(bytes).toString("base64url") !== encoded
+        ) throw communityCursorError();
+        const value = JSON.parse(new TextDecoder().decode(
+          await crypto.subtle.decrypt(
+            {
+              name: "AES-GCM",
+              iv: bytes.slice(0, 12),
+              additionalData: COMMUNITY_CURSOR_AAD,
+            },
+            await key,
+            bytes.slice(12),
+          ),
+        )) as CommunityCursorPayload;
+        validate(value);
+        if (value.metric !== expected.metric || value.window !== expected.window) {
+          throw communityCursorError();
+        }
+        return value;
+      } catch (error) {
+        if (error instanceof DomainError) throw error;
+        throw communityCursorError();
+      }
+    },
+  };
+}
+
+const parseCommunityLeaderboardQuery = (c: Context) => {
+  const url = new URL(c.req.url);
+  const allowed = new Set(["metric", "window", "limit", "cursor"]);
+  for (const key of url.searchParams.keys()) {
+    if (!allowed.has(key) || url.searchParams.getAll(key).length !== 1) {
+      throw new DomainError("validation_error", "Community leaderboard query is invalid", 422);
+    }
+  }
+  const raw: Record<string, unknown> = {};
+  for (const key of allowed) {
+    const value = url.searchParams.get(key);
+    if (value !== null) {
+      if (key === "limit" && !/^(?:[1-9]|[1-9][0-9]|100)$/u.test(value)) {
+        throw new DomainError("validation_error", "Community leaderboard query is invalid", 422);
+      }
+      raw[key] = key === "limit" ? Number(value) : value;
+    }
+  }
+  const parsed = communityLeaderboardQuerySchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new DomainError("validation_error", "Community leaderboard query is invalid", 422);
+  }
+  return parsed.data;
 };
 
 const parseAdminUserQuery = (c: Context): AdminUserQuery => {
@@ -1111,6 +1483,89 @@ const parseAdminApiTokenQuery = (c: Context): AdminApiTokenQuery =>
 const parseAdminLedgerQuery = (c: Context): AdminLedgerQuery =>
   parseAdminDetailQuery(c, ["kind", "cursor", "limit"], adminLedgerQuerySchema, "Ledger");
 
+const adminAttachmentStates = new Set([
+  "pending",
+  "inspecting",
+  "ready",
+  "quarantined",
+  "failed",
+  "deleted",
+]);
+const adminAttachmentDeletions = new Set(["present", "deleted", "all"]);
+const parseAdminAttachmentQuery = (c: Context): AdminAttachmentQuery => {
+  const url = new URL(c.req.url);
+  const allowed = new Set(["ownerId", "state", "deletion", "cursor", "limit"]);
+  for (const key of url.searchParams.keys()) {
+    if (!allowed.has(key) || url.searchParams.getAll(key).length !== 1) {
+      throw new DomainError("validation_error", "Attachment query parameters are invalid", 422);
+    }
+  }
+  const ownerId = url.searchParams.get("ownerId")?.trim() || undefined;
+  const state = url.searchParams.get("state")?.trim() || undefined;
+  const deletion = url.searchParams.get("deletion")?.trim() || "present";
+  const cursor = url.searchParams.get("cursor")?.trim() || undefined;
+  const rawLimit = url.searchParams.get("limit");
+  const limit = rawLimit === null ? 50 : Number(rawLimit);
+  if (
+    (ownerId !== undefined && !auditUuid.test(ownerId)) ||
+    (state !== undefined && !adminAttachmentStates.has(state)) ||
+    !adminAttachmentDeletions.has(deletion) ||
+    (cursor !== undefined &&
+      (cursor.length > 2_048 || !/^[A-Za-z0-9_-]+$/.test(cursor))) ||
+    !Number.isSafeInteger(limit) || limit < 1 || limit > 100
+  ) throw new DomainError("validation_error", "Attachment query parameters are invalid", 422);
+  return {
+    ownerId,
+    state: state as AdminAttachmentQuery["state"],
+    deletion: deletion as AdminAttachmentQuery["deletion"],
+    cursor,
+    limit,
+  };
+};
+
+const publicAdminAttachment = (attachment: AttachmentRecord): AdminAttachmentSummary => ({
+  id: attachment.id,
+  ownerId: attachment.ownerId,
+  filename: attachment.filename,
+  mimeType: attachment.mimeType,
+  sizeBytes: attachment.sizeBytes,
+  state: attachment.state,
+  inspectionError: attachment.inspectionError,
+  inspectionEpoch: attachment.inspectionEpoch,
+  version: attachment.version,
+  reinspectionEligible: attachmentReinspectionEligibility(attachment).eligible,
+  reinspectionBlockedReason: attachmentReinspectionEligibility(attachment).blockedReason,
+  createdAt: attachment.createdAt,
+  updatedAt: attachment.updatedAt,
+  deletedAt: attachment.deletedAt,
+});
+
+const parseAttachmentReinspection = async (c: Context) => {
+  let value: unknown;
+  try {
+    value = await c.req.json();
+  } catch {
+    throw new DomainError("validation_error", "Reinspection request is invalid", 422);
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new DomainError("validation_error", "Reinspection request is invalid", 422);
+  }
+  const input = value as Record<string, unknown>;
+  const keys = Object.keys(input);
+  const reason = typeof input.reason === "string" ? input.reason.trim() : "";
+  if (
+    keys.length !== 2 || !keys.includes("expectedVersion") || !keys.includes("reason") ||
+    !Number.isSafeInteger(input.expectedVersion) || Number(input.expectedVersion) < 1 ||
+    Number(input.expectedVersion) > 2_147_483_647 ||
+    reason.length < 8 || reason.length > 500 ||
+    [...reason].some((character) => {
+      const code = character.charCodeAt(0);
+      return code < 32 && character !== "\n" && character !== "\t" || code === 127;
+    })
+  ) throw new DomainError("validation_error", "Reinspection request is invalid", 422);
+  return { expectedVersion: Number(input.expectedVersion), reason };
+};
+
 const isCanonicalShareCapability = (value: string): boolean => {
   if (!/^[A-Za-z0-9_-]{43}$/.test(value)) return false;
   try {
@@ -1147,7 +1602,7 @@ async function stageMultipartUpload(
   }
   const contentLength = Number(request.headers.get("content-length"));
   if (
-    Number.isFinite(contentLength) && contentLength > maxBytes + 1024 * 1024
+    Number.isFinite(contentLength) && contentLength > maxBytes + MULTIPART_WIRE_OVERHEAD_BYTES
   ) throw new UploadSecurityError("upload_too_large", "Upload exceeds the byte limit", 413);
   if (!request.body) throw new UploadSecurityError("empty_upload", "Upload is empty", 400);
 
@@ -1244,10 +1699,23 @@ async function stageMultipartUpload(
   });
   const pump = (async () => {
     const reader = request.body!.getReader();
+    let wireBytes = 0;
     try {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
+        wireBytes += value.byteLength;
+        if (wireBytes > maxBytes + MULTIPART_WIRE_OVERHEAD_BYTES) {
+          const exceeded = new UploadSecurityError(
+            "upload_too_large",
+            "Upload exceeds the byte limit",
+            413,
+          );
+          failure ??= exceeded;
+          await reader.cancel(exceeded).catch(() => undefined);
+          busboy.destroy(exceeded);
+          break;
+        }
         if (!busboy.write(value)) {
           await new Promise<void>((resolve, reject) => {
             const drained = () => {
@@ -1302,6 +1770,10 @@ async function stageMultipartUpload(
 
 export function createApp(options: AppOptions = {}) {
   const repo = options.repository ?? new MemoryRepository();
+  const communityCursorCodec = createCommunityLeaderboardCursorCodec(
+    options.communityCursorSecret ?? Deno.env.get("APP_SECRET") ??
+      `test-only-${crypto.randomUUID()}`,
+  );
   const requestLogSink = options.requestLogSink ?? ((line: string) => console.log(line));
   const requestErrorLogSink = options.requestErrorLogSink ??
     ((line: string) => console.error(line));
@@ -1323,6 +1795,8 @@ export function createApp(options: AppOptions = {}) {
   const audioConcurrencyLimiter = options.audioConcurrencyLimiter ??
     new MemoryAudioConcurrencyLimiter();
   const imageConcurrencyLimiter = options.imageConcurrencyLimiter ?? audioConcurrencyLimiter;
+  const conversationSearchConcurrencyLimiter = options.conversationSearchConcurrencyLimiter ??
+    audioConcurrencyLimiter;
   const providerStream = options.providerStream ?? streamChatCompletion;
   const providerComplete = options.providerComplete ?? complete;
   const idempotencyHeartbeatMs = Math.max(10, options.idempotencyHeartbeatMs ?? 30_000);
@@ -1343,9 +1817,53 @@ export function createApp(options: AppOptions = {}) {
     !Number.isSafeInteger(temporaryRetentionDays) || temporaryRetentionDays < 1 ||
     temporaryRetentionDays > 3650
   ) throw new Error("Temporary chat retention must be an integer between 1 and 3650 days");
+  const attachmentStorageQuota = options.attachmentStorageQuota;
+  const attachmentUploadPutTimeoutMs = options.attachmentUploadPutTimeoutMs ?? 300_000;
+  const attachmentUploadLeaseSeconds = options.attachmentUploadLeaseSeconds ?? 900;
+  const attachmentUploadHeartbeatMs = options.attachmentUploadHeartbeatMs ??
+    Math.min(30_000, Math.floor(attachmentUploadLeaseSeconds * 1_000 / 3));
+  const attachmentUploadHeartbeatTimeoutMs = options.attachmentUploadHeartbeatTimeoutMs ??
+    Math.min(10_000, Math.max(1_000, Math.floor(attachmentUploadPutTimeoutMs / 4)));
+  if (
+    !Number.isSafeInteger(attachmentUploadPutTimeoutMs) ||
+    attachmentUploadPutTimeoutMs < 1_000 ||
+    attachmentUploadPutTimeoutMs > 3_600_000 ||
+    !Number.isSafeInteger(attachmentUploadLeaseSeconds) ||
+    attachmentUploadLeaseSeconds < 60 ||
+    attachmentUploadLeaseSeconds > 86_400 ||
+    attachmentUploadLeaseSeconds * 1_000 < attachmentUploadPutTimeoutMs + 60_000 ||
+    !Number.isSafeInteger(attachmentUploadHeartbeatMs) ||
+    attachmentUploadHeartbeatMs < 10 ||
+    attachmentUploadHeartbeatMs >= attachmentUploadLeaseSeconds * 500 ||
+    !Number.isSafeInteger(attachmentUploadHeartbeatTimeoutMs) ||
+    attachmentUploadHeartbeatTimeoutMs < 10 ||
+    attachmentUploadHeartbeatTimeoutMs > attachmentUploadPutTimeoutMs
+  ) {
+    throw new Error(
+      "Attachment upload PUT, lease, and heartbeat bounds are invalid",
+    );
+  }
+  const attachmentExternalInspectionRequired = options.attachmentExternalInspectionRequired ??
+    false;
+  if (
+    attachmentStorageQuota &&
+    (
+      !Number.isSafeInteger(attachmentStorageQuota.perUserBytes) ||
+      attachmentStorageQuota.perUserBytes < 1 ||
+      !Number.isSafeInteger(attachmentStorageQuota.perUserObjects) ||
+      attachmentStorageQuota.perUserObjects < 1 ||
+      !Number.isSafeInteger(attachmentStorageQuota.installationBytes) ||
+      attachmentStorageQuota.installationBytes < attachmentStorageQuota.perUserBytes ||
+      !Number.isSafeInteger(attachmentStorageQuota.installationObjects) ||
+      attachmentStorageQuota.installationObjects < attachmentStorageQuota.perUserObjects
+    )
+  ) throw new Error("Attachment storage quota is invalid");
   const webComplete = options.webComplete ?? complete;
   const activeWebGenerations = new Map<string, AbortController>();
-  const setupToken = options.setupToken ?? Deno.env.get("SETUP_TOKEN") ?? "";
+  const setupToken = validateSetupToken(
+    options.setupToken ?? Deno.env.get("SETUP_TOKEN"),
+    Deno.env.get("DENO_ENV") === "production",
+  ) ?? "";
   const configuredStartingCredit = Deno.env.get("STARTING_CREDIT_MICROS");
   const configuredStartingUsd = Deno.env.get("DEFAULT_APPROVAL_CREDIT_USD");
   const startingCredit = options.startingCreditMicros ??
@@ -1392,6 +1910,20 @@ export function createApp(options: AppOptions = {}) {
   const identityDeliveryTimeoutMs = options.identityDeliveryTimeoutMs ??
     DEFAULT_IDENTITY_DELIVERY_TIMEOUT_MS;
   const pendingIdentityDeliveries = new Map<Promise<void>, AbortController>();
+  const recordIdentityAuditWithSanitizedFailure = async (
+    input: Parameters<DomainRepository["recordAudit"]>[0],
+    failureMessage = "Identity outcome audit persistence failed",
+  ): Promise<void> => {
+    try {
+      await repo.recordAudit(input);
+    } catch {
+      emitOperationalLog({
+        level: "error",
+        message: failureMessage,
+        action: input.action,
+      });
+    }
+  };
   const dispatchIdentityDelivery = (
     userId: string,
     actorId: string | null,
@@ -1399,22 +1931,13 @@ export function createApp(options: AppOptions = {}) {
     sentAction: string,
     failedAction: string,
   ) => {
-    const audit = async (action: string): Promise<void> => {
-      try {
-        await repo.recordAudit({
-          actorId,
-          action,
-          targetType: "user",
-          targetId: userId,
-        });
-      } catch {
-        emitOperationalLog({
-          level: "error",
-          message: "Identity delivery audit persistence failed",
-          action,
-        });
-      }
-    };
+    const audit = (action: string): Promise<void> =>
+      recordIdentityAuditWithSanitizedFailure({
+        actorId,
+        action,
+        targetType: "user",
+        targetId: userId,
+      }, "Identity delivery audit persistence failed");
     const controller = new AbortController();
     const pending = boundedIdentityDelivery(delivery, controller, identityDeliveryTimeoutMs)
       .then(
@@ -1457,12 +1980,33 @@ export function createApp(options: AppOptions = {}) {
     positiveInteger("PUBLIC_SHARE_CLIENT_RATE_LIMIT", 240);
   const configuredShareMutationLimit = options.shareMutationRateLimit ??
     positiveInteger("SHARE_MUTATION_RATE_LIMIT", 20);
+  const configuredConversationSearchLimit = options.conversationSearchRateLimit ??
+    positiveInteger("CONVERSATION_SEARCH_RATE_LIMIT", 30);
   if (
     !Number.isSafeInteger(configuredPublicShareLimit) || configuredPublicShareLimit < 1 ||
     !Number.isSafeInteger(configuredPublicShareClientLimit) ||
     configuredPublicShareClientLimit < 1 ||
     !Number.isSafeInteger(configuredShareMutationLimit) || configuredShareMutationLimit < 1
   ) throw new Error("Share rate limits must be positive safe integers");
+  if (
+    !Number.isSafeInteger(configuredConversationSearchLimit) ||
+    configuredConversationSearchLimit < 1
+  ) throw new Error("CONVERSATION_SEARCH_RATE_LIMIT must be a positive safe integer");
+  const conversationSearchMaxConcurrent = options.conversationSearchMaxConcurrent ??
+    positiveInteger("CONVERSATION_SEARCH_MAX_CONCURRENT", 4);
+  const conversationSearchMaxConcurrentPerUser = options.conversationSearchMaxConcurrentPerUser ??
+    positiveInteger("CONVERSATION_SEARCH_MAX_CONCURRENT_PER_USER", 1);
+  if (
+    !Number.isSafeInteger(conversationSearchMaxConcurrent) ||
+    conversationSearchMaxConcurrent < 1 ||
+    !Number.isSafeInteger(conversationSearchMaxConcurrentPerUser) ||
+    conversationSearchMaxConcurrentPerUser < 1 ||
+    conversationSearchMaxConcurrentPerUser > conversationSearchMaxConcurrent
+  ) {
+    throw new Error(
+      "Conversation search concurrency limits must be positive and per-user cannot exceed global",
+    );
+  }
   const configuredRateWindow = positiveInteger("RATE_LIMIT_WINDOW_SECONDS", 60);
   const effectiveTokenRpmLimit = Math.ceil(
     configuredOpenAILimit * 60 / configuredRateWindow,
@@ -1471,7 +2015,17 @@ export function createApp(options: AppOptions = {}) {
   if (configuredTokenDefaultBurst > 1_000) {
     throw new Error("TOKEN_DEFAULT_BURST_LIMIT must be between 1 and 1000");
   }
-  const uploadMaxBytes = positiveInteger("UPLOAD_MAX_BYTES", 25 * 1024 * 1024);
+  const uploadMaxBytes = options.uploadMaxBytes ??
+    positiveInteger("UPLOAD_MAX_BYTES", 25 * 1024 * 1024);
+  if (!Number.isSafeInteger(uploadMaxBytes) || uploadMaxBytes < 1) {
+    throw new Error("uploadMaxBytes must be a positive safe integer");
+  }
+  const fileUploadRecoveryMaxAgeMs = options.fileUploadRecoveryMaxAgeMs ??
+    positiveInteger("FILE_UPLOAD_RECOVERY_MAX_AGE_SECONDS", 7 * 24 * 60 * 60) * 1_000;
+  if (
+    !Number.isSafeInteger(fileUploadRecoveryMaxAgeMs) ||
+    fileUploadRecoveryMaxAgeMs < 1
+  ) throw new Error("fileUploadRecoveryMaxAgeMs must be a positive safe integer");
   const uploadMaxConcurrent = positiveInteger("UPLOAD_MAX_CONCURRENT", 4);
   const uploadMaxConcurrentPerUser = positiveInteger("UPLOAD_MAX_CONCURRENT_PER_USER", 2);
   if (uploadMaxConcurrentPerUser > uploadMaxConcurrent) {
@@ -1726,7 +2280,7 @@ export function createApp(options: AppOptions = {}) {
       ]
       : []),
     {
-      async reserve(execution) {
+      async admit(execution) {
         const rate = await rateLimiter.consume(
           `tool:${execution.toolId}:user:${execution.ownerId}`,
           toolRateLimit,
@@ -1739,16 +2293,46 @@ export function createApp(options: AppOptions = {}) {
             429,
           );
         }
+      },
+      billingSnapshot(execution) {
+        return {
+          reservedMicros: toolReserveMicros,
+          provider: "tool",
+          model: `tool/${execution.toolId}`,
+        };
+      },
+      async reserve(execution) {
+        const billing = execution.billingSnapshot!;
         await repo.ensureIdempotentReservation({
           userId: execution.ownerId,
           usageRunId: `tool:${execution.id}`,
-          model: `tool/${execution.toolId}`,
-          provider: "tool",
-          reservedMicros: toolReserveMicros,
+          model: billing.model,
+          provider: billing.provider,
+          reservedMicros: billing.reservedMicros,
+          recoveryOwner: "tool",
+        });
+      },
+      async reconcileReservation(execution) {
+        // Reconciliation repairs an already-admitted request. It must not consume or enforce a
+        // fresh request rate-limit slot, or cancellation can outrun an in-flight reservation.
+        const billing = execution.billingSnapshot!;
+        await repo.ensureIdempotentReservation({
+          userId: execution.ownerId,
+          usageRunId: `tool:${execution.id}`,
+          model: billing.model,
+          provider: billing.provider,
+          reservedMicros: billing.reservedMicros,
+          recoveryOwner: "tool",
         });
       },
       async settle(execution, latencyMs) {
-        await repo.settle(`tool:${execution.id}`, toolReserveMicros, 0, 0, latencyMs);
+        await repo.settle(
+          `tool:${execution.id}`,
+          execution.billingSnapshot!.reservedMicros,
+          0,
+          0,
+          latencyMs,
+        );
       },
       async refund(execution, error) {
         return (await repo.refund(`tool:${execution.id}`, error)) !== undefined;
@@ -1963,6 +2547,18 @@ export function createApp(options: AppOptions = {}) {
   };
   let bootstrapInProgress = false;
   const app = new Hono<{ Variables: Variables }>();
+  const applyPrivateCredentialCachePolicy = (c: Context) => {
+    const path = c.req.path;
+    const cookieSurface = path === "/api/auth" || path.startsWith("/api/auth/") ||
+      path === "/api/sessions" || path.startsWith("/api/sessions/") ||
+      path === "/api/tokens" || path.startsWith("/api/tokens/");
+    const setupSurface = path === "/api/setup" || path.startsWith("/api/setup/");
+    const adminSurface = path === "/api/admin" || path.startsWith("/api/admin/");
+    const communitySurface = path === "/api/community/profile" ||
+      path === "/api/community/leaderboard";
+    if (!cookieSurface && !setupSurface && !adminSurface && !communitySurface) return;
+    privateNoStore(c);
+  };
   const accessSubject = (c: Context<{ Variables: Variables }>): TokenAccessSubject => ({
     userId: c.get("user").id,
     tokenId: c.get("authType") === "token" ? c.get("tokenId") ?? null : null,
@@ -2011,6 +2607,17 @@ export function createApp(options: AppOptions = {}) {
       }
     }
   });
+  // Credential responses must remain private even when an earlier body, maintenance, CORS, or
+  // rate-limit gate returns before the route handler. Reapply after downstream execution because
+  // Hono handlers may replace the prepared Response and its headers.
+  app.use("*", async (c, next) => {
+    applyPrivateCredentialCachePolicy(c);
+    try {
+      await next();
+    } finally {
+      applyPrivateCredentialCachePolicy(c);
+    }
+  });
   app.use(
     "*",
     secureHeaders({
@@ -2022,6 +2629,44 @@ export function createApp(options: AppOptions = {}) {
         objectSrc: ["'none'"],
         scriptSrc: ["'self'"],
       },
+    }),
+  );
+  // Install CORS before maintenance and body-limit gates so their early error responses expose the
+  // same request, retry, rate-limit, and replay metadata as successful API responses.
+  app.use(
+    "*",
+    cors({
+      origin: webOrigin,
+      credentials: true,
+      // Keep this bounded to headers emitted by the supported OpenAI JavaScript client plus the
+      // gateway's own idempotency/request metadata. Arbitrary caller-selected headers stay denied.
+      allowHeaders: [
+        "Authorization",
+        "Content-Type",
+        "Idempotency-Key",
+        "OpenAI-Beta",
+        "OpenAI-Organization",
+        "OpenAI-Project",
+        "X-Request-Id",
+        "X-Stainless-Arch",
+        "X-Stainless-Custom-Poll-Interval",
+        "X-Stainless-Helper-Method",
+        "X-Stainless-Lang",
+        "X-Stainless-OS",
+        "X-Stainless-Package-Version",
+        "X-Stainless-Poll-Helper",
+        "X-Stainless-Retry-Count",
+        "X-Stainless-Runtime",
+        "X-Stainless-Runtime-Version",
+        "X-Stainless-Timeout",
+      ],
+      exposeHeaders: [
+        "X-Request-Id",
+        "Retry-After",
+        "X-RateLimit-Limit",
+        "X-RateLimit-Remaining",
+        "X-Idempotent-Replay",
+      ],
     }),
   );
   app.use("*", async (c, next) => {
@@ -2094,15 +2739,6 @@ export function createApp(options: AppOptions = {}) {
           ].includes(c.req.path)
         ? next()
         : openAIBodyLimit(c, next),
-  );
-  app.use(
-    "*",
-    cors({
-      origin: webOrigin,
-      credentials: true,
-      allowHeaders: ["Authorization", "Content-Type", "Idempotency-Key", "X-Request-Id"],
-      exposeHeaders: ["X-Request-Id"],
-    }),
   );
   app.use("*", async (c, next) => {
     if (c.req.method === "OPTIONS") return next();
@@ -2305,7 +2941,8 @@ export function createApp(options: AppOptions = {}) {
         if (
           !legacySession || !legacyUser || legacyUser.state !== "active" ||
           legacyUser.deletedAt !== null ||
-          legacyUser.passwordResetPending === true
+          legacyUser.passwordResetPending === true ||
+          (!legacySession.limited && legacyUser.authorityEpoch !== legacySession.authorityEpoch)
         ) {
           return c.json(openAIError("Invalid or expired session", "unauthorized"), 401);
         }
@@ -2314,13 +2951,15 @@ export function createApp(options: AppOptions = {}) {
         c.set("sessionId", legacySession.id);
         c.set("sessionSource", "legacy");
         c.set("sessionLimited", legacySession.limited);
+        c.set("authorityEpoch", legacySession.authorityEpoch);
         c.set("sessionAuthenticatedAt", legacySession.createdAt);
         return next();
       }
       const user = await repo.findUser(session.userId);
       if (
         !user || user.state !== "active" || user.deletedAt !== null ||
-        user.passwordResetPending === true
+        user.passwordResetPending === true ||
+        (!session.limited && user.authorityEpoch !== session.authorityEpoch)
       ) {
         return c.json(openAIError("Invalid or expired session", "unauthorized"), 401);
       }
@@ -2329,6 +2968,7 @@ export function createApp(options: AppOptions = {}) {
       c.set("sessionId", session.id);
       c.set("sessionSource", "better_auth");
       c.set("sessionLimited", session.limited);
+      c.set("authorityEpoch", session.authorityEpoch);
       c.set("sessionAuthenticatedAt", session.authenticatedAt);
       return next();
     }
@@ -2345,6 +2985,7 @@ export function createApp(options: AppOptions = {}) {
         user.passwordResetPending === true ||
         user.approvalStatus !== "approved" ||
         (requireEmailVerification && !user.emailVerifiedAt) ||
+        user.authorityEpoch !== apiToken.authorityEpoch ||
         apiToken.revokedAt || (apiToken.expiresAt && Date.parse(apiToken.expiresAt) <= Date.now())
       ) return c.json(openAIError("Invalid or expired token", "unauthorized"), 401);
       c.set("user", publicUser(user)!);
@@ -2356,13 +2997,15 @@ export function createApp(options: AppOptions = {}) {
         requestsPerMinute: apiToken.rpmLimit,
         burst: apiToken.burstLimit,
       });
+      c.set("authorityEpoch", apiToken.authorityEpoch);
       return next();
     }
     const session = await repo.getSession(hash);
     const user = session ? await repo.findUser(session.userId) : undefined;
     if (
       !session || !user || user.state !== "active" || user.deletedAt !== null ||
-      user.passwordResetPending === true
+      user.passwordResetPending === true ||
+      (!session.limited && user.authorityEpoch !== session.authorityEpoch)
     ) {
       return c.json(openAIError("Invalid or expired session", "unauthorized"), 401);
     }
@@ -2371,6 +3014,7 @@ export function createApp(options: AppOptions = {}) {
     c.set("sessionId", session.id);
     c.set("sessionSource", "legacy");
     c.set("sessionLimited", session.limited);
+    c.set("authorityEpoch", session.authorityEpoch);
     c.set("sessionAuthenticatedAt", session.createdAt);
     if (legacySession && raw === legacySession) {
       setCookie(c, sessionCookie, legacySession, {
@@ -2393,6 +3037,7 @@ export function createApp(options: AppOptions = {}) {
       !apiToken || !user || user.state !== "active" || user.deletedAt !== null ||
       user.passwordResetPending === true ||
       user.approvalStatus !== "approved" ||
+      user.authorityEpoch !== apiToken.authorityEpoch ||
       (requireEmailVerification && !user.emailVerifiedAt) || apiToken.revokedAt ||
       (apiToken.expiresAt && Date.parse(apiToken.expiresAt) <= Date.now())
     ) return c.json(openAIError("Invalid or expired token", "unauthorized"), 401);
@@ -2405,6 +3050,7 @@ export function createApp(options: AppOptions = {}) {
       requestsPerMinute: apiToken.rpmLimit,
       burst: apiToken.burstLimit,
     });
+    c.set("authorityEpoch", apiToken.authorityEpoch);
     return next();
   };
   const approved: MiddlewareHandler<{ Variables: Variables }> = async (c, next) => {
@@ -2461,16 +3107,10 @@ export function createApp(options: AppOptions = {}) {
     };
 
   app.get("/health", (c) => c.json({ status: "ok", service: "api" }));
-  type ReadinessSnapshot = {
-    status: "ready" | "not_ready";
-    storage: { ready: boolean; storage: string };
-    redis: boolean;
-    objects: { configured: boolean; ready: boolean };
-  };
   let readinessCache: { snapshot: ReadinessSnapshot; expiresAt: number } | undefined;
   let readinessInFlight: Promise<ReadinessSnapshot> | undefined;
   const probeReadiness = async (): Promise<ReadinessSnapshot> => {
-    const [storage, redis, objects] = await Promise.all([
+    const [storageProbe, redisReady, objectsReady] = await Promise.all([
       boundedReadiness(
         readinessTimeouts.postgresMs,
         { ready: false, storage: repo.storageKind },
@@ -2485,12 +3125,44 @@ export function createApp(options: AppOptions = {}) {
         )
         : Promise.resolve(false),
     ]);
-    const ready = storage.ready && redis && (objectStore ? objects : true);
+    const redisImplementation = rateLimiter.implementation ?? "custom";
+    const objectImplementation = objectStore?.implementation ?? (objectStore ? "custom" : "none");
+    // Repository identity is constructor-owned authority. A compromised or buggy health response
+    // may report liveness only; it must never upgrade a memory adapter into durable PostgreSQL.
+    const storageImplementation = repo.storageKind;
+    const storage = {
+      // Memory is a healthy local adapter, not configured durable PostgreSQL.
+      configured: storageImplementation !== "memory",
+      ready: storageProbe.ready,
+      implementation: storageImplementation,
+    };
+    const redis = {
+      // A memory adapter is a supported local implementation, not configured Redis.
+      configured: redisImplementation !== "memory",
+      ready: redisReady,
+      implementation: redisImplementation,
+    };
+    const objects = {
+      configured: Boolean(objectStore),
+      ready: objectsReady,
+      implementation: objectImplementation,
+    };
+    const requirements = options.readinessRequirements;
+    const requirementsReady = (!requirements?.storage ||
+      (storage.configured && storage.ready &&
+        storage.implementation === requirements.storage)) &&
+      (!requirements?.redis ||
+        (redis.configured && redis.ready && redis.implementation === requirements.redis)) &&
+      (!requirements?.objects ||
+        (objects.configured && objects.ready &&
+          objects.implementation === requirements.objects));
+    const ready = storage.ready && redis.ready && (objects.configured ? objects.ready : true) &&
+      requirementsReady;
     return {
       status: ready ? "ready" : "not_ready",
       storage,
       redis,
-      objects: { configured: Boolean(objectStore), ready: objects },
+      objects,
     };
   };
   const readinessSnapshot = (): Promise<ReadinessSnapshot> => {
@@ -2517,6 +3189,7 @@ export function createApp(options: AppOptions = {}) {
     return snapshot.status === "ready" ? c.json(snapshot, 200) : c.json(snapshot, 503);
   });
   app.get("/api/setup/status", async (c) => {
+    privateNoStore(c);
     const users = await repo.listUsers();
     return c.json({
       bootstrapRequired: !users.some((user) => user.role === "admin"),
@@ -2527,61 +3200,173 @@ export function createApp(options: AppOptions = {}) {
     });
   });
 
-  const persistUpload = async (ownerId: string, staged: StagedUpload) => {
+  const persistUpload = async (
+    ownerId: string,
+    staged: StagedUpload,
+    requestSignal: AbortSignal,
+  ) => {
     if (!objectStore) {
       throw new DomainError("storage_not_configured", "Object storage is not configured", 503);
     }
     const objectKey = safeUploadObjectKey(ownerId, staged.inspection.mime);
+    const uploadStageId = crypto.randomUUID();
     let stored = false;
     let registered = false;
+    let objectAttempted = false;
+    let provenCollision = false;
+    const uploadStage = await repo.stageAttachmentUpload({
+      id: uploadStageId,
+      ownerId,
+      objectKey,
+      filename: staged.inspection.filename,
+      mimeType: staged.inspection.mime,
+      sizeBytes: staged.inspection.size,
+      sha256: staged.inspection.sha256,
+    }, attachmentUploadLeaseSeconds);
+    const uploadSignal = AbortSignal.any([
+      requestSignal,
+      AbortSignal.timeout(attachmentUploadPutTimeoutMs),
+    ]);
+    const heartbeatAbort = new AbortController();
+    const putSignal = AbortSignal.any([uploadSignal, heartbeatAbort.signal]);
+    let heartbeatFailure: unknown;
+    let heartbeatInFlight: Promise<void> | undefined;
+    let heartbeatClosed = false;
+    const heartbeatInterval = setInterval(() => {
+      if (heartbeatClosed || heartbeatInFlight) return;
+      const operation = Promise.resolve().then(() =>
+        repo.heartbeatAttachmentUpload(
+          uploadStageId,
+          ownerId,
+          uploadStage.uploadLeaseToken,
+          attachmentUploadLeaseSeconds,
+        )
+      ).then(() => undefined);
+      let deadline: ReturnType<typeof setTimeout> | undefined;
+      const bounded = Promise.race([
+        operation,
+        new Promise<void>((_, reject) => {
+          deadline = setTimeout(
+            () => reject(new Error("Attachment upload heartbeat timed out")),
+            attachmentUploadHeartbeatTimeoutMs,
+          );
+        }),
+      ]).finally(() => clearTimeout(deadline));
+      heartbeatInFlight = bounded.catch((error) => {
+        if (!heartbeatClosed) {
+          heartbeatFailure = error;
+          heartbeatAbort.abort(error);
+        }
+      }).finally(() => {
+        heartbeatInFlight = undefined;
+      });
+    }, attachmentUploadHeartbeatMs);
     try {
       const file = await Deno.open(staged.path, { read: true });
       try {
-        await objectStore.put({
-          key: objectKey,
-          body: file.readable,
-          contentLength: staged.inspection.size,
-          contentType: staged.inspection.mime,
-          metadata: { sha256: staged.inspection.sha256, owner: ownerId },
-        });
+        objectAttempted = true;
+        try {
+          await objectStore.put({
+            key: objectKey,
+            body: file.readable,
+            contentLength: staged.inspection.size,
+            contentType: staged.inspection.mime,
+            metadata: { sha256: staged.inspection.sha256, owner: ownerId },
+            signal: putSignal,
+          });
+        } catch (error) {
+          if (heartbeatFailure) throw heartbeatFailure;
+          throw error;
+        }
+        clearInterval(heartbeatInterval);
+        await heartbeatInFlight;
+        if (heartbeatFailure) throw heartbeatFailure;
+        heartbeatClosed = true;
         stored = true;
       } catch (error) {
         if (error instanceof ObjectAlreadyExistsError) {
+          provenCollision = true;
+          await repo.abandonAttachmentUpload(
+            uploadStageId,
+            ownerId,
+            "object key collision; existing bytes were not deleted",
+          );
           throw new DomainError("object_key_conflict", "Upload identifier collision", 409);
         }
         throw error;
       }
-      const created = await repo.createAttachment({
+      await repo.markAttachmentUploadStored(
+        uploadStageId,
         ownerId,
-        objectKey,
-        filename: staged.inspection.filename,
-        mimeType: staged.inspection.mime,
-        sizeBytes: staged.inspection.size,
-        sha256: staged.inspection.sha256,
-        state: staged.inspection.decision.state === "ready" ? "ready" : "quarantined",
-        inspectionError: staged.inspection.decision.state === "ready"
-          ? null
-          : staged.inspection.decision.reason,
-      });
+        uploadStage.uploadLeaseToken,
+        attachmentUploadLeaseSeconds,
+      );
+      const requiresExternalInspection = attachmentExternalInspectionRequired &&
+        staged.inspection.decision.state === "ready";
+      const created = await repo.createAttachmentFromUploadStage(
+        uploadStageId,
+        ownerId,
+        uploadStage.uploadLeaseToken,
+        {
+          ownerId,
+          objectKey,
+          filename: staged.inspection.filename,
+          mimeType: staged.inspection.mime,
+          sizeBytes: staged.inspection.size,
+          sha256: staged.inspection.sha256,
+          state: requiresExternalInspection
+            ? "pending"
+            : staged.inspection.decision.state === "ready"
+            ? "ready"
+            : "quarantined",
+          inspectionError: staged.inspection.decision.state === "ready"
+            ? null
+            : staged.inspection.decision.reason,
+          requiredInspectionMode: requiresExternalInspection ? "external" : "local",
+          inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
+          // Synchronous parsing remains the first policy layer. An enabled external scanner is a
+          // second durable decision, so clean uploads stay unavailable until its epoch-bound job
+          // completes. Synchronously quarantined bytes never need to reach that service.
+          inspectionComplete: !requiresExternalInspection,
+        },
+        attachmentStorageQuota,
+      );
       if (created.deduplicated) {
-        await objectStore.delete(objectKey).catch(() => {
-          emitOperationalLog({
-            level: "error",
-            message: "Duplicate upload object cleanup failed",
-          });
-        });
         stored = false;
         return created.attachment;
       }
       registered = true;
       return created.attachment;
     } catch (error) {
-      if (stored && !registered) await objectStore.delete(objectKey).catch(() => undefined);
+      if ((stored || objectAttempted) && !registered && !provenCollision) {
+        await Promise.resolve(
+          repo.requestAttachmentUploadCleanup(
+            uploadStageId,
+            ownerId,
+            uploadStage.uploadLeaseToken,
+            error instanceof Error ? error.message : "browser upload finalization failed",
+          ),
+        ).catch((cleanupError) => {
+          emitOperationalLog({
+            level: "error",
+            message: "Durable browser upload cleanup enqueue failed",
+            error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+          });
+        });
+      }
       throw error;
+    } finally {
+      heartbeatClosed = true;
+      clearInterval(heartbeatInterval);
     }
   };
 
-  const uploadFor = async (request: Request, ownerId: string, requirePurpose = false) => {
+  const withStagedUpload = async <T>(
+    request: Request,
+    ownerId: string,
+    requirePurpose: boolean,
+    use: (staged: StagedUpload) => Promise<T>,
+  ): Promise<T> => {
     const ownerUploads = activeUploadsByUser.get(ownerId) ?? 0;
     if (activeUploads >= uploadMaxConcurrent || ownerUploads >= uploadMaxConcurrentPerUser) {
       throw new DomainError("upload_capacity_exceeded", "Too many uploads are in progress", 429);
@@ -2591,7 +3376,7 @@ export function createApp(options: AppOptions = {}) {
     let staged: StagedUpload | undefined;
     try {
       staged = await stageMultipartUpload(request, uploadMaxBytes, requirePurpose);
-      return { attachment: await persistUpload(ownerId, staged), purpose: staged.purpose };
+      return await use(staged);
     } finally {
       if (staged) await Deno.remove(staged.path).catch(() => undefined);
       activeUploads--;
@@ -2600,6 +3385,11 @@ export function createApp(options: AppOptions = {}) {
       else activeUploadsByUser.delete(ownerId);
     }
   };
+  const uploadFor = async (request: Request, ownerId: string, requirePurpose = false) =>
+    await withStagedUpload(request, ownerId, requirePurpose, async (staged) => ({
+      attachment: await persistUpload(ownerId, staged, request.signal),
+      purpose: staged.purpose,
+    }));
 
   const readExactObjectBody = async (
     body: ReadableStream<Uint8Array>,
@@ -3189,11 +3979,12 @@ export function createApp(options: AppOptions = {}) {
   };
 
   app.post("/api/setup/bootstrap", async (c) => {
+    privateNoStore(c);
     if (!setupToken) throw new DomainError("setup_disabled", "SETUP_TOKEN is not configured", 503);
     if (bootstrapInProgress) {
       throw new DomainError("already_bootstrapped", "An administrator already exists", 409);
     }
-    if (c.req.header("x-setup-token") !== setupToken) {
+    if (!timingSafeTextEqual(c.req.header("x-setup-token"), setupToken)) {
       throw new DomainError("invalid_setup_token", "Invalid setup token", 401);
     }
     bootstrapInProgress = true;
@@ -3203,12 +3994,6 @@ export function createApp(options: AppOptions = {}) {
         ...body,
         passwordHash: await hashPassword(body.password),
       }, startingCredit);
-      await repo.recordAudit({
-        actorId: user.id,
-        action: "identity.bootstrap_admin",
-        targetType: "user",
-        targetId: user.id,
-      });
       return c.json({ user: publicUser(user) }, 201);
     } catch (error) {
       bootstrapInProgress = false;
@@ -3223,7 +4008,11 @@ export function createApp(options: AppOptions = {}) {
       passwordHash: await hashPassword(body.password),
       emailVerified: false,
     });
-    await repo.recordAudit({ action: "identity.signup", targetType: "user", targetId: user.id });
+    await recordIdentityAuditWithSanitizedFailure({
+      action: "identity.signup",
+      targetType: "user",
+      targetId: user.id,
+    });
     if (mailer) {
       const verificationToken = randomToken("verify_");
       await repo.createIdentityToken(
@@ -3231,6 +4020,7 @@ export function createApp(options: AppOptions = {}) {
         "email_verification",
         await sha256(verificationToken),
         new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+        user.authorityEpoch,
       );
       try {
         await mailer.send({
@@ -3239,13 +4029,13 @@ export function createApp(options: AppOptions = {}) {
           token: verificationToken,
           url: `${webOrigin}/verify-email#token=${encodeURIComponent(verificationToken)}`,
         });
-        await repo.recordAudit({
+        await recordIdentityAuditWithSanitizedFailure({
           action: "identity.verification_sent",
           targetType: "user",
           targetId: user.id,
         });
       } catch {
-        await repo.recordAudit({
+        await recordIdentityAuditWithSanitizedFailure({
           action: "identity.verification_delivery_failed",
           targetType: "user",
           targetId: user.id,
@@ -3253,7 +4043,7 @@ export function createApp(options: AppOptions = {}) {
       }
     }
     const token = randomToken("sess_");
-    await repo.createSession(user.id, await sha256(token), true);
+    await repo.createSession(user.id, await sha256(token), true, user.authorityEpoch);
     setCookie(c, sessionCookie, token, {
       httpOnly: true,
       sameSite: "Lax",
@@ -3307,38 +4097,13 @@ export function createApp(options: AppOptions = {}) {
   app.post("/api/auth/verify-email", async (c) => {
     const body = await parseJson(c, identityTokenSchema);
     if (browserAuth && !body.token.startsWith("verify_")) {
-      const url = new URL(c.req.url);
-      url.pathname = "/api/auth/verify-email";
-      url.search = new URLSearchParams({ token: body.token }).toString();
-      const response = await browserAuth.handler(
-        new Request(url, { method: "GET", headers: c.req.raw.headers }),
-      );
-      if (!response.ok) {
-        throw new DomainError(
-          "invalid_identity_token",
-          "Verification token is invalid or expired",
-          400,
-        );
-      }
-      // The digest was registered when the mail was emitted. Consuming it after Better Auth's
-      // signature/expiry check provides an atomic, one-response-only replay fence without ever
-      // trusting JWT payload fields for identity lookup.
+      // The exact opaque token digest was registered when Better Auth emitted the mail. Consume
+      // that record directly so auth_users and domain users change in one repository transaction;
+      // forwarding through Better Auth first would create a cross-transaction authority race.
       const verified = await repo.verifyEmail(await sha256(body.token));
-      await repo.recordAudit({
-        actorId: verified.id,
-        action: "identity.email_verified",
-        targetType: "user",
-        targetId: verified.id,
-      });
       return c.json({ user: publicUser(verified) });
     }
     const user = await repo.verifyEmail(await sha256(body.token));
-    await repo.recordAudit({
-      actorId: user.id,
-      action: "identity.email_verified",
-      targetType: "user",
-      targetId: user.id,
-    });
     return c.json({ user: publicUser(user) });
   });
   app.post("/api/auth/verify-email/request", authenticate, async (c) => {
@@ -3358,12 +4123,22 @@ export function createApp(options: AppOptions = {}) {
     }
     const user = c.get("user");
     if (user.emailVerifiedAt) return c.body(null, 204);
+    // Limited status sessions intentionally survive rejection so applicants can observe their
+    // state. Rejection advances full-authority epochs and consumes prior verification links, but
+    // must not make an unverified account impossible to reconsider: rejected users cannot sign in
+    // for a fresh status session. Re-read current domain authority and let createIdentityToken's
+    // user-row fence reject any lifecycle change that races this resend.
+    const currentUser = await repo.findUser(user.id);
+    if (!currentUser || currentUser.state !== "active" || currentUser.deletedAt !== null) {
+      throw new DomainError("account_unavailable", "This account is unavailable", 403);
+    }
     const token = randomToken("verify_");
     await repo.createIdentityToken(
       user.id,
       "email_verification",
       await sha256(token),
       new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+      currentUser.authorityEpoch,
     );
     await mailer.send({
       to: user.email,
@@ -3371,7 +4146,7 @@ export function createApp(options: AppOptions = {}) {
       token,
       url: `${webOrigin}/verify-email#token=${encodeURIComponent(token)}`,
     });
-    await repo.recordAudit({
+    await recordIdentityAuditWithSanitizedFailure({
       actorId: user.id,
       action: "identity.verification_sent",
       targetType: "user",
@@ -3382,74 +4157,78 @@ export function createApp(options: AppOptions = {}) {
   app.post("/api/auth/password-reset/request", async (c) => {
     if (browserAuth) {
       const body = await parseJson(c, passwordResetRequestSchema);
-      const response = await forwardBetterAuthJson(c, "/api/auth/request-password-reset", {
-        email: body.email,
-        redirectTo: `${webOrigin}/reset-password`,
-      });
-      // Better Auth deliberately does not disclose whether the account exists. Normalize its
-      // successful response too so local and durable auth have the same product contract.
-      if (!response.ok) {
+      try {
+        const response = await forwardBetterAuthJson(c, "/api/auth/request-password-reset", {
+          email: body.email,
+          redirectTo: `${webOrigin}/reset-password`,
+        });
+        if (!response.ok) {
+          emitOperationalLog({
+            level: "error",
+            message: "Password reset request could not be processed",
+            status: response.status,
+          });
+        }
+      } catch {
+        // Public reset requests are deliberately non-enumerating. Storage, lifecycle, and
+        // delivery setup failures are observable internally but never distinguish an address.
         emitOperationalLog({
           level: "error",
           message: "Password reset request could not be processed",
-          status: response.status,
         });
       }
       return c.body(null, 202);
     }
     const body = await parseJson(c, passwordResetRequestSchema);
-    const user = await repo.findUserByEmail(body.email);
-    if (user && user.state === "active" && user.deletedAt === null && mailer) {
-      const token = randomToken("reset_");
-      await repo.createIdentityToken(
-        user.id,
-        "password_reset",
-        await sha256(token),
-        new Date(Date.now() + 60 * 60 * 1000).toISOString(),
-      );
-      dispatchIdentityDelivery(
-        user.id,
-        null,
-        (signal) =>
-          mailer.send({
-            to: user.email,
-            kind: "password_reset",
-            token,
-            url: `${webOrigin}/reset-password#token=${encodeURIComponent(token)}`,
-          }, signal),
-        "identity.password_reset_requested",
-        "identity.password_reset_delivery_failed",
-      );
+    try {
+      const user = await repo.findUserByEmail(body.email);
+      if (
+        user && user.state === "active" && user.deletedAt === null &&
+        user.approvalStatus !== "rejected" && user.passwordResetPending !== true && mailer
+      ) {
+        const token = randomToken("reset_");
+        await repo.createIdentityToken(
+          user.id,
+          "password_reset",
+          await sha256(token),
+          new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+          user.authorityEpoch,
+        );
+        dispatchIdentityDelivery(
+          user.id,
+          null,
+          (signal) =>
+            mailer.send({
+              to: user.email,
+              kind: "password_reset",
+              token,
+              url: `${webOrigin}/reset-password#token=${encodeURIComponent(token)}`,
+            }, signal),
+          "identity.password_reset_requested",
+          "identity.password_reset_delivery_failed",
+        );
+      }
+    } catch {
+      emitOperationalLog({
+        level: "error",
+        message: "Password reset request could not be processed",
+      });
     }
     return c.body(null, 202);
   });
   app.post("/api/auth/password-reset", async (c) => {
     const body = await parseJson(c, passwordResetSchema);
     if (browserAuth && !body.token.startsWith("reset_")) {
-      await repo.prepareBetterAuthPasswordReset(body.token);
-      const url = new URL(c.req.url);
-      url.pathname = "/api/auth/reset-password";
-      const headers = new Headers(c.req.raw.headers);
-      headers.set("x-dg-password-reset-token", body.token);
-      const response = await browserAuth.handler(
-        new Request(url, {
-          method: "POST",
-          headers,
-          body: JSON.stringify({ token: body.token, newPassword: body.password }),
-        }),
+      await repo.resetBetterAuthPassword(
+        body.token,
+        await hashPassword(body.password),
       );
-      return response.ok ? c.body(null, 204) : response;
+      return c.body(null, 204);
     }
-    const user = await repo.resetPassword(
+    await repo.resetPassword(
       await sha256(body.token),
       await hashPassword(body.password),
     );
-    await repo.recordAudit({
-      actorId: user.id,
-      action: "identity.password_reset_completed",
-      targetType: "user",
-      targetId: user.id,
-    });
     return c.body(null, 204);
   });
   const signIn = async (c: Context) => {
@@ -3460,7 +4239,7 @@ export function createApp(options: AppOptions = {}) {
       user?.passwordHash ?? DUMMY_PASSWORD_HASH,
     );
     if (!user || !passwordValid) {
-      await repo.recordAudit({
+      await recordIdentityAuditWithSanitizedFailure({
         action: "identity.login_failed",
         targetType: "user",
         targetId: user?.id ?? null,
@@ -3476,8 +4255,8 @@ export function createApp(options: AppOptions = {}) {
     const limited = user.approvalStatus !== "approved" ||
       (requireEmailVerification && !user.emailVerifiedAt);
     const token = randomToken("sess_");
-    await repo.createSession(user.id, await sha256(token), limited);
-    await repo.recordAudit({
+    await repo.createSession(user.id, await sha256(token), limited, user.authorityEpoch);
+    await recordIdentityAuditWithSanitizedFailure({
       actorId: user.id,
       action: "identity.login_succeeded",
       targetType: "user",
@@ -3531,7 +4310,7 @@ export function createApp(options: AppOptions = {}) {
       const session = await repo.getSession(hash);
       await repo.deleteSession(hash);
       if (session) {
-        await repo.recordAudit({
+        await recordIdentityAuditWithSanitizedFailure({
           actorId: session.userId,
           action: "session.signed_out",
           targetType: "session",
@@ -3584,6 +4363,7 @@ export function createApp(options: AppOptions = {}) {
     "/api/sessions",
     authenticate,
     sessionOnly,
+    approved,
     async (c) => {
       const ownerId = c.get("user").id;
       const presentedBetterAuth = browserAuth?.presentedSessionToken(c.req.raw.headers);
@@ -3614,7 +4394,7 @@ export function createApp(options: AppOptions = {}) {
       return c.json({ data: [...durable, ...legacy] });
     },
   );
-  app.delete("/api/sessions/:id", authenticate, sessionOnly, async (c) => {
+  app.delete("/api/sessions/:id", authenticate, sessionOnly, approved, async (c) => {
     const requestedId = c.req.param("id");
     if (browserAuth && requestedId.startsWith("better_auth:")) {
       await browserAuth.revokeUserSession(
@@ -4130,6 +4910,84 @@ export function createApp(options: AppOptions = {}) {
       ),
     );
   });
+  app.use("/api/community/*", authenticate, approved, sessionOnly);
+  app.use("/api/community", authenticate, approved, sessionOnly);
+  app.use("/api/community/leaderboard", authenticate, approved, sessionOnly);
+  app.get("/api/community/profile", async (c) => {
+    privateNoStore(c);
+    return c.json(await repo.getCommunityProfile(c.get("user").id));
+  });
+  app.patch("/api/community/profile", async (c) => {
+    privateNoStore(c);
+    const patch = await parseJson(c, updateCommunityProfileSchema);
+    try {
+      return c.json(
+        await repo.updateCommunityProfile(
+          c.get("user").id,
+          patch,
+          { actorId: c.get("user").id },
+        ),
+      );
+    } catch (error) {
+      if (error instanceof CommunityProfileValidationError) {
+        throw new DomainError(
+          "validation_error",
+          "Community profile update is invalid",
+          422,
+        );
+      }
+      throw error;
+    }
+  });
+  app.get("/api/community/leaderboard", async (c) => {
+    privateNoStore(c);
+    const parsed = parseCommunityLeaderboardQuery(c);
+    const window = parsed.metric === "balance" ? "current" : parsed.window ?? "30d";
+    const cursor = parsed.cursor
+      ? await communityCursorCodec.decode(parsed.cursor, { metric: parsed.metric, window })
+      : undefined;
+    const asOf = cursor?.asOf ??
+      new Date(options.now?.() ?? Date.now()).toISOString();
+    const from = cursor?.from ??
+      (window === "current"
+        ? null
+        : new Date(Date.parse(asOf) - COMMUNITY_WINDOW_MS[window] * 86_400_000).toISOString());
+    const page = await repo.listCommunityLeaderboard({
+      metric: parsed.metric,
+      window,
+      from,
+      asOf,
+      limit: parsed.limit,
+      after: cursor
+        ? { score: cursor.score, userId: cursor.userId, position: cursor.position }
+        : undefined,
+    });
+    const nextCursor = page.nextBoundary
+      ? await communityCursorCodec.encode({
+        v: 1,
+        metric: parsed.metric,
+        window,
+        from,
+        asOf,
+        ...page.nextBoundary,
+      })
+      : null;
+    const response: CommunityLeaderboardPage = {
+      metric: parsed.metric,
+      window,
+      from,
+      asOf,
+      data: page.data.map(({ position, identityMode, nickname, color, value }) => ({
+        position,
+        identityMode,
+        nickname: identityMode === "nickname" ? nickname : null,
+        color: identityMode === "nickname" ? color : null,
+        value,
+      })),
+      nextCursor,
+    };
+    return c.json(response);
+  });
   app.use("/api/folders/*", authenticate, approved, sessionOnly);
   app.use("/api/folders", authenticate, approved, sessionOnly);
   app.get("/api/folders", async (c) => {
@@ -4281,6 +5139,79 @@ export function createApp(options: AppOptions = {}) {
       ),
       201,
     );
+  });
+  app.post("/api/conversations/search", async (c) => {
+    privateNoStore(c);
+    let rate;
+    try {
+      rate = await rateLimiter.consume(
+        `conversation-search:owner:${c.get("user").id}`,
+        configuredConversationSearchLimit,
+        configuredRateWindow,
+      );
+    } catch {
+      c.header("Retry-After", "5");
+      throw new DomainError(
+        "service_unavailable",
+        "Conversation search is temporarily unavailable",
+        503,
+      );
+    }
+    c.header("X-RateLimit-Limit", String(rate.limit));
+    c.header("X-RateLimit-Remaining", String(rate.remaining));
+    if (!rate.allowed) {
+      c.header("Retry-After", String(rate.retryAfterSeconds));
+      throw new DomainError("rate_limit_exceeded", "Too many requests", 429);
+    }
+    const body = await parseJson(c, conversationSearchSchema);
+    let lease;
+    try {
+      lease = await conversationSearchConcurrencyLimiter.acquire(c.get("user").id, {
+        global: conversationSearchMaxConcurrent,
+        perUser: conversationSearchMaxConcurrentPerUser,
+      }, "search");
+    } catch {
+      c.header("Retry-After", "5");
+      throw new DomainError(
+        "service_unavailable",
+        "Conversation search is temporarily unavailable",
+        503,
+      );
+    }
+    if (!lease) {
+      c.header("Retry-After", "1");
+      throw new DomainError(
+        "conversation_search_capacity_exceeded",
+        "Too many conversation searches are in progress",
+        429,
+      );
+    }
+    try {
+      const requestSignal = c.req.raw.signal;
+      const searchSignal = AbortSignal.any([requestSignal, lease.signal]);
+      const result = await repo.searchConversations(c.get("user").id, body, searchSignal);
+      if (lease.signal.aborted) {
+        c.header("Retry-After", "5");
+        throw new DomainError(
+          "service_unavailable",
+          "Conversation search is temporarily unavailable",
+          503,
+        );
+      }
+      return c.json(result);
+    } catch (error) {
+      if (!c.req.raw.signal.aborted && lease.signal.aborted) {
+        c.header("Retry-After", "5");
+        throw new DomainError(
+          "service_unavailable",
+          "Conversation search is temporarily unavailable",
+          503,
+        );
+      }
+      throw error;
+    } finally {
+      await lease.release().catch(() => undefined);
+    }
   });
   app.post("/api/conversations/:id/keep", async (c) => {
     const ownerId = c.get("user").id;
@@ -5271,25 +6202,23 @@ export function createApp(options: AppOptions = {}) {
       ...body,
       tokenHash: await sha256(secret),
       preview: `${secret.slice(0, 7)}…${secret.slice(-4)}`,
-    });
-    const { tokenHash: _h, userId: _u, ...summary } = record;
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "api_token.created",
-      targetType: "api_token",
-      targetId: record.id,
-    });
+    }, c.get("authorityEpoch"));
+    const {
+      tokenHash: _h,
+      userId: _u,
+      authorityEpoch: _authorityEpoch,
+      ...summary
+    } = record;
     return c.json({ token: secret, ...summary }, 201);
   });
   app.patch("/api/tokens/:id", async (c) => {
     const body = await parseJson(c, updateTokenSchema);
-    const summary = await repo.updateApiToken(c.get("user").id, c.req.param("id"), body);
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "api_token.updated",
-      targetType: "api_token",
-      targetId: c.req.param("id"),
-    });
+    const summary = await repo.updateApiToken(
+      c.get("user").id,
+      c.req.param("id"),
+      body,
+      c.get("authorityEpoch"),
+    );
     return c.json(summary);
   });
   app.post("/api/tokens/:id/rotate", async (c) => {
@@ -5299,25 +6228,17 @@ export function createApp(options: AppOptions = {}) {
       ...body,
       tokenHash: await sha256(secret),
       preview: `${secret.slice(0, 7)}…${secret.slice(-4)}`,
-    });
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "api_token.rotated",
-      targetType: "api_token",
-      targetId: rotated.replacement.id,
-      metadata: { previousTokenId: rotated.previous.id, overlapSeconds: body.overlapSeconds },
-    });
+    }, c.get("authorityEpoch"));
     return c.json({ token: secret, ...rotated }, 201);
   });
   app.delete("/api/tokens/:id", async (c) => {
     const body = await parseJson(c, revokeTokenSchema);
-    await repo.revokeApiTokenFamily(c.req.param("id"), c.get("user").id, body.expectedVersion);
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "api_token.revoked",
-      targetType: "api_token",
-      targetId: c.req.param("id"),
-    });
+    await repo.revokeApiTokenFamily(
+      c.req.param("id"),
+      c.get("user").id,
+      body.expectedVersion,
+      c.get("authorityEpoch"),
+    );
     return c.body(null, 204);
   });
   app.get(
@@ -5343,6 +6264,16 @@ export function createApp(options: AppOptions = {}) {
       .map(({ definition }) => definition);
     return c.json({ data: available });
   });
+  const publicToolExecution = (execution: Awaited<ReturnType<ToolExecutionService["get"]>>) => {
+    const normalized = normalizeToolExecutionForRead(execution);
+    const {
+      claimToken: _claimToken,
+      claimExpiresAt: _claimExpiresAt,
+      billingSnapshot: _billingSnapshot,
+      ...view
+    } = normalized;
+    return view;
+  };
   app.post("/api/tools/executions", async (c) => {
     let body: unknown;
     try {
@@ -5368,11 +6299,12 @@ export function createApp(options: AppOptions = {}) {
       targetId: execution.id,
       metadata: { toolId: execution.toolId },
     });
-    return c.json(execution, 201);
+    return c.json(publicToolExecution(execution), 201);
   });
   app.get(
     "/api/tools/executions/:id",
-    async (c) => c.json(await toolExecution.get(c.get("user").id, c.req.param("id"))),
+    async (c) =>
+      c.json(publicToolExecution(await toolExecution.get(c.get("user").id, c.req.param("id")))),
   );
   app.post("/api/tools/executions/:id/approve", async (c) => {
     const execution = await toolExecution.approve(c.get("user").id, c.req.param("id"));
@@ -5383,7 +6315,7 @@ export function createApp(options: AppOptions = {}) {
       targetId: execution.id,
       metadata: { toolId: execution.toolId },
     });
-    return c.json(execution, 202);
+    return c.json(publicToolExecution(execution), 202);
   });
   app.delete("/api/tools/executions/:id", async (c) => {
     const execution = await toolExecution.cancel(c.get("user").id, c.req.param("id"));
@@ -5394,7 +6326,7 @@ export function createApp(options: AppOptions = {}) {
       targetId: execution.id,
       metadata: { toolId: execution.toolId },
     });
-    return c.json(execution);
+    return c.json(publicToolExecution(execution));
   });
 
   app.use("/api/admin/*", authenticate, approved, sessionOnly, admin);
@@ -5410,6 +6342,66 @@ export function createApp(options: AppOptions = {}) {
     privateNoStore(c);
     c.header("Vary", "Cookie");
     return c.json({ defaultApprovalCreditMicros: startingCredit });
+  });
+  app.get("/api/admin/storage/summary", async (c) => {
+    const summary = await repo.adminStorageSummary(c.get("user").id);
+    const bytesLimit = attachmentStorageQuota?.installationBytes ?? null;
+    const objectsLimit = attachmentStorageQuota?.installationObjects ?? null;
+    return c.json({
+      summary: {
+        ...summary,
+        perUserBytesLimit: attachmentStorageQuota?.perUserBytes ?? null,
+        perUserObjectsLimit: attachmentStorageQuota?.perUserObjects ?? null,
+        installationBytesLimit: bytesLimit,
+        installationObjectsLimit: objectsLimit,
+        installationBytesRemaining: bytesLimit === null
+          ? null
+          : Math.max(0, bytesLimit - summary.physicalBytes),
+        installationObjectsRemaining: objectsLimit === null
+          ? null
+          : Math.max(0, objectsLimit - summary.physicalObjects),
+        installationBytesOverage: bytesLimit === null
+          ? null
+          : Math.max(0, summary.physicalBytes - bytesLimit),
+        installationObjectsOverage: objectsLimit === null
+          ? null
+          : Math.max(0, summary.physicalObjects - objectsLimit),
+        installationBytesPercent: bytesLimit === null
+          ? null
+          : bytesLimit === 0
+          ? summary.physicalBytes === 0 ? 0 : null
+          : summary.physicalBytes / bytesLimit * 100,
+        installationObjectsPercent: objectsLimit === null
+          ? null
+          : objectsLimit === 0
+          ? summary.physicalObjects === 0 ? 0 : null
+          : summary.physicalObjects / objectsLimit * 100,
+      },
+    });
+  });
+  app.get("/api/admin/storage/attachments", async (c) => {
+    const page = await repo.listAdminAttachments(
+      c.get("user").id,
+      parseAdminAttachmentQuery(c),
+    );
+    return c.json(page);
+  });
+  app.post("/api/admin/storage/attachments/:id/reinspect", async (c) => {
+    requireRecentAdminAuthentication(c, "requesting attachment reinspection");
+    const attachmentId = requireUuid(c.req.param("id"), "Attachment id");
+    const input = await parseAttachmentReinspection(c);
+    const result = await repo.requestAttachmentReinspection({
+      attachmentId,
+      actorId: c.get("user").id,
+      expectedVersion: input.expectedVersion,
+      reason: input.reason,
+      requiredInspectionMode: attachmentExternalInspectionRequired ? "external" : "local",
+      inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
+    });
+    return c.json({
+      attachment: publicAdminAttachment(result.attachment),
+      inspectionJobId: result.inspectionJobId,
+    }, 202);
   });
   const requireBackupAdmin = (): BackupAdminService => {
     if (!options.backupAdmin) {
@@ -5912,105 +6904,112 @@ export function createApp(options: AppOptions = {}) {
     async (c) => c.json({ data: await repo.listModelAliases() }),
   );
   app.post("/api/admin/model-access/aliases", async (c) => {
-    const alias = await repo.createModelAlias(await parseJson(c, createModelAliasSchema));
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "model_alias.created",
-      targetType: "model_alias",
-      targetId: alias.id,
-    });
+    const alias = await repo.createModelAlias(
+      await parseJson(c, createModelAliasSchema),
+      {
+        actorId: c.get("user").id,
+        action: "model_alias.created",
+        targetType: "model_alias",
+        requireEmailVerification,
+        expectedAuthorityEpoch: c.get("authorityEpoch"),
+      },
+    );
     return c.json(alias, 201);
   });
   app.patch("/api/admin/model-access/aliases/:id", async (c) => {
     const alias = await repo.updateModelAlias(
       c.req.param("id"),
       await parseJson(c, updateModelAliasSchema),
+      {
+        actorId: c.get("user").id,
+        action: "model_alias.updated",
+        targetType: "model_alias",
+        targetId: c.req.param("id"),
+        requireEmailVerification,
+        expectedAuthorityEpoch: c.get("authorityEpoch"),
+      },
     );
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "model_alias.updated",
-      targetType: "model_alias",
-      targetId: alias.id,
-    });
     return c.json(alias);
   });
   app.delete("/api/admin/model-access/aliases/:id", async (c) => {
     const { expectedVersion } = await parseJson(c, revokeTokenSchema);
-    await repo.deleteModelAlias(c.req.param("id"), expectedVersion);
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "model_alias.deleted",
-      targetType: "model_alias",
-      targetId: c.req.param("id"),
-    });
+    await repo.deleteModelAlias(
+      c.req.param("id"),
+      expectedVersion,
+      {
+        actorId: c.get("user").id,
+        action: "model_alias.deleted",
+        targetType: "model_alias",
+        targetId: c.req.param("id"),
+        requireEmailVerification,
+        expectedAuthorityEpoch: c.get("authorityEpoch"),
+      },
+    );
     return c.body(null, 204);
   });
   app.get(
     "/api/admin/model-access/groups",
-    async (c) => c.json({ data: await repo.listAccessGroups() }),
+    async (c) =>
+      c.json({
+        data: await repo.listAccessGroups({
+          actorId: c.get("user").id,
+          requireEmailVerification,
+          expectedAuthorityEpoch: c.get("authorityEpoch"),
+        }),
+      }),
   );
   app.post("/api/admin/model-access/groups", async (c) => {
-    const group = await repo.createAccessGroup(await parseJson(c, createAccessGroupSchema));
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "model_access_group.created",
-      targetType: "model_access_group",
-      targetId: group.id,
-    });
+    const body = await parseJson(c, createAccessGroupSchema);
+    const group = await repo.createAccessGroup(
+      body,
+      {
+        actorId: c.get("user").id,
+        action: "model_access_group.created",
+        targetType: "model_access_group",
+        metadata: {
+          userCount: body.userIds.length,
+          modelCount: body.modelIds.length,
+          tokenCount: body.tokenIds.length,
+        },
+        requireEmailVerification,
+        expectedAuthorityEpoch: c.get("authorityEpoch"),
+      },
+    );
     return c.json(group, 201);
   });
   app.patch("/api/admin/model-access/groups/:id", async (c) => {
     const group = await repo.updateAccessGroup(
       c.req.param("id"),
       await parseJson(c, updateAccessGroupSchema),
+      {
+        actorId: c.get("user").id,
+        action: "model_access_group.updated",
+        targetType: "model_access_group",
+        targetId: c.req.param("id"),
+        requireEmailVerification,
+        expectedAuthorityEpoch: c.get("authorityEpoch"),
+      },
     );
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "model_access_group.updated",
-      targetType: "model_access_group",
-      targetId: group.id,
-    });
     return c.json(group);
   });
-  const requireModelWideningAcknowledgement = (
-    actual: string[],
-    acknowledged: string[],
-  ) => {
-    const expected = [...new Set(actual)].sort();
-    const supplied = [...new Set(acknowledged)].sort();
-    if (
-      expected.length !== supplied.length || expected.some((id, index) => id !== supplied[index])
-    ) {
-      throw new DomainError(
-        "model_access_widening_acknowledgement_required",
-        `Acknowledge the exact models that will become public before applying this change: ${
-          expected.join(", ")
-        }`,
-        409,
-      );
-    }
-  };
   app.delete("/api/admin/model-access/groups/:id", async (c) => {
     const { expectedVersion, acknowledgePublicModelIds } = await parseJson(
       c,
       deleteAccessGroupSchema,
     );
-    const impact = await repo.previewAccessGroupPolicyImpact(c.req.param("id"), {
-      userIds: [],
-      modelIds: [],
-      tokenIds: [],
-    });
-    requireModelWideningAcknowledgement(
-      impact.modelIdsBecomingPublic,
+    await repo.deleteAccessGroup(
+      c.req.param("id"),
+      expectedVersion,
       acknowledgePublicModelIds,
+      {
+        actorId: c.get("user").id,
+        action: "model_access_group.deleted",
+        targetType: "model_access_group",
+        targetId: c.req.param("id"),
+        requireEmailVerification,
+        expectedAuthorityEpoch: c.get("authorityEpoch"),
+      },
     );
-    await repo.deleteAccessGroup(c.req.param("id"), expectedVersion);
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "model_access_group.deleted",
-      targetType: "model_access_group",
-      targetId: c.req.param("id"),
-    });
     return c.body(null, 204);
   });
   app.put("/api/admin/model-access/groups/:id/users", async (c) => {
@@ -6019,62 +7018,71 @@ export function createApp(options: AppOptions = {}) {
       c.req.param("id"),
       body.ids,
       body.expectedVersion,
+      {
+        actorId: c.get("user").id,
+        action: "model_access_group.users_replaced",
+        targetType: "model_access_group",
+        targetId: c.req.param("id"),
+        metadata: { userCount: body.ids.length },
+        requireEmailVerification,
+        expectedAuthorityEpoch: c.get("authorityEpoch"),
+      },
     );
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "model_access_group.users_replaced",
-      targetType: "model_access_group",
-      targetId: group.id,
-      metadata: { userCount: body.ids.length },
-    });
     return c.json(group);
   });
   app.put("/api/admin/model-access/groups/:id/models", async (c) => {
     const body = await parseJson(c, replaceAccessGroupModelsSchema);
-    const current = (await repo.listAccessGroups()).find((group) => group.id === c.req.param("id"));
-    if (!current) throw new DomainError("not_found", "Access group not found", 404);
-    const impact = await repo.previewAccessGroupPolicyImpact(c.req.param("id"), {
-      userIds: current.userIds,
-      modelIds: body.ids,
-      tokenIds: current.tokenIds,
-    });
-    requireModelWideningAcknowledgement(
-      impact.modelIdsBecomingPublic,
-      body.acknowledgePublicModelIds,
-    );
     const group = await repo.replaceAccessGroupModels(
       c.req.param("id"),
       body.ids,
       body.expectedVersion,
+      body.acknowledgePublicModelIds,
+      {
+        actorId: c.get("user").id,
+        action: "model_access_group.models_replaced",
+        targetType: "model_access_group",
+        targetId: c.req.param("id"),
+        metadata: { modelCount: body.ids.length },
+        requireEmailVerification,
+        expectedAuthorityEpoch: c.get("authorityEpoch"),
+      },
     );
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "model_access_group.models_replaced",
-      targetType: "model_access_group",
-      targetId: group.id,
-      metadata: { modelCount: body.ids.length },
-    });
     return c.json(group);
   });
   app.put("/api/admin/model-access/groups/:id/policy", async (c) => {
     const body = await parseJson(c, replaceAccessGroupPolicySchema);
-    const group = await repo.replaceAccessGroupPolicy(c.req.param("id"), body);
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "model_access_group.policy_replaced",
-      targetType: "model_access_group",
-      targetId: group.id,
-      metadata: {
-        userCount: body.userIds.length,
-        modelCount: body.modelIds.length,
-        tokenCount: body.tokenIds.length,
+    const group = await repo.replaceAccessGroupPolicy(
+      c.req.param("id"),
+      body,
+      {
+        actorId: c.get("user").id,
+        action: "model_access_group.policy_replaced",
+        targetType: "model_access_group",
+        targetId: c.req.param("id"),
+        metadata: {
+          userCount: body.userIds.length,
+          modelCount: body.modelIds.length,
+          tokenCount: body.tokenIds.length,
+        },
+        requireEmailVerification,
+        expectedAuthorityEpoch: c.get("authorityEpoch"),
       },
-    });
+    );
     return c.json(group);
   });
   app.post("/api/admin/model-access/groups/:id/impact", async (c) => {
     const body = await parseJson(c, previewAccessGroupPolicySchema);
-    return c.json(await repo.previewAccessGroupPolicyImpact(c.req.param("id"), body.proposal));
+    return c.json(
+      await repo.previewAccessGroupPolicyImpact(
+        {
+          actorId: c.get("user").id,
+          requireEmailVerification,
+          expectedAuthorityEpoch: c.get("authorityEpoch"),
+        },
+        c.req.param("id"),
+        body.proposal,
+      ),
+    );
   });
   app.get("/api/admin/model-access/tokens", async (c) => {
     const query = c.req.query("query")?.trim();
@@ -6087,7 +7095,18 @@ export function createApp(options: AppOptions = {}) {
       throw new DomainError("invalid_request", "Token search parameters are invalid", 422);
     }
     if (cursor) requireUuid(cursor, "cursor");
-    return c.json(await repo.searchApiTokens(query, requestedLimit, cursor));
+    return c.json(
+      await repo.searchApiTokens(
+        {
+          actorId: c.get("user").id,
+          requireEmailVerification,
+          expectedAuthorityEpoch: c.get("authorityEpoch"),
+        },
+        query,
+        requestedLimit,
+        cursor,
+      ),
+    );
   });
   app.put("/api/admin/model-access/tokens/:id/groups", async (c) => {
     const body = await parseJson(c, setTokenAccessGroupsSchema);
@@ -6096,14 +7115,16 @@ export function createApp(options: AppOptions = {}) {
       c.req.param("id"),
       body.groupIds,
       body.expectedVersion,
+      {
+        actorId: c.get("user").id,
+        action: "api_token.access_groups_set",
+        targetType: "api_token",
+        targetId: c.req.param("id"),
+        metadata: { groupCount: body.groupIds.length },
+        requireEmailVerification,
+        expectedAuthorityEpoch: c.get("authorityEpoch"),
+      },
     );
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "api_token.access_groups_set",
-      targetType: "api_token",
-      targetId: token.id,
-      metadata: { groupCount: body.groupIds.length },
-    });
     return c.json(token);
   });
   app.put("/api/admin/model-access/tokens/:id/access-mode", async (c) => {
@@ -6113,14 +7134,16 @@ export function createApp(options: AppOptions = {}) {
       c.req.param("id"),
       body.accessMode,
       body.expectedVersion,
+      {
+        actorId: c.get("user").id,
+        action: "api_token.access_mode_set",
+        targetType: "api_token",
+        targetId: c.req.param("id"),
+        metadata: { accessMode: body.accessMode },
+        requireEmailVerification,
+        expectedAuthorityEpoch: c.get("authorityEpoch"),
+      },
     );
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "api_token.access_mode_set",
-      targetType: "api_token",
-      targetId: token.id,
-      metadata: { accessMode: body.accessMode },
-    });
     return c.json(token);
   });
   app.get("/api/admin/tools", async (c) => c.json({ data: await toolExecution.listPolicies() }));
@@ -6279,6 +7302,7 @@ export function createApp(options: AppOptions = {}) {
     const body = await parseJson(c, adminApprovalSchema);
     const updated = await repo.decideUserApproval({
       actorId: c.get("user").id,
+      expectedAuthorityEpoch: c.get("authorityEpoch"),
       targetUserId: requireUuid(c.req.param("id"), "User id"),
       expectedVersion: body.expectedVersion,
       status: body.status,
@@ -6295,10 +7319,12 @@ export function createApp(options: AppOptions = {}) {
     const body = await parseJson(c, adminRoleSchema);
     const updated = await repo.setAdminUserRole({
       actorId: c.get("user").id,
+      expectedAuthorityEpoch: c.get("authorityEpoch"),
       targetUserId: requireUuid(c.req.param("id"), "User id"),
       expectedVersion: body.expectedVersion,
       role: body.role,
       reason: body.reason,
+      requireEmailVerification,
     });
     privateNoStore(c);
     c.header("Vary", "Cookie");
@@ -6309,10 +7335,12 @@ export function createApp(options: AppOptions = {}) {
     const body = await parseJson(c, adminAccountStateSchema);
     const updated = await repo.setAdminUserState({
       actorId: c.get("user").id,
+      expectedAuthorityEpoch: c.get("authorityEpoch"),
       targetUserId: requireUuid(c.req.param("id"), "User id"),
       expectedVersion: body.expectedVersion,
       state: body.state,
       reason: body.reason,
+      requireEmailVerification,
     });
     privateNoStore(c);
     c.header("Vary", "Cookie");
@@ -6323,10 +7351,12 @@ export function createApp(options: AppOptions = {}) {
     const body = await parseJson(c, adminDeleteUserSchema);
     const updated = await repo.setAdminUserDeleted({
       actorId: c.get("user").id,
+      expectedAuthorityEpoch: c.get("authorityEpoch"),
       targetUserId: requireUuid(c.req.param("id"), "User id"),
       expectedVersion: body.expectedVersion,
       deleted: true,
       reason: body.reason,
+      requireEmailVerification,
     });
     privateNoStore(c);
     c.header("Vary", "Cookie");
@@ -6337,31 +7367,16 @@ export function createApp(options: AppOptions = {}) {
     const body = await parseJson(c, adminRestoreUserSchema);
     const updated = await repo.setAdminUserDeleted({
       actorId: c.get("user").id,
+      expectedAuthorityEpoch: c.get("authorityEpoch"),
       targetUserId: requireUuid(c.req.param("id"), "User id"),
       expectedVersion: body.expectedVersion,
       deleted: false,
       reason: body.reason,
+      requireEmailVerification,
     });
     privateNoStore(c);
     c.header("Vary", "Cookie");
     return c.json(updated);
-  });
-  app.delete("/api/admin/sessions/:id", async (c) => {
-    const requestedId = c.req.param("id");
-    if (browserAuth && requestedId.startsWith("better_auth:")) {
-      await browserAuth.revokeSessionAsAdmin(requestedId.slice("better_auth:".length));
-    } else {
-      await repo.revokeSession(
-        requestedId.startsWith("legacy:") ? requestedId.slice("legacy:".length) : requestedId,
-      );
-    }
-    await repo.recordAudit({
-      actorId: c.get("user").id,
-      action: "session.admin_revoked",
-      targetType: "session",
-      targetId: c.req.param("id"),
-    });
-    return c.body(null, 204);
   });
   app.get(
     "/api/admin/audit",
@@ -6403,6 +7418,10 @@ export function createApp(options: AppOptions = {}) {
   app.get("/api/admin/jobs", async (c) => {
     c.header("Cache-Control", "private, no-store");
     return c.json(await repo.listJobs(parseAdminJobQuery(c)));
+  });
+  app.get("/api/admin/workers", async (c) => {
+    c.header("Cache-Control", "private, no-store");
+    return c.json(await repo.listWorkerInstances(parseAdminWorkerQuery(c)));
   });
   app.post("/api/admin/jobs/:id/retry", async (c) => {
     c.header("Cache-Control", "private, no-store");
@@ -6982,6 +8001,28 @@ export function createApp(options: AppOptions = {}) {
       (request.state === "completed" || request.failureStartedStream);
     const headers = new Headers(request.responseHeaders);
     headers.set("X-Idempotent-Replay", "true");
+    const storedRetryAfter = headers.get("Retry-After");
+    if (storedRetryAfter !== null && /^\d+$/.test(storedRetryAfter)) {
+      const seconds = Number(storedRetryAfter);
+      const completedAt = Date.parse(request.completedAt ?? "");
+      const delayMs = seconds * 1_000;
+      if (
+        !Number.isSafeInteger(seconds) || seconds < 0 ||
+        !Number.isSafeInteger(delayMs) || !Number.isSafeInteger(completedAt) ||
+        !Number.isSafeInteger(completedAt + delayMs)
+      ) {
+        headers.delete("Retry-After");
+      } else {
+        const remainingMs = completedAt + delayMs - Date.now();
+        if (remainingMs <= 0) headers.delete("Retry-After");
+        else headers.set("Retry-After", String(Math.ceil(remainingMs / 1_000)));
+      }
+    } else if (storedRetryAfter !== null) {
+      const absoluteDeadline = Date.parse(storedRetryAfter);
+      if (!Number.isSafeInteger(absoluteDeadline) || absoluteDeadline <= Date.now()) {
+        headers.delete("Retry-After");
+      }
+    }
     if (replayAsStream && !headers.has("Content-Type")) {
       headers.set("Content-Type", "text/event-stream");
     } else if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
@@ -6995,6 +8036,21 @@ export function createApp(options: AppOptions = {}) {
       { status: request.responseStatus ?? 500, headers },
     );
   };
+  const inProgressApiResponse = (retryAfterSeconds: number) =>
+    new Response(
+      JSON.stringify(
+        openAIError("An identical request is still in progress", "idempotency_in_progress"),
+      ),
+      {
+        status: 409,
+        headers: {
+          "content-type": "application/json",
+          "retry-after": String(
+            Number.isSafeInteger(retryAfterSeconds) ? Math.max(1, retryAfterSeconds) : 1,
+          ),
+        },
+      },
+    );
   const keepApiLeaseAlive = (
     idempotency?: { id: string; leaseToken: string },
     runLease?: { runId: string; leaseToken: string },
@@ -7118,18 +8174,7 @@ export function createApp(options: AppOptions = {}) {
     if (result.kind === "in_progress") {
       return {
         kind: "replay" as const,
-        response: new Response(
-          JSON.stringify(
-            openAIError("An identical request is still in progress", "idempotency_in_progress"),
-          ),
-          {
-            status: 409,
-            headers: {
-              "content-type": "application/json",
-              "retry-after": String(result.retryAfterSeconds),
-            },
-          },
-        ),
+        response: inProgressApiResponse(result.retryAfterSeconds),
       };
     }
     if (result.kind === "started") {
@@ -7194,7 +8239,6 @@ export function createApp(options: AppOptions = {}) {
       sizeBytes: output.bytes.byteLength,
       sha256: digest,
     });
-    let stored = false;
     try {
       await objectStore.put({
         key: objectKey,
@@ -7203,7 +8247,6 @@ export function createApp(options: AppOptions = {}) {
         contentType: mimeType,
         metadata: { sha256: digest, owner: ownerId, usage_run: runId },
       });
-      stored = true;
     } catch (error) {
       if (!(error instanceof ObjectAlreadyExistsError)) throw error;
       // A reclaimed idempotent execution can encounter an object written before a crash.
@@ -7226,7 +8269,7 @@ export function createApp(options: AppOptions = {}) {
     }
     await repo.markGeneratedObjectStored(stage.id, ownerId);
     try {
-      const created = await repo.createAttachment({
+      const created = await repo.createAttachmentFromGeneratedObjectStage(stage.id, ownerId, {
         ownerId,
         objectKey,
         filename: `generated-${ordinal + 1}.${extension}`,
@@ -7236,16 +8279,16 @@ export function createApp(options: AppOptions = {}) {
         state: "ready",
         inspectionError: null,
         inspectionComplete: true,
-      });
-      await repo.attachGeneratedObject(
-        stage.id,
-        ownerId,
-        created.attachment.id,
-        !created.deduplicated,
-      );
+      }, attachmentStorageQuota);
       return created.attachment;
     } catch (error) {
-      if (stored) await objectStore.delete(objectKey).catch(() => undefined);
+      await Promise.resolve().then(() =>
+        repo.requestGeneratedObjectCleanup(
+          ownerId,
+          runId,
+          "generated object persistence did not complete",
+        )
+      ).catch(() => undefined);
       throw error;
     }
   };
@@ -7319,7 +8362,6 @@ export function createApp(options: AppOptions = {}) {
       sizeBytes: input.bytes.byteLength,
       sha256: input.sha256,
     });
-    let stored = false;
     try {
       await objectStore.put({
         key: objectKey,
@@ -7328,7 +8370,6 @@ export function createApp(options: AppOptions = {}) {
         contentType: input.mimeType,
         metadata: { sha256: input.sha256, owner: ownerId },
       });
-      stored = true;
     } catch (error) {
       if (!(error instanceof ObjectAlreadyExistsError)) throw error;
       const prior = await objectStore.get(objectKey);
@@ -7351,7 +8392,7 @@ export function createApp(options: AppOptions = {}) {
     }
     await repo.markGeneratedObjectStored(stage.id, ownerId);
     try {
-      const created = await repo.createAttachment({
+      const created = await repo.createAttachmentFromGeneratedObjectStage(stage.id, ownerId, {
         ownerId,
         objectKey,
         filename: input.filename,
@@ -7361,16 +8402,16 @@ export function createApp(options: AppOptions = {}) {
         state: "ready",
         inspectionError: null,
         inspectionComplete: true,
-      });
-      await repo.attachGeneratedObject(
-        stage.id,
-        ownerId,
-        created.attachment.id,
-        !created.deduplicated,
-      );
+      }, attachmentStorageQuota);
       return created.attachment;
     } catch (error) {
-      if (stored) await objectStore.delete(objectKey).catch(() => undefined);
+      await Promise.resolve().then(() =>
+        repo.requestGeneratedObjectCleanup(
+          ownerId,
+          runId,
+          "generated edit input persistence did not complete",
+        )
+      ).catch(() => undefined);
       throw error;
     }
   };
@@ -8477,27 +9518,36 @@ export function createApp(options: AppOptions = {}) {
       return new Response(responseBody, { headers: { "content-type": "application/json" } });
     } catch (error) {
       if (terminalAccounting) throw error;
-      const responseStatus = error instanceof EmbeddingsProviderError ? error.status : 502;
-      const code = error instanceof EmbeddingsProviderError ? error.code : "provider_error";
+      const classifiedError = error instanceof EmbeddingsProviderError
+        ? new ProviderAttemptError(error.message, {
+          category: error.upstreamStatus === undefined ? "invalid_response" : undefined,
+          status: error.upstreamStatus ?? error.status,
+          retryAfterMs: error.retryAfterMs,
+        })
+        : error;
+      const failure = publicProviderFailure(classifiedError, c.req.raw.signal.aborted);
+      const responseHeaders = {
+        "content-type": "application/json",
+        ...(failure.retryAfterMs !== undefined
+          ? { "retry-after": String(Math.max(1, Math.ceil(failure.retryAfterMs / 1_000))) }
+          : {}),
+      };
       const responseBody = JSON.stringify(
-        openAIError(
-          c.req.raw.signal.aborted ? "Request cancelled" : "Embedding provider request failed",
-          c.req.raw.signal.aborted ? "request_cancelled" : code,
-        ),
+        openAIError(failure.message, failure.code, failure.type, failure.param),
       );
       if (idempotency) {
         await failOpenAIUsage({
           id: idempotency.id,
           leaseToken: idempotency.leaseToken,
-          responseStatus: c.req.raw.signal.aborted ? 499 : responseStatus,
-          responseHeaders: { "content-type": "application/json" },
+          responseStatus: failure.status,
+          responseHeaders,
           responseBody,
           billing: { mode: "refund" },
         });
       } else await repo.refund(runId);
       return new Response(responseBody, {
-        status: c.req.raw.signal.aborted ? 499 : responseStatus,
-        headers: { "content-type": "application/json" },
+        status: failure.status,
+        headers: responseHeaders,
       });
     } finally {
       await lease.stop();
@@ -8509,6 +9559,17 @@ export function createApp(options: AppOptions = {}) {
     const model = resolvedModel?.info;
     if (!model) {
       return c.json(openAIError("The requested model is unavailable", "model_not_found"), 404);
+    }
+    if (request.tools?.length && !model.capabilities.includes("tools")) {
+      return c.json(
+        openAIError(
+          "The requested model does not support tools",
+          "unsupported_feature",
+          400,
+          "tools",
+        ),
+        400,
+      );
     }
     const maxOutput = request.max_tokens ?? request.max_completion_tokens ?? 4096;
     const providerPlan = resolvedModel.registryModel && providerExecution
@@ -8721,42 +9782,81 @@ export function createApp(options: AppOptions = {}) {
       });
     }
     if (request.stream) {
+      const downstreamAbort = new AbortController();
+      const upstreamSignal = AbortSignal.any([c.req.raw.signal, downstreamAbort.signal]);
+      const upstreamRequest: ChatCompletionRequest = {
+        ...request,
+        stream_options: {
+          ...request.stream_options,
+          include_usage: true,
+        },
+      };
+      const providerEvents = resolvedModel.registryModel && providerExecution
+        ? providerExecution.stream(
+          resolvedModel.registryModel.id,
+          runId,
+          executionLeaseToken,
+          upstreamRequest,
+          upstreamSignal,
+          providerPlan,
+          c.get("user").id,
+        )
+        : providerStream(upstreamRequest, upstreamSignal, resolvedModel.upstream);
+      let firstProviderEvent: IteratorResult<string>;
+      try {
+        // Pull once before committing the HTTP response. A provider rejection before its first SSE
+        // event can then expose Retry-After on both the live response and its durable replay.
+        firstProviderEvent = await providerEvents.next();
+      } catch (error) {
+        const projected = projectOpenAIProviderFailure(error, upstreamSignal.aborted);
+        const responseHeaders = {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache",
+          ...projected.retryHeaders,
+        };
+        try {
+          if (idempotency) {
+            await failOpenAIUsage({
+              id: idempotency.id,
+              leaseToken: idempotency.leaseToken,
+              responseStatus: 200,
+              responseHeaders,
+              responseBody: projected.responseBody,
+              terminalFrame: sseData(projected.responseBody),
+              billing: { mode: "refund" },
+            });
+          } else await repo.refund(runId);
+        } finally {
+          await lease.stop();
+        }
+        for (const [name, value] of Object.entries(projected.retryHeaders)) c.header(name, value);
+        return streamSSE(c, async (stream) => {
+          if (!stream.aborted && !c.req.raw.signal.aborted) {
+            await stream.writeSSE({ data: projected.responseBody });
+          }
+        });
+      }
       return streamSSE(c, async (stream) => {
-        const downstreamAbort = new AbortController();
         stream.onAbort(() =>
           downstreamAbort.abort(new DOMException("Client disconnected", "AbortError"))
         );
-        const upstreamSignal = AbortSignal.any([c.req.raw.signal, downstreamAbort.signal]);
         let visibleOutputBytes = 0;
         let inputTokens = estimateInputTokens(request);
         let outputTokens = 0;
         let cachedInputTokens = 0;
         let reasoningTokens = 0;
+        let sawProviderUsage = false;
         let sawProviderOutputUsage = false;
         let settled = false;
         let sawDone = false;
         let sequence = 0;
         let replayBytes = 0;
-        const upstreamRequest: ChatCompletionRequest = {
-          ...request,
-          stream_options: {
-            ...request.stream_options,
-            include_usage: true,
-          },
-        };
         try {
-          const providerEvents = resolvedModel.registryModel && providerExecution
-            ? providerExecution.stream(
-              resolvedModel.registryModel.id,
-              runId,
-              executionLeaseToken,
-              upstreamRequest,
-              upstreamSignal,
-              providerPlan,
-              c.get("user").id,
-            )
-            : providerStream(upstreamRequest, upstreamSignal, resolvedModel.upstream);
-          for await (const data of providerEvents) {
+          const remainingProviderEvents = async function* () {
+            if (!firstProviderEvent.done) yield firstProviderEvent.value;
+            for await (const data of providerEvents) yield data;
+          };
+          for await (const data of remainingProviderEvents()) {
             if (data === "[DONE]") {
               sawDone = true;
               continue;
@@ -8785,6 +9885,7 @@ export function createApp(options: AppOptions = {}) {
               error?: { message?: string };
             };
             if (chunk.error) throw new Error(chunk.error.message ?? "Provider stream failed");
+            if (chunk.usage !== undefined) sawProviderUsage = true;
             if (chunk.usage?.completion_tokens !== undefined) {
               sawProviderOutputUsage = true;
             }
@@ -8914,24 +10015,28 @@ export function createApp(options: AppOptions = {}) {
           }
         } catch (error) {
           if (error instanceof TerminalAccountingPersistenceError) throw error;
+          const projected = projectOpenAIProviderFailure(error, upstreamSignal.aborted);
+          // The response has already started, so retry metadata cannot be added to its headers.
+          // Persist only the headers the original caller actually received; the terminal SSE frame
+          // still carries the safely projected provider classification.
+          const responseHeaders = {
+            "content-type": "text/event-stream",
+            "cache-control": "no-cache",
+          };
           if (!settled && idempotency) {
             const finalOutput = sawProviderOutputUsage
               ? outputTokens
               : Math.max(outputTokens, Math.ceil(visibleOutputBytes / 4));
             const latencyMs = Math.round(performance.now() - started);
+            const hasBillableWork = visibleOutputBytes > 0 || sawProviderUsage;
             await failOpenAIUsage({
               id: idempotency.id,
               leaseToken: idempotency.leaseToken,
               responseStatus: 200,
-              responseHeaders: {
-                "content-type": "text/event-stream",
-                "cache-control": "no-cache",
-              },
-              responseBody: JSON.stringify(openAIError("Provider stream failed", "provider_error")),
-              terminalFrame: sseData(
-                JSON.stringify(openAIError("Provider stream failed", "provider_error")),
-              ),
-              billing: finalOutput > 0
+              responseHeaders,
+              responseBody: projected.responseBody,
+              terminalFrame: sseData(projected.responseBody),
+              billing: hasBillableWork
                 ? {
                   mode: "settle",
                   costMicros: priceUsage(model, inputTokens, finalOutput, {
@@ -8944,7 +10049,7 @@ export function createApp(options: AppOptions = {}) {
                 }
                 : { mode: "refund" },
             });
-          } else if (!settled && visibleOutputBytes > 0) {
+          } else if (!settled && (visibleOutputBytes > 0 || sawProviderUsage)) {
             const finalOutput = sawProviderOutputUsage
               ? outputTokens
               : Math.max(outputTokens, Math.ceil(visibleOutputBytes / 4));
@@ -8963,7 +10068,7 @@ export function createApp(options: AppOptions = {}) {
           }
           if (upstreamSignal.aborted) return;
           await stream.writeSSE({
-            data: JSON.stringify(openAIError("Provider stream failed", "provider_error")),
+            data: projected.responseBody,
           });
         } finally {
           await lease.stop();
@@ -9063,19 +10168,27 @@ export function createApp(options: AppOptions = {}) {
         await lease.stop();
         throw error;
       }
-      if (!providerCompleted && idempotency) {
-        const body = JSON.stringify(openAIError("Provider request failed", "provider_error"));
-        await failOpenAIUsage({
-          id: idempotency.id,
-          leaseToken: idempotency.leaseToken,
-          responseStatus: 502,
-          responseHeaders: { "content-type": "application/json" },
-          responseBody: body,
-          billing: { mode: "refund" },
+      if (!providerCompleted) {
+        const projected = projectOpenAIProviderFailure(error, c.req.raw.signal.aborted);
+        const responseHeaders = {
+          "content-type": "application/json",
+          ...projected.retryHeaders,
+        };
+        if (idempotency) {
+          await failOpenAIUsage({
+            id: idempotency.id,
+            leaseToken: idempotency.leaseToken,
+            responseStatus: projected.failure.status,
+            responseHeaders,
+            responseBody: projected.responseBody,
+            billing: { mode: "refund" },
+          });
+        } else await repo.refund(runId);
+        return new Response(projected.responseBody, {
+          status: projected.failure.status,
+          headers: responseHeaders,
         });
-        return new Response(body, { status: 502, headers: { "content-type": "application/json" } });
       }
-      if (!providerCompleted) await repo.refund(runId);
       throw error;
     } finally {
       await lease.stop();
@@ -9085,7 +10198,8 @@ export function createApp(options: AppOptions = {}) {
   app.post("/v1/responses", requireScope("chat:write"), async (c) => {
     const body = await parseJson(c, responsesSchema);
     if (body.store === true) {
-      throw new DomainError(
+      throw new OpenAIParameterError(
+        "store",
         "unsupported_parameter",
         "store=true is not supported until stored Responses can be retrieved by public response ID",
         400,
@@ -9118,32 +10232,44 @@ export function createApp(options: AppOptions = {}) {
             409,
           );
         }
-        if (existing.state !== "in_progress") {
-          if (!await replayModelIsEntitled(c, existing.model, "chat")) {
-            return c.json(
-              openAIError("The requested model is unavailable", "model_not_found"),
-              404,
-            );
-          }
-          return replayResponse(existing);
+        if (existing.state === "in_progress") {
+          const leaseRemaining = existing.leaseExpiresAt === null
+            ? 1
+            : Math.ceil((Date.parse(existing.leaseExpiresAt) - Date.now()) / 1_000);
+          return inProgressApiResponse(leaseRemaining);
         }
+        if (!await replayModelIsEntitled(c, existing.model, "chat")) {
+          return c.json(
+            openAIError("The requested model is unavailable", "model_not_found"),
+            404,
+          );
+        }
+        return replayResponse(existing);
       }
     }
     let request: ChatCompletionRequest;
     let nativeResponseInput: unknown;
+    let nativeResponseRequest: Record<string, unknown>;
     let requiresNativeInput = false;
+    let resolvedBody: Record<string, unknown>;
     try {
-      const resolvedBody = await resolveResponseInputFiles(
+      resolvedBody = await resolveResponseInputFiles(
         body as Record<string, unknown>,
         c.get("user").id,
       );
       nativeResponseInput = structuredClone(resolvedBody.input);
       requiresNativeInput = responsesRequestRequiresNativeInput(resolvedBody);
-      request = responsesRequestToChatCompletions(resolvedBody) as unknown as ChatCompletionRequest;
+      nativeResponseRequest = structuredClone(resolvedBody);
+      request = responsesRequestToChatCompletions(
+        resolvedBody,
+      ) as unknown as ChatCompletionRequest;
     } catch (error) {
       if (error instanceof ProviderProtocolError) {
         const status = error.code === "payload_too_large" ? 413 : 400;
-        return c.json(openAIError(error.message, error.code, status), status);
+        return c.json(
+          openAIError(error.message, error.code, status, safeOpenAIParameter(error.path)),
+          status,
+        );
       }
       throw error;
     }
@@ -9152,11 +10278,26 @@ export function createApp(options: AppOptions = {}) {
     if (!model) {
       return c.json(openAIError("The requested model is unavailable", "model_not_found"), 404);
     }
+    if (
+      Array.isArray(body.tools) && body.tools.length > 0 && !model.capabilities.includes("tools")
+    ) {
+      return c.json(
+        openAIError(
+          "The requested model does not support tools",
+          "unsupported_feature",
+          400,
+          "tools",
+        ),
+        400,
+      );
+    }
     if (requiresNativeInput && (!resolvedModel.registryModel || !providerExecution)) {
       return c.json(
         openAIError(
           "This Responses input requires a native Responses provider",
           "unsupported_feature",
+          400,
+          "input",
         ),
         400,
       );
@@ -9269,6 +10410,7 @@ export function createApp(options: AppOptions = {}) {
       store: false,
       input: nativeResponseInput,
       requiresNativeInput,
+      request: nativeResponseRequest,
       ...(body.metadata && typeof body.metadata === "object" && !Array.isArray(body.metadata)
         ? { metadata: body.metadata as Record<string, unknown> }
         : {}),
@@ -9463,7 +10605,7 @@ export function createApp(options: AppOptions = {}) {
               type: "error",
               code: publicFailure.code,
               message: publicFailure.message,
-              param: null,
+              param: publicFailure.param,
             };
             const terminalFrame = eventFrame(failure);
             if (idempotency) {
@@ -9476,7 +10618,12 @@ export function createApp(options: AppOptions = {}) {
                   "cache-control": "no-cache",
                 },
                 responseBody: JSON.stringify(
-                  openAIError(failure.message, failure.code, publicFailure.type),
+                  openAIError(
+                    failure.message,
+                    failure.code,
+                    publicFailure.type,
+                    publicFailure.param,
+                  ),
                 ),
                 terminalFrame,
                 billing: hasBillableWork
@@ -9530,7 +10677,7 @@ export function createApp(options: AppOptions = {}) {
       if (!providerCompleted && idempotency) {
         const failure = publicProviderFailure(error, c.req.raw.signal.aborted);
         const failureBody = JSON.stringify(
-          openAIError(failure.message, failure.code, failure.type),
+          openAIError(failure.message, failure.code, failure.type, failure.param),
         );
         const responseHeaders = {
           "content-type": "application/json",
@@ -9556,7 +10703,7 @@ export function createApp(options: AppOptions = {}) {
         await repo.refund(runId);
         const failure = publicProviderFailure(error, c.req.raw.signal.aborted);
         return c.json(
-          openAIError(failure.message, failure.code, failure.type),
+          openAIError(failure.message, failure.code, failure.type, failure.param),
           failure.status as 400,
           {
             ...(failure.retryAfterMs !== undefined
@@ -9650,7 +10797,9 @@ export function createApp(options: AppOptions = {}) {
           "Response replay persistence failed",
           status,
         );
-        const failureBody = JSON.stringify(openAIError(failure.message, failure.code));
+        const failureBody = JSON.stringify(
+          openAIError(failure.message, failure.code),
+        );
         await failOpenAIUsage({
           id: idempotency.id,
           leaseToken: idempotency.leaseToken,
@@ -9856,7 +11005,12 @@ export function createApp(options: AppOptions = {}) {
         });
       }
       const activeAudioSlot = audioSlot;
-      audioSignal = AbortSignal.any([c.req.raw.signal, activeAudioSlot.signal]);
+      const audioDownstreamAbort = new AbortController();
+      audioSignal = AbortSignal.any([
+        c.req.raw.signal,
+        activeAudioSlot.signal,
+        audioDownstreamAbort.signal,
+      ]);
       if (activeAudioSlot.signal.aborted) {
         const responseBody = JSON.stringify(
           openAIError(
@@ -9903,6 +11057,11 @@ export function createApp(options: AppOptions = {}) {
           leaseDeferred = true;
           audioSlotDeferred = true;
           return streamSSE(c, async (stream) => {
+            stream.onAbort(() =>
+              audioDownstreamAbort.abort(
+                new DOMException("Client disconnected", "AbortError"),
+              )
+            );
             let sequence = 0;
             let settled = false;
             let visibleCharacters = 0;
@@ -10667,24 +11826,499 @@ export function createApp(options: AppOptions = {}) {
     sessionOnly,
     speechHandler,
   );
+  const recoverFileUploads = async (limit = 100) => {
+    if (!objectStore) return 0;
+    const candidates = await repo.listStaleFileUploads(limit);
+    let recovered = 0;
+    for (const { stage, request } of candidates) {
+      if (!request.leaseToken) continue;
+      let leaseToken: string;
+      try {
+        leaseToken = (await repo.reclaimApiRequest(
+          request.id,
+          request.leaseToken,
+          idempotencyLeaseSeconds,
+        )).leaseToken;
+      } catch {
+        continue;
+      }
+      const lease = keepApiLeaseAlive({ id: request.id, leaseToken });
+      let terminal = false;
+      try {
+        if (
+          (options.now ?? Date.now)() - Date.parse(request.createdAt) >
+            fileUploadRecoveryMaxAgeMs
+        ) {
+          await repo.enqueueJob(
+            "file_object.cleanup",
+            {
+              requestId: request.id,
+              ownerId: stage.ownerId,
+              objectKey: stage.objectKey,
+            },
+            new Date(Date.now() + 5 * 60_000).toISOString(),
+            `file_object.cleanup:${request.id}`,
+          );
+          await failOpenAIUsage({
+            id: request.id,
+            leaseToken,
+            responseStatus: 500,
+            responseHeaders: { "content-type": "application/json" },
+            responseBody: JSON.stringify(
+              openAIError(
+                "File upload recovery window expired",
+                "upload_recovery_expired",
+              ),
+            ),
+            billing: { mode: "refund" },
+          });
+          terminal = true;
+          recovered++;
+          continue;
+        }
+        const object = await objectStore.get(stage.objectKey);
+        if (!object) {
+          await failOpenAIUsage({
+            id: request.id,
+            leaseToken,
+            responseStatus: 500,
+            responseHeaders: { "content-type": "application/json" },
+            responseBody: JSON.stringify(
+              openAIError("Interrupted file upload did not store an object", "upload_interrupted"),
+            ),
+            billing: { mode: "refund" },
+          });
+          terminal = true;
+          recovered++;
+          continue;
+        }
+        let valid = object.contentLength === stage.sizeBytes &&
+          object.contentType === stage.mimeType &&
+          object.metadata.sha256 === stage.sha256 &&
+          object.metadata.owner === stage.ownerId;
+        if (valid) {
+          // A body-read error is storage ambiguity, not proof of corruption. Let the outer retry
+          // path release the lease so a later maintenance pass can verify again.
+          const bytes = await readExactObjectBody(
+            object.body,
+            stage.sizeBytes,
+            stage.sizeBytes,
+            () => new DomainError("attachment_corrupt", "Stored upload failed validation", 503),
+          );
+          valid = await imageBytesSha256(bytes) === stage.sha256;
+        } else await object.body.cancel().catch(() => undefined);
+        if (!valid) {
+          await repo.enqueueJob(
+            "file_object.cleanup",
+            {
+              requestId: request.id,
+              ownerId: stage.ownerId,
+              objectKey: stage.objectKey,
+            },
+            new Date(Date.now() + 5 * 60_000).toISOString(),
+            `file_object.cleanup:${request.id}`,
+          );
+          await failOpenAIUsage({
+            id: request.id,
+            leaseToken,
+            responseStatus: 409,
+            responseHeaders: { "content-type": "application/json" },
+            responseBody: JSON.stringify(
+              openAIError(
+                "Stored upload conflicts with its durable metadata",
+                "object_key_conflict",
+              ),
+            ),
+            billing: { mode: "refund" },
+          });
+          terminal = true;
+          recovered++;
+          continue;
+        }
+        await lease.checkpoint();
+        await repo.markFileUploadStored(request.id, leaseToken);
+        await repo.finalizeFileUpload({
+          attachment: {
+            ownerId: stage.ownerId,
+            objectKey: stage.objectKey,
+            filename: stage.filename,
+            mimeType: stage.mimeType,
+            sizeBytes: stage.sizeBytes,
+            sha256: stage.sha256,
+            state: stage.attachmentState,
+            inspectionError: stage.inspectionError,
+            requiredInspectionMode: stage.requiredInspectionMode,
+            inspectionPolicyVersion: stage.inspectionPolicyVersion,
+            inspectionComplete: stage.attachmentState !== "pending",
+          },
+          request: {
+            id: request.id,
+            leaseToken,
+            responseStatus: 201,
+            responseHeaders: { "content-type": "application/json" },
+            costMicros: 0,
+            inputTokens: 0,
+            outputTokens: 0,
+            latencyMs: Math.max(0, Date.now() - Date.parse(request.createdAt)),
+            quota: replayQuota,
+          },
+          responseBody: (attachment) => JSON.stringify(openAIFile(attachment, stage.purpose)),
+        }, attachmentStorageQuota);
+        terminal = true;
+        recovered++;
+      } catch (error) {
+        if (error instanceof DomainError && error.code === "storage_quota_exceeded") {
+          const body = JSON.stringify(
+            openAIError(error.message, error.code, error.status),
+          );
+          try {
+            await repo.enqueueJob(
+              "file_object.cleanup",
+              {
+                requestId: request.id,
+                ownerId: stage.ownerId,
+                objectKey: stage.objectKey,
+              },
+              new Date(Date.now() + 5 * 60_000).toISOString(),
+              `file_object.cleanup:${request.id}`,
+            );
+            await failOpenAIUsage({
+              id: request.id,
+              leaseToken,
+              responseStatus: error.status,
+              responseHeaders: { "content-type": "application/json" },
+              responseBody: body,
+              billing: { mode: "refund" },
+            });
+            terminal = true;
+            recovered++;
+          } catch {
+            // A later pass reconciles ambiguous cleanup or terminal-request persistence.
+          }
+        }
+        // Other storage ambiguity and transient database failures remain resumable until the
+        // explicit recovery-age policy above expires.
+      } finally {
+        await lease.stop();
+        if (!terminal) {
+          await Promise.resolve(repo.releaseApiRequestLease(request.id, leaseToken)).catch(() =>
+            undefined
+          );
+        }
+      }
+    }
+    return recovered;
+  };
   app.get(
     "/v1/files",
     requireScope("files:read"),
-    async (c) =>
-      c.json({
+    async (c) => {
+      const query = openAIFileListQuery(c.req.raw);
+      let page: { data: AttachmentRecord[]; hasMore: boolean };
+      try {
+        if (query.purpose !== undefined && query.purpose !== "assistants") {
+          // The OpenAI contract accepts an arbitrary purpose string. Unsupported purposes simply
+          // have no matches, but an `after` cursor must still belong to this owner so combining a
+          // filter with a foreign cursor cannot bypass cursor validation.
+          if (query.after !== undefined) {
+            await repo.listAttachmentPage(c.get("user").id, { ...query, limit: 1 });
+          }
+          page = { data: [], hasMore: false };
+        } else page = await repo.listAttachmentPage(c.get("user").id, query);
+      } catch (error) {
+        if (error instanceof DomainError && error.code === "invalid_file_cursor") {
+          throw new OpenAIParameterError("after", error.code, error.message);
+        }
+        throw error;
+      }
+      return c.json({
         object: "list",
-        has_more: false,
-        data: (await repo.listAttachments(c.get("user").id)).map((attachment) =>
-          openAIFile(attachment)
-        ),
-      }),
+        data: page.data.map((attachment) => openAIFile(attachment)),
+        first_id: page.data[0]?.id ?? null,
+        last_id: page.data.at(-1)?.id ?? null,
+        has_more: page.hasMore,
+      });
+    },
   );
   app.post(
     "/v1/files",
     requireScope("files:write"),
     async (c) => {
-      const uploaded = await uploadFor(c.req.raw, c.get("user").id, true);
-      return c.json(openAIFile(uploaded.attachment, uploaded.purpose), 201);
+      const ownerId = c.get("user").id;
+      const idempotencyHeader = c.req.header("idempotency-key");
+      if (!idempotencyHeader) {
+        const uploaded = await uploadFor(c.req.raw, ownerId, true);
+        return c.json(openAIFile(uploaded.attachment, uploaded.purpose), 201);
+      }
+      const idempotencyKey = requireIdempotencyKey(idempotencyHeader);
+      return await withStagedUpload(c.req.raw, ownerId, true, async (staged) => {
+        const requestHash = await sha256Hex(canonicalJson({
+          endpoint: "files",
+          credential: c.get("tokenId") ?? `session:${c.get("sessionId") ?? "legacy"}`,
+          file: {
+            filename: staged.inspection.filename,
+            mimeType: staged.inspection.mime,
+            sizeBytes: staged.inspection.size,
+            sha256: staged.inspection.sha256,
+            decision: staged.inspection.decision,
+            image: staged.inspection.image ?? null,
+          },
+          purpose: staged.purpose,
+        }));
+        const objectKey = safeUploadBlobObjectKey(
+          ownerId,
+          staged.inspection.sha256,
+          staged.inspection.mime,
+        );
+        const runId = `${ownerId}:files:${crypto.randomUUID()}`;
+        const begun = await repo.beginApiRequest({
+          userId: ownerId,
+          endpoint: "files",
+          idempotencyKey,
+          requestHash,
+          stream: false,
+          model: "files/upload",
+          runId,
+          reserveMicros: 0,
+          provider: "local",
+          tokenId: c.get("tokenId"),
+          leaseSeconds: idempotencyLeaseSeconds,
+          quota: replayQuota,
+          replayReservedBytes: 16 * 1024,
+        });
+        if (begun.request.model !== "files/upload") {
+          throw new DomainError("idempotency_conflict", "Idempotency key payload differs", 409);
+        }
+        let active: { request: ApiIdempotencyRequest; leaseToken: string };
+        if (begun.kind === "started") {
+          active = { request: begun.request, leaseToken: begun.leaseToken };
+        } else if (
+          begun.kind === "in_progress" && begun.request.leaseToken &&
+          begun.request.leaseExpiresAt &&
+          Date.parse(begun.request.leaseExpiresAt) <= Date.now()
+        ) {
+          active = await repo.reclaimApiRequest(
+            begun.request.id,
+            begun.request.leaseToken,
+            idempotencyLeaseSeconds,
+          );
+        } else if (begun.kind === "in_progress") {
+          return inProgressApiResponse(begun.retryAfterSeconds);
+        } else {
+          return replayResponse(begun.request);
+        }
+        const started = performance.now();
+        const lease = keepApiLeaseAlive({
+          id: active.request.id,
+          leaseToken: active.leaseToken,
+        });
+        let terminal = false;
+        let blobDurable = false;
+        let objectAttempted = false;
+        let provenCollision = false;
+        try {
+          if (!objectStore) {
+            throw new DomainError(
+              "storage_not_configured",
+              "Object storage is not configured",
+              503,
+            );
+          }
+          await repo.stageFileUpload({
+            requestId: active.request.id,
+            ownerId,
+            objectKey,
+            filename: staged.inspection.filename,
+            mimeType: staged.inspection.mime,
+            sizeBytes: staged.inspection.size,
+            sha256: staged.inspection.sha256,
+            purpose: staged.purpose,
+            attachmentState: attachmentExternalInspectionRequired &&
+                staged.inspection.decision.state === "ready"
+              ? "pending"
+              : staged.inspection.decision.state === "ready"
+              ? "ready"
+              : "quarantined",
+            inspectionError: staged.inspection.decision.state === "ready"
+              ? null
+              : staged.inspection.decision.reason,
+            requiredInspectionMode: attachmentExternalInspectionRequired &&
+                staged.inspection.decision.state === "ready"
+              ? "external"
+              : "local",
+            inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
+          });
+          const verifyStoredBlob = async () => {
+            const existing = await objectStore.get(objectKey);
+            if (
+              !existing || existing.contentLength !== staged.inspection.size ||
+              existing.contentType !== staged.inspection.mime ||
+              existing.metadata.sha256 !== staged.inspection.sha256 ||
+              existing.metadata.owner !== ownerId
+            ) {
+              await existing?.body.cancel().catch(() => undefined);
+              return false;
+            }
+            const bytes = await readExactObjectBody(
+              existing.body,
+              staged.inspection.size,
+              staged.inspection.size,
+              () => new DomainError("object_key_conflict", "Upload object collision", 409),
+            );
+            return await imageBytesSha256(bytes) === staged.inspection.sha256;
+          };
+          const file = await Deno.open(staged.path, { read: true });
+          try {
+            objectAttempted = true;
+            await objectStore.put({
+              key: objectKey,
+              body: file.readable,
+              contentLength: staged.inspection.size,
+              contentType: staged.inspection.mime,
+              metadata: { sha256: staged.inspection.sha256, owner: ownerId },
+            });
+          } catch (error) {
+            // ObjectAlreadyExists is the normal blob-dedup path. The same reconciliation also
+            // covers a lost ACK where the backend committed bytes before throwing.
+            if (!await verifyStoredBlob()) {
+              if (error instanceof ObjectAlreadyExistsError) {
+                provenCollision = true;
+                throw new DomainError("object_key_conflict", "Upload object collision", 409);
+              }
+              throw error;
+            }
+          } finally {
+            try {
+              file.close();
+            } catch {
+              // The readable stream closes the file after normal consumption.
+            }
+          }
+          blobDurable = true;
+          await repo.markFileUploadStored(active.request.id, active.leaseToken);
+          await lease.checkpoint();
+          const finalized = await repo.finalizeFileUpload({
+            attachment: {
+              ownerId,
+              objectKey,
+              filename: staged.inspection.filename,
+              mimeType: staged.inspection.mime,
+              sizeBytes: staged.inspection.size,
+              sha256: staged.inspection.sha256,
+              state: attachmentExternalInspectionRequired &&
+                  staged.inspection.decision.state === "ready"
+                ? "pending"
+                : staged.inspection.decision.state === "ready"
+                ? "ready"
+                : "quarantined",
+              inspectionError: staged.inspection.decision.state === "ready"
+                ? null
+                : staged.inspection.decision.reason,
+              requiredInspectionMode: attachmentExternalInspectionRequired &&
+                  staged.inspection.decision.state === "ready"
+                ? "external"
+                : "local",
+              inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
+              inspectionComplete: staged.inspection.decision.state !== "ready" ||
+                !attachmentExternalInspectionRequired,
+            },
+            request: {
+              id: begun.request.id,
+              leaseToken: active.leaseToken,
+              responseStatus: 201,
+              responseHeaders: { "content-type": "application/json" },
+              costMicros: 0,
+              inputTokens: 0,
+              outputTokens: 0,
+              latencyMs: Math.round(performance.now() - started),
+              quota: replayQuota,
+            },
+            responseBody: (attachment) => JSON.stringify(openAIFile(attachment, staged.purpose)),
+          }, attachmentStorageQuota);
+          terminal = true;
+          const body = finalized.request.responseBody!;
+          return new Response(body, {
+            status: 201,
+            headers: { "content-type": "application/json" },
+          });
+        } catch (error) {
+          if (terminal) throw error;
+          const reconciled = await Promise.resolve(
+            repo.getApiRequest(ownerId, "files", idempotencyKey),
+          ).catch(() => undefined);
+          if (reconciled?.state === "completed") {
+            terminal = true;
+            return replayResponse(reconciled);
+          }
+          if (error instanceof DomainError && error.code === "storage_quota_exceeded") {
+            const body = JSON.stringify(openAIError(error.message, error.code, error.status));
+            await repo.enqueueJob(
+              "file_object.cleanup",
+              { requestId: active.request.id, ownerId, objectKey },
+              new Date(Date.now() + 5 * 60_000).toISOString(),
+              `file_object.cleanup:${active.request.id}`,
+            );
+            await failOpenAIUsage({
+              id: active.request.id,
+              leaseToken: active.leaseToken,
+              responseStatus: error.status,
+              responseHeaders: { "content-type": "application/json" },
+              responseBody: body,
+              billing: { mode: "refund" },
+            });
+            terminal = true;
+            return new Response(body, {
+              status: error.status,
+              headers: { "content-type": "application/json" },
+            });
+          }
+          if ((blobDurable || objectAttempted) && !provenCollision) {
+            // The exact blob is content-addressed and durably named by the replay row. Leave the
+            // reservation resumable; a retry reclaims this deliberately expired lease and
+            // atomically finalizes the one File record.
+            await repo.releaseApiRequestLease(active.request.id, active.leaseToken);
+            return new Response(
+              JSON.stringify(
+                openAIError(
+                  "File finalization is temporarily unavailable",
+                  "service_unavailable",
+                  503,
+                ),
+              ),
+              {
+                status: 503,
+                headers: { "content-type": "application/json", "retry-after": "1" },
+              },
+            );
+          }
+          const known = error instanceof UploadSecurityError || error instanceof DomainError;
+          const status = known ? error.status : 500;
+          const code = known ? error.code : "storage_error";
+          const message = known ? error.message : "File storage is temporarily unavailable";
+          const body = JSON.stringify(openAIError(message, code, status));
+          try {
+            await failOpenAIUsage({
+              id: active.request.id,
+              leaseToken: active.leaseToken,
+              responseStatus: status,
+              responseHeaders: { "content-type": "application/json" },
+              responseBody: body,
+              billing: { mode: "refund" },
+            });
+            terminal = true;
+            return new Response(body, {
+              status,
+              headers: { "content-type": "application/json" },
+            });
+          } catch {
+            // The completion may have committed immediately before a transport failure. Preserve
+            // its durable state for a later replay instead of exposing internal storage details.
+            throw error;
+          }
+        } finally {
+          await lease.stop();
+        }
+      });
     },
   );
   app.get(
@@ -10692,7 +12326,7 @@ export function createApp(options: AppOptions = {}) {
     requireScope("files:read"),
     async (c) =>
       c.json(openAIFile(
-        await repo.getAttachment(c.req.param("id"), c.get("user").id),
+        await repo.getAttachment(openAIFileId(c.req.param("id")), c.get("user").id),
       )),
   );
   app.get(
@@ -10700,19 +12334,29 @@ export function createApp(options: AppOptions = {}) {
     requireScope("files:read"),
     async (c) =>
       await attachmentContent(
-        await repo.getAttachment(c.req.param("id"), c.get("user").id),
+        await repo.getAttachment(openAIFileId(c.req.param("id")), c.get("user").id),
       ),
   );
   app.delete(
     "/v1/files/:id",
     requireScope("files:write"),
     async (c) => {
-      await repo.deleteAttachment(c.req.param("id"), c.get("user").id);
-      return c.json({ id: c.req.param("id"), object: "file", deleted: true });
+      const id = openAIFileId(c.req.param("id"));
+      await repo.deleteAttachment(id, c.get("user").id);
+      return c.json({ id, object: "file", deleted: true });
     },
   );
 
   app.onError((error, c) => {
+    if (
+      c.req.raw.signal.aborted &&
+      (error === c.req.raw.signal.reason ||
+        (error instanceof DOMException && error.name === "AbortError"))
+    ) {
+      // The client is gone. Avoid reporting an expected disconnect as a server defect while still
+      // giving direct in-process callers a deterministic terminal response.
+      return new Response(null, { status: 499 });
+    }
     if (error instanceof HTTPException) {
       if (c.req.path.startsWith("/v1/")) {
         const code = error.status === 413 ? "request_too_large" : "request_error";
@@ -10738,6 +12382,12 @@ export function createApp(options: AppOptions = {}) {
       return c.req.path.startsWith("/v1/")
         ? c.json(openAIError(error.message, error.code, error.status), error.status as 400)
         : c.json({ error: { code: error.code, message: error.message } }, error.status as 400);
+    }
+    if (error instanceof OpenAIParameterError) {
+      return c.json(
+        openAIError(error.message, error.code, error.status, error.param),
+        error.status as 400,
+      );
     }
     if (error instanceof BackupServiceError) {
       const status = error.code === "not_found"
@@ -10782,6 +12432,7 @@ export function createApp(options: AppOptions = {}) {
     repository: repo,
     circuitBreaker,
     toolExecutionService: toolExecution,
+    recoverFileUploads,
     drainIdentityDeliveries,
     replayQuota,
   };

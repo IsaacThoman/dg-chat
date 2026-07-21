@@ -1,12 +1,17 @@
 import { domainMatches } from "./network-policy.ts";
-import type { ToolAdapter } from "./tool-execution.ts";
-import { SearxngSearchAdapter, type WebSearchAdapter } from "./web-search.ts";
+import { type ToolAdapter, ToolAdapterError } from "./tool-execution.ts";
+import type { WebSearchAdapter } from "./web-search.ts";
 
 export class WebSearchToolAdapter implements ToolAdapter {
+  // This policy check is defense-in-depth for trusted in-process adapters. `networkTarget` is
+  // declarative metadata, not a sandbox; SearxngSearchAdapter's DNS-pinned transport is the SSRF
+  // enforcement boundary for the built-in implementation.
+  readonly #target: Readonly<{ hostname: string; privateNetwork: boolean }> | null;
   readonly definition = {
     id: "web_search",
     name: "Web search",
     description: "Search the web through the administrator-configured search service.",
+    recoverySafety: "read_only",
     enabled: true,
     inputSchema: {
       type: "object",
@@ -21,7 +26,25 @@ export class WebSearchToolAdapter implements ToolAdapter {
     },
   } as const;
 
-  constructor(readonly search: WebSearchAdapter) {}
+  constructor(readonly search: WebSearchAdapter) {
+    try {
+      const target = search.networkTarget;
+      const descriptors = target && Object.getOwnPropertyDescriptors(target);
+      const hostname = descriptors?.hostname;
+      const privateNetwork = descriptors?.privateNetwork;
+      this.#target = hostname && "value" in hostname &&
+          typeof hostname.value === "string" && /^[a-z0-9.-]+$/i.test(hostname.value) &&
+          privateNetwork && "value" in privateNetwork &&
+          typeof privateNetwork.value === "boolean"
+        ? Object.freeze({
+          hostname: hostname.value.toLowerCase().replace(/^\.+|\.+$/g, ""),
+          privateNetwork: privateNetwork.value,
+        })
+        : null;
+    } catch {
+      this.#target = null;
+    }
+  }
 
   async execute(input: unknown, context: Parameters<ToolAdapter["execute"]>[1]) {
     if (!input || typeof input !== "object" || Array.isArray(input)) {
@@ -35,14 +58,14 @@ export class WebSearchToolAdapter implements ToolAdapter {
     ) {
       throw new Error("Web search input is invalid");
     }
-    if (this.search instanceof SearxngSearchAdapter) {
-      const targetHostname = this.search.targetHostname;
-      if (
-        !context.policy.allowedDomains.some((domain) => domainMatches(targetHostname, domain))
-      ) throw new Error("Search endpoint is outside the tool domain allowlist");
-      if (this.search.usesPrivateEndpoint && !context.policy.allowPrivateNetwork) {
-        throw new Error("Private-network search is disabled by tool policy");
-      }
+    const target = this.#target;
+    if (
+      !target || typeof target.hostname !== "string" || !target.hostname ||
+      typeof target.privateNetwork !== "boolean" ||
+      !context.policy.allowedDomains.some((domain) => domainMatches(target.hostname, domain))
+    ) throw new ToolAdapterError("policy_denied");
+    if (target.privateNetwork !== false && !context.policy.allowPrivateNetwork) {
+      throw new ToolAdapterError("policy_denied");
     }
     return await this.search.search({
       query: value.query,

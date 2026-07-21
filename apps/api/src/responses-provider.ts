@@ -9,6 +9,7 @@ import {
   normalizeResponsesResult,
   normalizeResponsesStreamEvent,
   ProviderProtocolError,
+  responsesRequestRequiresNativeInput,
 } from "./provider-protocol.ts";
 import { type UpstreamStreamOptions } from "./models.ts";
 import { providerResponseByteLimit } from "./provider-limits.ts";
@@ -562,6 +563,8 @@ export interface NativeResponsesRequestFields {
   input?: unknown;
   /** The original request contains Responses items that cannot pass through Chat Completions. */
   requiresNativeInput?: boolean;
+  /** Fully validated public Responses request, preserved without a lossy Chat round-trip. */
+  request?: Record<string, unknown>;
 }
 
 export interface ResponsesChatCompletion {
@@ -852,6 +855,18 @@ function responseRequest(
   requestFields: NativeResponsesRequestFields = {},
 ): Record<string, unknown> {
   try {
+    if (requestFields.request) {
+      // Internal callers cross the same trust boundary as the public route. Never forward a
+      // provider-managed network tool merely because a caller constructed requestFields directly.
+      responsesRequestRequiresNativeInput(requestFields.request);
+      return {
+        ...customParams,
+        ...structuredClone(requestFields.request),
+        model: upstreamModel,
+        stream,
+        ...(requestFields.store === undefined ? {} : { store: requestFields.store }),
+      };
+    }
     const withDefaults = { ...customParams, ...request };
     const translated = {
       ...chatCompletionsRequestToResponses(withDefaults),
@@ -872,6 +887,7 @@ function responseRequest(
         category: "invalid_request",
         transient: false,
         candidateLocal: true,
+        param: error.path,
       });
     }
     throw error;

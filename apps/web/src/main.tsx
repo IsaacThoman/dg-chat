@@ -8,6 +8,7 @@ import {
   Outlet,
   redirect,
   RouterProvider,
+  useRouterState,
 } from "@tanstack/react-router";
 import { App, AuthScreen, PendingScreen, SetupScreen } from "./App.tsx";
 import { isAdminSection, parseAdminSearch } from "./adminRouting.ts";
@@ -18,10 +19,94 @@ import {
   ResetPasswordScreen,
   VerifyEmailScreen,
 } from "./IdentityRecovery.tsx";
+import { PwaUpdateNotice } from "./PwaUpdateNotice.tsx";
+import { parseCommunitySearch } from "./communityRouting.ts";
+import { TooltipProvider } from "./components/ui/tooltip.tsx";
 import "./styles.css";
 
 const rootRoute = createRootRoute({ component: () => <Outlet /> });
-const indexRoute = createRoute({ getParentRoute: () => rootRoute, path: "/", component: App });
+function WorkspaceShell() {
+  const location = useRouterState({ select: (state) => state.location });
+  const path = location.pathname;
+  const parts = path.split("/").filter(Boolean).map(decodeURIComponent);
+  const search = location.search as Record<string, unknown>;
+  const adminUserDetail = parts.length === 4 && parts[0] === "admin" && parts[1] === "users" &&
+      isAdminUserRouteId(parts[2]) && isAdminUserTab(parts[3])
+    ? { userId: parts[2], tab: parts[3] }
+    : undefined;
+  const routeAdminSection = parts[1] ?? "";
+  const adminSection = parts[0] === "admin" && isAdminSection(routeAdminSection)
+    ? routeAdminSection
+    : "overview";
+  const initialView = path === "/community"
+    ? "community"
+    : path === "/archived"
+    ? "archived"
+    : path === "/trash"
+    ? "trash"
+    : path === "/knowledge"
+    ? "knowledge"
+    : path === "/settings"
+    ? "settings"
+    : path === "/tokens"
+    ? "tokens"
+    : parts[0] === "admin"
+    ? "admin"
+    : "chat";
+
+  return (
+    <App
+      initialView={initialView}
+      initialAdminSection={adminSection}
+      initialAdminSearch={parseAdminSearch(search)}
+      initialAdminUserDetail={adminUserDetail}
+      initialCommunitySearch={parseCommunitySearch(search)}
+    />
+  );
+}
+
+const workspaceRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  id: "workspace",
+  component: WorkspaceShell,
+});
+const emptyWorkspaceRoute = () => null;
+const indexRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "/",
+  component: emptyWorkspaceRoute,
+});
+const communityRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "/community",
+  validateSearch: parseCommunitySearch,
+  component: emptyWorkspaceRoute,
+});
+const archivedRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "/archived",
+  component: emptyWorkspaceRoute,
+});
+const trashRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "/trash",
+  component: emptyWorkspaceRoute,
+});
+const knowledgeRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "/knowledge",
+  component: emptyWorkspaceRoute,
+});
+const settingsRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "/settings",
+  component: emptyWorkspaceRoute,
+});
+const tokensRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "/tokens",
+  component: emptyWorkspaceRoute,
+});
 const loginRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/login",
@@ -61,23 +146,13 @@ const publicShareRoute = createRoute({
   },
 });
 const adminRoute = createRoute({
-  getParentRoute: () => rootRoute,
+  getParentRoute: () => workspaceRoute,
   path: "/admin/$section",
   validateSearch: parseAdminSearch,
-  component: () => {
-    const { section } = adminRoute.useParams();
-    const search = adminRoute.useSearch();
-    return (
-      <App
-        initialView="admin"
-        initialAdminSection={isAdminSection(section) ? section : "overview"}
-        initialAdminSearch={search}
-      />
-    );
-  },
+  component: emptyWorkspaceRoute,
 });
 const adminUserDetailRoute = createRoute({
-  getParentRoute: () => rootRoute,
+  getParentRoute: () => workspaceRoute,
   path: "/admin/users/$userId/$tab",
   validateSearch: parseAdminSearch,
   beforeLoad: ({ params, search }) => {
@@ -90,23 +165,21 @@ const adminUserDetailRoute = createRoute({
       });
     }
   },
-  component: () => {
-    const { userId, tab } = adminUserDetailRoute.useParams();
-    const search = adminUserDetailRoute.useSearch();
-    return (
-      <App
-        initialView="admin"
-        initialAdminSection="users"
-        initialAdminSearch={search}
-        initialAdminUserDetail={isAdminUserRouteId(userId) && isAdminUserTab(tab)
-          ? { userId, tab }
-          : undefined}
-      />
-    );
-  },
+  component: emptyWorkspaceRoute,
 });
-const routeTree = rootRoute.addChildren([
+const workspaceTree = workspaceRoute.addChildren([
   indexRoute,
+  communityRoute,
+  archivedRoute,
+  trashRoute,
+  knowledgeRoute,
+  settingsRoute,
+  tokensRoute,
+  adminUserDetailRoute,
+  adminRoute,
+]);
+const routeTree = rootRoute.addChildren([
+  workspaceTree,
   loginRoute,
   setupRoute,
   pendingRoute,
@@ -114,8 +187,6 @@ const routeTree = rootRoute.addChildren([
   resetPasswordRoute,
   verifyEmailRoute,
   publicShareRoute,
-  adminUserDetailRoute,
-  adminRoute,
 ]);
 const router = createRouter({ routeTree });
 declare module "@tanstack/react-router" {
@@ -130,7 +201,10 @@ const queryClient = new QueryClient({
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
-      <RouterProvider router={router} />
+      <TooltipProvider>
+        <RouterProvider router={router} />
+        <PwaUpdateNotice />
+      </TooltipProvider>
     </QueryClientProvider>
   </React.StrictMode>,
 );

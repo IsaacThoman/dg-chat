@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { Buffer } from "node:buffer";
-import { bootstrap, createChat, login } from "./helpers.ts";
+import { activeChatSession, bootstrap, createChat, login } from "./helpers.ts";
 
 test.beforeEach(async ({ page, request }) => {
   await bootstrap(request);
@@ -8,7 +8,7 @@ test.beforeEach(async ({ page, request }) => {
   await createChat(page);
 });
 
-test("sends a ready attachment without prompt text and keeps empty text-only sends blocked", async ({ page }) => {
+test("sends and selectively shares a ready attachment while keeping empty text-only sends blocked", async ({ page }) => {
   const attachment = {
     id: "attachment-only-ready",
     filename: "diagram.png",
@@ -18,6 +18,7 @@ test("sends a ready attachment without prompt text and keeps empty text-only sen
     createdAt: "2026-07-10T00:00:00.000Z",
   };
   let generationBody: Record<string, unknown> | undefined;
+  let shareBody: Record<string, unknown> | undefined;
   await page.route("**/api/attachments", (route) =>
     route.fulfill({
       status: 201,
@@ -71,10 +72,38 @@ test("sends a ready attachment without prompt text and keeps empty text-only sen
       body: events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
     });
   });
+  await page.route("**/api/conversations/*/shares", async (route) => {
+    shareBody = route.request().postDataJSON() as Record<string, unknown>;
+    const capability = String(shareBody.capability);
+    await route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify({
+        share: {
+          id: crypto.randomUUID(),
+          conversationId: new URL(route.request().url()).pathname.split("/").at(-2),
+          leafId: shareBody.leafId,
+          conversationVersion: shareBody.expectedConversationVersion,
+          title: "Attachment snapshot",
+          identityVisibility: shareBody.identityVisibility,
+          attachmentPolicy: shareBody.attachmentPolicy,
+          attachmentCount: 1,
+          messageCount: 2,
+          version: 1,
+          createdAt: new Date().toISOString(),
+          expiresAt: null,
+          revokedAt: null,
+        },
+        capability,
+        path: `/share/${capability}`,
+        replayed: false,
+      }),
+    });
+  });
 
   const send = page.getByRole("button", { name: "Send" });
   await expect(send).toBeDisabled();
-  await page.locator('input[type="file"]').setInputFiles({
+  await activeChatSession(page).locator('input[type="file"]').setInputFiles({
     name: "diagram.png",
     mimeType: "image/png",
     buffer: Buffer.from([137, 80, 78, 71]),
@@ -86,6 +115,19 @@ test("sends a ready attachment without prompt text and keeps empty text-only sen
   expect(generationBody?.attachmentIds).toEqual([attachment.id]);
   await expect(page.getByText("I can see the attachment.", { exact: true })).toBeVisible();
   await expect(send).toBeDisabled();
+
+  await page.getByRole("button", { name: "Share an immutable snapshot" }).click();
+  const shareDialog = page.getByRole("dialog", { name: "Share conversation" });
+  await shareDialog.getByRole("radio", { name: "Choose files" }).check();
+  await expect(shareDialog.getByRole("button", { name: "Create snapshot" })).toBeDisabled();
+  await shareDialog.getByRole("checkbox", { name: "diagram.png" }).check();
+  await expect(shareDialog.getByRole("button", { name: "Create snapshot" })).toBeEnabled();
+  await shareDialog.getByRole("button", { name: "Create snapshot" }).click();
+  await expect(shareDialog.getByRole("heading", { name: "Snapshot ready" })).toBeVisible();
+  expect(shareBody).toMatchObject({
+    attachmentPolicy: "selected",
+    selectedAttachmentIds: [attachment.id],
+  });
 });
 
 test("uploads, retains attachments on edit branches, and removes unsent uploads", async ({
@@ -180,7 +222,7 @@ test("uploads, retains attachments on edit branches, and removes unsent uploads"
     });
   });
 
-  const input = page.locator('input[type="file"]');
+  const input = activeChatSession(page).locator('input[type="file"]');
   await input.setInputFiles({
     name: "notes.txt",
     mimeType: "text/plain",
@@ -198,7 +240,7 @@ test("uploads, retains attachments on edit branches, and removes unsent uploads"
   await page.getByRole("button", { name: "Send" }).click();
   await expect.poll(() => generationBody?.attachmentIds).toEqual([attachment.id]);
   await expect(page.getByLabel("Selected attachments")).toBeHidden();
-  await expect(page.locator("article.user-message .attachment")).toHaveCount(1);
+  await expect(activeChatSession(page).locator("article.user-message .attachment")).toHaveCount(1);
 
   await page.getByRole("button", { name: "Edit without overwriting" }).click();
   await expect(page.getByText("Retained from the original branch", { exact: true })).toBeVisible();
@@ -206,6 +248,17 @@ test("uploads, retains attachments on edit branches, and removes unsent uploads"
     name: "Exclude attachment notes.txt from edited branch",
   }).click();
   await expect(page.getByText("Retained from the original branch", { exact: true })).toBeHidden();
+  await expect(page.getByText("Excluded from this edited branch", { exact: true })).toBeVisible();
+  const includeOriginal = page.getByRole("button", {
+    name: "Include attachment notes.txt in edited branch",
+  });
+  await expect(includeOriginal).toBeFocused();
+  await includeOriginal.click();
+  await expect(page.getByText("Retained from the original branch", { exact: true })).toBeVisible();
+  await expect(page.getByText("Excluded from this edited branch", { exact: true })).toBeHidden();
+  await expect(page.getByRole("button", {
+    name: "Exclude attachment notes.txt from edited branch",
+  })).toBeFocused();
   expect(deleted).toBe(false);
   await page.getByRole("button", { name: "Cancel edit" }).click();
   await page.getByRole("button", { name: "Edit without overwriting" }).click();
@@ -340,7 +393,7 @@ test("isolates draft uploads from immutable edits and restores them afterward", 
   });
 
   const composer = page.getByRole("textbox", { name: "Message" });
-  const fileInput = page.locator('input[type="file"]');
+  const fileInput = activeChatSession(page).locator('input[type="file"]');
   await composer.fill("Saved prompt");
   await composer.press("Enter");
   await expect(page.getByText("Isolated upload response 1", { exact: true })).toBeVisible();
@@ -352,7 +405,7 @@ test("isolates draft uploads from immutable edits and restores them afterward", 
     buffer: Buffer.from("draft notes"),
   });
   await expect(page.getByText("draft-notes.txt", { exact: true })).toBeVisible();
-  await page.locator(".composer-wrap").evaluate((element) => {
+  await activeChatSession(page).locator(".composer-wrap").evaluate((element) => {
     const transfer = new DataTransfer();
     const oversized = new File(["oversized"], "oversized.txt", { type: "text/plain" });
     Object.defineProperty(oversized, "size", { value: 25 * 1024 * 1024 + 1 });
@@ -442,7 +495,7 @@ test("double-clicking upload retry claims one request and leaves no orphan objec
     await route.fulfill({ status: 204, body: "" });
   });
 
-  await page.locator('input[type="file"]').setInputFiles({
+  await activeChatSession(page).locator('input[type="file"]').setInputFiles({
     name: "double-retry.txt",
     mimeType: "text/plain",
     buffer: Buffer.from("retry"),
@@ -450,7 +503,9 @@ test("double-clicking upload retry claims one request and leaves no orphan objec
   await expect(page.getByText("Retry this upload", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Retry upload double-retry.txt", exact: true })
     .dblclick();
-  await expect(page.locator(".upload-ready").filter({ hasText: "double-retry.txt" }))
+  await expect(
+    activeChatSession(page).locator(".upload-ready").filter({ hasText: "double-retry.txt" }),
+  )
     .toContainText("Ready");
   await expect.poll(() => attempts).toBe(2);
   expect(createdAttachmentIds).toEqual(["claimed-retry-2"]);
@@ -494,7 +549,7 @@ test("failed and cancelled uploads block send and can be retried", async ({ page
     }).catch(() => undefined);
   });
 
-  const input = page.locator('input[type="file"]');
+  const input = activeChatSession(page).locator('input[type="file"]');
   await input.setInputFiles({
     name: "retry.txt",
     mimeType: "text/plain",
@@ -507,7 +562,7 @@ test("failed and cancelled uploads block send and can be retried", async ({ page
   await expect(page.getByText(/Ready$/, { exact: false })).toBeVisible();
   await expect(page.getByRole("button", { name: "Send" })).toBeEnabled();
 
-  await page.locator(".composer-wrap").evaluate((element) => {
+  await activeChatSession(page).locator(".composer-wrap").evaluate((element) => {
     const transfer = new DataTransfer();
     transfer.items.add(new File(["cancel"], "cancel.txt", { type: "text/plain" }));
     const event = new Event("drop", { bubbles: true, cancelable: true });
@@ -519,7 +574,9 @@ test("failed and cancelled uploads block send and can be retried", async ({ page
   await expect(page.getByRole("button", { name: "Retry upload cancel.txt" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Send" })).toBeDisabled();
   await page.getByRole("button", { name: "Retry upload cancel.txt" }).click();
-  const retried = page.locator(".upload-ready").filter({ hasText: "cancel.txt" });
+  const retried = activeChatSession(page).locator(".upload-ready").filter({
+    hasText: "cancel.txt",
+  });
   await expect(retried).toContainText("Ready");
   await expect(page.getByRole("button", { name: "Send" })).toBeEnabled();
 });

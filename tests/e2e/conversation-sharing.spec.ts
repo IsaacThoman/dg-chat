@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { bootstrap, createChat, login, openSidebar } from "./helpers.ts";
+import { activeChatSession, bootstrap, createChat, login, openSidebar } from "./helpers.ts";
 
 const capability = "a".repeat(43);
 const createdAt = "2026-07-13T04:00:00.000Z";
@@ -28,7 +28,7 @@ test("creates and revokes an immutable snapshot with conservative defaults", asy
   await createChat(page);
   await page.getByRole("textbox", { name: "Message" }).fill("A snapshot-safe prompt");
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.locator(".assistant-message")).toBeVisible();
+  await expect(activeChatSession(page).locator(".assistant-message")).toBeVisible();
   await expect(page.getByRole("button", { name: "Stop generating" })).toBeHidden({
     timeout: 20_000,
   });
@@ -97,6 +97,7 @@ test("creates and revokes an immutable snapshot with conservative defaults", asy
   await expect(dialog.getByRole("alert")).toContainText("Try again");
   await dialog.getByRole("button", { name: "Create snapshot" }).click();
   await expect(dialog.getByRole("heading", { name: "Snapshot ready" })).toBeVisible();
+  await expect(dialog.getByLabel("Share link")).toBeFocused();
   const createdCapability = String(createBodies[1]?.capability);
   await expect(dialog.getByLabel("Share link")).toHaveValue(
     `${new URL(page.url()).origin}/share/${createdCapability}`,
@@ -173,7 +174,7 @@ test("real stack pins a snapshot and revocation invalidates its public link", as
   const prompt = `real immutable share ${crypto.randomUUID()}`;
   await page.getByRole("textbox", { name: "Message" }).fill(prompt);
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.locator(".assistant-message")).toContainText(prompt);
+  await expect(activeChatSession(page).locator(".assistant-message")).toContainText(prompt);
   await expect(page.getByRole("button", { name: "Stop generating" })).toBeHidden({
     timeout: 20_000,
   });

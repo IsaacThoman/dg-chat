@@ -1,4 +1,5 @@
 import { defineConfig, devices } from "@playwright/test";
+import { assertSafeE2ETarget } from "./tests/e2e/target-safety.ts";
 
 const runtime = globalThis as typeof globalThis & {
   Deno?: { env: { get(key: string): string | undefined } };
@@ -6,6 +7,15 @@ const runtime = globalThis as typeof globalThis & {
 };
 const env = (name: string) => runtime.Deno?.env.get(name) ?? runtime.process?.env[name];
 const baseURL = env("E2E_BASE_URL") ?? "http://localhost:5173";
+const apiURL = env("E2E_API_URL") ?? "http://localhost:8000";
+
+assertSafeE2ETarget({
+  targetUrls: [baseURL, apiURL],
+  allowDestructiveRemote: env("E2E_ALLOW_DESTRUCTIVE_REMOTE"),
+  setupToken: env("SETUP_TOKEN"),
+  adminEmail: env("E2E_ADMIN_EMAIL"),
+  adminPassword: env("E2E_ADMIN_PASSWORD"),
+});
 
 export default defineConfig({
   testDir: "./tests/e2e",
@@ -42,7 +52,7 @@ export default defineConfig({
     ? [
       {
         command: "deno task dev",
-        url: `${env("E2E_API_URL") ?? "http://localhost:8000"}/health`,
+        url: `${apiURL}/health`,
         reuseExistingServer: !env("CI"),
         timeout: 120_000,
         // Browser journeys repeatedly authenticate the same fixture administrator. Dedicated

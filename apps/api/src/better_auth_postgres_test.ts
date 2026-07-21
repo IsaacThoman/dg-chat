@@ -23,6 +23,14 @@ async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 
   throw new Error("Timed out waiting for asynchronous identity delivery");
 }
 
+function assertPrivateCookieResponse(response: Response): void {
+  assertEquals(response.headers.get("cache-control"), "private, no-store");
+  assertEquals(response.headers.get("pragma"), "no-cache");
+  assert(
+    (response.headers.get("vary") ?? "").split(",").map((value) => value.trim()).includes("Cookie"),
+  );
+}
+
 Deno.test({
   name: "Better Auth creates UUID-backed pending identities and limited sessions",
   ignore: !databaseUrl,
@@ -35,6 +43,7 @@ Deno.test({
     let repository: PostgresRepository | undefined;
     const verificationDeliveries: Array<{ email: string; url: string; token: string }> = [];
     const passwordResetDeliveries: Array<{ email: string; url: string; token: string }> = [];
+    const authOperationalLogs: string[] = [];
     let rejectPasswordResetDelivery = false;
     let rejectVerificationDelivery = false;
     let heldPasswordResetDelivery: Promise<void> | undefined;
@@ -55,6 +64,7 @@ Deno.test({
           approval_status approval_status NOT NULL DEFAULT 'pending',
           state account_state NOT NULL DEFAULT 'active',
           version integer NOT NULL DEFAULT 1,
+          authority_epoch bigint NOT NULL DEFAULT 1,
           balance_micros bigint NOT NULL DEFAULT 0,
           email_verified_at timestamptz,
           created_at timestamptz NOT NULL DEFAULT now(),
@@ -66,6 +76,7 @@ Deno.test({
           user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
           token_hash text NOT NULL UNIQUE,
           limited boolean NOT NULL DEFAULT false,
+          authority_epoch bigint NOT NULL DEFAULT 1,
           expires_at timestamptz NOT NULL,
           created_at timestamptz NOT NULL DEFAULT now(),
           invalidated_at timestamptz
@@ -86,6 +97,7 @@ Deno.test({
           token_hash text NOT NULL UNIQUE,
           preview text NOT NULL,
           scopes jsonb NOT NULL,
+          authority_epoch bigint NOT NULL DEFAULT 1,
           expires_at timestamptz,
           last_used_at timestamptz,
           created_at timestamptz NOT NULL DEFAULT now(),
@@ -145,6 +157,46 @@ Deno.test({
         ),
       );
       await adminSql.unsafe(migration);
+      await adminSql.unsafe(
+        "ALTER TABLE auth_sessions ADD COLUMN authority_epoch bigint NOT NULL DEFAULT 1",
+      );
+      await adminSql.unsafe(
+        "ALTER TABLE auth_verifications ADD COLUMN authority_epoch bigint",
+      );
+      await adminSql.unsafe(
+        "ALTER TABLE identity_tokens ADD COLUMN authority_epoch bigint NOT NULL DEFAULT 1",
+      );
+      await adminSql.unsafe(`
+        CREATE FUNCTION dg_test_auth_session_epoch_fence() RETURNS trigger LANGUAGE plpgsql AS $$
+        DECLARE current_epoch bigint;
+        BEGIN
+          SELECT authority_epoch INTO current_epoch FROM users WHERE id=NEW.user_id FOR UPDATE;
+          IF current_epoch IS NOT NULL AND NEW.authority_epoch<>current_epoch THEN
+            RAISE EXCEPTION 'stale authentication authority' USING ERRCODE='42501';
+          END IF;
+          RETURN NEW;
+        END $$;
+        CREATE TRIGGER dg_test_auth_session_epoch_fence BEFORE INSERT ON auth_sessions
+          FOR EACH ROW EXECUTE FUNCTION dg_test_auth_session_epoch_fence();
+        CREATE FUNCTION dg_test_auth_verification_epoch_fence() RETURNS trigger
+          LANGUAGE plpgsql AS $$
+        DECLARE domain record;
+        BEGIN
+          IF NEW.identifier LIKE 'reset-password:%' THEN
+            SELECT authority_epoch,state::text state,deleted_at,password_reset_pending
+              INTO domain FROM users WHERE id::text=NEW.value FOR UPDATE;
+            IF domain IS NULL OR NEW.authority_epoch IS NULL OR
+                NEW.authority_epoch<>domain.authority_epoch OR domain.state<>'active' OR
+                domain.deleted_at IS NOT NULL OR domain.password_reset_pending IS TRUE THEN
+              RAISE EXCEPTION 'password reset authority epoch is stale' USING ERRCODE='42501';
+            END IF;
+          END IF;
+          RETURN NEW;
+        END $$;
+        CREATE TRIGGER dg_test_auth_verification_epoch_fence
+          BEFORE INSERT ON auth_verifications FOR EACH ROW
+          EXECUTE FUNCTION dg_test_auth_verification_epoch_fence();
+      `);
 
       repository = await PostgresRepository.connect(schemaDatabaseUrl(databaseUrl!, schema));
       const bootstrap = await repository.bootstrapAdmin({
@@ -152,6 +204,7 @@ Deno.test({
         name: "Bootstrap Admin",
         passwordHash: await hashPassword("bootstrap password remains valid"),
       }, 5_000_000);
+      let bootstrapAuthorityEpoch = 1;
       const mockOidc = await createMockOidcProvider({
         publicIssuer: "http://localhost:4020",
         internalBaseUrl: "http://mock-oidc:4020",
@@ -179,6 +232,7 @@ Deno.test({
             mockOidc.fetch(input instanceof Request ? input : new Request(input, init)),
         },
         requireEmailVerification: true,
+        authLogSink: (line) => authOperationalLogs.push(line),
         sendVerificationEmail: (delivery) => {
           if (rejectVerificationDelivery) {
             return Promise.reject(new Error("injected verification delivery failure"));
@@ -253,6 +307,7 @@ Deno.test({
       assert(oidcSessionCookie);
       const oidcMe = await app.request("/api/auth/me", { headers: { cookie: oidcSessionCookie } });
       assertEquals(oidcMe.status, 200, await oidcMe.clone().text());
+      assertPrivateCookieResponse(oidcMe);
       const oidcIdentity = await oidcMe.json() as {
         user: { id: string; email: string; approvalStatus: string };
         limited: boolean;
@@ -274,6 +329,7 @@ Deno.test({
       );
       const firstOidcApproval = await repository.decideUserApproval({
         actorId: bootstrap.id,
+        expectedAuthorityEpoch: bootstrapAuthorityEpoch,
         targetUserId: oidcIdentity.user.id,
         expectedVersion: 1,
         status: "approved",
@@ -281,6 +337,7 @@ Deno.test({
       });
       const rejectedOidcIdentity = await repository.decideUserApproval({
         actorId: bootstrap.id,
+        expectedAuthorityEpoch: bootstrapAuthorityEpoch,
         targetUserId: oidcIdentity.user.id,
         expectedVersion: firstOidcApproval.version,
         status: "rejected",
@@ -289,6 +346,7 @@ Deno.test({
       });
       const repeatedOidcApproval = await repository.decideUserApproval({
         actorId: bootstrap.id,
+        expectedAuthorityEpoch: bootstrapAuthorityEpoch,
         targetUserId: oidcIdentity.user.id,
         expectedVersion: rejectedOidcIdentity.version,
         status: "approved",
@@ -299,6 +357,9 @@ Deno.test({
       const approvedOidcStatus = await app.request("/api/auth/status", {
         headers: { cookie: oidcSessionCookie },
       });
+      // Rejection advances the full-authority generation, but the physically limited applicant
+      // session remains useful only for status polling. Reapproval must never promote it into a
+      // workspace session; the user still has to establish a fresh identity proof.
       assertEquals(approvedOidcStatus.status, 200);
       assertEquals(await approvedOidcStatus.json(), {
         approvalStatus: "approved",
@@ -333,6 +394,13 @@ Deno.test({
         { userId: legacyId, limited: false },
       );
       assertMatch(legacySession.authenticatedAt, /^\d{4}-\d{2}-\d{2}T/u);
+      const legacySignOut = await app.request("/api/auth/sign-out", {
+        method: "POST",
+        headers: { cookie: legacyCookie, origin: "http://localhost:5173" },
+      });
+      assertEquals(legacySignOut.status, 200, await legacySignOut.clone().text());
+      assertPrivateCookieResponse(legacySignOut);
+      assertEquals(await service.getSession(new Headers({ cookie: legacyCookie })), null);
       assertEquals(bootstrap.passwordHash, null);
       assertEquals(bootstrap.balanceMicros, 5_000_000);
       const bootstrapSignin = await service.handler(
@@ -411,17 +479,14 @@ Deno.test({
       );
       const resetToken = resetLocation.searchParams.get("token");
       assert(resetToken);
-      const originalHandler = service.handler;
+      const originalReset = repository.resetBetterAuthPassword.bind(repository);
       let failResetOnce = true;
-      service.handler = (request) => {
-        const url = new URL(request.url);
-        if (
-          failResetOnce && request.method === "POST" && url.pathname.endsWith("/reset-password")
-        ) {
+      repository.resetBetterAuthPassword = (token, passwordHash) => {
+        if (failResetOnce) {
           failResetOnce = false;
-          return Promise.resolve(new Response("temporary auth storage failure", { status: 503 }));
+          return Promise.reject(new Error("injected atomic reset failure"));
         }
-        return originalHandler(request);
+        return originalReset(token, passwordHash);
       };
       const failedReset = await app.request("/api/auth/password-reset", {
         method: "POST",
@@ -431,52 +496,17 @@ Deno.test({
         },
         body: JSON.stringify({ token: resetToken, password: "new bootstrap password valid" }),
       });
-      assertEquals(failedReset.status, 503, await failedReset.clone().text());
+      assertEquals(failedReset.status, 500, await failedReset.clone().text());
       const guarded = await adminSql<
         { state: string; password_reset_pending: boolean }[]
       >`SELECT state,password_reset_pending FROM users WHERE email='admin@example.com'`;
-      assertEquals(guarded[0], { state: "active", password_reset_pending: true });
+      assertEquals(guarded[0], { state: "active", password_reset_pending: false });
       assertEquals(
         (await app.request("/v1/models", {
           headers: { authorization: `Bearer ${apiToken}` },
         })).status,
-        401,
+        200,
       );
-      const originalSecureAfterReset = repository.secureAfterPasswordReset.bind(repository);
-      let failCompletionOnce = true;
-      repository.secureAfterPasswordReset = (userId, token) => {
-        if (failCompletionOnce) {
-          failCompletionOnce = false;
-          return Promise.reject(new Error("injected reset completion failure"));
-        }
-        return originalSecureAfterReset(userId, token);
-      };
-      const completionFailed = await app.request("/api/auth/password-reset", {
-        method: "POST",
-        headers: {
-          origin: "http://localhost:5173",
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({ token: resetToken, password: "new bootstrap password valid" }),
-      });
-      assertEquals(completionFailed.status, 500, await completionFailed.clone().text());
-      const replacementRequest = await app.request("/api/auth/password-reset/request", {
-        method: "POST",
-        headers: {
-          origin: "http://localhost:5173",
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({ email: "admin@example.com" }),
-      });
-      assertEquals(replacementRequest.status, 202, await replacementRequest.clone().text());
-      await waitFor(() => passwordResetDeliveries.length === 2);
-      assertEquals(passwordResetDeliveries.length, 2);
-      const replacementCallback = await service.handler(
-        new Request(passwordResetDeliveries[1].url, { redirect: "manual" }),
-      );
-      const replacementLocation = new URL(replacementCallback.headers.get("location")!);
-      const replacementToken = replacementLocation.searchParams.get("token");
-      assert(replacementToken);
       const reset = await app.request("/api/auth/password-reset", {
         method: "POST",
         headers: {
@@ -484,14 +514,20 @@ Deno.test({
           "content-type": "application/json",
         },
         body: JSON.stringify({
-          token: replacementToken,
+          token: resetToken,
           password: "final bootstrap password valid",
         }),
       });
       assertEquals(reset.status, 204, await reset.clone().text());
+      bootstrapAuthorityEpoch = Number(
+        (await adminSql<{ authority_epoch: number | string }[]>`
+          SELECT authority_epoch FROM users WHERE id=${bootstrap.id}
+        `)[0].authority_epoch,
+      );
+      assertEquals(bootstrapAuthorityEpoch, 2);
       for (
         const token of [
-          replacementToken,
+          resetToken,
           "invalid_better_auth_password_reset_token_0000000000",
         ]
       ) {
@@ -629,6 +665,7 @@ Deno.test({
         }),
       });
       assertEquals(signup.status, 200, await signup.clone().text());
+      assertPrivateCookieResponse(signup);
       const body = await signup.json() as { user: { id: string; email: string } };
       assertMatch(
         body.user.id,
@@ -658,10 +695,12 @@ Deno.test({
       assertEquals(directSessions.length >= 1, true);
       assertEquals(directSessions.find((candidate) => candidate.current)?.id, session.id);
       assertEquals((await repository.listSessions(body.user.id)).length, 0);
-      const listedSessions = await (await app.request("/api/sessions", { headers: { cookie } }))
-        .json() as { data: Array<{ id: string; current: boolean }> };
-      assertEquals(listedSessions.data.some((candidate) => candidate.current), true);
-      assertEquals(listedSessions.data.filter((candidate) => candidate.current).length, 1);
+      const limitedSessionListing = await app.request("/api/sessions", { headers: { cookie } });
+      assertEquals(limitedSessionListing.status, 403);
+      assertEquals(
+        (await limitedSessionListing.json() as { error: { code: string } }).error.code,
+        "session_refresh_required",
+      );
       assertEquals((await app.request("/v1/models", { headers: { cookie } })).status, 401);
       assertEquals(
         (await app.request("/api/auth/me", {
@@ -765,8 +804,9 @@ Deno.test({
         },
       );
 
-      await repository.decideUserApproval({
+      let bridgeManaged = await repository.decideUserApproval({
         actorId: bootstrap.id,
+        expectedAuthorityEpoch: bootstrapAuthorityEpoch,
         targetUserId: body.user.id,
         expectedVersion: domainUser!.version,
         status: "approved",
@@ -791,12 +831,238 @@ Deno.test({
         (await staleWorkspace.json() as { error: { code: string } }).error.code,
         "session_refresh_required",
       );
+      bridgeManaged = await repository.decideUserApproval({
+        actorId: bootstrap.id,
+        expectedAuthorityEpoch: bootstrapAuthorityEpoch,
+        targetUserId: body.user.id,
+        expectedVersion: bridgeManaged.version,
+        status: "rejected",
+        startingCreditMicros: 0,
+        reason: "Exercise stale-cookie reauthentication",
+      });
+      // Rejection invalidates full authority but deliberately leaves the already-issued physical
+      // status session able to observe the terminal decision.
+      assertEquals(
+        await (await app.request("/api/auth/status", { headers: { cookie } })).json(),
+        {
+          approvalStatus: "rejected",
+          state: "active",
+          emailVerified: true,
+          emailVerificationRequired: true,
+          sessionLimited: true,
+          fullSessionEligible: false,
+          fullAccess: false,
+        },
+      );
+      // A rejected identity must not use its password to mint another status capability.
+      const rejectedSignin = await app.request("/api/auth/sign-in/email", {
+        method: "POST",
+        headers: {
+          origin: "http://localhost:5173",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          email: "bridge@example.com",
+          password: "correct horse battery staple",
+        }),
+      });
+      assertEquals(rejectedSignin.status, 401, await rejectedSignin.clone().text());
+      assertPrivateCookieResponse(rejectedSignin);
+      assertEquals(rejectedSignin.headers.has("set-cookie"), false);
+      const resetRowsBeforeRejection = Number(
+        (await adminSql`
+          SELECT count(*)::int count FROM auth_verifications
+          WHERE identifier LIKE 'reset-password:%' AND value=${body.user.id}
+        `)[0].count,
+      );
+      const resetDeliveriesBeforeRejection = passwordResetDeliveries.length;
+      const rejectedReset = await app.request("/api/auth/password-reset/request", {
+        method: "POST",
+        headers: {
+          origin: "http://localhost:5173",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ email: "bridge@example.com" }),
+      });
+      assertEquals(rejectedReset.status, 202);
+      assertEquals(
+        Number(
+          (await adminSql`
+            SELECT count(*)::int count FROM auth_verifications
+            WHERE identifier LIKE 'reset-password:%' AND value=${body.user.id}
+          `)[0].count,
+        ),
+        resetRowsBeforeRejection,
+      );
+      assertEquals(passwordResetDeliveries.length, resetDeliveriesBeforeRejection);
+      bridgeManaged = await repository.decideUserApproval({
+        actorId: bootstrap.id,
+        expectedAuthorityEpoch: bootstrapAuthorityEpoch,
+        targetUserId: body.user.id,
+        expectedVersion: bridgeManaged.version,
+        status: "approved",
+        startingCreditMicros: 0,
+      });
+      const restoredLimitedMe = await app.request("/api/auth/me", { headers: { cookie } });
+      assertEquals(restoredLimitedMe.status, 200);
+      const restoredLimitedBody = await restoredLimitedMe.json() as {
+        user: { id: string; approvalStatus: string };
+        limited: boolean;
+      };
+      assertEquals(
+        {
+          userId: restoredLimitedBody.user.id,
+          approvalStatus: restoredLimitedBody.user.approvalStatus,
+          limited: restoredLimitedBody.limited,
+        },
+        { userId: body.user.id, approvalStatus: "approved", limited: true },
+      );
+      const runDelayedResetIssuance = async (
+        transition: () => Promise<void>,
+      ) => {
+        const originalFindForReset = repository!.findUserByEmail.bind(repository);
+        const resetObserved = Promise.withResolvers<void>();
+        const releaseReset = Promise.withResolvers<void>();
+        let pauseResetObservation = true;
+        repository!.findUserByEmail = async (email) => {
+          const result = await originalFindForReset(email);
+          if (pauseResetObservation && email === "bridge@example.com") {
+            pauseResetObservation = false;
+            resetObserved.resolve();
+            await releaseReset.promise;
+          }
+          return result;
+        };
+        const beforeRows = Number(
+          (await adminSql`
+          SELECT count(*)::int count FROM auth_verifications
+          WHERE identifier LIKE 'reset-password:%' AND value=${body.user.id}
+        `)[0].count,
+        );
+        const beforeDeliveries = passwordResetDeliveries.length;
+        try {
+          const request = app.request("/api/auth/password-reset/request", {
+            method: "POST",
+            headers: {
+              origin: "http://localhost:5173",
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({ email: "bridge@example.com" }),
+          });
+          await resetObserved.promise;
+          await transition();
+          releaseReset.resolve();
+          const response = await request;
+          assertEquals(response.status, 202, await response.clone().text());
+          assertEquals(await response.text(), "");
+          assertEquals(
+            Number(
+              (await adminSql`
+              SELECT count(*)::int count FROM auth_verifications
+              WHERE identifier LIKE 'reset-password:%' AND value=${body.user.id}
+            `)[0].count,
+            ),
+            beforeRows,
+          );
+          assertEquals(passwordResetDeliveries.length, beforeDeliveries);
+        } finally {
+          releaseReset.resolve();
+          repository!.findUserByEmail = originalFindForReset;
+        }
+      };
+
+      // The request observes active authority at E, then loses and regains lifecycle eligibility.
+      // Restoring the account must never make the delayed E-generation reset request valid again.
+      await runDelayedResetIssuance(async () => {
+        bridgeManaged = await repository!.setAdminUserState({
+          actorId: bootstrap.id,
+          expectedAuthorityEpoch: bootstrapAuthorityEpoch,
+          targetUserId: body.user.id,
+          expectedVersion: bridgeManaged.version,
+          state: "suspended",
+          reason: "Fence delayed password reset issuance",
+        });
+        bridgeManaged = await repository!.setAdminUserState({
+          actorId: bootstrap.id,
+          expectedAuthorityEpoch: bootstrapAuthorityEpoch,
+          targetUserId: body.user.id,
+          expectedVersion: bridgeManaged.version,
+          state: "active",
+          reason: "Restore after delayed password reset observation",
+        });
+      });
+
+      bridgeManaged = await repository.setAdminUserState({
+        actorId: bootstrap.id,
+        expectedAuthorityEpoch: bootstrapAuthorityEpoch,
+        targetUserId: body.user.id,
+        expectedVersion: bridgeManaged.version,
+        state: "suspended",
+        reason: "Begin suspended reset-observation regression",
+      });
+      // A request that starts while suspended stays ineligible even if the account is restored
+      // before Better Auth reaches its verification insert.
+      await runDelayedResetIssuance(async () => {
+        bridgeManaged = await repository!.setAdminUserState({
+          actorId: bootstrap.id,
+          expectedAuthorityEpoch: bootstrapAuthorityEpoch,
+          targetUserId: body.user.id,
+          expectedVersion: bridgeManaged.version,
+          state: "active",
+          reason: "Restore after suspended password reset observation",
+        });
+      });
+
+      const originalFindByEmail = repository.findUserByEmail.bind(repository);
+      const observed = Promise.withResolvers<void>();
+      const releaseObservedLogin = Promise.withResolvers<void>();
+      let pauseObservedLogin = true;
+      repository.findUserByEmail = async (email) => {
+        const result = await originalFindByEmail(email);
+        if (pauseObservedLogin && email === "bridge@example.com") {
+          pauseObservedLogin = false;
+          observed.resolve();
+          await releaseObservedLogin.promise;
+        }
+        return result;
+      };
+      const delayedSignin = service.handler(
+        new Request("http://localhost:8000/api/auth/sign-in/email", {
+          method: "POST",
+          headers: { "content-type": "application/json", origin: "http://localhost:5173" },
+          body: JSON.stringify({
+            email: "bridge@example.com",
+            password: "correct horse battery staple",
+          }),
+        }),
+      );
+      await observed.promise;
+      bridgeManaged = await repository.setAdminUserState({
+        actorId: bootstrap.id,
+        expectedAuthorityEpoch: bootstrapAuthorityEpoch,
+        targetUserId: body.user.id,
+        expectedVersion: bridgeManaged.version,
+        state: "suspended",
+        reason: "Fence an observed local-password login",
+      });
+      bridgeManaged = await repository.setAdminUserState({
+        actorId: bootstrap.id,
+        expectedAuthorityEpoch: bootstrapAuthorityEpoch,
+        targetUserId: body.user.id,
+        expectedVersion: bridgeManaged.version,
+        state: "active",
+        reason: "Restore after observed local-password login",
+      });
+      releaseObservedLogin.resolve();
+      assertEquals((await delayedSignin).status === 200, false);
+      repository.findUserByEmail = originalFindByEmail;
       const approvedSignin = await service.handler(
         new Request("http://localhost:8000/api/auth/sign-in/email", {
           method: "POST",
           headers: {
             "content-type": "application/json",
             origin: "http://localhost:5173",
+            cookie,
           },
           body: JSON.stringify({
             email: "bridge@example.com",
@@ -814,6 +1080,55 @@ Deno.test({
         { userId: body.user.id, limited: false },
       );
       assertMatch(approvedSession.authenticatedAt, /^\d{4}-\d{2}-\d{2}T/u);
+      const originalRecordAudit = repository.recordAudit.bind(repository);
+      repository.recordAudit = (input) => {
+        if (input.action === "identity.login_succeeded") {
+          return Promise.reject(new Error("sensitive injected persistence details"));
+        }
+        return originalRecordAudit(input);
+      };
+      const loginWithUnavailableAudit = await (async () => {
+        try {
+          return await app.request("/api/auth/sign-in/email", {
+            method: "POST",
+            headers: {
+              origin: "http://localhost:5173",
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({
+              email: "bridge@example.com",
+              password: "correct horse battery staple",
+            }),
+          });
+        } finally {
+          repository.recordAudit = originalRecordAudit;
+        }
+      })();
+      assertEquals(
+        loginWithUnavailableAudit.status,
+        200,
+        await loginWithUnavailableAudit.clone().text(),
+      );
+      const outcomeFailureLog = authOperationalLogs.find((line) =>
+        line.includes("Authentication outcome audit persistence failed")
+      );
+      assert(outcomeFailureLog);
+      assertEquals(outcomeFailureLog.includes("bridge@example.com"), false);
+      assertEquals(outcomeFailureLog.includes("correct horse battery staple"), false);
+      assertEquals(outcomeFailureLog.includes("sensitive injected persistence details"), false);
+      const staleLimitedRevoke = await app.request(
+        `/api/sessions/better_auth:${approvedSession.id}`,
+        {
+          method: "DELETE",
+          headers: { cookie, origin: "http://localhost:5173" },
+        },
+      );
+      assertEquals(staleLimitedRevoke.status, 403);
+      assertEquals(
+        (await staleLimitedRevoke.json() as { error: { code: string } }).error.code,
+        "session_refresh_required",
+      );
+      assert(await service.getSession(new Headers({ cookie: approvedCookie })));
       const approvedTokenResponse = await app.request("/api/tokens", {
         method: "POST",
         headers: {
@@ -916,6 +1231,7 @@ Deno.test({
       const bridgeUser = await repository.getAdminUser(body.user.id);
       await repository.setAdminUserState({
         actorId: bootstrap.id,
+        expectedAuthorityEpoch: bootstrapAuthorityEpoch,
         targetUserId: body.user.id,
         expectedVersion: bridgeUser.version,
         state: "suspended",
@@ -950,6 +1266,31 @@ Deno.test({
         })),
         [{ provider_id: "credential", password: true }],
       );
+      const authenticationAudit = (await repository.listAudit({ limit: 100 })).data;
+      for (
+        const action of [
+          "identity.signup",
+          "identity.login_succeeded",
+          "identity.login_failed",
+          "identity.oidc_login_succeeded",
+          "session.signed_out",
+        ]
+      ) {
+        assert(
+          authenticationAudit.some((event) => event.action === action),
+          `Missing durable authentication audit event ${action}`,
+        );
+      }
+      for (
+        const event of authenticationAudit.filter((candidate) =>
+          candidate.action === "identity.signup" ||
+          candidate.action.startsWith("identity.login_") ||
+          candidate.action.startsWith("identity.oidc_login_") ||
+          candidate.action.startsWith("session.sign")
+        )
+      ) {
+        assertEquals(event.metadata, {});
+      }
     } finally {
       await service?.close();
       await repository?.close();

@@ -7,6 +7,14 @@ services:
       OPENAI_ALLOWED_MODELS: mock-fast,mock-split,mock-error,mock-role-stall
       # This exact-name exception is honored only in DENO_ENV=test.
       OPENAI_TEST_ALLOW_HTTP_HOST: mock-provider
+      KNOWLEDGE_EMBEDDING_BASE_URL: http://mock-provider:4010/v1
+      KNOWLEDGE_EMBEDDING_API_KEY: ci-mock-provider-key
+      KNOWLEDGE_EMBEDDING_MODEL: mock-embedding
+      KNOWLEDGE_EMBEDDING_UPSTREAM_MODEL: mock-embedding
+      KNOWLEDGE_EMBEDDING_VERSION: mock-embedding-v1
+      KNOWLEDGE_EMBEDDING_QUERY_TIMEOUT_MS: "10000"
+      KNOWLEDGE_EMBEDDING_INPUT_MICROS_PER_MILLION: "1000000"
+      KNOWLEDGE_EMBEDDING_FIXED_CALL_MICROS: "5"
       # The contract job intentionally runs both official SDK suites back-to-back.
       OPENAI_RATE_LIMIT: 1000
       GENERATION_RATE_LIMIT: 1000
@@ -14,8 +22,28 @@ services:
       mock-provider:
         condition: service_healthy
 
+  worker:
+    environment:
+      DENO_ENV: test
+      OPENAI_TEST_ALLOW_HTTP_HOST: mock-provider
+      KNOWLEDGE_EMBEDDING_BASE_URL: http://mock-provider:4010/v1
+      KNOWLEDGE_EMBEDDING_API_KEY: ci-mock-provider-key
+      KNOWLEDGE_EMBEDDING_MODEL: mock-embedding
+      KNOWLEDGE_EMBEDDING_UPSTREAM_MODEL: mock-embedding
+      KNOWLEDGE_EMBEDDING_VERSION: mock-embedding-v1
+      KNOWLEDGE_EMBEDDING_BATCH_SIZE: "64"
+      KNOWLEDGE_EMBEDDING_INPUT_MICROS_PER_MILLION: "1000000"
+      KNOWLEDGE_EMBEDDING_FIXED_CALL_MICROS: "5"
+    depends_on:
+      mock-provider:
+        condition: service_healthy
+
   mock-provider:
     image: denoland/deno:alpine
+    # Contract stacks are intentionally durable across a container-runtime restart, just like the
+    # app that depends on this provider. A test-only dependency must not remain exited while the
+    # rest of the stack recovers.
+    restart: unless-stopped
     working_dir: /tests
     command:
       [

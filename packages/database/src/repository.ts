@@ -3,6 +3,8 @@ import type {
   AdminApiTokenPage,
   AdminApiTokenQuery,
   AdminApiTokenRevocationCommand,
+  AdminAttachmentPage,
+  AdminAttachmentQuery,
   AdminBalanceAdjustment,
   AdminBalanceAdjustmentCommand,
   AdminLedgerPage,
@@ -10,16 +12,25 @@ import type {
   AdminSessionPage,
   AdminSessionQuery,
   AdminSessionRevocationCommand,
+  AdminStorageSummary,
   AdminUser,
   AdminUserPage,
   AdminUserQuery,
   ApiTokenSummary,
   ApprovalStatus,
+  AttachmentStorageUsage,
+  CommunityColorToken,
+  CommunityIdentityMode,
+  CommunityLeaderboardMetric,
+  CommunityLeaderboardWindow,
+  CommunityProfile,
   Conversation,
   ConversationDetail,
   ConversationFolder,
   ConversationFolderMembership,
   ConversationPortabilityV1,
+  ConversationSearchPage,
+  ConversationSearchQuery,
   ConversationShareAttachmentPolicy,
   ConversationShareIdentityVisibility,
   ConversationShareSummary,
@@ -32,9 +43,15 @@ import type {
   PublicConversationShare,
   PublicConversationShareAttachment,
   PublicUser,
+  UpdateCommunityProfileRequest,
   UsageSummary,
   UserPreferences,
   UserRole,
+} from "@dg-chat/contracts";
+import {
+  COMMUNITY_COLOR_TOKENS,
+  hasVisibleConversationSearchText,
+  stripConversationSearchControls,
 } from "@dg-chat/contracts";
 import type { LedgerEntry, StoredApiToken, StoredSession, StoredUser, UsageRun } from "./memory.ts";
 export {
@@ -44,6 +61,164 @@ export {
 } from "./attachment-policy.ts";
 
 export type MaybePromise<T> = T | Promise<T>;
+
+const CONVERSATION_SEARCH_CURSOR_VERSION = 1;
+export const CONVERSATION_SEARCH_CURSOR_MAX_CHARS = 2_048;
+const CONVERSATION_SEARCH_CURSOR_PATTERN = /^[A-Za-z0-9_-]+$/;
+/** PostgreSQL cancels a conversation search before an admission lease may expire. */
+export const CONVERSATION_SEARCH_STATEMENT_TIMEOUT_MS = 5_000;
+/** Search reads cannot starve transactional application work in the repository's primary pool. */
+export const CONVERSATION_SEARCH_POOL_MAX = 4;
+export const CONVERSATION_SEARCH_APPLICATION_NAME = "dg-chat-conversation-search";
+export const CONVERSATION_SEARCH_QUERY_VALIDATION_MESSAGE =
+  "Search query must be between 2 and 200 characters and contain safe visible text";
+const CONVERSATION_SEARCH_SNIPPET_CHARS = 240;
+const CONVERSATION_SEARCH_SCAN_CHARS = 4_096;
+const CONVERSATION_SEARCH_EXCERPT_CHARS = 1_024;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const CURSOR_TIMESTAMP_PATTERN = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3})(?:\d{3})?Z$/;
+
+function validConversationSearchCursorTimestamp(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const match = CURSOR_TIMESTAMP_PATTERN.exec(value);
+  if (!match || value.startsWith("0000-")) return false;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) && new Date(timestamp).toISOString() === `${match[1]}Z`;
+}
+
+function conversationSearchFingerprint(
+  query: Pick<ConversationSearchQuery, "query" | "view" | "folderId" | "tagIds">,
+  ownerId: string,
+) {
+  // A compact one-way binding keeps the search text itself out of the opaque cursor. The cursor
+  // is only a position hint; owner authorization is independently enforced by every query.
+  const input = JSON.stringify({
+    ownerId,
+    view: query.view,
+    query: query.query.trim().toLowerCase(),
+    folderId: query.folderId ?? null,
+    tagIds: [...(query.tagIds ?? [])].sort(),
+  });
+  let left = 0x811c9dc5;
+  let right = 0x9e3779b9;
+  for (const byte of new TextEncoder().encode(input)) {
+    left = Math.imul(left ^ byte, 0x01000193) >>> 0;
+    right = Math.imul(right ^ byte, 0x85ebca6b) >>> 0;
+  }
+  return left.toString(16).padStart(8, "0") + right.toString(16).padStart(8, "0");
+}
+
+export function encodeConversationSearchCursor(
+  value: { updatedAt: string; id: string },
+  query: Pick<ConversationSearchQuery, "query" | "view" | "folderId" | "tagIds">,
+  ownerId: string,
+): string {
+  const bytes = new TextEncoder().encode(JSON.stringify([
+    CONVERSATION_SEARCH_CURSOR_VERSION,
+    value.updatedAt,
+    value.id,
+    conversationSearchFingerprint(query, ownerId),
+  ]));
+  return btoa(String.fromCharCode(...bytes)).replaceAll("+", "-").replaceAll("/", "_")
+    .replace(/=+$/, "");
+}
+
+export function decodeConversationSearchCursor(
+  cursor: string,
+  query: Pick<ConversationSearchQuery, "query" | "view" | "folderId" | "tagIds">,
+  ownerId: string,
+): { updatedAt: string; id: string } | undefined {
+  try {
+    if (
+      cursor.length === 0 || cursor.length > CONVERSATION_SEARCH_CURSOR_MAX_CHARS ||
+      !CONVERSATION_SEARCH_CURSOR_PATTERN.test(cursor)
+    ) return undefined;
+    const base64 = cursor.replaceAll("-", "+").replaceAll("_", "/");
+    const binary = atob(base64.padEnd(Math.ceil(base64.length / 4) * 4, "="));
+    // Reject alternate encodings with non-zero trailing bits. Keeping one canonical wire form
+    // makes cursors safely comparable in logs and prevents padded/non-base64url variants from
+    // bypassing validation at repository boundaries.
+    const canonical = btoa(binary).replaceAll("+", "-").replaceAll("/", "_")
+      .replace(/=+$/, "");
+    if (canonical !== cursor) return undefined;
+    const value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(
+      Uint8Array.from(binary, (character) => character.charCodeAt(0)),
+    ));
+    if (
+      !Array.isArray(value) || value.length !== 4 ||
+      value[0] !== CONVERSATION_SEARCH_CURSOR_VERSION ||
+      !validConversationSearchCursorTimestamp(value[1]) || typeof value[2] !== "string" ||
+      !UUID_PATTERN.test(value[2]) || value[3] !== conversationSearchFingerprint(query, ownerId)
+    ) return undefined;
+    return { updatedAt: value[1], id: value[2] };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Finds case-insensitive text without allocating a normalized copy of a potentially huge body. */
+export function conversationSearchMatchIndex(content: string, query: string): number {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return -1;
+  const overlap = Math.min(Math.max(needle.length * 3, 32), CONVERSATION_SEARCH_SCAN_CHARS - 1);
+  for (let offset = 0; offset < content.length; offset += CONVERSATION_SEARCH_SCAN_CHARS) {
+    const start = Math.max(0, offset - overlap);
+    const chunk = content.slice(start, offset + CONVERSATION_SEARCH_SCAN_CHARS);
+    const match = chunk.toLowerCase().indexOf(needle);
+    if (match >= 0) return start + match;
+  }
+  return -1;
+}
+
+/** Removes terminal/bidi controls and produces a short single-line plain-text excerpt. */
+export function conversationSearchSnippet(content: string, query: string): string {
+  const rawMatch = conversationSearchMatchIndex(content, query);
+  const rawStart = Math.max(0, rawMatch < 0 ? 0 : rawMatch - 256);
+  const rawEnd = Math.min(content.length, rawStart + CONVERSATION_SEARCH_EXCERPT_CHARS);
+  const plain = stripConversationSearchControls(content.slice(rawStart, rawEnd), " ")
+    .replace(/\s+/gu, " ").trim();
+  if (
+    plain.length <= CONVERSATION_SEARCH_SNIPPET_CHARS && rawStart === 0 &&
+    rawEnd === content.length
+  ) return plain;
+  const match = conversationSearchMatchIndex(plain, query);
+  let prefix = rawStart > 0;
+  let suffix = rawEnd < content.length;
+  let available = CONVERSATION_SEARCH_SNIPPET_CHARS - Number(prefix) - Number(suffix);
+  let start = Math.max(
+    0,
+    Math.min(match < 0 ? 0 : match - 80, plain.length - available),
+  );
+  prefix ||= start > 0;
+  available = CONVERSATION_SEARCH_SNIPPET_CHARS - Number(prefix) - Number(suffix);
+  start = Math.max(0, Math.min(match < 0 ? 0 : match - 80, plain.length - available));
+  suffix ||= start + available < plain.length;
+  available = CONVERSATION_SEARCH_SNIPPET_CHARS - Number(prefix) - Number(suffix);
+  start = Math.max(0, Math.min(match < 0 ? 0 : match - 80, plain.length - available));
+  const excerpt = plain.slice(
+    start,
+    start + available,
+  );
+  return `${prefix ? "…" : ""}${excerpt}${suffix ? "…" : ""}`;
+}
+
+export function validConversationSearchTerm(value: string): boolean {
+  const trimmed = value.trim();
+  return trimmed.length >= 2 && trimmed.length <= 200 && !trimmed.includes("\u0000") &&
+    hasVisibleConversationSearchText(trimmed);
+}
+
+export function validConversationSearchScopeId(value: string): boolean {
+  return UUID_PATTERN.test(value);
+}
+
+export function conversationSearchMessageContent(
+  message: Pick<MessageNode, "role" | "content" | "metadata">,
+): string {
+  return message.role === "user" && typeof message.metadata.authoredContent === "string"
+    ? message.metadata.authoredContent
+    : message.content;
+}
 
 export interface ConversationPortabilityExportOptions {
   includeTemporary?: boolean;
@@ -108,6 +283,7 @@ export interface CreateUserInput {
 
 export interface AdminUserCommand {
   actorId: string;
+  expectedAuthorityEpoch: number;
   targetUserId: string;
   expectedVersion: number;
   reason?: string;
@@ -122,15 +298,18 @@ export interface AdminApprovalCommand extends AdminUserCommand {
 export interface AdminRoleCommand extends AdminUserCommand {
   role: UserRole;
   reason: string;
+  requireEmailVerification?: boolean;
 }
 
 export interface AdminStateCommand extends AdminUserCommand {
   state: AccountState;
+  requireEmailVerification?: boolean;
 }
 
 export interface AdminDeletionCommand extends AdminUserCommand {
   deleted: boolean;
   reason: string;
+  requireEmailVerification?: boolean;
 }
 
 const ADMIN_USER_CURSOR_VERSION = 2;
@@ -298,6 +477,17 @@ export interface AuditEventInput {
   targetId?: string | null;
   metadata?: Record<string, unknown>;
 }
+export interface PrivilegedAuditEventInput extends AuditEventInput {
+  actorId: string;
+  requireEmailVerification: boolean;
+  expectedAuthorityEpoch: number;
+}
+/** Authority admitted by middleware and revalidated at the storage disclosure boundary. */
+export interface PrivilegedReadContext {
+  actorId: string;
+  requireEmailVerification: boolean;
+  expectedAuthorityEpoch: number;
+}
 export interface AuditEvent extends AuditEventInput {
   id: string;
   createdAt: string;
@@ -386,12 +576,119 @@ export interface AttachmentRecord {
   sha256: string;
   state: AttachmentState;
   inspectionError: string | null;
+  requiredInspectionMode: RequiredAttachmentInspectionMode;
+  inspectionPolicyVersion: typeof ATTACHMENT_INSPECTION_POLICY_VERSION;
+  /** Monotonic policy epoch. Inspection results must bind to the epoch they examined. */
+  inspectionEpoch: number;
+  /** Optimistic administrative version, independent from the immutable content digest. */
+  version: number;
   ingestionStatus: AttachmentIngestionStatus;
   ingestionError: string | null;
   ingestedAt: string | null;
   createdAt: string;
   updatedAt: string;
   deletedAt: string | null;
+}
+/** Stable machine-readable inspection outcomes shared by workers and authorization decisions. */
+export const ATTACHMENT_INSPECTION_REASON = Object.freeze(
+  {
+    localPolicyRejected: "worker_local_policy_rejected",
+    malwareDetected: "worker_malware_detected",
+    retryExhausted: "worker_retry_exhausted",
+    externalScannerUnavailable: "worker_external_scanner_unavailable",
+  } as const,
+);
+export const ATTACHMENT_INSPECTION_POLICY_VERSION = "worker-policy-v1" as const;
+export type RequiredAttachmentInspectionMode = "local" | "external";
+export type AttachmentReinspectionBlockReason =
+  | "deleted"
+  | "nonterminal"
+  | "policy_quarantine";
+export interface AttachmentReinspectionEligibility {
+  eligible: boolean;
+  blockedReason: AttachmentReinspectionBlockReason | null;
+}
+export function attachmentReinspectionEligibility(
+  attachment: Pick<AttachmentRecord, "state" | "inspectionError" | "deletedAt">,
+): AttachmentReinspectionEligibility {
+  if (attachment.deletedAt !== null || attachment.state === "deleted") {
+    return { eligible: false, blockedReason: "deleted" };
+  }
+  if (attachment.state === "ready" || attachment.state === "failed") {
+    return { eligible: true, blockedReason: null };
+  }
+  if (attachment.state === "quarantined") {
+    const workerOwned = attachment.inspectionError ===
+        ATTACHMENT_INSPECTION_REASON.localPolicyRejected ||
+      attachment.inspectionError === ATTACHMENT_INSPECTION_REASON.malwareDetected;
+    return workerOwned
+      ? { eligible: true, blockedReason: null }
+      : { eligible: false, blockedReason: "policy_quarantine" };
+  }
+  return { eligible: false, blockedReason: "nonterminal" };
+}
+export type AttachmentListOrder = "asc" | "desc";
+/**
+ * Owner-scoped keyset pagination for attachment-backed file APIs. `after` is the public
+ * attachment identifier returned by the preceding page, rather than an opaque internal cursor.
+ */
+export interface AttachmentListQuery {
+  limit: number;
+  order: AttachmentListOrder;
+  after?: string;
+}
+export interface AttachmentPage {
+  data: AttachmentRecord[];
+  hasMore: boolean;
+}
+
+const ADMIN_ATTACHMENT_CURSOR_VERSION = 1;
+function adminAttachmentFingerprint(query: AdminAttachmentQuery): string {
+  // The bounded filter tuple itself is safe to embed and avoids accepting deliberate collisions
+  // from a short non-cryptographic digest.
+  return JSON.stringify({
+    ownerId: query.ownerId ?? null,
+    state: query.state ?? null,
+    deletion: query.deletion ?? "present",
+  });
+}
+export function encodeAdminAttachmentCursor(
+  createdAt: string,
+  id: string,
+  query: AdminAttachmentQuery,
+): string {
+  return btoa(JSON.stringify([
+    ADMIN_ATTACHMENT_CURSOR_VERSION,
+    createdAt,
+    id,
+    adminAttachmentFingerprint(query),
+  ])).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+export function decodeAdminAttachmentCursor(
+  cursor: string,
+  query: AdminAttachmentQuery,
+): { createdAt: string; id: string } | undefined {
+  try {
+    if (!cursor || cursor.length > 2_048 || !/^[A-Za-z0-9_-]+$/.test(cursor)) return undefined;
+    const base64 = cursor.replaceAll("-", "+").replaceAll("_", "/");
+    const decoded = atob(base64.padEnd(Math.ceil(base64.length / 4) * 4, "="));
+    if (
+      btoa(decoded).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "") !== cursor
+    ) return undefined;
+    const value = JSON.parse(decoded);
+    if (
+      !Array.isArray(value) || value.length !== 4 ||
+      value[0] !== ADMIN_ATTACHMENT_CURSOR_VERSION ||
+      typeof value[1] !== "string" ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$/.test(value[1]) ||
+      !Number.isFinite(Date.parse(value[1])) ||
+      typeof value[2] !== "string" || !UUID_PATTERN.test(value[2]) ||
+      value[3] !== adminAttachmentFingerprint(query)
+    ) return undefined;
+    return { createdAt: value[1], id: value[2] };
+  } catch {
+    return undefined;
+  }
 }
 export interface DocumentChunkMetadata extends Record<string, unknown> {
   sourceAttachmentId?: string;
@@ -590,13 +887,127 @@ export interface CreateAttachmentInput {
   sha256: string;
   state?: "pending" | "ready" | "quarantined";
   inspectionError?: string | null;
+  requiredInspectionMode?: RequiredAttachmentInspectionMode;
+  inspectionPolicyVersion?: typeof ATTACHMENT_INSPECTION_POLICY_VERSION;
   /** Set only when trusted server-side validation has already completed. */
   inspectionComplete?: boolean;
+}
+export interface AttachmentStorageQuota {
+  /** Retained physical bytes for one owner, inclusive of historical soft-deleted attachments. */
+  perUserBytes: number;
+  /** Retained physical object count for one owner. */
+  perUserObjects: number;
+  /** Retained physical bytes across the installation. */
+  installationBytes: number;
+  /** Retained physical object count across the installation. */
+  installationObjects: number;
+}
+export interface RequestAttachmentReinspectionInput {
+  attachmentId: string;
+  actorId: string;
+  expectedVersion: number;
+  reason: string;
+  /** Trusted server-side policy snapshot to apply to the new inspection epoch. */
+  requiredInspectionMode: RequiredAttachmentInspectionMode;
+  inspectionPolicyVersion: typeof ATTACHMENT_INSPECTION_POLICY_VERSION;
+}
+export interface AttachmentReinspectionResult {
+  attachment: AttachmentRecord;
+  inspectionJobId: string;
+}
+export interface TransitionAttachmentInspectionInput {
+  attachmentId: string;
+  ownerId: string;
+  inspectionEpoch: number;
+  expectedState: "pending" | "inspecting";
+  nextState: "inspecting" | "ready" | "quarantined" | "failed";
+  inspectionError?: string | null;
 }
 export interface CreateAttachmentResult {
   attachment: AttachmentRecord;
   inspectionJobId: string | null;
   deduplicated: boolean;
+}
+export interface FinalizeFileUploadInput {
+  attachment: CreateAttachmentInput;
+  request: Omit<
+    CompleteApiRequestInput,
+    "responseBody" | "responseBodyEncoding" | "frames" | "terminalFrame"
+  >;
+  responseBody: (attachment: AttachmentRecord) => string;
+}
+export interface FinalizeFileUploadResult {
+  attachment: AttachmentRecord;
+  request: ApiIdempotencyRequest;
+}
+export interface FileUploadStage {
+  requestId: string;
+  ownerId: string;
+  objectKey: string;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+  sha256: string;
+  purpose: string;
+  attachmentState: "pending" | "ready" | "quarantined";
+  inspectionError: string | null;
+  requiredInspectionMode: RequiredAttachmentInspectionMode;
+  inspectionPolicyVersion: typeof ATTACHMENT_INSPECTION_POLICY_VERSION;
+  state: "pending" | "stored" | "finalized";
+  attachmentId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+export type StageFileUploadInput = Omit<
+  FileUploadStage,
+  "state" | "attachmentId" | "createdAt" | "updatedAt"
+>;
+
+export interface AttachmentUploadStage {
+  id: string;
+  ownerId: string;
+  objectKey: string;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+  sha256: string;
+  state:
+    | "pending"
+    | "stored"
+    | "cleanup_pending"
+    | "cleaning"
+    | "finalized"
+    | "cleaned"
+    | "abandoned";
+  attachmentId: string | null;
+  cleanupError: string | null;
+  /** Untrusted workers may clean this object only after the active PUT lease expires. */
+  uploadLeaseToken: string;
+  uploadLeaseExpiresAt: string;
+  createdAt: string;
+  updatedAt: string;
+}
+export type StageAttachmentUploadInput = Pick<
+  AttachmentUploadStage,
+  "id" | "ownerId" | "objectKey" | "filename" | "mimeType" | "sizeBytes" | "sha256"
+>;
+
+/** Accept only the content-addressed namespace shared by Files uploads and cleanup jobs. */
+export function isCanonicalFileUploadObjectKey(
+  ownerId: string,
+  sha256: string,
+  objectKey: string,
+): boolean {
+  if (!/^[a-zA-Z0-9_-]{1,128}$/.test(ownerId) || !/^[0-9a-f]{64}$/.test(sha256)) return false;
+  const escapedOwner = ownerId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(
+    `^uploads/${escapedOwner}/blobs/${sha256.slice(0, 2)}/${sha256}\\.[a-z0-9]{1,12}$`,
+  ).test(objectKey);
+}
+
+export interface StaleFileUpload {
+  stage: FileUploadStage;
+  request: ApiIdempotencyRequest;
 }
 
 export type GeneratedAssetInputRole = "source" | "mask" | "reference";
@@ -689,6 +1100,11 @@ export interface StageGeneratedObjectInput {
   mimeType: string;
   sizeBytes: number;
   sha256: string;
+}
+export interface GeneratedObjectCleanupSettlement {
+  stage: GeneratedObjectStage;
+  /** True only for the first durable release of an admitted generated object. */
+  storageReleased: boolean;
 }
 
 const unicodeScalarLength = (value: string): number => [...value].length;
@@ -941,6 +1357,10 @@ export interface AccessGroup {
 export interface CreateAccessGroupInput {
   name: string;
   description?: string;
+  /** Initial policy subjects. Omitted arrays preserve the legacy empty-group behavior. */
+  userIds?: string[];
+  modelIds?: string[];
+  tokenIds?: string[];
 }
 export interface UpdateAccessGroupInput {
   expectedVersion: number;
@@ -951,6 +1371,7 @@ export interface ReplaceAccessGroupPolicyInput extends UpdateAccessGroupInput {
   userIds: string[];
   modelIds: string[];
   tokenIds: string[];
+  acknowledgePublicModelIds: string[];
 }
 export interface AccessGroupPolicyProposal {
   userIds: string[];
@@ -961,6 +1382,25 @@ export interface AccessGroupPolicyImpact {
   modelIdsBecomingPublic: string[];
   tokenIdsLosingGroupAccess: string[];
   tokenIdsRevertingToOwnerInheritance: string[];
+}
+
+/**
+ * Canonicalizes an acknowledgement as a mathematical set. Callers use the same representation
+ * for both the locked impact and the supplied acknowledgement so neither ordering nor duplicate
+ * JSON entries can create a false mismatch.
+ */
+export function normalizeModelAccessWideningAcknowledgement(ids: readonly string[]): string[] {
+  return [...new Set(ids)].sort();
+}
+
+export function modelAccessWideningAcknowledgementMatches(
+  actualModelIds: readonly string[],
+  acknowledgedModelIds: readonly string[],
+): boolean {
+  const actual = normalizeModelAccessWideningAcknowledgement(actualModelIds);
+  const acknowledged = normalizeModelAccessWideningAcknowledgement(acknowledgedModelIds);
+  return actual.length === acknowledged.length &&
+    actual.every((modelId, index) => modelId === acknowledged[index]);
 }
 export interface EntitledProviderModel {
   model: ProviderModelRecord;
@@ -1126,6 +1566,145 @@ export type UserPreferencesPatch =
     >
   >
   & { expectedVersion: number };
+
+/** Authenticated self-service actor for an atomically audited consent mutation. */
+export interface CommunityProfileMutationContext {
+  actorId: string;
+}
+
+export type CommunityProfilePatch = UpdateCommunityProfileRequest;
+
+/** Expected validation failure at the persistence boundary, safe to project as a client error. */
+export class CommunityProfileValidationError extends TypeError {}
+
+const COMMUNITY_NICKNAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9_. -]{0,30}[A-Za-z0-9])?$/;
+const COMMUNITY_PROFILE_PATCH_FIELDS = new Set([
+  "expectedVersion",
+  "optedIn",
+  "identityMode",
+  "nickname",
+  "color",
+  "shareBalance",
+]);
+
+/**
+ * Persistence-boundary canonicalization. API schemas are defense in depth; direct repository
+ * callers and future transports receive the exact same consent and display-identity invariants.
+ */
+export function applyCommunityProfilePatch(
+  current: CommunityProfile,
+  patch: CommunityProfilePatch,
+): Omit<CommunityProfile, "version" | "createdAt" | "updatedAt"> {
+  const nickname = typeof patch?.nickname === "string" ? patch.nickname.trim() : patch?.nickname;
+  if (
+    !patch || typeof patch !== "object" || Array.isArray(patch) ||
+    Object.keys(patch).some((key) => !COMMUNITY_PROFILE_PATCH_FIELDS.has(key)) ||
+    !Number.isSafeInteger(patch.expectedVersion) || patch.expectedVersion < 1 ||
+    Object.keys(patch).every((key) => key === "expectedVersion") ||
+    (patch.optedIn !== undefined && typeof patch.optedIn !== "boolean") ||
+    (patch.identityMode !== undefined &&
+      patch.identityMode !== "anonymous" && patch.identityMode !== "nickname") ||
+    (nickname !== undefined && nickname !== null &&
+      (typeof nickname !== "string" || nickname.length < 2 ||
+        nickname.length > 32 || !COMMUNITY_NICKNAME_PATTERN.test(nickname))) ||
+    (patch.color !== undefined &&
+      !(COMMUNITY_COLOR_TOKENS as readonly string[]).includes(patch.color)) ||
+    (patch.shareBalance !== undefined && typeof patch.shareBalance !== "boolean")
+  ) {
+    throw new CommunityProfileValidationError("Community profile update is invalid");
+  }
+
+  const optedIn = patch.optedIn ?? current.optedIn;
+  const identityMode = patch.identityMode ?? current.identityMode;
+  let canonicalNickname = nickname === undefined ? current.nickname : nickname;
+  if (identityMode === "anonymous") {
+    if (nickname != null) {
+      throw new CommunityProfileValidationError("Anonymous identity cannot publish a nickname");
+    }
+    canonicalNickname = null;
+  } else if (!canonicalNickname) {
+    throw new CommunityProfileValidationError("Nickname identity requires a nickname");
+  }
+  if (!optedIn && patch.shareBalance === true) {
+    throw new CommunityProfileValidationError(
+      "Balance sharing requires leaderboard participation",
+    );
+  }
+  return {
+    userId: current.userId,
+    optedIn,
+    identityMode,
+    nickname: canonicalNickname,
+    color: patch.color ?? current.color,
+    shareBalance: optedIn ? patch.shareBalance ?? current.shareBalance : false,
+  };
+}
+
+export interface CommunityLeaderboardBoundary {
+  score: number;
+  userId: string;
+  position: number;
+}
+
+export interface CommunityLeaderboardReadQuery {
+  metric: CommunityLeaderboardMetric;
+  window: CommunityLeaderboardWindow | "current";
+  from: string | null;
+  asOf: string;
+  limit: number;
+  after?: CommunityLeaderboardBoundary;
+}
+
+/** Internal row; API projection must remove `userId` before serialization. */
+export interface CommunityLeaderboardRepositoryEntry {
+  userId: string;
+  position: number;
+  identityMode: CommunityIdentityMode;
+  nickname: string | null;
+  color: CommunityColorToken;
+  value: number;
+}
+
+export interface CommunityLeaderboardRepositoryPage {
+  data: CommunityLeaderboardRepositoryEntry[];
+  nextBoundary: CommunityLeaderboardBoundary | null;
+}
+
+const COMMUNITY_LEADERBOARD_METRIC_SET = new Set(["calls", "tokens", "cost", "balance"]);
+const COMMUNITY_LEADERBOARD_WINDOW_DAYS = { "7d": 7, "30d": 30, "90d": 90 } as const;
+const COMMUNITY_LEADERBOARD_UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+export function validateCommunityLeaderboardReadQuery(
+  input: CommunityLeaderboardReadQuery,
+): CommunityLeaderboardReadQuery {
+  const asOfMs = Date.parse(input?.asOf);
+  const fromMs = input?.from === null ? null : Date.parse(input?.from);
+  const days = input?.window === "current"
+    ? null
+    : COMMUNITY_LEADERBOARD_WINDOW_DAYS[input?.window];
+  if (
+    !input || typeof input !== "object" ||
+    !COMMUNITY_LEADERBOARD_METRIC_SET.has(input.metric) ||
+    !Number.isFinite(asOfMs) || new Date(asOfMs).toISOString() !== input.asOf ||
+    !Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 100 ||
+    (input.metric === "balance" &&
+      (input.window !== "current" || input.from !== null)) ||
+    (input.metric !== "balance" &&
+      (input.window === "current" ||
+        days == null || fromMs === null ||
+        !Number.isFinite(fromMs) || new Date(fromMs).toISOString() !== input.from ||
+        fromMs >= asOfMs || asOfMs - fromMs !== days * 86_400_000)) ||
+    (input.after !== undefined &&
+      (!input.after || !Number.isSafeInteger(input.after.score) || input.after.score < 0 ||
+        !Number.isSafeInteger(input.after.position) || input.after.position < 1 ||
+        !COMMUNITY_LEADERBOARD_UUID_PATTERN.test(input.after.userId)))
+  ) {
+    throw new TypeError("Community leaderboard query is invalid");
+  }
+  return input;
+}
+
 export interface WorkspaceList {
   folders: ConversationFolder[];
   memberships: ConversationFolderMembership[];
@@ -1139,7 +1718,6 @@ export interface AdminSummary {
   calls: number;
   users: number;
   balanceMicros: number;
-  ledger: LedgerEntry[];
 }
 export type AnalyticsBucket = "hour" | "day";
 export type AdminAnalyticsStatus = "reserved" | "completed" | "failed";
@@ -1218,6 +1796,38 @@ export interface AdminJobPage {
 export interface RetriedAdminJob {
   job: AdminJobSummary;
   priorAttempts: number;
+}
+export interface AdminWorkerInstance {
+  instanceId: string;
+  workerName: string;
+  state: "starting" | "running" | "draining" | "stopped";
+  startedAt: string;
+  heartbeatAt: string;
+  progressAt: string;
+  heartbeatAgeMs: number;
+  progressAgeMs: number;
+  heartbeatStaleMs: number;
+  progressStaleMs: number;
+  healthClockToleranceMs: number;
+  liveness: "fresh" | "heartbeat_stale" | "progress_stalled" | "inactive";
+  currentJobId: string | null;
+  currentJobType: string | null;
+  lastCompletedAt: string | null;
+  lastCompletedJobId: string | null;
+  lastCompletedJobType: string | null;
+}
+export type AdminWorkerScope = "active" | "history" | "all";
+export interface AdminWorkerQuery {
+  scope?: AdminWorkerScope;
+  cursor?: string;
+  limit?: number;
+}
+export interface AdminWorkerPage {
+  items: AdminWorkerInstance[];
+  scope: AdminWorkerScope;
+  limit: number;
+  nextCursor: string | null;
+  hasMore: boolean;
 }
 export type RetentionDays = 1 | 7 | 14 | 30 | 90;
 export interface RetentionPolicy {
@@ -1300,10 +1910,27 @@ export interface EnqueueRetentionScrubInput {
   requestCutoffAt: string;
   responseCutoffAt: string;
 }
+export interface ScheduleRetentionScrubInput {
+  /** Durable cadence. Production configuration is bounded to five minutes through thirty days. */
+  intervalSeconds: number;
+  /** Injectable only so memory and PostgreSQL implementations can exercise identical boundaries. */
+  now?: string;
+}
+export type RetentionScheduleReason = "interval_due" | "policy_changed";
+export interface RetentionScheduleResult {
+  scheduled: boolean;
+  reason: RetentionScheduleReason | null;
+  run: RetentionScrubRun | null;
+  intervalSeconds: number;
+  nextDueAt: string;
+  /** How late the due slot was when this scheduling transaction began. */
+  overdueSeconds: number;
+}
 export type ApiIdempotencyEndpoint =
   | "chat.completions"
   | "responses"
   | "embeddings"
+  | "files"
   | "images.generations"
   | "images.edits"
   | "audio.transcriptions"
@@ -1895,12 +2522,20 @@ export interface EnsureIdempotentReservationInput {
   model: string;
   provider: string;
   reservedMicros: number;
+  recoveryOwner: UsageRecoveryOwner;
 }
+
+export type UsageRecoveryOwner =
+  | "provider"
+  | "api_replay"
+  | "document_embedding"
+  | "tool";
 
 /** Persistence boundary shared by synchronous test stores and async production stores. */
 export interface DomainRepository {
   readonly storageKind: "postgres" | "memory";
   close(): MaybePromise<void>;
+  /** Creates the first administrator, credit grant, and bootstrap audit as one transaction. */
   bootstrapAdmin(input: CreateUserInput, startingCreditMicros: number): MaybePromise<StoredUser>;
   createUser(input: CreateUserInput): MaybePromise<StoredUser>;
   findUser(id: string): MaybePromise<StoredUser | undefined>;
@@ -1908,7 +2543,12 @@ export interface DomainRepository {
   listUsers(): MaybePromise<PublicUser[]>;
   listAdminUsers(query?: AdminUserQuery): MaybePromise<AdminUserPage>;
   getAdminUser(id: string): MaybePromise<AdminUser>;
-  createSession(userId: string, tokenHash: string, limited: boolean): MaybePromise<StoredSession>;
+  createSession(
+    userId: string,
+    tokenHash: string,
+    limited: boolean,
+    expectedAuthorityEpoch?: number,
+  ): MaybePromise<StoredSession>;
   getSession(tokenHash: string): MaybePromise<StoredSession | undefined>;
   invalidateUserSessions(userId: string): MaybePromise<void>;
   deleteSession(tokenHash: string): MaybePromise<void>;
@@ -1940,12 +2580,15 @@ export interface DomainRepository {
     purpose: IdentityTokenPurpose,
     tokenHash: string,
     expiresAt: string,
+    expectedAuthorityEpoch: number,
   ): MaybePromise<void>;
+  /** Consumes the token, verifies the identity, and appends its audit as one transaction. */
   verifyEmail(tokenHash: string): MaybePromise<StoredUser>;
   markUserEmailVerified(userId: string): MaybePromise<StoredUser>;
+  /** Changes the credential, revokes prior authority, and appends its audit as one transaction. */
   resetPassword(tokenHash: string, passwordHash: string): MaybePromise<StoredUser>;
-  prepareBetterAuthPasswordReset(token: string): MaybePromise<void>;
-  secureAfterPasswordReset(userId: string, token: string): MaybePromise<void>;
+  /** Better Auth equivalent of resetPassword, with the same transactional audit invariant. */
+  resetBetterAuthPassword(token: string, passwordHash: string): MaybePromise<StoredUser>;
   recordAudit(input: AuditEventInput): MaybePromise<AuditEvent>;
   listAudit(query?: AuditQuery): MaybePromise<AuditPage>;
   decideUserApproval(input: AdminApprovalCommand): MaybePromise<AdminUser>;
@@ -1963,6 +2606,11 @@ export interface DomainRepository {
     ownerId: string,
     includeDeleted?: boolean,
   ): MaybePromise<LifecycleConversation[]>;
+  searchConversations(
+    ownerId: string,
+    query: ConversationSearchQuery,
+    signal?: AbortSignal,
+  ): MaybePromise<ConversationSearchPage>;
   updateConversation(
     ownerId: string,
     id: string,
@@ -1978,6 +2626,7 @@ export interface DomainRepository {
     input: PurgeTemporaryConversationsInput,
   ): MaybePromise<PurgeTemporaryConversationsResult>;
   getUserPreferences(ownerId: string): MaybePromise<UserPreferences>;
+  getCommunityProfile(ownerId: string): MaybePromise<CommunityProfile>;
   exportConversationPortability(
     ownerId: string,
     options?: ConversationPortabilityExportOptions,
@@ -2015,6 +2664,15 @@ export interface DomainRepository {
     ownerId: string,
     patch: UserPreferencesPatch,
   ): MaybePromise<UserPreferences>;
+  /** Updates installation-community consent and appends its audit in the same transaction. */
+  updateCommunityProfile(
+    ownerId: string,
+    patch: CommunityProfilePatch,
+    context: CommunityProfileMutationContext,
+  ): MaybePromise<CommunityProfile>;
+  listCommunityLeaderboard(
+    query: CommunityLeaderboardReadQuery,
+  ): MaybePromise<CommunityLeaderboardRepositoryPage>;
   listConversationFolders(ownerId: string): MaybePromise<WorkspaceList>;
   createConversationFolder(
     ownerId: string,
@@ -2093,8 +2751,67 @@ export interface DomainRepository {
     leafId: string,
     expectedVersion: number,
   ): MaybePromise<Conversation>;
-  createAttachment(input: CreateAttachmentInput): MaybePromise<CreateAttachmentResult>;
+  createAttachment(
+    input: CreateAttachmentInput,
+    quota?: AttachmentStorageQuota,
+  ): MaybePromise<CreateAttachmentResult>;
+  /**
+   * Atomically admits an attachment and binds it to a stored generated-object stage.
+   * Callers must use this instead of publishing the attachment and stage in separate commits.
+   */
+  createAttachmentFromGeneratedObjectStage(
+    id: string,
+    ownerId: string,
+    input: CreateAttachmentInput,
+    quota?: AttachmentStorageQuota,
+  ): MaybePromise<CreateAttachmentResult>;
+  stageAttachmentUpload(
+    input: StageAttachmentUploadInput,
+    leaseSeconds: number,
+  ): MaybePromise<AttachmentUploadStage>;
+  heartbeatAttachmentUpload(
+    id: string,
+    ownerId: string,
+    uploadLeaseToken: string,
+    leaseSeconds: number,
+  ): MaybePromise<AttachmentUploadStage>;
+  markAttachmentUploadStored(
+    id: string,
+    ownerId: string,
+    uploadLeaseToken: string,
+    leaseSeconds: number,
+  ): MaybePromise<AttachmentUploadStage>;
+  createAttachmentFromUploadStage(
+    id: string,
+    ownerId: string,
+    uploadLeaseToken: string,
+    input: CreateAttachmentInput,
+    quota?: AttachmentStorageQuota,
+  ): MaybePromise<CreateAttachmentResult>;
+  requestAttachmentUploadCleanup(
+    id: string,
+    ownerId: string,
+    uploadLeaseToken: string,
+    reason: string,
+  ): MaybePromise<AttachmentUploadStage>;
+  abandonAttachmentUpload(
+    id: string,
+    ownerId: string,
+    reason: string,
+  ): MaybePromise<AttachmentUploadStage>;
+  stageFileUpload(input: StageFileUploadInput): MaybePromise<FileUploadStage>;
+  markFileUploadStored(requestId: string, leaseToken: string): MaybePromise<FileUploadStage>;
+  listStaleFileUploads(limit?: number): MaybePromise<StaleFileUpload[]>;
+  attachmentObjectReferenceCount(objectKey: string): MaybePromise<number>;
+  finalizeFileUpload(
+    input: FinalizeFileUploadInput,
+    quota?: AttachmentStorageQuota,
+  ): MaybePromise<FinalizeFileUploadResult>;
   listAttachments(ownerId: string, includeDeleted?: boolean): MaybePromise<AttachmentRecord[]>;
+  listAttachmentPage(
+    ownerId: string,
+    query: AttachmentListQuery,
+  ): MaybePromise<AttachmentPage>;
   getAttachment(
     id: string,
     ownerId: string,
@@ -2108,6 +2825,18 @@ export interface DomainRepository {
     nextState: AttachmentState,
     inspectionError?: string | null,
   ): MaybePromise<AttachmentRecord>;
+  requestAttachmentReinspection(
+    input: RequestAttachmentReinspectionInput,
+  ): MaybePromise<AttachmentReinspectionResult>;
+  transitionAttachmentInspection(
+    input: TransitionAttachmentInspectionInput,
+  ): MaybePromise<AttachmentRecord>;
+  attachmentStorageUsage(ownerId: string): MaybePromise<AttachmentStorageUsage>;
+  adminStorageSummary(actorId: string): MaybePromise<AdminStorageSummary>;
+  listAdminAttachments(
+    actorId: string,
+    query: AdminAttachmentQuery,
+  ): MaybePromise<AdminAttachmentPage>;
   linkAttachmentToMessage(
     messageId: string,
     attachmentId: string,
@@ -2151,6 +2880,14 @@ export interface DomainRepository {
     usageRunId: string,
     reason: string,
   ): MaybePromise<number>;
+  /**
+   * Settle a generated cleanup only after the object-store delete succeeds. Replays are
+   * idempotent; cleanupAttachment=false stages never decrement retained-storage counters.
+   */
+  settleGeneratedObjectCleanup(
+    stageId: string,
+    ownerId: string,
+  ): MaybePromise<GeneratedObjectCleanupSettlement>;
   beginAttachmentIngestion(id: string, ownerId: string): MaybePromise<AttachmentRecord>;
   completeAttachmentIngestion(
     id: string,
@@ -2227,50 +2964,102 @@ export interface DomainRepository {
     ownerId: string,
     input: ReplaceConversationKnowledgeInput,
   ): MaybePromise<KnowledgeConversationBinding[]>;
-  createApiToken(userId: string, input: CreateApiTokenInput): MaybePromise<StoredApiToken>;
+  /** Creates a personal token and its mandatory audit record as one atomic command. */
+  createApiToken(
+    userId: string,
+    input: CreateApiTokenInput,
+    expectedAuthorityEpoch: number,
+  ): MaybePromise<StoredApiToken>;
   authenticateApiToken(hash: string): MaybePromise<StoredApiToken | undefined>;
   findApiTokenByHash(hash: string): MaybePromise<StoredApiToken | undefined>;
   listApiTokens(userId: string): MaybePromise<ApiTokenSummary[]>;
-  revokeApiToken(id: string, userId: string): MaybePromise<void>;
+  /** Revokes the token family and appends its mandatory audit in the same transaction. */
+  revokeApiToken(
+    id: string,
+    userId: string,
+    expectedAuthorityEpoch: number,
+  ): MaybePromise<void>;
+  /** Updates the token family and appends its mandatory audit in the same transaction. */
   updateApiToken(
     userId: string,
     id: string,
     input: UpdateApiTokenInput,
+    expectedAuthorityEpoch: number,
   ): MaybePromise<ApiTokenSummary>;
+  /** Rotates the token and appends its mandatory audit before the replacement secret is returned. */
   rotateApiToken(
     userId: string,
     id: string,
     input: RotateApiTokenInput,
+    expectedAuthorityEpoch: number,
   ): MaybePromise<RotatedApiToken>;
-  revokeApiTokenFamily(id: string, userId: string, expectedVersion: number): MaybePromise<void>;
+  /** CAS-revokes the family and appends its mandatory audit in the same transaction. */
+  revokeApiTokenFamily(
+    id: string,
+    userId: string,
+    expectedVersion: number,
+    expectedAuthorityEpoch: number,
+  ): MaybePromise<void>;
   searchApiTokens(
+    context: PrivilegedReadContext,
     query?: string,
     limit?: number,
     cursor?: string,
   ): MaybePromise<AdminTokenLookupPage>;
   listModelAliases(): MaybePromise<ModelAlias[]>;
-  createModelAlias(input: CreateModelAliasInput): MaybePromise<ModelAlias>;
-  updateModelAlias(id: string, input: UpdateModelAliasInput): MaybePromise<ModelAlias>;
-  deleteModelAlias(id: string, expectedVersion: number): MaybePromise<void>;
-  listAccessGroups(): MaybePromise<AccessGroup[]>;
-  createAccessGroup(input: CreateAccessGroupInput): MaybePromise<AccessGroup>;
-  updateAccessGroup(id: string, input: UpdateAccessGroupInput): MaybePromise<AccessGroup>;
-  deleteAccessGroup(id: string, expectedVersion: number): MaybePromise<void>;
+  /** Creates a model alias and appends its mandatory privileged audit atomically. */
+  createModelAlias(
+    input: CreateModelAliasInput,
+    audit: PrivilegedAuditEventInput,
+  ): MaybePromise<ModelAlias>;
+  /** Updates a model alias and appends its mandatory privileged audit atomically. */
+  updateModelAlias(
+    id: string,
+    input: UpdateModelAliasInput,
+    audit: PrivilegedAuditEventInput,
+  ): MaybePromise<ModelAlias>;
+  /** Deletes a model alias and appends its mandatory privileged audit atomically. */
+  deleteModelAlias(
+    id: string,
+    expectedVersion: number,
+    audit: PrivilegedAuditEventInput,
+  ): MaybePromise<void>;
+  listAccessGroups(context: PrivilegedReadContext): MaybePromise<AccessGroup[]>;
+  createAccessGroup(
+    input: CreateAccessGroupInput,
+    audit: PrivilegedAuditEventInput,
+  ): MaybePromise<AccessGroup>;
+  updateAccessGroup(
+    id: string,
+    input: UpdateAccessGroupInput,
+    audit: PrivilegedAuditEventInput,
+  ): MaybePromise<AccessGroup>;
+  deleteAccessGroup(
+    id: string,
+    expectedVersion: number,
+    acknowledgePublicModelIds: string[],
+    audit: PrivilegedAuditEventInput,
+  ): MaybePromise<void>;
   replaceAccessGroupUsers(
     id: string,
     userIds: string[],
     expectedVersion: number,
+    audit: PrivilegedAuditEventInput,
   ): MaybePromise<AccessGroup>;
   replaceAccessGroupModels(
     id: string,
     modelIds: string[],
     expectedVersion: number,
+    acknowledgePublicModelIds: string[],
+    audit: PrivilegedAuditEventInput,
   ): MaybePromise<AccessGroup>;
   replaceAccessGroupPolicy(
     id: string,
     input: ReplaceAccessGroupPolicyInput,
+    audit: PrivilegedAuditEventInput,
   ): MaybePromise<AccessGroup>;
   previewAccessGroupPolicyImpact(
+    context: PrivilegedReadContext,
     id: string,
     proposal?: AccessGroupPolicyProposal | null,
   ): MaybePromise<AccessGroupPolicyImpact>;
@@ -2279,12 +3068,14 @@ export interface DomainRepository {
     tokenId: string,
     groupIds: string[],
     expectedVersion: number,
+    audit: PrivilegedAuditEventInput,
   ): MaybePromise<ApiTokenSummary>;
   setTokenAccessMode(
     userId: string,
     tokenId: string,
     mode: "inherit" | "restricted",
     expectedVersion: number,
+    audit: PrivilegedAuditEventInput,
   ): MaybePromise<ApiTokenSummary>;
   listEntitledProviderModels(subject: TokenAccessSubject): MaybePromise<ProviderModelRecord[]>;
   resolveEntitledProviderModel(
@@ -2426,6 +3217,7 @@ export interface DomainRepository {
     leaseSeconds?: number,
     observation?: ApiUsageObservation,
   ): MaybePromise<void>;
+  releaseApiRequestLease(id: string, leaseToken: string): MaybePromise<ApiIdempotencyRequest>;
   reclaimApiRequest(
     id: string,
     expiredLeaseToken: string,
@@ -2438,10 +3230,16 @@ export interface DomainRepository {
   pruneExpiredApiRequests(limit?: number): MaybePromise<number>;
   usage(userId: string): MaybePromise<UsageSummary>;
   listLedger(userId: string): MaybePromise<LedgerEntry[]>;
-  enqueueJob(type: string, payload: unknown, availableAt?: string): MaybePromise<string>;
+  enqueueJob(
+    type: string,
+    payload: unknown,
+    availableAt?: string,
+    idempotencyKey?: string,
+  ): MaybePromise<string>;
   adminSummary(): MaybePromise<AdminSummary>;
   adminAnalytics(query: AdminAnalyticsQuery): MaybePromise<AdminAnalytics>;
   listJobs(query?: AdminJobQuery): MaybePromise<AdminJobPage>;
+  listWorkerInstances(query?: AdminWorkerQuery): MaybePromise<AdminWorkerPage>;
   /** Atomically requeues a failed job and records the privileged actor in the audit log. */
   retryFailedJob(id: string, actorId: string): MaybePromise<RetriedAdminJob>;
   getRetentionPolicy(): MaybePromise<RetentionPolicy>;
@@ -2455,8 +3253,15 @@ export interface DomainRepository {
   previewRetentionScrub(): MaybePromise<RetentionPreview>;
   enqueueRetentionScrub(
     input: EnqueueRetentionScrubInput,
-    actorId: string,
+    actorId: string | null,
   ): MaybePromise<RetentionScrubRun>;
+  /**
+   * Atomically fences all scheduler replicas, snapshots the current policy/cutoffs, and enqueues
+   * at most one durable retention.scrub job for the due slot or newly activated policy version.
+   */
+  scheduleRetentionScrub(
+    input: ScheduleRetentionScrubInput,
+  ): MaybePromise<RetentionScheduleResult>;
   getRetentionScrubRun(id: string): MaybePromise<RetentionScrubRun>;
   listRetentionScrubRuns(query?: RetentionScrubQuery): MaybePromise<RetentionScrubPage>;
   scrubRetentionBatch(runId: string, limit?: number): MaybePromise<RetentionScrubBatchResult>;

@@ -60,6 +60,31 @@ Deno.test("public Chat and Responses routes execute a native Responses registry 
     }
     const id = `resp_${upstreamBodies.length}`;
     if (body.stream === true) {
+      if (JSON.stringify(body.input).includes("force streaming secret")) {
+        const events = [{
+          type: "response.created",
+          response: { id, status: "in_progress", model: "native-upstream" },
+        }, {
+          type: "response.failed",
+          response: {
+            id,
+            status: "failed",
+            model: "native-upstream",
+            error: {
+              code: "server_error",
+              message: "Bearer streaming-provider-secret at https://internal.example.test",
+            },
+          },
+        }];
+        return Promise.resolve(
+          new Response(
+            events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(
+              "",
+            ),
+            { headers: { "content-type": "text/event-stream" } },
+          ),
+        );
+      }
       if (JSON.stringify(body.input).includes("long token without usage")) {
         const text = " ".repeat(256);
         const messageId = `msg_long_${upstreamBodies.length}`;
@@ -318,7 +343,9 @@ Deno.test("public Chat and Responses routes execute a native Responses registry 
         ),
       );
     }
-    const incomplete = JSON.stringify(body.input).includes("truncate response");
+    const serializedInput = JSON.stringify(body.input);
+    const incomplete = serializedInput.includes("truncate response");
+    const highNativeToolUsage = serializedInput.includes("native shadow tool accounting");
     return Promise.resolve(Response.json({
       id,
       object: "response",
@@ -330,9 +357,15 @@ Deno.test("public Chat and Responses routes execute a native Responses registry 
         type: "message",
         role: "assistant",
         status: "completed",
-        content: [{ type: "output_text", text: "native buffered result", annotations: [] }],
+        content: [{
+          type: "output_text",
+          text: highNativeToolUsage ? "ok" : "native buffered result",
+          annotations: [],
+        }],
       }],
-      usage: { input_tokens: 8, output_tokens: 3, total_tokens: 11 },
+      usage: highNativeToolUsage
+        ? { input_tokens: 8_000, output_tokens: 1, total_tokens: 8_001 }
+        : { input_tokens: 8, output_tokens: 3, total_tokens: 11 },
     }));
   };
   const { app, repository } = createApp({
@@ -400,7 +433,7 @@ Deno.test("public Chat and Responses routes execute a native Responses registry 
       publicModelId: "native-responses/model",
       upstreamModelId: "native-upstream",
       displayName: "Native Responses",
-      capabilities: ["chat", "streaming"],
+      capabilities: ["chat", "streaming", "tools"],
       // A tiny request must reserve its bounded input, not nearly the entire large context window.
       contextWindow: 4_000_000,
       enabled: true,
@@ -502,7 +535,7 @@ Deno.test("public Chat and Responses routes execute a native Responses registry 
       user: "public-buffered-user",
     }),
   });
-  assertEquals(response.status, 200);
+  assertEquals(response.status, 200, await response.clone().text());
   assertStringIncludes((await json(response)).output[0].content[0].text, "native buffered result");
   assertEquals(upstreamBodies[2].store, false);
   assertEquals(upstreamBodies[2].metadata, { request: "buffered" });
@@ -676,6 +709,11 @@ Deno.test("public Chat and Responses routes execute a native Responses registry 
   assertEquals(cancelledUsage?.status, "completed");
   assertEquals((cancelledUsage?.outputTokens ?? 0) > 0, true);
 
+  const nativeUser = [...(repository as MemoryRepository).users.values()].find((candidate) =>
+    candidate.email === "native-responses@example.com"
+  );
+  assertExists(nativeUser);
+  const balanceBeforeRateLimit = (await repository.usage(nativeUser.id)).balanceMicros;
   const rateLimited = await app.request("/v1/responses", {
     method: "POST",
     headers: { ...openAIHeaders, "idempotency-key": "native-response-rate-limit" },
@@ -689,7 +727,9 @@ Deno.test("public Chat and Responses routes execute a native Responses registry 
   assertEquals(rateLimited.headers.get("retry-after"), "2");
   assertEquals(rateLimitedBody.error.code, "rate_limit_exceeded");
   assertEquals(rateLimitedBody.error.type, "rate_limit_error");
-  assertStringIncludes(rateLimitedBody.error.message, "Native provider rate limit");
+  assertEquals(rateLimitedBody.error.message, "The provider rate limit was exceeded");
+  assertEquals(JSON.stringify(rateLimitedBody).includes("Native provider rate limit"), false);
+  assertEquals((await repository.usage(nativeUser.id)).balanceMicros, balanceBeforeRateLimit);
 
   const authenticationFailure = await app.request("/v1/responses", {
     method: "POST",
@@ -743,6 +783,99 @@ Deno.test("public Chat and Responses routes execute a native Responses registry 
   assertEquals(timeoutBody.error.code, "timeout");
   assertEquals(timeoutBody.error.type, "server_error");
 
+  for (
+    const [name, tool] of [
+      ["web-search", { type: "web_search", search_context_size: "medium" }],
+      ["mcp", { type: "mcp", server_label: "docs", server_url: "https://mcp.example.test" }],
+    ] as const
+  ) {
+    const dispatchesBefore = upstreamBodies.length;
+    const usageBefore = memory.usageRuns.size;
+    const deniedTool = await app.request("/v1/responses", {
+      method: "POST",
+      headers: { ...openAIHeaders, "idempotency-key": `native-response-${name}` },
+      body: JSON.stringify({
+        model: "native-responses/model",
+        input: "do not dispatch network tools",
+        tools: [tool],
+        tool_choice: "auto",
+      }),
+    });
+    const deniedBody = await json(deniedTool);
+    assertEquals(deniedTool.status, 400, JSON.stringify(deniedBody));
+    assertEquals(deniedBody.error.code, "unsupported_feature");
+    assertEquals(upstreamBodies.length, dispatchesBefore);
+    assertEquals(memory.usageRuns.size, usageBefore);
+  }
+
+  const safeFunctionTools = [{
+    type: "function",
+    name: "lookup",
+    description: "Look up an internal value",
+    parameters: { type: "object", properties: { key: { type: "string" } } },
+  }];
+  const functionToolResponse = await app.request("/v1/responses", {
+    method: "POST",
+    headers: { ...openAIHeaders, "idempotency-key": "native-response-function-tools" },
+    body: JSON.stringify({
+      model: "native-responses/model",
+      input: "use a bounded function",
+      tools: safeFunctionTools,
+      tool_choice: "auto",
+    }),
+  });
+  assertEquals(functionToolResponse.status, 200, await functionToolResponse.clone().text());
+  assertEquals(upstreamBodies.at(-1)?.tools, safeFunctionTools);
+
+  const nativeOnlyInput = [{
+    type: "reasoning",
+    summary: [{ type: "summary_text", text: "prior provider state" }],
+    status: "completed",
+  }, {
+    type: "message",
+    role: "user",
+    content: "native shadow tool accounting",
+  }];
+  const largeNativeFunctionTools = [{
+    type: "function",
+    name: "large_native_schema",
+    description: "x".repeat(8_192),
+    parameters: { type: "object", properties: {} },
+  }];
+  const nativeToolAccounting = await app.request("/v1/responses", {
+    method: "POST",
+    headers: { ...openAIHeaders, "idempotency-key": "native-response-native-tool-accounting" },
+    body: JSON.stringify({
+      model: "native-responses/model",
+      input: nativeOnlyInput,
+      max_output_tokens: 8,
+      tools: largeNativeFunctionTools,
+      tool_choice: "auto",
+    }),
+  });
+  assertEquals(
+    nativeToolAccounting.status,
+    200,
+    await nativeToolAccounting.clone().text(),
+  );
+  assertEquals(upstreamBodies.at(-1)?.input, nativeOnlyInput);
+  assertEquals(upstreamBodies.at(-1)?.tools, largeNativeFunctionTools);
+
+  const streamingFailure = await app.request("/v1/responses", {
+    method: "POST",
+    headers: { ...openAIHeaders, "idempotency-key": "native-response-stream-secret" },
+    body: JSON.stringify({
+      model: "native-responses/model",
+      input: "force streaming secret",
+      stream: true,
+    }),
+  });
+  const streamingFailureText = await streamingFailure.text();
+  assertStringIncludes(streamingFailureText, '"code":"provider_error"');
+  assertStringIncludes(streamingFailureText, '"message":"Provider request failed"');
+  assertEquals(streamingFailureText.includes("streaming-provider-secret"), false);
+  assertEquals(streamingFailureText.includes("internal.example.test"), false);
+
   const dispatchesBeforeUnsupportedStore = upstreamBodies.length;
   const usageBeforeUnsupportedStore = memory.usageRuns.size;
   const unsupportedStore = await app.request("/v1/responses", {
@@ -759,4 +892,50 @@ Deno.test("public Chat and Responses routes execute a native Responses registry 
   assertEquals(unsupportedStoreBody.error.code, "unsupported_parameter");
   assertEquals(upstreamBodies.length, dispatchesBeforeUnsupportedStore);
   assertEquals(memory.usageRuns.size, usageBeforeUnsupportedStore);
+
+  const account = memory.users.get(nativeUser.id);
+  assertExists(account);
+  account.balanceMicros = 5_000;
+  const dispatchesBeforeNativeToolCredit = upstreamBodies.length;
+  const insufficientNativeToolCredit = await app.request("/v1/responses", {
+    method: "POST",
+    headers: {
+      ...openAIHeaders,
+      "idempotency-key": "native-response-native-tool-insufficient-credit",
+    },
+    body: JSON.stringify({
+      model: "native-responses/model",
+      input: nativeOnlyInput,
+      max_output_tokens: 8,
+      tools: largeNativeFunctionTools,
+      tool_choice: "auto",
+    }),
+  });
+  assertEquals(
+    insufficientNativeToolCredit.status,
+    402,
+    await insufficientNativeToolCredit.clone().text(),
+  );
+  assertEquals((await json(insufficientNativeToolCredit)).error.code, "insufficient_credit");
+  assertEquals(upstreamBodies.length, dispatchesBeforeNativeToolCredit);
+
+  const dispatchesBeforeLargeTool = upstreamBodies.length;
+  const insufficientToolCredit = await app.request("/v1/responses", {
+    method: "POST",
+    headers: { ...openAIHeaders, "idempotency-key": "native-response-large-tool-credit" },
+    body: JSON.stringify({
+      model: "native-responses/model",
+      input: "small prompt",
+      max_output_tokens: 1,
+      tools: [{
+        type: "function",
+        name: "large_schema",
+        description: "x".repeat(8_192),
+        parameters: { type: "object", properties: {} },
+      }],
+    }),
+  });
+  assertEquals(insufficientToolCredit.status, 402, await insufficientToolCredit.clone().text());
+  assertEquals((await json(insufficientToolCredit)).error.code, "insufficient_credit");
+  assertEquals(upstreamBodies.length, dispatchesBeforeLargeTool);
 });

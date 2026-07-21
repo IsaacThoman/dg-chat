@@ -144,6 +144,44 @@ Deno.test("isolated extraction preemptively terminates CPU-bound worker code", a
   if (performance.now() - started > 1_000) throw new Error("CPU-bound worker was not preempted");
 });
 
+Deno.test("worker shutdown preemptively terminates active isolated extraction", async () => {
+  const script = URL.createObjectURL(
+    new Blob([`self.onmessage = () => { while (true) {} };`], { type: "text/javascript" }),
+  );
+  const controller = new AbortController();
+  const started = performance.now();
+  const extraction = extractDocumentIsolated(
+    new Uint8Array([1]),
+    "application/pdf",
+    {},
+    Date.now() + 60_000,
+    () => new Worker(script, { type: "module", deno: { permissions: "none" } }),
+    controller.signal,
+  );
+  controller.abort(new DOMException("Worker stopping", "AbortError"));
+  await assertRejects(() => extraction, DOMException, "Worker stopping");
+  URL.revokeObjectURL(script);
+  if (performance.now() - started > 1_000) throw new Error("Shutdown did not stop extraction");
+});
+
+Deno.test("synchronous isolated-worker construction failure disposes its deadline timer", async () => {
+  const failure = new Error("worker construction failed");
+  await assertRejects(
+    () =>
+      extractDocumentIsolated(
+        new Uint8Array([1]),
+        "application/pdf",
+        {},
+        Date.now() + 60_000,
+        () => {
+          throw failure;
+        },
+      ),
+    Error,
+    failure.message,
+  );
+});
+
 Deno.test("real extraction worker returns a structured document", async () => {
   const bytes = zipSync({
     "[Content_Types].xml": strToU8(
@@ -163,7 +201,10 @@ Deno.test("real extraction worker returns a structured document", async () => {
     bytes,
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     {},
-    Date.now() + 5_000,
+    // A real module worker performs a cold module graph check before its first message. Keep this
+    // integration assertion independent of host/CI contention; deadline behavior is covered by
+    // the deterministic timeout tests above.
+    Date.now() + 30_000,
   );
   assertEquals(result.text, "isolated text");
 });

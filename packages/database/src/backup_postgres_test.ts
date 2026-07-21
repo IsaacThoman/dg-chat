@@ -1,6 +1,7 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.14";
 import postgres from "npm:postgres@3.4.7";
 import { BackupOperationError, PostgresBackupStore } from "./backup-postgres.ts";
+import { runAuditTestMaintenanceSql } from "./postgres-test-maintenance.ts";
 
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
 
@@ -14,7 +15,10 @@ Deno.test({
     const first = await PostgresBackupStore.connect(databaseUrl!);
     const second = await PostgresBackupStore.connect(databaseUrl!);
     try {
-      await sql`TRUNCATE backup_operations,installation_state,users RESTART IDENTITY CASCADE`;
+      await runAuditTestMaintenanceSql(
+        sql,
+        "TRUNCATE backup_operations,installation_state,users RESTART IDENTITY CASCADE",
+      );
       await sql`INSERT INTO installation_state(singleton_id) VALUES(1)`;
       const actorId = crypto.randomUUID();
       await sql`INSERT INTO users(

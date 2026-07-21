@@ -6,7 +6,7 @@ import {
   ProviderExecutionEngine,
   TerminalAccountingPersistenceError,
 } from "./provider-execution.ts";
-import { ProviderAttemptError } from "./provider-resilience.ts";
+import { ProviderAttemptError, ResilienceExhaustedError } from "./provider-resilience.ts";
 import { ProviderSecretKeyring } from "./provider-secrets.ts";
 
 Deno.test("provider execution retries through the breaker, falls back, and persists exact attempts", async () => {
@@ -1264,7 +1264,7 @@ Deno.test("provider execution dispatches native Responses targets", async () => 
   assertEquals(fixture.repo.listProviderAttempts(fixture.runId)[0].status, "succeeded");
 });
 
-Deno.test("provider execution rejects store=true before a Chat dispatch", async () => {
+Deno.test("provider execution privately exhausts store=true before a Chat dispatch", async () => {
   const fixture = await singleProviderFixture("chat_completions");
   let dispatched = false;
   const engine = new ProviderExecutionEngine({
@@ -1294,17 +1294,19 @@ Deno.test("provider execution rejects store=true before a Chat dispatch", async 
         undefined,
         { store: true },
       ),
-    ProviderAttemptError,
-    "cannot preserve",
+    ResilienceExhaustedError,
+    "All provider candidates were exhausted",
   );
-  assertEquals(error.options.candidateLocal, true);
+  assertEquals(error.attempts, 1);
+  assertEquals(error.lastError, undefined);
+  assertEquals(error.retryAfterMs, undefined);
   assertEquals(dispatched, false);
   const [attempt] = fixture.repo.listProviderAttempts(fixture.runId);
   assertEquals(attempt.costMicros, 0);
   assertEquals(attempt.inputTokens, 0);
 });
 
-Deno.test("provider execution skips Chat transport for native-only stateless input", async () => {
+Deno.test("provider execution privately exhausts Chat transport for native-only input", async () => {
   const fixture = await singleProviderFixture("chat_completions");
   let dispatched = false;
   const engine = new ProviderExecutionEngine({
@@ -1338,10 +1340,12 @@ Deno.test("provider execution skips Chat transport for native-only stateless inp
           requiresNativeInput: true,
         },
       ),
-    ProviderAttemptError,
-    "cannot preserve",
+    ResilienceExhaustedError,
+    "All provider candidates were exhausted",
   );
-  assertEquals(error.options.candidateLocal, true);
+  assertEquals(error.attempts, 1);
+  assertEquals(error.lastError, undefined);
+  assertEquals(error.retryAfterMs, undefined);
   assertEquals(dispatched, false);
   const [attempt] = fixture.repo.listProviderAttempts(fixture.runId);
   assertEquals(attempt.costMicros, 0);

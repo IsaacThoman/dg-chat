@@ -3,6 +3,7 @@ import io
 import json
 import uuid
 import base64
+import struct
 
 from openai import OpenAI
 
@@ -212,11 +213,23 @@ if (
     or len(embeddings.data) != 2
     or embeddings.data[0].index != 0
     or embeddings.data[1].index != 1
-    or embeddings.data[0].embedding != [0.1, 0.2, 0.3, 0.4]
+    or embeddings.data[0].embedding != [0.01, 0.02, 0.03, 0.04]
     or embeddings.usage.prompt_tokens != 2
     or embeddings.usage.total_tokens != 2
 ):
     raise RuntimeError("Python embeddings.create() returned an invalid response")
+
+base64_embeddings = client.embeddings.create(
+    model=embedding_model,
+    input="Python base64 embedding",
+    encoding_format="base64",
+)
+encoded_embedding = base64_embeddings.data[0].embedding
+if not isinstance(encoded_embedding, str):
+    raise RuntimeError("Python base64 embeddings did not preserve the encoded vector")
+decoded_embedding = base64.b64decode(encoded_embedding)
+if len(decoded_embedding) != 16 or abs(struct.unpack("<f", decoded_embedding[:4])[0] - 0.01) > 1e-6:
+    raise RuntimeError("Python base64 embedding bytes were invalid")
 
 completion = client.chat.completions.create(
     model=model,
@@ -234,6 +247,19 @@ stream = client.chat.completions.create(
 streamed_text = "".join((chunk.choices[0].delta.content or "") for chunk in stream)
 if "Python streaming contract" not in streamed_text:
     raise RuntimeError("Python streaming completion did not contain the expected content")
+
+usage_stream = client.chat.completions.create(
+    model=model,
+    stream=True,
+    stream_options={"include_usage": True},
+    messages=[{"role": "user", "content": "Python streaming usage contract"}],
+)
+streamed_usage = 0
+for chunk in usage_stream:
+    if chunk.usage is not None:
+        streamed_usage = chunk.usage.total_tokens
+if streamed_usage <= 0:
+    raise RuntimeError("Python Chat stream omitted requested terminal usage")
 
 nullable_completion = client.chat.completions.create(
     model=model,
@@ -372,6 +398,34 @@ native_response = client.responses.create(
 if "native Responses public contract" not in native_response.output_text:
     raise RuntimeError("Python Responses API did not use a native Responses upstream")
 
+direct_tool_response = client.responses.create(
+    model=responses_model,
+    input="Python direct Responses tool contract",
+    tools=[{
+        "type": "function",
+        "name": "lookup_weather",
+        "description": "Look up weather",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    }],
+    tool_choice={"type": "function", "name": "lookup_weather"},
+)
+direct_tool_call = next(
+    (item for item in direct_tool_response.output if item.type == "function_call"),
+    None,
+)
+if (
+    direct_tool_call is None
+    or direct_tool_call.name != "lookup_weather"
+    or json.loads(direct_tool_call.arguments)["city"] != "New York"
+):
+    raise RuntimeError("Python direct Responses function tool contract was invalid")
+
 stateless_native_response = client.responses.create(
     model=responses_model,
     input=[
@@ -471,11 +525,41 @@ if (
 file_text = f"Python files contract {uuid.uuid4()}\n"
 file_bytes = file_text.encode("utf-8")
 file_name = f"python-contract-{uuid.uuid4()}.txt"
-uploaded = client.files.create(
+file_idempotency_key = f"python-file-{uuid.uuid4()}"
+upload_result = client.files.with_raw_response.create(
     file=(file_name, io.BytesIO(file_bytes), "text/plain"),
     purpose="assistants",
+    extra_headers={"Idempotency-Key": file_idempotency_key},
 )
+uploaded = upload_result.parse()
+upload_replay = client.files.with_raw_response.create(
+    file=(file_name, io.BytesIO(file_bytes), "text/plain"),
+    purpose="assistants",
+    extra_headers={"Idempotency-Key": file_idempotency_key},
+)
+replayed_upload = upload_replay.parse()
+if (
+    replayed_upload.id != uploaded.id
+    or replayed_upload.model_dump() != uploaded.model_dump()
+    or upload_replay.headers.get("x-idempotent-replay") != "true"
+):
+    raise RuntimeError("Python files.create() idempotent replay contract failed")
+file_conflict = False
+try:
+    client.files.create(
+        file=(file_name, io.BytesIO(file_bytes + b"drift"), "text/plain"),
+        purpose="assistants",
+        extra_headers={"Idempotency-Key": file_idempotency_key},
+    )
+except Exception as error:
+    file_conflict = (
+        getattr(error, "status_code", None) == 409
+        and getattr(error, "code", None) == "idempotency_conflict"
+    )
+if not file_conflict:
+    raise RuntimeError("Python files.create() idempotency drift was not rejected")
 deleted = False
+pagination_uploads = [uploaded]
 try:
     if (
         uploaded.object != "file"
@@ -485,13 +569,47 @@ try:
     ):
         raise RuntimeError("Python files.create() returned an invalid file object")
 
-    files = client.files.list()
+    for index in range(2):
+        page_text = f"Python paginated file {index} {uuid.uuid4()}\n".encode("utf-8")
+        pagination_uploads.append(
+            client.files.create(
+                file=(
+                    f"python-page-{uuid.uuid4()}.txt",
+                    io.BytesIO(page_text),
+                    "text/plain",
+                ),
+                purpose="assistants",
+            )
+        )
+
+    files = client.files.list(limit=1, order="desc", purpose="assistants")
     if (
-        not isinstance(files.data, list)
-        or files.has_more is not False
-        or not any(item.id == uploaded.id for item in files.data)
+        len(files.data) != 1
+        or files.has_more is not True
+        or not files.has_next_page()
     ):
-        raise RuntimeError("Python files.list() did not include the uploaded file")
+        raise RuntimeError(
+            "Python files.list() did not return a compatible bounded first page"
+        )
+    second_files_page = files.get_next_page()
+    if (
+        len(second_files_page.data) != 1
+        or second_files_page.data[0].id == files.data[0].id
+    ):
+        raise RuntimeError("Python files.list() cursor repeated or skipped its second page")
+    expected_page_ids = {item.id for item in pagination_uploads}
+    iterated_page_ids = {
+        item.id
+        for item in client.files.list(limit=1, order="asc", purpose="assistants")
+        if item.id in expected_page_ids
+    }
+    if iterated_page_ids != expected_page_ids:
+        raise RuntimeError(
+            "Python files.list() auto-pagination did not visit every uploaded file"
+        )
+    unrelated_purpose = client.files.list(limit=1, purpose="fine-tune")
+    if unrelated_purpose.data or unrelated_purpose.has_more is not False:
+        raise RuntimeError("Python files.list() purpose filtering returned unrelated files")
 
     retrieved = client.files.retrieve(uploaded.id)
     if retrieved.id != uploaded.id or retrieved.filename != file_name:
@@ -516,9 +634,11 @@ try:
     else:
         raise RuntimeError("Python deleted file remained retrievable")
 finally:
-    if not deleted:
+    for pagination_upload in pagination_uploads:
+        if pagination_upload.id == uploaded.id and deleted:
+            continue
         try:
-            client.files.delete(uploaded.id)
+            client.files.delete(pagination_upload.id)
         except Exception:
             pass
 

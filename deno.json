@@ -5,16 +5,19 @@
     "./apps/worker",
     "./apps/web",
     "./packages/contracts",
-    "./packages/database"
+    "./packages/database",
+    "./packages/observability"
   ],
   "nodeModulesDir": "manual",
   "tasks": {
     "dev": "deno task --filter @dg-chat/api dev",
     "dev:web": "deno task --filter @dg-chat/web dev",
     "dev:worker": "deno task --filter @dg-chat/worker dev",
-    "check": "deno fmt --check && deno lint && deno check apps/api/src/main.ts apps/mock-oidc/src/main.ts apps/mock-oidc/src/provider.ts apps/worker/src/main.ts apps/web/src/main.tsx packages/contracts/mod.ts packages/database/mod.ts",
+    "check": "deno fmt --check && deno lint && deno check apps/api/src/main.ts apps/mock-oidc/src/main.ts apps/mock-oidc/src/provider.ts apps/worker/src/main.ts apps/web/src/main.tsx packages/contracts/mod.ts packages/database/mod.ts packages/observability/mod.ts",
     "test": "deno test --unstable-worker-options apps/api apps/mock-oidc apps/worker packages/contracts packages/database --allow-env --allow-net --allow-read --allow-write --allow-run",
     "test:web": "deno task --filter @dg-chat/web test",
+    "test:load:safety": "deno test tests/load/safety_test.ts tests/load/runtime_test.ts tests/load/run_script_test.ts --allow-env --allow-read --allow-write --allow-run=bash,openssl,deno",
+    "load": "bash tests/load/run.sh",
     "build": "deno task --filter @dg-chat/web build",
     "db:generate": "deno task --filter @dg-chat/database generate",
     "db:migrate": "deno task --filter @dg-chat/database migrate"

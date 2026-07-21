@@ -8,6 +8,9 @@ import type {
   AdminApiTokenPage,
   AdminApiTokenQuery,
   AdminApiTokenRevocationCommand,
+  AdminAttachmentPage,
+  AdminAttachmentQuery,
+  AdminAttachmentSummary,
   AdminBalanceAdjustment,
   AdminBalanceAdjustmentCommand,
   AdminLedgerPage,
@@ -15,15 +18,21 @@ import type {
   AdminSessionPage,
   AdminSessionQuery,
   AdminSessionRevocationCommand,
+  AdminStorageSummary,
   AdminUser,
   AdminUserPage,
   AdminUserQuery,
   ApiTokenSummary,
   ApprovalStatus,
+  AttachmentStorageUsage,
+  CommunityProfile,
   Conversation,
   ConversationFolder,
   ConversationFolderMembership,
   ConversationPortabilityV1,
+  ConversationSearchPage,
+  ConversationSearchQuery,
+  ConversationSearchResult,
   ConversationShareSummary,
   ConversationTag,
   ConversationTagBinding,
@@ -50,21 +59,32 @@ import {
   API_SSE_REPLAY_REQUEST_MAX_BYTES,
   API_SSE_REPLAY_REQUEST_MAX_EVENTS,
   apiResponseBodyByteLength,
+  applyCommunityProfilePatch,
   canonicalWorkspaceName,
+  CONVERSATION_SEARCH_QUERY_VALIDATION_MESSAGE,
+  conversationSearchMatchIndex,
+  conversationSearchMessageContent,
+  conversationSearchSnippet,
   decodeAdminResourceCursor,
   decodeAdminUserCursor,
+  decodeConversationSearchCursor,
   DEFAULT_API_REPLAY_QUOTA,
   encodeAdminResourceCursor,
   encodeAdminUserCursor,
+  encodeConversationSearchCursor,
+  isCanonicalFileUploadObjectKey,
   MAX_ACTIVE_CONVERSATION_SHARES,
   MAX_CONVERSATION_SHARE_ATTACHMENTS,
   MAX_CONVERSATION_SHARE_CONTENT_CHARS,
   MAX_CONVERSATION_SHARE_MESSAGES,
+  modelAccessWideningAcknowledgementMatches,
   normalizeKnowledgeSearchLimit,
   planAbandonedApiReplay,
   splitApiSseReplayFrame,
   validateChunkEmbeddings,
   validateDocumentChunkInputs,
+  validConversationSearchScopeId,
+  validConversationSearchTerm,
 } from "./repository.ts";
 import type {
   AccessGroup,
@@ -82,12 +102,19 @@ import type {
   AdminRoleCommand,
   AdminStateCommand,
   AdminTokenLookupPage,
+  AdminWorkerPage,
+  AdminWorkerQuery,
   ApiIdempotencyEndpoint,
   ApiIdempotencyRequest,
   ApiReplayQuota,
   ApiUsageObservation,
+  AttachmentListQuery,
+  AttachmentPage,
   AttachmentRecord,
+  AttachmentReinspectionResult,
   AttachmentState,
+  AttachmentStorageQuota,
+  AttachmentUploadStage,
   AuditEvent,
   AuditEventInput,
   AuditPage,
@@ -97,6 +124,10 @@ import type {
   BeginAssistantGenerationInput,
   BeginGenerationInput,
   BeginGenerationResult,
+  CommunityLeaderboardReadQuery,
+  CommunityLeaderboardRepositoryPage,
+  CommunityProfileMutationContext,
+  CommunityProfilePatch,
   CompleteApiRequestInput,
   CompleteGenerationInput,
   ConversationPortabilityImportResult,
@@ -124,7 +155,10 @@ import type {
   EntitledProviderModel,
   FailApiRequestInput,
   FailGenerationInput,
+  FileUploadStage,
   FinalizeEmbeddingProviderUsageInput,
+  FinalizeFileUploadInput,
+  FinalizeFileUploadResult,
   FinalizeGeneratedAssetsInput,
   FinalizeProviderUsageInput,
   FinishEmbeddingProviderAttemptInput,
@@ -142,6 +176,8 @@ import type {
   LifecycleConversationDetail,
   ModelAlias,
   ModelPriceVersion,
+  PrivilegedAuditEventInput,
+  PrivilegedReadContext,
   ProviderAttempt,
   ProviderCredentialEnvelope,
   ProviderCredentialMutation,
@@ -158,9 +194,11 @@ import type {
   RegistryMutationContext,
   ReplaceAccessGroupPolicyInput,
   ReplaceConversationKnowledgeInput,
+  RequestAttachmentReinspectionInput,
   ReserveChildProviderUsageInput,
   RetentionPolicy,
   RetentionPreview,
+  RetentionScheduleResult,
   RetentionScrubBatchResult,
   RetentionScrubFailureCode,
   RetentionScrubPage,
@@ -168,13 +206,17 @@ import type {
   RetentionScrubRun,
   RotateApiTokenInput,
   RotatedApiToken,
+  ScheduleRetentionScrubInput,
   SearchConversationKnowledgeInput,
   SessionSummary,
   SetProviderModelRouteInput,
+  StageAttachmentUploadInput,
+  StageFileUploadInput,
   StageGeneratedObjectInput,
   StartProviderAttemptInput,
   StoredProviderCredential,
   TokenAccessSubject,
+  TransitionAttachmentInspectionInput,
   UpdateAccessGroupInput,
   UpdateApiTokenInput,
   UpdateModelAliasInput,
@@ -183,25 +225,34 @@ import type {
   UpdateProviderRetryPolicyInput,
   UpdateRetentionPolicyInput,
   UsagePricingSnapshot,
+  UsageRecoveryOwner,
 } from "./repository.ts";
 import {
+  ATTACHMENT_INSPECTION_POLICY_VERSION,
+  attachmentReinspectionEligibility,
+  decodeAdminAttachmentCursor,
   decodeAuditCursor,
+  encodeAdminAttachmentCursor,
   encodeAuditCursor,
   isUsagePricingSnapshot,
   sameGeneratedAssetFinalization,
   usagePricingSnapshotsEqual,
+  validateCommunityLeaderboardReadQuery,
   validateGeneratedAssetFinalization,
 } from "./repository.ts";
 
 export interface StoredUser extends PublicUser {
   passwordHash: string | null;
   passwordResetPending?: boolean;
+  /** Monotonic generation invalidating credentials and already-admitted issuance requests. */
+  authorityEpoch: number;
 }
 export interface StoredSession {
   id: string;
   tokenHash: string;
   userId: string;
   limited: boolean;
+  authorityEpoch: number;
   expiresAt: number;
   createdAt: string;
   invalidatedAt: string | null;
@@ -209,6 +260,7 @@ export interface StoredSession {
 export interface StoredApiToken extends ApiTokenSummary {
   userId: string;
   tokenHash: string;
+  authorityEpoch: number;
 }
 interface StoredConversationShare {
   summary: ConversationShareSummary;
@@ -232,8 +284,10 @@ export interface LedgerEntry {
 export interface UsageRun {
   id: string;
   userId: string;
+  tokenId: string | null;
   model: string;
   provider: string;
+  recoveryOwner: UsageRecoveryOwner;
   status: "reserved" | "completed" | "failed";
   reservedMicros: number;
   costMicros: number;
@@ -253,6 +307,8 @@ export interface UsageRun {
   generationLeaseToken: string | null;
   generationLeaseExpiresAt: string | null;
   createdAt: string;
+  /** Settlement fence used by analytics; legacy in-memory fixtures may omit it. */
+  completedAt?: string | null;
 }
 
 export class DomainError extends Error {
@@ -536,9 +592,34 @@ export class MemoryRepository {
     purpose: IdentityTokenPurpose;
     expiresAt: string;
     consumedAt: string | null;
+    authorityEpoch: number;
   }>();
   readonly auditEvents: AuditEvent[] = [];
   readonly attachments = new Map<string, AttachmentRecord>();
+  readonly attachmentStorageBlobs = new Map<
+    string,
+    { ownerId: string; objectKey: string; sizeBytes: number; sha256: string; mimeType: string }
+  >();
+  readonly attachmentStorageReleases = new Map<
+    string,
+    {
+      id: string;
+      stageId: string;
+      usageRunId: string;
+      ownerId: string;
+      objectKey: string;
+      attachmentId: string;
+      sizeBytes: number;
+      sha256: string;
+      mimeType: string;
+      releasedAt: string;
+    }
+  >();
+  readonly attachmentStorageUsageByOwner = new Map<
+    string,
+    { physicalBytes: number; physicalObjects: number }
+  >();
+  attachmentStorageInstallation = { physicalBytes: 0, physicalObjects: 0 };
   readonly attachmentDimensions = new Map<
     string,
     { width: number | null; height: number | null }
@@ -578,8 +659,24 @@ export class MemoryRepository {
   };
   readonly providerPayloadCaptures = new Map<string, ProviderPayloadCapture>();
   readonly retentionScrubRuns = new Map<string, RetentionScrubRun>();
+  retentionScheduleState: {
+    intervalSeconds: number;
+    nextDueAt: string;
+    lastPolicyVersion: number | null;
+    lastScheduledAt: string | null;
+    lastRunId: string | null;
+    updatedAt: string;
+  } = {
+    intervalSeconds: 86_400,
+    nextDueAt: new Date(0).toISOString(),
+    lastPolicyVersion: null,
+    lastScheduledAt: null,
+    lastRunId: null,
+    updatedAt: new Date(0).toISOString(),
+  };
   readonly conversations = new Map<string, Conversation>();
   readonly userPreferences = new Map<string, UserPreferences>();
+  readonly communityProfiles = new Map<string, CommunityProfile>();
   readonly conversationFolders = new Map<string, ConversationFolder>();
   readonly conversationFolderMemberships = new Map<string, ConversationFolderMembership>();
   readonly conversationTags = new Map<string, ConversationTag>();
@@ -603,6 +700,9 @@ export class MemoryRepository {
   readonly generationControls = new Map<string, GenerationControl>();
   readonly apiIdempotencyRequests = new Map<string, ApiIdempotencyRequest>();
   readonly apiIdempotencyKeys = new Map<string, string>();
+  readonly fileUploadStages = new Map<string, FileUploadStage>();
+  readonly attachmentUploadStages = new Map<string, AttachmentUploadStage>();
+  #attachmentUploadFinalizeStageId: string | null = null;
   readonly jobs: Array<
     {
       id: string;
@@ -638,14 +738,30 @@ export class MemoryRepository {
     if ([...this.users.values()].some((user) => user.role === "admin")) {
       throw new DomainError("already_bootstrapped", "An administrator already exists", 409);
     }
-    const user = this.createUser({
-      ...input,
-      role: "admin",
-      approvalStatus: "approved",
-      emailVerified: true,
-    });
-    this.credit(user.id, `bootstrap:${user.id}`, "grant", startingCreditMicros);
-    return user;
+    const ledgerLength = this.ledger.length;
+    const auditLength = this.auditEvents.length;
+    let user: StoredUser | undefined;
+    try {
+      user = this.createUser({
+        ...input,
+        role: "admin",
+        approvalStatus: "approved",
+        emailVerified: true,
+      });
+      this.credit(user.id, `bootstrap:${user.id}`, "grant", startingCreditMicros);
+      this.recordAudit({
+        actorId: user.id,
+        action: "identity.bootstrap_admin",
+        targetType: "user",
+        targetId: user.id,
+      });
+      return user;
+    } catch (error) {
+      if (user) this.users.delete(user.id);
+      this.ledger.length = ledgerLength;
+      this.auditEvents.length = auditLength;
+      throw error;
+    }
   }
 
   createUser(
@@ -676,6 +792,7 @@ export class MemoryRepository {
       email: input.email,
       name: input.name,
       passwordHash: input.passwordHash ?? null,
+      authorityEpoch: 1,
       role: input.role ?? "user",
       approvalStatus: input.approvalStatus ?? "pending",
       state: input.state ?? "active",
@@ -718,18 +835,47 @@ export class MemoryRepository {
     return [...this.users.values()].map((user) => this.publicUser(user));
   }
 
-  #isEffectiveAdmin(user: StoredUser): boolean {
+  #isEffectiveAdmin(user: StoredUser, requireEmailVerification = false): boolean {
     return user.role === "admin" && user.approvalStatus === "approved" &&
-      user.state === "active" && user.deletedAt === null;
+      user.state === "active" && user.deletedAt === null && !user.passwordResetPending &&
+      (!requireEmailVerification || user.emailVerifiedAt !== null);
   }
 
   #adminUser(user: StoredUser): AdminUser {
     return { ...this.publicUser(user), effectiveAdmin: this.#isEffectiveAdmin(user) };
   }
 
-  #assertEffectiveAdminActor(actorId: string): void {
+  #requireAuthorityEpoch(expectedAuthorityEpoch: number | undefined): number {
+    if (!Number.isSafeInteger(expectedAuthorityEpoch) || expectedAuthorityEpoch! < 1) {
+      throw new DomainError(
+        "validation_error",
+        "Expected authority epoch must be a positive integer",
+        422,
+      );
+    }
+    return expectedAuthorityEpoch!;
+  }
+
+  #assertEffectiveAdminActor(
+    actorId: string,
+    requireEmailVerification = false,
+    expectedAuthorityEpoch?: number,
+  ): void {
+    if (
+      expectedAuthorityEpoch !== undefined &&
+      (!Number.isSafeInteger(expectedAuthorityEpoch) || expectedAuthorityEpoch < 1)
+    ) {
+      throw new DomainError(
+        "validation_error",
+        "Expected authority epoch must be a positive integer",
+        422,
+      );
+    }
     const actor = this.users.get(actorId);
-    if (!actor || !this.#isEffectiveAdmin(actor)) {
+    if (
+      !actor || !this.#isEffectiveAdmin(actor, requireEmailVerification) ||
+      expectedAuthorityEpoch !== undefined && actor.authorityEpoch !== expectedAuthorityEpoch
+    ) {
       throw new DomainError(
         "admin_authority_required",
         "Administrator authority changed before the request completed",
@@ -762,10 +908,14 @@ export class MemoryRepository {
     return user;
   }
 
-  #assertAdminCanLoseAuthority(user: StoredUser, remainsEffective: boolean): void {
-    if (!this.#isEffectiveAdmin(user) || remainsEffective) return;
+  #assertAdminCanLoseAuthority(
+    user: StoredUser,
+    remainsEffective: boolean,
+    requireEmailVerification = false,
+  ): void {
+    if (!this.#isEffectiveAdmin(user, requireEmailVerification) || remainsEffective) return;
     const otherEffectiveAdmins = [...this.users.values()].filter((candidate) =>
-      candidate.id !== user.id && this.#isEffectiveAdmin(candidate)
+      candidate.id !== user.id && this.#isEffectiveAdmin(candidate, requireEmailVerification)
     );
     if (otherEffectiveAdmins.length === 0) {
       throw new DomainError("final_admin", "The final active administrator is protected", 409);
@@ -773,6 +923,8 @@ export class MemoryRepository {
   }
 
   #invalidateFullAuthority(userId: string): void {
+    const user = this.users.get(userId);
+    if (user) user.authorityEpoch++;
     for (const [hash, session] of this.sessions) {
       if (session.userId === userId && !session.limited) this.sessions.delete(hash);
     }
@@ -912,7 +1064,12 @@ export class MemoryRepository {
   }
 
   decideUserApproval(input: AdminApprovalCommand): AdminUser {
-    this.#assertEffectiveAdminActor(input.actorId);
+    this.#requireAuthorityEpoch(input.expectedAuthorityEpoch);
+    this.#assertEffectiveAdminActor(
+      input.actorId,
+      input.requireEmailVerification,
+      input.expectedAuthorityEpoch,
+    );
     return this.#withAtomicAdminMutation(input.targetUserId, () => {
       const user = this.#adminTarget(
         input.targetUserId,
@@ -930,8 +1087,9 @@ export class MemoryRepository {
         input.status === "approved" && input.requireEmailVerification && !user.emailVerifiedAt
       ) throw new DomainError("email_not_verified", "Email must be verified before approval", 409);
       const remainsEffective = user.role === "admin" && input.status === "approved" &&
-        user.state === "active" && user.deletedAt === null;
-      this.#assertAdminCanLoseAuthority(user, remainsEffective);
+        user.state === "active" && user.deletedAt === null && !user.passwordResetPending &&
+        (!input.requireEmailVerification || user.emailVerifiedAt !== null);
+      this.#assertAdminCanLoseAuthority(user, remainsEffective, input.requireEmailVerification);
       if (
         !Number.isSafeInteger(input.startingCreditMicros) || input.startingCreditMicros < 0 ||
         input.startingCreditMicros > 1_000_000_000
@@ -961,7 +1119,12 @@ export class MemoryRepository {
   }
 
   setAdminUserRole(input: AdminRoleCommand): AdminUser {
-    this.#assertEffectiveAdminActor(input.actorId);
+    this.#requireAuthorityEpoch(input.expectedAuthorityEpoch);
+    this.#assertEffectiveAdminActor(
+      input.actorId,
+      input.requireEmailVerification,
+      input.expectedAuthorityEpoch,
+    );
     return this.#withAtomicAdminMutation(input.targetUserId, () => {
       const user = this.#adminTarget(input.targetUserId, input.expectedVersion, input.reason, true);
       if (user.role === input.role) {
@@ -972,7 +1135,8 @@ export class MemoryRepository {
       }
       if (
         input.role === "admin" &&
-        (user.approvalStatus !== "approved" || user.state !== "active" || user.deletedAt !== null)
+        (user.approvalStatus !== "approved" || user.state !== "active" ||
+          user.deletedAt !== null || user.passwordResetPending)
       ) {
         throw new DomainError(
           "invalid_transition",
@@ -980,9 +1144,13 @@ export class MemoryRepository {
           409,
         );
       }
+      if (input.role === "admin" && input.requireEmailVerification && !user.emailVerifiedAt) {
+        throw new DomainError("email_not_verified", "Email must be verified before promotion", 409);
+      }
       const remainsEffective = input.role === "admin" && user.approvalStatus === "approved" &&
-        user.state === "active" && user.deletedAt === null;
-      this.#assertAdminCanLoseAuthority(user, remainsEffective);
+        user.state === "active" && user.deletedAt === null && !user.passwordResetPending &&
+        (!input.requireEmailVerification || user.emailVerifiedAt !== null);
+      this.#assertAdminCanLoseAuthority(user, remainsEffective, input.requireEmailVerification);
       const before = {
         role: user.role,
         approvalStatus: user.approvalStatus,
@@ -991,12 +1159,21 @@ export class MemoryRepository {
         version: user.version,
       };
       user.role = input.role;
+      // A role transition changes the privilege represented by every full credential in either
+      // direction. Promotion must not turn a previously stolen ordinary-user session into an
+      // administrator session without a fresh proof of identity.
+      this.#invalidateFullAuthority(user.id);
       return this.#finishAdminMutation(input, user, `user.role.${input.role}`, before);
     });
   }
 
   setAdminUserState(input: AdminStateCommand): AdminUser {
-    this.#assertEffectiveAdminActor(input.actorId);
+    this.#requireAuthorityEpoch(input.expectedAuthorityEpoch);
+    this.#assertEffectiveAdminActor(
+      input.actorId,
+      input.requireEmailVerification,
+      input.expectedAuthorityEpoch,
+    );
     return this.#withAtomicAdminMutation(input.targetUserId, () => {
       const user = this.#adminTarget(
         input.targetUserId,
@@ -1011,8 +1188,9 @@ export class MemoryRepository {
         throw new DomainError("self_action_forbidden", "You cannot suspend your own account", 403);
       }
       const remainsEffective = user.role === "admin" && user.approvalStatus === "approved" &&
-        input.state === "active" && user.deletedAt === null;
-      this.#assertAdminCanLoseAuthority(user, remainsEffective);
+        input.state === "active" && user.deletedAt === null && !user.passwordResetPending &&
+        (!input.requireEmailVerification || user.emailVerifiedAt !== null);
+      this.#assertAdminCanLoseAuthority(user, remainsEffective, input.requireEmailVerification);
       const before = {
         role: user.role,
         approvalStatus: user.approvalStatus,
@@ -1027,7 +1205,12 @@ export class MemoryRepository {
   }
 
   setAdminUserDeleted(input: AdminDeletionCommand): AdminUser {
-    this.#assertEffectiveAdminActor(input.actorId);
+    this.#requireAuthorityEpoch(input.expectedAuthorityEpoch);
+    this.#assertEffectiveAdminActor(
+      input.actorId,
+      input.requireEmailVerification,
+      input.expectedAuthorityEpoch,
+    );
     return this.#withAtomicAdminMutation(input.targetUserId, () => {
       const user = this.#adminTarget(input.targetUserId, input.expectedVersion, input.reason, true);
       if ((user.deletedAt !== null) === input.deleted) {
@@ -1037,8 +1220,9 @@ export class MemoryRepository {
         throw new DomainError("self_action_forbidden", "You cannot delete your own account", 403);
       }
       const remainsEffective = user.role === "admin" && user.approvalStatus === "approved" &&
-        user.state === "active" && !input.deleted;
-      this.#assertAdminCanLoseAuthority(user, remainsEffective);
+        user.state === "active" && !input.deleted && !user.passwordResetPending &&
+        (!input.requireEmailVerification || user.emailVerifiedAt !== null);
+      this.#assertAdminCanLoseAuthority(user, remainsEffective, input.requireEmailVerification);
       const before = {
         role: user.role,
         approvalStatus: user.approvalStatus,
@@ -1057,13 +1241,27 @@ export class MemoryRepository {
     });
   }
 
-  createSession(userId: string, tokenHash: string, limited: boolean): StoredSession {
+  createSession(
+    userId: string,
+    tokenHash: string,
+    limited: boolean,
+    expectedAuthorityEpoch = 1,
+  ): StoredSession {
+    const user = this.users.get(userId);
+    const eligible = user && user.state === "active" && user.deletedAt === null &&
+      user.passwordResetPending !== true && user.approvalStatus !== "rejected" &&
+      (limited || user.approvalStatus === "approved") &&
+      user.authorityEpoch === expectedAuthorityEpoch;
+    if (!eligible) {
+      throw new DomainError("account_unavailable", "Account cannot create this session", 403);
+    }
     const now = new Date().toISOString();
     const session = {
       id: crypto.randomUUID(),
       tokenHash,
       userId,
       limited,
+      authorityEpoch: expectedAuthorityEpoch,
       expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000,
       createdAt: now,
       invalidatedAt: null,
@@ -1074,7 +1272,11 @@ export class MemoryRepository {
 
   getSession(tokenHash: string) {
     const session = this.sessions.get(tokenHash);
-    if (!session || session.invalidatedAt || session.expiresAt <= Date.now()) return undefined;
+    const user = session ? this.users.get(session.userId) : undefined;
+    if (
+      !session || !user || (!session.limited && session.authorityEpoch !== user.authorityEpoch) ||
+      session.invalidatedAt || session.expiresAt <= Date.now()
+    ) return undefined;
     return session;
   }
 
@@ -1429,11 +1631,21 @@ export class MemoryRepository {
     purpose: IdentityTokenPurpose,
     tokenHash: string,
     expiresAt: string,
+    expectedAuthorityEpoch: number,
   ) {
+    const user = this.users.get(userId);
+    if (
+      !user || user.state !== "active" || user.deletedAt !== null ||
+      user.authorityEpoch !== expectedAuthorityEpoch ||
+      (purpose === "password_reset" &&
+        (user.approvalStatus === "rejected" || user.passwordResetPending === true))
+    ) throw new DomainError("account_unavailable", "Identity authority changed", 403);
     const existing = this.identityTokens.get(tokenHash);
     if (existing) {
       if (
-        existing.userId !== userId || existing.purpose !== purpose || existing.consumedAt !== null
+        existing.userId !== userId || existing.purpose !== purpose ||
+        existing.consumedAt !== null ||
+        existing.authorityEpoch !== expectedAuthorityEpoch
       ) {
         throw new DomainError(
           "identity_token_conflict",
@@ -1443,13 +1655,20 @@ export class MemoryRepository {
       }
       return;
     }
-    this.identityTokens.set(tokenHash, { userId, purpose, expiresAt, consumedAt: null });
+    this.identityTokens.set(tokenHash, {
+      userId,
+      purpose,
+      expiresAt,
+      consumedAt: null,
+      authorityEpoch: expectedAuthorityEpoch,
+    });
   }
   verifyEmail(tokenHash: string) {
     const token = this.identityTokens.get(tokenHash);
     if (
       !token || token.purpose !== "email_verification" || token.consumedAt ||
-      Date.parse(token.expiresAt) <= Date.now()
+      Date.parse(token.expiresAt) <= Date.now() ||
+      token.authorityEpoch !== this.users.get(token.userId)?.authorityEpoch
     ) {
       throw new DomainError(
         "invalid_identity_token",
@@ -1457,17 +1676,25 @@ export class MemoryRepository {
         400,
       );
     }
-    const user = this.users.get(token.userId)!;
-    if (user.state !== "active" || user.deletedAt !== null) {
-      throw new DomainError(
-        "invalid_identity_token",
-        "Verification token is invalid or expired",
-        400,
-      );
-    }
-    token.consumedAt = new Date().toISOString();
-    user.emailVerifiedAt = new Date().toISOString();
-    return user;
+    return this.#withAtomicAdminMutation(token.userId, () => {
+      const user = this.users.get(token.userId)!;
+      if (user.state !== "active" || user.deletedAt !== null) {
+        throw new DomainError(
+          "invalid_identity_token",
+          "Verification token is invalid or expired",
+          400,
+        );
+      }
+      token.consumedAt = new Date().toISOString();
+      user.emailVerifiedAt = new Date().toISOString();
+      this.recordAudit({
+        actorId: user.id,
+        action: "identity.email_verified",
+        targetType: "user",
+        targetId: user.id,
+      });
+      return user;
+    });
   }
   markUserEmailVerified(userId: string) {
     const user = this.users.get(userId);
@@ -1482,51 +1709,47 @@ export class MemoryRepository {
     const token = this.identityTokens.get(tokenHash);
     if (
       !token || token.purpose !== "password_reset" || token.consumedAt ||
-      Date.parse(token.expiresAt) <= Date.now()
+      Date.parse(token.expiresAt) <= Date.now() ||
+      token.authorityEpoch !== this.users.get(token.userId)?.authorityEpoch
     ) throw new DomainError("invalid_identity_token", "Reset token is invalid or expired", 400);
-    const user = this.users.get(token.userId)!;
-    if (user.state !== "active" || user.deletedAt !== null) {
-      throw new DomainError("invalid_identity_token", "Reset token is invalid or expired", 400);
-    }
-    token.consumedAt = new Date().toISOString();
-    user.passwordHash = passwordHash;
-    this.invalidateUserSessions(user.id);
-    for (const apiToken of this.tokens.values()) {
-      if (apiToken.userId === user.id && !apiToken.revokedAt) {
-        apiToken.revokedAt = new Date().toISOString();
+    return this.#withAtomicAdminMutation(token.userId, () => {
+      const user = this.users.get(token.userId)!;
+      if (
+        user.state !== "active" || user.deletedAt !== null ||
+        user.approvalStatus === "rejected" || user.passwordResetPending === true
+      ) {
+        throw new DomainError("invalid_identity_token", "Reset token is invalid or expired", 400);
       }
-    }
-    const consumedAt = new Date().toISOString();
-    for (const identityToken of this.identityTokens.values()) {
-      if (identityToken.userId === user.id && !identityToken.consumedAt) {
-        identityToken.consumedAt = consumedAt;
+      token.consumedAt = new Date().toISOString();
+      user.authorityEpoch++;
+      user.passwordHash = passwordHash;
+      this.invalidateUserSessions(user.id);
+      for (const apiToken of this.tokens.values()) {
+        if (apiToken.userId === user.id && !apiToken.revokedAt) {
+          apiToken.revokedAt = new Date().toISOString();
+        }
       }
-    }
-    return user;
+      const consumedAt = new Date().toISOString();
+      for (const identityToken of this.identityTokens.values()) {
+        if (identityToken.userId === user.id && !identityToken.consumedAt) {
+          identityToken.consumedAt = consumedAt;
+        }
+      }
+      this.recordAudit({
+        actorId: user.id,
+        action: "identity.password_reset_completed",
+        targetType: "user",
+        targetId: user.id,
+      });
+      return user;
+    });
   }
-  prepareBetterAuthPasswordReset(_token: string) {
+  resetBetterAuthPassword(_token: string, _passwordHash: string): StoredUser {
     throw new DomainError(
       "better_auth_storage_required",
       "Better Auth password reset requires durable authentication storage",
       503,
     );
-  }
-  secureAfterPasswordReset(userId: string, _token: string) {
-    const user = this.users.get(userId);
-    if (!user) throw new DomainError("not_found", "User not found", 404);
-    if (user.state !== "active" || user.deletedAt !== null) {
-      throw new DomainError("account_unavailable", "Account is unavailable", 403);
-    }
-    user.passwordHash = null;
-    this.invalidateUserSessions(userId);
-    for (const token of this.tokens.values()) {
-      if (token.userId === userId && !token.revokedAt) token.revokedAt = new Date().toISOString();
-    }
-    for (const identityToken of this.identityTokens.values()) {
-      if (identityToken.userId === userId && !identityToken.consumedAt) {
-        identityToken.consumedAt = new Date().toISOString();
-      }
-    }
   }
   recordAudit(input: AuditEventInput): AuditEvent {
     const event = {
@@ -1724,6 +1947,119 @@ export class MemoryRepository {
       c.ownerId === ownerId && (includeDeleted || !c.deletedAt)
     ).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
+  searchConversations(
+    ownerId: string,
+    query: ConversationSearchQuery,
+    signal?: AbortSignal,
+  ): ConversationSearchPage {
+    signal?.throwIfAborted();
+    const limit = query.limit ?? 25;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new DomainError("validation_error", "Search limit must be between 1 and 100", 422);
+    }
+    const needle = query.query.trim().toLowerCase();
+    if (!validConversationSearchTerm(query.query)) {
+      throw new DomainError(
+        "validation_error",
+        CONVERSATION_SEARCH_QUERY_VALIDATION_MESSAGE,
+        422,
+      );
+    }
+    const tagIds = query.tagIds ?? [];
+    if (
+      !["chat", "archived", "trash"].includes(query.view) ||
+      (query.folderId !== undefined && !validConversationSearchScopeId(query.folderId)) ||
+      tagIds.length > 20 || new Set(tagIds).size !== tagIds.length ||
+      tagIds.some((id) => !validConversationSearchScopeId(id))
+    ) throw new DomainError("validation_error", "Invalid conversation search", 422);
+    if (
+      (query.folderId !== undefined &&
+        this.conversationFolders.get(query.folderId)?.ownerId !== ownerId) ||
+      tagIds.some((id) => this.conversationTags.get(id)?.ownerId !== ownerId)
+    ) {
+      throw new DomainError(
+        "validation_error",
+        query.cursor ? "Invalid conversation search cursor" : "Invalid conversation search scope",
+        422,
+      );
+    }
+    const cursor = query.cursor
+      ? decodeConversationSearchCursor(query.cursor, query, ownerId)
+      : undefined;
+    if (query.cursor && !cursor) {
+      throw new DomainError("validation_error", "Invalid conversation search cursor", 422);
+    }
+    const inView = (value: Conversation) =>
+      query.view === "trash" ? value.deletedAt !== null : value.deletedAt === null &&
+        (query.view === "archived" ? value.archivedAt !== null : value.archivedAt === null);
+    const results: ConversationSearchResult[] = [];
+    for (const value of this.conversations.values()) {
+      signal?.throwIfAborted();
+      if (value.ownerId !== ownerId || !inView(value)) continue;
+      const membership = this.conversationFolderMemberships.get(value.id);
+      if (
+        query.folderId &&
+        (membership?.ownerId !== ownerId || membership.folderId !== query.folderId)
+      ) continue;
+      if (
+        tagIds.some((tagId) =>
+          this.conversationTagBindings.get(`${value.id}:${tagId}`)?.ownerId !== ownerId
+        )
+      ) continue;
+      let matched: MessageNode | undefined;
+      if (!value.title.toLowerCase().includes(needle)) {
+        const seen = new Set<string>();
+        let node = value.activeLeafId ? this.messages.get(value.activeLeafId) : undefined;
+        while (node && node.conversationId === value.id && !seen.has(node.id)) {
+          signal?.throwIfAborted();
+          seen.add(node.id);
+          if (
+            (node.role === "user" || node.role === "assistant") && node.status !== "tombstoned" &&
+            conversationSearchMatchIndex(conversationSearchMessageContent(node), needle) >= 0
+          ) {
+            matched = node;
+            break;
+          }
+          node = node.parentId ? this.messages.get(node.parentId) : undefined;
+        }
+        if (!matched) continue;
+      }
+      const titleMatch = value.title.toLowerCase().includes(needle);
+      results.push({
+        ...value,
+        snippet: conversationSearchSnippet(
+          titleMatch ? value.title : conversationSearchMessageContent(matched!),
+          query.query,
+        ),
+        matchSource: titleMatch ? "title" : "message",
+        messageId: titleMatch ? null : matched!.id,
+        messageRole: titleMatch ? null : matched!.role as "user" | "assistant",
+      });
+    }
+    results.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || b.id.localeCompare(a.id));
+    // Cursors are opaque, state-bound positions rather than portable client-provided seek keys.
+    // Requiring the exact tuple to remain visible rejects forged positions and stale cursors after
+    // a conversation changes; the client can restart from the first page in either case.
+    if (
+      cursor &&
+      !results.some((value) => value.id === cursor.id && value.updatedAt === cursor.updatedAt)
+    ) {
+      throw new DomainError("validation_error", "Invalid conversation search cursor", 422);
+    }
+    const afterCursor = cursor
+      ? results.filter((value) =>
+        value.updatedAt < cursor.updatedAt ||
+        (value.updatedAt === cursor.updatedAt && value.id < cursor.id)
+      )
+      : results;
+    const data = afterCursor.slice(0, limit);
+    return {
+      data,
+      nextCursor: afterCursor.length > limit
+        ? encodeConversationSearchCursor(data[data.length - 1], query, ownerId)
+        : null,
+    };
+  }
   updateConversation(
     ownerId: string,
     id: string,
@@ -1795,6 +2131,27 @@ export class MemoryRepository {
         updatedAt: now,
       };
       this.userPreferences.set(ownerId, value);
+    }
+    return { ...value };
+  }
+
+  getCommunityProfile(ownerId: string): CommunityProfile {
+    if (!this.users.has(ownerId)) throw new DomainError("not_found", "User not found", 404);
+    let value = this.communityProfiles.get(ownerId);
+    if (!value) {
+      const now = new Date().toISOString();
+      value = {
+        userId: ownerId,
+        optedIn: false,
+        identityMode: "anonymous",
+        nickname: null,
+        color: "slate",
+        shareBalance: false,
+        version: 1,
+        createdAt: now,
+        updatedAt: now,
+      };
+      this.communityProfiles.set(ownerId, value);
     }
     return { ...value };
   }
@@ -2038,6 +2395,10 @@ export class MemoryRepository {
         sha256: value.sha256,
         state: "failed",
         inspectionError: "Attachment bytes were not included in the .dgchat manifest",
+        requiredInspectionMode: "local",
+        inspectionPolicyVersion: ATTACHMENT_INSPECTION_POLICY_VERSION,
+        inspectionEpoch: 1,
+        version: 1,
         ingestionStatus: "failed",
         ingestionError: "Attachment bytes require a separate restore",
         ingestedAt: null,
@@ -2487,6 +2848,141 @@ export class MemoryRepository {
     } as UserPreferences;
     this.userPreferences.set(ownerId, next);
     return { ...next };
+  }
+
+  updateCommunityProfile(
+    ownerId: string,
+    patch: CommunityProfilePatch,
+    context: CommunityProfileMutationContext,
+  ): CommunityProfile {
+    if (!context || context.actorId !== ownerId) {
+      throw new DomainError("forbidden", "Community profile can only be changed by its owner", 403);
+    }
+    const existed = this.communityProfiles.has(ownerId);
+    const current = this.getCommunityProfile(ownerId);
+    if (current.version !== patch.expectedVersion) {
+      if (!existed) this.communityProfiles.delete(ownerId);
+      throw new DomainError(
+        "version_conflict",
+        "Community profile changed in another request",
+        409,
+      );
+    }
+    let canonical: ReturnType<typeof applyCommunityProfilePatch>;
+    try {
+      canonical = applyCommunityProfilePatch(current, patch);
+    } catch (error) {
+      if (!existed) this.communityProfiles.delete(ownerId);
+      throw error;
+    }
+    const next: CommunityProfile = {
+      ...canonical,
+      version: current.version + 1,
+      createdAt: current.createdAt,
+      updatedAt: new Date().toISOString(),
+    };
+    const auditLength = this.auditEvents.length;
+    this.communityProfiles.set(ownerId, next);
+    try {
+      const changedFields = (
+        ["optedIn", "identityMode", "nickname", "color", "shareBalance"] as const
+      ).filter((field) => current[field] !== next[field]);
+      this.recordAudit({
+        actorId: ownerId,
+        action: "community.profile_updated",
+        targetType: "community_profile",
+        targetId: ownerId,
+        metadata: {
+          changedFields,
+          optedIn: next.optedIn,
+          identityMode: next.identityMode,
+          color: next.color,
+          shareBalance: next.shareBalance,
+          nicknameChanged: current.nickname !== next.nickname,
+          version: next.version,
+        },
+      });
+      return { ...next };
+    } catch (error) {
+      this.auditEvents.length = auditLength;
+      if (existed) this.communityProfiles.set(ownerId, current);
+      else this.communityProfiles.delete(ownerId);
+      throw error;
+    }
+  }
+
+  listCommunityLeaderboard(
+    input: CommunityLeaderboardReadQuery,
+  ): CommunityLeaderboardRepositoryPage {
+    const query = validateCommunityLeaderboardReadQuery(input);
+    const asOf = Date.parse(query.asOf);
+    const from = query.from === null ? null : Date.parse(query.from);
+    const add = (left: number, right: number) => {
+      const safeLeft = Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, left));
+      const safeRight = Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, right));
+      return safeLeft >= Number.MAX_SAFE_INTEGER - safeRight
+        ? Number.MAX_SAFE_INTEGER
+        : safeLeft + safeRight;
+    };
+    const eligible = [...this.communityProfiles.values()].flatMap((profile) => {
+      const user = this.users.get(profile.userId);
+      if (
+        !user || !profile.optedIn || user.approvalStatus !== "approved" ||
+        user.state !== "active" || user.deletedAt !== null ||
+        (query.metric === "balance" && !profile.shareBalance)
+      ) return [];
+      let value = query.metric === "balance" ? Math.max(0, user.balanceMicros) : 0;
+      if (query.metric !== "balance") {
+        for (const run of this.usageRuns.values()) {
+          const completedAt = Date.parse(run.completedAt ?? run.createdAt);
+          if (
+            run.userId !== user.id ||
+            (run.status !== "completed" && run.costMicros <= 0) ||
+            !Number.isFinite(completedAt) ||
+            (from !== null && completedAt < from) || completedAt >= asOf
+          ) continue;
+          value = query.metric === "calls"
+            ? add(value, 1)
+            : query.metric === "tokens"
+            ? add(value, add(run.inputTokens, run.outputTokens))
+            : add(value, run.costMicros);
+        }
+      }
+      return [{
+        userId: user.id,
+        identityMode: profile.identityMode,
+        nickname: profile.identityMode === "nickname" ? profile.nickname : null,
+        color: profile.color,
+        value,
+      }];
+    }).sort((left, right) =>
+      right.value - left.value ||
+      (left.userId < right.userId ? -1 : left.userId > right.userId ? 1 : 0)
+    );
+    let densePosition = 0;
+    let previousValue: number | undefined;
+    const ranked = eligible.map((entry) => {
+      if (previousValue === undefined || entry.value !== previousValue) densePosition++;
+      previousValue = entry.value;
+      return { ...entry, position: densePosition };
+    });
+    const after = query.after;
+    const remaining = after
+      ? ranked.filter((entry) =>
+        entry.value < after.score ||
+        (entry.value === after.score && entry.userId > after.userId)
+      )
+      : ranked;
+    const selected = remaining.slice(0, query.limit + 1);
+    const page = selected.slice(0, query.limit);
+    const data = page;
+    const last = data.at(-1);
+    return {
+      data,
+      nextBoundary: selected.length > query.limit && last
+        ? { score: last.value, userId: last.userId, position: last.position }
+        : null,
+    };
   }
 
   listConversationFolders(ownerId: string) {
@@ -3424,12 +3920,109 @@ export class MemoryRepository {
     return conversation;
   }
 
-  createAttachment(input: CreateAttachmentInput): CreateAttachmentResult {
+  #admitAttachmentStorage(input: CreateAttachmentInput, quota?: AttachmentStorageQuota): boolean {
+    if (
+      quota && (
+        !Number.isSafeInteger(quota.perUserBytes) || quota.perUserBytes < 0 ||
+        !Number.isSafeInteger(quota.perUserObjects) || quota.perUserObjects < 0 ||
+        !Number.isSafeInteger(quota.installationBytes) || quota.installationBytes < 0 ||
+        !Number.isSafeInteger(quota.installationObjects) || quota.installationObjects < 0
+      )
+    ) throw new DomainError("validation_error", "Attachment storage quota is invalid", 422);
+    const key = `${input.ownerId}\0${input.objectKey}`;
+    const prior = this.attachmentStorageBlobs.get(key);
+    if (prior) {
+      if (
+        prior.sizeBytes !== input.sizeBytes || prior.sha256 !== input.sha256 ||
+        prior.mimeType !== input.mimeType
+      ) {
+        throw new DomainError(
+          "attachment_object_conflict",
+          "Attachment object metadata differs from retained history",
+          409,
+        );
+      }
+      if (
+        [...this.attachmentStorageReleases.values()].some((release) =>
+          release.ownerId === input.ownerId && release.objectKey === input.objectKey
+        )
+      ) {
+        throw new DomainError(
+          "attachment_object_conflict",
+          "Released attachment object keys cannot be reused",
+          409,
+        );
+      }
+      return false;
+    }
+    const owner = this.attachmentStorageUsageByOwner.get(input.ownerId) ??
+      { physicalBytes: 0, physicalObjects: 0 };
+    if (
+      quota && (
+        owner.physicalBytes > quota.perUserBytes - input.sizeBytes ||
+        owner.physicalObjects >= quota.perUserObjects ||
+        this.attachmentStorageInstallation.physicalBytes >
+          quota.installationBytes - input.sizeBytes ||
+        this.attachmentStorageInstallation.physicalObjects >= quota.installationObjects
+      )
+    ) throw new DomainError("storage_quota_exceeded", "Attachment storage quota exceeded", 413);
+    this.attachmentStorageBlobs.set(key, {
+      ownerId: input.ownerId,
+      objectKey: input.objectKey,
+      sizeBytes: input.sizeBytes,
+      sha256: input.sha256,
+      mimeType: input.mimeType,
+    });
+    this.attachmentStorageUsageByOwner.set(input.ownerId, {
+      physicalBytes: owner.physicalBytes + input.sizeBytes,
+      physicalObjects: owner.physicalObjects + 1,
+    });
+    this.attachmentStorageInstallation = {
+      physicalBytes: this.attachmentStorageInstallation.physicalBytes + input.sizeBytes,
+      physicalObjects: this.attachmentStorageInstallation.physicalObjects + 1,
+    };
+    return true;
+  }
+
+  #rollbackAttachmentStorageAdmission(input: CreateAttachmentInput): void {
+    const key = `${input.ownerId}\0${input.objectKey}`;
+    if (!this.attachmentStorageBlobs.delete(key)) return;
+    const owner = this.attachmentStorageUsageByOwner.get(input.ownerId)!;
+    this.attachmentStorageUsageByOwner.set(input.ownerId, {
+      physicalBytes: owner.physicalBytes - input.sizeBytes,
+      physicalObjects: owner.physicalObjects - 1,
+    });
+    this.attachmentStorageInstallation = {
+      physicalBytes: this.attachmentStorageInstallation.physicalBytes - input.sizeBytes,
+      physicalObjects: this.attachmentStorageInstallation.physicalObjects - 1,
+    };
+  }
+
+  createAttachment(
+    input: CreateAttachmentInput,
+    quota?: AttachmentStorageQuota,
+  ): CreateAttachmentResult {
     this.validateAttachmentInput(input);
     if (!this.users.has(input.ownerId)) throw new DomainError("not_found", "User not found", 404);
+    if (
+      [...this.attachmentUploadStages.values()].some((stage) =>
+        stage.objectKey === input.objectKey && stage.id !== this.#attachmentUploadFinalizeStageId
+      )
+    ) {
+      throw new DomainError(
+        "upload_stage_conflict",
+        "Attachment object is controlled by a browser upload stage",
+        409,
+      );
+    }
+    const requiredInspectionMode = input.requiredInspectionMode ?? "local";
+    const inspectionPolicyVersion = input.inspectionPolicyVersion ??
+      ATTACHMENT_INSPECTION_POLICY_VERSION;
     const prior = [...this.attachments.values()].find((attachment) =>
       attachment.ownerId === input.ownerId && attachment.sha256 === input.sha256 &&
-      attachment.state !== "deleted"
+      attachment.deletedAt === null &&
+      attachment.requiredInspectionMode === requiredInspectionMode &&
+      attachment.inspectionPolicyVersion === inspectionPolicyVersion
     );
     if (prior) {
       if (prior.sizeBytes !== input.sizeBytes || prior.mimeType !== input.mimeType) {
@@ -3450,13 +4043,422 @@ export class MemoryRepository {
     ) {
       throw new DomainError("object_key_taken", "Attachment object key already exists", 409);
     }
+    const admitted = this.#admitAttachmentStorage(input, quota);
+    const jobsBefore = this.jobs.length;
     const now = new Date().toISOString();
     const attachment: AttachmentRecord = {
       ...input,
       id: crypto.randomUUID(),
       state: input.state ?? "pending",
       inspectionError: input.inspectionError ?? null,
+      requiredInspectionMode,
+      inspectionPolicyVersion,
+      inspectionEpoch: 1,
+      version: 1,
       ingestionStatus: input.state === "ready" && isIngestibleDocumentMime(input.mimeType)
+        ? "queued"
+        : "not_applicable",
+      ingestionError: null,
+      ingestedAt: null,
+      createdAt: now,
+      updatedAt: now,
+      deletedAt: null,
+    };
+    try {
+      this.attachments.set(attachment.id, attachment);
+      this.enqueueAttachmentIngestion(attachment);
+      return {
+        attachment,
+        inspectionJobId: input.inspectionComplete
+          ? null
+          : this.enqueueAttachmentInspection(attachment),
+        deduplicated: false,
+      };
+    } catch (error) {
+      this.attachments.delete(attachment.id);
+      this.jobs.splice(jobsBefore);
+      if (admitted) this.#rollbackAttachmentStorageAdmission(input);
+      throw error;
+    }
+  }
+
+  createAttachmentFromGeneratedObjectStage(
+    id: string,
+    ownerId: string,
+    input: CreateAttachmentInput,
+    quota?: AttachmentStorageQuota,
+  ): CreateAttachmentResult {
+    const stage = this.generatedObjectStages.get(id);
+    if (!stage || stage.ownerId !== ownerId) {
+      throw new DomainError("not_found", "Generated object stage not found", 404);
+    }
+    if (
+      stage.state !== "stored" || input.ownerId !== ownerId ||
+      stage.objectKey !== input.objectKey || stage.sizeBytes !== input.sizeBytes ||
+      stage.sha256 !== input.sha256 || stage.mimeType !== input.mimeType
+    ) {
+      throw new DomainError("generated_stage_conflict", "Generated object stage changed", 409);
+    }
+    const requiredInspectionMode = input.requiredInspectionMode ?? "local";
+    const inspectionPolicyVersion = input.inspectionPolicyVersion ??
+      ATTACHMENT_INSPECTION_POLICY_VERSION;
+    const prior = [...this.attachments.values()].find((attachment) =>
+      attachment.ownerId === input.ownerId && attachment.sha256 === input.sha256 &&
+      attachment.deletedAt === null &&
+      attachment.requiredInspectionMode === requiredInspectionMode &&
+      attachment.inspectionPolicyVersion === inspectionPolicyVersion
+    );
+    if (prior ? prior.state !== "ready" : input.state !== "ready") {
+      throw new DomainError(
+        "generated_stage_conflict",
+        "Generated object attachment is not ready",
+        409,
+      );
+    }
+    const jobsBefore = this.jobs.length;
+    let created: CreateAttachmentResult | undefined;
+    try {
+      created = this.createAttachment(input, quota);
+      this.attachGeneratedObject(
+        id,
+        ownerId,
+        created.attachment.id,
+        created.attachment.objectKey === stage.objectKey,
+      );
+      return created;
+    } catch (error) {
+      this.jobs.splice(jobsBefore);
+      if (created && !created.deduplicated) {
+        this.attachments.delete(created.attachment.id);
+        this.#rollbackAttachmentStorageAdmission(input);
+      }
+      throw error;
+    }
+  }
+
+  stageAttachmentUpload(
+    input: StageAttachmentUploadInput,
+    leaseSeconds: number,
+  ): AttachmentUploadStage {
+    this.validateAttachmentInput(input);
+    if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1 || leaseSeconds > 86_400) {
+      throw new DomainError("validation_error", "Attachment upload lease is invalid", 422);
+    }
+    const prior = this.attachmentUploadStages.get(input.id);
+    if (prior) {
+      if (
+        prior.ownerId !== input.ownerId || prior.objectKey !== input.objectKey ||
+        prior.filename !== input.filename || prior.mimeType !== input.mimeType ||
+        prior.sizeBytes !== input.sizeBytes || prior.sha256 !== input.sha256
+      ) throw new DomainError("idempotency_conflict", "Attachment upload stage differs", 409);
+      return structuredClone(prior);
+    }
+    if (
+      [...this.attachmentUploadStages.values()].some((stage) => stage.objectKey === input.objectKey)
+    ) {
+      throw new DomainError("object_key_taken", "Attachment upload object key already exists", 409);
+    }
+    const now = new Date().toISOString();
+    const stage: AttachmentUploadStage = {
+      ...input,
+      state: "pending",
+      attachmentId: null,
+      cleanupError: null,
+      uploadLeaseToken: crypto.randomUUID(),
+      uploadLeaseExpiresAt: new Date(Date.now() + leaseSeconds * 1_000).toISOString(),
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.attachmentUploadStages.set(stage.id, stage);
+    return structuredClone(stage);
+  }
+
+  markAttachmentUploadStored(
+    id: string,
+    ownerId: string,
+    uploadLeaseToken: string,
+    leaseSeconds: number,
+  ): AttachmentUploadStage {
+    if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1 || leaseSeconds > 86_400) {
+      throw new DomainError("validation_error", "Attachment upload lease is invalid", 422);
+    }
+    const stage = this.attachmentUploadStages.get(id);
+    if (
+      !stage || stage.ownerId !== ownerId || stage.uploadLeaseToken !== uploadLeaseToken ||
+      Date.parse(stage.uploadLeaseExpiresAt) <= Date.now() ||
+      !["pending", "stored"].includes(stage.state)
+    ) {
+      throw new DomainError("upload_stage_conflict", "Attachment upload stage changed", 409);
+    }
+    stage.state = "stored";
+    stage.uploadLeaseExpiresAt = new Date(Date.now() + leaseSeconds * 1_000).toISOString();
+    stage.updatedAt = new Date().toISOString();
+    return structuredClone(stage);
+  }
+
+  heartbeatAttachmentUpload(
+    id: string,
+    ownerId: string,
+    uploadLeaseToken: string,
+    leaseSeconds: number,
+  ): AttachmentUploadStage {
+    if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1 || leaseSeconds > 86_400) {
+      throw new DomainError("validation_error", "Attachment upload lease is invalid", 422);
+    }
+    const stage = this.attachmentUploadStages.get(id);
+    if (
+      !stage || stage.ownerId !== ownerId || stage.uploadLeaseToken !== uploadLeaseToken ||
+      Date.parse(stage.uploadLeaseExpiresAt) <= Date.now() ||
+      !["pending", "stored"].includes(stage.state)
+    ) throw new DomainError("upload_stage_conflict", "Attachment upload stage changed", 409);
+    stage.uploadLeaseExpiresAt = new Date(Date.now() + leaseSeconds * 1_000).toISOString();
+    stage.updatedAt = new Date().toISOString();
+    return structuredClone(stage);
+  }
+
+  createAttachmentFromUploadStage(
+    id: string,
+    ownerId: string,
+    uploadLeaseToken: string,
+    input: CreateAttachmentInput,
+    quota?: AttachmentStorageQuota,
+  ): CreateAttachmentResult {
+    const stage = this.attachmentUploadStages.get(id);
+    if (
+      !stage || stage.ownerId !== ownerId || stage.uploadLeaseToken !== uploadLeaseToken ||
+      Date.parse(stage.uploadLeaseExpiresAt) <= Date.now() || stage.state !== "stored" ||
+      input.ownerId !== ownerId || stage.objectKey !== input.objectKey ||
+      stage.filename !== input.filename || stage.mimeType !== input.mimeType ||
+      stage.sizeBytes !== input.sizeBytes || stage.sha256 !== input.sha256
+    ) throw new DomainError("upload_stage_conflict", "Attachment upload stage differs", 409);
+    let result: CreateAttachmentResult;
+    this.#attachmentUploadFinalizeStageId = id;
+    try {
+      result = this.createAttachment(input, quota);
+    } finally {
+      this.#attachmentUploadFinalizeStageId = null;
+    }
+    if (result.deduplicated) {
+      stage.state = "cleanup_pending";
+      stage.cleanupError = "deduplicated browser upload";
+      stage.updatedAt = new Date().toISOString();
+      this.enqueueJob(
+        "attachment_object.cleanup",
+        { stageId: id, ownerId },
+        stage.uploadLeaseExpiresAt,
+        `attachment_object.cleanup:${id}`,
+      );
+      return {
+        ...result,
+        attachment: structuredClone(result.attachment),
+        inspectionJobId: null,
+      };
+    }
+    stage.state = "finalized";
+    stage.attachmentId = result.attachment.id;
+    stage.cleanupError = null;
+    stage.uploadLeaseExpiresAt = new Date().toISOString();
+    stage.updatedAt = new Date().toISOString();
+    return { ...result, attachment: structuredClone(result.attachment) };
+  }
+
+  requestAttachmentUploadCleanup(
+    id: string,
+    ownerId: string,
+    uploadLeaseToken: string,
+    reason: string,
+  ): AttachmentUploadStage {
+    const stage = this.attachmentUploadStages.get(id);
+    if (
+      !stage || stage.ownerId !== ownerId || stage.uploadLeaseToken !== uploadLeaseToken ||
+      !["pending", "stored", "cleanup_pending", "cleaning", "cleaned"].includes(stage.state)
+    ) throw new DomainError("upload_stage_conflict", "Attachment upload stage changed", 409);
+    stage.state = "cleanup_pending";
+    stage.cleanupError = reason.slice(0, 1000);
+    stage.updatedAt = new Date().toISOString();
+    const key = `attachment_object.cleanup:${id}`;
+    const prior = this.jobs.find((job) => job.idempotencyKey === key);
+    if (prior && ["completed", "failed"].includes(prior.status)) {
+      prior.status = "queued";
+      prior.attempts = 0;
+      prior.availableAt = stage.uploadLeaseExpiresAt;
+      prior.lockedAt = null;
+      prior.lockedBy = null;
+      prior.lastError = null;
+      prior.completedAt = null;
+    } else {
+      this.enqueueJob(
+        "attachment_object.cleanup",
+        { stageId: id, ownerId },
+        stage.uploadLeaseExpiresAt,
+        key,
+      );
+    }
+    return structuredClone(stage);
+  }
+
+  abandonAttachmentUpload(id: string, ownerId: string, reason: string): AttachmentUploadStage {
+    const stage = this.attachmentUploadStages.get(id);
+    if (
+      !stage || stage.ownerId !== ownerId || !["pending", "abandoned"].includes(stage.state)
+    ) throw new DomainError("upload_stage_conflict", "Attachment upload stage changed", 409);
+    stage.state = "abandoned";
+    stage.cleanupError = reason.slice(0, 1000);
+    stage.updatedAt = new Date().toISOString();
+    return structuredClone(stage);
+  }
+
+  stageFileUpload(input: StageFileUploadInput): FileUploadStage {
+    if (input.purpose !== "assistants") {
+      throw new DomainError("unsupported_purpose", "File purpose is not supported", 422);
+    }
+    this.validateAttachmentInput({
+      ownerId: input.ownerId,
+      objectKey: input.objectKey,
+      filename: input.filename,
+      mimeType: input.mimeType,
+      sizeBytes: input.sizeBytes,
+      sha256: input.sha256,
+      state: input.attachmentState,
+      inspectionError: input.inspectionError,
+    });
+    if (!isCanonicalFileUploadObjectKey(input.ownerId, input.sha256, input.objectKey)) {
+      throw new DomainError("validation_error", "File upload object key is invalid", 422);
+    }
+    const request = this.#apiRequest(input.requestId);
+    if (request.endpoint !== "files" || request.userId !== input.ownerId) {
+      throw new DomainError("idempotency_conflict", "File upload stage owner differs", 409);
+    }
+    const prior = this.fileUploadStages.get(input.requestId);
+    if (prior) {
+      const comparable = {
+        requestId: prior.requestId,
+        ownerId: prior.ownerId,
+        objectKey: prior.objectKey,
+        filename: prior.filename,
+        mimeType: prior.mimeType,
+        sizeBytes: prior.sizeBytes,
+        sha256: prior.sha256,
+        purpose: prior.purpose,
+        attachmentState: prior.attachmentState,
+        inspectionError: prior.inspectionError,
+        requiredInspectionMode: prior.requiredInspectionMode,
+        inspectionPolicyVersion: prior.inspectionPolicyVersion,
+      };
+      if (JSON.stringify(comparable) !== JSON.stringify(input)) {
+        throw new DomainError("idempotency_conflict", "File upload stage differs", 409);
+      }
+      return structuredClone(prior);
+    }
+    const now = new Date().toISOString();
+    const stage: FileUploadStage = {
+      ...input,
+      state: "pending",
+      attachmentId: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.fileUploadStages.set(input.requestId, stage);
+    return structuredClone(stage);
+  }
+  markFileUploadStored(requestId: string, leaseToken: string) {
+    const request = this.#apiRequest(requestId);
+    this.#assertLease(request, leaseToken);
+    const stage = this.fileUploadStages.get(requestId);
+    if (!stage) throw new DomainError("not_found", "File upload stage not found", 404);
+    if (stage.state === "finalized") {
+      throw new DomainError("file_upload_finalized", "File upload is already finalized", 409);
+    }
+    stage.state = "stored";
+    stage.updatedAt = new Date().toISOString();
+    return structuredClone(stage);
+  }
+  listStaleFileUploads(limit = 100) {
+    return [...this.fileUploadStages.values()].flatMap((stage) => {
+      const request = this.apiIdempotencyRequests.get(stage.requestId);
+      return stage.state !== "finalized" && request?.state === "in_progress" &&
+          request.leaseExpiresAt !== null && Date.parse(request.leaseExpiresAt) <= Date.now()
+        ? [{ stage: structuredClone(stage), request: structuredClone(request) }]
+        : [];
+    }).slice(0, limit);
+  }
+  attachmentObjectReferenceCount(objectKey: string) {
+    return [...this.attachments.values()].filter((attachment) =>
+      attachment.objectKey === objectKey && attachment.state !== "deleted"
+    ).length;
+  }
+
+  finalizeFileUpload(
+    input: FinalizeFileUploadInput,
+    quota?: AttachmentStorageQuota,
+  ): FinalizeFileUploadResult {
+    this.validateAttachmentInput(input.attachment);
+    const request = this.#apiRequest(input.request.id);
+    if (
+      input.request.responseStatus !== 201 || input.request.costMicros !== 0 ||
+      input.request.inputTokens !== 0 || input.request.outputTokens !== 0
+    ) throw new DomainError("validation_error", "File completion accounting is invalid", 422);
+    if (request.endpoint !== "files" || request.userId !== input.attachment.ownerId) {
+      throw new DomainError("idempotency_conflict", "File completion owner differs", 409);
+    }
+    if (request.state === "completed") {
+      const id = JSON.parse(request.responseBody ?? "{}")?.id;
+      const prior = typeof id === "string" ? this.attachments.get(id) : undefined;
+      if (!prior || prior.ownerId !== input.attachment.ownerId) {
+        throw new DomainError("idempotency_corrupt", "Stored file replay is invalid", 500);
+      }
+      return { attachment: structuredClone(prior), request: structuredClone(request) };
+    }
+    this.#assertLease(request, input.request.leaseToken);
+    if (
+      request.endpoint !== "files" || request.model !== "files/upload" ||
+      input.request.responseStatus !== 201 || input.request.costMicros !== 0 ||
+      input.request.inputTokens !== 0 || input.request.outputTokens !== 0
+    ) throw new DomainError("validation_error", "File completion accounting is invalid", 422);
+    const stage = this.fileUploadStages.get(request.id);
+    if (
+      !stage || stage.state !== "stored" ||
+      stage.ownerId !== input.attachment.ownerId ||
+      stage.objectKey !== input.attachment.objectKey ||
+      stage.filename !== input.attachment.filename ||
+      stage.mimeType !== input.attachment.mimeType ||
+      stage.sizeBytes !== input.attachment.sizeBytes ||
+      stage.sha256 !== input.attachment.sha256 ||
+      stage.attachmentState !== (input.attachment.state ?? "pending") ||
+      stage.inspectionError !== (input.attachment.inspectionError ?? null) ||
+      stage.requiredInspectionMode !== (input.attachment.requiredInspectionMode ?? "local") ||
+      stage.inspectionPolicyVersion !==
+        (input.attachment.inspectionPolicyVersion ?? ATTACHMENT_INSPECTION_POLICY_VERSION)
+    ) throw new DomainError("file_upload_stage_conflict", "File upload stage differs", 409);
+    if (!this.users.has(input.attachment.ownerId)) {
+      throw new DomainError("not_found", "User not found", 404);
+    }
+    const objectPeers = [...this.attachments.values()].filter((attachment) =>
+      attachment.objectKey === input.attachment.objectKey && attachment.state !== "deleted"
+    );
+    if (
+      objectPeers.some((attachment) =>
+        attachment.ownerId !== input.attachment.ownerId ||
+        attachment.sha256 !== input.attachment.sha256 ||
+        attachment.sizeBytes !== input.attachment.sizeBytes ||
+        attachment.mimeType !== input.attachment.mimeType
+      )
+    ) throw new DomainError("object_key_taken", "Attachment object key already exists", 409);
+    const jobsBefore = this.jobs.length;
+    const admitted = this.#admitAttachmentStorage(input.attachment, quota);
+    const now = new Date().toISOString();
+    const attachment: AttachmentRecord = {
+      ...input.attachment,
+      id: crypto.randomUUID(),
+      state: input.attachment.state ?? "pending",
+      inspectionError: input.attachment.inspectionError ?? null,
+      requiredInspectionMode: input.attachment.requiredInspectionMode ?? "local",
+      inspectionPolicyVersion: input.attachment.inspectionPolicyVersion ??
+        ATTACHMENT_INSPECTION_POLICY_VERSION,
+      inspectionEpoch: 1,
+      version: 1,
+      ingestionStatus: input.attachment.state === "ready" &&
+          isIngestibleDocumentMime(input.attachment.mimeType)
         ? "queued"
         : "not_applicable",
       ingestionError: null,
@@ -3467,26 +4469,77 @@ export class MemoryRepository {
     };
     this.attachments.set(attachment.id, attachment);
     this.enqueueAttachmentIngestion(attachment);
-    return {
-      attachment,
-      inspectionJobId: input.inspectionComplete
-        ? null
-        : this.enqueueAttachmentInspection(attachment),
-      deduplicated: false,
-    };
+    if (!input.attachment.inspectionComplete) this.enqueueAttachmentInspection(attachment);
+    try {
+      const completed = this.#completeApi({
+        ...input.request,
+        responseBody: input.responseBody(attachment),
+      }, false);
+      stage.state = "finalized";
+      stage.attachmentId = attachment.id;
+      stage.updatedAt = new Date().toISOString();
+      return {
+        attachment: structuredClone(attachment),
+        request: completed,
+      };
+    } catch (error) {
+      this.attachments.delete(attachment.id);
+      this.jobs.splice(jobsBefore);
+      if (admitted) this.#rollbackAttachmentStorageAdmission(input.attachment);
+      throw error;
+    }
   }
 
   listAttachments(ownerId: string, includeDeleted = false) {
     return [...this.attachments.values()].filter((attachment) =>
-      attachment.ownerId === ownerId && (includeDeleted || attachment.state !== "deleted")
+      attachment.ownerId === ownerId && (includeDeleted || attachment.deletedAt === null)
     ).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  listAttachmentPage(ownerId: string, query: AttachmentListQuery): AttachmentPage {
+    if (!Number.isInteger(query.limit) || query.limit < 1 || query.limit > 10_000) {
+      throw new DomainError(
+        "invalid_file_limit",
+        "File list limit must be between 1 and 10000",
+        400,
+      );
+    }
+    if (query.order !== "asc" && query.order !== "desc") {
+      throw new DomainError("invalid_file_order", "File list order must be asc or desc", 400);
+    }
+    const direction = query.order === "asc" ? 1 : -1;
+    const compare = (left: AttachmentRecord, right: AttachmentRecord) => {
+      const timestamp = left.createdAt.localeCompare(right.createdAt);
+      return (timestamp || left.id.localeCompare(right.id)) * direction;
+    };
+    const cursor = query.after === undefined ? undefined : this.attachments.get(query.after);
+    if (query.after !== undefined && (!cursor || cursor.ownerId !== ownerId)) {
+      throw new DomainError(
+        "invalid_file_cursor",
+        "The file list cursor is invalid for this owner",
+        400,
+      );
+    }
+    const ordered = [...this.attachments.values()].filter((attachment) =>
+      attachment.ownerId === ownerId && attachment.deletedAt === null
+    ).sort(compare);
+    // Deleted attachments are retained as tombstones. Their immutable creation tuple remains a
+    // valid keyset position so deleting the last item from one page does not break the next page.
+    const afterCursor = cursor
+      ? ordered.filter((attachment) => compare(attachment, cursor) > 0)
+      : ordered;
+    const rows = afterCursor.slice(0, query.limit + 1);
+    return {
+      data: rows.slice(0, query.limit),
+      hasMore: rows.length > query.limit,
+    };
   }
 
   getAttachment(id: string, ownerId: string, includeDeleted = false) {
     const attachment = this.attachments.get(id);
     if (
       !attachment || attachment.ownerId !== ownerId ||
-      (!includeDeleted && attachment.state === "deleted")
+      (!includeDeleted && attachment.deletedAt !== null)
     ) throw new DomainError("not_found", "Attachment not found", 404);
     return attachment;
   }
@@ -3498,6 +4551,7 @@ export class MemoryRepository {
     attachment.state = "deleted";
     attachment.deletedAt = now;
     attachment.updatedAt = now;
+    attachment.version++;
     return attachment;
   }
 
@@ -3508,13 +4562,33 @@ export class MemoryRepository {
     nextState: AttachmentState,
     inspectionError: string | null = null,
   ) {
+    if (
+      expectedState === "inspecting" &&
+      ["ready", "quarantined", "failed"].includes(nextState)
+    ) {
+      return this.transitionAttachmentInspection({
+        attachmentId: id,
+        ownerId,
+        inspectionEpoch: 1,
+        expectedState,
+        nextState: nextState as "ready" | "quarantined" | "failed",
+        inspectionError,
+      });
+    }
     const attachment = this.getAttachment(id, ownerId, true);
+    if (attachment.inspectionEpoch !== 1) {
+      throw new DomainError(
+        "attachment_inspection_conflict",
+        "Versioned reinspection requires an epoch-bound transition",
+        409,
+      );
+    }
     if (attachment.state !== expectedState) {
       throw new DomainError("attachment_state_conflict", "Attachment state changed", 409);
     }
     const allowed: Record<AttachmentState, AttachmentState[]> = {
       pending: ["inspecting", "deleted"],
-      inspecting: ["ready", "quarantined", "failed", "deleted"],
+      inspecting: ["deleted"],
       ready: ["deleted"],
       quarantined: ["deleted"],
       failed: ["pending", "deleted"],
@@ -3529,6 +4603,7 @@ export class MemoryRepository {
     }
     attachment.state = nextState;
     attachment.inspectionError = inspectionError;
+    attachment.version++;
     attachment.updatedAt = new Date().toISOString();
     if (nextState === "deleted") attachment.deletedAt = attachment.updatedAt;
     if (nextState === "ready" && isIngestibleDocumentMime(attachment.mimeType)) {
@@ -3537,6 +4612,226 @@ export class MemoryRepository {
       this.enqueueAttachmentIngestion(attachment);
     }
     return attachment;
+  }
+
+  requestAttachmentReinspection(
+    input: RequestAttachmentReinspectionInput,
+  ): AttachmentReinspectionResult {
+    this.#assertEffectiveAdminActor(input.actorId);
+    const reason = input.reason.trim();
+    if (
+      !reason || reason.length > 500 || !Number.isSafeInteger(input.expectedVersion) ||
+      input.expectedVersion < 1 ||
+      !["local", "external"].includes(input.requiredInspectionMode) ||
+      input.inspectionPolicyVersion !== ATTACHMENT_INSPECTION_POLICY_VERSION
+    ) throw new DomainError("validation_error", "Reinspection request is invalid", 422);
+    const attachment = this.attachments.get(input.attachmentId);
+    if (!attachment) throw new DomainError("not_found", "Attachment not found", 404);
+    const eligibility = attachmentReinspectionEligibility(attachment);
+    if (eligibility.blockedReason === "deleted") {
+      throw new DomainError("attachment_deleted", "Deleted attachments cannot be reinspected", 409);
+    }
+    if (!eligibility.eligible) {
+      throw new DomainError(
+        "attachment_state_conflict",
+        eligibility.blockedReason === "policy_quarantine"
+          ? "This quarantine was issued by a non-retriable upload policy"
+          : "Only terminal attachments can be reinspected",
+        409,
+      );
+    }
+    if (attachment.version !== input.expectedVersion) {
+      throw new DomainError(
+        "version_conflict",
+        "Attachment was modified by another administrator",
+        409,
+      );
+    }
+    const before = {
+      state: attachment.state,
+      inspectionError: attachment.inspectionError,
+      inspectionEpoch: attachment.inspectionEpoch,
+      requiredInspectionMode: attachment.requiredInspectionMode,
+      inspectionPolicyVersion: attachment.inspectionPolicyVersion,
+      version: attachment.version,
+      updatedAt: attachment.updatedAt,
+    };
+    const jobsBefore = this.jobs.length;
+    const auditsBefore = this.auditEvents.length;
+    try {
+      attachment.state = "pending";
+      attachment.inspectionError = null;
+      attachment.inspectionEpoch++;
+      attachment.requiredInspectionMode = input.requiredInspectionMode;
+      attachment.inspectionPolicyVersion = input.inspectionPolicyVersion;
+      attachment.version++;
+      attachment.updatedAt = new Date().toISOString();
+      const inspectionJobId = this.enqueueAttachmentInspection(attachment);
+      this.recordAudit({
+        actorId: input.actorId,
+        action: "attachment.reinspection_requested",
+        targetType: "attachment",
+        targetId: attachment.id,
+        metadata: {
+          ownerId: attachment.ownerId,
+          reason,
+          before,
+          after: {
+            state: attachment.state,
+            inspectionEpoch: attachment.inspectionEpoch,
+            requiredInspectionMode: attachment.requiredInspectionMode,
+            inspectionPolicyVersion: attachment.inspectionPolicyVersion,
+            version: attachment.version,
+          },
+          inspectionJobId,
+        },
+      });
+      return { attachment: structuredClone(attachment), inspectionJobId };
+    } catch (error) {
+      attachment.state = before.state;
+      attachment.inspectionError = before.inspectionError;
+      attachment.inspectionEpoch = before.inspectionEpoch;
+      attachment.requiredInspectionMode = before.requiredInspectionMode;
+      attachment.inspectionPolicyVersion = before.inspectionPolicyVersion;
+      attachment.version = before.version;
+      attachment.updatedAt = before.updatedAt;
+      this.jobs.splice(jobsBefore);
+      this.auditEvents.splice(auditsBefore);
+      throw error;
+    }
+  }
+
+  transitionAttachmentInspection(input: TransitionAttachmentInspectionInput): AttachmentRecord {
+    const inspectionError = input.inspectionError?.trim() || null;
+    const requiresReason = ["quarantined", "failed"].includes(input.nextState);
+    if (
+      !Number.isSafeInteger(input.inspectionEpoch) || input.inspectionEpoch < 1 ||
+      (input.expectedState === "pending" && input.nextState !== "inspecting") ||
+      (input.expectedState === "inspecting" &&
+        !["ready", "quarantined", "failed"].includes(input.nextState)) ||
+      (requiresReason ? inspectionError === null : inspectionError !== null) ||
+      (inspectionError !== null && inspectionError.length > 1_000)
+    ) throw new DomainError("validation_error", "Attachment inspection transition is invalid", 422);
+    const attachment = this.getAttachment(input.attachmentId, input.ownerId, true);
+    if (
+      attachment.deletedAt !== null || attachment.state !== input.expectedState ||
+      attachment.inspectionEpoch !== input.inspectionEpoch
+    ) {
+      throw new DomainError(
+        "attachment_inspection_conflict",
+        "Attachment inspection epoch or state changed",
+        409,
+      );
+    }
+    const before = structuredClone(attachment);
+    const jobsBefore = this.jobs.length;
+    const auditsBefore = this.auditEvents.length;
+    try {
+      attachment.state = input.nextState;
+      attachment.inspectionError = inspectionError;
+      attachment.version++;
+      attachment.updatedAt = new Date().toISOString();
+      if (input.nextState === "ready" && isIngestibleDocumentMime(attachment.mimeType)) {
+        if (attachment.ingestionStatus !== "ready") {
+          attachment.ingestionStatus = "queued";
+          attachment.ingestionError = null;
+          this.enqueueAttachmentIngestion(attachment);
+        }
+      }
+      if (["ready", "quarantined", "failed"].includes(input.nextState)) {
+        this.recordAudit({
+          actorId: null,
+          action: "attachment.inspection.completed",
+          targetType: "attachment",
+          targetId: attachment.id,
+          metadata: {
+            ownerId: attachment.ownerId,
+            inspectionEpoch: input.inspectionEpoch,
+            outcome: input.nextState,
+            reason: inspectionError,
+          },
+        });
+      }
+      return structuredClone(attachment);
+    } catch (error) {
+      this.attachments.set(attachment.id, before);
+      this.jobs.splice(jobsBefore);
+      this.auditEvents.splice(auditsBefore);
+      throw error;
+    }
+  }
+
+  attachmentStorageUsage(ownerId: string): AttachmentStorageUsage {
+    const usage = this.attachmentStorageUsageByOwner.get(ownerId) ??
+      { physicalBytes: 0, physicalObjects: 0 };
+    return { ownerId, ...usage };
+  }
+
+  adminStorageSummary(actorId: string): AdminStorageSummary {
+    this.#assertEffectiveAdminActor(actorId);
+    const records = [...this.attachments.values()];
+    return {
+      ...this.attachmentStorageInstallation,
+      attachmentRecords: records.length,
+      activeRecords: records.filter((item) => item.deletedAt === null).length,
+      deletedRecords: records.filter((item) => item.deletedAt !== null).length,
+      quarantinedRecords:
+        records.filter((item) => item.deletedAt === null && item.state === "quarantined").length,
+      ownersWithStorage:
+        [...this.attachmentStorageUsageByOwner.values()].filter((usage) =>
+          usage.physicalObjects > 0
+        ).length,
+    };
+  }
+
+  listAdminAttachments(actorId: string, query: AdminAttachmentQuery): AdminAttachmentPage {
+    this.#assertEffectiveAdminActor(actorId);
+    const limit = query.limit ?? 50;
+    const deletion = query.deletion ?? "present";
+    if (
+      !Number.isSafeInteger(limit) || limit < 1 || limit > 200 ||
+      (query.ownerId !== undefined &&
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+          .test(query.ownerId)) ||
+      !["present", "deleted", "all"].includes(deletion)
+    ) throw new DomainError("validation_error", "Attachment inventory query is invalid", 422);
+    const cursor = query.cursor ? decodeAdminAttachmentCursor(query.cursor, query) : undefined;
+    if (query.cursor && !cursor) {
+      throw new DomainError("invalid_cursor", "Attachment inventory cursor is invalid", 400);
+    }
+    const filtered = [...this.attachments.values()].filter((item) =>
+      (query.ownerId === undefined || item.ownerId === query.ownerId) &&
+      (query.state === undefined || item.state === query.state) &&
+      (deletion === "all" || (deletion === "deleted") === (item.deletedAt !== null)) &&
+      (!cursor ||
+        item.createdAt < cursor.createdAt ||
+        (item.createdAt === cursor.createdAt && item.id < cursor.id))
+    ).sort((left, right) =>
+      right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id)
+    );
+    const rows = filtered.slice(0, limit + 1);
+    const project = (item: AttachmentRecord): AdminAttachmentSummary => ({
+      id: item.id,
+      ownerId: item.ownerId,
+      filename: item.filename,
+      mimeType: item.mimeType,
+      sizeBytes: item.sizeBytes,
+      state: item.state,
+      inspectionError: item.inspectionError,
+      inspectionEpoch: item.inspectionEpoch,
+      version: item.version,
+      reinspectionEligible: attachmentReinspectionEligibility(item).eligible,
+      reinspectionBlockedReason: attachmentReinspectionEligibility(item).blockedReason,
+      createdAt: item.createdAt,
+      updatedAt: item.updatedAt,
+      deletedAt: item.deletedAt,
+    });
+    return {
+      data: rows.slice(0, limit).map(project),
+      nextCursor: rows.length > limit
+        ? encodeAdminAttachmentCursor(rows[limit - 1].createdAt, rows[limit - 1].id, query)
+        : null,
+    };
   }
 
   linkAttachmentToMessage(messageId: string, attachmentId: string, ownerId: string) {
@@ -3703,14 +4998,24 @@ export class MemoryRepository {
       stage.state = stage.cleanupAttachment ? "finalized" : "cleanup_pending";
       stage.updatedAt = now;
       if (!stage.cleanupAttachment) {
-        this.enqueueJob("generated_object.cleanup", { stageId: stage.id, ownerId: input.ownerId });
+        this.enqueueJob(
+          "generated_object.cleanup",
+          { stageId: stage.id, ownerId: input.ownerId },
+          undefined,
+          `generated_object.cleanup:${stage.id}`,
+        );
       }
     }
     for (const stage of editStages) {
       stage.state = stage.cleanupAttachment ? "finalized" : "cleanup_pending";
       stage.updatedAt = now;
       if (!stage.cleanupAttachment) {
-        this.enqueueJob("generated_object.cleanup", { stageId: stage.id, ownerId: input.ownerId });
+        this.enqueueJob(
+          "generated_object.cleanup",
+          { stageId: stage.id, ownerId: input.ownerId },
+          undefined,
+          `generated_object.cleanup:${stage.id}`,
+        );
       }
     }
     return created;
@@ -3829,6 +5134,25 @@ export class MemoryRepository {
     if (attachment.state !== "ready") {
       throw new DomainError("attachment_not_ready", "Generated attachment is not ready", 409);
     }
+    const retainedBlob = this.attachmentStorageBlobs.get(
+      `${ownerId}\0${attachment.objectKey}`,
+    );
+    if (
+      (cleanupAttachment && stage.objectKey !== attachment.objectKey) ||
+      stage.sizeBytes !== attachment.sizeBytes ||
+      stage.sha256 !== attachment.sha256 ||
+      stage.mimeType !== attachment.mimeType ||
+      !retainedBlob ||
+      retainedBlob.sizeBytes !== attachment.sizeBytes ||
+      retainedBlob.sha256 !== attachment.sha256 ||
+      retainedBlob.mimeType !== attachment.mimeType
+    ) {
+      throw new DomainError(
+        "generated_stage_conflict",
+        "Generated object attachment differs from the staged object",
+        409,
+      );
+    }
     if (stage.state === "stored") {
       stage.state = "attached";
       stage.attachmentId = attachmentId;
@@ -3854,10 +5178,164 @@ export class MemoryRepository {
       stage.state = "cleanup_pending";
       stage.cleanupError = reason.slice(0, 1000);
       stage.updatedAt = new Date().toISOString();
-      this.enqueueJob("generated_object.cleanup", { stageId: stage.id, ownerId });
+      const payload = { stageId: stage.id, ownerId };
+      const key = `generated_object.cleanup:${stage.id}`;
+      const prior = this.jobs.find((job) => job.idempotencyKey === key);
+      if (prior && ["completed", "failed"].includes(prior.status)) {
+        prior.status = "queued";
+        prior.attempts = 0;
+        prior.availableAt = new Date().toISOString();
+        prior.lockedAt = null;
+        prior.lockedBy = null;
+        prior.lastError = null;
+        prior.completedAt = null;
+      } else {
+        this.enqueueJob("generated_object.cleanup", payload, undefined, key);
+      }
       count++;
     }
     return count;
+  }
+
+  settleGeneratedObjectCleanup(stageId: string, ownerId: string) {
+    const stage = this.generatedObjectStages.get(stageId);
+    if (!stage || stage.ownerId !== ownerId) {
+      throw new DomainError("not_found", "Generated object stage not found", 404);
+    }
+    const priorRelease = this.attachmentStorageReleases.get(stageId);
+    if (stage.state === "cleaned") {
+      if (!stage.cleanupAttachment && !priorRelease) {
+        return { stage: structuredClone(stage), storageReleased: false };
+      }
+      if (
+        priorRelease?.ownerId === ownerId && priorRelease.objectKey === stage.objectKey &&
+        priorRelease.attachmentId === stage.attachmentId
+      ) return { stage: structuredClone(stage), storageReleased: false };
+      throw new DomainError(
+        "generated_cleanup_invariant",
+        "Cleaned generated stage has inconsistent storage release history",
+        500,
+      );
+    }
+    if (stage.state !== "cleaning") {
+      throw new DomainError(
+        "generated_stage_conflict",
+        "Generated object stage is not being cleaned",
+        409,
+      );
+    }
+    if (!stage.cleanupAttachment) {
+      stage.state = "cleaned";
+      stage.cleanupError = null;
+      stage.updatedAt = new Date().toISOString();
+      return { stage: structuredClone(stage), storageReleased: false };
+    }
+    const attachment = stage.attachmentId ? this.attachments.get(stage.attachmentId) : undefined;
+    if (
+      !attachment || attachment.ownerId !== ownerId || attachment.state !== "deleted" ||
+      attachment.deletedAt === null || attachment.objectKey !== stage.objectKey ||
+      attachment.sizeBytes !== stage.sizeBytes || attachment.sha256 !== stage.sha256
+    ) {
+      throw new DomainError(
+        "generated_cleanup_fenced",
+        "Generated cleanup requires the exact tombstoned attachment",
+        409,
+      );
+    }
+    const attachmentId = attachment.id;
+    const hasReference =
+      [...this.attachments.values()].some((candidate) =>
+        candidate.ownerId === ownerId && candidate.objectKey === stage.objectKey &&
+        candidate.id !== attachmentId
+      ) ||
+      [...this.messageAttachments.values()].some((ids) => ids.has(attachmentId)) ||
+      [...this.knowledgeAttachments.values()].some((ids) => ids.has(attachmentId)) ||
+      this.documentChunks.has(attachmentId) ||
+      [...this.generatedAssets.values()].some((asset) =>
+        asset.usageRunId === stage.usageRunId || asset.attachmentId === attachmentId ||
+        asset.inputs.some((input) => input.attachmentId === attachmentId)
+      ) ||
+      [...this.generatedObjectStages.values()].some((candidate) =>
+        candidate.id !== stage.id && candidate.state !== "cleaned" &&
+        (candidate.attachmentId === attachmentId ||
+          candidate.ownerId === ownerId && candidate.objectKey === stage.objectKey)
+      ) ||
+      [...this.fileUploadStages.values()].some((candidate) =>
+        candidate.attachmentId === attachmentId ||
+        candidate.ownerId === ownerId && candidate.objectKey === stage.objectKey
+      ) ||
+      [...this.attachmentUploadStages.values()].some((candidate) =>
+        candidate.attachmentId === attachmentId ||
+        candidate.ownerId === ownerId && candidate.objectKey === stage.objectKey
+      ) ||
+      [...this.conversationShares.values()].some((share) =>
+        Object.values(share.sourceAttachments).some((source) =>
+          source.attachmentId === attachmentId
+        )
+      );
+    if (hasReference) {
+      throw new DomainError(
+        "generated_cleanup_fenced",
+        "Generated cleanup is fenced by a durable reference",
+        409,
+      );
+    }
+    const storageKey = `${ownerId}\0${stage.objectKey}`;
+    const blob = this.attachmentStorageBlobs.get(storageKey);
+    if (
+      !blob || blob.sizeBytes !== stage.sizeBytes || blob.sha256 !== stage.sha256 ||
+      blob.mimeType !== stage.mimeType
+    ) {
+      throw new DomainError(
+        "generated_cleanup_invariant",
+        "Generated cleanup storage history differs",
+        500,
+      );
+    }
+    const usage = this.attachmentStorageUsageByOwner.get(ownerId);
+    if (
+      !usage || usage.physicalBytes < blob.sizeBytes || usage.physicalObjects < 1 ||
+      this.attachmentStorageInstallation.physicalBytes < blob.sizeBytes ||
+      this.attachmentStorageInstallation.physicalObjects < 1
+    ) {
+      throw new DomainError(
+        "generated_cleanup_invariant",
+        "Generated cleanup storage accounting would underflow",
+        500,
+      );
+    }
+    const releasedAt = new Date().toISOString();
+    this.recordAudit({
+      actorId: ownerId,
+      action: "attachment.storage_reclaimed",
+      targetType: "attachment",
+      targetId: attachmentId,
+      metadata: { sizeBytes: blob.sizeBytes, stageId },
+    });
+    this.attachmentStorageReleases.set(stageId, {
+      id: crypto.randomUUID(),
+      stageId,
+      usageRunId: stage.usageRunId,
+      ownerId,
+      objectKey: stage.objectKey,
+      attachmentId,
+      sizeBytes: blob.sizeBytes,
+      sha256: blob.sha256,
+      mimeType: blob.mimeType,
+      releasedAt,
+    });
+    this.attachmentStorageUsageByOwner.set(ownerId, {
+      physicalBytes: usage.physicalBytes - blob.sizeBytes,
+      physicalObjects: usage.physicalObjects - 1,
+    });
+    this.attachmentStorageInstallation = {
+      physicalBytes: this.attachmentStorageInstallation.physicalBytes - blob.sizeBytes,
+      physicalObjects: this.attachmentStorageInstallation.physicalObjects - 1,
+    };
+    stage.state = "cleaned";
+    stage.cleanupError = null;
+    stage.updatedAt = releasedAt;
+    return { stage: structuredClone(stage), storageReleased: true };
   }
 
   beginAttachmentIngestion(id: string, ownerId: string) {
@@ -3957,7 +5435,14 @@ export class MemoryRepository {
   }
 
   startEmbeddingProviderAttempt(input: EmbeddingProviderAttemptInput): void {
-    if (this.embeddingProviderAttempts.has(input.usageRunId)) {
+    const existing = this.embeddingProviderAttempts.get(input.usageRunId);
+    if (existing) {
+      if (
+        existing.status === "running" && existing.parentUsageRunId === input.parentUsageRunId &&
+        existing.purpose === input.purpose && existing.provider === input.provider &&
+        existing.model === input.model && existing.upstreamModel === input.upstreamModel &&
+        existing.itemCount === input.itemCount
+      ) return;
       throw new DomainError("idempotency_conflict", "Embedding attempt already exists", 409);
     }
     this.embeddingProviderAttempts.set(input.usageRunId, {
@@ -4337,14 +5822,20 @@ export class MemoryRepository {
   }
 
   private enqueueAttachmentInspection(attachment: AttachmentRecord) {
-    const idempotencyKey = `attachment.inspect:${attachment.id}`;
+    const idempotencyKey = `attachment.inspect:${attachment.id}:${attachment.inspectionEpoch}`;
     const prior = this.jobs.find((job) => job.idempotencyKey === idempotencyKey);
     if (prior) return prior.id;
     const id = crypto.randomUUID();
     this.jobs.push({
       id,
       type: "attachment.inspect",
-      payload: { attachmentId: attachment.id, ownerId: attachment.ownerId },
+      payload: {
+        attachmentId: attachment.id,
+        ownerId: attachment.ownerId,
+        inspectionEpoch: attachment.inspectionEpoch,
+        requiredInspectionMode: attachment.requiredInspectionMode,
+        inspectionPolicyVersion: attachment.inspectionPolicyVersion,
+      },
       status: "queued",
       attempts: 0,
       availableAt: new Date().toISOString(),
@@ -4388,6 +5879,12 @@ export class MemoryRepository {
     if (!Number.isSafeInteger(input.sizeBytes) || input.sizeBytes < 0) {
       throw new DomainError("validation_error", "Attachment size is invalid", 422);
     }
+    if (
+      input.requiredInspectionMode != null &&
+        !["local", "external"].includes(input.requiredInspectionMode) ||
+      input.inspectionPolicyVersion != null &&
+        input.inspectionPolicyVersion !== ATTACHMENT_INSPECTION_POLICY_VERSION
+    ) throw new DomainError("validation_error", "Attachment inspection policy is invalid", 422);
     if (
       !input.filename || input.filename.length > 255 || /[\\/\0]/.test(input.filename) ||
       !input.mimeType || input.mimeType.length > 255 ||
@@ -5503,6 +7000,16 @@ export class MemoryRepository {
   }
 
   ensureIdempotentReservation(input: EnsureIdempotentReservationInput): UsageRun {
+    if (
+      typeof input.userId !== "string" || input.userId.length < 1 || input.userId.length > 128 ||
+      typeof input.usageRunId !== "string" || input.usageRunId.length < 1 ||
+      input.usageRunId.length > 512 || typeof input.model !== "string" ||
+      input.model.length < 1 || input.model.length > 255 || typeof input.provider !== "string" ||
+      input.provider.length < 1 || input.provider.length > 255 ||
+      !(["provider", "api_replay", "document_embedding", "tool"] as const).includes(
+        input.recoveryOwner,
+      ) || !Number.isSafeInteger(input.reservedMicros) || input.reservedMicros < 0
+    ) throw new DomainError("validation_error", "Usage reservation is invalid", 422);
     const existing = this.usageRuns.get(input.usageRunId);
     if (!existing) {
       return this.reserve(
@@ -5511,23 +7018,76 @@ export class MemoryRepository {
         input.model,
         input.reservedMicros,
         input.provider,
+        undefined,
+        undefined,
+        input.recoveryOwner,
       );
     }
     if (
       existing.userId !== input.userId || existing.model !== input.model ||
-      existing.provider !== input.provider ||
-      existing.reservedMicros !== input.reservedMicros || existing.status !== "reserved"
+      existing.provider !== input.provider || existing.recoveryOwner !== input.recoveryOwner ||
+      existing.reservedMicros !== input.reservedMicros || existing.status !== "reserved" ||
+      existing.tokenId !== null
     ) {
       throw new DomainError("idempotency_conflict", "Existing reservation does not match", 409);
     }
     return structuredClone(existing);
   }
 
+  #withAtomicApiTokenMutation<T>(userId: string, operation: () => T): T {
+    const tokensBefore = new Map(
+      [...this.tokens].filter(([, value]) => value.userId === userId)
+        .map(([key, value]) => [key, structuredClone(value)]),
+    );
+    const accessGroupsBefore = new Map(
+      [...this.accessGroups].map(([key, value]) => [key, structuredClone(value)]),
+    );
+    const auditLength = this.auditEvents.length;
+    try {
+      return operation();
+    } catch (error) {
+      for (const [key, value] of this.tokens) {
+        if (value.userId === userId) this.tokens.delete(key);
+      }
+      for (const [key, value] of tokensBefore) this.tokens.set(key, value);
+      this.accessGroups.clear();
+      for (const [key, value] of accessGroupsBefore) this.accessGroups.set(key, value);
+      this.auditEvents.length = auditLength;
+      throw error;
+    }
+  }
+
   createApiToken(
     userId: string,
     input: CreateApiTokenInput,
+    expectedAuthorityEpoch: number,
+  ): StoredApiToken {
+    return this.#withAtomicApiTokenMutation(userId, () => {
+      const created = this.#createApiTokenMutation(userId, input, expectedAuthorityEpoch);
+      this.recordAudit({
+        actorId: userId,
+        action: "api_token.created",
+        targetType: "api_token",
+        targetId: created.id,
+      });
+      return created;
+    });
+  }
+
+  #createApiTokenMutation(
+    userId: string,
+    input: CreateApiTokenInput,
+    expectedAuthorityEpoch: number,
   ): StoredApiToken {
     this.#validateTokenRates(input.rpmLimit ?? null, input.burstLimit ?? null);
+    const user = this.users.get(userId);
+    if (
+      !user || user.approvalStatus !== "approved" || user.state !== "active" ||
+      user.deletedAt !== null || user.passwordResetPending === true ||
+      user.authorityEpoch !== expectedAuthorityEpoch
+    ) {
+      throw new DomainError("account_unavailable", "Account cannot create API tokens", 403);
+    }
     const now = new Date().toISOString();
     const id = crypto.randomUUID();
     const token: StoredApiToken = {
@@ -5535,6 +7095,7 @@ export class MemoryRepository {
       userId,
       name: input.name,
       scopes: input.scopes,
+      authorityEpoch: expectedAuthorityEpoch,
       tokenHash: input.tokenHash,
       preview: input.preview,
       version: 1,
@@ -5560,7 +7121,12 @@ export class MemoryRepository {
   }
   authenticateApiToken(hash: string) {
     const token = [...this.tokens.values()].find((t) => t.tokenHash === hash);
-    if (!token) return undefined;
+    const user = token ? this.users.get(token.userId) : undefined;
+    if (
+      !token || !user || token.authorityEpoch !== user.authorityEpoch ||
+      user.approvalStatus !== "approved" || user.state !== "active" ||
+      user.deletedAt !== null || user.passwordResetPending === true
+    ) return undefined;
     const now = Date.now();
     if (
       token.revokedAt || (token.expiresAt && Date.parse(token.expiresAt) <= now) ||
@@ -5571,17 +7137,61 @@ export class MemoryRepository {
   }
   listApiTokens(userId: string): ApiTokenSummary[] {
     return [...this.tokens.values()].filter((t) => t.userId === userId).map((
-      { userId: _u, tokenHash: _h, ...t },
+      { userId: _u, tokenHash: _h, authorityEpoch: _epoch, ...t },
     ) => t);
   }
-  revokeApiToken(id: string, userId: string) {
-    const token = this.tokens.get(id);
-    if (!token || token.userId !== userId) {
-      throw new DomainError("not_found", "Token not found", 404);
+  #assertPersonalTokenOwner(
+    userId: string,
+    expectedAuthorityEpoch: number,
+    action: "update" | "revoke",
+  ) {
+    const user = this.users.get(userId);
+    if (
+      !user || user.approvalStatus !== "approved" || user.state !== "active" ||
+      user.deletedAt !== null || user.passwordResetPending === true ||
+      user.authorityEpoch !== expectedAuthorityEpoch
+    ) {
+      throw new DomainError(
+        "account_unavailable",
+        `Account cannot ${action} API tokens`,
+        403,
+      );
     }
-    this.#revokeFamily(token.rotationFamilyId);
   }
-  revokeApiTokenFamily(id: string, userId: string, expectedVersion: number) {
+  revokeApiToken(id: string, userId: string, expectedAuthorityEpoch: number) {
+    return this.#withAtomicApiTokenMutation(userId, () => {
+      this.#assertPersonalTokenOwner(userId, expectedAuthorityEpoch, "revoke");
+      const token = this.tokens.get(id);
+      if (!token || token.userId !== userId) {
+        throw new DomainError("not_found", "Token not found", 404);
+      }
+      this.#revokeApiTokenFamilyMutation(id, userId, token.version);
+      this.recordAudit({
+        actorId: userId,
+        action: "api_token.revoked",
+        targetType: "api_token",
+        targetId: id,
+      });
+    });
+  }
+  revokeApiTokenFamily(
+    id: string,
+    userId: string,
+    expectedVersion: number,
+    expectedAuthorityEpoch: number,
+  ) {
+    return this.#withAtomicApiTokenMutation(userId, () => {
+      this.#assertPersonalTokenOwner(userId, expectedAuthorityEpoch, "revoke");
+      this.#revokeApiTokenFamilyMutation(id, userId, expectedVersion);
+      this.recordAudit({
+        actorId: userId,
+        action: "api_token.revoked",
+        targetType: "api_token",
+        targetId: id,
+      });
+    });
+  }
+  #revokeApiTokenFamilyMutation(id: string, userId: string, expectedVersion: number) {
     const token = this.tokens.get(id);
     if (!token || token.userId !== userId) {
       throw new DomainError("not_found", "Token not found", 404);
@@ -5610,7 +7220,7 @@ export class MemoryRepository {
     }
   }
   #tokenSummary(token: StoredApiToken): ApiTokenSummary {
-    const { userId: _u, tokenHash: _h, ...summary } = token;
+    const { userId: _u, tokenHash: _h, authorityEpoch: _epoch, ...summary } = token;
     return structuredClone(summary);
   }
   #familyTokens(token: StoredApiToken) {
@@ -5618,7 +7228,25 @@ export class MemoryRepository {
       candidate.rotationFamilyId === token.rotationFamilyId
     );
   }
-  updateApiToken(userId: string, id: string, input: UpdateApiTokenInput) {
+  updateApiToken(
+    userId: string,
+    id: string,
+    input: UpdateApiTokenInput,
+    expectedAuthorityEpoch: number,
+  ) {
+    return this.#withAtomicApiTokenMutation(userId, () => {
+      this.#assertPersonalTokenOwner(userId, expectedAuthorityEpoch, "update");
+      const updated = this.#updateApiTokenMutation(userId, id, input);
+      this.recordAudit({
+        actorId: userId,
+        action: "api_token.updated",
+        targetType: "api_token",
+        targetId: id,
+      });
+      return updated;
+    });
+  }
+  #updateApiTokenMutation(userId: string, id: string, input: UpdateApiTokenInput) {
     const token = this.tokens.get(id);
     if (!token || token.userId !== userId) {
       throw new DomainError("not_found", "Token not found", 404);
@@ -5639,7 +7267,38 @@ export class MemoryRepository {
     }
     return this.#tokenSummary(token);
   }
-  rotateApiToken(userId: string, id: string, input: RotateApiTokenInput): RotatedApiToken {
+  rotateApiToken(
+    userId: string,
+    id: string,
+    input: RotateApiTokenInput,
+    expectedAuthorityEpoch: number,
+  ): RotatedApiToken {
+    return this.#withAtomicApiTokenMutation(userId, () => {
+      const rotated = this.#rotateApiTokenMutation(
+        userId,
+        id,
+        input,
+        expectedAuthorityEpoch,
+      );
+      this.recordAudit({
+        actorId: userId,
+        action: "api_token.rotated",
+        targetType: "api_token",
+        targetId: rotated.replacement.id,
+        metadata: {
+          previousTokenId: rotated.previous.id,
+          overlapSeconds: input.overlapSeconds,
+        },
+      });
+      return rotated;
+    });
+  }
+  #rotateApiTokenMutation(
+    userId: string,
+    id: string,
+    input: RotateApiTokenInput,
+    expectedAuthorityEpoch: number,
+  ): RotatedApiToken {
     if (
       !Number.isInteger(input.overlapSeconds) || input.overlapSeconds < 0 ||
       input.overlapSeconds > 3600
@@ -5649,6 +7308,14 @@ export class MemoryRepository {
         "Rotation overlap must be between 0 and 3600 seconds",
         422,
       );
+    }
+    const user = this.users.get(userId);
+    if (
+      !user || user.approvalStatus !== "approved" || user.state !== "active" ||
+      user.deletedAt !== null || user.passwordResetPending === true ||
+      user.authorityEpoch !== expectedAuthorityEpoch
+    ) {
+      throw new DomainError("account_unavailable", "Account cannot rotate API tokens", 403);
     }
     const old = this.tokens.get(id);
     if (!old || old.userId !== userId) throw new DomainError("not_found", "Token not found", 404);
@@ -5696,7 +7363,12 @@ export class MemoryRepository {
     }
     return { previous: this.#tokenSummary(old), replacement: this.#tokenSummary(replacement) };
   }
-  searchApiTokens(query = "", limit = 50, cursor?: string): AdminTokenLookupPage {
+  searchApiTokens(
+    context: PrivilegedReadContext,
+    query = "",
+    limit = 50,
+    cursor?: string,
+  ): AdminTokenLookupPage {
     if (
       cursor &&
       !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
@@ -5705,6 +7377,7 @@ export class MemoryRepository {
     ) {
       throw new DomainError("validation_error", "cursor must be a valid UUID", 422);
     }
+    this.#assertPrivilegedReadContext(context);
     const bounded = Math.min(100, Math.max(1, limit));
     const q = query.trim().toLowerCase();
     const all = [...this.tokens.values()].filter((t) =>
@@ -5734,189 +7407,533 @@ export class MemoryRepository {
   listModelAliases() {
     return structuredClone([...this.modelAliases.values()]);
   }
-  createModelAlias(input: CreateModelAliasInput) {
-    if (
-      !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$/.test(input.alias) ||
-      [...this.modelAliases.values()].some((a) => a.alias === input.alias) ||
-      [...this.providerModels.values()].some((m) => m.publicModelId === input.alias)
-    ) throw new DomainError("conflict", "Model alias is invalid or already used", 409);
-    if (!this.providerModels.has(input.targetModelId)) {
-      throw new DomainError("not_found", "Target model not found", 404);
+  #withAtomicModelAliasMutation<T>(
+    operation: () => T,
+    audit: PrivilegedAuditEventInput,
+  ): T {
+    this.#requirePrivilegedAuditContext(audit);
+    const aliasesBefore = new Map(
+      [...this.modelAliases].map(([key, value]) => [key, structuredClone(value)]),
+    );
+    const auditLength = this.auditEvents.length;
+    try {
+      this.#assertEffectiveAdminActor(
+        audit.actorId,
+        audit.requireEmailVerification,
+        audit.expectedAuthorityEpoch,
+      );
+      const result = operation();
+      const {
+        requireEmailVerification: _requireEmailVerification,
+        expectedAuthorityEpoch: _expectedAuthorityEpoch,
+        ...event
+      } = audit;
+      this.recordAudit(event);
+      return result;
+    } catch (error) {
+      this.modelAliases.clear();
+      for (const [key, value] of aliasesBefore) this.modelAliases.set(key, value);
+      this.auditEvents.length = auditLength;
+      throw error;
     }
-    const now = new Date().toISOString();
-    const value: ModelAlias = {
-      id: crypto.randomUUID(),
-      alias: input.alias,
-      targetModelId: input.targetModelId,
-      description: input.description ?? "",
-      version: 1,
-      createdAt: now,
-      updatedAt: now,
+  }
+  createModelAlias(
+    input: CreateModelAliasInput,
+    audit: PrivilegedAuditEventInput,
+  ) {
+    this.#requirePrivilegedAuditContext(audit);
+    const id = crypto.randomUUID();
+    const mutationAudit: PrivilegedAuditEventInput = {
+      ...audit,
+      targetId: id,
+      metadata: { ...audit.metadata },
     };
-    this.modelAliases.set(value.id, value);
-    return structuredClone(value);
+    return this.#withAtomicModelAliasMutation(() => {
+      if (
+        !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$/.test(input.alias) ||
+        [...this.modelAliases.values()].some((a) => a.alias === input.alias) ||
+        [...this.providerModels.values()].some((m) => m.publicModelId === input.alias)
+      ) throw new DomainError("conflict", "Model alias is invalid or already used", 409);
+      if (!this.providerModels.has(input.targetModelId)) {
+        throw new DomainError("not_found", "Target model not found", 404);
+      }
+      const now = new Date().toISOString();
+      const value: ModelAlias = {
+        id,
+        alias: input.alias,
+        targetModelId: input.targetModelId,
+        description: input.description ?? "",
+        version: 1,
+        createdAt: now,
+        updatedAt: now,
+      };
+      this.modelAliases.set(value.id, value);
+      mutationAudit.metadata = {
+        ...mutationAudit.metadata,
+        after: {
+          alias: value.alias,
+          targetModelId: value.targetModelId,
+          description: value.description,
+        },
+      };
+      return structuredClone(value);
+    }, mutationAudit);
   }
-  updateModelAlias(id: string, input: UpdateModelAliasInput) {
-    const value = this.modelAliases.get(id);
-    if (!value) throw new DomainError("not_found", "Model alias not found", 404);
-    if (value.version !== input.expectedVersion) {
-      throw new DomainError("version_conflict", "Model alias was modified", 409);
-    }
-    const alias = input.alias ?? value.alias;
-    if (
-      !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$/.test(alias) ||
-      [...this.modelAliases.values()].some((a) => a.id !== id && a.alias === alias) ||
-      [...this.providerModels.values()].some((m) => m.publicModelId === alias)
-    ) throw new DomainError("conflict", "Model alias is invalid or already used", 409);
-    if (input.targetModelId !== undefined && !this.providerModels.has(input.targetModelId)) {
-      throw new DomainError("not_found", "Target model not found", 404);
-    }
-    value.alias = alias;
-    value.targetModelId = input.targetModelId ?? value.targetModelId;
-    value.description = input.description ?? value.description;
-    value.version++;
-    value.updatedAt = new Date().toISOString();
-    return structuredClone(value);
+  updateModelAlias(
+    id: string,
+    input: UpdateModelAliasInput,
+    audit: PrivilegedAuditEventInput,
+  ) {
+    this.#requirePrivilegedAuditContext(audit);
+    const mutationAudit: PrivilegedAuditEventInput = {
+      ...audit,
+      targetId: id,
+      metadata: { ...audit.metadata },
+    };
+    return this.#withAtomicModelAliasMutation(() => {
+      const value = this.modelAliases.get(id);
+      if (!value) throw new DomainError("not_found", "Model alias not found", 404);
+      if (value.version !== input.expectedVersion) {
+        throw new DomainError("version_conflict", "Model alias was modified", 409);
+      }
+      const alias = input.alias ?? value.alias;
+      if (
+        !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$/.test(alias) ||
+        [...this.modelAliases.values()].some((a) => a.id !== id && a.alias === alias) ||
+        [...this.providerModels.values()].some((m) => m.publicModelId === alias)
+      ) throw new DomainError("conflict", "Model alias is invalid or already used", 409);
+      if (input.targetModelId !== undefined && !this.providerModels.has(input.targetModelId)) {
+        throw new DomainError("not_found", "Target model not found", 404);
+      }
+      const before = {
+        alias: value.alias,
+        targetModelId: value.targetModelId,
+        description: value.description,
+      };
+      value.alias = alias;
+      value.targetModelId = input.targetModelId ?? value.targetModelId;
+      value.description = input.description ?? value.description;
+      value.version++;
+      value.updatedAt = new Date().toISOString();
+      mutationAudit.metadata = {
+        ...mutationAudit.metadata,
+        before,
+        after: {
+          alias: value.alias,
+          targetModelId: value.targetModelId,
+          description: value.description,
+        },
+      };
+      return structuredClone(value);
+    }, mutationAudit);
   }
-  deleteModelAlias(id: string, expectedVersion: number) {
-    const value = this.modelAliases.get(id);
-    if (!value) throw new DomainError("not_found", "Model alias not found", 404);
-    if (value.version !== expectedVersion) {
-      throw new DomainError("version_conflict", "Model alias was modified", 409);
-    }
-    this.modelAliases.delete(id);
+  deleteModelAlias(
+    id: string,
+    expectedVersion: number,
+    audit: PrivilegedAuditEventInput,
+  ) {
+    this.#requirePrivilegedAuditContext(audit);
+    const mutationAudit: PrivilegedAuditEventInput = {
+      ...audit,
+      targetId: id,
+      metadata: { ...audit.metadata },
+    };
+    this.#withAtomicModelAliasMutation(() => {
+      const value = this.modelAliases.get(id);
+      if (!value) throw new DomainError("not_found", "Model alias not found", 404);
+      if (value.version !== expectedVersion) {
+        throw new DomainError("version_conflict", "Model alias was modified", 409);
+      }
+      mutationAudit.metadata = {
+        ...mutationAudit.metadata,
+        before: {
+          alias: value.alias,
+          targetModelId: value.targetModelId,
+          description: value.description,
+        },
+      };
+      this.modelAliases.delete(id);
+    }, mutationAudit);
   }
-  listAccessGroups() {
+  listAccessGroups(context: PrivilegedReadContext) {
+    this.#assertPrivilegedReadContext(context);
     return structuredClone([...this.accessGroups.values()]);
   }
-  createAccessGroup(input: CreateAccessGroupInput) {
+  #assertPrivilegedReadContext(context: PrivilegedReadContext | undefined): void {
     if (
-      !input.name.trim() ||
-      [...this.accessGroups.values()].some((g) =>
-        g.name.toLowerCase() === input.name.trim().toLowerCase()
-      )
-    ) throw new DomainError("conflict", "Access group name is already used", 409);
-    const now = new Date().toISOString();
-    const value: AccessGroup = {
-      id: crypto.randomUUID(),
-      name: input.name.trim(),
-      description: input.description ?? "",
-      version: 1,
-      userIds: [],
-      modelIds: [],
-      tokenIds: [],
-      tokenOwners: [],
-      createdAt: now,
-      updatedAt: now,
+      !context ||
+      typeof context.actorId !== "string" || context.actorId.trim() === "" ||
+      typeof context.requireEmailVerification !== "boolean" ||
+      !Number.isSafeInteger(context.expectedAuthorityEpoch) ||
+      context.expectedAuthorityEpoch < 1
+    ) {
+      throw new DomainError(
+        "admin_authority_required",
+        "Privileged read context is required",
+        403,
+      );
+    }
+    this.#assertEffectiveAdminActor(
+      context.actorId,
+      context.requireEmailVerification,
+      context.expectedAuthorityEpoch,
+    );
+  }
+  #requirePrivilegedAuditContext(
+    audit: PrivilegedAuditEventInput | undefined,
+  ): asserts audit is PrivilegedAuditEventInput {
+    if (
+      !audit ||
+      typeof audit.actorId !== "string" || audit.actorId.trim() === "" ||
+      typeof audit.action !== "string" || audit.action.trim() === "" ||
+      typeof audit.targetType !== "string" || audit.targetType.trim() === "" ||
+      typeof audit.requireEmailVerification !== "boolean" ||
+      !Number.isSafeInteger(audit.expectedAuthorityEpoch) ||
+      audit.expectedAuthorityEpoch < 1
+    ) {
+      throw new DomainError(
+        "admin_authority_required",
+        "Privileged mutation context is required",
+        403,
+      );
+    }
+  }
+  createAccessGroup(input: CreateAccessGroupInput, audit: PrivilegedAuditEventInput) {
+    this.#requirePrivilegedAuditContext(audit);
+    const id = crypto.randomUUID();
+    const name = input.name.trim();
+    const description = input.description ?? "";
+    const userIds = [...new Set(input.userIds ?? [])];
+    const modelIds = [...new Set(input.modelIds ?? [])];
+    const requestedTokenIds = [...new Set(input.tokenIds ?? [])];
+    const mutationAudit: PrivilegedAuditEventInput = {
+      ...audit,
+      targetId: id,
+      metadata: { ...audit.metadata },
     };
-    this.accessGroups.set(value.id, value);
-    return structuredClone(value);
-  }
-  updateAccessGroup(id: string, input: UpdateAccessGroupInput) {
-    const g = this.#group(id, input.expectedVersion);
-    if (
-      input.name !== undefined &&
-      [...this.accessGroups.values()].some((other) =>
-        other.id !== id && other.name.toLowerCase() === input.name!.trim().toLowerCase()
-      )
-    ) throw new DomainError("conflict", "Access group name is already used", 409);
-    if (input.name !== undefined) g.name = input.name.trim();
-    if (input.description !== undefined) g.description = input.description;
-    g.version++;
-    g.updatedAt = new Date().toISOString();
-    return structuredClone(g);
-  }
-  deleteAccessGroup(id: string, expectedVersion: number) {
-    this.#group(id, expectedVersion);
-    this.accessGroups.delete(id);
-  }
-  replaceAccessGroupUsers(id: string, userIds: string[], expectedVersion: number) {
-    const g = this.#group(id, expectedVersion);
-    for (const uid of userIds) {
-      if (!this.users.has(uid)) throw new DomainError("not_found", "User not found", 404);
-    }
-    g.userIds = [...new Set(userIds)];
-    g.tokenIds = g.tokenIds.filter((tid) => g.userIds.includes(this.tokens.get(tid)?.userId ?? ""));
-    g.tokenOwners = g.tokenIds.map((tokenId) => ({
-      tokenId,
-      ownerId: this.tokens.get(tokenId)!.userId,
-    }));
-    g.version++;
-    g.updatedAt = new Date().toISOString();
-    return structuredClone(g);
-  }
-  replaceAccessGroupModels(id: string, modelIds: string[], expectedVersion: number) {
-    const g = this.#group(id, expectedVersion);
-    for (const mid of modelIds) {
-      if (!this.providerModels.has(mid)) {
-        throw new DomainError("not_found", "Model not found", 404);
+    return this.#withAtomicAccessGroupMutation(() => {
+      if (
+        !name ||
+        [...this.accessGroups.values()].some((g) => g.name.toLowerCase() === name.toLowerCase())
+      ) throw new DomainError("conflict", "Access group name is already used", 409);
+      for (const userId of userIds) {
+        if (!this.users.has(userId)) throw new DomainError("not_found", "User not found", 404);
       }
-    }
-    g.modelIds = [...new Set(modelIds)];
-    g.version++;
-    g.updatedAt = new Date().toISOString();
-    return structuredClone(g);
-  }
-  replaceAccessGroupPolicy(id: string, input: ReplaceAccessGroupPolicyInput) {
-    const group = this.#group(id, input.expectedVersion);
-    if (
-      input.name !== undefined &&
-      [...this.accessGroups.values()].some((other) =>
-        other.id !== id && other.name.toLowerCase() === input.name!.trim().toLowerCase()
-      )
-    ) throw new DomainError("conflict", "Access group name is already used", 409);
-    const userIds = [...new Set(input.userIds)];
-    const modelIds = [...new Set(input.modelIds)];
-    const tokenIds = [
-      ...new Set(input.tokenIds.flatMap((tokenId) => {
-        const token = this.tokens.get(tokenId);
-        return token ? this.#familyTokens(token).map((generation) => generation.id) : [tokenId];
-      })),
-    ];
-    for (const userId of userIds) {
-      if (!this.users.has(userId)) throw new DomainError("not_found", "User not found", 404);
-    }
-    for (const modelId of modelIds) {
-      if (!this.providerModels.has(modelId)) {
-        throw new DomainError("not_found", "Model not found", 404);
+      for (const modelId of modelIds) {
+        if (!this.providerModels.has(modelId)) {
+          throw new DomainError("not_found", "Model not found", 404);
+        }
       }
-    }
-    for (const tokenId of tokenIds) {
-      const token = this.tokens.get(tokenId);
-      if (!token) throw new DomainError("not_found", "Token not found", 404);
-      if (!userIds.includes(token.userId)) {
-        throw new DomainError(
-          "validation_error",
-          "Every token owner must be included in the group",
-          422,
-        );
+      const tokenIds = [
+        ...new Set(requestedTokenIds.flatMap((tokenId) => {
+          const token = this.tokens.get(tokenId);
+          if (!token) throw new DomainError("not_found", "Token not found", 404);
+          return this.#familyTokens(token).map((generation) => generation.id);
+        })),
+      ];
+      for (const tokenId of tokenIds) {
+        const token = this.tokens.get(tokenId)!;
+        if (!userIds.includes(token.userId)) {
+          throw new DomainError(
+            "validation_error",
+            "Every token owner must be included in the group",
+            422,
+          );
+        }
       }
-    }
-    if (input.name !== undefined) group.name = input.name.trim();
-    if (input.description !== undefined) group.description = input.description;
-    const priorTokenIds = [...group.tokenIds];
-    group.userIds = userIds;
-    group.modelIds = modelIds;
-    group.tokenIds = tokenIds;
-    group.tokenOwners = tokenIds.map((tokenId) => ({
-      tokenId,
-      ownerId: this.tokens.get(tokenId)!.userId,
-    }));
-    for (const tokenId of new Set([...priorTokenIds, ...tokenIds])) {
-      if (priorTokenIds.includes(tokenId) !== tokenIds.includes(tokenId)) {
+      const now = new Date().toISOString();
+      const value: AccessGroup = {
+        id,
+        name,
+        description,
+        version: 1,
+        userIds,
+        modelIds,
+        tokenIds,
+        tokenOwners: tokenIds.map((tokenId) => ({
+          tokenId,
+          ownerId: this.tokens.get(tokenId)!.userId,
+        })),
+        createdAt: now,
+        updatedAt: now,
+      };
+      this.accessGroups.set(value.id, value);
+      for (const tokenId of tokenIds) {
         const token = this.tokens.get(tokenId)!;
         token.accessMode = "restricted";
         token.version++;
       }
+      mutationAudit.metadata = {
+        ...mutationAudit.metadata,
+        after: { name, description, userIds, modelIds, tokenIds },
+      };
+      return structuredClone(value);
+    }, mutationAudit);
+  }
+  updateAccessGroup(
+    id: string,
+    input: UpdateAccessGroupInput,
+    audit: PrivilegedAuditEventInput,
+  ) {
+    this.#requirePrivilegedAuditContext(audit);
+    if (input.name === undefined && input.description === undefined) {
+      throw new DomainError(
+        "validation_error",
+        "Provide a name or description to update",
+        422,
+      );
     }
-    group.version++;
-    group.updatedAt = new Date().toISOString();
-    return structuredClone(group);
+    const mutationAudit: PrivilegedAuditEventInput = {
+      ...audit,
+      targetId: id,
+      metadata: { ...audit.metadata },
+    };
+    return this.#withAtomicAccessGroupMutation(() => {
+      const g = this.#group(id, input.expectedVersion);
+      const before = { name: g.name, description: g.description };
+      const after = {
+        name: input.name?.trim() ?? before.name,
+        description: input.description ?? before.description,
+      };
+      if (
+        input.name !== undefined &&
+        [...this.accessGroups.values()].some((other) =>
+          other.id !== id && other.name.toLowerCase() === input.name!.trim().toLowerCase()
+        )
+      ) throw new DomainError("conflict", "Access group name is already used", 409);
+      g.name = after.name;
+      g.description = after.description;
+      g.version++;
+      g.updatedAt = new Date().toISOString();
+      mutationAudit.metadata = { ...mutationAudit.metadata, before, after };
+      return structuredClone(g);
+    }, mutationAudit);
+  }
+  #withAtomicAccessGroupMutation<T>(
+    operation: () => T,
+    audit: PrivilegedAuditEventInput,
+  ): T {
+    if (!audit) {
+      throw new DomainError(
+        "admin_authority_required",
+        "Privileged mutation context is required",
+        403,
+      );
+    }
+    const groupsBefore = new Map(
+      [...this.accessGroups].map(([key, value]) => [key, structuredClone(value)]),
+    );
+    const tokensBefore = new Map(
+      [...this.tokens].map(([key, value]) => [key, structuredClone(value)]),
+    );
+    const auditLength = this.auditEvents.length;
+    try {
+      this.#assertEffectiveAdminActor(
+        audit.actorId,
+        audit.requireEmailVerification,
+        audit.expectedAuthorityEpoch,
+      );
+      const result = operation();
+      const {
+        requireEmailVerification: _requireEmailVerification,
+        expectedAuthorityEpoch: _expectedAuthorityEpoch,
+        ...event
+      } = audit;
+      this.recordAudit(event);
+      return result;
+    } catch (error) {
+      this.accessGroups.clear();
+      for (const [key, value] of groupsBefore) this.accessGroups.set(key, value);
+      this.tokens.clear();
+      for (const [key, value] of tokensBefore) this.tokens.set(key, value);
+      this.auditEvents.length = auditLength;
+      throw error;
+    }
+  }
+  deleteAccessGroup(
+    id: string,
+    expectedVersion: number,
+    acknowledgePublicModelIds: string[],
+    audit: PrivilegedAuditEventInput,
+  ) {
+    this.#requirePrivilegedAuditContext(audit);
+    const mutationAudit = { ...audit, targetId: id, metadata: { ...audit.metadata } };
+    return this.#withAtomicAccessGroupMutation(
+      () => {
+        const group = this.#group(id, expectedVersion);
+        const modelIdsBecomingPublic = this.#modelIdsBecomingPublic(id, group.modelIds, []);
+        this.#requireModelAccessWideningAcknowledgement(
+          modelIdsBecomingPublic,
+          acknowledgePublicModelIds,
+        );
+        this.#restrictTokenFamiliesForMembershipChange(group.tokenIds);
+        this.accessGroups.delete(id);
+        mutationAudit.metadata = { ...mutationAudit.metadata, modelIdsBecomingPublic };
+      },
+      mutationAudit,
+    );
+  }
+  replaceAccessGroupUsers(
+    id: string,
+    userIds: string[],
+    expectedVersion: number,
+    audit: PrivilegedAuditEventInput,
+  ) {
+    this.#requirePrivilegedAuditContext(audit);
+    const mutationAudit = { ...audit, targetId: id };
+    return this.#withAtomicAccessGroupMutation(() => {
+      const g = this.#group(id, expectedVersion);
+      for (const uid of userIds) {
+        if (!this.users.has(uid)) throw new DomainError("not_found", "User not found", 404);
+      }
+      g.userIds = [...new Set(userIds)];
+      const tokenIdsLosingMembership = g.tokenIds.filter((tokenId) =>
+        !g.userIds.includes(this.tokens.get(tokenId)?.userId ?? "")
+      );
+      g.tokenIds = g.tokenIds.filter((tid) =>
+        g.userIds.includes(this.tokens.get(tid)?.userId ?? "")
+      );
+      g.tokenOwners = g.tokenIds.map((tokenId) => ({
+        tokenId,
+        ownerId: this.tokens.get(tokenId)!.userId,
+      }));
+      this.#restrictTokenFamiliesForMembershipChange(tokenIdsLosingMembership);
+      g.version++;
+      g.updatedAt = new Date().toISOString();
+      return structuredClone(g);
+    }, mutationAudit);
+  }
+  replaceAccessGroupModels(
+    id: string,
+    modelIds: string[],
+    expectedVersion: number,
+    acknowledgePublicModelIds: string[],
+    audit: PrivilegedAuditEventInput,
+  ) {
+    this.#requirePrivilegedAuditContext(audit);
+    const desiredModelIds = [...new Set(modelIds)];
+    const mutationAudit = { ...audit, targetId: id, metadata: { ...audit.metadata } };
+    return this.#withAtomicAccessGroupMutation(
+      () => {
+        const g = this.#group(id, expectedVersion);
+        const modelIdsBecomingPublic = this.#modelIdsBecomingPublic(
+          id,
+          g.modelIds,
+          desiredModelIds,
+        );
+        for (const mid of desiredModelIds) {
+          if (!this.providerModels.has(mid)) {
+            throw new DomainError("not_found", "Model not found", 404);
+          }
+        }
+        this.#requireModelAccessWideningAcknowledgement(
+          modelIdsBecomingPublic,
+          acknowledgePublicModelIds,
+        );
+        g.modelIds = desiredModelIds;
+        g.version++;
+        g.updatedAt = new Date().toISOString();
+        mutationAudit.metadata = { ...mutationAudit.metadata, modelIdsBecomingPublic };
+        return structuredClone(g);
+      },
+      mutationAudit,
+    );
+  }
+  replaceAccessGroupPolicy(
+    id: string,
+    input: ReplaceAccessGroupPolicyInput,
+    audit: PrivilegedAuditEventInput,
+  ) {
+    this.#requirePrivilegedAuditContext(audit);
+    const modelIds = [...new Set(input.modelIds)];
+    const mutationAudit = { ...audit, targetId: id, metadata: { ...audit.metadata } };
+    return this.#withAtomicAccessGroupMutation(
+      () => {
+        const group = this.#group(id, input.expectedVersion);
+        const modelIdsBecomingPublic = this.#modelIdsBecomingPublic(
+          id,
+          group.modelIds,
+          modelIds,
+        );
+        const before = { name: group.name, description: group.description };
+        const after = {
+          name: input.name?.trim() ?? before.name,
+          description: input.description ?? before.description,
+        };
+        if (
+          input.name !== undefined &&
+          [...this.accessGroups.values()].some((other) =>
+            other.id !== id && other.name.toLowerCase() === input.name!.trim().toLowerCase()
+          )
+        ) {
+          throw new DomainError("conflict", "Access group name is already used", 409);
+        }
+        const userIds = [...new Set(input.userIds)];
+        const tokenIds = [
+          ...new Set(input.tokenIds.flatMap((tokenId) => {
+            const token = this.tokens.get(tokenId);
+            return token ? this.#familyTokens(token).map((generation) => generation.id) : [tokenId];
+          })),
+        ];
+        for (const userId of userIds) {
+          if (!this.users.has(userId)) throw new DomainError("not_found", "User not found", 404);
+        }
+        for (const modelId of modelIds) {
+          if (!this.providerModels.has(modelId)) {
+            throw new DomainError("not_found", "Model not found", 404);
+          }
+        }
+        for (const tokenId of tokenIds) {
+          const token = this.tokens.get(tokenId);
+          if (!token) throw new DomainError("not_found", "Token not found", 404);
+          if (!userIds.includes(token.userId)) {
+            throw new DomainError(
+              "validation_error",
+              "Every token owner must be included in the group",
+              422,
+            );
+          }
+        }
+        this.#requireModelAccessWideningAcknowledgement(
+          modelIdsBecomingPublic,
+          input.acknowledgePublicModelIds,
+        );
+        group.name = after.name;
+        group.description = after.description;
+        const priorTokenIds = [...group.tokenIds];
+        group.userIds = userIds;
+        group.modelIds = modelIds;
+        group.tokenIds = tokenIds;
+        group.tokenOwners = tokenIds.map((tokenId) => ({
+          tokenId,
+          ownerId: this.tokens.get(tokenId)!.userId,
+        }));
+        for (const tokenId of new Set([...priorTokenIds, ...tokenIds])) {
+          if (priorTokenIds.includes(tokenId) !== tokenIds.includes(tokenId)) {
+            const token = this.tokens.get(tokenId)!;
+            token.accessMode = "restricted";
+            token.version++;
+          }
+        }
+        group.version++;
+        group.updatedAt = new Date().toISOString();
+        mutationAudit.metadata = {
+          ...mutationAudit.metadata,
+          before,
+          after,
+          modelIdsBecomingPublic,
+        };
+        return structuredClone(group);
+      },
+      mutationAudit,
+    );
   }
   previewAccessGroupPolicyImpact(
+    context: PrivilegedReadContext,
     id: string,
     proposal: AccessGroupPolicyProposal | null = null,
   ): AccessGroupPolicyImpact {
+    this.#assertPrivilegedReadContext(context);
     const group = this.accessGroups.get(id);
     if (!group) throw new DomainError("not_found", "Access group not found", 404);
     const nextModels = new Set(proposal?.modelIds ?? []);
@@ -5924,11 +7941,10 @@ export class MemoryRepository {
       const token = this.tokens.get(tokenId);
       return token ? this.#familyTokens(token).map((generation) => generation.id) : [tokenId];
     }));
-    const modelIdsBecomingPublic = group.modelIds.filter((modelId) =>
-      !nextModels.has(modelId) &&
-      ![...this.accessGroups.values()].some((other) =>
-        other.id !== id && other.modelIds.includes(modelId)
-      )
+    const modelIdsBecomingPublic = this.#modelIdsBecomingPublic(
+      id,
+      group.modelIds,
+      [...nextModels],
     );
     const tokenIdsLosingGroupAccess = group.tokenIds.filter((tokenId) => !nextTokens.has(tokenId));
     const tokenIdsRevertingToOwnerInheritance = tokenIdsLosingGroupAccess.filter((tokenId) =>
@@ -5940,6 +7956,35 @@ export class MemoryRepository {
       tokenIdsRevertingToOwnerInheritance,
     };
   }
+  #modelIdsBecomingPublic(
+    groupId: string,
+    currentModelIds: readonly string[],
+    nextModelIds: readonly string[],
+  ): string[] {
+    const nextModels = new Set(nextModelIds);
+    return currentModelIds.filter((modelId) =>
+      !nextModels.has(modelId) &&
+      ![...this.accessGroups.values()].some((other) =>
+        other.id !== groupId && other.modelIds.includes(modelId)
+      )
+    ).sort();
+  }
+  #requireModelAccessWideningAcknowledgement(
+    actualModelIds: readonly string[],
+    acknowledgedModelIds: readonly string[],
+  ) {
+    if (
+      !modelAccessWideningAcknowledgementMatches(actualModelIds, acknowledgedModelIds)
+    ) {
+      throw new DomainError(
+        "model_access_widening_acknowledgement_required",
+        `Acknowledge the exact models that will become public before applying this change: ${
+          actualModelIds.join(", ")
+        }`,
+        409,
+      );
+    }
+  }
   #group(id: string, version: number) {
     const g = this.accessGroups.get(id);
     if (!g) throw new DomainError("not_found", "Access group not found", 404);
@@ -5948,7 +7993,49 @@ export class MemoryRepository {
     }
     return g;
   }
+  #restrictTokenFamiliesForMembershipChange(tokenIds: readonly string[]) {
+    const familyIds = new Set(
+      tokenIds.flatMap((tokenId) => {
+        const token = this.tokens.get(tokenId);
+        return token ? [token.rotationFamilyId] : [];
+      }),
+    );
+    for (const token of this.tokens.values()) {
+      if (!familyIds.has(token.rotationFamilyId)) continue;
+      token.accessMode = "restricted";
+      token.version++;
+    }
+  }
   setTokenAccessGroups(
+    userId: string,
+    tokenId: string,
+    groupIds: string[],
+    expectedVersion: number,
+    audit: PrivilegedAuditEventInput,
+  ) {
+    this.#requirePrivilegedAuditContext(audit);
+    return this.#withAtomicApiTokenMutation(userId, () => {
+      this.#assertEffectiveAdminActor(
+        audit.actorId,
+        audit.requireEmailVerification,
+        audit.expectedAuthorityEpoch,
+      );
+      const updated = this.#setTokenAccessGroupsMutation(
+        userId,
+        tokenId,
+        groupIds,
+        expectedVersion,
+      );
+      const {
+        requireEmailVerification: _requireEmailVerification,
+        expectedAuthorityEpoch: _expectedAuthorityEpoch,
+        ...event
+      } = audit;
+      this.recordAudit({ ...event, targetId: tokenId });
+      return updated;
+    });
+  }
+  #setTokenAccessGroupsMutation(
     userId: string,
     tokenId: string,
     groupIds: string[],
@@ -5986,6 +8073,35 @@ export class MemoryRepository {
     return this.#tokenSummary(token);
   }
   setTokenAccessMode(
+    userId: string,
+    tokenId: string,
+    mode: "inherit" | "restricted",
+    expectedVersion: number,
+    audit: PrivilegedAuditEventInput,
+  ) {
+    this.#requirePrivilegedAuditContext(audit);
+    return this.#withAtomicApiTokenMutation(userId, () => {
+      this.#assertEffectiveAdminActor(
+        audit.actorId,
+        audit.requireEmailVerification,
+        audit.expectedAuthorityEpoch,
+      );
+      const updated = this.#setTokenAccessModeMutation(
+        userId,
+        tokenId,
+        mode,
+        expectedVersion,
+      );
+      const {
+        requireEmailVerification: _requireEmailVerification,
+        expectedAuthorityEpoch: _expectedAuthorityEpoch,
+        ...event
+      } = audit;
+      this.recordAudit({ ...event, targetId: tokenId });
+      return updated;
+    });
+  }
+  #setTokenAccessModeMutation(
     userId: string,
     tokenId: string,
     mode: "inherit" | "restricted",
@@ -6118,8 +8234,9 @@ export class MemoryRepository {
     model: string,
     amountMicros: number,
     provider = "unknown",
-    _tokenId?: string,
+    tokenId?: string,
     pricingSnapshot?: UsagePricingSnapshot,
+    recoveryOwner: UsageRecoveryOwner = "provider",
   ) {
     if (pricingSnapshot !== undefined && !isUsagePricingSnapshot(pricingSnapshot)) {
       throw new DomainError("validation_error", "Usage pricing snapshot is invalid", 422);
@@ -6136,8 +8253,10 @@ export class MemoryRepository {
     const run: UsageRun = {
       id: runId,
       userId,
+      tokenId: tokenId ?? null,
       model,
       provider,
+      recoveryOwner,
       status: "reserved",
       reservedMicros: amountMicros,
       costMicros: 0,
@@ -6157,6 +8276,7 @@ export class MemoryRepository {
       generationLeaseToken: null,
       generationLeaseExpiresAt: null,
       createdAt: new Date().toISOString(),
+      completedAt: null,
     };
     this.usageRuns.set(runId, run);
     return run;
@@ -6191,6 +8311,7 @@ export class MemoryRepository {
     run.runLeaseExpiresAt = null;
     run.generationLeaseToken = null;
     run.generationLeaseExpiresAt = null;
+    run.completedAt = new Date().toISOString();
     return run;
   }
 
@@ -6205,6 +8326,7 @@ export class MemoryRepository {
       run.costMicros = run.reservedMicros;
       run.runLeaseToken = null;
       run.runLeaseExpiresAt = null;
+      run.completedAt = new Date().toISOString();
       return run;
     }
     if (run.executionEpoch > 0) {
@@ -6216,10 +8338,12 @@ export class MemoryRepository {
       run.outputTokens = 0;
       run.runLeaseToken = null;
       run.runLeaseExpiresAt = null;
+      run.completedAt = new Date().toISOString();
       return run;
     }
     this.credit(run.userId, runId, "refund", run.reservedMicros);
     run.status = "failed";
+    run.completedAt = new Date().toISOString();
     return run;
   }
 
@@ -6325,6 +8449,7 @@ export class MemoryRepository {
       input.provider,
       input.tokenId,
       input.pricingSnapshot,
+      "api_replay",
     );
     usageRun.runLeaseToken = null;
     usageRun.runLeaseExpiresAt = null;
@@ -6483,6 +8608,12 @@ export class MemoryRepository {
       request.observedLatencyMs = Math.max(request.observedLatencyMs, observation.latencyMs);
     }
     request.leaseExpiresAt = new Date(Date.now() + leaseSeconds * 1000).toISOString();
+  }
+  releaseApiRequestLease(id: string, leaseToken: string) {
+    const request = this.#apiRequest(id);
+    this.#assertLease(request, leaseToken);
+    request.leaseExpiresAt = new Date(Date.now() - 1).toISOString();
+    return structuredClone(request);
   }
   reclaimApiRequest(id: string, expiredLeaseToken: string, leaseSeconds = 120) {
     if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1) {
@@ -6715,6 +8846,10 @@ export class MemoryRepository {
         request.endpoint === "images.generations" &&
         [...this.generatedAssets.values()].some((asset) => asset.usageRunId === request.usageRunId)
       ) continue;
+      const fileStage = request.endpoint === "files"
+        ? this.fileUploadStages.get(request.id)
+        : undefined;
+      if (fileStage && fileStage.state !== "finalized") continue;
       for (const attempt of this.providerAttempts.values()) {
         if (attempt.usageRunId !== request.usageRunId || attempt.status !== "running") continue;
         attempt.status = "cancelled";
@@ -6786,7 +8921,7 @@ export class MemoryRepository {
       if (
         run.status !== "reserved" || !run.runLeaseToken || !run.runLeaseExpiresAt ||
         Date.parse(run.runLeaseExpiresAt) > Date.now() || run.generationLeaseToken ||
-        belongsToApiReplay
+        belongsToApiReplay || run.recoveryOwner !== "provider"
       ) continue;
       this.refund(run.id);
       for (const attempt of this.providerAttempts.values()) {
@@ -6834,12 +8969,22 @@ export class MemoryRepository {
     };
   }
   adminSummary() {
-    return {
+    const result = {
       calls: this.usageRuns.size,
       users: this.users.size,
       balanceMicros: [...this.users.values()].reduce((sum, value) => sum + value.balanceMicros, 0),
-      ledger: [...this.ledger],
     };
+    if (
+      !Number.isSafeInteger(result.calls) || !Number.isSafeInteger(result.users) ||
+      !Number.isSafeInteger(result.balanceMicros)
+    ) {
+      throw new DomainError(
+        "accounting_overflow",
+        "Administrative usage summary exceeds safe integer bounds",
+        500,
+      );
+    }
+    return result;
   }
   adminAnalytics(query: AdminAnalyticsQuery): AdminAnalytics {
     const from = Date.parse(query.from);
@@ -7013,6 +9158,23 @@ export class MemoryRepository {
         : null,
     };
   }
+  listWorkerInstances(query: AdminWorkerQuery = {}): AdminWorkerPage {
+    const limit = query.limit ?? 50;
+    const scope = query.scope ?? "active";
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new DomainError("validation_error", "Worker page limit must be between 1 and 100", 422);
+    }
+    if (!["active", "history", "all"].includes(scope) || query.cursor) {
+      throw new DomainError("validation_error", "Worker page query is invalid", 422);
+    }
+    return {
+      items: [],
+      scope,
+      limit,
+      nextCursor: null,
+      hasMore: false,
+    };
+  }
   retryFailedJob(id: string, actorId: string) {
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) {
       throw new DomainError("validation_error", "Invalid job id", 422);
@@ -7172,7 +9334,11 @@ export class MemoryRepository {
       responseBytes: responses.reduce((sum, value) => sum + value.responseBytes, 0),
     };
   }
-  enqueueRetentionScrub(input: EnqueueRetentionScrubInput, actorId: string): RetentionScrubRun {
+  enqueueRetentionScrub(
+    input: EnqueueRetentionScrubInput,
+    actorId: string | null,
+    validationNow = Date.now(),
+  ): RetentionScrubRun {
     if (
       !input.idempotencyKey || input.idempotencyKey.length < 8 ||
       input.idempotencyKey.length > 200 ||
@@ -7197,8 +9363,10 @@ export class MemoryRepository {
     if (input.expectedPolicyVersion !== this.retentionPolicy.version) {
       throw new DomainError("version_conflict", "Retention preview is stale", 409);
     }
-    const maximumRequestCutoff = Date.now() - this.retentionPolicy.requestBodyDays * 86_400_000;
-    const maximumResponseCutoff = Date.now() - this.retentionPolicy.responseBodyDays * 86_400_000;
+    const maximumRequestCutoff = validationNow -
+      this.retentionPolicy.requestBodyDays * 86_400_000;
+    const maximumResponseCutoff = validationNow -
+      this.retentionPolicy.responseBodyDays * 86_400_000;
     if (
       Date.parse(input.requestCutoffAt) > maximumRequestCutoff ||
       Date.parse(input.responseCutoffAt) > maximumResponseCutoff
@@ -7244,6 +9412,96 @@ export class MemoryRepository {
       metadata: { policyVersion: run.policy.version },
     });
     return structuredClone(run);
+  }
+  scheduleRetentionScrub(input: ScheduleRetentionScrubInput): RetentionScheduleResult {
+    if (
+      !Number.isSafeInteger(input.intervalSeconds) || input.intervalSeconds < 300 ||
+      input.intervalSeconds > 2_592_000
+    ) {
+      throw new DomainError(
+        "validation_error",
+        "Retention schedule interval must be between 300 and 2592000 seconds",
+        422,
+      );
+    }
+    const now = new Date(input.now ?? new Date().toISOString());
+    if (!Number.isFinite(now.getTime())) {
+      throw new DomainError("validation_error", "Retention schedule time is invalid", 422);
+    }
+    const state = this.retentionScheduleState;
+    let dueAt = new Date(state.nextDueAt);
+    if (state.lastScheduledAt === null && state.lastPolicyVersion === null) {
+      dueAt = new Date(now);
+      state.nextDueAt = dueAt.toISOString();
+    }
+    if (state.intervalSeconds !== input.intervalSeconds) {
+      const cadenceAnchor = state.lastScheduledAt === null
+        ? now.getTime()
+        : Date.parse(state.lastScheduledAt);
+      dueAt = new Date(cadenceAnchor + input.intervalSeconds * 1_000);
+      state.nextDueAt = dueAt.toISOString();
+    }
+    const intervalDue = dueAt.getTime() <= now.getTime();
+    const policyChanged = state.lastPolicyVersion !== this.retentionPolicy.version;
+    const overdueSeconds = intervalDue
+      ? Math.max(0, Math.floor((now.getTime() - dueAt.getTime()) / 1_000))
+      : 0;
+    state.intervalSeconds = input.intervalSeconds;
+    if (!intervalDue && !policyChanged) {
+      state.updatedAt = now.toISOString();
+      return {
+        scheduled: false,
+        reason: null,
+        run: null,
+        intervalSeconds: state.intervalSeconds,
+        nextDueAt: state.nextDueAt,
+        overdueSeconds,
+      };
+    }
+    const reason = policyChanged ? "policy_changed" : "interval_due";
+    const preview = {
+      expectedPolicyVersion: this.retentionPolicy.version,
+      requestCutoffAt: new Date(
+        now.getTime() - this.retentionPolicy.requestBodyDays * 86_400_000,
+      ).toISOString(),
+      responseCutoffAt: new Date(
+        now.getTime() - this.retentionPolicy.responseBodyDays * 86_400_000,
+      ).toISOString(),
+      // The singleton schedule state is the exactly-once fence. A unique key cannot collide with
+      // administrator-chosen idempotency keys created before automatic scheduling existed.
+      idempotencyKey: `retention.auto:${crypto.randomUUID()}`,
+    };
+    const run = this.enqueueRetentionScrub(preview, null, now.getTime());
+    const intervalMs = input.intervalSeconds * 1_000;
+    const nextDueMs = intervalDue
+      ? dueAt.getTime() +
+        (Math.floor((now.getTime() - dueAt.getTime()) / intervalMs) + 1) * intervalMs
+      : now.getTime() + intervalMs;
+    state.nextDueAt = new Date(nextDueMs).toISOString();
+    state.lastPolicyVersion = this.retentionPolicy.version;
+    state.lastScheduledAt = now.toISOString();
+    state.lastRunId = run.id;
+    state.updatedAt = now.toISOString();
+    this.recordAudit({
+      action: "retention.schedule.enqueued",
+      targetType: "retention_scrub_run",
+      targetId: run.id,
+      metadata: {
+        reason,
+        policyVersion: run.policy.version,
+        intervalSeconds: input.intervalSeconds,
+        overdueSeconds,
+        nextDueAt: state.nextDueAt,
+      },
+    });
+    return {
+      scheduled: true,
+      reason,
+      run,
+      intervalSeconds: state.intervalSeconds,
+      nextDueAt: state.nextDueAt,
+      overdueSeconds,
+    };
   }
   getRetentionScrubRun(id: string): RetentionScrubRun {
     if (!/^[0-9a-f-]{36}$/i.test(id)) {
@@ -7357,7 +9615,25 @@ export class MemoryRepository {
     return this.ledger.filter((entry) => entry.userId === userId);
   }
 
-  enqueueJob(type: string, payload: unknown): string {
+  enqueueJob(
+    type: string,
+    payload: unknown,
+    availableAt?: string,
+    idempotencyKey?: string,
+  ): string {
+    if (idempotencyKey !== undefined) {
+      const prior = this.jobs.find((job) => job.idempotencyKey === idempotencyKey);
+      if (prior) {
+        if (prior.type !== type || JSON.stringify(prior.payload) !== JSON.stringify(payload)) {
+          throw new DomainError(
+            "job_idempotency_conflict",
+            "Job idempotency key payload differs",
+            409,
+          );
+        }
+        return prior.id;
+      }
+    }
     const id = crypto.randomUUID();
     this.jobs.push({
       id,
@@ -7365,11 +9641,12 @@ export class MemoryRepository {
       payload,
       status: "queued",
       attempts: 0,
-      availableAt: new Date().toISOString(),
+      availableAt: availableAt ?? new Date().toISOString(),
       lockedAt: null,
       lockedBy: null,
       lastError: null,
       completedAt: null,
+      idempotencyKey,
       createdAt: new Date().toISOString(),
     });
     return id;

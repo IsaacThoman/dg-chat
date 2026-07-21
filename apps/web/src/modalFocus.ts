@@ -22,9 +22,16 @@ export function modalShouldRestoreFocus(value: boolean | (() => boolean)): boole
 }
 
 export function modalOverlayPresent(
-  root: Pick<Document, "querySelector"> = document,
+  root: Pick<Document, "querySelectorAll"> = document,
+  excludedDialog?: Element | null,
 ): boolean {
-  return Boolean(root.querySelector(".modal-overlay"));
+  return [...root.querySelectorAll('.modal-overlay, [role="dialog"][aria-modal="true"]')].some(
+    (candidate) => {
+      if (candidate === excludedDialog) return false;
+      const overlay = candidate as HTMLElement;
+      return !overlay.closest('[hidden], [inert], [aria-hidden="true"]');
+    },
+  );
 }
 
 export function consumeModalEscape(
@@ -53,4 +60,29 @@ export function modalInitialFocus(
   return focusable.find((element) =>
     element.hasAttribute("data-autofocus") || element.hasAttribute("autofocus")
   ) ?? focusable[0] ?? dialog;
+}
+
+export function modalTabTarget(
+  dialog: HTMLElement,
+  activeElement: Element | null,
+  backwards: boolean,
+  focusable = modalFocusableElements(dialog),
+): HTMLElement | null {
+  if (!focusable.length) return dialog;
+  const first = focusable[0];
+  const last = focusable.at(-1)!;
+  if (!activeElement || !dialog.contains(activeElement)) return backwards ? last : first;
+  if (backwards && activeElement === first) return last;
+  if (!backwards && activeElement === last) return first;
+  return null;
+}
+
+export function modalContainmentTarget(
+  dialog: HTMLElement,
+  focusedElement: EventTarget | null,
+  focusable = modalFocusableElements(dialog),
+): HTMLElement | null {
+  return focusedElement && dialog.contains(focusedElement as Node)
+    ? null
+    : modalInitialFocus(dialog, focusable);
 }

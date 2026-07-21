@@ -47,13 +47,13 @@ Deno.test("memory admin security pages are target-bound, filtered, cursor-bound,
     scopes: ["chat:write"],
     tokenHash: "secret-token-one",
     preview: "dg_one",
-  });
+  }, target.authorityEpoch);
   repository.createApiToken(target.id, {
     name: "Second",
     scopes: ["models:read"],
     tokenHash: "secret-token-two",
     preview: "dg_two",
-  });
+  }, target.authorityEpoch);
 
   const sessions = repository.listAdminUserSessions(
     actor.id,
@@ -109,7 +109,7 @@ Deno.test("memory admin session and token revocation are target-bound, versioned
     scopes: ["chat:write"],
     tokenHash: "family-secret",
     preview: "family",
-  });
+  }, target.authorityEpoch);
 
   code(() =>
     repository.revokeAdminUserSession({
@@ -158,6 +158,8 @@ Deno.test("memory admin session and token revocation are target-bound, versioned
   });
   assertEquals(token.revokedAt !== null, true);
   assertEquals(repository.auditEvents.map((event) => event.action), [
+    "identity.bootstrap_admin",
+    "api_token.created",
     "user.session.revoked",
     "user.api_token_family.revoked",
   ]);
@@ -273,20 +275,20 @@ Deno.test("memory rotation invalidates stale administrative versions across the 
     scopes: ["chat:write"],
     tokenHash: "rotation-one",
     preview: "one",
-  });
+  }, target.authorityEpoch);
   const second = repository.rotateApiToken(target.id, first.id, {
     expectedVersion: 1,
     tokenHash: "rotation-two",
     preview: "two",
     overlapSeconds: 3600,
-  });
+  }, target.authorityEpoch);
   const staleFirstVersion = second.previous.version;
   const third = repository.rotateApiToken(target.id, second.replacement.id, {
     expectedVersion: 1,
     tokenHash: "rotation-three",
     preview: "three",
     overlapSeconds: 3600,
-  });
+  }, target.authorityEpoch);
   code(() =>
     repository.revokeAdminUserTokenFamily({
       actorId: actor.id,

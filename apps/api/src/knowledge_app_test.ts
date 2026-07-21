@@ -123,6 +123,7 @@ Deno.test("knowledge API lifecycle, versions, deleted parents, and owner isolati
   const other = (await json(signup)).user;
   await repository.decideUserApproval({
     actorId: admin.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: other.id,
     expectedVersion: other.version,
     status: "approved",

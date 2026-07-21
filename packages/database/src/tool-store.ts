@@ -5,6 +5,8 @@ export type StoredToolExecutionStatus =
   | "queued_pending_reservation"
   | "queued"
   | "running"
+  | "failed_pending_refund"
+  | "cancelled_pending_refund"
   | "succeeded_pending_settlement"
   | "succeeded"
   | "failed"
@@ -31,8 +33,11 @@ export interface StoredToolExecution {
   approvedAt: string | null;
   approvedBy: string | null;
   cancellationRequestedAt: string | null;
+  billingSnapshot: { reservedMicros: number; provider: string; model: string } | null;
   createdAt: string;
   updatedAt: string;
+  claimToken?: string | null;
+  claimExpiresAt?: string | null;
 }
 
 type Row = Record<string, unknown>;
@@ -58,8 +63,13 @@ const execution = (row: Row): StoredToolExecution => ({
   approvedAt: nullableIso(row.approved_at),
   approvedBy: row.approved_by == null ? null : String(row.approved_by),
   cancellationRequestedAt: nullableIso(row.cancellation_requested_at),
+  billingSnapshot: row.billing_snapshot == null
+    ? null
+    : row.billing_snapshot as StoredToolExecution["billingSnapshot"],
   createdAt: iso(row.created_at),
   updatedAt: iso(row.updated_at),
+  claimToken: row.claim_token == null ? null : String(row.claim_token),
+  claimExpiresAt: nullableIso(row.claim_expires_at),
 });
 
 /** Durable tool state with database-level CAS and ownership-scoped reads. */
@@ -137,13 +147,15 @@ export class PostgresToolExecutionStore {
     const [row] = await this.#sql`
       INSERT INTO tool_executions
         (id, owner_id, tool_id, input, status, result, error, approved_at, approved_by,
-         cancellation_requested_at, created_at, updated_at)
+         cancellation_requested_at, billing_snapshot, created_at, updated_at)
       VALUES (${value.id}::uuid, ${value.ownerId}::uuid, ${value.toolId}, ${
       this.#sql.json(value.input as never)
     },
         ${value.status}, ${value.result == null ? null : this.#sql.json(value.result as never)},
         ${value.error == null ? null : this.#sql.json(value.error)}, ${value.approvedAt},
-        ${value.approvedBy}::uuid, ${value.cancellationRequestedAt}, ${value.createdAt}, ${value.updatedAt})
+        ${value.approvedBy}::uuid, ${value.cancellationRequestedAt},
+        ${value.billingSnapshot == null ? null : this.#sql.json(value.billingSnapshot)},
+        ${value.createdAt}, ${value.updatedAt})
       RETURNING *`;
     return execution(row);
   }
@@ -160,6 +172,7 @@ export class PostgresToolExecutionStore {
     id: string,
     expected: readonly StoredToolExecutionStatus[],
     patch: Partial<Omit<StoredToolExecution, "id" | "ownerId" | "toolId" | "input" | "createdAt">>,
+    claimToken?: string,
   ): Promise<StoredToolExecution | undefined> {
     const row = await this.#sql.begin(async (tx) => {
       const [updated] = await tx`
@@ -177,8 +190,16 @@ export class PostgresToolExecutionStore {
           THEN cancellation_requested_at ELSE ${
         patch.cancellationRequestedAt ?? null
       }::timestamptz END,
+        billing_snapshot = CASE WHEN ${patch.billingSnapshot === undefined} THEN billing_snapshot
+          ELSE ${patch.billingSnapshot == null ? null : tx.json(patch.billingSnapshot)} END,
+        claim_token = CASE WHEN ${patch.status !== undefined && patch.status !== "running"}
+          THEN NULL ELSE claim_token END,
+        claim_expires_at = CASE WHEN ${patch.status !== undefined && patch.status !== "running"}
+          THEN NULL ELSE claim_expires_at END,
         updated_at = now()
       WHERE id = ${id}::uuid AND status = ANY(${expected as string[]})
+        AND (${patch.billingSnapshot === undefined} OR billing_snapshot IS NULL)
+        AND (${claimToken ?? null}::uuid IS NULL OR claim_token=${claimToken ?? null}::uuid)
       RETURNING *`;
       if (updated && patch.status && patch.status !== "running") {
         await tx`
@@ -240,5 +261,21 @@ export class PostgresToolExecutionStore {
       WHERE status IN ('queued_pending_reservation','queued')
         AND cancellation_requested_at IS NOT NULL ORDER BY updated_at LIMIT ${limit}`)
       .map(execution);
+  }
+  async listPendingRefund(limit: number): Promise<StoredToolExecution[]> {
+    return (await this.#sql`SELECT * FROM tool_executions
+      WHERE status IN ('failed_pending_refund','cancelled_pending_refund')
+      ORDER BY updated_at LIMIT ${limit}`)
+      .map(execution);
+  }
+  async renewClaim(id: string, claimToken: string, leaseMs: number): Promise<boolean> {
+    if (!Number.isSafeInteger(leaseMs) || leaseMs < 1_000 || leaseMs > 600_000) return false;
+    const intervalSeconds = Math.max(1, Math.ceil(leaseMs / 1_000));
+    const rows = await this.#sql`UPDATE tool_executions
+      SET claim_expires_at=now()+(${intervalSeconds}::text || ' seconds')::interval,
+        updated_at=now()
+      WHERE id=${id}::uuid AND status='running' AND claim_token=${claimToken}::uuid
+      RETURNING id`;
+    return rows.length === 1;
   }
 }

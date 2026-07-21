@@ -3,6 +3,7 @@
 FROM denoland/deno:alpine AS dependencies
 WORKDIR /workspace
 ENV DENO_DIR=/deno-dir
+RUN apk add --no-cache musl-dev
 COPY deno.json package.json deno.lock ./
 COPY apps/api/deno.json apps/api/deno.json
 COPY apps/mock-oidc/deno.json apps/mock-oidc/deno.json
@@ -10,9 +11,21 @@ COPY apps/worker/deno.json apps/worker/deno.json
 COPY apps/web/deno.json apps/web/package.json apps/web/
 COPY packages/contracts/deno.json packages/contracts/deno.json
 COPY packages/database/deno.json packages/database/deno.json
+COPY packages/observability/deno.json packages/observability/deno.json
 # Keep the resolved dependency cache in the image. Runtime containers are read-only
 # and must never need network access or mutate workspace links during startup.
 RUN deno install --frozen
+# Deno materializes optional npm dependency links for the host that generated the
+# lockfile. The web build runs on Alpine, so install the explicitly locked musl
+# binding at Lightning CSS's native fallback path as well.
+RUN set -eux; \
+    case "$(uname -m)" in \
+      x86_64) lightning_arch=x64 ;; \
+      aarch64) lightning_arch=arm64 ;; \
+      *) echo "Unsupported build architecture: $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    cp "/workspace/node_modules/lightningcss-linux-${lightning_arch}-musl/lightningcss.linux-${lightning_arch}-musl.node" \
+      "/workspace/node_modules/.deno/lightningcss@1.32.0/node_modules/lightningcss/lightningcss.linux-${lightning_arch}-musl.node"
 
 FROM dependencies AS source
 COPY apps ./apps
@@ -22,8 +35,12 @@ FROM source AS web-build
 RUN deno task build
 
 FROM source AS service-build
-RUN deno compile --frozen -A --node-modules-dir=none --output /workspace/dg-chat-api apps/api/src/main.ts \
+# A shared workspace lockfile also contains the web and test toolchains. Without
+# --exclude-unused-npm, Deno embeds that entire managed npm snapshot in every executable.
+RUN deno compile --frozen -A --node-modules-dir=none --exclude-unused-npm \
+      --output /workspace/dg-chat-api apps/api/src/main.ts \
     && deno compile --unstable-worker-options --frozen -A --node-modules-dir=none \
+      --exclude-unused-npm \
       --include apps/worker/src/extraction-worker.ts \
       --output /workspace/dg-chat-worker apps/worker/src/main.ts
 
@@ -49,13 +66,24 @@ server {
   listen 8080;
   server_name _;
   root /usr/share/nginx/html;
-  client_max_body_size 100m;
+  # Compose service addresses can change when a dependency is restarted. Resolve through
+  # Docker's embedded DNS for every upstream cache window instead of pinning the address that
+  # happened to exist when nginx started.
+  resolver 127.0.0.11 valid=5s ipv6=off;
+  set $dgchat_app_upstream app:8000;
+  # The API applies route-specific streaming limits (including the configurable backup ceiling).
+  # Do not introduce a smaller, buffered ingress limit that rejects a valid restore before the
+  # authenticated application can inspect it.
+  client_max_body_size 0;
   access_log /dev/stdout dgchat_privacy;
   add_header Referrer-Policy "no-referrer" always;
+  add_header X-Content-Type-Options "nosniff" always;
+  add_header Content-Security-Policy "default-src 'self'; base-uri 'self'; connect-src 'self'; font-src 'self' data:; form-action 'self'; frame-ancestors 'none'; frame-src 'none'; img-src 'self' data: blob: https:; manifest-src 'self'; media-src 'self' blob:; object-src 'none'; script-src 'self'; script-src-attr 'none'; style-src 'self' 'unsafe-inline'; worker-src 'self' blob:" always;
 
-  location ~ ^/(api|v1)/ {
-    proxy_pass http://app:8000;
+  location ~ ^/(api|v1)(?:/|$) {
+    proxy_pass http://$dgchat_app_upstream;
     proxy_http_version 1.1;
+    proxy_request_buffering off;
     proxy_set_header Host $host;
     proxy_set_header X-Forwarded-Host $host;
     proxy_set_header X-Forwarded-Proto $scheme;
@@ -64,9 +92,21 @@ server {
     proxy_read_timeout 600s;
   }
 
-  location ~ ^/(health|ready|metrics)$ {
-    proxy_pass http://app:8000;
+  # Metrics are an internal operational surface. Never expose a future exporter through the
+  # public product proxy by accident.
+  location ~ ^/metrics(?:/|$) {
+    default_type application/json;
+    return 404 '{"error":{"code":"NOT_FOUND","message":"Not found"}}';
+  }
+
+  location ~ ^/(health|ready)(?:/|$) {
+    proxy_pass http://$dgchat_app_upstream;
     proxy_set_header Host $host;
+  }
+
+  location = /manifest.webmanifest {
+    default_type application/manifest+json;
+    try_files $uri =404;
   }
 
   location / {
@@ -97,7 +137,7 @@ RUN set -eux; \
 COPY --from=service-build /workspace/dg-chat-api /usr/local/bin/dg-chat-api
 ENV DENO_ENV=production \
     PORT=8000
-EXPOSE 8000
+EXPOSE 8000 9090
 USER dgchat
 CMD ["/usr/local/bin/dg-chat-api"]
 
@@ -108,7 +148,7 @@ RUN set -eux; \
       rm -rf /var/lib/apt/lists/*; \
       if apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update \
         && apt-get upgrade -y --no-install-recommends \
-        && apt-get install -y --no-install-recommends ca-certificates postgresql-client; then \
+        && apt-get install -y --no-install-recommends ca-certificates; then \
         installed=1; \
         break; \
       fi; \
@@ -123,12 +163,13 @@ cat > /usr/local/bin/worker-healthcheck <<'SCRIPT'
 #!/bin/sh
 set -eu
 test "$(cat /proc/1/comm)" = "dg-chat-worker"
-exec psql "$DATABASE_URL" --no-psqlrc --tuples-only --command "SELECT 1 FROM jobs LIMIT 0" >/dev/null
+OTEL_DENO=false exec /usr/local/bin/dg-chat-worker --health
 SCRIPT
 chmod 0755 /usr/local/bin/worker-healthcheck
 EOF
 COPY --from=service-build /workspace/dg-chat-worker /usr/local/bin/dg-chat-worker
 ENV DENO_ENV=production
+EXPOSE 9091
 USER dgchat
 CMD ["/usr/local/bin/dg-chat-worker"]
 

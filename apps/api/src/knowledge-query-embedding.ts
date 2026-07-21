@@ -38,8 +38,12 @@ export function knowledgeQueryEmbedderFromEnv(
   const model = env.KNOWLEDGE_EMBEDDING_MODEL?.trim();
   const upstreamModel = env.KNOWLEDGE_EMBEDDING_UPSTREAM_MODEL?.trim() || model;
   const baseVersion = env.KNOWLEDGE_EMBEDDING_VERSION?.trim() || model;
+  const batchSize = Number(env.KNOWLEDGE_EMBEDDING_BATCH_SIZE ?? 64);
   if (!baseUrl && !apiKey && !model) return undefined;
-  if (!baseUrl || !apiKey || !model || !upstreamModel || !baseVersion) {
+  if (
+    !baseUrl || !apiKey || !model || !upstreamModel || !baseVersion ||
+    !Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > 256
+  ) {
     throw new Error("Knowledge embedding configuration is incomplete");
   }
   const timeoutMs = Number(env.KNOWLEDGE_EMBEDDING_QUERY_TIMEOUT_MS ?? 10_000);
@@ -48,7 +52,16 @@ export function knowledgeQueryEmbedderFromEnv(
   }
   const billing = parseEmbeddingBillingConfig(env);
   const provider = new URL(baseUrl).host;
-  const version = knowledgeEmbeddingIdentityVersion({ baseVersion, baseUrl, model, upstreamModel });
+  // The worker persists vectors under an identity that includes its effective batch size.
+  // Query vectors must use the exact same identity or PostgreSQL correctly excludes every
+  // otherwise-compatible stored vector from semantic retrieval.
+  const version = knowledgeEmbeddingIdentityVersion({
+    baseVersion,
+    baseUrl,
+    model,
+    upstreamModel,
+    batchSize,
+  });
   const embed = async (query: string, signal?: AbortSignal) => {
     const normalized = query.trim().slice(0, 8_000);
     if (!normalized) throw new Error("Knowledge embedding query is empty");

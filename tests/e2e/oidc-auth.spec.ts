@@ -1,8 +1,12 @@
 import { expect, test } from "@playwright/test";
 import { adminEmail, adminPassword, apiURL, bootstrap, login } from "./helpers.ts";
-import { lightweightManagedStack } from "./env.ts";
+import { lightweightManagedStack, strictDurableCapabilities } from "./env.ts";
 
-const mockControlUrl = "http://localhost:4020";
+// Compose intentionally exposes this privileged test-only control surface on IPv4 loopback only.
+// Node/Playwright may prefer ::1 for `localhost` and does not consistently retry IPv4 after a
+// refused connection, so use the address that the port binding actually guarantees. Browser OIDC
+// navigation still exercises the provider's configured public `localhost` issuer below.
+const mockControlUrl = "http://127.0.0.1:4020";
 const mockControlHeaders = { authorization: "Bearer ci-mock-oidc-control-token" };
 
 async function signInWithOidc(page: import("@playwright/test").Page, personaName: string) {
@@ -27,6 +31,17 @@ test("OIDC creates a pending applicant and approval enables a fresh SSO session"
   const persona = `new_verified_${viewport}_${retry}`;
   const personaName = `OIDC ${viewport === "mobile" ? "Mobile" : "Desktop"} ${runId.slice(0, 8)}`;
   const oidcEmail = `oidc-${viewport}-${runId}@e2e.invalid`;
+  const setupStatusResponse = await request.get(`${apiURL}/api/setup/status`);
+  expect(setupStatusResponse.ok()).toBeTruthy();
+  const setupStatus = await setupStatusResponse.json() as { oidcEnabled?: boolean };
+  if (setupStatus.oidcEnabled !== true) {
+    const reason =
+      "requires the OIDC-enabled stack; add docker-compose.oidc.yml to the Compose invocation";
+    if (strictDurableCapabilities()) {
+      throw new Error(`Full-stack E2E configuration error: ${reason}`);
+    }
+    test.skip(true, reason);
+  }
   await bootstrap(request);
   const reset = await request.post(`${mockControlUrl}/control/reset`, {
     headers: mockControlHeaders,

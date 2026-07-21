@@ -5,21 +5,21 @@ import {
   type ReactNode,
   type RefObject,
   useCallback,
+  useContext,
   useEffect,
   useId,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import rehypeHighlight from "rehype-highlight";
 import { createPortal } from "react-dom";
 import {
   Activity,
   Archive,
+  ArchiveRestore,
   ArrowDown,
   ArrowRight,
   BarChart3,
@@ -31,7 +31,6 @@ import {
   ChevronRight,
   CircleDollarSign,
   Cloud,
-  Code2,
   Copy,
   Database,
   Download,
@@ -59,21 +58,24 @@ import {
   Search,
   Settings,
   Shield,
+  ShieldAlert,
   ShieldCheck,
   SlidersHorizontal,
   Sparkles,
   Square,
   Sun,
   Trash2,
+  Trophy,
   UserCheck,
   Users,
   Volume2,
   X,
 } from "lucide-react";
-import { type AdminUserFilters, api, ApiError } from "./api.ts";
+import { type AdminUserFilters, api, ApiError, pollAttachmentInspection } from "./api.ts";
 import type { AdminSearch, AdminSection } from "./adminRouting.ts";
 import { AdminAnalyticsView, AdminJobsView } from "./AdminOperations.tsx";
 import { AdminRetentionView } from "./AdminRetention.tsx";
+import { AdminStorageView } from "./AdminStorage.tsx";
 import { AdminBackupsView } from "./AdminBackups.tsx";
 import { PersonalTokenSettings } from "./TokenGovernance.tsx";
 import { UserPortability } from "./UserPortability.tsx";
@@ -85,6 +87,7 @@ import {
   parseStartingCreditMicros,
 } from "./adminLifecycleUi.ts";
 import { SessionCenter } from "./SessionCenter.tsx";
+import { RichMarkdown } from "./rich-output/RichMarkdown.tsx";
 import {
   PASSWORD_MAX_LENGTH,
   PASSWORD_MIN_LENGTH,
@@ -95,6 +98,7 @@ import {
   mergeAttachmentIds,
   refreshConversationGraph,
 } from "./chatWorkflow.ts";
+import { resizeComposerTextarea } from "./composerTextarea.ts";
 import {
   chatStreamAdapter,
   enqueuePrompt,
@@ -110,21 +114,43 @@ import {
   messageBranch,
   type MessageTreeNode,
   preferredLeaf,
+  reconcileBranchPreview,
 } from "./conversationGraph.ts";
+import { branchControlLabels } from "./branchControlA11y.ts";
+import {
+  availableMediaModel,
+  isSpeechVoice,
+  SPEECH_VOICES,
+  type SpeechVoice,
+} from "./chatMediaPreferences.ts";
 import { demoConversations, demoMessages, demoModels, demoUser } from "./demo.ts";
 import { setupDestination } from "./setupDiscovery.ts";
 import {
+  activeConversationIdForView,
   type ConversationListView,
   conversationsForView,
   fallbackConversationId,
   mergeConversationSnapshot,
 } from "./conversationLifecycle.ts";
 import { Modal } from "./Modal.tsx";
+import { ChatSessionActivityContext } from "./chatSessionActivity.ts";
+import {
+  chatComposerRequiresRetention,
+  chatSessionProtectionStatus,
+  chatSessionQueryActivity,
+  planChatSessionVisit,
+  protectedChatReviewTarget,
+  pruneChatSessions,
+} from "./chatSessionRetention.ts";
+import { conversationListWindow, INITIAL_CONVERSATION_WINDOW } from "./conversationListWindow.ts";
 import { drawerShouldHandleEscape, modalOverlayPresent } from "./modalFocus.ts";
 import { AdminModels, AdminProviders } from "./AdminRegistry.tsx";
 import { AdminResilience } from "./AdminResilience.tsx";
 import { AdminTools } from "./AdminTools.tsx";
 import { ToolLauncher } from "./ToolLauncher.tsx";
+import { Button as ShadcnButton } from "./components/ui/button.tsx";
+import { Card } from "./components/ui/card.tsx";
+import { Input as ShadcnInput } from "./components/ui/input.tsx";
 import { AdminUserDetail } from "./admin/users/AdminUserDetail.tsx";
 import type { AdminUserTab } from "./admin/users/adminUserRouting.ts";
 import {
@@ -132,9 +158,14 @@ import {
   storeAdminUserReturnPath,
 } from "./admin/users/adminUserRouting.ts";
 import { ConversationKnowledgePicker, KnowledgeView } from "./Knowledge.tsx";
+import { CommunityView } from "./Community.tsx";
+import type { CommunitySearch } from "./communityRouting.ts";
 import { VoiceRecorder } from "./voice/VoiceRecorder.tsx";
+import { ScreenCapture } from "./screen-capture/ScreenCapture.tsx";
+import { chatScreenCaptureTargetKey } from "./screen-capture/captureDisplay.ts";
 import { insertTranscript } from "./voice/voiceState.ts";
 import { SpeechPlaybackControl } from "./speech/SpeechPlaybackControl.tsx";
+import { reconcileSpeechMessageSnapshot } from "./speech/invalidation.ts";
 import { speechTextForMarkdown } from "./speech/speechText.ts";
 import { useSpeechPlayback } from "./speech/useSpeechPlayback.ts";
 import type { SpeechPlaybackController, SpeechPlaybackState } from "./speech/playback.ts";
@@ -149,6 +180,15 @@ import {
 } from "./images/index.ts";
 import { ModelPicker } from "./models/ModelPicker.tsx";
 import { focusConversationSearch, useGlobalShortcuts } from "./shortcuts/useGlobalShortcuts.ts";
+import {
+  conversationSearchAnnouncement,
+  invalidateConversationSearch,
+  reconcileConversationSearchResult,
+  useConversationSearch,
+} from "./useConversationSearch.ts";
+import { conversationTimestampLabel } from "./conversationTimestamp.ts";
+import { visibleComposerUploads } from "./uploadContinuity.ts";
+import { friendlyAttachmentInspectionError } from "./attachment-inspection.ts";
 import {
   AppearancePreferences,
   PersonalizationPreferences,
@@ -171,9 +211,99 @@ import {
 import { conversationMenuPosition } from "./workspace/conversationMenu.ts";
 import type { Attachment, AuditFilters, Conversation, Message, Model, User } from "./types.ts";
 
-type View = "chat" | "archived" | "trash" | "knowledge" | "settings" | "tokens" | "admin";
+type View =
+  | "chat"
+  | "archived"
+  | "trash"
+  | "knowledge"
+  | "community"
+  | "settings"
+  | "tokens"
+  | "admin";
 const cn = (...v: Array<string | false | null | undefined>) => v.filter(Boolean).join(" ");
 const mobileSidebarQuery = "(max-width: 760px)";
+
+interface ChatMediaPreferences {
+  speechModel: string;
+  setSpeechModel: (modelId: string) => void;
+  speechVoice: SpeechVoice;
+  setSpeechVoice: (voice: string) => void;
+  transcriptionModel: string;
+  setTranscriptionModel: (modelId: string) => void;
+}
+
+function storedMediaPreference(key: string): string {
+  try {
+    return localStorage.getItem(key) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function persistMediaPreference(key: string, value: string): void {
+  try {
+    if (value) localStorage.setItem(key, value);
+    else localStorage.removeItem(key);
+  } catch {
+    // Hardened/private browser contexts keep the shared in-memory preference.
+  }
+}
+
+function useChatMediaPreferences(models: readonly Model[]): ChatMediaPreferences {
+  const [speechModel, setSpeechModelState] = useState(() =>
+    storedMediaPreference("dg-chat.speech-model")
+  );
+  const [speechVoice, setSpeechVoiceState] = useState<SpeechVoice>(() => {
+    const stored = storedMediaPreference("dg-chat.speech-voice");
+    return isSpeechVoice(stored) ? stored : "alloy";
+  });
+  const [transcriptionModel, setTranscriptionModelState] = useState(() =>
+    storedMediaPreference("dg-chat.transcription-model")
+  );
+
+  useEffect(() => {
+    const selected = availableMediaModel(models, "speech", speechModel);
+    if (selected !== speechModel) setSpeechModelState(selected);
+    persistMediaPreference("dg-chat.speech-model", selected);
+  }, [models, speechModel]);
+  useEffect(() => {
+    const selected = availableMediaModel(models, "transcription", transcriptionModel);
+    if (selected !== transcriptionModel) setTranscriptionModelState(selected);
+    persistMediaPreference("dg-chat.transcription-model", selected);
+  }, [models, transcriptionModel]);
+
+  const setSpeechModel = useCallback((modelId: string) => {
+    if (models.some((model) => model.id === modelId && model.capabilities.includes("speech"))) {
+      setSpeechModelState(modelId);
+    }
+  }, [models]);
+  const setSpeechVoice = useCallback((voice: string) => {
+    if (!isSpeechVoice(voice)) return;
+    setSpeechVoiceState(voice);
+    persistMediaPreference("dg-chat.speech-voice", voice);
+  }, []);
+  const setTranscriptionModel = useCallback((modelId: string) => {
+    if (
+      models.some((model) => model.id === modelId && model.capabilities.includes("transcription"))
+    ) setTranscriptionModelState(modelId);
+  }, [models]);
+
+  return useMemo(() => ({
+    speechModel,
+    setSpeechModel,
+    speechVoice,
+    setSpeechVoice,
+    transcriptionModel,
+    setTranscriptionModel,
+  }), [
+    setSpeechModel,
+    setSpeechVoice,
+    setTranscriptionModel,
+    speechModel,
+    speechVoice,
+    transcriptionModel,
+  ]);
+}
 
 function useMediaQuery(query: string): boolean {
   const [matches, setMatches] = useState(() =>
@@ -240,7 +370,16 @@ function Brand({ compact = false }: { compact?: boolean }) {
 }
 
 function IconButton(
-  { label, children, className, onClick, disabled, ariaHaspopup, ariaExpanded }: {
+  {
+    label,
+    children,
+    className,
+    onClick,
+    disabled,
+    ariaHaspopup,
+    ariaExpanded,
+    ariaDescribedby,
+  }: {
     label: string;
     children: ReactNode;
     className?: string;
@@ -248,6 +387,7 @@ function IconButton(
     disabled?: boolean;
     ariaHaspopup?: "menu";
     ariaExpanded?: boolean;
+    ariaDescribedby?: string;
   },
 ) {
   return (
@@ -260,6 +400,7 @@ function IconButton(
       disabled={disabled}
       aria-haspopup={ariaHaspopup}
       aria-expanded={ariaExpanded}
+      aria-describedby={ariaDescribedby}
     >
       {children}
     </button>
@@ -306,11 +447,13 @@ function Sidebar({
   staleWarning,
   retryList,
   searchInputRef,
-  busyConversationId,
+  busyConversationIds,
+  protectedConversationIds,
+  creatingConversation,
 }: {
   conversations: Conversation[];
   active: string;
-  onOpen: (id: string) => void;
+  onOpen: (id: string, searchResult?: Conversation) => void;
   view: View;
   setView: (v: View) => void;
   mobileOpen: boolean;
@@ -327,7 +470,9 @@ function Sidebar({
   staleWarning: boolean;
   retryList: () => void;
   searchInputRef: RefObject<HTMLInputElement | null>;
-  busyConversationId: string;
+  busyConversationIds: ReadonlySet<string>;
+  protectedConversationIds: ReadonlySet<string>;
+  creatingConversation: boolean;
 }) {
   const sidebarRef = useRef<HTMLElement>(null);
   const menuPortalRef = useRef<HTMLDivElement>(null);
@@ -336,6 +481,9 @@ function Sidebar({
   closeMobileRef.current = closeMobile;
   const searchId = useId();
   const [query, setQuery] = useState("");
+  const [conversationWindowLimit, setConversationWindowLimit] = useState(
+    INITIAL_CONVERSATION_WINDOW,
+  );
   const [selectedFolder, setSelectedFolder] = useState<string | null>(null);
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [activeRowDialogId, setActiveRowDialogId] = useState<string | null>(null);
@@ -367,10 +515,26 @@ function Sidebar({
     listView === "chat" ? selectedFolder : null,
     listView === "chat" ? selectedTags : [],
   ));
-  const filtered = visible.filter((c) =>
-    scopedIds.has(c.id) &&
-    `${c.title} ${c.preview}`.toLowerCase().includes(query.toLowerCase())
+  const search = useConversationSearch(
+    query,
+    listView,
+    listView === "chat" ? selectedFolder ?? undefined : undefined,
+    listView === "chat" ? selectedTags : [],
+    [...scopedIds],
   );
+  const filtered = search.searching ? search.results : visible.filter((c) => scopedIds.has(c.id));
+  const essentialConversationIds = new Set([
+    active,
+    ...busyConversationIds,
+    ...protectedConversationIds,
+  ]);
+  const windowed = search.searching
+    ? { conversations: filtered, hiddenCount: 0 }
+    : conversationListWindow(filtered, conversationWindowLimit, essentialConversationIds);
+  const displayedConversations = windowed.conversations;
+  useEffect(() => {
+    setConversationWindowLimit(INITIAL_CONVERSATION_WINDOW);
+  }, [listView, selectedFolder, selectedTags.join("|")]);
   const select = (v: View) => {
     setView(v);
     closeMobile();
@@ -381,7 +545,7 @@ function Sidebar({
     const panel = sidebarRef.current;
     panel?.querySelector<HTMLButtonElement>('[aria-label="Close sidebar"]')?.focus();
     const keydown = (event: KeyboardEvent) => {
-      if (drawerShouldHandleEscape(event, modalOverlayPresent())) {
+      if (drawerShouldHandleEscape(event, modalOverlayPresent(document, sidebarRef.current))) {
         event.preventDefault();
         closeMobileRef.current();
         return;
@@ -405,8 +569,22 @@ function Sidebar({
     return () => {
       document.removeEventListener("keydown", keydown);
       requestAnimationFrame(() => {
+        const activeElement = document.activeElement as HTMLElement | null;
+        if (
+          activeElement && activeElement !== document.body &&
+          !sidebarRef.current?.contains(activeElement) &&
+          activeElement.isConnected && activeElement.getClientRects().length > 0 &&
+          !activeElement.closest("[inert], [hidden]")
+        ) {
+          // A navigation action may have intentionally moved focus to an alert or destination.
+          // Do not overwrite that handoff while cleaning up the now-inert drawer.
+          return;
+        }
         const target = previousFocus.current;
-        if (target?.isConnected && target.getClientRects().length > 0) {
+        if (
+          target?.isConnected && target.getClientRects().length > 0 &&
+          !target.closest("[inert], [hidden]")
+        ) {
           target.focus();
           return;
         }
@@ -417,12 +595,17 @@ function Sidebar({
           destinationMenu.focus();
           return;
         }
-        const composer = document.querySelector<HTMLElement>(".composer textarea");
+        const composer = document.querySelector<HTMLElement>(
+          "[data-chat-session]:not([hidden]) .composer textarea",
+        );
         if (composer?.getClientRects().length) {
           composer.focus();
           return;
         }
-        const heading = document.querySelector<HTMLElement>("main h1, main h2");
+        const heading = [...document.querySelectorAll<HTMLElement>("main h1, main h2")].find(
+          (candidate) =>
+            candidate.getClientRects().length > 0 && !candidate.closest("[hidden], [inert]"),
+        );
         if (heading) {
           heading.tabIndex = -1;
           heading.focus();
@@ -451,6 +634,8 @@ function Sidebar({
       </div>
       <button
         className="new-chat"
+        disabled={creatingConversation}
+        aria-busy={creatingConversation || undefined}
         onClick={() => {
           onOpen("new");
           select("chat");
@@ -466,6 +651,8 @@ function Sidebar({
           ref={searchInputRef}
           value={query}
           onChange={(e) => setQuery(e.target.value)}
+          maxLength={200}
+          aria-describedby={search.tooShort ? `${searchId}-minimum` : undefined}
           placeholder="Search conversations"
           onKeyDown={(event) => {
             if (event.key === "Escape" && query) {
@@ -490,27 +677,58 @@ function Sidebar({
           )
           : <kbd>⌘F</kbd>}
       </div>
+      {search.tooShort && (
+        <span id={`${searchId}-minimum`} className="sr-only">
+          Enter at least 2 characters to search conversations
+        </span>
+      )}
       <span className="sr-only" aria-live="polite" aria-atomic="true">
-        {query ? `${filtered.length} conversation${filtered.length === 1 ? "" : "s"} found` : ""}
+        {search.searching
+          ? search.tooShort
+            ? "Enter at least 2 characters to search conversations"
+            : search.loading
+            ? "Searching conversations"
+            : search.error
+            ? "Conversation search failed"
+            : conversationSearchAnnouncement(filtered.length, Boolean(search.cursor))
+          : ""}
       </span>
       <nav className="side-nav">
-        <button onClick={() => select("chat")} className={view === "chat" ? "selected" : ""}>
+        <button
+          onClick={() => select("chat")}
+          className={view === "chat" ? "selected" : ""}
+          aria-current={view === "chat" ? "page" : undefined}
+        >
           <MessageSquare size={17} /> Chats
         </button>
         <button
           type="button"
           onClick={() => select("knowledge")}
           className={view === "knowledge" ? "selected" : ""}
+          aria-current={view === "knowledge" ? "page" : undefined}
         >
           <BookOpen size={17} /> Knowledge
         </button>
         <button
+          type="button"
+          onClick={() => select("community")}
+          className={view === "community" ? "selected" : ""}
+          aria-current={view === "community" ? "page" : undefined}
+        >
+          <Trophy size={17} /> Community
+        </button>
+        <button
           onClick={() => select("archived")}
           className={view === "archived" ? "selected" : ""}
+          aria-current={view === "archived" ? "page" : undefined}
         >
           <Archive size={17} /> Archived
         </button>
-        <button onClick={() => select("trash")} className={view === "trash" ? "selected" : ""}>
+        <button
+          onClick={() => select("trash")}
+          className={view === "trash" ? "selected" : ""}
+          aria-current={view === "trash" ? "page" : undefined}
+        >
           <Trash2 size={17} /> Trash
         </button>
       </nav>
@@ -532,7 +750,28 @@ function Sidebar({
         />
       )}
       <div className="conversation-scroll">
-        {listLoading && (
+        {search.searching && search.loading && (
+          <div className="empty-mini" role="status">
+            <div className="typing" aria-hidden="true">
+              <span />
+              <span />
+              <span />
+            </div>
+            <span>Searching conversations…</span>
+          </div>
+        )}
+        {search.searching && search.error && !search.loading && (
+          <div className="empty-mini" role="alert">
+            <span>Search is unavailable</span>
+            <button
+              className="secondary"
+              onClick={search.retry}
+            >
+              <RefreshCw size={14} /> Retry
+            </button>
+          </div>
+        )}
+        {!search.searching && listLoading && (
           <div className="empty-mini" role="status">
             <div className="typing" aria-hidden="true">
               <span />
@@ -542,7 +781,7 @@ function Sidebar({
             <span>Loading conversations…</span>
           </div>
         )}
-        {listError && (
+        {!search.searching && listError && (
           <div className="empty-mini" role="alert">
             <span>Conversations are unavailable</span>
             <button className="secondary" onClick={retryList}>
@@ -550,44 +789,59 @@ function Sidebar({
             </button>
           </div>
         )}
-        {staleWarning && (
+        {!search.searching && staleWarning && (
           <div className="stale-warning" role="status">
             <span>Showing saved conversations. Refresh failed.</span>
             <button onClick={retryList}>Retry</button>
           </div>
         )}
-        {!listLoading && !listError && (
+        {!search.loading && !search.error &&
+          (search.searching || !listLoading && !listError) && (
           <>
-            {filtered.some((c) => c.pinned) && <p className="section-label">PINNED</p>}
-            {filtered.filter((c) => c.pinned).map((c) => (
+            {displayedConversations.some((c) => c.pinned) && (
+              <p className="section-label">
+                PINNED
+              </p>
+            )}
+            {displayedConversations.filter((c) => c.pinned).map((c) => (
               <ConversationRow
                 key={c.id}
                 c={c}
                 active={active === c.id &&
                   (view === "chat" || view === "archived" || view === "trash")}
-                onOpen={onOpen}
+                onOpen={(id) => onOpen(id, search.searching ? c : undefined)}
                 listView={listView}
                 onUpdate={onUpdate}
                 folders={workspace.folders.data}
                 tags={workspace.tags.data}
-                mutationLocked={busyConversationId === c.id}
+                mutationLocked={busyConversationIds.has(c.id)}
+                protectionStatus={chatSessionProtectionStatus(
+                  c.id,
+                  busyConversationIds,
+                  protectedConversationIds,
+                )}
                 menuPortalRef={menuPortalRef}
                 onDialogChange={setRowDialogOpen}
               />
             ))}
             <p className="section-label">RECENT</p>
-            {filtered.filter((c) => !c.pinned).map((c) => (
+            {displayedConversations.filter((c) => !c.pinned).map((c) => (
               <ConversationRow
                 key={c.id}
                 c={c}
                 active={active === c.id &&
                   (view === "chat" || view === "archived" || view === "trash")}
-                onOpen={onOpen}
+                onOpen={(id) => onOpen(id, search.searching ? c : undefined)}
                 listView={listView}
                 onUpdate={onUpdate}
                 folders={workspace.folders.data}
                 tags={workspace.tags.data}
-                mutationLocked={busyConversationId === c.id}
+                mutationLocked={busyConversationIds.has(c.id)}
+                protectionStatus={chatSessionProtectionStatus(
+                  c.id,
+                  busyConversationIds,
+                  protectedConversationIds,
+                )}
                 menuPortalRef={menuPortalRef}
                 onDialogChange={setRowDialogOpen}
               />
@@ -596,12 +850,57 @@ function Sidebar({
               <div className="empty-mini">
                 <Search size={20} />
                 <span>
-                  {listView === "archived"
-                    ? "No archived conversations"
+                  {search.tooShort
+                    ? "Enter at least 2 characters to search"
+                    : listView === "archived"
+                    ? search.searching
+                      ? "No archived conversations match"
+                      : "No archived conversations"
                     : listView === "trash"
-                    ? "Trash is empty"
+                    ? search.searching ? "No trashed conversations match" : "Trash is empty"
+                    : search.searching
+                    ? "No conversations match"
                     : "No conversations found"}
                 </span>
+              </div>
+            )}
+            {!search.searching && windowed.hiddenCount > 0 && (
+              <div className="conversation-window-more">
+                <p>
+                  Showing {displayedConversations.length} of {filtered.length}{" "}
+                  chats. Search finds your full history.
+                </p>
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() =>
+                    setConversationWindowLimit((current) => current + INITIAL_CONVERSATION_WINDOW)}
+                >
+                  Show {Math.min(INITIAL_CONVERSATION_WINDOW, windowed.hiddenCount)} more chats
+                </button>
+              </div>
+            )}
+            {search.searching && search.cursor && !search.pageError && (
+              <button
+                type="button"
+                className="secondary conversation-search-more"
+                disabled={search.loadingMore}
+                onClick={() => void search.loadMore()}
+              >
+                {search.loadingMore ? "Loading more…" : "Load more results"}
+              </button>
+            )}
+            {search.searching && search.pageError && (
+              <div className="conversation-search-page-error" role="alert">
+                <span>More results couldn’t be loaded.</span>
+                <button
+                  type="button"
+                  disabled={search.loadingMore}
+                  onClick={() =>
+                    void search.loadMore()}
+                >
+                  Retry
+                </button>
               </div>
             )}
           </>
@@ -612,6 +911,7 @@ function Sidebar({
           <button
             className={view === "admin" ? "selected" : ""}
             onClick={() => select("admin")}
+            aria-current={view === "admin" ? "page" : undefined}
           >
             <ShieldCheck size={17} /> Admin console
           </button>
@@ -619,6 +919,7 @@ function Sidebar({
         <button
           className={view === "settings" || view === "tokens" ? "selected" : ""}
           onClick={() => select("settings")}
+          aria-current={view === "settings" || view === "tokens" ? "page" : undefined}
         >
           <Settings size={17} /> Settings
         </button>
@@ -646,6 +947,7 @@ function ConversationRow(
     folders,
     tags,
     mutationLocked,
+    protectionStatus,
     menuPortalRef,
     onDialogChange,
   }: {
@@ -661,6 +963,7 @@ function ConversationRow(
     folders?: import("./workspace/WorkspaceNavigation.tsx").FolderData;
     tags?: import("./workspace/WorkspaceNavigation.tsx").TagData;
     mutationLocked: boolean;
+    protectionStatus: "response" | "unfinished" | null;
     menuPortalRef: RefObject<HTMLDivElement | null>;
     onDialogChange: (id: string, open: boolean) => void;
   },
@@ -672,6 +975,7 @@ function ConversationRow(
   const [organize, setOrganize] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const protectionStatusId = useId();
   const rowRef = useRef<HTMLDivElement>(null);
   const actionRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -760,12 +1064,39 @@ function ConversationRow(
         }
       }}
     >
-      <button className="conversation-open" onClick={() => onOpen(c.id)}>
+      <button
+        className="conversation-open"
+        aria-describedby={protectionStatus ? protectionStatusId : undefined}
+        aria-current={active ? "page" : undefined}
+        onClick={() => onOpen(c.id)}
+      >
         <span>
           <strong>{c.title}</strong>
           <small>{c.preview}</small>
         </span>
-        <span className="row-meta">{c.updatedAt}</span>
+        <span className="row-meta">
+          {protectionStatus && (
+            <>
+              <span
+                className={cn(
+                  "conversation-work-status",
+                  `conversation-work-${protectionStatus}`,
+                )}
+                data-protected-work={protectionStatus}
+                aria-hidden="true"
+              >
+                <span className="conversation-work-dot" />
+                {protectionStatus === "response" ? "Responding" : "Unfinished"}
+              </span>
+              <span id={protectionStatusId} className="sr-only">
+                {protectionStatus === "response"
+                  ? "A response is in progress in this chat."
+                  : "This chat has unfinished work."}
+              </span>
+            </>
+          )}
+          <span>{conversationTimestampLabel(c)}</span>
+        </span>
       </button>
       <button
         ref={actionRef}
@@ -838,9 +1169,16 @@ function ConversationRow(
           {listView === "chat" && folders && tags && (
             <button
               role="menuitem"
+              disabled={c.temporary}
+              title={c.temporary
+                ? "Keep this temporary chat before adding it to projects or tags"
+                : undefined}
+              aria-label={c.temporary
+                ? "Organize unavailable: keep temporary chat first"
+                : undefined}
               onClick={() => openRowDialog(() => setOrganize(true))}
             >
-              <Folder size={14} /> Organize
+              <Folder size={14} /> {c.temporary ? "Keep chat to organize" : "Organize"}
             </button>
           )}
           {listView === "chat" && (
@@ -1006,31 +1344,58 @@ function RenameConversationDialog(
 }
 
 function BranchControl(
-  { branch, onTree, onSelect, busy }: {
+  { branch, message, messagePosition, onTree, onSelect, busy }: {
     branch: MessageBranch;
+    message: Pick<Message, "id" | "role">;
+    messagePosition: number;
     onTree: () => void;
-    onSelect: (messageId: string) => void;
+    onSelect: (messageId: string, returnFocus: HTMLElement | null) => void;
     busy: boolean;
   },
 ) {
+  const statusId = useId();
+  const groupRef = useRef<HTMLDivElement>(null);
+  const labels = branchControlLabels(
+    message.role === "user" ? "user" : "assistant",
+    messagePosition,
+    branch.index,
+    branch.total,
+  );
   return (
-    <div className="branch-control" aria-label={`Branch ${branch.index} of ${branch.total}`}>
+    <div
+      ref={groupRef}
+      className="branch-control"
+      data-branch-message-id={message.id}
+      tabIndex={-1}
+      role="group"
+      aria-label={labels.group}
+      aria-describedby={statusId}
+    >
       <IconButton
-        label="Previous branch"
+        label={labels.previous}
+        ariaDescribedby={statusId}
         disabled={!branch.previousId || busy}
-        onClick={() => branch.previousId && onSelect(branch.previousId)}
+        onClick={() => branch.previousId && onSelect(branch.previousId, groupRef.current)}
       >
         <ChevronLeft size={15} />
       </IconButton>
-      <span aria-live="polite">{branch.index} / {branch.total}</span>
+      <span id={statusId} role="status" aria-live="polite" aria-label={labels.status}>
+        {branch.index} / {branch.total}
+      </span>
       <IconButton
-        label="Next branch"
+        label={labels.next}
+        ariaDescribedby={statusId}
         disabled={!branch.nextId || busy}
-        onClick={() => branch.nextId && onSelect(branch.nextId)}
+        onClick={() => branch.nextId && onSelect(branch.nextId, groupRef.current)}
       >
         <ChevronRight size={15} />
       </IconButton>
-      <IconButton label="View conversation tree" disabled={busy} onClick={onTree}>
+      <IconButton
+        label={labels.tree}
+        ariaDescribedby={statusId}
+        disabled={busy}
+        onClick={onTree}
+      >
         <GitBranch size={15} />
       </IconButton>
     </div>
@@ -1039,7 +1404,9 @@ function BranchControl(
 
 function MessageItem(
   {
+    conversationId,
     message,
+    messagePosition,
     branch,
     onTree,
     onEdit,
@@ -1052,11 +1419,13 @@ function MessageItem(
     speech,
     readOnly = false,
   }: {
+    conversationId: string;
     message: Message;
+    messagePosition: number;
     branch: MessageBranch | null;
     onTree: () => void;
     onEdit: (m: Message) => void;
-    onSelectBranch: (messageId: string) => void;
+    onSelectBranch: (messageId: string, returnFocus: HTMLElement | null) => void;
     onRegenerate: (message: Message) => void;
     onContinue: (message: Message) => void;
     branchBusy: boolean;
@@ -1072,16 +1441,28 @@ function MessageItem(
     readOnly?: boolean;
   },
 ) {
-  const [copied, setCopied] = useState(false);
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
+  const copyOperation = useRef(0);
+  const copyResetTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => {
+    copyOperation.current += 1;
+    if (copyResetTimer.current) clearTimeout(copyResetTimer.current);
+  }, []);
   const copy = async () => {
+    const operation = ++copyOperation.current;
+    if (copyResetTimer.current) clearTimeout(copyResetTimer.current);
     try {
-      if (!navigator.clipboard) return;
+      if (!navigator.clipboard) throw new Error("Clipboard unavailable");
       await navigator.clipboard.writeText(message.content);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1200);
+      if (operation !== copyOperation.current) return;
+      setCopyState("copied");
     } catch {
-      // Keep the copy affordance unchanged when browser permissions deny the write.
+      if (operation !== copyOperation.current) return;
+      setCopyState("failed");
     }
+    copyResetTimer.current = setTimeout(() => {
+      if (operation === copyOperation.current) setCopyState("idle");
+    }, 1800);
   };
   if (message.role === "user") {
     return (
@@ -1117,16 +1498,37 @@ function MessageItem(
                     <small>{a.mimeType} · {Math.max(1, Math.ceil(a.sizeBytes / 1024))} KB</small>
                   </div>
                 </a>
-                <AttachmentIngestionBadge attachment={a} />
+                <AttachmentIngestionBadge
+                  attachment={a}
+                  conversationId={conversationId}
+                />
               </Fragment>
             ))}
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
+            <RichMarkdown
+              source={message.content}
+              className="user-rich-markdown"
+              artifacts={false}
+            />
           </div>
           <div className="message-actions user-actions">
             <span>{message.createdAt}</span>
-            <IconButton label="Copy" onClick={() => void copy()}>
-              {copied ? <Check size={15} /> : <Copy size={15} />}
+            <IconButton
+              label={copyState === "failed"
+                ? "Copy failed"
+                : copyState === "copied"
+                ? "Copied"
+                : "Copy"}
+              onClick={() => void copy()}
+            >
+              {copyState === "copied" ? <Check size={15} /> : <Copy size={15} />}
             </IconButton>
+            <span className="sr-only" role="status" aria-live="polite">
+              {copyState === "failed"
+                ? "Message could not be copied. Check browser clipboard permissions."
+                : copyState === "copied"
+                ? "Message copied"
+                : ""}
+            </span>
             {!readOnly && (
               <IconButton
                 label="Edit without overwriting"
@@ -1139,6 +1541,8 @@ function MessageItem(
             {branch && (
               <BranchControl
                 branch={branch}
+                message={message}
+                messagePosition={messagePosition}
                 onTree={onTree}
                 onSelect={onSelectBranch}
                 busy={branchBusy || generationBusy || editing}
@@ -1163,15 +1567,15 @@ function MessageItem(
         {message.reasoning && (
           <details className="reasoning-panel">
             <summary>Reasoning</summary>
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.reasoning}</ReactMarkdown>
+            <RichMarkdown
+              source={message.reasoning}
+              className="reasoning-markdown"
+              artifacts={false}
+            />
           </details>
         )}
         {message.toolStatus && <p className="tool-status">{message.toolStatus}</p>}
-        <div className="markdown">
-          <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
-            {message.content}
-          </ReactMarkdown>
-        </div>
+        <RichMarkdown source={message.content} />
         {message.knowledgeSources?.length
           ? (
             <details className="reasoning-panel">
@@ -1187,9 +1591,23 @@ function MessageItem(
           )
           : null}
         <div className="message-actions">
-          <IconButton label="Copy response" onClick={() => void copy()}>
-            {copied ? <Check size={15} /> : <Copy size={15} />}
+          <IconButton
+            label={copyState === "failed"
+              ? "Copy response failed"
+              : copyState === "copied"
+              ? "Response copied"
+              : "Copy response"}
+            onClick={() => void copy()}
+          >
+            {copyState === "copied" ? <Check size={15} /> : <Copy size={15} />}
           </IconButton>
+          <span className="sr-only" role="status" aria-live="polite">
+            {copyState === "failed"
+              ? "Response could not be copied. Check browser clipboard permissions."
+              : copyState === "copied"
+              ? "Response copied"
+              : ""}
+          </span>
           {speech
             ? (
               <SpeechPlaybackControl
@@ -1216,7 +1634,7 @@ function MessageItem(
           {!readOnly && (
             <IconButton
               label="Regenerate response in a new branch"
-              disabled={generationBusy || editing}
+              disabled={branchBusy || generationBusy || editing}
               onClick={() => onRegenerate(message)}
             >
               <RefreshCw size={15} />
@@ -1225,18 +1643,17 @@ function MessageItem(
           {!readOnly && (
             <IconButton
               label="Continue response"
-              disabled={generationBusy || editing}
+              disabled={branchBusy || generationBusy || editing}
               onClick={() => onContinue(message)}
             >
               <ArrowRight size={15} />
             </IconButton>
           )}
-          <IconButton label="More response actions (not available yet)" disabled>
-            <MoreHorizontal size={15} />
-          </IconButton>
           {branch && (
             <BranchControl
               branch={branch}
+              message={message}
+              messagePosition={messagePosition}
               onTree={onTree}
               onSelect={onSelectBranch}
               busy={branchBusy || generationBusy || editing}
@@ -1249,20 +1666,28 @@ function MessageItem(
   );
 }
 
-function AttachmentIngestionBadge({ attachment }: { attachment: Attachment }) {
+export function shouldPollAttachmentIngestion(
+  messages: readonly {
+    attachments?: readonly Pick<Attachment, "ingestionStatus">[];
+  }[],
+  sessionActive: boolean,
+): boolean {
+  return sessionActive &&
+    messages.some((message) =>
+      message.attachments?.some((attachment) =>
+        attachment.ingestionStatus === "queued" || attachment.ingestionStatus === "processing"
+      )
+    );
+}
+
+function AttachmentIngestionBadge(
+  { attachment, conversationId }: { attachment: Attachment; conversationId: string },
+) {
   const queryClient = useQueryClient();
   const [status, setStatus] = useState(attachment.ingestionStatus);
   const [busy, setBusy] = useState(false);
   const [retryError, setRetryError] = useState(false);
   useEffect(() => setStatus(attachment.ingestionStatus), [attachment.ingestionStatus]);
-  useEffect(() => {
-    if (status !== "queued" && status !== "processing") return;
-    const timer = setInterval(
-      () => void queryClient.invalidateQueries({ queryKey: ["messages"] }),
-      2000,
-    );
-    return () => clearInterval(timer);
-  }, [queryClient, status]);
   if (!status || status === "not_applicable") return null;
   if (status !== "failed") return <small role="status">Knowledge: {status}</small>;
   return (
@@ -1277,6 +1702,7 @@ function AttachmentIngestionBadge({ attachment }: { attachment: Attachment }) {
           setRetryError(false);
           void api.retryAttachmentIngestion(attachment.id).then((updated) => {
             setStatus(updated.ingestionStatus);
+            void queryClient.invalidateQueries({ queryKey: ["messages", conversationId] });
           }).catch(() => setRetryError(true)).finally(() => setBusy(false));
         }}
       >
@@ -1293,6 +1719,7 @@ export function Composer(
     edit,
     cancelEdit,
     disabled,
+    branchTransitioning = false,
     streaming,
     stopping,
     queuedCount,
@@ -1302,7 +1729,13 @@ export function Composer(
     setTranscriptionModel,
     imageModels,
     imageEditModels,
+    visionCapable = false,
     disabledReason,
+    onRetentionProtectionChange,
+    voiceTargetKey,
+    screenCaptureTargetKey,
+    getScreenCaptureTargetKey,
+    onVoiceBusyChange,
   }: {
     onSend: (
       value: string,
@@ -1312,6 +1745,7 @@ export function Composer(
     edit?: Message;
     cancelEdit: () => void;
     disabled: boolean;
+    branchTransitioning?: boolean;
     streaming: boolean;
     stopping: boolean;
     queuedCount: number;
@@ -1321,9 +1755,17 @@ export function Composer(
     setTranscriptionModel: (id: string) => void;
     imageModels: Model[];
     imageEditModels: Model[];
+    visionCapable?: boolean;
     disabledReason?: string;
+    onRetentionProtectionChange?: (protect: boolean) => void;
+    voiceTargetKey?: string;
+    screenCaptureTargetKey?: string;
+    getScreenCaptureTargetKey?: () => string;
+    onVoiceBusyChange?: (busy: boolean) => void;
   },
 ) {
+  const editDescriptionId = useId();
+  const interactionDisabled = disabled || branchTransitioning;
   const [value, setValue] = useState("");
   const [toolsOpen, setToolsOpen] = useState(false);
   const [toolContexts, setToolContexts] = useState<Array<{ id: string }>>([]);
@@ -1333,6 +1775,12 @@ export function Composer(
   const [imageEditSource, setImageEditSource] = useState<GeneratedAsset>();
   const [generatedAssets, setGeneratedAssets] = useState<GeneratedAsset[]>([]);
   const [selectedGeneratedAssets, setSelectedGeneratedAssets] = useState<GeneratedAsset[]>([]);
+  const [voiceBusy, setVoiceBusy] = useState(false);
+  const [screenCaptureBusy, setScreenCaptureBusy] = useState(false);
+  const handleVoiceBusyChange = useCallback((busy: boolean) => {
+    setVoiceBusy(busy);
+    onVoiceBusyChange?.(busy);
+  }, [onVoiceBusyChange]);
   const [imageHistoryLoading, setImageHistoryLoading] = useState(false);
   const [imageHistoryError, setImageHistoryError] = useState("");
   const [imageHistoryCursor, setImageHistoryCursor] = useState<string | null>(null);
@@ -1350,6 +1798,7 @@ export function Composer(
   imageHistoryFiltersRef.current = imageHistoryFilters;
   type UploadState =
     | "uploading"
+    | "scanning"
     | "ready"
     | "failed"
     | "cancelled"
@@ -1372,6 +1821,7 @@ export function Composer(
   uploadsRef.current = uploads;
   const activeUploadScope = edit ? uploadScopeForEdit(edit.id) : draftUploadScope;
   const activeUploads = uploads.filter((item) => item.scope === activeUploadScope);
+  const displayedUploads = visibleComposerUploads(uploads, activeUploadScope);
   const [excludedEditAttachments, setExcludedEditAttachments] = useState<Set<string>>(new Set());
   const editDraftRef = useRef<
     {
@@ -1387,6 +1837,44 @@ export function Composer(
   const claimedRetryKeys = useRef(new Set<string>());
   const fileRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  useLayoutEffect(() => {
+    const textarea = textareaRef.current;
+    if (textarea) resizeComposerTextarea(textarea);
+  }, [value]);
+  useEffect(() => {
+    let disposed = false;
+    const resize = () => {
+      if (disposed) return;
+      const textarea = textareaRef.current;
+      if (textarea) resizeComposerTextarea(textarea);
+    };
+    const composer = textareaRef.current?.closest<HTMLElement>(".composer");
+    let composerWidth = composer?.getBoundingClientRect().width ?? 0;
+    const resizeObserver = typeof ResizeObserver === "undefined" || !composer
+      ? null
+      : new ResizeObserver(([entry]) => {
+        // A retained chat can change width without a window resize (for example when its shell or
+        // navigation layout changes). Only react to width changes so resizing the textarea itself
+        // cannot create a ResizeObserver feedback loop.
+        const nextWidth = entry?.contentRect.width ?? composerWidth;
+        if (Math.abs(nextWidth - composerWidth) < 0.5) return;
+        composerWidth = nextWidth;
+        resize();
+      });
+    if (composer) resizeObserver?.observe(composer);
+    // Web-font activation can change wrapping and scrollHeight without changing the controlled
+    // value or viewport. Re-measure once the document font set settles so restored drafts do not
+    // remain clipped until the user types again.
+    void document.fonts?.ready.then(resize);
+    globalThis.addEventListener("resize", resize);
+    globalThis.visualViewport?.addEventListener("resize", resize);
+    return () => {
+      disposed = true;
+      resizeObserver?.disconnect();
+      globalThis.removeEventListener("resize", resize);
+      globalThis.visualViewport?.removeEventListener("resize", resize);
+    };
+  }, []);
   useEffect(() => () => {
     liveUploadKeys.current.clear();
     claimedRetryKeys.current.clear();
@@ -1400,20 +1888,24 @@ export function Composer(
       claimedRetryKeys.current.delete(item.key);
       uploadControllers.current.get(item.key)?.abort();
       if (item.attachment) {
-        void api.deleteAttachment(item.attachment.id).catch(() => {
-          // Attachment garbage collection remains a server-side safety net when immediate
-          // best-effort cleanup is unavailable.
-        });
+        void removeUpload(item);
       }
     }
-    setUploads((current) => current.filter((item) => item.scope !== scope));
+    // An in-flight request which honors abort has no server attachment and can disappear. If its
+    // transport resolves late, beginUpload recreates a cleanup row. Already-created attachments
+    // remain visible until DELETE is acknowledged, including after this edit scope closes.
+    setUploads((current) =>
+      current.filter((item) => item.scope !== scope || Boolean(item.attachment))
+    );
   };
-  // This transition deliberately follows only the selected immutable message. Draft state is
-  // captured once on entry; including live composer fields would overwrite that snapshot while
-  // the user types the edit.
-  useEffect(() => {
-    setExcludedEditAttachments(new Set());
+  // Initialize an immutable edit before the browser can accept input. A passive effect leaves a
+  // click-to-type window where its delayed source write can overwrite the user's first keystrokes.
+  // The immutable ID is the transition key so a refetched object for the same node cannot reset an
+  // in-progress replacement.
+  useLayoutEffect(() => {
     if (edit) {
+      if (previousEditIdRef.current === edit.id) return;
+      setExcludedEditAttachments(new Set());
       if (previousEditIdRef.current === null) {
         editDraftRef.current = {
           value,
@@ -1429,12 +1921,22 @@ export function Composer(
       setToolContexts((edit.toolExecutionIds ?? []).map((id) => ({ id })));
       setSelectedGeneratedAssets([]);
       setSelectionError("");
+      const frame = requestAnimationFrame(() => {
+        const textarea = textareaRef.current;
+        if (!textarea) return;
+        textarea.focus();
+        textarea.setSelectionRange(edit.content.length, edit.content.length);
+        textarea.scrollIntoView({ block: "nearest" });
+      });
+      return () => cancelAnimationFrame(frame);
     } else {
       previousEditIdRef.current = null;
+      setExcludedEditAttachments(new Set());
     }
-  }, [edit]);
+  }, [edit?.id]);
   const cancelCurrentEdit = () => {
     const draft = editDraftRef.current;
+    const restoredValue = draft?.value ?? "";
     if (draft) {
       setValue(draft.value);
       setToolContexts(draft.toolContexts);
@@ -1448,6 +1950,13 @@ export function Composer(
     previousEditIdRef.current = null;
     setExcludedEditAttachments(new Set());
     cancelEdit();
+    requestAnimationFrame(() => {
+      const textarea = textareaRef.current;
+      if (!textarea || textarea.disabled || textarea.closest("[inert]")) return;
+      textarea.focus();
+      textarea.setSelectionRange(restoredValue.length, restoredValue.length);
+      textarea.scrollIntoView({ block: "nearest" });
+    });
   };
   const retainedAttachments = (edit?.attachments ?? []).filter((attachment) =>
     !excludedEditAttachments.has(attachment.id)
@@ -1556,12 +2065,14 @@ export function Composer(
   };
   const openImageEditorFromGallery = (asset?: GeneratedAsset) => {
     imageModalHandoff.current = true;
-    document.querySelector<HTMLButtonElement>('[aria-label="Open image history"]')?.focus();
+    document.querySelector<HTMLButtonElement>(
+      '[data-chat-session]:not([hidden]) [aria-label="Open image history"]',
+    )?.focus();
     imageGeneration.reset();
     setImageEditSource(asset);
     setImagePanel("create");
   };
-  const beginUpload = (key: string, file: File) => {
+  const beginUpload = (key: string, file: File, scope: string) => {
     const controller = new AbortController();
     uploadControllers.current.set(key, controller);
     setUploads((current) =>
@@ -1576,14 +2087,81 @@ export function Composer(
           current.map((item) => item.key === key ? { ...item, progress } : item)
         ),
       controller.signal,
-    ).then((attachment) => {
+    ).then(async (attachment) => {
       uploadControllers.current.delete(key);
       if (!liveUploadKeys.current.has(key)) {
-        void api.deleteAttachment(attachment.id).catch(() => {
-          // The durable attachment cleanup worker remains a fallback for this abort/resolve race.
+        claimedRetryKeys.current.delete(key);
+        // Do not hide canceled content until cleanup is acknowledged. If DELETE fails, retain a
+        // visible retry handle instead of leaving an accessible orphan with no recovery path.
+        setUploads((current) => {
+          const cleanupItem: UploadItem = {
+            key,
+            scope,
+            file,
+            status: "removing",
+            progress: 100,
+            attachment,
+          };
+          return current.some((item) => item.key === key)
+            ? current.map((item) => item.key === key ? cleanupItem : item)
+            : [...current, cleanupItem];
+        });
+        void api.deleteAttachment(attachment.id).then(() => {
+          setUploads((current) => current.filter((item) => item.key !== key));
+        }).catch(() => {
+          setUploads((current) =>
+            current.map((item) =>
+              item.key === key
+                ? {
+                  ...item,
+                  status: "delete-failed",
+                  error: "Couldn’t remove this canceled upload. Retry removal.",
+                }
+                : item
+            )
+          );
         });
         return;
       }
+      if (["pending", "inspecting"].includes(attachment.state)) {
+        const polling = new AbortController();
+        uploadControllers.current.set(key, polling);
+        setUploads((current) =>
+          current.map((item) =>
+            item.key === key
+              ? {
+                ...item,
+                status: "scanning",
+                progress: 100,
+                attachment,
+                error: "Scanning with the installation policy…",
+              }
+              : item
+          )
+        );
+        try {
+          attachment = await pollAttachmentInspection(attachment.id, polling.signal);
+        } catch (error) {
+          if (polling.signal.aborted || !liveUploadKeys.current.has(key)) return;
+          setUploads((current) =>
+            current.map((item) =>
+              item.key === key
+                ? {
+                  ...item,
+                  status: "not-ready",
+                  error: error instanceof Error
+                    ? error.message
+                    : "Inspection status is unavailable.",
+                }
+                : item
+            )
+          );
+          return;
+        } finally {
+          uploadControllers.current.delete(key);
+        }
+      }
+      if (!liveUploadKeys.current.has(key)) return;
       setUploads((current) =>
         current.map((item) =>
           item.key === key
@@ -1594,7 +2172,8 @@ export function Composer(
                 status: "not-ready",
                 progress: 100,
                 attachment,
-                error: `Upload is ${attachment.state}; it is not ready to send.`,
+                error: friendlyAttachmentInspectionError(attachment.inspectionError) ??
+                  `Upload is ${attachment.state}; it is not ready to send.`,
               }
             : item
         )
@@ -1618,6 +2197,53 @@ export function Composer(
       );
     });
   };
+  const refreshAttachment = async (item: UploadItem) => {
+    if (!item.attachment || uploadControllers.current.has(item.key)) return;
+    const controller = new AbortController();
+    uploadControllers.current.set(item.key, controller);
+    setUploads((current) =>
+      current.map((candidate) =>
+        candidate.key === item.key
+          ? { ...candidate, status: "scanning", error: "Checking inspection status…" }
+          : candidate
+      )
+    );
+    try {
+      const attachment = await pollAttachmentInspection(item.attachment.id, controller.signal);
+      if (!liveUploadKeys.current.has(item.key)) return;
+      setUploads((current) =>
+        current.map((candidate) =>
+          candidate.key === item.key
+            ? attachment.state === "ready"
+              ? { ...candidate, attachment, status: "ready", error: undefined }
+              : {
+                ...candidate,
+                attachment,
+                status: "not-ready",
+                error: friendlyAttachmentInspectionError(attachment.inspectionError) ??
+                  `Upload is ${attachment.state}; it is not ready to send.`,
+              }
+            : candidate
+        )
+      );
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        setUploads((current) =>
+          current.map((candidate) =>
+            candidate.key === item.key
+              ? {
+                ...candidate,
+                status: "not-ready",
+                error: error instanceof Error ? error.message : "Inspection status is unavailable.",
+              }
+              : candidate
+          )
+        );
+      }
+    } finally {
+      uploadControllers.current.delete(item.key);
+    }
+  };
   const retryUpload = (item: UploadItem) => {
     if (claimedRetryKeys.current.has(item.key)) return;
     claimedRetryKeys.current.add(item.key);
@@ -1631,10 +2257,10 @@ export function Composer(
           : candidate
       )
     );
-    queueMicrotask(() => beginUpload(retryKey, item.file));
+    queueMicrotask(() => beginUpload(retryKey, item.file, item.scope));
   };
   const addFiles = (files: File[]) => {
-    if (disabled || !files.length) return;
+    if (interactionDisabled || !files.length) return;
     const allowed = files.filter((file) => file.size <= 25 * 1024 * 1024);
     const selected = allowed.slice(
       0,
@@ -1657,15 +2283,16 @@ export function Composer(
         ...current,
         { key, scope: activeUploadScope, file, status: "uploading", progress: 0 },
       ]);
-      queueMicrotask(() => beginUpload(key, file));
+      queueMicrotask(() => beginUpload(key, file, activeUploadScope));
     }
   };
-  const removeUpload = async (item: UploadItem) => {
+  async function removeUpload(item: UploadItem) {
     if (item.status === "uploading") {
       liveUploadKeys.current.delete(item.key);
       uploadControllers.current.get(item.key)?.abort();
       return;
     }
+    if (item.status === "scanning") uploadControllers.current.get(item.key)?.abort();
     if (!item.attachment) {
       liveUploadKeys.current.delete(item.key);
       setUploads((current) => current.filter((candidate) => candidate.key !== item.key));
@@ -1691,7 +2318,7 @@ export function Composer(
         )
       );
     }
-  };
+  }
   const blockedByUpload = activeUploads.some((item) => item.status !== "ready");
   const readyAttachmentIds = mergeAttachmentIds(
     retainedAttachments.map((attachment) => attachment.id),
@@ -1704,7 +2331,23 @@ export function Composer(
   );
   const canSubmit =
     (value.trim().length > 0 || readyAttachmentIds.length > 0 || toolContexts.length > 0) &&
-    !disabled && !blockedByUpload;
+    !interactionDisabled && !voiceBusy && !screenCaptureBusy && !blockedByUpload;
+  const protectsRetainedSession = chatComposerRequiresRetention({
+    hasDraft: value.length > 0,
+    editing: Boolean(edit),
+    uploadCount: uploads.length,
+    approvedToolCount: toolContexts.length,
+    selectedAssetCount: selectedGeneratedAssets.length,
+    recordingOrTranscribing: voiceBusy || screenCaptureBusy,
+    imageGenerationBusy: imageGeneration.state.phase === "submitting",
+    imageMutationCount: imageMutationIds.size,
+    imagePanelOpen: imagePanel !== null,
+    toolApprovalOpen: toolsOpen,
+  });
+  useEffect(() => {
+    onRetentionProtectionChange?.(protectsRetainedSession);
+  }, [onRetentionProtectionChange, protectsRetainedSession]);
+  useEffect(() => () => onRetentionProtectionChange?.(false), [onRetentionProtectionChange]);
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     if (!canSubmit) return;
@@ -1728,7 +2371,7 @@ export function Composer(
       className={cn("composer-wrap", dragging && "dragging")}
       onDragEnter={(event) => {
         event.preventDefault();
-        if (!disabled) setDragging(true);
+        if (!interactionDisabled) setDragging(true);
       }}
       onDragOver={(event) => event.preventDefault()}
       onDragLeave={(event) => {
@@ -1741,39 +2384,78 @@ export function Composer(
       }}
     >
       {edit && (
-        <div className="edit-banner">
+        <div
+          className="edit-banner"
+          id={editDescriptionId}
+          role="status"
+          aria-live="polite"
+        >
           <GitBranch size={16} />
           <span>
-            <strong>Create a new branch</strong>
-            <small>The original message and every response after it will stay intact.</small>
+            <strong>Immutable edit: create a new branch</strong>
+            <small>
+              Sending this edit creates a separate branch. The original message and every response
+              after it will stay intact.
+            </small>
           </span>
           <IconButton label="Cancel edit" onClick={cancelCurrentEdit}>
             <X size={16} />
           </IconButton>
         </div>
       )}
-      {(retainedAttachments.length > 0 || activeUploads.length > 0 ||
+      {((edit?.attachments?.length ?? 0) > 0 ||
+        displayedUploads.length > 0 ||
         selectedGeneratedAssets.length > 0) && (
-        <div className="upload-list" aria-label="Selected attachments" aria-live="polite">
-          {retainedAttachments.map((attachment) => (
-            <div className="upload-chip upload-ready" key={`retained-${attachment.id}`}>
-              <FileText size={18} aria-hidden="true" />
-              <span>
-                <strong>{attachment.filename}</strong>
-                <small>Retained from the original branch</small>
-              </span>
-              <IconButton
-                label={`Exclude attachment ${attachment.filename} from edited branch`}
-                onClick={() =>
-                  setExcludedEditAttachments((current) =>
-                    new Set(current).add(attachment.id)
-                  )}
+        <div
+          className="upload-list"
+          aria-label={edit ? "Edited branch attachments" : "Selected attachments"}
+        >
+          {(edit?.attachments ?? []).map((attachment) => {
+            const excluded = excludedEditAttachments.has(attachment.id);
+            return (
+              <div
+                className={cn("upload-chip", excluded ? "upload-excluded" : "upload-ready")}
+                key={`edit-attachment-${attachment.id}`}
               >
-                <X size={15} />
-              </IconButton>
-            </div>
-          ))}
-          {activeUploads.map((item) => (
+                <FileText size={18} aria-hidden="true" />
+                <span>
+                  <strong>{attachment.filename}</strong>
+                  <small aria-live="polite">
+                    {excluded
+                      ? "Excluded from this edited branch"
+                      : "Retained from the original branch"}
+                  </small>
+                </span>
+                <IconButton
+                  label={excluded
+                    ? `Include attachment ${attachment.filename} in edited branch`
+                    : `Exclude attachment ${attachment.filename} from edited branch`}
+                  onClick={() =>
+                    setExcludedEditAttachments((current) => {
+                      const next = new Set(current);
+                      if (excluded) {
+                        const selectedCount = retainedAttachments.length + activeUploads.length +
+                          selectedGeneratedAssets.length;
+                        if (selectedCount >= 10) {
+                          setSelectionError(
+                            "Remove another attachment before including this original attachment.",
+                          );
+                          return current;
+                        }
+                        next.delete(attachment.id);
+                      } else {
+                        next.add(attachment.id);
+                      }
+                      setSelectionError("");
+                      return next;
+                    })}
+                >
+                  {excluded ? <RotateCcw size={15} /> : <X size={15} />}
+                </IconButton>
+              </div>
+            );
+          })}
+          {displayedUploads.map((item) => (
             <div className={cn("upload-chip", `upload-${item.status}`)} key={item.key}>
               <FileText size={18} aria-hidden="true" />
               <span>
@@ -1783,6 +2465,8 @@ export function Composer(
                     ? `${Math.max(1, Math.ceil(item.file.size / 1024))} KB · Ready`
                     : item.status === "uploading"
                     ? `Uploading ${item.progress}%`
+                    : item.status === "scanning"
+                    ? item.error ?? "Scanning…"
                     : item.status === "removing"
                     ? "Removing…"
                     : item.error}
@@ -1811,9 +2495,19 @@ export function Composer(
                   <RefreshCw size={15} />
                 </IconButton>
               )}
+              {item.status === "not-ready" && item.attachment && (
+                <IconButton
+                  label={`Check inspection status for ${item.file.name}`}
+                  onClick={() => void refreshAttachment(item)}
+                >
+                  <RefreshCw size={15} />
+                </IconButton>
+              )}
               <IconButton
                 label={item.status === "uploading"
                   ? `Cancel upload ${item.file.name}`
+                  : item.status === "scanning"
+                  ? `Cancel inspection and remove ${item.file.name}`
                   : `Remove attachment ${item.file.name}`}
                 disabled={item.status === "removing"}
                 onClick={() =>
@@ -1823,6 +2517,15 @@ export function Composer(
               </IconButton>
             </div>
           ))}
+          <span className="sr-only" role="status" aria-live="polite">
+            {displayedUploads.filter((item) => item.status !== "uploading").map((item) =>
+              item.status === "ready"
+                ? `${item.file.name} is ready`
+                : item.status === "removing"
+                ? `Removing ${item.file.name}`
+                : `${item.file.name}: ${item.error ?? item.status}`
+            ).join(". ")}
+          </span>
           {selectedGeneratedAssets.map((asset) => (
             <div className="upload-chip upload-ready generated-attachment-chip" key={asset.id}>
               {asset.thumbnailUrl || asset.contentUrl
@@ -1874,8 +2577,9 @@ export function Composer(
       <form className="composer" onSubmit={submit}>
         <textarea
           ref={textareaRef}
+          data-chat-composer
           rows={1}
-          disabled={disabled}
+          disabled={interactionDisabled}
           value={value}
           onChange={(e) => setValue(e.target.value)}
           onPaste={(event) => {
@@ -1888,8 +2592,9 @@ export function Composer(
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) void submit(e);
           }}
-          placeholder="Message DG Chat…"
-          aria-label="Message"
+          placeholder={edit ? "Edit message for a new branch…" : "Message DG Chat…"}
+          aria-label={edit ? "Edit message in a new branch" : "Message"}
+          aria-describedby={edit ? editDescriptionId : undefined}
         />
         <div className="composer-tools">
           <input
@@ -1904,15 +2609,23 @@ export function Composer(
           />
           <IconButton
             label="Attach files"
-            disabled={disabled}
+            disabled={interactionDisabled}
             onClick={() => fileRef.current?.click()}
           >
             <Paperclip size={19} />
           </IconButton>
+          <ScreenCapture
+            disabled={interactionDisabled}
+            visionCapable={visionCapable}
+            targetKey={screenCaptureTargetKey ?? ""}
+            getCurrentTargetKey={getScreenCaptureTargetKey}
+            onBusyChange={setScreenCaptureBusy}
+            onCapture={(file) => addFiles([file])}
+          />
           <button
             type="button"
             className="tool-pill"
-            disabled={disabled}
+            disabled={interactionDisabled}
             aria-label="Open web search"
             onClick={() => setToolsOpen(true)}
           >
@@ -1922,6 +2635,7 @@ export function Composer(
             <button
               type="button"
               className="tool-pill"
+              disabled={branchTransitioning}
               aria-label="Create images"
               onClick={() => {
                 imageGeneration.reset();
@@ -1935,19 +2649,11 @@ export function Composer(
           <button
             type="button"
             className="tool-pill"
+            disabled={branchTransitioning}
             aria-label="Open image history"
             onClick={openImageGallery}
           >
             <Boxes size={16} /> Images
-          </button>
-          <button
-            type="button"
-            className="tool-pill"
-            disabled
-            aria-label="Tools (not available yet)"
-            title="Tools (not available yet)"
-          >
-            <Code2 size={16} /> Tools
           </button>
           <span className="push" />
           {transcriptionModels.length > 1 && (
@@ -1955,6 +2661,7 @@ export function Composer(
               className="voice-model-select"
               aria-label="Voice transcription model"
               value={transcriptionModel}
+              disabled={interactionDisabled || voiceBusy}
               onChange={(event) => setTranscriptionModel(event.target.value)}
             >
               {transcriptionModels.map((model) => (
@@ -1964,7 +2671,9 @@ export function Composer(
           )}
           <VoiceRecorder
             model={transcriptionModel}
-            disabled={disabled}
+            disabled={interactionDisabled || streaming || queuedCount > 0}
+            targetKey={voiceTargetKey}
+            onBusyChange={handleVoiceBusyChange}
             onTranscript={(transcript) => {
               const textarea = textareaRef.current;
               const selectionStart = textarea?.selectionStart;
@@ -1999,7 +2708,11 @@ export function Composer(
           )}
           <button
             className="send-button"
-            aria-label={streaming ? "Queue message" : "Send"}
+            aria-label={edit
+              ? "Send edited message as a new branch"
+              : streaming
+              ? "Queue message"
+              : "Send"}
             disabled={!canSubmit}
           >
             <ArrowDown size={19} />
@@ -2118,6 +2831,16 @@ export function Composer(
   );
 }
 
+function flattenTreeNodes(nodes: readonly MessageTreeNode[]): MessageTreeNode[] {
+  const flattened: MessageTreeNode[] = [];
+  const visit = (node: MessageTreeNode) => {
+    flattened.push(node);
+    node.children.forEach(visit);
+  };
+  nodes.forEach(visit);
+  return flattened;
+}
+
 function TreePanel({
   messages,
   activeLeafId,
@@ -2133,7 +2856,13 @@ function TreePanel({
   busy: boolean;
   returnFocus?: HTMLElement | null;
 }) {
-  const roots = conversationTree(messages, activeLeafId);
+  const sessionActive = useContext(ChatSessionActivityContext);
+  const roots = useMemo(() => conversationTree(messages, activeLeafId), [messages, activeLeafId]);
+  const flattenedNodes = useMemo(() => flattenTreeNodes(roots), [roots]);
+  const [focusedTreeItemId, setFocusedTreeItemId] = useState(() =>
+    flattenedNodes.find((node) => node.active)?.message.id ??
+      flattenedNodes[0]?.message.id ?? ""
+  );
   const titleId = useId();
   const panelRef = useRef<HTMLElement>(null);
   const closeRef = useRef(close);
@@ -2143,6 +2872,14 @@ function TreePanel({
   closeRef.current = close;
   busyRef.current = busy;
   useEffect(() => {
+    if (flattenedNodes.some((node) => node.message.id === focusedTreeItemId)) return;
+    setFocusedTreeItemId(
+      flattenedNodes.find((node) => node.active)?.message.id ??
+        flattenedNodes[0]?.message.id ?? "",
+    );
+  }, [flattenedNodes, focusedTreeItemId]);
+  useEffect(() => {
+    if (!sessionActive) return;
     if (restoreFrame.current !== null) {
       cancelAnimationFrame(restoreFrame.current);
       restoreFrame.current = null;
@@ -2159,7 +2896,7 @@ function TreePanel({
       if (event.key !== "Tab" || !panel) return;
       const items = [
         ...panel.querySelectorAll<HTMLElement>(
-          'button:not(:disabled), [role="treeitem"]:not([aria-disabled="true"])',
+          'button:not(:disabled), [role="treeitem"][tabindex="0"]:not([aria-disabled="true"])',
         ),
       ];
       if (!items.length) return;
@@ -2181,7 +2918,7 @@ function TreePanel({
         previousFocus.current?.focus();
       });
     };
-  }, []);
+  }, [sessionActive]);
   return (
     <div className="drawer-overlay" onClick={() => !busyRef.current && closeRef.current()}>
       <aside
@@ -2210,21 +2947,34 @@ function TreePanel({
           role="tree"
           aria-label="Conversation branches"
           onKeyDown={(event) => {
-            if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+            if (
+              !["ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight", "Home", "End"].includes(
+                event.key,
+              )
+            ) return;
             const items = [...event.currentTarget.querySelectorAll<HTMLElement>(
               '[role="treeitem"]:not([aria-disabled="true"])',
             )];
             const current = (event.target as HTMLElement).closest<HTMLElement>('[role="treeitem"]');
             const index = current ? items.indexOf(current) : -1;
+            const directChild = current?.querySelector<HTMLElement>(
+              ':scope > .tree-children > [role="treeitem"]',
+            );
+            const parent = current?.parentElement?.closest<HTMLElement>('[role="treeitem"]');
             const next = event.key === "Home"
               ? items[0]
               : event.key === "End"
               ? items.at(-1)
               : event.key === "ArrowDown"
               ? items[Math.min(items.length - 1, index + 1)]
-              : items[Math.max(0, index - 1)];
+              : event.key === "ArrowUp"
+              ? items[Math.max(0, index - 1)]
+              : event.key === "ArrowRight"
+              ? directChild
+              : parent;
             if (next) {
               event.preventDefault();
+              setFocusedTreeItemId(next.dataset.treeMessageId ?? "");
               next.focus();
             }
           }}
@@ -2236,6 +2986,8 @@ function TreePanel({
                 node={root}
                 onSelect={onSelect}
                 busy={busy}
+                focusedTreeItemId={focusedTreeItemId}
+                setFocusedTreeItemId={setFocusedTreeItemId}
               />
             ))
             : <p className="muted">This conversation does not have any messages yet.</p>}
@@ -2252,10 +3004,12 @@ function TreePanel({
   );
 }
 function TreeNode(
-  { node, onSelect, busy }: {
+  { node, onSelect, busy, focusedTreeItemId, setFocusedTreeItemId }: {
     node: MessageTreeNode;
     onSelect: (messageId: string) => void;
     busy: boolean;
+    focusedTreeItemId: string;
+    setFocusedTreeItemId: (messageId: string) => void;
   },
 ) {
   const disabled = busy;
@@ -2263,9 +3017,16 @@ function TreeNode(
     <div
       className="tree-subtree"
       role="treeitem"
-      tabIndex={disabled ? -1 : 0}
+      data-tree-message-id={node.message.id}
+      tabIndex={!disabled && node.message.id === focusedTreeItemId ? 0 : -1}
       aria-disabled={disabled || undefined}
       aria-current={node.active ? "true" : undefined}
+      aria-expanded={node.children.length > 0 ? true : undefined}
+      onFocus={(event) => {
+        // React focus events bubble. Without this target guard, focusing a nested item lets every
+        // ancestor overwrite the roving tab stop even though focus correctly reached the child.
+        if (event.currentTarget === event.target) setFocusedTreeItemId(node.message.id);
+      }}
       onClick={(event) => {
         event.stopPropagation();
         if (!disabled) onSelect(node.message.id);
@@ -2294,6 +3055,8 @@ function TreeNode(
               node={child}
               onSelect={onSelect}
               busy={busy}
+              focusedTreeItemId={focusedTreeItemId}
+              setFocusedTreeItemId={setFocusedTreeItemId}
             />
           ))}
         </div>
@@ -2314,6 +3077,7 @@ function ChatView({
   onConversationCreated,
   onUpdateConversation,
   onKeepConversation,
+  mediaPreferences,
   readOnly: readOnlyProp = false,
   saveHistory = true,
   modelPreferenceError = "",
@@ -2321,6 +3085,7 @@ function ChatView({
   messagesStale = false,
   retryMessages,
   onGenerationBusyChange,
+  onRetentionProtectionChange,
 }: {
   conversations: Conversation[];
   activeId: string;
@@ -2336,6 +3101,7 @@ function ChatView({
     patch: { title?: string; pinned?: boolean; archived?: boolean; deleted?: boolean },
   ) => Promise<void>;
   onKeepConversation: (conversation: Conversation) => Promise<Conversation>;
+  mediaPreferences: ChatMediaPreferences;
   readOnly?: boolean;
   saveHistory?: boolean;
   modelPreferenceError?: string;
@@ -2343,12 +3109,27 @@ function ChatView({
   messagesStale?: boolean;
   retryMessages: () => void;
   onGenerationBusyChange: (conversationId: string, busy: boolean) => void;
+  onRetentionProtectionChange: (conversationId: string, protect: boolean) => void;
 }) {
+  const sessionActive = useContext(ChatSessionActivityContext);
   const queryClient = useQueryClient();
   const chatModels = useMemo(
     () => models.filter((model) => model.capabilities.includes("chat")),
     [models],
   );
+  // React batches a model-picker click until the native event finishes. Keep the selected ID
+  // authoritative synchronously as well, so a stale preview action later in that same event task
+  // cannot upload content captured for the model that is being left.
+  const selectedModelRef = useRef(selectedModel);
+  const renderedSelectedModelRef = useRef(selectedModel);
+  if (renderedSelectedModelRef.current !== selectedModel) {
+    renderedSelectedModelRef.current = selectedModel;
+    selectedModelRef.current = selectedModel;
+  }
+  const selectModel = (modelId: string) => {
+    selectedModelRef.current = modelId;
+    setSelectedModel(modelId);
+  };
   const transcriptionModels = useMemo(
     () => models.filter((model) => model.capabilities.includes("transcription")),
     [models],
@@ -2365,81 +3146,15 @@ function ChatView({
     () => models.filter((model) => model.capabilities.includes("image_editing")),
     [models],
   );
-  const speechVoices = [
-    "alloy",
-    "ash",
-    "ballad",
-    "coral",
-    "echo",
-    "fable",
-    "nova",
-    "onyx",
-    "sage",
-    "shimmer",
-    "verse",
-  ] as const;
-  const [speechModel, setSpeechModel] = useState(() => {
-    try {
-      return localStorage.getItem("dg-chat.speech-model") ?? "";
-    } catch {
-      return "";
-    }
-  });
-  useEffect(() => {
-    if (models.length === 0) return;
-    const selected = speechModels.some((model) => model.id === speechModel)
-      ? speechModel
-      : speechModels[0]?.id ?? "";
-    if (selected !== speechModel) setSpeechModel(selected);
-    try {
-      if (selected) localStorage.setItem("dg-chat.speech-model", selected);
-      else localStorage.removeItem("dg-chat.speech-model");
-    } catch {
-      // Private browser contexts retain the valid in-memory fallback.
-    }
-  }, [models.length, speechModel, speechModels]);
-  const [speechVoice, setSpeechVoice] = useState(() => {
-    try {
-      const stored = localStorage.getItem("dg-chat.speech-voice");
-      return speechVoices.includes(stored as (typeof speechVoices)[number]) ? stored! : "alloy";
-    } catch {
-      return "alloy";
-    }
-  });
-  const chooseSpeechVoice = (voice: string) => {
-    if (!speechVoices.includes(voice as (typeof speechVoices)[number])) return;
-    setSpeechVoice(voice);
-    try {
-      localStorage.setItem("dg-chat.speech-voice", voice);
-    } catch {
-      // The validated in-memory preference remains available in private contexts.
-    }
-  };
+  const {
+    speechModel,
+    setSpeechModel,
+    speechVoice,
+    setSpeechVoice,
+    transcriptionModel,
+    setTranscriptionModel,
+  } = mediaPreferences;
   const speechPlayback = useSpeechPlayback();
-  const [transcriptionModel, setTranscriptionModelState] = useState(() => {
-    try {
-      return localStorage.getItem("dg-chat.transcription-model") ?? "";
-    } catch {
-      return "";
-    }
-  });
-  useEffect(() => {
-    // Preserve the stored preference while the asynchronous catalog is still loading.
-    if (models.length === 0) return;
-    const selected = transcriptionModels.some((model) => model.id === transcriptionModel)
-      ? transcriptionModel
-      : transcriptionModels[0]?.id ?? "";
-    if (selected !== transcriptionModel) setTranscriptionModelState(selected);
-    try {
-      if (selected) localStorage.setItem("dg-chat.transcription-model", selected);
-      else localStorage.removeItem("dg-chat.transcription-model");
-    } catch {
-      // Hardened/private browser contexts can use the in-memory selection.
-    }
-  }, [models.length, transcriptionModel, transcriptionModels]);
-  const setTranscriptionModel = (id: string) => {
-    if (transcriptionModels.some((model) => model.id === id)) setTranscriptionModelState(id);
-  };
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const followStreamRef = useRef(true);
   const [localMessages, setLocalMessages] = useState(messages);
@@ -2447,6 +3162,8 @@ function ChatView({
   localMessagesRef.current = localMessages;
   const [tree, setTree] = useState(false);
   const treeReturnFocusRef = useRef<HTMLElement | null>(null);
+  const branchFocusTargetRef = useRef<string | null>(null);
+  const branchFocusFallbackRef = useRef<HTMLElement | null>(null);
   const [edit, setEdit] = useState<Message>();
   const [queue, setQueue] = useState<QueuedPrompt[]>([]);
   const [activeStream, setActiveStream] = useState<{
@@ -2455,18 +3172,24 @@ function ChatView({
     assistant: Message;
     phase: "connecting" | "streaming" | "stopping";
   }>();
+  const [streamAnnouncement, setStreamAnnouncement] = useState("");
   const [failedPrompt, setFailedPrompt] = useState<QueuedPrompt>();
   const streamAbortRef = useRef<AbortController | null>(null);
   const runPromptRef = useRef<(item: QueuedPrompt) => Promise<void>>(() => Promise.resolve());
   const branchInFlightRef = useRef(false);
   const [branchBusy, setBranchBusy] = useState(false);
+  const [voiceBusy, setVoiceBusy] = useState(false);
   const [sendError, setSendError] = useState("");
   const [renaming, setRenaming] = useState(false);
   const [keepingTemporary, setKeepingTemporary] = useState(false);
+  const [composerProtectsRetention, setComposerProtectsRetention] = useState(false);
+  const [shareProtectsRetention, setShareProtectsRetention] = useState(false);
   const [keepTemporaryError, setKeepTemporaryError] = useState("");
+  const [temporaryChatAnnouncement, setTemporaryChatAnnouncement] = useState("");
   const initialConversation = conversations.find((c) => c.id === activeId);
   const [conversation, setConversation] = useState(initialConversation);
   const [previewLeafId, setPreviewLeafId] = useState<string | null>(null);
+  const conversationIdentityRef = useRef(activeId);
   const syncConversation = (next: Conversation) => {
     setPreviewLeafId(null);
     setConversation(next);
@@ -2476,14 +3199,33 @@ function ChatView({
         (current) => mergeConversationSnapshot(current, next),
       );
     }
+    invalidateConversationSearch();
   };
   const readOnly = readOnlyProp || Boolean(conversation?.archived || conversation?.deleted);
   useEffect(() => setLocalMessages(messages), [messages]);
   useEffect(() => {
-    setPreviewLeafId(null);
+    setPreviewLeafId((current) =>
+      reconcileBranchPreview(
+        current,
+        conversationIdentityRef.current,
+        activeId,
+        localMessagesRef.current,
+        readOnly,
+      )
+    );
+    conversationIdentityRef.current = activeId;
     setConversation(initialConversation);
-  }, [activeId, initialConversation]);
-  const effectiveActiveLeafId = previewLeafId ?? conversation?.activeLeafId;
+  }, [activeId, initialConversation, readOnly]);
+  useEffect(() => {
+    setPreviewLeafId((current) =>
+      reconcileBranchPreview(current, activeId, activeId, localMessages, readOnly)
+    );
+  }, [activeId, localMessages, readOnly]);
+  // A read-only preview is presentation-only. Ignore it synchronously on the first editable
+  // render so the composer can never appear over a path whose hidden send parent is different.
+  const effectiveActiveLeafId = readOnly
+    ? previewLeafId ?? conversation?.activeLeafId
+    : conversation?.activeLeafId;
   const activePath = useMemo(
     () => activeMessagePath(localMessages, effectiveActiveLeafId),
     [localMessages, effectiveActiveLeafId],
@@ -2494,14 +3236,39 @@ function ChatView({
     onGenerationBusyChange(activeId, generationBusy);
     return () => onGenerationBusyChange(activeId, false);
   }, [activeId, generationBusy, onGenerationBusyChange]);
-  const speechContentFingerprint = useMemo(
-    () => localMessages.map((message) => `${message.id}:${message.content}`).join("\u0000"),
-    [localMessages],
+  const protectsRetention = generationBusy || composerProtectsRetention ||
+    shareProtectsRetention || tree || Boolean(failedPrompt) ||
+    branchBusy ||
+    renaming || keepingTemporary;
+  useEffect(() => {
+    onRetentionProtectionChange(activeId, protectsRetention);
+  }, [activeId, onRetentionProtectionChange, protectsRetention]);
+  useEffect(
+    () => () => onRetentionProtectionChange(activeId, false),
+    [activeId, onRetentionProtectionChange],
   );
+  useLayoutEffect(() => {
+    const messageId = branchFocusTargetRef.current;
+    if (!messageId || branchBusy) return;
+    const group = document.querySelector<HTMLElement>(
+      `[data-chat-session="${CSS.escape(activeId)}"] .branch-control[data-branch-message-id="${
+        CSS.escape(messageId)
+      }"]`,
+    );
+    const fallback = branchFocusFallbackRef.current;
+    const target = group ?? (fallback?.isConnected ? fallback : null);
+    target?.focus();
+    branchFocusTargetRef.current = null;
+    branchFocusFallbackRef.current = null;
+  }, [activeId, activePath, branchBusy]);
+  const speechMessagesRef = useRef<readonly Message[] | undefined>(undefined);
+  const speechMessages = reconcileSpeechMessageSnapshot(speechMessagesRef.current, activePath);
+  speechMessagesRef.current = speechMessages;
   useEffect(() => speechPlayback.controller.cancel(), [
+    sessionActive,
     activeId,
     effectiveActiveLeafId,
-    speechContentFingerprint,
+    speechMessages,
     speechModel,
     speechVoice,
     speechPlayback.controller,
@@ -2513,10 +3280,17 @@ function ChatView({
       behavior: "smooth",
     });
   }, [activeStream?.assistant.content]);
-  const selectBranch = async (messageId: string) => {
-    if (!conversation || branchInFlightRef.current) return;
+  const selectBranch = async (
+    messageId: string,
+    returnFocus: HTMLElement | null = null,
+  ) => {
+    if (!conversation || branchInFlightRef.current || voiceBusy) return;
     const leafId = preferredLeaf(localMessages, messageId);
     if (leafId === effectiveActiveLeafId) return;
+    if (returnFocus) {
+      branchFocusTargetRef.current = messageId;
+      branchFocusFallbackRef.current = returnFocus;
+    }
     if (readOnly) {
       setPreviewLeafId(leafId);
       return;
@@ -2592,6 +3366,7 @@ function ChatView({
       assistant: optimisticAssistant,
       phase: "connecting",
     });
+    setStreamAnnouncement("Connecting to the model");
     setSendError("");
     setFailedPrompt(undefined);
     let acceptedUserId: string | undefined;
@@ -2618,7 +3393,11 @@ function ChatView({
           mode: item.mode,
         }, controller.signal)
       ) {
+        // A terminal frame may already be queued when Stop aborts the transport. Never let that
+        // stale frame overwrite the user's explicit stopped state or its recovery announcement.
+        if (controller.signal.aborted) throw new Error("generation_aborted");
         if (event.type === "accepted") {
+          setStreamAnnouncement("Assistant response is streaming");
           acceptedUserId = event.user.id;
           setActiveStream((current) =>
             current && current.item.id === item.id
@@ -2684,6 +3463,13 @@ function ChatView({
               : current
           );
         } else {
+          if (event.outcome === "stopped") {
+            setStreamAnnouncement(
+              "Generation stopped. The saved conversation remains available.",
+            );
+          } else if (event.outcome === "complete") {
+            setStreamAnnouncement("Assistant response complete. Response actions are available.");
+          }
           terminalAssistant = event.assistant;
           const nextById = new Map(
             localMessagesRef.current.map((message) => [message.id, message]),
@@ -2702,12 +3488,15 @@ function ChatView({
           } else setLocalMessages(next);
         }
       }
+      if (controller.signal.aborted) throw new Error("generation_aborted");
     } catch (error) {
       if (controller.signal.aborted) {
+        setStreamAnnouncement("Generation stopped. The saved conversation remains available.");
         setSendError(
           "Generation stopped. Your saved conversation and previous branches are intact.",
         );
       } else {
+        setStreamAnnouncement("Generation failed. Recovery actions are available.");
         let retryPrompt = terminalAssistant
           ? {
             ...item,
@@ -2786,11 +3575,14 @@ function ChatView({
     }
   };
   useEffect(() => {
-    if (activeStream || queue.length === 0 || readOnly) return;
+    if (
+      activeStream || queue.length === 0 || readOnly || branchBusy || voiceBusy ||
+      branchInFlightRef.current
+    ) return;
     const { next, remaining } = nextQueuedPrompt(queue);
     setQueue(remaining);
     if (next) void runPromptRef.current(next);
-  }, [activeStream, queue, readOnly]);
+  }, [activeStream, branchBusy, queue, readOnly, voiceBusy]);
   useEffect(() => () => streamAbortRef.current?.abort(), []);
 
   const send = (
@@ -2798,6 +3590,7 @@ function ChatView({
     attachmentIds: string[],
     toolExecutionIds: string[],
   ): Promise<boolean> => {
+    if (branchInFlightRef.current || branchBusy || voiceBusy) return Promise.resolve(false);
     const item: QueuedPrompt = {
       id: crypto.randomUUID(),
       content,
@@ -2817,6 +3610,7 @@ function ChatView({
     mode: "regenerate" | "continue",
     sourceMessageId: string,
   ) => {
+    if (branchInFlightRef.current || branchBusy || voiceBusy) return;
     const operationId = crypto.randomUUID();
     setQueue((current) =>
       enqueuePrompt(current, {
@@ -2834,11 +3628,14 @@ function ChatView({
   };
   return (
     <main className="chat-main">
+      <span className="sr-only" aria-live="polite" aria-atomic="true">
+        {temporaryChatAnnouncement}
+      </span>
       <header className="chat-header">
         <IconButton label="Open menu" className="mobile-only" onClick={onMenu}>
           <Menu size={20} />
         </IconButton>
-        <ModelPicker models={chatModels} selected={selectedModel} setSelected={setSelectedModel} />
+        <ModelPicker models={chatModels} selected={selectedModel} setSelected={selectModel} />
         {modelPreferenceError && (
           <span className="model-preference-error" role="alert">{modelPreferenceError}</span>
         )}
@@ -2867,9 +3664,9 @@ function ChatView({
                   aria-label="Speech voice"
                   value={speechVoice}
                   onChange={(event) =>
-                    chooseSpeechVoice(event.currentTarget.value)}
+                    setSpeechVoice(event.currentTarget.value)}
                 >
-                  {speechVoices.map((voice) => <option key={voice} value={voice}>{voice}</option>)}
+                  {SPEECH_VOICES.map((voice) => <option key={voice} value={voice}>{voice}</option>)}
                 </select>
               </label>
             </div>
@@ -2887,12 +3684,11 @@ function ChatView({
             <ConversationShareButton
               conversation={conversation}
               messages={activePath}
+              visibleLeafId={effectiveActiveLeafId ?? null}
               disabled={generationBusy || activePath.length === 0}
+              onRetentionProtectionChange={setShareProtectsRetention}
             />
           )}
-          <IconButton label="Conversation options (not available yet)" disabled>
-            <MoreHorizontal size={19} />
-          </IconButton>
         </div>
       </header>
       <div
@@ -2922,7 +3718,8 @@ function ChatView({
             <div>
               <strong>Temporary chat</strong>
               <span>
-                This chat is excluded from organization and user exports and will be deleted
+                This chat is excluded by default from organization and user exports and will be
+                deleted
                 {conversation.temporaryExpiresAt
                   ? ` after ${new Date(conversation.temporaryExpiresAt).toLocaleString()}`
                   : " automatically"}.
@@ -2939,6 +3736,14 @@ function ChatView({
                   setKeepTemporaryError("");
                   try {
                     syncConversation(await onKeepConversation(conversation));
+                    setTemporaryChatAnnouncement("Chat kept in your saved history.");
+                    requestAnimationFrame(() => {
+                      document.querySelector<HTMLTextAreaElement>(
+                        `[data-chat-session="${
+                          CSS.escape(activeId)
+                        }"] textarea[data-chat-composer]`,
+                      )?.focus();
+                    });
                   } catch (error) {
                     setKeepTemporaryError(
                       error instanceof Error ? error.message : "This chat could not be kept.",
@@ -2953,16 +3758,20 @@ function ChatView({
             )}
           </div>
         )}
-        {activePath.map((m) => (
+        {activePath.map((m, messageIndex) => (
           <MessageItem
             key={m.id}
+            conversationId={conversation?.id ?? activeId}
             message={m}
+            messagePosition={messageIndex + 1}
             branch={messageBranch(localMessages, m.id)}
             onTree={() => {
               treeReturnFocusRef.current = document.activeElement as HTMLElement;
               setTree(true);
             }}
-            onEdit={setEdit}
+            onEdit={(message) => {
+              if (!voiceBusy) setEdit(message);
+            }}
             onSelectBranch={selectBranch}
             onRegenerate={(assistant) => {
               const source = localMessages.find((message) => message.id === assistant.parentId);
@@ -2976,8 +3785,8 @@ function ChatView({
                 "continue",
                 assistant.id,
               )}
-            branchBusy={branchBusy}
-            generationBusy={streaming || queue.length > 0}
+            branchBusy={branchBusy || voiceBusy}
+            generationBusy={streaming || queue.length > 0 || voiceBusy}
             editing={Boolean(edit)}
             speech={speechModel
               ? {
@@ -2997,18 +3806,18 @@ function ChatView({
             readOnly={readOnly}
           />
         ))}
+        {streamAnnouncement && (
+          <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+            {streamAnnouncement}
+          </span>
+        )}
         {activeStream && (
           <div className="streaming-turn" aria-busy="true">
-            <span className="sr-only" role="status" aria-live="polite">
-              {activeStream.phase === "stopping"
-                ? "Stopping generation"
-                : activeStream.phase === "connecting"
-                ? "Connecting to the model"
-                : "Assistant response is streaming"}
-            </span>
             {activeStream.item.mode === "send" && (
               <MessageItem
+                conversationId={conversation?.id ?? activeId}
                 message={activeStream.user}
+                messagePosition={activePath.length + 1}
                 branch={null}
                 onTree={() => setTree(true)}
                 onEdit={() => undefined}
@@ -3022,7 +3831,9 @@ function ChatView({
               />
             )}
             <MessageItem
+              conversationId={conversation?.id ?? activeId}
               message={activeStream.assistant}
+              messagePosition={activePath.length + (activeStream.item.mode === "send" ? 2 : 1)}
               branch={null}
               onTree={() => setTree(true)}
               onEdit={() => undefined}
@@ -3055,16 +3866,44 @@ function ChatView({
           <div className="stream-error" role="alert">
             <span>{sendError}</span>
             {failedPrompt && (
-              <button
-                type="button"
-                onClick={() => {
-                  setQueue((current) => enqueuePrompt(current, retryQueuedPrompt(failedPrompt)));
-                  setFailedPrompt(undefined);
-                  setSendError("");
-                }}
-              >
-                <RefreshCw size={14} /> Retry
-              </button>
+              <>
+                <button
+                  type="button"
+                  disabled={branchBusy || voiceBusy}
+                  onClick={() => {
+                    if (branchInFlightRef.current || branchBusy || voiceBusy) return;
+                    setQueue((current) => enqueuePrompt(current, retryQueuedPrompt(failedPrompt)));
+                    setFailedPrompt(undefined);
+                    setSendError("");
+                    requestAnimationFrame(() => {
+                      document.querySelector<HTMLTextAreaElement>(
+                        `[data-chat-session="${
+                          CSS.escape(activeId)
+                        }"] textarea[data-chat-composer]`,
+                      )?.focus();
+                    });
+                  }}
+                >
+                  <RefreshCw size={14} /> Retry
+                </button>
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => {
+                    setFailedPrompt(undefined);
+                    setSendError("");
+                    requestAnimationFrame(() => {
+                      document.querySelector<HTMLTextAreaElement>(
+                        `[data-chat-session="${
+                          CSS.escape(activeId)
+                        }"] textarea[data-chat-composer]`,
+                      )?.focus();
+                    });
+                  }}
+                >
+                  Discard failed prompt
+                </button>
+              </>
             )}
           </div>
         )}
@@ -3110,7 +3949,10 @@ function ChatView({
               edit={edit}
               cancelEdit={() => setEdit(undefined)}
               disabled={chatModels.length === 0}
-              disabledReason={chatModels.length === 0
+              branchTransitioning={branchBusy}
+              disabledReason={branchBusy
+                ? "Switching branches… New generations will be available when the selected branch is active."
+                : chatModels.length === 0
                 ? "No chat-capable model is available."
                 : undefined}
               streaming={streaming}
@@ -3121,8 +3963,45 @@ function ChatView({
               setTranscriptionModel={setTranscriptionModel}
               imageModels={imageModels}
               imageEditModels={imageEditModels}
+              visionCapable={Boolean(
+                chatModels.find((model) => model.id === selectedModel)?.capabilities.includes(
+                  "vision",
+                ),
+              )}
+              screenCaptureTargetKey={chatScreenCaptureTargetKey({
+                sessionActive,
+                conversationId: activeId,
+                leafId: effectiveActiveLeafId,
+                editId: edit?.id,
+                selectedModelId: selectedModel,
+                visionCapable: Boolean(
+                  chatModels.find((model) => model.id === selectedModel)?.capabilities.includes(
+                    "vision",
+                  ),
+                ),
+              })}
+              getScreenCaptureTargetKey={() => {
+                const currentModelId = selectedModelRef.current;
+                return chatScreenCaptureTargetKey({
+                  sessionActive,
+                  conversationId: activeId,
+                  leafId: effectiveActiveLeafId,
+                  editId: edit?.id,
+                  selectedModelId: currentModelId,
+                  visionCapable: Boolean(
+                    chatModels.find((model) => model.id === currentModelId)?.capabilities.includes(
+                      "vision",
+                    ),
+                  ),
+                });
+              }}
+              voiceTargetKey={`${sessionActive ? "active" : "inactive"}:${activeId}:${
+                effectiveActiveLeafId ?? ""
+              }:${edit?.id ?? ""}:${transcriptionModel}`}
+              onVoiceBusyChange={setVoiceBusy}
               onStop={() => {
                 if (activeStream?.phase === "stopping") return;
+                setStreamAnnouncement("Stopping generation");
                 setActiveStream((current) => current ? { ...current, phase: "stopping" } : current);
                 const stop = activeStream && !activeStream.user.id.startsWith("pending-user-")
                   ? chatStreamAdapter.stop?.({
@@ -3132,17 +4011,16 @@ function ChatView({
                   })
                   : undefined;
                 if (stop) {
-                  void stop.catch(() =>
-                    streamAbortRef.current?.abort(
-                      new DOMException("Stopped by user", "AbortError"),
-                    )
-                  );
+                  void stop.catch(() => streamAbortRef.current?.abort(
+                    new DOMException("Stopped by user", "AbortError"),
+                  ));
                 } else {
                   streamAbortRef.current?.abort(
                     new DOMException("Stopped by user", "AbortError"),
                   );
                 }
               }}
+              onRetentionProtectionChange={setComposerProtectsRetention}
             />
           </>
         )}
@@ -3152,7 +4030,7 @@ function ChatView({
           activeLeafId={effectiveActiveLeafId}
           close={() => setTree(false)}
           onSelect={selectBranch}
-          busy={branchBusy || streaming || queue.length > 0 || Boolean(edit)}
+          busy={branchBusy || voiceBusy || streaming || queue.length > 0 || Boolean(edit)}
           returnFocus={treeReturnFocusRef.current}
         />
       )}
@@ -3169,6 +4047,101 @@ function ChatView({
       )}
     </main>
   );
+}
+
+type ChatViewProps = Parameters<typeof ChatView>[0];
+type ChatSessionSharedProps = Omit<
+  ChatViewProps,
+  "activeId" | "messages" | "messagesStale" | "readOnly" | "retryMessages"
+>;
+
+function ChatSession({
+  conversationId,
+  active,
+  readOnly,
+  demoMode,
+  shared,
+}: {
+  conversationId: string;
+  active: boolean;
+  readOnly: boolean;
+  demoMode: boolean;
+  shared: ChatSessionSharedProps;
+}) {
+  const messages = useQuery({
+    queryKey: ["messages", conversationId],
+    queryFn: () => api.messages(conversationId),
+    ...chatSessionQueryActivity(active),
+  });
+  const queryClient = useQueryClient();
+  const pollAttachmentIngestion = shouldPollAttachmentIngestion(messages.data ?? [], active);
+  useEffect(() => {
+    if (!pollAttachmentIngestion) return;
+    const timer = setInterval(
+      () => void queryClient.invalidateQueries({ queryKey: ["messages", conversationId] }),
+      2000,
+    );
+    return () => clearInterval(timer);
+  }, [conversationId, pollAttachmentIngestion, queryClient]);
+  const blockingLoading = !demoMode && messages.isLoading && messages.data === undefined;
+  const blockingError = !demoMode && messages.isError && messages.data === undefined;
+
+  return (
+    <ChatSessionActivityContext.Provider value={active}>
+      <div
+        className="chat-session"
+        hidden={!active}
+        inert={!active || undefined}
+        aria-hidden={!active || undefined}
+        data-chat-session={conversationId}
+      >
+        {blockingLoading && <ConversationMessagesQueryState kind="loading" />}
+        {blockingError && (
+          <ConversationMessagesQueryState
+            kind="error"
+            retry={() => void messages.refetch()}
+          />
+        )}
+        {!blockingLoading && !blockingError && (
+          <ChatView
+            {...shared}
+            activeId={conversationId}
+            messages={messages.data ?? (demoMode ? demoMessages : [])}
+            readOnly={readOnly}
+            messagesStale={!demoMode && messages.isError && messages.data !== undefined}
+            retryMessages={() => void messages.refetch()}
+          />
+        )}
+      </div>
+    </ChatSessionActivityContext.Provider>
+  );
+}
+
+function ChatSessionHost({
+  conversationIds,
+  activeId,
+  visible,
+  readOnly,
+  demoMode,
+  shared,
+}: {
+  conversationIds: readonly string[];
+  activeId: string;
+  visible: boolean;
+  readOnly: boolean;
+  demoMode: boolean;
+  shared: ChatSessionSharedProps;
+}) {
+  return conversationIds.map((conversationId) => (
+    <ChatSession
+      key={conversationId}
+      conversationId={conversationId}
+      active={visible && conversationId === activeId}
+      readOnly={visible && conversationId === activeId && readOnly}
+      demoMode={demoMode}
+      shared={shared}
+    />
+  ));
 }
 
 const settingsNav = [
@@ -3216,46 +4189,17 @@ function SettingsView(
                   <strong>{user.name}</strong>
                   <small>{user.email}</small>
                 </div>
-                <button
-                  className="secondary push"
-                  disabled
-                  title="Avatar editing is not available yet"
-                >
-                  Change avatar
-                </button>
               </div>
               <Field label="Display name" value={user.name} />
               <Field label="Email address" value={user.email} />
               <div className="setting-row">
                 <span>
                   <strong>Password</strong>
-                  <small>Last changed 3 months ago</small>
+                  <small>Use the secure reset flow to choose a new password.</small>
                 </span>
-                <button
-                  className="secondary"
-                  disabled
-                  title="Password changes are not available in the app yet"
-                >
-                  Change password
-                </button>
+                <a className="secondary" href="/forgot-password">Reset password</a>
               </div>
               <SessionCenter />
-              <div className="danger-zone">
-                <h3>Danger zone</h3>
-                <div className="setting-row">
-                  <span>
-                    <strong>Delete account</strong>
-                    <small>Schedule your account and data for deletion.</small>
-                  </span>
-                  <button
-                    className="danger-button"
-                    disabled
-                    title="Self-service account deletion is not available yet"
-                  >
-                    Delete account
-                  </button>
-                </div>
-              </div>
             </>
           )}
           {section === "appearance" && (
@@ -3382,7 +4326,8 @@ const adminNav: { id: AdminSection; label: string; icon: typeof Gauge }[] = [
   { id: "jobs", label: "Background jobs", icon: Boxes },
   { id: "audit", label: "Audit log", icon: Shield },
   { id: "retention", label: "Retention", icon: Database },
-  { id: "storage", label: "Storage & backups", icon: HardDrive },
+  { id: "storage", label: "Attachment storage", icon: HardDrive },
+  { id: "backups", label: "Backups", icon: ArchiveRestore },
 ];
 function AdminView(
   {
@@ -3409,8 +4354,9 @@ function AdminView(
 ) {
   const currentLabel = adminNav.find((item) => item.id === section)?.label ?? "Admin";
   useEffect(() => {
+    if (userDetail) return;
     document.title = `${currentLabel} · DG Chat Admin`;
-  }, [currentLabel]);
+  }, [currentLabel, userDetail]);
   return (
     <main className="admin-main">
       <header className="admin-mobile-head">
@@ -3534,6 +4480,9 @@ function AdminSectionContent(
   }
   if (section === "retention") {
     return <AdminRetentionView search={search} onSearch={setSearch} />;
+  }
+  if (section === "storage") {
+    return <AdminStorageView onReauthenticate={reauthenticate} />;
   }
   return <AdminBackupsView />;
 }
@@ -3774,7 +4723,12 @@ function Applicants({ compact = false }: { compact?: boolean }) {
   };
   return (
     <>
-      <div className="data-table admin-applicant-table" aria-busy={users.isLoading}>
+      <div
+        className="data-table admin-applicant-table"
+        aria-busy={users.isLoading}
+        aria-label="Pending applicants"
+        role="list"
+      >
         {!compact && (
           <div className="table-head">
             <span>APPLICANT</span>
@@ -3794,7 +4748,7 @@ function Applicants({ compact = false }: { compact?: boolean }) {
           <div className="empty-mini">No pending applicants</div>
         )}
         {applicants.map((applicant) => (
-          <div className="applicant-row" key={applicant.id}>
+          <div className="applicant-row" key={applicant.id} role="listitem">
             <Avatar user={applicant} small />
             <span>
               <strong>{applicant.name}</strong>
@@ -3813,10 +4767,18 @@ function Applicants({ compact = false }: { compact?: boolean }) {
               {new Date(applicant.createdAt).toLocaleDateString()}
             </time>
             <span className="applicant-actions">
-              <button className="approve" onClick={() => openDecision(applicant, "approved")}>
+              <button
+                className="approve"
+                onClick={() =>
+                  openDecision(applicant, "approved")}
+              >
                 <Check size={15} /> Approve
               </button>
-              <IconButton label="Reject" onClick={() => openDecision(applicant, "rejected")}>
+              <IconButton
+                label="Reject"
+                onClick={() =>
+                  openDecision(applicant, "rejected")}
+              >
                 <X size={16} />
               </IconButton>
             </span>
@@ -3955,6 +4917,17 @@ function UserManagement(
     deletion: search.userDeletion,
   });
   const [cursors, setCursors] = useState<string[]>([]);
+  useEffect(() => {
+    setSearchDraft(search.userSearch ?? "");
+    setFilters({
+      limit: 25,
+      search: search.userSearch,
+      role: search.userRole,
+      state: search.userState,
+      deletion: search.userDeletion,
+    });
+    setCursors([]);
+  }, [search.userDeletion, search.userRole, search.userSearch, search.userState]);
   const cursor = cursors.at(-1);
   const query = useMemo(() => ({ ...filters, cursor }), [filters, cursor]);
   const updateFilters = (next: AdminUserFilters) => {
@@ -4049,7 +5022,12 @@ function UserManagement(
         </label>
         <button type="submit" className="secondary">Apply</button>
       </form>
-      <div className="table-card full data-table admin-user-table" aria-busy={users.isLoading}>
+      <div
+        className="table-card full data-table admin-user-table"
+        aria-busy={users.isLoading}
+        aria-label="User directory"
+        role="list"
+      >
         <div className="table-head">
           <span>USER</span>
           <span>STATUS</span>
@@ -4067,7 +5045,7 @@ function UserManagement(
           <div className="empty-mini">No users match these filters.</div>
         )}
         {users.data?.data.map((user) => (
-          <div className="applicant-row" key={user.id}>
+          <div className="applicant-row" key={user.id} role="listitem">
             <Avatar user={user} small />
             <span>
               <strong>{user.name}</strong>
@@ -4301,11 +5279,13 @@ export function App(
     initialAdminSection = "overview",
     initialAdminSearch = {},
     initialAdminUserDetail,
+    initialCommunitySearch = { metric: "calls", window: "30d" },
   }: {
     initialView?: View;
     initialAdminSection?: AdminSection;
     initialAdminSearch?: AdminSearch;
     initialAdminUserDetail?: { userId: string; tab: AdminUserTab };
+    initialCommunitySearch?: CommunitySearch;
   } = {},
 ) {
   const navigate = useNavigate();
@@ -4335,6 +5315,7 @@ export function App(
     ),
   ];
   const models = modelQuery.data ?? (demoMode ? demoModels : []);
+  const mediaPreferences = useChatMediaPreferences(models);
   const [activeId, setActiveId] = useState(() => {
     try {
       return sessionStorage.getItem("dg-chat.active-conversation") ?? "";
@@ -4342,11 +5323,39 @@ export function App(
       return "";
     }
   });
-  const [busyConversationId, setBusyConversationId] = useState("");
+  const [busyConversationIds, setBusyConversationIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const [protectedConversationIds, setProtectedConversationIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const busyConversationIdsRef = useRef<ReadonlySet<string>>(new Set());
+  const retentionConversationIdsRef = useRef<ReadonlySet<string>>(new Set());
+  const protectedConversationIdsRef = useRef<ReadonlySet<string>>(new Set());
   const updateGenerationBusy = useCallback((conversationId: string, busy: boolean) => {
-    setBusyConversationId((current) =>
-      busy ? conversationId : current === conversationId ? "" : current
-    );
+    setBusyConversationIds((current) => {
+      if (current.has(conversationId) === busy) return current;
+      const next = new Set(current);
+      if (busy) next.add(conversationId);
+      else next.delete(conversationId);
+      busyConversationIdsRef.current = next;
+      protectedConversationIdsRef.current = new Set([
+        ...next,
+        ...retentionConversationIdsRef.current,
+      ]);
+      return next;
+    });
+  }, []);
+  const updateRetentionProtection = useCallback((conversationId: string, protect: boolean) => {
+    setProtectedConversationIds((current) => {
+      if (current.has(conversationId) === protect) return current;
+      const next = new Set(current);
+      if (protect) next.add(conversationId);
+      else next.delete(conversationId);
+      retentionConversationIdsRef.current = next;
+      protectedConversationIdsRef.current = new Set([...busyConversationIdsRef.current, ...next]);
+      return next;
+    });
   }, []);
   const [view, setViewState] = useState<View>(initialView);
   const [adminSection, setAdminSectionState] = useState<AdminSection>(initialAdminSection);
@@ -4357,10 +5366,31 @@ export function App(
       void navigate({ to: "/admin/$section", params: { section: adminSection } });
       return;
     }
-    if (view === "admin") {
-      void navigate({ to: "/" });
+    if (next === "community") {
+      void navigate({ to: "/community", search: initialCommunitySearch });
+      return;
     }
-    setViewState(next);
+    if (next === "archived") {
+      void navigate({ to: "/archived" });
+      return;
+    }
+    if (next === "trash") {
+      void navigate({ to: "/trash" });
+      return;
+    }
+    if (next === "knowledge") {
+      void navigate({ to: "/knowledge" });
+      return;
+    }
+    if (next === "settings") {
+      void navigate({ to: "/settings" });
+      return;
+    }
+    if (next === "tokens") {
+      void navigate({ to: "/tokens" });
+      return;
+    }
+    void navigate({ to: "/" });
   };
   const setAdminSection = (next: AdminSection) => {
     setAdminSectionState(next);
@@ -4384,12 +5414,13 @@ export function App(
     });
   };
   const reauthenticateAdminUser = () => {
-    if (!initialAdminUserDetail) return;
-    try {
-      storeAdminUserReturnPath(`${location.pathname}${location.search}`);
-    } catch {
-      // Reauthentication still works when private browsing blocks session storage;
-      // only restoration of the exact detail route is unavailable.
+    if (initialAdminUserDetail) {
+      try {
+        storeAdminUserReturnPath(`${location.pathname}${location.search}`);
+      } catch {
+        // Reauthentication still works when private browsing blocks session storage;
+        // only restoration of the exact detail route is unavailable.
+      }
     }
     location.assign("/login");
   };
@@ -4404,13 +5435,160 @@ export function App(
   }, [mobileSidebar]);
   const conversationSearchRef = useRef<HTMLInputElement>(null);
   const [creatingConversation, setCreatingConversation] = useState(false);
+  const creatingConversationRef = useRef(false);
+  const pendingNewConversationFocusRef = useRef<string | null>(null);
+  const newChatOperationIdRef = useRef<string | null>(null);
+  const newChatRetryRef = useRef<HTMLButtonElement>(null);
+  const capacityReviewRef = useRef<HTMLButtonElement>(null);
+  const [newChatError, setNewChatError] = useState("");
+  const [createdChatRecoveryId, setCreatedChatRecoveryId] = useState<string | null>(null);
+  const [chatActivationAnnouncement, setChatActivationAnnouncement] = useState("");
   const [selectedModel, setSelectedModel] = useState(models[0]?.id ?? "openai/gpt-4.1");
   const preferredModelApplied = useRef(false);
-  const messagesQuery = useQuery({
-    queryKey: ["messages", activeId],
-    queryFn: () => api.messages(activeId),
-    enabled: Boolean(activeId),
-  });
+  const [chatSessionIds, setChatSessionIds] = useState<string[]>(() => activeId ? [activeId] : []);
+  const chatSessionIdsRef = useRef(chatSessionIds);
+  const [chatSessionCapacityError, setChatSessionCapacityError] = useState("");
+  const [pendingCapacityReviewId, setPendingCapacityReviewId] = useState<string | null>(null);
+  chatSessionIdsRef.current = chatSessionIds;
+  busyConversationIdsRef.current = busyConversationIds;
+  retentionConversationIdsRef.current = protectedConversationIds;
+  protectedConversationIdsRef.current = new Set([
+    ...busyConversationIds,
+    ...protectedConversationIds,
+  ]);
+  const activateChatSession = useCallback((conversationId: string) => {
+    if (!conversationId) {
+      setActiveId("");
+      return true;
+    }
+    const plan = planChatSessionVisit(
+      chatSessionIdsRef.current,
+      conversationId,
+      protectedConversationIdsRef.current,
+    );
+    if (!plan.admitted) {
+      setChatSessionCapacityError(
+        "Six chats already contain unsent or in-progress work. Finish, cancel, or send work in one of them before opening another chat.",
+      );
+      return false;
+    }
+    chatSessionIdsRef.current = plan.sessionIds;
+    setChatSessionIds(plan.sessionIds);
+    setActiveId(conversationId);
+    setChatSessionCapacityError("");
+    return true;
+  }, []);
+  useLayoutEffect(() => {
+    const protectedIds = new Set([...busyConversationIds, ...protectedConversationIds]);
+    protectedConversationIdsRef.current = protectedIds;
+    setChatSessionIds((current) => {
+      const next = activeId
+        ? planChatSessionVisit(current, activeId, protectedIds).sessionIds
+        : pruneChatSessions(current, { activeId, protectedIds });
+      chatSessionIdsRef.current = next;
+      return next;
+    });
+  }, [activeId, busyConversationIds, protectedConversationIds]);
+  useEffect(() => {
+    const conversationId = pendingNewConversationFocusRef.current;
+    if (!conversationId || creatingConversation) return;
+    if (view !== "chat" || activeId !== conversationId) {
+      pendingNewConversationFocusRef.current = null;
+      return;
+    }
+
+    const session = document.querySelector<HTMLElement>(
+      `[data-chat-session="${CSS.escape(conversationId)}"]`,
+    );
+    if (!session) {
+      pendingNewConversationFocusRef.current = null;
+      return;
+    }
+    const focusComposer = () => {
+      const composer = session.querySelector<HTMLTextAreaElement>(
+        "textarea[data-chat-composer]",
+      );
+      if (!composer || composer.disabled || session.hidden || session.closest("[inert]")) {
+        return false;
+      }
+      composer.focus();
+      if (document.activeElement !== composer) return false;
+      pendingNewConversationFocusRef.current = null;
+      setChatActivationAnnouncement("New chat ready. Message composer focused.");
+      return true;
+    };
+    if (focusComposer()) return;
+
+    // A newly created session can briefly render its message-query loading state. Hand focus to
+    // the composer as soon as that scoped subtree becomes interactive, without polling or
+    // retaining a focus request that could fire after the user navigates elsewhere.
+    const observer = new MutationObserver(() => {
+      if (!focusComposer()) return;
+      observer.disconnect();
+      globalThis.clearTimeout(timeout);
+    });
+    observer.observe(session, { childList: true, subtree: true });
+    const timeout = globalThis.setTimeout(() => {
+      observer.disconnect();
+      if (pendingNewConversationFocusRef.current === conversationId) {
+        pendingNewConversationFocusRef.current = null;
+      }
+    }, 5_000);
+    return () => {
+      observer.disconnect();
+      globalThis.clearTimeout(timeout);
+    };
+  }, [activeId, creatingConversation, view]);
+  useEffect(() => {
+    if (!newChatError || creatingConversation) return;
+    newChatRetryRef.current?.focus();
+  }, [creatingConversation, newChatError]);
+  useEffect(() => {
+    if (!chatSessionCapacityError || newChatError || creatingConversation) return;
+    capacityReviewRef.current?.focus();
+  }, [chatSessionCapacityError, creatingConversation, newChatError]);
+  useEffect(() => {
+    const conversationId = pendingCapacityReviewId;
+    if (!conversationId || activeId !== conversationId) return;
+    if (view !== "chat" && view !== "archived" && view !== "trash") return;
+
+    const session = document.querySelector<HTMLElement>(
+      `[data-chat-session="${CSS.escape(conversationId)}"]`,
+    );
+    if (!session || session.hidden || session.closest("[inert]")) return;
+    const focusReviewTarget = () => {
+      const composer = session.querySelector<HTMLTextAreaElement>(
+        "textarea[data-chat-composer]:not(:disabled)",
+      );
+      const stop = session.querySelector<HTMLButtonElement>(
+        'button[aria-label="Stop generating"]:not(:disabled)',
+      );
+      const heading = session.querySelector<HTMLElement>("h1");
+      const target = stop ?? composer ?? heading;
+      if (!target || target.closest("[inert]") || target.getClientRects().length === 0) {
+        return false;
+      }
+      if (target === heading) target.tabIndex = -1;
+      target.focus();
+      if (document.activeElement !== target) return false;
+      setPendingCapacityReviewId(null);
+      return true;
+    };
+    if (focusReviewTarget()) return;
+
+    const observer = new MutationObserver(() => {
+      if (focusReviewTarget()) observer.disconnect();
+    });
+    observer.observe(session, { attributes: true, childList: true, subtree: true });
+    const timeout = globalThis.setTimeout(() => {
+      observer.disconnect();
+      setPendingCapacityReviewId((current) => current === conversationId ? null : current);
+    }, 5_000);
+    return () => {
+      observer.disconnect();
+      globalThis.clearTimeout(timeout);
+    };
+  }, [activeId, pendingCapacityReviewId, view]);
   useAppliedPreferences(preferencesQuery.data);
   useEffect(() => {
     if (demoMode) return;
@@ -4421,10 +5599,14 @@ export function App(
     if (view !== "chat" && view !== "archived" && view !== "trash") return;
     if (lifecycleQuery.isLoading) return;
     const visible = conversationsForView(allConversations, view);
+    // A successful create is placed in the query cache and activated in the same task. React can
+    // render the active id before the cache observer publishes that new conversation. Do not let
+    // the lifecycle fallback replace that intentional activation during this one-render gap.
+    if (pendingNewConversationFocusRef.current === activeId) return;
     if (!visible.some((conversation) => conversation.id === activeId)) {
-      setActiveId(visible[0]?.id ?? "");
+      activateChatSession(visible[0]?.id ?? "");
     }
-  }, [activeId, allConversations, lifecycleQuery.isLoading, view]);
+  }, [activateChatSession, activeId, allConversations, lifecycleQuery.isLoading, view]);
   useEffect(() => {
     try {
       if (activeId) sessionStorage.setItem("dg-chat.active-conversation", activeId);
@@ -4448,30 +5630,153 @@ export function App(
       setSelectedModel(chatModels[0].id);
     }
   }, [models, preferencesQuery.data?.preferredModelId, selectedModel]);
-  const open = async (id: string) => {
+  const open = async (id: string, searchResult?: Conversation) => {
     if (id !== "new") {
-      setActiveId(id);
+      if (searchResult?.id === id) {
+        const reconciled = reconcileConversationSearchResult(
+          queryClient.getQueryData<Conversation[]>(["conversations"]),
+          queryClient.getQueryData<Conversation[]>(["conversations", "deleted"]),
+          searchResult,
+        );
+        queryClient.setQueryData<Conversation[]>(["conversations"], reconciled.conversations);
+        queryClient.setQueryData<Conversation[]>(
+          ["conversations", "deleted"],
+          reconciled.deletedConversations,
+        );
+        setView(reconciled.destination);
+      }
+      activateChatSession(id);
       setMobile(false);
       return;
     }
-    setCreatingConversation(true);
-    setView("chat");
-    setMobile(false);
+    if (creatingConversationRef.current) {
+      setMobile(false);
+      return;
+    }
+    if (createdChatRecoveryId) {
+      openCreatedChat();
+      setMobile(false);
+      return;
+    }
+    creatingConversationRef.current = true;
     try {
+      // A previous request error must not remain stacked underneath a newer capacity notice.
+      setNewChatError("");
+      setCreatedChatRecoveryId(null);
+      const capacityProbe = planChatSessionVisit(
+        chatSessionIdsRef.current,
+        "__new-chat-capacity-probe__",
+        protectedConversationIdsRef.current,
+      );
+      if (!capacityProbe.admitted) {
+        setChatSessionCapacityError(
+          "Six chats already contain unsent or in-progress work. Finish, cancel, or send work in one of them before opening another chat.",
+        );
+        setMobile(false);
+        return;
+      }
+      setCreatingConversation(true);
+      setChatActivationAnnouncement("");
+      setView("chat");
+      setMobile(false);
+      const operationId = newChatOperationIdRef.current ?? crypto.randomUUID();
+      newChatOperationIdRef.current = operationId;
       const resolved = await api.createConversation(
         "New chat",
-        crypto.randomUUID(),
+        operationId,
         temporaryChatUntilPreferencesResolve(demoMode, preferencesQuery.data),
       );
       queryClient.setQueryData<Conversation[]>(
         ["conversations"],
         (current = []) => [resolved, ...current.filter((item) => item.id !== resolved.id)],
       );
-      setActiveId(resolved.id);
-      await conversationQuery.refetch();
+      invalidateConversationSearch();
+      if (activateChatSession(resolved.id)) {
+        pendingNewConversationFocusRef.current = resolved.id;
+      } else {
+        // Capacity can change while the POST is in flight. The idempotent create succeeded, so
+        // retain an explicit recovery path instead of silently leaving the new chat unopened or
+        // inviting a second POST.
+        setChatSessionCapacityError("");
+        setCreatedChatRecoveryId(resolved.id);
+        setNewChatError(
+          "Your new chat was created, but six chats now contain unfinished work. Finish or discard work in one of them, then open the created chat.",
+        );
+      }
+      newChatOperationIdRef.current = null;
+      void conversationQuery.refetch();
+    } catch (error) {
+      pendingNewConversationFocusRef.current = null;
+      setNewChatError(
+        error instanceof ApiError && error.status >= 400 && error.status < 500
+          ? error.message
+          : "The new chat could not be created. Your current chat is unchanged.",
+      );
     } finally {
       setCreatingConversation(false);
+      creatingConversationRef.current = false;
     }
+  };
+  const openCreatedChat = () => {
+    if (!createdChatRecoveryId) return;
+    if (activateChatSession(createdChatRecoveryId)) {
+      pendingNewConversationFocusRef.current = createdChatRecoveryId;
+      setCreatedChatRecoveryId(null);
+      setNewChatError("");
+      return;
+    }
+    // activateChatSession reports the generic limit notice. Keep the more useful recovery notice
+    // as the single alert while the created conversation remains recoverable.
+    setChatSessionCapacityError("");
+    setNewChatError(
+      "Your new chat is safe, but six chats still contain unfinished work. Finish or discard work in one of them, then open the created chat.",
+    );
+  };
+  const focusAfterCapacityNotice = () => {
+    requestAnimationFrame(() => {
+      const session = activeId
+        ? document.querySelector<HTMLElement>(
+          `[data-chat-session="${CSS.escape(activeId)}"]:not([hidden])`,
+        )
+        : null;
+      const target = session?.querySelector<HTMLButtonElement>(
+        'button[aria-label="Stop generating"]:not(:disabled)',
+      ) ?? session?.querySelector<HTMLTextAreaElement>(
+        "textarea[data-chat-composer]:not(:disabled)",
+      ) ?? session?.querySelector<HTMLElement>("h1") ??
+        [...document.querySelectorAll<HTMLButtonElement>(".new-chat:not(:disabled)")]
+          .find((button) => !button.closest("[inert]") && button.getClientRects().length > 0);
+      if (!target || target.closest("[inert]") || target.getClientRects().length === 0) return;
+      if (target.tagName === "H1") target.tabIndex = -1;
+      target.focus();
+    });
+  };
+  const reviewProtectedWork = () => {
+    // Prefer a running response: Stop is the fastest and least destructive way to free capacity.
+    const conversationId = protectedChatReviewTarget(
+      chatSessionIdsRef.current,
+      busyConversationIdsRef.current,
+      activeId,
+    ) ?? protectedChatReviewTarget(
+      chatSessionIdsRef.current,
+      protectedConversationIdsRef.current,
+      activeId,
+    );
+    if (!conversationId) {
+      setChatSessionCapacityError("");
+      focusAfterCapacityNotice();
+      return;
+    }
+    const conversation = allConversations.find((candidate) => candidate.id === conversationId);
+    const destination: ConversationListView = conversation?.deleted
+      ? "trash"
+      : conversation?.archived
+      ? "archived"
+      : "chat";
+    setView(destination);
+    setMobile(false);
+    setChatSessionCapacityError("");
+    if (activateChatSession(conversationId)) setPendingCapacityReviewId(conversationId);
   };
   useGlobalShortcuts({
     newChat: () => void open("new"),
@@ -4481,11 +5786,30 @@ export function App(
         focus: () => conversationSearchRef.current?.focus(),
       }),
   });
+  useEffect(() => {
+    if (!user || user.limited || view === "admin") return;
+    const conversationTitle = allConversations.find((item) => item.id === activeId)?.title;
+    const title = view === "chat"
+      ? conversationTitle ?? "Chats"
+      : view === "archived"
+      ? "Archived"
+      : view === "trash"
+      ? "Trash"
+      : view === "knowledge"
+      ? "Knowledge"
+      : view === "community"
+      ? "Community"
+      : view === "tokens"
+      ? "API tokens"
+      : "Settings";
+    document.title = `${title} · DG Chat`;
+  }, [activeId, allConversations, user, view]);
   const conversationCreated = async (id: string) => {
     // The terminal generation event has already populated both conversation and message caches.
     // Activate it before the network refresh so controls cannot start work on the temporary
     // ChatView and then be silently disposed when that refresh eventually changes the key.
-    setActiveId(id);
+    activateChatSession(id);
+    invalidateConversationSearch();
     await conversationQuery.refetch();
   };
   const updateConversation = async (
@@ -4508,10 +5832,11 @@ export function App(
       (current = []) =>
         updated.deleted ? replace(current) : current.filter((item) => item.id !== updated.id),
     );
+    invalidateConversationSearch();
     await Promise.allSettled([conversationQuery.refetch(), deletedConversationQuery.refetch()]);
     if (
       conversation.id !== activeId || view === "settings" || view === "tokens" ||
-      view === "admin" || view === "knowledge"
+      view === "admin" || view === "knowledge" || view === "community"
     ) return;
     const regular = queryClient.getQueryData<Conversation[]>(["conversations"]) ?? [];
     const deleted = queryClient.getQueryData<Conversation[]>(["conversations", "deleted"]) ?? [];
@@ -4522,7 +5847,7 @@ export function App(
     const listView: ConversationListView = view;
     if (!conversationsForView(refreshed, listView).some((item) => item.id === activeId)) {
       const nextId = fallbackConversationId(refreshed, listView, conversation.id);
-      setActiveId(nextId);
+      activateChatSession(nextId);
       if (options.restoreLifecycleFocus === false) return;
       requestAnimationFrame(() => {
         const nextAction = nextId
@@ -4543,20 +5868,51 @@ export function App(
       ["conversations"],
       (current) => mergeConversationSnapshot(current, updated),
     );
+    invalidateConversationSearch();
     await conversationQuery.refetch();
     return updated;
   };
-  const messagesBlockingLoading = !demoMode && Boolean(
-    activeId && messagesQuery.isLoading && messagesQuery.data === undefined,
-  );
-  const messagesBlockingError = !demoMode && Boolean(
-    activeId && messagesQuery.isError && messagesQuery.data === undefined,
-  );
+  const lifecycleView: ConversationListView | null = view === "chat" || view === "archived" ||
+      view === "trash"
+    ? view
+    : null;
+  const visibleLifecycleConversations = lifecycleView
+    ? conversationsForView(allConversations, lifecycleView)
+    : [];
+  // Retained sessions can belong to another lifecycle view. Never expose one merely because a
+  // capacity-constrained activation could not admit the first conversation in this destination.
+  const lifecycleActiveId = lifecycleView
+    ? activeConversationIdForView(allConversations, lifecycleView, activeId)
+    : "";
+  const lifecycleHasUnselectedConversation = !lifecycleActiveId &&
+    visibleLifecycleConversations.length > 0;
   if (!user || user.limited) {
     return <DiscoveryLoading unavailable={setupQuery.isError && userQuery.isError} />;
   }
   return (
     <div className="app-shell">
+      <button
+        type="button"
+        className="skip-link"
+        onClick={() => {
+          const target = [...document.querySelectorAll<HTMLElement>(".app-shell main")].find(
+            (main) => main.getClientRects().length > 0,
+          );
+          if (target) {
+            target.tabIndex = -1;
+            target.focus();
+          }
+        }}
+      >
+        Skip to main content
+      </button>
+      <span
+        className="sr-only chat-activation-announcement"
+        aria-live="polite"
+        aria-atomic="true"
+      >
+        {chatActivationAnnouncement}
+      </span>
       <Sidebar
         conversations={allConversations}
         active={activeId}
@@ -4577,9 +5933,58 @@ export function App(
             : conversationQuery.refetch());
         }}
         searchInputRef={conversationSearchRef}
-        busyConversationId={busyConversationId}
+        busyConversationIds={busyConversationIds}
+        protectedConversationIds={protectedConversationIds}
+        creatingConversation={creatingConversation}
       />
       {mobile && <div className="sidebar-scrim" onClick={() => setMobile(false)} />}
+      {newChatError && (
+        <div className="chat-session-capacity-alert" role="alert">
+          <span className="chat-session-capacity-message">{newChatError}</span>
+          <button
+            ref={newChatRetryRef}
+            type="button"
+            className="secondary"
+            disabled={creatingConversation}
+            onClick={() => createdChatRecoveryId ? openCreatedChat() : void open("new")}
+          >
+            {createdChatRecoveryId ? "Open created chat" : "Try again"}
+          </button>
+          <IconButton
+            label="Dismiss new chat error"
+            onClick={() => {
+              newChatOperationIdRef.current = null;
+              setCreatedChatRecoveryId(null);
+              setNewChatError("");
+              focusAfterCapacityNotice();
+            }}
+          >
+            <X size={16} />
+          </IconButton>
+        </div>
+      )}
+      {chatSessionCapacityError && (
+        <div className="chat-session-capacity-alert" role="alert">
+          <span className="chat-session-capacity-message">{chatSessionCapacityError}</span>
+          <button
+            ref={capacityReviewRef}
+            type="button"
+            className="secondary chat-session-capacity-review"
+            onClick={reviewProtectedWork}
+          >
+            Review unfinished chat
+          </button>
+          <IconButton
+            label="Dismiss chat limit notice"
+            onClick={() => {
+              setChatSessionCapacityError("");
+              focusAfterCapacityNotice();
+            }}
+          >
+            <X size={16} />
+          </IconButton>
+        </div>
+      )}
       {(view === "chat" || view === "archived" || view === "trash") && creatingConversation && (
         <main className="chat-main auth-page" aria-label="Creating conversation">
           <div className="typing" aria-hidden="true">
@@ -4589,25 +5994,20 @@ export function App(
           </div>
         </main>
       )}
-      {(view === "chat" || view === "archived" || view === "trash") && !creatingConversation &&
-        activeId && messagesBlockingLoading && <ConversationMessagesQueryState kind="loading" />}
-      {(view === "chat" || view === "archived" || view === "trash") && !creatingConversation &&
-        activeId && messagesBlockingError && (
-        <ConversationMessagesQueryState
-          kind="error"
-          retry={() => void messagesQuery.refetch()}
-        />
-      )}
-      {(view === "chat" || view === "archived" || view === "trash") && !creatingConversation &&
-        activeId && !messagesBlockingLoading && !messagesBlockingError && (
-        <ChatView
-          key={activeId}
-          conversations={allConversations}
-          activeId={activeId}
-          messages={messagesQuery.data ?? (demoMode ? demoMessages : [])}
-          models={models}
-          selectedModel={selectedModel}
-          setSelectedModel={(modelId) => {
+      <ChatSessionHost
+        conversationIds={chatSessionIds}
+        activeId={lifecycleActiveId}
+        visible={!creatingConversation &&
+          (view === "chat" || view === "archived" || view === "trash") &&
+          Boolean(lifecycleActiveId)}
+        readOnly={view !== "chat"}
+        demoMode={demoMode}
+        shared={{
+          conversations: allConversations,
+          models,
+          mediaPreferences,
+          selectedModel,
+          setSelectedModel: (modelId) => {
             setSelectedModel(modelId);
             setModelPreferenceError("");
             if (preferencesQuery.data) {
@@ -4623,23 +6023,61 @@ export function App(
                 },
               });
             }
-          }}
-          onMenu={() => setMobile(true)}
-          balance={user.balance}
-          onConversationCreated={conversationCreated}
-          onUpdateConversation={updateConversation}
-          onKeepConversation={keepConversation}
-          readOnly={view !== "chat"}
-          saveHistory={!temporaryChatUntilPreferencesResolve(demoMode, preferencesQuery.data)}
-          modelPreferenceError={modelPreferenceError}
-          historyPreferenceWarning={historyPreferenceWarning(demoMode, preferencesQuery.isError)}
-          messagesStale={!demoMode && messagesQuery.isError && messagesQuery.data !== undefined}
-          retryMessages={() => void messagesQuery.refetch()}
-          onGenerationBusyChange={updateGenerationBusy}
-        />
+          },
+          onMenu: () => setMobile(true),
+          balance: user.balance,
+          onConversationCreated: conversationCreated,
+          onUpdateConversation: updateConversation,
+          onKeepConversation: keepConversation,
+          saveHistory: !temporaryChatUntilPreferencesResolve(demoMode, preferencesQuery.data),
+          modelPreferenceError,
+          historyPreferenceWarning: historyPreferenceWarning(demoMode, preferencesQuery.isError),
+          onGenerationBusyChange: updateGenerationBusy,
+          onRetentionProtectionChange: updateRetentionProtection,
+        }}
+      />
+      {(view === "chat" || view === "archived" || view === "trash") && !creatingConversation &&
+        !lifecycleLoading && !lifecycleBlockingError && lifecycleHasUnselectedConversation && (
+        <main
+          className="chat-main lifecycle-empty"
+          role={chatSessionCapacityError ? undefined : "status"}
+        >
+          <header className="admin-mobile-head lifecycle-mobile-head">
+            <IconButton label="Open menu" onClick={() => setMobile(true)}>
+              <Menu size={20} />
+            </IconButton>
+            <strong>
+              {view === "chat" ? "Chats" : view === "archived" ? "Archived" : "Trash"}
+            </strong>
+          </header>
+          {chatSessionCapacityError
+            ? (
+              <>
+                <ShieldAlert size={28} />
+                <h2>Conversation not opened</h2>
+                <p>
+                  Six retained chats contain unfinished work. Review one before opening a
+                  conversation in this view.
+                </p>
+                <button className="secondary" type="button" onClick={reviewProtectedWork}>
+                  Review retained chats
+                </button>
+              </>
+            )
+            : (
+              <>
+                <div className="typing" aria-hidden="true">
+                  <span />
+                  <span />
+                  <span />
+                </div>
+                <p>Opening conversation…</p>
+              </>
+            )}
+        </main>
       )}
       {(view === "chat" || view === "archived" || view === "trash") && !creatingConversation &&
-        !activeId && lifecycleLoading && (
+        !lifecycleActiveId && !lifecycleHasUnselectedConversation && lifecycleLoading && (
         <main className="chat-main lifecycle-empty" role="status">
           <div className="typing" aria-hidden="true">
             <span />
@@ -4650,7 +6088,7 @@ export function App(
         </main>
       )}
       {(view === "chat" || view === "archived" || view === "trash") && !creatingConversation &&
-        !activeId &&
+        !lifecycleActiveId && !lifecycleHasUnselectedConversation &&
         !lifecycleLoading && lifecycleBlockingError && (
         <main className="chat-main lifecycle-empty" role="alert">
           <header className="admin-mobile-head lifecycle-mobile-head">
@@ -4678,7 +6116,7 @@ export function App(
         </main>
       )}
       {(view === "chat" || view === "archived" || view === "trash") && !creatingConversation &&
-        !activeId &&
+        !lifecycleActiveId && !lifecycleHasUnselectedConversation &&
         !lifecycleLoading && !lifecycleBlockingError && (
         <main className="chat-main lifecycle-empty">
           <header className="admin-mobile-head lifecycle-mobile-head">
@@ -4736,6 +6174,13 @@ export function App(
         />
       )}
       {view === "knowledge" && <KnowledgeView onMenu={() => setMobile(true)} />}
+      {view === "community" && (
+        <CommunityView
+          onMenu={() => setMobile(true)}
+          initialSearch={initialCommunitySearch}
+          onSearchChange={(search) => void navigate({ to: "/community", search })}
+        />
+      )}
     </div>
   );
 }
@@ -4743,11 +6188,14 @@ export function App(
 export function AuthCard(
   { children, title, subtitle }: { children: ReactNode; title: string; subtitle: string },
 ) {
+  useEffect(() => {
+    document.title = `${title} · DG Chat`;
+  }, [title]);
   return (
     <main className="auth-page">
       <div className="auth-ambient one" />
       <div className="auth-ambient two" />
-      <div className="auth-card">
+      <Card className="auth-card">
         <Brand />
         <div className="auth-title">
           <h1>{title}</h1>
@@ -4757,23 +6205,23 @@ export function AuthCard(
         <p className="auth-footer">
           <Lock size={13} /> Hosted privately on your infrastructure
         </p>
-      </div>
+      </Card>
     </main>
   );
 }
 function DiscoveryLoading({ unavailable = false }: { unavailable?: boolean }) {
   return (
     <main className="auth-page" aria-live="polite">
-      <div className="auth-card discovery-card">
+      <Card className="auth-card discovery-card">
         <Brand />
         {unavailable
           ? (
             <>
               <h1>Workspace unavailable</h1>
               <p>DG Chat could not reach the server. Check the deployment and try again.</p>
-              <button className="secondary wide" onClick={() => location.reload()}>
+              <ShadcnButton className="secondary wide" onClick={() => location.reload()}>
                 <RefreshCw size={16} /> Retry
-              </button>
+              </ShadcnButton>
             </>
           )
           : (
@@ -4786,7 +6234,7 @@ function DiscoveryLoading({ unavailable = false }: { unavailable?: boolean }) {
               <p>Opening your workspace…</p>
             </>
           )}
-      </div>
+      </Card>
     </main>
   );
 }
@@ -4850,7 +6298,7 @@ export function AuthScreen() {
         {signup && (
           <label>
             <span>Name</span>
-            <input
+            <ShadcnInput
               required
               autoComplete="name"
               placeholder="Your name"
@@ -4861,7 +6309,7 @@ export function AuthScreen() {
         )}
         <label>
           <span>Email address</span>
-          <input
+          <ShadcnInput
             required
             autoComplete="email"
             type="email"
@@ -4872,7 +6320,7 @@ export function AuthScreen() {
         </label>
         <label>
           <span>Password</span>
-          <input
+          <ShadcnInput
             required
             minLength={signup ? PASSWORD_MIN_LENGTH : 1}
             maxLength={PASSWORD_MAX_LENGTH}
@@ -4899,14 +6347,14 @@ export function AuthScreen() {
           </p>
         )}
         {error && <p className="form-error" role="alert">{error}</p>}
-        <button
+        <ShadcnButton
           className="primary wide"
           type="submit"
           disabled={busy || Boolean(signupPasswordError)}
         >
           {busy ? "Please wait…" : signup ? "Request access" : "Continue"}
           <ArrowRight size={17} />
-        </button>
+        </ShadcnButton>
       </form>
       {!signup && (
         <p className="auth-help-link">
@@ -4918,14 +6366,27 @@ export function AuthScreen() {
           <div className="divider">
             <span>or</span>
           </div>
-          <button className="oidc-button" type="button" onClick={startOidc} disabled={busy}>
+          <ShadcnButton
+            className="oidc-button"
+            variant="outline"
+            type="button"
+            onClick={startOidc}
+            disabled={busy}
+          >
             <span>SSO</span> Continue with organization SSO
-          </button>
+          </ShadcnButton>
         </>
       )}
       <p className="switch-auth">
         {signup ? "Already have an account?" : "New to this workspace?"}{" "}
-        <button onClick={() => setSignup(!signup)}>{signup ? "Sign in" : "Request access"}</button>
+        <ShadcnButton
+          key={signup ? "sign-in-toggle" : "request-access-toggle"}
+          type="button"
+          variant="link"
+          onClick={() => setSignup(!signup)}
+        >
+          {signup ? "Sign in" : "Request access"}
+        </ShadcnButton>
       </p>
     </AuthCard>
   );
@@ -4991,7 +6452,7 @@ export function SetupScreen() {
       <form className="auth-form" onSubmit={submit}>
         <label>
           <span>Setup token</span>
-          <input
+          <ShadcnInput
             required
             type="password"
             value={setupToken}
@@ -5001,7 +6462,7 @@ export function SetupScreen() {
         </label>
         <label>
           <span>Administrator name</span>
-          <input
+          <ShadcnInput
             required
             value={name}
             onChange={(event) => setName(event.target.value)}
@@ -5010,7 +6471,7 @@ export function SetupScreen() {
         </label>
         <label>
           <span>Email address</span>
-          <input
+          <ShadcnInput
             required
             type="email"
             value={email}
@@ -5020,7 +6481,7 @@ export function SetupScreen() {
         </label>
         <label>
           <span>Password</span>
-          <input
+          <ShadcnInput
             required
             minLength={PASSWORD_MIN_LENGTH}
             maxLength={PASSWORD_MAX_LENGTH}
@@ -5043,13 +6504,13 @@ export function SetupScreen() {
           {setupPasswordError ?? `Use ${PASSWORD_MIN_LENGTH}–${PASSWORD_MAX_LENGTH} characters.`}
         </p>
         {error && <p className="form-error" role="alert">{error}</p>}
-        <button
+        <ShadcnButton
           className="primary wide"
           type="submit"
           disabled={busy || Boolean(setupPasswordError)}
         >
           {busy ? "Creating…" : "Create workspace"} <ArrowRight size={17} />
-        </button>
+        </ShadcnButton>
       </form>
     </AuthCard>
   );

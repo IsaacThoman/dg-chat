@@ -3,6 +3,7 @@ import {
   parseDocumentEmbeddingPayload,
   parseKnowledgeEmbeddingConfig,
   sha256,
+  validateKnowledgeEmbeddings,
 } from "./knowledge-embedding.ts";
 
 Deno.test("knowledge embedding configuration is disabled cleanly and validates complete HTTPS config", () => {
@@ -52,6 +53,23 @@ Deno.test("knowledge embedding configuration is disabled cleanly and validates c
     KNOWLEDGE_EMBEDDING_VERSION: "embed-v2",
   });
   assertNotEquals(config?.version, changed?.version);
+  const changedBatch = parseKnowledgeEmbeddingConfig({
+    KNOWLEDGE_EMBEDDING_BASE_URL: "https://provider.example/v1",
+    KNOWLEDGE_EMBEDDING_API_KEY: "secret",
+    KNOWLEDGE_EMBEDDING_MODEL: "public-embed",
+    KNOWLEDGE_EMBEDDING_UPSTREAM_MODEL: "upstream-embed",
+    KNOWLEDGE_EMBEDDING_VERSION: "embed-v2",
+    KNOWLEDGE_EMBEDDING_BATCH_SIZE: "16",
+  });
+  assertNotEquals(config?.version, changedBatch?.version);
+});
+
+Deno.test("knowledge embedding vectors are finite and exactly match the configured dimensions", () => {
+  const valid = [Array(1536).fill(0)];
+  assertEquals(validateKnowledgeEmbeddings(valid, 1), valid);
+  assertThrows(() => validateKnowledgeEmbeddings([], 1));
+  assertThrows(() => validateKnowledgeEmbeddings([[0]], 1));
+  assertThrows(() => validateKnowledgeEmbeddings([Array(1536).fill(Number.NaN)], 1));
 });
 
 Deno.test("document embedding payload and content digest are deterministic", async () => {

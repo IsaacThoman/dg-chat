@@ -9,6 +9,23 @@ export interface ClaimedJob {
   attempts: number;
   claimToken: string;
   idempotencyKey: string | null;
+  /** Local monotonic boundary conservatively derived from the database lease budget. */
+  externalDeadlineMonotonicMs: number;
+}
+
+export function conservativeClaimDeadline(input: {
+  claimStartedMonotonicMs: number;
+  claimFinishedMonotonicMs: number;
+  databaseRemainingLeaseMs: number;
+}): number {
+  const { claimStartedMonotonicMs, claimFinishedMonotonicMs, databaseRemainingLeaseMs } = input;
+  if (
+    ![claimStartedMonotonicMs, claimFinishedMonotonicMs, databaseRemainingLeaseMs].every(
+      Number.isFinite,
+    ) || claimFinishedMonotonicMs < claimStartedMonotonicMs || databaseRemainingLeaseMs < 0
+  ) throw new TypeError("Claim lease timing is invalid");
+  const fullRoundTripMs = claimFinishedMonotonicMs - claimStartedMonotonicMs;
+  return claimFinishedMonotonicMs + Math.max(0, databaseRemainingLeaseMs - fullRoundTripMs);
 }
 
 export async function claimJob(
@@ -17,7 +34,8 @@ export async function claimJob(
   leaseSeconds: number,
 ): Promise<ClaimedJob | undefined> {
   const claimToken = `${workerId}:${crypto.randomUUID()}`;
-  return await sql.begin(async (tx) => {
+  const claimStartedMonotonicMs = performance.now();
+  const result = await sql.begin(async (tx) => {
     const rows = await tx<
       {
         id: string;
@@ -39,16 +57,39 @@ export async function claimJob(
     `;
     const job = rows[0];
     if (!job) return undefined;
-    const claimed = await tx<{ id: string }[]>`
+    const claimed = await tx<{ id: string; remaining_lease_ms: number | string }[]>`
       UPDATE jobs
       SET status = 'running', locked_at = now(), locked_by = ${claimToken},
           attempts = attempts + 1
       WHERE id = ${job.id}
-      RETURNING id
+      RETURNING id,GREATEST(0,FLOOR(EXTRACT(EPOCH FROM
+        ((locked_at + ${leaseSeconds} * interval '1 second') - clock_timestamp())) * 1000))::bigint
+        AS remaining_lease_ms
     `;
     if (!claimed[0]) return undefined;
-    return { ...job, idempotencyKey: job.idempotency_key, claimToken };
+    return {
+      ...job,
+      idempotencyKey: job.idempotency_key,
+      claimToken,
+      databaseRemainingLeaseMs: Number(claimed[0].remaining_lease_ms),
+    };
   });
+  if (!result) return undefined;
+  const claimFinishedMonotonicMs = performance.now();
+  const externalDeadlineMonotonicMs = conservativeClaimDeadline({
+    claimStartedMonotonicMs,
+    claimFinishedMonotonicMs,
+    databaseRemainingLeaseMs: result.databaseRemainingLeaseMs,
+  });
+  return {
+    id: result.id,
+    type: result.type,
+    payload: result.payload,
+    attempts: result.attempts,
+    claimToken: result.claimToken,
+    idempotencyKey: result.idempotencyKey,
+    externalDeadlineMonotonicMs,
+  };
 }
 
 export async function completeJob(sql: Sql, job: ClaimedJob): Promise<boolean> {
@@ -56,6 +97,20 @@ export async function completeJob(sql: Sql, job: ClaimedJob): Promise<boolean> {
     UPDATE jobs
     SET status = 'completed', completed_at = now(), locked_at = NULL, locked_by = NULL
     WHERE id = ${job.id} AND status = 'running' AND locked_by = ${job.claimToken}
+    RETURNING id
+  `;
+  return Boolean(rows[0]);
+}
+
+/**
+ * Renews only the database reclaim fence; a reclaimed job can never be resurrected by stale work.
+ * `job.externalDeadlineMonotonicMs` deliberately remains the original external-operation
+ * deadline, so renewal cannot authorize a new or longer provider/object-store operation.
+ */
+export async function renewJobClaim(sql: Sql, job: ClaimedJob): Promise<boolean> {
+  const rows = await sql<{ id: string }[]>`
+    UPDATE jobs SET locked_at=now()
+    WHERE id=${job.id} AND status='running' AND locked_by=${job.claimToken}
     RETURNING id
   `;
   return Boolean(rows[0]);

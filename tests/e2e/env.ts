@@ -11,11 +11,12 @@ export const lightweightManagedStack = env("E2E_MANAGED_SERVER") === "true" &&
   env("E2E_FULL_STACK") !== "true";
 
 export interface AppReadiness {
-  storage?: { ready?: boolean; storage?: string };
-  objects?: { configured?: boolean; ready?: boolean };
+  storage?: { configured?: boolean; ready?: boolean; implementation?: string };
+  redis?: { configured?: boolean; ready?: boolean; implementation?: string };
+  objects?: { configured?: boolean; ready?: boolean; implementation?: string };
 }
 
-export type DurableCapability = "postgres" | "objects";
+export type DurableCapability = "postgres" | "redis" | "objects";
 
 /**
  * Environment flags select tests, but only live readiness can prove that durable dependencies are
@@ -29,13 +30,22 @@ export function missingDurableCapabilities(
   const missing: string[] = [];
   if (
     required.includes("postgres") &&
-    (readiness.storage?.ready !== true || readiness.storage.storage !== "postgres")
+    (readiness.storage?.configured !== true || readiness.storage.ready !== true ||
+      readiness.storage.implementation !== "postgres")
   ) {
     missing.push("PostgreSQL");
   }
   if (
+    required.includes("redis") &&
+    (readiness.redis?.configured !== true || readiness.redis.ready !== true ||
+      readiness.redis.implementation !== "redis")
+  ) {
+    missing.push("Redis");
+  }
+  if (
     required.includes("objects") &&
-    (readiness.objects?.configured !== true || readiness.objects.ready !== true)
+    (readiness.objects?.configured !== true || readiness.objects.ready !== true ||
+      readiness.objects.implementation !== "s3")
   ) {
     missing.push("object storage");
   }

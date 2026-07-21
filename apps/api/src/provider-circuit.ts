@@ -28,6 +28,8 @@ export interface BreakerSnapshot {
   failureCount: number;
   openUntil: number | null;
   probeUntil: number | null;
+  /** Server-clock-derived remaining delay, safe to translate onto the application clock. */
+  retryAfterMs?: number;
 }
 
 export interface CircuitBreaker {
@@ -252,6 +254,11 @@ export class MemoryCircuitBreaker implements CircuitBreaker {
       failureCount: entry.failures.length,
       openUntil: entry.openUntil,
       probeUntil: entry.probeUntil,
+      ...(state === "open" && entry.openUntil !== null
+        ? { retryAfterMs: Math.max(0, entry.openUntil - now) }
+        : state === "half_open" && entry.probeUntil !== null && entry.probeUntil > now
+        ? { retryAfterMs: entry.probeUntil - now }
+        : {}),
     };
   }
 
@@ -544,6 +551,7 @@ export class CircuitBreakerStoreAdapter implements CircuitStore {
   constructor(
     private readonly breaker: CircuitBreaker,
     policy: BreakerPolicy,
+    private readonly now: () => number = Date.now,
   ) {
     this.#policy = validateBreakerPolicy(policy);
   }
@@ -556,7 +564,7 @@ export class CircuitBreakerStoreAdapter implements CircuitStore {
     return {
       allowed: permit.allowed,
       state: permit.state,
-      retryAt: permit.retryAfterMs === undefined ? undefined : Date.now() + permit.retryAfterMs,
+      retryAt: permit.retryAfterMs === undefined ? undefined : this.now() + permit.retryAfterMs,
       lease: permit,
     };
   }
@@ -570,9 +578,13 @@ export class CircuitBreakerStoreAdapter implements CircuitStore {
     candidateId: string,
     permit: ResilienceCircuitPermit,
     _policy: ResiliencePolicy,
-  ): Promise<BreakerState> {
+  ): Promise<{ state: BreakerState; retryAt?: number }> {
     const lease = this.#lease(permit);
-    return (await this.breaker.recordFailure(candidateId, lease, this.#policy)).state;
+    const snapshot = await this.breaker.recordFailure(candidateId, lease, this.#policy);
+    const retryAt = snapshot.retryAfterMs === undefined
+      ? undefined
+      : this.now() + snapshot.retryAfterMs;
+    return { state: snapshot.state, ...(retryAt === undefined ? {} : { retryAt }) };
   }
 
   #lease(permit: ResilienceCircuitPermit): BreakerPermit {
@@ -598,12 +610,18 @@ function snapshot(
   ];
   const openUntil = rawOpenUntil || null;
   const probeUntil = rawProbeUntil || null;
+  const state = openUntil === null ? "closed" : openUntil > now ? "open" : "half_open";
   return {
-    state: openUntil === null ? "closed" : openUntil > now ? "open" : "half_open",
+    state,
     version,
     failureCount,
     openUntil,
     probeUntil,
+    ...(state === "open" && openUntil !== null
+      ? { retryAfterMs: Math.max(0, openUntil - now) }
+      : state === "half_open" && probeUntil !== null && probeUntil > now
+      ? { retryAfterMs: probeUntil - now }
+      : {}),
   };
 }
 

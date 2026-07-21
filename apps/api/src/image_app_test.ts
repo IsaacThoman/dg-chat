@@ -192,7 +192,8 @@ async function fixture(options: {
     }),
   });
   assertEquals(setup.status, 201);
-  const user = (await setup.json()).user;
+  const setupUser = (await setup.json()).user;
+  const user = repository.findUser(setupUser.id)!;
   const mutation = { actorId: user.id, action: "test.image-route" };
   const created = repository.createProvider({
     slug: "image-primary",
@@ -342,8 +343,21 @@ Deno.test("completed image generation and edit replays reauthorize model access"
     };
     const completed = await request();
     assertEquals(completed.status, 200, await completed.clone().text());
-    const group = fx.repository.createAccessGroup({ name: `deny-${editing}` });
-    fx.repository.replaceAccessGroupModels(group.id, [fx.model.id], group.version);
+    const group = fx.repository.createAccessGroup({ name: `deny-${editing}` }, {
+      actorId: fx.user.id,
+      action: "test.model_access_group.created",
+      targetType: "model_access_group",
+      requireEmailVerification: false,
+      expectedAuthorityEpoch: fx.user.authorityEpoch,
+    });
+    fx.repository.replaceAccessGroupModels(group.id, [fx.model.id], group.version, [], {
+      actorId: fx.user.id,
+      action: "test.model_access_group.models_replaced",
+      targetType: "model_access_group",
+      targetId: group.id,
+      requireEmailVerification: false,
+      expectedAuthorityEpoch: fx.user.authorityEpoch,
+    });
     const denied = await request();
     const deniedBody = await denied.text();
     assertEquals(denied.status, 404, deniedBody);
@@ -1312,6 +1326,58 @@ Deno.test("completed provider work is charged when immutable storage fails", asy
   assertEquals(repository.listGeneratedAssets(run.userId).length, 0);
 });
 
+Deno.test("generated persistence failures retain bytes for durable cleanup, including ambiguous commits", async () => {
+  for (const ambiguousCommit of [false, true]) {
+    const { app, repository, objectStore, cookie } = await fixture();
+    const original = repository.createAttachmentFromGeneratedObjectStage.bind(repository);
+    let deletionAttempts = 0;
+    objectStore.delete = (key) => {
+      deletionAttempts++;
+      objectStore.objects.delete(key);
+      return Promise.resolve();
+    };
+    repository.createAttachmentFromGeneratedObjectStage = (id, ownerId, input, quota) => {
+      if (ambiguousCommit) original(id, ownerId, input, quota);
+      throw new Error(
+        ambiguousCommit
+          ? "simulated lost commit acknowledgement"
+          : "simulated attachment transaction failure",
+      );
+    };
+    const response = await app.request("/v1/images/generations", {
+      method: "POST",
+      headers: {
+        cookie,
+        "content-type": "application/json",
+        "idempotency-key": `generated-attachment-${ambiguousCommit ? "ambiguous" : "failed"}`,
+      },
+      body: JSON.stringify({ model: "images/public", prompt: "retain durable bytes" }),
+    });
+    assertEquals(response.status, 502);
+    assertEquals(deletionAttempts, 0, "the request path must never race durable cleanup");
+    assertEquals(
+      objectStore.objects.size,
+      1,
+      "stored bytes remain available to the cleanup worker",
+    );
+    const stages = [...repository.generatedObjectStages.values()];
+    assertEquals(stages.length, 1);
+    assertEquals(stages[0].state, "cleanup_pending");
+    assertEquals(
+      [...repository.attachments.values()].filter((attachment) => attachment.deletedAt === null)
+        .length,
+      ambiguousCommit ? 1 : 0,
+    );
+    assertEquals(
+      repository.jobs.some((job) =>
+        job.idempotencyKey === `generated_object.cleanup:${stages[0].id}` &&
+        job.status === "queued"
+      ),
+      true,
+    );
+  }
+});
+
 Deno.test("stale image finalization reauthorizes its stored canonical model before reclaim", async () => {
   const { app, repository, cookie, calls } = await fixture();
   const originalComplete = repository.completeApiJson.bind(repository);
@@ -1400,8 +1466,17 @@ Deno.test("stale image finalization reauthorizes its stored canonical model befo
 });
 
 Deno.test("buffered image crash recovery accepts an alias for its canonical asset", async () => {
-  const { app, repository, cookie, calls, model } = await fixture();
-  repository.createModelAlias({ alias: "images/buffered-recovery-alias", targetModelId: model.id });
+  const { app, repository, cookie, calls, model, user } = await fixture();
+  repository.createModelAlias(
+    { alias: "images/buffered-recovery-alias", targetModelId: model.id },
+    {
+      actorId: user.id,
+      action: "test.model_alias.created",
+      targetType: "model_alias",
+      requireEmailVerification: false,
+      expectedAuthorityEpoch: user.authorityEpoch,
+    },
+  );
   const originalComplete = repository.completeApiJson.bind(repository);
   const originalFail = repository.failApiRequest.bind(repository);
   let crashComplete = true;
@@ -1446,7 +1521,7 @@ Deno.test("buffered image crash recovery accepts an alias for its canonical asse
 });
 
 Deno.test("stream crash recovery preserves exact partial SSE frames and provider timestamp", async () => {
-  const { app, repository, cookie, calls } = await fixture({
+  const { app, repository, cookie, calls, user } = await fixture({
     streaming: "success",
     replayMaxBytes: 80 * 1024 * 1024,
   });
@@ -1472,6 +1547,12 @@ Deno.test("stream crash recovery preserves exact partial SSE frames and provider
   repository.createModelAlias({
     alias: "images/stream-recovery-alias",
     targetModelId: canonical.id,
+  }, {
+    actorId: user.id,
+    action: "test.model_alias.created",
+    targetType: "model_alias",
+    requireEmailVerification: false,
+    expectedAuthorityEpoch: user.authorityEpoch,
   });
   const headers = {
     cookie,

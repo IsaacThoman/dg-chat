@@ -4,6 +4,26 @@ export interface ReadinessTimeouts {
   objectStoreMs: number;
 }
 
+export interface DependencyReadiness {
+  configured: boolean;
+  ready: boolean;
+  implementation: string;
+}
+
+export interface ReadinessSnapshot {
+  status: "ready" | "not_ready";
+  storage: DependencyReadiness;
+  redis: DependencyReadiness;
+  objects: DependencyReadiness;
+}
+
+/** Expected durable implementations for a runtime that must fail closed. */
+export interface ReadinessRequirements {
+  storage?: "postgres";
+  redis?: "redis";
+  objects?: "s3";
+}
+
 const DEFAULT_READINESS_TIMEOUT_MS = 2_000;
 const MAX_READINESS_TIMEOUT_MS = 30_000;
 

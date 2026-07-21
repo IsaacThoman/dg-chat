@@ -1,0 +1,83 @@
+# Disposable, loopback-only load profile. Invoke only through tests/load/run.sh, which generates a
+# unique project/database namespace, verifies ownership labels, and removes every volume on exit.
+x-load-labels: &load-labels
+  com.dg-chat.load-owned: "true"
+  com.dg-chat.load-project: ${COMPOSE_PROJECT_NAME:?COMPOSE_PROJECT_NAME is required}
+
+services:
+  app:
+    labels: *load-labels
+    environment:
+      DENO_ENV: test
+      LOG_LEVEL: warn
+      AUTH_RATE_LIMIT: "1000"
+      AUTH_CLIENT_RATE_LIMIT: "1000"
+      OPENAI_RATE_LIMIT: "10000"
+      GENERATION_RATE_LIMIT: "10000"
+      OPENAI_ALLOWED_MODELS: mock-slow
+      APP_URL: ${LOAD_BASE_URL:?LOAD_BASE_URL is required}
+      WEB_URL: ${LOAD_BASE_URL:?LOAD_BASE_URL is required}
+
+  web:
+    labels: *load-labels
+    ports: !override
+      - "127.0.0.1:${LOAD_WEB_HOST_PORT:?LOAD_WEB_HOST_PORT is required}:8080"
+
+  worker:
+    labels: *load-labels
+    environment:
+      DENO_ENV: test
+      WORKER_POLL_MS: "10"
+      WORKER_JOB_LEASE_SECONDS: "5"
+      WORKER_JOB_DEADLINE_MARGIN_MS: "1000"
+      WORKER_HEARTBEAT_INTERVAL_MS: "1000"
+      RETENTION_SCHEDULER_POLL_SECONDS: "3600"
+
+  migrate:
+    labels: *load-labels
+
+  postgres:
+    labels: *load-labels
+    # Docker does not publish ports for a container attached exclusively to an internal network.
+    # This disposable bridge exists only so the host-side invariant runner can query PostgreSQL.
+    networks:
+      - backend
+      - load-host
+    ports:
+      - "127.0.0.1:${LOAD_POSTGRES_HOST_PORT:?LOAD_POSTGRES_HOST_PORT is required}:5432"
+
+  redis:
+    labels: *load-labels
+
+  minio:
+    labels: *load-labels
+
+  minio-init:
+    labels: *load-labels
+
+  mock-provider:
+    labels: *load-labels
+    networks:
+      - backend
+      - load-host
+    ports:
+      - "127.0.0.1:${LOAD_MOCK_HOST_PORT:?LOAD_MOCK_HOST_PORT is required}:4010"
+
+  prometheus:
+    labels: *load-labels
+    profiles: ["observability"]
+    volumes:
+      - ./tests/load/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - backend
+      - load-host
+    ports:
+      - "127.0.0.1:${LOAD_PROMETHEUS_HOST_PORT:?LOAD_PROMETHEUS_HOST_PORT is required}:9090"
+
+networks:
+  # Docker does not publish ports for containers attached only to an internal network. This
+  # disposable bridge makes the loopback host bindings above reachable without changing the
+  # production backend topology or exposing them on a LAN interface.
+  load-host:
+    driver: bridge
+    labels: *load-labels

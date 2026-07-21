@@ -4,16 +4,21 @@ import {
   deterministicChunks,
   readIngestionText,
   requireIngestionObject,
+  requireVerifiedIngestionObject,
 } from "./attachment-ingestion.ts";
 
-const stored = (bytes: Uint8Array, splits = [bytes.length]): StoredObject => {
+const stored = (
+  bytes: Uint8Array,
+  splits = [bytes.length],
+  metadata: Record<string, string> = {},
+): StoredObject => {
   let offset = 0;
   return {
     key: "object",
     contentLength: bytes.length,
     contentType: "text/plain",
     etag: null,
-    metadata: {},
+    metadata,
     body: new ReadableStream({
       pull(controller) {
         const size = splits.shift() ?? bytes.length;
@@ -78,12 +83,97 @@ Deno.test("ingestion enforces stream byte and time bounds", async () => {
   await assertRejects(() => readIngestionText(stalled, "text/plain", 10, 5), Error, "timed out");
 });
 
+Deno.test("ingestion cancels an active object stream on worker shutdown", async () => {
+  let cancelled: unknown;
+  const stalled: StoredObject = {
+    key: "stalled",
+    contentLength: null,
+    contentType: "text/plain",
+    etag: null,
+    metadata: {},
+    body: new ReadableStream({
+      pull: () => new Promise(() => {}),
+      cancel(reason) {
+        cancelled = reason;
+      },
+    }),
+  };
+  const controller = new AbortController();
+  const reading = readIngestionText(
+    stalled,
+    "text/plain",
+    10,
+    60_000,
+    undefined,
+    controller.signal,
+  );
+  const reason = new DOMException("Worker stopping", "AbortError");
+  controller.abort(reason);
+  await assertRejects(() => reading, DOMException, "Worker stopping");
+  assertEquals(cancelled, reason);
+});
+
 Deno.test("ingestion fails explicitly when its object is missing", async () => {
   await assertRejects(
     () => requireIngestionObject({ get: () => Promise.resolve(undefined) } as never, "missing"),
     Error,
     "object is missing",
   );
+});
+
+Deno.test("ingestion requires exact metadata and verifies bytes before extraction", async () => {
+  const ownerId = "00000000-0000-4000-8000-000000000001";
+  const admitted = new TextEncoder().encode("hello");
+  const replaced = new TextEncoder().encode("jello");
+  const sha256 = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+  const expected = {
+    ownerId,
+    sha256,
+    sizeBytes: admitted.byteLength,
+    maxBytes: 100,
+    timeoutMs: 1_000,
+  };
+  const get = (object: StoredObject) =>
+    ({
+      get: () => Promise.resolve(object),
+    }) as never;
+
+  await assertRejects(
+    () =>
+      requireVerifiedIngestionObject(
+        get(stored(admitted, undefined, { sha256 })),
+        "object",
+        expected,
+      ),
+    Error,
+    "owner metadata",
+  );
+  await assertRejects(
+    () =>
+      requireVerifiedIngestionObject(
+        get(stored(admitted, undefined, { owner: ownerId })),
+        "object",
+        expected,
+      ),
+    Error,
+    "digest metadata",
+  );
+  await assertRejects(
+    () =>
+      requireVerifiedIngestionObject(
+        get(stored(replaced, undefined, { owner: ownerId, sha256 })),
+        "object",
+        expected,
+      ),
+    Error,
+    "digest",
+  );
+  const verified = await requireVerifiedIngestionObject(
+    get(stored(admitted, undefined, { owner: ownerId, sha256 })),
+    "object",
+    expected,
+  );
+  assertEquals(await new Response(verified.body).text(), "hello");
 });
 
 Deno.test("deterministic overlapping chunks have stable citation ranges", async () => {

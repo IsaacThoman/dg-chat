@@ -2,6 +2,7 @@ import { assertEquals, assertExists, assertRejects } from "jsr:@std/assert@1.0.1
 import postgres from "npm:postgres@3.4.7";
 import { DomainError } from "./memory.ts";
 import { PostgresRepository } from "./normalized-postgres.ts";
+import { runAuditTestMaintenanceSql } from "./postgres-test-maintenance.ts";
 
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
 const HASH_A = "a".repeat(64);
@@ -23,10 +24,13 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     const sql = postgres(databaseUrl!, { max: 3 });
-    await sql`TRUNCATE admin_balance_adjustments,audit_events,ledger_entries,identity_tokens,
-      access_group_tokens,access_group_users,access_group_models,access_groups,api_tokens,
-      auth_verifications,auth_sessions,auth_accounts,auth_users,sessions,users
-      RESTART IDENTITY CASCADE`;
+    await runAuditTestMaintenanceSql(
+      sql,
+      `TRUNCATE admin_balance_adjustments,audit_events,ledger_entries,identity_tokens,
+        access_group_tokens,access_group_users,access_group_models,access_groups,api_tokens,
+        auth_verifications,auth_sessions,auth_accounts,auth_users,sessions,users
+        RESTART IDENTITY CASCADE`,
+    );
     const actorId = crypto.randomUUID();
     const targetId = crypto.randomUUID();
     await sql`INSERT INTO users(id,email,name,role,approval_status,state,email_verified_at)
@@ -83,6 +87,58 @@ Deno.test({
         "validation_error",
       );
 
+      const precisionTargetId = crypto.randomUUID();
+      await sql`INSERT INTO users(id,email,name,role,approval_status,state,email_verified_at)
+        VALUES(${precisionTargetId},'precision-target@example.com','Precision target','user',
+          'approved','active',now())`;
+      await sql`INSERT INTO auth_users(id,name,email,email_verified)
+        VALUES(${precisionTargetId},'Precision target','precision-target@example.com',true)`;
+      const precisionSessionIds = Array.from({ length: 4 }, () => crypto.randomUUID());
+      const precisionSessionTimestamps = [
+        "2026-07-10T00:00:00.000900Z",
+        "2026-07-10T00:00:00.000500Z",
+        "2026-07-10T00:00:00.000100Z",
+        "2026-07-10T00:00:00.000100Z",
+      ];
+      await sql`INSERT INTO auth_sessions(
+        id,expires_at,token,created_at,updated_at,user_id,limited,ip_address,user_agent)
+        VALUES(${precisionSessionIds[0]},now()+interval '1 day','precision-auth-one',
+          ${precisionSessionTimestamps[0]}::text::timestamptz,now(),${precisionTargetId},false,
+          '192.0.2.10','precision auth one'),
+          (${precisionSessionIds[2]},now()+interval '1 day','precision-auth-two',
+          ${precisionSessionTimestamps[2]}::text::timestamptz,now(),${precisionTargetId},false,
+          '192.0.2.11','precision auth two')`;
+      await sql`INSERT INTO sessions(id,user_id,token_hash,limited,expires_at,created_at)
+        VALUES(${precisionSessionIds[1]},${precisionTargetId},'precision-legacy-one',false,
+          now()+interval '1 day',${precisionSessionTimestamps[1]}::text::timestamptz),
+          (${precisionSessionIds[3]},${precisionTargetId},'precision-legacy-two',false,
+          now()+interval '1 day',${precisionSessionTimestamps[3]}::text::timestamptz)`;
+      const expectedPrecisionSessions = await sql<{ sort_id: string }[]>`
+        WITH all_sessions AS (
+          SELECT created_at,'legacy:'||id::text sort_id FROM sessions
+            WHERE user_id=${precisionTargetId}
+          UNION ALL
+          SELECT created_at,'better_auth:'||id::text sort_id FROM auth_sessions
+            WHERE user_id=${precisionTargetId}
+        ) SELECT sort_id FROM all_sessions ORDER BY created_at DESC,sort_id DESC`;
+      const seenPrecisionSessions: string[] = [];
+      let precisionSessionCursor: string | undefined;
+      for (let index = 0; index < expectedPrecisionSessions.length; index++) {
+        const page = await repository.listAdminUserSessions(actorId, precisionTargetId, {
+          limit: 1,
+          cursor: precisionSessionCursor,
+        });
+        assertEquals(page.data.length, 1);
+        seenPrecisionSessions.push(page.data[0].id);
+        precisionSessionCursor = page.nextCursor ?? undefined;
+      }
+      assertEquals(precisionSessionCursor, undefined);
+      assertEquals(new Set(seenPrecisionSessions).size, expectedPrecisionSessions.length);
+      assertEquals(
+        seenPrecisionSessions,
+        expectedPrecisionSessions.map((row) => row.sort_id),
+      );
+
       const tokens = await repository.listAdminUserTokens(actorId, targetId, { limit: 1 });
       assertEquals(tokens.data.length, 1);
       assertEquals(tokens.data[0].ownerId, targetId);
@@ -106,6 +162,42 @@ Deno.test({
         repository.listAdminUserTokens(actorId, targetId, {
           cursor: forgedCursor("tokens", targetId, new Date().toISOString(), "not-a-uuid"),
         }), "validation_error");
+
+      const precisionTokenIds = Array.from({ length: 4 }, () => crypto.randomUUID());
+      const precisionTokenTimestamps = [
+        "2026-07-10T00:00:00.000900Z",
+        "2026-07-10T00:00:00.000500Z",
+        "2026-07-10T00:00:00.000100Z",
+        "2026-07-10T00:00:00.000100Z",
+      ];
+      for (let index = 0; index < precisionTokenIds.length; index++) {
+        const id = precisionTokenIds[index];
+        await sql`INSERT INTO api_tokens(
+          id,user_id,name,token_hash,preview,scopes,rotation_family_id,created_at)
+          VALUES(${id},${precisionTargetId},${`Precision token ${index}`},
+            ${`precision-token-hash-${index}`},${`dg_precision_${index}`},'[]',${id},
+            ${precisionTokenTimestamps[index]}::text::timestamptz)`;
+      }
+      const expectedPrecisionTokens = await sql<{ id: string }[]>`
+        SELECT id FROM api_tokens WHERE user_id=${precisionTargetId}
+        ORDER BY created_at DESC,id DESC`;
+      const seenPrecisionTokens: string[] = [];
+      let precisionTokenCursor: string | undefined;
+      for (let index = 0; index < expectedPrecisionTokens.length; index++) {
+        const page = await repository.listAdminUserTokens(actorId, precisionTargetId, {
+          limit: 1,
+          cursor: precisionTokenCursor,
+        });
+        assertEquals(page.data.length, 1);
+        seenPrecisionTokens.push(page.data[0].id);
+        precisionTokenCursor = page.nextCursor ?? undefined;
+      }
+      assertEquals(precisionTokenCursor, undefined);
+      assertEquals(new Set(seenPrecisionTokens).size, expectedPrecisionTokens.length);
+      assertEquals(
+        seenPrecisionTokens,
+        expectedPrecisionTokens.map((row) => String(row.id)),
+      );
       const ledgerBefore = await repository.listAdminUserLedger(actorId, targetId);
       assertEquals(ledgerBefore.data, []);
 
@@ -145,13 +237,13 @@ Deno.test({
         scopes: ["chat:write"],
         tokenHash: "rotation-one",
         preview: "one",
-      });
+      }, 1);
       const rotatedTwice = await repository.rotateApiToken(targetId, rotating.id, {
         expectedVersion: 1,
         tokenHash: "rotation-two",
         preview: "two",
         overlapSeconds: 3600,
-      });
+      }, 1);
       const staleFirstVersion = rotatedTwice.previous.version;
       const rotatedThrice = await repository.rotateApiToken(
         targetId,
@@ -162,6 +254,7 @@ Deno.test({
           preview: "three",
           overlapSeconds: 3600,
         },
+        1,
       );
       await code(() =>
         repository.revokeAdminUserTokenFamily({

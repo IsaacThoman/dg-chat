@@ -326,6 +326,30 @@ Deno.test("upstream streaming surfaces structured provider errors", async () => 
   );
 });
 
+Deno.test("non-stream upstream rejects a non-null top-level error on HTTP success", async () => {
+  const fetchMock = (() =>
+    Promise.resolve(Response.json({
+      id: "chatcmpl_nominal",
+      error: {
+        message: "authorization=must-not-be-treated-as-success",
+        signed_url: "https://objects.example/private?X-Amz-Signature=secret",
+      },
+      choices: [{ index: 0, message: { role: "assistant", content: "nominal success" } }],
+      usage: { prompt_tokens: 1, completion_tokens: 1 },
+    }))) as typeof fetch;
+  const error = await assertRejects(
+    () =>
+      complete(request, new AbortController().signal, {
+        baseUrl: "https://provider.example/v1",
+        apiKey: "secret",
+        fetch: fetchMock,
+      }),
+    ProviderAttemptError,
+  );
+  assertEquals(error.options.category, "invalid_response");
+  assertEquals(error.message, "Provider returned an error in a successful HTTP response");
+});
+
 Deno.test("SSE error events fail the provider attempt even when followed by DONE", async () => {
   await assertRejects(
     () =>

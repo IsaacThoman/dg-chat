@@ -27,10 +27,38 @@ export class EmbeddingsProviderError extends Error {
     message: string,
     public readonly status = 502,
     public readonly code = "provider_error",
+    public readonly dispatchOutcome: "rejected" | "uncertain" = "uncertain",
+    public readonly upstreamStatus?: number,
+    public readonly retryAfterMs?: number,
   ) {
     super(message);
     this.name = "EmbeddingsProviderError";
   }
+}
+
+function retryAfterMs(headers: Headers): number | undefined {
+  const value = headers.get("retry-after")?.trim();
+  if (!value) return undefined;
+  const seconds = Number(value);
+  const delay = Number.isFinite(seconds)
+    ? Math.ceil(seconds * 1_000)
+    : Date.parse(value) - Date.now();
+  return Number.isSafeInteger(delay) && delay >= 0 ? Math.min(delay, 300_000) : undefined;
+}
+
+/** Starts best-effort response disposal without allowing a broken stream to delay error handling. */
+function discardResponseBody(response: Response): void {
+  try {
+    void response.body?.cancel().catch(() => undefined);
+  } catch {
+    // A locked or non-conforming stream must not replace the authoritative HTTP failure.
+  }
+}
+
+/** Only protocol-level rejections that conclusively precede model execution are retry-safe. */
+export function embeddingHttpResponseProvesNoExecution(status: number): boolean {
+  return [400, 401, 403, 404, 405, 406, 411, 413, 414, 415, 416, 417, 421, 422, 426, 431]
+    .includes(status);
 }
 
 function endpoint(baseUrl: string): URL {
@@ -231,12 +259,19 @@ export async function createEmbeddings(
       signal: options.signal,
     },
   );
-  const payload = await boundedJson(response);
   if (!response.ok) {
+    // The HTTP status is authoritative even when an error body is empty, malformed, or oversized.
+    // Do not let best-effort provider diagnostics erase retry/fallback/accounting semantics.
+    discardResponseBody(response);
     throw new EmbeddingsProviderError(
       "Embedding provider request failed",
       response.status >= 500 ? 502 : 400,
+      "provider_error",
+      embeddingHttpResponseProvesNoExecution(response.status) ? "rejected" : "uncertain",
+      response.status,
+      retryAfterMs(response.headers),
     );
   }
+  const payload = await boundedJson(response);
   return validateEmbeddingsResponse(payload, request, options.publicModel);
 }

@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { bootstrap, login, openSidebar } from "./helpers.ts";
+import { Buffer } from "node:buffer";
 
 const preview = {
   dryRun: true,

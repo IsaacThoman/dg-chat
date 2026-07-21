@@ -3,10 +3,12 @@ import {
   adminAnalyticsQuery,
   adminJobsQuery,
   api,
+  mapConversation,
   responseError,
   uploadAttachment,
 } from "./api.ts";
 import type { Conversation, KnowledgeCollection } from "./types.ts";
+import { reconcileConversationSearchResult } from "./useConversationSearch.ts";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -60,6 +62,27 @@ describe("operational admin API", () => {
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/admin/jobs/00000000-0000-4000-8000-000000000002/retry",
       expect.objectContaining({ method: "POST", credentials: "include" }),
+    );
+  });
+
+  it("keeps the admin usage client contract bounded even if a server adds extra data", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      Response.json({
+        calls: 12,
+        users: 3,
+        balanceMicros: 4_500_000,
+        ledger: Array.from({ length: 10 }, () => ({ secret: "must-not-propagate" })),
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(api.adminUsage()).resolves.toEqual({
+      calls: 12,
+      users: 3,
+      balanceMicros: 4_500_000,
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/admin/usage",
+      expect.objectContaining({ credentials: "include" }),
     );
   });
 });
@@ -507,6 +530,21 @@ describe("conversation lifecycle API", () => {
     archivedAt: null,
     deletedAt,
     updatedAt: "2026-07-10T00:00:00.000Z",
+  });
+
+  it("keeps canonical timestamps so search reconciliation orders 10:00 after 09:00", () => {
+    const nine = mapConversation({
+      ...rawConversation("nine"),
+      updatedAt: "2026-07-15T09:00:00.000Z",
+    });
+    const ten = mapConversation({
+      ...rawConversation("ten"),
+      updatedAt: "2026-07-15T10:00:00.000Z",
+    });
+
+    expect(nine.updatedAt).toBe("2026-07-15T09:00:00.000Z");
+    expect(ten.updatedAt).toBe("2026-07-15T10:00:00.000Z");
+    expect(reconcileConversationSearchResult([nine], [], ten).conversations).toEqual([ten, nine]);
   });
 
   it("lists only deleted conversations from the include-deleted endpoint", async () => {

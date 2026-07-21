@@ -1,6 +1,7 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useContext, useEffect, useId, useRef, useState } from "react";
 import { Check, ChevronDown, SlidersHorizontal } from "lucide-react";
 import type { Model } from "../types.ts";
+import { ChatSessionActivityContext } from "../chatSessionActivity.ts";
 
 export function ModelPicker({
   models,
@@ -11,11 +12,16 @@ export function ModelPicker({
   selected: string;
   setSelected: (id: string) => void;
 }) {
+  const sessionActive = useContext(ChatSessionActivityContext);
   const [open, setOpen] = useState(false);
+  const [focusedModelId, setFocusedModelId] = useState(selected);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const listId = useId();
   const model = models.find((item) => item.id === selected) ?? models[0];
+  const initialModelId = models.some((item) => item.id === selected)
+    ? selected
+    : models[0]?.id ?? "";
 
   const close = (restoreFocus = true) => {
     setOpen(false);
@@ -23,9 +29,9 @@ export function ModelPicker({
   };
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || !sessionActive) return;
     const selectedItem = panelRef.current?.querySelector<HTMLButtonElement>(
-      `[data-model-id="${CSS.escape(selected)}"]`,
+      `[data-model-id="${CSS.escape(initialModelId)}"]`,
     );
     (selectedItem ?? panelRef.current?.querySelector<HTMLButtonElement>("button"))?.focus();
     const pointer = (event: PointerEvent) => {
@@ -36,7 +42,7 @@ export function ModelPicker({
     };
     document.addEventListener("pointerdown", pointer);
     return () => document.removeEventListener("pointerdown", pointer);
-  }, [open, selected]);
+  }, [initialModelId, open, sessionActive]);
 
   return (
     <div className="model-picker">
@@ -48,7 +54,10 @@ export function ModelPicker({
         aria-controls={open ? listId : undefined}
         aria-expanded={open}
         disabled={!models.length}
-        onClick={() => setOpen((value) => !value)}
+        onClick={() => {
+          if (!open) setFocusedModelId(initialModelId);
+          setOpen((value) => !value);
+        }}
       >
         <span className="model-glyph" aria-hidden="true">{model?.provider[0]}</span>
         <span>
@@ -65,6 +74,10 @@ export function ModelPicker({
           role="listbox"
           aria-label="Chat model"
           onKeyDown={(event) => {
+            if (event.key === "Tab") {
+              close(false);
+              return;
+            }
             if (event.key === "Escape") {
               event.preventDefault();
               close();
@@ -93,7 +106,9 @@ export function ModelPicker({
               type="button"
               role="option"
               aria-selected={selected === item.id}
+              tabIndex={focusedModelId === item.id ? 0 : -1}
               key={item.id}
+              onFocus={() => setFocusedModelId(item.id)}
               onClick={() => {
                 setSelected(item.id);
                 close();

@@ -8,6 +8,9 @@ import type {
   AdminApiTokenPage,
   AdminApiTokenQuery,
   AdminApiTokenRevocationCommand,
+  AdminAttachmentPage,
+  AdminAttachmentQuery,
+  AdminAttachmentSummary,
   AdminBalanceAdjustment,
   AdminBalanceAdjustmentCommand,
   AdminLedgerPage,
@@ -15,12 +18,18 @@ import type {
   AdminSessionPage,
   AdminSessionQuery,
   AdminSessionRevocationCommand,
+  AdminStorageSummary,
   AdminUser,
   AdminUserPage,
   AdminUserQuery,
+  AttachmentStorageUsage,
+  CommunityProfile,
   ConversationFolder,
   ConversationFolderMembership,
   ConversationPortabilityV1,
+  ConversationSearchPage,
+  ConversationSearchQuery,
+  ConversationSearchResult,
   ConversationShareSummary,
   ConversationTag,
   ConversationTagBinding,
@@ -46,18 +55,34 @@ import {
   API_SSE_REPLAY_REQUEST_MAX_BYTES,
   API_SSE_REPLAY_REQUEST_MAX_EVENTS,
   apiResponseBodyByteLength,
+  applyCommunityProfilePatch,
+  ATTACHMENT_INSPECTION_POLICY_VERSION,
+  attachmentReinspectionEligibility,
   canonicalWorkspaceName,
+  CONVERSATION_SEARCH_APPLICATION_NAME,
+  CONVERSATION_SEARCH_POOL_MAX,
+  CONVERSATION_SEARCH_QUERY_VALIDATION_MESSAGE,
+  CONVERSATION_SEARCH_STATEMENT_TIMEOUT_MS,
+  conversationSearchSnippet,
+  decodeAdminAttachmentCursor,
+  decodeConversationSearchCursor,
   DEFAULT_API_REPLAY_QUOTA,
+  encodeAdminAttachmentCursor,
+  encodeConversationSearchCursor,
+  isCanonicalFileUploadObjectKey,
   KNOWLEDGE_EMBEDDING_DIMENSIONS,
   MAX_ACTIVE_CONVERSATION_SHARES,
   MAX_CONVERSATION_SHARE_ATTACHMENTS,
   MAX_CONVERSATION_SHARE_CONTENT_CHARS,
   MAX_CONVERSATION_SHARE_MESSAGES,
+  modelAccessWideningAcknowledgementMatches,
   normalizeKnowledgeSearchLimit,
   planAbandonedApiReplay,
   splitApiSseReplayFrame,
   validateChunkEmbeddings,
   validateDocumentChunkInputs,
+  validConversationSearchScopeId,
+  validConversationSearchTerm,
 } from "./repository.ts";
 import type { LedgerEntry, StoredApiToken, StoredSession, StoredUser, UsageRun } from "./memory.ts";
 import type {
@@ -76,6 +101,9 @@ import type {
   AdminRoleCommand,
   AdminStateCommand,
   AdminTokenLookupPage,
+  AdminWorkerInstance,
+  AdminWorkerPage,
+  AdminWorkerQuery,
   ApiIdempotencyEndpoint,
   ApiIdempotencyFrame,
   ApiIdempotencyRequest,
@@ -83,8 +111,13 @@ import type {
   ApiSseFrameInput,
   ApiUsageObservation,
   AppendMessageInput,
+  AttachmentListQuery,
+  AttachmentPage,
   AttachmentRecord,
+  AttachmentReinspectionResult,
   AttachmentState,
+  AttachmentStorageQuota,
+  AttachmentUploadStage,
   AuditEvent,
   AuditEventInput,
   AuditPage,
@@ -93,6 +126,10 @@ import type {
   BeginApiRequestResult,
   BeginAssistantGenerationInput,
   BeginGenerationInput,
+  CommunityLeaderboardReadQuery,
+  CommunityLeaderboardRepositoryPage,
+  CommunityProfileMutationContext,
+  CommunityProfilePatch,
   CompleteApiRequestInput,
   CompleteGenerationInput,
   ConversationPatch,
@@ -123,7 +160,10 @@ import type {
   EntitledProviderModel,
   FailApiRequestInput,
   FailGenerationInput,
+  FileUploadStage,
   FinalizeEmbeddingProviderUsageInput,
+  FinalizeFileUploadInput,
+  FinalizeFileUploadResult,
   FinalizeGeneratedAssetsInput,
   FinalizeProviderUsageInput,
   FinishEmbeddingProviderAttemptInput,
@@ -139,6 +179,8 @@ import type {
   LifecycleConversation,
   ModelAlias,
   ModelPriceVersion,
+  PrivilegedAuditEventInput,
+  PrivilegedReadContext,
   ProviderAttempt,
   ProviderCredentialEnvelope,
   ProviderCredentialMutation,
@@ -154,9 +196,11 @@ import type {
   RegistryMutationContext,
   ReplaceAccessGroupPolicyInput,
   ReplaceConversationKnowledgeInput,
+  RequestAttachmentReinspectionInput,
   ReserveChildProviderUsageInput,
   RetentionPolicy,
   RetentionPreview,
+  RetentionScheduleResult,
   RetentionScrubBatchResult,
   RetentionScrubFailureCode,
   RetentionScrubPage,
@@ -164,13 +208,17 @@ import type {
   RetentionScrubRun,
   RotateApiTokenInput,
   RotatedApiToken,
+  ScheduleRetentionScrubInput,
   SearchConversationKnowledgeInput,
   SessionSummary,
   SetProviderModelRouteInput,
+  StageAttachmentUploadInput,
+  StageFileUploadInput,
   StageGeneratedObjectInput,
   StartProviderAttemptInput,
   StoredProviderCredential,
   TokenAccessSubject,
+  TransitionAttachmentInspectionInput,
   UpdateAccessGroupInput,
   UpdateApiTokenInput,
   UpdateModelAliasInput,
@@ -190,6 +238,7 @@ import {
   isUsagePricingSnapshot,
   sameGeneratedAssetFinalization,
   usagePricingSnapshotsEqual,
+  validateCommunityLeaderboardReadQuery,
   validateGeneratedAssetFinalization,
 } from "./repository.ts";
 
@@ -199,21 +248,76 @@ const iso = (value: unknown) => value instanceof Date ? value.toISOString() : St
 const nullableIso = (value: unknown) => value == null ? null : iso(value);
 const number = (value: unknown) => Number(value);
 
-const isEffectiveAdminRow = (row: Row): boolean =>
+function requirePrivilegedAuditContext(
+  audit: PrivilegedAuditEventInput | undefined,
+): asserts audit is PrivilegedAuditEventInput {
+  if (
+    !audit ||
+    typeof audit.actorId !== "string" || audit.actorId.trim() === "" ||
+    typeof audit.action !== "string" || audit.action.trim() === "" ||
+    typeof audit.targetType !== "string" || audit.targetType.trim() === "" ||
+    typeof audit.requireEmailVerification !== "boolean" ||
+    !Number.isSafeInteger(audit.expectedAuthorityEpoch) ||
+    audit.expectedAuthorityEpoch < 1
+  ) {
+    throw new DomainError(
+      "admin_authority_required",
+      "Privileged mutation context is required",
+      403,
+    );
+  }
+}
+
+function requirePrivilegedReadContext(
+  context: PrivilegedReadContext | undefined,
+): asserts context is PrivilegedReadContext {
+  if (
+    !context ||
+    typeof context.actorId !== "string" || context.actorId.trim() === "" ||
+    typeof context.requireEmailVerification !== "boolean" ||
+    !Number.isSafeInteger(context.expectedAuthorityEpoch) ||
+    context.expectedAuthorityEpoch < 1
+  ) {
+    throw new DomainError(
+      "admin_authority_required",
+      "Privileged read context is required",
+      403,
+    );
+  }
+}
+
+const isEffectiveAdminRow = (row: Row, requireEmailVerification = false): boolean =>
   row.role === "admin" && row.approval_status === "approved" && row.state === "active" &&
-  row.deleted_at == null;
+  row.deleted_at == null && row.password_reset_pending === false &&
+  (!requireEmailVerification || row.email_verified_at != null);
 
 function adminUser(row: Row): AdminUser {
   const stored = user(row);
   return { ...publicUser(stored), effectiveAdmin: isEffectiveAdminRow(row) };
 }
 
-function validateAdminCommand(input: {
-  expectedVersion: number;
-  reason?: string;
-}, reasonRequired = false): string | undefined {
+function validateAdminCommand(
+  input: {
+    expectedVersion: number;
+    expectedAuthorityEpoch?: number;
+    reason?: string;
+  },
+  reasonRequired = false,
+  authorityEpochRequired = false,
+): string | undefined {
   if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1) {
     throw new DomainError("validation_error", "Expected version must be a positive integer", 422);
+  }
+  if (
+    (authorityEpochRequired || input.expectedAuthorityEpoch !== undefined) &&
+    (!Number.isSafeInteger(input.expectedAuthorityEpoch) ||
+      (input.expectedAuthorityEpoch ?? 0) < 1)
+  ) {
+    throw new DomainError(
+      "validation_error",
+      "Expected authority epoch must be a positive integer",
+      422,
+    );
   }
   const reason = input.reason?.trim();
   if (
@@ -252,15 +356,73 @@ function adminMutationMetadata(
   };
 }
 
-async function assertEffectiveAdminActor(
-  tx: postgres.TransactionSql,
+async function lockUsersAndAssertEffectiveAdminActor(
+  tx: postgres.Sql,
   actorId: string,
-): Promise<void> {
-  const actors = await tx<Row[]>`SELECT * FROM users WHERE id=${actorId} FOR UPDATE`;
-  if (!actors[0] || !isEffectiveAdminRow(actors[0])) {
+  userIds: readonly string[],
+  requireEmailVerification = false,
+  expectedAuthorityEpoch?: number,
+): Promise<Row[]> {
+  if (
+    expectedAuthorityEpoch !== undefined &&
+    (!Number.isSafeInteger(expectedAuthorityEpoch) || expectedAuthorityEpoch < 1)
+  ) {
+    throw new DomainError(
+      "validation_error",
+      "Expected authority epoch must be a positive integer",
+      422,
+    );
+  }
+  const lockIds = [...new Set([actorId, ...userIds])].sort();
+  const actors = await tx<Row[]>`SELECT * FROM users
+    WHERE id=ANY(${tx.array(lockIds)}::uuid[]) ORDER BY id FOR UPDATE`;
+  const actor = actors.find((row) => String(row.id) === actorId);
+  if (
+    !actor || !isEffectiveAdminRow(actor, requireEmailVerification) ||
+    expectedAuthorityEpoch !== undefined &&
+      number(actor.authority_epoch) !== expectedAuthorityEpoch
+  ) {
     throw new DomainError(
       "admin_authority_required",
       "Administrator authority changed before the request completed",
+      403,
+    );
+  }
+  return actors;
+}
+
+async function assertEffectiveAdminActor(
+  tx: postgres.Sql,
+  actorId: string,
+  requireEmailVerification = false,
+  expectedAuthorityEpoch?: number,
+): Promise<void> {
+  await lockUsersAndAssertEffectiveAdminActor(
+    tx,
+    actorId,
+    [],
+    requireEmailVerification,
+    expectedAuthorityEpoch,
+  );
+}
+
+async function assertPersonalTokenOwner(
+  tx: postgres.TransactionSql,
+  userId: string,
+  expectedAuthorityEpoch: number,
+  action: "update" | "revoke",
+): Promise<void> {
+  const users = await tx<Row[]>`SELECT approval_status,state,deleted_at,
+    password_reset_pending,authority_epoch FROM users WHERE id=${userId} FOR UPDATE`;
+  const user = users[0];
+  if (
+    !user || user.approval_status !== "approved" || user.state !== "active" ||
+    user.deleted_at != null || user.password_reset_pending === true ||
+    number(user.authority_epoch) !== expectedAuthorityEpoch
+  ) {
+    throw new DomainError(
+      "account_unavailable",
+      `Account cannot ${action} API tokens`,
       403,
     );
   }
@@ -270,6 +432,8 @@ async function invalidateFullUserAuthority(
   tx: postgres.TransactionSql,
   userId: string,
 ): Promise<void> {
+  await tx`UPDATE users SET authority_epoch=authority_epoch+1,updated_at=now()
+    WHERE id=${userId}`;
   await tx`UPDATE sessions SET invalidated_at=now()
     WHERE user_id=${userId} AND limited=false AND invalidated_at IS NULL`;
   await tx`DELETE FROM auth_sessions WHERE user_id=${userId} AND limited=false`;
@@ -364,6 +528,7 @@ function user(row: Row): StoredUser {
     name: String(row.name),
     passwordHash: row.password_hash == null ? null : String(row.password_hash),
     passwordResetPending: row.password_reset_pending === true,
+    authorityEpoch: number(row.authority_epoch ?? 1),
     role: row.role as StoredUser["role"],
     approvalStatus: row.approval_status as StoredUser["approvalStatus"],
     state: row.state as StoredUser["state"],
@@ -418,6 +583,19 @@ function preferences(row: Row): UserPreferences {
     useMemory: Boolean(row.use_memory),
     saveHistory: Boolean(row.save_history),
     preferredModelId: row.preferred_model_id == null ? null : String(row.preferred_model_id),
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+  };
+}
+function communityProfile(row: Row): CommunityProfile {
+  return {
+    userId: String(row.user_id),
+    optedIn: Boolean(row.opted_in),
+    identityMode: String(row.identity_mode) as CommunityProfile["identityMode"],
+    nickname: row.nickname == null ? null : String(row.nickname),
+    color: String(row.color) as CommunityProfile["color"],
+    shareBalance: Boolean(row.share_balance),
+    version: number(row.version),
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at),
   };
@@ -528,6 +706,7 @@ function token(row: Row): StoredApiToken {
     tokenHash: String(row.token_hash),
     preview: String(row.preview),
     scopes: row.scopes as string[],
+    authorityEpoch: number(row.authority_epoch ?? 1),
     version: number(row.version),
     rpmLimit: row.rpm_limit == null ? null : number(row.rpm_limit),
     burstLimit: row.burst_limit == null ? null : number(row.burst_limit),
@@ -546,7 +725,12 @@ function token(row: Row): StoredApiToken {
   };
 }
 function tokenSummary(value: StoredApiToken) {
-  const { tokenHash: _hash, userId: _userId, ...summary } = value;
+  const {
+    tokenHash: _hash,
+    userId: _userId,
+    authorityEpoch: _authorityEpoch,
+    ...summary
+  } = value;
   return summary;
 }
 function adminBalanceAdjustment(row: Row, replayed: boolean): AdminBalanceAdjustment {
@@ -586,8 +770,10 @@ function run(row: Row): UsageRun {
   return {
     id: String(row.id),
     userId: String(row.user_id),
+    tokenId: row.token_id == null ? null : String(row.token_id),
     model: String(row.model),
     provider: String(row.provider),
+    recoveryOwner: String(row.recovery_owner) as UsageRun["recoveryOwner"],
     status: row.status as UsageRun["status"],
     reservedMicros: number(row.reserved_micros),
     costMicros: number(row.cost_micros),
@@ -622,6 +808,14 @@ function attachment(row: Row): AttachmentRecord {
     sha256: String(row.sha256),
     state: row.state as AttachmentState,
     inspectionError: row.inspection_error ? String(row.inspection_error) : null,
+    requiredInspectionMode: String(
+      row.required_inspection_mode ?? "local",
+    ) as AttachmentRecord["requiredInspectionMode"],
+    inspectionPolicyVersion: String(
+      row.inspection_policy_version ?? ATTACHMENT_INSPECTION_POLICY_VERSION,
+    ) as AttachmentRecord["inspectionPolicyVersion"],
+    inspectionEpoch: number(row.inspection_epoch ?? 1),
+    version: number(row.version ?? 1),
     ingestionStatus: String(
       row.ingestion_status ?? "not_applicable",
     ) as AttachmentRecord["ingestionStatus"],
@@ -630,6 +824,48 @@ function attachment(row: Row): AttachmentRecord {
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at ?? row.created_at),
     deletedAt: nullableIso(row.deleted_at),
+  };
+}
+function fileUploadStage(row: Row): FileUploadStage {
+  return {
+    requestId: String(row.request_id),
+    ownerId: String(row.owner_id),
+    objectKey: String(row.object_key),
+    filename: String(row.filename),
+    mimeType: String(row.mime_type),
+    sizeBytes: number(row.size_bytes),
+    sha256: String(row.sha256),
+    purpose: String(row.purpose),
+    attachmentState: row.attachment_state as FileUploadStage["attachmentState"],
+    inspectionError: row.inspection_error ? String(row.inspection_error) : null,
+    requiredInspectionMode: row.required_inspection_mode as FileUploadStage[
+      "requiredInspectionMode"
+    ],
+    inspectionPolicyVersion: String(row.inspection_policy_version) as FileUploadStage[
+      "inspectionPolicyVersion"
+    ],
+    state: row.state as FileUploadStage["state"],
+    attachmentId: row.attachment_id ? String(row.attachment_id) : null,
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
+  };
+}
+function attachmentUploadStage(row: Row): AttachmentUploadStage {
+  return {
+    id: String(row.id),
+    ownerId: String(row.owner_id),
+    objectKey: String(row.object_key),
+    filename: String(row.filename),
+    mimeType: String(row.mime_type),
+    sizeBytes: number(row.size_bytes),
+    sha256: String(row.sha256),
+    state: row.state as AttachmentUploadStage["state"],
+    attachmentId: row.attachment_id ? String(row.attachment_id) : null,
+    cleanupError: row.cleanup_error ? String(row.cleanup_error) : null,
+    uploadLeaseToken: String(row.upload_lease_token),
+    uploadLeaseExpiresAt: iso(row.upload_lease_expires_at),
+    createdAt: iso(row.created_at),
+    updatedAt: iso(row.updated_at),
   };
 }
 function generatedAsset(row: Row): GeneratedAssetRecord {
@@ -1069,12 +1305,88 @@ function validateAttachmentInput(input: CreateAttachmentInput) {
     throw new DomainError("validation_error", "Attachment size is invalid", 422);
   }
   if (
+    input.requiredInspectionMode != null &&
+      !["local", "external"].includes(input.requiredInspectionMode) ||
+    input.inspectionPolicyVersion != null &&
+      input.inspectionPolicyVersion !== ATTACHMENT_INSPECTION_POLICY_VERSION
+  ) throw new DomainError("validation_error", "Attachment inspection policy is invalid", 422);
+  if (
     !input.filename || input.filename.length > 255 || /[\\/\0]/.test(input.filename) ||
     !input.mimeType || input.mimeType.length > 255 ||
     !/^[\w.+-]+\/[\w.+-]+$/.test(input.mimeType) ||
     !input.objectKey || input.objectKey.length > 1024 || input.objectKey.startsWith("/") ||
     input.objectKey.split("/").some((part) => part === ".." || part === "")
   ) throw new DomainError("validation_error", "Attachment metadata is invalid", 422);
+}
+
+function validateAttachmentStorageQuota(quota?: AttachmentStorageQuota): void {
+  if (
+    quota && (
+      !Number.isSafeInteger(quota.perUserBytes) || quota.perUserBytes < 0 ||
+      !Number.isSafeInteger(quota.perUserObjects) || quota.perUserObjects < 0 ||
+      !Number.isSafeInteger(quota.installationBytes) || quota.installationBytes < 0 ||
+      !Number.isSafeInteger(quota.installationObjects) || quota.installationObjects < 0
+    )
+  ) throw new DomainError("validation_error", "Attachment storage quota is invalid", 422);
+}
+
+async function admitAttachmentStorage(
+  tx: postgres.TransactionSql,
+  input: CreateAttachmentInput,
+  quota?: AttachmentStorageQuota,
+): Promise<void> {
+  validateAttachmentStorageQuota(quota);
+  try {
+    await tx`SELECT dg_chat_admit_attachment_storage(
+      ${input.ownerId},${input.objectKey},${input.sizeBytes},${input.sha256},${input.mimeType},
+      ${quota?.perUserBytes ?? null},${quota?.perUserObjects ?? null},
+      ${quota?.installationBytes ?? null},${quota?.installationObjects ?? null}
+    )`;
+  } catch (error) {
+    const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+    const message = error instanceof Error ? error.message : "";
+    if (code === "P0001" && message.includes("quota exceeded")) {
+      throw new DomainError("storage_quota_exceeded", "Attachment storage quota exceeded", 413);
+    }
+    if (
+      code === "23514" &&
+      (message.includes("retained blob") || message.includes("cannot be reused"))
+    ) {
+      throw new DomainError(
+        "attachment_object_conflict",
+        "Attachment object metadata differs from retained history",
+        409,
+      );
+    }
+    throw error;
+  }
+}
+
+/**
+ * Every writer that makes attachment bytes durably reachable takes this row lock before writing
+ * its reference. Generated-object cleanup takes the same lock before tombstoning and deleting the
+ * object, so either the reference commits first and fences deletion or the writer observes the
+ * tombstone. Sorting the unique IDs gives multi-attachment writers one global lock order.
+ */
+async function lockReferenceableAttachments(
+  tx: postgres.TransactionSql,
+  ownerId: string,
+  attachmentIds: readonly string[],
+  code: string,
+  message: string,
+): Promise<Row[]> {
+  const ids = [...new Set(attachmentIds)].sort();
+  if (!ids.length) return [];
+  const rows = await tx<Row[]>`
+    SELECT * FROM attachments
+    WHERE owner_id=${ownerId} AND id=ANY(${ids}::uuid[])
+    ORDER BY id
+    FOR UPDATE`;
+  if (
+    rows.length !== ids.length ||
+    rows.some((row) => String(row.state) !== "ready" || row.deleted_at !== null)
+  ) throw new DomainError(code, message, 409);
+  return rows;
 }
 
 function validateGeneratedObjectStageInput(input: StageGeneratedObjectInput) {
@@ -1129,19 +1441,173 @@ function apiFrame(row: Row): ApiIdempotencyFrame {
   };
 }
 
+interface CancellablePostgresQuery<T> extends PromiseLike<T> {
+  cancel(): void | Promise<void>;
+}
+
+async function endPostgresPool(
+  sql: ReturnType<typeof postgres>,
+  timeout: number,
+): Promise<void> {
+  await sql.end({ timeout });
+}
+
+/**
+ * Closes every distinct pool owned by a repository before reporting any failure. Keeping this
+ * settlement at the repository boundary prevents a rejected driver close from being mistaken for
+ * proof that shutdown completed.
+ */
+export async function closeOwnedPostgresPools<T extends object>(
+  pools: readonly (T | undefined)[],
+  timeout: number,
+  closePool: (pool: T, timeout: number) => Promise<void>,
+): Promise<void> {
+  const uniquePools = [...new Set(pools.filter((pool): pool is T => pool !== undefined))];
+  const results = await Promise.allSettled(
+    uniquePools.map(async (pool) => await closePool(pool, timeout)),
+  );
+  const failures = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+  if (failures.length) throw new AggregateError(failures, "Failed to close PostgreSQL pools");
+}
+
+/**
+ * A search has one wall-clock deadline across scope checks and the result query. The PostgreSQL
+ * startup parameter is the authoritative per-statement limit; this watchdog also bounds time spent
+ * waiting for a connection in postgres.js' queue, where PostgreSQL cannot yet enforce a timeout.
+ */
+async function awaitConversationSearchQuery<T>(
+  query: CancellablePostgresQuery<T>,
+  deadlineAt: number,
+  callerSignal?: AbortSignal,
+): Promise<T> {
+  callerSignal?.throwIfAborted();
+  let deadlineElapsed = false;
+  const cancel = () => {
+    try {
+      void Promise.resolve(query.cancel()).catch(() => undefined);
+    } catch {
+      // The query may have completed between the abort event and cancellation dispatch.
+    }
+  };
+  const remainingMs = Math.max(0, deadlineAt - performance.now());
+  const deadlineTimer = setTimeout(() => {
+    deadlineElapsed = true;
+    cancel();
+  }, remainingMs);
+  callerSignal?.addEventListener("abort", cancel, { once: true });
+  try {
+    const result = await query;
+    // A caller cancellation always wins a same-turn race with the internal deadline.
+    callerSignal?.throwIfAborted();
+    if (deadlineElapsed) {
+      throw new DomainError(
+        "search_timeout",
+        "Conversation search took too long. Try a more specific phrase.",
+        503,
+      );
+    }
+    return result;
+  } catch (error) {
+    callerSignal?.throwIfAborted();
+    if (deadlineElapsed || (error as { code?: string }).code === "57014") {
+      throw new DomainError(
+        "search_timeout",
+        "Conversation search took too long. Try a more specific phrase.",
+        503,
+      );
+    }
+    throw error;
+  } finally {
+    clearTimeout(deadlineTimer);
+    callerSignal?.removeEventListener("abort", cancel);
+  }
+}
+
 export class PostgresRepository implements DomainRepository {
   readonly storageKind = "postgres" as const;
   readonly #sql: ReturnType<typeof postgres>;
-  private constructor(sql: ReturnType<typeof postgres>) {
+  readonly #conversationSearchSql: ReturnType<typeof postgres>;
+  private constructor(
+    sql: ReturnType<typeof postgres>,
+    conversationSearchSql: ReturnType<typeof postgres>,
+  ) {
     this.#sql = sql;
+    this.#conversationSearchSql = conversationSearchSql;
   }
-  static async connect(url: string) {
-    const sql = postgres(url, { max: 10 });
-    await sql`SELECT 1`;
-    return new PostgresRepository(sql);
+  static async connect(
+    url: string,
+    options: {
+      connectTimeoutSeconds?: number;
+      statementTimeoutMs?: number;
+      /** Worker processes never execute conversation search and must not reserve its pool. */
+      conversationSearch?: boolean;
+      poolMax?: number;
+    } = {},
+  ) {
+    const connectTimeoutSeconds = options.connectTimeoutSeconds;
+    const statementTimeoutMs = options.statementTimeoutMs;
+    if (
+      statementTimeoutMs !== undefined &&
+      (!Number.isSafeInteger(statementTimeoutMs) || statementTimeoutMs < 1 ||
+        statementTimeoutMs > 2_147_483_647)
+    ) throw new TypeError("PostgreSQL statement timeout is invalid");
+    let sql: ReturnType<typeof postgres> | undefined;
+    if (
+      options.poolMax !== undefined &&
+      (!Number.isSafeInteger(options.poolMax) || options.poolMax < 1 || options.poolMax > 100)
+    ) throw new TypeError("PostgreSQL pool maximum is invalid");
+    let conversationSearchSql: ReturnType<typeof postgres> | undefined;
+    try {
+      sql = postgres(url, {
+        max: options.poolMax ?? 10,
+        ...(connectTimeoutSeconds === undefined ? {} : { connect_timeout: connectTimeoutSeconds }),
+        ...(statementTimeoutMs === undefined
+          ? {}
+          : { connection: { statement_timeout: statementTimeoutMs } }),
+      });
+      conversationSearchSql = options.conversationSearch === false ? sql : postgres(url, {
+        max: CONVERSATION_SEARCH_POOL_MAX,
+        connect_timeout: connectTimeoutSeconds ?? 5,
+        idle_timeout: 20,
+        max_lifetime: 60 * 30,
+        connection: {
+          application_name: CONVERSATION_SEARCH_APPLICATION_NAME,
+          statement_timeout: statementTimeoutMs === undefined
+            ? CONVERSATION_SEARCH_STATEMENT_TIMEOUT_MS
+            : Math.min(statementTimeoutMs, CONVERSATION_SEARCH_STATEMENT_TIMEOUT_MS),
+        },
+      });
+      await sql`SELECT 1`;
+      if (conversationSearchSql !== sql) {
+        await conversationSearchSql`/* dg-chat:conversation-search:connect */ SELECT 1`;
+      }
+      return new PostgresRepository(sql, conversationSearchSql);
+    } catch (error) {
+      // A failed constructor or startup connection never reaches an instance whose close() caller
+      // can invoke. Attempt both closes even if one pool failed to initialize or close cleanly.
+      await closeOwnedPostgresPools(
+        [sql, conversationSearchSql],
+        0,
+        endPostgresPool,
+      ).catch(() => undefined);
+      throw error;
+    }
   }
   async close() {
-    await this.#sql.end({ timeout: 5 });
+    await closeOwnedPostgresPools(
+      [this.#sql, this.#conversationSearchSql],
+      5,
+      endPostgresPool,
+    );
+  }
+
+  /** Immediately destroys owned pools. Used only by the worker's absolute shutdown watchdog. */
+  async forceClose(): Promise<void> {
+    await closeOwnedPostgresPools(
+      [this.#sql, this.#conversationSearchSql],
+      0,
+      endPostgresPool,
+    );
   }
 
   async bootstrapAdmin(input: CreateUserInput, credit: number) {
@@ -1172,6 +1638,8 @@ export class PostgresRepository implements DomainRepository {
         )
       `;
       await tx`INSERT INTO ledger_entries (user_id,usage_run_id,kind,amount_micros,balance_after_micros) VALUES (${userId},${`bootstrap:${userId}`},'grant',${credit},${credit})`;
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${userId},'identity.bootstrap_admin','user',${userId},'{}'::jsonb)`;
       return user(rows[0]);
     });
   }
@@ -1270,30 +1738,55 @@ export class PostgresRepository implements DomainRepository {
     if (!rows[0]) throw new DomainError("not_found", "User not found", 404);
     return adminUser(rows[0]);
   }
-  async createSession(userId: string, tokenHash: string, limited: boolean) {
-    const rows = await this.#sql<
-      Row[]
-    >`INSERT INTO sessions (user_id,token_hash,limited,expires_at) VALUES (${userId},${tokenHash},${limited},now()+interval '30 days') RETURNING *`;
-    return {
-      id: String(rows[0].id),
-      tokenHash: String(rows[0].token_hash),
-      userId: String(rows[0].user_id),
-      limited: Boolean(rows[0].limited),
-      expiresAt: new Date(rows[0].expires_at as string).getTime(),
-      createdAt: iso(rows[0].created_at),
-      invalidatedAt: nullableIso(rows[0].invalidated_at),
-    };
+  async createSession(
+    userId: string,
+    tokenHash: string,
+    limited: boolean,
+    expectedAuthorityEpoch = 1,
+  ) {
+    return await this.#sql.begin(async (tx) => {
+      // Credential issuance and administrative authority loss take the same row lock. If a
+      // suspension/rejection/deletion commits first, issuance observes the terminal state and
+      // fails. If issuance commits first, the lifecycle transaction invalidates this session.
+      const users = await tx<Row[]>`SELECT approval_status,state,deleted_at,
+        password_reset_pending,authority_epoch FROM users WHERE id=${userId} FOR UPDATE`;
+      const user = users[0];
+      const eligible = user && user.state === "active" && user.deleted_at == null &&
+        user.password_reset_pending !== true && user.approval_status !== "rejected" &&
+        (limited || user.approval_status === "approved") &&
+        number(user.authority_epoch) === expectedAuthorityEpoch;
+      if (!eligible) {
+        throw new DomainError("account_unavailable", "Account cannot create this session", 403);
+      }
+      const rows = await tx<
+        Row[]
+      >`INSERT INTO sessions (user_id,token_hash,limited,authority_epoch,expires_at)
+        VALUES (${userId},${tokenHash},${limited},${expectedAuthorityEpoch},now()+interval '30 days') RETURNING *`;
+      return {
+        id: String(rows[0].id),
+        tokenHash: String(rows[0].token_hash),
+        userId: String(rows[0].user_id),
+        limited: Boolean(rows[0].limited),
+        authorityEpoch: number(rows[0].authority_epoch),
+        expiresAt: new Date(rows[0].expires_at as string).getTime(),
+        createdAt: iso(rows[0].created_at),
+        invalidatedAt: nullableIso(rows[0].invalidated_at),
+      };
+    });
   }
   async getSession(tokenHash: string): Promise<StoredSession | undefined> {
     const rows = await this.#sql<
       Row[]
-    >`SELECT * FROM sessions WHERE token_hash=${tokenHash} AND invalidated_at IS NULL AND expires_at>now()`;
+    >`SELECT s.* FROM sessions s JOIN users u ON u.id=s.user_id
+      WHERE s.token_hash=${tokenHash} AND s.invalidated_at IS NULL AND s.expires_at>now()
+        AND (s.limited=true OR s.authority_epoch=u.authority_epoch)`;
     return rows[0]
       ? {
         id: String(rows[0].id),
         tokenHash,
         userId: String(rows[0].user_id),
         limited: Boolean(rows[0].limited),
+        authorityEpoch: number(rows[0].authority_epoch),
         expiresAt: new Date(rows[0].expires_at as string).getTime(),
         createdAt: iso(rows[0].created_at),
         invalidatedAt: nullableIso(rows[0].invalidated_at),
@@ -1403,7 +1896,9 @@ export class PostgresRepository implements DomainRepository {
       WHERE (${query.source ?? null}::text IS NULL OR source=${query.source ?? null})
         AND (${query.status ?? null}::text IS NULL OR status=${query.status ?? null})
         AND (${cursor?.position ?? null}::text IS NULL OR
-          (created_at,sort_id)<(${cursor?.position ?? null}::timestamptz,${cursor?.id ?? null}))
+          (created_at,sort_id)<(
+            ${cursor?.position ?? null}::text::timestamptz,${cursor?.id ?? null}
+          ))
       ORDER BY created_at DESC,sort_id DESC LIMIT ${limit + 1}`;
       const data = rows.slice(0, limit).map((row) => ({
         id: String(row.sort_id),
@@ -1462,7 +1957,9 @@ export class PostgresRepository implements DomainRepository {
       ) SELECT * FROM token_page
       WHERE (${query.status ?? null}::text IS NULL OR status=${query.status ?? null})
         AND (${cursor?.position ?? null}::text IS NULL OR
-          (created_at,id)<(${cursor?.position ?? null}::timestamptz,${cursor?.id ?? null}::uuid))
+          (created_at,id)<(
+            ${cursor?.position ?? null}::text::timestamptz,${cursor?.id ?? null}::uuid
+          ))
       ORDER BY created_at DESC,id DESC LIMIT ${limit + 1}`;
       const data = rows.slice(0, limit).map((row) => ({
         ...tokenSummary(token(row)),
@@ -1672,16 +2169,30 @@ export class PostgresRepository implements DomainRepository {
     purpose: IdentityTokenPurpose,
     tokenHash: string,
     expiresAt: string,
+    expectedAuthorityEpoch: number,
   ) {
-    const rows = await this.#sql<{ user_id: string }[]>`
-      INSERT INTO identity_tokens(user_id,purpose,token_hash,expires_at)
-      VALUES(${userId},${purpose},${tokenHash},${expiresAt})
+    const rows = await this.#sql.begin(async (tx) => {
+      const users = await tx<Row[]>`SELECT authority_epoch,state,deleted_at,approval_status,
+        password_reset_pending FROM users
+        WHERE id=${userId} FOR UPDATE`;
+      if (
+        !users[0] || users[0].state !== "active" || users[0].deleted_at != null ||
+        number(users[0].authority_epoch) !== expectedAuthorityEpoch ||
+        (purpose === "password_reset" &&
+          (users[0].approval_status === "rejected" ||
+            users[0].password_reset_pending === true))
+      ) throw new DomainError("account_unavailable", "Identity authority changed", 403);
+      return await tx<{ user_id: string }[]>`
+      INSERT INTO identity_tokens(user_id,purpose,token_hash,expires_at,authority_epoch)
+      VALUES(${userId},${purpose},${tokenHash},${expiresAt},${expectedAuthorityEpoch})
       ON CONFLICT(token_hash) DO UPDATE SET token_hash=EXCLUDED.token_hash
       WHERE identity_tokens.user_id=EXCLUDED.user_id
         AND identity_tokens.purpose=EXCLUDED.purpose
+        AND identity_tokens.authority_epoch=EXCLUDED.authority_epoch
         AND identity_tokens.consumed_at IS NULL
       RETURNING user_id
-    `;
+      `;
+    });
     if (!rows[0]) {
       throw new DomainError(
         "identity_token_conflict",
@@ -1692,13 +2203,28 @@ export class PostgresRepository implements DomainRepository {
   }
   async verifyEmail(tokenHash: string) {
     return await this.#sql.begin(async (tx) => {
-      const tokens = await tx<
-        Row[]
-      >`UPDATE identity_tokens t SET consumed_at=now() FROM users u
-        WHERE t.token_hash=${tokenHash} AND t.purpose='email_verification'
-          AND t.consumed_at IS NULL AND t.expires_at>now() AND u.id=t.user_id
-          AND u.state='active' AND u.deleted_at IS NULL
-        RETURNING t.user_id`;
+      const candidates = await tx<Row[]>`SELECT user_id FROM identity_tokens
+        WHERE token_hash=${tokenHash} AND purpose='email_verification'`;
+      if (!candidates[0]) {
+        throw new DomainError(
+          "invalid_identity_token",
+          "Verification token is invalid or expired",
+          400,
+        );
+      }
+      const userId = String(candidates[0].user_id);
+      const users = await tx<Row[]>`SELECT * FROM users WHERE id=${userId} FOR UPDATE`;
+      if (!users[0] || users[0].state !== "active" || users[0].deleted_at !== null) {
+        throw new DomainError(
+          "invalid_identity_token",
+          "Verification token is invalid or expired",
+          400,
+        );
+      }
+      const tokens = await tx<Row[]>`SELECT id FROM identity_tokens
+        WHERE token_hash=${tokenHash} AND purpose='email_verification' AND user_id=${userId}
+          AND authority_epoch=${number(users[0].authority_epoch)}
+          AND consumed_at IS NULL AND expires_at>now() FOR UPDATE`;
       if (!tokens[0]) {
         throw new DomainError(
           "invalid_identity_token",
@@ -1706,15 +2232,17 @@ export class PostgresRepository implements DomainRepository {
           400,
         );
       }
+      await tx`UPDATE identity_tokens SET consumed_at=now() WHERE id=${String(tokens[0].id)}`;
       const rows = await tx<
         Row[]
-      >`UPDATE users SET email_verified_at=COALESCE(email_verified_at,now()),updated_at=now() WHERE id=${
-        String(tokens[0].user_id)
-      } RETURNING *`;
+      >`UPDATE users SET email_verified_at=COALESCE(email_verified_at,now()),updated_at=now()
+        WHERE id=${userId} RETURNING *`;
       await tx`
         UPDATE auth_users SET email_verified=true,updated_at=now()
-        WHERE id=${String(tokens[0].user_id)}
+        WHERE id=${userId}
       `;
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${userId},'identity.email_verified','user',${userId},'{}'::jsonb)`;
       return user(rows[0]);
     });
   }
@@ -1730,17 +2258,30 @@ export class PostgresRepository implements DomainRepository {
   }
   async resetPassword(tokenHash: string, passwordHash: string) {
     return await this.#sql.begin(async (tx) => {
-      const tokens = await tx<
-        Row[]
-      >`UPDATE identity_tokens t SET consumed_at=now() FROM users u
-        WHERE t.token_hash=${tokenHash} AND t.purpose='password_reset'
-          AND t.consumed_at IS NULL AND t.expires_at>now() AND u.id=t.user_id
-          AND u.state='active' AND u.deleted_at IS NULL
-        RETURNING t.user_id`;
+      // Discover the subject without a lock, then take every durable lock in the global
+      // user-before-verification order used by lifecycle invalidation.
+      const candidates = await tx<Row[]>`SELECT user_id FROM identity_tokens
+        WHERE token_hash=${tokenHash} AND purpose='password_reset'`;
+      if (!candidates[0]) {
+        throw new DomainError("invalid_identity_token", "Reset token is invalid or expired", 400);
+      }
+      const userId = String(candidates[0].user_id);
+      const users = await tx<Row[]>`SELECT * FROM users WHERE id=${userId} FOR UPDATE`;
+      if (
+        !users[0] || users[0].state !== "active" || users[0].deleted_at !== null ||
+        users[0].approval_status === "rejected" ||
+        users[0].password_reset_pending === true
+      ) {
+        throw new DomainError("invalid_identity_token", "Reset token is invalid or expired", 400);
+      }
+      const tokens = await tx<Row[]>`SELECT id FROM identity_tokens
+        WHERE token_hash=${tokenHash} AND purpose='password_reset' AND user_id=${userId}
+          AND authority_epoch=${number(users[0].authority_epoch)}
+          AND consumed_at IS NULL AND expires_at>now() FOR UPDATE`;
       if (!tokens[0]) {
         throw new DomainError("invalid_identity_token", "Reset token is invalid or expired", 400);
       }
-      const userId = String(tokens[0].user_id);
+      await tx`UPDATE identity_tokens SET consumed_at=now() WHERE id=${String(tokens[0].id)}`;
       const credentials = await tx`
         UPDATE auth_accounts SET password=${passwordHash},updated_at=now()
         WHERE provider_id='credential' AND account_id=${userId} AND user_id=${userId}
@@ -1751,67 +2292,73 @@ export class PostgresRepository implements DomainRepository {
       }
       const rows = await tx<
         Row[]
-      >`UPDATE users SET password_hash=NULL,updated_at=now() WHERE id=${userId} RETURNING *`;
+      >`UPDATE users SET password_hash=NULL,authority_epoch=authority_epoch+1,updated_at=now()
+        WHERE id=${userId} RETURNING *`;
       await tx`UPDATE sessions SET invalidated_at=now() WHERE user_id=${userId} AND invalidated_at IS NULL`;
       await tx`DELETE FROM auth_sessions WHERE user_id=${userId}`;
       await tx`UPDATE api_tokens SET revoked_at=now() WHERE user_id=${userId} AND revoked_at IS NULL`;
       await tx`UPDATE identity_tokens SET consumed_at=now() WHERE user_id=${userId} AND consumed_at IS NULL`;
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${userId},'identity.password_reset_completed','user',${userId},'{}'::jsonb)`;
       return user(rows[0]);
     });
   }
-  async prepareBetterAuthPasswordReset(token: string) {
-    await this.#sql.begin(async (tx) => {
-      const verifications = await tx<{ value: string }[]>`
+  async resetBetterAuthPassword(token: string, passwordHash: string) {
+    return await this.#sql.begin(async (tx) => {
+      const identifier = `reset-password:${token}`;
+      // Subject discovery is deliberately non-locking. Every authority-changing transaction
+      // takes the durable user lock first, followed by the verification lock.
+      const candidates = await tx<{ value: string }[]>`
         SELECT value FROM auth_verifications
-        WHERE identifier=${`reset-password:${token}`} AND expires_at>now()
+        WHERE identifier=${identifier} AND expires_at>now()
+      `;
+      if (!candidates[0]) {
+        throw new DomainError("invalid_identity_token", "Reset token is invalid or expired", 400);
+      }
+      const userId = candidates[0].value;
+      const users = await tx<Row[]>`SELECT * FROM users WHERE id=${userId} FOR UPDATE`;
+      if (
+        !users[0] || users[0].state !== "active" || users[0].deleted_at !== null ||
+        users[0].approval_status === "rejected" ||
+        users[0].password_reset_pending === true
+      ) {
+        throw new DomainError("invalid_identity_token", "Reset token is invalid or expired", 400);
+      }
+      const authorityEpoch = number(users[0].authority_epoch);
+      const verifications = await tx<Row[]>`
+        SELECT id FROM auth_verifications
+        WHERE identifier=${identifier} AND value=${userId}
+          AND authority_epoch=${authorityEpoch} AND expires_at>now()
         FOR UPDATE
       `;
       if (!verifications[0]) {
         throw new DomainError("invalid_identity_token", "Reset token is invalid or expired", 400);
       }
-      const userId = verifications[0].value;
-      const users = await tx<Row[]>`SELECT * FROM users WHERE id=${userId} FOR UPDATE`;
-      if (!users[0] || users[0].state !== "active" || users[0].deleted_at !== null) {
-        throw new DomainError("account_unavailable", "Account is unavailable", 403);
+      const credentials = await tx`
+        UPDATE auth_accounts SET password=${passwordHash},updated_at=now()
+        WHERE provider_id='credential' AND account_id=${userId} AND user_id=${userId}
+        RETURNING id
+      `;
+      if (!credentials.length) {
+        throw new DomainError("credential_not_found", "Local credential is unavailable", 409);
       }
-      const identifier = `reset-password:${token}`;
-      if (
-        users[0].password_reset_pending === true &&
-        users[0].password_reset_token_identifier !== identifier
-      ) {
-        await tx`DELETE FROM auth_verifications
-          WHERE identifier=${String(users[0].password_reset_token_identifier)}`;
-      }
-      // Fail closed before Better Auth changes the credential. If any later
-      // reset step fails, authorization remains denied and all old authority
-      // stays revoked. The same unconsumed token may retry safely.
-      await tx`UPDATE users SET password_reset_pending=true,
-        password_reset_token_identifier=${identifier},password_hash=NULL,updated_at=now()
-        WHERE id=${userId}`;
+      const rows = await tx<Row[]>`
+        UPDATE users SET password_hash=NULL,authority_epoch=authority_epoch+1,
+          password_reset_pending=false,password_reset_token_identifier=NULL,updated_at=now()
+        WHERE id=${userId} RETURNING *
+      `;
       await tx`UPDATE sessions SET invalidated_at=now()
         WHERE user_id=${userId} AND invalidated_at IS NULL`;
       await tx`DELETE FROM auth_sessions WHERE user_id=${userId}`;
-      await tx`UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,now()) WHERE user_id=${userId}`;
-      await tx`UPDATE identity_tokens SET consumed_at=COALESCE(consumed_at,now()) WHERE user_id=${userId}`;
-    });
-  }
-  async secureAfterPasswordReset(userId: string, token: string) {
-    await this.#sql.begin(async (tx) => {
-      const users = await tx`UPDATE users SET password_hash=NULL,
-        password_reset_pending=false,password_reset_token_identifier=NULL,
-        updated_at=now()
-        WHERE id=${userId} AND password_reset_pending=true
-          AND state='active' AND deleted_at IS NULL
-          AND password_reset_token_identifier=${`reset-password:${token}`} RETURNING id`;
-      if (!users.length) {
-        throw new DomainError("password_reset_guard_mismatch", "Password reset guard changed", 409);
-      }
-      await tx`UPDATE sessions SET invalidated_at=now()
-        WHERE user_id=${userId} AND invalidated_at IS NULL`;
-      await tx`DELETE FROM auth_sessions WHERE user_id=${userId}`;
-      await tx`UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,now()) WHERE user_id=${userId}`;
+      await tx`UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,now())
+        WHERE user_id=${userId}`;
       await tx`UPDATE identity_tokens SET consumed_at=COALESCE(consumed_at,now())
         WHERE user_id=${userId}`;
+      await tx`DELETE FROM auth_verifications
+        WHERE value=${userId} AND identifier LIKE 'reset-password:%'`;
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${userId},'identity.password_reset_completed','user',${userId},'{}'::jsonb)`;
+      return user(rows[0]);
     });
   }
   async recordAudit(input: AuditEventInput): Promise<AuditEvent> {
@@ -1891,16 +2438,21 @@ export class PostgresRepository implements DomainRepository {
   }
 
   async decideUserApproval(input: AdminApprovalCommand): Promise<AdminUser> {
-    const reason = validateAdminCommand(input, input.status === "rejected");
+    const reason = validateAdminCommand(input, input.status === "rejected", true);
     if (
       !Number.isSafeInteger(input.startingCreditMicros) || input.startingCreditMicros < 0 ||
       input.startingCreditMicros > 1_000_000_000
     ) throw new DomainError("validation_error", "Starting credit is invalid", 422);
     return await this.#sql.begin(async (tx) => {
       await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-final-admin'))`;
-      await assertEffectiveAdminActor(tx, input.actorId);
-      const rows = await tx<Row[]>`SELECT * FROM users WHERE id=${input.targetUserId} FOR UPDATE`;
-      const row = rows[0];
+      const rows = await lockUsersAndAssertEffectiveAdminActor(
+        tx,
+        input.actorId,
+        [input.targetUserId],
+        input.requireEmailVerification,
+        input.expectedAuthorityEpoch,
+      );
+      const row = rows.find((candidate) => String(candidate.id) === input.targetUserId);
       if (!row) throw new DomainError("not_found", "User not found", 404);
       if (number(row.version) !== input.expectedVersion) {
         throw new DomainError(
@@ -1919,12 +2471,15 @@ export class PostgresRepository implements DomainRepository {
         throw new DomainError("email_not_verified", "Email must be verified before approval", 409);
       }
       const remainsEffective = row.role === "admin" && input.status === "approved" &&
-        row.state === "active" && row.deleted_at == null;
-      if (isEffectiveAdminRow(row) && !remainsEffective) {
+        row.state === "active" && row.deleted_at == null && row.password_reset_pending === false &&
+        (!input.requireEmailVerification || row.email_verified_at != null);
+      if (isEffectiveAdminRow(row, input.requireEmailVerification) && !remainsEffective) {
         const others = await tx<{ count: number }[]>`
           SELECT count(*)::int count FROM users WHERE id<>${input.targetUserId}
             AND role='admin' AND approval_status='approved' AND state='active'
-            AND deleted_at IS NULL`;
+            AND deleted_at IS NULL AND password_reset_pending=false AND (${
+          input.requireEmailVerification === true
+        }=false OR email_verified_at IS NOT NULL)`;
         if (others[0].count === 0) {
           throw new DomainError("final_admin", "The final active administrator is protected", 409);
         }
@@ -1966,12 +2521,17 @@ export class PostgresRepository implements DomainRepository {
   }
 
   async setAdminUserRole(input: AdminRoleCommand): Promise<AdminUser> {
-    const reason = validateAdminCommand(input, true);
+    const reason = validateAdminCommand(input, true, true);
     return await this.#sql.begin(async (tx) => {
       await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-final-admin'))`;
-      await assertEffectiveAdminActor(tx, input.actorId);
-      const rows = await tx<Row[]>`SELECT * FROM users WHERE id=${input.targetUserId} FOR UPDATE`;
-      const row = rows[0];
+      const rows = await lockUsersAndAssertEffectiveAdminActor(
+        tx,
+        input.actorId,
+        [input.targetUserId],
+        input.requireEmailVerification,
+        input.expectedAuthorityEpoch,
+      );
+      const row = rows.find((candidate) => String(candidate.id) === input.targetUserId);
       if (!row) throw new DomainError("not_found", "User not found", 404);
       if (number(row.version) !== input.expectedVersion) {
         throw new DomainError(
@@ -1988,7 +2548,8 @@ export class PostgresRepository implements DomainRepository {
       }
       if (
         input.role === "admin" &&
-        (row.approval_status !== "approved" || row.state !== "active" || row.deleted_at != null)
+        (row.approval_status !== "approved" || row.state !== "active" ||
+          row.deleted_at != null || row.password_reset_pending !== false)
       ) {
         throw new DomainError(
           "invalid_transition",
@@ -1996,13 +2557,19 @@ export class PostgresRepository implements DomainRepository {
           409,
         );
       }
+      if (input.role === "admin" && input.requireEmailVerification && !row.email_verified_at) {
+        throw new DomainError("email_not_verified", "Email must be verified before promotion", 409);
+      }
       const remainsEffective = input.role === "admin" && row.approval_status === "approved" &&
-        row.state === "active" && row.deleted_at == null;
-      if (isEffectiveAdminRow(row) && !remainsEffective) {
+        row.state === "active" && row.deleted_at == null && row.password_reset_pending === false &&
+        (!input.requireEmailVerification || row.email_verified_at != null);
+      if (isEffectiveAdminRow(row, input.requireEmailVerification) && !remainsEffective) {
         const others = await tx<{ count: number }[]>`
           SELECT count(*)::int count FROM users WHERE id<>${input.targetUserId}
             AND role='admin' AND approval_status='approved' AND state='active'
-            AND deleted_at IS NULL`;
+            AND deleted_at IS NULL AND password_reset_pending=false AND (${
+          input.requireEmailVerification === true
+        }=false OR email_verified_at IS NOT NULL)`;
         if (others[0].count === 0) {
           throw new DomainError("final_admin", "The final active administrator is protected", 409);
         }
@@ -2010,6 +2577,9 @@ export class PostgresRepository implements DomainRepository {
       const before = adminMutationBefore(row);
       const updated = await tx<Row[]>`UPDATE users SET role=${input.role},version=version+1,
         updated_at=now() WHERE id=${input.targetUserId} RETURNING *`;
+      // Promotion and demotion both invalidate the privilege represented by every full
+      // credential. An old user session must never become an administrator session in place.
+      await invalidateFullUserAuthority(tx, input.targetUserId);
       const result = updated[0];
       await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
         VALUES(${input.actorId},${`user.role.${input.role}`},'user',${input.targetUserId},
@@ -2019,12 +2589,17 @@ export class PostgresRepository implements DomainRepository {
   }
 
   async setAdminUserState(input: AdminStateCommand): Promise<AdminUser> {
-    const reason = validateAdminCommand(input, input.state === "suspended");
+    const reason = validateAdminCommand(input, input.state === "suspended", true);
     return await this.#sql.begin(async (tx) => {
       await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-final-admin'))`;
-      await assertEffectiveAdminActor(tx, input.actorId);
-      const rows = await tx<Row[]>`SELECT * FROM users WHERE id=${input.targetUserId} FOR UPDATE`;
-      const row = rows[0];
+      const rows = await lockUsersAndAssertEffectiveAdminActor(
+        tx,
+        input.actorId,
+        [input.targetUserId],
+        input.requireEmailVerification,
+        input.expectedAuthorityEpoch,
+      );
+      const row = rows.find((candidate) => String(candidate.id) === input.targetUserId);
       if (!row) throw new DomainError("not_found", "User not found", 404);
       if (number(row.version) !== input.expectedVersion) {
         throw new DomainError(
@@ -2040,12 +2615,16 @@ export class PostgresRepository implements DomainRepository {
         throw new DomainError("self_action_forbidden", "You cannot suspend your own account", 403);
       }
       const remainsEffective = row.role === "admin" && row.approval_status === "approved" &&
-        input.state === "active" && row.deleted_at == null;
-      if (isEffectiveAdminRow(row) && !remainsEffective) {
+        input.state === "active" && row.deleted_at == null &&
+        row.password_reset_pending === false &&
+        (!input.requireEmailVerification || row.email_verified_at != null);
+      if (isEffectiveAdminRow(row, input.requireEmailVerification) && !remainsEffective) {
         const others = await tx<{ count: number }[]>`
           SELECT count(*)::int count FROM users WHERE id<>${input.targetUserId}
             AND role='admin' AND approval_status='approved' AND state='active'
-            AND deleted_at IS NULL`;
+            AND deleted_at IS NULL AND password_reset_pending=false AND (${
+          input.requireEmailVerification === true
+        }=false OR email_verified_at IS NOT NULL)`;
         if (others[0].count === 0) {
           throw new DomainError("final_admin", "The final active administrator is protected", 409);
         }
@@ -2065,12 +2644,17 @@ export class PostgresRepository implements DomainRepository {
   }
 
   async setAdminUserDeleted(input: AdminDeletionCommand): Promise<AdminUser> {
-    const reason = validateAdminCommand(input, true);
+    const reason = validateAdminCommand(input, true, true);
     return await this.#sql.begin(async (tx) => {
       await tx`SELECT pg_advisory_xact_lock(hashtext('dg-chat-final-admin'))`;
-      await assertEffectiveAdminActor(tx, input.actorId);
-      const rows = await tx<Row[]>`SELECT * FROM users WHERE id=${input.targetUserId} FOR UPDATE`;
-      const row = rows[0];
+      const rows = await lockUsersAndAssertEffectiveAdminActor(
+        tx,
+        input.actorId,
+        [input.targetUserId],
+        input.requireEmailVerification,
+        input.expectedAuthorityEpoch,
+      );
+      const row = rows.find((candidate) => String(candidate.id) === input.targetUserId);
       if (!row) throw new DomainError("not_found", "User not found", 404);
       if (number(row.version) !== input.expectedVersion) {
         throw new DomainError(
@@ -2086,12 +2670,15 @@ export class PostgresRepository implements DomainRepository {
         throw new DomainError("self_action_forbidden", "You cannot delete your own account", 403);
       }
       const remainsEffective = row.role === "admin" && row.approval_status === "approved" &&
-        row.state === "active" && !input.deleted;
-      if (isEffectiveAdminRow(row) && !remainsEffective) {
+        row.state === "active" && !input.deleted && row.password_reset_pending === false &&
+        (!input.requireEmailVerification || row.email_verified_at != null);
+      if (isEffectiveAdminRow(row, input.requireEmailVerification) && !remainsEffective) {
         const others = await tx<{ count: number }[]>`
           SELECT count(*)::int count FROM users WHERE id<>${input.targetUserId}
             AND role='admin' AND approval_status='approved' AND state='active'
-            AND deleted_at IS NULL`;
+            AND deleted_at IS NULL AND password_reset_pending=false AND (${
+          input.requireEmailVerification === true
+        }=false OR email_verified_at IS NOT NULL)`;
         if (others[0].count === 0) {
           throw new DomainError("final_admin", "The final active administrator is protected", 409);
         }
@@ -2240,6 +2827,207 @@ export class PostgresRepository implements DomainRepository {
       >`SELECT * FROM conversations WHERE owner_id=${ownerId} AND deleted_at IS NULL ORDER BY updated_at DESC`;
     return rows.map(conversation);
   }
+  async searchConversations(
+    ownerId: string,
+    query: ConversationSearchQuery,
+    signal?: AbortSignal,
+  ): Promise<ConversationSearchPage> {
+    signal?.throwIfAborted();
+    const deadlineAt = performance.now() + CONVERSATION_SEARCH_STATEMENT_TIMEOUT_MS;
+    const limit = query.limit ?? 25;
+    const needle = query.query.trim();
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new DomainError("validation_error", "Search limit must be between 1 and 100", 422);
+    }
+    const tagIds = query.tagIds ?? [];
+    if (
+      !validConversationSearchTerm(query.query) ||
+      !["chat", "archived", "trash"].includes(query.view) ||
+      (query.folderId !== undefined && !validConversationSearchScopeId(query.folderId)) ||
+      tagIds.length > 20 || new Set(tagIds).size !== tagIds.length ||
+      tagIds.some((id) => !validConversationSearchScopeId(id))
+    ) {
+      if (!validConversationSearchTerm(query.query)) {
+        throw new DomainError(
+          "validation_error",
+          CONVERSATION_SEARCH_QUERY_VALIDATION_MESSAGE,
+          422,
+        );
+      }
+      throw new DomainError("validation_error", "Invalid conversation search", 422);
+    }
+    if (query.folderId) {
+      const folder = await awaitConversationSearchQuery(
+        this.#conversationSearchSql<Row[]>`/* dg-chat:conversation-search:folder-scope */
+          SELECT 1 FROM conversation_folders
+          WHERE id=${query.folderId} AND owner_id=${ownerId}`,
+        deadlineAt,
+        signal,
+      );
+      if (!folder[0]) {
+        throw new DomainError(
+          "validation_error",
+          query.cursor ? "Invalid conversation search cursor" : "Invalid conversation search scope",
+          422,
+        );
+      }
+    }
+    if (tagIds.length) {
+      const tags = await awaitConversationSearchQuery(
+        this.#conversationSearchSql<Row[]>`/* dg-chat:conversation-search:tag-scope */
+          SELECT count(*)::integer AS count FROM conversation_tags
+          WHERE owner_id=${ownerId} AND id=ANY(${
+          this.#conversationSearchSql.array(tagIds)
+        }::uuid[])`,
+        deadlineAt,
+        signal,
+      );
+      if (Number(tags[0]?.count) !== tagIds.length) {
+        throw new DomainError(
+          "validation_error",
+          query.cursor ? "Invalid conversation search cursor" : "Invalid conversation search scope",
+          422,
+        );
+      }
+    }
+    const cursor = query.cursor
+      ? decodeConversationSearchCursor(query.cursor, query, ownerId)
+      : undefined;
+    if (query.cursor && !cursor) {
+      throw new DomainError("validation_error", "Invalid conversation search cursor", 422);
+    }
+    const cursorTimestamp = cursor?.updatedAt ?? null;
+    const cursorId = cursor?.id ?? null;
+    const literalPattern = `%${
+      needle.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_")
+    }%`;
+    const rows = await awaitConversationSearchQuery(
+      this.#conversationSearchSql<Row[]>`/* dg-chat:conversation-search:results */
+      WITH RECURSIVE eligible_base AS (
+        SELECT c.* FROM conversations c
+        WHERE c.owner_id=${ownerId}
+          AND (
+            (${query.view}::text='chat' AND c.deleted_at IS NULL AND c.archived_at IS NULL) OR
+            (${query.view}::text='archived' AND c.deleted_at IS NULL AND c.archived_at IS NOT NULL) OR
+            (${query.view}::text='trash' AND c.deleted_at IS NOT NULL)
+          )
+          AND (${query.folderId ?? null}::uuid IS NULL OR EXISTS(
+            SELECT 1 FROM conversation_folder_memberships folder_scope
+            WHERE folder_scope.owner_id=${ownerId} AND folder_scope.folder_id=${
+        query.folderId ?? null
+      }::uuid AND folder_scope.conversation_id=c.id
+          ))
+          AND (${tagIds.length}=0 OR (
+            SELECT count(*) FROM conversation_tag_bindings tag_scope
+            WHERE tag_scope.owner_id=${ownerId} AND tag_scope.conversation_id=c.id
+              AND tag_scope.tag_id=ANY(${this.#conversationSearchSql.array(tagIds)}::uuid[])
+          )=${tagIds.length})
+      ), matching_titles AS (
+        SELECT c.id
+        FROM conversations c JOIN eligible_base scoped ON scoped.id=c.id
+        WHERE lower(c.title) LIKE lower(${literalPattern}) ESCAPE chr(92)
+      ), searchable_messages AS (
+        SELECT m.id,m.conversation_id,
+          CASE WHEN m.role='user' AND jsonb_typeof(m.metadata->'authoredContent')='string'
+            THEN m.metadata->>'authoredContent' ELSE m.content END AS search_content
+        FROM eligible_base c JOIN messages m ON m.conversation_id=c.id
+        WHERE m.role IN ('user','assistant') AND m.status<>'tombstoned'
+      ), matching_messages AS (
+        SELECT id,conversation_id,
+          substring(search_content FROM greatest(
+            1,strpos(lower(search_content),lower(${needle}))-256
+          ) FOR 1024) AS search_content
+        FROM searchable_messages
+        WHERE lower(search_content) LIKE lower(${literalPattern}) ESCAPE chr(92)
+      ), message_candidate_conversations AS (
+        SELECT DISTINCT conversation_id FROM matching_messages
+      ), active_path AS (
+        SELECT m.id,m.conversation_id,m.parent_id,m.role,m.created_at,
+          ARRAY[m.id]::uuid[] AS visited_ids
+        FROM eligible_base c
+        JOIN message_candidate_conversations candidate ON candidate.conversation_id=c.id
+        JOIN messages m ON m.id=c.active_leaf_id AND m.conversation_id=c.id
+        UNION ALL
+        SELECT parent.id,parent.conversation_id,parent.parent_id,parent.role,parent.created_at,
+          child.visited_ids || parent.id
+        FROM active_path child JOIN messages parent
+          ON parent.id=child.parent_id AND parent.conversation_id=child.conversation_id
+        WHERE NOT parent.id=ANY(child.visited_ids)
+      ), message_matches AS (
+        SELECT DISTINCT ON (path.conversation_id)
+          path.conversation_id,path.id,path.role,candidate.search_content
+        FROM active_path path JOIN matching_messages candidate ON candidate.id=path.id
+        ORDER BY path.conversation_id,path.created_at DESC,path.id DESC
+      ), all_matches AS (
+        SELECT c.*,matched.id AS search_message_id,matched.role AS search_message_role,
+          matched.search_content AS search_message_content,
+          (title_match.id IS NOT NULL) AS search_title_match,
+          to_char(c.updated_at AT TIME ZONE 'UTC',
+            'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS search_cursor_updated_at
+        FROM eligible_base c
+        LEFT JOIN matching_titles title_match ON title_match.id=c.id
+        LEFT JOIN message_matches matched ON matched.conversation_id=c.id
+        WHERE title_match.id IS NOT NULL OR matched.id IS NOT NULL
+      ), cursor_guard AS (
+        SELECT ${cursorTimestamp}::text::timestamptz IS NULL OR EXISTS(
+          SELECT 1 FROM all_matches cursor_match
+          WHERE cursor_match.id=${cursorId}::uuid
+            AND cursor_match.updated_at=${cursorTimestamp}::text::timestamptz
+        ) AS valid
+      ), page AS (
+        SELECT * FROM all_matches candidate
+        WHERE ${cursorTimestamp}::text::timestamptz IS NULL OR
+          -- Cast through text so postgres.js does not coerce the ISO cursor through a
+          -- millisecond-precision JavaScript Date before PostgreSQL compares it.
+          (candidate.updated_at,candidate.id)<(
+            ${cursorTimestamp}::text::timestamptz,${cursorId}::uuid
+          )
+        ORDER BY candidate.updated_at DESC,candidate.id DESC
+        LIMIT ${limit + 1}
+      )
+      -- RIGHT JOIN deliberately emits one null page row when the page is empty. That lets the
+      -- repository distinguish an ordinary final page from an invalid/stale state-bound cursor
+      -- without a second statement or a race between cursor validation and the search snapshot.
+      SELECT page.*,cursor_guard.valid AS search_cursor_valid
+      FROM page RIGHT JOIN cursor_guard ON cursor_guard.valid
+      ORDER BY page.updated_at DESC,page.id DESC NULLS LAST`,
+      deadlineAt,
+      signal,
+    );
+    signal?.throwIfAborted();
+    if (rows[0]?.search_cursor_valid !== true) {
+      throw new DomainError("validation_error", "Invalid conversation search cursor", 422);
+    }
+    const resultRows = rows.filter((row) => row.id != null);
+    const hasMore = resultRows.length > limit;
+    const data: ConversationSearchResult[] = resultRows.slice(0, limit).map((row) => {
+      const titleMatch = Boolean(row.search_title_match);
+      const base = conversation(row);
+      return {
+        ...base,
+        snippet: conversationSearchSnippet(
+          titleMatch ? base.title : String(row.search_message_content),
+          needle,
+        ),
+        matchSource: titleMatch ? "title" : "message",
+        messageId: titleMatch ? null : String(row.search_message_id),
+        messageRole: titleMatch ? null : row.search_message_role as "user" | "assistant",
+      };
+    });
+    return {
+      data,
+      nextCursor: hasMore
+        ? encodeConversationSearchCursor(
+          {
+            updatedAt: String(resultRows[limit - 1].search_cursor_updated_at),
+            id: String(resultRows[limit - 1].id),
+          },
+          query,
+          ownerId,
+        )
+        : null,
+    };
+  }
   async updateConversation(ownerId: string, id: string, patch: ConversationPatch) {
     return await this.#sql.begin(async (tx) => {
       if (patch.deleted === true) {
@@ -2301,6 +3089,24 @@ export class PostgresRepository implements DomainRepository {
       rows = await this.#sql<Row[]>`SELECT * FROM user_preferences WHERE user_id=${ownerId}`;
     }
     return preferences(rows[0]);
+  }
+  async getCommunityProfile(ownerId: string): Promise<CommunityProfile> {
+    let rows = await this.#sql<Row[]>`SELECT * FROM community_profiles WHERE user_id=${ownerId}`;
+    if (!rows[0]) {
+      const inserted = await this.#sql<Row[]>`
+        INSERT INTO community_profiles(user_id)
+        SELECT id FROM users WHERE id=${ownerId}
+        ON CONFLICT(user_id) DO NOTHING
+        RETURNING *
+      `;
+      if (!inserted[0]) {
+        rows = await this.#sql<Row[]>`SELECT * FROM community_profiles WHERE user_id=${ownerId}`;
+        if (!rows[0]) throw new DomainError("not_found", "User not found", 404);
+      } else {
+        rows = inserted;
+      }
+    }
+    return communityProfile(rows[0]);
   }
   async exportConversationPortability(
     ownerId: string,
@@ -2557,11 +3363,12 @@ export class PostgresRepository implements DomainRepository {
         const id = idMap[value.id];
         await tx`INSERT INTO attachments(
           id,owner_id,object_key,filename,mime_type,size_bytes,sha256,state,inspection_error,
-          ingestion_status,ingestion_error,width,height,created_at,updated_at,deleted_at
+          ingestion_status,ingestion_error,width,height,physical_object,
+          created_at,updated_at,deleted_at
         ) VALUES(${id},${ownerId},${`imports/${ownerId}/${id}/manifest-only`},${value.filename},
           ${value.mimeType},${value.byteSize},${value.sha256},'failed',
           'Attachment bytes were not included in the .dgchat manifest','failed',
-          'Attachment bytes require a separate restore',${value.width},${value.height},
+          'Attachment bytes require a separate restore',${value.width},${value.height},false,
           ${value.createdAt},${importedAt},${importedAt})`;
       }
       const foldersWithMemberships = new Set<string>();
@@ -2821,13 +3628,13 @@ export class PostgresRepository implements DomainRepository {
           422,
         );
       }
-      const attachmentRows = selected.length
-        ? await tx<Row[]>`SELECT * FROM attachments WHERE id=ANY(${selected}::uuid[])
-          AND owner_id=${ownerId} AND state='ready' AND deleted_at IS NULL`
-        : [];
-      if (attachmentRows.length !== selected.length) {
-        throw new DomainError("invalid_attachment", "Shared attachment is unavailable", 409);
-      }
+      const attachmentRows = await lockReferenceableAttachments(
+        tx,
+        ownerId,
+        selected,
+        "invalid_attachment",
+        "Shared attachment is unavailable",
+      );
       const attachmentById = new Map(attachmentRows.map((value) => [String(value.id), value]));
       const attachmentPublicIds = new Map(selected.map((id) => [id, crypto.randomUUID()]));
       const publicAttachments: PublicConversationShareAttachment[] = selected.map(
@@ -3028,6 +3835,179 @@ export class PostgresRepository implements DomainRepository {
     }
     return preferences(rows[0]);
   }
+  async updateCommunityProfile(
+    ownerId: string,
+    patch: CommunityProfilePatch,
+    context: CommunityProfileMutationContext,
+  ): Promise<CommunityProfile> {
+    if (!context || context.actorId !== ownerId) {
+      throw new DomainError("forbidden", "Community profile can only be changed by its owner", 403);
+    }
+    return await this.#sql.begin(async (tx) => {
+      const inserted = await tx<Row[]>`
+        INSERT INTO community_profiles(user_id)
+        SELECT id FROM users WHERE id=${ownerId}
+        ON CONFLICT(user_id) DO NOTHING
+        RETURNING *
+      `;
+      let rows = inserted;
+      if (!rows[0]) {
+        rows = await tx<Row[]>`
+          SELECT * FROM community_profiles WHERE user_id=${ownerId} FOR UPDATE
+        `;
+      }
+      if (!rows[0]) throw new DomainError("not_found", "User not found", 404);
+      const current = communityProfile(rows[0]);
+      if (current.version !== patch.expectedVersion) {
+        throw new DomainError(
+          "version_conflict",
+          "Community profile changed in another request",
+          409,
+        );
+      }
+      const canonical = applyCommunityProfilePatch(current, patch);
+      const changedFields = (
+        ["optedIn", "identityMode", "nickname", "color", "shareBalance"] as const
+      ).filter((field) => current[field] !== canonical[field]);
+      const updated = await tx<Row[]>`
+        UPDATE community_profiles SET
+          opted_in=${canonical.optedIn},
+          identity_mode=${canonical.identityMode},
+          nickname=${canonical.nickname},
+          color=${canonical.color},
+          share_balance=${canonical.shareBalance},
+          version=version+1,
+          updated_at=now()
+        WHERE user_id=${ownerId} AND version=${patch.expectedVersion}
+        RETURNING *
+      `;
+      if (!updated[0]) {
+        throw new DomainError(
+          "version_conflict",
+          "Community profile changed in another request",
+          409,
+        );
+      }
+      const next = communityProfile(updated[0]);
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(
+          ${ownerId},
+          'community.profile_updated',
+          'community_profile',
+          ${ownerId},
+          ${
+        tx.json({
+          changedFields,
+          optedIn: next.optedIn,
+          identityMode: next.identityMode,
+          color: next.color,
+          shareBalance: next.shareBalance,
+          nicknameChanged: current.nickname !== next.nickname,
+          version: next.version,
+        })
+      }
+        )`;
+      return next;
+    });
+  }
+
+  async listCommunityLeaderboard(
+    input: CommunityLeaderboardReadQuery,
+  ): Promise<CommunityLeaderboardRepositoryPage> {
+    const query = validateCommunityLeaderboardReadQuery(input);
+    const afterScore = query.after?.score ?? 0;
+    const afterUserId = query.after?.userId ?? "00000000-0000-0000-0000-000000000000";
+    const hasAfter = query.after !== undefined;
+    const rows = await this.#sql<Row[]>`
+      WITH aggregated AS (
+        SELECT
+          users.id AS user_id,
+          profiles.identity_mode,
+          profiles.nickname,
+          profiles.color,
+          GREATEST(0, LEAST(
+            CASE ${query.metric}
+              WHEN 'balance' THEN users.balance_micros::numeric
+              WHEN 'calls' THEN count(runs.id)::numeric
+              WHEN 'tokens' THEN COALESCE(
+                sum(runs.input_tokens::numeric + runs.output_tokens::numeric),
+                0
+              )
+              ELSE COALESCE(sum(runs.cost_micros::numeric), 0)
+            END,
+            ${Number.MAX_SAFE_INTEGER}::numeric
+          ))::bigint AS value
+        FROM community_profiles profiles
+        JOIN users ON users.id=profiles.user_id
+        LEFT JOIN usage_runs runs ON
+          ${query.metric !== "balance"}
+          AND runs.user_id=users.id
+          AND (runs.status='completed' OR runs.cost_micros>0)
+          AND (
+            ${query.from === null}
+            OR COALESCE(runs.completed_at,runs.created_at)>=${query.from}::timestamptz
+          )
+          AND COALESCE(runs.completed_at,runs.created_at)<${query.asOf}::timestamptz
+        WHERE profiles.opted_in=true
+          AND users.approval_status='approved'
+          AND users.state='active'
+          AND users.deleted_at IS NULL
+          AND (${query.metric !== "balance"} OR profiles.share_balance=true)
+        GROUP BY
+          users.id,
+          users.balance_micros,
+          profiles.identity_mode,
+          profiles.nickname,
+          profiles.color
+      ),
+      ranked AS (
+        SELECT
+          user_id,
+          identity_mode,
+          nickname,
+          color,
+          value,
+          dense_rank() OVER (ORDER BY value DESC)::bigint AS position
+        FROM aggregated
+      )
+      SELECT user_id,identity_mode,nickname,color,value,position
+      FROM ranked
+      WHERE (
+        ${!hasAfter}
+        OR value<${afterScore}::bigint
+        OR (value=${afterScore}::bigint AND user_id>${afterUserId}::uuid)
+      )
+      ORDER BY value DESC,user_id ASC
+      LIMIT ${query.limit + 1}
+    `;
+    const selected = rows.slice(0, query.limit);
+    const data = selected.map((row) => ({
+      userId: String(row.user_id),
+      position: number(row.position),
+      identityMode: String(row.identity_mode) as "anonymous" | "nickname",
+      nickname: row.identity_mode === "nickname" && row.nickname != null
+        ? String(row.nickname)
+        : null,
+      color: String(row.color) as
+        | "slate"
+        | "blue"
+        | "cyan"
+        | "emerald"
+        | "amber"
+        | "orange"
+        | "rose"
+        | "violet",
+      value: number(row.value),
+    }));
+    const last = data.at(-1);
+    return {
+      data,
+      nextBoundary: rows.length > query.limit && last
+        ? { score: last.value, userId: last.userId, position: last.position }
+        : null,
+    };
+  }
+
   async listConversationFolders(ownerId: string) {
     const [folders, memberships] = await Promise.all([
       this.#sql<
@@ -3603,17 +4583,13 @@ export class PostgresRepository implements DomainRepository {
           );
         }
       }
-      for (const attachmentId of attachmentIds) {
-        const ready = await tx`
-          SELECT id FROM attachments
-          WHERE id=${attachmentId} AND owner_id=${input.message.ownerId}
-            AND state='ready' AND deleted_at IS NULL
-          FOR UPDATE
-        `;
-        if (!ready.length) {
-          throw new DomainError("attachment_not_ready", "Attachment is not ready", 409);
-        }
-      }
+      await lockReferenceableAttachments(
+        tx,
+        input.message.ownerId,
+        attachmentIds,
+        "attachment_not_ready",
+        "Attachment is not ready",
+      );
       const account = await tx<
         Row[]
       >`SELECT balance_micros FROM users WHERE id=${input.message.ownerId} FOR UPDATE`;
@@ -3637,9 +4613,11 @@ export class PostgresRepository implements DomainRepository {
       const pricing = input.pricingSnapshot;
       const runs = await tx<
         Row[]
-      >`INSERT INTO usage_runs(id,user_id,token_id,model,provider,status,reserved_micros,pricing_version_id,pricing_input_micros_per_million,pricing_cached_input_micros_per_million,pricing_reasoning_micros_per_million,pricing_output_micros_per_million,pricing_fixed_call_micros,pricing_source,generation_lease_token,generation_lease_expires_at) VALUES(${input.runId},${input.message.ownerId},${
+      >`INSERT INTO usage_runs(id,user_id,token_id,model,provider,recovery_owner,status,reserved_micros,pricing_version_id,pricing_input_micros_per_million,pricing_cached_input_micros_per_million,pricing_reasoning_micros_per_million,pricing_output_micros_per_million,pricing_fixed_call_micros,pricing_source,generation_lease_token,generation_lease_expires_at) VALUES(${input.runId},${input.message.ownerId},${
         input.tokenId ?? null
-      },${input.message.model ?? "unknown"},${input.provider},'reserved',${input.reserveMicros},${
+      },${
+        input.message.model ?? "unknown"
+      },${input.provider},'provider','reserved',${input.reserveMicros},${
         pricing?.pricingVersionId ?? null
       },${pricing?.inputMicrosPerMillion ?? null},${pricing?.cachedInputMicrosPerMillion ?? null},${
         pricing?.reasoningMicrosPerMillion ?? null
@@ -3784,11 +4762,11 @@ export class PostgresRepository implements DomainRepository {
       const pricing = input.pricingSnapshot;
       const runs = await tx<
         Row[]
-      >`INSERT INTO usage_runs(id,user_id,model,provider,status,reserved_micros,
+      >`INSERT INTO usage_runs(id,user_id,model,provider,recovery_owner,status,reserved_micros,
         pricing_version_id,pricing_input_micros_per_million,pricing_cached_input_micros_per_million,
         pricing_reasoning_micros_per_million,pricing_output_micros_per_million,
         pricing_fixed_call_micros,pricing_source,generation_lease_token,generation_lease_expires_at)
-        VALUES(${input.runId},${input.ownerId},${input.model},${input.provider},'reserved',${input.reserveMicros},${
+        VALUES(${input.runId},${input.ownerId},${input.model},${input.provider},'provider','reserved',${input.reserveMicros},${
         pricing?.pricingVersionId ?? null
       },${pricing?.inputMicrosPerMillion ?? null},${pricing?.cachedInputMicrosPerMillion ?? null},${
         pricing?.reasoningMicrosPerMillion ?? null
@@ -4167,33 +5145,251 @@ export class PostgresRepository implements DomainRepository {
     });
   }
 
-  async createAttachment(input: CreateAttachmentInput): Promise<CreateAttachmentResult> {
+  async createAttachment(
+    input: CreateAttachmentInput,
+    quota?: AttachmentStorageQuota,
+  ): Promise<CreateAttachmentResult> {
     validateAttachmentInput(input);
-    return await this.#sql.begin(async (tx) => {
-      const owner = await tx`SELECT id FROM users WHERE id=${input.ownerId} FOR UPDATE`;
-      if (!owner.length) throw new DomainError("not_found", "User not found", 404);
+    validateAttachmentStorageQuota(quota);
+    return await this.#sql.begin((tx) => this.#createAttachment(tx, input, quota));
+  }
+
+  async #createAttachment(
+    tx: postgres.TransactionSql,
+    input: CreateAttachmentInput,
+    quota?: AttachmentStorageQuota,
+  ): Promise<CreateAttachmentResult> {
+    const requiredInspectionMode = input.requiredInspectionMode ?? "local";
+    const inspectionPolicyVersion = input.inspectionPolicyVersion ??
+      ATTACHMENT_INSPECTION_POLICY_VERSION;
+    await tx`SELECT pg_advisory_xact_lock(hashtextextended(${`attachment-dedup:${input.ownerId}:${input.sha256}`},0))`;
+    await tx`SELECT pg_advisory_xact_lock(hashtextextended(${input.objectKey},0))`;
+    const stagedObject = await tx`SELECT id FROM attachment_upload_staging
+        WHERE object_key=${input.objectKey} LIMIT 1`;
+    if (stagedObject.length) {
+      throw new DomainError(
+        "upload_stage_conflict",
+        "Attachment object is controlled by a browser upload stage",
+        409,
+      );
+    }
+    const owner = await tx`SELECT id FROM users WHERE id=${input.ownerId} FOR UPDATE`;
+    if (!owner.length) throw new DomainError("not_found", "User not found", 404);
+    const existing = await tx<
+      Row[]
+    >`SELECT * FROM attachments WHERE owner_id=${input.ownerId} AND sha256=${input.sha256}
+        AND required_inspection_mode=${requiredInspectionMode}
+        AND inspection_policy_version=${inspectionPolicyVersion}
+        AND deleted_at IS NULL ORDER BY created_at,id LIMIT 1 FOR UPDATE`;
+    let record = existing[0];
+    const deduplicated = Boolean(record);
+    if (record) {
+      if (
+        number(record.size_bytes) !== input.sizeBytes ||
+        String(record.mime_type) !== input.mimeType
+      ) {
+        throw new DomainError(
+          "attachment_hash_conflict",
+          "Attachment digest metadata differs",
+          409,
+        );
+      }
+    } else {
+      const objectConflict = await tx`
+          SELECT id FROM attachments WHERE object_key=${input.objectKey} LIMIT 1`;
+      if (objectConflict.length) {
+        throw new DomainError("object_key_taken", "Attachment object key already exists", 409);
+      }
+      await admitAttachmentStorage(tx, input, quota);
       const inserted = await tx<
         Row[]
-      >`INSERT INTO attachments(owner_id,object_key,filename,mime_type,size_bytes,sha256,state,inspection_error,ingestion_status) VALUES(${input.ownerId},${input.objectKey},${input.filename},${input.mimeType},${input.sizeBytes},${input.sha256},${
-        input.state ?? "pending"
-      },${input.inspectionError ?? null},${
+      >`INSERT INTO attachments(owner_id,object_key,filename,mime_type,size_bytes,sha256,state,
+          inspection_error,required_inspection_mode,inspection_policy_version,ingestion_status)
+          VALUES(${input.ownerId},${input.objectKey},${input.filename},${input.mimeType},
+          ${input.sizeBytes},${input.sha256},${input.state ?? "pending"},${
+        input.inspectionError ?? null
+      },${requiredInspectionMode},${inspectionPolicyVersion},${
         input.state === "ready" && isIngestibleDocumentMime(input.mimeType)
           ? "queued"
           : "not_applicable"
-      }) ON CONFLICT DO NOTHING RETURNING *`;
-      let record = inserted[0];
-      const deduplicated = !record;
-      if (!record) {
-        const existing = await tx<
-          Row[]
-        >`SELECT * FROM attachments WHERE owner_id=${input.ownerId} AND sha256=${input.sha256} AND deleted_at IS NULL FOR UPDATE`;
-        record = existing[0];
-        if (!record) {
-          throw new DomainError("object_key_taken", "Attachment object key already exists", 409);
-        }
+      }) RETURNING *`;
+      record = inserted[0];
+    }
+    const attachmentId = String(record.id);
+    const inspectionEpoch = number(record.inspection_epoch ?? 1);
+    const idempotencyKey = `attachment.inspect:${attachmentId}:${inspectionEpoch}`;
+    const jobs = input.inspectionComplete ? [] : await tx<
+      Row[]
+    >`INSERT INTO jobs(type,payload,idempotency_key) VALUES('attachment.inspect',${
+      tx.json({
+        attachmentId,
+        ownerId: input.ownerId,
+        inspectionEpoch,
+        requiredInspectionMode: String(record.required_inspection_mode),
+        inspectionPolicyVersion: String(record.inspection_policy_version),
+      })
+    },${idempotencyKey}) ON CONFLICT(idempotency_key) DO UPDATE SET idempotency_key=EXCLUDED.idempotency_key RETURNING id`;
+    if (String(record.ingestion_status) === "queued") {
+      await tx`INSERT INTO jobs(type,payload,idempotency_key) VALUES('attachment.ingest',${
+        tx.json({ attachmentId, ownerId: input.ownerId })
+      },${`attachment.ingest:${attachmentId}`}) ON CONFLICT(idempotency_key) DO NOTHING`;
+    }
+    return {
+      attachment: attachment(record),
+      inspectionJobId: jobs[0] ? String(jobs[0].id) : null,
+      deduplicated,
+    };
+  }
+
+  async createAttachmentFromGeneratedObjectStage(
+    id: string,
+    ownerId: string,
+    input: CreateAttachmentInput,
+    quota?: AttachmentStorageQuota,
+  ): Promise<CreateAttachmentResult> {
+    validateAttachmentInput(input);
+    validateAttachmentStorageQuota(quota);
+    return await this.#sql.begin(async (tx) => {
+      const stages = await tx<Row[]>`SELECT * FROM generated_object_staging
+        WHERE id=${id} AND owner_id=${ownerId} FOR UPDATE`;
+      const stage = stages[0];
+      if (!stage) throw new DomainError("not_found", "Generated object stage not found", 404);
+      if (
+        String(stage.state) !== "stored" || input.ownerId !== ownerId ||
+        String(stage.object_key) !== input.objectKey ||
+        number(stage.size_bytes) !== input.sizeBytes ||
+        String(stage.sha256) !== input.sha256 ||
+        String(stage.mime_type) !== input.mimeType
+      ) {
+        throw new DomainError("generated_stage_conflict", "Generated object stage changed", 409);
+      }
+      const created = await this.#createAttachment(tx, input, quota);
+      const referenceable = await tx`SELECT id FROM attachments
+        WHERE id=${created.attachment.id} AND owner_id=${ownerId}
+          AND state='ready' AND deleted_at IS NULL AND physical_object FOR UPDATE`;
+      if (!referenceable.length) {
+        throw new DomainError(
+          "generated_stage_conflict",
+          "Generated object attachment is not ready",
+          409,
+        );
+      }
+      const attached = await tx`UPDATE generated_object_staging SET state='attached',
+        attachment_id=${created.attachment.id},
+        cleanup_attachment=${created.attachment.objectKey === String(stage.object_key)},
+        updated_at=now() WHERE id=${id} AND owner_id=${ownerId} AND state='stored'
+        RETURNING id`;
+      if (!attached.length) {
+        throw new DomainError("generated_stage_conflict", "Generated object stage changed", 409);
+      }
+      return created;
+    });
+  }
+
+  async stageAttachmentUpload(input: StageAttachmentUploadInput, leaseSeconds: number) {
+    validateAttachmentInput({
+      ownerId: input.ownerId,
+      objectKey: input.objectKey,
+      filename: input.filename,
+      mimeType: input.mimeType,
+      sizeBytes: input.sizeBytes,
+      sha256: input.sha256,
+    });
+    if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1 || leaseSeconds > 86_400) {
+      throw new DomainError("validation_error", "Attachment upload lease is invalid", 422);
+    }
+    const rows = await this.#sql<Row[]>`
+      INSERT INTO attachment_upload_staging(
+        id,owner_id,object_key,filename,mime_type,size_bytes,sha256,upload_lease_expires_at
+      ) VALUES(${input.id},${input.ownerId},${input.objectKey},${input.filename},
+        ${input.mimeType},${input.sizeBytes},${input.sha256},
+        now()+${leaseSeconds}*interval '1 second')
+      ON CONFLICT(id) DO UPDATE SET id=EXCLUDED.id RETURNING *`;
+    const stage = attachmentUploadStage(rows[0]);
+    if (
+      stage.ownerId !== input.ownerId || stage.objectKey !== input.objectKey ||
+      stage.filename !== input.filename || stage.mimeType !== input.mimeType ||
+      stage.sizeBytes !== input.sizeBytes || stage.sha256 !== input.sha256
+    ) throw new DomainError("idempotency_conflict", "Attachment upload stage differs", 409);
+    return stage;
+  }
+
+  async markAttachmentUploadStored(
+    id: string,
+    ownerId: string,
+    uploadLeaseToken: string,
+    leaseSeconds: number,
+  ) {
+    if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1 || leaseSeconds > 86_400) {
+      throw new DomainError("validation_error", "Attachment upload lease is invalid", 422);
+    }
+    const rows = await this.#sql<Row[]>`UPDATE attachment_upload_staging
+      SET state='stored',upload_lease_expires_at=now()+${leaseSeconds}*interval '1 second',
+        updated_at=now() WHERE id=${id} AND owner_id=${ownerId}
+        AND upload_lease_token=${uploadLeaseToken} AND upload_lease_expires_at>now()
+        AND state IN('pending','stored') RETURNING *`;
+    if (!rows[0]) {
+      throw new DomainError("upload_stage_conflict", "Attachment upload stage changed", 409);
+    }
+    return attachmentUploadStage(rows[0]);
+  }
+
+  async heartbeatAttachmentUpload(
+    id: string,
+    ownerId: string,
+    uploadLeaseToken: string,
+    leaseSeconds: number,
+  ) {
+    if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1 || leaseSeconds > 86_400) {
+      throw new DomainError("validation_error", "Attachment upload lease is invalid", 422);
+    }
+    const rows = await this.#sql<Row[]>`UPDATE attachment_upload_staging
+      SET upload_lease_expires_at=now()+${leaseSeconds}*interval '1 second',updated_at=now()
+      WHERE id=${id} AND owner_id=${ownerId} AND upload_lease_token=${uploadLeaseToken}
+        AND upload_lease_expires_at>now() AND state IN('pending','stored') RETURNING *`;
+    if (!rows[0]) {
+      throw new DomainError("upload_stage_conflict", "Attachment upload stage changed", 409);
+    }
+    return attachmentUploadStage(rows[0]);
+  }
+
+  async createAttachmentFromUploadStage(
+    id: string,
+    ownerId: string,
+    uploadLeaseToken: string,
+    input: CreateAttachmentInput,
+    quota?: AttachmentStorageQuota,
+  ) {
+    validateAttachmentInput(input);
+    validateAttachmentStorageQuota(quota);
+    if (input.ownerId !== ownerId) {
+      throw new DomainError("upload_stage_conflict", "Attachment upload owner differs", 409);
+    }
+    const requiredInspectionMode = input.requiredInspectionMode ?? "local";
+    const inspectionPolicyVersion = input.inspectionPolicyVersion ??
+      ATTACHMENT_INSPECTION_POLICY_VERSION;
+    return await this.#sql.begin(async (tx) => {
+      const stages = await tx<Row[]>`SELECT * FROM attachment_upload_staging
+        WHERE id=${id} AND owner_id=${ownerId} AND upload_lease_token=${uploadLeaseToken}
+          AND upload_lease_expires_at>now() FOR UPDATE`;
+      const stage = stages[0] ? attachmentUploadStage(stages[0]) : undefined;
+      if (
+        !stage || stage.state !== "stored" || stage.objectKey !== input.objectKey ||
+        stage.filename !== input.filename || stage.mimeType !== input.mimeType ||
+        stage.sizeBytes !== input.sizeBytes || stage.sha256 !== input.sha256
+      ) throw new DomainError("upload_stage_conflict", "Attachment upload stage differs", 409);
+      await tx`SELECT pg_advisory_xact_lock(hashtextextended(${`attachment-dedup:${ownerId}:${input.sha256}`},0))`;
+      await tx`SELECT pg_advisory_xact_lock(hashtextextended(${input.objectKey},0))`;
+      const existing = await tx<Row[]>`SELECT * FROM attachments
+        WHERE owner_id=${ownerId} AND sha256=${input.sha256}
+          AND required_inspection_mode=${requiredInspectionMode}
+          AND inspection_policy_version=${inspectionPolicyVersion}
+          AND deleted_at IS NULL
+        ORDER BY created_at,id LIMIT 1 FOR UPDATE`;
+      if (existing[0]) {
         if (
-          number(record.size_bytes) !== input.sizeBytes ||
-          String(record.mime_type) !== input.mimeType
+          number(existing[0].size_bytes) !== input.sizeBytes ||
+          String(existing[0].mime_type) !== input.mimeType
         ) {
           throw new DomainError(
             "attachment_hash_conflict",
@@ -4201,24 +5397,318 @@ export class PostgresRepository implements DomainRepository {
             409,
           );
         }
+        await tx`UPDATE attachment_upload_staging SET state='cleanup_pending',
+          cleanup_error='deduplicated browser upload',updated_at=now() WHERE id=${id}`;
+        await tx`INSERT INTO jobs(type,payload,idempotency_key,status,attempts,available_at)
+          VALUES('attachment_object.cleanup',${tx.json({ stageId: id, ownerId })},
+            ${`attachment_object.cleanup:${id}`},'queued',0,${stages[0]
+          .upload_lease_expires_at as Date})
+          ON CONFLICT(idempotency_key) DO NOTHING`;
+        return {
+          attachment: attachment(existing[0]),
+          inspectionJobId: null,
+          deduplicated: true,
+        };
       }
+      const conflict = await tx`SELECT 1 FROM attachments WHERE object_key=${input.objectKey}
+        LIMIT 1`;
+      if (conflict.length) {
+        throw new DomainError("object_key_taken", "Attachment object key already exists", 409);
+      }
+      await admitAttachmentStorage(tx, input, quota);
+      const inserted = await tx<Row[]>`INSERT INTO attachments(
+        owner_id,object_key,filename,mime_type,size_bytes,sha256,state,inspection_error,
+        required_inspection_mode,inspection_policy_version,ingestion_status
+      ) VALUES(${ownerId},${input.objectKey},${input.filename},${input.mimeType},
+        ${input.sizeBytes},${input.sha256},${input.state ?? "pending"},
+        ${input.inspectionError ?? null},${requiredInspectionMode},${inspectionPolicyVersion},${
+        input.state === "ready" && isIngestibleDocumentMime(input.mimeType)
+          ? "queued"
+          : "not_applicable"
+      }) RETURNING *`;
+      const record = inserted[0];
       const attachmentId = String(record.id);
-      const idempotencyKey = `attachment.inspect:${attachmentId}`;
-      const jobs = input.inspectionComplete ? [] : await tx<
-        Row[]
-      >`INSERT INTO jobs(type,payload,idempotency_key) VALUES('attachment.inspect',${
-        tx.json({ attachmentId, ownerId: input.ownerId })
-      },${idempotencyKey}) ON CONFLICT(idempotency_key) DO UPDATE SET idempotency_key=EXCLUDED.idempotency_key RETURNING id`;
-      if (String(record.ingestion_status) === "queued") {
-        await tx`INSERT INTO jobs(type,payload,idempotency_key) VALUES('attachment.ingest',${
-          tx.json({ attachmentId, ownerId: input.ownerId })
-        },${`attachment.ingest:${attachmentId}`}) ON CONFLICT(idempotency_key) DO NOTHING`;
+      const inspectionEpoch = number(record.inspection_epoch ?? 1);
+      let inspectionJobId: string | null = null;
+      if (!input.inspectionComplete) {
+        const jobs = await tx<Row[]>`INSERT INTO jobs(type,payload,idempotency_key)
+          VALUES('attachment.inspect',${
+          tx.json({
+            attachmentId,
+            ownerId,
+            inspectionEpoch,
+            requiredInspectionMode: String(record.required_inspection_mode),
+            inspectionPolicyVersion: String(record.inspection_policy_version),
+          })
+        },${`attachment.inspect:${attachmentId}:${inspectionEpoch}`}) RETURNING id`;
+        inspectionJobId = String(jobs[0].id);
       }
-      return {
-        attachment: attachment(record),
-        inspectionJobId: jobs[0] ? String(jobs[0].id) : null,
-        deduplicated,
-      };
+      if (String(record.ingestion_status) === "queued") {
+        await tx`INSERT INTO jobs(type,payload,idempotency_key)
+          VALUES('attachment.ingest',${tx.json({ attachmentId, ownerId })},
+            ${`attachment.ingest:${attachmentId}`}) ON CONFLICT(idempotency_key) DO NOTHING`;
+      }
+      await tx`UPDATE attachment_upload_staging SET state='finalized',
+        attachment_id=${attachmentId},cleanup_error=NULL,upload_lease_expires_at=now(),
+        updated_at=now() WHERE id=${id}`;
+      return { attachment: attachment(record), inspectionJobId, deduplicated: false };
+    });
+  }
+
+  async requestAttachmentUploadCleanup(
+    id: string,
+    ownerId: string,
+    uploadLeaseToken: string,
+    reason: string,
+  ) {
+    return await this.#sql.begin(async (tx) => {
+      const rows = await tx<Row[]>`UPDATE attachment_upload_staging
+        SET state='cleanup_pending',cleanup_error=${reason.slice(0, 1000)},updated_at=now()
+        WHERE id=${id} AND owner_id=${ownerId} AND upload_lease_token=${uploadLeaseToken}
+          AND state IN('pending','stored','cleanup_pending','cleaning','cleaned') RETURNING *`;
+      if (!rows[0]) {
+        throw new DomainError("upload_stage_conflict", "Attachment upload stage changed", 409);
+      }
+      await tx`INSERT INTO jobs(type,payload,idempotency_key,status,attempts,available_at)
+        VALUES('attachment_object.cleanup',${tx.json({ stageId: id, ownerId })},
+          ${`attachment_object.cleanup:${id}`},'queued',0,${rows[0]
+        .upload_lease_expires_at as Date})
+        ON CONFLICT(idempotency_key) DO UPDATE SET status='queued',
+          attempts=0,
+          available_at=EXCLUDED.available_at,
+          last_error=NULL,locked_at=NULL,locked_by=NULL,completed_at=NULL
+        WHERE jobs.status IN('completed','failed')`;
+      return attachmentUploadStage(rows[0]);
+    });
+  }
+
+  async abandonAttachmentUpload(id: string, ownerId: string, reason: string) {
+    const rows = await this.#sql<Row[]>`UPDATE attachment_upload_staging
+      SET state='abandoned',cleanup_error=${reason.slice(0, 1000)},updated_at=now()
+      WHERE id=${id} AND owner_id=${ownerId} AND state IN('pending','abandoned')
+      RETURNING *`;
+    if (!rows[0]) {
+      throw new DomainError("upload_stage_conflict", "Attachment upload stage changed", 409);
+    }
+    return attachmentUploadStage(rows[0]);
+  }
+
+  async stageFileUpload(input: StageFileUploadInput) {
+    if (input.purpose !== "assistants") {
+      throw new DomainError("unsupported_purpose", "File purpose is not supported", 422);
+    }
+    validateAttachmentInput({
+      ownerId: input.ownerId,
+      objectKey: input.objectKey,
+      filename: input.filename,
+      mimeType: input.mimeType,
+      sizeBytes: input.sizeBytes,
+      sha256: input.sha256,
+      state: input.attachmentState,
+      inspectionError: input.inspectionError,
+    });
+    if (!isCanonicalFileUploadObjectKey(input.ownerId, input.sha256, input.objectKey)) {
+      throw new DomainError("validation_error", "File upload object key is invalid", 422);
+    }
+    return await this.#sql.begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtextextended(${input.objectKey},0))`;
+      const requests = await tx<Row[]>`
+        SELECT * FROM api_idempotency_requests WHERE id=${input.requestId} FOR UPDATE`;
+      if (
+        !requests[0] || String(requests[0].endpoint) !== "files" ||
+        String(requests[0].user_id) !== input.ownerId
+      ) throw new DomainError("idempotency_conflict", "File upload stage owner differs", 409);
+      const rows = await tx<Row[]>`
+        INSERT INTO file_upload_staging(request_id,owner_id,object_key,filename,mime_type,
+          size_bytes,sha256,purpose,attachment_state,inspection_error,
+          required_inspection_mode,inspection_policy_version)
+        VALUES(${input.requestId},${input.ownerId},${input.objectKey},${input.filename},
+          ${input.mimeType},${input.sizeBytes},${input.sha256},${input.purpose},
+          ${input.attachmentState},${input.inspectionError},${input.requiredInspectionMode},
+          ${input.inspectionPolicyVersion})
+        ON CONFLICT(request_id) DO UPDATE SET request_id=EXCLUDED.request_id RETURNING *`;
+      const stage = fileUploadStage(rows[0]);
+      if (
+        stage.ownerId !== input.ownerId || stage.objectKey !== input.objectKey ||
+        stage.filename !== input.filename || stage.mimeType !== input.mimeType ||
+        stage.sizeBytes !== input.sizeBytes || stage.sha256 !== input.sha256 ||
+        stage.purpose !== input.purpose || stage.attachmentState !== input.attachmentState ||
+        stage.inspectionError !== input.inspectionError ||
+        stage.requiredInspectionMode !== input.requiredInspectionMode ||
+        stage.inspectionPolicyVersion !== input.inspectionPolicyVersion
+      ) throw new DomainError("idempotency_conflict", "File upload stage differs", 409);
+      return stage;
+    });
+  }
+  async markFileUploadStored(requestId: string, leaseToken: string) {
+    const rows = await this.#sql<Row[]>`
+      UPDATE file_upload_staging s SET state='stored',updated_at=now()
+      FROM api_idempotency_requests r WHERE s.request_id=${requestId}
+        AND r.id=s.request_id AND r.state='in_progress' AND r.lease_token=${leaseToken}
+        AND r.lease_expires_at>now() AND s.state IN ('pending','stored') RETURNING s.*`;
+    if (!rows[0]) throw new DomainError("stale_lease", "File upload lease is stale", 409);
+    return fileUploadStage(rows[0]);
+  }
+  async listStaleFileUploads(limit = 100) {
+    const rows = await this.#sql<Row[]>`
+      SELECT s.*,row_to_json(r.*) request FROM file_upload_staging s
+        JOIN api_idempotency_requests r
+        ON r.id=s.request_id WHERE s.state<>'finalized' AND r.state='in_progress'
+        AND r.lease_expires_at<=now() ORDER BY r.lease_expires_at LIMIT ${limit}`;
+    return rows.map((row) => ({
+      stage: fileUploadStage(row),
+      request: apiRequest(row.request as Row),
+    }));
+  }
+  async attachmentObjectReferenceCount(objectKey: string) {
+    const rows = await this.#sql<{ count: number }[]>`
+      SELECT count(*)::int count FROM attachments
+      WHERE object_key=${objectKey} AND deleted_at IS NULL`;
+    return rows[0]?.count ?? 0;
+  }
+
+  async finalizeFileUpload(
+    input: FinalizeFileUploadInput,
+    quota?: AttachmentStorageQuota,
+  ): Promise<FinalizeFileUploadResult> {
+    validateAttachmentInput(input.attachment);
+    validateAttachmentStorageQuota(quota);
+    if (
+      input.request.responseStatus !== 201 || input.request.costMicros !== 0 ||
+      input.request.inputTokens !== 0 || input.request.outputTokens !== 0
+    ) throw new DomainError("validation_error", "File completion accounting is invalid", 422);
+    return await this.#sql.begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(hashtextextended(${input.attachment.objectKey},0))`;
+      const requests = await tx<Row[]>`
+        SELECT *,lease_expires_at>now() AS lease_active
+        FROM api_idempotency_requests WHERE id=${input.request.id} FOR UPDATE`;
+      const request = requests[0];
+      if (!request) throw new DomainError("not_found", "Idempotent request not found", 404);
+      if (
+        String(request.user_id) !== input.attachment.ownerId ||
+        String(request.endpoint) !== "files" || String(request.model) !== "files/upload"
+      ) throw new DomainError("idempotency_conflict", "File completion owner differs", 409);
+      if (String(request.state) === "completed") {
+        let attachmentId: string | undefined;
+        try {
+          const parsed = JSON.parse(String(request.response_body ?? "{}"));
+          if (typeof parsed.id === "string") attachmentId = parsed.id;
+        } catch {
+          // Converted to a categorical corruption error below.
+        }
+        const prior = attachmentId
+          ? await tx<Row[]>`SELECT * FROM attachments WHERE id=${attachmentId}
+            AND owner_id=${input.attachment.ownerId}`
+          : [];
+        if (!prior[0]) {
+          throw new DomainError("idempotency_corrupt", "Stored file replay is invalid", 500);
+        }
+        return {
+          attachment: attachment(prior[0]),
+          request: apiRequest(request),
+        };
+      }
+      if (
+        String(request.state) !== "in_progress" ||
+        String(request.lease_token) !== input.request.leaseToken ||
+        request.lease_active !== true
+      ) throw new DomainError("stale_lease", "Idempotent request lease is no longer active", 409);
+      const owners = await tx`
+        SELECT id FROM users WHERE id=${input.attachment.ownerId} FOR UPDATE`;
+      if (!owners.length) throw new DomainError("not_found", "User not found", 404);
+      const stages = await tx<Row[]>`
+        SELECT * FROM file_upload_staging WHERE request_id=${input.request.id} FOR UPDATE`;
+      const stage = stages[0] ? fileUploadStage(stages[0]) : undefined;
+      if (
+        !stage || stage.state !== "stored" ||
+        stage.ownerId !== input.attachment.ownerId ||
+        stage.objectKey !== input.attachment.objectKey ||
+        stage.filename !== input.attachment.filename ||
+        stage.mimeType !== input.attachment.mimeType ||
+        stage.sizeBytes !== input.attachment.sizeBytes ||
+        stage.sha256 !== input.attachment.sha256 ||
+        stage.attachmentState !== (input.attachment.state ?? "pending") ||
+        stage.inspectionError !== (input.attachment.inspectionError ?? null) ||
+        stage.requiredInspectionMode !== (input.attachment.requiredInspectionMode ?? "local") ||
+        stage.inspectionPolicyVersion !==
+          (input.attachment.inspectionPolicyVersion ?? ATTACHMENT_INSPECTION_POLICY_VERSION)
+      ) throw new DomainError("file_upload_stage_conflict", "File upload stage differs", 409);
+      const peers = await tx<Row[]>`
+        SELECT * FROM attachments WHERE object_key=${input.attachment.objectKey}
+          AND deleted_at IS NULL FOR UPDATE`;
+      if (
+        peers.some((peer) =>
+          String(peer.owner_id) !== input.attachment.ownerId ||
+          String(peer.sha256) !== input.attachment.sha256 ||
+          number(peer.size_bytes) !== input.attachment.sizeBytes ||
+          String(peer.mime_type) !== input.attachment.mimeType
+        )
+      ) throw new DomainError("object_key_taken", "Attachment object key already exists", 409);
+      await admitAttachmentStorage(tx, input.attachment, quota);
+      const requiredInspectionMode = input.attachment.requiredInspectionMode ?? "local";
+      const inspectionPolicyVersion = input.attachment.inspectionPolicyVersion ??
+        ATTACHMENT_INSPECTION_POLICY_VERSION;
+      const inserted = await tx<Row[]>`
+        INSERT INTO attachments(owner_id,object_key,filename,mime_type,size_bytes,sha256,state,
+          inspection_error,required_inspection_mode,inspection_policy_version,ingestion_status)
+        VALUES(${input.attachment.ownerId},${input.attachment.objectKey},
+          ${input.attachment.filename},${input.attachment.mimeType},
+          ${input.attachment.sizeBytes},${input.attachment.sha256},
+          ${input.attachment.state ?? "pending"},${input.attachment.inspectionError ?? null},
+          ${requiredInspectionMode},${inspectionPolicyVersion},${
+        input.attachment.state === "ready" &&
+          isIngestibleDocumentMime(input.attachment.mimeType)
+          ? "queued"
+          : "not_applicable"
+      }) RETURNING *`;
+      const record = inserted[0];
+      const attachmentId = String(record.id);
+      const inspectionEpoch = number(record.inspection_epoch ?? 1);
+      if (!input.attachment.inspectionComplete) {
+        await tx`INSERT INTO jobs(type,payload,idempotency_key)
+          VALUES('attachment.inspect',${
+          tx.json({
+            attachmentId,
+            ownerId: input.attachment.ownerId,
+            inspectionEpoch,
+            requiredInspectionMode: String(record.required_inspection_mode),
+            inspectionPolicyVersion: String(record.inspection_policy_version),
+          })
+        },${`attachment.inspect:${attachmentId}:${inspectionEpoch}`})`;
+      }
+      if (String(record.ingestion_status) === "queued") {
+        await tx`INSERT INTO jobs(type,payload,idempotency_key)
+          VALUES('attachment.ingest',${
+          tx.json({ attachmentId, ownerId: input.attachment.ownerId })
+        },${`attachment.ingest:${attachmentId}`})`;
+      }
+      const materialized = attachment(record);
+      const responseBody = input.responseBody(materialized);
+      const responseBytes = new TextEncoder().encode(responseBody).length;
+      const reservedBytes = number(request.replay_reserved_bytes ?? 0);
+      if (
+        responseBytes > API_SSE_REPLAY_REQUEST_MAX_BYTES ||
+        (reservedBytes > 0 && responseBytes > reservedBytes)
+      ) throw new DomainError("replay_quota_exceeded", "Reserved replay capacity exceeded", 429);
+      const runs = await tx<Row[]>`
+        SELECT * FROM usage_runs WHERE id=${String(request.usage_run_id)} FOR UPDATE`;
+      if (!runs[0] || String(runs[0].status) !== "reserved") {
+        throw new DomainError("invalid_usage_state", "Usage run is not reserved", 409);
+      }
+      await tx`UPDATE usage_runs SET status='completed',cost_micros=0,input_tokens=0,
+        output_tokens=0,latency_ms=${input.request.latencyMs},run_lease_token=NULL,
+        run_lease_expires_at=NULL,completed_at=now()
+        WHERE id=${String(request.usage_run_id)}`;
+      const updated = await tx<Row[]>`
+        UPDATE api_idempotency_requests SET state='completed',lease_token=NULL,
+          lease_expires_at=NULL,response_status=201,response_headers=${
+        tx.json((input.request.responseHeaders ?? {}) as postgres.JSONValue)
+      },response_body=${responseBody},response_body_encoding='utf8',completed_at=now(),
+          updated_at=now(),expires_at=now()+retention_seconds*interval '1 second'
+        WHERE id=${input.request.id} RETURNING *`;
+      await tx`UPDATE file_upload_staging SET state='finalized',attachment_id=${attachmentId},
+        updated_at=now() WHERE request_id=${input.request.id}`;
+      return { attachment: materialized, request: apiRequest(updated[0]) };
     });
   }
 
@@ -4231,6 +5721,68 @@ export class PostgresRepository implements DomainRepository {
         Row[]
       >`SELECT * FROM attachments WHERE owner_id=${ownerId} AND deleted_at IS NULL ORDER BY created_at DESC,id`;
     return rows.map(attachment);
+  }
+
+  async listAttachmentPage(
+    ownerId: string,
+    query: AttachmentListQuery,
+  ): Promise<AttachmentPage> {
+    if (!Number.isInteger(query.limit) || query.limit < 1 || query.limit > 10_000) {
+      throw new DomainError(
+        "invalid_file_limit",
+        "File list limit must be between 1 and 10000",
+        400,
+      );
+    }
+    if (query.order !== "asc" && query.order !== "desc") {
+      throw new DomainError("invalid_file_order", "File list order must be asc or desc", 400);
+    }
+
+    let cursor: { id: string; created_at: string } | undefined;
+    if (query.after !== undefined) {
+      const cursorRows = await this.#sql<{ id: string; created_at: string }[]>`
+        SELECT id,created_at::text AS created_at
+        FROM attachments
+        WHERE id=${query.after} AND owner_id=${ownerId}`;
+      cursor = cursorRows[0];
+      if (!cursor) {
+        throw new DomainError(
+          "invalid_file_cursor",
+          "The file list cursor is invalid for this owner",
+          400,
+        );
+      }
+    }
+
+    const fetchLimit = query.limit + 1;
+    let rows: Row[];
+    if (query.order === "asc") {
+      rows = query.after === undefined
+        ? await this.#sql<Row[]>`
+          SELECT * FROM attachments
+          WHERE owner_id=${ownerId} AND deleted_at IS NULL
+          ORDER BY created_at ASC,id ASC LIMIT ${fetchLimit}`
+        : await this.#sql<Row[]>`
+          SELECT * FROM attachments
+          WHERE owner_id=${ownerId} AND deleted_at IS NULL
+            AND (created_at,id)>(${cursor!.created_at}::text::timestamptz,${cursor!.id}::uuid)
+          ORDER BY created_at ASC,id ASC LIMIT ${fetchLimit}`;
+    } else {
+      rows = query.after === undefined
+        ? await this.#sql<Row[]>`
+          SELECT * FROM attachments
+          WHERE owner_id=${ownerId} AND deleted_at IS NULL
+          ORDER BY created_at DESC,id DESC LIMIT ${fetchLimit}`
+        : await this.#sql<Row[]>`
+          SELECT * FROM attachments
+          WHERE owner_id=${ownerId} AND deleted_at IS NULL
+            AND (created_at,id)<(${cursor!.created_at}::text::timestamptz,${cursor!.id}::uuid)
+          ORDER BY created_at DESC,id DESC LIMIT ${fetchLimit}`;
+    }
+    return {
+      data: rows.slice(0, query.limit).map(attachment),
+      hasMore: rows.length > query.limit,
+    };
   }
 
   async getAttachment(id: string, ownerId: string, includeDeleted = false) {
@@ -4246,7 +5798,10 @@ export class PostgresRepository implements DomainRepository {
   async deleteAttachment(id: string, ownerId: string) {
     const rows = await this.#sql<
       Row[]
-    >`UPDATE attachments SET state='deleted',deleted_at=COALESCE(deleted_at,now()),updated_at=now() WHERE id=${id} AND owner_id=${ownerId} RETURNING *`;
+    >`UPDATE attachments SET state='deleted',
+      version=CASE WHEN deleted_at IS NULL THEN version+1 ELSE version END,
+      deleted_at=COALESCE(deleted_at,now()),updated_at=now()
+      WHERE id=${id} AND owner_id=${ownerId} RETURNING *`;
     if (!rows[0]) throw new DomainError("not_found", "Attachment not found", 404);
     return attachment(rows[0]);
   }
@@ -4258,9 +5813,22 @@ export class PostgresRepository implements DomainRepository {
     nextState: AttachmentState,
     inspectionError: string | null = null,
   ) {
+    if (
+      expectedState === "inspecting" &&
+      ["ready", "quarantined", "failed"].includes(nextState)
+    ) {
+      return await this.transitionAttachmentInspection({
+        attachmentId: id,
+        ownerId,
+        inspectionEpoch: 1,
+        expectedState,
+        nextState: nextState as "ready" | "quarantined" | "failed",
+        inspectionError,
+      });
+    }
     const allowed: Record<AttachmentState, AttachmentState[]> = {
       pending: ["inspecting", "deleted"],
-      inspecting: ["ready", "quarantined", "failed", "deleted"],
+      inspecting: ["deleted"],
       ready: ["deleted"],
       quarantined: ["deleted"],
       failed: ["pending", "deleted"],
@@ -4277,12 +5845,14 @@ export class PostgresRepository implements DomainRepository {
       const rows = await tx<
         Row[]
       >`UPDATE attachments SET state=${nextState},inspection_error=${inspectionError},
+        version=version+1,
         ingestion_status=CASE WHEN ${nextState}='ready' AND mime_type = ANY(${[
         ...INGESTIBLE_DOCUMENT_MIME_TYPES,
       ]}) THEN 'queued' ELSE ingestion_status END,
         ingestion_error=CASE WHEN ${nextState}='ready' THEN NULL ELSE ingestion_error END,
         deleted_at=CASE WHEN ${nextState}='deleted' THEN COALESCE(deleted_at,now()) ELSE deleted_at END,
-        updated_at=now() WHERE id=${id} AND owner_id=${ownerId} AND state=${expectedState} RETURNING *`;
+        updated_at=now() WHERE id=${id} AND owner_id=${ownerId} AND state=${expectedState}
+        AND inspection_epoch=1 RETURNING *`;
       if (rows[0] && nextState === "ready" && isIngestibleDocumentMime(String(rows[0].mime_type))) {
         await tx`INSERT INTO jobs(type,payload,idempotency_key) VALUES('attachment.ingest',${
           tx.json({ attachmentId: id, ownerId })
@@ -4291,14 +5861,286 @@ export class PostgresRepository implements DomainRepository {
       if (rows[0]) return attachment(rows[0]);
       const exists = await tx`SELECT id FROM attachments WHERE id=${id} AND owner_id=${ownerId}`;
       if (!exists.length) throw new DomainError("not_found", "Attachment not found", 404);
+      const versioned = await tx`
+        SELECT id FROM attachments WHERE id=${id} AND owner_id=${ownerId}
+          AND inspection_epoch<>1`;
+      if (versioned.length) {
+        throw new DomainError(
+          "attachment_inspection_conflict",
+          "Versioned reinspection requires an epoch-bound transition",
+          409,
+        );
+      }
       throw new DomainError("attachment_state_conflict", "Attachment state changed", 409);
+    });
+  }
+
+  async requestAttachmentReinspection(
+    input: RequestAttachmentReinspectionInput,
+  ): Promise<AttachmentReinspectionResult> {
+    const reason = validateAdminCommand(input, true)!;
+    if (
+      !["local", "external"].includes(input.requiredInspectionMode) ||
+      input.inspectionPolicyVersion !== ATTACHMENT_INSPECTION_POLICY_VERSION
+    ) throw new DomainError("validation_error", "Reinspection request is invalid", 422);
+    return await this.#sql.begin(async (tx) => {
+      await assertEffectiveAdminActor(tx, input.actorId);
+      const rows = await tx<Row[]>`
+        SELECT * FROM attachments WHERE id=${input.attachmentId} FOR UPDATE`;
+      const prior = rows[0];
+      if (!prior) throw new DomainError("not_found", "Attachment not found", 404);
+      const eligibility = attachmentReinspectionEligibility(attachment(prior));
+      if (eligibility.blockedReason === "deleted") {
+        throw new DomainError(
+          "attachment_deleted",
+          "Deleted attachments cannot be reinspected",
+          409,
+        );
+      }
+      if (!eligibility.eligible) {
+        throw new DomainError(
+          "attachment_state_conflict",
+          eligibility.blockedReason === "policy_quarantine"
+            ? "This quarantine was issued by a non-retriable upload policy"
+            : "Only terminal attachments can be reinspected",
+          409,
+        );
+      }
+      if (number(prior.version) !== input.expectedVersion) {
+        throw new DomainError(
+          "version_conflict",
+          "Attachment was modified by another administrator",
+          409,
+        );
+      }
+      const updated = await tx<Row[]>`
+        UPDATE attachments SET state='pending',inspection_error=NULL,
+          inspection_epoch=inspection_epoch+1,
+          required_inspection_mode=${input.requiredInspectionMode},
+          inspection_policy_version=${input.inspectionPolicyVersion},
+          version=version+1,updated_at=now()
+        WHERE id=${input.attachmentId} RETURNING *`;
+      const record = updated[0];
+      const epoch = number(record.inspection_epoch);
+      const key = `attachment.inspect:${input.attachmentId}:${epoch}`;
+      const jobs = await tx<Row[]>`
+        INSERT INTO jobs(type,payload,idempotency_key)
+        VALUES('attachment.inspect',${
+        tx.json({
+          attachmentId: input.attachmentId,
+          ownerId: String(record.owner_id),
+          inspectionEpoch: epoch,
+          requiredInspectionMode: String(record.required_inspection_mode),
+          inspectionPolicyVersion: String(record.inspection_policy_version),
+        })
+      },${key})
+        ON CONFLICT(idempotency_key) DO UPDATE SET idempotency_key=EXCLUDED.idempotency_key
+        RETURNING id`;
+      const jobId = String(jobs[0].id);
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${input.actorId},'attachment.reinspection_requested','attachment',${input.attachmentId},${
+        tx.json({
+          ownerId: String(record.owner_id),
+          reason,
+          before: {
+            state: String(prior.state),
+            inspectionEpoch: number(prior.inspection_epoch),
+            requiredInspectionMode: String(prior.required_inspection_mode),
+            inspectionPolicyVersion: String(prior.inspection_policy_version),
+            version: number(prior.version),
+          },
+          after: {
+            state: "pending",
+            inspectionEpoch: epoch,
+            requiredInspectionMode: String(record.required_inspection_mode),
+            inspectionPolicyVersion: String(record.inspection_policy_version),
+            version: number(record.version),
+          },
+          inspectionJobId: jobId,
+        })
+      })`;
+      return { attachment: attachment(record), inspectionJobId: jobId };
+    });
+  }
+
+  async transitionAttachmentInspection(
+    input: TransitionAttachmentInspectionInput,
+  ): Promise<AttachmentRecord> {
+    const inspectionError = input.inspectionError?.trim() || null;
+    const requiresReason = ["quarantined", "failed"].includes(input.nextState);
+    if (
+      !Number.isSafeInteger(input.inspectionEpoch) || input.inspectionEpoch < 1 ||
+      (input.expectedState === "pending" && input.nextState !== "inspecting") ||
+      (input.expectedState === "inspecting" &&
+        !["ready", "quarantined", "failed"].includes(input.nextState)) ||
+      (requiresReason ? inspectionError === null : inspectionError !== null) ||
+      (inspectionError !== null && inspectionError.length > 1_000)
+    ) throw new DomainError("validation_error", "Attachment inspection transition is invalid", 422);
+    return await this.#sql.begin(async (tx) => {
+      const rows = await tx<Row[]>`
+        UPDATE attachments SET state=${input.nextState},
+          inspection_error=${inspectionError},version=version+1,
+          ingestion_status=CASE
+            WHEN ${input.nextState}='ready'
+              AND ingestion_status<>'ready'
+              AND mime_type=ANY(${[...INGESTIBLE_DOCUMENT_MIME_TYPES]})
+            THEN 'queued' ELSE ingestion_status END,
+          ingestion_error=CASE WHEN ${input.nextState}='ready' THEN NULL ELSE ingestion_error END,
+          updated_at=now()
+        WHERE id=${input.attachmentId} AND owner_id=${input.ownerId}
+          AND deleted_at IS NULL AND inspection_epoch=${input.inspectionEpoch}
+          AND state=${input.expectedState}
+        RETURNING *`;
+      if (!rows[0]) {
+        const exists = await tx`
+          SELECT id FROM attachments WHERE id=${input.attachmentId}
+            AND owner_id=${input.ownerId}`;
+        if (!exists.length) throw new DomainError("not_found", "Attachment not found", 404);
+        throw new DomainError(
+          "attachment_inspection_conflict",
+          "Attachment inspection epoch or state changed",
+          409,
+        );
+      }
+      if (
+        input.nextState === "ready" && String(rows[0].ingestion_status) === "queued"
+      ) {
+        await tx`INSERT INTO jobs(type,payload,idempotency_key)
+          VALUES('attachment.ingest',${
+          tx.json({ attachmentId: input.attachmentId, ownerId: input.ownerId })
+        },${`attachment.ingest:${input.attachmentId}`})
+          ON CONFLICT(idempotency_key) DO NOTHING`;
+      }
+      if (["ready", "quarantined", "failed"].includes(input.nextState)) {
+        await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+          VALUES(NULL,'attachment.inspection.completed','attachment',${input.attachmentId},${
+          tx.json({
+            ownerId: input.ownerId,
+            inspectionEpoch: input.inspectionEpoch,
+            outcome: input.nextState,
+            reason: inspectionError,
+          })
+        })`;
+      }
+      return attachment(rows[0]);
+    });
+  }
+
+  async attachmentStorageUsage(ownerId: string): Promise<AttachmentStorageUsage> {
+    const rows = await this.#sql<Row[]>`
+      SELECT physical_bytes,physical_objects FROM attachment_storage_usage
+      WHERE owner_id=${ownerId}`;
+    return {
+      ownerId,
+      physicalBytes: number(rows[0]?.physical_bytes ?? 0),
+      physicalObjects: number(rows[0]?.physical_objects ?? 0),
+    };
+  }
+
+  async adminStorageSummary(actorId: string): Promise<AdminStorageSummary> {
+    return await this.#sql.begin(async (tx) => {
+      await assertEffectiveAdminActor(tx, actorId);
+      const rows = await tx<Row[]>`
+        SELECT installation.physical_bytes,installation.physical_objects,
+          (SELECT count(*) FROM attachments) attachment_records,
+          (SELECT count(*) FROM attachments WHERE deleted_at IS NULL) active_records,
+          (SELECT count(*) FROM attachments WHERE deleted_at IS NOT NULL) deleted_records,
+          (SELECT count(*) FROM attachments
+            WHERE deleted_at IS NULL AND state='quarantined') quarantined_records,
+          (SELECT count(*) FROM attachment_storage_usage
+            WHERE physical_objects>0) owners_with_storage
+        FROM attachment_storage_installation installation WHERE singleton_id=1`;
+      const row = rows[0];
+      return {
+        physicalBytes: number(row.physical_bytes),
+        physicalObjects: number(row.physical_objects),
+        attachmentRecords: number(row.attachment_records),
+        activeRecords: number(row.active_records),
+        deletedRecords: number(row.deleted_records),
+        quarantinedRecords: number(row.quarantined_records),
+        ownersWithStorage: number(row.owners_with_storage),
+      };
+    });
+  }
+
+  async listAdminAttachments(
+    actorId: string,
+    query: AdminAttachmentQuery,
+  ): Promise<AdminAttachmentPage> {
+    const limit = query.limit ?? 50;
+    const deletion = query.deletion ?? "present";
+    if (
+      !Number.isSafeInteger(limit) || limit < 1 || limit > 200 ||
+      (query.ownerId !== undefined && !UUID_PATTERN.test(query.ownerId)) ||
+      !["present", "deleted", "all"].includes(deletion)
+    ) throw new DomainError("validation_error", "Attachment inventory query is invalid", 422);
+    const cursor = query.cursor ? decodeAdminAttachmentCursor(query.cursor, query) : undefined;
+    if (query.cursor && !cursor) {
+      throw new DomainError("invalid_cursor", "Attachment inventory cursor is invalid", 400);
+    }
+    const fetchLimit = limit + 1;
+    return await this.#sql.begin(async (tx) => {
+      await assertEffectiveAdminActor(tx, actorId);
+      const rows = await tx<Row[]>`
+        SELECT attachments.*,
+          to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+            AS created_at_cursor
+        FROM attachments
+        WHERE (${query.ownerId ?? null}::uuid IS NULL OR owner_id=${query.ownerId ?? null}::uuid)
+          AND (${query.state ?? null}::text IS NULL OR state=${query.state ?? null}::text)
+          AND (${deletion}='all'
+            OR (${deletion}='deleted' AND deleted_at IS NOT NULL)
+            OR (${deletion}='present' AND deleted_at IS NULL))
+          AND (${cursor?.createdAt ?? null}::timestamptz IS NULL
+            OR (created_at,id)<(
+              ${cursor?.createdAt ?? null}::timestamptz,
+              ${cursor?.id ?? null}::uuid
+            ))
+        ORDER BY created_at DESC,id DESC LIMIT ${fetchLimit}`;
+      const project = (row: Row): AdminAttachmentSummary => {
+        const item = attachment(row);
+        return {
+          id: item.id,
+          ownerId: item.ownerId,
+          filename: item.filename,
+          mimeType: item.mimeType,
+          sizeBytes: item.sizeBytes,
+          state: item.state,
+          inspectionError: item.inspectionError,
+          inspectionEpoch: item.inspectionEpoch,
+          version: item.version,
+          reinspectionEligible: attachmentReinspectionEligibility(item).eligible,
+          reinspectionBlockedReason: attachmentReinspectionEligibility(item).blockedReason,
+          createdAt: item.createdAt,
+          updatedAt: item.updatedAt,
+          deletedAt: item.deletedAt,
+        };
+      };
+      return {
+        data: rows.slice(0, limit).map(project),
+        nextCursor: rows.length > limit
+          ? encodeAdminAttachmentCursor(
+            String(rows[limit - 1].created_at_cursor),
+            String(rows[limit - 1].id),
+            query,
+          )
+          : null,
+      };
     });
   }
 
   async linkAttachmentToMessage(messageId: string, attachmentId: string, ownerId: string) {
     await this.#sql.begin(async (tx) => {
-      const ready = await tx`SELECT id FROM attachments WHERE id=${attachmentId}
-        AND owner_id=${ownerId} AND state='ready' AND deleted_at IS NULL FOR UPDATE`;
+      const ready = await lockReferenceableAttachments(
+        tx,
+        ownerId,
+        [attachmentId],
+        "attachment_not_ready",
+        "Message or ready attachment not found",
+      ).catch((error) => {
+        if (error instanceof DomainError && error.code === "attachment_not_ready") return [];
+        throw error;
+      });
       const message = await tx`SELECT m.id FROM messages m JOIN conversations c
         ON c.id=m.conversation_id WHERE m.id=${messageId} AND c.owner_id=${ownerId} FOR UPDATE OF m`;
       if (!ready.length || !message.length) {
@@ -4392,16 +6234,13 @@ export class PostgresRepository implements DomainRepository {
           ...(asset.inputs ?? []).map((source) => source.attachmentId),
         ])),
       ];
-      const ready = await tx<{ id: string; mime_type: string }[]>`
-        SELECT id,mime_type FROM attachments WHERE owner_id=${input.ownerId} AND id=ANY(${attachmentIds})
-          AND state='ready' AND deleted_at IS NULL FOR UPDATE`;
-      if (ready.length !== attachmentIds.length) {
-        throw new DomainError(
-          "attachment_not_ready",
-          "Generated asset attachment is not ready",
-          409,
-        );
-      }
+      const ready = await lockReferenceableAttachments(
+        tx,
+        input.ownerId,
+        attachmentIds,
+        "attachment_not_ready",
+        "Generated asset attachment is not ready",
+      );
       const mimeById = new Map(ready.map((attachment) => [
         String(attachment.id),
         String(attachment.mime_type).toLowerCase(),
@@ -4632,19 +6471,43 @@ export class PostgresRepository implements DomainRepository {
     attachmentId: string,
     cleanupAttachment = true,
   ) {
-    const rows = await this.#sql<Row[]>`UPDATE generated_object_staging s SET state='attached',
-      attachment_id=${attachmentId},cleanup_attachment=${cleanupAttachment},updated_at=now()
-      FROM attachments a
-      WHERE s.id=${id} AND s.owner_id=${ownerId} AND s.state IN ('stored','attached')
-        AND (s.attachment_id IS NULL OR s.attachment_id=${attachmentId})
-        AND (s.state='stored' OR s.cleanup_attachment=${cleanupAttachment})
-        AND a.id=${attachmentId} AND a.owner_id=${ownerId} AND a.state='ready'
-        AND a.deleted_at IS NULL RETURNING s.*`;
-    if (rows[0]) return generatedObjectStage(rows[0]);
-    const exists = await this.#sql`SELECT id FROM generated_object_staging
-      WHERE id=${id} AND owner_id=${ownerId}`;
-    if (!exists.length) throw new DomainError("not_found", "Generated object stage not found", 404);
-    throw new DomainError("generated_stage_conflict", "Generated object stage changed", 409);
+    return await this.#sql.begin(async (tx) => {
+      // Generated staging is itself a durable path to attachment bytes. Take the same row lock as
+      // every other reference writer before publishing that path. Cleanup takes this lock before
+      // tombstoning, so a concurrent attach either commits first and fences cleanup or wakes after
+      // the tombstone and fails without publishing a dangling attachment_id.
+      const [attachment] = await lockReferenceableAttachments(
+        tx,
+        ownerId,
+        [attachmentId],
+        "generated_stage_conflict",
+        "Generated object attachment is not ready",
+      );
+      if (attachment.physical_object !== true) {
+        throw new DomainError(
+          "generated_stage_conflict",
+          "Generated object attachment differs from the staged object",
+          409,
+        );
+      }
+      const rows = await tx<Row[]>`UPDATE generated_object_staging SET state='attached',
+        attachment_id=${attachmentId},cleanup_attachment=${cleanupAttachment},updated_at=now()
+        WHERE id=${id} AND owner_id=${ownerId} AND state IN ('stored','attached')
+          AND (attachment_id IS NULL OR attachment_id=${attachmentId})
+          AND (state='stored' OR cleanup_attachment=${cleanupAttachment})
+          AND (${!cleanupAttachment} OR object_key=${String(attachment.object_key)})
+          AND size_bytes=${number(attachment.size_bytes)}
+          AND sha256=${String(attachment.sha256)}
+          AND mime_type=${String(attachment.mime_type)}
+        RETURNING *`;
+      if (rows[0]) return generatedObjectStage(rows[0]);
+      const exists = await tx`SELECT id FROM generated_object_staging
+        WHERE id=${id} AND owner_id=${ownerId}`;
+      if (!exists.length) {
+        throw new DomainError("not_found", "Generated object stage not found", 404);
+      }
+      throw new DomainError("generated_stage_conflict", "Generated object stage changed", 409);
+    });
   }
 
   async requestGeneratedObjectCleanup(ownerId: string, usageRunId: string, reason: string) {
@@ -4657,12 +6520,49 @@ export class PostgresRepository implements DomainRepository {
         await tx`INSERT INTO jobs(type,payload,idempotency_key,status,attempts,available_at)
           VALUES('generated_object.cleanup',${tx.json({ stageId: String(row.id), ownerId })},
             ${`generated_object.cleanup:${String(row.id)}`},'queued',0,now())
-          ON CONFLICT(idempotency_key) DO UPDATE SET status='queued',available_at=now(),
+          ON CONFLICT(idempotency_key) DO UPDATE SET status='queued',attempts=0,available_at=now(),
             last_error=NULL,locked_at=NULL,locked_by=NULL,completed_at=NULL
             WHERE jobs.status IN ('completed','failed')`;
       }
       return rows.length;
     });
+  }
+
+  async settleGeneratedObjectCleanup(stageId: string, ownerId: string) {
+    try {
+      return await this.#sql.begin(async (tx) => {
+        const settled = await tx<{ storage_released: boolean }[]>`
+          SELECT dg_chat_settle_generated_object_cleanup(
+            ${stageId},${ownerId}
+          ) storage_released`;
+        const rows = await tx<Row[]>`SELECT * FROM generated_object_staging
+          WHERE id=${stageId} AND owner_id=${ownerId}`;
+        if (!rows[0]) throw new DomainError("not_found", "Generated object stage not found", 404);
+        return {
+          stage: generatedObjectStage(rows[0]),
+          storageReleased: Boolean(settled[0]?.storage_released),
+        };
+      });
+    } catch (error) {
+      if (error instanceof DomainError) throw error;
+      const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+      const message = error instanceof Error ? error.message : "";
+      if (
+        code === "55000" &&
+        (message.includes("requires the exact tombstoned attachment") ||
+          message.includes("fenced by a durable reference") ||
+          message.includes("release stage is invalid"))
+      ) {
+        throw new DomainError("generated_cleanup_fenced", message, 409);
+      }
+      if (
+        code === "55000" &&
+        (message.includes("storage") || message.includes("cleaned generated stage"))
+      ) {
+        throw new DomainError("generated_cleanup_invariant", message, 500);
+      }
+      throw error;
+    }
   }
 
   async beginAttachmentIngestion(id: string, ownerId: string) {
@@ -4799,6 +6699,20 @@ export class PostgresRepository implements DomainRepository {
           ${input.provider},${input.model},${input.upstreamModel},${input.itemCount})`;
     } catch (error) {
       if ((error as { code?: string }).code === "23505") {
+        const rows = await this.#sql<Row[]>`SELECT * FROM embedding_provider_attempts
+          WHERE usage_run_id=${input.usageRunId}`;
+        const existing = rows[0];
+        if (
+          existing && String(existing.status) === "running" &&
+          (existing.parent_usage_run_id === null
+              ? undefined
+              : String(existing.parent_usage_run_id)) ===
+            input.parentUsageRunId &&
+          String(existing.purpose) === input.purpose &&
+          String(existing.provider) === input.provider && String(existing.model) === input.model &&
+          String(existing.upstream_model) === input.upstreamModel &&
+          number(existing.item_count) === input.itemCount
+        ) return;
         throw new DomainError("idempotency_conflict", "Embedding attempt already exists", 409);
       }
       throw error;
@@ -5063,10 +6977,20 @@ export class PostgresRepository implements DomainRepository {
       if (!collections[0]) {
         throw new DomainError("not_found", "Knowledge collection not found", 404);
       }
-      const attachments = await tx<
-        Row[]
-      >`SELECT id FROM attachments WHERE id=${attachmentId} AND owner_id=${ownerId} AND state='ready' AND deleted_at IS NULL`;
-      if (!attachments[0]) throw new DomainError("not_found", "Ready attachment not found", 404);
+      try {
+        await lockReferenceableAttachments(
+          tx,
+          ownerId,
+          [attachmentId],
+          "not_found",
+          "Ready attachment not found",
+        );
+      } catch (error) {
+        if (error instanceof DomainError && error.code === "not_found") {
+          throw new DomainError("not_found", "Ready attachment not found", 404);
+        }
+        throw error;
+      }
       const prior =
         await tx`SELECT 1 FROM knowledge_collection_attachments WHERE collection_id=${collectionId} AND attachment_id=${attachmentId}`;
       if (prior.length) return knowledgeCollection(collections[0]);
@@ -6351,11 +8275,11 @@ export class PostgresRepository implements DomainRepository {
       let rows: Row[];
       try {
         rows = await tx<Row[]>`INSERT INTO usage_runs(
-          id,user_id,model,provider,status,reserved_micros,run_lease_token,run_lease_expires_at,
+          id,user_id,model,provider,recovery_owner,status,reserved_micros,run_lease_token,run_lease_expires_at,
           pricing_version_id,pricing_input_micros_per_million,
           pricing_cached_input_micros_per_million,pricing_reasoning_micros_per_million,
           pricing_output_micros_per_million,pricing_fixed_call_micros,pricing_source)
-          VALUES(${input.runId},${userId},${input.model},${input.provider},'reserved',
+          VALUES(${input.runId},${userId},${input.model},${input.provider},'provider','reserved',
           ${input.reserveMicros},${leaseToken},now()+120*interval '1 second',
           ${p.pricingVersionId},${p.inputMicrosPerMillion},${p.cachedInputMicrosPerMillion},
           ${p.reasoningMicrosPerMillion},${p.outputMicrosPerMillion},${p.fixedCallMicros},${p.source})
@@ -6412,27 +8336,83 @@ export class PostgresRepository implements DomainRepository {
   }
 
   async ensureIdempotentReservation(input: EnsureIdempotentReservationInput): Promise<UsageRun> {
-    try {
-      return await this.reserve(
-        input.userId,
-        input.usageRunId,
-        input.model,
-        input.reservedMicros,
-        input.provider,
-      );
-    } catch (error) {
-      if (!(error instanceof DomainError) || error.code !== "idempotency_conflict") throw error;
-      const rows = await this.#sql<Row[]>`SELECT * FROM usage_runs WHERE id=${input.usageRunId}`;
-      const existing = rows[0];
+    if (
+      typeof input.userId !== "string" || input.userId.length < 1 || input.userId.length > 128 ||
+      typeof input.usageRunId !== "string" || input.usageRunId.length < 1 ||
+      input.usageRunId.length > 512 || typeof input.model !== "string" ||
+      input.model.length < 1 || input.model.length > 255 || typeof input.provider !== "string" ||
+      input.provider.length < 1 || input.provider.length > 255 ||
+      !(["provider", "api_replay", "document_embedding", "tool"] as const).includes(
+        input.recoveryOwner,
+      ) || !Number.isSafeInteger(input.reservedMicros) || input.reservedMicros < 0
+    ) throw new DomainError("validation_error", "Usage reservation is invalid", 422);
+    const acceptExisting = (existing: Row) => {
       if (
-        !existing || String(existing.user_id) !== input.userId ||
+        String(existing.user_id) !== input.userId ||
         String(existing.model) !== input.model || String(existing.provider) !== input.provider ||
+        String(existing.recovery_owner) !== input.recoveryOwner ||
         number(existing.reserved_micros) !== input.reservedMicros ||
         String(existing.status) !== "reserved" || existing.token_id !== null
       ) {
         throw new DomainError("idempotency_conflict", "Existing reservation does not match", 409);
       }
       return run(existing);
+    };
+    try {
+      return await this.#sql.begin(async (tx) => {
+        // Existing runs use the same run -> user lock order as settlement/refund, avoiding an
+        // otherwise needless deadlock. Most importantly, inspect the already-committed debit
+        // before current-balance admission: consuming the last cent must not make it invisible.
+        let rows = await tx<Row[]>`SELECT * FROM usage_runs
+          WHERE id=${input.usageRunId} FOR UPDATE`;
+        if (rows[0]) return acceptExisting(rows[0]);
+
+        // New reservations for an account serialize on the user row. Recheck after acquiring it:
+        // another same-account reconciler may have committed while this transaction was waiting.
+        const users = await tx<Row[]>`SELECT balance_micros FROM users
+          WHERE id=${input.userId} FOR UPDATE`;
+        if (!users[0]) throw new DomainError("not_found", "User not found", 404);
+        rows = await tx<Row[]>`SELECT * FROM usage_runs
+          WHERE id=${input.usageRunId} FOR UPDATE`;
+        if (rows[0]) return acceptExisting(rows[0]);
+
+        const balance = number(users[0].balance_micros);
+        if (balance < input.reservedMicros) {
+          throw new DomainError("insufficient_credit", "Insufficient credit", 402);
+        }
+        const runLeaseToken = crypto.randomUUID();
+        const inserted = await tx<Row[]>`INSERT INTO usage_runs(
+          id,user_id,token_id,model,provider,recovery_owner,status,reserved_micros,
+          run_lease_token,run_lease_expires_at)
+          VALUES(${input.usageRunId},${input.userId},NULL,${input.model},${input.provider},
+            ${input.recoveryOwner},'reserved',${input.reservedMicros},${runLeaseToken},
+            now()+120*interval '1 second')
+          RETURNING *`;
+        const after = balance - input.reservedMicros;
+        await tx`UPDATE users SET balance_micros=${after},updated_at=now()
+          WHERE id=${input.userId}`;
+        await tx`INSERT INTO ledger_entries(
+          user_id,usage_run_id,kind,amount_micros,balance_after_micros)
+          VALUES(${input.userId},${input.usageRunId},'reserve',${-input.reservedMicros},${after})`;
+        return run(inserted[0]);
+      });
+    } catch (error) {
+      // Different accounts do not share a user lock. A globally colliding run ID can therefore
+      // lose at the unique constraint even after both transactions observed a missing row. Keep
+      // the repository contract categorical and never expose a driver-specific 23505.
+      if ((error as { code?: string }).code === "23505") {
+        const rows = await this.#sql<Row[]>`SELECT * FROM usage_runs
+          WHERE id=${input.usageRunId}`;
+        if (rows[0]) {
+          return acceptExisting(rows[0]);
+        }
+        throw new DomainError(
+          "idempotency_conflict",
+          "This idempotency key has already been used",
+          409,
+        );
+      }
+      throw error;
     }
   }
 
@@ -6443,30 +8423,63 @@ export class PostgresRepository implements DomainRepository {
     return await this.#sql.begin(async (tx) => {
       const rows = await tx<Row[]>`SELECT r.* FROM usage_runs r
         WHERE r.status='reserved' AND r.run_lease_token IS NOT NULL
+          -- Document embeddings share this conservative provider-attempt reaper once their owning
+          -- job is terminal. API replay and tool recovery remain fenced to their own state machines.
+          AND r.recovery_owner IN ('provider','document_embedding')
           AND r.run_lease_expires_at<=now() AND r.generation_lease_token IS NULL
           AND NOT EXISTS(SELECT 1 FROM api_idempotency_requests a WHERE a.usage_run_id=r.id)
+          AND NOT EXISTS(
+            SELECT 1 FROM document_embedding_batches b
+            JOIN jobs j ON j.id=b.job_id
+            WHERE b.usage_run_id=r.id
+              AND b.phase IN ('pre_dispatch','dispatched','succeeded')
+              AND j.status IN ('queued','running')
+          )
         ORDER BY r.run_lease_expires_at FOR UPDATE SKIP LOCKED LIMIT ${limit}`;
       for (const row of rows) {
         const runId = String(row.id);
-        const uncertainty = await tx<{ uncertain: boolean; embedding_uncertain: boolean }[]>`
+        const uncertainty = await tx<{
+          uncertain: boolean;
+          embedding_uncertain: boolean;
+          embedding_retry_safe: boolean;
+          embedding_estimated_input_tokens: number;
+        }[]>`
           SELECT EXISTS(SELECT 1 FROM provider_attempts
             WHERE usage_run_id=${runId} AND status='running') AS uncertain,
           EXISTS(SELECT 1 FROM embedding_provider_attempts
-            WHERE usage_run_id=${runId} AND status='running') AS embedding_uncertain`;
+            WHERE usage_run_id=${runId} AND status='running') AS embedding_uncertain,
+          COALESCE((SELECT retry_safe FROM document_embedding_batches
+            WHERE usage_run_id=${runId} AND phase='dispatched'),false) AS embedding_retry_safe,
+          COALESCE((SELECT maximum_input_tokens FROM document_embedding_batches
+            WHERE usage_run_id=${runId}),0)::int AS embedding_estimated_input_tokens`;
         await tx`UPDATE provider_attempts SET status='cancelled',phase='planning',
           error_code='execution_lease_expired',breaker_after='unavailable',retryable=true,
           latency_ms=GREATEST(0,floor(extract(epoch FROM (now()-started_at))*1000)::int),
           completed_at=now() WHERE usage_run_id=${runId} AND status='running'`;
-        await tx`UPDATE embedding_provider_attempts SET status='cancelled',
-          cost_micros=${number(row.reserved_micros)},cost_source='calculated',
-          token_source='estimated',error='execution lease expired',
+        const retrySafeEmbedding = uncertainty[0].embedding_retry_safe === true;
+        const embeddingCost = uncertainty[0].embedding_uncertain && !retrySafeEmbedding
+          ? number(row.reserved_micros)
+          : 0;
+        const embeddingInputTokens = uncertainty[0].embedding_uncertain && !retrySafeEmbedding
+          ? number(uncertainty[0].embedding_estimated_input_tokens)
+          : 0;
+        await tx`UPDATE embedding_provider_attempts SET
+          status=${retrySafeEmbedding ? "failed" : "cancelled"},
+          input_tokens=${embeddingInputTokens},cost_micros=${embeddingCost},
+          cost_source=${retrySafeEmbedding ? "none" : "calculated"},
+          token_source=${retrySafeEmbedding ? "none" : "estimated"},
+          error=${
+          retrySafeEmbedding
+            ? "definitive provider rejection settlement interrupted"
+            : "execution lease expired"
+        },
           latency_ms=GREATEST(0,floor(extract(epoch FROM (now()-started_at))*1000)::int),
           completed_at=now() WHERE usage_run_id=${runId} AND status='running'`;
         const userId = String(row.user_id);
         const users = await tx<
           Row[]
         >`SELECT balance_micros FROM users WHERE id=${userId} FOR UPDATE`;
-        const cost = uncertainty[0].embedding_uncertain ? number(row.reserved_micros) : 0;
+        const cost = uncertainty[0].embedding_uncertain ? embeddingCost : 0;
         const delta = number(row.reserved_micros) - cost;
         const after = number(users[0].balance_micros) + delta;
         await tx`UPDATE users SET balance_micros=${after},updated_at=now() WHERE id=${userId}`;
@@ -6474,7 +8487,8 @@ export class PostgresRepository implements DomainRepository {
           await tx`INSERT INTO ledger_entries(user_id,usage_run_id,kind,amount_micros,balance_after_micros)
             VALUES(${userId},${runId},${delta > 0 ? "refund" : "settle"},${delta},${after})`;
         }
-        await tx`UPDATE usage_runs SET status='failed',cost_micros=${cost},input_tokens=0,
+        await tx`UPDATE usage_runs SET status='failed',cost_micros=${cost},
+          input_tokens=${uncertainty[0].embedding_uncertain ? embeddingInputTokens : 0},
           output_tokens=0,run_lease_token=NULL,run_lease_expires_at=NULL,error='provider execution lease expired',
           completed_at=now() WHERE id=${runId}`;
       }
@@ -6482,17 +8496,39 @@ export class PostgresRepository implements DomainRepository {
     });
   }
 
-  async createApiToken(userId: string, input: CreateApiTokenInput) {
+  async createApiToken(
+    userId: string,
+    input: CreateApiTokenInput,
+    expectedAuthorityEpoch: number,
+  ) {
     validateTokenRates(input.rpmLimit ?? null, input.burstLimit ?? null);
     const id = crypto.randomUUID();
-    const rows = await this.#sql<
-      Row[]
-    >`INSERT INTO api_tokens(id,user_id,name,token_hash,preview,scopes,expires_at,rpm_limit,burst_limit,rotation_family_id) VALUES(${id},${userId},${input.name},${input.tokenHash},${input.preview},${
-      this.#sql.json(input.scopes)
-    },${input.expiresAt ?? null},${input.rpmLimit ?? null},${
-      input.burstLimit ?? null
-    },${id}) RETURNING *`;
-    return token(rows[0]);
+    return await this.#sql.begin(async (tx) => {
+      // See createSession: this lock makes token creation linearizable with every lifecycle
+      // transition that invalidates full user authority.
+      const users = await tx<Row[]>`SELECT approval_status,state,deleted_at,
+        password_reset_pending,authority_epoch FROM users WHERE id=${userId} FOR UPDATE`;
+      const user = users[0];
+      if (
+        !user || user.approval_status !== "approved" || user.state !== "active" ||
+        user.deleted_at != null || user.password_reset_pending === true ||
+        number(user.authority_epoch) !== expectedAuthorityEpoch
+      ) {
+        throw new DomainError("account_unavailable", "Account cannot create API tokens", 403);
+      }
+      const rows = await tx<
+        Row[]
+      >`INSERT INTO api_tokens(id,user_id,name,token_hash,preview,scopes,authority_epoch,
+        expires_at,rpm_limit,burst_limit,rotation_family_id)
+        VALUES(${id},${userId},${input.name},${input.tokenHash},${input.preview},${
+        tx.json(input.scopes)
+      },${expectedAuthorityEpoch},${input.expiresAt ?? null},${input.rpmLimit ?? null},${
+        input.burstLimit ?? null
+      },${id}) RETURNING *`;
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${userId},'api_token.created','api_token',${id},'{}'::jsonb)`;
+      return token(rows[0]);
+    });
   }
   async findApiTokenByHash(hash: string) {
     return await this.authenticateApiToken(hash);
@@ -6500,28 +8536,58 @@ export class PostgresRepository implements DomainRepository {
   async authenticateApiToken(hash: string) {
     const rows = await this.#sql<
       Row[]
-    >`UPDATE api_tokens SET last_used_at=now() WHERE token_hash=${hash} AND revoked_at IS NULL
-      AND (expires_at IS NULL OR expires_at>now())
-      AND (replaced_by_token_id IS NULL OR overlap_ends_at>now()) RETURNING *`;
+    >`UPDATE api_tokens t SET last_used_at=now() FROM users u
+      WHERE t.token_hash=${hash} AND t.user_id=u.id
+        AND t.authority_epoch=u.authority_epoch AND u.state='active' AND u.deleted_at IS NULL
+        AND u.password_reset_pending=false AND u.approval_status='approved'
+        AND t.revoked_at IS NULL AND (t.expires_at IS NULL OR t.expires_at>now())
+        AND (t.replaced_by_token_id IS NULL OR t.overlap_ends_at>now()) RETURNING t.*`;
     return rows[0] ? token(rows[0]) : undefined;
   }
   async listApiTokens(userId: string) {
     return (await this.#sql<
       Row[]
     >`SELECT * FROM api_tokens WHERE user_id=${userId} ORDER BY created_at DESC`).map((row) => {
-      const { tokenHash: _hash, userId: _userId, ...summary } = token(row);
+      const {
+        tokenHash: _hash,
+        userId: _userId,
+        authorityEpoch: _authorityEpoch,
+        ...summary
+      } = token(row);
       return summary;
     });
   }
-  async revokeApiToken(id: string, userId: string) {
-    const current = await this.#sql<
-      Row[]
-    >`SELECT version FROM api_tokens WHERE id=${id} AND user_id=${userId}`;
-    if (!current[0]) throw new DomainError("not_found", "Token not found", 404);
-    await this.revokeApiTokenFamily(id, userId, number(current[0].version));
-  }
-  async revokeApiTokenFamily(id: string, userId: string, expectedVersion: number) {
+  async revokeApiToken(id: string, userId: string, expectedAuthorityEpoch: number) {
     await this.#sql.begin(async (tx) => {
+      await assertPersonalTokenOwner(tx, userId, expectedAuthorityEpoch, "revoke");
+      const family = await tx<
+        Row[]
+      >`SELECT rotation_family_id FROM api_tokens WHERE id=${id} AND user_id=${userId}`;
+      if (!family[0]) throw new DomainError("not_found", "Token not found", 404);
+      const familyId = String(family[0].rotation_family_id);
+      await tx`SELECT pg_advisory_xact_lock(hashtext(${familyId}))`;
+      const selected = await tx<
+        Row[]
+      >`SELECT id FROM api_tokens WHERE id=${id} AND user_id=${userId} FOR UPDATE`;
+      if (!selected[0]) throw new DomainError("not_found", "Token not found", 404);
+      await tx`UPDATE api_tokens
+        SET revoked_at=COALESCE(revoked_at,now()),version=version+1
+        WHERE rotation_family_id=${familyId}`;
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${userId},'api_token.revoked','api_token',${id},'{}'::jsonb)`;
+    });
+  }
+  async revokeApiTokenFamily(
+    id: string,
+    userId: string,
+    expectedVersion: number,
+    expectedAuthorityEpoch: number,
+  ) {
+    await this.#sql.begin(async (tx) => {
+      // Account lifecycle transitions lock the user before revoking token rows. Preserve that
+      // global order here: the mandatory audit insert also references this user, so taking the
+      // family lock first would create a user<->token deadlock with suspension or deletion.
+      await assertPersonalTokenOwner(tx, userId, expectedAuthorityEpoch, "revoke");
       const family = await tx<
         Row[]
       >`SELECT rotation_family_id FROM api_tokens WHERE id=${id} AND user_id=${userId}`;
@@ -6537,10 +8603,20 @@ export class PostgresRepository implements DomainRepository {
       await tx`UPDATE api_tokens SET revoked_at=COALESCE(revoked_at,now()),version=version+1 WHERE rotation_family_id=${
         String(selected[0].rotation_family_id)
       }`;
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${userId},'api_token.revoked','api_token',${id},'{}'::jsonb)`;
     });
   }
-  async updateApiToken(userId: string, id: string, input: UpdateApiTokenInput) {
+  async updateApiToken(
+    userId: string,
+    id: string,
+    input: UpdateApiTokenInput,
+    expectedAuthorityEpoch: number,
+  ) {
     return await this.#sql.begin(async (tx) => {
+      // See revokeApiTokenFamily: lifecycle transitions and personal-token mutations must always
+      // acquire the owning user row before the family advisory lock and token rows.
+      await assertPersonalTokenOwner(tx, userId, expectedAuthorityEpoch, "update");
       const family = await tx<
         Row[]
       >`SELECT rotation_family_id FROM api_tokens WHERE id=${id} AND user_id=${userId}`;
@@ -6563,6 +8639,8 @@ export class PostgresRepository implements DomainRepository {
         input.expiresAt === undefined ? old.expiresAt : input.expiresAt
       },rpm_limit=${rpm},burst_limit=${burst},version=version+1 WHERE rotation_family_id=${old.rotationFamilyId}`;
       const updated = await tx<Row[]>`SELECT * FROM api_tokens WHERE id=${id}`;
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${userId},'api_token.updated','api_token',${id},'{}'::jsonb)`;
       return tokenSummary(token(updated[0]));
     });
   }
@@ -6570,6 +8648,7 @@ export class PostgresRepository implements DomainRepository {
     userId: string,
     id: string,
     input: RotateApiTokenInput,
+    expectedAuthorityEpoch: number,
   ): Promise<RotatedApiToken> {
     if (
       !Number.isInteger(input.overlapSeconds) || input.overlapSeconds < 0 ||
@@ -6582,6 +8661,22 @@ export class PostgresRepository implements DomainRepository {
       );
     }
     return await this.#sql.begin(async (tx) => {
+      // Keep the user row first in the lock order. Lifecycle transitions also lock the user before
+      // revoking token rows, so taking a family/token lock first would introduce a user<->token
+      // deadlock. It also makes replacement issuance linearizable with authority loss: either the
+      // replacement commits first and is revoked by the transition, or the transition commits first
+      // and this eligibility check fails.
+      const users = await tx<Row[]>`SELECT approval_status,state,deleted_at,
+        password_reset_pending,authority_epoch FROM users WHERE id=${userId} FOR UPDATE`;
+      const currentUser = users[0];
+      if (
+        !currentUser || currentUser.approval_status !== "approved" ||
+        currentUser.state !== "active" || currentUser.deleted_at != null ||
+        currentUser.password_reset_pending === true ||
+        number(currentUser.authority_epoch) !== expectedAuthorityEpoch
+      ) {
+        throw new DomainError("account_unavailable", "Account cannot rotate API tokens", 403);
+      }
       const family = await tx<
         Row[]
       >`SELECT rotation_family_id FROM api_tokens WHERE id=${id} AND user_id=${userId}`;
@@ -6610,9 +8705,12 @@ export class PostgresRepository implements DomainRepository {
       try {
         inserted = await tx<
           Row[]
-        >`INSERT INTO api_tokens(id,user_id,name,token_hash,preview,scopes,expires_at,rpm_limit,burst_limit,access_mode,rotation_family_id,rotation_generation,rotated_from_token_id) VALUES(${nextId},${userId},${old.name},${input.tokenHash},${input.preview},${
+        >`INSERT INTO api_tokens(id,user_id,name,token_hash,preview,scopes,authority_epoch,
+          expires_at,rpm_limit,burst_limit,access_mode,rotation_family_id,rotation_generation,
+          rotated_from_token_id)
+          VALUES(${nextId},${userId},${old.name},${input.tokenHash},${input.preview},${
           tx.json(old.scopes)
-        },${old.expiresAt},${old.rpmLimit},${old.burstLimit},${old.accessMode},${old.rotationFamilyId},${
+        },${expectedAuthorityEpoch},${old.expiresAt},${old.rpmLimit},${old.burstLimit},${old.accessMode},${old.rotationFamilyId},${
           old.rotationGeneration + 1
         },${old.id}) RETURNING *`;
       } catch (error) {
@@ -6627,43 +8725,64 @@ export class PostgresRepository implements DomainRepository {
       const previous = await tx<
         Row[]
       >`UPDATE api_tokens SET replaced_by_token_id=${nextId},overlap_ends_at=now()+${input.overlapSeconds}*interval '1 second' WHERE id=${old.id} RETURNING *`;
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${userId},'api_token.rotated','api_token',${nextId},${
+        tx.json({
+          previousTokenId: old.id,
+          overlapSeconds: input.overlapSeconds,
+        })
+      })`;
       return {
         previous: tokenSummary(token(previous[0])),
         replacement: tokenSummary(token(inserted[0])),
       };
     });
   }
-  async searchApiTokens(query = "", limit = 50, cursor?: string): Promise<AdminTokenLookupPage> {
+  async searchApiTokens(
+    context: PrivilegedReadContext,
+    query = "",
+    limit = 50,
+    cursor?: string,
+  ): Promise<AdminTokenLookupPage> {
+    requirePrivilegedReadContext(context);
     if (cursor && !UUID_PATTERN.test(cursor)) {
       throw new DomainError("validation_error", "cursor must be a valid UUID", 422);
     }
     const bounded = Math.min(100, Math.max(1, limit));
     const q = `%${query.trim()}%`;
-    const rows = await this.#sql<
-      Row[]
-    >`SELECT t.id,t.name token_name,t.preview,t.user_id,t.version,t.revoked_at,t.access_mode,u.email,u.name owner_name,COALESCE(array_agg(gt.group_id) FILTER(WHERE gt.group_id IS NOT NULL),'{}') group_ids FROM api_tokens t JOIN users u ON u.id=t.user_id LEFT JOIN access_group_tokens gt ON gt.token_id=t.id WHERE (${
-      query.trim() === ""
-    } OR t.name ILIKE ${q} OR t.preview ILIKE ${q} OR u.email ILIKE ${q}) AND (${
-      cursor ?? null
-    }::uuid IS NULL OR t.id>${cursor ?? null}) GROUP BY t.id,u.id ORDER BY t.id LIMIT ${
-      bounded + 1
-    }`;
-    const page = rows.slice(0, bounded);
-    return {
-      data: page.map((r) => ({
-        id: String(r.id),
-        name: String(r.token_name),
-        preview: String(r.preview),
-        ownerId: String(r.user_id),
-        ownerEmail: String(r.email),
-        ownerName: String(r.owner_name),
-        version: number(r.version),
-        groupIds: (r.group_ids as unknown[]).map(String),
-        revokedAt: nullableIso(r.revoked_at),
-        accessMode: r.access_mode as "inherit" | "restricted",
-      })),
-      nextCursor: rows.length > bounded ? String(page.at(-1)!.id) : null,
-    };
+    return await this.#sql.begin(async (tx) => {
+      await assertEffectiveAdminActor(
+        tx,
+        context.actorId,
+        context.requireEmailVerification,
+        context.expectedAuthorityEpoch,
+      );
+      const rows = await tx<
+        Row[]
+      >`SELECT t.id,t.name token_name,t.preview,t.user_id,t.version,t.revoked_at,t.access_mode,u.email,u.name owner_name,COALESCE(array_agg(gt.group_id) FILTER(WHERE gt.group_id IS NOT NULL),'{}') group_ids FROM api_tokens t JOIN users u ON u.id=t.user_id LEFT JOIN access_group_tokens gt ON gt.token_id=t.id WHERE (${
+        query.trim() === ""
+      } OR t.name ILIKE ${q} OR t.preview ILIKE ${q} OR u.email ILIKE ${q}) AND (${
+        cursor ?? null
+      }::uuid IS NULL OR t.id>${cursor ?? null}) GROUP BY t.id,u.id ORDER BY t.id LIMIT ${
+        bounded + 1
+      }`;
+      const page = rows.slice(0, bounded);
+      return {
+        data: page.map((r) => ({
+          id: String(r.id),
+          name: String(r.token_name),
+          preview: String(r.preview),
+          ownerId: String(r.user_id),
+          ownerEmail: String(r.email),
+          ownerName: String(r.owner_name),
+          version: number(r.version),
+          groupIds: (r.group_ids as unknown[]).map(String),
+          revokedAt: nullableIso(r.revoked_at),
+          accessMode: r.access_mode as "inherit" | "restricted",
+        })),
+        nextCursor: rows.length > bounded ? String(page.at(-1)!.id) : null,
+      };
+    });
   }
 
   async listModelAliases(): Promise<ModelAlias[]> {
@@ -6677,20 +8796,44 @@ export class PostgresRepository implements DomainRepository {
       updatedAt: iso(r.updated_at),
     }));
   }
-  async createModelAlias(input: CreateModelAliasInput) {
+  async createModelAlias(
+    input: CreateModelAliasInput,
+    audit: PrivilegedAuditEventInput,
+  ) {
+    requirePrivilegedAuditContext(audit);
     if (!/^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$/.test(input.alias)) {
       throw new DomainError("validation_error", "Invalid model alias", 422);
     }
     const r = await this.#sql.begin(async (tx) => {
+      await assertEffectiveAdminActor(
+        tx,
+        audit.actorId,
+        audit.requireEmailVerification,
+        audit.expectedAuthorityEpoch,
+      );
       await tx`SELECT pg_advisory_xact_lock(hashtext('model-public-id-namespace'))`;
       if ((await tx`SELECT 1 FROM provider_models WHERE public_model_id=${input.alias}`).length) {
         throw new DomainError("conflict", "Alias collides with a canonical model", 409);
       }
-      return await tx<
+      const rows = await tx<
         Row[]
       >`INSERT INTO model_aliases(alias,target_model_id,description) VALUES(${input.alias},${input.targetModelId},${
         input.description ?? ""
       }) RETURNING *`;
+      const row = rows[0];
+      const metadata = {
+        ...audit.metadata,
+        after: {
+          alias: String(row.alias),
+          targetModelId: String(row.target_model_id),
+          description: String(row.description),
+        },
+      };
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${audit.actorId},${audit.action},${audit.targetType},${String(row.id)},${
+        tx.json(metadata as postgres.JSONValue)
+      })`;
+      return rows;
     });
     return {
       id: String(r[0].id),
@@ -6702,22 +8845,56 @@ export class PostgresRepository implements DomainRepository {
       updatedAt: iso(r[0].updated_at),
     };
   }
-  async updateModelAlias(id: string, input: UpdateModelAliasInput) {
+  async updateModelAlias(
+    id: string,
+    input: UpdateModelAliasInput,
+    audit: PrivilegedAuditEventInput,
+  ) {
+    requirePrivilegedAuditContext(audit);
     const r = await this.#sql.begin(async (tx) => {
+      await assertEffectiveAdminActor(
+        tx,
+        audit.actorId,
+        audit.requireEmailVerification,
+        audit.expectedAuthorityEpoch,
+      );
       await tx`SELECT pg_advisory_xact_lock(hashtext('model-public-id-namespace'))`;
       if (
         input.alias &&
         (await tx`SELECT 1 FROM provider_models WHERE public_model_id=${input.alias}`).length
       ) throw new DomainError("conflict", "Alias collides with a canonical model", 409);
-      return await tx<Row[]>`UPDATE model_aliases SET alias=COALESCE(${
+      const current = (await tx<Row[]>`SELECT * FROM model_aliases
+        WHERE id=${id} FOR UPDATE`)[0];
+      if (!current || number(current.version) !== input.expectedVersion) {
+        throw new DomainError("version_conflict", "Model alias not found or modified", 409);
+      }
+      const rows = await tx<Row[]>`UPDATE model_aliases SET alias=COALESCE(${
         input.alias ?? null
       },alias),target_model_id=COALESCE(${
         input.targetModelId ?? null
       }::uuid,target_model_id),description=COALESCE(${
         input.description ?? null
-      },description),version=version+1,updated_at=now() WHERE id=${id} AND version=${input.expectedVersion} RETURNING *`;
+      },description),version=version+1,updated_at=now() WHERE id=${id} RETURNING *`;
+      const row = rows[0];
+      const metadata = {
+        ...audit.metadata,
+        before: {
+          alias: String(current.alias),
+          targetModelId: String(current.target_model_id),
+          description: String(current.description),
+        },
+        after: {
+          alias: String(row.alias),
+          targetModelId: String(row.target_model_id),
+          description: String(row.description),
+        },
+      };
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${audit.actorId},${audit.action},${audit.targetType},${id},${
+        tx.json(metadata as postgres.JSONValue)
+      })`;
+      return rows;
     });
-    if (!r[0]) throw new DomainError("version_conflict", "Model alias not found or modified", 409);
     return {
       id: String(r[0].id),
       alias: String(r[0].alias),
@@ -6728,12 +8905,38 @@ export class PostgresRepository implements DomainRepository {
       updatedAt: iso(r[0].updated_at),
     };
   }
-  async deleteModelAlias(id: string, expectedVersion: number) {
-    const r = await this
-      .#sql`DELETE FROM model_aliases WHERE id=${id} AND version=${expectedVersion} RETURNING id`;
-    if (!r.length) {
-      throw new DomainError("version_conflict", "Model alias not found or modified", 409);
-    }
+  async deleteModelAlias(
+    id: string,
+    expectedVersion: number,
+    audit: PrivilegedAuditEventInput,
+  ) {
+    requirePrivilegedAuditContext(audit);
+    await this.#sql.begin(async (tx) => {
+      await assertEffectiveAdminActor(
+        tx,
+        audit.actorId,
+        audit.requireEmailVerification,
+        audit.expectedAuthorityEpoch,
+      );
+      const current = (await tx<Row[]>`SELECT * FROM model_aliases
+        WHERE id=${id} FOR UPDATE`)[0];
+      if (!current || number(current.version) !== expectedVersion) {
+        throw new DomainError("version_conflict", "Model alias not found or modified", 409);
+      }
+      await tx`DELETE FROM model_aliases WHERE id=${id}`;
+      const metadata = {
+        ...audit.metadata,
+        before: {
+          alias: String(current.alias),
+          targetModelId: String(current.target_model_id),
+          description: String(current.description),
+        },
+      };
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${audit.actorId},${audit.action},${audit.targetType},${id},${
+        tx.json(metadata as postgres.JSONValue)
+      })`;
+    });
   }
   async #loadAccessGroup(tx: postgres.Sql, id: string): Promise<AccessGroup> {
     const r = (await tx<Row[]>`SELECT * FROM access_groups WHERE id=${id}`)[0];
@@ -6758,228 +8961,689 @@ export class PostgresRepository implements DomainRepository {
       updatedAt: iso(r.updated_at),
     };
   }
-  async listAccessGroups() {
-    const rows = await this.#sql<Row[]>`SELECT g.*,
-      ARRAY(SELECT gu.user_id FROM access_group_users gu WHERE gu.group_id=g.id ORDER BY gu.user_id) user_ids,
-      ARRAY(SELECT gm.provider_model_id FROM access_group_models gm WHERE gm.group_id=g.id ORDER BY gm.provider_model_id) model_ids,
-      ARRAY(SELECT gt.token_id FROM access_group_tokens gt WHERE gt.group_id=g.id ORDER BY gt.token_id) token_ids,
-      COALESCE((SELECT jsonb_agg(jsonb_build_object('tokenId',gt.token_id,'ownerId',gt.user_id) ORDER BY gt.token_id) FROM access_group_tokens gt WHERE gt.group_id=g.id),'[]'::jsonb) token_owners
-      FROM access_groups g ORDER BY g.name`;
+  async #lockAccessGroupModelPolicy(
+    tx: postgres.Sql,
+    id: string,
+    expectedVersion: number,
+    nextModelIds: readonly string[],
+    lockForDeletion = false,
+  ): Promise<{ currentModelIds: string[]; modelIdsBecomingPublic: string[] }> {
+    // The group row is the first lock in every access-policy mutation. Model locks follow in
+    // canonical UUID order, before any token-family advisory lock or token row lock.
+    // Non-deleting writes deliberately use NO KEY UPDATE: it still serializes every writer and
+    // protects the version check, while remaining compatible with the KEY SHARE lock taken by a
+    // concurrent token rotation's access-group FK insert. Deletion must exclude KEY SHARE.
+    const groupRows = lockForDeletion
+      ? await tx<Row[]>`SELECT version FROM access_groups WHERE id=${id} FOR UPDATE`
+      : await tx<Row[]>`SELECT version FROM access_groups WHERE id=${id} FOR NO KEY UPDATE`;
+    if (!groupRows[0] || number(groupRows[0].version) !== expectedVersion) {
+      throw new DomainError("version_conflict", "Access group not found or modified", 409);
+    }
+    const currentRows = await tx<
+      Row[]
+    >`SELECT provider_model_id FROM access_group_models WHERE group_id=${id} ORDER BY provider_model_id`;
+    const currentModelIds = currentRows.map((row) => String(row.provider_model_id));
+    const nextSet = new Set(nextModelIds);
+    const affectedModelIds = [...new Set([...currentModelIds, ...nextSet])].sort();
+    for (const modelId of affectedModelIds) {
+      // Prefixing the exact text input gives access policies a dedicated namespace without
+      // passing an imprecise JavaScript number as hashtextextended's bigint seed.
+      await tx`SELECT pg_advisory_xact_lock(
+        hashtextextended(${`dg-chat:model-access:${modelId}`}, 0)
+      )`;
+    }
+    const removedModelIds = currentModelIds.filter((modelId) => !nextSet.has(modelId));
+    const stillRestrictedRows = removedModelIds.length
+      ? await tx<
+        Row[]
+      >`SELECT DISTINCT provider_model_id FROM access_group_models
+        WHERE group_id<>${id} AND provider_model_id=ANY(${tx.array(removedModelIds)}::uuid[])`
+      : [];
+    const stillRestricted = new Set(
+      stillRestrictedRows.map((row) => String(row.provider_model_id)),
+    );
+    return {
+      currentModelIds,
+      modelIdsBecomingPublic: removedModelIds.filter((modelId) => !stillRestricted.has(modelId))
+        .sort(),
+    };
+  }
+  async #accessGroupTokenSubjects(
+    tx: postgres.Sql,
+    groupId: string,
+    requestedTokenIds: readonly string[] = [],
+  ): Promise<Array<{ ownerId: string; familyId: string }>> {
+    const rows = await tx<Row[]>`SELECT DISTINCT t.user_id,t.rotation_family_id
+      FROM api_tokens t
+      WHERE t.id=ANY(${tx.array([...requestedTokenIds])}::uuid[])
+        OR EXISTS(
+          SELECT 1 FROM access_group_tokens gt
+          WHERE gt.group_id=${groupId} AND gt.token_id=t.id
+        )
+      ORDER BY t.user_id,t.rotation_family_id`;
     return rows.map((row) => ({
-      id: String(row.id),
-      name: String(row.name),
-      description: String(row.description),
-      version: number(row.version),
-      userIds: (row.user_ids as unknown[]).map(String),
-      modelIds: (row.model_ids as unknown[]).map(String),
-      tokenIds: (row.token_ids as unknown[]).map(String),
-      tokenOwners: (row.token_owners as Array<{ tokenId: string; ownerId: string }>).map((
-        entry,
-      ) => ({ tokenId: String(entry.tokenId), ownerId: String(entry.ownerId) })),
-      createdAt: iso(row.created_at),
-      updatedAt: iso(row.updated_at),
+      ownerId: String(row.user_id),
+      familyId: String(row.rotation_family_id),
     }));
   }
-  async createAccessGroup(input: CreateAccessGroupInput) {
-    const r = await this.#sql<
+  #requireAccessGroupSubjectOwnersLocked(
+    subjects: readonly { ownerId: string }[],
+    lockedUserIds: ReadonlySet<string>,
+  ): void {
+    if (subjects.some((subject) => !lockedUserIds.has(subject.ownerId))) {
+      throw new DomainError(
+        "version_conflict",
+        "Access group token ownership changed; refresh and retry",
+        409,
+      );
+    }
+  }
+  async #lockTokenFamilies(
+    tx: postgres.Sql,
+    subjects: readonly { familyId: string }[],
+  ): Promise<Array<{ id: string; familyId: string }>> {
+    const familyIds = [...new Set(subjects.map((subject) => subject.familyId))].sort();
+    for (const familyId of familyIds) {
+      await tx`SELECT pg_advisory_xact_lock(hashtext(${familyId}))`;
+    }
+    if (!familyIds.length) return [];
+    const rows = await tx<Row[]>`SELECT id,rotation_family_id FROM api_tokens
+      WHERE rotation_family_id=ANY(${tx.array(familyIds)}::uuid[])
+      ORDER BY id FOR UPDATE`;
+    return rows.map((row) => ({
+      id: String(row.id),
+      familyId: String(row.rotation_family_id),
+    }));
+  }
+  #requireModelAccessWideningAcknowledgement(
+    actualModelIds: readonly string[],
+    acknowledgedModelIds: readonly string[],
+  ) {
+    if (
+      !modelAccessWideningAcknowledgementMatches(actualModelIds, acknowledgedModelIds)
+    ) {
+      throw new DomainError(
+        "model_access_widening_acknowledgement_required",
+        `Acknowledge the exact models that will become public before applying this change: ${
+          actualModelIds.join(", ")
+        }`,
+        409,
+      );
+    }
+  }
+  async #requireProviderModelsExist(tx: postgres.Sql, modelIds: readonly string[]) {
+    if (!modelIds.length) return;
+    const existing = await tx<
       Row[]
-    >`INSERT INTO access_groups(name,description) VALUES(${input.name.trim()},${
-      input.description ?? ""
-    }) RETURNING id`;
-    return await this.#loadAccessGroup(this.#sql, String(r[0].id));
-  }
-  async updateAccessGroup(id: string, input: UpdateAccessGroupInput) {
-    const r = await this.#sql`UPDATE access_groups SET name=COALESCE(${
-      input.name ?? null
-    },name),description=COALESCE(${
-      input.description ?? null
-    },description),version=version+1,updated_at=now() WHERE id=${id} AND version=${input.expectedVersion} RETURNING id`;
-    if (!r.length) {
-      throw new DomainError("version_conflict", "Access group not found or modified", 409);
-    }
-    return await this.#loadAccessGroup(this.#sql, id);
-  }
-  async deleteAccessGroup(id: string, expectedVersion: number) {
-    const r = await this
-      .#sql`DELETE FROM access_groups WHERE id=${id} AND version=${expectedVersion} RETURNING id`;
-    if (!r.length) {
-      throw new DomainError("version_conflict", "Access group not found or modified", 409);
+    >`SELECT id FROM provider_models WHERE id=ANY(${tx.array([...modelIds])}::uuid[])`;
+    if (existing.length !== modelIds.length) {
+      throw new DomainError("not_found", "Model not found", 404);
     }
   }
-  async replaceAccessGroupUsers(id: string, userIds: string[], expectedVersion: number) {
+  async listAccessGroups(context: PrivilegedReadContext) {
+    requirePrivilegedReadContext(context);
     return await this.#sql.begin(async (tx) => {
-      const r =
-        await tx`UPDATE access_groups SET version=version+1,updated_at=now() WHERE id=${id} AND version=${expectedVersion} RETURNING id`;
-      if (!r.length) {
+      await assertEffectiveAdminActor(
+        tx,
+        context.actorId,
+        context.requireEmailVerification,
+        context.expectedAuthorityEpoch,
+      );
+      const rows = await tx<Row[]>`SELECT g.*,
+        ARRAY(SELECT gu.user_id FROM access_group_users gu WHERE gu.group_id=g.id ORDER BY gu.user_id) user_ids,
+        ARRAY(SELECT gm.provider_model_id FROM access_group_models gm WHERE gm.group_id=g.id ORDER BY gm.provider_model_id) model_ids,
+        ARRAY(SELECT gt.token_id FROM access_group_tokens gt WHERE gt.group_id=g.id ORDER BY gt.token_id) token_ids,
+        COALESCE((SELECT jsonb_agg(jsonb_build_object('tokenId',gt.token_id,'ownerId',gt.user_id) ORDER BY gt.token_id) FROM access_group_tokens gt WHERE gt.group_id=g.id),'[]'::jsonb) token_owners
+        FROM access_groups g ORDER BY g.name`;
+      return rows.map((row) => ({
+        id: String(row.id),
+        name: String(row.name),
+        description: String(row.description),
+        version: number(row.version),
+        userIds: (row.user_ids as unknown[]).map(String),
+        modelIds: (row.model_ids as unknown[]).map(String),
+        tokenIds: (row.token_ids as unknown[]).map(String),
+        tokenOwners: (row.token_owners as Array<{ tokenId: string; ownerId: string }>).map((
+          entry,
+        ) => ({ tokenId: String(entry.tokenId), ownerId: String(entry.ownerId) })),
+        createdAt: iso(row.created_at),
+        updatedAt: iso(row.updated_at),
+      }));
+    });
+  }
+  async createAccessGroup(
+    input: CreateAccessGroupInput,
+    audit: PrivilegedAuditEventInput,
+  ) {
+    requirePrivilegedAuditContext(audit);
+    const name = input.name.trim();
+    const description = input.description ?? "";
+    const userIds = [...new Set(input.userIds ?? [])].sort();
+    const modelIds = [...new Set(input.modelIds ?? [])].sort();
+    const requestedTokenIds = [...new Set(input.tokenIds ?? [])].sort();
+    try {
+      return await this.#sql.begin(async (tx) => {
+        // Model-access mutations take locks in one order everywhere: users (including the
+        // authority-bearing actor and token owners), models/groups, then token families.
+        // Reading token subjects before locking is safe because token lifecycle mutations
+        // must first lock their owner user; the locked re-read below detects any stale row.
+        const requestedRows = requestedTokenIds.length
+          ? await tx<Row[]>`SELECT id,user_id,rotation_family_id FROM api_tokens
+              WHERE id=ANY(${tx.array(requestedTokenIds)}::uuid[]) ORDER BY id`
+          : [];
+        if (requestedRows.length !== requestedTokenIds.length) {
+          throw new DomainError("not_found", "Token not found", 404);
+        }
+        const requestedFamilyIds = [
+          ...new Set(requestedRows.map((row) => String(row.rotation_family_id))),
+        ].sort();
+        const preliminaryFamilyRows = requestedFamilyIds.length
+          ? await tx<Row[]>`SELECT DISTINCT user_id,rotation_family_id FROM api_tokens
+              WHERE rotation_family_id=ANY(${tx.array(requestedFamilyIds)}::uuid[])
+              ORDER BY user_id,rotation_family_id`
+          : [];
+        const preliminarySubjects = preliminaryFamilyRows.map((row) => ({
+          ownerId: String(row.user_id),
+          familyId: String(row.rotation_family_id),
+        }));
+        const lockedUsers = await lockUsersAndAssertEffectiveAdminActor(
+          tx,
+          audit.actorId,
+          [...userIds, ...preliminarySubjects.map((subject) => subject.ownerId)],
+          audit.requireEmailVerification,
+          audit.expectedAuthorityEpoch,
+        );
+        const lockedUserIds = new Set(lockedUsers.map((row) => String(row.id)));
+        if (userIds.some((userId) => !lockedUserIds.has(userId))) {
+          throw new DomainError("not_found", "User not found", 404);
+        }
+        for (const modelId of modelIds) {
+          await tx`SELECT pg_advisory_xact_lock(
+            hashtextextended(${`dg-chat:model-access:${modelId}`}, 0)
+          )`;
+        }
+        await this.#requireProviderModelsExist(tx, modelIds);
+        const rows = await tx<
+          Row[]
+        >`INSERT INTO access_groups(name,description) VALUES(${name},${description}) RETURNING id`;
+        const id = String(rows[0].id);
+        this.#requireAccessGroupSubjectOwnersLocked(preliminarySubjects, lockedUserIds);
+        const lockedTokens = await this.#lockTokenFamilies(tx, preliminarySubjects);
+        const lockedTokenIds = new Set(lockedTokens.map((token) => token.id));
+        if (requestedTokenIds.some((tokenId) => !lockedTokenIds.has(tokenId))) {
+          throw new DomainError(
+            "version_conflict",
+            "API token changed while creating the access group; refresh and retry",
+            409,
+          );
+        }
+        const expandedRows = requestedFamilyIds.length
+          ? await tx<Row[]>`SELECT id,user_id FROM api_tokens
+              WHERE rotation_family_id=ANY(${tx.array(requestedFamilyIds)}::uuid[]) ORDER BY id`
+          : [];
+        const tokenIds = expandedRows.map((row) => String(row.id));
+        const tokenOwners = new Map(
+          expandedRows.map((row) => [String(row.id), String(row.user_id)]),
+        );
+        for (const tokenId of tokenIds) {
+          if (!userIds.includes(tokenOwners.get(tokenId)!)) {
+            throw new DomainError(
+              "validation_error",
+              "Every token owner must be included in the group",
+              422,
+            );
+          }
+        }
+        for (const userId of userIds) {
+          await tx`INSERT INTO access_group_users(group_id,user_id) VALUES(${id},${userId})`;
+        }
+        for (const modelId of modelIds) {
+          await tx`INSERT INTO access_group_models(group_id,provider_model_id)
+            VALUES(${id},${modelId})`;
+        }
+        for (const tokenId of tokenIds) {
+          await tx`INSERT INTO access_group_tokens(group_id,token_id,user_id)
+            VALUES(${id},${tokenId},${tokenOwners.get(tokenId)!})`;
+        }
+        if (tokenIds.length) {
+          await tx`UPDATE api_tokens SET access_mode='restricted',version=version+1
+            WHERE id=ANY(${tx.array(tokenIds)}::uuid[])`;
+        }
+        const metadata = {
+          ...audit.metadata,
+          after: { name, description, userIds, modelIds, tokenIds },
+        };
+        await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+          VALUES(${audit.actorId},${audit.action},${audit.targetType},${id},${
+          tx.json(metadata as postgres.JSONValue)
+        })`;
+        return await this.#loadAccessGroup(tx, id);
+      });
+    } catch (error) {
+      const postgresError = error as { code?: string; constraint_name?: string };
+      if (
+        postgresError.code === "23505" &&
+        postgresError.constraint_name === "access_groups_name_uq"
+      ) {
+        throw new DomainError("conflict", "Access group name is already used", 409);
+      }
+      throw error;
+    }
+  }
+  async updateAccessGroup(
+    id: string,
+    input: UpdateAccessGroupInput,
+    audit: PrivilegedAuditEventInput,
+  ) {
+    requirePrivilegedAuditContext(audit);
+    if (input.name === undefined && input.description === undefined) {
+      throw new DomainError(
+        "validation_error",
+        "Provide a name or description to update",
+        422,
+      );
+    }
+    try {
+      return await this.#sql.begin(async (tx) => {
+        await assertEffectiveAdminActor(
+          tx,
+          audit.actorId,
+          audit.requireEmailVerification,
+          audit.expectedAuthorityEpoch,
+        );
+        const currentRows = await tx<
+          Row[]
+        >`SELECT name,description,version FROM access_groups WHERE id=${id} FOR UPDATE`;
+        const current = currentRows[0];
+        if (!current || number(current.version) !== input.expectedVersion) {
+          throw new DomainError("version_conflict", "Access group not found or modified", 409);
+        }
+        const before = {
+          name: String(current.name),
+          description: String(current.description),
+        };
+        const after = {
+          name: input.name?.trim() ?? before.name,
+          description: input.description ?? before.description,
+        };
+        await tx`UPDATE access_groups SET name=${after.name},description=${after.description},
+          version=version+1,updated_at=now() WHERE id=${id}`;
+        const metadata = { ...audit.metadata, before, after };
+        await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+          VALUES(${audit.actorId},${audit.action},${audit.targetType},${id},${
+          tx.json(metadata as postgres.JSONValue)
+        })`;
+        return await this.#loadAccessGroup(tx, id);
+      });
+    } catch (error) {
+      const postgresError = error as { code?: string; constraint_name?: string };
+      if (
+        postgresError.code === "23505" &&
+        postgresError.constraint_name === "access_groups_name_uq"
+      ) {
+        throw new DomainError("conflict", "Access group name is already used", 409);
+      }
+      throw error;
+    }
+  }
+  async deleteAccessGroup(
+    id: string,
+    expectedVersion: number,
+    acknowledgePublicModelIds: string[],
+    audit: PrivilegedAuditEventInput,
+  ) {
+    requirePrivilegedAuditContext(audit);
+    await this.#sql.begin(async (tx) => {
+      const preliminarySubjects = await this.#accessGroupTokenSubjects(tx, id);
+      const lockedUsers = await lockUsersAndAssertEffectiveAdminActor(
+        tx,
+        audit.actorId,
+        preliminarySubjects.map((subject) => subject.ownerId),
+        audit.requireEmailVerification,
+        audit.expectedAuthorityEpoch,
+      );
+      const lockedUserIds = new Set(lockedUsers.map((row) => String(row.id)));
+      const impact = await this.#lockAccessGroupModelPolicy(tx, id, expectedVersion, [], true);
+      const subjects = await this.#accessGroupTokenSubjects(tx, id);
+      this.#requireAccessGroupSubjectOwnersLocked(subjects, lockedUserIds);
+      const lockedTokens = await this.#lockTokenFamilies(tx, subjects);
+      this.#requireModelAccessWideningAcknowledgement(
+        impact.modelIdsBecomingPublic,
+        acknowledgePublicModelIds,
+      );
+      if (lockedTokens.length) {
+        await tx`UPDATE api_tokens SET access_mode='restricted',version=version+1
+          WHERE id=ANY(${tx.array(lockedTokens.map((token) => token.id))}::uuid[])`;
+      }
+      await tx`DELETE FROM access_groups WHERE id=${id}`;
+      const metadata = {
+        ...audit.metadata,
+        modelIdsBecomingPublic: impact.modelIdsBecomingPublic,
+      };
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+          VALUES(${audit.actorId ?? null},${audit.action},${audit.targetType},${id},${
+        tx.json(metadata as postgres.JSONValue)
+      })`;
+    });
+  }
+  async replaceAccessGroupUsers(
+    id: string,
+    userIds: string[],
+    expectedVersion: number,
+    audit: PrivilegedAuditEventInput,
+  ) {
+    requirePrivilegedAuditContext(audit);
+    return await this.#sql.begin(async (tx) => {
+      const desired = [...new Set(userIds)].sort();
+      const preliminarySubjects = await this.#accessGroupTokenSubjects(tx, id);
+      const lockedUsers = await lockUsersAndAssertEffectiveAdminActor(
+        tx,
+        audit.actorId,
+        [...desired, ...preliminarySubjects.map((subject) => subject.ownerId)],
+        audit.requireEmailVerification,
+        audit.expectedAuthorityEpoch,
+      );
+      const lockedUserIds = new Set(lockedUsers.map((row) => String(row.id)));
+      if (desired.some((userId) => !lockedUserIds.has(userId))) {
+        throw new DomainError("not_found", "User not found", 404);
+      }
+      const rows = await tx<
+        Row[]
+      >`SELECT version FROM access_groups WHERE id=${id} FOR UPDATE`;
+      if (!rows[0] || number(rows[0].version) !== expectedVersion) {
         throw new DomainError("version_conflict", "Access group not found or modified", 409);
       }
-      const desired = [...new Set(userIds)];
+      const subjects = await this.#accessGroupTokenSubjects(tx, id);
+      this.#requireAccessGroupSubjectOwnersLocked(subjects, lockedUserIds);
+      const lockedTokens = await this.#lockTokenFamilies(tx, subjects);
+      const removedFamilyIds = new Set(
+        subjects.filter((subject) => !desired.includes(subject.ownerId)).map((subject) =>
+          subject.familyId
+        ),
+      );
+      const tokensLosingMembership = lockedTokens.filter((token) =>
+        removedFamilyIds.has(token.familyId)
+      );
+      if (tokensLosingMembership.length) {
+        await tx`UPDATE api_tokens SET access_mode='restricted',version=version+1
+          WHERE id=ANY(${tx.array(tokensLosingMembership.map((token) => token.id))}::uuid[])`;
+      }
       await tx`DELETE FROM access_group_users WHERE group_id=${id} AND NOT (user_id = ANY(${
         tx.array(desired)
       }::uuid[]))`;
       for (const uid of desired) {
         await tx`INSERT INTO access_group_users(group_id,user_id) VALUES(${id},${uid}) ON CONFLICT DO NOTHING`;
       }
-      return await this.#loadAccessGroup(tx, id);
+      await tx`UPDATE access_groups SET version=version+1,updated_at=now() WHERE id=${id}`;
+      const group = await this.#loadAccessGroup(tx, id);
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+          VALUES(${audit.actorId},${audit.action},${audit.targetType},${id},${
+        tx.json((audit.metadata ?? {}) as postgres.JSONValue)
+      })`;
+      return group;
     });
   }
-  async replaceAccessGroupModels(id: string, modelIds: string[], expectedVersion: number) {
+  async replaceAccessGroupModels(
+    id: string,
+    modelIds: string[],
+    expectedVersion: number,
+    acknowledgePublicModelIds: string[],
+    audit: PrivilegedAuditEventInput,
+  ) {
+    requirePrivilegedAuditContext(audit);
     return await this.#sql.begin(async (tx) => {
-      const r =
-        await tx`UPDATE access_groups SET version=version+1,updated_at=now() WHERE id=${id} AND version=${expectedVersion} RETURNING id`;
-      if (!r.length) {
-        throw new DomainError("version_conflict", "Access group not found or modified", 409);
-      }
+      await assertEffectiveAdminActor(
+        tx,
+        audit.actorId,
+        audit.requireEmailVerification,
+        audit.expectedAuthorityEpoch,
+      );
+      const desiredModelIds = [...new Set(modelIds)];
+      const impact = await this.#lockAccessGroupModelPolicy(
+        tx,
+        id,
+        expectedVersion,
+        desiredModelIds,
+      );
+      await this.#requireProviderModelsExist(tx, desiredModelIds);
+      this.#requireModelAccessWideningAcknowledgement(
+        impact.modelIdsBecomingPublic,
+        acknowledgePublicModelIds,
+      );
+      await tx`UPDATE access_groups SET version=version+1,updated_at=now() WHERE id=${id}`;
       await tx`DELETE FROM access_group_models WHERE group_id=${id}`;
-      for (const mid of new Set(modelIds)) {
+      for (const mid of desiredModelIds) {
         await tx`INSERT INTO access_group_models(group_id,provider_model_id) VALUES(${id},${mid})`;
       }
-      return await this.#loadAccessGroup(tx, id);
+      const group = await this.#loadAccessGroup(tx, id);
+      const metadata = {
+        ...audit.metadata,
+        modelIdsBecomingPublic: impact.modelIdsBecomingPublic,
+      };
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+          VALUES(${audit.actorId ?? null},${audit.action},${audit.targetType},${id},${
+        tx.json(metadata as postgres.JSONValue)
+      })`;
+      return group;
     });
   }
-  async replaceAccessGroupPolicy(id: string, input: ReplaceAccessGroupPolicyInput) {
-    return await this.#sql.begin(async (tx) => {
-      const changed = await tx`UPDATE access_groups SET name=COALESCE(${
-        input.name ?? null
-      },name),description=COALESCE(${
-        input.description ?? null
-      },description),version=version+1,updated_at=now() WHERE id=${id} AND version=${input.expectedVersion} RETURNING id`;
-      if (!changed.length) {
-        throw new DomainError("version_conflict", "Access group not found or modified", 409);
-      }
-      const userIds = [...new Set(input.userIds)],
-        modelIds = [...new Set(input.modelIds)];
-      const requestedTokenIds = [...new Set(input.tokenIds)];
-      const requestedExisting = requestedTokenIds.length
-        ? await tx<Row[]>`SELECT id FROM api_tokens WHERE id=ANY(${
-          tx.array(requestedTokenIds)
-        }::uuid[])`
-        : [];
-      if (requestedExisting.length !== requestedTokenIds.length) {
-        throw new DomainError("not_found", "Token not found", 404);
-      }
-      const initialExistingRows = await tx<
-        Row[]
-      >`SELECT token_id FROM access_group_tokens WHERE group_id=${id}`;
-      const initialTokenIds = [
-        ...new Set([
-          ...requestedTokenIds,
-          ...initialExistingRows.map((row) => String(row.token_id)),
-        ]),
-      ];
-      const familyRows = initialTokenIds.length
-        ? await tx<Row[]>`SELECT DISTINCT rotation_family_id FROM api_tokens WHERE id=ANY(${
-          tx.array(initialTokenIds)
-        }::uuid[]) ORDER BY rotation_family_id`
-        : [];
-      // Rotation and every family-wide token mutation use the same locks. Taking all locks in
-      // UUID order prevents both a newly rotated generation from escaping this replacement and
-      // deadlocks when one policy spans multiple families.
-      for (const row of familyRows) {
-        await tx`SELECT pg_advisory_xact_lock(hashtext(${String(row.rotation_family_id)}))`;
-      }
-      const desiredRows = requestedTokenIds.length
-        ? await tx<
-          Row[]
-        >`SELECT id FROM api_tokens WHERE rotation_family_id IN (SELECT rotation_family_id FROM api_tokens WHERE id=ANY(${
-          tx.array(requestedTokenIds)
-        }::uuid[])) ORDER BY id`
-        : [];
-      const tokenIds = desiredRows.map((row) => String(row.id));
-      const existingRows = await tx<
-        Row[]
-      >`SELECT token_id FROM access_group_tokens WHERE group_id=${id}`;
-      const rawExistingTokenIds = existingRows.map((row) => String(row.token_id));
-      const expandedExisting = rawExistingTokenIds.length
-        ? await tx<
-          Row[]
-        >`SELECT id FROM api_tokens WHERE rotation_family_id IN (SELECT rotation_family_id FROM api_tokens WHERE id=ANY(${
-          tx.array(rawExistingTokenIds)
-        }::uuid[])) ORDER BY id`
-        : [];
-      const existingTokenIds = expandedExisting.map((row) => String(row.id));
-      const affected = [...new Set([...existingTokenIds, ...tokenIds])].sort();
-      const locked = affected.length
-        ? await tx<Row[]>`SELECT id,user_id FROM api_tokens WHERE id=ANY(${
-          tx.array(affected)
-        }::uuid[]) ORDER BY id FOR UPDATE`
-        : [];
-      const owners = new Map(locked.map((row) => [String(row.id), String(row.user_id)]));
-      if (owners.size !== affected.length) {
-        throw new DomainError("not_found", "Token not found", 404);
-      }
-      for (const tokenId of tokenIds) {
-        const owner = owners.get(tokenId)!;
-        if (!userIds.includes(owner)) {
-          throw new DomainError(
-            "validation_error",
-            "Every token owner must be included in the group",
-            422,
-          );
+  async replaceAccessGroupPolicy(
+    id: string,
+    input: ReplaceAccessGroupPolicyInput,
+    audit: PrivilegedAuditEventInput,
+  ) {
+    requirePrivilegedAuditContext(audit);
+    try {
+      return await this.#sql.begin(async (tx) => {
+        const userIds = [...new Set(input.userIds)].sort();
+        const modelIds = [...new Set(input.modelIds)];
+        const requestedTokenIds = [...new Set(input.tokenIds)];
+        const preliminarySubjects = await this.#accessGroupTokenSubjects(
+          tx,
+          id,
+          requestedTokenIds,
+        );
+        const lockedUsers = await lockUsersAndAssertEffectiveAdminActor(
+          tx,
+          audit.actorId,
+          [...userIds, ...preliminarySubjects.map((subject) => subject.ownerId)],
+          audit.requireEmailVerification,
+          audit.expectedAuthorityEpoch,
+        );
+        const lockedUserIds = new Set(lockedUsers.map((row) => String(row.id)));
+        if (userIds.some((userId) => !lockedUserIds.has(userId))) {
+          throw new DomainError("not_found", "User not found", 404);
         }
+        const impact = await this.#lockAccessGroupModelPolicy(
+          tx,
+          id,
+          input.expectedVersion,
+          modelIds,
+          true,
+        );
+        const metadataRows = await tx<
+          Row[]
+        >`SELECT name,description FROM access_groups WHERE id=${id}`;
+        const before = {
+          name: String(metadataRows[0].name),
+          description: String(metadataRows[0].description),
+        };
+        const after = {
+          name: input.name?.trim() ?? before.name,
+          description: input.description ?? before.description,
+        };
+        await this.#requireProviderModelsExist(tx, modelIds);
+        this.#requireModelAccessWideningAcknowledgement(
+          impact.modelIdsBecomingPublic,
+          input.acknowledgePublicModelIds,
+        );
+        const requestedExisting = requestedTokenIds.length
+          ? await tx<Row[]>`SELECT id FROM api_tokens WHERE id=ANY(${
+            tx.array(requestedTokenIds)
+          }::uuid[])`
+          : [];
+        if (requestedExisting.length !== requestedTokenIds.length) {
+          throw new DomainError("not_found", "Token not found", 404);
+        }
+        const subjects = await this.#accessGroupTokenSubjects(tx, id, requestedTokenIds);
+        this.#requireAccessGroupSubjectOwnersLocked(subjects, lockedUserIds);
+        await this.#lockTokenFamilies(tx, subjects);
+        const desiredRows = requestedTokenIds.length
+          ? await tx<
+            Row[]
+          >`SELECT id FROM api_tokens WHERE rotation_family_id IN (SELECT rotation_family_id FROM api_tokens WHERE id=ANY(${
+            tx.array(requestedTokenIds)
+          }::uuid[])) ORDER BY id`
+          : [];
+        const tokenIds = desiredRows.map((row) => String(row.id));
+        const existingRows = await tx<
+          Row[]
+        >`SELECT token_id FROM access_group_tokens WHERE group_id=${id}`;
+        const rawExistingTokenIds = existingRows.map((row) => String(row.token_id));
+        const expandedExisting = rawExistingTokenIds.length
+          ? await tx<
+            Row[]
+          >`SELECT id FROM api_tokens WHERE rotation_family_id IN (SELECT rotation_family_id FROM api_tokens WHERE id=ANY(${
+            tx.array(rawExistingTokenIds)
+          }::uuid[])) ORDER BY id`
+          : [];
+        const existingTokenIds = expandedExisting.map((row) => String(row.id));
+        const affected = [...new Set([...existingTokenIds, ...tokenIds])].sort();
+        const locked = affected.length
+          ? await tx<Row[]>`SELECT id,user_id FROM api_tokens WHERE id=ANY(${
+            tx.array(affected)
+          }::uuid[]) ORDER BY id FOR UPDATE`
+          : [];
+        const owners = new Map(locked.map((row) => [String(row.id), String(row.user_id)]));
+        if (owners.size !== affected.length) {
+          throw new DomainError("not_found", "Token not found", 404);
+        }
+        for (const tokenId of tokenIds) {
+          const owner = owners.get(tokenId)!;
+          if (!userIds.includes(owner)) {
+            throw new DomainError(
+              "validation_error",
+              "Every token owner must be included in the group",
+              422,
+            );
+          }
+        }
+        await tx`UPDATE access_groups SET name=${after.name},description=${after.description},
+        version=version+1,updated_at=now() WHERE id=${id}`;
+        await tx`DELETE FROM access_group_tokens WHERE group_id=${id}`;
+        await tx`DELETE FROM access_group_users WHERE group_id=${id}`;
+        await tx`DELETE FROM access_group_models WHERE group_id=${id}`;
+        for (const userId of userIds) {
+          await tx`INSERT INTO access_group_users(group_id,user_id) VALUES(${id},${userId})`;
+        }
+        for (const modelId of modelIds) {
+          await tx`INSERT INTO access_group_models(group_id,provider_model_id) VALUES(${id},${modelId})`;
+        }
+        for (const tokenId of tokenIds) {
+          const owner = owners.get(tokenId)!;
+          await tx`INSERT INTO access_group_tokens(group_id,token_id,user_id) VALUES(${id},${tokenId},${owner})`;
+        }
+        const changedTokens = affected.filter((tokenId) =>
+          existingTokenIds.includes(tokenId) !== tokenIds.includes(tokenId)
+        );
+        if (changedTokens.length) {
+          await tx`UPDATE api_tokens SET access_mode='restricted',version=version+1 WHERE id=ANY(${
+            tx.array(changedTokens)
+          }::uuid[])`;
+        }
+        const group = await this.#loadAccessGroup(tx, id);
+        const metadata = {
+          ...audit.metadata,
+          before,
+          after,
+          modelIdsBecomingPublic: impact.modelIdsBecomingPublic,
+        };
+        await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+          VALUES(${audit.actorId ?? null},${audit.action},${audit.targetType},${id},${
+          tx.json(metadata as postgres.JSONValue)
+        })`;
+        return group;
+      });
+    } catch (error) {
+      const postgresError = error as { code?: string; constraint_name?: string };
+      if (
+        postgresError.code === "23505" &&
+        postgresError.constraint_name === "access_groups_name_uq"
+      ) {
+        throw new DomainError("conflict", "Access group name is already used", 409);
       }
-      await tx`DELETE FROM access_group_tokens WHERE group_id=${id}`;
-      await tx`DELETE FROM access_group_users WHERE group_id=${id}`;
-      await tx`DELETE FROM access_group_models WHERE group_id=${id}`;
-      for (const userId of userIds) {
-        await tx`INSERT INTO access_group_users(group_id,user_id) VALUES(${id},${userId})`;
-      }
-      for (const modelId of modelIds) {
-        await tx`INSERT INTO access_group_models(group_id,provider_model_id) VALUES(${id},${modelId})`;
-      }
-      for (const tokenId of tokenIds) {
-        const owner = owners.get(tokenId)!;
-        await tx`INSERT INTO access_group_tokens(group_id,token_id,user_id) VALUES(${id},${tokenId},${owner})`;
-      }
-      const changedTokens = affected.filter((tokenId) =>
-        existingTokenIds.includes(tokenId) !== tokenIds.includes(tokenId)
-      );
-      if (changedTokens.length) {
-        await tx`UPDATE api_tokens SET access_mode='restricted',version=version+1 WHERE id=ANY(${
-          tx.array(changedTokens)
-        }::uuid[])`;
-      }
-      return await this.#loadAccessGroup(tx, id);
-    });
+      throw error;
+    }
   }
   async previewAccessGroupPolicyImpact(
+    context: PrivilegedReadContext,
     id: string,
     proposal: AccessGroupPolicyProposal | null = null,
   ): Promise<AccessGroupPolicyImpact> {
-    const group = await this.#loadAccessGroup(this.#sql, id);
-    const nextModels = new Set(proposal?.modelIds ?? []);
-    const proposedTokenIds = [...new Set(proposal?.tokenIds ?? [])];
-    const expandedProposed = proposedTokenIds.length
-      ? await this.#sql<Row[]>`SELECT id FROM api_tokens WHERE rotation_family_id IN
-        (SELECT rotation_family_id FROM api_tokens WHERE id=ANY(${
-        this.#sql.array(proposedTokenIds)
-      }::uuid[]))`
-      : [];
-    const nextTokens = new Set(expandedProposed.map((row) => String(row.id)));
-    const models: string[] = [];
-    for (const modelId of group.modelIds) {
-      if (
-        !nextModels.has(modelId) &&
-        !(await this
-          .#sql`SELECT 1 FROM access_group_models WHERE provider_model_id=${modelId} AND group_id<>${id} LIMIT 1`)
-          .length
-      ) models.push(modelId);
-    }
-    const tokens = group.tokenIds.filter((tokenId) => !nextTokens.has(tokenId));
-    return {
-      modelIdsBecomingPublic: models,
-      tokenIdsLosingGroupAccess: tokens,
-      tokenIdsRevertingToOwnerInheritance: [],
-    };
+    requirePrivilegedReadContext(context);
+    return await this.#sql.begin(async (tx) => {
+      await assertEffectiveAdminActor(
+        tx,
+        context.actorId,
+        context.requireEmailVerification,
+        context.expectedAuthorityEpoch,
+      );
+      const group = await this.#loadAccessGroup(tx, id);
+      const nextModels = new Set(proposal?.modelIds ?? []);
+      const proposedTokenIds = [...new Set(proposal?.tokenIds ?? [])];
+      const expandedProposed = proposedTokenIds.length
+        ? await tx<Row[]>`SELECT id FROM api_tokens WHERE rotation_family_id IN
+          (SELECT rotation_family_id FROM api_tokens WHERE id=ANY(${
+          tx.array(proposedTokenIds)
+        }::uuid[]))`
+        : [];
+      const nextTokens = new Set(expandedProposed.map((row) => String(row.id)));
+      const models: string[] = [];
+      for (const modelId of group.modelIds) {
+        if (
+          !nextModels.has(modelId) &&
+          !(await tx<
+            Row[]
+          >`SELECT 1 FROM access_group_models WHERE provider_model_id=${modelId} AND group_id<>${id} LIMIT 1`)
+            .length
+        ) models.push(modelId);
+      }
+      const tokens = group.tokenIds.filter((tokenId) => !nextTokens.has(tokenId));
+      return {
+        modelIdsBecomingPublic: models,
+        tokenIdsLosingGroupAccess: tokens,
+        tokenIdsRevertingToOwnerInheritance: [],
+      };
+    });
   }
   async setTokenAccessGroups(
     userId: string,
     tokenId: string,
     groupIds: string[],
     expectedVersion: number,
+    audit: PrivilegedAuditEventInput,
   ) {
+    requirePrivilegedAuditContext(audit);
     return await this.#sql.begin(async (tx) => {
-      for (const groupId of new Set(groupIds)) {
+      const userLockIds = [
+        ...new Set([userId, audit.actorId].filter(
+          (id): id is string => typeof id === "string",
+        )),
+      ].sort();
+      await tx`SELECT id FROM users WHERE id=ANY(${tx.array(userLockIds)}::uuid[])
+        ORDER BY id FOR UPDATE`;
+      await assertEffectiveAdminActor(
+        tx,
+        audit.actorId,
+        audit.requireEmailVerification,
+        audit.expectedAuthorityEpoch,
+      );
+      const desiredGroupIds = [...new Set(groupIds)].sort();
+      if (desiredGroupIds.length) {
+        await tx`SELECT id FROM access_groups
+          WHERE id=ANY(${tx.array(desiredGroupIds)}::uuid[]) ORDER BY id FOR KEY SHARE`;
+      }
+      for (const groupId of desiredGroupIds) {
         const membership =
           await tx`SELECT 1 FROM access_group_users WHERE group_id=${groupId} AND user_id=${userId}`;
         if (!membership.length) {
@@ -6991,19 +9655,23 @@ export class PostgresRepository implements DomainRepository {
       >`SELECT rotation_family_id FROM api_tokens WHERE id=${tokenId} AND user_id=${userId}`;
       if (!seed[0]) throw new DomainError("not_found", "Token not found", 404);
       const familyId = String(seed[0].rotation_family_id);
-      await tx`SELECT pg_advisory_xact_lock(hashtext(${familyId}))`;
+      await this.#lockTokenFamilies(tx, [{ familyId }]);
       const current = await tx<
         Row[]
-      >`SELECT * FROM api_tokens WHERE id=${tokenId} AND user_id=${userId} FOR UPDATE`;
+      >`SELECT * FROM api_tokens WHERE id=${tokenId} AND user_id=${userId}`;
       if (!current[0] || number(current[0].version) !== expectedVersion) {
         throw new DomainError("version_conflict", "Token not found or modified", 409);
       }
       await tx`DELETE FROM access_group_tokens WHERE token_id IN (SELECT id FROM api_tokens WHERE rotation_family_id=${familyId})`;
-      for (const gid of new Set(groupIds)) {
+      for (const gid of desiredGroupIds) {
         await tx`INSERT INTO access_group_tokens(group_id,token_id,user_id) SELECT ${gid},id,user_id FROM api_tokens WHERE rotation_family_id=${familyId}`;
       }
       await tx`UPDATE api_tokens SET access_mode='restricted',version=version+1 WHERE rotation_family_id=${familyId}`;
       const updated = await tx<Row[]>`SELECT * FROM api_tokens WHERE id=${tokenId}`;
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${audit.actorId ?? null},${audit.action},${audit.targetType},${tokenId},${
+        tx.json((audit.metadata ?? {}) as postgres.JSONValue)
+      })`;
       return tokenSummary(token(updated[0]));
     });
   }
@@ -7012,17 +9680,32 @@ export class PostgresRepository implements DomainRepository {
     tokenId: string,
     mode: "inherit" | "restricted",
     expectedVersion: number,
+    audit: PrivilegedAuditEventInput,
   ) {
+    requirePrivilegedAuditContext(audit);
     return await this.#sql.begin(async (tx) => {
+      const userLockIds = [
+        ...new Set([userId, audit.actorId].filter(
+          (id): id is string => typeof id === "string",
+        )),
+      ].sort();
+      await tx`SELECT id FROM users WHERE id=ANY(${tx.array(userLockIds)}::uuid[])
+        ORDER BY id FOR UPDATE`;
+      await assertEffectiveAdminActor(
+        tx,
+        audit.actorId,
+        audit.requireEmailVerification,
+        audit.expectedAuthorityEpoch,
+      );
       const seed = await tx<
         Row[]
       >`SELECT rotation_family_id FROM api_tokens WHERE id=${tokenId} AND user_id=${userId}`;
       if (!seed[0]) throw new DomainError("not_found", "Token not found", 404);
       const familyId = String(seed[0].rotation_family_id);
-      await tx`SELECT pg_advisory_xact_lock(hashtext(${familyId}))`;
+      await this.#lockTokenFamilies(tx, [{ familyId }]);
       const current = await tx<
         Row[]
-      >`SELECT * FROM api_tokens WHERE id=${tokenId} AND user_id=${userId} FOR UPDATE`;
+      >`SELECT * FROM api_tokens WHERE id=${tokenId} AND user_id=${userId}`;
       if (!current[0] || number(current[0].version) !== expectedVersion) {
         throw new DomainError("version_conflict", "Token not found or modified", 409);
       }
@@ -7031,6 +9714,10 @@ export class PostgresRepository implements DomainRepository {
       }
       await tx`UPDATE api_tokens SET access_mode=${mode},version=version+1 WHERE rotation_family_id=${familyId}`;
       const updated = await tx<Row[]>`SELECT * FROM api_tokens WHERE id=${tokenId}`;
+      await tx`INSERT INTO audit_events(actor_id,action,target_type,target_id,metadata)
+        VALUES(${audit.actorId ?? null},${audit.action},${audit.targetType},${tokenId},${
+        tx.json((audit.metadata ?? {}) as postgres.JSONValue)
+      })`;
       return tokenSummary(token(updated[0]));
     });
   }
@@ -7126,9 +9813,9 @@ export class PostgresRepository implements DomainRepository {
         const runLeaseToken = crypto.randomUUID();
         const runs = await tx<
           Row[]
-        >`INSERT INTO usage_runs(id,user_id,token_id,model,provider,status,reserved_micros,run_lease_token,run_lease_expires_at,pricing_version_id,pricing_input_micros_per_million,pricing_cached_input_micros_per_million,pricing_reasoning_micros_per_million,pricing_output_micros_per_million,pricing_fixed_call_micros,pricing_source) VALUES(${runId},${userId},${
+        >`INSERT INTO usage_runs(id,user_id,token_id,model,provider,recovery_owner,status,reserved_micros,run_lease_token,run_lease_expires_at,pricing_version_id,pricing_input_micros_per_million,pricing_cached_input_micros_per_million,pricing_reasoning_micros_per_million,pricing_output_micros_per_million,pricing_fixed_call_micros,pricing_source) VALUES(${runId},${userId},${
           tokenId ?? null
-        },${model},${provider},'reserved',${amount},${runLeaseToken},now()+120*interval '1 second',${
+        },${model},${provider},'provider','reserved',${amount},${runLeaseToken},now()+120*interval '1 second',${
           pricingSnapshot?.pricingVersionId ?? null
         },${pricingSnapshot?.inputMicrosPerMillion ?? null},${
           pricingSnapshot?.cachedInputMicrosPerMillion ?? null
@@ -7335,9 +10022,9 @@ export class PostgresRepository implements DomainRepository {
       const pricing = input.pricingSnapshot;
       const runs = await tx<
         Row[]
-      >`INSERT INTO usage_runs(id,user_id,token_id,model,provider,status,reserved_micros,pricing_version_id,pricing_input_micros_per_million,pricing_cached_input_micros_per_million,pricing_reasoning_micros_per_million,pricing_output_micros_per_million,pricing_fixed_call_micros,pricing_source) VALUES(${input.runId},${input.userId},${
+      >`INSERT INTO usage_runs(id,user_id,token_id,model,provider,recovery_owner,status,reserved_micros,pricing_version_id,pricing_input_micros_per_million,pricing_cached_input_micros_per_million,pricing_reasoning_micros_per_million,pricing_output_micros_per_million,pricing_fixed_call_micros,pricing_source) VALUES(${input.runId},${input.userId},${
         input.tokenId ?? null
-      },${input.model},${input.provider},'reserved',${input.reserveMicros},${
+      },${input.model},${input.provider},'api_replay','reserved',${input.reserveMicros},${
         pricing?.pricingVersionId ?? null
       },${pricing?.inputMicrosPerMillion ?? null},${pricing?.cachedInputMicrosPerMillion ?? null},${
         pricing?.reasoningMicrosPerMillion ?? null
@@ -7526,6 +10213,16 @@ export class PostgresRepository implements DomainRepository {
     if (!rows.length) {
       throw new DomainError("stale_lease", "Idempotent request lease is no longer active", 409);
     }
+  }
+  async releaseApiRequestLease(id: string, leaseToken: string) {
+    const rows = await this.#sql<Row[]>`
+      UPDATE api_idempotency_requests SET lease_expires_at=now()-interval '1 millisecond',
+        updated_at=now() WHERE id=${id} AND state='in_progress' AND lease_token=${leaseToken}
+        AND lease_expires_at>now() RETURNING *`;
+    if (!rows[0]) throw new DomainError("stale_lease", "Idempotent request lease is stale", 409);
+    const events = await this.#sql<Row[]>`
+      SELECT * FROM api_idempotency_events WHERE request_id=${id} ORDER BY sequence`;
+    return apiRequest(rows[0], events.map(apiFrame));
   }
   async reclaimApiRequest(id: string, expiredLeaseToken: string, leaseSeconds = 120) {
     if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1) {
@@ -7923,6 +10620,9 @@ export class PostgresRepository implements DomainRepository {
         WHERE r.state='in_progress' AND r.lease_expires_at<=now()
           AND NOT (r.endpoint='images.generations' AND EXISTS(
             SELECT 1 FROM generated_assets ga WHERE ga.usage_run_id=r.usage_run_id))
+          AND NOT (r.endpoint='files' AND EXISTS(
+            SELECT 1 FROM file_upload_staging s
+            WHERE s.request_id=r.id AND s.state<>'finalized'))
         ORDER BY r.lease_expires_at FOR UPDATE OF r SKIP LOCKED LIMIT ${limit}`;
       for (const row of rows) {
         const id = String(row.id);
@@ -8054,23 +10754,64 @@ export class PostgresRepository implements DomainRepository {
       createdAt: iso(row.created_at),
     }));
   }
-  async enqueueJob(type: string, payload: unknown, availableAt?: string) {
-    const rows = await this.#sql<
-      Row[]
-    >`INSERT INTO jobs(type,payload,available_at) VALUES(${type},${
-      this.#sql.json(payload as postgres.JSONValue)
-    },${availableAt ?? new Date().toISOString()}) RETURNING id`;
-    return String(rows[0].id);
+  async enqueueJob(
+    type: string,
+    payload: unknown,
+    availableAt?: string,
+    idempotencyKey?: string,
+  ) {
+    if (idempotencyKey === undefined) {
+      const rows = await this.#sql<
+        Row[]
+      >`INSERT INTO jobs(type,payload,available_at) VALUES(${type},${
+        this.#sql.json(payload as postgres.JSONValue)
+      },${availableAt ?? new Date().toISOString()}) RETURNING id`;
+      return String(rows[0].id);
+    }
+    return await this.#sql.begin(async (tx) => {
+      const inserted = await tx<Row[]>`
+        INSERT INTO jobs(type,payload,available_at,idempotency_key)
+        VALUES(${type},${tx.json(payload as postgres.JSONValue)},
+          ${availableAt ?? new Date().toISOString()},${idempotencyKey})
+        ON CONFLICT(idempotency_key) DO NOTHING RETURNING id`;
+      if (inserted[0]) return String(inserted[0].id);
+      const existing = await tx<Row[]>`
+        SELECT id FROM jobs WHERE idempotency_key=${idempotencyKey}
+          AND type=${type} AND payload=${tx.json(payload as postgres.JSONValue)}`;
+      const prior = existing[0];
+      if (!prior) {
+        throw new DomainError(
+          "job_idempotency_conflict",
+          "Job idempotency key payload differs",
+          409,
+        );
+      }
+      return String(prior.id);
+    });
   }
   async adminSummary() {
     const totals = await this.#sql<
       Row[]
-    >`SELECT (SELECT count(*)::int FROM usage_runs) calls,(SELECT count(*)::int FROM users) users,COALESCE((SELECT sum(balance_micros) FROM users),0)::bigint balance_micros`;
+    >`SELECT (SELECT count(*)::numeric FROM usage_runs) calls,
+      (SELECT count(*)::numeric FROM users) users,
+      COALESCE((SELECT sum(balance_micros)::numeric FROM users),0::numeric) balance_micros`;
+    const calls = Number(totals[0].calls);
+    const users = Number(totals[0].users);
+    const balanceMicros = Number(totals[0].balance_micros);
+    if (
+      !Number.isSafeInteger(calls) || !Number.isSafeInteger(users) ||
+      !Number.isSafeInteger(balanceMicros)
+    ) {
+      throw new DomainError(
+        "accounting_overflow",
+        "Administrative usage summary exceeds safe integer bounds",
+        500,
+      );
+    }
     return {
-      calls: number(totals[0].calls),
-      users: number(totals[0].users),
-      balanceMicros: number(totals[0].balance_micros),
-      ledger: await this.listAllLedger(),
+      calls,
+      users,
+      balanceMicros,
     };
   }
   async adminAnalytics(query: AdminAnalyticsQuery): Promise<AdminAnalytics> {
@@ -8187,20 +10928,6 @@ export class PostgresRepository implements DomainRepository {
         statuses: await distribution("status"),
       };
     });
-  }
-  private async listAllLedger(): Promise<LedgerEntry[]> {
-    return (await this.#sql<Row[]>`SELECT * FROM ledger_entries ORDER BY user_id,sequence,id`).map((
-      row,
-    ) => ({
-      id: String(row.id),
-      userId: String(row.user_id),
-      sequence: number(row.sequence),
-      usageRunId: String(row.usage_run_id),
-      kind: row.kind as LedgerEntry["kind"],
-      amountMicros: number(row.amount_micros),
-      balanceAfterMicros: number(row.balance_after_micros),
-      createdAt: iso(row.created_at),
-    }));
   }
   async listJobs(query: AdminJobQuery = {}): Promise<AdminJobPage> {
     const limit = query.limit ?? 50;
@@ -8321,6 +11048,98 @@ export class PostgresRepository implements DomainRepository {
       return { job: adminJob(updated[0]), priorAttempts };
     });
   }
+  async listWorkerInstances(query: AdminWorkerQuery = {}): Promise<AdminWorkerPage> {
+    const limit = query.limit ?? 50;
+    const scope = query.scope ?? "active";
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new DomainError("validation_error", "Worker page limit must be between 1 and 100", 422);
+    }
+    if (!["active", "history", "all"].includes(scope)) {
+      throw new DomainError("validation_error", "Worker scope is invalid", 422);
+    }
+    let cursor: { startedAtMicros: string; id: string; scope: string } | undefined;
+    if (query.cursor) {
+      try {
+        const decoded = JSON.parse(atob(query.cursor));
+        if (
+          !decoded || typeof decoded.startedAtMicros !== "string" ||
+          !/^\d{1,20}$/u.test(decoded.startedAtMicros) ||
+          BigInt(decoded.startedAtMicros) > 253_402_300_799_999_999n ||
+          typeof decoded.id !== "string" || !UUID_PATTERN.test(decoded.id) ||
+          decoded.scope !== scope
+        ) throw new Error();
+        cursor = decoded;
+      } catch {
+        throw new DomainError("validation_error", "Worker cursor is invalid", 422);
+      }
+    }
+    const rows = await this.#sql<Row[]>`SELECT instance_id,worker_name,state,started_at,
+      heartbeat_at,progress_at,current_job_id,current_job_type,last_completed_at,
+      last_completed_job_id,last_completed_job_type,heartbeat_stale_ms,progress_stale_ms,
+      health_clock_tolerance_ms,
+      greatest(0,floor(extract(epoch FROM (clock_timestamp()-heartbeat_at))*1000))::bigint
+        heartbeat_age_ms,
+      greatest(0,floor(extract(epoch FROM (clock_timestamp()-progress_at))*1000))::bigint
+        progress_age_ms,
+      CASE
+        WHEN state='stopped' THEN 'inactive'
+        WHEN heartbeat_at NOT BETWEEN
+          clock_timestamp()-heartbeat_stale_ms*interval '1 millisecond'
+          AND clock_timestamp()+health_clock_tolerance_ms*interval '1 millisecond'
+          THEN 'heartbeat_stale'
+        WHEN progress_at NOT BETWEEN
+          clock_timestamp()-progress_stale_ms*interval '1 millisecond'
+          AND clock_timestamp()+health_clock_tolerance_ms*interval '1 millisecond'
+          THEN 'progress_stalled'
+        ELSE 'fresh'
+      END liveness,
+      floor(extract(epoch FROM started_at)*1000000)::bigint started_at_micros
+      FROM worker_instances
+      WHERE (${scope === "all"} OR (${scope === "active"} AND state<>'stopped') OR
+        (${scope === "history"} AND state='stopped'))
+      AND (${cursor === undefined} OR started_at<to_timestamp(${
+      cursor?.startedAtMicros ?? "0"
+    }::numeric/1000000) OR
+        (started_at=to_timestamp(${cursor?.startedAtMicros ?? "0"}::numeric/1000000)
+          AND instance_id<${cursor?.id ?? "00000000-0000-4000-8000-000000000000"}::uuid))
+      ORDER BY started_at DESC,instance_id DESC LIMIT ${limit + 1}`;
+    const page = rows.slice(0, limit);
+    const last = page.at(-1);
+    const items = page.map((row) => ({
+      instanceId: String(row.instance_id),
+      workerName: String(row.worker_name),
+      state: row.state as AdminWorkerInstance["state"],
+      startedAt: iso(row.started_at),
+      heartbeatAt: iso(row.heartbeat_at),
+      progressAt: iso(row.progress_at),
+      heartbeatAgeMs: number(row.heartbeat_age_ms),
+      progressAgeMs: number(row.progress_age_ms),
+      heartbeatStaleMs: number(row.heartbeat_stale_ms),
+      progressStaleMs: number(row.progress_stale_ms),
+      healthClockToleranceMs: number(row.health_clock_tolerance_ms),
+      liveness: String(row.liveness) as AdminWorkerInstance["liveness"],
+      currentJobId: row.current_job_id ? String(row.current_job_id) : null,
+      currentJobType: row.current_job_type ? String(row.current_job_type) : null,
+      lastCompletedAt: row.last_completed_at ? iso(row.last_completed_at) : null,
+      lastCompletedJobId: row.last_completed_job_id ? String(row.last_completed_job_id) : null,
+      lastCompletedJobType: row.last_completed_job_type
+        ? String(row.last_completed_job_type)
+        : null,
+    }));
+    return {
+      items,
+      scope,
+      limit,
+      hasMore: rows.length > limit,
+      nextCursor: rows.length > limit && last
+        ? btoa(JSON.stringify({
+          startedAtMicros: String(last.started_at_micros),
+          id: String(last.instance_id),
+          scope,
+        }))
+        : null,
+    };
+  }
   async getRetentionPolicy(): Promise<RetentionPolicy> {
     const rows = await this.#sql<Row[]>`SELECT v.* FROM retention_policy_state s
       JOIN retention_policy_versions v ON v.version=s.current_version WHERE s.singleton_id=1`;
@@ -8430,7 +11249,7 @@ export class PostgresRepository implements DomainRepository {
       responseBytes: number(row.response_bytes),
     };
   }
-  async enqueueRetentionScrub(input: EnqueueRetentionScrubInput, actorId: string) {
+  async enqueueRetentionScrub(input: EnqueueRetentionScrubInput, actorId: string | null) {
     if (
       !input.idempotencyKey || input.idempotencyKey.length < 8 ||
       input.idempotencyKey.length > 200 ||
@@ -8502,6 +11321,122 @@ export class PostgresRepository implements DomainRepository {
         policy_updated_at: current[0].updated_at,
         policy_updated_by: current[0].updated_by,
       });
+    });
+  }
+  async scheduleRetentionScrub(
+    input: ScheduleRetentionScrubInput,
+  ): Promise<RetentionScheduleResult> {
+    if (
+      !Number.isSafeInteger(input.intervalSeconds) || input.intervalSeconds < 300 ||
+      input.intervalSeconds > 2_592_000
+    ) {
+      throw new DomainError(
+        "validation_error",
+        "Retention schedule interval must be between 300 and 2592000 seconds",
+        422,
+      );
+    }
+    const now = new Date(input.now ?? new Date().toISOString());
+    if (!Number.isFinite(now.getTime())) {
+      throw new DomainError("validation_error", "Retention schedule time is invalid", 422);
+    }
+    const nowIso = now.toISOString();
+    return await this.#sql.begin(async (tx) => {
+      const rows = await tx<Row[]>`SELECT s.*,v.version current_policy_version,
+        v.capture_enabled,v.request_body_days,
+        v.response_body_days,v.updated_at policy_updated_at,v.updated_by policy_updated_by
+        FROM retention_schedule_state s
+        JOIN retention_policy_state ps ON ps.singleton_id=1
+        JOIN retention_policy_versions v ON v.version=ps.current_version
+        WHERE s.singleton_id=1 FOR UPDATE OF s`;
+      const state = rows[0];
+      if (!state) {
+        throw new DomainError("not_found", "Retention schedule is not initialized", 500);
+      }
+      let dueAt = new Date(String(state.next_due_at));
+      if (number(state.interval_seconds) !== input.intervalSeconds) {
+        const cadenceAnchor = state.last_scheduled_at === null
+          ? now.getTime()
+          : new Date(String(state.last_scheduled_at)).getTime();
+        dueAt = new Date(cadenceAnchor + input.intervalSeconds * 1_000);
+      }
+      const policyVersion = number(state.current_policy_version);
+      const lastPolicyVersion = state.last_policy_version === null
+        ? null
+        : number(state.last_policy_version);
+      const intervalDue = dueAt.getTime() <= now.getTime();
+      const policyChanged = lastPolicyVersion !== policyVersion;
+      const overdueSeconds = intervalDue
+        ? Math.max(0, Math.floor((now.getTime() - dueAt.getTime()) / 1_000))
+        : 0;
+      if (!intervalDue && !policyChanged) {
+        const unchanged = await tx<Row[]>`UPDATE retention_schedule_state
+          SET interval_seconds=${input.intervalSeconds},next_due_at=${dueAt.toISOString()},
+          updated_at=${nowIso}
+          WHERE singleton_id=1 RETURNING next_due_at`;
+        return {
+          scheduled: false,
+          reason: null,
+          run: null,
+          intervalSeconds: input.intervalSeconds,
+          nextDueAt: iso(unchanged[0].next_due_at),
+          overdueSeconds,
+        };
+      }
+      const reason = policyChanged ? "policy_changed" : "interval_due";
+      // The locked singleton state is the exactly-once fence. A unique key cannot collide with
+      // administrator-chosen idempotency keys created before automatic scheduling existed.
+      const idempotencyKey = `retention.auto:${crypto.randomUUID()}`;
+      const requestCutoffAt = new Date(
+        now.getTime() - number(state.request_body_days) * 86_400_000,
+      ).toISOString();
+      const responseCutoffAt = new Date(
+        now.getTime() - number(state.response_body_days) * 86_400_000,
+      ).toISOString();
+      const inserted = await tx<Row[]>`INSERT INTO retention_scrub_runs(idempotency_key,status,
+        policy_version,capture_enabled,request_body_days,response_body_days,request_cutoff_at,
+        response_cutoff_at,requested_by)
+        VALUES(${idempotencyKey},'queued',${policyVersion},${Boolean(state.capture_enabled)},
+          ${number(state.request_body_days)},${number(state.response_body_days)},${requestCutoffAt},
+          ${responseCutoffAt},NULL) RETURNING *`;
+      const runId = String(inserted[0].id);
+      await tx`INSERT INTO jobs(type,payload,idempotency_key) VALUES('retention.scrub',
+        ${tx.json({ runId })},${`retention.scrub:${runId}`})`;
+      const intervalMs = input.intervalSeconds * 1_000;
+      const nextDueMs = intervalDue
+        ? dueAt.getTime() +
+          (Math.floor((now.getTime() - dueAt.getTime()) / intervalMs) + 1) * intervalMs
+        : now.getTime() + intervalMs;
+      const nextDueAt = new Date(nextDueMs).toISOString();
+      await tx`UPDATE retention_schedule_state SET interval_seconds=${input.intervalSeconds},
+        next_due_at=${nextDueAt},last_policy_version=${policyVersion},last_scheduled_at=${nowIso},
+        last_run_id=${runId}::uuid,updated_at=${nowIso} WHERE singleton_id=1`;
+      await tx`INSERT INTO audit_events(action,target_type,target_id,metadata)
+        VALUES('retention.scrub.enqueued','retention_scrub_run',${runId},${
+        tx.json({ policyVersion, source: "automatic" } as postgres.JSONValue)
+      }),('retention.schedule.enqueued','retention_scrub_run',${runId},${
+        tx.json(
+          {
+            reason,
+            policyVersion,
+            intervalSeconds: input.intervalSeconds,
+            overdueSeconds,
+            nextDueAt,
+          } as postgres.JSONValue,
+        )
+      })`;
+      return {
+        scheduled: true,
+        reason,
+        run: retentionRun({
+          ...inserted[0],
+          policy_updated_at: state.policy_updated_at,
+          policy_updated_by: state.policy_updated_by,
+        }),
+        intervalSeconds: input.intervalSeconds,
+        nextDueAt,
+        overdueSeconds,
+      };
     });
   }
   async getRetentionScrubRun(id: string) {

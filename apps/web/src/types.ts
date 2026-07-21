@@ -1,4 +1,12 @@
 import type {
+  CommunityColorToken,
+  CommunityIdentityMode,
+  CommunityLeaderboardEntry,
+  CommunityLeaderboardMetric,
+  CommunityLeaderboardPage,
+  CommunityLeaderboardQuery,
+  CommunityLeaderboardWindow,
+  CommunityProfile,
   ConversationFolder,
   ConversationFolderMembership,
   ConversationShareAttachmentPolicy,
@@ -11,14 +19,24 @@ import type {
   PublicConversationShare,
   PublicConversationShareAttachment,
   PublicConversationShareMessage,
+  UpdateCommunityProfileRequest,
   UserPreferences,
 } from "../../../packages/contracts/src/types.ts";
 export type {
+  CommunityColorToken,
+  CommunityIdentityMode,
+  CommunityLeaderboardEntry,
+  CommunityLeaderboardMetric,
+  CommunityLeaderboardPage,
+  CommunityLeaderboardQuery,
+  CommunityLeaderboardWindow,
+  CommunityProfile,
   ConversationFolder,
   ConversationFolderMembership,
   ConversationTag,
   ConversationTagBinding,
   ConversationTagSet,
+  UpdateCommunityProfileRequest,
   UserPreferences,
 };
 export type { ConversationShareSummary, PublicConversationShare };
@@ -58,7 +76,10 @@ export interface Conversation {
   id: string;
   title: string;
   preview: string;
+  /** Canonical server timestamp. Localize this only where it is rendered. */
   updatedAt: string;
+  /** Optional product/demo copy which replaces the localized timestamp without affecting sorting. */
+  updatedAtLabel?: string;
   pinned?: boolean;
   archived?: boolean;
   deleted?: boolean;
@@ -67,6 +88,14 @@ export interface Conversation {
   project?: string;
   activeLeafId?: string | null;
   version?: number;
+  searchMatchSource?: "title" | "message";
+  searchMessageId?: string | null;
+  searchMessageRole?: "user" | "assistant" | null;
+}
+
+export interface ConversationSearchPage {
+  data: Conversation[];
+  nextCursor: string | null;
 }
 export type ShareIdentityVisibility = ConversationShareIdentityVisibility;
 export type ShareAttachmentPolicy = ConversationShareAttachmentPolicy;
@@ -239,10 +268,12 @@ export interface Attachment {
   mimeType: string;
   sizeBytes: number;
   state: string;
+  inspectionError?: string | null;
   ingestionStatus?: "not_applicable" | "queued" | "processing" | "ready" | "failed";
   ingestionError?: string | null;
   ingestedAt?: string | null;
   createdAt: string;
+  updatedAt?: string;
 }
 
 export interface KnowledgeCollection {
@@ -359,6 +390,33 @@ export interface AdminJobPage {
 export interface RetriedAdminJob {
   job: AdminJob;
   priorAttempts: number;
+}
+export interface AdminWorkerInstance {
+  instanceId: string;
+  workerName: string;
+  state: "starting" | "running" | "draining" | "stopped";
+  startedAt: string;
+  heartbeatAt: string;
+  progressAt: string;
+  heartbeatAgeMs: number;
+  progressAgeMs: number;
+  heartbeatStaleMs: number;
+  progressStaleMs: number;
+  healthClockToleranceMs: number;
+  liveness: "fresh" | "heartbeat_stale" | "progress_stalled" | "inactive";
+  currentJobId: string | null;
+  currentJobType: string | null;
+  lastCompletedAt: string | null;
+  lastCompletedJobId: string | null;
+  lastCompletedJobType: string | null;
+}
+export type AdminWorkerScope = "active" | "history" | "all";
+export interface AdminWorkerPage {
+  items: AdminWorkerInstance[];
+  scope: AdminWorkerScope;
+  limit: number;
+  nextCursor: string | null;
+  hasMore: boolean;
 }
 export type RetentionDays = 1 | 7 | 14 | 30 | 90;
 export interface RetentionPolicy {

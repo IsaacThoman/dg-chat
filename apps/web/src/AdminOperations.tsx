@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, ApiError } from "./api.ts";
 import { AdminAnalytics, type AnalyticsFilters } from "./AdminAnalytics.tsx";
 import { AdminJobs, type JobFilters } from "./AdminJobs.tsx";
@@ -9,6 +9,8 @@ import type {
   AdminAnalyticsStatus,
   AdminJobFilters,
   AdminJobStatus,
+  AdminWorkerInstance,
+  AdminWorkerScope,
 } from "./types.ts";
 
 interface OperationsProps {
@@ -106,6 +108,14 @@ export function AdminJobsView({ search, onSearch }: OperationsProps) {
     queryFn: () => api.adminJobs(apiFilters, search.cursor),
     placeholderData: (previous) => previous,
   });
+  const [workerScope, setWorkerScope] = useState<Exclude<AdminWorkerScope, "all">>("active");
+  const workers = useInfiniteQuery({
+    queryKey: ["admin-workers", workerScope],
+    queryFn: ({ pageParam }) => api.adminWorkers(workerScope, pageParam),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.nextCursor ?? undefined,
+    refetchInterval: 10_000,
+  });
   const [actionOutcome, setActionOutcome] = useState<
     { kind: "success" | "error"; message: string } | undefined
   >();
@@ -134,19 +144,158 @@ export function AdminJobsView({ search, onSearch }: OperationsProps) {
     });
   };
   return (
-    <AdminJobs
-      page={query.data}
-      filters={filters}
-      loading={query.isLoading}
-      stale={query.isFetching && query.data !== undefined}
-      error={query.error ? message(query.error) : undefined}
-      actionMessage={actionOutcome?.message}
-      actionError={actionOutcome?.kind === "error"}
-      retryingJobId={retry.isPending ? retry.variables : undefined}
-      onApply={apply}
-      onRetryLoad={() => void query.refetch()}
-      onRetryJob={(id) => retry.mutateAsync(id).then(() => undefined)}
-      onCursor={changeCursor}
-    />
+    <>
+      <WorkerFleet
+        workers={workers.data?.pages.flatMap((page) => page.items)}
+        scope={workerScope}
+        onScope={setWorkerScope}
+        hasMore={workers.hasNextPage}
+        loadingMore={workers.isFetchingNextPage}
+        onLoadMore={() => void workers.fetchNextPage()}
+        loading={workers.isLoading}
+        error={workers.error ? message(workers.error) : undefined}
+        onRetry={() => void workers.refetch()}
+      />
+      <AdminJobs
+        page={query.data}
+        filters={filters}
+        loading={query.isLoading}
+        stale={query.isFetching && query.data !== undefined}
+        error={query.error ? message(query.error) : undefined}
+        actionMessage={actionOutcome?.message}
+        actionError={actionOutcome?.kind === "error"}
+        retryingJobId={retry.isPending ? retry.variables : undefined}
+        onApply={apply}
+        onRetryLoad={() => void query.refetch()}
+        onRetryJob={(id) => retry.mutateAsync(id).then(() => undefined)}
+        onCursor={changeCursor}
+      />
+    </>
+  );
+}
+
+function duration(ageMs: number) {
+  if (ageMs < 1_000) return "now";
+  if (ageMs < 60_000) return `${Math.floor(ageMs / 1_000)}s ago`;
+  return `${Math.floor(ageMs / 60_000)}m ago`;
+}
+
+export function WorkerFleet(props: {
+  workers?: AdminWorkerInstance[];
+  scope: Exclude<AdminWorkerScope, "all">;
+  onScope(scope: Exclude<AdminWorkerScope, "all">): void;
+  hasMore: boolean;
+  loadingMore: boolean;
+  onLoadMore(): void;
+  loading: boolean;
+  error?: string;
+  onRetry(): void;
+}) {
+  return (
+    <section className="ops-page" aria-labelledby="worker-fleet-title">
+      <div className="ops-heading">
+        <div>
+          <h1 id="worker-fleet-title">Worker fleet</h1>
+          <p>Boot-scoped heartbeat and durable progress for every background worker.</p>
+        </div>
+      </div>
+      <div className="ops-filters" role="group" aria-label="Worker scope">
+        {(["active", "history"] as const).map((scope) => (
+          <button
+            className={props.scope === scope ? "primary ops-target" : "secondary ops-target"}
+            aria-pressed={props.scope === scope}
+            onClick={() => props.onScope(scope)}
+            key={scope}
+          >
+            {scope === "active" ? "Active boots" : "Stopped history"}
+          </button>
+        ))}
+      </div>
+      <div role={props.error && !props.workers ? "alert" : "status"} aria-live="polite">
+        {props.loading
+          ? "Loading worker health…"
+          : props.error
+          ? props.workers ? `Showing cached workers. ${props.error}` : props.error
+          : props.workers?.length === 0
+          ? "No worker boots have registered yet."
+          : ""}
+      </div>
+      {props.error && !props.workers && (
+        <button className="secondary ops-target" onClick={props.onRetry}>
+          Retry worker health
+        </button>
+      )}
+      {props.workers && props.workers.length > 0 && (
+        <ul className="ops-job-list" aria-label="Worker instances">
+          {props.workers.map((worker) => (
+            <li className="ops-job-card" key={worker.instanceId}>
+              <div className="ops-job-primary">
+                <strong>{worker.workerName}</strong>
+                <span>
+                  <span
+                    className={`ops-status ops-status-${worker.state}`}
+                    aria-label={`Lifecycle: ${worker.state}`}
+                  >
+                    {worker.state}
+                  </span>{" "}
+                  <span
+                    className={`ops-status ops-status-${worker.liveness}`}
+                    aria-label={`Liveness: ${worker.liveness.replaceAll("_", " ")}`}
+                  >
+                    {worker.liveness.replaceAll("_", " ")}
+                  </span>
+                </span>
+              </div>
+              <dl>
+                <div>
+                  <dt>Boot</dt>
+                  <dd>
+                    <code>{worker.instanceId}</code>
+                  </dd>
+                </div>
+                <div>
+                  <dt>Heartbeat</dt>
+                  <dd>{duration(worker.heartbeatAgeMs)}</dd>
+                </div>
+                <div>
+                  <dt>Progress</dt>
+                  <dd>{duration(worker.progressAgeMs)}</dd>
+                </div>
+                {worker.currentJobType && (
+                  <div>
+                    <dt>Current job</dt>
+                    <dd>{worker.currentJobType}</dd>
+                  </div>
+                )}
+                {worker.lastCompletedAt && (
+                  <div>
+                    <dt>Last completion</dt>
+                    <dd>
+                      {worker.lastCompletedJobType ?? "Job"}
+                      {" · "}
+                      <time dateTime={worker.lastCompletedAt}>
+                        {new Date(worker.lastCompletedAt).toLocaleString()}
+                      </time>
+                    </dd>
+                  </div>
+                )}
+              </dl>
+            </li>
+          ))}
+        </ul>
+      )}
+      {props.hasMore && (
+        <div className="ops-pagination">
+          <button
+            className="secondary ops-target"
+            disabled={props.loadingMore}
+            onClick={props.onLoadMore}
+          >
+            {props.loadingMore ? "Loading more…" : "Load more worker boots"}
+          </button>
+          <span role="status">More {props.scope} worker boots are available.</span>
+        </div>
+      )}
+    </section>
   );
 }

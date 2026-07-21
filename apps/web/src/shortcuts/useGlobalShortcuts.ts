@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { modalOverlayPresent } from "../modalFocus.ts";
 
 export function mobileSidebarLayout(
   match: Pick<typeof globalThis, "matchMedia"> = globalThis,
@@ -37,7 +38,7 @@ export function useGlobalShortcuts({
 }) {
   useEffect(() => {
     const keydown = (event: KeyboardEvent) => {
-      if (event.defaultPrevented || event.altKey || document.querySelector('[aria-modal="true"]')) {
+      if (event.defaultPrevented || event.altKey || modalOverlayPresent()) {
         return;
       }
       const mod = event.metaKey || event.ctrlKey;

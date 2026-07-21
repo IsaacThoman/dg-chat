@@ -16,6 +16,8 @@ regexes = [
   '''d3JhcHBlZC1rZXk=''',
   # Rejected object-key field in the strict DGCHAT schema test; not a credential.
   '''private/bucket/key''',
+  # UUID-shaped provider-payload redaction fixture; deliberately synthetic and never a credential.
+  '''123E4567-E89B-12D3-A456-426614174000''',
 ]
 paths = [
   '''\.github/workflows/ci\.yml''',

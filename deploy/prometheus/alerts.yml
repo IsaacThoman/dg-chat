@@ -1,0 +1,120 @@
+groups:
+  - name: dg-chat-runtime
+    rules:
+      - alert: DgChatTargetDown
+        expr: up{job=~"dg-chat-(api|worker)"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "DG Chat {{ $labels.job }} metrics target is down"
+          description: "Prometheus has been unable to scrape the private metrics listener for two minutes."
+      - alert: DgChatApiTargetsAbsent
+        expr: label_replace(absent(up{job="dg-chat-api"} == 1), "job", "dg-chat-api", "", "")
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: DG Chat has no healthy API metrics targets
+          description: "Prometheus has observed no healthy API scrape target for two minutes."
+      - alert: DgChatWorkerTargetsAbsent
+        expr: label_replace(absent(up{job="dg-chat-worker"} == 1), "job", "dg-chat-worker", "", "")
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: DG Chat has no healthy worker metrics targets
+          description: "Prometheus has observed no healthy worker scrape target for two minutes."
+      - alert: DgChatApiNotReady
+        expr: dg_chat_process_ready{service="api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: DG Chat API is not ready
+          description: "The most recent readiness request failed; remove this replica from traffic."
+      - alert: DgChatWorkerNotReady
+        expr: dg_chat_process_ready{service="worker"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: DG Chat worker is not ready
+          description: "The worker has not reported a ready durable poll loop for two minutes."
+      - alert: DgChatDependencyUnavailable
+        expr: dg_chat_dependency_ready == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "DG Chat {{ $labels.service }} cannot reach {{ $labels.dependency }}"
+          description: "A bounded dependency readiness probe has failed for two minutes."
+      - alert: DgChatHttpErrorRatioHigh
+        expr: sum(rate(dg_chat_http_requests_total{status_class="5xx"}[5m])) / clamp_min(sum(rate(dg_chat_http_requests_total[5m])), 0.001) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: DG Chat API error ratio is high
+          description: "More than five percent of requests have returned 5xx for ten minutes."
+      - alert: DgChatHttpResponseBodyFailures
+        expr: sum(increase(dg_chat_http_response_lifecycle_total{outcome="failed"}[5m])) > 2
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: DG Chat HTTP response streams are failing
+          description: "More than two HTTP response bodies failed after dispatch in the rolling five-minute window."
+
+  - name: dg-chat-durable-work
+    rules:
+      - alert: DgChatQueueBacklog
+        # Every worker observes the same durable PostgreSQL queue. Collapse per-replica copies
+        # before alerting so a scaled fleet produces one installation-level queue alert.
+        expr: max by (status) (dg_chat_job_queue_depth{status="queued"}) > 100
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: DG Chat durable queue is backing up
+          description: "More than 100 jobs have remained queued for ten minutes."
+      - alert: DgChatQueueStalled
+        expr: max by (status) (dg_chat_job_queue_oldest_seconds{status="queued"}) > 300 and max by (status) (dg_chat_job_queue_depth{status="queued"}) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: DG Chat durable queue appears stalled
+          description: "The oldest runnable queued job is more than five minutes old."
+      - alert: DgChatRunningJobLeaseStalled
+        expr: max by (status) (dg_chat_job_queue_oldest_seconds{status="running"}) > 240
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: DG Chat has an unusually old running job
+          description: "A running job has exceeded the normal two-minute lease by a wide margin."
+      - alert: DgChatWorkerDatabaseFailures
+        expr: increase(dg_chat_worker_loop_failures_total{kind="database"}[5m]) > 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: DG Chat worker is repeatedly losing PostgreSQL
+          description: "The worker has recorded repeated bounded database-loop failures."
+      - alert: DgChatProviderFailures
+        expr: sum(increase(dg_chat_provider_attempts_total{outcome="failed"}[5m])) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: DG Chat providers are failing
+          description: "More than five provider attempts failed in the rolling five-minute collection window."
+      - alert: DgChatProviderCircuitOpen
+        expr: dg_chat_provider_circuit_last_open_timestamp_seconds > 0 and time() - dg_chat_provider_circuit_last_open_timestamp_seconds < 300
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: A DG Chat provider circuit is open
+          description: "Provider routing recorded an open-circuit state or circuit skip in the last five minutes."

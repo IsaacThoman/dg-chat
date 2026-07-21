@@ -22,7 +22,12 @@ Deno.test("tool API enforces admin allowlisting, explicit approval, status, canc
       id: "test_tool",
       name: "Test tool",
       description: "Adapter for API tests",
-      inputSchema: { type: "object" },
+      recoverySafety: "idempotent_by_execution_id",
+      inputSchema: {
+        type: "object",
+        required: ["query"],
+        properties: { query: { type: "string", minLength: 1 } },
+      },
       enabled: true,
     },
     execute: async (_input, { signal }) => {
@@ -101,7 +106,11 @@ Deno.test("tool API enforces admin allowlisting, explicit approval, status, canc
     const state = await json(
       await app.request(`/api/tools/executions/${execution.id}`, { headers }),
     );
-    if (state.status === "running") break;
+    if (state.status === "running") {
+      assertEquals("claimToken" in state, false);
+      assertEquals("claimExpiresAt" in state, false);
+      break;
+    }
     await new Promise((resolve) => setTimeout(resolve, 2));
   }
   const cancel = await app.request(`/api/tools/executions/${execution.id}`, {
@@ -129,6 +138,7 @@ Deno.test("approved tools reserve and settle credit and enforce a per-user tool 
       id: "metered_tool",
       name: "Metered tool",
       description: "Metered adapter",
+      recoverySafety: "idempotent_by_execution_id",
       inputSchema: { type: "object" },
       enabled: true,
     },
@@ -199,4 +209,65 @@ Deno.test("approved tools reserve and settle credit and enforce a per-user tool 
     (await json(await app.request(`/api/tools/executions/${second.id}`, { headers }))).status,
     "pending_approval",
   );
+});
+
+Deno.test("tool API categorically normalizes legacy persisted exception text", async () => {
+  const adapter: ToolAdapter = {
+    definition: {
+      id: "legacy_tool",
+      name: "Legacy tool",
+      description: "Legacy failure fixture",
+      recoverySafety: "read_only",
+      inputSchema: { type: "object" },
+      enabled: true,
+    },
+    execute: () => Promise.resolve({ ok: true }),
+  };
+  const store = new MemoryToolExecutionStore();
+  const tools = new ToolExecutionService(store, [adapter]);
+  const { app } = createApp({ setupToken: "legacy-tool-setup", toolExecutionService: tools });
+  await app.request("/api/setup/bootstrap", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-setup-token": "legacy-tool-setup" },
+    body: JSON.stringify({
+      email: "legacy-tool-admin@example.com",
+      name: "Legacy Tool Admin",
+      password: "correct horse battery staple",
+    }),
+  });
+  const login = await app.request("/api/auth/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email: "legacy-tool-admin@example.com",
+      password: "correct horse battery staple",
+    }),
+  });
+  const headers = {
+    cookie: cookie(login),
+    origin: "http://localhost:5173",
+    "content-type": "application/json",
+  };
+  await tools.setPolicy({ toolId: "legacy_tool", allowed: true, actorId: "admin" });
+  const requested = await json(
+    await app.request("/api/tools/executions", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ toolId: "legacy_tool", input: {} }),
+    }),
+  );
+  const secret = "postgres://operator:password@metadata.internal/private";
+  await store.transitionExecution(requested.id, ["pending_approval"], {
+    status: "failed",
+    error: { code: "request_failed", message: secret },
+  });
+
+  const response = await app.request(`/api/tools/executions/${requested.id}`, { headers });
+  const body = await json(response);
+  assertEquals(response.status, 200);
+  assertEquals(body.error, {
+    code: "tool_upstream_unavailable",
+    message: "Tool service is unavailable",
+  });
+  assertEquals(JSON.stringify(body).includes(secret), false);
 });

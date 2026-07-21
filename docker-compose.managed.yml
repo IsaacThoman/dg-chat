@@ -1,0 +1,39 @@
+# Production overlay for externally managed PostgreSQL, Redis, and S3-compatible storage.
+# Use with: docker compose -f docker-compose.yml -f docker-compose.managed.yml up -d --build
+services:
+  app:
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required for managed dependencies}
+      REDIS_URL: ${REDIS_URL:?REDIS_URL is required for managed dependencies}
+      S3_ENDPOINT: ${S3_ENDPOINT:?S3_ENDPOINT is required for managed dependencies}
+      S3_ALLOW_INSECURE: ${S3_ALLOW_INSECURE:-false}
+    depends_on: !override
+      migrate:
+        condition: service_completed_successfully
+
+  migrate:
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required for managed dependencies}
+    depends_on: !reset {}
+    networks:
+      - egress
+
+  worker:
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required for managed dependencies}
+      S3_ENDPOINT: ${S3_ENDPOINT:?S3_ENDPOINT is required for managed dependencies}
+      S3_ALLOW_INSECURE: ${S3_ALLOW_INSECURE:-false}
+    depends_on: !override
+      migrate:
+        condition: service_completed_successfully
+
+  # These services remain available only through an explicit profile for maintenance or migration
+  # back to bundled dependencies. Ordinary managed-overlay startup does not create or wait for them.
+  postgres:
+    profiles: [bundled-dependencies]
+  redis:
+    profiles: [bundled-dependencies]
+  minio:
+    profiles: [bundled-dependencies]
+  minio-init:
+    profiles: [bundled-dependencies]

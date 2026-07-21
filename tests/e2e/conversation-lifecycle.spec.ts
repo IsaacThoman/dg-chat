@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { bootstrap, createChat, login, openSidebar } from "./helpers.ts";
+import { activeChatSession, bootstrap, createChat, login, openSidebar } from "./helpers.ts";
 
 test.beforeEach(async ({ page, request }) => {
   await bootstrap(request);
@@ -7,7 +7,7 @@ test.beforeEach(async ({ page, request }) => {
 });
 
 async function selectDeterministicChatModel(page: import("@playwright/test").Page) {
-  await page.locator('button.model-trigger[aria-haspopup="listbox"]').click();
+  await activeChatSession(page).locator('button.model-trigger[aria-haspopup="listbox"]').click();
   await page.getByRole("listbox", { name: "Chat model" })
     .getByRole("option", { name: /DG Chat Simulated/ }).click();
   await expect(page.getByRole("button", { name: /DG Chat Simulated/ })).toBeVisible();
@@ -164,20 +164,24 @@ test("archived chats keep immutable branches navigable without becoming editable
   ).getAttribute("data-conversation-actions");
   expect(conversationId).toBeTruthy();
   const actions = page.locator(`[data-conversation-actions="${conversationId}"]`);
-  const composer = page.getByRole("textbox", { name: /message/i });
+  const composer = activeChatSession(page).getByRole("textbox", { name: /message/i });
   await composer.fill("Original lifecycle branch");
   await composer.press("Enter");
-  const prompt = page.getByText("Original lifecycle branch", { exact: true });
+  const prompt = activeChatSession(page).getByText("Original lifecycle branch", { exact: true });
   await prompt.locator("xpath=ancestor::article[1]").getByRole("button", { name: /edit/i }).click();
   await composer.fill("Edited lifecycle branch");
   await composer.press("Enter");
-  await expect(page.getByText(
-    "This is a simulated response to: Edited lifecycle branch",
-    { exact: true },
-  )).toBeVisible();
+  await expect(
+    activeChatSession(page).getByText(
+      "This is a simulated response to: Edited lifecycle branch",
+      { exact: true },
+    ),
+  ).toBeVisible();
   // Visible streamed text can precede the terminal graph event. Prove that the immutable branch
   // has been reconciled and that lifecycle mutations are unlocked before archiving it.
-  await expect(page.getByRole("button", { name: "Previous branch" }).first()).toBeEnabled();
+  await expect(
+    activeChatSession(page).getByRole("button", { name: /^Previous branch for / }).first(),
+  ).toBeEnabled();
   await openSidebar(page);
   await expect(actions).toBeEnabled();
   await actions.click();
@@ -190,24 +194,102 @@ test("archived chats keep immutable branches navigable without becoming editable
     `.conversation-row:has([data-conversation-actions="${conversationId}"]) > button`,
   )
     .first().click();
-  await expect(page.getByText(
-    "This is a simulated response to: Edited lifecycle branch",
-    { exact: true },
-  )).toBeVisible();
-  const previousBranch = page.getByRole("button", { name: "Previous branch" }).first();
+  await expect(
+    activeChatSession(page).getByText(
+      "This is a simulated response to: Edited lifecycle branch",
+      { exact: true },
+    ),
+  ).toBeVisible();
+  const previousBranch = activeChatSession(page).getByRole("button", {
+    name: /^Previous branch for /,
+  }).first();
   await expect(previousBranch).toBeEnabled();
   await previousBranch.click();
-  await expect(page.getByText(
-    "This is a simulated response to: Original lifecycle branch",
-    { exact: true },
-  )).toBeVisible();
-  await expect(page.getByRole("textbox", { name: /message/i })).toBeHidden();
-  const treeTrigger = page.getByRole("button", { name: "View conversation tree" }).first();
+  await expect(
+    activeChatSession(page).getByText(
+      "This is a simulated response to: Original lifecycle branch",
+      { exact: true },
+    ),
+  ).toBeVisible();
+  await expect(activeChatSession(page).getByRole("textbox", { name: /message/i })).toBeHidden();
+  const previewRow = (await openSidebar(page)).locator(
+    `.conversation-row:has([data-conversation-actions="${conversationId}"])`,
+  );
+  await expect(previewRow.locator("[data-protected-work]"))
+    .toHaveCount(0);
+
+  // Creating an unrelated chat refreshes the conversation list with new object instances. The
+  // archived source remains inside the normal LRU capacity, and its read-only preview must not be
+  // mistaken for either a conversation identity change or unfinished work that blocks eviction.
+  await createChat(page);
+  await expect(page.locator(`[data-chat-session="${conversationId}"]`)).toHaveAttribute(
+    "hidden",
+    "",
+  );
+  const sidebar = await openSidebar(page);
+  await sidebar.getByRole("button", { name: "Archived", exact: true }).click();
+  const archivedSidebar = await openSidebar(page);
+  await archivedSidebar.locator(
+    `.conversation-row:has([data-conversation-actions="${conversationId}"]) button.conversation-open`,
+  ).click();
+  await expect(activeChatSession(page)).toHaveAttribute("data-chat-session", conversationId!);
+  await expect(
+    activeChatSession(page).getByText(
+      "This is a simulated response to: Original lifecycle branch",
+      { exact: true },
+    ),
+  ).toBeVisible();
+  await expect(
+    activeChatSession(page).getByText(
+      "This is a simulated response to: Edited lifecycle branch",
+      { exact: true },
+    ),
+  ).toBeHidden();
+
+  const graphResponse = await page.request.get(`/api/conversations/${conversationId}`);
+  expect(graphResponse.ok()).toBeTruthy();
+  const graph = await graphResponse.json() as {
+    activeLeafId: string;
+    messages: Array<{ id: string; parentId: string | null; content: string; role: string }>;
+  };
+  const canonicalLeafId = graph.activeLeafId;
+  const visiblePreviewLeafId = graph.messages.find((message) =>
+    message.role === "assistant" &&
+    message.content === "This is a simulated response to: Original lifecycle branch"
+  )?.id;
+  expect(visiblePreviewLeafId).toBeTruthy();
+  expect(visiblePreviewLeafId).not.toBe(canonicalLeafId);
+
+  await activeChatSession(page).getByRole("button", {
+    name: "Share an immutable snapshot",
+  }).click();
+  const shareDialog = page.getByRole("dialog", { name: "Share conversation" });
+  await shareDialog.getByRole("button", { name: "Create snapshot" }).click();
+  await expect(shareDialog.getByLabel("Share link")).toBeVisible();
+  const shareListResponse = await page.request.get("/api/shares");
+  expect(shareListResponse.ok()).toBeTruthy();
+  const shareList = await shareListResponse.json() as {
+    data: Array<{ conversationId: string; leafId: string }>;
+  };
+  expect(
+    shareList.data.find((share) => share.conversationId === conversationId)?.leafId,
+  ).toBe(visiblePreviewLeafId);
+  page.once("dialog", (dialog) => dialog.accept());
+  await shareDialog.locator(".modal-actions").getByRole("button", { name: "Close" }).click();
+
+  const treeTrigger = activeChatSession(page).getByRole("button", {
+    name: /^View conversation tree from /,
+  }).first();
   await treeTrigger.press("Enter");
   const treeDialog = page.getByRole("dialog", { name: "Conversation tree" });
   await expect(treeDialog).toBeVisible();
   await expect(treeDialog.getByRole("button", { name: "Close" })).toBeFocused();
   await expect(page.getByRole("treeitem").first()).not.toHaveAttribute("aria-disabled", "true");
+  const treeConversationId = await activeChatSession(page).getAttribute("data-chat-session");
+  await page.keyboard.press("ControlOrMeta+K");
+  await expect(treeDialog).toBeVisible();
+  await expect(activeChatSession(page)).toHaveAttribute("data-chat-session", treeConversationId!);
+  await expect(treeDialog.getByRole("button", { name: "Close" })).toBeFocused();
   await page.keyboard.press("Escape");
   await expect(treeDialog).toBeHidden();
   await expect(treeTrigger).toBeFocused();
@@ -215,4 +297,44 @@ test("archived chats keep immutable branches navigable without becoming editable
   await openSidebar(page);
   await actions.click();
   await page.getByRole("menuitem", { name: "Restore to chats" }).click();
+  await (await openSidebar(page)).getByRole("button", { name: "Chats", exact: true }).click();
+  await openSidebar(page);
+  await page.locator(
+    `.conversation-row:has([data-conversation-actions="${conversationId}"]) button.conversation-open`,
+  ).click();
+  await expect(
+    activeChatSession(page).getByText(
+      "This is a simulated response to: Edited lifecycle branch",
+      { exact: true },
+    ),
+  ).toBeVisible();
+  await expect(
+    activeChatSession(page).getByText(
+      "This is a simulated response to: Original lifecycle branch",
+      { exact: true },
+    ),
+  ).toBeHidden();
+  const restoredComposer = activeChatSession(page).getByRole("textbox", { name: /message/i });
+  await restoredComposer.fill("Continue only from the canonical lifecycle branch");
+  await restoredComposer.press("Enter");
+  await expect(
+    activeChatSession(page).getByText(
+      "This is a simulated response to: Continue only from the canonical lifecycle branch",
+      { exact: true },
+    ),
+  ).toBeVisible();
+  await expect(
+    activeChatSession(page).getByRole("button", { name: "Stop generating" }),
+  ).toBeHidden({ timeout: 20_000 });
+  const restoredGraphResponse = await page.request.get(`/api/conversations/${conversationId}`);
+  expect(restoredGraphResponse.ok()).toBeTruthy();
+  const restoredGraph = await restoredGraphResponse.json() as {
+    messages: Array<{ parentId: string | null; content: string; role: string }>;
+  };
+  expect(
+    restoredGraph.messages.find((message) =>
+      message.role === "user" &&
+      message.content === "Continue only from the canonical lifecycle branch"
+    )?.parentId,
+  ).toBe(canonicalLeafId);
 });

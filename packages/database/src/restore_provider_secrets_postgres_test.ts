@@ -1,5 +1,6 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.14";
 import postgres from "npm:postgres@3.4.7";
+import { runAuditTestMaintenanceSql } from "./postgres-test-maintenance.ts";
 import type { ProviderCredentialEnvelope } from "./repository.ts";
 import {
   PostgresRestoreProviderSecretsStore,
@@ -28,8 +29,11 @@ Deno.test({
     const sql = postgres(databaseUrl!, { max: 1 });
     const store = await PostgresRestoreProviderSecretsStore.connect(databaseUrl!);
     try {
-      await sql`TRUNCATE backup_restore_secret_sidecars,backup_operations,installation_state,
-        providers,users RESTART IDENTITY CASCADE`;
+      await runAuditTestMaintenanceSql(
+        sql,
+        `TRUNCATE backup_restore_secret_sidecars,backup_operations,installation_state,
+          providers,users RESTART IDENTITY CASCADE`,
+      );
       await sql`INSERT INTO installation_state(singleton_id) VALUES(1) ON CONFLICT DO NOTHING`;
       const actor = crypto.randomUUID();
       await sql`INSERT INTO users(

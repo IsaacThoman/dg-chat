@@ -28,6 +28,7 @@ Deno.test("admin lifecycle protects the exact final effective administrator", ()
   assertDomainCode(() =>
     repo.setAdminUserState({
       actorId: admin.id,
+      expectedAuthorityEpoch: 1,
       targetUserId: admin.id,
       expectedVersion: admin.version,
       state: "suspended",
@@ -37,6 +38,7 @@ Deno.test("admin lifecycle protects the exact final effective administrator", ()
   assertDomainCode(() =>
     repo.setAdminUserState({
       actorId: pendingAdmin.id,
+      expectedAuthorityEpoch: 1,
       targetUserId: admin.id,
       expectedVersion: admin.version,
       state: "suspended",
@@ -51,6 +53,7 @@ Deno.test("admin lifecycle protects the exact final effective administrator", ()
   });
   const promoted = repo.setAdminUserRole({
     actorId: admin.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: second.id,
     expectedVersion: second.version,
     role: "admin",
@@ -60,6 +63,7 @@ Deno.test("admin lifecycle protects the exact final effective administrator", ()
 
   const suspended = repo.setAdminUserState({
     actorId: second.id,
+    expectedAuthorityEpoch: repo.findUser(second.id)!.authorityEpoch,
     targetUserId: admin.id,
     expectedVersion: admin.version,
     state: "suspended",
@@ -85,17 +89,19 @@ Deno.test("admin lifecycle uses optimistic versions and keeps deletion independe
     scopes: ["chat:write"],
     tokenHash: "lifecycle-token",
     preview: "dg_life",
-  });
+  }, user.authorityEpoch);
   repo.createIdentityToken(
     user.id,
     "password_reset",
     "pending-password-reset",
     new Date(Date.now() + 60_000).toISOString(),
+    user.authorityEpoch,
   );
   const originalVersion = user.version;
 
   const deleted = repo.setAdminUserDeleted({
     actorId: admin.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: user.id,
     expectedVersion: user.version,
     deleted: true,
@@ -112,6 +118,7 @@ Deno.test("admin lifecycle uses optimistic versions and keeps deletion independe
   assertDomainCode(() =>
     repo.setAdminUserState({
       actorId: admin.id,
+      expectedAuthorityEpoch: 1,
       targetUserId: user.id,
       expectedVersion: originalVersion,
       state: "suspended",
@@ -120,6 +127,7 @@ Deno.test("admin lifecycle uses optimistic versions and keeps deletion independe
 
   const restored = repo.setAdminUserDeleted({
     actorId: admin.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: user.id,
     expectedVersion: deleted.version,
     deleted: false,
@@ -140,6 +148,7 @@ Deno.test("admin lifecycle fails closed after actor authority is revoked", () =>
   });
   repo.setAdminUserRole({
     actorId: admin.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: second.id,
     expectedVersion: second.version,
     role: "admin",
@@ -147,6 +156,7 @@ Deno.test("admin lifecycle fails closed after actor authority is revoked", () =>
   });
   repo.setAdminUserRole({
     actorId: second.id,
+    expectedAuthorityEpoch: repo.findUser(second.id)!.authorityEpoch,
     targetUserId: admin.id,
     expectedVersion: admin.version,
     role: "user",
@@ -158,6 +168,7 @@ Deno.test("admin lifecycle fails closed after actor authority is revoked", () =>
   assertDomainCode(() =>
     repo.decideUserApproval({
       actorId: admin.id,
+      expectedAuthorityEpoch: 1,
       targetUserId: applicant.id,
       expectedVersion: applicant.version,
       status: "approved",
@@ -229,6 +240,7 @@ Deno.test("approval grant is append-only and never repeated on reapproval", () =
   const user = repo.createUser({ email: "applicant@example.com", name: "Applicant" });
   const approved = repo.decideUserApproval({
     actorId: admin.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: user.id,
     expectedVersion: user.version,
     status: "approved",
@@ -236,6 +248,7 @@ Deno.test("approval grant is append-only and never repeated on reapproval", () =
   });
   const rejected = repo.decideUserApproval({
     actorId: admin.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: user.id,
     expectedVersion: approved.version,
     status: "rejected",
@@ -244,6 +257,7 @@ Deno.test("approval grant is append-only and never repeated on reapproval", () =
   });
   const reapproved = repo.decideUserApproval({
     actorId: admin.id,
+    expectedAuthorityEpoch: 1,
     targetUserId: user.id,
     expectedVersion: rejected.version,
     status: "approved",

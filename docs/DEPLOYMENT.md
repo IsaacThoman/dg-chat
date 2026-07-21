@@ -55,6 +55,41 @@ a public or externally routed endpoint. Terminate TLS at the object store for th
 Uploads default to 25 MiB with at most four concurrent uploads per application replica and two per
 user. Tune `UPLOAD_MAX_BYTES`, `UPLOAD_MAX_CONCURRENT`, and `UPLOAD_MAX_CONCURRENT_PER_USER` while
 keeping the application `/tmp` tmpfs large enough for the resulting worst-case staged bytes.
+Retained attachment storage defaults to 5 GiB per user and 100 GiB installation-wide. Configure
+`ATTACHMENT_STORAGE_PER_USER_BYTES` and `ATTACHMENT_STORAGE_INSTALLATION_BYTES` as whole byte counts
+between 1 MiB and 1 PiB. Object-count limits default to 10,000 per user and 1,000,000
+installation-wide; configure them with `ATTACHMENT_STORAGE_PER_USER_OBJECTS` and
+`ATTACHMENT_STORAGE_INSTALLATION_OBJECTS`. Installation byte and object capacity must each be at
+least their corresponding per-user value. These limits count distinct immutable physical objects,
+including objects referenced only by soft-deleted attachments, so deleting a chat or attachment does
+not silently restore capacity. Admission is transactional across browser uploads, generated media,
+and OpenAI Files finalization. Interrupted content-addressed uploads remain resumable for seven days
+by default. After `FILE_UPLOAD_RECOVERY_MAX_AGE_SECONDS`, the API refunds the reservation, records
+an explicit `upload_recovery_expired` terminal response, and schedules delayed reference-fenced
+object cleanup. This age policy bounds permanently ambiguous storage failures without labeling them
+as corruption.
+
+Every attachment worker performs the built-in bounded integrity pass: it streams no more than
+`ATTACHMENT_INSPECTION_MAX_BYTES`, verifies the stored SHA-256 digest, and quarantines the standard
+EICAR test marker. This is a deterministic integrity and test-signature gate, not a general-purpose
+antivirus engine. Installations that require a malware verdict can configure the optional external
+scanner:
+
+- `ATTACHMENT_SCANNER_ENABLED` must be exactly `true` or `false`; malformed values fail startup.
+- `ATTACHMENT_SCANNER_URL`, `ATTACHMENT_SCANNER_TOKEN`, and `ATTACHMENT_SCANNER_ALLOWED_HOSTS`
+  configure an authenticated scanner and an exact hostname allowlist. Public endpoints must use
+  HTTPS.
+- `ATTACHMENT_SCANNER_ALLOW_PRIVATE_NETWORK=true` is required for a scanner on a private, loopback,
+  or single-label container address. DNS is resolved once and pinned; a public scanner cannot
+  resolve privately, and a private scanner cannot resolve publicly.
+- `ATTACHMENT_SCANNER_TIMEOUT_MS`, `ATTACHMENT_SCANNER_MAX_BYTES`, and
+  `ATTACHMENT_SCANNER_MAX_RESPONSE_BYTES` bound the complete request, streamed attachment body, and
+  categorical JSON response. Redirects are handled manually and rejected.
+
+The API and every worker replica must receive the same scanner configuration. Upload records persist
+the required scanner mode and policy version, so a worker missing a scanner cannot silently approve
+an externally-required upload. Transport failures expose only a sanitized inspection failure; they
+never relay scanner response bodies, credentials, or network details to users.
 
 Audio transcription is independently bounded to 25 MiB per request and defaults to four active
 requests across all API replicas, with two per user. Tune `AUDIO_MAX_CONCURRENT` and
@@ -66,6 +101,15 @@ validated audio body and a bounded retry body in memory.
 For an external object store, set an HTTPS `S3_ENDPOINT`, `S3_REGION`, and `S3_FORCE_PATH_STYLE` as
 required by that service in addition to the bucket and scoped credentials.
 
+Browser uploads are staged before object-store transfer so abandoned PUTs can be reclaimed without
+racing a successful publication. `ATTACHMENT_UPLOAD_PUT_TIMEOUT_MS` defaults to 300 seconds and is
+the hard API-side deadline for the object-store PUT. `ATTACHMENT_UPLOAD_LEASE_SECONDS` defaults to
+900 seconds and must exceed the PUT timeout by at least 60 seconds. The API renews the opaque,
+owner-bound lease while the PUT is active; renewal failure aborts the request and fails closed.
+Workers evaluate lease expiry with the PostgreSQL clock and never delete an object protected by an
+active lease. Keep both values identical on every API replica, and increase the lease whenever the
+PUT timeout is raised.
+
 Validate and launch:
 
 ```sh
@@ -76,15 +120,104 @@ docker compose ps
 curl --fail https://chat.example.com/ready
 ```
 
-Wait for both `app` and `worker` to report healthy. The worker health check verifies that its
-process is running and that the migrated durable-job table is queryable. A worker restart during
-initial deployment indicates a migration-ordering or database-connectivity fault and should block
-rollout. `WORKER_JOB_LEASE_SECONDS` defaults to 120 seconds. Keep it longer than the maximum
-synchronous job handler duration; expired claims are fenced and may be reclaimed by another worker.
+Wait for both `app` and `worker` to report healthy. Each worker boot generates a new UUID and writes
+it atomically to its private `WORKER_INSTANCE_FILE` (default `/tmp/dg-chat-worker-instance`). The
+health command accepts only that exact boot's `worker_instances` row: the state must be `running`,
+both the independently refreshed heartbeat and loop/job progress timestamps must be fresh, and a
+bounded S3 `HeadBucket` probe must succeed. A live process with a wedged job therefore differs from
+an idle worker that is still advancing its poll loop, and an old healthy row cannot make a restarted
+container healthy. A worker restart during initial deployment indicates a migration-ordering,
+database-connectivity, object-storage, or liveness fault and should block rollout.
+
+`WORKER_HEARTBEAT_INTERVAL_MS` defaults to 5 seconds and `WORKER_HEARTBEAT_STALE_MS` to 20 seconds;
+the stale threshold must be at least two intervals. `WORKER_PROGRESS_STALE_MS` defaults to 180
+seconds and should exceed the longest legitimate bounded job interval while remaining short enough
+to detect a stalled handler. `WORKER_HEALTH_TIMEOUT_MS` defaults to 4 seconds and bounds the
+database and S3 probes. Freshness uses the PostgreSQL clock rather than host time;
+`WORKER_HEALTH_CLOCK_TOLERANCE_MS` allows at most 5 seconds of future-clock correction while still
+failing closed on implausible timestamps. Stopped or very stale instance history is retained for
+`WORKER_INSTANCE_RETENTION_HOURS` (168 by default), with cleanup performed safely by each boot
+without sharing or replacing another replica's identity. SIGTERM immediately publishes a `draining`
+state when PostgreSQL is available and the final fenced shutdown records `stopped` before closing
+the pool. Containers have private `/tmp` namespaces. A bare-metal supervisor that launches multiple
+workers in one filesystem namespace must assign each service a distinct `WORKER_INSTANCE_FILE`;
+otherwise one process could overwrite another process's health identity.
+
+`WORKER_JOB_LEASE_SECONDS` defaults to 120 seconds. Keep it longer than the maximum synchronous job
+handler duration; expired claims are fenced and may be reclaimed by another worker. Transient
+database outages are retried with bounded exponential backoff. Configure the initial and maximum
+delays with `WORKER_DATABASE_RETRY_INITIAL_MS` and `WORKER_DATABASE_RETRY_MAX_MS`.
+`WORKER_DATABASE_RETRY_JITTER_RATIO` (default `0.2`) randomly subtracts up to that fraction from
+each delay, desynchronizing replicas without ever exceeding the configured exponential schedule.
+`WORKER_DATABASE_OPERATION_TIMEOUT_MS` (default 5 seconds) bounds every worker-owned statement and
+lock wait. Its SQLSTATE `57014` is neutrally deferred rather than consuming a job attempt or killing
+the worker. `WORKER_SHUTDOWN_SETTLEMENT_TIMEOUT_MS` (default 10 seconds) is one absolute window for
+fenced settlement, retries, graceful pool close, and forced pool destruction. A new settlement query
+starts only when a complete statement-timeout window remains. Keep this value comfortably below the
+worker's Compose `stop_grace_period` (30 seconds by default); the final watchdog exits at the
+settlement deadline even if a database driver blackholes. Shutdown interrupts retry, network I/O,
+extraction, and idle waits immediately. Safe interrupted work is neutrally returned to the queue
+without consuming an application attempt. A deadline before embedding `fetch` is invoked is recorded
+retry-safe and settled at zero cost. An embedding request aborted after provider dispatch is instead
+made terminal and operator-visible: it is never replayed, and its reservation is conservatively
+settled exactly once.
+
+The watchdog remains armed until every graceful close resolves, or every forced close resolves after
+a graceful rejection or timeout. A rejected close is never treated as success, and a blackholed
+forced close cannot extend the absolute settlement budget. Job claims expose a remaining lease
+duration rather than a database timestamp. The worker subtracts the complete observed claim round
+trip and anchors the result to its monotonic clock, avoiding database/host wall-clock skew. Claim
+renewal extends only the database reclaim fence; it never extends the original provider,
+object-storage, or extraction deadline.
+
+Startup reconciliation scans generated-object cleanup and missing embedding work in independently
+committed batches. Large backlogs therefore make durable forward progress across statement timeouts
+or restarts instead of replaying one unbounded startup transaction. The worker uses two small
+two-connection pools and does not create the API-only conversation-search pool.
+
+Document ingestion and knowledge retrieval must share one versioned embedding configuration. Set
+`KNOWLEDGE_EMBEDDING_BASE_URL`, `KNOWLEDGE_EMBEDDING_API_KEY`, `KNOWLEDGE_EMBEDDING_MODEL`, and,
+when needed, `KNOWLEDGE_EMBEDDING_UPSTREAM_MODEL` and `KNOWLEDGE_EMBEDDING_VERSION`. Compose passes
+the same identity and pricing values to the API and worker; the API embeds retrieval queries while
+the worker embeds document chunks. An incomplete configuration fails startup instead of silently
+producing incompatible vectors. The base URL must be credential-free HTTPS in production.
+`KNOWLEDGE_EMBEDDING_INPUT_MICROS_PER_MILLION` and `KNOWLEDGE_EMBEDDING_FIXED_CALL_MICROS` are
+USD-micro prices used for both paths; explicit zeroes support self-hosted models without inventing
+provider cost.
+
+The worker retries only explicitly transient PostgreSQL SQLSTATEs. Connection rejection (`08004`),
+protocol violations (`08P01`), authentication failures, schema errors, and invalid configuration
+remain fatal. After a claim, a transient fault from an explicitly marked database operation is
+settled as a neutral, fenced defer that reverses the claim's attempt increment. The settlement is
+retried under that claim; if another replica reclaims it first, its claim token prevents the stale
+worker from mutating the job. Identical transport codes from S3 or a model provider are ordinary
+application failures and consume the job's configured retry budget.
 
 The app is published on `${PORT:-8000}`. Put it behind a TLS-terminating reverse proxy and forward
 the original scheme and host. Preserve streaming responses by disabling proxy buffering for `/v1/*`
 and chat streams and by setting idle timeouts above the maximum generation timeout.
+
+The generic Compose file intentionally contains no installation-specific reverse-proxy network
+label. If an orchestrator attaches `web` to several routable networks, configure that platform's
+network-selection label in a deployment-local override instead of committing a generated network ID
+to the application manifest. Compose health checks cover the API, worker, public web proxy, and
+isolated search proxy; route traffic only after all required services are healthy.
+
+The bundled public nginx serves the web app with `X-Content-Type-Options: nosniff` and a restrictive
+Content Security Policy. Executable scripts, API connections, fonts, the manifest, and the PWA
+worker are same-origin only; inline script and dynamic evaluation are not allowed. The one
+render-blocking theme initializer is a release static asset, so the saved theme is applied before
+React paints without weakening `script-src`. Inline styles remain allowed because React positions
+menus at runtime and sanitized Mermaid SVGs carry presentation styles. Blob image/audio URLs support
+local previews and playback, while user-approved Markdown images may load over HTTPS. OIDC starts at
+the same-origin API and then uses a top-level provider navigation, so it does not require adding an
+identity provider to `connect-src`. If a replacement proxy sets its own CSP, preserve these
+capabilities without adding `unsafe-inline` or `unsafe-eval` to `script-src`.
+
+`/metrics` is deliberately unavailable on the public nginx listener and returns a fixed JSON 404.
+The API and worker exporters instead listen on ports 9090 and 9091 respectively inside the private
+backend network. The application containers do not publish either port. Do not replace this deny
+rule with a proxy to the application or expose an operational endpoint through the product origin.
 
 Every application migration that creates a portable or explicitly cleared business table must also
 attach the `dg_chat_restore_maintenance_fence` statement trigger. Backup catalog validation fails
@@ -98,14 +231,32 @@ separate releases so rolling upgrades remain compatible.
 
 ## Managed dependencies
 
-PostgreSQL, Redis, and S3 can be externalized by overriding their connection environment variables
-and removing the matching Compose dependencies. PostgreSQL must provide the `vector` extension.
-Object storage needs private buckets, server-side encryption, lifecycle rules compatible with the
-application retention policy, and CORS only if direct browser uploads are enabled.
+For externally managed PostgreSQL, Redis, and S3-compatible storage, set `DATABASE_URL`,
+`REDIS_URL`, `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY`, and `S3_SECRET_KEY`, then use the
+supported overlay:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.managed.yml up -d --build
+```
+
+The overlay passes the exact database URL to the API, migration job, and worker; attaches the
+migration job to the egress network; removes local PostgreSQL, Redis, and MinIO dependency gates;
+and excludes those bundled services from ordinary startup through the `bundled-dependencies`
+profile. It renders without `POSTGRES_PASSWORD`, `MINIO_ROOT_USER`, or `MINIO_ROOT_PASSWORD` because
+those credentials belong only to disabled bundled services. Do not enable the profile in a managed
+deployment unless deliberately bringing the local services back and supplying their credentials.
+
+Without this overlay, omitted connection variables select the bundled `postgres`, `redis`, and
+`minio` DNS names. Bundled startup still requires non-empty `POSTGRES_PASSWORD`, `MINIO_ROOT_USER`,
+and `MINIO_ROOT_PASSWORD`; missing values resolve only to deliberately invalid local-service
+credentials, causing the official images to fail closed rather than install known defaults.
+PostgreSQL must provide the `vector` extension. Object storage needs private buckets, server-side
+encryption, lifecycle rules compatible with the application retention policy, and CORS only if
+direct browser uploads are enabled.
 
 ## Backups and restore
 
-The Storage section of the admin console creates a versioned `.dgbackup` recovery artifact
+The Backups section of the admin console creates a versioned `.dgbackup` recovery artifact
 containing a repeatable-read relational snapshot and every referenced immutable object. The manifest
 and every entry are integrity checked and authenticated with `BACKUP_SIGNING_KEY`; normal exports
 redact provider credentials and exclude diagnostic request/response bodies by default. They still
@@ -184,11 +335,33 @@ Take a recovery point first, monitor lock waits and free disk, and do not start 
 or workers until migration completion. A future online-migration runner may replace this explicit
 maintenance-window requirement with `CREATE INDEX CONCURRENTLY`.
 
+Migration `0040` enables `pg_trgm` and transactionally builds GIN indexes over conversation titles
+and visible user/assistant message content. The current Drizzle runner wraps each migration in a
+transaction, so PostgreSQL does not permit `CREATE INDEX CONCURRENTLY`. For an existing
+installation, stop every API and worker replica, confirm no application transaction is active, take
+a recovery point, and run the migration once inside a maintenance window. The migration uses a
+five-second `lock_timeout`: a competing writer makes the deployment fail and roll back cleanly
+instead of waiting indefinitely. Leave the replicas stopped, drain the conflicting transaction, and
+rerun the migration; do not bypass the timeout or manually mark `0040` complete. The index build
+itself can be long-running and requires free disk proportional to the indexed title and message
+content.
+
 Migration `0026` adds the disabled-by-default diagnostic capture and retention subsystem. It adds a
 composite uniqueness constraint to `provider_attempts` and creates new policy, capture, and
 scrub-run tables; it does not rewrite existing provider-attempt rows. After deployment, confirm the
 Retention admin screen reports capture disabled, run a zero-result preview, and verify the worker
 can query the new durable job type before enabling capture.
+
+Migration `0049` makes retention scrub runs system-ownable and adds the singleton automatic
+retention schedule. Every worker may check the schedule: PostgreSQL serializes those checks on the
+singleton row and commits the snapshotted scrub run, durable job, schedule advance, and null-actor
+audit evidence in one transaction. The default interval is one day
+(`RETENTION_SCRUB_INTERVAL_SECONDS=86400`, bounded from 300 through 2592000 seconds), checked once a
+minute (`RETENTION_SCHEDULER_POLL_SECONDS=60`, bounded from 10 through 3600 seconds). Missed cadence
+slots coalesce into one run with current cutoffs, policy changes trigger a fresh run without waiting
+for the old deadline, and a shorter configured interval is rebased from the last durable schedule.
+Backups include the schedule state; restoring an older supported archive initializes it due
+immediately.
 
 ## Monitoring
 
@@ -207,15 +380,65 @@ dependency state changes. Readiness responses use `Cache-Control: no-store` so i
 extend that TTL. It has a 30-second stop grace period, allowing its HTTP and resource-drain budgets
 to complete.
 
+Production startup fails closed unless `DATABASE_URL`, `REDIS_URL`, and S3-compatible object storage
+are configured. Development and test processes may intentionally use in-memory database and
+coordination adapters. Each `/ready` dependency entry reports `configured`, `ready`, and a sanitized
+`implementation` (`postgres`, `redis`, `s3`, `memory`, `custom`, or `none`), so an in-process
+fallback can never be mistaken for live Redis or durable object storage. Production also binds
+readiness to the exact `postgres`, `redis`, and `s3` implementations. A miswired in-process adapter
+therefore remains `not_ready` even when that adapter is healthy.
+
 Each HTTP response includes a server-generated `X-Request-Id`, exposed to allowed browser origins.
 Caller-supplied values are not reused as authoritative correlation IDs. Request logs are one JSON
 object per request and contain only that UUID, method, registered route template, status, and
 duration. They deliberately exclude raw paths, query strings, request headers, user identifiers, and
 exception messages. The bundled nginx access log coarsens API, OpenAI, chat, admin, and public-share
 paths so concrete identifiers and bearer capabilities are not emitted. Keep the same query/path
-redaction policy in any replacement reverse proxy. Prometheus metrics, OpenTelemetry export, and
-executable alert rules are not shipped yet; the alert list above is operator guidance, not evidence
-that an exporter is present.
+redaction policy in any replacement reverse proxy.
+
+Start the bundled private scraper and executable alert rules with:
+
+```sh
+docker compose --profile observability up -d prometheus
+```
+
+The Prometheus UI is published through `PROMETHEUS_HOST_PORT` on `PROMETHEUS_BIND_ADDRESS=127.0.0.1`
+by default; firewall it before choosing a non-loopback bind on a remote host. Prometheus has no
+startup dependency on the API or worker, so it can boot with zero targets and report their absence.
+API and worker exporters use fixed private ports 9090 and 9091 respectively; these ports are
+deliberately not configurable because the bundled discovery contract must never drift. Run
+`bash tests/assert-observability-profile.sh` against a disposable healthy stack to exercise scaled
+DNS discovery, the private exporter boundary, loaded alert rules, and zero-target detection. For a
+rolling upgrade, an inherited `METRICS_PORT` equal to that service's fixed port is accepted as a
+deprecated no-op; remove it after the rollout. Any conflicting value fails startup.
+`deploy/prometheus/alerts.yml` covers target/readiness failures, dependency failures, API 5xx ratio,
+post-dispatch HTTP response-body failures, queue depth/age/stalls, worker database failures,
+provider failures, and observed open circuits. Queue gauges come from a bounded 15-second worker
+query; provider counters are emitted at the durable terminal-attempt boundary. HTTP lifecycle
+counters distinguish completed, cancelled, and failed delivery without exposing request content.
+They contain neither user nor model/provider labels.
+
+Native Deno OpenTelemetry must remain disabled with `OTEL_DENO=false`: native server and client
+spans retain raw full URLs, paths, and queries in their exported attribute list, even after user
+code adds redacted replacements. Enable DG Chat's privacy-bounded manual SDK with
+`DG_CHAT_OTEL_ENABLED=true`, an explicit credential-free `OTEL_EXPORTER_OTLP_ENDPOINT` (or the
+trace-specific endpoint), and optionally an `OTEL_EXPORTER_OTLP_HEADERS` deployment secret. The
+exporter owns that header value and DG Chat never logs or returns it. The supported protocol is
+`http/protobuf`. `DG_CHAT_OTEL_SAMPLER=local_random_ratio` is the required privacy-bounded
+algorithm, and its default 10% ratio is configurable with `OTEL_TRACES_SAMPLER_ARG`. Each remote or
+root request receives a fresh, locally random sampling decision. Incoming W3C `traceparent`
+identifiers are honored for correlation, but neither the remote sampled bit nor a caller-selected or
+reused trace ID can override the local ratio. Caller-controlled `tracestate` and baggage are
+ignored. API spans contain only bounded method and route-group attributes, while worker spans
+contain only bounded job types and categorical outcomes. No raw URL, query, header,
+user/model/provider identity, exception, prompt, or object key is attached. Shutdown closes both
+private metrics listeners and gives the bounded batch exporter 2.5 seconds to flush.
+
+During an upgrade, `OTEL_TRACES_SAMPLER` is ignored while DG Chat tracing is disabled. When tracing
+is enabled, the exact legacy value `parentbased_traceidratio` is accepted as a deprecated migration
+alias but is executed with DG Chat's safer local-random semantics; remove it and set
+`DG_CHAT_OTEL_SAMPLER=local_random_ratio`. Any other legacy sampler value fails startup rather than
+silently changing the privacy or telemetry-volume boundary.
 
 Provider connection tests and discovery are limited by `PROVIDER_ADMIN_RATE_LIMIT` (30 mutations per
 minute by default). Registry models are not published to users until the provider is enabled, has an
@@ -229,3 +452,14 @@ enable `TRUST_PROXY_HEADERS` only after that proxy strips inbound forwarding hea
 the direct client address; without that trust boundary, the client ceiling intentionally becomes
 installation-wide. Public capability paths must be redacted from proxy/access logs, and the web
 `/share/*` route must retain `Referrer-Policy: no-referrer`.
+
+Authenticated conversation search is limited independently per user by
+`CONVERSATION_SEARCH_RATE_LIMIT` (30) in the common `RATE_LIMIT_WINDOW_SECONDS` window. A separate
+distributed admission gate allows at most `CONVERSATION_SEARCH_MAX_CONCURRENT` (4) searches across
+the installation and `CONVERSATION_SEARCH_MAX_CONCURRENT_PER_USER` (1) for one account. This keeps
+slow full-text searches from exhausting every database connection. The API fails search closed with
+a retryable service error when either shared limiter is unavailable. Search capacity uses a
+dedicated Redis client and `CONVERSATION_SEARCH_CONCURRENCY_LEASE_SECONDS` defaults to 15 seconds.
+It must be an integer greater than the PostgreSQL search statement deadline of 5 seconds and no
+greater than 60 seconds. A crashed replica therefore cannot strand a slot beyond that bounded lease,
+while a healthy query is cancelled before its admission fence can expire.

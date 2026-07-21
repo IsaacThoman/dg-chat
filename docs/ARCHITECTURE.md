@@ -33,8 +33,9 @@ flowchart LR
 - S3-compatible storage owns immutable upload objects. Browser attachment routes and the
   OpenAI-compatible Files lifecycle stream uploads into private objects and authorize every read by
   owner or immutable historical message link. Attachment deletion is a logical tombstone so edits
-  cannot break an earlier conversation branch; retention-aware object garbage collection remains
-  planned.
+  cannot break an earlier conversation branch. Durable upload staging reconciles interrupted writes,
+  and generated-object cleanup uses row-locked reference fences plus append-only release settlement
+  after physical deletion. General retention-policy-driven deletion remains planned.
 - The worker claims durable jobs using `FOR UPDATE SKIP LOCKED`. Handlers must be idempotent and
   retry-safe. Text and JSON attachments use a separate, fenced ingestion state machine that streams
   private objects through byte/time and format validation, then transactionally replaces stable,
@@ -46,8 +47,15 @@ flowchart LR
   or section provenance. Conversation-bound collections support hybrid lexical/vector retrieval or
   bounded full-context injection with persisted source provenance. The OpenAI-compatible embeddings
   endpoint and durable pgvector indexing are implemented for capable provider-registry models. OCR
-  interception is implemented with bounded image fetching and a hashed TTL cache. Other Office
-  formats, malware scanning, and quarantined-file reprocessing remain planned.
+  interception is implemented with bounded image fetching and a hashed TTL cache. Administrative
+  attachment reinspection increments a policy epoch and enters the same durable worker boundary;
+  stale jobs cannot overwrite newer policy decisions and there is no manual release bypass. A
+  disabled-by-default authenticated external scanner integration supplies malware verdicts when
+  configured; the built-in pass verifies the stored digest and detects the EICAR test marker, while
+  the external path uses exact-host allowlisting, one pinned DNS resolution, manual redirect
+  rejection, bounded streaming/time/response limits, and sanitized failures. Scanner requirements
+  and the policy version are persisted with each upload so split API/worker configuration fails
+  closed. Other Office formats remain planned.
 
 ## Core invariants
 
@@ -77,10 +85,13 @@ boundary.
 ## Trust boundaries
 
 All browser input, uploaded content, provider output, tool calls, and fetched URLs are untrusted.
-Authorization is evaluated on every object read, not only when signed URLs are created. Provider and
-search egress must reject private, loopback, link-local, and metadata-network destinations after
-every redirect. Optional code execution is a separate, authenticated service with no default
-network, read-only inputs, strict resources, and no Docker socket.
+Authorization is evaluated on every object read, not only when signed URLs are created. Search
+adapters are trusted in-process application code: their `networkTarget` metadata supports policy
+checks but is advisory and cannot sandbox a custom adapter. The built-in SearXNG adapter's
+DNS-resolved, address-pinned, no-redirect transport is the actual SSRF enforcement boundary and
+rejects private, loopback, link-local, and metadata-network destinations. Custom adapters must
+provide an equivalent transport boundary. Optional code execution is a separate, authenticated
+service with no default network, read-only inputs, strict resources, and no Docker socket.
 
 ## Availability and observability
 
@@ -88,9 +99,14 @@ network, read-only inputs, strict resources, and no Docker socket.
 remove an instance from service when readiness fails without restarting it solely for a transient
 provider outage. HTTP request logs carry a server-generated request ID and a registered route
 template while excluding raw URLs, queries, headers, identities, secrets, and prompt bodies. Durable
-usage runs and provider attempts retain their own relational correlation. End-to-end trace
-correlation, Prometheus metrics, OpenTelemetry exporters, and alert rules remain a planned
-operational milestone and must not be assumed present by deployments.
+usage runs and provider attempts retain their own relational correlation. The API and worker expose
+separate Prometheus listeners on the private deployment network with closed, low-cardinality label
+sets. A manual OpenTelemetry SDK supplies W3C trace-context extraction and batched OTLP export when
+enabled. API spans contain only bounded method/route attributes; worker job spans contain only a
+bounded job-type attribute. Exception text is never attached. Deno's native auto-instrumentation is
+explicitly disabled because its exported attribute list retains the original `url.full`, `url.path`,
+and `url.query`, even if application code adds redacted replacements. This prevents conversation
+identifiers, share capabilities, signed URLs, and query content from entering traces.
 
 See [SECURITY.md](SECURITY.md) for controls and [DEPLOYMENT.md](DEPLOYMENT.md) for the production
 topology.

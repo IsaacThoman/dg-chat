@@ -15,6 +15,7 @@ import {
   withRepeatableReadBackupSnapshot,
 } from "./backup-data.ts";
 import { PostgresBackupStore } from "./backup-postgres.ts";
+import { runAuditTestMaintenanceSql } from "./postgres-test-maintenance.ts";
 
 const databaseUrl = Deno.env.get("TEST_DATABASE_URL");
 
@@ -47,6 +48,71 @@ async function captureData(databaseUrl: string) {
   return captured;
 }
 
+async function seedBackupInvariantFixture(
+  sql: ReturnType<typeof postgres>,
+) {
+  const userId = crypto.randomUUID();
+  const tokenId = crypto.randomUUID();
+  const providerId = crypto.randomUUID();
+  const conversationId = crypto.randomUUID();
+  const messageId = crypto.randomUUID();
+  const toolId = crypto.randomUUID();
+  const usageRunId = `tool:${toolId}`;
+
+  await sql`INSERT INTO users(
+    id,email,name,role,approval_status,state,balance_micros,email_verified_at
+  ) VALUES(
+    ${userId},${`backup-invariants-${userId}@test.invalid`},'Backup invariant fixture',
+    'admin','approved','active',90,now()
+  )`;
+  await sql`INSERT INTO api_tokens(
+    id,user_id,name,token_hash,preview,scopes,authority_epoch,rotation_family_id
+  ) VALUES(
+    ${tokenId},${userId},'Backup invariant token',${`backup-invariants-${tokenId}`},
+    'fixture','["chat:write"]'::jsonb,1,${tokenId}
+  )`;
+  await sql`INSERT INTO providers(
+    id,slug,display_name,base_url,protocol,enabled,version
+  ) VALUES(
+    ${providerId},${`backup-invariants-${providerId}`},'Backup invariant provider',
+    'https://provider.example/v1','chat_completions',true,1
+  )`;
+  await sql`INSERT INTO conversations(id,owner_id,title)
+    VALUES(${conversationId},${userId},'Backup invariant conversation')`;
+  await sql`INSERT INTO messages(
+    id,conversation_id,sibling_index,role,content,status,metadata,idempotency_key
+  ) VALUES(
+    ${messageId},${conversationId},0,'user','fixture','complete','{}'::jsonb,
+    ${`backup-invariants-${messageId}`}
+  )`;
+  await sql`UPDATE conversations SET active_leaf_id=${messageId} WHERE id=${conversationId}`;
+  await sql`INSERT INTO usage_runs(
+    id,user_id,model,provider,recovery_owner,status,reserved_micros
+  ) VALUES(
+    ${usageRunId},${userId},'tool/web_search','tool','tool','reserved',10
+  )`;
+  await sql`INSERT INTO tool_executions(
+    id,owner_id,tool_id,input,status,billing_snapshot
+  ) VALUES(
+    ${toolId},${userId},'web_search','{}'::jsonb,'cancelled_pending_refund',
+    ${sql.json({ reservedMicros: 10, provider: "tool", model: "tool/web_search" })}
+  )`;
+  await sql`INSERT INTO ledger_entries(
+    id,user_id,usage_run_id,kind,amount_micros,balance_after_micros,created_at
+  ) VALUES(
+    ${crypto.randomUUID()},${userId},${`grant:${userId}`},'grant',100,100,
+    '2026-07-01T00:00:00Z'
+  )`;
+  await sql`INSERT INTO ledger_entries(
+    id,user_id,usage_run_id,kind,amount_micros,balance_after_micros,created_at
+  ) VALUES(
+    ${crypto.randomUUID()},${userId},${usageRunId},'reserve',-10,90,
+    '2026-07-01T00:00:01Z'
+  )`;
+
+  return { userId, tokenId, providerId, messageId, toolId, usageRunId };
+}
+
 Deno.test({
   name: "backup data streams a repeatable snapshot and transactionally restores redacted state",
   ignore: !databaseUrl,
@@ -63,15 +129,20 @@ Deno.test({
         ...BACKUP_DATA_TABLES.map((table) => table.name),
         ...BACKUP_EPHEMERAL_TABLES,
       ];
-      await sql.unsafe(
+      await runAuditTestMaintenanceSql(
+        sql,
         `TRUNCATE ${[...new Set(resetTables)].join(",")} RESTART IDENTITY CASCADE`,
       );
       await sql`INSERT INTO installation_state(singleton_id) VALUES(1)`;
+      await sql`INSERT INTO attachment_storage_installation(singleton_id) VALUES(1)`;
       const userId = crypto.randomUUID();
       const conversationId = crypto.randomUUID();
       const temporaryConversationId = crypto.randomUUID();
       const messageId = crypto.randomUUID();
       const attachmentId = crypto.randomUUID();
+      const releasedAttachmentId = crypto.randomUUID();
+      const releasedStageId = crypto.randomUUID();
+      const releasedUsageRunId = `released-attachment:${releasedStageId}`;
       const activeShareId = crypto.randomUUID();
       const revokedShareId = crypto.randomUUID();
       const expiredShareId = crypto.randomUUID();
@@ -84,17 +155,32 @@ Deno.test({
       const adjustmentLedgerId = crypto.randomUUID();
       const adjustmentAuditId = crypto.randomUUID();
       const adjustmentId = crypto.randomUUID();
+      const revokedTokenId = crypto.randomUUID();
+      const terminalToolId = crypto.randomUUID();
+      const legacyQueuedToolId = crypto.randomUUID();
+      const legacyReservedToolId = crypto.randomUUID();
+      const legacyReserveLedgerId = crypto.randomUUID();
       await sql`INSERT INTO users(
         id,email,name,password_hash,role,approval_status,state,balance_micros,email_verified_at
       ) VALUES(
         ${userId},'portable-admin@example.com','Portable Admin',NULL,
         'admin','approved','active',125,now()
       )`;
+      await sql`INSERT INTO community_profiles(
+        user_id,opted_in,identity_mode,nickname,color,share_balance,version
+      ) VALUES(${userId},true,'nickname','Portable-user','cyan',true,4)`;
       await sql`INSERT INTO auth_users(id,name,email,email_verified)
         VALUES(${userId},'Portable Admin','portable-admin@example.com',true)`;
       await sql`INSERT INTO auth_accounts(
         id,account_id,provider_id,user_id,password,created_at,updated_at
       ) VALUES(${crypto.randomUUID()},${userId},'credential',${userId},'password-hash',now(),now())`;
+      await sql`INSERT INTO usage_runs(
+        id,user_id,model,provider,recovery_owner,status,reserved_micros
+      ) VALUES(${`tool:${terminalToolId}`},${userId},'tool/web_search','tool','tool','completed',0)`;
+      await sql`INSERT INTO tool_executions(
+        id,owner_id,tool_id,input,status,error,billing_snapshot
+      ) VALUES(${terminalToolId},${userId},'web_search','{}'::jsonb,'failed',
+        ${sql.json({ code: "tool_execution_failed", message: "Tool execution failed" })},NULL)`;
       await sql`INSERT INTO ledger_entries(
         id,user_id,usage_run_id,kind,amount_micros,balance_after_micros,created_at
       ) VALUES
@@ -224,6 +310,9 @@ Deno.test({
         version,capture_enabled,request_body_days,response_body_days,updated_by
       ) VALUES(1,false,30,30,${userId})`;
       await sql`INSERT INTO retention_policy_state(singleton_id,current_version) VALUES(1,1)`;
+      await sql`INSERT INTO retention_schedule_state(
+        singleton_id,interval_seconds,next_due_at,updated_at
+      ) VALUES(1,86400,now(),now())`;
       await sql`INSERT INTO sessions(user_id,token_hash,limited,expires_at)
         VALUES(${userId},'legacy-session',false,now()+interval '1 hour')`;
       await sql`INSERT INTO auth_sessions(
@@ -231,6 +320,15 @@ Deno.test({
       ) VALUES(${crypto.randomUUID()},now()+interval '1 hour','browser-session',now(),${userId},false)`;
       await sql`INSERT INTO auth_verifications(identifier,value,expires_at)
         VALUES('reset','secret-reset-token',now()+interval '1 hour')`;
+      await sql`INSERT INTO api_tokens(
+        id,user_id,name,token_hash,preview,scopes,authority_epoch,rotation_family_id,revoked_at
+      ) VALUES(
+        ${revokedTokenId},${userId},'Historical revoked token','historical-revoked-hash',
+        'historical','["chat:write"]'::jsonb,1,${revokedTokenId},now()
+      )`;
+      // Lifecycle transitions preserve revoked-token history at its issuance generation. A
+      // portable backup must retain this audit/governance record without reviving its authority.
+      await sql`UPDATE users SET authority_epoch=authority_epoch+1 WHERE id=${userId}`;
       await sql`INSERT INTO jobs(type,payload,status) VALUES('stale.job','{}'::jsonb,'queued')`;
 
       const captured = new Map<string, BackupDataBatch[]>();
@@ -262,6 +360,17 @@ Deno.test({
       const capturedAccount = captured.get("auth_accounts")!.flat()[0];
       assertEquals("access_token" in capturedAccount, false);
       assertEquals(captured.get("conversation_share_snapshots")!.flat().length, 3);
+      assertEquals(captured.get("community_profiles")!.flat(), [{
+        user_id: userId,
+        opted_in: true,
+        identity_mode: "nickname",
+        nickname: "Portable-user",
+        color: "cyan",
+        share_balance: true,
+        version: 4,
+        created_at: captured.get("community_profiles")!.flat()[0].created_at,
+        updated_at: captured.get("community_profiles")!.flat()[0].updated_at,
+      }]);
 
       const concurrentProviderId = crypto.randomUUID();
       const privilegedCredentials: BackupProviderCredential[] = [];
@@ -306,8 +415,170 @@ Deno.test({
       const preview = await dryRunBackupData(databaseUrl!, source);
       assertEquals(preview.users, 1);
       assertEquals(preview.providersDisabledForRedactedCredentials, 1);
+      const preCommunitySource: BackupDataSource = {
+        schemaVersion: "0050",
+        rows(name) {
+          return (async function* () {
+            if (name === "community_profiles") {
+              throw new Error("0050 restore must not request community consent");
+            }
+            for (const batch of captured.get(name) ?? []) yield structuredClone(batch);
+          })();
+        },
+      };
+      const preCommunityPreview = await dryRunBackupData(databaseUrl!, preCommunitySource);
+      assertEquals(preCommunityPreview.rowsByTable.community_profiles, 0);
+      assertEquals(preCommunityPreview.rowsByTable.retention_schedule_state, 1);
       assertEquals(Number((await sql`SELECT count(*) count FROM conversations`)[0].count), 3);
       assertEquals(Number((await sql`SELECT count(*) count FROM sessions`)[0].count), 1);
+
+      const canonicalManifestOnly = structuredClone(captured);
+      canonicalManifestOnly.set(
+        "attachments",
+        canonicalManifestOnly.get("attachments")!.map((batch) =>
+          batch.map((row) =>
+            row.id === attachmentId
+              ? {
+                ...row,
+                object_key: `imports/${userId}/${attachmentId}/manifest-only`,
+                state: "failed",
+                inspection_error: "Attachment bytes were not included in the .dgchat manifest",
+                physical_object: false,
+                deleted_at: "2026-07-02T00:00:00.000Z",
+                ingestion_status: "failed",
+                ingestion_error: "Attachment bytes require a separate restore",
+                ingested_at: null,
+              }
+              : row
+          )
+        ),
+      );
+      canonicalManifestOnly.set("attachment_storage_blobs", []);
+      canonicalManifestOnly.set("attachment_storage_releases", []);
+      canonicalManifestOnly.set("attachment_storage_usage", []);
+      canonicalManifestOnly.set(
+        "attachment_storage_installation",
+        canonicalManifestOnly.get("attachment_storage_installation")!.map((batch) =>
+          batch.map((row) => ({ ...row, physical_bytes: "0", physical_objects: "0" }))
+        ),
+      );
+      assertEquals(
+        (await dryRunBackupData(databaseUrl!, replaySource(canonicalManifestOnly))).attachments,
+        1,
+      );
+      const forgedNonphysical = structuredClone(canonicalManifestOnly);
+      forgedNonphysical.set(
+        "attachments",
+        forgedNonphysical.get("attachments")!.map((batch) =>
+          batch.map((row) =>
+            row.id === attachmentId
+              ? { ...row, object_key: `imports/${userId}/${attachmentId}/not-canonical` }
+              : row
+          )
+        ),
+      );
+      await assertRejects(
+        () => dryRunBackupData(databaseUrl!, replaySource(forgedNonphysical)),
+        BackupDataError,
+        "attachment storage accounting is inconsistent",
+      );
+
+      const missingScheduleState = structuredClone(captured);
+      missingScheduleState.set("retention_schedule_state", []);
+      await assertRejects(
+        () => dryRunBackupData(databaseUrl!, replaySource(missingScheduleState)),
+        BackupDataError,
+        "exactly one retention schedule state",
+      );
+
+      const preToolAccountingCaptured = structuredClone(captured);
+      preToolAccountingCaptured.delete("retention_schedule_state");
+      preToolAccountingCaptured.set(
+        "usage_runs",
+        preToolAccountingCaptured.get("usage_runs")!.map((batch, index) => {
+          const legacy = batch.map(({ recovery_owner: _recoveryOwner, ...row }) => row);
+          if (index !== 0) return legacy;
+          const terminalUsage = legacy.find((row) => row.id === `tool:${terminalToolId}`)!;
+          return [...legacy, {
+            ...terminalUsage,
+            id: `tool:${legacyReservedToolId}`,
+            model: "tool/web_search",
+            provider: "tool",
+            status: "reserved",
+            reserved_micros: "10",
+            error: null,
+          }];
+        }),
+      );
+      const legacyTerminalTool = preToolAccountingCaptured.get("tool_executions")!
+        .flat().find((row) => row.id === terminalToolId)!;
+      const legacyToolBatches = preToolAccountingCaptured.get("tool_executions")!.map((batch) =>
+        batch.map(({ billing_snapshot: _billingSnapshot, ...row }) => row)
+      );
+      legacyToolBatches[0] = [...legacyToolBatches[0], {
+        ...Object.fromEntries(
+          Object.entries(legacyTerminalTool).filter(([column]) => column !== "billing_snapshot"),
+        ),
+        id: legacyQueuedToolId,
+        status: "queued",
+        error: null,
+      }, {
+        ...Object.fromEntries(
+          Object.entries(legacyTerminalTool).filter(([column]) => column !== "billing_snapshot"),
+        ),
+        id: legacyReservedToolId,
+        status: "queued",
+        error: null,
+      }];
+      preToolAccountingCaptured.set("tool_executions", legacyToolBatches);
+      preToolAccountingCaptured.set(
+        "users",
+        preToolAccountingCaptured.get("users")!.map((batch) =>
+          batch.map((row) => row.id === userId ? { ...row, balance_micros: "115" } : row)
+        ),
+      );
+      preToolAccountingCaptured.set(
+        "ledger_entries",
+        preToolAccountingCaptured.get("ledger_entries")!.map((batch, index) => {
+          if (index !== 0) return batch;
+          const adjustment = batch.find((row) => row.id === adjustmentLedgerId)!;
+          return [...batch, {
+            ...adjustment,
+            id: legacyReserveLedgerId,
+            usage_run_id: `tool:${legacyReservedToolId}`,
+            kind: "reserve",
+            amount_micros: "-10",
+            balance_after_micros: "115",
+            created_at: "2026-07-01T00:00:02.000Z",
+            metadata: {},
+          }];
+        }),
+      );
+      const legacyToolSource: BackupDataSource = {
+        schemaVersion: "0043",
+        rows(name) {
+          return (async function* () {
+            for (const batch of preToolAccountingCaptured.get(name) ?? []) {
+              yield structuredClone(batch);
+            }
+          })();
+        },
+      };
+      const preToolPreview = await dryRunBackupData(databaseUrl!, legacyToolSource);
+      assertEquals(preToolPreview.users, preview.users);
+
+      const maliciousActiveStaleToken = structuredClone(captured);
+      maliciousActiveStaleToken.set(
+        "api_tokens",
+        maliciousActiveStaleToken.get("api_tokens")!.map((batch) =>
+          batch.map((row) => row.id === revokedTokenId ? { ...row, revoked_at: null } : row)
+        ),
+      );
+      await assertRejects(
+        () => dryRunBackupData(databaseUrl!, replaySource(maliciousActiveStaleToken)),
+        BackupDataError,
+        "invalid active API-token authority",
+      );
 
       const preSequenceCaptured = structuredClone(captured);
       preSequenceCaptured.set(
@@ -449,8 +720,94 @@ Deno.test({
         operation.version,
         operation.confirmationFingerprint!,
       );
+      const excludedFileRequestId = crypto.randomUUID();
+      await sql`INSERT INTO api_idempotency_requests(
+        id,user_id,endpoint,idempotency_key,request_hash,stream,model,state,usage_run_id,
+        response_status,completed_at,expires_at
+      ) VALUES(
+        ${excludedFileRequestId},${userId},'files','excluded-file-stage',${"6".repeat(64)},
+        false,'files','completed',${`tool:${terminalToolId}`},201,now(),now()+interval '1 day'
+      )`;
+      await sql`INSERT INTO generated_object_staging(
+        owner_id,usage_run_id,ordinal,object_key,mime_type,size_bytes,sha256,state
+      ) VALUES(
+        ${userId},${`tool:${terminalToolId}`},0,'restore-excluded/generated','image/png',1,
+        ${"3".repeat(64)},'pending'
+      )`;
+      await sql`INSERT INTO file_upload_staging(
+        request_id,owner_id,object_key,filename,mime_type,size_bytes,sha256,purpose,
+        attachment_state,state
+      ) VALUES(
+        ${excludedFileRequestId},${userId},'restore-excluded/file','file.txt','text/plain',1,
+        ${"4".repeat(64)},'assistants','ready','pending'
+      )`;
+      await sql`INSERT INTO attachment_upload_staging(
+        id,owner_id,object_key,filename,mime_type,size_bytes,sha256,state
+      ) VALUES(
+        ${crypto.randomUUID()},${userId},'restore-excluded/browser','browser.txt','text/plain',1,
+        ${"5".repeat(64)},'pending'
+      )`;
+      assertEquals(
+        [
+          ...await sql`
+            SELECT 'generated_object_staging' name,count(*)::int count
+              FROM generated_object_staging
+            UNION ALL SELECT 'file_upload_staging',count(*)::int FROM file_upload_staging
+            UNION ALL SELECT 'attachment_upload_staging',count(*)::int
+              FROM attachment_upload_staging
+            ORDER BY name
+          `,
+        ],
+        [
+          { name: "attachment_upload_staging", count: 1 },
+          { name: "file_upload_staging", count: 1 },
+          { name: "generated_object_staging", count: 1 },
+        ],
+      );
       const maintenance = await store.beginRestoreMaintenance(operation.id, operation.version);
-      const restored = await restoreBackupData(databaseUrl!, replaySource(captured), {
+      // pg_locks cannot distinguish session and transaction advisory locks. Prove a same-key
+      // session lock plus a forged operation GUC cannot impersonate the restore transaction.
+      const forgedSession = postgres(databaseUrl!, { max: 1 });
+      try {
+        const forged = await assertRejects(() =>
+          forgedSession.begin(async (tx) => {
+            await tx`SELECT pg_advisory_lock(hashtext('dg-chat-backup-restore'))`;
+            await tx`SELECT set_config('dg_chat.restore_bypass',${operation.id},true)`;
+            await tx`INSERT INTO api_tokens(
+              id,user_id,name,token_hash,preview,scopes,authority_epoch,rotation_family_id,revoked_at
+            ) VALUES(
+              ${crypto.randomUUID()},${userId},'Forged restore history','forged-restore-history',
+              'forged','[]'::jsonb,1,${crypto.randomUUID()},now()
+            )`;
+          })
+        );
+        assertEquals((forged as { code?: string }).code, "55000");
+
+        // Trigger functions must never resolve maintenance control through a caller-controlled
+        // search_path. PostgreSQL sessions may create temporary relations by default, so a shadow
+        // table claiming maintenance is disabled must not bypass the real installation fence.
+        await forgedSession`CREATE TEMP TABLE installation_state(
+          singleton_id smallint PRIMARY KEY,maintenance_enabled boolean NOT NULL
+        )`;
+        await forgedSession`INSERT INTO pg_temp.installation_state VALUES(1,false)`;
+        const shadowed = await assertRejects(() =>
+          forgedSession.begin(async (tx) => {
+            await tx`SELECT set_config('search_path','pg_temp,public',true)`;
+            await tx`INSERT INTO audit_events(action,target_type,target_id,metadata)
+              VALUES('forged.restore.shadow','backup_operation',${operation.id},'{}'::jsonb)`;
+          })
+        );
+        assertEquals((shadowed as { code?: string }).code, "55000");
+      } finally {
+        // max:1 reserves the exact backend that acquired the session lock. Never ask a pool with
+        // multiple sessions to clean it up on an arbitrary connection.
+        const [released] = await forgedSession<{ released: boolean }[]>`
+          SELECT pg_advisory_unlock(hashtext('dg-chat-backup-restore')) released
+        `;
+        assertEquals(released.released, true);
+        await forgedSession.end({ timeout: 5 });
+      }
+      const restored = await restoreBackupData(databaseUrl!, legacyToolSource, {
         restoreOperationId: operation.id,
         expectedOperationVersion: operation.version,
         expectedInstallationVersion: maintenance.installation.version,
@@ -460,6 +817,44 @@ Deno.test({
         ]]),
       });
       assertEquals(restored.restoreOperationVersion, operation.version + 1);
+      assertEquals(
+        [
+          ...await sql<{ id: string; status: string; billing_snapshot: unknown }[]>`
+          SELECT id::text,status,billing_snapshot FROM tool_executions
+          WHERE id IN (${terminalToolId},${legacyQueuedToolId},${legacyReservedToolId})
+          ORDER BY id::text`,
+        ],
+        [{ id: terminalToolId, status: "failed", billing_snapshot: null }, {
+          id: legacyQueuedToolId,
+          status: "failed",
+          billing_snapshot: null,
+        }, {
+          id: legacyReservedToolId,
+          status: "cancelled_pending_refund",
+          billing_snapshot: {
+            reservedMicros: 10,
+            provider: "tool",
+            model: "tool/web_search",
+          },
+        }].sort((left, right) => left.id.localeCompare(right.id)),
+      );
+      assertEquals(
+        (await sql<{ recovery_owner: string }[]>`
+          SELECT recovery_owner FROM usage_runs WHERE id=${`tool:${terminalToolId}`}`)[0]
+          .recovery_owner,
+        "tool",
+      );
+      assertEquals(
+        (await sql<{ recovery_owner: string; status: string }[]>`
+          SELECT recovery_owner,status FROM usage_runs
+          WHERE id=${`tool:${legacyReservedToolId}`}`)[0],
+        { recovery_owner: "tool", status: "reserved" },
+      );
+      assertEquals(
+        (await sql`SELECT restore_transaction_id IS NULL released FROM installation_state
+          WHERE singleton_id=1`)[0].released,
+        true,
+      );
       await store.finishRestore(
         operation.id,
         restored.restoreOperationVersion!,
@@ -525,6 +920,19 @@ Deno.test({
         (await sql`SELECT object_key FROM attachments WHERE id=${attachmentId}`)[0].object_key,
         `restores/${operation.id}/portable.txt`,
       );
+      assertEquals(
+        (await sql<{
+          authority_epoch: string;
+          revoked: boolean;
+        }[]>`SELECT authority_epoch::text,revoked_at IS NOT NULL revoked
+          FROM api_tokens WHERE id=${revokedTokenId}`)[0],
+        { authority_epoch: "1", revoked: true },
+      );
+      assertEquals(
+        (await sql<{ authority_epoch: string }[]>`
+          SELECT authority_epoch::text FROM users WHERE id=${userId}`)[0].authority_epoch,
+        "2",
+      );
       const [provider] = await sql<{ enabled: boolean; credential_envelope: unknown }[]>`
         SELECT enabled,credential_envelope FROM providers WHERE id=${providerId}`;
       assertEquals(provider, { enabled: false, credential_envelope: null });
@@ -553,6 +961,23 @@ Deno.test({
       assertEquals(Number((await sql`SELECT count(*) count FROM jobs`)[0].count), 0);
       assertEquals(
         [
+          ...await sql`
+            SELECT 'generated_object_staging' name,count(*)::int count
+              FROM generated_object_staging
+            UNION ALL SELECT 'file_upload_staging',count(*)::int FROM file_upload_staging
+            UNION ALL SELECT 'attachment_upload_staging',count(*)::int
+              FROM attachment_upload_staging
+            ORDER BY name
+          `,
+        ],
+        [
+          { name: "attachment_upload_staging", count: 0 },
+          { name: "file_upload_staging", count: 0 },
+          { name: "generated_object_staging", count: 0 },
+        ],
+      );
+      assertEquals(
+        [
           ...await sql`SELECT id,actor_id,target_user_id,amount_micros,balance_before_micros,
           balance_after_micros,reason,ledger_entry_id,audit_event_id
           FROM admin_balance_adjustments`,
@@ -576,6 +1001,177 @@ Deno.test({
         ),
         1,
       );
+      // Wire versions before 0053 deliberately omit installation-community consent.
+      assertEquals(
+        Number((await sql`SELECT count(*) count FROM community_profiles`)[0].count),
+        0,
+      );
+
+      // Add a genuine released object after the legacy-source exercise. The current wire-format
+      // round trip below must preserve its history without staging nonexistent bytes.
+      await sql`INSERT INTO usage_runs(
+        id,user_id,model,provider,recovery_owner,status,reserved_micros
+      ) VALUES(
+        ${releasedUsageRunId},${userId},'portable/released','portable','provider','completed',0
+      )`;
+      await sql`INSERT INTO attachments(
+        id,owner_id,object_key,filename,mime_type,size_bytes,sha256,state,ingestion_status
+      ) VALUES(
+        ${releasedAttachmentId},${userId},${`users/${userId}/released.png`},'released.png',
+        'image/png',7,${"7".repeat(64)},'ready','not_applicable'
+      )`;
+      await sql`INSERT INTO generated_object_staging(
+        id,owner_id,usage_run_id,ordinal,object_key,mime_type,size_bytes,sha256,attachment_id,
+        state,cleanup_attachment
+      ) VALUES(
+        ${releasedStageId},${userId},${releasedUsageRunId},0,
+        ${`users/${userId}/released.png`},'image/png',7,${"7".repeat(64)},
+        ${releasedAttachmentId},'cleaning',true
+      )`;
+      await sql`UPDATE attachments SET state='deleted',deleted_at=now()
+        WHERE id=${releasedAttachmentId}`;
+      assertEquals(
+        Boolean(
+          (await sql`SELECT dg_chat_settle_generated_object_cleanup(
+            ${releasedStageId},${userId}
+          ) released`)[0].released,
+        ),
+        true,
+      );
+      await sql`INSERT INTO community_profiles(
+        user_id,opted_in,identity_mode,nickname,color,share_balance,version
+      ) VALUES(${userId},true,'nickname','Portable-user','cyan',true,4)`;
+
+      // Capture the repaired database in the current wire format and apply it again. This proves
+      // that a valid pending tool-accounting outbox and physical release history are portable.
+      const currentCaptured = await captureData(databaseUrl!);
+      assertEquals(currentCaptured.get("attachment_storage_releases")?.flat().length, 1);
+      assertEquals(currentCaptured.get("community_profiles")?.flat().length, 1);
+      await sql`UPDATE community_profiles SET
+        opted_in=false,identity_mode='anonymous',nickname=NULL,color='slate',
+        share_balance=false,version=5
+        WHERE user_id=${userId}`;
+      const currentSource = replaySource(currentCaptured);
+      const currentPreview = await dryRunBackupData(databaseUrl!, currentSource);
+      assertEquals(currentPreview.rowsByTable.attachment_storage_releases, 1);
+      let currentOperation = await store.create({
+        kind: "restore",
+        actorId: userId,
+        idempotencyKey: "portable-current-accounting-roundtrip",
+        sourceObjectKey: "backup-uploads/portable-current.dgcb",
+        archiveSha256: "9".repeat(64),
+      });
+      currentOperation = await store.claim(currentOperation.id, currentOperation.version);
+      currentOperation = await store.updateProgress(currentOperation.id, currentOperation.version, {
+        stage: "validating",
+        objectsProcessed: 0,
+        objectsTotal: 0,
+        bytesProcessed: 0,
+        bytesTotal: 0,
+      });
+      currentOperation = await store.validateRestore(
+        currentOperation.id,
+        currentOperation.version,
+        {
+          archiveSha256: "9".repeat(64),
+          manifest: { schemaVersion: BACKUP_DATA_SCHEMA_VERSION },
+          impact: currentPreview as unknown as Record<string, unknown>,
+        },
+      );
+      currentOperation = await store.beginRestoreApply(
+        currentOperation.id,
+        currentOperation.version,
+        currentOperation.confirmationFingerprint!,
+      );
+      const currentMaintenance = await store.beginRestoreMaintenance(
+        currentOperation.id,
+        currentOperation.version,
+      );
+      const currentRestored = await restoreBackupData(databaseUrl!, currentSource, {
+        restoreOperationId: currentOperation.id,
+        expectedOperationVersion: currentOperation.version,
+        expectedInstallationVersion: currentMaintenance.installation.version,
+      });
+      assertEquals(currentRestored.rowsByTable.attachment_storage_releases, 1);
+      assertEquals(
+        Number(
+          (await sql`SELECT count(*) count FROM attachment_storage_releases
+            WHERE stage_id=${releasedStageId}`)[0].count,
+        ),
+        1,
+      );
+      await store.finishRestore(
+        currentOperation.id,
+        currentRestored.restoreOperationVersion!,
+        currentMaintenance.installation.version,
+        {
+          archiveSha256: "9".repeat(64),
+          impact: currentRestored as unknown as Record<string, unknown>,
+        },
+      );
+      assertEquals(
+        [
+          ...await sql`SELECT stage_id,attachment_id,object_key
+          FROM attachment_storage_releases WHERE stage_id=${releasedStageId}`,
+        ],
+        [{
+          stage_id: releasedStageId,
+          attachment_id: releasedAttachmentId,
+          object_key: `users/${userId}/released.png`,
+        }],
+      );
+      assertEquals(
+        [
+          ...await sql`SELECT opted_in,identity_mode,nickname,color,share_balance,version
+          FROM community_profiles WHERE user_id=${userId}`,
+        ],
+        [{
+          opted_in: true,
+          identity_mode: "nickname",
+          nickname: "Portable-user",
+          color: "cyan",
+          share_balance: true,
+          version: 4,
+        }],
+      );
+      assertEquals(
+        [
+          ...await sql`SELECT physical_bytes::int,physical_objects::int
+          FROM attachment_storage_usage WHERE owner_id=${userId}`,
+        ],
+        [{ physical_bytes: 4, physical_objects: 1 }],
+      );
+      await assertRejects(
+        () =>
+          sql`INSERT INTO attachments(
+            owner_id,object_key,filename,mime_type,size_bytes,sha256,state,ingestion_status
+          ) VALUES(
+            ${userId},${`users/${userId}/released.png`},'illegal-reuse.png','image/png',7,
+            ${"7".repeat(64)},'ready','not_applicable'
+          )`,
+        Error,
+        "released attachment object keys cannot be reused",
+      );
+      assertEquals(
+        (await sql<{ status: string; billing_snapshot: unknown }[]>`
+          SELECT status,billing_snapshot FROM tool_executions
+          WHERE id=${legacyReservedToolId}`)[0],
+        {
+          status: "cancelled_pending_refund",
+          billing_snapshot: {
+            reservedMicros: 10,
+            provider: "tool",
+            model: "tool/web_search",
+          },
+        },
+      );
+      assertEquals(
+        Number(
+          (await sql`SELECT count(*) count FROM audit_events
+            WHERE action='backup.restore.database_committed'`)[0].count,
+        ),
+        2,
+      );
     } finally {
       await store.close();
       await sql.end();
@@ -592,8 +1188,9 @@ Deno.test({
     const sql = postgres(databaseUrl!, { max: 2 });
     const store = await PostgresBackupStore.connect(databaseUrl!);
     try {
-      const [admin] = await sql<{ id: string; name: string }[]>`
-        SELECT id,name FROM users WHERE role='admin' AND approval_status='approved' LIMIT 1
+      const [admin] = await sql<{ id: string; name: string; authority_epoch: string }[]>`
+        SELECT id,name,authority_epoch::text FROM users
+        WHERE role='admin' AND approval_status='approved' LIMIT 1
       `;
       const captured = await captureData(databaseUrl!);
       const preview = await dryRunBackupData(databaseUrl!, replaySource(captured));
@@ -626,8 +1223,9 @@ Deno.test({
       };
 
       await sql`UPDATE users SET name='Destination survives rollback' WHERE id=${admin.id}`;
-      await sql`INSERT INTO sessions(user_id,token_hash,limited,expires_at)
-        VALUES(${admin.id},'rollback-session',false,now()+interval '1 hour')`;
+      await sql`INSERT INTO sessions(user_id,token_hash,limited,authority_epoch,expires_at)
+        VALUES(${admin.id},'rollback-session',false,${admin.authority_epoch},
+          now()+interval '1 hour')`;
       const failedOperation = await prepare("fault-rollback-restore", "c".repeat(64));
       const failedMaintenance = await store.beginRestoreMaintenance(
         failedOperation.id,
@@ -731,9 +1329,156 @@ Deno.test({
   async fn() {
     const sql = postgres(databaseUrl!, { max: 1 });
     try {
+      const fixture = await seedBackupInvariantFixture(sql);
       const captured = await captureData(databaseUrl!);
+      const pendingTool = captured.get("tool_executions")!.flat().find((row) =>
+        row.id === fixture.toolId
+      );
+      if (!pendingTool) throw new Error("Failed to capture the pending tool fixture");
+      const pendingUsageId = fixture.usageRunId;
+      const assertUnsafeRecovery = async (
+        mutate: (copy: Map<string, BackupDataBatch[]>) => void,
+      ) => {
+        const copy = structuredClone(captured);
+        mutate(copy);
+        await assertRejects(
+          () => dryRunBackupData(databaseUrl!, replaySource(copy)),
+          BackupDataError,
+          "unsafe recovery accounting state",
+        );
+      };
+      const addIsolatedUser = (copy: Map<string, BackupDataBatch[]>) => {
+        const otherUserId = crypto.randomUUID();
+        const sourceUser = copy.get("users")!.flat().find((row) => row.id === fixture.userId)!;
+        copy.get("users")![0] = [...copy.get("users")![0], {
+          ...sourceUser,
+          id: otherUserId,
+          email: `cross-owner-${otherUserId}@test.invalid`,
+          name: "Cross-owner ledger fixture",
+          role: "user",
+          balance_micros: "0",
+        }];
+        return otherUserId;
+      };
+      await assertUnsafeRecovery((copy) => {
+        const usage = copy.get("usage_runs")!.flat().find((row) =>
+          row.id === pendingUsageId
+        )! as Record<string, unknown>;
+        usage.recovery_owner = "provider";
+      });
+      await assertUnsafeRecovery((copy) => {
+        const usage = copy.get("usage_runs")!.flat().find((row) =>
+          row.id === pendingUsageId
+        )! as Record<string, unknown>;
+        usage.token_id = fixture.tokenId;
+      });
+      await assertUnsafeRecovery((copy) => {
+        const execution = copy.get("tool_executions")!.flat().find((row) =>
+          row.id === pendingTool.id
+        )! as Record<string, unknown>;
+        execution.billing_snapshot = {
+          ...(execution.billing_snapshot as Record<string, unknown>),
+          reservedMicros: 11,
+        };
+      });
+      await assertUnsafeRecovery((copy) => {
+        const reserve = copy.get("ledger_entries")!.flat().find((row) =>
+          row.usage_run_id === pendingUsageId && row.kind === "reserve"
+        )! as Record<string, unknown>;
+        reserve.kind = "settle";
+      });
+      await assertUnsafeRecovery((copy) => {
+        const otherUserId = addIsolatedUser(copy);
+        copy.get("ledger_entries")![0] = [...copy.get("ledger_entries")![0], {
+          id: crypto.randomUUID(),
+          user_id: otherUserId,
+          usage_run_id: pendingUsageId,
+          kind: "grant",
+          sequence: "1",
+          amount_micros: "0",
+          balance_after_micros: "0",
+          metadata: {},
+          created_at: new Date().toISOString(),
+        }];
+      });
+      await assertUnsafeRecovery((copy) => {
+        const otherUserId = addIsolatedUser(copy);
+        const usage = copy.get("usage_runs")!.flat().find((row) =>
+          row.id === pendingUsageId
+        )! as Record<string, unknown>;
+        usage.user_id = otherUserId;
+      });
+      for (const invalidAmount of ["0", "-1", "9007199254740992"]) {
+        await assertUnsafeRecovery((copy) => {
+          const usage = copy.get("usage_runs")!.flat().find((row) =>
+            row.id === pendingUsageId
+          )! as Record<string, unknown>;
+          usage.reserved_micros = invalidAmount;
+        });
+      }
+      await assertUnsafeRecovery((copy) => {
+        const ledger = copy.get("ledger_entries")!.flat();
+        const reserve = ledger.find((row) =>
+          row.usage_run_id === pendingUsageId && row.kind === "reserve"
+        )!;
+        copy.set(
+          "ledger_entries",
+          [[
+            ...ledger.filter((row) => row.id !== reserve.id).map((row) =>
+              row.user_id === fixture.userId ? { ...row, balance_after_micros: "100" } : row
+            ),
+          ]],
+        );
+        const user = copy.get("users")!.flat().find((row) => row.id === fixture.userId)! as Record<
+          string,
+          unknown
+        >;
+        user.balance_micros = "100";
+      });
+      await assertUnsafeRecovery((copy) => {
+        const reserve = copy.get("ledger_entries")!.flat().find((row) =>
+          row.usage_run_id === pendingUsageId && row.kind === "reserve"
+        )! as Record<string, unknown>;
+        reserve.amount_micros = "-5";
+        reserve.balance_after_micros = "95";
+        copy.get("ledger_entries")![0] = [...copy.get("ledger_entries")![0], {
+          ...reserve,
+          id: crypto.randomUUID(),
+          sequence: "3",
+          amount_micros: "-5",
+          balance_after_micros: "90",
+          created_at: "2026-07-01T00:00:02.000Z",
+        }];
+      });
+      await assertUnsafeRecovery((copy) => {
+        const reserve = copy.get("ledger_entries")!.flat().find((row) =>
+          row.usage_run_id === pendingUsageId && row.kind === "reserve"
+        )!;
+        copy.get("ledger_entries")![0] = [...copy.get("ledger_entries")![0], {
+          ...reserve,
+          id: crypto.randomUUID(),
+          kind: "settle",
+          sequence: "3",
+          amount_micros: "0",
+          balance_after_micros: "90",
+          created_at: "2026-07-01T00:00:02.000Z",
+        }];
+      });
+      await assertUnsafeRecovery((copy) => {
+        const unmatchedId = crypto.randomUUID();
+        copy.get("tool_executions")![0] = [...copy.get("tool_executions")![0], {
+          ...pendingTool,
+          id: unmatchedId,
+          created_at: "2026-07-01T00:00:02.000Z",
+          updated_at: "2026-07-01T00:00:02.000Z",
+        }];
+      });
+
       const messageBatches = structuredClone(captured.get("messages")!);
-      const message = messageBatches.flat()[0] as Record<string, unknown>;
+      const message = messageBatches.flat().find((row) => row.id === fixture.messageId)! as Record<
+        string,
+        unknown
+      >;
       message.parent_id = message.id;
       const cycle = new Map(captured);
       cycle.set("messages", messageBatches);
@@ -755,7 +1500,9 @@ Deno.test({
       assertEquals(Number((await sql`SELECT count(*) count FROM messages`)[0].count), before);
 
       const providerBatches = structuredClone(captured.get("providers")!);
-      const provider = providerBatches.flat()[0] as Record<string, unknown>;
+      const provider = providerBatches.flat().find((row) =>
+        row.id === fixture.providerId
+      )! as Record<string, unknown>;
       provider.protocol = "responses";
       const modelId = crypto.randomUUID();
       const model: Record<string, unknown> = {
@@ -889,6 +1636,53 @@ Deno.test({
       await assertRejects(() => verifyBackupDataCatalog(databaseUrl!), BackupDataError);
     } finally {
       await sql`DROP TABLE IF EXISTS backup_unclassified_probe`;
+      await sql.end();
+    }
+  },
+});
+
+Deno.test({
+  name: "backup catalog fails closed when immutable audit history loses its database guard",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 1 });
+    try {
+      await sql`DROP TRIGGER dg_chat_audit_events_append_only ON audit_events`;
+      await assertRejects(
+        () => verifyBackupDataCatalog(databaseUrl!),
+        BackupDataError,
+        "append-only guard",
+      );
+    } finally {
+      await sql`CREATE TRIGGER dg_chat_audit_events_append_only
+        BEFORE UPDATE OR DELETE OR TRUNCATE ON audit_events
+        FOR EACH STATEMENT EXECUTE FUNCTION dg_chat_enforce_audit_event_immutability()`;
+      await sql.end();
+    }
+  },
+});
+
+Deno.test({
+  name: "backup catalog fails closed when attachment release history loses its guard",
+  ignore: !databaseUrl,
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const sql = postgres(databaseUrl!, { max: 1 });
+    try {
+      await sql`DROP TRIGGER dg_chat_attachment_storage_releases_append_only
+        ON attachment_storage_releases`;
+      await assertRejects(
+        () => verifyBackupDataCatalog(databaseUrl!),
+        BackupDataError,
+        "append-only guard",
+      );
+    } finally {
+      await sql`CREATE TRIGGER dg_chat_attachment_storage_releases_append_only
+        BEFORE UPDATE OR DELETE OR TRUNCATE ON attachment_storage_releases
+        FOR EACH STATEMENT EXECUTE FUNCTION dg_chat_enforce_attachment_blob_history()`;
       await sql.end();
     }
   },

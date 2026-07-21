@@ -35,9 +35,11 @@ export interface StoredObject {
 }
 
 export interface ObjectStore {
+  /** Public, non-secret adapter identity used by readiness diagnostics. */
+  readonly implementation?: "s3" | "memory" | "custom";
   put(input: PutObjectInput): Promise<{ etag: string | null }>;
-  get(key: string): Promise<StoredObject | undefined>;
-  delete(key: string): Promise<void>;
+  get(key: string, signal?: AbortSignal): Promise<StoredObject | undefined>;
+  delete(key: string, signal?: AbortSignal): Promise<void>;
   readiness(signal?: AbortSignal): Promise<boolean>;
   close(): void;
 }
@@ -168,6 +170,7 @@ function webBody(body: unknown): ReadableStream<Uint8Array> {
 
 /** Streaming S3 adapter compatible with AWS S3 and path-style MinIO deployments. */
 export class S3ObjectStore implements ObjectStore {
+  readonly implementation = "s3" as const;
   readonly #client: S3Sender;
   readonly #bucket: string;
 
@@ -214,11 +217,12 @@ export class S3ObjectStore implements ObjectStore {
     }
   }
 
-  async get(key: string): Promise<StoredObject | undefined> {
+  async get(key: string, signal?: AbortSignal): Promise<StoredObject | undefined> {
     assertKey(key);
     try {
       const response = await this.#client.send(
         new GetObjectCommand({ Bucket: this.#bucket, Key: key }),
+        signal ? { abortSignal: signal } : undefined,
       );
       return {
         key,
@@ -240,9 +244,12 @@ export class S3ObjectStore implements ObjectStore {
     }
   }
 
-  async delete(key: string) {
+  async delete(key: string, signal?: AbortSignal) {
     assertKey(key);
-    await this.#client.send(new DeleteObjectCommand({ Bucket: this.#bucket, Key: key }));
+    await this.#client.send(
+      new DeleteObjectCommand({ Bucket: this.#bucket, Key: key }),
+      signal ? { abortSignal: signal } : undefined,
+    );
   }
 
   async readiness(signal?: AbortSignal) {

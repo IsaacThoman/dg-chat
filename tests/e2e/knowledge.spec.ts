@@ -1,9 +1,10 @@
 import { expect, test } from "@playwright/test";
 import { strToU8, zipSync } from "fflate";
 import { Buffer } from "node:buffer";
-import { apiURL, bootstrap, createChat, login, openSidebar } from "./helpers.ts";
+import { activeChatSession, apiURL, bootstrap, createChat, login, openSidebar } from "./helpers.ts";
 import {
   type AppReadiness,
+  env,
   lightweightManagedStack,
   missingDurableCapabilities,
   strictDurableCapabilities,
@@ -61,7 +62,7 @@ const workspaceNavigation = (page: import("@playwright/test").Page) =>
 async function requireKnowledgeStack(request: import("@playwright/test").APIRequestContext) {
   const response = await request.get(`${apiURL}/ready`);
   const readiness = await response.json().catch(() => null) as AppReadiness | null;
-  const missing = missingDurableCapabilities(readiness, ["postgres", "objects"]);
+  const missing = missingDurableCapabilities(readiness, ["postgres", "redis", "objects"]);
   if (!missing.length) return;
   const reason = `requires live ${
     missing.join(" and ")
@@ -74,9 +75,10 @@ async function expectComposerUploadReady(
   page: import("@playwright/test").Page,
   filename: string,
 ) {
-  const chip = page.getByLabel("Selected attachments").locator(".upload-chip").filter({
-    has: page.getByText(filename, { exact: true }),
-  });
+  const chip = activeChatSession(page).getByLabel("Selected attachments").locator(".upload-chip")
+    .filter({
+      has: page.getByText(filename, { exact: true }),
+    });
   await expect(chip).toBeVisible();
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
@@ -93,7 +95,7 @@ async function expectComposerUploadReady(
 }
 
 test("manages a collection and persists conversation knowledge", async ({ page }, testInfo) => {
-  test.setTimeout(120_000);
+  testInfo.setTimeout(120_000);
   test.skip(
     lightweightManagedStack,
     "requires the durable PostgreSQL, object-storage, and worker stack",
@@ -103,10 +105,20 @@ test("manages a collection and persists conversation knowledge", async ({ page }
   const originalName = `Knowledge ${suffix}`;
   const renamedName = `Product docs ${suffix}`;
   const filename = `knowledge-${suffix}.txt`;
+  const embeddingE2E = env("E2E_KNOWLEDGE_EMBEDDINGS") === "true";
+  const completedEmbeddingJobs = new Set<string>();
+  if (embeddingE2E) {
+    const jobs = await page.request.get(
+      `${apiURL}/api/admin/jobs?type=document.embed&status=completed&limit=100`,
+    );
+    expect(jobs.ok(), await jobs.text()).toBeTruthy();
+    const body = await jobs.json() as { items: Array<{ id: string }> };
+    body.items.forEach((job) => completedEmbeddingJobs.add(job.id));
+  }
 
   // Exercise the real upload and ingestion path so the collection can only accept a genuinely
   // ready, owner-scoped attachment. The worker updates this status asynchronously.
-  await page.locator('input[type="file"]').setInputFiles({
+  await activeChatSession(page).locator('input[type="file"]').setInputFiles({
     name: filename,
     mimeType: "text/plain",
     buffer: Buffer.from(`DG Chat knowledge browser test document ${suffix}.`),
@@ -121,6 +133,17 @@ test("manages a collection and persists conversation knowledge", async ({ page }
     return body.data.find((attachment) => attachment.filename === filename)?.ingestionStatus ??
       "missing";
   }, { timeout: 30_000 }).toBe("ready");
+  if (embeddingE2E) {
+    await expect.poll(async () => {
+      const response = await page.request.get(
+        `${apiURL}/api/admin/jobs?type=document.embed&status=completed&limit=100`,
+      );
+      if (!response.ok()) return false;
+      const body = await response.json() as { items: Array<{ id: string }> };
+      return body.items.some((job) => !completedEmbeddingJobs.has(job.id));
+    }, { timeout: 60_000, message: "the production worker to persist document embeddings" })
+      .toBe(true);
+  }
 
   await openSidebar(page);
   await workspaceNavigation(page).getByRole("button", {
@@ -148,7 +171,9 @@ test("manages a collection and persists conversation knowledge", async ({ page }
   const addDialog = page.getByRole("dialog", { name: "Add an uploaded file" });
   await addDialog.getByRole("radio", { name: new RegExp(filename) }).check();
   await addDialog.getByRole("button", { name: "Add file" }).click();
-  await expect(page.getByText(filename, { exact: true })).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: `Remove ${filename} from collection` }),
+  ).toBeVisible();
   await expect(page.locator(".knowledge-list nav button.active")).toContainText(
     "1 file",
   );
@@ -160,9 +185,20 @@ test("manages a collection and persists conversation knowledge", async ({ page }
   await knowledgeTrigger.click();
   const picker = page.getByRole("dialog", { name: "Conversation knowledge" });
   await picker.getByRole("checkbox", { name: new RegExp(renamedName) }).check();
-  await picker.getByRole("radio", { name: /Full context/ }).check();
+  await picker.getByRole("radio", { name: embeddingE2E ? /Retrieval/ : /Full context/ }).check();
   await picker.getByRole("button", { name: "Use knowledge" }).click();
   await expect(knowledgeTrigger).toContainText("1");
+
+  if (embeddingE2E) {
+    const composer = page.getByRole("textbox", { name: "Message" });
+    await composer.fill(`spaceship semantic retrieval probe ${suffix}`);
+    await page.getByRole("button", { name: "Send", exact: true }).click();
+    await expect(
+      activeChatSession(page).locator(".assistant-message details").filter({
+        has: page.getByText(/^Sources \([1-9][0-9]*\)$/),
+      }),
+    ).toBeVisible({ timeout: 60_000 });
+  }
 
   await page.reload();
   await expect(knowledgeTrigger).toContainText("1");
@@ -170,7 +206,9 @@ test("manages a collection and persists conversation knowledge", async ({ page }
   const persistedPicker = page.getByRole("dialog", { name: "Conversation knowledge" });
   await expect(persistedPicker.getByRole("checkbox", { name: new RegExp(renamedName) }))
     .toBeChecked();
-  await expect(persistedPicker.getByRole("radio", { name: /Full context/ })).toBeChecked();
+  await expect(
+    persistedPicker.getByRole("radio", { name: embeddingE2E ? /Retrieval/ : /Full context/ }),
+  ).toBeChecked();
   await persistedPicker.getByRole("checkbox", { name: new RegExp(renamedName) }).uncheck();
   await persistedPicker.getByRole("button", { name: "Remove knowledge" }).click();
   await expect(knowledgeTrigger).not.toContainText("1");
@@ -189,7 +227,10 @@ test("manages a collection and persists conversation knowledge", async ({ page }
     expect(createBox?.height ?? 0).toBeGreaterThanOrEqual(44);
   }
   await removeFile.click();
-  await expect(page.getByText(filename, { exact: true })).toBeHidden();
+  // Retained chat sessions intentionally keep their composer uploads mounted while this
+  // workspace view is active, so the filename can still exist outside the collection.
+  // Assert the collection-specific control disappears instead of using a page-wide text match.
+  await expect(removeFile).toBeHidden();
 
   await page.getByRole("button", { name: `Delete ${renamedName}` }).click();
   const deleteDialog = page.getByRole("dialog", { name: "Delete collection?" });
@@ -344,7 +385,7 @@ test("extracts uploaded PDF pages and DOCX sections with persisted provenance", 
   const pdfText = `PDF browser extraction ${suffix}`;
   const firstSection = `DOCX first section ${suffix}`;
   const secondSection = `DOCX second section ${suffix}`;
-  const input = page.locator('input[type="file"]');
+  const input = activeChatSession(page).locator('input[type="file"]');
   await input.setInputFiles({
     name: pdfName,
     mimeType: "application/pdf",

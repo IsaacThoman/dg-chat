@@ -125,13 +125,60 @@ export async function backfillLegacyRuntimeSnapshot(url: string): Promise<Legacy
           await tx`UPDATE conversations SET active_leaf_id=${value.activeLeafId} WHERE id=${value.id}`;
         }
       }
+      const ledgerSequenceByUser = new Map<string, number>();
+      const ledgerBalanceByUser = new Map<string, number>();
+      const ledgerByUsageRun = new Map<string, NonNullable<LegacySnapshot["ledger"]>>();
       for (const value of snapshot.ledger ?? []) {
+        const sequence = (ledgerSequenceByUser.get(value.userId) ?? 0) + 1;
+        const priorBalance = ledgerBalanceByUser.get(value.userId) ?? 0;
+        if (
+          !Number.isSafeInteger(value.amountMicros) ||
+          !Number.isSafeInteger(value.balanceAfterMicros) ||
+          priorBalance + value.amountMicros !== value.balanceAfterMicros
+        ) {
+          throw new DomainError(
+            "backfill_invalid_ledger",
+            "Legacy accounting history is not causally consistent",
+            422,
+          );
+        }
+        // The database trigger owns sequence allocation and validates the same causal balance
+        // transition under the user-row lock. Explicit sequence values are restore-only.
         await tx`INSERT INTO ledger_entries(id,user_id,usage_run_id,kind,amount_micros,balance_after_micros,created_at) VALUES(${value.id},${value.userId},${value.usageRunId},${value.kind},${value.amountMicros},${value.balanceAfterMicros},${value.createdAt})`;
+        ledgerSequenceByUser.set(value.userId, sequence);
+        ledgerBalanceByUser.set(value.userId, value.balanceAfterMicros);
+        const entries = ledgerByUsageRun.get(value.usageRunId) ?? [];
+        entries.push(value);
+        ledgerByUsageRun.set(value.usageRunId, entries);
       }
       for (const [, value] of snapshot.usageRuns ?? []) {
-        await tx`INSERT INTO usage_runs(id,user_id,model,provider,status,reserved_micros,input_tokens,output_tokens,cost_micros,latency_ms,created_at,completed_at) VALUES(${value.id},${value.userId},${value.model},'legacy',${value.status},${value.reservedMicros},${value.inputTokens},${value.outputTokens},${value.costMicros},${value.latencyMs},${value.createdAt},${
-          value.status === "reserved" ? null : value.createdAt
-        })`;
+        // Runtime snapshots predate subsystem-specific recovery. Their usage calls were owned by
+        // the synchronous provider path; never infer recovery authority from a run-ID prefix.
+        const interrupted = value.status === "reserved";
+        await tx`INSERT INTO usage_runs(id,user_id,token_id,model,provider,recovery_owner,status,reserved_micros,input_tokens,output_tokens,cost_micros,latency_ms,error,created_at,completed_at) VALUES(${value.id},${value.userId},${
+          value.tokenId ?? null
+        },${value.model},'legacy','provider',${
+          interrupted ? "failed" : value.status
+        },${value.reservedMicros},${value.inputTokens},${value.outputTokens},${value.costMicros},${value.latencyMs},${
+          interrupted ? "Legacy in-flight usage was stopped during import" : null
+        },${value.createdAt},${interrupted ? value.createdAt : value.createdAt})`;
+        if (interrupted && value.reservedMicros > 0) {
+          const evidence = ledgerByUsageRun.get(value.id) ?? [];
+          const exactDebit = evidence.length === 1 && evidence[0].userId === value.userId &&
+            evidence[0].kind === "reserve" && evidence[0].amountMicros === -value.reservedMicros;
+          if (exactDebit) {
+            const sequence = (ledgerSequenceByUser.get(value.userId) ?? 0) + 1;
+            const balance = (ledgerBalanceByUser.get(value.userId) ?? 0) + value.reservedMicros;
+            await tx`INSERT INTO ledger_entries(
+              user_id,usage_run_id,kind,amount_micros,balance_after_micros,created_at
+            ) VALUES(${value.userId},${value.id},'refund',${value.reservedMicros},
+              ${balance},${value.createdAt})`;
+            await tx`UPDATE users SET balance_micros=${balance},updated_at=${value.createdAt}
+              WHERE id=${value.userId}`;
+            ledgerSequenceByUser.set(value.userId, sequence);
+            ledgerBalanceByUser.set(value.userId, balance);
+          }
+        }
       }
       for (const value of snapshot.jobs ?? []) {
         await tx`INSERT INTO jobs(id,type,payload,status,attempts,created_at) VALUES(${value.id},${value.type},${

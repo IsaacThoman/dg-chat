@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { bootstrap, createChat, login } from "./helpers.ts";
+import { Buffer } from "node:buffer";
 
 const pngDataUrl =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZQmcAAAAASUVORK5CYII=";
@@ -171,7 +172,7 @@ test("image generation is capability-aware, durable, and keyboard accessible", a
   await createDialog.getByRole("combobox").first().selectOption("e2e/image");
   await page.getByLabel("Describe the image").fill(asset.prompt);
   await page.getByRole("button", { name: "Create", exact: true }).click();
-  await expect(page.getByRole("status")).toContainText("Creating durable image assets");
+  await expect(createDialog.getByRole("status")).toContainText("Creating durable image assets");
   await expect(page.getByRole("img", { name: `Generated image: ${asset.prompt}` })).toBeVisible();
   expect(generatedBody).toMatchObject({ model: "e2e/image", prompt: asset.prompt, n: 1 });
   await page.getByRole("button", { name: "Add", exact: true }).click();
@@ -243,9 +244,10 @@ test("image generation is capability-aware, durable, and keyboard accessible", a
   await expect(page.locator(".image-lineage-source-error")).toContainText(
     "Source 1 unavailable.",
   );
-  await expect(page.getByRole("status")).toContainText(
-    "Source 1 unavailable. Retry is available.",
-  );
+  await expect(page.getByRole("dialog", { name: "Image history" }).getByRole("status"))
+    .toContainText(
+      "Source 1 unavailable. Retry is available.",
+    );
   allowLazySource = true;
   await page.getByRole("button", { name: "Retry", exact: true }).click();
   await expect(page.getByRole("button", { name: "Source 1" })).toBeVisible();

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Check, Globe2, LoaderCircle, Square, X } from "lucide-react";
 import { api, ApiError, type ToolExecution } from "./api.ts";
@@ -6,6 +6,8 @@ import { Modal } from "./Modal.tsx";
 
 const terminal = (status: ToolExecution["status"]) =>
   status === "succeeded" || status === "failed" || status === "cancelled";
+const refundPending = (status: ToolExecution["status"]) =>
+  status === "failed_pending_refund" || status === "cancelled_pending_refund";
 const errorText = (error: unknown) =>
   error instanceof ApiError || error instanceof Error ? error.message : "The tool request failed";
 export function toolResultForMessage(execution: ToolExecution, maxCharacters = 50_000) {
@@ -26,55 +28,130 @@ export function ToolLauncher({ open, close, insert }: {
   const [execution, setExecution] = useState<ToolExecution>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [pollRevision, setPollRevision] = useState(0);
+  const operationGeneration = useRef(0);
+  const actionController = useRef<AbortController | undefined>(undefined);
+  const pollController = useRef<AbortController | undefined>(undefined);
+  const invalidateOperations = () => {
+    operationGeneration.current += 1;
+    actionController.current?.abort();
+    pollController.current?.abort();
+    actionController.current = undefined;
+    pollController.current = undefined;
+  };
+  const beginAction = () => {
+    invalidateOperations();
+    const generation = operationGeneration.current;
+    const controller = new AbortController();
+    actionController.current = controller;
+    return { controller, generation };
+  };
+  useEffect(() => () => invalidateOperations(), []);
   useEffect(() => {
     if (!execution || terminal(execution.status)) return;
-    const timer = setInterval(() => {
-      void api.toolExecution(execution.id).then(setExecution).catch((reason) =>
-        setError(errorText(reason))
-      );
-    }, 500);
-    return () => clearInterval(timer);
-  }, [execution?.id, execution?.status]);
+    const executionId = execution.id;
+    const generation = ++operationGeneration.current;
+    const controller = new AbortController();
+    pollController.current = controller;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const current = () => operationGeneration.current === generation && !controller.signal.aborted;
+    const poll = async () => {
+      try {
+        const next = await api.toolExecution(executionId, controller.signal);
+        if (!current()) return;
+        setError("");
+        setExecution((existing) => existing?.id === executionId ? next : existing);
+        if (!terminal(next.status)) timer = setTimeout(() => void poll(), 500);
+      } catch (reason) {
+        if (!current() || reason instanceof DOMException && reason.name === "AbortError") return;
+        setError(errorText(reason));
+        timer = setTimeout(() => void poll(), 1_500);
+      }
+    };
+    timer = setTimeout(() => void poll(), 500);
+    return () => {
+      controller.abort();
+      if (timer) clearTimeout(timer);
+      if (pollController.current === controller) pollController.current = undefined;
+      if (operationGeneration.current === generation) operationGeneration.current += 1;
+    };
+  }, [execution?.id, execution?.status, pollRevision]);
   if (!open) return null;
   const dismiss = () => {
+    invalidateOperations();
     setExecution(undefined);
+    setBusy(false);
     setError("");
     setQuery("");
     close();
   };
   const webSearch = tools.data?.find((tool) => tool.id === "web_search");
   const run = async () => {
+    const { controller, generation } = beginAction();
     setBusy(true);
     setError("");
     try {
-      setExecution(await api.requestToolExecution("web_search", { query: query.trim() }));
+      const next = await api.requestToolExecution(
+        "web_search",
+        { query: query.trim() },
+        controller.signal,
+      );
+      if (operationGeneration.current === generation) setExecution(next);
     } catch (reason) {
-      setError(errorText(reason));
+      if (operationGeneration.current === generation && !controller.signal.aborted) {
+        setError(errorText(reason));
+      }
     } finally {
-      setBusy(false);
+      if (operationGeneration.current === generation) {
+        actionController.current = undefined;
+        setBusy(false);
+      }
     }
   };
   const approve = async () => {
     if (!execution) return;
+    const { controller, generation } = beginAction();
     setBusy(true);
     setError("");
     try {
-      setExecution(await api.approveToolExecution(execution.id));
+      const next = await api.approveToolExecution(execution.id, controller.signal);
+      if (operationGeneration.current === generation) {
+        setExecution(next);
+        if (!terminal(next.status)) setPollRevision((current) => current + 1);
+      }
     } catch (reason) {
-      setError(errorText(reason));
+      if (operationGeneration.current === generation && !controller.signal.aborted) {
+        setError(errorText(reason));
+        setPollRevision((current) => current + 1);
+      }
     } finally {
-      setBusy(false);
+      if (operationGeneration.current === generation) {
+        actionController.current = undefined;
+        setBusy(false);
+      }
     }
   };
   const cancel = async () => {
     if (!execution) return;
+    const { controller, generation } = beginAction();
     setBusy(true);
+    setError("");
     try {
-      setExecution(await api.cancelToolExecution(execution.id));
+      const next = await api.cancelToolExecution(execution.id, controller.signal);
+      if (operationGeneration.current === generation) {
+        setExecution(next);
+        if (!terminal(next.status)) setPollRevision((current) => current + 1);
+      }
     } catch (reason) {
-      setError(errorText(reason));
+      if (operationGeneration.current === generation && !controller.signal.aborted) {
+        setError(errorText(reason));
+        setPollRevision((current) => current + 1);
+      }
     } finally {
-      setBusy(false);
+      if (operationGeneration.current === generation) {
+        actionController.current = undefined;
+        setBusy(false);
+      }
     }
   };
   return (
@@ -83,7 +160,15 @@ export function ToolLauncher({ open, close, insert }: {
         Search runs only after your explicit approval. Its result can be attached to your next
         immutable chat branch.
       </p>
-      {!webSearch && !tools.isLoading && (
+      {tools.isError && (
+        <div className="inline-error" role="alert">
+          <p>{errorText(tools.error)}</p>
+          <button type="button" className="secondary" onClick={() => void tools.refetch()}>
+            Try loading tools again
+          </button>
+        </div>
+      )}
+      {!webSearch && !tools.isLoading && !tools.isError && (
         <p className="inline-error" role="alert">Web search is not enabled by an administrator.</p>
       )}
       {!execution && webSearch && (
@@ -112,12 +197,18 @@ export function ToolLauncher({ open, close, insert }: {
               <Check size={16} /> Approve this search
             </button>
           )}
-          {!terminal(execution.status) && execution.status !== "pending_approval" && (
+          {!terminal(execution.status) && execution.status !== "pending_approval" &&
+            !refundPending(execution.status) && (
             <p>
               <LoaderCircle className="spin" size={17} /> Searching…
             </p>
           )}
-          {!terminal(execution.status) && (
+          {refundPending(execution.status) && (
+            <p>
+              <LoaderCircle className="spin" size={17} /> Finalizing account refund…
+            </p>
+          )}
+          {!terminal(execution.status) && !refundPending(execution.status) && (
             <button className="secondary" disabled={busy} onClick={cancel}>
               <Square size={14} /> Cancel
             </button>
@@ -138,6 +229,18 @@ export function ToolLauncher({ open, close, insert }: {
           )}
           {execution.error && (
             <p className="inline-error" role="alert">{execution.error.message}</p>
+          )}
+          {execution.status === "failed" && (
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => {
+                setExecution(undefined);
+                setError("");
+              }}
+            >
+              Try search again
+            </button>
           )}
           {execution.status === "cancelled" && (
             <p>

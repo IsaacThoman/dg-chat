@@ -49,7 +49,13 @@ export function parseKnowledgeEmbeddingConfig(
   ) {
     throw new Error("KNOWLEDGE_EMBEDDING_BASE_URL must be a credential-free HTTPS URL");
   }
-  const version = knowledgeEmbeddingIdentityVersion({ baseVersion, baseUrl, model, upstreamModel });
+  const version = knowledgeEmbeddingIdentityVersion({
+    baseVersion,
+    baseUrl,
+    model,
+    upstreamModel,
+    batchSize,
+  });
   return {
     baseUrl,
     apiKey,
@@ -84,6 +90,20 @@ export async function sha256(value: string): Promise<string> {
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+export function validateKnowledgeEmbeddings(
+  embeddings: number[][],
+  expectedItems: number,
+): number[][] {
+  if (
+    embeddings.length !== expectedItems ||
+    embeddings.some((vector) =>
+      vector.length !== KNOWLEDGE_EMBEDDING_DIMENSIONS ||
+      vector.some((part) => typeof part !== "number" || !Number.isFinite(part))
+    )
+  ) throw new Error("Embedding provider returned invalid vectors");
+  return embeddings;
+}
+
 export async function embedKnowledgeChunks(
   content: string[],
   config: KnowledgeEmbeddingConfig,
@@ -111,8 +131,8 @@ export async function embedKnowledgeChunks(
     if (!Array.isArray(item.embedding)) throw new Error("Embedding provider returned base64 data");
     return item.embedding;
   });
-  if (embeddings.length !== content.length) {
-    throw new Error("Embedding provider returned the wrong number of vectors");
-  }
-  return { embeddings, inputTokens: response.usage.prompt_tokens };
+  return {
+    embeddings: validateKnowledgeEmbeddings(embeddings, content.length),
+    inputTokens: response.usage.prompt_tokens,
+  };
 }

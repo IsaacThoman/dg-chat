@@ -44,7 +44,9 @@ Deno.test("restricted chat fallback is fenced before buffered, streaming, or Res
       password: "correct horse battery staple",
     }),
   });
-  const user = (await setup.json()).user;
+  const publicUser = (await setup.json()).user;
+  const user = repository.findUser(publicUser.id);
+  assertExists(user);
   const mutation = { actorId: user.id, action: "test.fallback_fence" };
   const createModel = async (slug: string) => {
     const created = repository.createProvider({
@@ -84,8 +86,21 @@ Deno.test("restricted chat fallback is fenced before buffered, streaming, or Res
     expectedVersion: 0,
     fallbackModelIds: [fallback.id],
   }, mutation);
-  const group = repository.createAccessGroup({ name: "restricted-fallback" });
-  repository.replaceAccessGroupModels(group.id, [fallback.id], group.version);
+  const group = repository.createAccessGroup({ name: "restricted-fallback" }, {
+    actorId: user.id,
+    action: "test.model_access_group.created",
+    targetType: "model_access_group",
+    requireEmailVerification: false,
+    expectedAuthorityEpoch: user.authorityEpoch,
+  });
+  repository.replaceAccessGroupModels(group.id, [fallback.id], group.version, [], {
+    actorId: user.id,
+    action: "test.model_access_group.models_replaced",
+    targetType: "model_access_group",
+    targetId: group.id,
+    requireEmailVerification: false,
+    expectedAuthorityEpoch: user.authorityEpoch,
+  });
   const login = await app.request("/api/auth/login", {
     method: "POST",
     headers: { "content-type": "application/json" },

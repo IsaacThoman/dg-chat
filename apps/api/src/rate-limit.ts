@@ -8,6 +8,8 @@ export interface RateLimitResult {
 }
 
 export interface RateLimiter {
+  /** Public, non-secret adapter identity used by readiness diagnostics. */
+  readonly implementation?: "memory" | "redis" | "custom";
   consume(key: string, limit: number, windowSeconds: number): Promise<RateLimitResult>;
   health(signal?: AbortSignal): Promise<boolean>;
   close(): Promise<void>;
@@ -20,6 +22,7 @@ export function authorizationCredentialIdentity(value: string | undefined): stri
 }
 
 export class MemoryRateLimiter implements RateLimiter {
+  readonly implementation = "memory" as const;
   readonly #entries = new Map<string, { count: number; resetsAt: number }>();
   readonly #maxEntries: number;
   readonly #now: () => number;
@@ -78,6 +81,7 @@ export class MemoryRateLimiter implements RateLimiter {
 }
 
 export class RedisRateLimiter implements RateLimiter {
+  readonly implementation = "redis" as const;
   readonly #redis: Redis;
   #connecting?: Promise<void>;
 

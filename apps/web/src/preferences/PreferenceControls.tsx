@@ -148,7 +148,7 @@ export function PersonalizationPreferences() {
         </label>
         <div className="preference-save-row">
           <small id="custom-instructions-help">
-            Applied to new responses. Project instructions may add more context.
+            Applied to new responses in your chats.
           </small>
           <small id="custom-instructions-count">
             {instructions.length.toLocaleString()} / 20,000
@@ -158,13 +158,6 @@ export function PersonalizationPreferences() {
           </button>
         </div>
       </form>
-      <div className="setting-row">
-        <span>
-          <strong>Conversation memory</strong>
-          <small>Cross-chat memory is not available in this release.</small>
-        </span>
-        <button type="button" className="secondary" disabled>Unavailable</button>
-      </div>
       <PreferenceSwitch
         label="Save conversation history"
         description="Temporary chats are never included"

@@ -3,6 +3,86 @@ export type UserRole = "user" | "admin";
 /** Whether an account may obtain authority. Soft deletion is tracked independently. */
 export type AccountState = "active" | "suspended";
 
+/** Deliberately small identity surface for the opt-in installation community leaderboard. */
+export const COMMUNITY_IDENTITY_MODES = ["anonymous", "nickname"] as const;
+export type CommunityIdentityMode = (typeof COMMUNITY_IDENTITY_MODES)[number];
+
+/** Stable design tokens; arbitrary CSS colors are never accepted or persisted. */
+export const COMMUNITY_COLOR_TOKENS = [
+  "slate",
+  "blue",
+  "cyan",
+  "emerald",
+  "amber",
+  "orange",
+  "rose",
+  "violet",
+] as const;
+export type CommunityColorToken = (typeof COMMUNITY_COLOR_TOKENS)[number];
+
+/**
+ * User-owned installation community profile.
+ *
+ * `shareBalance` is separately explicit because opting into aggregate rankings must never
+ * silently disclose an account balance. Anonymous is the default even after opting in.
+ */
+export interface CommunityProfile {
+  userId: string;
+  optedIn: boolean;
+  identityMode: CommunityIdentityMode;
+  nickname: string | null;
+  color: CommunityColorToken;
+  shareBalance: boolean;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface UpdateCommunityProfileRequest {
+  expectedVersion: number;
+  optedIn?: boolean;
+  identityMode?: CommunityIdentityMode;
+  nickname?: string | null;
+  color?: CommunityColorToken;
+  shareBalance?: boolean;
+}
+
+export const COMMUNITY_LEADERBOARD_METRICS = ["calls", "tokens", "cost", "balance"] as const;
+export type CommunityLeaderboardMetric = (typeof COMMUNITY_LEADERBOARD_METRICS)[number];
+export const COMMUNITY_LEADERBOARD_WINDOWS = ["7d", "30d", "90d"] as const;
+export type CommunityLeaderboardWindow = (typeof COMMUNITY_LEADERBOARD_WINDOWS)[number];
+
+export interface CommunityLeaderboardQuery {
+  metric: CommunityLeaderboardMetric;
+  /** Omitted for the current-balance view. */
+  window?: CommunityLeaderboardWindow;
+  limit: number;
+  cursor?: string;
+}
+
+/**
+ * Privacy-safe public ranking row. Internal account identifiers and account profile fields are
+ * deliberately absent; `position` is scoped to this ordered result, not a stable user identity.
+ */
+export interface CommunityLeaderboardEntry {
+  position: number;
+  identityMode: CommunityIdentityMode;
+  nickname: string | null;
+  /** Anonymous rows deliberately have no user-selected color fingerprint. */
+  color: CommunityColorToken | null;
+  /** Calls/tokens are units; cost/balance are integer USD micros. */
+  value: number;
+}
+
+export interface CommunityLeaderboardPage {
+  metric: CommunityLeaderboardMetric;
+  window: CommunityLeaderboardWindow | "current";
+  from: string | null;
+  asOf: string;
+  data: CommunityLeaderboardEntry[];
+  nextCursor: string | null;
+}
+
 /** Canonical provider-model capabilities shared by persistence, API validation, and clients. */
 export const MODEL_CAPABILITIES = [
   "chat",
@@ -161,6 +241,31 @@ export interface Conversation {
 
 export interface ConversationDetail extends Conversation {
   messages: MessageNode[];
+}
+
+export type ConversationSearchView = "chat" | "archived" | "trash";
+export type ConversationSearchMatchSource = "title" | "message";
+
+/** A conversation projection with a bounded, display-as-text search excerpt. */
+export interface ConversationSearchResult extends Conversation {
+  snippet: string;
+  matchSource: ConversationSearchMatchSource;
+  messageId: string | null;
+  messageRole: "user" | "assistant" | null;
+}
+
+export interface ConversationSearchQuery {
+  query: string;
+  view: ConversationSearchView;
+  folderId?: string;
+  tagIds?: string[];
+  limit?: number;
+  cursor?: string;
+}
+
+export interface ConversationSearchPage {
+  data: ConversationSearchResult[];
+  nextCursor: string | null;
 }
 
 /** Visibility of the conversation owner's identity on an immutable public share. */
@@ -411,6 +516,74 @@ export interface AdminLedgerQuery {
 export interface AdminLedgerPage {
   data: AdminLedgerEntry[];
   nextCursor: string | null;
+}
+
+export type AdminAttachmentState =
+  | "pending"
+  | "inspecting"
+  | "ready"
+  | "quarantined"
+  | "failed"
+  | "deleted";
+export type AdminAttachmentDeletionFilter = "present" | "deleted" | "all";
+
+/** Filter-bound keyset query for the installation-wide attachment inventory. */
+export interface AdminAttachmentQuery {
+  ownerId?: string;
+  state?: AdminAttachmentState;
+  deletion?: AdminAttachmentDeletionFilter;
+  cursor?: string;
+  limit?: number;
+}
+
+/** Credential-free administrative projection. Object-store keys never cross this contract. */
+export interface AdminAttachmentSummary {
+  id: string;
+  ownerId: string;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+  state: AdminAttachmentState;
+  inspectionError: string | null;
+  inspectionEpoch: number;
+  version: number;
+  reinspectionEligible: boolean;
+  reinspectionBlockedReason: "deleted" | "nonterminal" | "policy_quarantine" | null;
+  createdAt: string;
+  updatedAt: string;
+  deletedAt: string | null;
+}
+
+export interface AdminAttachmentPage {
+  data: AdminAttachmentSummary[];
+  nextCursor: string | null;
+}
+
+/** Fixed-size installation storage projection; historical retained blobs remain included. */
+export interface AdminStorageSummary {
+  physicalBytes: number;
+  physicalObjects: number;
+  attachmentRecords: number;
+  activeRecords: number;
+  deletedRecords: number;
+  quarantinedRecords: number;
+  ownersWithStorage: number;
+  perUserBytesLimit?: number | null;
+  perUserObjectsLimit?: number | null;
+  installationBytesLimit?: number | null;
+  installationObjectsLimit?: number | null;
+  installationBytesRemaining?: number | null;
+  installationObjectsRemaining?: number | null;
+  installationBytesOverage?: number | null;
+  installationObjectsOverage?: number | null;
+  installationBytesPercent?: number | null;
+  installationObjectsPercent?: number | null;
+}
+
+export interface AttachmentStorageUsage {
+  ownerId: string;
+  physicalBytes: number;
+  physicalObjects: number;
 }
 
 export interface AdminBalanceAdjustmentRequest {

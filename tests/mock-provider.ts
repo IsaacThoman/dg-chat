@@ -4,6 +4,17 @@ const controlToken = Deno.env.get("MOCK_PROVIDER_CONTROL_TOKEN") ?? "ci-mock-con
 const encoder = new TextEncoder();
 const attempts = new Map<string, number>();
 
+interface ChatBarrier {
+  model: string;
+  target: number;
+  opened: number;
+  released: boolean;
+  release: () => void;
+  promise: Promise<void>;
+}
+
+let chatBarrier: ChatBarrier | null = null;
+
 interface AudioState {
   calls: number;
   lastAuthorized: boolean;
@@ -45,6 +56,14 @@ const images = {
   lastResponseFormat: null as string | null,
   lastCount: 0,
   lastPrompt: null as string | null,
+};
+
+const embeddings = {
+  calls: 0,
+  lastAuthorized: false,
+  lastModel: null as string | null,
+  lastDimensions: null as number | null,
+  lastInputCount: 0,
 };
 
 // Valid 1x1 PNG. The API decodes and validates dimensions before persistence.
@@ -127,10 +146,71 @@ function textFrom(body: Record<string, unknown>): string {
   return "Hello";
 }
 
-function completionText(model: string, prompt: string): string {
-  if (model.includes("reasoning")) return `The deterministic answer to “${prompt}” is 42.`;
-  if (model.includes("tool")) return "I will use the requested tool.";
-  return `Mock response: ${prompt}`;
+function requestedOutputTokens(body: Record<string, unknown>): number | undefined {
+  const value = body.max_tokens ?? body.max_completion_tokens ?? body.max_output_tokens;
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+function truncateUtf8(value: string, maximumBytes: number): string {
+  if (encoder.encode(value).byteLength <= maximumBytes) return value;
+  let result = "";
+  let bytes = 0;
+  for (const character of value) {
+    const encoded = encoder.encode(character).byteLength;
+    if (bytes + encoded > maximumBytes) break;
+    result += character;
+    bytes += encoded;
+  }
+  return result;
+}
+
+function completionText(
+  model: string,
+  prompt: string,
+  maximumTokens?: number,
+): string {
+  const content = model.includes("reasoning")
+    ? `The deterministic answer to “${prompt}” is 42.`
+    : model.includes("tool")
+    ? "I will use the requested tool."
+    : `Mock response: ${prompt}`;
+  return maximumTokens === undefined ? content : truncateUtf8(content, maximumTokens * 4);
+}
+
+function releaseChatBarrier(): void {
+  const barrier = chatBarrier;
+  if (!barrier || barrier.released) return;
+  barrier.released = true;
+  barrier.release();
+}
+
+function configureChatBarrier(model: string, target: number): ChatBarrier {
+  releaseChatBarrier();
+  let release!: () => void;
+  const promise = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const barrier = { model, target, opened: 0, released: false, release, promise };
+  chatBarrier = barrier;
+  return barrier;
+}
+
+async function waitAtChatBarrier(request: Request, model: string): Promise<void> {
+  const barrier = chatBarrier;
+  if (!barrier || barrier.model !== model || barrier.released) return;
+  barrier.opened++;
+  if (request.signal.aborted) throw request.signal.reason;
+  let rejectAbort!: (reason?: unknown) => void;
+  const aborted = new Promise<never>((_, reject) => {
+    rejectAbort = reject;
+  });
+  const onAbort = () => rejectAbort(request.signal.reason);
+  request.signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    await Promise.race([barrier.promise, aborted]);
+  } finally {
+    request.signal.removeEventListener("abort", onAbort);
+  }
 }
 
 function maybeFail(model: string): Response | undefined {
@@ -331,20 +411,26 @@ async function handleChat(request: Request): Promise<Response> {
   if (failure) return failure;
   const id = `chatcmpl_${crypto.randomUUID().replaceAll("-", "")}`;
   const prompt = textFrom(body);
-  const content = completionText(model, prompt);
+  const content = completionText(model, prompt, requestedOutputTokens(body));
   if (body.stream === true) {
     if (model.includes("split")) return splitChatStream(model, content, id, state);
     if (model.includes("role-stall")) return roleStallStream(request, model, id, state);
     return normalChatStream(request, model, content, id, state);
   }
+  await waitAtChatBarrier(request, model);
   state.completed++;
+  const completionTokens = Math.max(1, Math.ceil(encoder.encode(content).byteLength / 4));
   return json({
     id,
     object: "chat.completion",
     created: 1_700_000_000,
     model,
     choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
-    usage: { prompt_tokens: 8, completion_tokens: 12, total_tokens: 20 },
+    usage: {
+      prompt_tokens: 8,
+      completion_tokens: completionTokens,
+      total_tokens: 8 + completionTokens,
+    },
   });
 }
 
@@ -357,7 +443,7 @@ async function handleResponses(request: Request): Promise<Response> {
   if (failure) return failure;
   const id = `resp_${crypto.randomUUID().replaceAll("-", "")}`;
   const prompt = textFrom(body);
-  const content = completionText(model, prompt);
+  const content = completionText(model, prompt, requestedOutputTokens(body));
   const tools = Array.isArray(body.tools) ? body.tools as Record<string, unknown>[] : [];
   const requestedTool = tools[0];
   if (requestedTool) {
@@ -503,6 +589,8 @@ Deno.serve({ port }, async (request) => {
   if (url.pathname === "/health") return json({ status: "ok" });
   if (url.pathname === "/__test/reset" && request.method === "POST") {
     if (!controlAuthorized(request)) return error("Invalid control token", 401, "unauthorized");
+    releaseChatBarrier();
+    chatBarrier = null;
     attempts.clear();
     scenarios.clear();
     Object.assign(audio, {
@@ -533,7 +621,38 @@ Deno.serve({ port }, async (request) => {
       lastCount: 0,
       lastPrompt: null,
     });
+    Object.assign(embeddings, {
+      calls: 0,
+      lastAuthorized: false,
+      lastModel: null,
+      lastDimensions: null,
+      lastInputCount: 0,
+    });
     return json({ reset: true });
+  }
+  if (url.pathname === "/__test/chat-barrier" && request.method === "POST") {
+    if (!controlAuthorized(request)) return error("Invalid control token", 401, "unauthorized");
+    const body = await request.json().catch(() => null) as Record<string, unknown> | null;
+    if (
+      !body || typeof body.model !== "string" || !body.model ||
+      typeof body.target !== "number" || !Number.isSafeInteger(body.target) ||
+      body.target < 1 || body.target > 1_000
+    ) {
+      return error("Invalid chat barrier", 400, "invalid_request");
+    }
+    const barrier = configureChatBarrier(body.model, body.target);
+    return json({ model: barrier.model, target: barrier.target, opened: barrier.opened });
+  }
+  if (url.pathname === "/__test/chat-barrier/release" && request.method === "POST") {
+    if (!controlAuthorized(request)) return error("Invalid control token", 401, "unauthorized");
+    const barrier = chatBarrier;
+    releaseChatBarrier();
+    return json({
+      released: Boolean(barrier),
+      model: barrier?.model ?? null,
+      target: barrier?.target ?? null,
+      opened: barrier?.opened ?? 0,
+    });
   }
   if (url.pathname === "/__test/state" && request.method === "GET") {
     if (!controlAuthorized(request)) return error("Invalid control token", 401, "unauthorized");
@@ -543,6 +662,15 @@ Deno.serve({ port }, async (request) => {
       audio,
       speech,
       images,
+      embeddings,
+      chatBarrier: chatBarrier
+        ? {
+          model: chatBarrier.model,
+          target: chatBarrier.target,
+          opened: chatBarrier.opened,
+          released: chatBarrier.released,
+        }
+        : null,
     });
   }
   if (url.pathname === "/v1/models" && request.method === "GET") {
@@ -575,13 +703,34 @@ Deno.serve({ port }, async (request) => {
     }
     const body = await request.json() as Record<string, unknown>;
     const inputs = Array.isArray(body.input) ? body.input : [body.input];
+    const dimensions = typeof body.dimensions === "number" &&
+        Number.isSafeInteger(body.dimensions) && body.dimensions > 0 && body.dimensions <= 4096
+      ? body.dimensions
+      : 4;
+    embeddings.calls++;
+    embeddings.lastAuthorized = true;
+    embeddings.lastModel = modelFrom(body);
+    embeddings.lastDimensions = dimensions;
+    embeddings.lastInputCount = inputs.length;
+    const vector = Array.from(
+      { length: dimensions },
+      (_, component) => ((component % 17) + 1) / 100,
+    );
+    const embedding = body.encoding_format === "base64"
+      ? (() => {
+        const bytes = new Uint8Array(dimensions * Float32Array.BYTES_PER_ELEMENT);
+        const view = new DataView(bytes.buffer);
+        vector.forEach((component, index) => view.setFloat32(index * 4, component, true));
+        return btoa(String.fromCharCode(...bytes));
+      })()
+      : vector;
     return json({
       object: "list",
       model: modelFrom(body),
       data: inputs.map((_, index) => ({
         object: "embedding",
         index,
-        embedding: [0.1, 0.2, 0.3, 0.4],
+        embedding,
       })),
       usage: { prompt_tokens: inputs.length, total_tokens: inputs.length },
     });

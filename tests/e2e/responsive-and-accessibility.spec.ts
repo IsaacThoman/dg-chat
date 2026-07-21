@@ -1,6 +1,8 @@
+/// <reference lib="dom" />
+
 import { expect, test } from "@playwright/test";
 import { env } from "./env.ts";
-import { bootstrap, createChat, login } from "./helpers.ts";
+import { activeChatSession, bootstrap, createChat, login } from "./helpers.ts";
 
 function contrastRatio(foreground: string, background: string): number {
   const luminance = (color: string) => {
@@ -28,26 +30,53 @@ test(
     await expect(composer).toBeVisible();
     await composer.focus();
     await expect(composer).toBeFocused();
+    const initialComposerHeight = (await composer.boundingBox())?.height ?? 0;
+    await composer.fill(
+      Array.from({ length: 20 }, (_, index) => `Bounded narrow draft line ${index + 1}`).join("\n"),
+    );
+    const grownComposer = await composer.boundingBox();
+    expect(grownComposer?.height ?? 0).toBeGreaterThan(initialComposerHeight);
+    expect(grownComposer?.height ?? Number.POSITIVE_INFINITY).toBeLessThanOrEqual(160);
+    expect(await composer.evaluate((element) => element.scrollHeight > element.clientHeight)).toBe(
+      true,
+    );
+    await composer.fill("Short draft");
+    expect((await composer.boundingBox())?.height ?? Number.POSITIVE_INFINITY).toBeLessThan(
+      grownComposer?.height ?? 0,
+    );
     if (mobile) {
       await expect(page.getByRole("button", { name: "Open menu", exact: true })).toBeVisible();
       await expect(page.getByRole("button", { name: "New chat ⌘ K", exact: true }))
         .toHaveCount(0);
     } else {
+      const skip = page.getByRole("button", { name: "Skip to main content" });
+      await skip.focus();
+      await expect(skip).toBeFocused();
+      await skip.press("Enter");
+      await expect(activeChatSession(page).locator("main.chat-main")).toBeFocused();
       await expect(page.getByRole("button", { name: "New chat ⌘ K", exact: true })).toBeVisible();
       await expect(page.getByRole("button", { name: "Open menu", exact: true })).toBeHidden();
       await expect(page.getByRole("button", { name: "Close sidebar", exact: true })).toBeHidden();
+      await expect(page.getByRole("button", { name: "Chats", exact: true })).toHaveAttribute(
+        "aria-current",
+        "page",
+      );
+      await expect(page.locator(".conversation-row.active .conversation-open")).toHaveAttribute(
+        "aria-current",
+        "page",
+      );
     }
     await expect(page.getByRole("button", { name: "Attach files" })).toBeEnabled();
     await expect(page.getByRole("button", { name: "Open web search" })).toBeEnabled();
-    await expect(page.getByRole("button", { name: "Tools (not available yet)" })).toBeDisabled();
+    await expect(page.getByRole("button", { name: "Tools (not available yet)" })).toHaveCount(0);
     await expect(page.getByRole("button", {
       name: /^(Start voice input|Voice input unavailable:)/,
     })).toBeVisible();
 
     await page.evaluate(() => document.documentElement.setAttribute("data-theme", "dark"));
-    const composerGradient = await page.locator(".composer-wrap").evaluate((element) =>
-      getComputedStyle(element).backgroundImage
-    );
+    const composerGradient = await activeChatSession(page).locator(".composer-wrap").evaluate((
+      element,
+    ) => getComputedStyle(element).backgroundImage);
     expect(composerGradient).toContain("rgb(23, 23, 21)");
     expect(composerGradient).not.toContain("rgb(255, 255, 255)");
     const darkSidebarColors = await page.evaluate(() => {
@@ -98,9 +127,58 @@ test(
       expect((sendBox?.x ?? 0) + (sendBox?.width ?? 0)).toBeLessThanOrEqual(
         page.viewportSize()?.width ?? 320,
       );
+      await composer.fill(
+        Array.from({ length: 24 }, (_, index) => `320px draft line ${index + 1}`).join("\n"),
+      );
+      const narrowComposer = await composer.boundingBox();
+      const narrowSend = await page.getByRole("button", { name: "Send", exact: true })
+        .boundingBox();
+      expect(narrowComposer?.height ?? Number.POSITIVE_INFINITY).toBeLessThanOrEqual(160);
+      expect((narrowSend?.y ?? Number.POSITIVE_INFINITY) + (narrowSend?.height ?? 0))
+        .toBeLessThanOrEqual(800);
     }
   },
 );
+
+test("model picker behaves as one composite keyboard control", async ({ page, request }) => {
+  await bootstrap(request);
+  await login(page);
+  await createChat(page);
+
+  const trigger = activeChatSession(page).locator('button.model-trigger[aria-haspopup="listbox"]');
+  await trigger.focus();
+  await trigger.press("Enter");
+  const listbox = page.getByRole("listbox", { name: "Chat model" });
+  await expect(listbox).toBeVisible();
+  const options = listbox.getByRole("option");
+  expect(await options.count()).toBeGreaterThan(1);
+  await expect(listbox.locator('[role="option"][tabindex="0"]')).toHaveCount(1);
+  const initiallyFocused = await options.evaluateAll((items) =>
+    items.findIndex((item) => item === document.activeElement)
+  );
+  expect(initiallyFocused).toBeGreaterThanOrEqual(0);
+
+  await page.keyboard.press("ArrowDown");
+  const nextFocused = await options.evaluateAll((items) =>
+    items.findIndex((item) => item === document.activeElement)
+  );
+  expect(nextFocused).toBe((initiallyFocused + 1) % await options.count());
+  await expect(options.nth(nextFocused)).toHaveAttribute("tabindex", "0");
+  await expect(listbox.locator('[role="option"][tabindex="0"]')).toHaveCount(1);
+
+  await page.keyboard.press("Tab");
+  expect(
+    await options.evaluateAll((items) => items.some((item) => item === document.activeElement)),
+  )
+    .toBe(false);
+  await expect(listbox).toBeHidden();
+  await expect(trigger).toHaveAttribute("aria-expanded", "false");
+  await trigger.click();
+  await expect(listbox).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(listbox).toBeHidden();
+  await expect(trigger).toBeFocused();
+});
 
 test("mobile drawer is inert while closed and sheds modal state at the desktop breakpoint", async ({
   page,
@@ -135,6 +213,11 @@ test("mobile drawer is inert while closed and sheds modal state at the desktop b
   await expect(sidebar).not.toHaveAttribute("aria-hidden", "true");
   await expect(sidebar).not.toHaveAttribute("inert", "");
   await expect(page.getByRole("button", { name: "Close sidebar", exact: true })).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(drawer).toHaveCount(0);
+  await expect(open).toBeFocused();
+  await open.click();
+  await expect(drawer).toBeVisible();
 
   const actions = drawer.locator(".conversation-row.active [data-conversation-actions]");
   await expect(actions).toHaveCount(1);
@@ -280,11 +363,13 @@ test("every admin section is reachable across desktop and mobile", async ({
     ["providers", "Providers", "Providers"],
     ["models", "Models & pricing", "Models & pricing"],
     ["resilience", "Routing resilience", "Routing resilience"],
+    ["tools", "Tools & search", "Tools & web search"],
     ["usage", "Usage analytics", "Usage analytics"],
     ["jobs", "Background jobs", "Background jobs"],
     ["audit", "Audit log", "Audit log"],
     ["retention", "Retention", "Retention"],
-    ["storage", "Storage & backups", "Storage & backups"],
+    ["storage", "Attachment storage", "Attachment storage"],
+    ["backups", "Backups", "Storage & backups"],
   ] as const;
 
   if (mobile) {
@@ -362,9 +447,14 @@ test("provider credentials, failures, and modal focus are safely managed", async
   );
   await baseUrl.fill("https://provider.invalid/v1");
   await page.getByRole("button", { name: "Save provider", exact: true }).click();
-  await expect(page.getByRole("heading", { name: providerName, exact: true })).toBeVisible();
+  await expect(page.getByRole("dialog", { name: "Add provider", exact: true })).toHaveCount(0);
+  const providerCard = page.locator(".provider-card").filter({
+    has: page.getByRole("heading", { name: providerName, exact: true }),
+  });
+  await expect(providerCard.getByRole("heading", { name: providerName, exact: true }))
+    .toBeVisible();
 
-  await page.getByRole("button", { name: `Manage ${providerName}`, exact: true }).click();
+  await providerCard.getByRole("button", { name: `Manage ${providerName}`, exact: true }).click();
   const replacement = page.getByLabel(/Replace credential/);
   await expect(replacement).toHaveValue("");
   await expect(replacement).toHaveAttribute("autocomplete", "new-password");
@@ -403,10 +493,12 @@ test("Responses providers expose safe defaults and typed OCR targets", async ({
   await providerDialog.getByLabel("Enabled", { exact: true }).check();
   await providerDialog.getByLabel(/API credential/).fill(`responses-secret-${suffix}`);
   await providerDialog.getByRole("button", { name: "Save provider", exact: true }).click();
-  await expect(page.getByRole("heading", { name: providerName, exact: true })).toBeVisible();
+  await expect(providerDialog).toHaveCount(0);
   const providerCard = page.locator(".provider-card").filter({
     has: page.getByRole("heading", { name: providerName, exact: true }),
   });
+  await expect(providerCard.getByRole("heading", { name: providerName, exact: true }))
+    .toBeVisible();
   await expect(providerCard).toContainText("Protocol");
   await expect(providerCard).toContainText("Responses");
 

@@ -229,8 +229,8 @@ jq -e '
 ' <<<"$audio_state" >/dev/null
 echo "Official SDK image generation/editing, streaming, PNG validation, and exact replay contracts passed"
 jq -e '
-  .scenarios["mock-responses"].opened == 18 and
-  .scenarios["mock-responses"].completed == 18 and
+  .scenarios["mock-responses"].opened == 20 and
+  .scenarios["mock-responses"].completed == 20 and
   .scenarios["mock-responses"].lastAuthorized == true and
   .scenarios["mock-responses"].lastPath == "/v1/responses" and
   .scenarios["mock-responses"].lastHasInput == true and

@@ -13,6 +13,40 @@ const failedJob = {
   lastError: "Extraction deadline exceeded",
 };
 
+test("user directory filters follow browser history exactly", async ({ page, request }) => {
+  test.slow();
+  await bootstrap(request);
+  await login(page);
+
+  await page.goto("/admin/users?userSearch=admin&userRole=admin&userDeletion=present");
+  await expect(page.getByRole("heading", { name: "Users", exact: true })).toBeVisible({
+    timeout: 30_000,
+  });
+  await expect(page.getByLabel("Search users")).toHaveValue("admin");
+  await expect(page.getByLabel("Role")).toHaveValue("admin");
+  await expect(page.getByLabel("Deletion")).toHaveValue("present");
+
+  await page.getByLabel("Access").selectOption("suspended");
+  await expect(page).toHaveURL(/userState=suspended/u);
+  await page.getByLabel("Role").selectOption("user");
+  await expect(page).toHaveURL(/userRole=user/u);
+
+  await page.goBack();
+  await expect(page).toHaveURL(/userRole=admin/u);
+  await expect(page).toHaveURL(/userState=suspended/u);
+  await expect(page.getByLabel("Role")).toHaveValue("admin");
+  await expect(page.getByLabel("Access")).toHaveValue("suspended");
+
+  await page.goBack();
+  await expect(page).not.toHaveURL(/userState=/u);
+  await expect(page.getByLabel("Role")).toHaveValue("admin");
+  await expect(page.getByLabel("Access")).toHaveValue("");
+  await expect(page.getByLabel("Search users")).toHaveValue("admin");
+
+  await page.goForward();
+  await expect(page.getByLabel("Access")).toHaveValue("suspended");
+});
+
 test("admin analytics and jobs are bookmarkable, accessible, and operable", async ({
   page,
   request,

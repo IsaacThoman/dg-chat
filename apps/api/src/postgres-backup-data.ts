@@ -24,6 +24,9 @@ import {
   isSupportedBackupDataSchemaVersion,
   LEGACY_BACKUP_DATA_OMITTED_TABLES,
   ObjectAlreadyExistsError,
+  PRE_ATTACHMENT_CONTROL_BACKUP_DATA_OMITTED_TABLES,
+  PRE_AUTOMATIC_RETENTION_BACKUP_DATA_OMITTED_TABLES,
+  PRE_COMMUNITY_PROFILE_BACKUP_DATA_OMITTED_TABLES,
   PRE_IMMUTABLE_SHARING_BACKUP_DATA_OMITTED_TABLES,
   restoreBackupData,
   signBackupManifest,
@@ -87,12 +90,28 @@ interface ObjectReference {
   bytes: number;
   contentType: string;
 }
+interface OwnedObjectReference {
+  ownerId: string;
+  reference: ObjectReference;
+}
 interface ObjectIndexRecord extends ObjectReference {
   entry: string;
 }
 interface TempPayload {
   path: string;
   entry: BackupManifestEntryV1;
+}
+
+function restoredObjectKey(
+  restoreNamespace: string,
+  ownerId: string,
+  reference: ObjectReference,
+) {
+  // Archive payloads are intentionally deduplicated by content digest, but retained storage
+  // identity is the original object key. Include both so equal bytes from two independently
+  // governed objects never collapse into one restored blob.
+  const sourceObjectIdentity = createHash("sha256").update(reference.objectKey).digest("hex");
+  return `restores/${restoreNamespace}/users/${ownerId}/${sourceObjectIdentity}/${reference.sha256}`;
 }
 
 const defaultDatabase: DatabaseAdapter = {
@@ -213,14 +232,48 @@ function exactObjectReference(value: unknown): ObjectReference {
   return row as unknown as ObjectReference;
 }
 
-function attachmentReference(row: Readonly<Record<string, unknown>>): ObjectReference | undefined {
-  if (row.state !== "ready" || row.deleted_at !== null) return undefined;
+function attachmentStorageIdentity(row: Readonly<Record<string, unknown>>): string {
+  if (typeof row.owner_id !== "string" || !UUID.test(row.owner_id)) {
+    throw new TypeError("Backup attachment owner is invalid");
+  }
+  if (
+    typeof row.object_key !== "string" || !row.object_key || row.object_key.length > 1024
+  ) throw new TypeError("Backup attachment object key is invalid");
+  return `${row.owner_id}\0${row.object_key}`;
+}
+
+function attachmentReference(
+  row: Readonly<Record<string, unknown>>,
+  retainedBlobIdentities?: ReadonlySet<string>,
+): ObjectReference | undefined {
+  if (retainedBlobIdentities) {
+    if (!retainedBlobIdentities.has(attachmentStorageIdentity(row))) return undefined;
+  } else if (row.state !== "ready" || row.deleted_at !== null) return undefined;
   return exactObjectReference({
     objectKey: row.object_key,
     sha256: row.sha256,
     bytes: Number(row.size_bytes),
     contentType: row.mime_type,
   });
+}
+
+function retainedStorageReference(
+  row: Readonly<Record<string, unknown>>,
+): OwnedObjectReference {
+  const identity = attachmentStorageIdentity(row);
+  return {
+    ownerId: identity.slice(0, identity.indexOf("\0")),
+    reference: exactObjectReference({
+      objectKey: row.object_key,
+      sha256: row.sha256,
+      bytes: Number(row.size_bytes),
+      contentType: row.mime_type,
+    }),
+  };
+}
+
+function sameObjectReference(left: ObjectReference, right: ObjectReference): boolean {
+  return canonicalJson(left) === canonicalJson(right);
 }
 
 async function spoolObject(
@@ -378,7 +431,12 @@ export function createPostgresBackupDataPort(
         const expectedTables = BACKUP_DATA_TABLES.filter((table) =>
           input.includeDiagnostics || table.name !== "provider_payload_captures"
         ).map((table) => table.name);
-        if (source.tables.map((table) => table.name).join() !== expectedTables.join()) {
+        const actualTables = source.tables.map((table) => table.name);
+        if (
+          actualTables.length !== expectedTables.length ||
+          new Set(actualTables).size !== actualTables.length ||
+          expectedTables.some((name) => !actualTables.includes(name))
+        ) {
           throw new TypeError("Backup database table catalog is incomplete");
         }
         const payloads = new Map<string, Uint8Array | AsyncIterable<Uint8Array>>();
@@ -386,21 +444,20 @@ export function createPostgresBackupDataPort(
         const referencesPath = `${root}/object-references.ndjson`;
         const references = new HashedFileWriter(referencesPath);
         try {
-          for (const table of source.tables) {
+          // Always emit the canonical catalog order, even if an adapter enumerates the exact table
+          // set differently. This keeps signatures deterministic and makes retention resolution
+          // independent of source enumeration order.
+          for (const tableName of expectedTables) {
             input.signal?.throwIfAborted();
-            const name = `${TABLE_PREFIX}${table.name}.ndjson`;
-            const path = `${root}/table-${table.name}.ndjson`;
+            const name = `${TABLE_PREFIX}${tableName}.ndjson`;
+            const path = `${root}/table-${tableName}.ndjson`;
             const writer = new HashedFileWriter(path);
             try {
-              for await (const batch of source.rows(table.name)) {
+              for await (const batch of source.rows(tableName)) {
                 input.signal?.throwIfAborted();
                 for (const row of batch) {
                   input.signal?.throwIfAborted();
                   await writer.line(row);
-                  if (table.name === "attachments") {
-                    const reference = attachmentReference(row);
-                    if (reference) await references.line(reference);
-                  }
                 }
               }
               const digest = writer.finish();
@@ -416,6 +473,56 @@ export function createPostgresBackupDataPort(
               writer.close();
               throw error;
             }
+          }
+          // Resolve the physical registry only after every table has been spooled. The portable
+          // table catalog is intentionally free to evolve its ordering; object retention must not
+          // depend on attachments happening to follow the accounting tables.
+          const retained = new Map<string, OwnedObjectReference>();
+          for await (const raw of ndjson(`${root}/table-attachment_storage_blobs.ndjson`)) {
+            if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+              throw new TypeError("Backup attachment storage row is invalid");
+            }
+            const row = raw as Record<string, unknown>;
+            const identity = attachmentStorageIdentity(row);
+            const candidate = retainedStorageReference(row);
+            const previous = retained.get(identity);
+            if (previous && !sameObjectReference(previous.reference, candidate.reference)) {
+              throw new TypeError("Duplicate attachment storage metadata is inconsistent");
+            }
+            retained.set(identity, candidate);
+          }
+          for await (const raw of ndjson(`${root}/table-attachment_storage_releases.ndjson`)) {
+            if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+              throw new TypeError("Backup attachment storage release row is invalid");
+            }
+            retained.delete(attachmentStorageIdentity(raw as Record<string, unknown>));
+          }
+          const unresolved = new Set(retained.keys());
+          for await (const raw of ndjson(`${root}/table-attachments.ndjson`)) {
+            if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+              throw new TypeError("Backup attachment row is invalid");
+            }
+            const row = raw as Record<string, unknown>;
+            const identity = attachmentStorageIdentity(row);
+            const stored = retained.get(identity);
+            if (!stored) continue;
+            const attachment = attachmentReference(row, new Set([identity]));
+            if (!attachment || !sameObjectReference(stored.reference, attachment)) {
+              throw new TypeError("Attachment metadata differs from retained storage");
+            }
+            unresolved.delete(identity);
+          }
+          if (unresolved.size) {
+            throw new TypeError("A retained attachment object has no attachment metadata");
+          }
+          const ownerByObjectKey = new Map<string, string>();
+          for (const { ownerId, reference } of retained.values()) {
+            const existingOwner = ownerByObjectKey.get(reference.objectKey);
+            if (existingOwner && existingOwner !== ownerId) {
+              throw new TypeError("Backup object key is ambiguously owned");
+            }
+            ownerByObjectKey.set(reference.objectKey, ownerId);
+            await references.line(reference);
           }
         } finally {
           references.finish();
@@ -649,6 +756,12 @@ export function createPostgresBackupDataPort(
           const path = paths.get(`${TABLE_PREFIX}${tableName}.ndjson`);
           if (!path) {
             if (
+              (stagedSchemaVersion !== BACKUP_DATA_SCHEMA_VERSION &&
+                PRE_COMMUNITY_PROFILE_BACKUP_DATA_OMITTED_TABLES.has(tableName)) ||
+              (!["0053", "0050"].includes(stagedSchemaVersion) &&
+                PRE_ATTACHMENT_CONTROL_BACKUP_DATA_OMITTED_TABLES.has(tableName)) ||
+              (!["0053", "0050", "0049"].includes(stagedSchemaVersion) &&
+                PRE_AUTOMATIC_RETENTION_BACKUP_DATA_OMITTED_TABLES.has(tableName)) ||
               (stagedSchemaVersion === "0028" &&
                 LEGACY_BACKUP_DATA_OMITTED_TABLES.has(tableName)) ||
               (["0037", "0034"].includes(stagedSchemaVersion) &&
@@ -693,17 +806,38 @@ export function createPostgresBackupDataPort(
           manifest.diagnosticPayloadPolicy !== "excluded" ||
           table.name !== "provider_payload_captures"
         ).map((table) => `${TABLE_PREFIX}${table.name}.ndjson`);
-        const legacyExpectedTables = currentExpectedTables.filter((name) =>
+        const preCommunityProfileExpectedTables = currentExpectedTables.filter((name) =>
+          !PRE_COMMUNITY_PROFILE_BACKUP_DATA_OMITTED_TABLES.has(
+            name.slice(TABLE_PREFIX.length, -".ndjson".length),
+          )
+        );
+        const preAttachmentControlExpectedTables = preCommunityProfileExpectedTables.filter((
+          name,
+        ) =>
+          !PRE_ATTACHMENT_CONTROL_BACKUP_DATA_OMITTED_TABLES.has(
+            name.slice(TABLE_PREFIX.length, -".ndjson".length),
+          )
+        );
+        const preAutomaticRetentionExpectedTables = preAttachmentControlExpectedTables.filter((
+          name,
+        ) =>
+          !PRE_AUTOMATIC_RETENTION_BACKUP_DATA_OMITTED_TABLES.has(
+            name.slice(TABLE_PREFIX.length, -".ndjson".length),
+          )
+        );
+        const legacyExpectedTables = preAutomaticRetentionExpectedTables.filter((name) =>
           !LEGACY_BACKUP_DATA_OMITTED_TABLES.has(
             name.slice(TABLE_PREFIX.length, -".ndjson".length),
           )
         );
-        const adminLifecycleExpectedTables = currentExpectedTables.filter((name) =>
+        const adminLifecycleExpectedTables = preAutomaticRetentionExpectedTables.filter((name) =>
           !ADMIN_LIFECYCLE_BACKUP_DATA_OMITTED_TABLES.has(
             name.slice(TABLE_PREFIX.length, -".ndjson".length),
           )
         );
-        const preImmutableSharingExpectedTables = currentExpectedTables.filter((name) =>
+        const preImmutableSharingExpectedTables = preAutomaticRetentionExpectedTables.filter((
+          name,
+        ) =>
           !PRE_IMMUTABLE_SHARING_BACKUP_DATA_OMITTED_TABLES.has(
             name.slice(TABLE_PREFIX.length, -".ndjson".length),
           )
@@ -717,8 +851,18 @@ export function createPostgresBackupDataPort(
           actualTables.every((entry, index) =>
             entry.name === expected[index] && entry.kind === "ndjson"
           );
-        const expectedTables = matches(currentExpectedTables)
+        const expectedTables = manifest.schemaVersion === BACKUP_DATA_SCHEMA_VERSION &&
+            matches(currentExpectedTables)
           ? currentExpectedTables
+          : manifest.schemaVersion === "0050" &&
+              matches(preCommunityProfileExpectedTables)
+          ? preCommunityProfileExpectedTables
+          : manifest.schemaVersion === "0049" &&
+              matches(preAttachmentControlExpectedTables)
+          ? preAttachmentControlExpectedTables
+          : ![BACKUP_DATA_SCHEMA_VERSION, "0050", "0049"].includes(manifest.schemaVersion) &&
+              matches(preAutomaticRetentionExpectedTables)
+          ? preAutomaticRetentionExpectedTables
           : ["0037", "0034"].includes(manifest.schemaVersion) &&
               matches(adminLifecycleExpectedTables)
           ? adminLifecycleExpectedTables
@@ -748,12 +892,75 @@ export function createPostgresBackupDataPort(
         const expectedReferences = new Map<string, number>();
         const attachmentsPath = paths.get(`${TABLE_PREFIX}attachments.ndjson`);
         if (!attachmentsPath) throw new TypeError("Backup attachment table is missing");
+        let retainedBlobs: Map<string, OwnedObjectReference> | undefined;
+        const storagePath = paths.get(`${TABLE_PREFIX}attachment_storage_blobs.ndjson`);
+        if (storagePath) {
+          retainedBlobs = new Map<string, OwnedObjectReference>();
+          for await (const raw of ndjson(storagePath)) {
+            if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+              throw new TypeError("Backup attachment storage row is invalid");
+            }
+            const row = raw as Record<string, unknown>;
+            const identity = attachmentStorageIdentity(row);
+            const candidate = retainedStorageReference(row);
+            const previous = retainedBlobs.get(identity);
+            if (previous && !sameObjectReference(previous.reference, candidate.reference)) {
+              throw new TypeError("Duplicate attachment storage metadata is inconsistent");
+            }
+            retainedBlobs.set(identity, candidate);
+          }
+          const releasesPath = paths.get(`${TABLE_PREFIX}attachment_storage_releases.ndjson`);
+          if (!releasesPath) {
+            throw new TypeError("Backup attachment storage release table is missing");
+          }
+          for await (const raw of ndjson(releasesPath)) {
+            if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+              throw new TypeError("Backup attachment storage release row is invalid");
+            }
+            retainedBlobs.delete(
+              attachmentStorageIdentity(raw as Record<string, unknown>),
+            );
+          }
+        }
+        const unresolvedRetainedBlobIdentities = retainedBlobs
+          ? new Set(retainedBlobs.keys())
+          : undefined;
+        const expectedOwnedReferences = new Map<string, OwnedObjectReference>();
+        const ownerByObjectKey = new Map<string, string>();
         for await (const raw of ndjson(attachmentsPath)) {
           if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
             throw new TypeError("Backup attachment row is invalid");
           }
-          const reference = attachmentReference(raw as Record<string, unknown>);
+          const row = raw as Record<string, unknown>;
+          const storageIdentity = attachmentStorageIdentity(row);
+          const retained = retainedBlobs?.get(storageIdentity);
+          const reference = retainedBlobs ? retained?.reference : attachmentReference(row);
           if (!reference) continue;
+          const attachmentMetadata = attachmentReference(
+            row,
+            retainedBlobs ? new Set([storageIdentity]) : undefined,
+          );
+          if (!attachmentMetadata || !sameObjectReference(reference, attachmentMetadata)) {
+            throw new TypeError("Attachment metadata differs from retained storage");
+          }
+          const ownerId = retained?.ownerId ?? String(row.owner_id);
+          unresolvedRetainedBlobIdentities?.delete(storageIdentity);
+          const existingOwner = ownerByObjectKey.get(reference.objectKey);
+          if (existingOwner && existingOwner !== ownerId) {
+            throw new TypeError("Backup object key is ambiguously owned");
+          }
+          ownerByObjectKey.set(reference.objectKey, ownerId);
+          const ownedIdentity = `${ownerId}\0${canonicalJson(reference)}`;
+          const previous = expectedOwnedReferences.get(ownedIdentity);
+          if (previous && !sameObjectReference(previous.reference, reference)) {
+            throw new TypeError("Duplicate attachment metadata is inconsistent");
+          }
+          expectedOwnedReferences.set(ownedIdentity, { ownerId, reference });
+        }
+        if (unresolvedRetainedBlobIdentities?.size) {
+          throw new TypeError("A retained attachment object has no attachment metadata");
+        }
+        for (const { reference } of expectedOwnedReferences.values()) {
           const identity = canonicalJson(reference);
           expectedReferences.set(identity, (expectedReferences.get(identity) ?? 0) + 1);
         }
@@ -779,6 +986,10 @@ export function createPostgresBackupDataPort(
             bytes: row.bytes,
             contentType: row.contentType,
           });
+          const ownerId = ownerByObjectKey.get(reference.objectKey);
+          if (!ownerId) {
+            throw new TypeError("Backup object index owner is missing");
+          }
           const referenceIdentity = canonicalJson(reference);
           const remaining = expectedReferences.get(referenceIdentity) ?? 0;
           if (remaining < 1) {
@@ -801,7 +1012,7 @@ export function createPostgresBackupDataPort(
           }
           uniqueObjects.set(reference.sha256, reference.bytes);
           referencedEntries.add(row.entry);
-          const key = `restores/${restoreNamespace}/${reference.sha256}`;
+          const key = restoredObjectKey(restoreNamespace, ownerId, reference);
           if (mode === "apply") {
             try {
               await options.objects.put({
@@ -809,14 +1020,16 @@ export function createPostgresBackupDataPort(
                 body: fileReadable(blobPath),
                 contentLength: reference.bytes,
                 contentType: reference.contentType,
-                metadata: { sha256: reference.sha256 },
+                metadata: { sha256: reference.sha256, owner: ownerId },
               });
             } catch (error) {
               if (!(error instanceof ObjectAlreadyExistsError)) throw error;
               const existing = await options.objects.get(key);
               if (
                 !existing || existing.contentLength !== reference.bytes ||
-                existing.metadata.sha256 !== reference.sha256
+                existing.contentType !== reference.contentType ||
+                existing.metadata.sha256 !== reference.sha256 ||
+                existing.metadata.owner !== ownerId
               ) throw new TypeError("Staged backup object conflicts with existing content");
               await existing.body.cancel().catch(() => undefined);
             }
@@ -827,12 +1040,14 @@ export function createPostgresBackupDataPort(
               stagedKeySet.add(key);
               stagedKeys.push(key);
             }
-          } else if (mode === "cleanup" && !cleanedEntries.has(reference.sha256)) {
+          } else if (mode === "cleanup" && !cleanedEntries.has(key)) {
             const existing = await options.objects.get(key);
             if (existing) {
               if (
                 existing.contentLength !== reference.bytes ||
-                existing.metadata.sha256 !== reference.sha256
+                existing.contentType !== reference.contentType ||
+                existing.metadata.sha256 !== reference.sha256 ||
+                existing.metadata.owner !== ownerId
               ) {
                 await existing.body.cancel().catch(() => undefined);
                 throw new TypeError("Staged backup object conflicts with signed archive metadata");
@@ -840,7 +1055,7 @@ export function createPostgresBackupDataPort(
               await existing.body.cancel().catch(() => undefined);
               await options.objects.delete(key);
             }
-            cleanedEntries.add(reference.sha256);
+            cleanedEntries.add(key);
           }
           const previous = map.get(reference.objectKey);
           if (previous && previous !== key) throw new TypeError("Backup object key is duplicated");

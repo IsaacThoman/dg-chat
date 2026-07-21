@@ -1,0 +1,114 @@
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: DgChatApiTargetsAbsent
+        exp_alerts:
+          - exp_labels:
+              job: dg-chat-api
+              severity: critical
+            exp_annotations:
+              summary: DG Chat has no healthy API metrics targets
+              description: "Prometheus has observed no healthy API scrape target for two minutes."
+      - eval_time: 3m
+        alertname: DgChatWorkerTargetsAbsent
+        exp_alerts:
+          - exp_labels:
+              job: dg-chat-worker
+              severity: critical
+            exp_annotations:
+              summary: DG Chat has no healthy worker metrics targets
+              description: "Prometheus has observed no healthy worker scrape target for two minutes."
+
+  - interval: 1m
+    input_series:
+      - series: 'up{job="dg-chat-api",instance="api-1"}'
+        values: "1x4"
+      - series: 'up{job="dg-chat-worker",instance="worker-1"}'
+        values: "1x4"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: DgChatApiTargetsAbsent
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: DgChatWorkerTargetsAbsent
+        exp_alerts: []
+
+  # DNS discovery can retain its previous targets as down series after a scaled service stops.
+  # Fleet detection must therefore handle present `up=0` samples, not only missing series.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="dg-chat-api",instance="api-stale"}'
+        values: "0x4"
+      - series: 'up{job="dg-chat-worker",instance="worker-stale"}'
+        values: "0x4"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: DgChatApiTargetsAbsent
+        exp_alerts:
+          - exp_labels:
+              job: dg-chat-api
+              severity: critical
+            exp_annotations:
+              summary: DG Chat has no healthy API metrics targets
+              description: "Prometheus has observed no healthy API scrape target for two minutes."
+      - eval_time: 3m
+        alertname: DgChatWorkerTargetsAbsent
+        exp_alerts:
+          - exp_labels:
+              job: dg-chat-worker
+              severity: critical
+            exp_annotations:
+              summary: DG Chat has no healthy worker metrics targets
+              description: "Prometheus has observed no healthy worker scrape target for two minutes."
+
+  - interval: 1m
+    input_series:
+      - series: 'dg_chat_http_response_lifecycle_total{job="dg-chat-api",instance="api-1",method="POST",route="v1_chat_completions",outcome="failed"}'
+        values: "0 1 2 3 4 5 6"
+      - series: 'dg_chat_http_response_lifecycle_total{job="dg-chat-api",instance="api-2",method="POST",route="v1_chat_completions",outcome="completed"}'
+        values: "0 10 20 30 40 50 60"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: DgChatHttpResponseBodyFailures
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: DG Chat HTTP response streams are failing
+              description: "More than two HTTP response bodies failed after dispatch in the rolling five-minute window."
+
+  - interval: 1m
+    input_series:
+      - series: 'dg_chat_job_queue_depth{service="worker",status="queued",instance="worker-1"}'
+        values: "120x12"
+      - series: 'dg_chat_job_queue_depth{service="worker",status="queued",instance="worker-2"}'
+        values: "130x12"
+      - series: 'dg_chat_job_queue_oldest_seconds{service="worker",status="queued",instance="worker-1"}'
+        values: "301x12"
+      - series: 'dg_chat_job_queue_oldest_seconds{service="worker",status="queued",instance="worker-2"}'
+        values: "400x12"
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: DgChatQueueBacklog
+        exp_alerts:
+          - exp_labels:
+              status: queued
+              severity: warning
+            exp_annotations:
+              summary: DG Chat durable queue is backing up
+              description: "More than 100 jobs have remained queued for ten minutes."
+      - eval_time: 6m
+        alertname: DgChatQueueStalled
+        exp_alerts:
+          - exp_labels:
+              status: queued
+              severity: critical
+            exp_annotations:
+              summary: DG Chat durable queue appears stalled
+              description: "The oldest runnable queued job is more than five minutes old."

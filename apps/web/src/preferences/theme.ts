@@ -7,14 +7,23 @@ export function resolvedTheme(
   return preference === "system" ? (systemDark ? "dark" : "light") : preference;
 }
 
+export function themeColor(theme: "light" | "dark"): string {
+  return theme === "dark" ? "#171715" : "#f7f7f5";
+}
+
 export function applyTheme(
   preference: ThemePreference,
   root: HTMLElement = document.documentElement,
   systemDark = globalThis.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false,
 ) {
+  const theme = resolvedTheme(preference, systemDark);
   root.dataset.themePreference = preference;
-  root.dataset.theme = resolvedTheme(preference, systemDark);
-  root.style.colorScheme = resolvedTheme(preference, systemDark);
+  root.dataset.theme = theme;
+  root.style.colorScheme = theme;
+  root.ownerDocument?.querySelector<HTMLMetaElement>('meta[name="theme-color"]')?.setAttribute(
+    "content",
+    themeColor(theme),
+  );
 }
 
 export function watchSystemTheme(
