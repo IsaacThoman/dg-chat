@@ -218,6 +218,7 @@ done
 # it currently owns a streaming POST, then restart that exact replica rather than an arbitrary one.
 active_metric_instance=""
 active_requests_before_restart=""
+active_replica_count=""
 restarted_container=""
 metric_deadline=$((SECONDS + 30))
 while [[ -z "$restarted_container" ]]; do
@@ -226,21 +227,33 @@ while [[ -z "$restarted_container" ]]; do
     'query=dg_chat_http_requests_in_flight{job="dg-chat-api",method="POST",route="api"} > 0' \
     "$LOAD_PROMETHEUS_URL/api/v1/query")" ||
     die "could not query Prometheus for active API streams."
+  candidate_container=""
+  candidate_instance_selected=""
+  candidate_value_selected=""
+  active_replica_count=0
   while IFS=$'\t' read -r candidate_instance candidate_value; do
     [[ -n "$candidate_instance" && "$candidate_value" =~ ^[0-9]+([.][0-9]+)?$ ]] || continue
     candidate_ip="${candidate_instance%:*}"
     for container in $app_containers; do
       if docker inspect -f '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' \
         "$container" | grep -Fxq "$candidate_ip"; then
-        active_metric_instance="$candidate_instance"
-        active_requests_before_restart="$candidate_value"
-        restarted_container="$container"
-        break 2
+        active_replica_count=$((active_replica_count + 1))
+        if [[ -z "$candidate_container" ]]; then
+          candidate_container="$container"
+          candidate_instance_selected="$candidate_instance"
+          candidate_value_selected="$candidate_value"
+        fi
+        break
       fi
     done
   done < <(jq -r '.data.result[]? | [.metric.instance, .value[1]] | @tsv' <<<"$metrics_response")
+  if (( active_replica_count == 2 )); then
+    active_metric_instance="$candidate_instance_selected"
+    active_requests_before_restart="$candidate_value_selected"
+    restarted_container="$candidate_container"
+  fi
   (( SECONDS < metric_deadline )) ||
-    die "Prometheus never identified an API replica with an active streaming request."
+    die "Prometheus never proved both API replicas owned active streaming requests."
   [[ -n "$restarted_container" ]] || sleep 0.1
 done
 docker restart --time 2 "$restarted_container" >/dev/null
@@ -259,11 +272,13 @@ jq -n \
   --arg restartedContainer "$restarted_container" \
   --arg activeMetricInstance "$active_metric_instance" \
   --argjson activeRequestsBeforeRestart "$active_requests_before_restart" \
+  --argjson activeReplicaCount "$active_replica_count" \
   --argjson markerActiveStreams "$active_streams" \
   '{
     restartedContainer:$restartedContainer,
     activeMetricInstance:$activeMetricInstance,
     activeRequestsBeforeRestart:$activeRequestsBeforeRestart,
+    activeReplicaCount:$activeReplicaCount,
     markerActiveStreams:$markerActiveStreams,
     directReplicaProbes:2
   }' \
