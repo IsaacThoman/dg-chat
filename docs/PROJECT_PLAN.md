@@ -1,6 +1,6 @@
 # DG Chat Product Goal and Completion Plan
 
-Last updated: 2026-07-21
+Last updated: 2026-07-22
 
 ## Overarching goal
 
@@ -33,8 +33,9 @@ the durable implementation handoff.
   by the spawned-worker shutdown/recovery tests.
 - The shadcn migration is initialized. Preset `b6ZjldV0i` supplies Mira style, mauve semantic
   tokens, small radius, Oxanium, Remix icons, and subtle default menus. Foundational primitives are
-  installed, theme-token collisions are isolated from legacy variables, and authentication/bootstrap
-  surfaces now use shadcn Card, Button, Input, and TooltipProvider primitives.
+  installed, theme-token collisions are isolated from legacy variables, and the authentication,
+  application shell, workspace navigation, composer, model picker, preferences, modal, and lifecycle
+  states now use shared shadcn primitives.
 
 ## Completion roadmap
 
@@ -157,6 +158,24 @@ Exact verification evidence for that revision:
 The overarching goal is complete: every roadmap item and revised release gate is satisfied with no
 known missing in-scope feature, unresolved defect, failing required gate, undocumented release risk,
 or unreviewed placeholder.
+
+## Native shadcn UI refinement record
+
+The 2026-07-22 refinement replaces the highest-leverage custom control boundaries with the installed
+`b6ZjldV0i` design system instead of attempting a risky page-by-page rewrite. The shared application
+shell and composer use shadcn Button, Input, Textarea, Badge, Card, and Empty primitives; the model
+picker uses the native Select composition; modals use the native Base UI-backed Dialog composition;
+and workspace and preference forms use the shared Field, Label, Checkbox, Switch, and Select
+primitives. These boundaries propagate consistent semantics, focus behavior, keyboard interaction,
+disabled states, and preset tokens across the product while preserving feature-specific layouts.
+
+The visual layer now treats the preset's semantic OKLCH tokens as authoritative for surfaces,
+borders, text, focus rings, destructive states, and dark mode. Desktop chat uses an inset content
+surface and clearer navigation hierarchy; mobile removes the inset treatment and retains the tested
+drawer behavior. App-shell icons use the preset's Remix icon family. Feature modules may retain
+specialized native HTML controls or local layout classes where shadcn has no behavioral advantage;
+“native shadcn” means shared interaction primitives and token ownership, not eliminating all product
+CSS or replacing semantic HTML with wrapper components.
 
 ## Definition of done
 

@@ -70,7 +70,7 @@ import {
   Users,
   Volume2,
   X,
-} from "lucide-react";
+} from "./components/icons.tsx";
 import { type AdminUserFilters, api, ApiError, pollAttachmentInspection } from "./api.ts";
 import type { AdminSearch, AdminSection } from "./adminRouting.ts";
 import { AdminAnalyticsView, AdminJobsView } from "./AdminOperations.tsx";
@@ -149,8 +149,18 @@ import { AdminResilience } from "./AdminResilience.tsx";
 import { AdminTools } from "./AdminTools.tsx";
 import { ToolLauncher } from "./ToolLauncher.tsx";
 import { Button as ShadcnButton } from "./components/ui/button.tsx";
+import { Badge } from "./components/ui/badge.tsx";
 import { Card } from "./components/ui/card.tsx";
+import {
+  Empty,
+  EmptyContent,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyMedia,
+  EmptyTitle,
+} from "./components/ui/empty.tsx";
 import { Input as ShadcnInput } from "./components/ui/input.tsx";
+import { Textarea } from "./components/ui/textarea.tsx";
 import { AdminUserDetail } from "./admin/users/AdminUserDetail.tsx";
 import type { AdminUserTab } from "./admin/users/adminUserRouting.ts";
 import {
@@ -345,9 +355,9 @@ export function ConversationMessagesQueryState(
           <>
             <h1>Conversation messages unavailable</h1>
             <p>The saved conversation could not be loaded. No messages were removed.</p>
-            <button type="button" className="primary" onClick={retry}>
+            <ShadcnButton type="button" onClick={retry}>
               <RefreshCw size={15} aria-hidden="true" /> Retry
-            </button>
+            </ShadcnButton>
           </>
         )}
     </main>
@@ -392,8 +402,10 @@ function IconButton(
   },
 ) {
   return (
-    <button
+    <ShadcnButton
       type="button"
+      variant="ghost"
+      size="icon"
       className={cn("icon-button", className)}
       aria-label={label}
       title={label}
@@ -404,7 +416,7 @@ function IconButton(
       aria-describedby={ariaDescribedby}
     >
       {children}
-    </button>
+    </ShadcnButton>
   );
 }
 
@@ -633,7 +645,9 @@ function Sidebar({
           <X size={19} />
         </IconButton>
       </div>
-      <button
+      <ShadcnButton
+        variant="outline"
+        size="lg"
         className="new-chat"
         disabled={creatingConversation}
         aria-busy={creatingConversation || undefined}
@@ -643,11 +657,11 @@ function Sidebar({
         }}
       >
         <Plus size={18} /> New chat <kbd>⌘ K</kbd>
-      </button>
+      </ShadcnButton>
       <div className="search" role="search">
         <label className="sr-only" htmlFor={searchId}>Search conversations</label>
         <Search size={16} aria-hidden="true" />
-        <input
+        <ShadcnInput
           id={searchId}
           ref={searchInputRef}
           value={query}
@@ -664,8 +678,10 @@ function Sidebar({
         />
         {query
           ? (
-            <button
+            <ShadcnButton
               type="button"
+              variant="ghost"
+              size="icon-xs"
               className="search-clear"
               aria-label="Clear conversation search"
               onClick={() => {
@@ -674,7 +690,7 @@ function Sidebar({
               }}
             >
               <X size={14} />
-            </button>
+            </ShadcnButton>
           )
           : <kbd>⌘F</kbd>}
       </div>
@@ -695,43 +711,48 @@ function Sidebar({
           : ""}
       </span>
       <nav className="side-nav">
-        <button
+        <ShadcnButton
+          variant="ghost"
           onClick={() => select("chat")}
           className={view === "chat" ? "selected" : ""}
           aria-current={view === "chat" ? "page" : undefined}
         >
           <MessageSquare size={17} /> Chats
-        </button>
-        <button
+        </ShadcnButton>
+        <ShadcnButton
+          variant="ghost"
           type="button"
           onClick={() => select("knowledge")}
           className={view === "knowledge" ? "selected" : ""}
           aria-current={view === "knowledge" ? "page" : undefined}
         >
           <BookOpen size={17} /> Knowledge
-        </button>
-        <button
+        </ShadcnButton>
+        <ShadcnButton
+          variant="ghost"
           type="button"
           onClick={() => select("community")}
           className={view === "community" ? "selected" : ""}
           aria-current={view === "community" ? "page" : undefined}
         >
           <Trophy size={17} /> Community
-        </button>
-        <button
+        </ShadcnButton>
+        <ShadcnButton
+          variant="ghost"
           onClick={() => select("archived")}
           className={view === "archived" ? "selected" : ""}
           aria-current={view === "archived" ? "page" : undefined}
         >
           <Archive size={17} /> Archived
-        </button>
-        <button
+        </ShadcnButton>
+        <ShadcnButton
+          variant="ghost"
           onClick={() => select("trash")}
           className={view === "trash" ? "selected" : ""}
           aria-current={view === "trash" ? "page" : undefined}
         >
           <Trash2 size={17} /> Trash
-        </button>
+        </ShadcnButton>
       </nav>
       {listView === "chat" && (
         <WorkspaceNavigation
@@ -764,12 +785,12 @@ function Sidebar({
         {search.searching && search.error && !search.loading && (
           <div className="empty-mini" role="alert">
             <span>Search is unavailable</span>
-            <button
+            <ShadcnButton
               className="secondary"
               onClick={search.retry}
             >
               <RefreshCw size={14} /> Retry
-            </button>
+            </ShadcnButton>
           </div>
         )}
         {!search.searching && listLoading && (
@@ -785,15 +806,15 @@ function Sidebar({
         {!search.searching && listError && (
           <div className="empty-mini" role="alert">
             <span>Conversations are unavailable</span>
-            <button className="secondary" onClick={retryList}>
+            <ShadcnButton className="secondary" onClick={retryList}>
               <RefreshCw size={14} /> Retry
-            </button>
+            </ShadcnButton>
           </div>
         )}
         {!search.searching && staleWarning && (
           <div className="stale-warning" role="status">
             <span>Showing saved conversations. Refresh failed.</span>
-            <button onClick={retryList}>Retry</button>
+            <ShadcnButton onClick={retryList}>Retry</ShadcnButton>
           </div>
         )}
         {!search.loading && !search.error &&
@@ -871,37 +892,37 @@ function Sidebar({
                   Showing {displayedConversations.length} of {filtered.length}{" "}
                   chats. Search finds your full history.
                 </p>
-                <button
+                <ShadcnButton
                   type="button"
                   className="secondary"
                   onClick={() =>
                     setConversationWindowLimit((current) => current + INITIAL_CONVERSATION_WINDOW)}
                 >
                   Show {Math.min(INITIAL_CONVERSATION_WINDOW, windowed.hiddenCount)} more chats
-                </button>
+                </ShadcnButton>
               </div>
             )}
             {search.searching && search.cursor && !search.pageError && (
-              <button
+              <ShadcnButton
                 type="button"
                 className="secondary conversation-search-more"
                 disabled={search.loadingMore}
                 onClick={() => void search.loadMore()}
               >
                 {search.loadingMore ? "Loading more…" : "Load more results"}
-              </button>
+              </ShadcnButton>
             )}
             {search.searching && search.pageError && (
               <div className="conversation-search-page-error" role="alert">
                 <span>More results couldn’t be loaded.</span>
-                <button
+                <ShadcnButton
                   type="button"
                   disabled={search.loadingMore}
                   onClick={() =>
                     void search.loadMore()}
                 >
                   Retry
-                </button>
+                </ShadcnButton>
               </div>
             )}
           </>
@@ -909,29 +930,29 @@ function Sidebar({
       </div>
       <div className="sidebar-footer">
         {user.role === "admin" && (
-          <button
+          <ShadcnButton
             className={view === "admin" ? "selected" : ""}
             onClick={() => select("admin")}
             aria-current={view === "admin" ? "page" : undefined}
           >
             <ShieldCheck size={17} /> Admin console
-          </button>
+          </ShadcnButton>
         )}
-        <button
+        <ShadcnButton
           className={view === "settings" || view === "tokens" ? "selected" : ""}
           onClick={() => select("settings")}
           aria-current={view === "settings" || view === "tokens" ? "page" : undefined}
         >
           <Settings size={17} /> Settings
-        </button>
-        <button className="user-row" onClick={() => select("settings")}>
+        </ShadcnButton>
+        <ShadcnButton className="user-row" onClick={() => select("settings")}>
           <Avatar user={user} />
           <span>
             <strong>{user.name}</strong>
             <small>${user.balance.toFixed(2)} remaining</small>
           </span>
           <MoreHorizontal size={17} className="push" />
-        </button>
+        </ShadcnButton>
       </div>
       <div ref={menuPortalRef} className="sidebar-menu-portal-root" />
     </aside>
@@ -1065,7 +1086,7 @@ function ConversationRow(
         }
       }}
     >
-      <button
+      <ShadcnButton
         className="conversation-open"
         aria-describedby={protectionStatus ? protectionStatusId : undefined}
         aria-current={active ? "page" : undefined}
@@ -1098,8 +1119,8 @@ function ConversationRow(
           )}
           <span>{conversationTimestampLabel(c)}</span>
         </span>
-      </button>
-      <button
+      </ShadcnButton>
+      <ShadcnButton
         ref={actionRef}
         className="icon-button"
         type="button"
@@ -1126,7 +1147,7 @@ function ConversationRow(
         }}
       >
         <Ellipsis size={16} />
-      </button>
+      </ShadcnButton>
       {menu && menuPortalRef.current && createPortal(
         <div
           ref={menuRef}
@@ -1159,16 +1180,16 @@ function ConversationRow(
           }}
         >
           {listView === "chat" && (
-            <button
+            <ShadcnButton
               autoFocus
               role="menuitem"
               onClick={() => openRowDialog(() => setRename(true))}
             >
               <Pencil size={14} /> Rename
-            </button>
+            </ShadcnButton>
           )}
           {listView === "chat" && folders && tags && (
-            <button
+            <ShadcnButton
               role="menuitem"
               disabled={c.temporary}
               title={c.temporary
@@ -1180,54 +1201,54 @@ function ConversationRow(
               onClick={() => openRowDialog(() => setOrganize(true))}
             >
               <Folder size={14} /> {c.temporary ? "Keep chat to organize" : "Organize"}
-            </button>
+            </ShadcnButton>
           )}
           {listView === "chat" && (
-            <button
+            <ShadcnButton
               role="menuitem"
               disabled={busy}
               onClick={() => update({ pinned: !c.pinned })}
             >
               <Pin size={14} /> {c.pinned ? "Unpin" : "Pin"}
-            </button>
+            </ShadcnButton>
           )}
           {listView === "chat" && (
-            <button
+            <ShadcnButton
               role="menuitem"
               disabled={busy}
               onClick={() => update({ archived: true })}
             >
               <Archive size={14} /> Archive
-            </button>
+            </ShadcnButton>
           )}
           {listView === "archived" && (
-            <button
+            <ShadcnButton
               autoFocus
               role="menuitem"
               disabled={busy}
               onClick={() => update({ archived: false })}
             >
               <RotateCcw size={14} /> Restore to chats
-            </button>
+            </ShadcnButton>
           )}
           {listView === "trash" && (
-            <button
+            <ShadcnButton
               autoFocus
               role="menuitem"
               disabled={busy}
               onClick={() => update({ deleted: false })}
             >
               <RotateCcw size={14} /> {c.archived ? "Restore to Archived" : "Restore to Chats"}
-            </button>
+            </ShadcnButton>
           )}
           {listView !== "trash" && (
-            <button
+            <ShadcnButton
               className="menu-danger"
               role="menuitem"
               onClick={() => openRowDialog(() => setConfirmDelete(true))}
             >
               <Trash2 size={14} /> Move to trash
-            </button>
+            </ShadcnButton>
           )}
         </div>,
         menuPortalRef.current,
@@ -1255,14 +1276,14 @@ function ConversationRow(
           <p className="muted">“{c.title}” can be restored later from Trash.</p>
           {error && <p className="form-error" role="alert">{error}</p>}
           <div className="modal-actions">
-            <button
+            <ShadcnButton
               className="secondary"
               disabled={busy}
               onClick={() => closeRowDialog(() => setConfirmDelete(false))}
             >
               Cancel
-            </button>
-            <button
+            </ShadcnButton>
+            <ShadcnButton
               className="danger-button"
               disabled={busy}
               onClick={async () => {
@@ -1272,7 +1293,7 @@ function ConversationRow(
               }}
             >
               Move to trash
-            </button>
+            </ShadcnButton>
           </div>
         </Modal>
       )}
@@ -1324,7 +1345,7 @@ function RenameConversationDialog(
       <form onSubmit={submit}>
         <label className="field">
           <span>Conversation title</span>
-          <input
+          <ShadcnInput
             maxLength={200}
             value={title}
             onChange={(event) => setTitle(event.target.value)}
@@ -1332,12 +1353,12 @@ function RenameConversationDialog(
         </label>
         {error && <p className="form-error" role="status">{error}</p>}
         <div className="modal-actions">
-          <button type="button" className="secondary" disabled={busy} onClick={close}>
+          <ShadcnButton type="button" className="secondary" disabled={busy} onClick={close}>
             Cancel
-          </button>
-          <button className="primary" disabled={busy || !title.trim()}>
+          </ShadcnButton>
+          <ShadcnButton className="primary" disabled={busy || !title.trim()}>
             {busy ? "Saving…" : "Save"}
-          </button>
+          </ShadcnButton>
         </div>
       </form>
     </Modal>
@@ -1694,7 +1715,7 @@ function AttachmentIngestionBadge(
   return (
     <span>
       <small>Knowledge ingestion failed.</small>{" "}
-      <button
+      <ShadcnButton
         type="button"
         className="link-button"
         disabled={busy}
@@ -1708,7 +1729,7 @@ function AttachmentIngestionBadge(
         }}
       >
         {busy ? "Retrying…" : "Retry knowledge ingestion"}
-      </button>
+      </ShadcnButton>
       {retryError && <small role="alert">Retry failed. Try again.</small>}
     </span>
   );
@@ -2576,7 +2597,8 @@ export function Composer(
       {selectionError && <p className="form-error" role="alert">{selectionError}</p>}
       {disabledReason && <p className="composer-status" role="status">{disabledReason}</p>}
       <form className="composer" onSubmit={submit}>
-        <textarea
+        <Textarea
+          className="composer-input"
           ref={textareaRef}
           data-chat-composer
           rows={1}
@@ -2598,7 +2620,7 @@ export function Composer(
           aria-describedby={edit ? editDescriptionId : undefined}
         />
         <div className="composer-tools">
-          <input
+          <ShadcnInput
             ref={fileRef}
             type="file"
             hidden
@@ -2623,18 +2645,20 @@ export function Composer(
             onBusyChange={setScreenCaptureBusy}
             onCapture={(file) => addFiles([file])}
           />
-          <button
+          <ShadcnButton
             type="button"
+            variant="ghost"
             className="tool-pill"
             disabled={interactionDisabled}
             aria-label="Open web search"
             onClick={() => setToolsOpen(true)}
           >
             <Globe2 size={16} /> Search
-          </button>
+          </ShadcnButton>
           {imageModels.length > 0 && (
-            <button
+            <ShadcnButton
               type="button"
+              variant="ghost"
               className="tool-pill"
               disabled={branchTransitioning}
               aria-label="Create images"
@@ -2645,17 +2669,18 @@ export function Composer(
               }}
             >
               <ImageIcon size={16} /> Create image
-            </button>
+            </ShadcnButton>
           )}
-          <button
+          <ShadcnButton
             type="button"
+            variant="ghost"
             className="tool-pill"
             disabled={branchTransitioning}
             aria-label="Open image history"
             onClick={openImageGallery}
           >
             <Boxes size={16} /> Images
-          </button>
+          </ShadcnButton>
           <span className="push" />
           {transcriptionModels.length > 1 && (
             <select
@@ -2697,17 +2722,19 @@ export function Composer(
             }}
           />
           {streaming && (
-            <button
+            <ShadcnButton
               type="button"
+              variant="destructive"
               className="stop-button"
               aria-label={stopping ? "Stopping generation" : "Stop generating"}
               disabled={stopping}
               onClick={onStop}
             >
-              <Square size={14} fill="currentColor" /> {stopping ? "Stopping…" : "Stop"}
-            </button>
+              <Square size={14} /> {stopping ? "Stopping…" : "Stop"}
+            </ShadcnButton>
           )}
-          <button
+          <ShadcnButton
+            size="icon-lg"
             className="send-button"
             aria-label={edit
               ? "Send edited message as a new branch"
@@ -2717,7 +2744,7 @@ export function Composer(
             disabled={!canSubmit}
           >
             <ArrowDown size={19} />
-          </button>
+          </ShadcnButton>
         </div>
       </form>
       <ToolLauncher
@@ -2805,11 +2832,11 @@ export function Composer(
             }}
           />
           <div className="modal-actions">
-            <button type="button" className="secondary" onClick={() => setImagePanel(null)}>
+            <ShadcnButton type="button" className="secondary" onClick={() => setImagePanel(null)}>
               Close
-            </button>
+            </ShadcnButton>
             {imageModels.length > 0 && (
-              <button
+              <ShadcnButton
                 type="button"
                 className="primary"
                 onClick={() => {
@@ -2817,7 +2844,7 @@ export function Composer(
                 }}
               >
                 <Plus size={16} /> Create image
-              </button>
+              </ShadcnButton>
             )}
           </div>
         </Modal>
@@ -3686,9 +3713,9 @@ function ChatView({
               disabled={readOnly || streaming || queue.length > 0}
             />
           )}
-          <span className="balance-pill">
+          <Badge variant="outline" className="balance-pill">
             <CircleDollarSign size={15} /> ${balance.toFixed(2)}
-          </span>
+          </Badge>
           {conversation && (
             <ConversationShareButton
               conversation={conversation}
@@ -3712,14 +3739,19 @@ function ChatView({
       >
         <div className="chat-title">
           <h1>{conversation?.title ?? "New conversation"}</h1>
-          <button onClick={() => setRenaming(true)} disabled={!conversation || readOnly}>
+          <ShadcnButton
+            variant="ghost"
+            size="sm"
+            onClick={() => setRenaming(true)}
+            disabled={!conversation || readOnly}
+          >
             <Pencil size={14} /> Rename
-          </button>
+          </ShadcnButton>
         </div>
         {messagesStale && (
           <div className="stale-warning" role="status">
             <span>Showing saved messages. The latest refresh failed.</span>
-            <button type="button" onClick={retryMessages}>Retry</button>
+            <ShadcnButton type="button" onClick={retryMessages}>Retry</ShadcnButton>
           </div>
         )}
         {conversation?.temporary && (
@@ -3736,7 +3768,7 @@ function ChatView({
               {keepTemporaryError && <span role="alert">{keepTemporaryError}</span>}
             </div>
             {!readOnly && (
-              <button
+              <ShadcnButton
                 type="button"
                 className="secondary"
                 disabled={keepingTemporary || generationBusy}
@@ -3763,7 +3795,7 @@ function ChatView({
                 }}
               >
                 {keepingTemporary ? "Keeping…" : "Keep chat"}
-              </button>
+              </ShadcnButton>
             )}
           </div>
         )}
@@ -3876,7 +3908,7 @@ function ChatView({
             <span>{sendError}</span>
             {failedPrompt && (
               <>
-                <button
+                <ShadcnButton
                   type="button"
                   disabled={branchBusy || voiceBusy}
                   onClick={() => {
@@ -3894,8 +3926,8 @@ function ChatView({
                   }}
                 >
                   <RefreshCw size={14} /> Retry
-                </button>
-                <button
+                </ShadcnButton>
+                <ShadcnButton
                   type="button"
                   className="secondary"
                   onClick={() => {
@@ -3911,7 +3943,7 @@ function ChatView({
                   }}
                 >
                   Discard failed prompt
-                </button>
+                </ShadcnButton>
               </>
             )}
           </div>
@@ -4177,7 +4209,7 @@ function SettingsView(
       <div className="settings-layout">
         <nav className="settings-nav">
           {settingsNav.map(({ id, label, icon: Icon }) => (
-            <button
+            <ShadcnButton
               className={section === id ? "active" : ""}
               key={id}
               onClick={() => setSection(id)}
@@ -4185,7 +4217,7 @@ function SettingsView(
               <Icon size={18} />
               {label}
               <ChevronRight size={15} className="push" />
-            </button>
+            </ShadcnButton>
           ))}
         </nav>
         <section className="settings-content">
@@ -4261,7 +4293,7 @@ function Field({ label, value }: { label: string; value: string }) {
   return (
     <label className="field">
       <span>{label}</span>
-      <input value={value} readOnly aria-readonly="true" />
+      <ShadcnInput value={value} readOnly aria-readonly="true" />
     </label>
   );
 }
@@ -4547,7 +4579,9 @@ function AdminOverview({ setSection }: { setSection: (section: AdminSection) => 
           <BarChart3 size={24} />
           <h3>Usage analytics</h3>
           <p>Explore request volume, token classes, cost, latency, and provider distributions.</p>
-          <button className="secondary" onClick={() => setSection("usage")}>Open analytics</button>
+          <ShadcnButton className="secondary" onClick={() => setSection("usage")}>
+            Open analytics
+          </ShadcnButton>
         </div>
         <div className="health-card">
           <div className="card-title">
@@ -4591,9 +4625,9 @@ function AdminOverview({ setSection }: { setSection: (section: AdminSection) => 
               <h3>Pending applicants</h3>
               <p>Review account requests awaiting a decision</p>
             </div>
-            <button className="link-button" onClick={() => setSection("applicants")}>
+            <ShadcnButton className="link-button" onClick={() => setSection("applicants")}>
               View all <ArrowRight size={15} />
-            </button>
+            </ShadcnButton>
           </div>
           <Applicants compact />
         </div>
@@ -4603,9 +4637,9 @@ function AdminOverview({ setSection }: { setSection: (section: AdminSection) => 
               <h3>Recent audit activity</h3>
               <p>Latest immutable security and administration events</p>
             </div>
-            <button className="link-button" onClick={() => setSection("audit")}>
+            <ShadcnButton className="link-button" onClick={() => setSection("audit")}>
               View all <ArrowRight size={15} />
-            </button>
+            </ShadcnButton>
           </div>
           {audit.isLoading && <div className="empty-mini">Loading activity…</div>}
           {audit.isError && <div className="empty-mini">Recent activity is unavailable</div>}
@@ -4750,7 +4784,9 @@ function Applicants({ compact = false }: { compact?: boolean }) {
         {users.isError && (
           <div className="empty-mini" role="alert">
             Applicant data is unavailable.{" "}
-            <button className="text-button" onClick={() => users.refetch()}>Retry</button>
+            <ShadcnButton className="text-button" onClick={() => users.refetch()}>
+              Retry
+            </ShadcnButton>
           </div>
         )}
         {!users.isLoading && !users.isError && !applicants.length && (
@@ -4776,13 +4812,13 @@ function Applicants({ compact = false }: { compact?: boolean }) {
               {new Date(applicant.createdAt).toLocaleDateString()}
             </time>
             <span className="applicant-actions">
-              <button
+              <ShadcnButton
                 className="approve"
                 onClick={() =>
                   openDecision(applicant, "approved")}
               >
                 <Check size={15} /> Approve
-              </button>
+              </ShadcnButton>
               <IconButton
                 label="Reject"
                 onClick={() =>
@@ -4796,21 +4832,21 @@ function Applicants({ compact = false }: { compact?: boolean }) {
       </div>
       {!compact && (
         <div className="admin-user-pagination" aria-label="Applicant pages">
-          <button
+          <ShadcnButton
             className="secondary"
             disabled={!cursors.length || users.isFetching}
             onClick={() => setCursors((current) => current.slice(0, -1))}
           >
             <ChevronLeft size={14} aria-hidden="true" /> Previous
-          </button>
+          </ShadcnButton>
           <span>Page {cursors.length + 1}</span>
-          <button
+          <ShadcnButton
             className="secondary"
             disabled={!users.data?.nextCursor || users.isFetching}
             onClick={() => setCursors((current) => [...current, users.data!.nextCursor!])}
           >
             Next <ChevronRight size={14} aria-hidden="true" />
-          </button>
+          </ShadcnButton>
         </div>
       )}
       {decision && (
@@ -4829,7 +4865,7 @@ function Applicants({ compact = false }: { compact?: boolean }) {
               <>
                 <label className="admin-user-reason">
                   <span>Starting credit override (USD, optional)</span>
-                  <input
+                  <ShadcnInput
                     autoFocus
                     type="number"
                     min="0"
@@ -4856,13 +4892,13 @@ function Applicants({ compact = false }: { compact?: boolean }) {
                     )}
                 </label>
                 {settings.isError && (
-                  <button
+                  <ShadcnButton
                     type="button"
                     className="text-button"
                     onClick={() => settings.refetch()}
                   >
                     Retry loading the server default
-                  </button>
+                  </ShadcnButton>
                 )}
               </>
             )}
@@ -4882,19 +4918,24 @@ function Applicants({ compact = false }: { compact?: boolean }) {
             </label>
             {error && <p className="form-error" role="alert">{error}</p>}
             {reauthRequired && (
-              <button
+              <ShadcnButton
                 type="button"
                 className="secondary"
                 onClick={() => location.assign("/login")}
               >
                 Sign in again
-              </button>
+              </ShadcnButton>
             )}
             <div className="modal-actions">
-              <button type="button" className="secondary" disabled={busy} onClick={closeDecision}>
+              <ShadcnButton
+                type="button"
+                className="secondary"
+                disabled={busy}
+                onClick={closeDecision}
+              >
                 Cancel
-              </button>
-              <button
+              </ShadcnButton>
+              <ShadcnButton
                 type="submit"
                 className={decision.status === "rejected" ? "danger-button" : "approve"}
                 disabled={busy || (decision.status === "rejected" && !reason.trim()) ||
@@ -4905,7 +4946,7 @@ function Applicants({ compact = false }: { compact?: boolean }) {
                   : decision.status === "approved"
                   ? "Approve applicant"
                   : "Reject applicant"}
-              </button>
+              </ShadcnButton>
             </div>
           </form>
         </Modal>
@@ -4969,7 +5010,7 @@ function UserManagement(
           <span>Search</span>
           <span>
             <Search size={15} aria-hidden="true" />
-            <input
+            <ShadcnInput
               aria-label="Search users"
               value={searchDraft}
               onChange={(event) => setSearchDraft(event.target.value)}
@@ -5029,7 +5070,7 @@ function UserManagement(
             <option value="all">All</option>
           </select>
         </label>
-        <button type="submit" className="secondary">Apply</button>
+        <ShadcnButton type="submit" className="secondary">Apply</ShadcnButton>
       </form>
       <div
         className="table-card full data-table admin-user-table"
@@ -5047,7 +5088,9 @@ function UserManagement(
         {users.isError && (
           <div className="empty-mini" role="alert">
             User data is unavailable.{" "}
-            <button className="text-button" onClick={() => users.refetch()}>Retry</button>
+            <ShadcnButton className="text-button" onClick={() => users.refetch()}>
+              Retry
+            </ShadcnButton>
           </div>
         )}
         {!users.isLoading && !users.isError && users.data?.data.length === 0 && (
@@ -5072,7 +5115,7 @@ function UserManagement(
               <small>Balance</small>
               <strong>${user.balance.toFixed(2)}</strong>
             </span>
-            <button
+            <ShadcnButton
               className="secondary"
               aria-label={`Manage ${user.name}`}
               onClick={() => {
@@ -5084,28 +5127,28 @@ function UserManagement(
               }}
             >
               Manage
-            </button>
+            </ShadcnButton>
           </div>
         ))}
       </div>
       <div className="admin-user-pagination" aria-label="User pages">
-        <button
+        <ShadcnButton
           className="secondary"
           aria-label="Previous page"
           disabled={!cursors.length || users.isFetching}
           onClick={() => setCursors((current) => current.slice(0, -1))}
         >
           <ChevronLeft size={14} /> Previous
-        </button>
+        </ShadcnButton>
         <span>Page {cursors.length + 1}</span>
-        <button
+        <ShadcnButton
           className="secondary"
           aria-label="Next page"
           disabled={!users.data?.nextCursor || users.isFetching}
           onClick={() => setCursors((current) => [...current, users.data!.nextCursor!])}
         >
           Next <ChevronRight size={14} />
-        </button>
+        </ShadcnButton>
       </div>
       <span className="sr-only" role="status" aria-live="polite">
         {users.isFetching ? "Refreshing user directory" : ""}
@@ -5175,7 +5218,7 @@ function AuditLog() {
       <form className="audit-filters" onSubmit={apply} aria-label="Audit filters">
         <label>
           <span>Action</span>
-          <input
+          <ShadcnInput
             value={draft.action}
             onChange={update("action")}
             placeholder="user.state.suspended"
@@ -5183,27 +5226,35 @@ function AuditLog() {
         </label>
         <label>
           <span>Actor ID</span>
-          <input value={draft.actorId} onChange={update("actorId")} placeholder="UUID" />
+          <ShadcnInput value={draft.actorId} onChange={update("actorId")} placeholder="UUID" />
         </label>
         <label>
           <span>Target type</span>
-          <input value={draft.targetType} onChange={update("targetType")} placeholder="user" />
+          <ShadcnInput
+            value={draft.targetType}
+            onChange={update("targetType")}
+            placeholder="user"
+          />
         </label>
         <label>
           <span>Target ID</span>
-          <input value={draft.targetId} onChange={update("targetId")} placeholder="Identifier" />
+          <ShadcnInput
+            value={draft.targetId}
+            onChange={update("targetId")}
+            placeholder="Identifier"
+          />
         </label>
         <label>
           <span>From</span>
-          <input type="datetime-local" value={draft.from} onChange={update("from")} />
+          <ShadcnInput type="datetime-local" value={draft.from} onChange={update("from")} />
         </label>
         <label>
           <span>To</span>
-          <input type="datetime-local" value={draft.to} onChange={update("to")} />
+          <ShadcnInput type="datetime-local" value={draft.to} onChange={update("to")} />
         </label>
         <div className="audit-filter-actions">
-          <button className="primary" type="submit">Apply filters</button>
-          <button className="secondary" type="button" onClick={reset}>Reset</button>
+          <ShadcnButton className="primary" type="submit">Apply filters</ShadcnButton>
+          <ShadcnButton className="secondary" type="button" onClick={reset}>Reset</ShadcnButton>
         </div>
       </form>
       <div className="table-card full audit-table-card">
@@ -5260,15 +5311,15 @@ function AuditLog() {
         )}
       </div>
       <div className="audit-pagination" aria-label="Audit pagination">
-        <button
+        <ShadcnButton
           className="secondary"
           disabled={cursors.length === 1 || events.isFetching}
           onClick={() => setCursors((current) => current.slice(0, -1))}
         >
           <ChevronLeft size={15} /> Previous
-        </button>
+        </ShadcnButton>
         <span>Page {cursors.length}</span>
-        <button
+        <ShadcnButton
           className="secondary"
           disabled={!events.data?.nextCursor || events.isFetching}
           onClick={() => {
@@ -5277,7 +5328,7 @@ function AuditLog() {
           }}
         >
           Next <ChevronRight size={15} />
-        </button>
+        </ShadcnButton>
       </div>
     </>
   );
@@ -5900,7 +5951,7 @@ export function App(
   }
   return (
     <div className="app-shell">
-      <button
+      <ShadcnButton
         type="button"
         className="skip-link"
         onClick={() => {
@@ -5914,7 +5965,7 @@ export function App(
         }}
       >
         Skip to main content
-      </button>
+      </ShadcnButton>
       <span
         className="sr-only chat-activation-announcement"
         aria-live="polite"
@@ -5950,7 +6001,7 @@ export function App(
       {newChatError && (
         <div className="chat-session-capacity-alert" role="alert">
           <span className="chat-session-capacity-message">{newChatError}</span>
-          <button
+          <ShadcnButton
             ref={newChatRetryRef}
             type="button"
             className="secondary"
@@ -5958,7 +6009,7 @@ export function App(
             onClick={() => createdChatRecoveryId ? openCreatedChat() : void open("new")}
           >
             {createdChatRecoveryId ? "Open created chat" : "Try again"}
-          </button>
+          </ShadcnButton>
           <IconButton
             label="Dismiss new chat error"
             onClick={() => {
@@ -5975,14 +6026,14 @@ export function App(
       {chatSessionCapacityError && (
         <div className="chat-session-capacity-alert" role="alert">
           <span className="chat-session-capacity-message">{chatSessionCapacityError}</span>
-          <button
+          <ShadcnButton
             ref={capacityReviewRef}
             type="button"
             className="secondary chat-session-capacity-review"
             onClick={reviewProtectedWork}
           >
             Review unfinished chat
-          </button>
+          </ShadcnButton>
           <IconButton
             label="Dismiss chat limit notice"
             onClick={() => {
@@ -6068,9 +6119,9 @@ export function App(
                   Six retained chats contain unfinished work. Review one before opening a
                   conversation in this view.
                 </p>
-                <button className="secondary" type="button" onClick={reviewProtectedWork}>
+                <ShadcnButton className="secondary" type="button" onClick={reviewProtectedWork}>
                   Review retained chats
-                </button>
+                </ShadcnButton>
               </>
             )
             : (
@@ -6110,18 +6161,26 @@ export function App(
             </IconButton>
             <strong>Conversations unavailable</strong>
           </header>
-          <RefreshCw size={28} />
-          <h2>Couldn’t load conversations</h2>
-          <p>Check your connection and try again.</p>
-          <button
-            className="secondary"
-            onClick={() =>
-              void (view === "trash"
-                ? deletedConversationQuery.refetch()
-                : conversationQuery.refetch())}
-          >
-            Retry
-          </button>
+          <Empty className="native-empty-state">
+            <EmptyHeader>
+              <EmptyMedia variant="icon">
+                <RefreshCw aria-hidden="true" />
+              </EmptyMedia>
+              <EmptyTitle>Couldn’t load conversations</EmptyTitle>
+              <EmptyDescription>Check your connection and try again.</EmptyDescription>
+            </EmptyHeader>
+            <EmptyContent>
+              <ShadcnButton
+                variant="outline"
+                onClick={() =>
+                  void (view === "trash"
+                    ? deletedConversationQuery.refetch()
+                    : conversationQuery.refetch())}
+              >
+                <RefreshCw aria-hidden="true" /> Retry
+              </ShadcnButton>
+            </EmptyContent>
+          </Empty>
         </main>
       )}
       {(view === "chat" || view === "archived" || view === "trash") && !creatingConversation &&
@@ -6136,29 +6195,32 @@ export function App(
               {view === "chat" ? "Chats" : view === "archived" ? "Archived" : "Trash"}
             </strong>
           </header>
-          <Archive size={28} />
-          <h2>
-            {view === "trash"
-              ? "Trash is empty"
-              : view === "archived"
-              ? "No archived conversations"
-              : "Start a new conversation"}
-          </h2>
-          <p>
-            {view === "chat"
-              ? "Create a chat to start a conversation."
-              : "Conversations moved here will appear in this view."}
-          </p>
-          {view === "chat" && (
-            <button
-              className="primary"
-              type="button"
-              onClick={() => void open("new")}
-            >
-              <Plus size={16} aria-hidden="true" />
-              New chat
-            </button>
-          )}
+          <Empty className="native-empty-state">
+            <EmptyHeader>
+              <EmptyMedia variant="icon">
+                {view === "chat" ? <Sparkles aria-hidden="true" /> : <Archive aria-hidden="true" />}
+              </EmptyMedia>
+              <EmptyTitle>
+                {view === "trash"
+                  ? "Trash is empty"
+                  : view === "archived"
+                  ? "No archived conversations"
+                  : "Start a new conversation"}
+              </EmptyTitle>
+              <EmptyDescription>
+                {view === "chat"
+                  ? "Choose a model and begin a focused conversation. Your recent work will stay organized here."
+                  : "Conversations moved here will appear in this view."}
+              </EmptyDescription>
+            </EmptyHeader>
+            {view === "chat" && (
+              <EmptyContent>
+                <ShadcnButton size="lg" type="button" onClick={() => void open("new")}>
+                  <Plus aria-hidden="true" /> New chat
+                </ShadcnButton>
+              </EmptyContent>
+            )}
+          </Empty>
         </main>
       )}
       {view === "settings" && <SettingsView user={user} onMenu={() => setMobile(true)} />}
@@ -6610,14 +6672,14 @@ export function PendingScreen() {
         </small>
       </div>
       {mode === "verification" && setup.data?.emailEnabled && (
-        <button
+        <ShadcnButton
           className="secondary wide"
           disabled={resending}
           onClick={() => void resend()}
         >
           <RefreshCw className={resending ? "spin" : ""} size={16} />
           {resending ? "Sending…" : "Send a new verification link"}
-        </button>
+        </ShadcnButton>
       )}
       {resendMessage && (
         <p className="pending-announcement" role={resendFailed ? "alert" : "status"}>
@@ -6626,18 +6688,18 @@ export function PendingScreen() {
       )}
       {mode === "refresh"
         ? (
-          <button className="primary wide" onClick={() => void signOut()}>
+          <ShadcnButton className="primary wide" onClick={() => void signOut()}>
             <LogOut size={16} /> Continue to sign in
-          </button>
+          </ShadcnButton>
         )
         : (
-          <button className="secondary wide" onClick={() => void status.refetch()}>
+          <ShadcnButton className="secondary wide" onClick={() => void status.refetch()}>
             <RefreshCw size={16} /> Check status
-          </button>
+          </ShadcnButton>
         )}
-      <button className="text-button" onClick={signOut}>
+      <ShadcnButton className="text-button" onClick={signOut}>
         <LogOut size={15} /> Sign out
-      </button>
+      </ShadcnButton>
     </AuthCard>
   );
 }
