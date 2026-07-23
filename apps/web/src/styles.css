@@ -3960,11 +3960,12 @@ kbd {
 }
 .portability-summary {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 6px;
   margin: 0;
 }
 .portability-summary > div {
+  min-width: 0;
   padding: 8px;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -3973,6 +3974,7 @@ kbd {
 .portability-summary dt {
   color: var(--supporting-ink);
   font-size: 12px;
+  overflow-wrap: anywhere;
 }
 .portability-summary dd {
   margin: 3px 0 0;
