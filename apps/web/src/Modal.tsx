@@ -4,7 +4,11 @@ import { RiCloseLine } from "@remixicon/react";
 import { ChatSessionActivityContext } from "./chatSessionActivity.ts";
 import { Button } from "./components/ui/button.tsx";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "./components/ui/dialog.tsx";
-import { modalInitialFocus, modalShouldRestoreFocus } from "./modalFocus.ts";
+import {
+  modalContainmentTarget,
+  modalInitialFocus,
+  modalShouldRestoreFocus,
+} from "./modalFocus.ts";
 
 export function Modal(
   {
@@ -54,6 +58,25 @@ export function Modal(
       }
     });
   }, []);
+
+  // Keep programmatic focus changes inside the modal as well. Base UI handles ordinary keyboard
+  // and pointer navigation, while this guard preserves the stricter contract used by assistive
+  // workflows that move focus through script (for example, browser permission recovery).
+  useEffect(() => {
+    if (!sessionActive) return;
+    const containFocus = (event: FocusEvent) => {
+      const dialog = dialogRef.current;
+      const focused = event.target;
+      if (!dialog || dialog.contains(focused as Node)) return;
+      if (
+        focused instanceof Element &&
+        focused.closest('[data-slot="select-content"], [role="listbox"], [role="dialog"]')
+      ) return;
+      modalContainmentTarget(dialog, focused)?.focus({ preventScroll: true });
+    };
+    document.addEventListener("focusin", containFocus);
+    return () => document.removeEventListener("focusin", containFocus);
+  }, [sessionActive]);
 
   return (
     <Dialog

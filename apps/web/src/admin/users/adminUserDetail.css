@@ -531,7 +531,7 @@
   .admin-user-detail-pagination button,
   .admin-user-reason-form .modal-actions button,
   .admin-user-adjustment .modal-actions button {
-    min-height: 44px;
+    min-height: 46px;
   }
   .admin-user-tab-heading,
   .admin-user-balance-hero {

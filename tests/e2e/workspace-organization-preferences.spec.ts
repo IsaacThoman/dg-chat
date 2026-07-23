@@ -102,7 +102,8 @@ test("projects and tags organize, filter, and preserve conversations when delete
     }
     await route.continue();
   });
-  await organize.getByLabel("Project").selectOption({ label: projectName });
+  await organize.getByRole("combobox", { name: "Project" }).click();
+  await page.getByRole("option", { name: projectName, exact: true }).click();
   await organize.getByRole("checkbox", { name: tagName, exact: true }).check();
   await organize.getByRole("button", { name: "Save", exact: true }).click();
   await expect(organize).toBeHidden();

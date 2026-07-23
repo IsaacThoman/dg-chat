@@ -1,4 +1,4 @@
-import { useContext, useState } from "react";
+import { useContext, useRef, useState } from "react";
 import { RiEqualizer2Line } from "@remixicon/react";
 
 import { ChatSessionActivityContext } from "../chatSessionActivity.ts";
@@ -24,6 +24,13 @@ export function ModelPicker({
 }) {
   const sessionActive = useContext(ChatSessionActivityContext);
   const [open, setOpen] = useState(false);
+  const selectedRef = useRef(selected);
+  if (selectedRef.current !== selected) selectedRef.current = selected;
+  const selectModel = (value: string | null) => {
+    if (!value || selectedRef.current === value) return;
+    selectedRef.current = value;
+    setSelected(value);
+  };
   const model = models.find((item) => item.id === selected) ?? models[0];
 
   return (
@@ -32,10 +39,16 @@ export function ModelPicker({
         value={model?.id ?? null}
         open={sessionActive && open}
         onOpenChange={setOpen}
-        onValueChange={(value) => value && setSelected(value)}
+        onValueChange={selectModel}
         disabled={!models.length}
       >
-        <SelectTrigger className="model-trigger" aria-label="Chat model">
+        <SelectTrigger
+          className="model-trigger"
+          aria-label="Chat model"
+          onClick={() => {
+            if (!open) setOpen(true);
+          }}
+        >
           <span className="model-glyph" aria-hidden="true">
             {model?.provider[0]?.toUpperCase() ?? "–"}
           </span>
@@ -55,7 +68,12 @@ export function ModelPicker({
               Choose a model <RiEqualizer2Line aria-hidden="true" />
             </SelectLabel>
             {models.map((item) => (
-              <SelectItem key={item.id} value={item.id} className="model-option">
+              <SelectItem
+                key={item.id}
+                value={item.id}
+                className="model-option"
+                onClick={() => selectModel(item.id)}
+              >
                 <span className={`health-dot ${item.healthy ? "" : "down"}`} />
                 <span className="model-option-copy">
                   <strong>{item.name}</strong>

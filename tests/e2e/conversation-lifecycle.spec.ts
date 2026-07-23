@@ -10,7 +10,8 @@ async function selectDeterministicChatModel(page: import("@playwright/test").Pag
   await activeChatSession(page).locator('button.model-trigger[aria-haspopup="listbox"]').click();
   await page.getByRole("listbox", { name: "Chat model" })
     .getByRole("option", { name: /DG Chat Simulated/ }).click();
-  await expect(page.getByRole("button", { name: /DG Chat Simulated/ })).toBeVisible();
+  await expect(page.getByRole("combobox", { name: "Chat model" }))
+    .toContainText("DG Chat Simulated");
 }
 
 test("conversation rename, archive, trash, and restore remain recoverable", async ({ page }) => {

@@ -398,6 +398,7 @@ export function WorkspaceNavigation({
                 Cancel
               </Button>
               <Button
+                type="submit"
                 disabled={!name.trim() || createFolder.isPending || createTag.isPending}
               >
                 Create
@@ -438,6 +439,7 @@ export function WorkspaceNavigation({
                 Cancel
               </Button>
               <Button
+                type="submit"
                 disabled={!name.trim() || name.trim() === editing.name || updateFolder.isPending}
               >
                 Save
@@ -484,7 +486,7 @@ export function WorkspaceNavigation({
               <Button type="button" variant="outline" onClick={() => setEditingTag(null)}>
                 Cancel
               </Button>
-              <Button disabled={!name.trim() || updateTag.isPending}>
+              <Button type="submit" disabled={!name.trim() || updateTag.isPending}>
                 Save
               </Button>
             </div>

@@ -1356,7 +1356,7 @@ function RenameConversationDialog(
           <ShadcnButton type="button" className="secondary" disabled={busy} onClick={close}>
             Cancel
           </ShadcnButton>
-          <ShadcnButton className="primary" disabled={busy || !title.trim()}>
+          <ShadcnButton type="submit" className="primary" disabled={busy || !title.trim()}>
             {busy ? "Saving…" : "Save"}
           </ShadcnButton>
         </div>
@@ -2734,6 +2734,7 @@ export function Composer(
             </ShadcnButton>
           )}
           <ShadcnButton
+            type="submit"
             size="icon-lg"
             className="send-button"
             aria-label={edit

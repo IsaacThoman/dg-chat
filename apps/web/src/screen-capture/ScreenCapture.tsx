@@ -95,6 +95,7 @@ export function ScreenCapture({
   }, [cancel, captureIdentity]);
   useEffect(() => {
     if (!open || !sessionActive) return;
+    phaseActionRef.current?.focus();
     const frame = requestAnimationFrame(() => phaseActionRef.current?.focus());
     return () => cancelAnimationFrame(frame);
   }, [open, phase, sessionActive]);
@@ -252,6 +253,7 @@ export function ScreenCapture({
               ref={phase === "requesting" ? phaseActionRef : undefined}
               type="button"
               className="secondary"
+              data-autofocus={phase === "requesting" ? "" : undefined}
               onClick={cancel}
             >
               Cancel

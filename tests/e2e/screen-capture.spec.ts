@@ -123,17 +123,20 @@ test.beforeEach(async ({ page, request }, testInfo) => {
   // administrator on the text-only model for the next test (and for Playwright retries).
   const session = activeChatSession(page);
   const modelTrigger = session.locator('button.model-trigger[aria-haspopup="listbox"]');
-  await modelTrigger.click();
-  const preferenceSaved = page.waitForResponse((response) =>
-    response.request().method() === "PATCH" &&
-    new URL(response.url()).pathname === "/api/preferences"
-  );
-  await page.getByRole("option", { name: /DG Chat Simulated/ }).click();
-  const preferenceResponse = await preferenceSaved;
-  expect(
-    preferenceResponse.ok(),
-    preferenceResponse.ok() ? "vision model preference saved" : await preferenceResponse.text(),
-  ).toBeTruthy();
+  await expect(modelTrigger).not.toContainText("No chat model");
+  if (!(await modelTrigger.textContent())?.includes("DG Chat Simulated")) {
+    await modelTrigger.click();
+    const preferenceSaved = page.waitForResponse((response) =>
+      response.request().method() === "PATCH" &&
+      new URL(response.url()).pathname === "/api/preferences"
+    );
+    await page.getByRole("option", { name: /DG Chat Simulated/ }).click();
+    const preferenceResponse = await preferenceSaved;
+    expect(
+      preferenceResponse.ok(),
+      preferenceResponse.ok() ? "vision model preference saved" : await preferenceResponse.text(),
+    ).toBeTruthy();
+  }
   await expect(modelTrigger).toContainText("DG Chat Simulated");
   await expect(session.getByRole("button", { name: "Capture screen", exact: true })).toBeEnabled();
 });
@@ -287,7 +290,9 @@ test("cancels and fences a pending capture when the selected model loses vision"
   await expect(dialog.getByRole("button", { name: "Cancel", exact: true })).toBeFocused();
 
   await session.locator('button.model-trigger[aria-haspopup="listbox"]').dispatchEvent("click");
-  await page.getByRole("option", { name: /E2E text only/ }).dispatchEvent("click");
+  await page.locator('[data-slot="select-content"][data-open] [role="option"]', {
+    hasText: "E2E text only",
+  }).dispatchEvent("click");
   await expect(dialog).toBeHidden();
   const unavailableCapture = session.getByRole("button", {
     name: "Capture screen unavailable: the selected model does not support images",
@@ -331,9 +336,9 @@ test("synchronously fences Use Screenshot on an immediate model capability downg
   await page.evaluate(() => {
     const testState = (globalThis as typeof globalThis & { __captureTest: CaptureTestState })
       .__captureTest;
-    const option = [...document.querySelectorAll<HTMLElement>('[role="option"]')].find((item) =>
-      item.textContent?.includes("E2E text only")
-    );
+    const option = [...document.querySelectorAll<HTMLElement>(
+      '[data-slot="select-content"][data-open] [role="option"]',
+    )].find((item) => item.textContent?.includes("E2E text only"));
     const useScreenshot = [...document.querySelectorAll<HTMLButtonElement>("button")].find((item) =>
       item.textContent?.trim() === "Use screenshot"
     );

@@ -162,7 +162,7 @@ export function PersonalizationPreferences() {
           <small id="custom-instructions-count">
             {instructions.length.toLocaleString()} / 20,000
           </small>
-          <Button disabled={!dirty || busy}>
+          <Button type="submit" disabled={!dirty || busy}>
             {busy ? "Saving…" : dirty ? "Save instructions" : "Saved"}
           </Button>
         </div>
