@@ -11,7 +11,8 @@ async function selectSlowStream(page: import("@playwright/test").Page) {
   await activeChatSession(page).locator('button.model-trigger[aria-haspopup="listbox"]').click();
   await page.getByRole("listbox", { name: "Chat model" })
     .getByRole("option", { name: /DG Chat Slow Stream/ }).click();
-  await expect(page.getByRole("button", { name: /DG Chat Slow Stream/ })).toBeVisible();
+  await expect(page.getByRole("combobox", { name: "Chat model" }))
+    .toContainText("DG Chat Slow Stream");
 }
 
 test("renders real incremental SSE and runs queued prompts in FIFO order", async ({ page }) => {

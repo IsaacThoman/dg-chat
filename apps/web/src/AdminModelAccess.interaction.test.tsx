@@ -2,7 +2,6 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { JSDOM } from "jsdom";
 import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { DeleteDialog, GroupDialog } from "./AdminModelAccess.tsx";
 import { api, ApiError } from "./api.ts";
 import type { AccessGroupPolicyImpact, AdminModel, ModelAccessGroup } from "./types.ts";
 
@@ -14,6 +13,7 @@ const browserGlobals = Object.entries({
   document: dom.window.document,
   navigator: dom.window.navigator,
   Node: dom.window.Node,
+  Element: dom.window.Element,
   HTMLElement: dom.window.HTMLElement,
   HTMLButtonElement: dom.window.HTMLButtonElement,
   Event: dom.window.Event,
@@ -31,6 +31,7 @@ for (const [key, value] of browserGlobals) {
 const { act, cleanup, fireEvent, render, screen, waitFor } = await import(
   "@testing-library/react"
 );
+const { DeleteDialog, GroupDialog } = await import("./AdminModelAccess.tsx");
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -291,7 +292,7 @@ describe("rendered model-access widening confirmation", () => {
     expect(signal.aborted).toBe(true);
     expect(close).not.toHaveBeenCalled();
     expect(description.value).toBe("Preserve this careful draft");
-    expect(description.disabled).toBe(false);
+    await waitFor(() => expect(description.disabled).toBe(false));
     await act(() => pendingPreview.resolve(impact([models[0].id])));
     await Promise.resolve();
     expect(replace).not.toHaveBeenCalled();

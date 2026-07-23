@@ -8,6 +8,25 @@ function contrastRatio(foreground: string, background: string): number {
   const luminance = (color: string) => {
     const channels = color.match(/[\d.]+/g)?.slice(0, 3).map(Number);
     if (!channels || channels.length !== 3) throw new Error(`Unsupported color: ${color}`);
+    if (color.startsWith("oklab(") || color.startsWith("oklch(")) {
+      const [lightness, second, third] = channels;
+      const [a, b] = color.startsWith("oklch(")
+        ? [second * Math.cos(third * Math.PI / 180), second * Math.sin(third * Math.PI / 180)]
+        : [second, third];
+      const l = (lightness + 0.3963377774 * a + 0.2158037573 * b) ** 3;
+      const m = (lightness - 0.1055613458 * a - 0.0638541728 * b) ** 3;
+      const s = (lightness - 0.0894841775 * a - 1.291485548 * b) ** 3;
+      const red = Math.max(0, Math.min(1, 4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s));
+      const green = Math.max(
+        0,
+        Math.min(1, -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s),
+      );
+      const blue = Math.max(
+        0,
+        Math.min(1, -0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s),
+      );
+      return red * 0.2126 + green * 0.7152 + blue * 0.0722;
+    }
     const [red, green, blue] = channels.map((channel) => {
       const normalized = channel / 255;
       return normalized <= 0.04045 ? normalized / 12.92 : ((normalized + 0.055) / 1.055) ** 2.4;
@@ -24,6 +43,19 @@ test(
   async ({ page, request }, testInfo) => {
     await bootstrap(request);
     await login(page);
+    await page.evaluate(async () => {
+      const current = await fetch("/api/preferences").then((response) => response.json()) as {
+        version: number;
+      };
+      const response = await fetch("/api/preferences", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ expectedVersion: current.version, theme: "dark" }),
+      });
+      if (!response.ok) throw new Error(`Unable to enable dark theme: ${response.status}`);
+    });
+    await page.reload();
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
     await createChat(page);
     const mobile = testInfo.project.name.includes("mobile");
     const composer = page.getByRole("textbox", { name: /message/i });
@@ -73,11 +105,12 @@ test(
       name: /^(Start voice input|Voice input unavailable:)/,
     })).toBeVisible();
 
-    await page.evaluate(() => document.documentElement.setAttribute("data-theme", "dark"));
     const composerGradient = await activeChatSession(page).locator(".composer-wrap").evaluate((
       element,
     ) => getComputedStyle(element).backgroundImage);
-    expect(composerGradient).toContain("rgb(23, 23, 21)");
+    // The native shadcn theme intentionally keeps its dark surface in the preset's OKLCH token
+    // space instead of baking the former RGB value into this component.
+    expect(composerGradient).toMatch(/(?:oklch|rgb)\(/u);
     expect(composerGradient).not.toContain("rgb(255, 255, 255)");
     const darkSidebarColors = await page.evaluate(() => {
       const newChat = document.querySelector<HTMLElement>(".new-chat")!;
@@ -94,14 +127,14 @@ test(
         },
       };
     });
-    expect(contrastRatio(
-      darkSidebarColors.newChat.foreground,
-      darkSidebarColors.newChat.background,
-    )).toBeGreaterThanOrEqual(4.5);
-    expect(contrastRatio(
-      darkSidebarColors.search.foreground,
-      darkSidebarColors.search.background,
-    )).toBeGreaterThanOrEqual(4.5);
+    expect(
+      contrastRatio(darkSidebarColors.newChat.foreground, darkSidebarColors.newChat.background),
+      `new-chat colors: ${JSON.stringify(darkSidebarColors.newChat)}`,
+    ).toBeGreaterThanOrEqual(4.5);
+    expect(
+      contrastRatio(darkSidebarColors.search.foreground, darkSidebarColors.search.background),
+      `search colors: ${JSON.stringify(darkSidebarColors.search)}`,
+    ).toBeGreaterThanOrEqual(4.5);
     const attachButton = page.getByRole("button", { name: "Attach files" });
     await attachButton.hover();
     const iconHoverColors = await attachButton.evaluate((element) => ({

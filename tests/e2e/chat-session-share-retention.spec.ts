@@ -105,9 +105,9 @@ test("a one-time share URL survives inactive-session LRU pressure", async ({ pag
   await expect(page.locator(`[data-chat-session="${sourceId}"]`)).toHaveAttribute("hidden", "");
   await expect(dialog).toHaveCount(0);
   const retainedOverlay = page.locator(".modal-overlay").filter({ hasText: "Snapshot ready" });
-  await expect(retainedOverlay).toHaveAttribute("hidden", "");
-  await expect(retainedOverlay).toHaveCSS("display", "none");
-  expect(await retainedOverlay.evaluate((element) => element.getClientRects().length)).toBe(0);
+  // Native Base UI dialogs unmount their portal while closed. The owning retained chat keeps the
+  // dialog state, while the inactive session exposes no overlay or focusable content at all.
+  await expect(retainedOverlay).toHaveCount(0);
 
   for (let index = 0; index < 7; index++) await createChat(page);
   await expect(page.locator(`[data-chat-session="${sourceId}"]`)).toHaveCount(1);
@@ -116,7 +116,7 @@ test("a one-time share URL survives inactive-session LRU pressure", async ({ pag
   await openConversation(page, sourceId);
   const restoredDialog = page.getByRole("dialog", { name: "Share conversation" });
   await expect(restoredDialog).toBeVisible();
-  await expect(retainedOverlay).not.toHaveAttribute("hidden", "");
+  await expect(retainedOverlay).toHaveCount(1);
   await expect(retainedOverlay).toHaveCSS("display", "grid");
   await expect(restoredDialog.getByRole("heading", { name: "Snapshot ready" })).toBeVisible();
   await expect(restoredDialog.getByLabel("Share link")).toHaveValue(oneTimeUrl);

@@ -1,7 +1,20 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowDown, ArrowUp, Check, Ellipsis, Folder, Plus, X } from "lucide-react";
+import {
+  RiAddLine as Plus,
+  RiArrowDownSLine as ArrowDown,
+  RiArrowUpSLine as ArrowUp,
+  RiCheckLine as Check,
+  RiCloseLine as X,
+  RiFolderLine as Folder,
+  RiMore2Line as Ellipsis,
+} from "@remixicon/react";
 import { type FormEvent, useRef, useState } from "react";
 import { api, ApiError } from "../api.ts";
+import { Button } from "../components/ui/button.tsx";
+import { Checkbox } from "../components/ui/checkbox.tsx";
+import { Input } from "../components/ui/input.tsx";
+import { Label } from "../components/ui/label.tsx";
+import { Select, SelectContent, SelectItem, SelectTrigger } from "../components/ui/select.tsx";
 import { invalidateConversationSearch } from "../useConversationSearch.ts";
 import type {
   Conversation,
@@ -183,8 +196,10 @@ export function WorkspaceNavigation({
     <div className="workspace-navigation">
       <div className="workspace-heading">
         <span>PROJECTS</span>
-        <button
+        <Button
           type="button"
+          variant="ghost"
+          size="icon-xs"
           aria-label="Create project"
           onClick={() => {
             setName("");
@@ -194,28 +209,32 @@ export function WorkspaceNavigation({
           }}
         >
           <Plus size={14} />
-        </button>
+        </Button>
       </div>
-      <button
+      <Button
         type="button"
+        variant="ghost"
         className={selectedFolder === null ? "selected" : ""}
         aria-current={selectedFolder === null ? "page" : undefined}
         onClick={() => onSelectFolder(null)}
       >
         <Folder size={15} /> All chats
-      </button>
+      </Button>
       {folders?.data.map((folder) => (
         <div className="workspace-folder-row" key={folder.id}>
-          <button
+          <Button
             type="button"
+            variant="ghost"
             className={selectedFolder === folder.id ? "selected" : ""}
             aria-current={selectedFolder === folder.id ? "page" : undefined}
             onClick={() => onSelectFolder(folder.id)}
           >
             <Folder size={15} /> <span>{folder.name}</span>
-          </button>
-          <button
+          </Button>
+          <Button
             type="button"
+            variant="ghost"
+            size="icon-xs"
             aria-label={`Manage ${folder.name}`}
             onClick={() => {
               setName(folder.name);
@@ -224,9 +243,11 @@ export function WorkspaceNavigation({
             }}
           >
             <Ellipsis size={14} />
-          </button>
-          <button
+          </Button>
+          <Button
             type="button"
+            variant="ghost"
+            size="icon-xs"
             aria-label={`Move ${folder.name} up`}
             disabled={folders.data[0]?.id === folder.id || reorderFolders.isPending}
             onClick={() => {
@@ -237,9 +258,11 @@ export function WorkspaceNavigation({
             }}
           >
             <ArrowUp size={13} />
-          </button>
-          <button
+          </Button>
+          <Button
             type="button"
+            variant="ghost"
+            size="icon-xs"
             aria-label={`Move ${folder.name} down`}
             disabled={folders.data.at(-1)?.id === folder.id || reorderFolders.isPending}
             onClick={() => {
@@ -250,13 +273,15 @@ export function WorkspaceNavigation({
             }}
           >
             <ArrowDown size={13} />
-          </button>
+          </Button>
         </div>
       ))}
       <div className="workspace-heading">
         <span>TAGS</span>
-        <button
+        <Button
           type="button"
+          variant="ghost"
+          size="icon-xs"
           aria-label="Create tag"
           onClick={() => {
             setName("");
@@ -266,20 +291,28 @@ export function WorkspaceNavigation({
           }}
         >
           <Plus size={14} />
-        </button>
+        </Button>
       </div>
       <div className="tag-filter-list" role="group" aria-label="Filter conversations by tag">
         {tags?.data.map((tag) => {
           const selected = selectedTags.includes(tag.id);
           return (
             <span className="tag-filter-item" key={tag.id}>
-              <button type="button" aria-pressed={selected} onClick={() => onToggleTag(tag.id)}>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                aria-pressed={selected}
+                onClick={() => onToggleTag(tag.id)}
+              >
                 <i style={{ backgroundColor: tag.color }} aria-hidden="true" />
                 {tag.name}
                 {selected && <Check size={13} />}
-              </button>
-              <button
+              </Button>
+              <Button
                 type="button"
+                variant="ghost"
+                size="icon-xs"
                 aria-label={`Manage ${tag.name}`}
                 onClick={() => {
                   setEditingTag(tag);
@@ -289,18 +322,20 @@ export function WorkspaceNavigation({
                 }}
               >
                 <Ellipsis size={12} />
-              </button>
+              </Button>
             </span>
           );
         })}
         {selectedTags.length > 0 && (
-          <button
+          <Button
             type="button"
+            variant="ghost"
+            size="sm"
             className="clear-tags"
             onClick={() => selectedTags.forEach(onToggleTag)}
           >
             <X size={13} /> Clear
-          </button>
+          </Button>
         )}
       </div>
       {(foldersError || tagsError) && (
@@ -312,29 +347,33 @@ export function WorkspaceNavigation({
               ? "Projects couldn’t be loaded."
               : "Tags couldn’t be loaded."}
           </span>
-          <button
+          <Button
             type="button"
+            variant="ghost"
+            size="sm"
             onClick={() => {
               if (foldersError) retryFolders();
               if (tagsError) retryTags();
             }}
           >
             Retry
-          </button>
+          </Button>
         </div>
       )}
       {workspaceError && (
         <div className="workspace-error" role="alert">
           <span>{workspaceError}</span>
-          <button
+          <Button
             type="button"
+            variant="ghost"
+            size="sm"
             onClick={() => {
               setWorkspaceError("");
               retryFolders();
             }}
           >
             Refresh
-          </button>
+          </Button>
         </div>
       )}
       {creating && (
@@ -345,7 +384,7 @@ export function WorkspaceNavigation({
           <form onSubmit={submit}>
             <label className="field">
               <span>{creating === "folder" ? "Project name" : "Tag name"}</span>
-              <input
+              <Input
                 autoFocus
                 data-autofocus
                 maxLength={creating === "folder" ? 120 : 64}
@@ -355,15 +394,15 @@ export function WorkspaceNavigation({
             </label>
             {error && <p role="alert" className="form-error">{error}</p>}
             <div className="modal-actions">
-              <button type="button" className="secondary" onClick={() => setCreating(null)}>
+              <Button type="button" variant="outline" onClick={() => setCreating(null)}>
                 Cancel
-              </button>
-              <button
-                className="primary"
+              </Button>
+              <Button
+                type="submit"
                 disabled={!name.trim() || createFolder.isPending || createTag.isPending}
               >
                 Create
-              </button>
+              </Button>
             </div>
           </form>
         </Modal>
@@ -377,7 +416,7 @@ export function WorkspaceNavigation({
           <form onSubmit={submit}>
             <label className="field">
               <span>Project name</span>
-              <input
+              <Input
                 autoFocus
                 data-autofocus
                 maxLength={120}
@@ -388,23 +427,23 @@ export function WorkspaceNavigation({
             <p className="muted">Deleting a project never deletes its conversations.</p>
             {error && <p role="alert" className="form-error">{error}</p>}
             <div className="modal-actions project-modal-actions">
-              <button
+              <Button
                 type="button"
-                className="danger-button"
+                variant="destructive"
                 disabled={deleteFolder.isPending || updateFolder.isPending}
                 onClick={() => deleteFolder.mutate(editing)}
               >
                 Delete project
-              </button>
-              <button type="button" className="secondary" onClick={() => setEditing(null)}>
+              </Button>
+              <Button type="button" variant="outline" onClick={() => setEditing(null)}>
                 Cancel
-              </button>
-              <button
-                className="primary"
+              </Button>
+              <Button
+                type="submit"
                 disabled={!name.trim() || name.trim() === editing.name || updateFolder.isPending}
               >
                 Save
-              </button>
+              </Button>
             </div>
           </form>
         </Modal>
@@ -418,7 +457,7 @@ export function WorkspaceNavigation({
           <form onSubmit={submit}>
             <label className="field">
               <span>Tag name</span>
-              <input
+              <Input
                 autoFocus
                 data-autofocus
                 maxLength={64}
@@ -428,7 +467,7 @@ export function WorkspaceNavigation({
             </label>
             <label className="field">
               <span>Color</span>
-              <input
+              <Input
                 type="color"
                 value={tagColor}
                 onChange={(event) => setTagColor(event.target.value)}
@@ -436,20 +475,20 @@ export function WorkspaceNavigation({
             </label>
             {error && <p role="alert" className="form-error">{error}</p>}
             <div className="modal-actions project-modal-actions">
-              <button
+              <Button
                 type="button"
-                className="danger-button"
+                variant="destructive"
                 disabled={deleteTag.isPending || updateTag.isPending}
                 onClick={() => deleteTag.mutate(editingTag)}
               >
                 Delete tag
-              </button>
-              <button type="button" className="secondary" onClick={() => setEditingTag(null)}>
+              </Button>
+              <Button type="button" variant="outline" onClick={() => setEditingTag(null)}>
                 Cancel
-              </button>
-              <button className="primary" disabled={!name.trim() || updateTag.isPending}>
+              </Button>
+              <Button type="submit" disabled={!name.trim() || updateTag.isPending}>
                 Save
-              </button>
+              </Button>
             </div>
           </form>
         </Modal>
@@ -562,40 +601,44 @@ export function OrganizeConversationDialog({
     >
       <label className="field">
         <span>Project</span>
-        <select
-          value={folderId}
+        <Select
+          value={folderId || "__none"}
           disabled={busy}
-          onChange={(event) => setFolderId(event.target.value)}
+          onValueChange={(value) => setFolderId(value === "__none" || value === null ? "" : value)}
         >
-          <option value="">No project</option>
-          {folders.data.map((folder) => (
-            <option key={folder.id} value={folder.id}>{folder.name}</option>
-          ))}
-        </select>
+          <SelectTrigger className="w-full">
+            {folders.data.find((folder) => folder.id === folderId)?.name ?? "No project"}
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="__none">No project</SelectItem>
+            {folders.data.map((folder) => (
+              <SelectItem key={folder.id} value={folder.id}>{folder.name}</SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
       </label>
       <fieldset className="tag-checkboxes">
         <legend>Tags</legend>
         {tags.data.map((tag) => (
-          <label key={tag.id}>
-            <input
-              type="checkbox"
+          <Label key={tag.id}>
+            <Checkbox
               checked={tagIds.includes(tag.id)}
               disabled={busy}
-              onChange={() =>
+              onCheckedChange={() =>
                 setTagIds((ids) =>
                   ids.includes(tag.id) ? ids.filter((id) => id !== tag.id) : [...ids, tag.id]
                 )}
             />
             <i style={{ backgroundColor: tag.color }} aria-hidden="true" /> {tag.name}
-          </label>
+          </Label>
         ))}
       </fieldset>
       {error && <p role="alert" className="form-error">{error}</p>}
       <div className="modal-actions">
-        <button type="button" className="secondary" disabled={busy} onClick={close}>Cancel</button>
-        <button type="button" className="primary" disabled={busy} onClick={() => void save()}>
+        <Button type="button" variant="outline" disabled={busy} onClick={close}>Cancel</Button>
+        <Button type="button" disabled={busy} onClick={() => void save()}>
           {busy ? "Saving…" : "Save"}
-        </button>
+        </Button>
       </div>
     </Modal>
   );

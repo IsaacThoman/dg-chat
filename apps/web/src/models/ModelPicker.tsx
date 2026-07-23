@@ -1,7 +1,17 @@
-import { useContext, useEffect, useId, useRef, useState } from "react";
-import { Check, ChevronDown, SlidersHorizontal } from "lucide-react";
-import type { Model } from "../types.ts";
+import { useContext, useRef, useState } from "react";
+import { RiEqualizer2Line } from "@remixicon/react";
+
 import { ChatSessionActivityContext } from "../chatSessionActivity.ts";
+import { Badge } from "../components/ui/badge.tsx";
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectLabel,
+  SelectTrigger,
+} from "../components/ui/select.tsx";
+import type { Model } from "../types.ts";
 
 export function ModelPicker({
   models,
@@ -14,119 +24,71 @@ export function ModelPicker({
 }) {
   const sessionActive = useContext(ChatSessionActivityContext);
   const [open, setOpen] = useState(false);
-  const [focusedModelId, setFocusedModelId] = useState(selected);
-  const triggerRef = useRef<HTMLButtonElement>(null);
-  const panelRef = useRef<HTMLDivElement>(null);
-  const listId = useId();
-  const model = models.find((item) => item.id === selected) ?? models[0];
-  const initialModelId = models.some((item) => item.id === selected)
-    ? selected
-    : models[0]?.id ?? "";
-
-  const close = (restoreFocus = true) => {
-    setOpen(false);
-    if (restoreFocus) requestAnimationFrame(() => triggerRef.current?.focus());
+  const selectedRef = useRef(selected);
+  if (selectedRef.current !== selected) selectedRef.current = selected;
+  const selectModel = (value: string | null) => {
+    if (!value || selectedRef.current === value) return;
+    selectedRef.current = value;
+    setSelected(value);
   };
-
-  useEffect(() => {
-    if (!open || !sessionActive) return;
-    const selectedItem = panelRef.current?.querySelector<HTMLButtonElement>(
-      `[data-model-id="${CSS.escape(initialModelId)}"]`,
-    );
-    (selectedItem ?? panelRef.current?.querySelector<HTMLButtonElement>("button"))?.focus();
-    const pointer = (event: PointerEvent) => {
-      if (
-        !panelRef.current?.contains(event.target as Node) &&
-        !triggerRef.current?.contains(event.target as Node)
-      ) close(false);
-    };
-    document.addEventListener("pointerdown", pointer);
-    return () => document.removeEventListener("pointerdown", pointer);
-  }, [initialModelId, open, sessionActive]);
+  const model = models.find((item) => item.id === selected) ?? models[0];
 
   return (
     <div className="model-picker">
-      <button
-        ref={triggerRef}
-        type="button"
-        className="model-trigger"
-        aria-haspopup="listbox"
-        aria-controls={open ? listId : undefined}
-        aria-expanded={open}
+      <Select
+        value={model?.id ?? null}
+        open={sessionActive && open}
+        onOpenChange={setOpen}
+        onValueChange={selectModel}
         disabled={!models.length}
-        onClick={() => {
-          if (!open) setFocusedModelId(initialModelId);
-          setOpen((value) => !value);
-        }}
       >
-        <span className="model-glyph" aria-hidden="true">{model?.provider[0]}</span>
-        <span>
-          <strong>{model?.name ?? "No chat model"}</strong>
-          {model && <small>{model.provider} · {model.context}</small>}
-        </span>
-        <ChevronDown size={16} aria-hidden="true" />
-      </button>
-      {open && (
-        <div
-          ref={panelRef}
-          id={listId}
-          className="model-popover"
-          role="listbox"
+        <SelectTrigger
+          className="model-trigger"
           aria-label="Chat model"
-          onKeyDown={(event) => {
-            if (event.key === "Tab") {
-              close(false);
-              return;
-            }
-            if (event.key === "Escape") {
-              event.preventDefault();
-              close();
-              return;
-            }
-            const items = [...event.currentTarget.querySelectorAll<HTMLButtonElement>("button")];
-            const index = items.indexOf(document.activeElement as HTMLButtonElement);
-            let next: HTMLButtonElement | undefined;
-            if (event.key === "ArrowDown") next = items[(index + 1) % items.length];
-            if (event.key === "ArrowUp") next = items[(index - 1 + items.length) % items.length];
-            if (event.key === "Home") next = items[0];
-            if (event.key === "End") next = items.at(-1);
-            if (next) {
-              event.preventDefault();
-              next.focus();
-            }
+          onClick={() => {
+            if (!open) setOpen(true);
           }}
         >
-          <div className="popover-title">
-            Choose a model <SlidersHorizontal size={15} />
-          </div>
-          {models.map((item) => (
-            <button
-              id={`${listId}-${item.id}`}
-              data-model-id={item.id}
-              type="button"
-              role="option"
-              aria-selected={selected === item.id}
-              tabIndex={focusedModelId === item.id ? 0 : -1}
-              key={item.id}
-              onFocus={() => setFocusedModelId(item.id)}
-              onClick={() => {
-                setSelected(item.id);
-                close();
-              }}
-            >
-              <span className={`health-dot ${item.healthy ? "" : "down"}`} />
-              <span>
-                <strong>{item.name}</strong>
-                <small>{item.provider} · {item.context} context</small>
-              </span>
-              <span className="capabilities">
-                {item.capabilities.map((capability) => <i key={capability}>{capability}</i>)}
-              </span>
-              {selected === item.id && <Check size={17} aria-hidden="true" />}
-            </button>
-          ))}
-        </div>
-      )}
+          <span className="model-glyph" aria-hidden="true">
+            {model?.provider[0]?.toUpperCase() ?? "–"}
+          </span>
+          <span className="model-trigger-copy">
+            <strong>{model?.name ?? "No chat model"}</strong>
+            {model && <small>{model.provider} · {model.context}</small>}
+          </span>
+        </SelectTrigger>
+        <SelectContent
+          className="model-popover"
+          align="start"
+          alignItemWithTrigger={false}
+          listProps={{ "aria-label": "Chat model" }}
+        >
+          <SelectGroup>
+            <SelectLabel className="popover-title">
+              Choose a model <RiEqualizer2Line aria-hidden="true" />
+            </SelectLabel>
+            {models.map((item) => (
+              <SelectItem
+                key={item.id}
+                value={item.id}
+                className="model-option"
+                onClick={() => selectModel(item.id)}
+              >
+                <span className={`health-dot ${item.healthy ? "" : "down"}`} />
+                <span className="model-option-copy">
+                  <strong>{item.name}</strong>
+                  <small>{item.provider} · {item.context} context</small>
+                </span>
+                <span className="capabilities" aria-label="Capabilities">
+                  {item.capabilities.map((capability) => (
+                    <Badge key={capability} variant="secondary">{capability}</Badge>
+                  ))}
+                </span>
+              </SelectItem>
+            ))}
+          </SelectGroup>
+        </SelectContent>
+      </Select>
     </div>
   );
 }

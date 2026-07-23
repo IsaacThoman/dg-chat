@@ -3960,11 +3960,12 @@ kbd {
 }
 .portability-summary {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 6px;
   margin: 0;
 }
 .portability-summary > div {
+  min-width: 0;
   padding: 8px;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -3973,6 +3974,7 @@ kbd {
 .portability-summary dt {
   color: var(--supporting-ink);
   font-size: 12px;
+  overflow-wrap: anywhere;
 }
 .portability-summary dd {
   margin: 3px 0 0;
@@ -8227,5 +8229,271 @@ kbd {
   }
   html {
     @apply font-sans;
+  }
+}
+
+/* Native shadcn shell -------------------------------------------------------
+ * Keep feature-specific legacy selectors while the application is decomposed,
+ * but make the shared shell consume the preset's semantic design tokens.
+ */
+.app-shell {
+  gap: 0;
+  background: var(--sidebar);
+}
+
+.sidebar {
+  width: 264px;
+  padding: 12px 10px 10px;
+  border-color: var(--sidebar-border);
+  background: var(--sidebar);
+  color: var(--sidebar-foreground);
+}
+
+.sidebar-head,
+.side-nav,
+.sidebar-footer,
+.workspace-navigation {
+  border-color: var(--sidebar-border);
+}
+
+.new-chat {
+  height: 38px;
+  border-color: var(--sidebar-border);
+  background: var(--background);
+  color: var(--foreground);
+  box-shadow: 0 1px 2px color-mix(in oklch, var(--foreground) 6%, transparent);
+}
+
+.new-chat:hover {
+  border-color: color-mix(in oklch, var(--sidebar-ring) 55%, var(--sidebar-border));
+  background: var(--sidebar-accent);
+  color: var(--sidebar-accent-foreground);
+}
+
+.search {
+  height: 34px;
+  border-color: transparent;
+  background: color-mix(in oklch, var(--sidebar-accent) 72%, transparent);
+  color: var(--muted-foreground);
+}
+
+.search:focus-within {
+  border-color: var(--sidebar-ring);
+  background: var(--background);
+  box-shadow: 0 0 0 2px color-mix(in oklch, var(--sidebar-ring) 20%, transparent);
+}
+
+.search input[data-slot="input"] {
+  height: auto;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--sidebar-foreground);
+  box-shadow: none;
+}
+
+.search input[data-slot="input"]::placeholder {
+  color: var(--muted-foreground);
+}
+
+.side-nav button,
+.sidebar-footer > button,
+.workspace-navigation > button,
+.workspace-folder-row > button:first-child {
+  color: var(--sidebar-foreground);
+}
+
+.side-nav button:hover,
+.sidebar-footer > button:hover,
+.side-nav button.selected,
+.sidebar-footer > button.selected,
+.workspace-navigation button.selected {
+  background: var(--sidebar-accent);
+  color: var(--sidebar-accent-foreground);
+}
+
+.chat-main {
+  height: calc(100% - 16px);
+  margin: 8px 8px 8px 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  background: var(--background);
+  box-shadow: 0 1px 2px color-mix(in oklch, var(--foreground) 5%, transparent);
+}
+
+.chat-header {
+  height: 58px;
+  border-color: var(--border);
+  background: color-mix(in oklch, var(--background) 88%, transparent);
+}
+
+.model-trigger[data-slot="select-trigger"] {
+  width: min(340px, 42vw);
+  height: 42px;
+  justify-content: flex-start;
+  border-color: transparent;
+  background: transparent;
+}
+
+.model-trigger[data-slot="select-trigger"]:hover,
+.model-trigger[data-popup-open] {
+  border-color: var(--border);
+  background: var(--muted);
+}
+
+.model-trigger-copy,
+.model-option-copy {
+  display: grid;
+  min-width: 0;
+  flex: 1;
+  gap: 1px;
+}
+
+.model-trigger-copy strong,
+.model-option-copy strong,
+.model-trigger-copy small,
+.model-option-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-trigger-copy small,
+.model-option-copy small {
+  color: var(--muted-foreground);
+  font-size: 0.625rem;
+}
+
+.model-glyph {
+  color: var(--primary-foreground);
+  background: var(--primary);
+}
+
+.model-popover[data-slot="select-content"] {
+  position: static;
+  top: auto;
+  left: auto;
+  width: min(440px, calc(100vw - 24px));
+  border: 0;
+  background: var(--popover);
+  color: var(--popover-foreground);
+  padding: 4px;
+}
+
+.model-option[data-slot="select-item"] {
+  min-height: 52px;
+  padding: 8px 34px 8px 10px;
+}
+
+.model-option .capabilities {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 3px;
+}
+
+.balance-pill[data-slot="badge"] {
+  min-height: 26px;
+  padding-inline: 9px;
+  border-color: var(--border);
+  background: color-mix(in oklch, var(--input) 55%, transparent);
+  color: var(--foreground);
+}
+
+.composer-wrap {
+  padding-top: 14px;
+  background: linear-gradient(to top, var(--background) 78%, transparent);
+}
+
+.composer {
+  border-color: var(--border);
+  border-radius: var(--radius-xl);
+  background: var(--card);
+  box-shadow: 0 10px 35px color-mix(in oklch, var(--foreground) 8%, transparent);
+}
+
+.composer:focus-within {
+  border-color: var(--ring);
+  box-shadow: 0 10px 35px color-mix(in oklch, var(--foreground) 8%, transparent),
+    0 0 0 3px color-mix(in oklch, var(--ring) 18%, transparent);
+}
+
+.composer textarea.composer-input[data-slot="textarea"] {
+  min-height: 38px;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.tool-pill[data-slot="button"] {
+  height: 30px;
+  padding-inline: 8px;
+  color: var(--muted-foreground);
+}
+
+.send-button[data-slot="button"] {
+  border-radius: var(--radius-lg);
+}
+
+.native-empty-state {
+  width: min(520px, calc(100% - 32px));
+  flex: none;
+  min-height: 280px;
+}
+
+.lifecycle-empty > .native-empty-state {
+  margin: auto;
+}
+
+.setting-row[data-slot="field"] {
+  min-height: 54px;
+  padding-block: 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.theme-grid button[data-slot="button"] {
+  height: auto;
+  padding: 8px;
+}
+
+.shadcn-modal-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  pointer-events: none;
+}
+
+.shadcn-modal-layer > * {
+  pointer-events: auto;
+}
+
+.modal[data-slot="dialog-content"] {
+  border: 0;
+  background: var(--popover);
+  color: var(--popover-foreground);
+  box-shadow: 0 24px 80px color-mix(in oklch, black 32%, transparent);
+  outline: 1px solid var(--border);
+}
+
+.modal-head[data-slot="dialog-header"] {
+  flex-direction: row;
+  align-items: center;
+}
+
+@media (max-width: 760px) {
+  .chat-main {
+    height: 100%;
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+  }
+
+  .model-trigger[data-slot="select-trigger"] {
+    width: min(250px, calc(100vw - 112px));
+  }
+
+  .native-empty-state {
+    min-height: 240px;
   }
 }

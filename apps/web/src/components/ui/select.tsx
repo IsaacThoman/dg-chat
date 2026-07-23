@@ -62,13 +62,15 @@ function SelectContent({
   align = "center",
   alignOffset = 0,
   alignItemWithTrigger = true,
+  listProps,
   ...props
 }:
   & SelectPrimitive.Popup.Props
   & Pick<
     SelectPrimitive.Positioner.Props,
     "align" | "alignOffset" | "side" | "sideOffset" | "alignItemWithTrigger"
-  >) {
+  >
+  & { listProps?: SelectPrimitive.List.Props }) {
   return (
     <SelectPrimitive.Portal>
       <SelectPrimitive.Positioner
@@ -89,7 +91,7 @@ function SelectContent({
           {...props}
         >
           <SelectScrollUpButton />
-          <SelectPrimitive.List>{children}</SelectPrimitive.List>
+          <SelectPrimitive.List {...listProps}>{children}</SelectPrimitive.List>
           <SelectScrollDownButton />
         </SelectPrimitive.Popup>
       </SelectPrimitive.Positioner>
