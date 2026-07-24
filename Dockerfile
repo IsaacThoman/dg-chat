@@ -44,7 +44,7 @@ RUN deno compile --frozen -A --node-modules-dir=none --exclude-unused-npm \
       --include apps/worker/src/extraction-worker.ts \
       --output /workspace/dg-chat-worker apps/worker/src/main.ts
 
-FROM nginxinc/nginx-unprivileged:1.27-alpine AS web
+FROM nginxinc/nginx-unprivileged:1.31-alpine AS web
 COPY --from=web-build /workspace/apps/web/dist /usr/share/nginx/html
 RUN <<'EOF'
 cat > /etc/nginx/conf.d/default.conf <<'NGINX'
